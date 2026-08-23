@@ -8,6 +8,9 @@
 const std = @import("std");
 const json = @import("../json.zig");
 const tools = @import("../tools.zig");
+const permission_category = @import("../permission/category.zig");
+const artifact_store = @import("tool_result_artifact.zig");
+const tool_result = @import("tool_result.zig");
 
 pub const CatalogError = error{
     UnknownBuiltinTool,
@@ -59,6 +62,63 @@ pub const HostSyncTool = struct {
     definition: json.ToolDefinition,
     ctx: *anyopaque,
     execute: HostSyncExecuteFn,
+    /// Conservative by default: a Host callback is executable authority unless
+    /// its trusted registrar explicitly proves a narrower read/write effect.
+    category: permission_category.ToolCategory = .execute,
+};
+
+/// Errors observable by a streaming Host producer. The sink is borrowed for
+/// one synchronous callback and owns neither commit nor rollback authority.
+pub const HostResultSinkError = error{
+    Aborted,
+    ArtifactTooLarge,
+    ArtifactSinkFailed,
+    ArtifactSinkClosed,
+};
+
+pub const HostResultSink = struct {
+    ctx: *anyopaque,
+    writeFn: *const fn (ctx: *anyopaque, bytes: []const u8) HostResultSinkError!void,
+
+    pub fn write(self: *const HostResultSink, bytes: []const u8) HostResultSinkError!void {
+        return self.writeFn(self.ctx, bytes);
+    }
+};
+
+/// A successful streaming callback publishes exactly the bytes already sent
+/// to the sink. Business failures may carry the same bounded Host-owned detail
+/// as legacy callbacks; partial sink bytes are discarded by the kernel.
+pub const HostStreamOutcome = union(enum) {
+    artifact: tool_result.MediaType,
+    failed: ?HostToolResult,
+    rejected: ?HostToolResult,
+    fatal,
+};
+
+pub const HostStreamExecuteError = error{
+    OutOfMemory,
+    Aborted,
+    ArtifactTooLarge,
+    ArtifactSinkFailed,
+    ArtifactSinkClosed,
+};
+
+pub const HostStreamExecuteFn = *const fn (
+    ctx: *anyopaque,
+    identity: HostRunIdentity,
+    args: []const u8,
+    sink: *const HostResultSink,
+) HostStreamExecuteError!HostStreamOutcome;
+
+/// Streaming Host tools are a distinct registration type: a descriptor can
+/// never accidentally provide both the legacy full-buffer callback and the
+/// byte-zero callback. The Session must enable its artifact store before this
+/// tool can be selected.
+pub const HostStreamTool = struct {
+    definition: json.ToolDefinition,
+    ctx: *anyopaque,
+    execute: HostStreamExecuteFn,
+    category: permission_category.ToolCategory = .execute,
 };
 
 pub const HostSyncExecutor = struct {
@@ -66,15 +126,50 @@ pub const HostSyncExecutor = struct {
     execute: HostSyncExecuteFn,
 };
 
+pub const HostStreamExecutor = struct {
+    ctx: *anyopaque,
+    execute: HostStreamExecuteFn,
+};
+
+/// Kernel-owned adapter for an isolated executor (currently a process plugin).
+/// Unlike `host_sync`, the callback receives the full borrowed ToolContext so
+/// cancellation can terminate the child process. It receives no Host session
+/// pointer and returns the already-typed dispatch outcome, keeping process code
+/// outside Host callback authority.
+pub const IsolatedExecuteFn = *const fn (
+    ctx: *anyopaque,
+    tool_ctx: *const tools.ToolContext,
+    args: []const u8,
+) anyerror!tools.ToolDispatchOutcome;
+
+pub const IsolatedTool = struct {
+    definition: json.ToolDefinition,
+    ctx: *anyopaque,
+    execute: IsolatedExecuteFn,
+    /// Non-zero digest of the executable/package/schema authority. Embedding
+    /// adapters use it to bind Session permission memory and checkpoints to
+    /// this exact isolated implementation instead of only its display name.
+    authority_binding: [32]u8,
+};
+
+pub const IsolatedExecutor = struct {
+    ctx: *anyopaque,
+    execute: IsolatedExecuteFn,
+    authority_binding: [32]u8,
+};
+
 pub const Executor = union(enum) {
     builtin: *const tools.ToolEntry,
     host_sync: HostSyncExecutor,
+    host_stream: HostStreamExecutor,
+    isolated: IsolatedExecutor,
 };
 
 pub const Entry = struct {
     definition: json.ToolDefinition,
     executor: Executor,
     prefetch_safe: bool,
+    category: permission_category.ToolCategory,
 };
 
 pub const Catalog = struct {
@@ -87,12 +182,34 @@ pub const Catalog = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, builtin_names: []const []const u8, host_tools: []const HostSyncTool) !Catalog {
+        return initWithIsolated(allocator, builtin_names, host_tools, &.{});
+    }
+
+    pub fn initWithIsolated(
+        allocator: std.mem.Allocator,
+        builtin_names: []const []const u8,
+        host_tools: []const HostSyncTool,
+        isolated_tools: []const IsolatedTool,
+    ) !Catalog {
+        return initWithExecutors(allocator, builtin_names, host_tools, &.{}, isolated_tools);
+    }
+
+    pub fn initWithExecutors(
+        allocator: std.mem.Allocator,
+        builtin_names: []const []const u8,
+        host_tools: []const HostSyncTool,
+        host_stream_tools: []const HostStreamTool,
+        isolated_tools: []const IsolatedTool,
+    ) !Catalog {
         const arena = try allocator.create(std.heap.ArenaAllocator);
         errdefer allocator.destroy(arena);
         arena.* = .init(allocator);
         errdefer arena.deinit();
         const owned = arena.allocator();
-        var entries = try std.ArrayList(Entry).initCapacity(owned, builtin_names.len + host_tools.len);
+        var entries = try std.ArrayList(Entry).initCapacity(
+            owned,
+            builtin_names.len + host_tools.len + host_stream_tools.len + isolated_tools.len,
+        );
 
         for (builtin_names) |name| {
             if (findEntry(entries.items, name) != null) return error.DuplicateToolName;
@@ -114,6 +231,7 @@ pub const Catalog = struct {
                 // built-ins. The extra gate exists only to keep Host and
                 // unselected entries out of the prefetch path.
                 .prefetch_safe = true,
+                .category = permission_category.getToolCategory(builtin.name),
             });
         }
 
@@ -127,6 +245,40 @@ pub const Catalog = struct {
                 .definition = try cloneDefinition(owned, host.definition),
                 .executor = .{ .host_sync = .{ .ctx = host.ctx, .execute = host.execute } },
                 .prefetch_safe = false,
+                .category = host.category,
+            });
+        }
+        for (host_stream_tools) |host| {
+            if (host.definition.name.len == 0 or
+                !std.mem.eql(u8, host.definition.input_schema.type, "object") or
+                host.definition.server_type != null or
+                host.definition.deferred) return error.InvalidHostTool;
+            if (findEntry(entries.items, host.definition.name) != null) return error.DuplicateToolName;
+            try entries.append(owned, .{
+                .definition = try cloneDefinition(owned, host.definition),
+                .executor = .{ .host_stream = .{ .ctx = host.ctx, .execute = host.execute } },
+                .prefetch_safe = false,
+                .category = host.category,
+            });
+        }
+        for (isolated_tools) |isolated| {
+            if (isolated.definition.name.len == 0 or
+                !std.mem.eql(u8, isolated.definition.input_schema.type, "object") or
+                isolated.definition.server_type != null or
+                isolated.definition.deferred or
+                std.mem.allEqual(u8, &isolated.authority_binding, 0)) return error.InvalidHostTool;
+            if (findEntry(entries.items, isolated.definition.name) != null) return error.DuplicateToolName;
+            try entries.append(owned, .{
+                .definition = try cloneDefinition(owned, isolated.definition),
+                .executor = .{ .isolated = .{
+                    .ctx = isolated.ctx,
+                    .execute = isolated.execute,
+                    .authority_binding = isolated.authority_binding,
+                } },
+                .prefetch_safe = false,
+                // Process manifests cannot self-classify into a weaker native
+                // permission category. Executable authority is conservative.
+                .category = .execute,
             });
         }
         return .{ .allocator = allocator, .arena = arena, .entries = try entries.toOwnedSlice(owned) };
@@ -155,6 +307,26 @@ fn cloneDefinition(allocator: std.mem.Allocator, source: json.ToolDefinition) st
         .input_schema = try cloneInputSchema(allocator, source.input_schema),
         .server_type = null,
         .deferred = false,
+        .model_activation = if (source.model_activation) |activation| .{
+            .mode = activation.mode,
+            .argument_name = if (activation.argument_name) |value|
+                try allocator.dupe(u8, value)
+            else
+                null,
+            .argument_value = if (activation.argument_value) |value|
+                try allocator.dupe(u8, value)
+            else
+                null,
+        } else null,
+    };
+}
+
+pub fn cloneHostTool(allocator: std.mem.Allocator, source: HostSyncTool) std.mem.Allocator.Error!HostSyncTool {
+    return .{
+        .definition = try cloneDefinition(allocator, source.definition),
+        .ctx = source.ctx,
+        .execute = source.execute,
+        .category = source.category,
     };
 }
 
@@ -297,7 +469,7 @@ pub const Selection = struct {
     }
 
     pub fn dispatcher(self: *const Selection) tools.ToolDispatcher {
-        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync, .builtinFn = isBuiltinEntry };
+        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync, .builtinFn = isBuiltinEntry, .categoryFn = category };
     }
 
     fn dispatch(raw: *const anyopaque, tool_ctx: *const tools.ToolContext, name: []const u8, args: []const u8) anyerror!tools.ToolDispatchOutcome {
@@ -307,7 +479,7 @@ pub const Selection = struct {
             .builtin => |builtin| {
                 try tools.validateRequired(builtin.name, args);
                 try tools.validateTypes(builtin.name, args);
-                return .{ .ok = try builtin.execute(tool_ctx, args) };
+                return .{ .ok = try builtin.execute.run(tool_ctx, args) };
             },
             .host_sync => |host| {
                 // Identity is admission-fixed and passed by value; a selected
@@ -320,7 +492,7 @@ pub const Selection = struct {
                 switch (outcome) {
                     .ok => |result| {
                         defer result.release();
-                        return .{ .ok = try tool_ctx.allocator.dupe(u8, result.bytes) };
+                        return .{ .ok = tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, result.bytes)) };
                     },
                     .failed => |maybe| {
                         const detail = try copyDetail(tool_ctx.allocator, maybe);
@@ -333,6 +505,57 @@ pub const Selection = struct {
                     .fatal => return .host_fatal,
                 }
             },
+            .host_stream => |host| {
+                const identity = tool_ctx.host_run orelse return error.HostRunIdentityMissing;
+                if (tool_ctx.artifact_root.len == 0) return error.ArtifactStoreRequired;
+                var spool = try artifact_store.Spool.begin(tool_ctx.allocator, tool_ctx.artifact_root);
+                defer spool.deinit();
+                var stream_state = StreamState{
+                    .spool = &spool,
+                    .abort = tool_ctx.abort,
+                };
+                const sink = HostResultSink{ .ctx = &stream_state, .writeFn = StreamState.write };
+                const outcome = try host.execute(host.ctx, identity, args, &sink);
+                switch (outcome) {
+                    .artifact => |media_type| {
+                        try stream_state.requireHealthy();
+                        return .{ .ok = tool_result.ToolResultBody.fromCompletedSpool(
+                            try spool.finish(),
+                            media_type,
+                        ) };
+                    },
+                    .failed => |maybe| {
+                        const detail = try copyDetail(tool_ctx.allocator, maybe);
+                        return .{ .host_failed = detail };
+                    },
+                    .rejected => |maybe| {
+                        const detail = try copyDetail(tool_ctx.allocator, maybe);
+                        return .{ .host_rejected = detail };
+                    },
+                    .fatal => return .host_fatal,
+                }
+            },
+            .isolated => |isolated| {
+                try validateIsolatedEnvelope(tool_ctx.allocator, entry.definition.input_schema, args);
+                return isolated.execute(isolated.ctx, tool_ctx, args);
+            },
+        }
+    }
+
+    fn validateIsolatedEnvelope(
+        allocator: std.mem.Allocator,
+        schema: json.InputSchema,
+        args: []const u8,
+    ) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, args, .{
+            .duplicate_field_behavior = .@"error",
+        }) catch return error.InvalidToolInput;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidToolInput;
+        if (schema.required) |required| {
+            for (required) |name| {
+                if (parsed.value.object.get(name) == null) return error.MissingRequiredField;
+            }
         }
     }
 
@@ -344,6 +567,53 @@ pub const Selection = struct {
         return try allocator.dupe(u8, result.bytes);
     }
 
+    const StreamFailure = enum {
+        aborted,
+        too_large,
+        sink_failed,
+        closed,
+    };
+
+    const StreamState = struct {
+        spool: *artifact_store.Spool,
+        abort: ?*const @import("../util/abort.zig").AbortSignal,
+        failure: ?StreamFailure = null,
+
+        fn write(raw: *anyopaque, bytes: []const u8) HostResultSinkError!void {
+            const self: *StreamState = @ptrCast(@alignCast(raw));
+            if (self.failure) |failure| return failureError(failure);
+            if (self.abort) |signal| {
+                if (signal.isAborted()) {
+                    self.failure = .aborted;
+                    return error.Aborted;
+                }
+            }
+            self.spool.write(bytes) catch |err| {
+                const failure: StreamFailure = switch (err) {
+                    error.ArtifactTooLarge => .too_large,
+                    error.ArtifactSpoolClosed => .closed,
+                    else => .sink_failed,
+                };
+                self.failure = failure;
+                return failureError(failure);
+            };
+        }
+
+        fn requireHealthy(self: *const StreamState) HostResultSinkError!void {
+            if (self.failure) |failure| return failureError(failure);
+            if (self.abort) |signal| if (signal.isAborted()) return error.Aborted;
+        }
+
+        fn failureError(failure: StreamFailure) HostResultSinkError {
+            return switch (failure) {
+                .aborted => error.Aborted,
+                .too_large => error.ArtifactTooLarge,
+                .sink_failed => error.ArtifactSinkFailed,
+                .closed => error.ArtifactSinkClosed,
+            };
+        }
+    };
+
     fn prefetchSafe(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Selection = @ptrCast(@alignCast(raw));
         const entry = self.find(name) orelse return false;
@@ -353,13 +623,19 @@ pub const Selection = struct {
     fn hostSync(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Selection = @ptrCast(@alignCast(raw));
         const entry = self.find(name) orelse return false;
-        return entry.executor == .host_sync;
+        return entry.executor == .host_sync or entry.executor == .host_stream;
     }
 
     fn isBuiltinEntry(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Selection = @ptrCast(@alignCast(raw));
         const entry = self.find(name) orelse return false;
         return entry.executor == .builtin;
+    }
+
+    fn category(raw: *const anyopaque, name: []const u8) ?permission_category.ToolCategory {
+        const self: *const Selection = @ptrCast(@alignCast(raw));
+        const entry = self.find(name) orelse return null;
+        return entry.category;
     }
 
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {
@@ -464,6 +740,84 @@ const HostProbe = struct {
     }
 };
 
+const HostStreamProbe = struct {
+    bytes_to_write: usize,
+    calls: usize = 0,
+    writes: usize = 0,
+    max_chunk_bytes: usize = 0,
+
+    fn execute(
+        raw: *anyopaque,
+        _: HostRunIdentity,
+        _: []const u8,
+        sink: *const HostResultSink,
+    ) HostStreamExecuteError!HostStreamOutcome {
+        const self: *HostStreamProbe = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        var chunk: [64 * 1024]u8 = undefined;
+        @memset(&chunk, 's');
+        var remaining = self.bytes_to_write;
+        while (remaining != 0) {
+            const count = @min(remaining, chunk.len);
+            try sink.write(chunk[0..count]);
+            self.writes += 1;
+            self.max_chunk_bytes = @max(self.max_chunk_bytes, count);
+            remaining -= count;
+        }
+        return .{ .artifact = .text_utf8 };
+    }
+
+    fn tool(self: *HostStreamProbe) HostStreamTool {
+        return .{
+            .definition = .{
+                .name = "HostStream",
+                .description = "Stream directly into the kernel CAS",
+                .input_schema = .{ .type = "object", .required = &.{} },
+            },
+            .ctx = self,
+            .execute = execute,
+        };
+    }
+};
+
+const HostStreamFailureProbe = struct {
+    calls: usize = 0,
+    releases: usize = 0,
+
+    fn execute(
+        raw: *anyopaque,
+        _: HostRunIdentity,
+        _: []const u8,
+        sink: *const HostResultSink,
+    ) HostStreamExecuteError!HostStreamOutcome {
+        const self: *HostStreamFailureProbe = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        try sink.write("partial-must-rollback");
+        return .{ .failed = .{
+            .bytes = "bounded failure detail",
+            .release_ctx = self,
+            .releaseFn = release,
+        } };
+    }
+
+    fn release(raw: *anyopaque, _: []const u8) void {
+        const self: *HostStreamFailureProbe = @ptrCast(@alignCast(raw));
+        self.releases += 1;
+    }
+
+    fn tool(self: *HostStreamFailureProbe) HostStreamTool {
+        return .{
+            .definition = .{
+                .name = "HostStreamFailure",
+                .description = "Write partial bytes then fail",
+                .input_schema = .{ .type = "object", .required = &.{} },
+            },
+            .ctx = self,
+            .execute = execute,
+        };
+    }
+};
+
 fn testIdentity(anchor: *anyopaque) HostRunIdentity {
     return .{
         .identity = .{ .session_id = @import("session_id.zig").SessionId.single, .run_id = 7 },
@@ -507,7 +861,7 @@ test "Host sync entry is Runtime-owned, selected once and released once" {
     };
     var outcome = try tools.dispatch(&ctx, "HostEcho", "{\"text\":\"ok\"}");
     defer outcome.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("{\"text\":\"ok\"}", outcome.ok);
+    try std.testing.expectEqualStrings("{\"text\":\"ok\"}", outcome.ok.@"inline".bytes);
     try std.testing.expectEqual(@as(u64, 7), probe.last_run_id);
     try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&probe)), probe.last_host_ctx);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
@@ -515,6 +869,204 @@ test "Host sync entry is Runtime-owned, selected once and released once" {
     // 身份缺失是接线 bug,不是工具错误——独立错误码,不落模型可见面。
     ctx.host_run = null;
     try std.testing.expectError(error.HostRunIdentityMissing, tools.dispatch(&ctx, "HostEcho", "{\"text\":\"x\"}"));
+}
+
+test "Host stream entry writes byte zero into CAS and returns no full inline buffer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const payload_bytes = 17 * 1024 * 1024 + 37;
+    var probe = HostStreamProbe{ .bytes_to_write = payload_bytes };
+    var catalog = try Catalog.initWithExecutors(
+        allocator,
+        &.{},
+        &.{},
+        &.{probe.tool()},
+        &.{},
+    );
+    defer catalog.deinit();
+    var selection = try Selection.init(allocator, &catalog, &.{"HostStream"});
+    defer selection.deinit();
+    var ctx = tools.ToolContext{
+        .allocator = allocator,
+        .host_run = testIdentity(@ptrCast(&probe)),
+        .tool_dispatcher = selection.dispatcher(),
+        .artifact_root = root,
+    };
+    var outcome = try tools.dispatch(&ctx, "HostStream", "{}");
+    defer outcome.deinit(allocator);
+    try std.testing.expect(outcome == .ok);
+    try std.testing.expect(outcome.ok == .artifact);
+    try std.testing.expectEqual(@as(u64, payload_bytes), outcome.ok.artifact.stored.bytes);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(probe.writes > 1);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), probe.max_chunk_bytes);
+    var recovered = try artifact_store.readChunk(
+        allocator,
+        root,
+        outcome.ok.artifact.stored.id(),
+        0,
+        32,
+    );
+    defer recovered.deinit();
+    try std.testing.expectEqualSlices(u8, "ssssssssssssssssssssssssssssssss", recovered.bytes);
+}
+
+test "Host stream entry requires artifact authority before callback" {
+    var probe = HostStreamProbe{ .bytes_to_write = 1 };
+    var catalog = try Catalog.initWithExecutors(
+        std.testing.allocator,
+        &.{},
+        &.{},
+        &.{probe.tool()},
+        &.{},
+    );
+    defer catalog.deinit();
+    var selection = try Selection.init(std.testing.allocator, &catalog, &.{"HostStream"});
+    defer selection.deinit();
+    var ctx = tools.ToolContext{
+        .allocator = std.testing.allocator,
+        .host_run = testIdentity(@ptrCast(&probe)),
+        .tool_dispatcher = selection.dispatcher(),
+    };
+    try std.testing.expectError(error.ArtifactStoreRequired, tools.dispatch(&ctx, "HostStream", "{}"));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+}
+
+test "Host stream business failure rolls back partial bytes and releases detail once" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    _ = try artifact_store.persist(allocator, root, "unrelated-sentinel");
+    var probe = HostStreamFailureProbe{};
+    var catalog = try Catalog.initWithExecutors(
+        allocator,
+        &.{},
+        &.{},
+        &.{probe.tool()},
+        &.{},
+    );
+    defer catalog.deinit();
+    var selection = try Selection.init(allocator, &catalog, &.{"HostStreamFailure"});
+    defer selection.deinit();
+    var ctx = tools.ToolContext{
+        .allocator = allocator,
+        .host_run = testIdentity(@ptrCast(&probe)),
+        .tool_dispatcher = selection.dispatcher(),
+        .artifact_root = root,
+    };
+    var outcome = try tools.dispatch(&ctx, "HostStreamFailure", "{}");
+    defer outcome.deinit(allocator);
+    try std.testing.expect(outcome == .host_failed);
+    try std.testing.expectEqualStrings("bounded failure detail", outcome.host_failed.?);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+    const digest = artifact_store.sha256Hex("partial-must-rollback");
+    var id: [artifact_store.ID_BYTES]u8 = undefined;
+    @memcpy(id[0..artifact_store.ID_PREFIX.len], artifact_store.ID_PREFIX);
+    @memcpy(id[artifact_store.ID_PREFIX.len..], digest[0..]);
+    try std.testing.expectError(
+        error.ArtifactNotFound,
+        artifact_store.readChunk(allocator, root, id[0..], 0, 1),
+    );
+}
+
+test "Host stream cancellation is latched and publishes no partial artifact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    _ = try artifact_store.persist(allocator, root, "unrelated-sentinel");
+    var probe = HostStreamProbe{ .bytes_to_write = 1 };
+    var catalog = try Catalog.initWithExecutors(allocator, &.{}, &.{}, &.{probe.tool()}, &.{});
+    defer catalog.deinit();
+    var selection = try Selection.init(allocator, &catalog, &.{"HostStream"});
+    defer selection.deinit();
+    var abort = @import("../util/abort.zig").AbortSignal.init();
+    abort.abort(.user_interrupt);
+    var ctx = tools.ToolContext{
+        .allocator = allocator,
+        .abort = &abort,
+        .host_run = testIdentity(@ptrCast(&probe)),
+        .tool_dispatcher = selection.dispatcher(),
+        .artifact_root = root,
+    };
+    try std.testing.expectError(error.Aborted, tools.dispatch(&ctx, "HostStream", "{}"));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    const digest = artifact_store.sha256Hex("s");
+    var id: [artifact_store.ID_BYTES]u8 = undefined;
+    @memcpy(id[0..artifact_store.ID_PREFIX.len], artifact_store.ID_PREFIX);
+    @memcpy(id[artifact_store.ID_PREFIX.len..], digest[0..]);
+    try std.testing.expectError(
+        error.ArtifactNotFound,
+        artifact_store.readChunk(allocator, root, id[0..], 0, 1),
+    );
+}
+
+test "Host stream sink latches the artifact size violation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    var spool = try artifact_store.Spool.begin(allocator, root_buffer[0..root_len]);
+    defer spool.deinit();
+    spool.preview.total_bytes = artifact_store.MAX_ARTIFACT_BYTES;
+    var state = Selection.StreamState{ .spool = &spool, .abort = null };
+    const sink = HostResultSink{ .ctx = &state, .writeFn = Selection.StreamState.write };
+    try std.testing.expectError(error.ArtifactTooLarge, sink.write("x"));
+    spool.preview.total_bytes = 0;
+    try std.testing.expectError(error.ArtifactTooLarge, sink.write("now-small"));
+    try std.testing.expectError(error.ArtifactTooLarge, state.requireHealthy());
+}
+
+test "Host stream equal bytes render cache-stable envelopes across artifact roots" {
+    const allocator = std.testing.allocator;
+    var first_tmp = std.testing.tmpDir(.{});
+    defer first_tmp.cleanup();
+    var second_tmp = std.testing.tmpDir(.{});
+    defer second_tmp.cleanup();
+    var first_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var second_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const first_len = try first_tmp.dir.realPath(std.testing.io, &first_buffer);
+    const second_len = try second_tmp.dir.realPath(std.testing.io, &second_buffer);
+    const first_root = first_buffer[0..first_len];
+    const second_root = second_buffer[0..second_len];
+    var probe = HostStreamProbe{ .bytes_to_write = 4097 };
+    var catalog = try Catalog.initWithExecutors(allocator, &.{}, &.{}, &.{probe.tool()}, &.{});
+    defer catalog.deinit();
+    var selection = try Selection.init(allocator, &catalog, &.{"HostStream"});
+    defer selection.deinit();
+    var first_ctx = tools.ToolContext{
+        .allocator = allocator,
+        .host_run = testIdentity(@ptrCast(&probe)),
+        .tool_dispatcher = selection.dispatcher(),
+        .artifact_root = first_root,
+    };
+    var second_ctx = first_ctx;
+    second_ctx.artifact_root = second_root;
+    var first = try tools.dispatch(&first_ctx, "HostStream", "{}");
+    defer first.deinit(allocator);
+    var second = try tools.dispatch(&second_ctx, "HostStream", "{}");
+    defer second.deinit(allocator);
+    try std.testing.expect(first == .ok and first.ok == .artifact);
+    try std.testing.expect(second == .ok and second.ok == .artifact);
+    var first_rendered = try first.ok.render(allocator);
+    defer first_rendered.deinit(allocator);
+    var second_rendered = try second.ok.render(allocator);
+    defer second_rendered.deinit(allocator);
+    try std.testing.expectEqualStrings(first_rendered.bytes, second_rendered.bytes);
+    try std.testing.expect(std.mem.indexOf(u8, first_rendered.bytes, first_root) == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_rendered.bytes, second_root) == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_rendered.bytes, "ReadArtifact") != null);
 }
 
 test "Host sync names cannot duplicate built-ins or each other" {

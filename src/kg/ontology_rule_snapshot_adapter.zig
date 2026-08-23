@@ -222,7 +222,7 @@ pub fn prepare(
     var parsed = try parseSource(allocator, source, request, build_before);
     defer parsed.deinit();
 
-    const rendered = try projection.renderSnapshot(allocator, .{
+    const snapshot_input = projection.SnapshotInput{
         .project_sha256 = request.project_sha256,
         .project_key = request.project_key,
         .revision = parsed.revision,
@@ -236,7 +236,8 @@ pub fn prepare(
         .ontology = parsed.items,
         .generation_evidence = request.generation_evidence,
         .held_out_commitments = request.held_out_commitments,
-    });
+    };
+    const rendered = try projection.renderSnapshot(allocator, &snapshot_input);
     errdefer allocator.free(rendered.bytes);
     var projected = try projection.project(
         allocator,

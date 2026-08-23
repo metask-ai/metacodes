@@ -150,6 +150,10 @@ pub const Environment = struct {
                 .prop_specs = properties,
                 .required = model_semantics.REQUIRED_FIELDS,
             },
+            .model_activation = model_semantics.modelActivationWithAvailability(
+                options.snapshot,
+                options.availability,
+            ),
         };
 
         var mcp_restrictions: std.ArrayList(mcp_session.SkillRestriction) = .empty;
@@ -418,7 +422,7 @@ pub const Environment = struct {
             .allowed = skill.definition.allowed_tools,
             .disallowed = skill.definition.disallowed_tools,
         });
-        return .{ .ok = output };
+        return .{ .ok = core.tools.ToolResultBody.initInline(output) };
     }
 
     fn executeFork(
@@ -605,7 +609,7 @@ pub const Environment = struct {
             output_allocator.free(output);
             return error.CoreError;
         }
-        return .{ .ok = output };
+        return .{ .ok = core.tools.ToolResultBody.initInline(output) };
     }
 
     fn eventBackend(self: *Environment) core.protocol.ui_backend.UiBackend {

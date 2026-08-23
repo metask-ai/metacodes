@@ -10,9 +10,11 @@ const util_json = @import("util/json.zig");
 pub const MessagesRequest = api_request.MessagesRequest;
 pub const ToolChoice = api_request.ToolChoice;
 pub const ToolDefinition = api_request.ToolDefinition;
+pub const ModelToolActivation = api_request.ModelToolActivation;
 pub const InputSchema = api_request.InputSchema;
 pub const PropSpec = api_request.PropSpec;
 pub const serializeMessagesRequest = api_request.serializeMessagesRequest;
+pub const serializeMessagesRequestWithDialect = api_request.serializeMessagesRequestWithDialect;
 
 // --- api/stream.zig 重导出 ---
 pub const SseParser = api_stream.SseParser;

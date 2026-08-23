@@ -13,6 +13,10 @@ const protocol = @import("protocol.zig");
 const StdioTransport = @import("transport_stdio.zig").StdioTransport;
 const sync = @import("platform").sync;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const artifact_store = @import("../core/tool_result_artifact.zig");
+const ToolResultBody = @import("../core/tool_result.zig").ToolResultBody;
+const ToolError = @import("../core/tool_error.zig").ToolError;
+const result_stream = @import("../agentcore/mcp_result_stream.zig");
 
 /// elicitation 回调:server 在 tool 执行中发 `elicitation/create` 请求用户输入时被调。
 /// 入参 = elicitation params JSON(含 message/requestedSchema);返回 = 用户回复的 content 对象 JSON
@@ -129,6 +133,132 @@ pub const McpClient = struct {
         }
     }
 
+    /// Typed byte-zero request path used by model-visible MCP tools/resources.
+    /// Small frames preserve the historical inline result bytes. Larger
+    /// frames are captured before parsing and only their successful `result`
+    /// range is published to the Session CAS.
+    fn requestBody(
+        self: *McpClient,
+        method: []const u8,
+        params_json: []const u8,
+        artifact_root: []const u8,
+        abort: ?*const AbortSignal,
+        require_content: bool,
+    ) !ToolResultBody {
+        self.request_mutex.lock();
+        defer self.request_mutex.unlock();
+        return self.requestBodyUnlocked(
+            method,
+            params_json,
+            artifact_root,
+            abort,
+            require_content,
+        );
+    }
+
+    fn requestBodyUnlocked(
+        self: *McpClient,
+        method: []const u8,
+        params_json: []const u8,
+        artifact_root: []const u8,
+        abort: ?*const AbortSignal,
+        require_content: bool,
+    ) !ToolResultBody {
+        if (artifact_root.len == 0) return error.ArtifactRootUnavailable;
+        const id = self.next_id;
+        self.next_id += 1;
+        const req = try protocol.serializeRequest(self.allocator, id, method, params_json);
+        defer self.allocator.free(req);
+        self.transport.abort = abort;
+        defer self.transport.abort = null;
+        self.transport.send(req) catch return error.McpServerCrashed;
+
+        while (true) {
+            var capture = try artifact_store.Capture.begin(
+                self.allocator,
+                artifact_root,
+                result_stream.MAX_RESPONSE_BYTES,
+            );
+            defer capture.deinit();
+            self.transport.recvLineCapture(&capture) catch return error.McpServerCrashed;
+            try capture.seal();
+
+            // Server→client requests are intentionally bounded control-plane
+            // frames. Materialize only this small class so elicitation keeps
+            // its existing synchronous semantics.
+            if (capture.bytes <= 1024 * 1024) {
+                const line = try capture.readRangeAlloc(
+                    self.allocator,
+                    0,
+                    @intCast(capture.bytes),
+                );
+                defer self.allocator.free(line);
+                var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{
+                    .duplicate_field_behavior = .@"error",
+                }) catch return error.McpMalformedResponse;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.McpMalformedResponse;
+                const obj = parsed.value.object;
+                if (obj.get("method")) |method_value| {
+                    if (method_value == .string) {
+                        if (obj.get("id")) |id_value| {
+                            if (id_value == .integer and id_value.integer >= 0)
+                                self.handleServerRequest(
+                                    @intCast(id_value.integer),
+                                    method_value.string,
+                                    line,
+                                );
+                        }
+                        continue;
+                    }
+                }
+                const response_id: ?u64 = if (obj.get("id")) |id_value|
+                    (if (id_value == .integer and id_value.integer >= 0)
+                        @intCast(id_value.integer)
+                    else
+                        null)
+                else
+                    null;
+                if (response_id != null and response_id.? != id) continue;
+                if (obj.get("error") != null)
+                    return try self.structuredMcpError(line);
+                const response = protocol.parseResponse(line) catch
+                    return error.McpMalformedResponse;
+                if (!response.isSuccess()) return try self.structuredMcpError(line);
+                const result = response.result_json orelse "null";
+                return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
+            }
+
+            const projected = try result_stream.project(
+                self.allocator,
+                &capture,
+                artifact_root,
+                id,
+                .classic_2025_11_25,
+                .{},
+                false,
+                require_content,
+            );
+            switch (projected) {
+                .result => |body| return body,
+                .diagnostic => |diagnostic| {
+                    if (diagnostic.code == .response_id_mismatch) continue;
+                    return try self.structuredMcpError(@tagName(diagnostic.code));
+                },
+            }
+        }
+    }
+
+    fn structuredMcpError(self: *McpClient, detail: []const u8) !ToolResultBody {
+        const bounded = detail[0..@min(detail.len, 64 * 1024)];
+        const owned = try self.allocator.dupe(u8, bounded);
+        const tool_error = ToolError.init(.other, .user_error, owned, true);
+        defer tool_error.deinit(self.allocator);
+        const encoded = try tool_error.toJson(self.allocator);
+        defer self.allocator.free(encoded);
+        return ToolResultBody.initStructuredError(self.allocator, encoded);
+    }
+
     /// 处理 server→client 请求并回复。elicitation/create → 回调(或 decline);其它 → method_not_found。
     fn handleServerRequest(self: *McpClient, server_id: u64, method: []const u8, line: []const u8) void {
         if (std.mem.eql(u8, method, "elicitation/create")) {
@@ -177,6 +307,18 @@ pub const McpClient = struct {
         return try self.request("tools/call", params, abort);
     }
 
+    pub fn callToolBodyAbortable(
+        self: *McpClient,
+        name: []const u8,
+        arguments_json: []const u8,
+        artifact_root: []const u8,
+        abort: ?*const AbortSignal,
+    ) !ToolResultBody {
+        const params = try protocol.callToolParams(self.allocator, name, arguments_json);
+        defer self.allocator.free(params);
+        return self.requestBody("tools/call", params, artifact_root, abort, true);
+    }
+
     /// 列出 server 暴露的 resources（resources/list）。返回原始 JSON-RPC result。
     pub fn listResources(self: *McpClient) ![]u8 {
         return self.listResourcesAbortable(null);
@@ -184,6 +326,14 @@ pub const McpClient = struct {
 
     pub fn listResourcesAbortable(self: *McpClient, abort: ?*const AbortSignal) ![]u8 {
         return try self.request("resources/list", protocol.EMPTY_PARAMS, abort);
+    }
+
+    pub fn listResourcesBodyAbortable(
+        self: *McpClient,
+        artifact_root: []const u8,
+        abort: ?*const AbortSignal,
+    ) !ToolResultBody {
+        return self.requestBody("resources/list", protocol.EMPTY_PARAMS, artifact_root, abort, false);
     }
 
     /// 读取一个 resource（resources/read）。uri 为 resource 标识。
@@ -195,6 +345,17 @@ pub const McpClient = struct {
         const params = try protocol.readResourceParams(self.allocator, uri);
         defer self.allocator.free(params);
         return try self.request("resources/read", params, abort);
+    }
+
+    pub fn readResourceBodyAbortable(
+        self: *McpClient,
+        uri: []const u8,
+        artifact_root: []const u8,
+        abort: ?*const AbortSignal,
+    ) !ToolResultBody {
+        const params = try protocol.readResourceParams(self.allocator, uri);
+        defer self.allocator.free(params);
+        return self.requestBody("resources/read", params, artifact_root, abort, false);
     }
 };
 

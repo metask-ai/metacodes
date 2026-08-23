@@ -2,7 +2,7 @@
 //!
 //! 加载顺序(对齐 Claude Code 优先级,**低优先级先加载,高的后覆盖**):
 //!   1. builtin(Explore / Plan / general-purpose)— 程序硬编码
-//!   2. plugin(~/.metacodes/plugins/*/agents/ + project plugins;暂未实现,P3)
+//!   2. plugin(Host-admitted immutable plugin generation; namespaced)
 //!   3. personal:~/.metacodes/agents + ~/.claude/agents(后者优先)
 //!   4. project:沿 cwd 向上每级 .metacodes/agents + .claude/agents
 //!   5. CLI --agents JSON(P3)
@@ -14,6 +14,8 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
 const def_mod = @import("def.zig");
+const plugin_runtime = @import("../plugin/runtime.zig");
+const plugin_contract = @import("../plugin/contract.zig");
 pub const AgentDef = def_mod.AgentDef;
 pub const Origin = def_mod.Origin;
 
@@ -32,10 +34,26 @@ pub const AgentSet = struct {
 
     /// 标准加载入口。cwd 用于沿父级向上扫 project 级;"" 跳过。
     pub fn loadFromStandardPaths(self: *AgentSet, cwd: []const u8) !void {
+        return self.loadFromStandardPathsWithPluginSources(cwd, &.{});
+    }
+
+    /// 加载顺序严格保持 builtin < plugin < personal < project。插件 agent 的
+    /// frontmatter name 和裸 preload skill 会被 Host namespace 限定，不能覆盖
+    /// builtin/用户/project agent，也不能意外绑定同名外部 skill。
+    pub fn loadFromStandardPathsWithPluginSources(
+        self: *AgentSet,
+        cwd: []const u8,
+        plugin_sources: []const plugin_runtime.AgentSource,
+    ) !void {
         // 0. builtin
         try injectBuiltins(self);
 
-        // 1. personal: ~/.claude/agents 然后 ~/.metacodes/agents
+        // 1. plugin:Snapshot 已按稳定 PluginId 顺序发布。
+        for (plugin_sources) |source| {
+            try self.loadFromPluginDirRecursive(source.root, source.namespace);
+        }
+
+        // 2. personal: ~/.claude/agents 然后 ~/.metacodes/agents
         if (@import("platform").paths.homeDir()) |home| {
             const claude_path = try std.fmt.allocPrint(self.allocator, "{s}/.claude/agents", .{home});
             defer self.allocator.free(claude_path);
@@ -88,6 +106,20 @@ pub const AgentSet = struct {
     /// 递归扫子目录,每个 `*.md` 都当 agent 定义。
     /// 子目录路径**不影响**调用名(只看 frontmatter `name`),这与 skill 不同。
     pub fn loadFromDirRecursive(self: *AgentSet, dir_path: []const u8, origin: Origin) !void {
+        return self.loadFromDirRecursiveNamespaced(dir_path, origin, "");
+    }
+
+    fn loadFromPluginDirRecursive(self: *AgentSet, dir_path: []const u8, namespace: []const u8) !void {
+        if (namespace.len == 0) return error.InvalidPluginNamespace;
+        return self.loadFromDirRecursiveNamespaced(dir_path, .plugin, namespace);
+    }
+
+    fn loadFromDirRecursiveNamespaced(
+        self: *AgentSet,
+        dir_path: []const u8,
+        origin: Origin,
+        namespace: []const u8,
+    ) !void {
         const path_z = try self.allocator.dupeZ(u8, dir_path);
         defer self.allocator.free(path_z);
         var it = pdir.open(path_z) orelse return;
@@ -103,22 +135,51 @@ pub const AgentSet = struct {
 
             // 是 .md 文件 → parse;是目录 → 递归
             if (std.mem.endsWith(u8, name_slice, ".md")) {
-                self.loadAgentFile(child_path, origin) catch |err| {
-                    @import("../util/log.zig").warn("agent", "load failed {s}: {s}", .{ child_path, @errorName(err) });
-                };
+                if (origin == .plugin) {
+                    try self.loadAgentFile(child_path, origin, namespace);
+                } else {
+                    self.loadAgentFile(child_path, origin, namespace) catch |err| {
+                        @import("../util/log.zig").warn("agent", "load failed {s}: {s}", .{ child_path, @errorName(err) });
+                    };
+                }
             } else {
                 // 尝试当目录(if opendir 失败就是普通文件,忽略)
-                try self.loadFromDirRecursive(child_path, origin);
+                try self.loadFromDirRecursiveNamespaced(child_path, origin, namespace);
             }
         }
     }
 
-    fn loadAgentFile(self: *AgentSet, path: []const u8, origin: Origin) !void {
+    fn loadAgentFile(self: *AgentSet, path: []const u8, origin: Origin, namespace: []const u8) !void {
         const md = try readAllFile(self.allocator, path);
         defer self.allocator.free(md);
         var a = try def_mod.parseAgentMd(self.allocator, md, path, origin);
         errdefer a.deinit(self.allocator);
+        if (namespace.len != 0) try self.namespacePluginAgent(&a, namespace);
         try self.upsert(a);
+    }
+
+    fn namespacePluginAgent(self: *AgentSet, agent: *AgentDef, namespace: []const u8) !void {
+        const qualified = try plugin_contract.qualifiedName(self.allocator, namespace, agent.name);
+        self.allocator.free(agent.name);
+        agent.name = qualified;
+        if (agent.preload_skills.len == 0) return;
+
+        const rewritten = try self.allocator.alloc([]const u8, agent.preload_skills.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (rewritten[0..initialized]) |skill| self.allocator.free(skill);
+            self.allocator.free(rewritten);
+        }
+        for (agent.preload_skills) |skill| {
+            rewritten[initialized] = if (std.mem.indexOfScalar(u8, skill, ':') != null)
+                try self.allocator.dupe(u8, skill)
+            else
+                try plugin_contract.qualifiedName(self.allocator, namespace, skill);
+            initialized += 1;
+        }
+        for (agent.preload_skills) |skill| self.allocator.free(skill);
+        self.allocator.free(agent.preload_skills);
+        agent.preload_skills = rewritten;
     }
 
     /// 添加或覆盖。重名时:相同 origin 内 Claude Code 行为是"静默丢弃一个"(由 fs 顺序决定);

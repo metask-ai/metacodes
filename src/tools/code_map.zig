@@ -14,6 +14,9 @@ const toolchain = @import("../util/toolchain.zig");
 const symbols = @import("../symbols/symbol.zig");
 const symbol_provider = @import("symbol_provider.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const ToolResultBody = @import("context.zig").ToolResultBody;
+const artifact_store = @import("../core/tool_result_artifact.zig");
+const result_spool = @import("result_spool.zig");
 
 /// 单次 CodeMap 最多处理的文件数(glob 命中很多时防失控)。
 const MAX_FILES: usize = 200;
@@ -46,16 +49,42 @@ pub fn renderOutlineForSource(
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try executeToWriter(ctx, args, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    if (ctx.artifact_root.len == 0)
+        return ToolResultBody.initInline(try execute(ctx, args));
+    var capture = try artifact_store.Capture.begin(
+        ctx.allocator,
+        ctx.artifact_root,
+        artifact_store.MAX_ARTIFACT_BYTES,
+    );
+    defer capture.deinit();
+    var output = result_spool.CaptureWriter.init(&capture);
+    try executeToWriter(ctx, args, &output.writer);
+    try output.check();
+    try capture.seal();
+    return result_spool.finishCaptureAsBody(
+        ctx.allocator,
+        ctx.artifact_root,
+        &capture,
+        .text_utf8,
+        true,
+    );
+}
+
+fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer) anyerror!void {
+    const allocator = ctx.allocator;
     const path_raw = common.extractJsonArg(args, "path") orelse return error.MissingPath;
     if (path_raw.len == 0) return error.EmptyPath;
     // 归一化(展开 ~、折叠、查 traversal)。path 可能含 glob 通配(src/**/*.zig),
     // ** 不被词法折叠影响;~ 必须展开(openat/rg 都不认)。
     const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
     defer allocator.free(path);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    const w = &out.writer;
 
     // path 含 glob 元字符 → 走 rg --files 解析文件列表;否则单文件。
     if (isGlob(path)) {
@@ -65,7 +94,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             allocator.free(files);
         }
         if (files.len == 0) {
-            return try allocator.dupe(u8, "(no files matched)\n");
+            try w.writeAll("(no files matched)\n");
+            return;
         }
         var shown: usize = 0;
         for (files) |f| {
@@ -83,11 +113,6 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     } else {
         try mapOneFile(ctx, allocator, w, path);
     }
-
-    if (out.written().len == 0) {
-        return try allocator.dupe(u8, "(no symbols found)\n");
-    }
-    return try out.toOwnedSlice();
 }
 
 /// 处理单个文件:读盘 → 推断语言 → 抽符号 → 渲染缩进树。
@@ -104,15 +129,14 @@ fn mapOneFile(
     }
 
     const source = readFile(allocator, file) catch |e| {
+        if (e == error.FileTooLarge) {
+            try w.print("{s}\n  (file too large to parse; limit {d} bytes)\n", .{ file, MAX_SOURCE_BYTES });
+            return;
+        }
         try w.print("{s}\n  (cannot read: {s})\n", .{ file, @errorName(e) });
         return;
     };
     defer allocator.free(source);
-
-    if (source.len > MAX_SOURCE_BYTES) {
-        try w.print("{s}\n  (file too large to parse: {d} bytes)\n", .{ file, source.len });
-        return;
-    }
 
     var syms = symbol_provider.extractSymbols(ctx, allocator, file, source) catch |e| {
         try w.print("{s}\n  (parse failed: {s})\n", .{ file, @errorName(e) });
@@ -181,7 +205,7 @@ fn renderRow(w: *std.Io.Writer, s: symbols.Symbol, depth: usize) !void {
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer pfs.close(fd);
-    return try common.readAllFromFd(fd, allocator);
+    return try common.readAllFromFdCapped(fd, allocator, MAX_SOURCE_BYTES);
 }
 
 fn isGlob(path: []const u8) bool {
@@ -222,4 +246,3 @@ fn listFiles(allocator: std.mem.Allocator, glob: []const u8, ctx: *const ToolCon
     }
     return try files.toOwnedSlice(allocator);
 }
-

@@ -1,0 +1,255 @@
+{
+  "candidate": {
+    "inventory": {
+      "contract_version": 1,
+      "generation": 1,
+      "plugins": [
+        {
+          "capabilities": [
+            "skill_bundle"
+          ],
+          "contribution_count": 1,
+          "form": "data_package",
+          "id": "metacodes.benchmark-coding",
+          "layer": "session",
+          "lifecycle": "active",
+          "source_root": "/Users/david/prj/cc-t2z/metacodes/evals/plugin-v1/coding-plugin",
+          "version": "1.0.0"
+        }
+      ],
+      "schema": "metacodes.plugin-inventory/v1"
+    },
+    "plugin_id": "metacodes.benchmark-coding",
+    "plugin_version": "1.0.0"
+  },
+  "checks": [
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin"
+      ],
+      "elapsed_ms": 28222,
+      "name": "plugin_component_l2",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin effect lifecycle"
+      ],
+      "elapsed_ms": 26140,
+      "name": "plugin_effect_lifecycle",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin service graph"
+      ],
+      "elapsed_ms": 29803,
+      "name": "plugin_service_graph",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=static advisory hook"
+      ],
+      "elapsed_ms": 27282,
+      "name": "plugin_advisory_hook",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=RuntimeHost atomically replaces plugin generations"
+      ],
+      "elapsed_ms": 27404,
+      "name": "plugin_runtime_generation",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:lib",
+        "-Dtfilter=plugin"
+      ],
+      "elapsed_ms": 2058,
+      "name": "plugin_library_isolation",
+      "output_sha256": "3c8e458557fa8bf02f01b45d0d59129ba5b8b3652d145b345d5dd99c7eff349a"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "agentcore:test",
+        "-Dtfilter=process plugin"
+      ],
+      "elapsed_ms": 8950,
+      "name": "agentcore_process_plugin_abi",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "example"
+      ],
+      "elapsed_ms": 5992,
+      "name": "independent_zig_host",
+      "output_sha256": "edcc28118480124c6bf225cb075e2f08d4f3a6f7b3b43e4665770744c7a94c53"
+    },
+    {
+      "argv": [
+        "/Users/david/prj/cc-t2z/metacodes/scripts/eval/fixtures/plugin_baseline.py",
+        "--dump-plugins"
+      ],
+      "elapsed_ms": 70,
+      "name": "baseline_empty_inventory",
+      "output_sha256": "6394b4f552d5b81243376998caaddad6a1d7bf8fed6a4946bfe43961149df326"
+    },
+    {
+      "argv": [
+        "/Users/david/prj/cc-t2z/metacodes/scripts/eval/fixtures/plugin_candidate.py",
+        "--dump-plugins"
+      ],
+      "elapsed_ms": 21,
+      "name": "candidate_namespaced_inventory",
+      "output_sha256": "8b5e3cb48d51d823e48d225a683a7fb5c32dc34e3b589020fbd22981f33d2a23"
+    },
+    {
+      "elapsed_ms": 91,
+      "name": "credential_free_cli_inventory",
+      "output_sha256": "143e5d7e1a38217f163189e609acac12ec90bce7b9c632ee39431290ffb410aa"
+    },
+    {
+      "name": "snapshot_microbenchmark",
+      "output_sha256": "e3d31856a596d119e59c978d505dcfe8c9e871c0a53cc56f3e8ff5825e1c96ed",
+      "repetitions": 5
+    }
+  ],
+  "coding_pair": {
+    "authorized_cost_usd": 0.0,
+    "provider_requests": 0,
+    "quality_claim": "none",
+    "status": "blocked_pending_explicit_paid_authority"
+  },
+  "content_sha256": "d22ce4e2322035ea3366bc97a8ce31a527fb5a32d82f90f360214b7986bc1623",
+  "deepseek_harness_commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  "implementation_fingerprint": "65d8c00ba4cd36d9f74266f001eb0c85b645bc0159e3022a43a048fdd2bb98f3",
+  "metacodes_git_head": "dfbcfb20b2f618dbd34801ce20ce6d80eb5d05a2",
+  "performance": {
+    "inventory_avg_ns_max": 2851,
+    "inventory_avg_ns_median": 2356,
+    "runs": [
+      {
+        "baseline_avg_ns": 22893,
+        "baseline_p95_ns": 25995,
+        "inventory_avg_ns": 2356,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 27943,
+        "static_plugin_p95_ns": 31057,
+        "static_plugin_p95_overhead_ns": 5062,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 22148,
+        "baseline_p95_ns": 22960,
+        "inventory_avg_ns": 2298,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 27526,
+        "static_plugin_p95_ns": 28938,
+        "static_plugin_p95_overhead_ns": 5978,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 23935,
+        "baseline_p95_ns": 25047,
+        "inventory_avg_ns": 2275,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 28921,
+        "static_plugin_p95_ns": 30240,
+        "static_plugin_p95_overhead_ns": 5193,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 22239,
+        "baseline_p95_ns": 23233,
+        "inventory_avg_ns": 2851,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 27460,
+        "static_plugin_p95_ns": 29036,
+        "static_plugin_p95_overhead_ns": 5803,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 22263,
+        "baseline_p95_ns": 23413,
+        "inventory_avg_ns": 2690,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 27435,
+        "static_plugin_p95_ns": 29513,
+        "static_plugin_p95_overhead_ns": 6100,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      }
+    ],
+    "static_plugin_p95_overhead_ns_max": 6100,
+    "static_plugin_p95_overhead_ns_median": 5803
+  },
+  "protocol_sha256": "df04fb0f5badd87e6499a30b4dafd07f662b9249910ebb8e87a370e50bc56764",
+  "provider_requests": 0,
+  "quality_evidence": false,
+  "release_status": "blocked_pending_paid_coding_pair",
+  "schema": "metacodes.plugin-zero-provider-receipt/v1"
+}

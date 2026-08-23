@@ -215,7 +215,8 @@ fn persistOntologyProjection(
         .member_sha256 = &held_members,
         .sealed = true,
     }};
-    const rendered = try cc.ontology_rule_projection.renderSnapshot(allocator, .{
+    const generation_evidence = [1]cc.ontology_rule_projection.GenerationEvidence{generation.value};
+    const snapshot_input = cc.ontology_rule_projection.SnapshotInput{
         .project_sha256 = PROJECT,
         .project_key = "metacodes:/private/rule-author-l2",
         .revision = ONTOLOGY_REVISION,
@@ -227,9 +228,10 @@ fn persistOntologyProjection(
         .active_bundle_revision = 0,
         .active_bundle_sha256 = ZERO_SHA,
         .ontology = &ontology,
-        .generation_evidence = &.{generation.value},
+        .generation_evidence = &generation_evidence,
         .held_out_commitments = &held,
-    });
+    };
+    const rendered = try cc.ontology_rule_projection.renderSnapshot(allocator, &snapshot_input);
     defer allocator.free(rendered.bytes);
     var projected = try cc.ontology_rule_projection.project(
         allocator,

@@ -96,13 +96,14 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
     // 留下"teammates 已置但 team_sanitized 未置"的半态(Linus L1)。
     const team_owned = try sw.allocator.dupe(u8, team_s);
     errdefer sw.allocator.free(team_owned);
-    sw.teammates = try teammate_mod.TeammateRegistry.init(
+    sw.teammates = try teammate_mod.TeammateRegistry.initWithDialectResolver(
         sw.allocator,
         sw.api_key,
         sw.base_url,
         sw.model,
         sw.provider_kind,
         sw.home,
+        sw.dialect_resolver,
     );
     errdefer if (sw.teammates) |*t| {
         t.deinit();

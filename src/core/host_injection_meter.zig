@@ -18,10 +18,10 @@ const std = @import("std");
 /// 结局 note、截断续写)——无条件、按构造各至多 1 次;②完整性修复
 /// (KG 枚举修复)——其语义是"修复或 fail-closed",不可静默放弃,进表
 /// 会把"额度尽"误判成完整性违规(review 抓到的 tool_loop 误杀地雷)。
-// 账目:verification 2 + requirement-ledger 2 + task-obligation 3 = 7
-// (v23 把义务预算 2→3 时漏了对齐总帽——组件和 7 > 旧帽 6,最坏第 7 次
-// 咨询性注入被静默拒;deny-safe 但账目失真,review 抓出)。
-pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = 7;
+// 账目:required-first provider repair 2 + verification 2 +
+// requirement-ledger 2 + task-obligation 3 = 9。required-first 在任何普通
+// 工具前发生，仍走同一计量器，不能因为它是插件路由就绕过合成上界。
+pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = 9;
 
 pub const Meter = struct {
     used: u8 = 0,

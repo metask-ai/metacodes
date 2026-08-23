@@ -506,22 +506,15 @@ pub const Environment = struct {
             },
         ) };
         defer instance.deinit();
-        var outcome = instance.client().callTool(
+        const outcome = instance.client().callToolBody(
             tool_ctx.allocator,
+            tool_ctx.artifact_root,
             entry.tool,
             arguments_json,
             cancellation,
         );
         return switch (outcome) {
-            .result => |*result| blk: {
-                const encoded = try tool_ctx.allocator.dupe(u8, result.raw_result_json);
-                const is_error = result.is_error;
-                result.deinit();
-                break :blk if (is_error)
-                    .{ .host_failed = encoded }
-                else
-                    .{ .ok = encoded };
-            },
+            .result => |body| .{ .ok = body },
             .failed => |failure| switch (failure) {
                 .out_of_memory => error.OutOfMemory,
                 else => .{ .host_failed = try encodeFailure(tool_ctx.allocator, failure) },
@@ -899,7 +892,17 @@ test "Session MCP view binds identity validates argument envelope and retains ge
         model_name,
         "{\"city\":7}",
     ));
-    var tool_context = core.tool_context.ToolContext{ .allocator = std.testing.allocator };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var artifact_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const artifact_root = artifact_root_buffer[0..try tmp.dir.realPath(
+        std.testing.io,
+        &artifact_root_buffer,
+    )];
+    var tool_context = core.tool_context.ToolContext{
+        .allocator = std.testing.allocator,
+        .artifact_root = artifact_root,
+    };
     var semantically_opaque = try environment.surface().dispatcher.dispatch(
         &tool_context,
         model_name,
@@ -1147,6 +1150,13 @@ test "all three protocol eras enter the same Session identity and dispatch seam"
         };
 
         fn run(era: canonical.Era, policy: negotiation.Policy) !Result {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var artifact_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const artifact_root = artifact_root_buffer[0..try tmp.dir.realPath(
+                std.testing.io,
+                &artifact_root_buffer,
+            )];
             var server = fixture.Server{ .era = era };
             const binding = [_]u8{0x91} ** 32;
             const specs = [_]catalog.ServerSpec{.{
@@ -1176,7 +1186,10 @@ test "all three protocol eras enter the same Session identity and dispatch seam"
                 null,
             );
             defer environment.deinit();
-            var tool_context = core.tool_context.ToolContext{ .allocator = std.testing.allocator };
+            var tool_context = core.tool_context.ToolContext{
+                .allocator = std.testing.allocator,
+                .artifact_root = artifact_root,
+            };
             var outcome = try environment.surface().dispatcher.dispatch(
                 &tool_context,
                 view.entries[0].model_name,

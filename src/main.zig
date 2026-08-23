@@ -18,6 +18,7 @@ pub const api_stream = @import("api/stream.zig");
 pub const api_provider = @import("api/provider.zig");
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_capability = @import("api/capability.zig");
+pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig");
 pub const api_http_status = @import("api/http_status.zig");
 pub const api_openai = @import("api/openai_client.zig");
@@ -38,6 +39,7 @@ pub const message = @import("core/message.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
 pub const agent_loop = @import("core/agent_loop.zig");
 pub const agent_session = @import("core/agent_session.zig");
+pub const plugin = @import("plugin/root.zig");
 pub const tool_catalog = @import("core/tool_catalog.zig");
 pub const workspace_policy = @import("core/workspace_policy.zig");
 pub const core_subagent = @import("core/subagent.zig");
@@ -84,8 +86,8 @@ pub const core_read_state = @import("core/read_state.zig");
 pub const core_edit_hl_cache = @import("core/edit_hl_cache.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const message_repair = @import("core/message_repair.zig");
-pub const tool_result_storage = @import("tools/tool_result_storage.zig");
 pub const tool_result_artifact = @import("core/tool_result_artifact.zig");
+pub const tool_result = @import("core/tool_result.zig");
 pub const result_projection = @import("core/result_projection.zig");
 pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
 pub const read_artifact = @import("tools/read_artifact.zig");
@@ -342,29 +344,35 @@ pub fn main(init: std.process.Init) !void {
     // --- record/replay cassette 录制目录(Stage 7)---
     if (config.record_dir) |dir| recorder.setDir(dir);
 
-    // Runtime resolution consumes one-shot FD authority before App/job/tool
-    // subprocesses exist. Ordinary env auth retains legacy teammate inheritance.
-    var resolved_credential = auth.resolveRuntimeCredential(allocator, config.api_key, config.auth_precedence) catch |err| {
-        @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
-        std.debug.print(
-            \\Authentication required.
-            \\Use one of:
-            \\  metacodes login --oauth-token-json <token-response.json>
-            \\  metacodes login --api-key <key>
-            \\  export METASK_API_KEY=...
-            \\
-            \\No token value was printed.
-            \\
-        , .{});
-        return err;
-    };
-    defer resolved_credential.deinit(allocator);
-    const api_key = resolved_credential.bearer_token;
+    // Introspection builds the same App/Plugin snapshot but cannot issue a
+    // provider request, so it neither requires credentials nor consumes the
+    // one-shot runtime FD authority. Every executable Run path still resolves
+    // credentials before App/job/tool subprocesses exist.
+    const introspection_only = config.dump_prompt or config.dump_plugins;
+    var resolved_credential: ?auth.ResolvedCredential = null;
+    if (!introspection_only) {
+        resolved_credential = auth.resolveRuntimeCredential(allocator, config.api_key, config.auth_precedence) catch |err| {
+            @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
+            std.debug.print(
+                \\Authentication required.
+                \\Use one of:
+                \\  metacodes login --oauth-token-json <token-response.json>
+                \\  metacodes login --api-key <key>
+                \\  export METASK_API_KEY=...
+                \\
+                \\No token value was printed.
+                \\
+            , .{});
+            return err;
+        };
+    }
+    defer if (resolved_credential) |*credential| credential.deinit(allocator);
+    const api_key = if (resolved_credential) |credential| credential.bearer_token else "";
 
     applyStoredLoginSelection(allocator, &config) catch |err| {
         log.debug("auth", "stored model selection unavailable: {s}", .{@errorName(err)});
     };
-    if (!isUsableConfiguredSession(config, resolved_credential.source)) {
+    if (resolved_credential) |credential| if (!isUsableConfiguredSession(config, credential.source)) {
         std.debug.print(
             \\Metask login is incomplete.
             \\Run `metacodes login` in a terminal and select an API key, model, and reasoning effort.
@@ -372,7 +380,7 @@ pub fn main(init: std.process.Init) !void {
             \\
         , .{});
         return error.IncompleteLoginSelection;
-    }
+    };
 
     const app = try app_mod.App.init(allocator, init.io, config, api_key);
     defer app.deinit();
@@ -385,6 +393,9 @@ pub fn main(init: std.process.Init) !void {
     // 不发网络、不需有效 key。用于验证提示词×工具复刻(工具长描述 + 动态裁剪)。
     if (config.dump_prompt) {
         dumpPromptAndExit(app);
+    }
+    if (config.dump_plugins) {
+        dumpPluginsAndExit(app);
     }
 
     // SW6 进程外 teammate 模式:`--teammate --agent-name X --team-name Y` → 跑 mailbox 消息循环,
@@ -494,6 +505,16 @@ fn dumpPromptAndExit(app: *app_mod.App) noreturn {
         dumpWrite(d.description);
         dumpWrite("\n");
     }
+    dumpWrite("\n");
+    std.process.exit(0);
+}
+
+fn dumpPluginsAndExit(app: *app_mod.App) noreturn {
+    const inventory = app.describePlugins(app.allocator) catch {
+        dumpWrite("{\"error\":\"plugin inventory unavailable\"}\n");
+        std.process.exit(1);
+    };
+    dumpWrite(inventory);
     dumpWrite("\n");
     std.process.exit(0);
 }
@@ -978,6 +999,18 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.requirement_ledger_observe = true;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
+        } else if (std.mem.eql(u8, arg, "--plugin-dir")) {
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --plugin-dir", .{});
+                return;
+            };
+            config.plugin_dirs = appendNulList(allocator, config.plugin_dirs, s);
+        } else if (std.mem.eql(u8, arg, "--process-plugin-dir")) {
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --process-plugin-dir", .{});
+                return;
+            };
+            config.process_plugin_dirs = appendNulList(allocator, config.process_plugin_dirs, s);
         } else if (std.mem.eql(u8, arg, "--answers-file")) {
             if (args.next()) |s| config.answers_file = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--base-url")) {
@@ -1093,6 +1126,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             }
         } else if (std.mem.eql(u8, arg, "--dump-prompt")) {
             config.dump_prompt = true;
+        } else if (std.mem.eql(u8, arg, "--dump-plugins")) {
+            config.dump_plugins = true;
         } else if (std.mem.eql(u8, arg, "-")) {
             // 从 stdin 读全部作为 prompt（headless pipe 模式）
             config.prompt = readAllStdin(allocator) catch null;
@@ -1146,7 +1181,8 @@ fn parsePermMode(s: []const u8) types.PermissionMode {
     return @import("permission/mode.zig").parse(s);
 }
 
-/// 累加一个 \x00 分隔的列表(--add-dir 可重复)。返回新分配的串,旧串泄漏到 arena。
+/// 累加一个 \x00 分隔的列表(--add-dir / --plugin-dir 可重复)。返回新分配的串,
+/// 旧串泄漏到 session arena。
 fn appendNulList(allocator: std.mem.Allocator, prev: ?[]const u8, item: []const u8) ?[]const u8 {
     if (prev) |p| {
         return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ p, item }) catch p;
@@ -1186,10 +1222,13 @@ fn printHelp() void {
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
         \\  --dump-prompt         Print the assembled system prompt and exit
+        \\  --dump-plugins        Print the immutable plugin inventory JSON and exit
         \\  serve [port]          Daemon mode (HTTP; default port 7777)
         \\  --sessions <n>        Daemon: static session count (>1 enables multi-session)
         \\  --uds <path>          Daemon: additional UDS+NDJSON binding
         \\  --add-dir <path>      Extra read/write directory (repeatable)
+        \\  --plugin-dir <path>   Enable a manifest-based data plugin package (repeatable)
+        \\  --process-plugin-dir <path>  Enable a pinned executable plugin package (repeatable)
         \\  --answers-file <path> Preset answers for permission .ask / AskUserQuestion (non-tty)
         \\  --base-url <url>      Override API endpoint (must end with /v1/messages)
         \\  --auth-precedence <p> api-key-first | oauth-first

@@ -158,6 +158,128 @@ const AbiHostTool = struct {
     }
 };
 
+const AbiHostResultSink = struct {
+    sink: *const core.agent_session.HostResultSink,
+
+    fn write(raw: ?*anyopaque, bytes_view: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *AbiHostResultSink = @ptrCast(@alignCast(raw orelse
+            return wire.HOST_SINK_FAILED));
+        const bytes = borrowed(bytes_view) catch return wire.HOST_SINK_FAILED;
+        self.sink.write(bytes) catch |err| return switch (err) {
+            error.Aborted => wire.HOST_SINK_ABORTED,
+            error.ArtifactTooLarge => wire.HOST_SINK_TOO_LARGE,
+            error.ArtifactSinkClosed => wire.HOST_SINK_CLOSED,
+            error.ArtifactSinkFailed => wire.HOST_SINK_FAILED,
+        };
+        return wire.HOST_SINK_OK;
+    }
+};
+
+const AbiHostStreamTool = struct {
+    ctx: ?*anyopaque,
+    execute_fn: wire.HostStreamExecuteFnV1,
+    release_fn: wire.HostReleaseFnV1,
+    binding: [32]u8 = [_]u8{1} ** 32,
+
+    fn execute(
+        raw: *anyopaque,
+        identity: core.agent_session.HostRunIdentity,
+        args: []const u8,
+        sink: *const core.agent_session.HostResultSink,
+    ) core.agent_session.HostStreamExecuteError!core.agent_session.HostStreamOutcome {
+        const self: *AbiHostStreamTool = @ptrCast(@alignCast(raw));
+        const session: *wire.SessionHandle = @ptrCast(identity.host_session_ctx);
+        const run = makeRunContext(session, &identity.identity);
+        var sink_bridge = AbiHostResultSink{ .sink = sink };
+        const public_sink = wire.HostResultSinkV1{
+            .struct_size = @sizeOf(wire.HostResultSinkV1),
+            .reserved0 = 0,
+            .ctx = &sink_bridge,
+            .write = AbiHostResultSink.write,
+            .max_bytes = wire.MAX_HOST_STREAM_ARTIFACT_BYTES_V1,
+            .reserved = [_]u64{0} ** 3,
+        };
+        var media_code: u32 = 0;
+        var detail = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+        const status = self.execute_fn(
+            self.ctx,
+            &run,
+            view(args),
+            &public_sink,
+            &media_code,
+            &detail,
+        );
+        if (status == wire.HOST_FATAL or
+            (status != wire.HOST_OK and status != wire.HOST_FAILED and status != wire.HOST_REJECTED))
+        {
+            if (hasReleaseToken(detail)) self.release_fn(self.ctx, &detail);
+            return .fatal;
+        }
+        if (!canonicalOwned(detail)) {
+            if (hasReleaseToken(detail)) self.release_fn(self.ctx, &detail);
+            return streamOutcomeWithoutDetail(status);
+        }
+        if (status == wire.HOST_OK) {
+            if (detail.len != 0 or mediaType(media_code) == null) {
+                if (hasReleaseToken(detail)) self.release_fn(self.ctx, &detail);
+                return .fatal;
+            }
+            return .{ .artifact = mediaType(media_code).? };
+        }
+        if (media_code != 0) {
+            if (hasReleaseToken(detail)) self.release_fn(self.ctx, &detail);
+            return streamOutcomeWithoutDetail(status);
+        }
+        if (detail.len == 0) return streamOutcomeWithoutDetail(status);
+        if (detail.len > wire.MAX_HOST_TOOL_RESULT_BYTES_V1) {
+            self.release_fn(self.ctx, &detail);
+            return streamOutcomeWithoutDetail(status);
+        }
+        const detail_bytes = ownedSlice(detail) catch {
+            self.release_fn(self.ctx, &detail);
+            return streamOutcomeWithoutDetail(status);
+        };
+        if (!std.unicode.utf8ValidateSlice(detail_bytes)) {
+            self.release_fn(self.ctx, &detail);
+            return streamOutcomeWithoutDetail(status);
+        }
+        const result = core.agent_session.HostToolResult{
+            .bytes = detail_bytes,
+            .release_ctx = self,
+            .releaseFn = release,
+        };
+        return switch (status) {
+            wire.HOST_FAILED => .{ .failed = result },
+            wire.HOST_REJECTED => .{ .rejected = result },
+            else => unreachable,
+        };
+    }
+
+    fn mediaType(code: u32) ?core.agent_session.HostStreamMediaType {
+        return switch (code) {
+            wire.HOST_STREAM_MEDIA_TEXT_UTF8 => .text_utf8,
+            wire.HOST_STREAM_MEDIA_JSON => .json,
+            wire.HOST_STREAM_MEDIA_BINARY => .binary,
+            else => null,
+        };
+    }
+
+    fn streamOutcomeWithoutDetail(status: u32) core.agent_session.HostStreamOutcome {
+        return switch (status) {
+            wire.HOST_FAILED => .{ .failed = null },
+            wire.HOST_REJECTED => .{ .rejected = null },
+            else => .fatal,
+        };
+    }
+
+    fn release(raw: *anyopaque, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        const self: *AbiHostStreamTool = @ptrCast(@alignCast(raw));
+        var detail = wire.OwnedBytesV1{ .ptr = @constCast(bytes.ptr), .len = bytes.len };
+        self.release_fn(self.ctx, &detail);
+    }
+};
+
 const AbiMcpConnector = struct {
     descriptor: wire.McpConnectorV1,
     max_frame_bytes: u64,
@@ -268,8 +390,56 @@ const AbiMcpConnection = struct {
         return .{
             .ctx = self,
             .request_fn = request,
+            .tool_request = .{ .streaming = requestToolStream },
             .notify_fn = notify,
             .close_fn = close,
+        };
+    }
+
+    fn requestToolStream(
+        raw: *anyopaque,
+        request_json: []const u8,
+        timeout_ms: u32,
+        cancellation: mcp_runtime.Cancellation,
+        sink: mcp_runtime.ToolResponseSink,
+    ) anyerror!mcp_runtime.ToolStreamExchangeOutcome {
+        const self: *AbiMcpConnection = @ptrCast(@alignCast(raw));
+        var cancellation_copy = cancellation;
+        const public_cancellation = wire.McpCancellationV1{
+            .struct_size = @sizeOf(wire.McpCancellationV1),
+            .reserved0 = 0,
+            .ctx = &cancellation_copy,
+            .is_cancelled = cancellationPoll,
+            .reserved = [_]u64{0} ** 2,
+        };
+        var sink_adapter = AbiMcpResponseSink{ .sink = sink };
+        const public_sink = wire.HostResultSinkV1{
+            .struct_size = @sizeOf(wire.HostResultSinkV1),
+            .reserved0 = 0,
+            .ctx = &sink_adapter,
+            .write = AbiMcpResponseSink.write,
+            .max_bytes = wire.MAX_MCP_TOOL_RESPONSE_BYTES_V1,
+            .reserved = [_]u64{0} ** 3,
+        };
+        const status = self.descriptor.request_tool_stream.?(
+            self.descriptor.ctx,
+            self.host_connection,
+            view(request_json),
+            timeout_ms,
+            &public_cancellation,
+            &public_sink,
+        );
+        if (sink_adapter.fatal_descriptor) return error.InvalidConnectorResponse;
+        return switch (status) {
+            wire.MCP_EXCHANGE_RESPONSE => .response,
+            wire.MCP_EXCHANGE_TIMEOUT => .timeout,
+            wire.MCP_EXCHANGE_NETWORK_ERROR => .network_error,
+            wire.MCP_EXCHANGE_AUTH_ERROR => .auth_error,
+            wire.MCP_EXCHANGE_SERVER_ERROR => .server_error,
+            wire.MCP_EXCHANGE_CHILD_EXIT => .child_exit,
+            wire.MCP_EXCHANGE_CANCELLED => .cancelled,
+            wire.MCP_EXCHANGE_INDETERMINATE => .indeterminate,
+            else => error.HostConnectorFatal,
         };
     }
 
@@ -368,9 +538,31 @@ const AbiMcpConnection = struct {
     }
 };
 
+const AbiMcpResponseSink = struct {
+    sink: mcp_runtime.ToolResponseSink,
+    fatal_descriptor: bool = false,
+
+    fn write(raw: ?*anyopaque, bytes: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *AbiMcpResponseSink = @ptrCast(@alignCast(raw orelse
+            return wire.HOST_SINK_FAILED));
+        const chunk = borrowed(bytes) catch {
+            self.fatal_descriptor = true;
+            return wire.HOST_SINK_FAILED;
+        };
+        self.sink.write(chunk) catch |err| return switch (err) {
+            error.Cancelled => wire.HOST_SINK_ABORTED,
+            error.ResourceLimit => wire.HOST_SINK_TOO_LARGE,
+            error.IoFailure => wire.HOST_SINK_FAILED,
+            error.Closed => wire.HOST_SINK_CLOSED,
+        };
+        return wire.HOST_SINK_OK;
+    }
+};
+
 const AbiRuntime = struct {
     core_runtime: *core.agent_session.AgentRuntime,
     host_tools: []AbiHostTool,
+    host_stream_tools: []AbiHostStreamTool = &.{},
     catalogs: skill_catalog_handles.RuntimeCatalogs,
     materializations: skill_materialization.Manager,
     /// Populated by the Revision 6 Runtime configuration seam. Null keeps the
@@ -739,6 +931,22 @@ const AbiSession = struct {
                     .name = entry.definition.name,
                     .binding = abi_tool.binding,
                 };
+            },
+            .host_stream => |host| blk: {
+                const abi_tool: *AbiHostStreamTool = @ptrCast(@alignCast(host.ctx));
+                break :blk .{
+                    .namespace = .host,
+                    .name = entry.definition.name,
+                    .binding = abi_tool.binding,
+                };
+            },
+            .isolated => |isolated| .{
+                // Process tools are external Host authority, but unlike an
+                // in-process callback their binding is derived from the
+                // pinned package/executable/schema during Runtime staging.
+                .namespace = .host,
+                .name = entry.definition.name,
+                .binding = isolated.authority_binding,
             },
         };
     }
@@ -3516,8 +3724,34 @@ fn inputErrorStatus(err: anyerror) u32 {
 fn runtimeErrorStatus(err: anyerror) u32 {
     return if (err == error.OutOfMemory)
         wire.STATUS_OUT_OF_MEMORY
+    else if (err == error.TooManyPlugins or err == error.TooManyEffects or
+        err == error.TooManyServices)
+        wire.STATUS_RESOURCE_LIMIT
     else if (err == error.UnknownBuiltinTool or err == error.UnsupportedBuiltinTool or
-        err == error.DuplicateToolName or err == error.InvalidHostTool)
+        err == error.DuplicateToolName or err == error.InvalidHostTool or
+        err == error.InvalidPackageRoot or err == error.PackageRootSymlink or
+        err == error.PackageManifestMissing or err == error.PackageManifestUntrusted or
+        err == error.PackageManifestTooLarge or err == error.UnsupportedSchema or
+        err == error.UnsupportedCapability or err == error.InvalidManifest or
+        err == error.ReservedPluginId or err == error.UnsupportedHostCapability or
+        err == error.DuplicatePluginAtLayer or err == error.IncompatibleDependency or
+        err == error.DependencyCycle or err == error.MissingContributionDirectory or
+        err == error.ContributionDirectorySymlink or err == error.UnsupportedContribution or
+        err == error.InvalidEffect or err == error.InactiveEffect or
+        err == error.PluginActivationFailed or err == error.InvalidService or
+        err == error.DuplicateService or err == error.UndeclaredServiceDependency or
+        err == error.MissingService or err == error.ServiceTypeMismatch or
+        err == error.ProcessPluginsUnsupported or err == error.ProcessConfigMissing or
+        err == error.ProcessConfigUntrusted or err == error.ProcessConfigTooLarge or
+        err == error.InvalidProcessConfig or err == error.UnsupportedProtocol or
+        err == error.UnsupportedProcessCapability or err == error.InvalidEntrypoint or
+        err == error.EntrypointOutsidePackage or err == error.EntrypointSymlink or
+        err == error.EntrypointNotExecutable or err == error.EntrypointTooLarge or
+        err == error.EntrypointHashMismatch or err == error.HandshakeSpawnFailed or
+        err == error.HandshakeTimeout or err == error.HandshakeOutputTooLarge or
+        err == error.HandshakeFailed or err == error.InvalidFrame or
+        err == error.InvalidHandshake or err == error.InvalidToolDefinition or
+        err == error.MissingDependency)
         wire.STATUS_INVALID_ARGUMENT
     else
         wire.STATUS_CORE_ERROR;
@@ -4146,6 +4380,7 @@ fn parseMcpSpecs(
             !allZero(descriptor.connector.reserved) or
             descriptor.connector.open == null or
             descriptor.connector.request == null or
+            descriptor.connector.request_tool_stream == null or
             descriptor.connector.notify == null or
             descriptor.connector.close == null or
             descriptor.connector.release_response == null or
@@ -4195,7 +4430,79 @@ fn parseMcpSpecs(
     return .{ .connectors = connectors, .specs = specs };
 }
 
+fn pluginLayer(code: u32) ?core.plugin.runtime.Layer {
+    return switch (code) {
+        wire.PLUGIN_LAYER_BUILTIN => .builtin,
+        wire.PLUGIN_LAYER_PERSONAL => .personal,
+        wire.PLUGIN_LAYER_PROJECT => .project,
+        wire.PLUGIN_LAYER_SESSION => .session,
+        wire.PLUGIN_LAYER_MANAGED => .managed,
+        else => null,
+    };
+}
+
+fn parseProcessPluginSources(
+    scratch: std.mem.Allocator,
+    optional: ?*const wire.RuntimePluginConfigV1,
+    metadata_bytes: *u64,
+) ![]core.agent_session.ProcessPlugin {
+    const raw = optional orelse return &.{};
+    if (raw.struct_size != @sizeOf(wire.RuntimePluginConfigV1) or
+        raw.reserved0 != 0 or !allZero(raw.reserved))
+        return error.InvalidArgument;
+    if (raw.process_plugin_count > wire.MAX_PROCESS_PLUGIN_SOURCES_V1)
+        return error.ResourceLimit;
+    const count = std.math.cast(usize, raw.process_plugin_count) orelse
+        return error.Overflow;
+    const descriptors = if (count == 0) &.{} else (raw.process_plugins orelse
+        return error.InvalidArgument)[0..count];
+    const result = try scratch.alloc(core.agent_session.ProcessPlugin, count);
+    for (descriptors, result) |descriptor, *destination| {
+        if (descriptor.struct_size != @sizeOf(wire.ProcessPluginSourceV1) or
+            !allZero(descriptor.reserved))
+            return error.InvalidArgument;
+        try addMetadata(
+            metadata_bytes,
+            descriptor.root.len,
+            wire.MAX_RUNTIME_METADATA_BYTES_V1,
+        );
+        const root = try text(descriptor.root);
+        if (root.len == 0 or root.len >= std.fs.max_path_bytes or
+            !std.fs.path.isAbsolute(root))
+            return error.InvalidArgument;
+        destination.* = .{
+            .root = root,
+            .layer = pluginLayer(descriptor.layer_code) orelse
+                return error.InvalidArgument,
+        };
+    }
+    return result;
+}
+
 fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+    return runtimeCreateImpl(config_ptr, null, out_runtime, out_error);
+}
+
+fn runtimeCreateWithPlugins(
+    config_ptr: ?*const wire.RuntimeConfigV1,
+    plugins_ptr: ?*const wire.RuntimePluginConfigV1,
+    out_runtime: ?*?*wire.RuntimeHandle,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (plugins_ptr == null) {
+        if (out_runtime) |out| out.* = null;
+        emptyError(out_error);
+        return fail(wire.STATUS_INVALID_ARGUMENT, "plugin runtime config is required", out_error);
+    }
+    return runtimeCreateImpl(config_ptr, plugins_ptr, out_runtime, out_error);
+}
+
+fn runtimeCreateImpl(
+    config_ptr: ?*const wire.RuntimeConfigV1,
+    plugins_ptr: ?*const wire.RuntimePluginConfigV1,
+    out_runtime: ?*?*wire.RuntimeHandle,
+    out_error: ?*wire.OwnedBytesV1,
+) u32 {
     if (out_runtime) |out| out.* = null;
     emptyError(out_error);
     const config = config_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "runtime config is required", out_error);
@@ -4207,6 +4514,24 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
     defer scratch.deinit();
     const a = scratch.allocator();
     var runtime_metadata: u64 = 0;
+    const process_plugins = parseProcessPluginSources(
+        a,
+        plugins_ptr,
+        &runtime_metadata,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    const host_stream_count_u64 = if (plugins_ptr) |plugins|
+        plugins.host_stream_tool_count
+    else
+        0;
+    if (host_stream_count_u64 > wire.MAX_TOOL_COUNT_V1)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "Host stream tool count exceeds AgentCore ABI v1 limit", out_error);
+    const host_stream_count = std.math.cast(usize, host_stream_count_u64) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "Host stream tool count overflow", out_error);
+    const host_stream_descriptors = if (host_stream_count == 0)
+        &.{}
+    else
+        (plugins_ptr.?.host_stream_tools orelse
+            return fail(wire.STATUS_INVALID_ARGUMENT, "host_stream_tools is required", out_error))[0..host_stream_count];
     const builtin_names = borrowedViews(
         a,
         config.builtin_tools,
@@ -4219,7 +4544,8 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         if (!validToolName(name)) return fail(wire.STATUS_INVALID_ARGUMENT, "invalid builtin tool name", out_error);
     }
     if (config.host_tool_count > wire.MAX_TOOL_COUNT_V1 or
-        config.builtin_tool_count > wire.MAX_TOOL_COUNT_V1 - config.host_tool_count)
+        host_stream_count_u64 > wire.MAX_TOOL_COUNT_V1 - config.host_tool_count or
+        config.builtin_tool_count > wire.MAX_TOOL_COUNT_V1 - config.host_tool_count - host_stream_count_u64)
         return fail(wire.STATUS_RESOURCE_LIMIT, "Runtime tool count exceeds AgentCore ABI v1 limit", out_error);
     const host_count = std.math.cast(usize, config.host_tool_count) orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "host tool count overflow", out_error);
@@ -4254,6 +4580,9 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
     self.host_tools = allocator.alloc(AbiHostTool, host_count) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Host tools failed", out_error);
     var keep_host_tools = false;
     defer if (!keep_host_tools) allocator.free(self.host_tools);
+    self.host_stream_tools = allocator.alloc(AbiHostStreamTool, host_stream_count) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Host stream tools failed", out_error);
+    var keep_host_stream_tools = false;
+    defer if (!keep_host_stream_tools) allocator.free(self.host_stream_tools);
     const native_tools = a.alloc(core.agent_session.HostSyncTool, host_count) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Host definitions failed", out_error);
     for (host_descriptors, 0..) |descriptor, i| {
         if (descriptor.struct_size != @sizeOf(wire.HostToolV1) or descriptor.reserved0 != 0 or !allZero(descriptor.reserved) or descriptor.execute == null or descriptor.release_result == null)
@@ -4286,6 +4615,41 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         };
         native_tools[i] = .{ .definition = .{ .name = name, .description = description, .input_schema = schema }, .ctx = &self.host_tools[i], .execute = AbiHostTool.execute };
     }
+    const native_stream_tools = a.alloc(core.agent_session.HostStreamTool, host_stream_count) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Host stream definitions failed", out_error);
+    for (host_stream_descriptors, 0..) |descriptor, i| {
+        if (descriptor.struct_size != @sizeOf(wire.HostStreamToolV1) or
+            descriptor.reserved0 != 0 or !allZero(descriptor.reserved) or
+            descriptor.execute_stream == null or descriptor.release_detail == null)
+            return fail(wire.STATUS_INVALID_ARGUMENT, "invalid HostStreamToolV1", out_error);
+        if (descriptor.input_schema_json.len > wire.MAX_TOOL_SCHEMA_BYTES_V1)
+            return fail(wire.STATUS_RESOURCE_LIMIT, "Host stream tool schema exceeds AgentCore ABI v1 limit", out_error);
+        addMetadata(&runtime_metadata, descriptor.name.len, wire.MAX_RUNTIME_METADATA_BYTES_V1) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
+        addMetadata(&runtime_metadata, descriptor.description.len, wire.MAX_RUNTIME_METADATA_BYTES_V1) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
+        addMetadata(&runtime_metadata, descriptor.input_schema_json.len, wire.MAX_RUNTIME_METADATA_BYTES_V1) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
+        const name = text(descriptor.name) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+        if (!validToolName(name)) return fail(wire.STATUS_INVALID_ARGUMENT, "invalid Host stream tool name", out_error);
+        if (std.mem.eql(u8, name, model_skill_tool.TOOL_NAME))
+            return fail(wire.STATUS_INVALID_ARGUMENT, "Host stream tool name 'Skill' is reserved by AgentCore", out_error);
+        const description = text(descriptor.description) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+        const schema_json = text(descriptor.input_schema_json) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+        const schema = parseSchema(a, schema_json) catch |err| return failError(inputErrorStatus(err), err, out_error);
+        const binding = session_permission.deriveHostBinding(a, name, schema_json) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
+        self.host_stream_tools[i] = .{
+            .ctx = descriptor.ctx,
+            .execute_fn = descriptor.execute_stream.?,
+            .release_fn = descriptor.release_detail.?,
+            .binding = binding,
+        };
+        native_stream_tools[i] = .{
+            .definition = .{ .name = name, .description = description, .input_schema = schema },
+            .ctx = &self.host_stream_tools[i],
+            .execute = AbiHostStreamTool.execute,
+        };
+    }
     self.mcp_manager = mcp_catalog.Manager.init(
         allocator,
         parsed_mcp.specs,
@@ -4296,11 +4660,21 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         self.mcp_manager.?.deinit();
         self.mcp_manager = null;
     };
-    self.core_runtime = core.agent_session.AgentRuntime.create(allocator, .{ .builtin_tools = builtin_names, .host_sync_tools = native_tools }) catch |err| {
+    self.core_runtime = core.agent_session.AgentRuntime.create(allocator, .{
+        .builtin_tools = builtin_names,
+        .host_sync_tools = native_tools,
+        .host_stream_tools = native_stream_tools,
+        .process_plugins = process_plugins,
+    }) catch |err| {
         return failError(runtimeErrorStatus(err), err, out_error);
     };
+    if (self.core_runtime.catalog.entries.len > wire.MAX_TOOL_COUNT_V1) {
+        self.core_runtime.destroy() catch unreachable;
+        return fail(wire.STATUS_RESOURCE_LIMIT, "Runtime tool count exceeds AgentCore ABI v1 limit", out_error);
+    }
     out.* = self.handle();
     keep_host_tools = true;
+    keep_host_stream_tools = true;
     keep_mcp_manager = true;
     keep_materializations = true;
     keep_catalogs = true;
@@ -4322,6 +4696,7 @@ fn runtimeDestroy(handle: ?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) 
     self.catalogs.finishDestroy();
     destroy_committed = true;
     allocator.free(self.host_tools);
+    allocator.free(self.host_stream_tools);
     allocator.destroy(self);
     return wire.STATUS_OK;
 }
@@ -4991,6 +5366,15 @@ const RestorePermissionResolver = struct {
                         const abi_tool: *AbiHostTool = @ptrCast(@alignCast(host.ctx));
                         break :inner std.mem.eql(u8, &abi_tool.binding, &tool.binding);
                     },
+                    .host_stream => |host| inner: {
+                        const abi_tool: *AbiHostStreamTool = @ptrCast(@alignCast(host.ctx));
+                        break :inner std.mem.eql(u8, &abi_tool.binding, &tool.binding);
+                    },
+                    .isolated => |isolated| std.mem.eql(
+                        u8,
+                        &isolated.authority_binding,
+                        &tool.binding,
+                    ),
                 };
             },
             .mcp => blk: {
@@ -5007,6 +5391,17 @@ const RestorePermissionResolver = struct {
 fn containsName(names: []const []const u8, needle: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, name, needle)) return true;
     return false;
+}
+
+fn withArtifactRecoveryTool(
+    allocator_: std.mem.Allocator,
+    allowed: []const []const u8,
+) std.mem.Allocator.Error![]const []const u8 {
+    if (containsName(allowed, "ReadArtifact")) return allowed;
+    const effective = try allocator_.alloc([]const u8, allowed.len + 1);
+    @memcpy(effective[0..allowed.len], allowed);
+    effective[allowed.len] = "ReadArtifact";
+    return effective;
 }
 
 /// Construct a facade only from canonical, already-bounded inputs. The caller
@@ -5145,6 +5540,7 @@ fn buildAbiSession(
         .permission_mode = config.permission_mode,
         .permission_rules = config.permission_rules,
         .workspace = config.workspace,
+        .artifact_store = .session_under_workspace_home,
         .allowed_tools = config.allowed_tools,
         // Always attach the AgentCore requester. A missing Host callback is a
         // typed `unavailable` outcome with provenance, never an implicit
@@ -5774,13 +6170,15 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     var keep_binding = false;
     defer if (!keep_binding) if (initial_binding) |*binding|
         binding.deinit(&runtime.catalogs);
-    const allowed = borrowedViews(
+    const host_allowed = borrowedViews(
         scratch.allocator(),
         host.allowed_tools,
         host.allowed_tool_count,
         &session_metadata,
         wire.MAX_SESSION_METADATA_BYTES_V1,
     ) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    const allowed = withArtifactRecoveryTool(scratch.allocator(), host_allowed) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
     const initial_mcp_selection = parseMcpSelection(
         scratch.allocator(),
@@ -5923,13 +6321,15 @@ fn sessionRestore(
             return failError(inputErrorStatus(err), err, out_error)
     else
         null;
-    const allowed = borrowedViews(
+    const host_allowed = borrowedViews(
         scratch.allocator(),
         host.allowed_tools,
         host.allowed_tool_count,
         &session_metadata,
         wire.MAX_SESSION_METADATA_BYTES_V1,
     ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    const allowed = withArtifactRecoveryTool(scratch.allocator(), host_allowed) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
     const mcp_selectors = parseMcpSelection(
         scratch.allocator(),
         host.mcp_selection,
@@ -6552,7 +6952,8 @@ const api_v1 = wire.ApiV1{
     .completion_stream_next = completionStreamNext,
     .completion_stream_abort = completionStreamAbort,
     .completion_stream_destroy = completionStreamDestroy,
-    .reserved = [_]u64{0} ** 3,
+    .runtime_create_with_plugins = runtimeCreateWithPlugins,
+    .reserved = [_]u64{0} ** 2,
 };
 
 pub export fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque {
@@ -9146,7 +9547,7 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
     runtime.catalogs.finishDestroy();
 }
 
-test "Revision 9 AgentCore restore uses execution identity and degrades unavailable or changed Skill authority" {
+test "Revision 12 AgentCore restore uses execution identity and degrades unavailable or changed Skill authority" {
     const record = skill_catalog.SkillRecord{
         .skill_id = [_]u8{'0'} ** 64,
         .execution_id = [_]u8{'1'} ** 64,
@@ -10939,7 +11340,13 @@ test "Skill materialization is post-admission and pre-Conversation" {
         .callback_status = .init(wire.STATUS_OK),
         .facade_poisoned = .init(false),
         .core_session = native_session,
+        // This narrow facade fixture calls the real admitted-Run boundary, so
+        // it must own the same RunState projector as a production ABI Session.
+        // Leaving the intentionally-undefined struct default here made the
+        // ReleaseSafe gate iterate 0xaa-filled ArrayList state during begin().
+        .run_state_projector = run_state.Projector.init(std.testing.allocator),
     };
+    defer session.run_state_projector.deinit();
     const root_frame = try policy_frame.PolicyFrame.createRoot(
         std.testing.allocator,
         &.{},

@@ -134,6 +134,16 @@ const StateSource = struct {
             task_views[i] = .{ .id = t.id, .subject = t.subject, .state = t.status.toString() };
         }
 
+        const plugin_inventory_json = try self.app.describePlugins(allocator);
+        defer allocator.free(plugin_inventory_json);
+        var plugin_inventory = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            plugin_inventory_json,
+            .{},
+        );
+        defer plugin_inventory.deinit();
+
         const u = &self.app.usage; // u64 无锁读，良性 skew（poll-based）
         return std.json.Stringify.valueAlloc(allocator, .{
             .seq = seq,
@@ -148,6 +158,7 @@ const StateSource = struct {
             .pending_request_id = self.wb.pendingId(),
             .agents = agent_views, // U6 A4:附着 roster
             .tasks = task_views, // task#19:mid-session task 列表进快照
+            .plugin_inventory = plugin_inventory.value,
         }, .{});
     }
 
@@ -485,6 +496,7 @@ test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
     app.config = @import("../types.zig").Config{}; // provider_kind=.anthropic(activeModel 读它)
     app.snapshot_cache = null; // → snapshotSlices 走 activeModel/additionalDirs 直读
     app.additional_dirs_abs = null;
+    app.plugin_snapshot = null;
     app.usage = .{};
     app.session_id = session_id.SessionId.single;
     app.permission_ctx = @import("../permission.zig").createContext(.default, a);
@@ -515,4 +527,6 @@ test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_calls\":3") != null);
     // seq 也在(附着握手)。
     try std.testing.expect(std.mem.indexOf(u8, json, "\"seq\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"plugin_inventory\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "metacodes.plugin-inventory/v1") != null);
 }

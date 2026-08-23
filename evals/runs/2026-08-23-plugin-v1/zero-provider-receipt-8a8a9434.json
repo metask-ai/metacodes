@@ -1,0 +1,266 @@
+{
+  "candidate": {
+    "inventory": {
+      "contract_version": 1,
+      "generation": 1,
+      "plugins": [
+        {
+          "capabilities": [
+            "skill_bundle"
+          ],
+          "contribution_count": 1,
+          "form": "data_package",
+          "id": "metacodes.benchmark-coding",
+          "layer": "session",
+          "lifecycle": "active",
+          "source_root": "/Users/david/prj/cc-t2z/metacodes/evals/plugin-v1/coding-plugin",
+          "version": "1.2.0"
+        }
+      ],
+      "schema": "metacodes.plugin-inventory/v1"
+    },
+    "plugin_id": "metacodes.benchmark-coding",
+    "plugin_version": "1.2.0"
+  },
+  "checks": [
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin"
+      ],
+      "elapsed_ms": 7578,
+      "name": "plugin_component_l2",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin effect lifecycle"
+      ],
+      "elapsed_ms": 2133,
+      "name": "plugin_effect_lifecycle",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin service graph"
+      ],
+      "elapsed_ms": 2358,
+      "name": "plugin_service_graph",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=static advisory hook"
+      ],
+      "elapsed_ms": 2241,
+      "name": "plugin_advisory_hook",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=RuntimeHost atomically replaces plugin generations"
+      ],
+      "elapsed_ms": 2641,
+      "name": "plugin_runtime_generation",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=RuntimeHost hot-swaps first-party core profiles"
+      ],
+      "elapsed_ms": 2266,
+      "name": "core_profile_hot_swap",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:lib",
+        "-Dtfilter=plugin"
+      ],
+      "elapsed_ms": 1332,
+      "name": "plugin_library_isolation",
+      "output_sha256": "a313ac258b87331d9843a398c62c2a4fc0ea0a9816076343ea8c5e309b3c0f68"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "agentcore:test",
+        "-Dtfilter=process plugin"
+      ],
+      "elapsed_ms": 931,
+      "name": "agentcore_process_plugin_abi",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "example"
+      ],
+      "elapsed_ms": 226,
+      "name": "independent_zig_host",
+      "output_sha256": "aebfb58507adea27d618aded7cd5614513a07a25e2fe2f694c99d7dbab9a1eee"
+    },
+    {
+      "argv": [
+        "/Users/david/prj/cc-t2z/metacodes/scripts/eval/fixtures/plugin_baseline.py",
+        "--dump-plugins"
+      ],
+      "elapsed_ms": 139,
+      "name": "baseline_empty_inventory",
+      "output_sha256": "6394b4f552d5b81243376998caaddad6a1d7bf8fed6a4946bfe43961149df326"
+    },
+    {
+      "argv": [
+        "/Users/david/prj/cc-t2z/metacodes/scripts/eval/fixtures/plugin_candidate.py",
+        "--dump-plugins"
+      ],
+      "elapsed_ms": 48,
+      "name": "candidate_namespaced_inventory",
+      "output_sha256": "8671ca856d4c3e7a3d195b344b61673050fca430b894a5bd86554d3dbecebdb3"
+    },
+    {
+      "elapsed_ms": 187,
+      "name": "credential_free_cli_inventory",
+      "output_sha256": "3e2bb92f83c3db3a65aaff09b8ec74c14f8e84a5b3daa66646185b01c5da1de8"
+    },
+    {
+      "name": "snapshot_microbenchmark",
+      "output_sha256": "c18626e234c0a21f8bfae8f12fe0eca95c9f22464ca6cd339e69868f71418330",
+      "repetitions": 5
+    }
+  ],
+  "coding_pair": {
+    "authorized_cost_usd": 0.0,
+    "provider_requests": 0,
+    "quality_claim": "none",
+    "status": "blocked_pending_explicit_paid_authority"
+  },
+  "content_sha256": "cf79c26693744b0360e980d3e81a63324d2cb413de4c2c5b473d8ae97d4a90c6",
+  "deepseek_harness_commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  "implementation_fingerprint": "1b5cf061469992494196888bd16e3f30de4eec9ad16d9ab3b78a7c550da3bdc5",
+  "metacodes_git_head": "dfbcfb20b2f618dbd34801ce20ce6d80eb5d05a2",
+  "performance": {
+    "inventory_avg_ns_max": 5181,
+    "inventory_avg_ns_median": 4987,
+    "runs": [
+      {
+        "baseline_avg_ns": 42844,
+        "baseline_p95_ns": 43654,
+        "inventory_avg_ns": 4584,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 52624,
+        "static_plugin_p95_ns": 54057,
+        "static_plugin_p95_overhead_ns": 10403,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 43634,
+        "baseline_p95_ns": 45581,
+        "inventory_avg_ns": 5181,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 53873,
+        "static_plugin_p95_ns": 57437,
+        "static_plugin_p95_overhead_ns": 11856,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 49390,
+        "baseline_p95_ns": 52699,
+        "inventory_avg_ns": 5149,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 59587,
+        "static_plugin_p95_ns": 64573,
+        "static_plugin_p95_overhead_ns": 11874,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 48883,
+        "baseline_p95_ns": 52585,
+        "inventory_avg_ns": 4987,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 59659,
+        "static_plugin_p95_ns": 64046,
+        "static_plugin_p95_overhead_ns": 11461,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 49155,
+        "baseline_p95_ns": 52645,
+        "inventory_avg_ns": 4789,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 59923,
+        "static_plugin_p95_ns": 64042,
+        "static_plugin_p95_overhead_ns": 11397,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      }
+    ],
+    "static_plugin_p95_overhead_ns_max": 11874,
+    "static_plugin_p95_overhead_ns_median": 11461
+  },
+  "protocol_sha256": "8a8a9434f6e116cdab4f5d8df6776dc6ac041e2e3ff45a7f94cf19626bd42a34",
+  "provider_requests": 0,
+  "quality_evidence": false,
+  "release_status": "blocked_pending_paid_coding_pair",
+  "schema": "metacodes.plugin-zero-provider-receipt/v1"
+}

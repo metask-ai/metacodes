@@ -16,6 +16,118 @@
 const std = @import("std");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const ToolResultBody = @import("context.zig").ToolResultBody;
+const artifact_store = @import("../core/tool_result_artifact.zig");
+const result_spool = @import("result_spool.zig");
+
+pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    if (ctx.artifact_root.len == 0)
+        return ToolResultBody.initInline(try listExecute(ctx, args));
+    const allocator = ctx.allocator;
+    const sessions = ctx.mcp_sessions orelse return error.NoMcpSessions;
+    const server_filter = common.extractJsonArg(args, "server");
+    var capture = try artifact_store.Capture.begin(
+        allocator,
+        ctx.artifact_root,
+        artifact_store.MAX_ARTIFACT_BYTES,
+    );
+    defer capture.deinit();
+    var output = result_spool.CaptureWriter.init(&capture);
+    try output.writer.writeAll("{\"resources\":[");
+    var first = true;
+    for (sessions.*) |*entry| {
+        if (server_filter) |filter| if (!std.mem.eql(u8, filter, entry.name)) continue;
+        var body = entry.client.listResourcesBodyAbortable(ctx.artifact_root, ctx.abort) catch |err| {
+            @import("../util/log.zig").warn("mcp", "list_resources failed for {s}: {s}", .{ entry.name, @errorName(err) });
+            continue;
+        };
+        defer body.deinit(allocator);
+        switch (body) {
+            .@"inline" => |inline_result| {
+                const array = findArrayField(inline_result.bytes, "resources") orelse continue;
+                var iter = jsonArrayIter(array);
+                while (iter.next()) |object| {
+                    if (!first) try output.writer.writeByte(',');
+                    first = false;
+                    try output.writer.writeAll("{\"server\":");
+                    try std.json.Stringify.encodeJsonString(entry.name, .{}, &output.writer);
+                    if (object.len > 2) {
+                        try output.writer.writeByte(',');
+                        try output.writer.writeAll(object[1 .. object.len - 1]);
+                    }
+                    try output.writer.writeByte('}');
+                }
+            },
+            .artifact => {
+                var rendered = try body.render(allocator);
+                defer rendered.deinit(allocator);
+                if (!first) try output.writer.writeByte(',');
+                first = false;
+                try output.writer.writeAll("{\"server\":");
+                try std.json.Stringify.encodeJsonString(entry.name, .{}, &output.writer);
+                try output.writer.writeAll(",\"resource_list_artifact\":");
+                try output.writer.writeAll(rendered.bytes);
+                try output.writer.writeByte('}');
+            },
+            .structured_error => continue,
+        }
+    }
+    try output.writer.writeAll("]}");
+    try output.check();
+    try capture.seal();
+    return result_spool.finishCaptureAsBody(
+        allocator,
+        ctx.artifact_root,
+        &capture,
+        .json,
+        true,
+    );
+}
+
+pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    if (ctx.artifact_root.len == 0)
+        return ToolResultBody.initInline(try readExecute(ctx, args));
+    const allocator = ctx.allocator;
+    const sessions = ctx.mcp_sessions orelse return error.NoMcpSessions;
+    const uri = common.extractJsonArg(args, "uri") orelse return error.MissingUri;
+    if (uri.len == 0) return error.EmptyUri;
+    const server_hint = common.extractJsonArg(args, "server");
+
+    if (server_hint) |hint| {
+        for (sessions.*) |*entry| if (std.mem.eql(u8, hint, entry.name)) {
+            return entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.abort) catch |err|
+                ToolResultBody.initInline(try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"error\":\"read_failed\",\"server\":\"{s}\",\"message\":\"{s}\"}}",
+                    .{ hint, @errorName(err) },
+                ));
+        };
+        return ToolResultBody.initInline(try std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"server_not_found\",\"server\":\"{s}\"}}",
+            .{hint},
+        ));
+    }
+
+    var last_error: ?[]const u8 = null;
+    for (sessions.*) |*entry| {
+        var body = entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.abort) catch |err| {
+            last_error = @errorName(err);
+            continue;
+        };
+        if (body == .structured_error) {
+            body.deinit(allocator);
+            last_error = "remote_error";
+            continue;
+        }
+        return body;
+    }
+    return ToolResultBody.initInline(try std.fmt.allocPrint(
+        allocator,
+        "{{\"error\":\"resource_not_found\",\"uri\":\"{s}\",\"last_err\":\"{s}\"}}",
+        .{ uri, last_error orelse "none" },
+    ));
+}
 
 pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const a = ctx.allocator;
@@ -71,14 +183,11 @@ pub fn readExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         for (sessions.*) |*entry| {
             if (std.mem.eql(u8, sh, entry.name)) {
                 return entry.client.readResource(uri) catch |err| {
-                    return try std.fmt.allocPrint(a,
-                        "{{\"error\":\"read_failed\",\"server\":\"{s}\",\"message\":\"{s}\"}}",
-                        .{ sh, @errorName(err) });
+                    return try std.fmt.allocPrint(a, "{{\"error\":\"read_failed\",\"server\":\"{s}\",\"message\":\"{s}\"}}", .{ sh, @errorName(err) });
                 };
             }
         }
-        return try std.fmt.allocPrint(a,
-            "{{\"error\":\"server_not_found\",\"server\":\"{s}\"}}", .{sh});
+        return try std.fmt.allocPrint(a, "{{\"error\":\"server_not_found\",\"server\":\"{s}\"}}", .{sh});
     }
 
     // 无 hint:依次尝试所有 server,第一个成功的
@@ -90,9 +199,7 @@ pub fn readExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         };
         return res;
     }
-    return try std.fmt.allocPrint(a,
-        "{{\"error\":\"resource_not_found\",\"uri\":\"{s}\",\"last_err\":\"{s}\"}}",
-        .{ uri, last_err orelse "none" });
+    return try std.fmt.allocPrint(a, "{{\"error\":\"resource_not_found\",\"uri\":\"{s}\",\"last_err\":\"{s}\"}}", .{ uri, last_err orelse "none" });
 }
 
 // ============================================================================
@@ -112,9 +219,18 @@ fn findArrayField(data: []const u8, field: []const u8) ?[]const u8 {
     var i = p;
     while (i < data.len) : (i += 1) {
         const c = data[i];
-        if (esc) { esc = false; continue; }
-        if (c == '\\') { esc = true; continue; }
-        if (c == '"') { in_str = !in_str; continue; }
+        if (esc) {
+            esc = false;
+            continue;
+        }
+        if (c == '\\') {
+            esc = true;
+            continue;
+        }
+        if (c == '"') {
+            in_str = !in_str;
+            continue;
+        }
         if (in_str) continue;
         if (c == '[') depth += 1;
         if (c == ']') {
@@ -141,9 +257,18 @@ const ArrayIter = struct {
         var esc = false;
         while (self.pos < self.data.len) : (self.pos += 1) {
             const c = self.data[self.pos];
-            if (esc) { esc = false; continue; }
-            if (c == '\\') { esc = true; continue; }
-            if (c == '"') { in_str = !in_str; continue; }
+            if (esc) {
+                esc = false;
+                continue;
+            }
+            if (c == '\\') {
+                esc = true;
+                continue;
+            }
+            if (c == '"') {
+                in_str = !in_str;
+                continue;
+            }
             if (in_str) continue;
             if (c == '{') depth += 1;
             if (c == '}') {

@@ -15,6 +15,7 @@
 const std = @import("std");
 const process = @import("platform").process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const Capture = @import("../core/tool_result_artifact.zig").Capture;
 
 /// 单行(一条 JSON-RPC 响应/resource)字节上限(轴A OOM 防线)。MCP resource 可合法较大(文件内容),
 /// 64MB 对真实响应绰绰;超此值必是无 `\n` 的病态/恶意巨型行 → 断帧报错 error.McpLineTooLarge。
@@ -91,6 +92,59 @@ pub const StdioTransport = struct {
             // 轴A OOM 防线:单行(一条响应/resource)无换行时 read_buf 会无界增长。超上限断帧报错,
             // 而非把 GB 级单行 JSON 全堆进内存(恶意/超大 MCP resource)。
             if (self.read_buf.items.len - self.read_buf_pos > MAX_MCP_LINE_BYTES) return error.McpLineTooLarge;
+        }
+    }
+
+    /// Receive one NDJSON frame directly into a kernel-private capture. Bytes
+    /// already buffered by a preceding control response are drained first;
+    /// bytes after the terminating newline remain available to the next frame.
+    /// The line itself is never assembled in `read_buf`.
+    pub fn recvLineCapture(self: *StdioTransport, capture: *Capture) !void {
+        if (self.read_buf_pos < self.read_buf.items.len) {
+            if (std.mem.indexOfScalarPos(u8, self.read_buf.items, self.read_buf_pos, '\n')) |nl| {
+                try capture.write(self.read_buf.items[self.read_buf_pos..nl]);
+                self.read_buf_pos = nl + 1;
+                self.compactReadBuffer();
+                return;
+            }
+            try capture.write(self.read_buf.items[self.read_buf_pos..]);
+            self.read_buf.clearRetainingCapacity();
+            self.read_buf_pos = 0;
+        }
+
+        var chunk: [32 * 1024]u8 = undefined;
+        while (true) {
+            if (self.abort) |ab| {
+                while (true) {
+                    if (ab.isAborted()) return error.Aborted;
+                    if (self.child.pollReadable(100)) break;
+                }
+            }
+            const n = self.child.read(&chunk);
+            if (n < 0) return error.ReadFailed;
+            if (n == 0) {
+                if (capture.bytes == 0) return error.Eof;
+                return;
+            }
+            const bytes = chunk[0..@as(usize, @intCast(n))];
+            if (std.mem.indexOfScalar(u8, bytes, '\n')) |nl| {
+                try capture.write(bytes[0..nl]);
+                if (nl + 1 != bytes.len)
+                    try self.read_buf.appendSlice(self.allocator, bytes[nl + 1 ..]);
+                return;
+            }
+            try capture.write(bytes);
+        }
+    }
+
+    fn compactReadBuffer(self: *StdioTransport) void {
+        if (self.read_buf_pos == self.read_buf.items.len) {
+            self.read_buf.clearRetainingCapacity();
+            self.read_buf_pos = 0;
+        } else if (self.read_buf_pos > 4096) {
+            std.mem.copyForwards(u8, self.read_buf.items, self.read_buf.items[self.read_buf_pos..]);
+            self.read_buf.items.len -= self.read_buf_pos;
+            self.read_buf_pos = 0;
         }
     }
 

@@ -26,6 +26,7 @@ const ToolContext = @import("context.zig").ToolContext;
 
 /// 单次 tool_result 中 stdout/stderr 的默认字节上限；避免 100MB 文件塞爆 context。
 const DEFAULT_MAX_BYTES: usize = 64 * 1024;
+const MAX_MAX_BYTES: usize = 256 * 1024;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -42,6 +43,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const stdout_since = parseUsizeArg(args, "stdout_since_byte") orelse 0;
     const stderr_since = parseUsizeArg(args, "stderr_since_byte") orelse 0;
     const max_bytes = parseUsizeArg(args, "max_bytes") orelse DEFAULT_MAX_BYTES;
+    if (max_bytes == 0 or max_bytes > MAX_MAX_BYTES) {
+        common.setErrorDetail(ctx.error_detail, allocator, "BashOutput max_bytes must be in 1..{d}", .{MAX_MAX_BYTES});
+        return error.InvalidMaxBytes;
+    }
 
     var stdout_chunk: Chunk = .{};
     var stderr_chunk: Chunk = .{};

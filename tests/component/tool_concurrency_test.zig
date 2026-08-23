@@ -43,7 +43,7 @@ test "L2 #5: 没有 provider factory 时两个 WebSearch 不重叠使用 session
                     std.Thread.yield() catch {};
                 }
             }
-            return .{ .ok = try tool_ctx.allocator.dupe(u8, "ok") };
+            return .{ .ok = tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, "ok")) };
         }
         fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
             return false;
@@ -109,7 +109,7 @@ test "L2 WebSearch 独立 provider 让混合批并发且 Read 不被隔离" {
             }
             if (is_web) self.web_active.store(false, .release);
             _ = self.active.fetchSub(1, .acq_rel);
-            return .{ .ok = try tool_ctx.allocator.dupe(u8, "ok") };
+            return .{ .ok = tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, "ok")) };
         }
         fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
             return false;

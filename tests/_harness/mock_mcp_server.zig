@@ -63,8 +63,30 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
         );
     } else if (std.mem.eql(u8, method, "tools/list")) {
         try writeResponse(alloc, id,
-            \\{"tools":[{"name":"echo","description":"echo back input","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},{"name":"slow_echo","description":"delayed echo for concurrency tests","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},{"name":"elicit","description":"asks user via elicitation","inputSchema":{"type":"object"}}]}
+            \\{"tools":[{"name":"echo","description":"echo back input","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},{"name":"slow_echo","description":"delayed echo for concurrency tests","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},{"name":"elicit","description":"asks user via elicitation","inputSchema":{"type":"object"}},{"name":"large","description":"stream a 17MiB result","inputSchema":{"type":"object"}}]}
         );
+    } else if (std.mem.eql(u8, method, "resources/list")) {
+        try writeResponse(alloc, id,
+            \\{"resources":[{"uri":"mock://large","name":"large fixture","mimeType":"text/plain"}]}
+        );
+    } else if (std.mem.eql(u8, method, "resources/read")) {
+        var header_buffer: [192]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &header_buffer,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"contents\":[{{\"uri\":\"mock://large\",\"mimeType\":\"text/plain\",\"text\":\"",
+            .{id},
+        );
+        try writeStdoutAll(header);
+        var block: [64 * 1024]u8 = undefined;
+        @memset(&block, 'r');
+        var remaining: usize = 17 * 1024 * 1024 + 29;
+        while (remaining != 0) {
+            const count = @min(remaining, block.len);
+            try writeStdoutAll(block[0..count]);
+            remaining -= count;
+        }
+        try writeStdoutAll("RESOURCE_TAIL\"}]}}\n");
+        return;
     } else if (std.mem.eql(u8, method, "tools/call")) {
         const tool = extractStringField(line, "name") orelse "";
         if (std.mem.eql(u8, tool, "elicit")) {
@@ -83,6 +105,25 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
         if (std.mem.eql(u8, tool, "slow_echo")) {
             @import("platform").sync.sleepMs(100);
         }
+        if (std.mem.eql(u8, tool, "large")) {
+            var header_buffer: [160]u8 = undefined;
+            const header = try std.fmt.bufPrint(
+                &header_buffer,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"",
+                .{id},
+            );
+            try writeStdoutAll(header);
+            var block: [64 * 1024]u8 = undefined;
+            @memset(&block, 'm');
+            var remaining: usize = 17 * 1024 * 1024 + 23;
+            while (remaining != 0) {
+                const count = @min(remaining, block.len);
+                try writeStdoutAll(block[0..count]);
+                remaining -= count;
+            }
+            try writeStdoutAll("\"}]}}\n");
+            return;
+        }
         const msg = extractNestedStringField(line, "message") orelse "<nothing>";
         const payload = try std.fmt.allocPrint(alloc,
             \\{{"content":[{{"type":"text","text":"{s}"}}]}}
@@ -91,6 +132,15 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
         try writeResponse(alloc, id, payload);
     } else {
         try writeError(alloc, id, -32601, "Method not found");
+    }
+}
+
+fn writeStdoutAll(bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset != bytes.len) {
+        const count = pfs.write(1, bytes[offset..]);
+        if (count <= 0) return error.WriteFailed;
+        offset += @intCast(count);
     }
 }
 

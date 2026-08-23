@@ -16,6 +16,7 @@ const std = @import("std");
 
 pub const VERSION = "0.1.0";
 pub const util_fs = @import("util/fs.zig");
+pub const plugin = @import("plugin/root.zig");
 
 // ── 引擎 ─────────────────────────────────────────────────────────────────
 pub const agent_loop = @import("core/agent_loop.zig"); // run(), Options, RunResult, StopReason
@@ -31,6 +32,7 @@ pub const tool_exec = @import("core/tool_exec.zig");
 pub const file_reference = @import("core/file_reference.zig");
 pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
 pub const tool_result_artifact = @import("core/tool_result_artifact.zig");
+pub const tool_result = @import("core/tool_result.zig");
 pub const result_projection = @import("core/result_projection.zig");
 pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
 pub const rule_impact_stats = @import("core/rule_impact_stats.zig");
@@ -92,6 +94,7 @@ pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_completion = @import("api/completion.zig"); // generic completion facade
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_capability = @import("api/capability.zig");
+pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
 pub const auth = @import("core/auth.zig");
 pub const api_openai = @import("api/openai_client.zig");
@@ -127,6 +130,7 @@ pub const skills_tool = @import("skills/tool.zig");
 pub const skills_render = @import("skills/render.zig");
 pub const mcp_client = @import("mcp/client.zig");
 pub const mcp_protocol = @import("mcp/protocol.zig");
+pub const mcp_result_stream = @import("agentcore/mcp_result_stream.zig");
 pub const sandbox_config = @import("sandbox/config.zig");
 
 // ── 协议(core ↔ UI 契约;实现自定义前端只需这几个)────────────────────────

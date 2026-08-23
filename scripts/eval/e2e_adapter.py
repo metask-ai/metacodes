@@ -18,11 +18,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from .model import SCHEMA_VERSION, ValidationError, stable_json
 
 
-# Native event payloads and evaluator semantics are a separate compatibility
-# contract from the normalized rollout/suite JSON schema.  Bump this whenever
-# an event becomes structurally incompatible or scoring semantics change.
-EVALUATION_CONTRACT_VERSION = 3
-NATIVE_EVENT_SCHEMA_VERSION = EVALUATION_CONTRACT_VERSION
+# Evaluator semantics and native event wire compatibility are separate
+# identities. A scoring-rule change must move the grader fingerprint without
+# forcing a byte-compatible native emitter to rev its wire schema.
+EVALUATION_CONTRACT_VERSION = 4
+NATIVE_EVENT_SCHEMA_VERSION = 3
 MAX_NATIVE_EVENT_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_VALIDATOR_OUTPUT_BYTES = 1024 * 1024
@@ -33,6 +33,7 @@ USAGE_RE = re.compile(
     r"usage in=(\d+) out=(\d+) cache_r=(\d+) cache_w=(\d+)"
 )
 MODEL_RE = re.compile(r"metacodes starting; model=([^\s]+)")
+SESSION_TIMEOUT_RE = re.compile(r"单段超时:\s*(\d+)s")
 TURN_RE = re.compile(r"turn\s+(\d+)/(\d+)\s+starting")
 TOOL_START_RE = re.compile(r"tool\.exec start(?:\(par\))? name=([A-Za-z0-9_]+)")
 TOOL_DONE_RE = re.compile(
@@ -285,6 +286,9 @@ def prepare_runtime_metadata(
         metadata["max_metered_tokens"] = max_metered_tokens
     if max_cost_usd is not None:
         metadata["max_cost_usd"] = float(max_cost_usd)
+    allowed_tools = task["tools"].get("allowed")
+    if allowed_tools is not None:
+        metadata["allowed_tools"] = list(allowed_tools)
     _write_new_private_file(
         output,
         (json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n").encode(
@@ -572,6 +576,14 @@ def _report_exit_code(report: str, task_id: str) -> Optional[int]:
         rf"^\|\s*{re.escape(task_id)}\s*\|\s*(-?\d+)\s*\|", report, re.MULTILINE
     )
     return int(row.group(1)) if row else None
+
+
+def _report_timeout_seconds(report: str) -> Optional[int]:
+    match = SESSION_TIMEOUT_RE.search(report)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    return value if value > 0 else None
 
 
 def _trace_metrics(debug_log: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -1091,10 +1103,10 @@ def _attribution(
     if exit_code == 124:
         result.append(
             {
-                "source": "L",
+                "source": "model" if execution_status == "completed" else "L",
                 "code": "rollout_timeout",
                 "count": 1,
-                "confidence": 0.6,
+                "confidence": 0.9 if execution_status == "completed" else 0.6,
             }
         )
     if evaluator_status == "invalid":
@@ -1395,6 +1407,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     dropped_events_total = 0
     dropped_events_max = 0
     incomplete_trace_ids: set[str] = set()
+    incomplete_model_turn_ids: set[str] = set()
     last_trace_id = str(events[-1][1].get("trace_id", ""))
     for trace_id, trace in trace_events.items():
         sequences = [event[2] for event in trace]
@@ -1457,6 +1470,12 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 finished_tools[key] = (name, sequence, payload)
         if not incomplete and set(started_tools) != set(finished_tools):
             structural_errors.append(f"trace {trace_id}: unpaired tool lifecycle")
+        if (
+            incomplete
+            and trace[-1][0] in {"turn_started", "usage"}
+            and set(started_tools) == set(finished_tools)
+        ):
+            incomplete_model_turn_ids.add(trace_id)
         for key in set(started_tools) & set(finished_tools):
             started_name, started_sequence = started_tools[key]
             finished_name, finished_sequence, _finished_payload = finished_tools[key]
@@ -1689,6 +1708,8 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         "metadata": metadata,
         "metrics": metrics,
         "complete": complete,
+        "incomplete_model_turn": bool(incomplete_trace_ids)
+        and incomplete_model_turn_ids == incomplete_trace_ids,
         "starts": len(starts),
         "finishes": len(finishes),
         "stop_reasons": stop_reasons,
@@ -1728,8 +1749,20 @@ def import_run(
         log_text = log_text or ""
         debug_text = debug_text or ""
         exit_code = _report_exit_code(report, task_id) if not report_error else None
+        timeout_seconds = _report_timeout_seconds(report) if not report_error else None
         native_path = workspace / "events.jsonl"
         native, native_error = _native_trace_metrics(native_path)
+        scored_watchdog_timeout = bool(
+            exit_code == 124
+            and timeout_seconds is not None
+            and native is not None
+            and not native["complete"]
+            and native["incomplete_model_turn"]
+            and native["dropped_events_total"] == 0
+            and native["failed_model_requests"] == 0
+            and native["metrics"]["harness_errors"] == 0
+            and native["metrics"]["network_errors"] == 0
+        )
 
         readiness_checks = [
             {
@@ -1762,12 +1795,14 @@ def import_run(
             readiness_checks.append(
                 {
                     "name": "native_events_complete",
-                    "passed": native is not None and bool(native["complete"]),
+                    "passed": native is not None
+                    and (bool(native["complete"]) or scored_watchdog_timeout),
                     "detail": native_error
                     or (
                         f"run_started={native['starts']} run_finished={native['finishes']} "
                         f"stop_reasons={native['stop_reasons']} "
-                        f"dropped_events={native['dropped_events_total']}"
+                        f"dropped_events={native['dropped_events_total']} "
+                        f"scored_watchdog_timeout={scored_watchdog_timeout}"
                     ),
                 }
             )
@@ -1807,6 +1842,27 @@ def import_run(
         if native is not None:
             native_meta = native["metadata"]
             metrics = native["metrics"]
+            if scored_watchdog_timeout:
+                timeout_ms = int(timeout_seconds) * 1000
+                observed_wall_ms = int(metrics.get("wall_time_ms") or 0)
+                missing_model_ms = max(0, timeout_ms - observed_wall_ms)
+                metrics["wall_time_ms"] = max(observed_wall_ms, timeout_ms)
+                metrics["model_request_time_ms"] = int(
+                    metrics.get("model_request_time_ms") or 0
+                ) + missing_model_ms
+                metrics["model_request_count"] = int(
+                    metrics.get("model_request_count") or 0
+                ) + 1
+                outcomes = dict(metrics.get("model_request_outcomes") or {})
+                outcomes["watchdog_timeout"] = outcomes.get("watchdog_timeout", 0) + 1
+                metrics["model_request_outcomes"] = outcomes
+                tool_stage_ms = int(metrics.get("tool_stage_time_ms") or 0)
+                metrics["harness_time_ms"] = max(
+                    0,
+                    int(metrics["wall_time_ms"])
+                    - int(metrics["model_request_time_ms"])
+                    - tool_stage_ms,
+                )
             trace_failures = native["tool_failures"]
             rollout_run_id = native_meta["run_id"]
             rollout_trial = int(native_meta["trial"])
@@ -1874,14 +1930,20 @@ def import_run(
         invalid_reasons = list(invalid_reasons_for_scenario)
         if not all(item["passed"] for item in readiness_checks):
             invalid_reasons.append("readiness_failed")
-        if exit_code is not None and exit_code != 0:
+        if exit_code is not None and exit_code != 0 and not scored_watchdog_timeout:
             invalid_reasons.append(f"nonzero_exit:{exit_code}")
         if metrics["harness_errors"]:
             invalid_reasons.append("harness_or_provider_error")
         if native is not None:
-            if any(reason != "end_turn" for reason in native["stop_reasons"]):
+            terminal_reasons = native["stop_reasons"]
+            terminal_failure = any(reason != "end_turn" for reason in terminal_reasons)
+            if scored_watchdog_timeout:
+                terminal_failure = terminal_reasons[-1:] != ["incomplete"] or any(
+                    reason != "end_turn" for reason in terminal_reasons[:-1]
+                )
+            if terminal_failure:
                 invalid_reasons.append(
-                    "native_terminal_failure:" + ",".join(native["stop_reasons"])
+                    "native_terminal_failure:" + ",".join(terminal_reasons)
                 )
             if native["dropped_events_total"]:
                 invalid_reasons.append(

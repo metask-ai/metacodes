@@ -741,6 +741,7 @@ fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMe
             .disallowed_tools = try cloneStringList(arena, source.definition.disallowed_tools),
             .arguments = try cloneStringList(arena, source.definition.arguments),
             .disable_model_invocation = source.definition.disable_model_invocation,
+            .model_activation = source.definition.model_activation,
             .context = source.definition.context,
             .agent = try arena.dupe(u8, source.definition.agent),
             .model = try arena.dupe(u8, source.definition.model),
@@ -1072,6 +1073,7 @@ fn computeContentRevision(record: *const SkillRecord) [64]u8 {
     hashField(&hash, record.definition.model);
     hashField(&hash, record.definition.shell);
     hashU64(&hash, @intFromBool(record.definition.disable_model_invocation));
+    hashField(&hash, @tagName(record.definition.model_activation));
     for (record.definition.arguments) |value| hashField(&hash, value);
     for (record.definition.allowed_tools) |value| hashField(&hash, value);
     for (record.definition.disallowed_tools) |value| hashField(&hash, value);
@@ -1129,6 +1131,7 @@ fn computeRevision(snapshot: *const Snapshot, workspace_epoch: []const u8) [64]u
         hashField(&hash, record.definition.model);
         hashField(&hash, record.definition.shell);
         hashU64(&hash, @intFromBool(record.definition.disable_model_invocation));
+        hashField(&hash, @tagName(record.definition.model_activation));
         for (record.definition.arguments) |value| hashField(&hash, value);
         for (record.definition.allowed_tools) |value| hashField(&hash, value);
         for (record.definition.disallowed_tools) |value| hashField(&hash, value);
@@ -1207,6 +1210,13 @@ fn validateSkillMetadata(md: []const u8) error{InvalidDefinition}!void {
             std.mem.eql(u8, key, "disable_model_invocation"))
         {
             if (!validBoolean(value)) return error.InvalidDefinition;
+        } else if (std.mem.eql(u8, key, "model-activation") or
+            std.mem.eql(u8, key, "model_activation"))
+        {
+            if (!std.mem.eql(u8, value, "advisory") and
+                !std.mem.eql(u8, value, "required-first") and
+                !std.mem.eql(u8, value, "required_first"))
+                return error.InvalidDefinition;
         }
     }
 }

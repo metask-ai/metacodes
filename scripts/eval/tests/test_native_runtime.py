@@ -148,16 +148,19 @@ class NativeRuntimeTest(unittest.TestCase):
                 harness_revision="test",
                 permission_mode="bypass_permissions",
                 binary_path=binary,
-                # The runtime reserves 200k input + 32k output. Equality is
-                # sufficient for the first request; its usage closes the gate
-                # immediately before the second provider boundary.
-                max_metered_tokens=232000,
+                # The request-local serialized bound fits the first request;
+                # the mock's large metered usage then closes the same
+                # process-wide allowance before submission two.
+                max_metered_tokens=160000,
                 max_cost_usd=100.0,
             )
             metadata_fd = os.open(metadata_path, os.O_RDONLY)
             metadata_path.unlink()
             events_file = tempfile.TemporaryFile()
-            with SlowMockServer(turns=[simple_text("first response")]) as server:
+            first = simple_text("first response").replace(
+                b'"input_tokens":1', b'"input_tokens":150000', 1
+            )
+            with SlowMockServer(turns=[first]) as server:
                 completed = subprocess.run(
                     [
                         str(binary),

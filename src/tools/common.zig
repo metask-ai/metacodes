@@ -2,6 +2,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const process = @import("platform").process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const artifact_store = @import("../core/tool_result_artifact.zig");
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 
@@ -164,7 +165,6 @@ pub fn spawnCaptureStdoutCapped(
     return spawnCaptureStdoutAbortableTimedCapped(argv, allocator, abort, timeout_ms, max_bytes);
 }
 
-
 /// v39 G2(终局取证:并行工具爆发下受限容器 fork 压力,Glob/Grep SpawnError
 /// 24 次/48 trial,无重试直接把瞬时资源竖成模型可见故障)。spawn 层一次
 /// 150ms 退避重试:只针对 SpawnError 类(fork/exec 资源性失败),Timeout/
@@ -256,6 +256,128 @@ pub const SpawnOut = struct {
     exit_code: i32,
     capture_complete: bool = true,
 };
+
+/// Byte-zero native subprocess capture. Both channels are kernel-private
+/// files created before spawn; no producer byte is first accumulated in an
+/// ArrayList. The caller owns both sealed captures and must call `deinit`.
+pub const SpoolSpawnOut = struct {
+    stdout: artifact_store.Capture,
+    stderr: artifact_store.Capture,
+    exit_code: i32,
+    capture_complete: bool,
+
+    pub fn deinit(self: *SpoolSpawnOut) void {
+        self.stdout.deinit();
+        self.stderr.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Spawn a finite native producer with stdout/stderr redirected into private
+/// Session captures. This is the common byte-zero seam for Grep, Glob and
+/// WebFetch. It preserves abort, timeout, progress ticks, process-group kill,
+/// a combined disk bound, and the historical one-shot transient spawn retry.
+pub fn spawnCaptureToSpoolTimed(
+    argv: []const ?[*:0]const u8,
+    allocator: std.mem.Allocator,
+    artifact_root: []const u8,
+    abort: ?*const AbortSignal,
+    timeout_ms: u64,
+    tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void,
+    max_bytes: usize,
+    stderr_max_bytes: usize,
+    cwd: ?[]const u8,
+) !SpoolSpawnOut {
+    if (max_bytes == 0 or stderr_max_bytes == 0) return error.InvalidCaptureLimit;
+    logSpawnArgv(argv, timeout_ms);
+
+    var stdout = try artifact_store.Capture.begin(allocator, artifact_root, max_bytes);
+    errdefer stdout.deinit();
+    var stderr = try artifact_store.Capture.begin(allocator, artifact_root, stderr_max_bytes);
+    errdefer stderr.deinit();
+
+    const out_fd = try stdout.outputFd();
+    const err_fd = try stderr.outputFd();
+    const proc = process.spawnToFilesWithEnv(argv, out_fd, err_fd, cwd, false) catch |first_err| blk: {
+        switch (first_err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        }
+        util_time.sleepMs(150);
+        break :blk process.spawnToFilesWithEnv(argv, out_fd, err_fd, cwd, false) catch
+            return error.SpawnError;
+    };
+    var proc_live = true;
+    defer if (proc_live) {
+        process.killJob(proc);
+        process.reapBlocking(proc);
+    };
+
+    const started = nowMs();
+    var last_tick = started;
+    var exit_code: i32 = 0;
+    var capture_complete = true;
+    while (true) {
+        if (abort) |signal| if (signal.isAborted()) {
+            process.killJob(proc);
+            process.reapBlocking(proc);
+            proc_live = false;
+            return error.Aborted;
+        };
+        const current = nowMs();
+        const elapsed: u64 = @intCast(@max(current - started, 0));
+        if (timeout_ms > 0 and elapsed >= timeout_ms) {
+            process.killJob(proc);
+            process.reapBlocking(proc);
+            proc_live = false;
+            return error.Timeout;
+        }
+        if (tick_fn) |tick| {
+            if (current - last_tick >= 2000) {
+                tick(elapsed, processLabel(argv));
+                last_tick = current;
+            }
+        }
+
+        switch (process.reapNonblock(proc)) {
+            .running => {},
+            .exited => |code| {
+                exit_code = code;
+                process.reapBlocking(proc); // closes Windows HANDLE; POSIX is already reaped
+                proc_live = false;
+                break;
+            },
+        }
+
+        const out_bytes = try stdout.observedExternalBytes();
+        const err_bytes = try stderr.observedExternalBytes();
+        if (out_bytes +| err_bytes >= max_bytes) {
+            capture_complete = false;
+            process.killJob(proc);
+            process.reapBlocking(proc);
+            proc_live = false;
+            exit_code = -9;
+            break;
+        }
+        util_time.sleepMs(25);
+    }
+
+    const stdout_complete = try stdout.sealExternal();
+    const stderr_complete = try stderr.sealExternal();
+    return .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = exit_code,
+        .capture_complete = capture_complete and stdout_complete and stderr_complete,
+    };
+}
+
+fn processLabel(argv: []const ?[*:0]const u8) []const u8 {
+    const raw = argv[0] orelse return "?";
+    const full = std.mem.span(raw);
+    const slash = std.mem.lastIndexOfScalar(u8, full, '/');
+    return if (slash) |index| full[index + 1 ..] else full;
+}
 
 /// spawn 子进程并同时捕获 stdout 和 stderr 到两个独立 buffer，返回 exit_code。
 /// 与 spawnCaptureStdoutAbortableTimed 语义一致（abort/timeout 行为、进程组、kill 策略相同），
@@ -486,4 +608,60 @@ test "spawnCaptureWithStderrTimed:max_bytes 封顶无限输出 killpg 止血不�
     try std.testing.expect(out.stdout.len >= 32 * 1024);
     try std.testing.expect(out.stdout.len < 32 * 1024 + 8 * 1024);
     try std.testing.expect(dt < 5000); // 远快于 8000ms timeout → 证明是 cap 而非超时才停
+}
+
+test "spawnCaptureToSpoolTimed captures both channels without full buffers" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var argv = [_]?[*:0]const u8{ "/bin/sh", "-c", "printf native-out; printf native-err >&2", null };
+    var captured = try spawnCaptureToSpoolTimed(
+        &argv,
+        allocator,
+        root,
+        null,
+        5_000,
+        null,
+        64 * 1024,
+        8 * 1024,
+        null,
+    );
+    defer captured.deinit();
+    try std.testing.expect(captured.capture_complete);
+    const stdout = try captured.stdout.readRangeAlloc(allocator, 0, @intCast(captured.stdout.bytes));
+    defer allocator.free(stdout);
+    const stderr = try captured.stderr.readRangeAlloc(allocator, 0, @intCast(captured.stderr.bytes));
+    defer allocator.free(stderr);
+    try std.testing.expectEqualStrings("native-out", stdout);
+    try std.testing.expectEqualStrings("native-err", stderr);
+}
+
+test "spawnCaptureToSpoolTimed kills an unbounded producer and seals a partial receipt" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var argv = [_]?[*:0]const u8{ "/usr/bin/yes", "spooled", null };
+    var captured = try spawnCaptureToSpoolTimed(
+        &argv,
+        allocator,
+        root,
+        null,
+        5_000,
+        null,
+        32 * 1024,
+        4 * 1024,
+        null,
+    );
+    defer captured.deinit();
+    try std.testing.expect(!captured.capture_complete);
+    try std.testing.expect(captured.stdout.bytes <= 32 * 1024);
+    try std.testing.expect(captured.stdout.bytes > 0);
 }

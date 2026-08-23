@@ -12,6 +12,9 @@ const toolchain = @import("../util/toolchain.zig");
 const symbols = @import("../symbols/symbol.zig");
 const symbol_provider = @import("symbol_provider.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const ToolResultBody = @import("context.zig").ToolResultBody;
+const artifact_store = @import("../core/tool_result_artifact.zig");
+const result_spool = @import("result_spool.zig");
 
 const MAX_CANDIDATE_FILES: usize = 300;
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
@@ -21,13 +24,44 @@ const LIST_BYTE_CAP: usize = 256 * 1024;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try executeToWriter(ctx, args, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    if (ctx.artifact_root.len == 0)
+        return ToolResultBody.initInline(try execute(ctx, args));
+    var capture = try artifact_store.Capture.begin(
+        ctx.allocator,
+        ctx.artifact_root,
+        artifact_store.MAX_ARTIFACT_BYTES,
+    );
+    defer capture.deinit();
+    var output = result_spool.CaptureWriter.init(&capture);
+    try executeToWriter(ctx, args, &output.writer);
+    try output.check();
+    try capture.seal();
+    return result_spool.finishCaptureAsBody(
+        ctx.allocator,
+        ctx.artifact_root,
+        &capture,
+        .json,
+        true,
+    );
+}
+
+fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer) anyerror!void {
+    const allocator = ctx.allocator;
     const name = common.extractJsonArg(args, "name") orelse return error.MissingName;
     if (name.len == 0) return error.EmptyName;
 
     // Y2 砍 tree-sitter 后符号只来自 LSP。无 --lsp → 带提示的空结果,别用裸 `[]` 把"能力缺失"
     // 伪装成"查无定义"(否则模型误判该符号不存在走错路;对齐 CodeMap 的 "(no LSP server...)" 提示)。
     if (ctx.lsp == null) {
-        return try allocator.dupe(u8, "[]\n(FindSymbol needs --lsp and an installed language server to resolve definitions; none is configured. This empty result does NOT mean the symbol is undefined — use Grep to search text, or restart with --lsp.)");
+        try w.writeAll("[]\n(FindSymbol needs --lsp and an installed language server to resolve definitions; none is configured. This empty result does NOT mean the symbol is undefined — use Grep to search text, or restart with --lsp.)");
+        return;
     }
 
     const path_raw = common.extractJsonArg(args, "path") orelse ".";
@@ -47,16 +81,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         allocator.free(defs);
     }
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    const w = &out.writer;
     try w.writeByte('[');
     for (defs, 0..) |s, i| {
         if (i != 0) try w.writeByte(',');
         try writeSymbolJson(w, s);
     }
     try w.writeByte(']');
-    return try out.toOwnedSlice();
 }
 
 /// 跨文件找符号*定义*,返回匹配的 Symbol 列表(owned:每个 Symbol 的字符串字段都 dupe 到
@@ -158,7 +188,7 @@ const writeJsonString = @import("../util/json.zig").writeJsonString;
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer pfs.close(fd);
-    return try common.readAllFromFd(fd, allocator);
+    return try common.readAllFromFdCapped(fd, allocator, MAX_SOURCE_BYTES);
 }
 
 /// rg -l -w <name> <path>:列出含该词(词边界)的文件。

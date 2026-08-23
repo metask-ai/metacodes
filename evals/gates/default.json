@@ -14,7 +14,7 @@
     "suites": [
       {
         "suite_id": "metacodes-core-e2e-v1",
-        "suite_fingerprint": "ab0688420045f510",
+        "suite_fingerprint": "746e4666318c2b55",
         "task_ids": [
           "00_smoke",
           "02_html_game",
@@ -31,7 +31,7 @@
       },
       {
         "suite_id": "metacodes-agentdef-release-v1",
-        "suite_fingerprint": "7401d5c509586455",
+        "suite_fingerprint": "0cfd05b74cc6c3ce",
         "task_ids": [
           "40_agentdef_background",
           "41_agentdef_memory",

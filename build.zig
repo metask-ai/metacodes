@@ -655,6 +655,30 @@ pub fn build(b: *std.Build) void {
     const install_agentcore_lib = b.addInstallArtifact(agentcore_lib, .{
         .dest_dir = .{ .override = .{ .custom = agentcore_lib_rel } },
     });
+    const installed_agentcore_library = b.fmt(
+        "{s}/lib/{s}",
+        .{ agentcore_install_root, agentcore_library_file },
+    );
+    var installed_agentcore_lib_ready: *std.Build.Step = &install_agentcore_lib.step;
+    if (target.result.os.tag == .macos) {
+        if (b.graph.host.result.os.tag != .macos) {
+            installed_agentcore_lib_ready = &b.addFail(
+                "AgentCore macOS archives require Apple ar/libtool repacking on a macOS build host",
+            ).step;
+        } else {
+            const repack_agentcore_archive = b.addSystemCommand(&.{
+                "sh",
+                "scripts/repack_agentcore_macos_archive.sh",
+                installed_agentcore_library,
+            });
+            repack_agentcore_archive.setCwd(b.path("."));
+            repack_agentcore_archive.step.dependOn(&install_agentcore_lib.step);
+            const installed_symbol_gate = b.addRunArtifact(agentcore_symbol_gate_tool);
+            installed_symbol_gate.addArg(installed_agentcore_library);
+            installed_symbol_gate.step.dependOn(&repack_agentcore_archive.step);
+            installed_agentcore_lib_ready = &installed_symbol_gate.step;
+        }
+    }
     const install_agentcore_header = b.addInstallFileWithDir(
         b.path("sdk/metask/agentcore.h"),
         .prefix,
@@ -718,7 +742,7 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.setCwd(b.path("."));
     if (missing_agentcore_target) |failure| manifest_cmd.step.dependOn(&failure.step);
     manifest_cmd.step.dependOn(&agentcore_symbol_gate_cmd.step);
-    manifest_cmd.step.dependOn(&install_agentcore_lib.step);
+    manifest_cmd.step.dependOn(installed_agentcore_lib_ready);
     manifest_cmd.step.dependOn(&install_agentcore_header.step);
     manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
     manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
@@ -882,6 +906,19 @@ pub fn build(b: *std.Build) void {
             rust_native_cmd.setCwd(b.path("."));
             rust_native_cmd.step.dependOn(&manifest_cmd.step);
             agentcore_gate_step.dependOn(&rust_native_cmd.step);
+            const rust_test_cmd = b.addSystemCommand(&.{ "cargo", "test", "--locked" });
+            rust_test_cmd.addArgs(&.{
+                "--manifest-path",
+                b.fmt("{s}/bindings/rust/Cargo.toml", .{agentcore_install_root}),
+                "--target",
+                rust_target,
+                "--target-dir",
+                b.getInstallPath(.prefix, b.fmt(".cargo-agentcore-test/{s}", .{resolved_agentcore_target})),
+            });
+            rust_test_cmd.setEnvironmentVariable("METASK_AGENTCORE_BUNDLE_DIR", agentcore_install_root_abs);
+            rust_test_cmd.setCwd(b.path("."));
+            rust_test_cmd.step.dependOn(&manifest_cmd.step);
+            agentcore_gate_step.dependOn(&rust_test_cmd.step);
         } else {
             agentcore_gate_step.dependOn(&b.addFail("selected target has no supported AgentCore Rust triple").step);
         }
@@ -1138,6 +1175,26 @@ pub fn build(b: *std.Build) void {
     const example_exe = b.addExecutable(.{ .name = "example", .root_module = example_mod });
     const example_step = b.step("example", "Build & run the metacodes-core example");
     example_step.dependOn(&b.addRunArtifact(example_exe).step);
+
+    // Zero-provider paired microbenchmark for the once-per-generation plugin
+    // snapshot/inventory cost. This is a performance regression gate, not
+    // coding-quality evidence (see doc/PLUGIN_EVALUATION.md).
+    const plugin_bench_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/plugin_snapshot_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    plugin_bench_mod.addImport("metacodes-core", core_mod);
+    const plugin_bench_exe = b.addExecutable(.{
+        .name = "plugin-snapshot-bench",
+        .root_module = plugin_bench_mod,
+    });
+    const plugin_bench_step = b.step(
+        "plugin:bench",
+        "Run the zero-provider immutable plugin snapshot regression benchmark",
+    );
+    plugin_bench_step.dependOn(&b.addRunArtifact(plugin_bench_exe).step);
 
     const run_step = b.step("run", "Run the release app");
     const run_cmd = b.addRunArtifact(exe);
@@ -1400,6 +1457,8 @@ pub fn build(b: *std.Build) void {
         "tests/component/subagent_agentdef_fields_test.zig",
         "tests/component/agent_session_tools_test.zig",
         "tests/component/agent_session_host_tools_test.zig",
+        "tests/component/plugin_runtime_test.zig",
+        "tests/component/plugin_process_test.zig",
         "tests/component/agent_session_ui_test.zig",
         "tests/component/http_error_test.zig",
         "tests/component/answer_queue_test.zig",

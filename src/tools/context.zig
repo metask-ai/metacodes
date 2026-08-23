@@ -22,6 +22,7 @@ const TaskStore = @import("../core/task_store.zig").TaskStore;
 const Client = @import("../client.zig").Client;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
 const DynRegistry = @import("dynamic.zig").DynRegistry;
+pub const ToolCategory = @import("../permission/category.zig").ToolCategory;
 
 /// Shared recursion ceiling for every child-agent/fork mechanism.
 pub const MAX_AGENT_DEPTH: u8 = 3;
@@ -118,6 +119,10 @@ pub const ToolProgressReporter = struct {
 pub const ToolObservationSink = @import("observation.zig").Sink;
 pub const ProjectRuleGate = @import("project_rule_gate.zig").Gate;
 pub const ToolObservationOrigin = @import("observation.zig").Origin;
+pub const ToolResultBody = @import("../core/tool_result.zig").ToolResultBody;
+pub const InlineResult = @import("../core/tool_result.zig").InlineResult;
+pub const ArtifactReceipt = @import("../core/tool_result.zig").ArtifactReceipt;
+pub const StructuredToolError = @import("../core/tool_result.zig").StructuredToolError;
 
 /// Host-only execution constraint installed after the formal recovery gate.
 /// It is not model input and cannot be selected through a tool argument.
@@ -148,7 +153,7 @@ pub const HostRunIdentity = struct {
 /// interface; tool_exec's arena caller merely degenerates deinit to arena
 /// lifetime). Callers release via `deinit(allocator)`.
 pub const ToolDispatchOutcome = union(enum) {
-    ok: []u8,
+    ok: ToolResultBody,
     host_failed: ?[]u8,
     host_rejected: ?[]u8,
     host_fatal,
@@ -157,7 +162,7 @@ pub const ToolDispatchOutcome = union(enum) {
     /// must trap in Debug rather than silently double-free.
     pub fn deinit(self: *ToolDispatchOutcome, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .ok => |bytes| allocator.free(bytes),
+            .ok => |*body| body.deinit(allocator),
             .host_failed, .host_rejected => |maybe| if (maybe) |bytes| allocator.free(bytes),
             .host_fatal => {},
         }
@@ -168,7 +173,7 @@ pub const ToolDispatchOutcome = union(enum) {
 test "ToolDispatchOutcome.deinit releases every owned payload branch" {
     const allocator = std.testing.allocator;
 
-    var ok: ToolDispatchOutcome = .{ .ok = try allocator.dupe(u8, "ok") };
+    var ok: ToolDispatchOutcome = .{ .ok = ToolResultBody.initInline(try allocator.dupe(u8, "ok")) };
     ok.deinit(allocator);
 
     var failed_detail: ToolDispatchOutcome = .{ .host_failed = try allocator.dupe(u8, "failed") };
@@ -203,6 +208,10 @@ pub const ToolDispatcher = struct {
     /// intentionally separate from dispatcher presence: AgentCore Sessions
     /// dispatch built-ins through a non-null dispatcher too.
     builtinFn: ?*const fn (ctx: *const anyopaque, name: []const u8) bool = null,
+    /// Permission classification for selected entries. Null keeps legacy
+    /// process registries on name-based classification; Session catalogs
+    /// provide it for every built-in and Host tool.
+    categoryFn: ?*const fn (ctx: *const anyopaque, name: []const u8) ?ToolCategory = null,
 
     pub fn dispatch(self: ToolDispatcher, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome {
         return self.dispatchFn(self.ctx, tool_ctx, name, args);
@@ -222,6 +231,11 @@ pub const ToolDispatcher = struct {
 
     pub fn isBuiltin(self: ToolDispatcher, name: []const u8) bool {
         const f = self.builtinFn orelse return false;
+        return f(self.ctx, name);
+    }
+
+    pub fn category(self: ToolDispatcher, name: []const u8) ?ToolCategory {
+        const f = self.categoryFn orelse return null;
         return f(self.ctx, name);
     }
 };

@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 9;
+pub const ABI_REVISION: u32 = 12;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 9 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 12 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -164,6 +164,8 @@ pub const MAX_TOOL_SCHEMA_DEPTH_V1: u32 = 32;
 pub const MAX_TOOL_SCHEMA_PROPERTIES_V1: u64 = 1024;
 pub const MAX_UI_RESPONSE_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_HOST_TOOL_RESULT_BYTES_V1: u64 = 16 * 1024 * 1024;
+pub const MAX_HOST_STREAM_ARTIFACT_BYTES_V1: u64 = 128 * 1024 * 1024;
+pub const MAX_MCP_TOOL_RESPONSE_BYTES_V1: u64 = 129 * 1024 * 1024;
 pub const MAX_TOOL_ERROR_PAYLOAD_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_SESSION_ID_BYTES_V1: u64 = 64;
 pub const MAX_METADATA_STRING_BYTES_V1: u64 = 1024 * 1024;
@@ -207,7 +209,14 @@ pub const MAX_COMPLETION_REQUEST_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_COMPLETION_RESULT_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_SKILL_SOURCES_V1: u64 = 64;
 pub const MAX_SKILL_SOURCE_ID_BYTES_V1: u64 = 128;
+pub const MAX_PROCESS_PLUGIN_SOURCES_V1: u64 = 64;
 pub const MAX_TURNS_V1: u32 = 1000;
+
+pub const PLUGIN_LAYER_BUILTIN: u32 = 1;
+pub const PLUGIN_LAYER_PERSONAL: u32 = 2;
+pub const PLUGIN_LAYER_PROJECT: u32 = 3;
+pub const PLUGIN_LAYER_SESSION: u32 = 4;
+pub const PLUGIN_LAYER_MANAGED: u32 = 5;
 
 pub const RUN_INPUT_TEXT: u32 = 1;
 pub const RUN_INPUT_SKILL: u32 = 2;
@@ -325,6 +334,14 @@ pub const HOST_OK: u32 = 0;
 pub const HOST_FAILED: u32 = 1;
 pub const HOST_REJECTED: u32 = 2;
 pub const HOST_FATAL: u32 = 3;
+pub const HOST_STREAM_MEDIA_TEXT_UTF8: u32 = 1;
+pub const HOST_STREAM_MEDIA_JSON: u32 = 2;
+pub const HOST_STREAM_MEDIA_BINARY: u32 = 3;
+pub const HOST_SINK_OK: u32 = 0;
+pub const HOST_SINK_ABORTED: u32 = 1;
+pub const HOST_SINK_TOO_LARGE: u32 = 2;
+pub const HOST_SINK_FAILED: u32 = 3;
+pub const HOST_SINK_CLOSED: u32 = 4;
 
 pub const CAP_RUNTIME: u64 = 1 << 0;
 pub const CAP_BUILTIN_TOOLS: u64 = 1 << 1;
@@ -348,7 +365,10 @@ pub const CAP_SESSION_PERMISSION_AUTHORITY: u64 = 1 << 18;
 pub const CAP_RUN_STATE_OBSERVATION: u64 = 1 << 19;
 pub const CAP_WORKSPACE_SKILL_CATALOG: u64 = 1 << 20;
 pub const CAP_TEXT_COMPLETION: u64 = 1 << 21;
-pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_POLICY | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY | CAP_RUN_STATE_OBSERVATION | CAP_WORKSPACE_SKILL_CATALOG | CAP_TEXT_COMPLETION;
+pub const CAP_PROCESS_PLUGIN_TOOLS: u64 = 1 << 22;
+pub const CAP_HOST_STREAM_TOOLS: u64 = 1 << 23;
+pub const CAP_MCP_TOOL_STREAM: u64 = 1 << 24;
+pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_POLICY | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY | CAP_RUN_STATE_OBSERVATION | CAP_WORKSPACE_SKILL_CATALOG | CAP_TEXT_COMPLETION | CAP_PROCESS_PLUGIN_TOOLS | CAP_HOST_STREAM_TOOLS | CAP_MCP_TOOL_STREAM;
 
 /// Each published v1 revision is rigid: every struct_size is exact and every
 /// reserved field is zero. A Host pins version, revision, table size, and
@@ -412,6 +432,48 @@ pub const HostToolV1 = extern struct {
     reserved: [2]u64,
 };
 
+/// Borrowed write-only sink for one synchronous Host stream callback. The
+/// callback must not retain it. AgentCore alone commits or discards the CAS
+/// object after the callback returns.
+pub const HostResultWriteFnV1 = *const fn (
+    sink_ctx: ?*anyopaque,
+    bytes: BytesViewV1,
+) callconv(.c) u32;
+
+pub const HostResultSinkV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    ctx: ?*anyopaque,
+    write: ?HostResultWriteFnV1,
+    max_bytes: u64,
+    reserved: [3]u64,
+};
+
+/// HOST_OK requires a valid media code and canonical-empty detail. FAILED and
+/// REJECTED require media code zero and may return bounded UTF-8 detail through
+/// the paired release callback. Partial sink bytes never become visible on a
+/// non-OK outcome.
+pub const HostStreamExecuteFnV1 = *const fn (
+    host_ctx: ?*anyopaque,
+    run: ?*const RunContextV1,
+    arguments_json: BytesViewV1,
+    sink: ?*const HostResultSinkV1,
+    out_media_code: ?*u32,
+    out_detail: ?*OwnedBytesV1,
+) callconv(.c) u32;
+
+pub const HostStreamToolV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    ctx: ?*anyopaque,
+    name: BytesViewV1,
+    description: BytesViewV1,
+    input_schema_json: BytesViewV1,
+    execute_stream: ?HostStreamExecuteFnV1,
+    release_detail: ?HostReleaseFnV1,
+    reserved: [2]u64,
+};
+
 /// MCP transport callbacks are Host-owned. AgentCore passes only borrowed
 /// request bytes and copies every successful response before the callback
 /// returns. A successful open produces one opaque connection context that is
@@ -449,6 +511,18 @@ pub const McpRequestFnV1 = *const fn (
     cancellation: ?*const McpCancellationV1,
     out_response_json: ?*OwnedBytesV1,
 ) callconv(.c) u32;
+/// Streaming `tools/call` exchange. The sink is borrowed for the duration of
+/// this callback and must receive the complete JSON-RPC response frame from
+/// byte zero. Returning MCP_EXCHANGE_RESPONSE authorizes AgentCore to seal and
+/// validate the capture; every other status rolls it back.
+pub const McpRequestToolStreamFnV1 = *const fn (
+    connector_ctx: ?*anyopaque,
+    connection_ctx: ?*anyopaque,
+    request_json: BytesViewV1,
+    timeout_ms: u32,
+    cancellation: ?*const McpCancellationV1,
+    response_sink: ?*const HostResultSinkV1,
+) callconv(.c) u32;
 pub const McpNotifyFnV1 = *const fn (
     connector_ctx: ?*anyopaque,
     connection_ctx: ?*anyopaque,
@@ -477,6 +551,7 @@ pub const McpConnectorV1 = extern struct {
     ctx: ?*anyopaque,
     open: ?McpOpenFnV1,
     request: ?McpRequestFnV1,
+    request_tool_stream: ?McpRequestToolStreamFnV1,
     notify: ?McpNotifyFnV1,
     close: ?McpCloseFnV1,
     release_response: ?McpReleaseResponseFnV1,
@@ -559,6 +634,29 @@ pub const RuntimeConfigV1 = extern struct {
     mcp_servers: ?[*]const McpServerV1,
     mcp_server_count: u64,
     mcp_catalog_limits: ?*const McpCatalogLimitsV1,
+    reserved: [4]u64,
+};
+
+/// Explicit executable authority supplied by the embedding Host. `root` is an
+/// absolute package directory containing the strict plugin/process manifests;
+/// AgentCore copies all retained state before the create call returns.
+pub const ProcessPluginSourceV1 = extern struct {
+    struct_size: u32,
+    layer_code: u32,
+    root: BytesViewV1,
+    reserved: [3]u64,
+};
+
+/// Optional executable contribution set for `runtime_create_with_plugins`.
+/// RuntimeConfigV1 remains byte-for-byte unchanged so executable authority
+/// cannot be smuggled through a field that revision 9 required to be zero.
+pub const RuntimePluginConfigV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    process_plugins: ?[*]const ProcessPluginSourceV1,
+    process_plugin_count: u64,
+    host_stream_tools: ?[*]const HostStreamToolV1,
+    host_stream_tool_count: u64,
     reserved: [4]u64,
 };
 
@@ -885,6 +983,12 @@ pub const SessionRestoreConfigV1 = extern struct {
 /// operation's primary status. Text is human-readable, non-normative, and
 /// unstable; consumers must not parse it or branch on its wording.
 pub const RuntimeCreateFnV1 = *const fn (?*const RuntimeConfigV1, ?*?*RuntimeHandle, ?*OwnedBytesV1) callconv(.c) u32;
+pub const RuntimeCreateWithPluginsFnV1 = *const fn (
+    config: ?*const RuntimeConfigV1,
+    plugins: ?*const RuntimePluginConfigV1,
+    out_runtime: ?*?*RuntimeHandle,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 pub const RuntimeDestroyFnV1 = *const fn (?*RuntimeHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const RuntimeQuerySkillCatalogFnV1 = *const fn (
     runtime: ?*RuntimeHandle,
@@ -1016,7 +1120,7 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 9 accepts
+/// Runs the canonical default best-effort compact policy. Revision 12 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1074,7 +1178,8 @@ pub const ApiV1 = extern struct {
     completion_stream_next: ?CompletionStreamNextFnV1,
     completion_stream_abort: ?CompletionStreamAbortFnV1,
     completion_stream_destroy: ?CompletionStreamDestroyFnV1,
-    reserved: [3]u64,
+    runtime_create_with_plugins: ?RuntimeCreateWithPluginsFnV1,
+    reserved: [2]u64,
 };
 
 test "ABI v1 public layouts are fixed on supported 64-bit targets" {
@@ -1083,14 +1188,18 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(OwnedBytesV1));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(RunContextV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(HostToolV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(HostResultSinkV1));
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(HostStreamToolV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpCancellationV1));
-    try std.testing.expectEqual(@as(usize, 80), @sizeOf(McpConnectorV1));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(McpConnectorV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(McpProtocolLimitsV1));
-    try std.testing.expectEqual(@as(usize, 224), @sizeOf(McpServerV1));
+    try std.testing.expectEqual(@as(usize, 232), @sizeOf(McpServerV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(McpConfigurationV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(McpApplyReportV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(McpCatalogLimitsV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(RuntimeConfigV1));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(ProcessPluginSourceV1));
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(RuntimePluginConfigV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionCallbacksV1));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(SkillPolicyV1));
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(PermissionRuleSetV1));
@@ -1122,12 +1231,17 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunContextV1, "run_id"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunContextV1, "session_id"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostToolV1, "ctx"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostResultSinkV1, "ctx"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostStreamToolV1, "ctx"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(McpConnectorV1, "ctx"));
     try std.testing.expectEqual(@as(usize, 104), @offsetOf(McpServerV1, "connector"));
-    try std.testing.expectEqual(@as(usize, 184), @offsetOf(McpServerV1, "protocol_limits"));
-    try std.testing.expectEqual(@as(usize, 192), @offsetOf(McpServerV1, "configuration_fingerprint"));
+    try std.testing.expectEqual(@as(usize, 192), @offsetOf(McpServerV1, "protocol_limits"));
+    try std.testing.expectEqual(@as(usize, 200), @offsetOf(McpServerV1, "configuration_fingerprint"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(RuntimeConfigV1, "mcp_servers"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(RuntimeConfigV1, "mcp_catalog_limits"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(ProcessPluginSourceV1, "root"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(RuntimePluginConfigV1, "process_plugins"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(RuntimePluginConfigV1, "host_stream_tools"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionHostConfigV1, "api_key"));
     try std.testing.expectEqual(@as(usize, 80), @offsetOf(SessionHostConfigV1, "allowed_tools"));
     try std.testing.expectEqual(@as(usize, 96), @offsetOf(SessionHostConfigV1, "skill_catalog"));
@@ -1176,7 +1290,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 184), @offsetOf(ApiV1, "runtime_apply_mcp_configuration"));
     try std.testing.expectEqual(@as(usize, 192), @offsetOf(ApiV1, "completion_create"));
     try std.testing.expectEqual(@as(usize, 248), @offsetOf(ApiV1, "completion_stream_destroy"));
-    try std.testing.expectEqual(@as(usize, 256), @offsetOf(ApiV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 256), @offsetOf(ApiV1, "runtime_create_with_plugins"));
+    try std.testing.expectEqual(@as(usize, 264), @offsetOf(ApiV1, "reserved"));
 }
 
 test "typed status and stop reason validate every public code" {
@@ -1211,11 +1326,14 @@ test "typed status and stop reason validate every public code" {
     );
 }
 
-test "Revision 9 Workspace Skill authority and Completion capabilities are exact" {
+test "Revision 12 capabilities add Host and MCP byte-zero streaming without weakening prior surfaces" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 9), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 12), ABI_REVISION);
     try std.testing.expectEqual(@as(u64, 1 << 20), CAP_WORKSPACE_SKILL_CATALOG);
     try std.testing.expectEqual(@as(u64, 1 << 21), CAP_TEXT_COMPLETION);
+    try std.testing.expectEqual(@as(u64, 1 << 22), CAP_PROCESS_PLUGIN_TOOLS);
+    try std.testing.expectEqual(@as(u64, 1 << 23), CAP_HOST_STREAM_TOOLS);
+    try std.testing.expectEqual(@as(u64, 1 << 24), CAP_MCP_TOOL_STREAM);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

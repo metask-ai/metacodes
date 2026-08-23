@@ -287,6 +287,42 @@ test "L2: buildUsingTools 段按工具集裁剪" {
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Grep instead of grep") == null);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Glob instead of find") != null); // Glob 仍在
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "Break down and manage your work") == null);
+
+    // 极简/文本 profile 不得残留不存在的基础工具指导。
+    const read_only_names = [_][]const u8{"Read"};
+    const sp_read_only = try cc.system_prompt.buildFull(a, "model", null, null, &read_only_names, "", false, "/tmp");
+    defer a.free(sp_read_only);
+    try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "To read files use Read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "To edit files use Edit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "To create files use Write") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "Reserve Bash") == null);
+
+    const sp_text_only = try cc.system_prompt.buildFull(a, "model", null, null, &.{}, "", false, "/tmp");
+    defer a.free(sp_text_only);
+    try std.testing.expect(std.mem.indexOf(u8, sp_text_only, "# Using your tools") == null);
+}
+
+test "L2: per-turn policy projection removes hidden ordinary tool guidance" {
+    const a = std.testing.allocator;
+    const names = [_][]const u8{ "Read", "Write", "Bash" };
+    const prompt = try cc.system_prompt.buildFull(a, "model", null, null, &names, "", false, "/tmp");
+    defer a.free(prompt);
+
+    const read = cc.tools.getTool("Read").?;
+    const visible = [_]cc.json_mod.ToolDefinition{.{
+        .name = read.name,
+        .description = read.description,
+        .input_schema = read.input_schema,
+    }};
+    const projected = (try cc.system_prompt.projectUsingToolsForExecution(a, prompt, &visible)) orelse
+        return error.TestUnexpectedResult;
+    defer a.free(projected);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "To read files use Read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "To create files use Write") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "Reserve Bash") == null);
+
+    // 同一个有效工具面再次投影不分配、不改变字节，保护 provider prefix cache。
+    try std.testing.expect((try cc.system_prompt.projectUsingToolsForExecution(a, projected, &visible)) == null);
 }
 
 // ③ Bash 描述按 include_git 增删 Git 段。

@@ -45,7 +45,7 @@ fn makeClient(a: std.mem.Allocator, io: std.Io, url: []const u8) cc.client_mod.C
 fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const u8) ![]u8 {
     var outcome = try cc.tools.dispatch(ctx, name, args);
     return switch (outcome) {
-        .ok => |bytes| bytes,
+        .ok => |*body| (try body.takeModelBytes(ctx.allocator)).bytes,
         else => {
             outcome.deinit(ctx.allocator);
             return error.UnexpectedDispatchOutcome;

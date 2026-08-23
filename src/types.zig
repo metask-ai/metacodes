@@ -61,6 +61,8 @@ pub const Config = struct {
     /// `--dump-prompt`：构造完 system prompt + 工具 defs 后打印到 stdout 并退出，
     /// 不发网络、不需 API key。用于验证提示词×工具复刻。
     dump_prompt: bool = false,
+    /// `--dump-plugins`:打印版本化 immutable plugin inventory JSON 后退出。
+    dump_plugins: bool = false,
     /// `--web [port]`:起 web UI(HTTP+SSE)驱动 agent loop,不进 TUI REPL。
     /// null = 不启用;0 = 内核分配端口(启动时打印真实端口)。
     web_port: ?u16 = null,
@@ -103,6 +105,13 @@ pub const Config = struct {
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,
+    /// `--plugin-dir <path>`(可重复):显式启用一个严格 manifest 的 data package。
+    /// 多个用 `\x00` 分隔；App 启动时把相对路径锚到 cwd、事务化构造一个不可变
+    /// plugin generation，再把贡献投影进 canonical Skill/Agent registries。
+    plugin_dirs: ?[]const u8 = null,
+    /// `--process-plugin-dir <path>`(可重复):显式授予一个 hash-pinned
+    /// out-of-process package 可执行权限。与 data package 加载通道分离。
+    process_plugin_dirs: ?[]const u8 = null,
     /// `--answers-file <path>` / `METACODES_ANSWERS`:预置应答队列(Stage 3)。
     /// 非 tty 下权限 .ask / AskUserQuestion 从队列按序弹出,而非读 fd 0(被 REPL 行流独占)。
     answers_file: ?[]const u8 = null,
@@ -318,4 +327,3 @@ pub const App = struct {
         try app.messages.append(app.allocator, .{ .role = role, .content = content_copy });
     }
 };
-

@@ -128,7 +128,8 @@ fn renderConfigured(
         .member_sha256 = &held_members,
         .sealed = true,
     }};
-    return projection.renderSnapshot(allocator, .{
+    const generation_evidence = [1]projection.GenerationEvidence{evidence};
+    const snapshot_input = projection.SnapshotInput{
         .project_sha256 = PROJECT,
         .project_key = "metacodes:/private/test",
         .revision = REVISION,
@@ -140,9 +141,10 @@ fn renderConfigured(
         .active_bundle_revision = active_bundle_revision,
         .active_bundle_sha256 = active_bundle_sha256,
         .ontology = &ontology,
-        .generation_evidence = &.{evidence},
+        .generation_evidence = &generation_evidence,
         .held_out_commitments = &held,
-    });
+    };
+    return projection.renderSnapshot(allocator, &snapshot_input);
 }
 
 fn render(allocator: std.mem.Allocator, value: *const Fixture) !projection.RenderedSnapshot {

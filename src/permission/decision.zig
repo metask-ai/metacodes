@@ -178,6 +178,19 @@ const util_json_mod = @import("../util/json.zig");
 
 /// 根据模式 + 工具名决定:允许 / 拒绝 / 询问。
 pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decision {
+    return checkClassified(ctx, tool_name, args, null);
+}
+
+/// Session catalogs classify Host tools from admission-fixed metadata instead
+/// of falling through the legacy "unknown name is read" compatibility rule.
+/// Settings/rules still match the exact tool name; this override affects only
+/// the final mode/risk fallback.
+pub fn checkClassified(
+    ctx: *const Context,
+    tool_name: []const u8,
+    args: []const u8,
+    category_override: ?category.ToolCategory,
+) Decision {
     // -1. 最高优先:PreToolUse hook(deny-first)。任一 hook block → deny,
     //     hook 看不到的工具(matcher 不匹配)直接 proceed 到下层。
     if (ctx.hooks) |h| {
@@ -311,8 +324,12 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
         }
     }
 
-    const cat = category.getToolCategory(tool_name);
-    const risk = category.getRiskLevel(tool_name);
+    const cat = category_override orelse category.getToolCategory(tool_name);
+    const risk: category.RiskLevel = switch (cat) {
+        .read => .low,
+        .write => .medium,
+        .execute => .high,
+    };
 
     const mode_mod = @import("mode.zig");
     const m = mode_mod.canonical(ctx.mode);
@@ -378,6 +395,17 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
         @tagName(decision),
     });
     return decision;
+}
+
+test "classified Host effect replaces legacy unknown-name read fallback" {
+    const plan = Context{ .mode = .plan };
+    try std.testing.expectEqual(Decision.allow, check(&plan, "PluginTool", "{}"));
+    try std.testing.expectEqual(Decision.deny, checkClassified(&plan, "PluginTool", "{}", .execute));
+    try std.testing.expectEqual(Decision.allow, checkClassified(&plan, "PluginTool", "{}", .read));
+
+    const auto = Context{ .mode = .auto };
+    try std.testing.expectEqual(Decision.ask, checkClassified(&auto, "PluginTool", "{}", .execute));
+    try std.testing.expectEqual(Decision.allow, checkClassified(&auto, "PluginTool", "{}", .read));
 }
 
 /// 工具是否在写一个 protected path?仅 Edit/Write/NotebookEdit 关心。

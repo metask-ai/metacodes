@@ -4,6 +4,14 @@ const std = @import("std");
 /// semantic value is owned by the shared Skill Runtime.
 pub const ExecContext = enum { inline_ctx, fork };
 
+/// Model-facing activation is behavioral routing metadata, not authority.
+/// `required_first` asks a compatible provider dialect to select the Skill
+/// tool once before ordinary work; dispatch and policy admission stay native.
+pub const ModelActivation = enum {
+    advisory,
+    required_first,
+};
+
 /// Canonical parsed SKILL.md definition shared by every product adapter.
 pub const Skill = struct {
     name: []const u8,
@@ -13,6 +21,7 @@ pub const Skill = struct {
     disallowed_tools: []const []const u8,
     arguments: []const []const u8,
     disable_model_invocation: bool,
+    model_activation: ModelActivation = .advisory,
     context: ExecContext,
     agent: []const u8,
     model: []const u8,
@@ -49,6 +58,7 @@ pub fn parseSkillMdWithFallback(
     var disallowed_raw: []const u8 = "";
     var arguments_raw: []const u8 = "";
     var disable_invoke = false;
+    var model_activation: ModelActivation = .advisory;
     var context_str: []const u8 = "inline";
     var agent_str: []const u8 = "";
     var model_str: []const u8 = "";
@@ -79,6 +89,9 @@ pub fn parseSkillMdWithFallback(
                     arguments_raw = value;
                 } else if (std.mem.eql(u8, key, "disable-model-invocation") or std.mem.eql(u8, key, "disable_model_invocation")) {
                     disable_invoke = parseBool(value);
+                } else if (std.mem.eql(u8, key, "model-activation") or std.mem.eql(u8, key, "model_activation")) {
+                    model_activation = parseModelActivation(value) orelse
+                        return error.InvalidModelActivation;
                 } else if (std.mem.eql(u8, key, "context")) {
                     context_str = value;
                 } else if (std.mem.eql(u8, key, "agent")) {
@@ -125,6 +138,7 @@ pub fn parseSkillMdWithFallback(
         .disallowed_tools = disallowed_tools,
         .arguments = arguments,
         .disable_model_invocation = disable_invoke,
+        .model_activation = model_activation,
         .context = if (std.mem.eql(u8, context_str, "fork")) .fork else .inline_ctx,
         .agent = owned_agent,
         .model = owned_model,
@@ -206,6 +220,13 @@ fn parseBool(value: []const u8) bool {
     return std.mem.eql(u8, value, "true") or
         std.mem.eql(u8, value, "yes") or
         std.mem.eql(u8, value, "1");
+}
+
+fn parseModelActivation(value: []const u8) ?ModelActivation {
+    if (std.mem.eql(u8, value, "advisory")) return .advisory;
+    if (std.mem.eql(u8, value, "required-first") or
+        std.mem.eql(u8, value, "required_first")) return .required_first;
+    return null;
 }
 
 test "parseSkillMdWithFallback releases every partial allocation" {
@@ -315,6 +336,7 @@ test "parseSkillMd preserves invocation and execution metadata" {
         "name: pr-summary\n" ++
         "description: Summarize PR\n" ++
         "disable-model-invocation: true\n" ++
+        "model-activation: required-first\n" ++
         "context: fork\n" ++
         "agent: Explore\n" ++
         "model: claude-haiku-4-5-20251001\n" ++
@@ -324,10 +346,22 @@ test "parseSkillMd preserves invocation and execution metadata" {
     const skill = try parseSkillMd(std.testing.allocator, md, "/x");
     defer skill.deinit(std.testing.allocator);
     try std.testing.expect(skill.disable_model_invocation);
+    try std.testing.expectEqual(ModelActivation.required_first, skill.model_activation);
     try std.testing.expectEqual(ExecContext.fork, skill.context);
     try std.testing.expectEqualStrings("Explore", skill.agent);
     try std.testing.expectEqualStrings("claude-haiku-4-5-20251001", skill.model);
     try std.testing.expectEqualStrings("bash", skill.shell);
+}
+
+test "parseSkillMd rejects unknown model activation instead of guessing" {
+    try std.testing.expectError(
+        error.InvalidModelActivation,
+        parseSkillMd(
+            std.testing.allocator,
+            "---\nname: bad\nmodel-activation: sometimes\n---\nbody",
+            "/x",
+        ),
+    );
 }
 
 test "parseSkillMdWithFallback uses directory invocation name" {

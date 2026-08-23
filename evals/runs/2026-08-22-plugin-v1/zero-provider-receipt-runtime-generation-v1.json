@@ -1,0 +1,244 @@
+{
+  "candidate": {
+    "inventory": {
+      "contract_version": 1,
+      "generation": 1,
+      "plugins": [
+        {
+          "capabilities": [
+            "skill_bundle"
+          ],
+          "contribution_count": 1,
+          "form": "data_package",
+          "id": "metacodes.benchmark-coding",
+          "layer": "session",
+          "lifecycle": "active",
+          "source_root": "/Users/david/prj/cc-t2z/metacodes/evals/plugin-v1/coding-plugin",
+          "version": "1.0.0"
+        }
+      ],
+      "schema": "metacodes.plugin-inventory/v1"
+    },
+    "plugin_id": "metacodes.benchmark-coding",
+    "plugin_version": "1.0.0"
+  },
+  "checks": [
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin"
+      ],
+      "elapsed_ms": 35033,
+      "name": "plugin_component_l2",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin effect lifecycle"
+      ],
+      "elapsed_ms": 26097,
+      "name": "plugin_effect_lifecycle",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin service graph"
+      ],
+      "elapsed_ms": 25208,
+      "name": "plugin_service_graph",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=RuntimeHost atomically replaces plugin generations"
+      ],
+      "elapsed_ms": 1293,
+      "name": "plugin_runtime_generation",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:lib",
+        "-Dtfilter=plugin"
+      ],
+      "elapsed_ms": 2029,
+      "name": "plugin_library_isolation",
+      "output_sha256": "8e30fe2e3dd4b774fdf1866162ae35bdba39a0a28f11e799317dc44c11baf29f"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "agentcore:test",
+        "-Dtfilter=process plugin"
+      ],
+      "elapsed_ms": 11784,
+      "name": "agentcore_process_plugin_abi",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "example"
+      ],
+      "elapsed_ms": 6202,
+      "name": "independent_zig_host",
+      "output_sha256": "edcc28118480124c6bf225cb075e2f08d4f3a6f7b3b43e4665770744c7a94c53"
+    },
+    {
+      "argv": [
+        "/Users/david/prj/cc-t2z/metacodes/scripts/eval/fixtures/plugin_baseline.py",
+        "--dump-plugins"
+      ],
+      "elapsed_ms": 403,
+      "name": "baseline_empty_inventory",
+      "output_sha256": "6394b4f552d5b81243376998caaddad6a1d7bf8fed6a4946bfe43961149df326"
+    },
+    {
+      "argv": [
+        "/Users/david/prj/cc-t2z/metacodes/scripts/eval/fixtures/plugin_candidate.py",
+        "--dump-plugins"
+      ],
+      "elapsed_ms": 42,
+      "name": "candidate_namespaced_inventory",
+      "output_sha256": "8b5e3cb48d51d823e48d225a683a7fb5c32dc34e3b589020fbd22981f33d2a23"
+    },
+    {
+      "elapsed_ms": 445,
+      "name": "credential_free_cli_inventory",
+      "output_sha256": "143e5d7e1a38217f163189e609acac12ec90bce7b9c632ee39431290ffb410aa"
+    },
+    {
+      "name": "snapshot_microbenchmark",
+      "output_sha256": "f0d25119524e2ea84b5e05624f75eb7cb5206d889914b0c990b5f498892ad509",
+      "repetitions": 5
+    }
+  ],
+  "coding_pair": {
+    "authorized_cost_usd": 0.0,
+    "provider_requests": 0,
+    "quality_claim": "none",
+    "status": "blocked_pending_explicit_paid_authority"
+  },
+  "content_sha256": "10d0768ba880146957c80e1b0a03629e921cacbce0b062c6584131f866a49d59",
+  "deepseek_harness_commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  "implementation_fingerprint": "4553965b15a9eb49414fc8dc978368027a63948f543fc3bee1766a50ee79843f",
+  "metacodes_git_head": "dfbcfb20b2f618dbd34801ce20ce6d80eb5d05a2",
+  "performance": {
+    "inventory_avg_ns_max": 3367,
+    "inventory_avg_ns_median": 2586,
+    "runs": [
+      {
+        "baseline_avg_ns": 21247,
+        "baseline_p95_ns": 25457,
+        "inventory_avg_ns": 3092,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 26509,
+        "static_plugin_p95_ns": 33789,
+        "static_plugin_p95_overhead_ns": 8332,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 20369,
+        "baseline_p95_ns": 22728,
+        "inventory_avg_ns": 2586,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 25977,
+        "static_plugin_p95_ns": 29282,
+        "static_plugin_p95_overhead_ns": 6554,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 20889,
+        "baseline_p95_ns": 22987,
+        "inventory_avg_ns": 3367,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 26556,
+        "static_plugin_p95_ns": 29766,
+        "static_plugin_p95_overhead_ns": 6779,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 25329,
+        "baseline_p95_ns": 30363,
+        "inventory_avg_ns": 2569,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 31858,
+        "static_plugin_p95_ns": 36153,
+        "static_plugin_p95_overhead_ns": 5790,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 20851,
+        "baseline_p95_ns": 25133,
+        "inventory_avg_ns": 2460,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 26189,
+        "static_plugin_p95_ns": 30522,
+        "static_plugin_p95_overhead_ns": 5389,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      }
+    ],
+    "static_plugin_p95_overhead_ns_max": 8332,
+    "static_plugin_p95_overhead_ns_median": 6554
+  },
+  "protocol_sha256": "f137044b62cfbe812468d4c737f1c05838047fd26c3bccde47210b88ed26fa08",
+  "provider_requests": 0,
+  "quality_evidence": false,
+  "release_status": "blocked_pending_paid_coding_pair",
+  "schema": "metacodes.plugin-zero-provider-receipt/v1"
+}

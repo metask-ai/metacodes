@@ -40,6 +40,7 @@ const provider_mod = @import("provider.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
+const dialect_mod = @import("dialect.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 const StreamEvent = api_stream.StreamEvent;
@@ -61,6 +62,7 @@ pub const OpenAIClient = struct {
     reasoning_effort: ?types.ReasoningEffort = null,
     /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
     overrides: request_overrides.RequestOverrides = .{},
+    dialect_resolver: dialect_mod.Resolver = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) OpenAIClient {
         return .{
@@ -157,13 +159,14 @@ pub const OpenAIClient = struct {
         var o = self.overrides;
         if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
         o.tool_choice = tool_choice;
-        const body = try serializeOpenAIRequestWithOverrides(self.allocator, model, messages, system, tools, o);
+        const dialect = self.dialect_resolver.resolve(.openai, model);
+        const body = try serializeOpenAIRequestWithOverridesAndDialect(self.allocator, model, messages, system, tools, o, dialect);
         defer self.allocator.free(body);
-        return self.doStream(body, abort);
+        return self.doStream(body, abort, dialect);
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
-    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal) !StreamHandle {
+    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect) !StreamHandle {
         const rid = log.genRequestId();
         log.infoId(
             "openai",
@@ -224,6 +227,7 @@ pub const OpenAIClient = struct {
         heap.* = .{
             .allocator = self.allocator,
             .model = self.model,
+            .dialect = dialect,
             .request = req_ptr,
             .response = response,
             .abort = abort,
@@ -246,6 +250,7 @@ var g_synth_id_serial = std.atomic.Value(u64).init(1);
 const OpenAIStream = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
+    dialect: dialect_mod.Dialect,
     request: *http.Client.Request,
     response: http.Client.Response,
     transfer_buf: [8192]u8 = undefined,
@@ -369,9 +374,7 @@ const OpenAIStream = struct {
         // delta.reasoning_content → thinking(DeepSeek/Kimi/Qwen/GLM-5)。
         // OpenAI 原生不返回此字段(仅 reasoning_tokens 计数);兼容端点把它作为平级字符串返回。
         // 委托给 dialect(按 model 选解析逻辑;OpenAI 原生 dialect 返 null)。
-        const dialect_mod = @import("dialect.zig");
-        const dialect = dialect_mod.dialectFor(.openai, self.model);
-        if (try dialect.extractThinkingDelta(data, self.allocator)) |reasoning| {
+        if (try self.dialect.extractThinkingDelta(data, self.allocator)) |reasoning| {
             if (reasoning.len > 0) {
                 return StreamEvent{ .thinking = reasoning };
             }
@@ -658,10 +661,28 @@ pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, m
 /// overrides 非 null 字段 = 显式覆盖;null 字段 = dialect 按 profile 静态推断(现状)。
 /// 来源:计划 jolly-glacier(2026-08-11)。
 pub fn serializeOpenAIRequestWithOverrides(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, overrides: request_overrides.RequestOverrides) ![]u8 {
-    const adapter = @import("model_adapter.zig");
-    const dialect_mod = @import("dialect.zig");
-    const profile = adapter.profileFor(.openai, model);
-    const dialect = dialect_mod.dialectFor(.openai, model);
+    return serializeOpenAIRequestWithOverridesAndDialect(
+        allocator,
+        model,
+        messages,
+        system,
+        tools,
+        overrides,
+        dialect_mod.dialectFor(.openai, model),
+    );
+}
+
+pub fn serializeOpenAIRequestWithOverridesAndDialect(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+) ![]u8 {
+    const profile = dialect.profileFor(.openai, model);
+    const visible_capabilities = dialect_mod.visibleCapabilities(tools);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"model\":");
@@ -681,13 +702,20 @@ pub fn serializeOpenAIRequestWithOverrides(allocator: std.mem.Allocator, model: 
     // {choices:[],usage:{...}} chunk。缓存命中(cached_tokens)就在这个 usage 里。
     try out.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     var first = true;
-    // system → 首条 {role:"system"}。dialect 可注入厂商特定标签(如旧 GLM-4.6 <reasoning_effort>;新 dialect 不调)。
-    if (system) |sys| {
+    // system → 首条 {role:"system"}。The dialect receives an exact typed
+    // projection of this request's tool surface before bytes are serialized.
+    var sys_buf: std.ArrayList(u8) = .empty;
+    defer sys_buf.deinit(allocator);
+    if (system) |sys| try sys_buf.appendSlice(allocator, sys);
+    try dialect.injectSystemMods(profile, overrides.reasoning_effort, &sys_buf, allocator);
+    try dialect.activateCapabilities(
+        profile,
+        visible_capabilities,
+        &sys_buf,
+        allocator,
+    );
+    if (sys_buf.items.len != 0) {
         try out.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
-        var sys_buf: std.ArrayList(u8) = .empty;
-        defer sys_buf.deinit(allocator);
-        try sys_buf.appendSlice(allocator, sys);
-        try dialect.injectSystemMods(profile, overrides.reasoning_effort, &sys_buf, allocator);
         try util_json.serializeString(sys_buf.items, &out, allocator);
         try out.append(allocator, '}');
         first = false;
@@ -710,7 +738,17 @@ pub fn serializeOpenAIRequestWithOverrides(allocator: std.mem.Allocator, model: 
         }
     }
     // tool_choice:委托给 dialect(按 model 翻译 + 能力降级 GLM-5)。
-    if (overrides.tool_choice) |tc| {
+    const route_already_invoked = if (visible_capabilities.required_first) |route|
+        route.satisfied or dialect_mod.hasSuccessfulRequiredFirst(messages, route)
+    else
+        false;
+    const effective_tool_choice = dialect.routeToolChoice(
+        profile,
+        visible_capabilities,
+        route_already_invoked,
+        overrides.tool_choice,
+    );
+    if (effective_tool_choice) |tc| {
         _ = try dialect.serializeToolChoice(profile, tc, &out, allocator);
     }
     // response_format:阶段 3 接线(此前 dead code)。能力守门在 dialect 内(GLM-5 json_schema→json_object)。
@@ -848,6 +886,37 @@ test "serializeOpenAIRequest: GLM-5.2 effort=high 走顶层 reasoning_effort bod
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "clear_thinking") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Model-specific capability activation") == null);
+}
+
+test "serializeOpenAIRequest: GLM Skill capability activation is typed and byte-stable" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const skill = json_mod.ToolDefinition{
+        .name = "Skill",
+        .description = "invoke a bound skill",
+        .input_schema = .{},
+        .model_activation = .{
+            .mode = .required_first,
+            .argument_name = "name",
+            .argument_value = "verify-change",
+        },
+    };
+    const first = try serializeOpenAIRequest(allocator, "glm-5.2", &msgs, "sys", &.{skill}, .high, null);
+    defer allocator.free(first);
+    const second = try serializeOpenAIRequest(allocator, "glm-5.2", &msgs, "sys", &.{skill}, .high, null);
+    defer allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.indexOf(u8, first, "Model-specific capability activation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "blocking requirement") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "`verify-change`") != null);
+    // GLM's OpenAI-compatible profile is auto-only: exact-name guidance is
+    // emitted, but an unsupported forced-function value is not.
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"tool_choice\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"name\":\"Skill\"") != null);
 }
 
 test "serializeOpenAIRequest: Kimi K3 effort=high 走顶层 reasoning_effort(不发 thinking body)" {

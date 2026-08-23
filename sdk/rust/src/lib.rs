@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 9 function table. Discovery rejects every earlier
+/// Validated Revision 12 function table. Discovery rejects every earlier
 /// revision; there is no legacy probe or alternate layout.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -45,6 +45,7 @@ impl Api {
             || table.capabilities != raw::METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 as u64
             || table.reserved.iter().any(|value| *value != 0)
             || table.runtime_create.is_none()
+            || table.runtime_create_with_plugins.is_none()
             || table.runtime_destroy.is_none()
             || table.runtime_query_skill_catalog.is_none()
             || table.skill_catalog_release.is_none()
@@ -89,6 +90,15 @@ impl Api {
 
     pub fn owned_buffer(self) -> OwnedBuffer {
         OwnedBuffer::new(self)
+    }
+
+    /// Create a Runtime with an explicit, hash-pinned process-plugin source
+    /// set. All descriptor memory is borrowed only for the duration of the
+    /// call; AgentCore owns the resulting Runtime snapshot.
+    pub fn runtime_create_with_plugins(
+        self,
+    ) -> raw::metask_agentcore_runtime_create_with_plugins_fn_v1 {
+        self.table().runtime_create_with_plugins
     }
 
     /// Intent-revealing SDK alias for the raw
@@ -430,6 +440,7 @@ impl raw::metask_agentcore_mcp_connector_v1 {
             ctx: ptr::null_mut::<c_void>(),
             open: None,
             request: None,
+            request_tool_stream: None,
             notify: None,
             close: None,
             release_response: None,
@@ -469,8 +480,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_nine_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 9);
+    fn revision_twelve_layout_codes_and_host_buffer_helpers_are_exact() {
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 12);
+        assert_eq!(raw::METASK_AGENTCORE_CAP_PROCESS_PLUGIN_TOOLS, 1 << 22);
+        assert_eq!(raw::METASK_AGENTCORE_CAP_HOST_STREAM_TOOLS, 1 << 23);
+        assert_eq!(raw::METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1, 0x1ff_ffff);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_AUTO, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY, 3);
@@ -482,6 +496,10 @@ mod tests {
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_SUPERSEDED, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_REJECTED, 3);
         assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 280);
+        assert_eq!(size_of::<raw::metask_agentcore_process_plugin_source_v1>(), 48);
+        assert_eq!(size_of::<raw::metask_agentcore_runtime_plugin_config_v1>(), 72);
+        assert_eq!(size_of::<raw::metask_agentcore_host_result_sink_v1>(), 56);
+        assert_eq!(size_of::<raw::metask_agentcore_host_stream_tool_v1>(), 96);
         assert_eq!(size_of::<raw::metask_agentcore_completion_config_v1>(), 88);
         assert_eq!(size_of::<raw::metask_agentcore_completion_event_v1>(), 80);
         assert_eq!(size_of::<raw::metask_agentcore_mcp_configuration_v1>(), 64);

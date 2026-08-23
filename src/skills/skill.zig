@@ -90,6 +90,7 @@ fn cloneProjection(allocator: std.mem.Allocator, record: catalog.SkillRecord) !S
         .disallowed_tools = disallowed_tools,
         .arguments = arguments,
         .disable_model_invocation = source.disable_model_invocation,
+        .model_activation = source.model_activation,
         .context = source.context,
         .agent = agent,
         .model = model,

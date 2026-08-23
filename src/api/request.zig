@@ -40,6 +40,28 @@ pub const ToolChoice = struct {
     name: ?[]const u8 = null,
 };
 
+/// Host-only model-routing metadata. It is deliberately excluded from every
+/// provider tool schema: the immutable Runtime uses it to ask a compatible
+/// dialect for a first-turn choice, while native dispatch/permission remains
+/// the only execution authority.
+pub const ModelToolActivation = struct {
+    mode: Mode,
+    /// Optional exact argument pair used only for deterministic dialect
+    /// guidance (for Skill this is `name=<invocation_name>`).
+    argument_name: ?[]const u8 = null,
+    argument_value: ?[]const u8 = null,
+    /// Request-scoped Host state. Runtime/catalog definitions always leave
+    /// this false; AgentLoop may set it on a shallow copy after an exact,
+    /// successful activation survives outside the provider-visible compact
+    /// window. It is never serialized, so tool schemas and cache prefixes are
+    /// byte-identical to the original immutable definition.
+    satisfied: bool = false,
+
+    pub const Mode = enum {
+        required_first,
+    };
+};
+
 pub const ToolDefinition = struct {
     name: []const u8,
     description: []const u8,
@@ -54,6 +76,9 @@ pub const ToolDefinition = struct {
     /// 运行期内部来源标记(不序列化)。非 null 只用于 MCP 注册桥接，
     /// AgentDef.mcpServers 必须按此字段过滤，不能从 `name` 猜来源。
     mcp_server: ?[]const u8 = null,
+    /// Runtime/dialect routing metadata; never serialized as part of the tool
+    /// declaration and never treated as permission.
+    model_activation: ?ModelToolActivation = null,
 };
 
 /// 单个参数的 JSON Schema 描述。comptime 友好（纯字面量），用于内置工具表里
@@ -90,6 +115,22 @@ pub const InputSchema = struct {
 
 /// 序列化请求为 JSON 字节串。调用方 free。
 pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocator) ![]u8 {
+    const dialect_mod = @import("dialect.zig");
+    return serializeMessagesRequestWithDialect(
+        req,
+        allocator,
+        dialect_mod.dialectFor(.anthropic, req.model),
+    );
+}
+
+/// Runtime-scoped variant. The selected Dialect is pinned by the Session's
+/// immutable plugin Snapshot; plugin metadata/generation never enters the
+/// serialized request, preserving provider prefix-cache identity.
+pub fn serializeMessagesRequestWithDialect(
+    req: MessagesRequest,
+    allocator: std.mem.Allocator,
+    dialect: @import("dialect.zig").Dialect,
+) ![]u8 {
     var result: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
     errdefer result.deinit(allocator);
 
@@ -104,9 +145,26 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
     try result.appendSlice(allocator, ",\"messages\":");
     try serializeMessages(req.messages, &result, allocator);
 
-    if (req.system) |s| {
+    const profile = dialect.profileFor(.anthropic, req.model);
+    const visible_capabilities = @import("dialect.zig").visibleCapabilities(req.tools);
+    var system_buf: std.ArrayList(u8) = .empty;
+    defer system_buf.deinit(allocator);
+    if (req.system) |s| try system_buf.appendSlice(allocator, s);
+    try dialect.injectSystemMods(
+        profile,
+        req.reasoning_effort,
+        &system_buf,
+        allocator,
+    );
+    try dialect.activateCapabilities(
+        profile,
+        visible_capabilities,
+        &system_buf,
+        allocator,
+    );
+    if (system_buf.items.len != 0) {
         try result.appendSlice(allocator, ",\"system\":");
-        try util_json.serializeString(s, &result, allocator);
+        try util_json.serializeString(system_buf.items, &result, allocator);
     }
 
     try result.appendSlice(allocator, ",\"stream\":");
@@ -119,7 +177,17 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
 
     // tool_choice:{"type":"auto"} | {"type":"tool","name":"web_search"} 等。
     // 强制工具(forced tool use)由 web_search 子请求用,保证模型必发搜索。
-    if (req.tool_choice) |tc| {
+    const route_already_invoked = if (visible_capabilities.required_first) |route|
+        route.satisfied or @import("dialect.zig").hasSuccessfulRequiredFirst(req.messages, route)
+    else
+        false;
+    const effective_tool_choice = dialect.routeToolChoice(
+        profile,
+        visible_capabilities,
+        route_already_invoked,
+        req.tool_choice,
+    );
+    if (effective_tool_choice) |tc| {
         try result.appendSlice(allocator, ",\"tool_choice\":{\"type\":");
         try util_json.serializeString(tc.type, &result, allocator);
         if (tc.name) |n| {
@@ -132,9 +200,6 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
     if (req.reasoning_effort) |effort| {
         // 委托给 ClaudeDialect 序列化 thinking 控制(对齐 metacodes 既有 wire 格式)。
         // dialect 产出 `,"output_config":{"effort":"..."},"thinking":{"type":"adaptive"}` 片段。
-        const dialect_mod = @import("dialect.zig");
-        const dialect = dialect_mod.dialectFor(.anthropic, req.model);
-        const profile = @import("model_adapter.zig").profileFor(.anthropic, req.model);
         try dialect.serializeThinking(profile, effort, &result, allocator);
     }
 
@@ -427,6 +492,152 @@ test "serializeMessagesRequest with system prompt" {
     const body = try serializeMessagesRequest(req, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":\"You are X.\"") != null);
+}
+
+test "Anthropic GLM dialect activates visible Skill with stable request bytes" {
+    const allocator = std.testing.allocator;
+    const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const skill_tool = ToolDefinition{
+        .name = "Skill",
+        .description = "invoke one bound skill",
+        .input_schema = .{},
+        .model_activation = .{
+            .mode = .required_first,
+            .argument_name = "name",
+            .argument_value = "verify-change",
+        },
+    };
+    const req = MessagesRequest{
+        .model = "glm-5.2",
+        .messages = &.{msg},
+        .system = "base",
+        .tools = &.{skill_tool},
+    };
+
+    const first = try serializeMessagesRequest(req, allocator);
+    defer allocator.free(first);
+    const second = try serializeMessagesRequest(req, allocator);
+    defer allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.indexOf(u8, first, "Model-specific capability activation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "blocking requirement") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "`verify-change`") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        first,
+        "\"tool_choice\":{\"type\":\"tool\",\"name\":\"Skill\"}",
+    ) != null);
+
+    const continued_messages = [_]types.ApiMessage{
+        msg,
+        .{ .role = .assistant, .content = &.{.{ .tool_use = .{
+            .id = "skill_1",
+            .name = "Skill",
+            .input = "{\"name\":\"verify-change\"}",
+        } }} },
+        .{ .role = .user, .content = &.{.{ .tool_result = .{
+            .tool_use_id = "skill_1",
+            .content = "instructions",
+        } }} },
+    };
+    const continued = try serializeMessagesRequest(.{
+        .model = "glm-5.2",
+        .messages = &continued_messages,
+        .system = "base",
+        .tools = &.{skill_tool},
+    }, allocator);
+    defer allocator.free(continued);
+    try std.testing.expect(std.mem.indexOf(u8, continued, "\"tool_choice\"") == null);
+
+    // Compaction hides the old call/result from provider messages, but the
+    // Host carries satisfaction in non-wire metadata. Capability prompt and
+    // tool schema remain byte-stable; only the no-longer-needed routing field
+    // disappears.
+    var satisfied_skill_tool = skill_tool;
+    satisfied_skill_tool.model_activation.?.satisfied = true;
+    const compacted = try serializeMessagesRequest(.{
+        .model = "glm-5.2",
+        .messages = &.{msg},
+        .system = "base",
+        .tools = &.{satisfied_skill_tool},
+    }, allocator);
+    defer allocator.free(compacted);
+    try std.testing.expect(std.mem.indexOf(u8, compacted, "\"tool_choice\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, compacted, "blocking requirement") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compacted, "`verify-change`") != null);
+
+    var original_schema: std.ArrayList(u8) = .empty;
+    defer original_schema.deinit(allocator);
+    var satisfied_schema: std.ArrayList(u8) = .empty;
+    defer satisfied_schema.deinit(allocator);
+    try serializeOneTool(skill_tool, &original_schema, allocator);
+    try serializeOneTool(satisfied_skill_tool, &satisfied_schema, allocator);
+    try std.testing.expectEqualStrings(original_schema.items, satisfied_schema.items);
+
+    const wrong_or_failed_messages = [_]types.ApiMessage{
+        msg,
+        .{ .role = .assistant, .content = &.{.{ .tool_use = .{
+            .id = "skill_wrong",
+            .name = "Skill",
+            .input = "{\"name\":\"another-skill\"}",
+        } }} },
+        .{ .role = .user, .content = &.{.{ .tool_result = .{
+            .tool_use_id = "skill_wrong",
+            .content = "not the required route",
+        } }} },
+        .{ .role = .assistant, .content = &.{.{ .tool_use = .{
+            .id = "skill_failed",
+            .name = "Skill",
+            .input = "{\"name\":\"verify-change\"}",
+        } }} },
+        .{ .role = .user, .content = &.{.{ .tool_result = .{
+            .tool_use_id = "skill_failed",
+            .content = "activation failed",
+            .is_error = true,
+        } }} },
+    };
+    const still_required = try serializeMessagesRequest(.{
+        .model = "glm-5.2",
+        .messages = &wrong_or_failed_messages,
+        .system = "base",
+        .tools = &.{skill_tool},
+    }, allocator);
+    defer allocator.free(still_required);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        still_required,
+        "\"tool_choice\":{\"type\":\"tool\",\"name\":\"Skill\"}",
+    ) != null);
+}
+
+test "Anthropic model-specific activation is absent without visible Skill capability" {
+    const allocator = std.testing.allocator;
+    const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = MessagesRequest{
+        .model = "glm-5.2",
+        .messages = &.{msg},
+        .system = "base",
+    };
+    const body = try serializeMessagesRequest(req, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "Model-specific capability activation") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":\"base\"") != null);
+}
+
+test "Anthropic Claude dialect does not inherit GLM capability activation" {
+    const allocator = std.testing.allocator;
+    const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = MessagesRequest{
+        .model = "claude-sonnet-4-5",
+        .messages = &.{msg},
+        .system = "# Available skills\n- verify: bounded review",
+    };
+    const body = try serializeMessagesRequest(req, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "Model-specific capability activation") == null);
 }
 
 test "serializeOneTool: 嵌套 PropSpec(array-of-object + object_props)递归输出" {

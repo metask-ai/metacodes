@@ -23,6 +23,10 @@ const SessionId = ui_backend.SessionId;
 const agent_loop = @import("agent_loop.zig");
 const secure = @import("../util/secure.zig");
 const tool_catalog = @import("tool_catalog.zig");
+const plugin_contract = @import("../plugin/contract.zig");
+const plugin_runtime = @import("../plugin/runtime.zig");
+const plugin_support = @import("../plugin/support.zig");
+const first_party_plugins = @import("../plugin/first_party.zig");
 const workspace_mod = @import("workspace_policy.zig");
 const ReadState = @import("read_state.zig").ReadState;
 const JobRegistry = @import("job_registry.zig").JobRegistry;
@@ -31,18 +35,7 @@ const ToolExecutionPolicy = @import("../tools.zig").ToolExecutionPolicy;
 const ToolDispatcher = @import("../tools.zig").ToolDispatcher;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
 
-pub const DEFAULT_BUILTIN_TOOLS = [_][]const u8{
-    "Read",
-    "Write",
-    "Edit",
-    "Glob",
-    "Grep",
-    "Bash",
-    "BashOutput",
-    "KillShell",
-    "WebSearch",
-    "WebFetch",
-};
+pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_party_plugins.ARTIFACT_TOOLS;
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
 /// Process-level tools (Task, Cron, KG, MCP, worktree, notifications, etc.) are
 /// deliberately rejected at Runtime creation instead of being advertised with
@@ -60,28 +53,72 @@ pub fn isSessionBuiltin(name: []const u8) bool {
     return false;
 }
 
+fn containsToolName(names: []const []const u8, needle: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, needle)) return true;
+    }
+    return false;
+}
+
 test "WebSearch and WebFetch are AgentSession-owned builtins" {
     try std.testing.expect(isSessionBuiltin("WebSearch"));
     try std.testing.expect(isSessionBuiltin("WebFetch"));
 }
 
-test "default AgentRuntime catalog includes WebSearch and WebFetch" {
-    var runtime = try AgentRuntime.create(std.testing.allocator, .{});
+test "default AgentRuntime preserves the coding tool surface through first-party plugin provenance" {
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{});
     defer runtime.destroy() catch unreachable;
-    try std.testing.expect(runtime.catalog.find("WebSearch") != null);
-    try std.testing.expect(runtime.catalog.find("WebFetch") != null);
+    try std.testing.expectEqual(DEFAULT_BUILTIN_TOOLS.len, runtime.catalog.entries.len);
+    for (DEFAULT_BUILTIN_TOOLS, runtime.catalog.entries) |expected, entry|
+        try std.testing.expectEqualStrings(expected, entry.definition.name);
+    const inventory = try runtime.describePlugins(std.testing.allocator);
+    defer std.testing.allocator.free(inventory);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "metacodes.core.coding") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":10") != null);
+}
+
+test "minimal and none core profiles retain the mandatory artifact recovery kernel" {
+    const minimal = try AgentRuntime.create(std.testing.allocator, .{ .core_profile = .minimal });
+    defer minimal.destroy() catch unreachable;
+    try std.testing.expect(minimal.catalog.find("Read") != null);
+    try std.testing.expect(minimal.catalog.find("Grep") != null);
+    try std.testing.expect(minimal.catalog.find("Write") == null);
+    try std.testing.expect(minimal.catalog.find("WebFetch") == null);
+
+    const none = try AgentRuntime.create(std.testing.allocator, .{ .core_profile = .none });
+    defer none.destroy() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), none.catalog.entries.len);
+    try std.testing.expect(none.catalog.find("ReadArtifact") != null);
 }
 
 pub const RuntimeConfig = struct {
-    builtin_tools: []const []const u8 = &DEFAULT_BUILTIN_TOOLS,
+    /// Null selects the first-party `core_profile`. A non-null slice is the
+    /// source-compatible explicit/legacy override used by older embedding
+    /// adapters and tests; first-party packs are then omitted, while any
+    /// explicitly supplied static builtin bundle is still composed.
+    builtin_tools: ?[]const []const u8 = null,
+    core_profile: first_party_plugins.Profile = .coding,
     host_sync_tools: []const tool_catalog.HostSyncTool = &.{},
+    host_stream_tools: []const tool_catalog.HostStreamTool = &.{},
+    static_plugins: []const plugin_runtime.StaticPlugin = &.{},
+    process_plugins: []const plugin_runtime.PackageSource = &.{},
 };
 
 pub const HostSyncTool = tool_catalog.HostSyncTool;
 pub const HostToolResult = tool_catalog.HostToolResult;
 pub const HostToolOutcome = tool_catalog.HostToolOutcome;
+pub const HostStreamTool = tool_catalog.HostStreamTool;
+pub const HostStreamOutcome = tool_catalog.HostStreamOutcome;
+pub const HostResultSink = tool_catalog.HostResultSink;
+pub const HostResultSinkError = tool_catalog.HostResultSinkError;
+pub const HostStreamExecuteError = tool_catalog.HostStreamExecuteError;
+pub const HostStreamMediaType = @import("tool_result.zig").MediaType;
 pub const RunIdentity = tool_catalog.RunIdentity;
 pub const HostRunIdentity = tool_catalog.HostRunIdentity;
+pub const StaticPlugin = plugin_runtime.StaticPlugin;
+pub const CoreProfile = first_party_plugins.Profile;
+pub const ProcessPlugin = plugin_runtime.PackageSource;
+pub const AdvisoryPolicy = ToolExecutionPolicy;
 pub const UiRequester = ui_request.UiRequester;
 
 pub const AgentSessionUiRequester = struct {
@@ -104,7 +141,7 @@ pub const RuntimeError = error{
     RuntimeUnavailable,
 };
 
-const RuntimeState = enum { active, destroying };
+const RuntimeState = enum { active, draining, destroying };
 
 const SessionIdSource = struct {
     ctx: ?*anyopaque = null,
@@ -134,6 +171,7 @@ const SessionCreateHooks = struct {
 
 pub const AgentRuntime = struct {
     allocator: std.mem.Allocator,
+    plugin_snapshot: *plugin_runtime.Snapshot,
     catalog: tool_catalog.Catalog,
     mutex: sync.Mutex = .{},
     live_sessions: usize = 0,
@@ -147,13 +185,56 @@ pub const AgentRuntime = struct {
     const MAX_SESSION_ID_RETRIES: usize = 8;
 
     pub fn create(allocator: std.mem.Allocator, config: RuntimeConfig) !*AgentRuntime {
-        for (config.builtin_tools) |name| {
-            if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
+        return createWithGeneration(allocator, config, @enumFromInt(1));
+    }
+
+    fn createWithGeneration(
+        allocator: std.mem.Allocator,
+        config: RuntimeConfig,
+        generation: plugin_contract.GenerationId,
+    ) !*AgentRuntime {
+        if (config.builtin_tools) |explicit| {
+            for (explicit) |name| {
+                if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
+            }
         }
+        var static_plugins: std.ArrayList(plugin_runtime.StaticPlugin) = .empty;
+        defer static_plugins.deinit(allocator);
+        try static_plugins.appendSlice(allocator, first_party_plugins.kernelPlugins());
+        if (config.builtin_tools == null)
+            try static_plugins.appendSlice(allocator, first_party_plugins.plugins(config.core_profile));
+        try static_plugins.appendSlice(allocator, config.static_plugins);
+
         const self = try allocator.create(AgentRuntime);
         errdefer allocator.destroy(self);
-        const catalog = try tool_catalog.Catalog.init(allocator, config.builtin_tools, config.host_sync_tools);
-        self.* = .{ .allocator = allocator, .catalog = catalog };
+        const plugin_snapshot = try plugin_runtime.Snapshot.create(allocator, .{
+            .generation = generation,
+            .supported_capabilities = plugin_support.acceptedCapabilities(.agent_core_static),
+            .compatibility_host_tools = config.host_sync_tools,
+            .static_plugins = static_plugins.items,
+            .process_packages = config.process_plugins,
+        });
+        errdefer plugin_snapshot.destroy();
+
+        var builtin_tools: std.ArrayList([]const u8) = .empty;
+        defer builtin_tools.deinit(allocator);
+        if (config.builtin_tools) |explicit| {
+            for (explicit) |name| {
+                if (!first_party_plugins.isKernelTool(name)) try builtin_tools.append(allocator, name);
+            }
+        }
+        try builtin_tools.appendSlice(allocator, plugin_snapshot.builtin_tools);
+        for (builtin_tools.items) |name| {
+            if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
+        }
+        const catalog = try tool_catalog.Catalog.initWithExecutors(
+            allocator,
+            builtin_tools.items,
+            plugin_snapshot.host_tools,
+            config.host_stream_tools,
+            plugin_snapshot.process_tools,
+        );
+        self.* = .{ .allocator = allocator, .plugin_snapshot = plugin_snapshot, .catalog = catalog };
         return self;
     }
 
@@ -173,11 +254,32 @@ pub const AgentRuntime = struct {
         std.debug.assert(self.session_ids.count() == 0);
         self.mutex.unlock();
 
+        self.destroyOwned();
+    }
+
+    fn destroyOwned(self: *AgentRuntime) void {
         const allocator = self.allocator;
+        std.debug.assert(self.state == .destroying);
+        std.debug.assert(self.live_sessions == 0);
+        std.debug.assert(self.session_ids.count() == 0);
         self.session_ids.deinit(allocator);
         self.catalog.deinit();
+        self.plugin_snapshot.destroy();
         self.* = undefined;
         allocator.destroy(self);
+    }
+
+    /// Stop admitting new Sessions. A zero-session Runtime is destroyed now;
+    /// otherwise the final Session release performs the destruction. This is
+    /// the immutable-generation drain boundary used by `RuntimeHost`.
+    fn retire(self: *AgentRuntime) void {
+        self.mutex.lock();
+        std.debug.assert(self.state == .active);
+        self.state = .draining;
+        const reap = self.live_sessions == 0;
+        if (reap) self.state = .destroying;
+        self.mutex.unlock();
+        if (reap) self.destroyOwned();
     }
 
     /// 原子注册:锁下 getOrPut,已存在 → false(调用方换新 ID 重试)。
@@ -196,6 +298,12 @@ pub const AgentRuntime = struct {
 
     pub fn createSession(self: *AgentRuntime, config: SessionConfig) !*AgentSession {
         return AgentSession.create(self, config);
+    }
+
+    /// Stable immutable inventory for in-process embedding Hosts. The returned
+    /// JSON is caller-owned and contains no callback pointers or kernel state.
+    pub fn describePlugins(self: *const AgentRuntime, allocator: std.mem.Allocator) ![]u8 {
+        return self.plugin_snapshot.describe(allocator);
     }
 
     /// Narrow Core seam for an already validated AgentCore checkpoint. The
@@ -220,12 +328,222 @@ pub const AgentRuntime = struct {
         self.mutex.lock();
         std.debug.assert(self.live_sessions > 0);
         self.live_sessions -= 1;
+        const reap = self.live_sessions == 0 and self.state == .draining;
+        if (reap) self.state = .destroying;
         self.mutex.unlock();
+        if (reap) self.destroyOwned();
+    }
+};
+
+const RuntimeHostState = enum {
+    active,
+    replacing,
+    destroying,
+};
+
+/// Stack-borrowed conjunction used only for one synchronous Run. Plugin policy
+/// and facade policy are both upper bounds: neither can authorize what the
+/// other, native permission, Lean, or workspace policy denies.
+const ExecutionPolicyIntersection = struct {
+    plugin: ToolExecutionPolicy,
+    facade: ToolExecutionPolicy,
+
+    fn policy(self: *const ExecutionPolicyIntersection) ToolExecutionPolicy {
+        return .{
+            .ctx = @ptrCast(self),
+            .allowsToolFn = allowsTool,
+            .allowsInvocationFn = allowsInvocation,
+        };
+    }
+
+    fn allowsTool(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const ExecutionPolicyIntersection = @ptrCast(@alignCast(raw));
+        return self.plugin.allowsTool(name) and self.facade.allowsTool(name);
+    }
+
+    fn allowsInvocation(raw: *const anyopaque, name: []const u8, arguments_json: []const u8) bool {
+        const self: *const ExecutionPolicyIntersection = @ptrCast(@alignCast(raw));
+        return self.plugin.allowsInvocation(name, arguments_json) and
+            self.facade.allowsInvocation(name, arguments_json);
+    }
+};
+
+/// Atomic owner for immutable AgentRuntime generations.
+///
+/// Replacement never edits an active Runtime. It stages a complete successor,
+/// swaps the admission pointer, then retires the predecessor. Sessions retain
+/// their original Runtime and trigger its cleanup after the final release.
+pub const RuntimeHost = struct {
+    allocator: std.mem.Allocator,
+    mutex: sync.Mutex = .{},
+    active: *AgentRuntime,
+    next_generation: ?u64 = 2,
+    state: RuntimeHostState = .active,
+
+    pub fn create(allocator: std.mem.Allocator, config: RuntimeConfig) !*RuntimeHost {
+        const runtime = try AgentRuntime.createWithGeneration(allocator, config, @enumFromInt(1));
+        errdefer runtime.destroy() catch unreachable;
+        const self = try allocator.create(RuntimeHost);
+        self.* = .{ .allocator = allocator, .active = runtime };
+        return self;
+    }
+
+    /// Stage and atomically publish the next generation. A staging failure
+    /// restores `.active` and leaves the existing admission pointer unchanged.
+    /// Reentrant/concurrent replacement is a typed error rather than a lock.
+    pub fn replace(self: *RuntimeHost, config: RuntimeConfig) !plugin_contract.GenerationId {
+        self.mutex.lock();
+        const generation_value = switch (self.state) {
+            .active => self.next_generation orelse {
+                self.mutex.unlock();
+                return error.GenerationExhausted;
+            },
+            .replacing => {
+                self.mutex.unlock();
+                return error.RuntimeHostBusy;
+            },
+            .destroying => {
+                self.mutex.unlock();
+                return error.RuntimeUnavailable;
+            },
+        };
+        self.state = .replacing;
+        self.mutex.unlock();
+
+        var restore_active = true;
+        defer if (restore_active) {
+            self.mutex.lock();
+            std.debug.assert(self.state == .replacing);
+            self.state = .active;
+            self.mutex.unlock();
+        };
+
+        const staged_generation: plugin_contract.GenerationId = @enumFromInt(generation_value);
+        const replacement = try AgentRuntime.createWithGeneration(self.allocator, config, staged_generation);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .replacing);
+        const previous = self.active;
+        self.active = replacement;
+        self.next_generation = std.math.add(u64, generation_value, 1) catch null;
+        self.mutex.unlock();
+
+        // Keep replacement serialized while immediate predecessor cleanup runs:
+        // trusted cleanup may reenter this Host, but cannot start a nested swap
+        // or destroy the owner halfway through this call. Session admission may
+        // already use the newly published pointer while state is `.replacing`.
+        previous.retire();
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .replacing);
+        self.state = .active;
+        self.mutex.unlock();
+        restore_active = false;
+        return staged_generation;
+    }
+
+    /// Session admission is serialized only across the pointer swap. Provider
+    /// and Session construction complete while holding the Host lock so the
+    /// chosen Runtime cannot enter draining before it records the Session.
+    pub fn createSession(self: *RuntimeHost, config: SessionConfig) !*AgentSession {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.state) {
+            .active, .replacing => self.active.createSession(config),
+            .destroying => error.RuntimeUnavailable,
+        };
+    }
+
+    pub fn createRestoredSession(
+        self: *RuntimeHost,
+        config: SessionConfig,
+        restored: RestoredSessionState,
+    ) !*AgentSession {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.state) {
+            .active, .replacing => self.active.createRestoredSession(config, restored),
+            .destroying => error.RuntimeUnavailable,
+        };
+    }
+
+    pub fn describePlugins(self: *RuntimeHost, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.state) {
+            .active, .replacing => self.active.describePlugins(allocator),
+            .destroying => error.RuntimeUnavailable,
+        };
+    }
+
+    pub fn generation(self: *RuntimeHost) !plugin_contract.GenerationId {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.state) {
+            .active, .replacing => self.active.plugin_snapshot.generation,
+            .destroying => error.RuntimeUnavailable,
+        };
+    }
+
+    /// Stop admission and retire the current generation. Existing Sessions
+    /// remain valid and self-reap their Runtime after their final destroy.
+    pub fn destroy(self: *RuntimeHost) error{RuntimeHostBusy}!void {
+        self.mutex.lock();
+        if (self.state == .replacing) {
+            self.mutex.unlock();
+            return error.RuntimeHostBusy;
+        }
+        std.debug.assert(self.state == .active);
+        self.state = .destroying;
+        const runtime = self.active;
+        self.mutex.unlock();
+
+        const allocator = self.allocator;
+        runtime.retire();
+        self.* = undefined;
+        allocator.destroy(self);
     }
 };
 
 pub const WorkspaceConfig = workspace_mod.Config;
 pub const ShellPolicy = workspace_mod.ShellPolicy;
+
+/// Artifact-store authority is fixed when the Session is created. A tagged
+/// policy avoids the old ambiguous empty-string state and makes restored
+/// AgentCore Sessions derive the same path from their logical Session ID.
+pub const ArtifactStoreConfig = union(enum) {
+    disabled,
+    exact_root: []const u8,
+    session_under_workspace_home,
+
+    pub fn enabled(self: ArtifactStoreConfig) bool {
+        return self != .disabled;
+    }
+
+    fn resolve(
+        self: ArtifactStoreConfig,
+        allocator: std.mem.Allocator,
+        workspace: workspace_mod.WorkspacePolicy,
+        session_id: SessionId,
+    ) ![]u8 {
+        return switch (self) {
+            .disabled => allocator.dupe(u8, ""),
+            .exact_root => |root| if (root.len == 0)
+                error.InvalidArtifactStoreConfig
+            else
+                allocator.dupe(u8, root),
+            .session_under_workspace_home => blk: {
+                const base = if (workspace.home.len != 0) workspace.home else workspace.root;
+                if (base.len == 0) return error.InvalidArtifactStoreConfig;
+                break :blk std.fmt.allocPrint(
+                    allocator,
+                    "{s}/.metacodes/agentcore/sessions/{s}",
+                    .{ base, session_id.asSlice() },
+                );
+            },
+        };
+    }
+};
 
 pub const SessionConfig = struct {
     provider_kind: types.ProviderKind,
@@ -235,12 +553,12 @@ pub const SessionConfig = struct {
     permission_mode: types.PermissionMode = .default,
     permission_rules: ?permission_settings.RuleSetInput = null,
     workspace: WorkspaceConfig,
-    /// Optional Host-owned private directory for recoverable large tool
-    /// results. It must remain stable across checkpoint restore when artifact
-    /// IDs in the Conversation are expected to stay readable.
-    artifact_root: []const u8 = "",
-    /// Explicit authority ceiling. It can only select names present in the
-    /// Runtime catalog; an empty list creates a text-only Session deliberately.
+    /// Session-stable recoverable Tool Result storage. AgentCore uses
+    /// `session_under_workspace_home`; CLI callers that already own a
+    /// transcript directory use `exact_root` at the lower agent-loop seam.
+    artifact_store: ArtifactStoreConfig = .disabled,
+    /// Explicit Host authority ceiling. The kernel adds only ReadArtifact when
+    /// `artifact_store` is enabled; no other global built-in fallback exists.
     allowed_tools: []const []const u8,
     /// Optional synchronous Host UI bridge. The Host-owned callback context
     /// must outlive this Session.
@@ -671,12 +989,13 @@ pub const AgentSession = struct {
 
     fn makeToolProvider(raw: *anyopaque) anyerror!provider_factory.OwnedProvider {
         const self: *AgentSession = @ptrCast(@alignCast(raw));
-        return provider_factory.makeProvider(
+        return provider_factory.makeProviderWithDialectResolver(
             std.heap.c_allocator,
             self.provider.kind(),
             self.api_key,
             self.model,
             self.base_url,
+            self.runtime.plugin_snapshot.dialectResolver(),
         );
     }
 
@@ -715,15 +1034,21 @@ pub const AgentSession = struct {
 
         var workspace = try workspace_mod.WorkspacePolicy.init(allocator, config.workspace);
         errdefer workspace.deinit();
-        const artifact_root = try allocator.dupe(u8, config.artifact_root);
-        errdefer allocator.free(artifact_root);
-        var selected_tools = try tool_catalog.Selection.init(allocator, &runtime.catalog, config.allowed_tools);
+        var selected_names: std.ArrayList([]const u8) = .empty;
+        defer selected_names.deinit(allocator);
+        try selected_names.appendSlice(allocator, config.allowed_tools);
+        if (config.artifact_store.enabled() and !containsToolName(selected_names.items, "ReadArtifact"))
+            try selected_names.append(allocator, "ReadArtifact");
+        var selected_tools = try tool_catalog.Selection.init(allocator, &runtime.catalog, selected_names.items);
         errdefer selected_tools.deinit();
         for (selected_tools.entries) |entry| {
             if (!workspace.allowsTool(entry.definition.name)) return error.ShellToolDisabled;
             // 选了 Host tool 却没有身份锚点 → admission 拒绝,消灭运行期空态。
-            if (entry.executor == .host_sync and config.host_identity_ctx == null)
+            if ((entry.executor == .host_sync or entry.executor == .host_stream) and
+                config.host_identity_ctx == null)
                 return error.HostIdentityRequired;
+            if (entry.executor == .host_stream and !config.artifact_store.enabled())
+                return error.ArtifactStoreRequired;
         }
         var jobs: ?JobRegistry = null;
         if (selected_tools.contains("Bash") or selected_tools.contains("BashOutput") or selected_tools.contains("KillShell")) {
@@ -753,12 +1078,13 @@ pub const AgentSession = struct {
             Conversation.init(allocator);
         errdefer conversation.deinit();
 
-        const owned_provider = try provider_factory.makeProvider(
+        const owned_provider = try provider_factory.makeProviderWithDialectResolver(
             allocator,
             config.provider_kind,
             api_key,
             model,
             base_url,
+            runtime.plugin_snapshot.dialectResolver(),
         );
         errdefer owned_provider.deinit();
 
@@ -778,6 +1104,8 @@ pub const AgentSession = struct {
         };
         errdefer runtime.unregisterSessionId(session_id);
         try hooks.afterIdRegistered();
+        const artifact_root = try config.artifact_store.resolve(allocator, workspace, session_id);
+        errdefer allocator.free(artifact_root);
         var permission_ctx = permission.createContext(config.permission_mode, allocator);
         permission_ctx.session = session_id;
 
@@ -889,6 +1217,11 @@ pub const AgentSession = struct {
         return self.state == .poisoned;
     }
 
+    /// Immutable plugin generation pinned when this Session was admitted.
+    pub fn pluginGeneration(self: *const AgentSession) plugin_contract.GenerationId {
+        return self.runtime.plugin_snapshot.generation;
+    }
+
     /// Admit an immutable committed-state view without copying the long
     /// Conversation. The dedicated lifecycle state prevents every mutation
     /// until the caller releases the returned lease.
@@ -984,12 +1317,13 @@ pub const AgentSession = struct {
             return error.OutOfMemory;
         };
         errdefer self.allocator.free(replacement_model);
-        var replacement_provider = provider_factory.makeProvider(
+        var replacement_provider = provider_factory.makeProviderWithDialectResolver(
             self.allocator,
             provider_kind,
             self.api_key,
             replacement_model,
             self.base_url,
+            self.runtime.plugin_snapshot.dialectResolver(),
         ) catch |err| {
             self.cancelMutation();
             return err;
@@ -1316,6 +1650,15 @@ pub const AgentSession = struct {
             surface.dispatcher
         else
             self.tools.dispatcher();
+        const plugin_policy = self.runtime.plugin_snapshot.executionPolicy();
+        var policy_intersection: ExecutionPolicyIntersection = undefined;
+        const effective_execution_policy: ?ToolExecutionPolicy = if (plugin_policy) |plugin| blk: {
+            if (execution_policy) |facade| {
+                policy_intersection = .{ .plugin = plugin, .facade = facade };
+                break :blk policy_intersection.policy();
+            }
+            break :blk plugin;
+        } else execution_policy;
 
         // 缺陷 A 修复:主 Agent 注入环境段 + 工具段 system_prompt。
         // 环境段 cwd 用 workspace.root(非进程 cwd——Session 隔离);工具段按 enabled_tool_names 裁剪。
@@ -1352,7 +1695,7 @@ pub const AgentSession = struct {
                 .provider_factory = self.toolProviderFactory(),
                 .tool_defs = tool_definitions,
                 .tool_dispatcher = tool_dispatcher,
-                .execution_policy = execution_policy,
+                .execution_policy = effective_execution_policy,
                 // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
                 .host_run = if (self.host_identity_ctx) |hctx| .{
                     .identity = identity,
@@ -2937,7 +3280,8 @@ test "restored AgentSession preserves logical identity and operation continuity"
         .api_key = "test-key",
         .model = "restored-model",
         .permission_mode = .default,
-        .workspace = .{ .root = cwd },
+        .workspace = .{ .root = cwd, .home = cwd },
+        .artifact_store = .session_under_workspace_home,
         .allowed_tools = &.{"Read"},
     };
 
@@ -2961,6 +3305,14 @@ test "restored AgentSession preserves logical identity and operation continuity"
         .last_compact_id = 4,
         .conversation = &source,
     });
+    const expected_artifact_root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/.metacodes/agentcore/sessions/{s}",
+        .{ cwd, logical_id.asSlice() },
+    );
+    defer std.testing.allocator.free(expected_artifact_root);
+    try std.testing.expectEqualStrings(expected_artifact_root, restored.artifact_root);
+    try std.testing.expect(restored.tools.contains("ReadArtifact"));
     try source.appendText(.user, "source mutates independently");
     try std.testing.expectEqual(@as(usize, 2), restored.conversation.messages.items.len);
 
@@ -2991,6 +3343,8 @@ test "restored AgentSession preserves logical identity and operation continuity"
         .last_compact_id = 4,
         .conversation = &source,
     });
+    try std.testing.expectEqualStrings(expected_artifact_root, reopened.artifact_root);
+    try std.testing.expect(reopened.tools.contains("ReadArtifact"));
     try reopened.destroy();
 }
 

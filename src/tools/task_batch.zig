@@ -18,8 +18,9 @@
 //!
 //! **已知差距(未实现,登记非沉默;完整差距矩阵见 metaknow E2E_TESTING §3.1)**:
 //!  - **结果落文件/summary 模式**:codex 结果落 CSV 只回 summary 防撑爆父 context;本实现 N 个 final_text
-//!    **全量内联返回**,大 N × 长输出会占父 context(>50K 才触发通用落盘,那时只剩 2K preview 丢其余)。
-//!    未做 per-item 截断/summary 模式(P1 待办)。
+//!    会先在 TaskBatch 聚合器内构造完整返回；随后统一投影能把超限结果保存到 Session CAS 并经
+//!    ReadArtifact 完整恢复，所以 Conversation 不再丢正文，但生成期峰值仍是 O(聚合结果)。未做
+//!    per-item byte-zero spool/summary 模式(P1 待办)。
 //!  - **output_schema 强制**:codex 每 worker 结果按 JSON Schema 校验;本实现不校验(schema 无此字段)。
 //!  - **per-item deadline 只在 turn 边界生效**:client 无 socket read timeout,watchdog 的 abort 打不断
 //!    卡在单次网络读里的子 agent(需 client 层 SO_RCVTIMEO,P2.4-adjacent)。串行(headless)路径无 watchdog。

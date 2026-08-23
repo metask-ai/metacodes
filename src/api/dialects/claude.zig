@@ -8,6 +8,7 @@ const types = @import("../../types.zig");
 const util_json = @import("../../util/json.zig");
 const model_adapter = @import("../model_adapter.zig");
 const dialect_mod = @import("../dialect.zig");
+const capability_activation = @import("../capability_activation.zig");
 
 const Dialect = dialect_mod.Dialect;
 const ModelProfile = model_adapter.ModelProfile;
@@ -63,8 +64,42 @@ const Claude = struct {
     };
 };
 
+/// GLM models are also exposed by Anthropic-compatible gateways. They keep the
+/// Anthropic wire dialect but benefit from a stricter capability-call contract;
+/// this is a presentation projection only and never auto-authorizes a Skill.
+const GlmAnthropic = struct {
+    fn activateCapabilities(ctx: *anyopaque, p: ModelProfile, capabilities: @import("../dialect.zig").VisibleCapabilities, system: *std.ArrayList(u8), allocator: std.mem.Allocator) anyerror!void {
+        _ = ctx;
+        _ = p;
+        try capability_activation.injectStrictSkillToolFirst(
+            system,
+            capabilities.skill_tool,
+            capabilities.requiredSkillInvocation(),
+            allocator,
+        );
+    }
+
+    fn routeToolChoice(ctx: *anyopaque, p: ModelProfile, capabilities: dialect_mod.VisibleCapabilities, already_invoked: bool, requested: ?ToolChoice) ?ToolChoice {
+        _ = ctx;
+        _ = p;
+        return dialect_mod.routeRequiredFirst(capabilities, already_invoked, requested);
+    }
+
+    const dialect = Dialect{
+        .ctx = undefined,
+        .serializeThinkingFn = Claude.serializeThinking,
+        .activateCapabilitiesFn = activateCapabilities,
+        .routeToolChoiceFn = routeToolChoice,
+        .extractThinkingDeltaFn = Claude.extractThinkingDelta,
+        .serializeToolChoiceFn = Claude.serializeToolChoice,
+    };
+};
+
 pub fn claudeDialectFor(model: []const u8) Dialect {
-    _ = model;
+    if (model_adapter.hasSubstr(model, "glm-5") or
+        model_adapter.hasSubstr(model, "glm4") or
+        model_adapter.hasSubstr(model, "glm-4"))
+        return GlmAnthropic.dialect.withCtx(statelessCtx());
     return Claude.dialect.withCtx(statelessCtx());
 }
 
@@ -87,4 +122,39 @@ test "claudeDialectFor: effort=null 不发 thinking wire" {
     defer out.deinit(a);
     try d.serializeThinking(.{}, null, &out, a);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "Anthropic-compatible GLM adds strict Skill activation only when visible" {
+    const allocator = std.testing.allocator;
+    const glm = claudeDialectFor("glm-5.2");
+    var system: std.ArrayList(u8) = .empty;
+    defer system.deinit(allocator);
+    try system.appendSlice(allocator, "base\n\n# Available skills\n- verify: bounded review");
+    try glm.activateCapabilities(.{}, .{ .skill_tool = true }, &system, allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        system.items,
+        capability_activation.STRICT_SKILL_SECTION_MARKER,
+    ) != null);
+
+    const claude = claudeDialectFor("claude-sonnet-4");
+    var ordinary: std.ArrayList(u8) = .empty;
+    defer ordinary.deinit(allocator);
+    try ordinary.appendSlice(allocator, "base\n\n# Available skills\n- verify");
+    try claude.activateCapabilities(.{}, .{ .skill_tool = true }, &ordinary, allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        ordinary.items,
+        capability_activation.STRICT_SKILL_SECTION_MARKER,
+    ) == null);
+
+    const required = dialect_mod.VisibleCapabilities{ .skill_tool = true, .required_first = .{
+        .tool_name = "Skill",
+        .argument_name = "name",
+        .argument_value = "verify-change",
+    } };
+    const first = glm.routeToolChoice(.{}, required, false, null).?;
+    try std.testing.expectEqualStrings("tool", first.type);
+    try std.testing.expectEqualStrings("Skill", first.name.?);
+    try std.testing.expect(glm.routeToolChoice(.{}, required, true, null) == null);
 }

@@ -79,13 +79,13 @@ test "USING_TOOLS env overrides # Using your tools section in buildFull" {
     const slot_z = PREFIX ++ "USING_TOOLS";
     const sentinel = "MARKER_USING_TOOLS_OVERRIDE_ab_test";
 
-    // ① 不设:默认段含 "Do NOT use the Bash",不含 sentinel。
+    // ① 不设:默认段含稳定的运行期工具面声明,不含 sentinel。
     {
         _ = unsetenv(slot_z);
         const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "CodeMap" }, "", false, "/tmp");
         defer a.free(s);
         try std.testing.expect(std.mem.indexOf(u8, s, sentinel) == null);
-        try std.testing.expect(std.mem.indexOf(u8, s, "Do NOT use the Bash") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "Use only tools present in the current API tool list") != null);
     }
 
     // ② 设:段被替换成 sentinel(整段 # Using your tools 内容),且默认那句不再出现。
@@ -95,6 +95,6 @@ test "USING_TOOLS env overrides # Using your tools section in buildFull" {
         const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "CodeMap" }, "", false, "/tmp");
         defer a.free(s);
         try std.testing.expect(std.mem.indexOf(u8, s, sentinel) != null);
-        try std.testing.expect(std.mem.indexOf(u8, s, "Do NOT use the Bash") == null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "Use only tools present in the current API tool list") == null);
     }
 }

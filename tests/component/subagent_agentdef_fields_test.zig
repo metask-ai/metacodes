@@ -560,7 +560,7 @@ test "L2 AgentDef.mcp_servers: 请求 tools 与子 ToolContext sessions 使用�
     );
     defer search_allowed.deinit(a);
     switch (search_allowed) {
-        .ok => |body| try std.testing.expect(std.mem.indexOf(u8, body, "allowed__probe") != null),
+        .ok => |body| try std.testing.expect(std.mem.indexOf(u8, body.@"inline".bytes, "allowed__probe") != null),
         else => return error.UnexpectedDispatchOutcome,
     }
 }

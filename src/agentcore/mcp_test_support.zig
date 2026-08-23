@@ -12,6 +12,7 @@ pub const Server = struct {
         "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"additionalProperties\":false}",
     output_schema_json: []const u8 =
         "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"]}",
+    result_padding_bytes: usize = 0,
     opens: u32 = 0,
     closes: u32 = 0,
     calls: u32 = 0,
@@ -36,6 +37,7 @@ pub const Server = struct {
         return .{ .connection = .{
             .ctx = connection,
             .request_fn = request,
+            .tool_request = .{ .completed = request },
             .notify_fn = notify,
             .close_fn = close,
         } };
@@ -78,16 +80,19 @@ pub const Server = struct {
             }
         else if (std.mem.indexOf(u8, encoded, "tools/call") != null) blk: {
             self.calls += 1;
+            const padding = try allocator.alloc(u8, self.result_padding_bytes);
+            defer allocator.free(padding);
+            @memset(padding, 'm');
             break :blk switch (self.era) {
                 .modern_2026_07_28 => try std.fmt.allocPrint(
                     allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":{{\"ok\":true}}}}}}",
-                    .{id},
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":{{\"ok\":true,\"padding\":\"{s}\"}}}}}}",
+                    .{ id, padding },
                 ),
                 .classic_2025_11_25, .classic_2025_06_18 => try std.fmt.allocPrint(
                     allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"content\":[],\"structuredContent\":{{\"ok\":true}}}}}}",
-                    .{id},
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"content\":[],\"structuredContent\":{{\"ok\":true,\"padding\":\"{s}\"}}}}}}",
+                    .{ id, padding },
                 ),
             };
         } else return .server_error;

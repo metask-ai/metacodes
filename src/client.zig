@@ -14,6 +14,7 @@ const provider_mod = @import("api/provider.zig");
 const sync = @import("platform").sync;
 const rng = @import("platform").rng;
 const connection_gate = @import("api/connection_gate.zig");
+const dialect_mod = @import("api/dialect.zig");
 
 pub const VERSION = "0.1.0";
 
@@ -263,6 +264,9 @@ pub const Client = struct {
     /// 用户 CLI `--max-tokens N` 覆盖；null = 自动（catalog → fallback table → default）。
     max_tokens_override: ?u32 = null,
     reasoning_effort: ?types.ReasoningEffort = null,
+    /// Immutable Runtime-scoped model dialect lookup. Ordinary App/CLI clients
+    /// use the built-in resolver; AgentRuntime injects its Snapshot resolver.
+    dialect_resolver: dialect_mod.Resolver = .{},
     abort_registry: provider_mod.RequestAbortRegistry = .{},
     request_setup_failure_injector: ?*RequestSetupFailureInjector = null,
 
@@ -470,7 +474,7 @@ pub const Client = struct {
         model_override: ?[]const u8,
     ) !ApiResponse {
         const effective_model = model_override orelse client.modelSnapshot();
-        const req_body = try json_mod.serializeMessagesRequest(.{
+        const req_body = try json_mod.serializeMessagesRequestWithDialect(.{
             .model = effective_model,
             .max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override), // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
             .messages = messages,
@@ -478,7 +482,7 @@ pub const Client = struct {
             .stream = false,
             .tools = tools,
             .reasoning_effort = client.reasoning_effort,
-        }, client.allocator);
+        }, client.allocator, client.dialect_resolver.resolve(.anthropic, effective_model));
         defer client.allocator.free(req_body);
 
         const result = try client.doRequest(req_body, false, null, null);
@@ -541,7 +545,7 @@ pub const Client = struct {
         retry_hint: ?*RetryHint,
     ) !StreamResponse {
         const effective_model = model_override orelse client.modelSnapshot();
-        const req_body = try json_mod.serializeMessagesRequest(.{
+        const req_body = try json_mod.serializeMessagesRequestWithDialect(.{
             .model = effective_model,
             .max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override), // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
             .messages = messages,
@@ -550,7 +554,7 @@ pub const Client = struct {
             .tools = tools,
             .tool_choice = tool_choice,
             .reasoning_effort = client.reasoning_effort,
-        }, client.allocator);
+        }, client.allocator, client.dialect_resolver.resolve(.anthropic, effective_model));
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
 

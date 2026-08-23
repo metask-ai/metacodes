@@ -1,0 +1,200 @@
+{
+  "candidate": {
+    "inventory": {
+      "contract_version": 1,
+      "generation": 1,
+      "plugins": [
+        {
+          "capabilities": [
+            "skill_bundle"
+          ],
+          "contribution_count": 1,
+          "form": "data_package",
+          "id": "metacodes.benchmark-coding",
+          "layer": "session",
+          "lifecycle": "active",
+          "source_root": "/Users/david/prj/cc-t2z/metacodes/evals/plugin-v1/coding-plugin",
+          "version": "1.0.0"
+        }
+      ],
+      "schema": "metacodes.plugin-inventory/v1"
+    },
+    "plugin_id": "metacodes.benchmark-coding",
+    "plugin_version": "1.0.0"
+  },
+  "checks": [
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:new",
+        "-Dtfilter=plugin"
+      ],
+      "elapsed_ms": 33968,
+      "name": "plugin_component_l2",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "test:lib",
+        "-Dtfilter=plugin"
+      ],
+      "elapsed_ms": 1970,
+      "name": "plugin_library_isolation",
+      "output_sha256": "4159142228b9c9000160a0075d5b27abbcac70b5b5cd917bba6a1b04c3f781b1"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "example"
+      ],
+      "elapsed_ms": 6523,
+      "name": "independent_zig_host",
+      "output_sha256": "edcc28118480124c6bf225cb075e2f08d4f3a6f7b3b43e4665770744c7a94c53"
+    },
+    {
+      "argv": [
+        "/Users/david/prj/cc-t2z/metacodes/scripts/eval/fixtures/plugin_baseline.py",
+        "--dump-plugins"
+      ],
+      "elapsed_ms": 328,
+      "name": "baseline_empty_inventory",
+      "output_sha256": "6394b4f552d5b81243376998caaddad6a1d7bf8fed6a4946bfe43961149df326"
+    },
+    {
+      "argv": [
+        "/Users/david/prj/cc-t2z/metacodes/scripts/eval/fixtures/plugin_candidate.py",
+        "--dump-plugins"
+      ],
+      "elapsed_ms": 37,
+      "name": "candidate_namespaced_inventory",
+      "output_sha256": "8b5e3cb48d51d823e48d225a683a7fb5c32dc34e3b589020fbd22981f33d2a23"
+    },
+    {
+      "elapsed_ms": 365,
+      "name": "credential_free_cli_inventory",
+      "output_sha256": "143e5d7e1a38217f163189e609acac12ec90bce7b9c632ee39431290ffb410aa"
+    },
+    {
+      "name": "snapshot_microbenchmark",
+      "output_sha256": "fc571d63ac1a389e2558f50391289cfe6133ab3b0cdddbbb59af55241b57cabf",
+      "repetitions": 5
+    }
+  ],
+  "coding_pair": {
+    "authorized_cost_usd": 0.0,
+    "provider_requests": 0,
+    "quality_claim": "none",
+    "status": "blocked_pending_explicit_paid_authority"
+  },
+  "content_sha256": "9189f5e5573ab900592fc385f8bdc4d72ae57679a58cc86dcca0acbd0d222d2e",
+  "deepseek_harness_commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  "implementation_fingerprint": "a9c7d1748ae2092cf11ac33946090a9db6fb3539019497caeab0581d7c99e917",
+  "metacodes_git_head": "dfbcfb20b2f618dbd34801ce20ce6d80eb5d05a2",
+  "performance": {
+    "inventory_avg_ns_max": 2393,
+    "inventory_avg_ns_median": 2348,
+    "runs": [
+      {
+        "baseline_avg_ns": 22079,
+        "baseline_p95_ns": 23661,
+        "inventory_avg_ns": 2386,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 27249,
+        "static_plugin_p95_ns": 28798,
+        "static_plugin_p95_overhead_ns": 5137,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 19505,
+        "baseline_p95_ns": 19852,
+        "inventory_avg_ns": 2348,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 24416,
+        "static_plugin_p95_ns": 24822,
+        "static_plugin_p95_overhead_ns": 4970,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 19500,
+        "baseline_p95_ns": 19855,
+        "inventory_avg_ns": 2393,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 24428,
+        "static_plugin_p95_ns": 24888,
+        "static_plugin_p95_overhead_ns": 5033,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 19547,
+        "baseline_p95_ns": 20062,
+        "inventory_avg_ns": 2328,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 24476,
+        "static_plugin_p95_ns": 24987,
+        "static_plugin_p95_overhead_ns": 4925,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      },
+      {
+        "baseline_avg_ns": 19778,
+        "baseline_p95_ns": 21212,
+        "inventory_avg_ns": 2298,
+        "inventory_bytes": 264,
+        "operations_per_sample": 200,
+        "passed": true,
+        "quality_evidence": false,
+        "samples": 128,
+        "schema": "metacodes.plugin-benchmark/v1",
+        "static_plugin_avg_ns": 24856,
+        "static_plugin_p95_ns": 27012,
+        "static_plugin_p95_overhead_ns": 5800,
+        "thresholds": {
+          "max_inventory_avg_ns": 100000,
+          "max_static_plugin_p95_overhead_ns": 50000
+        }
+      }
+    ],
+    "static_plugin_p95_overhead_ns_max": 5800,
+    "static_plugin_p95_overhead_ns_median": 5033
+  },
+  "protocol_sha256": "21d7fd04599218bdabc4bbde3d3d51c93464c8e4fed24b8df437ea73e8fbaf64",
+  "provider_requests": 0,
+  "quality_evidence": false,
+  "release_status": "blocked_pending_paid_coding_pair",
+  "schema": "metacodes.plugin-zero-provider-receipt/v1"
+}

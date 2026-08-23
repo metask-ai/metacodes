@@ -195,12 +195,24 @@ emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工
 tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)/ 达 max_turns / abort /
 挂起(`suspended`,见 §5)。`tool_loop` 枚举值保留为 ABI 兼容(无生产者,对齐 codex 无主动熔断)。
 
-**大结果提交协议**:`executeSlots`、PostToolUse hook 和 backend 先观察原始结果；随后
-`result_projection` 只做一次确定性提交。结构化工具应优先返回合法的 bounded envelope
-（`rows/cursor/total/truncated`）；其余超限结果写入 session 下的内容寻址 artifact，模型只看到
-稳定的 SHA-256、head/tail 预览和 `ReadArtifact(offset,limit)` 恢复指令。最后的通用字节截断仅是
-失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新投影，
-避免无意义破坏 prompt-cache 前缀。
+**大结果提交协议**:工具统一返回 `ToolResultBody`。旧工具经 `legacy_inline` adapter 仍先产生
+完整 bytes；byte-zero 原生工具和 process plugin 则在产生第一字节前取得 kernel Spool，最终直接
+返回 artifact receipt。`executeSlots`、PostToolUse hook 和 backend 观察该类型的确定性模型投影：
+inline 路径保持原始结果，artifact 路径观察 bounded recovery envelope（全文从未进入内核内存）。
+随后 `result_projection` 只做一次确定性 Conversation 提交。结构化工具应优先返回合法的 bounded
+envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 Session 内容寻址 artifact，
+模型只看到稳定 SHA-256、head/tail 预览和 `ReadArtifact(offset,limit)` 指令。最后的通用字节截断
+仅是失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新
+投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
+
+静态 `ToolEntry.result_production` 把生产方式收成三种不可混淆的状态：`bounded_inline`、
+`input_derived`、`byte_zero_spool`；comptime 断言禁止 `byte_zero_spool` 工具接回
+`legacy_inline` executor。当前原生 byte-zero 清单是 `Glob`、`Grep`、`CodeMap`、
+`FindSymbol`、`Bash`、`ListMcpResourcesTool`、`ReadMcpResourceTool`、`WebFetch`。
+其中 Bash 在第一个 stdout/stderr 字节前重定向到 JobRegistry 文件；没有长生命周期
+JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次同步调用建立临时 registry，
+不会退回 pipe 全量捕获。MCP stdio、AgentCore MCP connector、process plugin 与公开 Host
+stream ABI 都复用同一 CAS/receipt/`ReadArtifact` 恢复面。
 
 真实 rollout 的非敏感证据用 `scripts/eval/tool_result_projection_eval.py <cassette>
 --headless-result <result.ndjson> --time-file <time.txt>` 导出；报告只含尺寸、hash、usage、

@@ -6,6 +6,244 @@ const toolchain = @import("../util/toolchain.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
+const ToolResultBody = @import("context.zig").ToolResultBody;
+const artifact_store = @import("../core/tool_result_artifact.zig");
+const result_spool = @import("result_spool.zig");
+
+const STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+
+/// Typed production path. The child stdout is captured on disk from byte zero;
+/// pagination and navigation prefixes are rendered into a second bounded
+/// capture, while an unmodified full result can become a CAS receipt directly.
+pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    if (ctx.artifact_root.len == 0)
+        return ToolResultBody.initInline(try execute(ctx, args));
+
+    const allocator = ctx.allocator;
+    const pattern = common.extractJsonArg(args, "pattern") orelse return error.MissingPattern;
+    const path_raw = common.extractJsonArg(args, "path") orelse ".";
+    if (pattern.len == 0) return error.EmptyPattern;
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{
+        .home = ctx.home_dir,
+        .base_dir = ctx.cwd_abs,
+        .resolve_relative = ctx.resolve_relative_paths,
+    });
+    defer allocator.free(path);
+    _ = read_state.statPath(path) catch {
+        common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
+        return error.PathNotFound;
+    };
+
+    const rg_path = try toolchain.ripgrepPath();
+    const output_mode = common.extractJsonArg(args, "output_mode") orelse "files_with_matches";
+    var base_argv = std.ArrayList([]const u8).empty;
+    defer base_argv.deinit(allocator);
+    try base_argv.append(allocator, rg_path);
+    try base_argv.append(allocator, "--no-messages");
+    if (std.mem.eql(u8, output_mode, "files_with_matches")) {
+        try base_argv.append(allocator, "-l");
+    } else if (std.mem.eql(u8, output_mode, "count")) {
+        try base_argv.append(allocator, "-c");
+    } else if (std.mem.eql(u8, output_mode, "content")) {
+        if (common.extractJsonArg(args, "-n") == null or isTrue(common.extractJsonArg(args, "-n")))
+            try base_argv.append(allocator, "-n");
+    } else return error.InvalidOutputMode;
+
+    if (std.mem.eql(u8, output_mode, "content")) {
+        if (common.extractJsonArg(args, "-B")) |value| {
+            try base_argv.append(allocator, "-B");
+            try base_argv.append(allocator, value);
+        }
+        if (common.extractJsonArg(args, "-A")) |value| {
+            try base_argv.append(allocator, "-A");
+            try base_argv.append(allocator, value);
+        }
+        if (common.extractJsonArg(args, "-C")) |value| {
+            try base_argv.append(allocator, "-C");
+            try base_argv.append(allocator, value);
+        } else if (common.extractJsonArg(args, "context")) |value| {
+            try base_argv.append(allocator, "-C");
+            try base_argv.append(allocator, value);
+        }
+    }
+    if (isTrue(common.extractJsonArg(args, "-i"))) try base_argv.append(allocator, "-i");
+    if (common.extractJsonArg(args, "type")) |value| {
+        try base_argv.append(allocator, "--type");
+        try base_argv.append(allocator, value);
+    }
+    if (common.extractJsonArg(args, "glob")) |value| {
+        try base_argv.append(allocator, "--glob");
+        try base_argv.append(allocator, value);
+    }
+    if (isTrue(common.extractJsonArg(args, "multiline"))) {
+        try base_argv.append(allocator, "-U");
+        try base_argv.append(allocator, "--multiline-dotall");
+    }
+
+    const head_limit = parseUsize(common.extractJsonArg(args, "head_limit")) orelse DEFAULT_HEAD_LIMIT;
+    const offset = parseUsize(common.extractJsonArg(args, "offset")) orelse 0;
+    const collapsed = collapseDoubleBackslashes(allocator, pattern);
+    defer if (collapsed) |value| allocator.free(value);
+    const Attempt = struct { pat: []const u8, literal: bool, note: ?[]const u8 };
+    var attempts: [3]Attempt = undefined;
+    var attempt_count: usize = 0;
+    attempts[attempt_count] = .{ .pat = pattern, .literal = false, .note = null };
+    attempt_count += 1;
+    if (collapsed) |value| {
+        attempts[attempt_count] = .{ .pat = value, .literal = false, .note = "[Grep: pattern auto-repaired — double-escaped backslashes collapsed]\n" };
+        attempt_count += 1;
+    }
+    attempts[attempt_count] = .{ .pat = pattern, .literal = true, .note = "[Grep: pattern was not a valid regex — matched as FIXED-STRING literal instead]\n" };
+    attempt_count += 1;
+
+    var spawned: common.SpoolSpawnOut = undefined;
+    var spawned_valid = false;
+    defer if (spawned_valid) spawned.deinit();
+    var used_note: ?[]const u8 = null;
+    var attempt_index: usize = 0;
+    while (attempt_index < attempt_count) : (attempt_index += 1) {
+        const attempt = attempts[attempt_index];
+        var items = std.array_list.Managed([]const u8).init(allocator);
+        defer items.deinit();
+        try items.appendSlice(base_argv.items);
+        if (attempt.literal) try items.append("-F");
+        try items.append(attempt.pat);
+        try items.append(path);
+        var argv_z = try allocator.alloc(?[*:0]const u8, items.items.len + 1);
+        defer {
+            for (argv_z[0..items.items.len]) |value| if (value) |ptr| allocator.free(std.mem.span(ptr));
+            allocator.free(argv_z);
+        }
+        for (items.items, 0..) |value, index|
+            argv_z[index] = (try allocator.dupeZ(u8, value)).ptr;
+        argv_z[items.items.len] = null;
+
+        spawned = try common.spawnCaptureToSpoolTimed(
+            argv_z,
+            allocator,
+            ctx.artifact_root,
+            ctx.abort,
+            0,
+            ctx.spawn_tick_fn,
+            artifact_store.MAX_ARTIFACT_BYTES,
+            STDERR_CAPTURE_BYTES,
+            null,
+        );
+        spawned_valid = true;
+        const parse_error = spawned.exit_code == 2 and
+            try captureContains(allocator, &spawned.stderr, "regex parse error");
+        if (parse_error and attempt_index + 1 < attempt_count) {
+            spawned.deinit();
+            spawned_valid = false;
+            continue;
+        }
+        used_note = attempt.note;
+        break;
+    }
+
+    const startup_failure = spawned.exit_code < 0 or spawned.exit_code > 2 or
+        (spawned.exit_code == 2 and spawned.stderr.bytes > 0);
+    if (spawned.stdout.bytes == 0 and startup_failure) {
+        const detail = try spawned.stderr.readRangeAlloc(
+            allocator,
+            0,
+            @intCast(@min(spawned.stderr.bytes, 300)),
+        );
+        defer allocator.free(detail);
+        common.setErrorDetail(ctx.error_detail, allocator, "ripgrep failed (exit {d}): {s}", .{ spawned.exit_code, detail });
+        return error.GrepExecFailed;
+    }
+
+    const prefix = definitionsPrefix(allocator, pattern, path, ctx);
+    defer if (prefix) |value| allocator.free(value);
+    const needs_projection = used_note != null or prefix != null or head_limit != 0 or offset != 0;
+    if (!needs_projection) {
+        return result_spool.finishCaptureAsBody(
+            allocator,
+            ctx.artifact_root,
+            &spawned.stdout,
+            .text_utf8,
+            spawned.capture_complete,
+        );
+    }
+
+    var projected = try artifact_store.Capture.begin(
+        allocator,
+        ctx.artifact_root,
+        artifact_store.MAX_ARTIFACT_BYTES,
+    );
+    defer projected.deinit();
+    if (used_note) |value| try projected.write(value);
+    if (prefix) |value| try projected.write(value);
+    if (head_limit == 0 and offset == 0) {
+        try result_spool.copyAll(&spawned.stdout, &projected);
+    } else {
+        try paginateCapture(&spawned.stdout, &projected, offset, head_limit);
+    }
+    try projected.seal();
+    return result_spool.finishCaptureAsBody(
+        allocator,
+        ctx.artifact_root,
+        &projected,
+        .text_utf8,
+        spawned.capture_complete,
+    );
+}
+
+fn captureContains(
+    allocator: std.mem.Allocator,
+    capture: *artifact_store.Capture,
+    needle: []const u8,
+) !bool {
+    const bytes = try capture.readRangeAlloc(allocator, 0, @intCast(capture.bytes));
+    defer allocator.free(bytes);
+    return std.mem.indexOf(u8, bytes, needle) != null;
+}
+
+fn paginateCapture(
+    source: *artifact_store.Capture,
+    destination: *artifact_store.Capture,
+    offset: usize,
+    head_limit: usize,
+) !void {
+    try source.rewind();
+    var buffer: [64 * 1024]u8 = undefined;
+    var line_index: usize = 0;
+    var line_has_bytes = false;
+    while (true) {
+        const read_count = try source.read(&buffer);
+        if (read_count == 0) break;
+        var cursor: usize = 0;
+        while (cursor < read_count) {
+            const newline = std.mem.indexOfScalarPos(u8, buffer[0..read_count], cursor, '\n');
+            const end = newline orelse read_count;
+            const selected = line_index >= offset and
+                (head_limit == 0 or line_index - offset < head_limit);
+            if (selected and end > cursor) try destination.write(buffer[cursor..end]);
+            line_has_bytes = line_has_bytes or end > cursor;
+            if (newline != null) {
+                if (selected) try destination.write("\n");
+                line_index += 1;
+                line_has_bytes = false;
+                cursor = end + 1;
+            } else cursor = end;
+        }
+    }
+    if (line_has_bytes) line_index += 1;
+    const start = @min(offset, line_index);
+    const remaining = line_index - start;
+    const take = if (head_limit == 0) remaining else @min(head_limit, remaining);
+    const end = start + take;
+    if (end < line_index or start > 0) {
+        var marker: [160]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(
+            &marker,
+            "\n[appliedLimit: showing lines {d}-{d} of {d}; pass offset={d} for the next page]\n",
+            .{ start + 1, end, line_index, end },
+        );
+        try destination.write(bytes);
+    }
+}
 
 /// 默认 head_limit(对齐 Claude Code GrepTool):content 模式不传 head_limit 时只返前 250 行,
 /// 防止宽匹配把整个文件灌进上下文。显式传 head_limit=0 = 无限。
@@ -300,7 +538,6 @@ fn isTrue(s: ?[]const u8) bool {
 fn testCtx() ToolContext {
     return ToolContext.simple(std.testing.allocator);
 }
-
 
 /// v39 G1:把双反斜杠折叠一级(`\\\\` 到 `\\`)。模式不含双反斜杠 → null(无可修)。
 fn collapseDoubleBackslashes(allocator: std.mem.Allocator, pat: []const u8) ?[]u8 {

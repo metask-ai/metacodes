@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-plugin-coding-pilot-v1",
+  "description": "Frozen three-task coding pilot for a no-plugin versus one data-package Skill comparison. This is a development pair, not a release leaderboard.",
+  "tasks": [
+    {
+      "id": "00_smoke",
+      "scenario": "tests/e2e/scenarios/00_smoke.txt",
+      "layers": ["E", "T", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {
+        "profile": "metacodes-runtime-coding-ceiling-v1",
+        "required": ["Write"],
+        "allowed": ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
+      },
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "hello-test/hello.txt", "description": "创建目标文件"},
+          {"type": "contains", "path": "hello-test/hello.txt", "text": "hello from cc-zig e2e", "description": "写入目标内容"}
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "max_model_tool_errors": 3,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "max_turns": "单文件创建应快速收口。",
+        "max_tool_calls": "限制重复无增益调用。",
+        "max_model_tool_errors": "允许少量参数自纠。",
+        "max_harness_tool_errors": "不接受 harness 自身执行失败。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "plugin-coding-pilot-v1"}
+    },
+    {
+      "id": "02_html_game",
+      "scenario": "tests/e2e/scenarios/02_html_game.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {
+        "profile": "metacodes-runtime-coding-ceiling-v1",
+        "required": ["Read", "Write", "Edit"],
+        "allowed": ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
+      },
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "snake-game/index.html", "description": "生成单文件游戏"},
+          {"type": "file_exists", "path": "snake-game/DESIGN.md", "description": "生成设计说明"},
+          {"type": "contains", "path": "snake-game/index.html", "text": "<canvas", "description": "使用 canvas 渲染"},
+          {"type": "min_lines", "path": "snake-game/index.html", "minimum": 50, "description": "产物非占位文件"}
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 18,
+        "max_tool_calls": 24,
+        "max_model_tool_errors": 6,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "max_turns": "允许设计、实现与复核但保持有界。",
+        "max_tool_calls": "允许多次读写校验。",
+        "max_model_tool_errors": "复杂任务容许有限参数自纠。",
+        "max_harness_tool_errors": "不接受 harness 自身执行失败。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "plugin-coding-pilot-v1"}
+    },
+    {
+      "id": "04_modify_feature",
+      "scenario": "tests/e2e/scenarios/04_modify_feature.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {
+        "profile": "metacodes-runtime-coding-ceiling-v1",
+        "required": ["Write", "Edit"],
+        "allowed": ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
+      },
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "snake-game/index.html", "description": "保留可运行游戏"},
+          {"type": "file_exists", "path": "snake-game/DESIGN.md", "description": "跨轮次补建设计文档"},
+          {"type": "contains_any", "path": "snake-game/index.html", "texts": ["加速", "boost", "speed"], "description": "实现文件包含加速机制语义"},
+          {"type": "contains_any", "path": "snake-game/DESIGN.md", "texts": ["加速", "boost", "acceleration", "speed"], "description": "设计文档记录加速特性"},
+          {"type": "contains_any", "path": "snake-game/DESIGN.md", "texts": ["触发", "trigger", "spawn", "appear", "出现"], "description": "设计文档记录触发条件"},
+          {"type": "contains_any", "path": "snake-game/DESIGN.md", "texts": ["持续", "duration", "second", "秒", "BOOST_MS"], "description": "设计文档记录持续时间"},
+          {"type": "contains_any", "path": "snake-game/DESIGN.md", "texts": ["得分", "score", "points", "reward", "奖励"], "description": "设计文档记录得分规则"}
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 24,
+        "max_tool_calls": 30,
+        "max_model_tool_errors": 8,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "max_turns": "跨轮修改允许实现与总结但保持有界。",
+        "max_tool_calls": "允许重写或增量编辑两种策略。",
+        "max_model_tool_errors": "多轮任务容许有限参数自纠。",
+        "max_harness_tool_errors": "不接受 harness 自身执行失败。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "plugin-coding-pilot-v1"}
+    }
+  ]
+}

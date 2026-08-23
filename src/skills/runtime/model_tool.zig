@@ -46,6 +46,46 @@ pub fn hasModelInvocableWithAvailability(
     return false;
 }
 
+/// Resolve an exact required-first Skill only when the visible catalog is
+/// unambiguous. Enumeration order never selects a winner: two required Skills
+/// deliberately collapse to advisory model behavior.
+pub fn requiredFirstInvocationWithAvailability(
+    snapshot: *const catalog.Snapshot,
+    available: availability.View,
+) ?[]const u8 {
+    var selected: ?[]const u8 = null;
+    for (snapshot.skills, 0..) |skill, index| {
+        if (!available.isEnabledAt(snapshot, index) or
+            skill.definition.disable_model_invocation or
+            skill.definition.model_activation != .required_first)
+            continue;
+        if (selected != null) return null;
+        selected = skill.invocation_name;
+    }
+    return selected;
+}
+
+pub fn requiredFirstInvocation(snapshot: *const catalog.Snapshot) ?[]const u8 {
+    return requiredFirstInvocationWithAvailability(snapshot, .all);
+}
+
+pub fn modelActivationWithAvailability(
+    snapshot: *const catalog.Snapshot,
+    available: availability.View,
+) ?json.ModelToolActivation {
+    const invocation = requiredFirstInvocationWithAvailability(snapshot, available) orelse
+        return null;
+    return .{
+        .mode = .required_first,
+        .argument_name = "name",
+        .argument_value = invocation,
+    };
+}
+
+pub fn modelActivation(snapshot: *const catalog.Snapshot) ?json.ModelToolActivation {
+    return modelActivationWithAvailability(snapshot, .all);
+}
+
 pub fn parseInvocation(
     arena: std.mem.Allocator,
     encoded: []const u8,
@@ -102,9 +142,14 @@ pub fn buildDescriptionWithAvailability(
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try output.writer.writeAll(
-        "Activate one Skill from the bound immutable catalog. " ++
-            "Use the exact canonical name; values are positional. Skill is a " ++
-            "serialization boundary, so later calls use its narrowed policy. Available:\n",
+        "Execute one Skill from the bound immutable catalog. When a listed " ++
+            "description clearly matches the current user request, calling Skill " ++
+            "before any other tool or task response is a blocking requirement. " ++
+            "Never merely imitate, mention, or summarize a matching Skill: call " ++
+            "this tool with its exact canonical name and then follow the returned " ++
+            "instructions. Do not guess a name or invoke a marginal match. Values " ++
+            "are positional. Skill is a serialization boundary, so later calls use " ++
+            "its narrowed policy. Available:\n",
     );
     for (snapshot.skills, 0..) |skill, index| {
         if (!available.isEnabledAt(snapshot, index) or
@@ -189,6 +234,7 @@ test "model Skill surface omits disabled records while catalog stays intact" {
                 .disallowed_tools = &.{},
                 .arguments = &.{},
                 .disable_model_invocation = false,
+                .model_activation = .required_first,
                 .context = .inline_ctx,
                 .agent = "",
                 .model = "",
@@ -209,6 +255,7 @@ test "model Skill surface omits disabled records while catalog stays intact" {
                 .disallowed_tools = &.{},
                 .arguments = &.{},
                 .disable_model_invocation = false,
+                .model_activation = .required_first,
                 .context = .inline_ctx,
                 .agent = "",
                 .model = "",
@@ -252,5 +299,16 @@ test "model Skill surface omits disabled records while catalog stays intact" {
     defer std.testing.allocator.free(description);
     try std.testing.expect(std.mem.indexOf(u8, description, "enabled: visible") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "disabled") == null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "blocking requirement") != null);
+    try std.testing.expectEqualStrings(
+        "enabled",
+        requiredFirstInvocationWithAvailability(&snapshot, view).?,
+    );
+    const route = modelActivationWithAvailability(&snapshot, view).?;
+    try std.testing.expectEqualStrings("name", route.argument_name.?);
+    try std.testing.expectEqualStrings("enabled", route.argument_value.?);
+    // With both records visible, enumeration order must never pick a winner.
+    try std.testing.expect(requiredFirstInvocation(&snapshot) == null);
+    try std.testing.expect(modelActivation(&snapshot) == null);
     try std.testing.expectEqual(@as(usize, 2), snapshot.skills.len);
 }

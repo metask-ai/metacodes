@@ -11,6 +11,7 @@ const pfs = @import("platform").fs;
 const types = @import("../types.zig");
 const client_mod = @import("../client.zig");
 const provider_mod = @import("../api/provider.zig");
+const dialect_mod = @import("../api/dialect.zig");
 const request_gate_mod = @import("request_gate.zig");
 const json_mod = @import("../json.zig");
 const tools_mod = @import("../tools.zig");
@@ -138,12 +139,12 @@ const EventTramp = struct {
 pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 32_000;
 pub const COMPACT_MIN_SAVED_PERCENT: usize = 5;
 
-/// Evaluation runs disable transparent provider retries. This keeps the
-/// request gate, native model-request event, cassette request, and external
-/// side effect in a one-to-one relation. A failed physical attempt invalidates
-/// the rollout instead of silently spending outside the measured boundary.
+/// Evaluation runs allow two bounded retries during connection setup/header
+/// receipt, before any response stream is consumed. They remain one semantic
+/// request under the same native budget and emit explicit retry telemetry;
+/// after three physical attempts the rollout still fails closed.
 pub fn providerAttemptLimit(evaluation_gated: bool) u32 {
-    return if (evaluation_gated) 1 else client_mod.defaultMaxRetries();
+    return if (evaluation_gated) 3 else client_mod.defaultMaxRetries();
 }
 
 /// 强制 auto-compact 阈值(测试/power-user 旋钮)。设 `METACODES_FORCE_COMPACT_AT=<tokens>` 后,
@@ -431,6 +432,56 @@ const EffectiveToolSet = struct {
     }
 };
 
+/// Provider tool_choice is advisory at compatibility gateways. Keep the
+/// required-first contract provider-neutral by checking the full native
+/// Conversation as well: only the exact call plus a successful paired result
+/// releases the gate. This also survives request serialization differences.
+fn conversationHasSuccessfulRequiredFirst(
+    conversation: *const Conversation,
+    route: dialect_mod.VisibleCapabilities.RequiredFirst,
+) bool {
+    for (conversation.messages.items, 0..) |message, message_index| {
+        for (message.blocks) |block| {
+            const tool_use = switch (block) {
+                .tool_use => |value| value,
+                else => continue,
+            };
+            if (!dialect_mod.matchesRequiredFirst(route, tool_use.name, tool_use.input))
+                continue;
+            for (conversation.messages.items[message_index + 1 ..]) |later| {
+                for (later.blocks) |later_block| switch (later_block) {
+                    .tool_result => |result| {
+                        if (std.mem.eql(u8, result.tool_use_id, tool_use.id) and
+                            !result.is_error) return true;
+                    },
+                    else => {},
+                };
+            }
+        }
+    }
+    return false;
+}
+
+const MAX_REQUIRED_FIRST_REPAIRS: u8 = 2;
+
+fn requiredFirstRepairText(
+    allocator: std.mem.Allocator,
+    route: dialect_mod.VisibleCapabilities.RequiredFirst,
+) ![]u8 {
+    if (route.argument_name) |argument_name| {
+        if (route.argument_value) |argument_value| return std.fmt.allocPrint(
+            allocator,
+            "Required-first activation is still pending. Before any answer or other tool, call `{s}` exactly with {{\"{s}\":\"{s}\"}}. Do not repeat the previous answer.",
+            .{ route.tool_name, argument_name, argument_value },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "Required-first activation is still pending. Before any answer or other tool, call `{s}`. Do not repeat the previous answer.",
+        .{route.tool_name},
+    );
+}
+
 fn buildEffectiveToolSet(
     allocator: std.mem.Allocator,
     tool_defs: []const json_mod.ToolDefinition,
@@ -598,6 +649,7 @@ pub fn run(
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
     var verification_nudges: u8 = 0;
+    var required_first_repairs: u8 = 0;
     const MAX_VERIFICATION_NUDGES: u8 = 2;
     var stream_turn_retries: u8 = 0;
     var requirement_ledger_state = requirement_ledger_mod.State{};
@@ -713,6 +765,36 @@ pub fn run(
         // 对齐 codex:无 breaker_finalization gate,gated_tool_defs 即 effective_tools.defs。
         // 保留别名减少下游改动,为将来可选 gate 预留。
         const gated_tool_defs: []const json_mod.ToolDefinition = effective_tools.defs;
+        const visible_capabilities = dialect_mod.visibleCapabilities(
+            @as(?[]const json_mod.ToolDefinition, gated_tool_defs),
+        );
+        const required_first_route = visible_capabilities.required_first;
+        const required_first_pending = if (required_first_route) |route|
+            !conversationHasSuccessfulRequiredFirst(conversation, route)
+        else
+            false;
+        // The full native Conversation deliberately outlives its compacted
+        // provider window. Preserve that Host fact in a turn-local shallow
+        // copy so serializers do not re-force activation after the paired
+        // call/result has moved behind the compact boundary. `satisfied` is
+        // host-only metadata: serialized tool schemas and capability prompt
+        // bytes remain identical, which keeps the provider cache prefix stable.
+        var provider_tool_defs_owned: ?[]json_mod.ToolDefinition = null;
+        defer if (provider_tool_defs_owned) |defs| allocator.free(defs);
+        const provider_tool_defs: []const json_mod.ToolDefinition = blk: {
+            const route = required_first_route orelse break :blk gated_tool_defs;
+            if (required_first_pending) break :blk gated_tool_defs;
+            const copied = try allocator.dupe(json_mod.ToolDefinition, gated_tool_defs);
+            provider_tool_defs_owned = copied;
+            for (copied) |*definition| {
+                if (!std.mem.eql(u8, definition.name, route.tool_name)) continue;
+                var activation = definition.model_activation orelse continue;
+                if (activation.mode != .required_first) continue;
+                activation.satisfied = true;
+                definition.model_activation = activation;
+            }
+            break :blk copied;
+        };
         // Deferred catalog sees policy + active-skill filtering, but intentionally
         // precedes activation filtering: unactivated deferred tools are exactly
         // the tools the catalog exists to advertise.
@@ -742,17 +824,34 @@ pub fn run(
             sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base, plan_seg, swarm_seg }) catch null;
             break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
         };
-        var projected_system_prompt_owned: ?[]u8 = null;
-        defer if (projected_system_prompt_owned) |p| allocator.free(p);
+        var projected_guidance_owned: ?[]u8 = null;
+        defer if (projected_guidance_owned) |p| allocator.free(p);
+        var projected_deferred_owned: ?[]u8 = null;
+        defer if (projected_deferred_owned) |p| allocator.free(p);
+        var projected_capabilities_owned: ?[]u8 = null;
+        defer if (projected_capabilities_owned) |p| allocator.free(p);
         const effective_system_prompt: ?[]const u8 = blk: {
             const base = augmented_system_prompt orelse break :blk null;
-            projected_system_prompt_owned = try @import("system_prompt.zig").projectDeferredToolsForExecution(
+            const system_prompt_mod = @import("system_prompt.zig");
+            projected_guidance_owned = try system_prompt_mod.projectUsingToolsForExecution(
                 allocator,
                 base,
+                gated_tool_defs,
+            );
+            const guidance_projected = if (projected_guidance_owned) |p| p else base;
+            projected_deferred_owned = try system_prompt_mod.projectDeferredToolsForExecution(
+                allocator,
+                guidance_projected,
                 deferred_catalog_defs,
                 gated_tool_defs,
             );
-            break :blk if (projected_system_prompt_owned) |p| p else base;
+            const deferred_projected = if (projected_deferred_owned) |p| p else guidance_projected;
+            projected_capabilities_owned = try system_prompt_mod.projectCapabilitySectionsForExecution(
+                allocator,
+                deferred_projected,
+                gated_tool_defs,
+            );
+            break :blk if (projected_capabilities_owned) |p| p else deferred_projected;
         };
 
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
@@ -771,7 +870,7 @@ pub fn run(
                     effective_system_prompt,
                     opts.inject_user_context,
                     synthetic_user_input,
-                    gated_tool_defs,
+                    provider_tool_defs,
                     opts.model_override,
                     msc.previous_model,
                     opts.auto_compact_threshold,
@@ -805,7 +904,7 @@ pub fn run(
                 effective_system_prompt,
                 opts.inject_user_context,
                 synthetic_user_input,
-                gated_tool_defs,
+                provider_tool_defs,
                 opts.model_override,
                 null,
                 opts.auto_compact_threshold,
@@ -937,24 +1036,35 @@ pub fn run(
         };
 
         request_recovery: while (true) {
-            if (opts.request_gate) |gate| {
-                if (!gate.allows())
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
-            }
             const model_request_started_ns = util_time.nowNs();
             var stream: api_stream.StreamHandle = undefined;
             var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
             defer freeApiMessages(&api_messages, allocator);
+            if (opts.request_gate) |gate| {
+                const max_input_tokens = serializedRequestInputTokenReserve(
+                    allocator,
+                    provider,
+                    api_messages.items,
+                    effective_system_prompt,
+                    provider_tool_defs,
+                    opts.model_override,
+                ) catch std.math.maxInt(u64);
+                if (!gate.allowsRequest(.{
+                    .max_input_tokens = max_input_tokens,
+                    .max_output_tokens = provider.maxTokens(),
+                }))
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+            }
 
             // 击穿检测必须跟真实 provider 前缀走：plan/swarm 会改变 effective
             // system prompt，同名工具也可能改变 description/input_schema。只看基础
             // system 或工具名会把真实前缀漂移误报成 TTL/server-side miss。
             {
                 var th = std.hash.Wyhash.init(0);
-                for (gated_tool_defs) |d| th.update(d.name);
+                for (provider_tool_defs) |d| th.update(d.name);
                 var tbuf: [16]u8 = undefined;
                 std.mem.writeInt(u64, tbuf[0..8], th.final(), .little);
-                const tool_schema = serializeToolSchemasForCache(allocator, gated_tool_defs) catch null;
+                const tool_schema = serializeToolSchemasForCache(allocator, provider_tool_defs) catch null;
                 defer if (tool_schema) |bytes| allocator.free(bytes);
                 const model_for_req = opts.model_override orelse provider.model();
                 cache_detector.recordRequest(
@@ -967,7 +1077,7 @@ pub fn run(
             stream = provider.sendStreamRetry(
                 api_messages.items,
                 effective_system_prompt,
-                gated_tool_defs,
+                provider_tool_defs,
                 opts.abort,
                 opts.model_override,
                 null,
@@ -992,7 +1102,7 @@ pub fn run(
                             effective_system_prompt,
                             opts.inject_user_context,
                             synthetic_user_input,
-                            gated_tool_defs,
+                            provider_tool_defs,
                             opts.model_override,
                             backend,
                             sess,
@@ -1092,7 +1202,12 @@ pub fn run(
                         // 流末 executeSlots 直接用结果。广播自 P0.4 只读白名单(Read/Grep/Glob)到全 safe 集
                         // (加只读 Bash `git status`/`ls`、BashOutput、WebFetch)。borrow 刚 append 的稳定堆切片。
                         const not_aborted = if (opts.abort) |ab| !ab.isAborted() else true;
-                        if (prefetch_enabled and not_aborted and sp.isStreamable(tu.name) and
+                        const activation_allows_prefetch = !required_first_pending or
+                            if (required_first_route) |route|
+                                dialect_mod.matchesRequiredFirst(route, tu.name, tu.input_json)
+                            else
+                                true;
+                        if (prefetch_enabled and not_aborted and activation_allows_prefetch and sp.isStreamable(tu.name) and
                             prefetch_ctx.isPrefetchSafe(tu.name) and
                             tools_mod.isConcurrencySafeInput(tu.name, tu.input_json) and
                             permission_mod.checkPermission(&pc_prefetch, tu.name, tu.input_json) == .allow)
@@ -1227,7 +1342,7 @@ pub fn run(
                         effective_system_prompt,
                         opts.inject_user_context,
                         synthetic_user_input,
-                        gated_tool_defs,
+                        provider_tool_defs,
                         opts.model_override,
                         backend,
                         sess,
@@ -1294,6 +1409,33 @@ pub fn run(
             break;
         };
         if (!has_tool_use) {
+            // Some Anthropic-compatible gateways accept but ignore a forced
+            // tool_choice. `required_first` is stronger than a prompt hint:
+            // one bounded, provider-neutral repair keeps the model from
+            // ending the Run before the exact activation boundary. Repeated
+            // non-compliance fails closed instead of silently bypassing the
+            // plugin contract.
+            if (required_first_pending) {
+                if (required_first_repairs >= MAX_REQUIRED_FIRST_REPAIRS or
+                    !host_injection_meter.tryConsume())
+                {
+                    backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+                }
+                required_first_repairs += 1;
+                const route = required_first_route.?;
+                const repair = try requiredFirstRepairText(allocator, route);
+                defer allocator.free(repair);
+                log.warnId(
+                    "agent",
+                    rid,
+                    "required-first route ignored; repair {d}/{d} tool={s}",
+                    .{ required_first_repairs, MAX_REQUIRED_FIRST_REPAIRS, route.tool_name },
+                );
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                try conversation.appendText(.user, repair);
+                continue;
+            }
             // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
             // 注入 continue 提示让它接着写,而不是当作完成。最多 MAX_CONTINUATIONS 次。
             if (turn_stop_reason == .max_tokens and continuations < MAX_CONTINUATIONS) {
@@ -1468,12 +1610,58 @@ pub fn run(
             for (mod_inputs.items) |mi| allocator.free(mi);
             mod_inputs.deinit(allocator);
         }
+        var required_first_accepted = false;
         for (last_msg.blocks) |b| {
             const tu = switch (b) {
                 .tool_use => |t| t,
                 else => continue,
             };
             total_tool_calls += 1;
+            if (required_first_pending) {
+                const route = required_first_route.?;
+                const exact_required_call = dialect_mod.matchesRequiredFirst(
+                    route,
+                    tu.name,
+                    tu.input,
+                );
+                if (!exact_required_call or required_first_accepted) {
+                    log.warnId(
+                        "permission",
+                        rid,
+                        "required-first DENY tool={s}; pending={s}",
+                        .{ tu.name, route.tool_name },
+                    );
+                    backend.emitEvent(sess, .{ .policy_decision = .{
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .id = tu.id,
+                        .tool = tu.name,
+                        .decision = "deny",
+                        .source = "model_activation_required_first",
+                        .allowed = false,
+                    } });
+                    var denied = tool_exec.Slot{
+                        .decision = .denied,
+                        .name = tu.name,
+                        .id = tu.id,
+                        .input = tu.input,
+                    };
+                    denied.content = try tool_error.errorToJson(
+                        "RequiredFirstPending",
+                        "tool '{s}' cannot run before the exact required-first '{s}' activation succeeds",
+                        .{ tu.name, route.tool_name },
+                        allocator,
+                    );
+                    denied.is_error = true;
+                    try slots.append(allocator, denied);
+                    continue;
+                }
+                // Calls in one assistant message are parallel, not ordered.
+                // Admit exactly one activation and deny every sibling above;
+                // ordinary tools become eligible only on the next model turn
+                // after the paired successful result is in Conversation.
+                required_first_accepted = true;
+            }
             // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
             var eff_input = tu.input;
             if (hookset) |hs| if (hs.hasPre()) {
@@ -1501,7 +1689,13 @@ pub fn run(
                     continue;
                 }
             };
-            const perm_result = permission_mod.checkPermission(&pc_nohooks, tu.name, eff_input);
+            const classified = if (opts.tool_dispatcher) |dispatcher|
+                dispatcher.category(tu.name)
+            else if (opts.dyn_registry) |registry|
+                registry.category(tu.name)
+            else
+                null;
+            const perm_result = permission_mod.checkPermissionClassified(&pc_nohooks, tu.name, eff_input, classified);
             log.infoId("permission", rid, "tool={s} decision={s}", .{ tu.name, @tagName(perm_result) });
             var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = eff_input };
             var policy_allowed = perm_result == .allow;
@@ -2179,6 +2373,11 @@ fn buildApiMessages(
         for (m.blocks) |b| {
             if (@as(std.meta.Tag(msg.Block), b) != .thinking) n_actual += 1;
         }
+        // max_tokens 可能恰好截断在 thinking 末尾：Conversation 会保留该
+        // thinking block 供本地审计，但 provider-visible 投影不能生成
+        // `content: []` 的空 assistant 消息。跳过后，紧随的 continuation user
+        // 会由 normalizeApiMessages 与前一条 user 合并，维持合法角色/content。
+        if (n_actual == 0) continue;
         const contents = try allocator.alloc(types.ApiContent, n_actual);
         var idx: usize = 0;
         for (m.blocks) |b| {
@@ -2278,6 +2477,34 @@ fn estimateApiRequestTokens(
     }, allocator);
     defer allocator.free(req_body);
     return Conversation.estimateTokens(req_body);
+}
+
+/// Conservative request-local input reserve used by the paid evaluation gate.
+/// Freeze both independent estimates: twice the calibrated local tokenizer
+/// estimate, or one token per two serialized UTF-8 bytes, whichever is larger.
+/// The fixed margin covers provider-side chat framing absent from the JSON.
+fn serializedRequestInputTokenReserve(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    messages: []const types.ApiMessage,
+    system_prompt: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) !u64 {
+    const req_body = try json_mod.serializeMessagesRequest(.{
+        .model = model_override orelse provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = messages,
+        .system = system_prompt,
+        .stream = true,
+        .tools = tool_defs,
+        .reasoning_effort = provider.reasoningEffort(),
+    }, allocator);
+    defer allocator.free(req_body);
+    const estimated = @as(u64, @intCast(Conversation.estimateTokens(req_body)));
+    const doubled_estimate = estimated *| 2;
+    const byte_reserve = (@as(u64, @intCast(req_body.len)) +| 1) / 2;
+    return @max(doubled_estimate, byte_reserve) +| 4096;
 }
 
 fn estimateNextRequestTokensOrFallback(
@@ -2795,6 +3022,26 @@ test "buildApiMessages maps blocks" {
     try std.testing.expectEqualStrings("hi", api.items[0].content[0].text);
 }
 
+test "buildApiMessages omits thinking-only assistant before continuation" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    try c.appendText(.user, "fix the bug");
+    const thinking_blocks = try a.alloc(msg.Block, 1);
+    thinking_blocks[0] = .{ .thinking = try a.dupe(u8, "private truncated reasoning") };
+    try c.append(.{ .role = .assistant, .blocks = thinking_blocks });
+    try c.appendText(.user, "Continue exactly where you left off.");
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+
+    try std.testing.expectEqual(@as(usize, 1), api.items.len);
+    try std.testing.expectEqual(types.MessageRole.user, api.items[0].role);
+    try std.testing.expect(api.items[0].content.len > 0);
+    for (api.items) |message| try std.testing.expect(message.content.len > 0);
+}
+
 test "buildApiMessages maps tool_use and tool_result" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
@@ -3014,6 +3261,20 @@ test "estimateNextRequestTokens serializes the actual next Anthropic request" {
     }, a);
     defer a.free(body);
     try std.testing.expectEqual(Conversation.estimateTokens(body), estimated);
+    try std.testing.expectEqual(
+        @max(
+            @as(u64, @intCast(Conversation.estimateTokens(body))) * 2,
+            (@as(u64, @intCast(body.len)) + 1) / 2,
+        ) + 4096,
+        try serializedRequestInputTokenReserve(
+            a,
+            provider,
+            api.items,
+            "system prompt text",
+            &tool_defs,
+            "override-model",
+        ),
+    );
     try std.testing.expect(std.mem.indexOf(u8, body, "synthetic steering text") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "override-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"output_config\":{\"effort\":\"medium\"}") != null);

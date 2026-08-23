@@ -6,6 +6,7 @@
 //! issued exactly once: an indeterminate transport outcome is never replayed.
 
 const std = @import("std");
+const core = @import("metacodes-core");
 const sync = @import("platform").sync;
 const canonical = @import("mcp_canonical.zig");
 const modern = @import("mcp_modern.zig");
@@ -13,6 +14,7 @@ const classic = @import("mcp_classic.zig");
 const negotiation = @import("mcp_negotiation.zig");
 const wire = @import("mcp_wire.zig");
 const schema = @import("mcp_schema.zig");
+const result_stream = core.mcp_result_stream;
 
 pub const ConnectionPurpose = enum(u8) { disposable_probe, actual };
 
@@ -42,6 +44,55 @@ pub const ExchangeOutcome = union(enum) {
     indeterminate,
 };
 
+pub const ToolResponseSinkError = error{
+    Cancelled,
+    ResourceLimit,
+    IoFailure,
+    Closed,
+};
+
+/// Borrowed response-frame sink. The kernel creates the private capture before
+/// invoking a streaming connector, so the first Host-produced byte is already
+/// subject to Session quota, cancellation and rollback.
+pub const ToolResponseSink = struct {
+    ctx: *anyopaque,
+    write_fn: *const fn (*anyopaque, []const u8) ToolResponseSinkError!void,
+
+    pub fn write(self: ToolResponseSink, chunk: []const u8) ToolResponseSinkError!void {
+        return self.write_fn(self.ctx, chunk);
+    }
+};
+
+pub const ToolStreamExchangeOutcome = enum {
+    response,
+    timeout,
+    network_error,
+    auth_error,
+    server_error,
+    child_exit,
+    cancelled,
+    indeterminate,
+};
+
+pub const ToolRequestExecutor = union(enum) {
+    /// Source-only compatibility/testing adapter. Production public AgentCore
+    /// connectors are admitted only through the streaming branch.
+    completed: *const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: []const u8,
+        timeout_ms: u32,
+        cancellation: Cancellation,
+    ) anyerror!ExchangeOutcome,
+    streaming: *const fn (
+        ctx: *anyopaque,
+        request: []const u8,
+        timeout_ms: u32,
+        cancellation: Cancellation,
+        sink: ToolResponseSink,
+    ) anyerror!ToolStreamExchangeOutcome,
+};
+
 pub const Connection = struct {
     ctx: *anyopaque,
     request_fn: *const fn (
@@ -51,6 +102,7 @@ pub const Connection = struct {
         timeout_ms: u32,
         cancellation: Cancellation,
     ) anyerror!ExchangeOutcome,
+    tool_request: ToolRequestExecutor,
     notify_fn: *const fn (
         ctx: *anyopaque,
         notification: []const u8,
@@ -78,9 +130,65 @@ pub const Connection = struct {
         return self.notify_fn(self.ctx, encoded, timeout_ms, cancellation);
     }
 
+    pub fn requestTool(
+        self: Connection,
+        allocator: std.mem.Allocator,
+        encoded: []const u8,
+        timeout_ms: u32,
+        cancellation: Cancellation,
+        sink: ToolResponseSink,
+    ) anyerror!ToolRequestOutcome {
+        return switch (self.tool_request) {
+            .completed => |callback| switch (try callback(
+                self.ctx,
+                allocator,
+                encoded,
+                timeout_ms,
+                cancellation,
+            )) {
+                .response => |bytes| .{ .completed_response = bytes },
+                .timeout => .timeout,
+                .network_error => .network_error,
+                .auth_error => .auth_error,
+                .server_error => .server_error,
+                .child_exit => .child_exit,
+                .cancelled => .cancelled,
+                .indeterminate => .indeterminate,
+            },
+            .streaming => |callback| switch (try callback(
+                self.ctx,
+                encoded,
+                timeout_ms,
+                cancellation,
+                sink,
+            )) {
+                .response => .streamed_response,
+                .timeout => .timeout,
+                .network_error => .network_error,
+                .auth_error => .auth_error,
+                .server_error => .server_error,
+                .child_exit => .child_exit,
+                .cancelled => .cancelled,
+                .indeterminate => .indeterminate,
+            },
+        };
+    }
+
     pub fn close(self: Connection) void {
         self.close_fn(self.ctx);
     }
+};
+
+pub const ToolRequestOutcome = union(enum) {
+    completed_response: []u8,
+    streamed_response,
+    timeout,
+    network_error,
+    auth_error,
+    server_error,
+    child_exit,
+    cancelled,
+    indeterminate,
 };
 
 pub const OpenOutcome = union(enum) {
@@ -159,6 +267,11 @@ pub const CallFailure = union(enum) {
 
 pub const CallOutcome = union(enum) {
     result: canonical.OwnedCallResult,
+    failed: CallFailure,
+};
+
+pub const BodyCallOutcome = union(enum) {
+    result: core.tool_result.ToolResultBody,
     failed: CallFailure,
 };
 
@@ -266,11 +379,172 @@ pub const Client = struct {
         return .{ .result = result };
     }
 
+    /// Byte-zero MCP tool call. Control-plane requests keep the bounded
+    /// completed-response API; only `tools/call` is allowed to use the much
+    /// larger artifact data plane.
+    pub fn callToolBody(
+        self: *Client,
+        result_allocator: std.mem.Allocator,
+        artifact_root: []const u8,
+        tool: *const canonical.Tool,
+        arguments_json: []const u8,
+        cancellation: Cancellation,
+    ) BodyCallOutcome {
+        if (artifact_root.len == 0) return .{ .failed = .resource_limit };
+        if (!std.mem.eql(u8, &tool.identity.server_binding_identity, &self.binding))
+            return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
+        if (schema.validateArguments(result_allocator, arguments_json, .{}) != .valid)
+            return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (cancellation.isCancelled()) return .{ .failed = .cancelled };
+        const request_id = self.takeRequestId() orelse return .{ .failed = .resource_limit };
+        var exchange_arena = std.heap.ArenaAllocator.init(self.backing);
+        defer exchange_arena.deinit();
+        const request = switch (self.era) {
+            .modern_2026_07_28 => modern.encodeCallToolRequest(
+                exchange_arena.allocator(),
+                request_id,
+                self.client_info,
+                tool.identity.name,
+                arguments_json,
+                self.limits,
+            ),
+            .classic_2025_11_25, .classic_2025_06_18 => classic.encodeCallToolRequest(
+                exchange_arena.allocator(),
+                request_id,
+                tool.identity.name,
+                arguments_json,
+                self.limits,
+            ),
+        } catch |err| return .{ .failed = if (err == error.OutOfMemory)
+            .out_of_memory
+        else
+            .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
+
+        var capture = core.tool_result_artifact.Capture.begin(
+            result_allocator,
+            artifact_root,
+            result_stream.MAX_RESPONSE_BYTES,
+        ) catch |err| return .{ .failed = if (err == error.OutOfMemory)
+            .out_of_memory
+        else
+            .resource_limit };
+        defer capture.deinit();
+        var capture_sink = CaptureSink{
+            .capture = &capture,
+            .cancellation = cancellation,
+        };
+        const exchange = self.connection.requestTool(
+            exchange_arena.allocator(),
+            request,
+            self.timeout_ms,
+            cancellation,
+            capture_sink.interface(),
+        ) catch return .{ .failed = .indeterminate };
+        switch (exchange) {
+            .completed_response => |bytes| capture_sink.write(bytes) catch
+                return .{ .failed = capture_sink.failureOutcome() },
+            .streamed_response => {},
+            .timeout => return .{ .failed = .timeout },
+            .network_error => return .{ .failed = .network_error },
+            .auth_error => return .{ .failed = .auth_error },
+            .server_error => return .{ .failed = .server_error },
+            .child_exit => return .{ .failed = .child_exit },
+            .cancelled => return .{ .failed = .cancelled },
+            .indeterminate => return .{ .failed = .indeterminate },
+        }
+        capture_sink.closed = true;
+        if (capture_sink.failure != null)
+            return .{ .failed = capture_sink.failureOutcome() };
+        capture.seal() catch |err| return .{ .failed = if (err == error.OutOfMemory)
+            .out_of_memory
+        else
+            .resource_limit };
+        const projected = result_stream.project(
+            result_allocator,
+            &capture,
+            artifact_root,
+            request_id,
+            switch (self.era) {
+                .modern_2026_07_28 => .modern_2026_07_28,
+                .classic_2025_11_25 => .classic_2025_11_25,
+                .classic_2025_06_18 => .classic_2025_06_18,
+            },
+            .{
+                .max_text_bytes = self.limits.max_text_bytes,
+                .max_json_depth = self.limits.max_json_depth,
+                .max_json_nodes = self.limits.max_json_nodes,
+            },
+            tool.output_schema_json != null,
+            true,
+        ) catch return .{ .failed = .out_of_memory };
+        return switch (projected) {
+            .result => |body| .{ .result = body },
+            .diagnostic => |diagnostic| .{ .failed = .{ .diagnostic = .{
+                .code = switch (diagnostic.code) {
+                    .invalid_json => .invalid_json,
+                    .invalid_envelope => .invalid_envelope,
+                    .response_id_mismatch => .response_id_mismatch,
+                    .remote_error => .remote_error,
+                    .method_not_found => .method_not_found,
+                    .missing_required_field => .missing_required_field,
+                    .invalid_field => .invalid_field,
+                    .resource_limit => .resource_limit,
+                    .missing_result_type => .missing_result_type,
+                    .unsupported_result_type => .unsupported_result_type,
+                    .input_required_unsupported => .input_required_unsupported,
+                },
+                .phase = .tools_call,
+                .rpc_code = diagnostic.rpc_code,
+            } } },
+        };
+    }
+
     fn takeRequestId(self: *Client) ?u64 {
         if (self.next_request_id == std.math.maxInt(u64)) return null;
         const value = self.next_request_id;
         self.next_request_id += 1;
         return value;
+    }
+};
+
+const CaptureSink = struct {
+    capture: *core.tool_result_artifact.Capture,
+    cancellation: Cancellation,
+    failure: ?ToolResponseSinkError = null,
+    closed: bool = false,
+
+    fn interface(self: *CaptureSink) ToolResponseSink {
+        return .{ .ctx = self, .write_fn = writeAdapter };
+    }
+
+    fn writeAdapter(raw: *anyopaque, chunk: []const u8) ToolResponseSinkError!void {
+        const self: *CaptureSink = @ptrCast(@alignCast(raw));
+        return self.write(chunk);
+    }
+
+    fn write(self: *CaptureSink, chunk: []const u8) ToolResponseSinkError!void {
+        if (self.failure) |failure| return failure;
+        if (self.closed) return self.latch(error.Closed);
+        if (self.cancellation.isCancelled()) return self.latch(error.Cancelled);
+        self.capture.write(chunk) catch |err| return self.latch(switch (err) {
+            error.ArtifactTooLarge => error.ResourceLimit,
+            else => error.IoFailure,
+        });
+    }
+
+    fn latch(self: *CaptureSink, failure: ToolResponseSinkError) ToolResponseSinkError {
+        if (self.failure == null) self.failure = failure;
+        return self.failure.?;
+    }
+
+    fn failureOutcome(self: *const CaptureSink) CallFailure {
+        return switch (self.failure orelse error.IoFailure) {
+            error.Cancelled => .cancelled,
+            error.ResourceLimit, error.IoFailure, error.Closed => .resource_limit,
+        };
     }
 };
 
@@ -726,6 +1000,7 @@ const FakeConnector = struct {
         return .{ .connection = .{
             .ctx = connection,
             .request_fn = request,
+            .tool_request = .{ .completed = request },
             .notify_fn = notify,
             .close_fn = close,
         } };

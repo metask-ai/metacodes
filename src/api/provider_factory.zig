@@ -15,6 +15,7 @@ const openai_mod = @import("openai_client.zig");
 const gemini_mod = @import("gemini_client.zig");
 const provider_mod = @import("provider.zig");
 const types = @import("../types.zig");
+const dialect_mod = @import("dialect.zig");
 
 /// 三选一具体 client。tagged union(ProviderKind)→ "kind 说 X 但字段 null" 的非法态
 /// 编译期不可表示(遵 CLAUDE.md "Make Illegal States Unrepresentable")。
@@ -92,6 +93,20 @@ pub fn makeProvider(
     model: []const u8,
     base_url: ?[]const u8,
 ) !OwnedProvider {
+    return makeProviderWithDialectResolver(a, kind, api_key, model, base_url, .builtin());
+}
+
+/// Runtime-scoped provider construction. The resolver is a borrowed immutable
+/// view owned by the Runtime Snapshot and therefore remains stable for the
+/// complete Provider/Session lifetime.
+pub fn makeProviderWithDialectResolver(
+    a: std.mem.Allocator,
+    kind: types.ProviderKind,
+    api_key: []const u8,
+    model: []const u8,
+    base_url: ?[]const u8,
+    dialect_resolver: dialect_mod.Resolver,
+) !OwnedProvider {
     @import("../util/log.zig").info("mp", "makeProvider kind={s} base_url={s}", .{ @tagName(kind), base_url orelse "<null>" });
     const io_rt = try a.create(std.Io.Threaded);
     errdefer a.destroy(io_rt);
@@ -104,16 +119,19 @@ pub fn makeProvider(
         .anthropic => blk: {
             const c = try a.create(client_mod.Client);
             c.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), api_key, model, base_url);
+            c.dialect_resolver = dialect_resolver;
             break :blk .{ .anthropic = c };
         },
         .openai => blk: {
             const c = try a.create(openai_mod.OpenAIClient);
             c.* = openai_mod.OpenAIClient.init(a, io_rt.io(), api_key, model, base_url);
+            c.dialect_resolver = dialect_resolver;
             break :blk .{ .openai = c };
         },
         .gemini => blk: {
             const c = try a.create(gemini_mod.GeminiClient);
             c.* = gemini_mod.GeminiClient.init(a, io_rt.io(), api_key, model, base_url);
+            c.dialect_resolver = dialect_resolver;
             break :blk .{ .gemini = c };
         },
     };

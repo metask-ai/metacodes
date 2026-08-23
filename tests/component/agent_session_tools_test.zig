@@ -14,6 +14,61 @@ const FINAL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const OPENAI_FINAL_SSE =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+var dialect_test_ctx: u8 = 0;
+
+fn injectPluginDialectMarker(
+    _: *anyopaque,
+    _: cc.model_adapter.ModelProfile,
+    _: ?cc.api_dialect.ReasoningEffort,
+    system: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) anyerror!void {
+    try system.appendSlice(allocator, "\nPLUGIN_DIALECT_MARKER");
+}
+
+const plugin_test_dialect = cc.api_dialect.Dialect{
+    .ctx = @ptrCast(&dialect_test_ctx),
+    .injectSystemModsFn = injectPluginDialectMarker,
+};
+
+var skill_surface_ctx: u8 = 0;
+
+fn rejectSkillDispatch(
+    _: *const anyopaque,
+    _: *const cc.tool_context.ToolContext,
+    _: []const u8,
+    _: []const u8,
+) anyerror!cc.tools.ToolDispatchOutcome {
+    return error.UnexpectedToolDispatch;
+}
+
+fn skillSurfacePrefetchSafe(_: *const anyopaque, _: []const u8) bool {
+    return false;
+}
+
+fn skillSurfaceNameAt(_: *const anyopaque, index: usize) ?[]const u8 {
+    return if (index == 0) "Skill" else null;
+}
+
+fn skillSurfaceHostSync(_: *const anyopaque, _: []const u8) bool {
+    return false;
+}
+
+fn skillSurfaceDispatcher() cc.tools.ToolDispatcher {
+    return .{
+        .ctx = @ptrCast(&skill_surface_ctx),
+        .dispatchFn = rejectSkillDispatch,
+        .prefetchSafeFn = skillSurfacePrefetchSafe,
+        .nameAtFn = skillSurfaceNameAt,
+        .hostSyncFn = skillSurfaceHostSync,
+    };
+}
+
 const GLOB_TOOL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_glob\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_glob\",\"name\":\"Glob\",\"input\":{}}}\n\n" ++
@@ -60,6 +115,15 @@ fn bashToolSse(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
         "data: {{\"type\":\"message_stop\"}}\n\n", .{command});
 }
 
+fn writeToolSse(allocator: std.mem.Allocator, path: []const u8, content: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_write\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_write\",\"name\":\"Write\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"file_path\\\":\\\"{s}\\\",\\\"content\\\":\\\"{s}\\\"}}\"}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+        "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+        "data: {{\"type\":\"message_stop\"}}\n\n", .{ path, content });
+}
+
 fn writeFile(path: [*:0]const u8, content: []const u8) !void {
     const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
     if (fd < 0) return error.OpenFailed;
@@ -77,6 +141,61 @@ const Sink = struct {
         return true;
     }
 };
+
+test "L2 artifact-enabled Host-only Session advertises its mandatory recovery plugin from request one" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var enabled_server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer enabled_server.stop();
+    var disabled_server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer disabled_server.stop();
+    const enabled_url = try enabled_server.urlOwned(allocator);
+    defer allocator.free(enabled_url);
+    const disabled_url = try disabled_server.urlOwned(allocator);
+    defer allocator.free(disabled_url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(allocator, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const inventory = try runtime.describePlugins(allocator);
+    defer allocator.free(inventory);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "metacodes.kernel.tool-result-artifact") != null);
+
+    const enabled = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = enabled_url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .home = root, .shell = .disabled },
+        .artifact_store = .{ .exact_root = root },
+        .allowed_tools = &.{},
+    });
+    defer enabled.destroy() catch unreachable;
+    const disabled = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = disabled_url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .home = root, .shell = .disabled },
+        .allowed_tools = &.{},
+    });
+    defer disabled.destroy() catch unreachable;
+    try std.testing.expect(enabled.tools.contains("ReadArtifact"));
+    try std.testing.expect(!disabled.tools.contains("ReadArtifact"));
+
+    var sink_state: u8 = 0;
+    _ = try enabled.runText(1, "enabled", 1, .{ .ctx = &sink_state, .emit = Sink.emit });
+    _ = try disabled.runText(1, "disabled", 1, .{ .ctx = &sink_state, .emit = Sink.emit });
+    const enabled_body = (enabled_server.lastRequest() orelse return error.NoRequestCaptured).body();
+    const disabled_body = (disabled_server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, enabled_body, "\"name\":\"ReadArtifact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, disabled_body, "\"name\":\"ReadArtifact\"") == null);
+}
 
 test "L2 AgentSession resolves selected built-in file tools against its workspace" {
     const a = std.testing.allocator;
@@ -136,6 +255,247 @@ test "L2 AgentSession resolves selected built-in file tools against its workspac
     try std.testing.expect(std.mem.indexOf(u8, body, "agentcore-tool-ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, glob_probe_name) != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\\\"name\\\":\\\"Bash\\\"") == null and std.mem.indexOf(u8, body, "\"name\":\"Bash\"") == null);
+}
+
+test "L2 RuntimeHost hot-swaps first-party core profiles without mutating live Sessions" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    for (root_buf[0..root_len]) |*c| if (c.* == '\\') {
+        c.* = '/';
+    };
+    const root = root_buf[0..root_len];
+    const source_path = try std.fmt.allocPrintSentinel(a, "{s}/source.txt", .{root}, 0);
+    defer a.free(source_path);
+    const target_path = try std.fmt.allocPrintSentinel(a, "{s}/hot-swapped.txt", .{root}, 0);
+    defer a.free(target_path);
+    try writeFile(source_path.ptr, "generation-one-readable\n");
+
+    const read_sse = try readToolSse(a, "source.txt");
+    defer a.free(read_sse);
+    const write_sse = try writeToolSse(a, target_path, "generation-two-writable");
+    defer a.free(write_sse);
+    const old_bodies = [_][]const u8{ read_sse, FINAL_SSE };
+    const new_bodies = [_][]const u8{ write_sse, FINAL_SSE };
+    var old_server = try harness.MockServer.startCassette(&old_bodies, 0);
+    defer old_server.stop();
+    var new_server = try harness.MockServer.startCassette(&new_bodies, 0);
+    defer new_server.stop();
+    const old_url = try old_server.urlOwned(a);
+    defer a.free(old_url);
+    const new_url = try new_server.urlOwned(a);
+    defer a.free(new_url);
+
+    const host = try cc.agent_session.RuntimeHost.create(a, .{ .core_profile = .minimal });
+    defer host.destroy() catch unreachable;
+    const initial_inventory = try host.describePlugins(a);
+    defer a.free(initial_inventory);
+    try std.testing.expect(std.mem.indexOf(u8, initial_inventory, "metacodes.core.minimal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, initial_inventory, "builtin_tool_bundle") != null);
+
+    const old_session = try host.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = old_url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{"Read"},
+    });
+    defer old_session.destroy() catch unreachable;
+
+    const generation = try host.replace(.{ .core_profile = .coding });
+    try std.testing.expectEqual(@as(u64, 2), @intFromEnum(generation));
+    try std.testing.expectEqual(@as(u64, 1), @intFromEnum(old_session.pluginGeneration()));
+    try std.testing.expect(!old_session.tools.contains("Write"));
+    const current_inventory = try host.describePlugins(a);
+    defer a.free(current_inventory);
+    try std.testing.expect(std.mem.indexOf(u8, current_inventory, "metacodes.core.coding") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current_inventory, "metacodes.core.minimal") == null);
+
+    const new_session = try host.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = new_url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{"Write"},
+    });
+    defer new_session.destroy() catch unreachable;
+    try std.testing.expectEqual(@as(u64, 2), @intFromEnum(new_session.pluginGeneration()));
+    try std.testing.expect(new_session.tools.contains("Write"));
+
+    var sink_state: u8 = 0;
+    const old_result = try old_session.runText(1, "read through generation one", 3, .{ .ctx = &sink_state, .emit = Sink.emit });
+    const new_result = try new_session.runText(1, "write through generation two", 3, .{ .ctx = &sink_state, .emit = Sink.emit });
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, old_result.stop_reason);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, new_result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), old_result.tool_calls);
+    try std.testing.expectEqual(@as(u32, 1), new_result.tool_calls);
+    const old_body = (old_server.lastRequest() orelse return error.NoRequestCaptured).body();
+    const new_body = (new_server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.c.access(target_path.ptr, std.c.F_OK) == 0);
+    try std.testing.expect(std.mem.indexOf(u8, old_body, "generation-one-readable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, old_body, "\"name\":\"Read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, old_body, "\\\"name\\\":\\\"Write\\\"") == null and std.mem.indexOf(u8, old_body, "\"name\":\"Write\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, old_body, "To read files use Read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, old_body, "To create files use Write") == null);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "\"name\":\"Write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "\"name\":\"Read\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "To create files use Write") != null);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "To read files use Read") == null);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "generation-two-writable") != null);
+}
+
+test "L2 provider dialect plugin is generation-pinned and equivalent replacement preserves request cache bytes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    var baseline_server = try harness.MockServer.startCassette(&.{OPENAI_FINAL_SSE}, 0);
+    defer baseline_server.stop();
+    var plugin_server = try harness.MockServer.startCassette(&.{OPENAI_FINAL_SSE}, 0);
+    defer plugin_server.stop();
+    var equivalent_server = try harness.MockServer.startCassette(&.{OPENAI_FINAL_SSE}, 0);
+    defer equivalent_server.stop();
+    const baseline_url = try baseline_server.urlOwned(a);
+    defer a.free(baseline_url);
+    const plugin_url = try plugin_server.urlOwned(a);
+    defer a.free(plugin_url);
+    const equivalent_url = try equivalent_server.urlOwned(a);
+    defer a.free(equivalent_url);
+
+    const dialect_plugin = cc.plugin.runtime.StaticPlugin{
+        .descriptor = .{
+            .id = try cc.plugin.contract.PluginId.parse("acme.model-dialect"),
+            .version = try cc.plugin.contract.Version.parse("1.0.0"),
+            .form = .static_trusted,
+            .capabilities = cc.plugin.contract.CapabilitySet.from(&.{.provider_dialect}),
+        },
+        .provider_dialects = &.{.{
+            .provider_kind = .openai,
+            .model_prefix = "acme-model-",
+            .dialect = plugin_test_dialect,
+        }},
+    };
+
+    const host = try cc.agent_session.RuntimeHost.create(a, .{ .core_profile = .none });
+    defer host.destroy() catch unreachable;
+    const baseline_session = try host.createSession(.{
+        .provider_kind = .openai,
+        .api_key = "test-key",
+        .model = "acme-model-1",
+        .base_url = baseline_url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{},
+    });
+    defer baseline_session.destroy() catch unreachable;
+
+    _ = try host.replace(.{ .core_profile = .none, .static_plugins = &.{dialect_plugin} });
+    const plugin_session = try host.createSession(.{
+        .provider_kind = .openai,
+        .api_key = "test-key",
+        .model = "acme-model-1",
+        .base_url = plugin_url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{},
+    });
+    defer plugin_session.destroy() catch unreachable;
+
+    // Publishing an equivalent generation must not inject generation/plugin
+    // inventory into provider-visible bytes and therefore must not break the
+    // prefix cache.
+    _ = try host.replace(.{ .core_profile = .none, .static_plugins = &.{dialect_plugin} });
+    const equivalent_session = try host.createSession(.{
+        .provider_kind = .openai,
+        .api_key = "test-key",
+        .model = "acme-model-1",
+        .base_url = equivalent_url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{},
+    });
+    defer equivalent_session.destroy() catch unreachable;
+    const inventory = try host.describePlugins(a);
+    defer a.free(inventory);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "provider_dialect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "acme.model-dialect") != null);
+
+    var sink_state: u8 = 0;
+    _ = try baseline_session.runText(1, "identical prompt", 1, .{ .ctx = &sink_state, .emit = Sink.emit });
+    _ = try plugin_session.runText(1, "identical prompt", 1, .{ .ctx = &sink_state, .emit = Sink.emit });
+    _ = try equivalent_session.runText(1, "identical prompt", 1, .{ .ctx = &sink_state, .emit = Sink.emit });
+
+    const baseline_body = (baseline_server.lastRequest() orelse return error.NoRequestCaptured).body();
+    const plugin_body = (plugin_server.lastRequest() orelse return error.NoRequestCaptured).body();
+    const equivalent_body = (equivalent_server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, baseline_body, "PLUGIN_DIALECT_MARKER") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin_body, "PLUGIN_DIALECT_MARKER") != null);
+    try std.testing.expectEqualStrings(plugin_body, equivalent_body);
+    try std.testing.expectEqual(@as(u64, 1), @intFromEnum(baseline_session.pluginGeneration()));
+    try std.testing.expectEqual(@as(u64, 2), @intFromEnum(plugin_session.pluginGeneration()));
+    try std.testing.expectEqual(@as(u64, 3), @intFromEnum(equivalent_session.pluginGeneration()));
+}
+
+test "L2 Anthropic GLM sees typed Skill capability activation in the real AgentSession request" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(allocator, .{ .core_profile = .none });
+    defer runtime.destroy() catch unreachable;
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "glm-5.2",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{},
+    });
+    defer session.destroy() catch unreachable;
+
+    const skill = cc.json_mod.ToolDefinition{
+        .name = "Skill",
+        .description = "Invoke the exact bound skill before other work when it clearly matches.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "skill", .type = "string" },
+        }, .required = &.{"skill"} },
+    };
+    var sink_state: u8 = 0;
+    var admitted = try session.admitRun(1, .{ .ctx = &sink_state, .emit = Sink.emit });
+    const result = try admitted.runUserMessagesWithToolSurface(
+        &.{"review this change"},
+        1,
+        null,
+        .{ .definitions = &.{skill}, .dispatcher = skillSurfaceDispatcher() },
+    );
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"name\":\"Skill\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Model-specific capability activation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "blocking requirement") != null);
+    // An ordinary advisory Skill gets model-specific guidance but never an
+    // unconditional forced route. Only explicit required-first metadata can
+    // request that stronger behavior.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\"") == null);
 }
 
 test "L2 AgentSession exposes WebSearch as a builtin and dispatches its isolated provider search" {

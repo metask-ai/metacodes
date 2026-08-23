@@ -51,7 +51,7 @@ const DOING_TASKS_SECTION =
     \\ - In general, do not propose changes to code you haven't read. If a user asks about or wants you to modify a file, read it first. Understand existing code before suggesting modifications.
     \\ - Do not create files unless they're absolutely necessary for achieving your goal. Generally prefer editing an existing file to creating a new one, as this prevents file bloat and builds on existing work more effectively.
     \\ - Avoid giving time estimates or predictions for how long tasks will take, whether for your own work or for users planning projects. Focus on what needs to be done, not how long it might take.
-    \\ - If an approach fails, diagnose why before switching tactics—read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either. Escalate to the user with AskUserQuestion only when you're genuinely stuck after investigation, not as a first response to friction.
+    \\ - If an approach fails, diagnose why before switching tactics—read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either. Ask the user only when you're genuinely stuck after investigation, not as a first response to friction.
     \\ - Be careful not to introduce security vulnerabilities such as command injection, XSS, SQL injection, and other OWASP top 10 vulnerabilities. If you notice that you wrote insecure code, immediately fix it. Prioritize writing safe, secure, and correct code.
     \\ - Don't add features, refactor code, or make "improvements" beyond what was asked. A bug fix doesn't need surrounding code cleaned up. A simple feature doesn't need extra configurability. Don't add docstrings, comments, or type annotations to code you didn't change. Only add comments where the logic isn't self-evident.
     \\ - Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Only validate at system boundaries (user input, external APIs). Don't use feature flags or backwards-compatibility shims when you can just change the code.
@@ -70,7 +70,7 @@ const VALIDATION_SECTION =
     \\# Completing and validating your work
     \\ - Keep going until the task is fully resolved before ending your turn. Do not stop at analysis or a partial fix; carry the change through implementation and verification. If a tool call fails, diagnose and continue — do not give up early.
     \\ - After your FINAL edit, re-run the narrowest check that covers what you changed (the failing test, the file's test module, or a quick build). Never end the turn with the workspace failing to build, or with a check you ran earlier now failing — fix it, or revert to the last working state, before finishing.
-    \\ - Run the most specific test first, then broaden only as needed for confidence. Do not re-read a file you just edited to "verify" the edit — the Edit tool fails loudly on mismatch; spend that step running a real check instead.
+    \\ - Run the most specific test first, then broaden only as needed for confidence. Do not re-read a file you just edited merely to verify a successful edit; spend that step running a real check instead.
     \\ - Fix problems at the root cause rather than papering over symptoms. Do not fix unrelated bugs or failing tests you did not cause; mention them in your final message instead.
 ;
 
@@ -321,6 +321,113 @@ pub const KG_SECTION =
     \\Division of labor: KgRemember is for short atomic facts. For long-form narrative (investigation writeups, multi-step lessons) write a memory markdown file instead (see # Memory) — those files are auto-imported into this same graph and recalled through the same path, so never store the same content both ways.
 ;
 
+const KG_RECALL_ONLY_RULES =
+    \\Lexical retrieval algorithm for the currently available KgRecall tool:
+    \\- TinyKG uses lexical BM25 and computes no embeddings or vector distance. A lexical miss is not proof that the knowledge is absent; hits are candidates, not facts.
+    \\- Start with one compact, untyped exact or canonical-alias seed. If that is insufficient, submit one fixed lexical-query-plan-v3 semantic_expansion batch containing 2-4 separate compact probes; never concatenate them into a keyword bag.
+    \\- Deduplicate by node_id and inspect evidence, freshness, supersession, and current code/tests/external state before treating a hit as current. If the bounded search is insufficient, report uncertainty rather than inventing a fact.
+;
+
+const KG_CONTEXT_ONLY_RULES =
+    \\Use KgContext only with a node_id already supplied by an authoritative TinyKG result or task packet. Inspect the node text, bounded graph, evidence, freshness, supersession, contradiction, and truncation signals. A graph edge or remembered statement alone is not proof of current reality; verify time-sensitive claims against code, tests, or external state.
+;
+
+const KG_PARTIAL_TASK_RULES_HEADER =
+    \\Persistent task control-plane rules for the currently available task tools:
+    \\- TinyKG is the workflow source of truth; task summaries and transcript text are projections, not authoritative live state.
+;
+
+fn toolNameEnabled(enabled_tool_names: ?[]const []const u8, name: []const u8) bool {
+    const names = enabled_tool_names orelse return true;
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
+fn allToolNamesEnabled(enabled_tool_names: ?[]const []const u8, required: []const []const u8) bool {
+    for (required) |name| {
+        if (!toolNameEnabled(enabled_tool_names, name)) return false;
+    }
+    return true;
+}
+
+/// Build only the TinyKG guidance whose executable tools are present in this
+/// Run. The common complete bundle returns the historical constant byte for
+/// byte, preserving the provider prefix-cache boundary.
+fn buildKnowledgeGraphSection(
+    allocator: std.mem.Allocator,
+    enabled_tool_names: ?[]const []const u8,
+    kg_ready: bool,
+) ![]u8 {
+    if (!kg_ready) return allocator.dupe(u8, "");
+
+    const full_bundle = [_][]const u8{
+        "KgRecall",   "KgContext", "KgRemember",
+        "TaskCreate", "TaskList",  "TaskGet",
+        "TaskUpdate",
+    };
+    if (allToolNamesEnabled(enabled_tool_names, &full_bundle))
+        return allocator.dupe(u8, KG_SECTION);
+
+    const recall = toolNameEnabled(enabled_tool_names, "KgRecall");
+    const context = toolNameEnabled(enabled_tool_names, "KgContext");
+    const remember = toolNameEnabled(enabled_tool_names, "KgRemember");
+    const task_create = toolNameEnabled(enabled_tool_names, "TaskCreate");
+    const task_list = toolNameEnabled(enabled_tool_names, "TaskList");
+    const task_get = toolNameEnabled(enabled_tool_names, "TaskGet");
+    const task_update = toolNameEnabled(enabled_tool_names, "TaskUpdate");
+    const any_task = task_create or task_list or task_get or task_update;
+    if (!recall and !context and !remember and !any_task)
+        return allocator.dupe(u8, "");
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll(
+        "# Knowledge Graph\n" ++
+            "A persistent TinyKG store exposes only the durable-memory and task operations present in the current API tool list.\n",
+    );
+
+    if (recall) {
+        try out.writer.writeAll("\nUse KgRecall when prior decisions, cross-session work, or ambiguous project choices matter.\n\n");
+        if (context) {
+            try out.writer.writeAll(kg_retrieval.SYSTEM_RULES);
+        } else {
+            try out.writer.writeAll(KG_RECALL_ONLY_RULES);
+        }
+    } else if (context) {
+        try out.writer.writeAll("\n");
+        try out.writer.writeAll(KG_CONTEXT_ONLY_RULES);
+    }
+
+    if (any_task) {
+        try out.writer.writeAll("\n\n");
+        if (task_create and task_list and task_get and task_update) {
+            try out.writer.writeAll(kg_tasks.SYSTEM_RULES);
+        } else {
+            try out.writer.writeAll(KG_PARTIAL_TASK_RULES_HEADER);
+            if (task_create)
+                try out.writer.writeAll("- Use TaskCreate once for a durable multi-phase lifecycle anchor; require a persisted kg-* id instead of treating an in-session fallback as equivalent.\n");
+            if (task_list)
+                try out.writer.writeAll("- Use TaskList to refresh the live frontier; select only an open, ready, unclaimed leaf.\n");
+            if (task_get)
+                try out.writer.writeAll("- Use TaskGet to recover the authoritative task packet after compaction/restart or whenever a compact summary is insufficient.\n");
+            if (task_update) {
+                try out.writer.writeAll("- Use TaskUpdate status=in_progress to claim before work, and close every claimed task with completed/failed plus verified evidence and a concise conclusion.\n");
+                if (recall) try out.writer.writeAll(
+                    "- LEXICAL EXPANSION: if the exact experience packet is insufficient, declare 2-4 separate compact semantic variants once in lexical-query-plan-v3; the host executes the fixed batch and deduplicates node ids.\n",
+                );
+            }
+        }
+    }
+
+    if (remember) try out.writer.writeAll(
+        "\n\nUse KgRemember only for short atomic confirmed decisions, user corrections, preferences, or non-obvious project facts. Never store transient task chatter or duplicate a long-form memory markdown file.",
+    );
+
+    return try out.toOwnedSlice();
+}
+
 pub fn buildFull(
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -334,10 +441,16 @@ pub fn buildFull(
     const env_section = try buildEnvSection(allocator, model, cwd);
     defer allocator.free(env_section);
 
-    const skills_section = if (skills) |s| try buildSkillsSection(allocator, s) else try allocator.dupe(u8, "");
+    const skills_section = if (toolNameEnabled(enabled_tool_names, "Skill"))
+        if (skills) |s| try buildSkillsSection(allocator, s) else try allocator.dupe(u8, "")
+    else
+        try allocator.dupe(u8, "");
     defer allocator.free(skills_section);
 
-    const agents_section = if (agents) |a| try buildAgentsSection(allocator, a) else try allocator.dupe(u8, "");
+    const agents_section = if (toolNameEnabled(enabled_tool_names, "Task"))
+        if (agents) |a| try buildAgentsSection(allocator, a) else try allocator.dupe(u8, "")
+    else
+        try allocator.dupe(u8, "");
     defer allocator.free(agents_section);
 
     // # Memory 段(通道 B):仅 memdir 启用(memdir_abs 非空)时拼。教模型管理自动记忆。
@@ -362,7 +475,8 @@ pub fn buildFull(
     const deferred_section = try buildDeferredToolsSection(allocator, enabled_tool_names, kg_ready);
     defer allocator.free(deferred_section);
 
-    const kg_section: []const u8 = if (kg_ready) KG_SECTION else "";
+    const kg_section = try buildKnowledgeGraphSection(allocator, enabled_tool_names, kg_ready);
+    defer allocator.free(kg_section);
 
     const sep = "\n\n";
     return try std.mem.concat(allocator, u8, &.{
@@ -421,6 +535,51 @@ fn buildDeferredToolsSection(
     }
     if (!any) return try allocator.dupe(u8, "");
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Keep the ordinary tool-usage guidance in an already-built system prompt
+/// consistent with the effective per-turn tool pool. `buildFull` sees the
+/// Session/Run surface, while execution policy and provider capability gates
+/// can narrow that surface later. The generated section has a stable canonical
+/// order, so equivalent plugin generations produce byte-identical prompt
+/// prefixes regardless of registration order or generation id.
+///
+/// Prompt overrides are intentionally opaque: only a section carrying our
+/// generated signature is projected. An A/B override that owns the
+/// `# Using your tools` section remains untouched.
+pub fn projectUsingToolsForExecution(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    visible_defs: []const @import("../json.zig").ToolDefinition,
+) !?[]u8 {
+    const marker = "# Using your tools\n";
+    const section_start = std.mem.indexOf(u8, prompt, marker) orelse return null;
+    const generated_signature = " - Use only tools present in the current API tool list.";
+    const signature_start = section_start + marker.len;
+    if (!std.mem.startsWith(u8, prompt[signature_start..], generated_signature)) return null;
+    const section_end = if (std.mem.indexOf(u8, prompt[signature_start..], "\n\n# ")) |rel|
+        signature_start + rel
+    else
+        prompt.len;
+
+    const names = try allocator.alloc([]const u8, visible_defs.len);
+    defer allocator.free(names);
+    for (visible_defs, 0..) |definition, index| names[index] = definition.name;
+    const desired = try buildUsingToolsSection(allocator, names);
+    defer allocator.free(desired);
+    const current = prompt[section_start..section_end];
+    if (std.mem.eql(u8, current, desired)) return null;
+
+    var replace_start = section_start;
+    var replace_end = section_end;
+    if (desired.len == 0) {
+        if (section_start >= 2 and std.mem.eql(u8, prompt[section_start - 2 .. section_start], "\n\n")) {
+            replace_start -= 2;
+        } else if (section_end + 2 <= prompt.len and std.mem.eql(u8, prompt[section_end .. section_end + 2], "\n\n")) {
+            replace_end += 2;
+        }
+    }
+    return try std.mem.concat(allocator, u8, &.{ prompt[0..replace_start], desired, prompt[replace_end..] });
 }
 
 /// Keep the deferred-tool catalog in an already-built system prompt consistent
@@ -489,6 +648,101 @@ pub fn projectDeferredToolsForExecution(
     return try std.mem.concat(allocator, u8, &.{ prompt[0..section_start], projected.items, prompt[section_end..] });
 }
 
+/// Project generated Skill, subagent, and TinyKG capability sections against
+/// the final provider-visible tool set. This runs after execution-policy,
+/// active-Skill, and provider gates, so a section can never advertise a tool
+/// omitted from the same request schema.
+///
+/// Generated signatures prevent this function from rewriting a caller-owned
+/// custom prompt. Equivalent tool sets return null and keep the original bytes
+/// and prefix-cache identity untouched.
+pub fn projectCapabilitySectionsForExecution(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    visible_defs: []const @import("../json.zig").ToolDefinition,
+) !?[]u8 {
+    const names = try allocator.alloc([]const u8, visible_defs.len);
+    defer allocator.free(names);
+    for (visible_defs, 0..) |definition, index| names[index] = definition.name;
+
+    var owned: ?[]u8 = null;
+    errdefer if (owned) |value| allocator.free(value);
+    var current = prompt;
+
+    if (!toolNameEnabled(names, "Skill")) {
+        if (try projectGeneratedSection(
+            allocator,
+            current,
+            "# Available skills\n",
+            "\nYou have access to the following skills.",
+            "",
+        )) |next| {
+            if (owned) |old| allocator.free(old);
+            owned = next;
+            current = next;
+        }
+    }
+
+    if (!toolNameEnabled(names, "Task")) {
+        if (try projectGeneratedSection(
+            allocator,
+            current,
+            "# Available subagents\n",
+            "\nYou can delegate side tasks to subagents using the `Task` tool.",
+            "",
+        )) |next| {
+            if (owned) |old| allocator.free(old);
+            owned = next;
+            current = next;
+        }
+    }
+
+    if (std.mem.indexOf(u8, current, "# Knowledge Graph\n") != null) {
+        const desired = try buildKnowledgeGraphSection(allocator, names, true);
+        defer allocator.free(desired);
+        if (try projectGeneratedSection(
+            allocator,
+            current,
+            "# Knowledge Graph\n",
+            "A persistent ",
+            desired,
+        )) |next| {
+            if (owned) |old| allocator.free(old);
+            owned = next;
+        }
+    }
+
+    return owned;
+}
+
+fn projectGeneratedSection(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    marker: []const u8,
+    generated_signature: []const u8,
+    desired: []const u8,
+) !?[]u8 {
+    const section_start = std.mem.indexOf(u8, prompt, marker) orelse return null;
+    const signature_start = section_start + marker.len;
+    if (!std.mem.startsWith(u8, prompt[signature_start..], generated_signature)) return null;
+    const section_end = if (std.mem.indexOf(u8, prompt[signature_start..], "\n\n# ")) |relative|
+        signature_start + relative
+    else
+        prompt.len;
+    if (std.mem.eql(u8, prompt[section_start..section_end], desired)) return null;
+
+    var replace_start = section_start;
+    var replace_end = section_end;
+    if (desired.len == 0) {
+        if (section_start >= 2 and std.mem.eql(u8, prompt[section_start - 2 .. section_start], "\n\n")) {
+            replace_start -= 2;
+        } else if (section_end + 2 <= prompt.len and std.mem.eql(u8, prompt[section_end .. section_end + 2], "\n\n")) {
+            replace_end += 2;
+        }
+    }
+    return try std.mem.concat(allocator, u8, &.{ prompt[0..replace_start], desired, prompt[replace_end..] });
+}
+
 fn hasToolDefinition(
     definitions: []const @import("../json.zig").ToolDefinition,
     name: []const u8,
@@ -502,10 +756,8 @@ fn hasToolDefinition(
 }
 
 /// 按当前工具集动态拼 # Using your tools 段（对应 cc getUsingYourToolsSection）。
-/// 动态耦合:
-/// - 无 Grep → 去掉 "use Grep instead of grep" 子条
-/// - 无 Glob → 去掉 "use Glob instead of find" 子条
-/// - 无 TaskCreate → 去掉任务管理那条
+/// 不得提及当前 schema 中不存在的工具；固定的规则顺序同时构成 prompt-cache
+/// 稳定性契约。未知的 Host/plugin 工具仍由 provider tool schema 自描述。
 fn buildUsingToolsSection(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
     const has = struct {
         fn f(list: []const []const u8, n: []const u8) bool {
@@ -514,16 +766,21 @@ fn buildUsingToolsSection(allocator: std.mem.Allocator, names: []const []const u
         }
     }.f;
 
+    if (names.len == 0) return allocator.dupe(u8, "");
+
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator,
         \\# Using your tools
-        \\ - Do NOT use the Bash to run commands when a relevant dedicated tool is provided. Using dedicated tools allows the user to better understand and review your work. This is CRITICAL to assisting the user:
-        \\  - To read files use Read instead of cat, head, tail, or sed
-        \\  - To edit files use Edit instead of sed or awk
-        \\  - To create files use Write instead of cat with heredoc or echo redirection
+        \\ - Use only tools present in the current API tool list. Tool availability is scoped to this Run and may differ between Sessions.
     );
+    if (has(names, "Read"))
+        try buf.appendSlice(allocator, "\n  - To read files use Read instead of cat, head, tail, or sed");
+    if (has(names, "Edit"))
+        try buf.appendSlice(allocator, "\n  - To edit files use Edit instead of sed or awk");
+    if (has(names, "Write"))
+        try buf.appendSlice(allocator, "\n  - To create files use Write instead of cat with heredoc or echo redirection");
     if (has(names, "Glob")) {
         try buf.appendSlice(allocator, "\n  - To search for files use Glob instead of find or ls");
     }
@@ -540,14 +797,15 @@ fn buildUsingToolsSection(allocator: std.mem.Allocator, names: []const []const u
         try buf.appendSlice(allocator, "\n  - To locate where functions/types/classes are DEFINED, use CodeMap (a structural outline) instead of reading whole files");
         try buf.appendSlice(allocator, find_sym);
     }
-    try buf.appendSlice(allocator,
-        \\
-        \\  - Reserve using the Bash exclusively for system commands and terminal operations that require shell execution. If you are unsure and there is a relevant dedicated tool, default to using the dedicated tool and only fallback on using the Bash tool for these if it is absolutely necessary.
-    );
-    if (has(names, "TaskCreate") or has(names, "TodoWrite")) {
+    if (has(names, "Bash"))
+        try buf.appendSlice(allocator, "\n  - Reserve Bash for system commands and terminal operations that do not have a relevant dedicated tool.");
+    if (has(names, "TaskCreate")) {
         try buf.appendSlice(allocator, "\n - Break down and manage your work with the TaskCreate tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.");
+    } else if (has(names, "TodoWrite")) {
+        try buf.appendSlice(allocator, "\n - Break down and manage your work with TodoWrite. Mark each item completed as soon as it is done; do not batch status updates.");
     }
-    try buf.appendSlice(allocator, "\n - You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially. For instance, if one operation must complete before another starts, run these operations sequentially instead.");
+    if (names.len > 1)
+        try buf.appendSlice(allocator, "\n - You can call multiple tools in one response. Run independent calls in parallel; keep dependent calls sequential.");
 
     return try buf.toOwnedSlice(allocator);
 }
@@ -571,7 +829,7 @@ fn buildSkillsSection(allocator: std.mem.Allocator, set: *const @import("../skil
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try out.writer.writeAll("# Available skills\n\nYou have access to the following skills. Each describes a focused workflow; activate one by calling the `Skill` tool with the matching `name`. The tool returns the skill's instructions, which you should then follow for that task.\n\n");
+    try out.writer.writeAll("# Available skills\n\nYou have access to the following skills. Before using other tools, compare the current user request with their descriptions. If exactly one skill clearly applies, activate it immediately by calling the `Skill` tool with the matching `name`, then follow the returned instructions. Do not activate a marginal match, and do not activate multiple skills speculatively.\n\n");
     for (set.skills.items) |s| {
         try out.writer.print("- **{s}** — {s}\n", .{ s.name, s.description });
     }
@@ -707,6 +965,77 @@ test "buildWithSkills includes skill name + description" {
     try testing.expect(std.mem.indexOf(u8, s, "# Available skills") != null);
     try testing.expect(std.mem.indexOf(u8, s, "**code-review**") != null);
     try testing.expect(std.mem.indexOf(u8, s, "Review pending changes") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "activate it immediately") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "Do not activate a marginal match") != null);
+}
+
+test "capability sections follow visible tools at build and per-turn projection" {
+    const a = testing.allocator;
+    const skill_mod = @import("../skills/skill.zig");
+    const agent_set_mod = @import("../agents/set.zig");
+    const agent_def_mod = @import("../agents/def.zig");
+
+    var skills = skill_mod.SkillSet.init(a);
+    defer skills.deinit();
+    try skills.skills.append(a, try skill_mod.parseSkillMd(
+        a,
+        "---\nname: review\ndescription: Review code\n---\nReview carefully.\n",
+        "/fake/skill.md",
+    ));
+
+    var agents = agent_set_mod.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.agents.append(a, try agent_def_mod.parseAgentMd(
+        a,
+        "---\nname: explore\ndescription: Explore code\n---\nExplore carefully.\n",
+        "/fake/agent.md",
+        .project,
+    ));
+
+    const read_only = [_][]const u8{"Read"};
+    const initial_slim = try buildFull(a, "model", &skills, &agents, &read_only, "", true, "/tmp");
+    defer a.free(initial_slim);
+    try testing.expect(std.mem.indexOf(u8, initial_slim, "# Available skills") == null);
+    try testing.expect(std.mem.indexOf(u8, initial_slim, "# Available subagents") == null);
+    try testing.expect(std.mem.indexOf(u8, initial_slim, "# Knowledge Graph") == null);
+
+    const full_names = [_][]const u8{
+        "Read",       "Skill",    "Task",    "KgRecall",   "KgContext", "KgRemember",
+        "TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
+    };
+    const full = try buildFull(a, "model", &skills, &agents, &full_names, "", true, "/tmp");
+    defer a.free(full);
+    try testing.expect(std.mem.indexOf(u8, full, "# Available skills") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "# Available subagents") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "# Knowledge Graph") != null);
+
+    const visible = [_]@import("../json.zig").ToolDefinition{.{
+        .name = "Read",
+        .description = "read",
+        .input_schema = .{},
+    }};
+    const projected = (try projectCapabilitySectionsForExecution(a, full, &visible)) orelse
+        return error.TestUnexpectedResult;
+    defer a.free(projected);
+    try testing.expect(std.mem.indexOf(u8, projected, "# Available skills") == null);
+    try testing.expect(std.mem.indexOf(u8, projected, "# Available subagents") == null);
+    try testing.expect(std.mem.indexOf(u8, projected, "# Knowledge Graph") == null);
+    try testing.expect((try projectCapabilitySectionsForExecution(a, projected, &visible)) == null);
+}
+
+test "partial TinyKG prompt never names unavailable operations" {
+    const a = testing.allocator;
+    const names = [_][]const u8{ "KgRecall", "TaskUpdate" };
+    const prompt = try buildFull(a, "model", null, null, &names, "", true, "/tmp");
+    defer a.free(prompt);
+
+    try testing.expect(std.mem.indexOf(u8, prompt, "Use KgRecall") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "TaskUpdate status=in_progress") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "KgContext") == null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "KgRemember") == null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "TaskCreate") == null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "TaskList") == null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "TaskGet") == null);
 }
 
 test "buildUsingToolsSection gates CodeMap + FindSymbol guidance on tool presence" {

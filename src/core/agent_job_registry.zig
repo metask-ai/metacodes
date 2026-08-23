@@ -23,6 +23,7 @@ const rng = @import("platform").rng;
 const sync = @import("platform").sync;
 const client_mod = @import("../client.zig");
 const pf = @import("../api/provider_factory.zig");
+const dialect_mod = @import("../api/dialect.zig");
 const types_mod = @import("../types.zig");
 const json_mod = @import("../json.zig");
 const permission_mod = @import("../permission.zig");
@@ -343,6 +344,9 @@ pub const AgentJobRegistry = struct {
     model: []u8,
     /// P0.5:parent 的 provider 协议 → per-job provider 据此造对应具体 client(子继承父 provider)。
     provider_kind: types_mod.ProviderKind = .anthropic,
+    /// Borrowed from the App/Runtime immutable plugin Snapshot. App drains all
+    /// jobs before destroying that Snapshot.
+    dialect_resolver: dialect_mod.Resolver = .builtin(),
     seq: u32 = 0,
 
     pub fn init(
@@ -351,6 +355,24 @@ pub const AgentJobRegistry = struct {
         base_url: ?[]const u8,
         model: []const u8,
         provider_kind: types_mod.ProviderKind,
+    ) !AgentJobRegistry {
+        return initWithDialectResolver(
+            allocator,
+            api_key,
+            base_url,
+            model,
+            provider_kind,
+            .builtin(),
+        );
+    }
+
+    pub fn initWithDialectResolver(
+        allocator: std.mem.Allocator,
+        api_key: []const u8,
+        base_url: ?[]const u8,
+        model: []const u8,
+        provider_kind: types_mod.ProviderKind,
+        dialect_resolver: dialect_mod.Resolver,
     ) !AgentJobRegistry {
         const key_owned = try allocator.dupe(u8, api_key);
         errdefer allocator.free(key_owned);
@@ -365,6 +387,7 @@ pub const AgentJobRegistry = struct {
             .base_url = url_owned,
             .model = model_owned,
             .provider_kind = provider_kind,
+            .dialect_resolver = dialect_resolver,
         };
     }
 
@@ -480,7 +503,14 @@ pub const AgentJobRegistry = struct {
         //    不一致 → Invalid free(GPA 实测)。后台单/多 job 用 registry.allocator 全程一致,已验证能跑。
         //    ⚠️ 线程安全存疑(见 HANDOFF):后台 job 线程用 registry.allocator 做 HTTP,若 App gpa 非线程安全
         //    且与 io_runtime worker 并发理论上有 TaskBatch 同款风险,但后台测试历来通过、未实测崩溃,留查。
-        var owned = try pf.makeProvider(self.allocator, self.provider_kind, self.api_key, self.model, self.base_url);
+        var owned = try pf.makeProviderWithDialectResolver(
+            self.allocator,
+            self.provider_kind,
+            self.api_key,
+            self.model,
+            self.base_url,
+            self.dialect_resolver,
+        );
         errdefer if (!committed) owned.deinit();
 
         // 3) dupe 所有借用内存进 JobInput(必须在 spawn 之前)
@@ -831,7 +861,14 @@ pub const AgentJobRegistry = struct {
         // TaskBatch 并发 worker),且主线程造它时可能与 App 的 io_runtime worker 线程并发。App 的
         // gpa(self.allocator)非线程安全并发访问会损坏(假 OOM/unreachable → SIGABRT,真机实测)。
         // 故用 c_allocator(malloc,线程安全)隔离。OwnedProvider 自带此 allocator,deinit 也用它,一致。
-        return pf.makeProvider(std.heap.c_allocator, self.provider_kind, self.api_key, self.model, self.base_url);
+        return pf.makeProviderWithDialectResolver(
+            std.heap.c_allocator,
+            self.provider_kind,
+            self.api_key,
+            self.model,
+            self.base_url,
+            self.dialect_resolver,
+        );
     }
 
     fn makeProviderForTool(raw: *anyopaque) anyerror!pf.OwnedProvider {

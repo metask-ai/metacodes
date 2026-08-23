@@ -646,8 +646,30 @@ pub const ToolEnvironment = struct {
             reservation.release();
             return err;
         };
+        const payload_cap = switch (kind) {
+            .tool => self.controller.profile.tool_result_cap_bytes,
+            .mcp => self.controller.profile.mcp_result_cap_bytes,
+            .provider => unreachable,
+        };
+        if (outcome == .ok and outcome.ok == .@"inline" and
+            outcome.ok.rawBytes() > payload_cap)
+        {
+            _ = outcome.ok.promoteInline(
+                tool_ctx.allocator,
+                tool_ctx.artifact_root,
+            ) catch |err| {
+                const required = outcome.ok.rawBytes();
+                outcome.deinit(tool_ctx.allocator);
+                if (err == error.OutOfMemory) {
+                    reservation.release();
+                    return error.OutOfMemory;
+                }
+                reservation.failResourceLimit(required);
+                return boundedToolOutcome(tool_ctx.allocator, RESOURCE_LIMIT_MARKER);
+            };
+        }
         const payload_bytes: u64 = switch (outcome) {
-            .ok => |bytes| @intCast(bytes.len),
+            .ok => |*body| @intCast(try body.modelVisibleBytes(tool_ctx.allocator)),
             .host_failed, .host_rejected => |maybe| if (maybe) |bytes|
                 @intCast(bytes.len)
             else
@@ -1431,7 +1453,7 @@ const TestDispatcher = struct {
         self.calls += 1;
         const bytes = try tool_ctx.allocator.alloc(u8, self.payload_bytes);
         @memset(bytes, 't');
-        return .{ .ok = bytes };
+        return .{ .ok = core.tools.ToolResultBody.initInline(bytes) };
     }
 
     fn no(_: *const anyopaque, _: []const u8) bool {
@@ -1589,6 +1611,58 @@ test "Tool reservation failure skips dispatch and oversized payload is replaced"
     );
 }
 
+test "oversized inline Tool result is promoted before the AgentCore raw cap" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const profile = Profile{
+        .hard_bytes = 64 * 1024,
+        .soft_bytes = 48 * 1024,
+        .input_cap_bytes = 8 * 1024,
+        .provider_request_cap_bytes = 8 * 1024,
+        .provider_result_cap_bytes = 8 * 1024,
+        .tool_result_cap_bytes = 4 * 1024,
+        .mcp_result_cap_bytes = 4 * 1024,
+        .audit_reserve_bytes = 256,
+        .terminal_reserve_bytes = 256,
+    };
+    var controller = Controller.init(allocator, profile, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 256,
+        .minimum_required_bytes = 256,
+    });
+    var base = TestDispatcher{ .payload_bytes = 16 * 1024 };
+    var environment = ToolEnvironment{
+        .controller = &controller,
+        .base = .{ .definitions = &.{}, .dispatcher = base.dispatcher() },
+    };
+    const tool_ctx = core.tool_context.ToolContext{
+        .allocator = allocator,
+        .artifact_root = root,
+    };
+    var outcome = try environment.surface().dispatcher.dispatch(&tool_ctx, "HostLarge", "{}");
+    defer outcome.deinit(allocator);
+    try std.testing.expect(outcome == .ok);
+    try std.testing.expect(outcome.ok == .artifact);
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+    var rendered = try outcome.ok.render(allocator);
+    defer rendered.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "ReadArtifact") != null);
+    var recovered = try core.tool_result_artifact.readChunk(
+        allocator,
+        root,
+        outcome.ok.artifact.stored.id(),
+        0,
+        16 * 1024,
+    );
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 16 * 1024), recovered.bytes.len);
+}
+
 test "MCP reservation failure occurs before connector invocation" {
     const fixture = @import("mcp_test_support.zig");
     const mcp_catalog = @import("mcp_catalog.zig");
@@ -1651,6 +1725,96 @@ test "MCP reservation failure occurs before connector invocation" {
     defer outcome.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 0), server.calls);
     try std.testing.expectEqual(Outcome.budget_exhausted, controller.outcome());
+}
+
+test "oversized MCP success is promoted to the shared recoverable artifact plane" {
+    const allocator = std.testing.allocator;
+    const fixture = @import("mcp_test_support.zig");
+    const mcp_catalog = @import("mcp_catalog.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    var server = fixture.Server{ .result_padding_bytes = 16 * 1024 };
+    const binding = [_]u8{0x95} ** 32;
+    const specs = [_]mcp_catalog.ServerSpec{.{
+        .binding = binding,
+        .namespace = "weather",
+        .connector = server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "budget-test", .version = "1" },
+    }};
+    var manager = try mcp_catalog.Manager.init(allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+    var view = try mcp_session.View.init(
+        allocator,
+        snapshot,
+        &.{.{
+            .server_binding_identity = binding,
+            .tool_name = "weather",
+        }},
+        .fresh,
+    );
+    defer view.deinit();
+    var builtin = TestDispatcher{ .payload_bytes = 1 };
+    var mcp_environment = try mcp_session.Environment.init(
+        allocator,
+        &view,
+        &.{},
+        builtin.dispatcher(),
+        null,
+    );
+    defer mcp_environment.deinit();
+    const profile = Profile{
+        .hard_bytes = 64 * 1024,
+        .soft_bytes = 48 * 1024,
+        .input_cap_bytes = 8 * 1024,
+        .provider_request_cap_bytes = 8 * 1024,
+        .provider_result_cap_bytes = 8 * 1024,
+        .tool_result_cap_bytes = 4 * 1024,
+        .mcp_result_cap_bytes = 4 * 1024,
+        .audit_reserve_bytes = 256,
+        .terminal_reserve_bytes = 256,
+    };
+    var controller = Controller.init(allocator, profile, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 256,
+        .minimum_required_bytes = 256,
+    });
+    var budgeted = ToolEnvironment{
+        .controller = &controller,
+        .base = mcp_environment.surface(),
+        .mcp_view = &view,
+    };
+    const tool_ctx = core.tool_context.ToolContext{
+        .allocator = allocator,
+        .artifact_root = root,
+    };
+    var outcome = try budgeted.surface().dispatcher.dispatch(
+        &tool_ctx,
+        view.entries[0].model_name,
+        "{\"city\":\"Paris\"}",
+    );
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 1), server.calls);
+    try std.testing.expect(outcome == .ok);
+    try std.testing.expect(outcome.ok == .artifact);
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+    var recovered = try core.tool_result_artifact.readChunk(
+        allocator,
+        root,
+        outcome.ok.artifact.stored.id(),
+        0,
+        32 * 1024,
+    );
+    defer recovered.deinit();
+    try std.testing.expect(recovered.bytes.len > profile.mcp_result_cap_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, recovered.bytes, "structuredContent") != null);
 }
 
 test "exact admission boundary and soft recommendation are deterministic" {

@@ -79,6 +79,7 @@ const sync = @import("platform").sync;
 const team_mod = @import("team.zig");
 const mailbox = @import("mailbox.zig");
 const pf = @import("../api/provider_factory.zig");
+const dialect_mod = @import("../api/dialect.zig");
 const types_mod = @import("../types.zig");
 const json_mod = @import("../json.zig");
 const permission_mod = @import("../permission.zig");
@@ -290,6 +291,7 @@ pub const TeammateRegistry = struct {
     base_url: ?[]u8,
     model: []u8,
     provider_kind: types_mod.ProviderKind = .anthropic,
+    dialect_resolver: dialect_mod.Resolver = .builtin(),
     home: []u8,
 
     pub fn init(
@@ -299,6 +301,26 @@ pub const TeammateRegistry = struct {
         model: []const u8,
         provider_kind: types_mod.ProviderKind,
         home: []const u8,
+    ) !TeammateRegistry {
+        return initWithDialectResolver(
+            allocator,
+            api_key,
+            base_url,
+            model,
+            provider_kind,
+            home,
+            .builtin(),
+        );
+    }
+
+    pub fn initWithDialectResolver(
+        allocator: std.mem.Allocator,
+        api_key: []const u8,
+        base_url: ?[]const u8,
+        model: []const u8,
+        provider_kind: types_mod.ProviderKind,
+        home: []const u8,
+        dialect_resolver: dialect_mod.Resolver,
     ) !TeammateRegistry {
         if (home.len == 0) return error.NoHome; // 路径 helper 空 home 约束(team.zig F9)
         const key_owned = try allocator.dupe(u8, api_key);
@@ -315,6 +337,7 @@ pub const TeammateRegistry = struct {
             .base_url = url_owned,
             .model = model_owned,
             .provider_kind = provider_kind,
+            .dialect_resolver = dialect_resolver,
             .home = home_owned,
         };
     }
@@ -560,7 +583,14 @@ pub const TeammateRegistry = struct {
         try mailbox.ensureInbox(lead_inbox_path);
 
         // 4) 专属 provider(c_allocator:线程安全 + 与 agent_loop 事件所有权一致)。
-        var owned = try pf.makeProvider(std.heap.c_allocator, self.provider_kind, self.api_key, p.model_override orelse self.model, self.base_url);
+        var owned = try pf.makeProviderWithDialectResolver(
+            std.heap.c_allocator,
+            self.provider_kind,
+            self.api_key,
+            p.model_override orelse self.model,
+            self.base_url,
+            self.dialect_resolver,
+        );
         errdefer if (!committed) owned.deinit();
 
         // 5) dupe 输入。

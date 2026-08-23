@@ -449,7 +449,11 @@ pub fn deriveRunObservationEvidence(
     return .{ .arena = arena, .value = value };
 }
 
-pub fn renderSnapshot(allocator: std.mem.Allocator, input: SnapshotInput) !RenderedSnapshot {
+/// Borrow the projection input. Encoding is synchronous and retains nothing;
+/// callers must nevertheless keep every nested slice alive for this call.
+/// Taking a pointer makes that lifetime contract visible at the API boundary
+/// and avoids another by-value copy of the identity arrays.
+pub fn renderSnapshot(allocator: std.mem.Allocator, input: *const SnapshotInput) !RenderedSnapshot {
     try requireNonzeroHex(input.project_sha256);
     try requireNonzeroHex(input.revision);
     try requireHex(input.active_bundle_sha256);

@@ -8,6 +8,7 @@ const std = @import("std");
 const teammate_mod = @import("teammate.zig");
 const team_mod = @import("team.zig");
 const types_mod = @import("../types.zig");
+const dialect_mod = @import("../api/dialect.zig");
 
 /// 一个进程外 teammate 的 lead 侧记录(owned strings)。
 pub const ProcessTeammate = struct {
@@ -42,6 +43,9 @@ pub const SwarmContext = struct {
     base_url: ?[]const u8 = null,
     model: []const u8 = "",
     provider_kind: types_mod.ProviderKind = .anthropic,
+    /// Immutable App/Runtime-scoped resolver; in-process teammates drain before
+    /// the owning plugin Snapshot is destroyed.
+    dialect_resolver: dialect_mod.Resolver = .builtin(),
 
     /// 非阻塞 reap:对进程外 teammate waitpid(WNOHANG),已退出的收尸+removeWorktree+摘除记录。
     /// 返回仍存活的数量。POSIX only(Windows 列表恒空)。

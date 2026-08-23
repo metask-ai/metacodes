@@ -91,6 +91,7 @@ pub const EvaluationBudget = struct {
     used_cost_usd: f64 = 0,
     request_reserve_tokens: u64 = 0,
     request_reserve_cost_usd: f64 = 0,
+    rates: pricing.Rates = pricing.DEFAULT_RATES,
     abort: ?*AbortSignal = null,
 
     pub fn configureRequestReserve(
@@ -100,30 +101,49 @@ pub const EvaluationBudget = struct {
         model: []const u8,
     ) void {
         self.request_reserve_tokens = max_input_tokens +| max_output_tokens;
-        const rates = pricing.rateFor(model);
-        const worst_input_rate = @max(
-            rates.input_per_mtok,
-            @max(rates.cache_read_per_mtok, rates.cache_write_per_mtok),
+        self.rates = pricing.rateFor(model);
+        self.request_reserve_cost_usd = reserveCost(
+            self.rates,
+            max_input_tokens,
+            max_output_tokens,
         );
-        self.request_reserve_cost_usd =
-            @as(f64, @floatFromInt(max_input_tokens)) / 1_000_000.0 * worst_input_rate +
-            @as(f64, @floatFromInt(max_output_tokens)) / 1_000_000.0 * rates.output_per_mtok;
     }
 
     pub fn allowsAnotherRequest(self: *const EvaluationBudget) bool {
+        return self.allowsBound(
+            self.request_reserve_tokens,
+            self.request_reserve_cost_usd,
+        );
+    }
+
+    pub fn allowsRequest(self: *const EvaluationBudget, bound: request_gate.RequestBound) bool {
+        const reserve_tokens = bound.max_input_tokens +| bound.max_output_tokens;
+        const reserve_cost_usd = reserveCost(
+            self.rates,
+            bound.max_input_tokens,
+            bound.max_output_tokens,
+        );
+        return self.allowsBound(reserve_tokens, reserve_cost_usd);
+    }
+
+    fn allowsBound(
+        self: *const EvaluationBudget,
+        reserve_tokens: u64,
+        reserve_cost_usd: f64,
+    ) bool {
         if (self.max_metered_tokens == null and self.max_cost_usd == null) return true;
-        if (self.request_reserve_tokens == 0 or
-            !std.math.isFinite(self.request_reserve_cost_usd) or
-            self.request_reserve_cost_usd <= 0)
+        if (reserve_tokens == 0 or
+            !std.math.isFinite(reserve_cost_usd) or
+            reserve_cost_usd <= 0)
             return false;
         if (self.max_metered_tokens) |limit| {
             if (self.used_metered_tokens >= limit or
-                self.request_reserve_tokens > limit - self.used_metered_tokens)
+                reserve_tokens > limit - self.used_metered_tokens)
                 return false;
         }
         if (self.max_cost_usd) |limit| {
             if (self.used_cost_usd >= limit or
-                self.request_reserve_cost_usd > limit - self.used_cost_usd)
+                reserve_cost_usd > limit - self.used_cost_usd)
                 return false;
         }
         return true;
@@ -151,11 +171,31 @@ pub const EvaluationBudget = struct {
         return false;
     }
 
+    fn boundedRequestAllowed(raw: *anyopaque, bound: request_gate.RequestBound) bool {
+        const self: *EvaluationBudget = @ptrCast(@alignCast(raw));
+        if (self.allowsRequest(bound)) return true;
+        if (self.abort) |signal| signal.abort(.evaluation_budget);
+        return false;
+    }
+
     pub fn gate(self: *EvaluationBudget, abort: *AbortSignal) request_gate.Gate {
         self.abort = abort;
-        return .{ .ctx = @ptrCast(self), .allows_fn = requestAllowed };
+        return .{
+            .ctx = @ptrCast(self),
+            .allows_fn = requestAllowed,
+            .allows_request_fn = boundedRequestAllowed,
+        };
     }
 };
+
+fn reserveCost(rates: pricing.Rates, max_input_tokens: u64, max_output_tokens: u64) f64 {
+    const worst_input_rate = @max(
+        rates.input_per_mtok,
+        @max(rates.cache_read_per_mtok, rates.cache_write_per_mtok),
+    );
+    return @as(f64, @floatFromInt(max_input_tokens)) / 1_000_000.0 * worst_input_rate +
+        @as(f64, @floatFromInt(max_output_tokens)) / 1_000_000.0 * rates.output_per_mtok;
+}
 
 pub const RuntimeConfig = struct {
     allocator: std.mem.Allocator,
@@ -886,6 +926,36 @@ test "EvaluationBudget reserves one worst-case request and aborts before oversho
 
     budget.record(1, 0, 0, 0, 0.001);
     try std.testing.expect(!budget.gate(&signal).allows());
+    try std.testing.expect(signal.isAborted());
+    try std.testing.expectEqual(
+        @import("../util/abort.zig").Reason.evaluation_budget,
+        signal.reason(),
+    );
+}
+
+test "EvaluationBudget accepts a serialized request bound without weakening caps" {
+    var signal = AbortSignal.init();
+    var budget = EvaluationBudget{
+        .max_metered_tokens = 800_000,
+        .max_cost_usd = 0.8,
+    };
+    budget.configureRequestReserve(200_000, 32_000, "glm-5.2");
+    const gate = budget.gate(&signal);
+
+    // The provider-wide context reserve is intentionally too large for this
+    // rollout, while the byte-dominating bound for the actual request fits.
+    try std.testing.expect(!budget.allowsAnotherRequest());
+    try std.testing.expect(gate.allowsRequest(.{
+        .max_input_tokens = 80_000,
+        .max_output_tokens = 8_192,
+    }));
+    try std.testing.expect(!signal.isAborted());
+
+    budget.record(70_000, 4_000, 0, 0, 0.4);
+    try std.testing.expect(!gate.allowsRequest(.{
+        .max_input_tokens = 80_000,
+        .max_output_tokens = 8_192,
+    }));
     try std.testing.expect(signal.isAborted());
     try std.testing.expectEqual(
         @import("../util/abort.zig").Reason.evaluation_budget,

@@ -109,6 +109,15 @@ pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) P
 }
 
 pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, args: []const u8) PermissionResult {
+    return checkPermissionClassified(ctx, tool_name, args, null);
+}
+
+pub fn checkPermissionClassified(
+    ctx: *const PermissionContext,
+    tool_name: []const u8,
+    args: []const u8,
+    category: ?ToolCategory,
+) PermissionResult {
     // B1 防御:规则匹配器(matchesPathDual)用 match_ctx.alloc 做路径 canonicalize
     // (unescape + 折叠 ..)。生产里 App.loadSettings 已填 .alloc,但那与 settings!=null 是
     // 隐式耦合;此处兜底——PermissionContext.allocator 非可选,恒填,消除"某路径设了 settings
@@ -132,7 +141,7 @@ pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, arg
         .memdir_allocator = ctx.allocator,
         .path_check_allocator = ctx.allocator,
     };
-    return decision_mod.check(&d_ctx, tool_name, args);
+    return decision_mod.checkClassified(&d_ctx, tool_name, args, category);
 }
 
 /// 询问用户(有副作用:写 session 记忆 / 落盘)。ctx 非 const,见 prompt.ask 线程契约。

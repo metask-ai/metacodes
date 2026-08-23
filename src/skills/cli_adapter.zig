@@ -71,18 +71,35 @@ pub const Runtime = struct {
         home: []const u8,
         projection: *skill_projection.SkillSet,
     ) !void {
+        return self.loadDefaultWithExtraSources(cwd, home, "", &.{}, projection);
+    }
+
+    /// Product defaults plus Host-admitted plugin sources are resolved by one
+    /// canonical catalog build. Plugins therefore cannot bypass normal Skill
+    /// parsing, availability, activation, policy frames, or revision hashing.
+    pub fn loadDefaultWithExtraSources(
+        self: *Runtime,
+        cwd: []const u8,
+        home: []const u8,
+        workspace_epoch: []const u8,
+        extra_sources: []const runtime.catalog.Source,
+        projection: *skill_projection.SkillSet,
+    ) !void {
         const workspace_root = skill_projection.findRepoRoot(self.allocator, cwd) catch
             try self.allocator.dupe(u8, cwd);
         defer self.allocator.free(workspace_root);
 
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        const sources = try runtime.catalog.defaultSources(
+        const defaults = try runtime.catalog.defaultSources(
             scratch.allocator(),
             workspace_root,
             home,
         );
-        try self.loadSources(workspace_root, home, "", sources, projection);
+        var combined: std.ArrayList(runtime.catalog.Source) = .empty;
+        try combined.appendSlice(scratch.allocator(), defaults);
+        try combined.appendSlice(scratch.allocator(), extra_sources);
+        try self.loadSources(workspace_root, home, workspace_epoch, combined.items, projection);
     }
 
     pub fn loadSources(
@@ -148,6 +165,23 @@ pub const Runtime = struct {
         if (self.materializations == null) return false;
         const snapshot = self.snapshot orelse return false;
         return runtime.model_tool.hasModelInvocable(snapshot);
+    }
+
+    /// Patch the CLI-owned dynamic definition with the canonical schema plus
+    /// immutable model-routing metadata. The exact Skill name is borrowed from
+    /// this Runtime snapshot and therefore stays stable for the Session.
+    pub fn applyModelToolSchema(self: *const Runtime, definitions: []ToolDefinition) bool {
+        const snapshot = self.snapshot orelse return false;
+        for (definitions) |*definition| {
+            if (!std.mem.eql(u8, definition.name, runtime.model_tool.TOOL_NAME))
+                continue;
+            definition.input_schema.prop_specs = &runtime.model_tool.INPUT_PROPERTIES;
+            definition.input_schema.properties = null;
+            definition.input_schema.required = runtime.model_tool.REQUIRED_FIELDS;
+            definition.model_activation = runtime.model_tool.modelActivation(snapshot);
+            return true;
+        }
+        return false;
     }
 
     pub fn activate(
@@ -453,9 +487,10 @@ pub fn registerModelTool(registry: *DynRegistry, skill_runtime: *Runtime) !void 
     );
 }
 
-/// DynRegistry retains the old registration shape and cannot describe array
-/// properties. Patch only the adapter-owned model surface after App assembles
-/// final definitions; execution still dispatches through the registry.
+/// DynRegistry's legacy required-fields registration shape cannot describe
+/// array properties. Patch only the adapter-owned model surface after App
+/// assembles final definitions; typed execution still dispatches through the
+/// registry.
 pub fn applyModelToolSchema(definitions: []ToolDefinition) bool {
     for (definitions) |*definition| {
         if (!std.mem.eql(u8, definition.name, runtime.model_tool.TOOL_NAME))

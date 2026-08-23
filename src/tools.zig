@@ -37,6 +37,7 @@ const find_symbol_tool = @import("tools/find_symbol.zig");
 pub const ToolContext = @import("tools/context.zig").ToolContext;
 pub const ToolDispatcher = @import("tools/context.zig").ToolDispatcher;
 pub const ToolDispatchOutcome = @import("tools/context.zig").ToolDispatchOutcome;
+pub const ToolResultBody = @import("tools/context.zig").ToolResultBody;
 pub const ToolExecutionPolicy = @import("tools/context.zig").ToolExecutionPolicy;
 pub const RunIdentity = @import("tools/context.zig").RunIdentity;
 pub const HostRunIdentity = @import("tools/context.zig").HostRunIdentity;
@@ -57,6 +58,32 @@ pub const ToolResult = struct {
 
 /// 工具执行函数签名（M2 起）：ctx 携带 allocator、abort、未来还有 permission/cwd。
 pub const ExecuteFn = *const fn (ctx: *const ToolContext, args: []const u8) anyerror![]u8;
+pub const ExecuteBodyFn = *const fn (ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody;
+
+/// Native tools migrate independently: legacy implementations are adapted at
+/// this single boundary, while spool-aware implementations return the typed
+/// body directly. The tagged union prevents a ToolEntry from carrying two
+/// competing executors or neither.
+pub const ToolExecutor = union(enum) {
+    legacy_inline: ExecuteFn,
+    result_body: ExecuteBodyFn,
+
+    pub fn run(self: ToolExecutor, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+        return switch (self) {
+            .legacy_inline => |execute| ToolResultBody.initInline(try execute(ctx, args)),
+            .result_body => |execute| execute(ctx, args),
+        };
+    }
+};
+
+/// Auditable producer classification. `byte_zero_spool` is a correctness
+/// contract, not a tuning hint: such entries must use the typed executor and
+/// acquire kernel storage before their unbounded producer starts.
+pub const ResultProduction = enum {
+    bounded_inline,
+    input_derived,
+    byte_zero_spool,
+};
 
 /// 工具长描述生成函数签名（动态耦合）：按 PromptContext 生成 owned 描述。
 /// 对应 cc/src/Tool.ts 的 tool.prompt(ctx)。
@@ -69,7 +96,8 @@ pub const ToolEntry = struct {
     /// 动态长描述生成器。非 null 时优先于 description（核心工具用，支持动态耦合）。
     describe_fn: ?DescribeFn = null,
     input_schema: json.InputSchema,
-    execute: ExecuteFn,
+    execute: ToolExecutor,
+    result_production: ResultProduction = .bounded_inline,
     /// deferred(对齐 cc ToolSearch):true = 不进默认 tools 数组,只在 prompt 列名;
     /// 模型须先调 ToolSearch 激活才可调。降低工具菜单稀释(弱后端会乱抓 Bash 的根因)。
     deferred: bool = false,
@@ -106,7 +134,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "limit", .type = "integer", .description = "The number of lines to read" },
             .{ .name = "outline", .type = "boolean", .description = "Return a symbol outline (functions/types with line numbers) instead of file contents. Requires --lsp and an installed language server for the file's language; falls back to normal reading otherwise." },
         }, .required = &.{"file_path"} },
-        .execute = read_tool.execute,
+        .execute = .{ .legacy_inline = read_tool.execute },
     },
     .{
         .name = "Write",
@@ -116,7 +144,8 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "file_path", .type = "string", .description = "The absolute path to the file to write" },
             .{ .name = "content", .type = "string", .description = "The content to write to the file" },
         }, .required = &.{ "file_path", "content" } },
-        .execute = write_tool.execute,
+        .execute = .{ .legacy_inline = write_tool.execute },
+        .result_production = .input_derived,
     },
     .{
         .name = "Edit",
@@ -128,7 +157,8 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "new_string", .type = "string", .description = "The text to replace it with (must differ from old_string)" },
             .{ .name = "replace_all", .type = "boolean", .description = "Replace all occurrences of old_string (default false)" },
         }, .required = &.{ "file_path", "old_string", "new_string" } },
-        .execute = edit_tool.execute,
+        .execute = .{ .legacy_inline = edit_tool.execute },
+        .result_production = .input_derived,
     },
     .{
         .name = "ApplyPatch",
@@ -136,7 +166,8 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "patch", .type = "string", .description = "The full patch text, from '*** Begin Patch' to '*** End Patch'." },
         }, .required = &.{"patch"} },
-        .execute = apply_patch_tool.execute,
+        .execute = .{ .legacy_inline = apply_patch_tool.execute },
+        .result_production = .input_derived,
     },
     .{
         .name = "Glob",
@@ -146,7 +177,8 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "pattern", .type = "string", .description = "The glob pattern to match files against (e.g. **/*.zig)" },
             .{ .name = "path", .type = "string", .description = "The directory to search in (defaults to cwd)" },
         }, .required = &.{"pattern"} },
-        .execute = glob_tool.execute,
+        .execute = .{ .result_body = glob_tool.executeBody },
+        .result_production = .byte_zero_spool,
     },
     .{
         .name = "Grep",
@@ -160,7 +192,8 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "-i", .type = "boolean", .description = "Case insensitive search" },
             .{ .name = "-n", .type = "boolean", .description = "Show line numbers (content mode)" },
         }, .required = &.{"pattern"} },
-        .execute = grep_tool.execute,
+        .execute = .{ .result_body = grep_tool.executeBody },
+        .result_production = .byte_zero_spool,
     },
     // CodeMap:代码结构大纲(LSP documentSymbol,Y2 砍 tree-sitter 后)。排在搜索工具之后、Bash
     // 之前——和 Grep/Glob 同属"专用搜索/导航工具",比整文件 Read 省 token,引导模型优先用它定位定义。
@@ -176,7 +209,8 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "path", .type = "string", .description = "A file path OR a glob pattern (e.g. src/**/*)" },
         }, .required = &.{"path"} },
-        .execute = code_map_tool.execute,
+        .execute = .{ .result_body = code_map_tool.executeBody },
+        .result_production = .byte_zero_spool,
     },
     // FindSymbol:跨文件找符号*定义*(LSP documentSymbol)。常驻默认工具菜单——A/B 实验(2026-06-08,
     // 192 次真模型)证明 deferred(藏 ToolSearch 后)致"找定义题"压不动(命中率仅 17%,
@@ -193,7 +227,8 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "kind", .type = "string", .description = "Optional kind filter", .enum_values = &.{ "function", "method", "struct", "enum", "union", "type", "constant", "variable", "class", "interface" } },
             .{ .name = "path", .type = "string", .description = "Optional directory/glob to scope the search (defaults to cwd)" },
         }, .required = &.{"name"} },
-        .execute = find_symbol_tool.execute,
+        .execute = .{ .result_body = find_symbol_tool.executeBody },
+        .result_production = .byte_zero_spool,
     },
     // Bash 排在所有文件/搜索专用工具(Read/Write/Edit/Glob/Grep)之后,对齐 mecode 的
     // 工具顺序(default.md 工具清单:…Glob, Grep, NotebookEdit, Bash…)。MiniMax 类模型
@@ -209,15 +244,21 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "timeout", .type = "integer", .description = "Optional timeout in milliseconds (max 600000)" },
             .{ .name = "run_in_background", .type = "boolean", .description = "Set to true to run this command in the background" },
         }, .required = &.{"command"} },
-        .execute = bash_tool.execute,
+        .execute = .{ .result_body = bash_tool.executeBody },
+        .result_production = .byte_zero_spool,
     },
     .{
         .name = "BashOutput",
-        .description = "Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks (from stdout_path/stderr_path files) plus status (running|exited|killed). Use stdout_since_byte/stderr_since_byte for incremental reads (pass previous stdout_total_bytes). max_bytes caps a single read (default 64KB). NOTE: if the command used shell redirection (>/>>/2>), the redirected output goes to the user-specified file, NOT stdout_path — Read that file directly. For long-running jobs, prefer Read on stdout_path (returned when the job auto-backgrounded) over polling BashOutput.",
+        .description = "Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks (from stdout_path/stderr_path files) plus status (running|exited|killed). Use stdout_since_byte/stderr_since_byte for incremental reads (pass previous stdout_total_bytes). max_bytes caps a single read (default 64KB, maximum 256KB). NOTE: if the command used shell redirection (>/>>/2>), the redirected output goes to the user-specified file, NOT stdout_path — Read that file directly. For long-running jobs, prefer Read on stdout_path (returned when the job auto-backgrounded) over polling BashOutput.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to read" },
+            .{ .name = "stdout", .type = "boolean", .description = "Include stdout (default true)" },
+            .{ .name = "stderr", .type = "boolean", .description = "Include stderr (default true)" },
+            .{ .name = "stdout_since_byte", .type = "integer", .description = "Read stdout starting at this byte offset" },
+            .{ .name = "stderr_since_byte", .type = "integer", .description = "Read stderr starting at this byte offset" },
+            .{ .name = "max_bytes", .type = "integer", .description = "Maximum bytes per selected channel (1..262144; default 65536)" },
         }, .required = &.{"job_id"} },
-        .execute = bash_output_tool.execute,
+        .execute = .{ .legacy_inline = bash_output_tool.execute },
     },
     .{
         .name = "ReadArtifact",
@@ -227,7 +268,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "offset", .type = "integer", .description = "Zero-based byte offset (default 0)" },
             .{ .name = "limit", .type = "integer", .description = "Maximum bytes to return (default 16384, maximum 32768)" },
         }, .required = &.{"artifact_id"} },
-        .execute = read_artifact_tool.execute,
+        .execute = .{ .legacy_inline = read_artifact_tool.execute },
     },
     .{
         .name = "KillShell",
@@ -235,7 +276,7 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to terminate" },
         }, .required = &.{"job_id"} },
-        .execute = kill_shell_tool.execute,
+        .execute = .{ .legacy_inline = kill_shell_tool.execute },
     },
     .{
         .name = "Monitor",
@@ -245,7 +286,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "description", .type = "string", .description = "Short description of what is being monitored" },
             .{ .name = "persistent", .type = "boolean", .description = "If true, run with no timeout for the session lifetime" },
         }, .required = &.{ "command", "description" } },
-        .execute = monitor_tool.execute,
+        .execute = .{ .legacy_inline = monitor_tool.execute },
     },
     .{
         .name = "NotebookEdit",
@@ -257,7 +298,8 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "cell_type", .type = "string", .description = "Cell type (required for insert)", .enum_values = &.{ "code", "markdown" } },
             .{ .name = "edit_mode", .type = "string", .description = "Edit mode", .enum_values = &.{ "replace", "insert", "delete" } },
         }, .required = &.{ "notebook_path", "new_source" } },
-        .execute = notebook_edit_tool.execute,
+        .execute = .{ .legacy_inline = notebook_edit_tool.execute },
+        .result_production = .input_derived,
     },
     .{
         .name = "EnterWorktree",
@@ -267,7 +309,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "path", .type = "string", .description = "Path of an existing worktree to switch into" },
             .{ .name = "base", .type = "string", .description = "Base branch for a newly created worktree" },
         }, .required = &.{} },
-        .execute = worktree_tool.enterExecute,
+        .execute = .{ .legacy_inline = worktree_tool.enterExecute },
     },
     .{
         .name = "ExitWorktree",
@@ -276,7 +318,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "action", .type = "string", .description = "keep leaves worktree intact; remove deletes it", .enum_values = &.{ "keep", "remove" } },
             .{ .name = "discard_changes", .type = "boolean", .description = "Force-remove even with uncommitted changes" },
         }, .required = &.{"action"} },
-        .execute = worktree_tool.exitExecute,
+        .execute = .{ .legacy_inline = worktree_tool.exitExecute },
     },
     .{
         .name = "ListMcpResourcesTool",
@@ -284,7 +326,8 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "server", .type = "string", .description = "Optional: filter to a single MCP server name" },
         }, .required = &.{} },
-        .execute = mcp_resources_tool.listExecute,
+        .execute = .{ .result_body = mcp_resources_tool.listExecuteBody },
+        .result_production = .byte_zero_spool,
     },
     .{
         .name = "ReadMcpResourceTool",
@@ -293,7 +336,8 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "uri", .type = "string", .description = "The URI of the MCP resource to read" },
             .{ .name = "server", .type = "string", .description = "Optional: hint for which server to query first" },
         }, .required = &.{"uri"} },
-        .execute = mcp_resources_tool.readExecute,
+        .execute = .{ .result_body = mcp_resources_tool.readExecuteBody },
+        .result_production = .byte_zero_spool,
     },
     .{
         .name = "PushNotification",
@@ -301,7 +345,7 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "message", .type = "string", .description = "The notification body, under 200 chars, one line" },
         }, .required = &.{"message"} },
-        .execute = push_notification_tool.execute,
+        .execute = .{ .legacy_inline = push_notification_tool.execute },
     },
     .{
         .name = "CronCreate",
@@ -312,7 +356,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "delaySeconds", .type = "integer", .description = "One-shot delay in seconds (alternative to cron)" },
             .{ .name = "recurring", .type = "boolean", .description = "Fire repeatedly (default true) vs once" },
         }, .required = &.{"prompt"} },
-        .execute = cron_tool.createExecute,
+        .execute = .{ .legacy_inline = cron_tool.createExecute },
     },
     .{
         .name = "CronDelete",
@@ -320,13 +364,13 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "id", .type = "string", .description = "The id of the cron job to cancel" },
         }, .required = &.{"id"} },
-        .execute = cron_tool.deleteExecute,
+        .execute = .{ .legacy_inline = cron_tool.deleteExecute },
     },
     .{
         .name = "CronList",
         .description = "List all scheduled cron jobs in this session.",
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
-        .execute = cron_tool.listExecute,
+        .execute = .{ .legacy_inline = cron_tool.listExecute },
     },
     .{
         .name = "WebFetch",
@@ -335,7 +379,8 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "url", .type = "string", .description = "The URL to fetch content from" },
             .{ .name = "prompt", .type = "string", .description = "Optional note about what you're looking for (currently NOT applied server-side — the full page text is returned for you to analyze directly)." },
         }, .required = &.{"url"} },
-        .execute = web_fetch_tool.execute,
+        .execute = .{ .result_body = web_fetch_tool.executeBody },
+        .result_production = .byte_zero_spool,
     },
     .{
         .name = "AskUserQuestion",
@@ -369,13 +414,13 @@ pub const registry: []const ToolEntry = &.{
             },
             .required = &.{"questions"},
         },
-        .execute = ask_user_tool.execute,
+        .execute = .{ .legacy_inline = ask_user_tool.execute },
     },
     .{
         .name = "EnterPlanMode",
         .description = "Enter plan mode to research and design before implementing. Use this tool PROACTIVELY at the start of any non-trivial task — new features, multi-file changes, refactors, architectural decisions, anything with multiple valid approaches, or when the user asks for a plan/design. In plan mode only read-only tools (Read/Grep/Glob) are allowed; write/exec are denied, so you investigate first, then call ExitPlanMode with your plan for the user to approve. Skip it only for trivial one-line fixes or pure questions. When in doubt, prefer entering plan mode — getting sign-off before writing code prevents wasted work.",
         .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
-        .execute = plan_mode_tool.executeEnter,
+        .execute = .{ .legacy_inline = plan_mode_tool.executeEnter },
     },
     .{
         .name = "ExitPlanMode",
@@ -383,7 +428,7 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "plan", .type = "string", .description = "The plan to present to the user for approval, as concise markdown." },
         }, .required = &.{} },
-        .execute = plan_mode_tool.executeExit,
+        .execute = .{ .legacy_inline = plan_mode_tool.executeExit },
     },
     .{
         .name = "KgRemember",
@@ -393,7 +438,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "kind", .type = "string", .description = "Memory type: decision | user_preference | module (a code module/component's responsibility or structure) | bug (a defect / wrong behavior) | observation (default, use only when none of the specific types fit). PREFER a specific type over observation — specific types make the memory retrievable by type." },
             .{ .name = "scope", .type = "string", .description = "project (default) | global — global only for cross-project user preferences" },
         }, .required = &.{"text"} },
-        .execute = kg_tools.executeRemember,
+        .execute = .{ .legacy_inline = kg_tools.executeRemember },
         .tinykg_gated = true,
     },
     .{
@@ -423,7 +468,7 @@ pub const registry: []const ToolEntry = &.{
                 .object_required = &.{ "schema_version", "intent", "stage", "variants" },
             },
         }, .required = &.{ "query", "lexical_plan" } },
-        .execute = kg_tools.executeRecall,
+        .execute = .{ .legacy_inline = kg_tools.executeRecall },
         .tinykg_gated = true,
     },
     .{
@@ -435,7 +480,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "text_offset", .type = "integer", .description = "Byte offset for paging long authoritative node text (default 0; use next_text_offset)." },
             .{ .name = "text_limit", .type = "integer", .description = "Maximum authoritative text bytes for this page, 4-12000 (default 6000; minimum fits one UTF-8 codepoint)." },
         }, .required = &.{"node_id"} },
-        .execute = kg_tools.executeContext,
+        .execute = .{ .legacy_inline = kg_tools.executeContext },
         .tinykg_gated = true,
     },
     .{
@@ -444,7 +489,7 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "root_task_id", .type = "integer", .description = "TinyKG root task id whose bounded task subgraph will be audited" },
         }, .required = &.{"root_task_id"} },
-        .execute = formal_task_audit.execute,
+        .execute = .{ .legacy_inline = formal_task_audit.execute },
         .deferred = true,
         .tinykg_gated = true,
     },
@@ -457,7 +502,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "description", .type = "string", .description = "What needs to be done" },
             .{ .name = "activeForm", .type = "string", .description = "Present-continuous form shown while in progress (e.g. 'Running tests')" },
         }, .required = &.{ "subject", "description" } },
-        .execute = task_tools.executeCreate,
+        .execute = .{ .legacy_inline = task_tools.executeCreate },
     },
     .{
         .name = "TaskGet",
@@ -466,14 +511,14 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "taskId", .type = "string", .description = "The id of the task to fetch" },
         }, .required = &.{"taskId"} },
-        .execute = task_tools.executeGet,
+        .execute = .{ .legacy_inline = task_tools.executeGet },
     },
     .{
         .name = "TaskList",
         .description = "List the live task frontier. For kg-* tasks select only an open, ready, unclaimed leaf; then claim it with TaskUpdate status=in_progress before work. This is a summary/projection, so use TaskGet/task_packet for full recovery context.",
         .describe_fn = descriptions.describeTaskList,
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
-        .execute = task_tools.executeList,
+        .execute = .{ .legacy_inline = task_tools.executeList },
     },
     .{
         .name = "TaskUpdate",
@@ -493,7 +538,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "uses", .type = "array", .description = "On completion: methods/concepts/tools this task actually used (KG projection).", .items_type = "string" },
             .{ .name = "produces", .type = "array", .description = "On completion: artifacts/outputs this task produced (KG projection).", .items_type = "string" },
         }, .required = &.{"taskId"} },
-        .execute = task_tools.executeUpdate,
+        .execute = .{ .legacy_inline = task_tools.executeUpdate },
     },
     .{
         .name = "TaskStop",
@@ -502,7 +547,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "taskId", .type = "string", .description = "The task id (todo id or agent_* job id) to stop" },
             .{ .name = "agent_job_id", .type = "string", .description = "Alternative: the backgrounded agent job id to terminate" },
         }, .required = &.{"taskId"} },
-        .execute = task_tools.executeStop,
+        .execute = .{ .legacy_inline = task_tools.executeStop },
     },
     .{
         .name = "TaskOutput",
@@ -510,9 +555,9 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "agent_job_id", .type = "string", .description = "The backgrounded agent job id to read" },
             .{ .name = "since_byte", .type = "integer", .description = "Byte offset to poll from (previous output_total_bytes)" },
-            .{ .name = "max_bytes", .type = "integer", .description = "Max bytes to return this call" },
+            .{ .name = "max_bytes", .type = "integer", .description = "Max bytes to return this call (1..262144)" },
         }, .required = &.{"agent_job_id"} },
-        .execute = task_output_tool.execute,
+        .execute = .{ .legacy_inline = task_output_tool.execute },
     },
     .{
         .name = "Task",
@@ -532,7 +577,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "run_in_background", .type = "boolean", .description = "Run async; returns agent_job_id immediately" },
             .{ .name = "name", .type = "string", .description = "Spawn a persistent teammate with this name (requires an active team via TeamCreate) instead of a one-shot subagent. The teammate joins the team, works, then idles waiting for SendMessage." },
         }, .required = &.{"prompt"} },
-        .execute = agent_tool.execute,
+        .execute = .{ .legacy_inline = agent_tool.execute },
     },
     .{
         .name = "TaskBatch",
@@ -543,7 +588,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "subagent_type", .type = "string", .description = "Agent type for all items (Explore/Plan/general-purpose/custom); defaults to general-purpose" },
             .{ .name = "max_turns", .type = "integer", .description = "Max agent loop turns per subagent (default 20)" },
         }, .required = &.{ "prompt_template", "items" } },
-        .execute = task_batch_tool.execute,
+        .execute = .{ .legacy_inline = task_batch_tool.execute },
     },
     .{
         // 兼容别名:某些上下文可能用 "Agent"。路由到同一 execute。主工具 name 是 "Task"
@@ -555,7 +600,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "subagent_type", .type = "string", .description = "Agent type; defaults to general-purpose" },
             .{ .name = "description", .type = "string", .description = "3-5 word UI label for the task" },
         }, .required = &.{"prompt"} },
-        .execute = agent_tool.execute,
+        .execute = .{ .legacy_inline = agent_tool.execute },
     },
     // ToolSearch:静态 registry 常驻，但 toToolDefinitionsFull 仅在确有 deferred 工具时
     // 广告。模型按 query 检索完整 schema 并激活，下一轮该 deferred 工具才进入 tools。
@@ -566,7 +611,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "query", .type = "string", .description = "Keywords to find deferred tools, or `select:<deferred_tool_name>` for an exact name listed under # Deferred tools. Do not select an already-visible core tool." },
             .{ .name = "max_results", .type = "integer", .description = "Maximum number of results to return (default 5)" },
         }, .required = &.{"query"} },
-        .execute = tool_search_tool.execute,
+        .execute = .{ .legacy_inline = tool_search_tool.execute },
     },
     // WebSearch:普通函数工具(对齐 mecode)。execute 在隔离子请求里用 server tool 真搜,
     // 主请求只暴露此规整 schema——避免 server-tool 异形毒化后端。deferred(按需激活)。
@@ -578,7 +623,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "allowed_domains", .type = "array", .description = "Restrict search results to these domains." },
             .{ .name = "blocked_domains", .type = "array", .description = "Exclude these domains from final returned results." },
         }, .required = &.{"query"} },
-        .execute = web_search_tool.execute,
+        .execute = .{ .legacy_inline = web_search_tool.execute },
         .display_name = "Web Search",
     },
     // ── Swarm(teams/teammates)。仅在 swarm-enabled(TUI lead)上下文注册;subagent/headless
@@ -590,14 +635,14 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "name", .type = "string", .description = "Team name" },
             .{ .name = "description", .type = "string", .description = "Optional team description" },
         }, .required = &.{"name"} },
-        .execute = swarm_tools.executeTeamCreate,
+        .execute = .{ .legacy_inline = swarm_tools.executeTeamCreate },
         .swarm_gated = true,
     },
     .{
         .name = "TeamDelete",
         .description = "Delete the current team and clean up its directory. Refuses while any teammate is still active — shut teammates down first (SendMessage a shutdown request and wait for approval). Takes no arguments.",
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
-        .execute = swarm_tools.executeTeamDelete,
+        .execute = .{ .legacy_inline = swarm_tools.executeTeamDelete },
         .swarm_gated = true,
     },
     .{
@@ -608,10 +653,19 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "message", .type = "string", .description = "The message text" },
             .{ .name = "summary", .type = "string", .description = "Optional 5-10 word preview shown in the UI" },
         }, .required = &.{ "to", "message" } },
-        .execute = swarm_tools.executeSendMessage,
+        .execute = .{ .legacy_inline = swarm_tools.executeSendMessage },
         .swarm_gated = true,
     },
 };
+
+comptime {
+    for (registry) |tool| {
+        if (tool.result_production == .byte_zero_spool) switch (tool.execute) {
+            .result_body => {},
+            .legacy_inline => @compileError("byte-zero native tool must use ToolExecutor.result_body: " ++ tool.name),
+        };
+    }
+}
 
 /// 用户可见名(对齐 cc userFacingName):TUI 工具卡标题用。查 registry display_name,
 /// 无则回退原名。tool_card / 底部 spinner 用它显示 `⏺ Web Search` 而非 `WebSearch`。
@@ -792,7 +846,9 @@ pub fn redescribeForContext(
 }
 
 pub fn executeTool(tool: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
-    return tool.execute(ctx, args);
+    var body = try tool.execute.run(ctx, args);
+    errdefer body.deinit(ctx.allocator);
+    return (try body.takeModelBytes(ctx.allocator)).bytes;
 }
 
 /// Schema 层校验(对齐 cc 的 zod safeParse 层):执行前检查 input JSON 含所有 required
@@ -929,10 +985,10 @@ pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) any
     if (getTool(name)) |t| {
         try validateRequired(name, args); // schema 层:缺 required 字段 → 早拦
         try validateTypes(name, args); // schema 层:字段类型不匹配 → 早拦
-        return .{ .ok = try t.execute(ctx, args) };
+        return .{ .ok = try t.execute.run(ctx, args) };
     }
     if (ctx.dyn_registry) |dr| {
-        if (dr.find(name)) |de| return .{ .ok = try de.execute(ctx, args, de.ctx_ptr) };
+        if (dr.find(name)) |de| return .{ .ok = try de.execute(ctx, args) };
     }
     // P0.6:弱模型幻觉工具名修复。**只**用确定性无损归一化(大小写/`-`/空格/CamelCase→snake/剥
     // `_tool` 尾缀)自动改派——这些是安全的等价变换。**不**用模糊编辑距离自动执行(那会把 "Wrote"
@@ -944,10 +1000,10 @@ pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) any
             if (getTool(repaired)) |t| {
                 try validateRequired(repaired, args);
                 try validateTypes(repaired, args);
-                return .{ .ok = try t.execute(ctx, args) };
+                return .{ .ok = try t.execute.run(ctx, args) };
             }
             if (ctx.dyn_registry) |dr| {
-                if (dr.find(repaired)) |de| return .{ .ok = try de.execute(ctx, args, de.ctx_ptr) };
+                if (dr.find(repaired)) |de| return .{ .ok = try de.execute(ctx, args) };
             }
         }
     }
@@ -972,7 +1028,7 @@ pub fn dispatchProjectExactEdit(
         return error.ProjectExactEditNativeUnavailable;
     try validateRequired("Edit", args);
     try validateTypes("Edit", args);
-    return .{ .ok = try edit_tool.execute(ctx, args) };
+    return .{ .ok = ToolResultBody.initInline(try edit_tool.execute(ctx, args)) };
 }
 
 /// 逗号分隔的所有真实工具名(静态 + dyn),供 UnknownTool 错误引导模型。caller free。
@@ -1373,7 +1429,69 @@ test "dispatch falls back to dyn_registry" {
     ctx.dyn_registry = &dyn;
     var out = try dispatch(&ctx, "Echo", "hello");
     defer out.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("hello", out.ok);
+    try std.testing.expectEqualStrings("hello", out.ok.@"inline".bytes);
+}
+
+test "ToolExecutor result_body preserves a native byte-zero artifact receipt" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const Native = struct {
+        fn execute(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+            var spool = try @import("core/tool_result_artifact.zig").Spool.begin(ctx.allocator, ctx.artifact_root);
+            defer spool.deinit();
+            try spool.write("native-head-");
+            try spool.write(args);
+            try spool.write("-native-tail");
+            return ToolResultBody.fromCompletedSpool(
+                try spool.finish(),
+                .text_utf8,
+            );
+        }
+    };
+    const executor = ToolExecutor{ .result_body = Native.execute };
+    var ctx = ToolContext{ .allocator = allocator, .artifact_root = root };
+    var body = try executor.run(&ctx, "streamed");
+    defer body.deinit(allocator);
+    try std.testing.expect(body == .artifact);
+    var recovered = try @import("core/tool_result_artifact.zig").readChunk(
+        allocator,
+        root,
+        body.artifact.stored.id(),
+        0,
+        64,
+    );
+    defer recovered.deinit();
+    try std.testing.expectEqualStrings("native-head-streamed-native-tail", recovered.bytes);
+}
+
+test "native byte-zero roster is declared and wired through typed executors" {
+    const expected = [_][]const u8{
+        "Glob",
+        "Grep",
+        "CodeMap",
+        "FindSymbol",
+        "Bash",
+        "ListMcpResourcesTool",
+        "ReadMcpResourceTool",
+        "WebFetch",
+    };
+    var observed: usize = 0;
+    for (registry) |tool| {
+        if (tool.result_production != .byte_zero_spool) continue;
+        observed += 1;
+        var named = false;
+        for (expected) |name| if (std.mem.eql(u8, name, tool.name)) {
+            named = true;
+            break;
+        };
+        try std.testing.expect(named);
+        try std.testing.expect(tool.execute == .result_body);
+    }
+    try std.testing.expectEqual(expected.len, observed);
 }
 
 test "dispatch returns UnknownTool when missing everywhere" {

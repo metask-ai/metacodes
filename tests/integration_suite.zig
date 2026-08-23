@@ -17,6 +17,8 @@ test {
     _ = @import("component/allowed_tools_test.zig");
     _ = @import("component/agent_session_tools_test.zig");
     _ = @import("component/agent_session_host_tools_test.zig");
+    _ = @import("component/plugin_runtime_test.zig");
+    _ = @import("component/plugin_process_test.zig");
     _ = @import("component/agent_session_ui_test.zig");
     _ = @import("component/skill_fork_test.zig");
     _ = @import("component/prompt_tool_coupling_test.zig");

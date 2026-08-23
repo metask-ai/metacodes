@@ -33,6 +33,14 @@ const HOST_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const HOST_STREAM_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_stream\",\"name\":\"HostStream\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const SKILL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_skill\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_skill\",\"name\":\"Skill\",\"input\":{}}}\n\n" ++
@@ -821,6 +829,7 @@ const PublicMcpProbe = struct {
     required_task: bool = false,
     dialect_matrix: bool = false,
     business_error: bool = false,
+    successful_call_padding_bytes: usize = 0,
     tool_count: u8 = 1,
     probe_open_status: u32 = wire.MCP_OPEN_OK,
     probe_exchange_status: ?u32 = null,
@@ -854,6 +863,7 @@ const PublicMcpProbe = struct {
         result.ctx = self;
         result.open = open;
         result.request = request;
+        result.request_tool_stream = requestToolStream;
         result.notify = notify;
         result.close = close;
         result.release_response = releaseResponse;
@@ -1023,6 +1033,90 @@ const PublicMcpProbe = struct {
         const owned = response catch return wire.MCP_EXCHANGE_FATAL;
         self.requests += 1;
         out.* = .{ .ptr = owned.ptr, .len = owned.len };
+        return wire.MCP_EXCHANGE_RESPONSE;
+    }
+
+    fn requestToolStream(
+        raw: ?*anyopaque,
+        connection_ctx: ?*anyopaque,
+        request_json: wire.BytesViewV1,
+        timeout_ms: u32,
+        cancellation: ?*const wire.McpCancellationV1,
+        sink: ?*const wire.HostResultSinkV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_EXCHANGE_FATAL));
+        const encoded = sdk.borrowedBytes(request_json) catch return wire.MCP_EXCHANGE_FATAL;
+        if (self.successful_call_padding_bytes != 0 and
+            std.mem.indexOf(u8, encoded, "tools/call") != null)
+        {
+            _ = liveConnection(raw, connection_ctx) orelse
+                return wire.MCP_EXCHANGE_FATAL;
+            const destination = sink orelse return wire.MCP_EXCHANGE_FATAL;
+            if (destination.struct_size != @sizeOf(wire.HostResultSinkV1) or
+                destination.write == null)
+                return wire.MCP_EXCHANGE_FATAL;
+            const id = requestId(encoded) orelse return wire.MCP_EXCHANGE_FATAL;
+            var header_buffer: [256]u8 = undefined;
+            const header = std.fmt.bufPrint(
+                &header_buffer,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":{{\"ok\":true,\"payload\":\"",
+                .{id},
+            ) catch return wire.MCP_EXCHANGE_FATAL;
+            if (destination.write.?(destination.ctx, sdk.bytesView(header)) != wire.HOST_SINK_OK)
+                return wire.MCP_EXCHANGE_FATAL;
+            var block: [4096]u8 = undefined;
+            @memset(&block, 'm');
+            var remaining = self.successful_call_padding_bytes;
+            while (remaining != 0) {
+                const count = @min(remaining, block.len);
+                const write_status = destination.write.?(
+                    destination.ctx,
+                    sdk.bytesView(block[0..count]),
+                );
+                if (write_status != wire.HOST_SINK_OK)
+                    return if (write_status == wire.HOST_SINK_ABORTED)
+                        wire.MCP_EXCHANGE_CANCELLED
+                    else
+                        wire.MCP_EXCHANGE_FATAL;
+                remaining -= count;
+            }
+            if (destination.write.?(destination.ctx, sdk.bytesView("\"}}}")) != wire.HOST_SINK_OK)
+                return wire.MCP_EXCHANGE_FATAL;
+            self.request_attempts += 1;
+            self.requests += 1;
+            self.call_requests += 1;
+            return wire.MCP_EXCHANGE_RESPONSE;
+        }
+        var response = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+        const status = request(
+            raw,
+            connection_ctx,
+            request_json,
+            timeout_ms,
+            cancellation,
+            &response,
+        );
+        defer releaseResponse(raw, connection_ctx, &response);
+        if (status != wire.MCP_EXCHANGE_RESPONSE) return status;
+        const destination = sink orelse return wire.MCP_EXCHANGE_FATAL;
+        if (destination.struct_size != @sizeOf(wire.HostResultSinkV1) or
+            destination.write == null or response.ptr == null)
+            return wire.MCP_EXCHANGE_FATAL;
+        const bytes = response.ptr.?[0..@intCast(response.len)];
+        var offset: usize = 0;
+        while (offset != bytes.len) {
+            const count = @min(bytes.len - offset, 4096);
+            const write_status = destination.write.?(
+                destination.ctx,
+                sdk.bytesView(bytes[offset .. offset + count]),
+            );
+            if (write_status != wire.HOST_SINK_OK)
+                return if (write_status == wire.HOST_SINK_ABORTED)
+                    wire.MCP_EXCHANGE_CANCELLED
+                else
+                    wire.MCP_EXCHANGE_FATAL;
+            offset += count;
+        }
         return wire.MCP_EXCHANGE_RESPONSE;
     }
 
@@ -1483,10 +1577,11 @@ test "L2 Revision 7 public MCP Apply requires explicit instance identity and lif
         _ = api.runtimeDestroy()(handle, &diagnostic);
     };
 
-    const invalid_contracts = [_]enum { zero_fingerprint, retain, release }{
+    const invalid_contracts = [_]enum { zero_fingerprint, retain, release, tool_stream }{
         .zero_fingerprint,
         .retain,
         .release,
+        .tool_stream,
     };
     for (invalid_contracts) |invalid| {
         var probe = PublicMcpProbe{};
@@ -1505,6 +1600,7 @@ test "L2 Revision 7 public MCP Apply requires explicit instance identity and lif
             .zero_fingerprint => server.configuration_fingerprint = [_]u8{0} ** 32,
             .retain => server.connector.retain_connector = null,
             .release => server.connector.release_connector = null,
+            .tool_stream => server.connector.request_tool_stream = null,
         }
         var servers = [_]wire.McpServerV1{server};
         var configuration = std.mem.zeroes(wire.McpConfigurationV1);
@@ -1986,6 +2082,130 @@ test "L2 MCP server schema Tool error crosses Session and ABI intact" {
     try std.testing.expect(mcp_probe.saw_schema_mismatch_arguments);
     try std.testing.expect(event_probe.saw_error);
     try std.testing.expect(event_probe.preserved_content);
+}
+
+test "L2 Revision 12 public MCP connector streams 17MiB response into recoverable artifact" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var provider_bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
+    var provider = try harness.MockServer.startCassette(&provider_bodies, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var mcp_probe = PublicMcpProbe{ .successful_call_padding_bytes = 17 * 1024 * 1024 + 31 };
+    var mcp_server = std.mem.zeroes(wire.McpServerV1);
+    mcp_server.struct_size = @sizeOf(wire.McpServerV1);
+    mcp_server.transport_code = wire.MCP_TRANSPORT_STDIO;
+    mcp_server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
+    mcp_server.server_binding_identity = [_]u8{0x74} ** 32;
+    mcp_server.configuration_fingerprint = mcp_server.server_binding_identity;
+    mcp_server.namespace = sdk.bytesView("streammcp");
+    mcp_server.client_name = sdk.bytesView("agentcore-component-test");
+    mcp_server.client_version = sdk.bytesView("12");
+    mcp_server.timeout_ms = 1000;
+    mcp_server.connector = mcp_probe.connector();
+    const servers = [_]wire.McpServerV1{mcp_server};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.mcp_servers = &servers;
+    runtime_config.mcp_server_count = servers.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    var session: ?*wire.SessionHandle = null;
+    defer {
+        if (session) |handle| _ = api.sessionDestroy()(handle, &diagnostic);
+        if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
+    }
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    var generation: u64 = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+    );
+
+    var selector = std.mem.zeroes(wire.McpSelectorV1);
+    selector.struct_size = @sizeOf(wire.McpSelectorV1);
+    selector.server_binding_identity = mcp_server.server_binding_identity;
+    selector.tool_name = sdk.bytesView("weather");
+    const selectors = [_]wire.McpSelectorV1{selector};
+    var selection = std.mem.zeroes(wire.McpSelectionV1);
+    selection.struct_size = @sizeOf(wire.McpSelectionV1);
+    selection.selectors = &selectors;
+    selection.selector_count = selectors.len;
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.mcp_selection = &selection;
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&description);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionDescribe()(session, &description, &diagnostic),
+    );
+    const decoded = try sdk.decodeSessionDescription(a, try sdk.borrowedBytes(.{
+        .ptr = description.ptr,
+        .len = description.len,
+    }));
+    defer decoded.deinit();
+    const model_name = decoded.value.mcp.tools[0].model_name;
+    const tool_sse = try std.fmt.allocPrint(
+        a,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_mcp_stream\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_mcp_stream\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"city\\\":\\\"Paris\\\"}}\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{model_name},
+    );
+    defer a.free(tool_sse);
+    provider_bodies[0] = tool_sse;
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(
+        session,
+        1,
+        sdk.bytesView("call the streamed MCP weather Tool"),
+        &options,
+        &result,
+        &diagnostic,
+    ));
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+    try std.testing.expectEqual(@as(u32, 1), mcp_probe.call_requests);
+    const request = provider.lastRequest() orelse return error.NoRequestCaptured;
+    const body = request.body();
+    try std.testing.expect(body.len < 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, body, core.tool_result.PROJECTION_SCHEMA) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "ReadArtifact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jsonrpc") == null);
 }
 
 test "L2 public MCP catalog preserves heterogeneous multi-server tool windows" {
@@ -2773,7 +2993,7 @@ test "L2 Revision 7 public MCP checkpoint restore facade preserves Conversation 
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 9), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 12), wire.ABI_REVISION);
     try std.testing.expectEqual(
         @as(u32, 8),
         std.mem.readInt(u32, &abi_revision_bytes, .little),
@@ -4040,7 +4260,7 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     try std.testing.expect(!server.captureOverflowed());
 }
 
-test "L2 Revision 9 catalog resolves one Workspace authority and rejects reserved query modes" {
+test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserved query modes" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4209,7 +4429,7 @@ test "L2 Revision 9 catalog resolves one Workspace authority and rejects reserve
     try std.testing.expect(found_conflict);
 }
 
-test "L2 Revision 9 Skill execution pins content and incomplete observation preserves last good binding" {
+test "L2 Revision 10 Skill execution pins content and incomplete observation preserves last good binding" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4416,7 +4636,7 @@ test "L2 Revision 9 Skill execution pins content and incomplete observation pres
     try std.testing.expect(std.mem.indexOf(u8, request.body(), "PINNED_NEW_CONTENT") == null);
 }
 
-test "L2 Revision 9 Completion complete owns config and uses all three provider streams" {
+test "L2 Revision 10 Completion complete owns config and uses all three provider streams" {
     const Exercise = struct {
         fn run(
             api: sdk.Api,
@@ -4521,7 +4741,7 @@ test "L2 Revision 9 Completion complete owns config and uses all three provider 
     try Exercise.run(api, wire.PROVIDER_GEMINI, GEMINI_FINAL_SSE, "completion-gemini", "gemini done");
 }
 
-test "L2 Revision 9 Completion stream owns request buffers and projects typed events" {
+test "L2 Revision 10 Completion stream owns request buffers and projects typed events" {
     const a = std.testing.allocator;
     var server = try harness.MockServer.start(CONTINUATION_HEAD_SSE, 0);
     defer server.stop();
@@ -4639,7 +4859,7 @@ test "L2 Revision 9 Completion stream owns request buffers and projects typed ev
     completion = null;
 }
 
-test "L2 Revision 9 Completion stream start releases request buffers for every provider" {
+test "L2 Revision 10 Completion stream start releases request buffers for every provider" {
     const Exercise = struct {
         fn run(api: sdk.Api, provider_kind: u32, response: []const u8, model: []const u8) !void {
             const a = std.testing.allocator;
@@ -4750,7 +4970,7 @@ test "L2 Revision 9 Completion stream start releases request buffers for every p
     try Exercise.run(api, wire.PROVIDER_GEMINI, GEMINI_FINAL_SSE, "lifetime-gemini");
 }
 
-test "L2 Revision 9 Completion abort concurrently interrupts blocking next" {
+test "L2 Revision 10 Completion abort concurrently interrupts blocking next" {
     const NextWorker = struct {
         api: sdk.Api,
         stream: *wire.CompletionStreamHandle,
@@ -4852,7 +5072,7 @@ test "L2 Revision 9 Completion abort concurrently interrupts blocking next" {
     completion = null;
 }
 
-test "L2 Revision 9 Completion rejects invalid requests and tool responses explicitly" {
+test "L2 Revision 10 Completion rejects invalid requests and tool responses explicitly" {
     const a = std.testing.allocator;
     var server = try harness.MockServer.start(HOST_SSE, 0);
     defer server.stop();
@@ -5150,6 +5370,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
         .data = "---\n" ++
             "name: Review\n" ++
             "description: Review a target selected by the model\n" ++
+            "model-activation: required-first\n" ++
             "arguments: [target]\n" ++
             "---\n" ++
             "Review $target using the bound snapshot.",
@@ -5340,7 +5561,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     host_config.allowed_tool_count = allowed.len;
     host_config.skill_catalog = catalog;
     host_config.skill_policy = &decoded_policy.policy;
-    var session_config = sessionCreateConfig(&host_config, "test-model");
+    var session_config = sessionCreateConfig(&host_config, "glm-5.2");
 
     var probe = Probe{};
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
@@ -5388,8 +5609,22 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
         probe.run_state_saw_completed and
         probe.run_state_terminal_empty);
 
+    const first_request = server.requestAt(0) orelse
+        return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        first_request.body(),
+        "\"tool_choice\":{\"type\":\"tool\",\"name\":\"Skill\"}",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        first_request.body(),
+        "`review`",
+    ) != null);
+
     const body = (server.lastRequest() orelse
         return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\"") == null);
     try std.testing.expect(
         std.mem.indexOf(u8, body, "\"name\":\"Skill\"") != null,
     );
@@ -5517,7 +5752,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
         ) == null) continue;
         found_fork_child = true;
         try std.testing.expectEqualStrings(
-            "\"test-model\"",
+            "\"glm-5.2\"",
             request.jsonField("model").?,
         );
     }
@@ -6114,6 +6349,366 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
     runtime = null;
 }
 
+test "L2 Revision 12 public Host stream callback spools byte zero and returns a bounded recoverable envelope" {
+    const StreamProbe = struct {
+        calls: usize = 0,
+        writes: usize = 0,
+        max_chunk_bytes: usize = 0,
+        releases: usize = 0,
+
+        fn execute(
+            raw: ?*anyopaque,
+            _: ?*const wire.RunContextV1,
+            _: wire.BytesViewV1,
+            sink_ptr: ?*const wire.HostResultSinkV1,
+            out_media_code: ?*u32,
+            out_detail: ?*wire.OwnedBytesV1,
+        ) callconv(.c) u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.HOST_FATAL));
+            const sink = sink_ptr orelse return wire.HOST_FATAL;
+            if (sink.struct_size != @sizeOf(wire.HostResultSinkV1) or
+                sink.reserved0 != 0 or sink.write == null or
+                sink.max_bytes != wire.MAX_HOST_STREAM_ARTIFACT_BYTES_V1)
+                return wire.HOST_FATAL;
+            const detail = out_detail orelse return wire.HOST_FATAL;
+            detail.* = .{ .ptr = null, .len = 0 };
+            self.calls += 1;
+            var chunk: [64 * 1024]u8 = undefined;
+            @memset(&chunk, 'a');
+            var remaining: usize = 17 * 1024 * 1024 + 19;
+            while (remaining != 0) {
+                const count = @min(remaining, chunk.len);
+                const status = sink.write.?(sink.ctx, sdk.bytesView(chunk[0..count]));
+                if (status != wire.HOST_SINK_OK) return wire.HOST_FAILED;
+                self.writes += 1;
+                self.max_chunk_bytes = @max(self.max_chunk_bytes, count);
+                remaining -= count;
+            }
+            (out_media_code orelse return wire.HOST_FATAL).* = wire.HOST_STREAM_MEDIA_TEXT_UTF8;
+            return wire.HOST_OK;
+        }
+
+        fn release(raw: ?*anyopaque, detail: ?*wire.OwnedBytesV1) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+            if (detail) |value| {
+                if (value.ptr != null or value.len != 0) self.releases += 1;
+                value.* = .{ .ptr = null, .len = 0 };
+            }
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_STREAM_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var probe = StreamProbe{};
+    var stream_tool = wire.HostStreamToolV1{
+        .struct_size = @sizeOf(wire.HostStreamToolV1),
+        .reserved0 = 0,
+        .ctx = &probe,
+        .name = sdk.bytesView("HostStream"),
+        .description = sdk.bytesView("Stream without constructing one Host result buffer"),
+        .input_schema_json = sdk.bytesView("{\"type\":\"object\",\"properties\":{},\"required\":[]}"),
+        .execute_stream = StreamProbe.execute,
+        .release_detail = StreamProbe.release,
+        .reserved = [_]u64{0} ** 2,
+    };
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var plugin_config = std.mem.zeroes(wire.RuntimePluginConfigV1);
+    plugin_config.struct_size = @sizeOf(wire.RuntimePluginConfigV1);
+    plugin_config.host_stream_tools = @ptrCast(&stream_tool);
+    plugin_config.host_stream_tool_count = 1;
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreateWithPlugins()(
+        &runtime_config,
+        &plugin_config,
+        &runtime,
+        &diagnostic,
+    ));
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    const allowed = [_]wire.BytesViewV1{sdk.bytesView("HostStream")};
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("stream-test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &allowed;
+    host_config.allowed_tool_count = allowed.len;
+    var session_config = sessionCreateConfig(&host_config, "stream-test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(
+        runtime,
+        &session_config,
+        &callbacks,
+        &session,
+        &diagnostic,
+    ));
+    defer if (session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    var options = wire.RunOptionsV1{
+        .struct_size = @sizeOf(wire.RunOptionsV1),
+        .max_turns = 4,
+        .reserved = [_]u64{0} ** 4,
+    };
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(
+        session,
+        1,
+        sdk.bytesView("stream a large result"),
+        &options,
+        &result,
+        &diagnostic,
+    ));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(probe.writes > 1);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), probe.max_chunk_bytes);
+    try std.testing.expectEqual(@as(usize, 0), probe.releases);
+    const request = server.lastRequest() orelse return error.NoRequestCaptured;
+    const body = request.body();
+    try std.testing.expect(body.len < 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, body, core.tool_result.PROJECTION_SCHEMA) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "ReadArtifact") != null);
+
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    session = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    runtime = null;
+}
+
+test "L2 Revision 12 Host stream failure rolls back partial bytes and releases detail exactly once" {
+    const FailureProbe = struct {
+        calls: usize = 0,
+        releases: usize = 0,
+
+        fn execute(
+            raw: ?*anyopaque,
+            _: ?*const wire.RunContextV1,
+            _: wire.BytesViewV1,
+            sink_ptr: ?*const wire.HostResultSinkV1,
+            out_media_code: ?*u32,
+            out_detail: ?*wire.OwnedBytesV1,
+        ) callconv(.c) u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.HOST_FATAL));
+            const sink = sink_ptr orelse return wire.HOST_FATAL;
+            const detail = out_detail orelse return wire.HOST_FATAL;
+            const media = out_media_code orelse return wire.HOST_FATAL;
+            self.calls += 1;
+            media.* = 0;
+            if (sink.write.?(sink.ctx, sdk.bytesView("partial-public-abi")) != wire.HOST_SINK_OK)
+                return wire.HOST_FATAL;
+            const message = "public stream failure";
+            detail.* = .{ .ptr = @constCast(message.ptr), .len = message.len };
+            return wire.HOST_FAILED;
+        }
+
+        fn release(raw: ?*anyopaque, detail: ?*wire.OwnedBytesV1) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+            const value = detail orelse return;
+            if (value.ptr != null or value.len != 0) self.releases += 1;
+            value.* = .{ .ptr = null, .len = 0 };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_STREAM_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var probe = FailureProbe{};
+    var stream_tool = wire.HostStreamToolV1{
+        .struct_size = @sizeOf(wire.HostStreamToolV1),
+        .reserved0 = 0,
+        .ctx = &probe,
+        .name = sdk.bytesView("HostStream"),
+        .description = sdk.bytesView("Fail after streaming partial bytes"),
+        .input_schema_json = sdk.bytesView("{\"type\":\"object\",\"properties\":{},\"required\":[]}"),
+        .execute_stream = FailureProbe.execute,
+        .release_detail = FailureProbe.release,
+        .reserved = [_]u64{0} ** 2,
+    };
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var plugin_config = std.mem.zeroes(wire.RuntimePluginConfigV1);
+    plugin_config.struct_size = @sizeOf(wire.RuntimePluginConfigV1);
+    plugin_config.host_stream_tools = @ptrCast(&stream_tool);
+    plugin_config.host_stream_tool_count = 1;
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreateWithPlugins()(
+        &runtime_config,
+        &plugin_config,
+        &runtime,
+        &diagnostic,
+    ));
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    const allowed = [_]wire.BytesViewV1{sdk.bytesView("HostStream")};
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("stream-failure-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &allowed;
+    host_config.allowed_tool_count = allowed.len;
+    var session_config = sessionCreateConfig(&host_config, "stream-failure-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(
+        runtime,
+        &session_config,
+        &callbacks,
+        &session,
+        &diagnostic,
+    ));
+    defer if (session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    var options = wire.RunOptionsV1{
+        .struct_size = @sizeOf(wire.RunOptionsV1),
+        .max_turns = 4,
+        .reserved = [_]u64{0} ** 4,
+    };
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(
+        session,
+        1,
+        sdk.bytesView("fail the stream"),
+        &options,
+        &result,
+        &diagnostic,
+    ));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+    const request = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "public stream failure") != null);
+    const digest = core.tool_result_artifact.sha256Hex("partial-public-abi");
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), digest[0..]) == null);
+
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    session = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    runtime = null;
+}
+
+test "Revision 12 Host stream descriptors reject missing callbacks and reserved fields" {
+    const Stub = struct {
+        fn execute(
+            _: ?*anyopaque,
+            _: ?*const wire.RunContextV1,
+            _: wire.BytesViewV1,
+            _: ?*const wire.HostResultSinkV1,
+            media: ?*u32,
+            detail: ?*wire.OwnedBytesV1,
+        ) callconv(.c) u32 {
+            (media orelse return wire.HOST_FATAL).* = wire.HOST_STREAM_MEDIA_TEXT_UTF8;
+            (detail orelse return wire.HOST_FATAL).* = .{ .ptr = null, .len = 0 };
+            return wire.HOST_OK;
+        }
+
+        fn release(_: ?*anyopaque, detail: ?*wire.OwnedBytesV1) callconv(.c) void {
+            if (detail) |value| value.* = .{ .ptr = null, .len = 0 };
+        }
+    };
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var descriptor = wire.HostStreamToolV1{
+        .struct_size = @sizeOf(wire.HostStreamToolV1),
+        .reserved0 = 0,
+        .ctx = null,
+        .name = sdk.bytesView("HostStream"),
+        .description = sdk.bytesView("descriptor validation"),
+        .input_schema_json = sdk.bytesView("{\"type\":\"object\",\"properties\":{},\"required\":[]}"),
+        .execute_stream = Stub.execute,
+        .release_detail = Stub.release,
+        .reserved = [_]u64{0} ** 2,
+    };
+    var plugins = std.mem.zeroes(wire.RuntimePluginConfigV1);
+    plugins.struct_size = @sizeOf(wire.RuntimePluginConfigV1);
+    plugins.host_stream_tools = @ptrCast(&descriptor);
+    plugins.host_stream_tool_count = 1;
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+
+    descriptor.execute_stream = null;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.runtimeCreateWithPlugins()(
+        &runtime_config,
+        &plugins,
+        &runtime,
+        &diagnostic,
+    ));
+    try std.testing.expect(runtime == null);
+    api.bufferRelease()(&diagnostic);
+
+    descriptor.execute_stream = Stub.execute;
+    descriptor.release_detail = null;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.runtimeCreateWithPlugins()(
+        &runtime_config,
+        &plugins,
+        &runtime,
+        &diagnostic,
+    ));
+    try std.testing.expect(runtime == null);
+    api.bufferRelease()(&diagnostic);
+
+    descriptor.release_detail = Stub.release;
+    descriptor.reserved[0] = 1;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.runtimeCreateWithPlugins()(
+        &runtime_config,
+        &plugins,
+        &runtime,
+        &diagnostic,
+    ));
+    try std.testing.expect(runtime == null);
+}
+
 test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6499,4 +7094,353 @@ test "L2 AskUserQuestion mapping is complete and canonical Permission bypasses p
         error.UnsupportedUiRequest,
         abi.protocol_v1.encodeUiRequest(std.testing.allocator, &custom),
     );
+}
+
+const AGENTCORE_PROCESS_TOOL_NAME = "acme_dreview__Echo";
+
+const AGENTCORE_PROCESS_TOOL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_process\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_process\",\"name\":\"" ++ AGENTCORE_PROCESS_TOOL_NAME ++ "\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"text\\\":\\\"hello\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const AGENTCORE_PROCESS_HANDSHAKE =
+    "{\"schema\":\"metacodes.plugin-process/v1\",\"operation\":\"handshake\",\"protocol_major\":1," ++
+    "\"plugin_id\":\"acme.review\",\"plugin_version\":\"1.0.0\",\"capabilities\":[\"host_tool\"]," ++
+    "\"limits\":{\"max_request_frame_bytes\":2048,\"max_response_bytes\":65536},\"cancellation\":\"terminate_process_group\"," ++
+    "\"tools\":[{\"name\":\"Echo\",\"description\":\"Echo through the public AgentCore ABI\"," ++
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}}]}";
+
+const AGENTCORE_PROCESS_RESULT =
+    "{\"schema\":\"metacodes.plugin-process/v1\",\"operation\":\"call_result\",\"protocol_major\":1," ++
+    "\"plugin_id\":\"acme.review\",\"plugin_version\":\"1.0.0\",\"tool\":\"Echo\"," ++
+    "\"status\":\"ok\",\"content\":\"agentcore-process-plugin-ok\"}";
+
+const ProcessPermissionProbe = struct {
+    expected_session: ?*wire.SessionHandle = null,
+    binding: [64]u8 = undefined,
+    binding_len: usize = 0,
+    ui_calls: u32 = 0,
+    ui_releases: u32 = 0,
+    provenance_events: u32 = 0,
+
+    fn validRun(self: *@This(), run_ptr: ?*const wire.RunContextV1) bool {
+        const run = sdk.validateRunContext(run_ptr) catch return false;
+        return run.session == self.expected_session and run.run_id == 1;
+    }
+
+    fn validTool(self: *@This(), tool: sdk.protocol.PermissionTool) bool {
+        if (tool.namespace != .host or
+            !std.mem.eql(u8, tool.name, AGENTCORE_PROCESS_TOOL_NAME) or
+            tool.binding.len != self.binding.len or self.binding_len == 0)
+            return false;
+        return std.mem.eql(u8, tool.binding, self.binding[0..self.binding_len]);
+    }
+
+    fn event(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        if (!self.validRun(run_ptr)) return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const event_value = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        switch (event_value) {
+            .permission_provenance => |provenance| {
+                if (!self.validTool(provenance.tool) or
+                    provenance.source != .callback or
+                    provenance.decision != .allow or
+                    provenance.response != .allow_once or
+                    provenance.used_session_rule)
+                    return wire.EVENT_FATAL;
+                self.provenance_events += 1;
+            },
+            else => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn ui(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        request_json: wire.BytesViewV1,
+        out_response: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        if (!self.validRun(run_ptr)) return wire.UI_FATAL;
+        const encoded = sdk.borrowedBytes(request_json) catch return wire.UI_FATAL;
+        const parsed = sdk.decodeUiRequest(std.heap.c_allocator, encoded) catch return wire.UI_FATAL;
+        defer parsed.deinit();
+        const request = switch (parsed.value) {
+            .permission => |value| value,
+            else => return wire.UI_FATAL,
+        };
+        if (request.tool.binding.len != 64 or
+            std.mem.allEqual(u8, request.tool.binding, '0') or
+            request.candidate != null)
+            return wire.UI_FATAL;
+        self.binding_len = request.tool.binding.len;
+        @memcpy(self.binding[0..self.binding_len], request.tool.binding);
+        if (!self.validTool(request.tool)) return wire.UI_FATAL;
+        const response_json = sdk.encodeUiResponse(
+            std.heap.c_allocator,
+            parsed.value,
+            .{ .permission = .{
+                .permission = .allow_once,
+                .request_id = request.request_id,
+                .policy_generation = request.policy_generation,
+            } },
+        ) catch return wire.UI_FATAL;
+        const out = out_response orelse {
+            std.heap.c_allocator.free(response_json);
+            return wire.UI_FATAL;
+        };
+        out.* = .{ .ptr = response_json.ptr, .len = response_json.len };
+        self.ui_calls += 1;
+        return wire.UI_ANSWERED;
+    }
+
+    fn releaseUi(raw: ?*anyopaque, response: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        const out = response orelse return;
+        if (out.ptr) |ptr| {
+            const len = std.math.cast(usize, out.len) orelse return;
+            std.heap.c_allocator.free(ptr[0..len]);
+            self.ui_releases += 1;
+        }
+        out.* = .{ .ptr = null, .len = 0 };
+    }
+};
+
+fn createAgentCoreProcessPackage(root: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const metadata_root = try std.fmt.allocPrint(allocator, "{s}/.metacodes-plugin", .{root});
+    defer allocator.free(metadata_root);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, metadata_root);
+
+    const script = try std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\if [ "$1" = "handshake" ]; then
+        \\  body='{s}'
+        \\else
+        \\  : > call.marker
+        \\  body='{s}'
+        \\fi
+        \\printf 'Content-Length: %s\r\n\r\n%s' "${{#body}}" "$body"
+        \\
+    , .{ AGENTCORE_PROCESS_HANDSHAKE, AGENTCORE_PROCESS_RESULT });
+    defer allocator.free(script);
+    const entrypoint = try std.fmt.allocPrint(allocator, "{s}/plugin.sh", .{root});
+    defer allocator.free(entrypoint);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = entrypoint, .data = script });
+    const entrypoint_z = try allocator.dupeZ(u8, entrypoint);
+    defer allocator.free(entrypoint_z);
+    if (std.c.chmod(entrypoint_z.ptr, 0o700) != 0) return error.SkipZigTest;
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/plugin.json", .{metadata_root});
+    defer allocator.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = "{\"schema_version\":1,\"id\":\"acme.review\",\"version\":\"1.0.0\",\"capabilities\":[\"host_tool\"]}",
+    });
+    const process_path = try std.fmt.allocPrint(allocator, "{s}/process.json", .{metadata_root});
+    defer allocator.free(process_path);
+    const process_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema_version\":1,\"protocol_major\":1,\"entrypoint\":\"plugin.sh\",\"sha256\":\"{s}\",\"handshake_timeout_ms\":10000,\"call_timeout_ms\":1000,\"max_response_bytes\":65536}}",
+        .{hash},
+    );
+    defer allocator.free(process_json);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = process_path, .data = process_json });
+}
+
+test "L2 Revision 10 independent Host loads a pinned process tool through AgentCore" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    try createAgentCoreProcessPackage(root);
+
+    const bodies = [_][]const u8{ AGENTCORE_PROCESS_TOOL_SSE, FINAL_SSE };
+    var provider = try harness.MockServer.startCassette(&bodies, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(allocator);
+    defer allocator.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    const process_sources = [_]wire.ProcessPluginSourceV1{.{
+        .struct_size = @sizeOf(wire.ProcessPluginSourceV1),
+        .layer_code = wire.PLUGIN_LAYER_SESSION,
+        .root = sdk.bytesView(root),
+        .reserved = [_]u64{0} ** 3,
+    }};
+    var plugin_config = wire.RuntimePluginConfigV1{
+        .struct_size = @sizeOf(wire.RuntimePluginConfigV1),
+        .reserved0 = 0,
+        .process_plugins = &process_sources,
+        .process_plugin_count = process_sources.len,
+        .host_stream_tools = null,
+        .host_stream_tool_count = 0,
+        .reserved = [_]u64{0} ** 4,
+    };
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreateWithPlugins()(
+            &runtime_config,
+            &plugin_config,
+            &runtime,
+            &diagnostic,
+        ),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var permission_probe = ProcessPermissionProbe{};
+    const allowed = [_]wire.BytesViewV1{sdk.bytesView(AGENTCORE_PROCESS_TOOL_NAME)};
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_DEFAULT;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.allowed_tools = &allowed;
+    host.allowed_tool_count = allowed.len;
+    var session_config = sessionCreateConfig(&host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &permission_probe;
+    callbacks.on_event = ProcessPermissionProbe.event;
+    callbacks.on_ui_request = ProcessPermissionProbe.ui;
+    callbacks.release_response = ProcessPermissionProbe.releaseUi;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(
+            runtime,
+            &session_config,
+            &callbacks,
+            &session,
+            &diagnostic,
+        ),
+    );
+    permission_probe.expected_session = session;
+    defer if (session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 4;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            1,
+            sdk.bytesView("call the configured process plugin"),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), permission_probe.ui_calls);
+    try std.testing.expectEqual(@as(u32, 1), permission_probe.ui_releases);
+    try std.testing.expectEqual(@as(u32, 1), permission_probe.provenance_events);
+    const last_body = (provider.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, last_body, AGENTCORE_PROCESS_TOOL_NAME) != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_body, "agentcore-process-plugin-ok") != null);
+    const marker = try std.fmt.allocPrint(allocator, "{s}/call.marker", .{root});
+    defer allocator.free(marker);
+    try std.Io.Dir.cwd().access(std.testing.io, marker, .{});
+}
+
+test "Revision 10 process plugin descriptors fail closed before staging" {
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.runtimeCreateWithPlugins()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime == null);
+    api.bufferRelease()(&diagnostic);
+
+    var source = wire.ProcessPluginSourceV1{
+        .struct_size = @sizeOf(wire.ProcessPluginSourceV1),
+        .layer_code = wire.PLUGIN_LAYER_SESSION,
+        .root = sdk.bytesView("relative/package"),
+        .reserved = [_]u64{0} ** 3,
+    };
+    var plugins = wire.RuntimePluginConfigV1{
+        .struct_size = @sizeOf(wire.RuntimePluginConfigV1),
+        .reserved0 = 0,
+        .process_plugins = @ptrCast(&source),
+        .process_plugin_count = 1,
+        .host_stream_tools = null,
+        .host_stream_tool_count = 0,
+        .reserved = [_]u64{0} ** 4,
+    };
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.runtimeCreateWithPlugins()(&runtime_config, &plugins, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime == null);
+    api.bufferRelease()(&diagnostic);
+
+    source.root = sdk.bytesView("/absolute/but/not-observed");
+    source.layer_code = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.runtimeCreateWithPlugins()(&runtime_config, &plugins, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime == null);
+    api.bufferRelease()(&diagnostic);
+
+    source.layer_code = wire.PLUGIN_LAYER_SESSION;
+    source.reserved[0] = 1;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.runtimeCreateWithPlugins()(&runtime_config, &plugins, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime == null);
+    api.bufferRelease()(&diagnostic);
+
+    source.reserved[0] = 0;
+    plugins.process_plugin_count = wire.MAX_PROCESS_PLUGIN_SOURCES_V1 + 1;
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        api.runtimeCreateWithPlugins()(&runtime_config, &plugins, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime == null);
 }

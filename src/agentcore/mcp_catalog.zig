@@ -1193,6 +1193,7 @@ const Fake = struct {
         return .{ .connection = .{
             .ctx = connection,
             .request_fn = request,
+            .tool_request = .{ .completed = request },
             .notify_fn = notify,
             .close_fn = close,
         } };

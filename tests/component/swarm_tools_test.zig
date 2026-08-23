@@ -17,6 +17,32 @@ const swctx = cc.swarm_context;
 const team = cc.swarm_team;
 const mailbox = cc.swarm_mailbox;
 
+var swarm_dialect_ctx: u8 = 0;
+
+fn injectSwarmDialectMarker(
+    _: *anyopaque,
+    _: cc.model_adapter.ModelProfile,
+    _: ?cc.api_dialect.ReasoningEffort,
+    system: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) anyerror!void {
+    try system.appendSlice(allocator, "\nSWARM_DIALECT_MARKER");
+}
+
+const swarm_test_dialect = cc.api_dialect.Dialect{
+    .ctx = @ptrCast(&swarm_dialect_ctx),
+    .injectSystemModsFn = injectSwarmDialectMarker,
+};
+
+fn resolveSwarmDialect(_: *const anyopaque, kind: cc.api_dialect.ProviderKind, model: []const u8) cc.api_dialect.Dialect {
+    if (kind == .anthropic) return swarm_test_dialect;
+    return cc.api_dialect.dialectFor(kind, model);
+}
+
+fn swarmDialectResolver() cc.api_dialect.Resolver {
+    return .{ .ctx = @ptrCast(&swarm_dialect_ctx), .resolveFn = resolveSwarmDialect };
+}
+
 const TURN_FMT =
     "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
     "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n" ++
@@ -61,6 +87,7 @@ test "L2 SW2 端到端: TeamCreate → Task spawn teammate → SendMessage → p
         .base_url = url,
         .model = "claude-sonnet-4-20250514",
         .provider_kind = .anthropic,
+        .dialect_resolver = swarmDialectResolver(),
     };
     defer sw.deinit();
 
@@ -108,6 +135,8 @@ test "L2 SW2 端到端: TeamCreate → Task spawn teammate → SendMessage → p
         sleepMs(30);
     }
     try std.testing.expect(pulled_status);
+    const first_request_body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, first_request_body, "SWARM_DIALECT_MARKER") != null);
 
     // SendMessage 续跑第二轮。
     const r2 = try cc.swarm_tools.executeSendMessage(&ctx, "{\"to\":\"worker\",\"message\":\"continue\",\"summary\":\"go\"}");

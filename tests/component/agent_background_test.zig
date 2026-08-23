@@ -14,6 +14,32 @@ const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
 
+var background_dialect_ctx: u8 = 0;
+
+fn injectBackgroundDialectMarker(
+    _: *anyopaque,
+    _: cc.model_adapter.ModelProfile,
+    _: ?cc.api_dialect.ReasoningEffort,
+    system: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) anyerror!void {
+    try system.appendSlice(allocator, "\nBACKGROUND_DIALECT_MARKER");
+}
+
+const background_test_dialect = cc.api_dialect.Dialect{
+    .ctx = @ptrCast(&background_dialect_ctx),
+    .injectSystemModsFn = injectBackgroundDialectMarker,
+};
+
+fn resolveBackgroundDialect(_: *const anyopaque, kind: cc.api_dialect.ProviderKind, model: []const u8) cc.api_dialect.Dialect {
+    if (kind == .anthropic) return background_test_dialect;
+    return cc.api_dialect.dialectFor(kind, model);
+}
+
+fn backgroundDialectResolver() cc.api_dialect.Resolver {
+    return .{ .ctx = @ptrCast(&background_dialect_ctx), .resolveFn = resolveBackgroundDialect };
+}
+
 // 子 agent 一轮就 end_turn,输出文本 "BG DONE"。
 const BG_DONE_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -127,7 +153,14 @@ test "L2 后台B: TaskOutput running→done 拿到 final_text + stop_reason" {
     try agents.loadFromStandardPaths("");
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
-    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
+    var reg = try cc.agent_job_registry.AgentJobRegistry.initWithDialectResolver(
+        a,
+        "k",
+        url,
+        "claude-sonnet-4-20250514",
+        .anthropic,
+        backgroundDialectResolver(),
+    );
     defer reg.deinit();
 
     const ctx = makeCtx(a, &client, &agents, &perm, &reg);
@@ -148,6 +181,8 @@ test "L2 后台B: TaskOutput running→done 拿到 final_text + stop_reason" {
     try std.testing.expect(std.mem.indexOf(u8, r, "\"status\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "BG DONE") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "\"stop_reason\":\"end_turn\"") != null);
+    const request_body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, request_body, "BACKGROUND_DIALECT_MARKER") != null);
 }
 
 test "L2 后台E: TaskStop 对普通 todo taskId 仍标 completed(分流不回归)" {

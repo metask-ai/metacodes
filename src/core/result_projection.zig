@@ -1,14 +1,17 @@
 //! One-shot, deterministic projection of completed tool results into Conversation.
 //!
-//! Hooks and UI consume the raw result first. This module then commits either
-//! the original small bytes or one stable artifact envelope; historical
-//! messages are never re-projected before later provider requests.
+//! Hooks and UI consume the typed result's deterministic rendering first:
+//! legacy inline results remain raw, while byte-zero results are already a
+//! bounded artifact envelope because no complete in-memory value exists. This
+//! module then commits either the original small bytes or one stable artifact
+//! envelope; historical messages are never re-projected before later requests.
 
 const std = @import("std");
 const artifact = @import("tool_result_artifact.zig");
+const tool_result = @import("tool_result.zig");
 
-pub const SCHEMA = "metacodes.tool-result-projection.v1";
-pub const ENVELOPE_PREFIX = "{\"schema_version\":\"" ++ SCHEMA ++ "\",\"projection\":";
+pub const SCHEMA = tool_result.PROJECTION_SCHEMA;
+pub const ENVELOPE_PREFIX = tool_result.ENVELOPE_PREFIX;
 pub const BASH_SCHEMA = "metacodes.bash-result.v2";
 pub const DEFAULT_PREVIEW_BYTES: usize = 1536;
 
@@ -54,7 +57,13 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
     const structured = try allocator.alloc(bool, items.len);
     defer allocator.free(structured);
     for (items, 0..) |item, index| {
-        stats.raw_bytes +|= item.content.*.len;
+        if (recoverableEnvelopeOriginalBytes(item.content.*)) |original_bytes| {
+            stats.raw_bytes +|= original_bytes;
+            stats.artifact_bytes +|= original_bytes;
+            stats.artifact_spill_count +|= 1;
+        } else {
+            stats.raw_bytes +|= item.content.*.len;
+        }
         structured[index] = isStructuredJson(item.content.*);
         if (structured[index]) stats.structured_result_count += 1;
     }
@@ -96,6 +105,16 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
     stats.projected_bytes = totalBytes(items);
     stats.budget_exhausted = stats.projected_bytes > config.per_turn_bytes;
     return stats;
+}
+
+fn recoverableEnvelopeOriginalBytes(content: []const u8) ?usize {
+    if (!isRecoverableEnvelope(content)) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const original = parsed.value.object.get("original_bytes") orelse return null;
+    if (original != .integer or original.integer < 0) return null;
+    return std.math.cast(usize, original.integer);
 }
 
 pub fn isProjectionEnvelope(content: []const u8) bool {

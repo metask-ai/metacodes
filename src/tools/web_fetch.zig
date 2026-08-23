@@ -3,21 +3,27 @@
 //! 实现策略：
 //! - 用系统 curl（已有 vendor/curl 或 /usr/bin/curl）抓 HTML
 //! - 简单 HTML-to-text：strip <script>/<style>/标签 + HTML entity decode
-//! - **返回全文**（受 16MB 捕获守卫上界）。**不再自截 8KB**——由 tool_exec 的通用 maybePersist
-//!   (50KB 落盘)统一处理三件套:小页 inline 全文、大页缓存到 tool-results 返回 preview+path,
-//!   模型用 Read(path,offset) 分页取剩余。WebFetch 遂从"特殊的 guard-and-drop"回归"普通工具走通用防线"。
+//! - **返回全文**（受 128MiB artifact 上界）。**不再自截 8KB**——由 Tool Result 内核的 Session CAS
+//!   统一处理三件套：小页 inline 全文，大页进入 Session CAS 并返回无路径 artifact receipt，
+//!   模型用 ReadArtifact(offset,limit) 分页取剩余。curl、HTML 清洗和 JSON 编码均为固定块流式路径。
 //!
 //! 不做：
 //! - JS 渲染页面（需要无头浏览器）
 //! - Markdown 格式保留（只做粗粒度文本提取）
 //! - 预批准域名（P2）
 //!
-//! 返回 JSON: {"url":"...","bytes":N,"content":"<全文>"}(大页由 tool_exec 落盘换成 persisted 信封)
+//! 返回 JSON: {"url":"...","bytes":N,"content":"<全文>"}(大页直接返回 typed artifact receipt)
 
 const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const ToolResultBody = @import("context.zig").ToolResultBody;
+const artifact_store = @import("../core/tool_result_artifact.zig");
+const result_spool = @import("result_spool.zig");
+
+const STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+const MAX_TEXT_CAPTURE_BYTES: usize = 60 * 1024 * 1024;
 
 /// v39 G4 离线熔断(终局取证:离线容器里 agent 陷 WebFetch 并行重试风暴后
 /// 进程死亡、零结果事件,整个 harbor run 中止)。进程级连续失败计数:达阈值
@@ -32,7 +38,6 @@ pub fn resetOfflineBreakerForTest() void {
     consecutive_failures.store(0, .release);
 }
 
-
 /// 测试钩子:模拟一次网络失败(与 execute 失败路径同一计数器)。
 pub fn noteFetchFailureForTest() u32 {
     return consecutive_failures.fetchAdd(1, .acq_rel) + 1;
@@ -40,6 +45,216 @@ pub fn noteFetchFailureForTest() u32 {
 
 pub fn offlineBreakerTripped() bool {
     return consecutive_failures.load(.acquire) >= OFFLINE_BREAKER_THRESHOLD;
+}
+
+/// Production byte-zero path. curl stdout first lands in a private Capture;
+/// HTML stripping and JSON encoding each stream through bounded captures, so
+/// no stage owns the full downloaded page or the full encoded tool result.
+pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    if (ctx.artifact_root.len == 0)
+        return ToolResultBody.initInline(try execute(ctx, args));
+
+    const allocator = ctx.allocator;
+    const url = common.extractJsonArg(args, "url") orelse return error.MissingUrl;
+    if (url.len == 0) return error.EmptyUrl;
+    _ = common.extractJsonArg(args, "prompt");
+    if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://"))
+        return error.InvalidUrl;
+    if (offlineBreakerTripped()) {
+        common.setErrorDetail(ctx.error_detail, allocator, "WebFetch disabled for this run after {d} consecutive network failures — the environment appears to be OFFLINE. Do not retry any network tool; solve the task with local files and commands only.", .{consecutive_failures.load(.acquire)});
+        return error.FetchFailed;
+    }
+
+    const url_z = try allocator.dupeZ(u8, url);
+    defer allocator.free(url_z);
+    const argv0: [*:0]const u8 = if (builtin.os.tag == .windows) "curl" else "/usr/bin/curl";
+    var argv: [9]?[*:0]const u8 = .{
+        argv0,
+        "-s",
+        "-L",
+        "--max-time",
+        "15",
+        "--user-agent",
+        "metacodes/0.1 (+https://anthropic.com)",
+        url_z.ptr,
+        null,
+    };
+    var spawned = try common.spawnCaptureToSpoolTimed(
+        argv[0..],
+        allocator,
+        ctx.artifact_root,
+        ctx.abort,
+        20_000,
+        ctx.spawn_tick_fn,
+        artifact_store.MAX_ARTIFACT_BYTES,
+        STDERR_CAPTURE_BYTES,
+        null,
+    );
+    defer spawned.deinit();
+    if (spawned.exit_code != 0 and (spawned.capture_complete or spawned.stdout.bytes == 0)) {
+        const failures = consecutive_failures.fetchAdd(1, .acq_rel) + 1;
+        if (failures >= OFFLINE_BREAKER_THRESHOLD) {
+            common.setErrorDetail(ctx.error_detail, allocator, "WebFetch failed ({d} consecutive network failures) — the environment appears to be OFFLINE. Further WebFetch calls this run will be rejected; solve the task with local files and commands only.", .{failures});
+        }
+        return error.FetchFailed;
+    }
+    consecutive_failures.store(0, .release);
+
+    var text_capture = try artifact_store.Capture.begin(
+        allocator,
+        ctx.artifact_root,
+        MAX_TEXT_CAPTURE_BYTES,
+    );
+    defer text_capture.deinit();
+    try streamHtmlToText(&spawned.stdout, &text_capture);
+    _ = try text_capture.sealExternal(); // local writer; permits an empty page
+
+    var result_capture = try artifact_store.Capture.begin(
+        allocator,
+        ctx.artifact_root,
+        artifact_store.MAX_ARTIFACT_BYTES,
+    );
+    defer result_capture.deinit();
+    var result_writer = result_spool.CaptureWriter.init(&result_capture);
+    try result_writer.writer.writeAll("{\"url\":");
+    try std.json.Stringify.encodeJsonString(url, .{}, &result_writer.writer);
+    try result_writer.writer.print(",\"bytes\":{d},\"content\":\"", .{text_capture.bytes});
+    try text_capture.rewind();
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = try text_capture.read(&buffer);
+        if (count == 0) break;
+        try std.json.Stringify.encodeJsonStringChars(buffer[0..count], .{}, &result_writer.writer);
+    }
+    try result_writer.writer.writeAll("\"}");
+    try result_writer.check();
+    try result_capture.seal();
+    return result_spool.finishCaptureAsBody(
+        allocator,
+        ctx.artifact_root,
+        &result_capture,
+        .json,
+        spawned.capture_complete,
+    );
+}
+
+const HtmlStream = struct {
+    destination: *artifact_store.Capture,
+    tag: [1024]u8 = undefined,
+    tag_len: usize = 0,
+    in_tag: bool = false,
+    skip: enum { none, script, style } = .none,
+    entity: [16]u8 = undefined,
+    entity_len: usize = 0,
+    last_was_space: bool = true,
+
+    fn feed(self: *HtmlStream, bytes: []const u8) !void {
+        for (bytes) |byte| try self.feedByte(byte);
+    }
+
+    fn finish(self: *HtmlStream) !void {
+        if (self.entity_len != 0) try self.writeLiteral(self.entity[0..self.entity_len]);
+    }
+
+    fn feedByte(self: *HtmlStream, byte: u8) !void {
+        if (self.in_tag) {
+            if (byte == '>') {
+                self.in_tag = false;
+                try self.finishTag();
+            } else if (self.tag_len < self.tag.len) {
+                self.tag[self.tag_len] = byte;
+                self.tag_len += 1;
+            }
+            return;
+        }
+        if (byte == '<') {
+            if (self.entity_len != 0) {
+                try self.writeLiteral(self.entity[0..self.entity_len]);
+                self.entity_len = 0;
+            }
+            self.in_tag = true;
+            self.tag_len = 0;
+            return;
+        }
+        if (self.skip != .none) return;
+
+        if (self.entity_len != 0) {
+            if (self.entity_len < self.entity.len) {
+                self.entity[self.entity_len] = byte;
+                self.entity_len += 1;
+                if (byte == ';') {
+                    const encoded = self.entity[0..self.entity_len];
+                    if (parseEntity(encoded)) |decoded|
+                        try self.writeLiteral(decoded.text)
+                    else
+                        try self.writeLiteral(encoded);
+                    self.entity_len = 0;
+                }
+                return;
+            }
+            try self.writeLiteral(self.entity[0..self.entity_len]);
+            self.entity_len = 0;
+        }
+        if (byte == '&') {
+            self.entity[0] = '&';
+            self.entity_len = 1;
+            return;
+        }
+        try self.writeTextByte(byte);
+    }
+
+    fn finishTag(self: *HtmlStream) !void {
+        const raw = std.mem.trim(u8, self.tag[0..self.tag_len], " \t\r\n");
+        const closing = raw.len > 0 and raw[0] == '/';
+        const start: usize = if (closing) 1 else 0;
+        var end = start;
+        while (end < raw.len and (std.ascii.isAlphanumeric(raw[end]) or raw[end] == '-')) : (end += 1) {}
+        const name = raw[start..end];
+        if (self.skip != .none) {
+            if (closing and ((self.skip == .script and std.ascii.eqlIgnoreCase(name, "script")) or
+                (self.skip == .style and std.ascii.eqlIgnoreCase(name, "style")))) self.skip = .none;
+            return;
+        }
+        if (!closing and std.ascii.eqlIgnoreCase(name, "script")) {
+            self.skip = .script;
+            return;
+        }
+        if (!closing and std.ascii.eqlIgnoreCase(name, "style")) {
+            self.skip = .style;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "script") or std.ascii.eqlIgnoreCase(name, "style")) return;
+        try self.writeSpace();
+    }
+
+    fn writeTextByte(self: *HtmlStream, byte: u8) !void {
+        if (byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r') return self.writeSpace();
+        if (byte < 0x20) return;
+        if (self.last_was_space and self.destination.bytes != 0)
+            try self.destination.write(" ");
+        try self.destination.write(&.{byte});
+        self.last_was_space = false;
+    }
+
+    fn writeLiteral(self: *HtmlStream, bytes: []const u8) !void {
+        for (bytes) |byte| try self.writeTextByte(byte);
+    }
+
+    fn writeSpace(self: *HtmlStream) !void {
+        self.last_was_space = true;
+    }
+};
+
+fn streamHtmlToText(source: *artifact_store.Capture, destination: *artifact_store.Capture) !void {
+    try source.rewind();
+    var stream = HtmlStream{ .destination = destination };
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = try source.read(&buffer);
+        if (count == 0) break;
+        try stream.feed(buffer[0..count]);
+    }
+    try stream.finish();
 }
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -89,11 +304,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
     consecutive_failures.store(0, .release);
 
-    // HTML → text(全文,受 16MB 捕获守卫上界)。
+    // Legacy no-artifact-root compatibility path: HTML → text(受 16MiB 捕获上界)。
     const text = try htmlToText(out.stdout, allocator);
     defer allocator.free(text);
 
-    // 返回全文;大页由 tool_exec 的 maybePersist 统一落盘换成 preview+path(三件套),模型 Read(path) 取剩余。
+    // 返回全文；大页在 AgentLoop 投影为 content-addressed receipt，模型用 ReadArtifact 分片恢复。
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"url\":");
@@ -237,6 +452,36 @@ test "htmlToText collapses whitespace" {
     const t = try htmlToText(html, a);
     defer a.free(t);
     try std.testing.expectEqualStrings("a b c", t);
+}
+
+test "streamHtmlToText preserves legacy semantics across tag and entity chunk boundaries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const html = "<html><body>Hello <scr" ++
+        "ipt>ignored &amp;</scr" ++
+        "ipt><p>A &am" ++
+        "p; B</p><style>x{}</style> Tail</body></html>";
+    const expected = try htmlToText(html, allocator);
+    defer allocator.free(expected);
+
+    var source = try artifact_store.Capture.begin(allocator, root, 4096);
+    defer source.deinit();
+    try source.write(html[0..21]);
+    try source.write(html[21..47]);
+    try source.write(html[47..63]);
+    try source.write(html[63..]);
+    try source.seal();
+    var destination = try artifact_store.Capture.begin(allocator, root, 4096);
+    defer destination.deinit();
+    try streamHtmlToText(&source, &destination);
+    _ = try destination.sealExternal();
+    const actual = try destination.readRangeAlloc(allocator, 0, @intCast(destination.bytes));
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
 test "WebFetch rejects non-http URLs" {

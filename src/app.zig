@@ -120,6 +120,8 @@ const system_prompt_mod = @import("core/system_prompt.zig");
 const DynRegistry = @import("tools/dynamic.zig").DynRegistry;
 const skill_tool_mod = @import("skills/tool.zig");
 const skill_cli_adapter = @import("skills/cli_adapter.zig");
+const plugin_mod = @import("plugin/root.zig");
+const path_util = @import("util/path.zig");
 const McpClient = @import("mcp/client.zig").McpClient;
 const McpSession = @import("mcp/registry_bridge.zig").McpSession;
 const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
@@ -138,6 +140,95 @@ pub const UsageTotals = @import("core/usage.zig").UsageTotals;
 /// 单一信号,只服务前台 TUI(N=1)会话。多 session(GUI)经每个会话的 per-instance
 /// app.abort.abort() 直接中断,旁路 SIGINT。故无需做成 per-session 路由表。
 var g_abort_signal: ?*AbortSignal = null;
+
+fn buildCliPluginSnapshot(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    home: []const u8,
+    packed_data_dirs: ?[]const u8,
+    packed_process_dirs: ?[]const u8,
+) !?*plugin_mod.runtime.Snapshot {
+    if (packed_data_dirs == null and packed_process_dirs == null) return null;
+    var roots: std.ArrayList([]u8) = .empty;
+    defer {
+        for (roots.items) |root| allocator.free(root);
+        roots.deinit(allocator);
+    }
+    var packages: std.ArrayList(plugin_mod.runtime.PackageSource) = .empty;
+    defer packages.deinit(allocator);
+    var process_packages: std.ArrayList(plugin_mod.runtime.PackageSource) = .empty;
+    defer process_packages.deinit(allocator);
+
+    try appendCliPluginSources(allocator, cwd, home, packed_data_dirs, &roots, &packages);
+    try appendCliPluginSources(allocator, cwd, home, packed_process_dirs, &roots, &process_packages);
+    if (packages.items.len == 0 and process_packages.items.len == 0)
+        return error.InvalidPackageRoot;
+
+    return try plugin_mod.runtime.Snapshot.create(allocator, .{
+        .generation = @enumFromInt(1),
+        .supported_capabilities = plugin_mod.support.acceptedCapabilities(.cli_data),
+        .packages = packages.items,
+        .process_packages = process_packages.items,
+    });
+}
+
+fn appendCliPluginSources(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    home: []const u8,
+    packed_dirs: ?[]const u8,
+    roots: *std.ArrayList([]u8),
+    packages: *std.ArrayList(plugin_mod.runtime.PackageSource),
+) !void {
+    const encoded_dirs = packed_dirs orelse return;
+    var iterator = std.mem.splitScalar(u8, encoded_dirs, 0);
+    while (iterator.next()) |raw| {
+        if (raw.len == 0) return error.InvalidPackageRoot;
+        const root = try path_util.normalize(allocator, raw, .{
+            .home = home,
+            .base_dir = cwd,
+            .resolve_relative = true,
+        });
+        try roots.append(allocator, root);
+        try packages.append(allocator, .{ .root = root, .layer = .session });
+    }
+}
+
+fn executeCliProcessTool(
+    ctx: *const @import("tools/context.zig").ToolContext,
+    args: []const u8,
+    raw: ?*anyopaque,
+) anyerror!@import("core/tool_result.zig").ToolResultBody {
+    const isolated: *const @import("core/tool_catalog.zig").IsolatedTool =
+        @ptrCast(@alignCast(raw orelse return error.ProcessPluginUnavailable));
+    const outcome = try isolated.execute(isolated.ctx, ctx, args);
+    return switch (outcome) {
+        .ok => |body| body,
+        .host_failed => |detail| {
+            installCliProcessError(ctx, detail);
+            return error.ProcessPluginFailed;
+        },
+        .host_rejected => |detail| {
+            installCliProcessError(ctx, detail);
+            return error.ProcessPluginRejected;
+        },
+        // process.zig never produces fatal. Keep the legacy adapter fail-closed
+        // if another isolated implementation violates that contract.
+        .host_fatal => error.ProcessPluginProtocolViolation,
+    };
+}
+
+fn installCliProcessError(
+    ctx: *const @import("tools/context.zig").ToolContext,
+    detail: ?[]u8,
+) void {
+    const bytes = detail orelse return;
+    if (ctx.error_detail) |slot| {
+        slot.* = bytes;
+    } else {
+        ctx.allocator.free(bytes);
+    }
+}
 
 /// 一个已连接 MCP server 的资源捆绑：name（owned）+ heap-allocated client + session。
 /// session 内的 binding 指针指向同一个 client；client 必须比 session 活得久。
@@ -208,6 +299,10 @@ pub const App = struct {
     /// Canonical Skill Runtime; `skills` above is only its legacy-shaped
     /// presentation/preload projection.
     skill_runtime: skill_cli_adapter.Runtime,
+    /// Host-admitted immutable plugin generation. The snapshot owns manifest
+    /// descriptors/provenance and only projects bounded contributions into
+    /// canonical registries; AgentLoop remains the sole orchestration owner.
+    plugin_snapshot: ?*plugin_mod.runtime.Snapshot = null,
     read_state: ReadState,
     /// Edit/Write 旁路高亮缓存(tool_id → 新旧全文)。供 diff 工具卡 hl-zig 着色;
     /// 不进对话历史。session 退出 deinit。
@@ -367,14 +462,39 @@ pub const App = struct {
             app.gemini_client.?.overrides = buildOverridesFromConfig(config);
         }
 
-        // 启动时由 canonical Runtime 解析 enterprise / personal / project
-        // sources；cwd 仅用于确定稳定的 Workspace root。
+        // 启动时先事务化解析 CLI data packages，再由 canonical Runtime 一次性解析
+        // enterprise / personal / project / plugin Skill sources。插件失败不降级：用户
+        // 显式声明的 package 若不可信或 Host 不支持，启动必须 fail closed。
         const cwd_for_skills = @import("util/fs.zig").getCwd(allocator) catch null;
         defer if (cwd_for_skills) |c| allocator.free(c);
+        if ((config.plugin_dirs != null or config.process_plugin_dirs != null) and cwd_for_skills == null)
+            return error.GetCwdFailed;
+        app.plugin_snapshot = try buildCliPluginSnapshot(
+            allocator,
+            cwd_for_skills orelse "",
+            @import("platform").paths.homeDir() orelse "",
+            config.plugin_dirs,
+            config.process_plugin_dirs,
+        );
+        // Bind every App-owned provider path to one immutable resolver. The
+        // clients are allocated before package discovery, but no model request
+        // is admitted before this point. Snapshot destruction happens only
+        // after clients, subagents, and swarm workers have drained.
+        const app_dialect_resolver = if (app.plugin_snapshot) |snapshot|
+            snapshot.dialectResolver()
+        else
+            dialect_mod.Resolver.builtin();
+        app.api_client.dialect_resolver = app_dialect_resolver;
+        if (app.openai_client) |*client| client.dialect_resolver = app_dialect_resolver;
+        if (app.gemini_client) |*client| client.dialect_resolver = app_dialect_resolver;
+        const plugin_skill_sources = if (app.plugin_snapshot) |snapshot| snapshot.skill_sources else &.{};
+        const plugin_agent_sources = if (app.plugin_snapshot) |snapshot| snapshot.agent_sources else &.{};
         if (cwd_for_skills) |cwd| {
-            app.skill_runtime.loadDefault(
+            app.skill_runtime.loadDefaultWithExtraSources(
                 cwd,
                 @import("platform").paths.homeDir() orelse "",
+                if (app.plugin_snapshot != null) "plugin-generation-1" else "",
+                plugin_skill_sources,
                 &app.skills,
             ) catch |err| {
                 @import("util/log.zig").warn(
@@ -384,8 +504,13 @@ pub const App = struct {
                 );
             };
         }
-        // 加载 subagent 定义(builtin 三个 + personal + project)
-        app.agents.loadFromStandardPaths(cwd_for_skills orelse "") catch {};
+        // 加载 subagent 定义(builtin + namespaced plugin + personal + project)
+        app.agents.loadFromStandardPathsWithPluginSources(
+            cwd_for_skills orelse "",
+            plugin_agent_sources,
+        ) catch |err| {
+            if (app.plugin_snapshot != null) return err;
+        };
         // 缓存 project root(供 ${CLAUDE_PROJECT_DIR} 替换)
         if (cwd_for_skills) |cwd| {
             app.project_dir = @import("skills/skill.zig").findRepoRoot(allocator, cwd) catch null;
@@ -430,6 +555,21 @@ pub const App = struct {
             };
         }
 
+        // Process tools enter the CLI through its canonical typed dynamic
+        // registry. Definitions borrow the immutable snapshot (destroyed only
+        // after dyn_registry), while typed artifact receipts pass through the
+        // same isolated adapter used by AgentRuntime without flattening.
+        if (app.plugin_snapshot) |snapshot| {
+            for (snapshot.process_tools) |*tool| {
+                try app.dyn_registry.registerBorrowedDefinitionBody(
+                    tool.definition,
+                    executeCliProcessTool,
+                    @ptrCast(@constCast(tool)),
+                    .execute,
+                );
+            }
+        }
+
         // 启动时尝试连接 config.json 里声明的 MCP servers。失败逐个 log，不影响启动。
         app.connectMcpServers() catch |err| {
             @import("util/log.zig").debug("mcp", "no servers connected: {s}", .{@errorName(err)});
@@ -459,7 +599,7 @@ pub const App = struct {
             .tinykg_enabled = config.long_horizon_arm.usesTinyKg(),
         };
         app.tool_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &prompt_ctx);
-        _ = skill_cli_adapter.applyModelToolSchema(app.tool_defs);
+        _ = app.skill_runtime.applyModelToolSchema(app.tool_defs);
         errdefer allocator.free(app.tool_defs);
 
         // 加载模型上下文窗口表(~/.metacode/models.toml)并挂到 client。
@@ -525,7 +665,7 @@ pub const App = struct {
         // Background jobs allocate and free from worker threads.  The session
         // arena is not thread-safe; keep the registry and all job-owned state
         // on c_allocator (the provider/agent_loop allocator must match too).
-        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.init(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind) catch |err| blk: {
+        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.initWithDialectResolver(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind, app_dialect_resolver) catch |err| blk: {
             @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -539,6 +679,7 @@ pub const App = struct {
             .base_url = config.base_url,
             .model = app.config.model,
             .provider_kind = app.config.provider_kind,
+            .dialect_resolver = app_dialect_resolver,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
         };
 
@@ -590,10 +731,6 @@ pub const App = struct {
             @import("util/log.zig").warn("memory", "user_context build failed: {s}", .{@errorName(err)});
             break :blk null;
         };
-
-        // P0.5:启动时清理 tool-results 落盘缓存(TTL 7 天 + 500MB LRU,节流 6h)。best-effort:
-        // 补"落盘缓存只增不删 → 磁盘无界"的洞。失败静默,绝不阻断启动。
-        @import("tools/tool_result_storage.zig").cleanupCache(allocator, app.homeDir());
 
         return app;
     }
@@ -689,6 +826,7 @@ pub const App = struct {
         if (app.plan_file_path.len > 0) app.allocator.free(app.plan_file_path);
         if (app.memdir_abs.len > 0) app.allocator.free(app.memdir_abs);
         app.agents.deinit();
+        if (app.plugin_snapshot) |snapshot| snapshot.destroy();
         for (app.worktree_stack.items) |entry| {
             app.allocator.free(entry.worktree_path);
             app.allocator.free(entry.original_cwd);
@@ -1002,6 +1140,14 @@ pub const App = struct {
     pub fn kgReady(app: *const App) bool {
         if (app.kg) |*k| return k.ready;
         return false;
+    }
+
+    /// Versioned immutable plugin inventory for CLI/Web/embedding Hosts.
+    pub fn describePlugins(app: *const App, allocator: std.mem.Allocator) ![]u8 {
+        return if (app.plugin_snapshot) |snapshot|
+            snapshot.describe(allocator)
+        else
+            plugin_mod.runtime.emptyInventory(allocator);
     }
 
     /// 初始化 TinyKG(设计 v3-final §1 D2、§6)。best-effort:任何步骤失败都不致命。

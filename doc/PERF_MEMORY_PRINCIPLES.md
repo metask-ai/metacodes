@@ -34,7 +34,10 @@
 
 ### 3b. Arena 批量释放优于逐个 free
 - 临时分配(一轮工具/一次请求)挂 arena,批量释放(已有)。命名:gpa(调用者释放)/arena(批量)/scratch(不逃逸)。
-- 避免长生命周期持有短期数据(对话历史/工具结果超阈值落盘——已有 tool_result_storage)。
+- 避免长生命周期持有短期数据（工具结果从 byte zero 写 Session CAS，Conversation 只持 artifact receipt）。
+- 静态工具必须声明 `ResultProduction`：未知规模的外部生产者只能是 `byte_zero_spool`，并由
+  comptime 拒绝 legacy callback；确定有界结果用 `bounded_inline`，编辑类结果用
+  `input_derived`。不能用“之后会投影”替代生成期 OOM 边界。
 
 ### 3c. 定长 + 值语义优于动态 + 指针
 - 跨线程状态用定长数组 + 持锁拷贝(防 {ptr,len} 撕裂 + 防悬挂)——见 UiState.tools。

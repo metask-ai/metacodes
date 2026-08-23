@@ -33,7 +33,7 @@ class DeclarationSensorTests(unittest.TestCase):
             ".{\n"
             '    .name = "Task",\n'
             '    .input_schema = .{ .required = &.{"prompt"} },\n'
-            "    .execute = agent_tool.execute,\n"
+            "    .execute = .{ .legacy_inline = agent_tool.execute },\n"
             "},\n",
             encoding="utf-8",
         )

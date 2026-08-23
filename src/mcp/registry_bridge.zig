@@ -14,6 +14,7 @@ const McpClient = @import("client.zig").McpClient;
 const protocol = @import("protocol.zig");
 const DynRegistry = @import("../tools/dynamic.zig").DynRegistry;
 const ToolContext = @import("../tools/context.zig").ToolContext;
+const ToolResultBody = @import("../tools/context.zig").ToolResultBody;
 
 /// 持有 MCP client + 它注入到 registry 的 tool bindings 的所有权。
 pub const McpSession = struct {
@@ -86,7 +87,7 @@ pub const McpSession = struct {
             // Once registerMcp succeeds, appendAssumeCapacity cannot strand a
             // registry entry pointing at a freed binding.
             try self.bindings.ensureUnusedCapacity(self.allocator, 1);
-            try registry.registerMcp(full_name, desc, &.{}, executeMcpTool, binding, server_prefix);
+            try registry.registerMcpBody(full_name, desc, &.{}, executeMcpToolBody, binding, server_prefix);
             self.bindings.appendAssumeCapacity(binding);
         }
     }
@@ -113,7 +114,7 @@ pub const McpSession = struct {
             errdefer self.allocator.free(binding.mcp_tool_name);
             const name = try std.fmt.allocPrint(self.allocator, "{s}__list_resources", .{server_prefix});
             defer self.allocator.free(name);
-            try registry.registerMcp(name, "List resources exposed by this MCP server.", &.{}, executeListResources, binding, server_prefix);
+            try registry.registerMcpBody(name, "List resources exposed by this MCP server.", &.{}, executeListResourcesBody, binding, server_prefix);
             self.bindings.appendAssumeCapacity(binding);
         }
         // read_resource
@@ -125,7 +126,7 @@ pub const McpSession = struct {
             const name = try std.fmt.allocPrint(self.allocator, "{s}__read_resource", .{server_prefix});
             defer self.allocator.free(name);
             const required = [_][]const u8{"uri"};
-            try registry.registerMcp(name, "Read a resource from this MCP server by uri.", &required, executeReadResource, binding, server_prefix);
+            try registry.registerMcpBody(name, "Read a resource from this MCP server by uri.", &required, executeReadResourceBody, binding, server_prefix);
             self.bindings.appendAssumeCapacity(binding);
         }
     }
@@ -141,16 +142,38 @@ fn executeMcpTool(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaqu
     return try binding.client.callToolAbortable(binding.mcp_tool_name, args, ctx.abort);
 }
 
+fn executeMcpToolBody(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror!ToolResultBody {
+    const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
+    return binding.client.callToolBodyAbortable(
+        binding.mcp_tool_name,
+        args,
+        ctx.artifact_root,
+        ctx.abort,
+    );
+}
+
 fn executeListResources(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
     const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
     _ = args;
     return try binding.client.listResourcesAbortable(ctx.abort);
 }
 
+fn executeListResourcesBody(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror!ToolResultBody {
+    const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
+    _ = args;
+    return binding.client.listResourcesBodyAbortable(ctx.artifact_root, ctx.abort);
+}
+
 fn executeReadResource(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
     const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
     const uri = extractStringField(args, "uri") orelse return error.MissingUri;
     return try binding.client.readResourceAbortable(uri, ctx.abort);
+}
+
+fn executeReadResourceBody(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror!ToolResultBody {
+    const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
+    const uri = extractStringField(args, "uri") orelse return error.MissingUri;
+    return binding.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.abort);
 }
 
 // 私有 helpers——和 protocol.zig 同逻辑但只处理 object

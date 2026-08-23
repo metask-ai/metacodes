@@ -336,6 +336,20 @@ pub fn currentPid() i32 {
 /// inherit_env=true（bg job 需 PATH 等）。argv 须 null 结尾。
 /// cwd 非 null → 子进程在 spawn 时 chdir(借用,spawn 时消费)。
 pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int, cwd: ?[]const u8) CaptureError!ProcHandle {
+    return spawnToFilesWithEnv(argv, out_fd, err_fd, cwd, true);
+}
+
+/// Variant used by the native tool-result spool adapter. Ordinary tool
+/// capture historically executes with an empty POSIX environment, while
+/// background shell jobs require inheritance. Keep that authority choice at
+/// the call site instead of changing `spawnToFiles` compatibility semantics.
+pub fn spawnToFilesWithEnv(
+    argv: []const ?[*:0]const u8,
+    out_fd: c_int,
+    err_fd: c_int,
+    cwd: ?[]const u8,
+    inherit_env: bool,
+) CaptureError!ProcHandle {
     if (is_windows) {
         const out_raw = _get_osfhandle(out_fd);
         const err_raw = _get_osfhandle(err_fd);
@@ -387,7 +401,8 @@ pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int, 
         // 缺陷 B 修复:子进程 chdir。
         if (!chdirChild(cwd)) std.c._exit(127);
         const argv0 = argv[0] orelse std.c._exit(127);
-        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), @ptrCast(std.c.environ));
+        const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
+        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
         std.c._exit(127);
     }
     _ = std.c.setpgid(pid, pid);

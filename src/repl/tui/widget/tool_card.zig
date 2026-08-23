@@ -72,7 +72,7 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     if (std.mem.eql(u8, tool_name, "Skill")) return .hidden;
     // 有专用 summary 渲染器的工具(renderResultBody 分发到 diff/搜索/Read/WebFetch 渲染器)。
     const summary_tools = [_][]const u8{
-        "Bash",     "BashOutput", "Edit", "Write", "Read", "Grep", "Glob",
+        "Bash",     "BashOutput", "Edit",  "Write", "Read", "Grep", "Glob",
         "WebFetch", "WebSearch",  "Agent",
     };
     for (summary_tools) |t| {
@@ -201,7 +201,6 @@ fn countGlobMatches(content: []const u8) usize {
     }
     return n; // 无 \n → 0(由 toolDoneTitle 兜底 "Found files")
 }
-
 
 /// 工具开始(无状态符,只有 ⏺ tool_name + 命令预览)。对齐 cc BLACK_CIRCLE bullet。
 /// caller free。
@@ -520,7 +519,6 @@ fn wrapPoint(s: []const u8, start: usize, max_w: usize) usize {
     }
     return i;
 }
-
 
 /// 按工具名分发结果体渲染。专用渲染器(Edit diff / 搜索摘要 / Read 摘要 / WebFetch 摘要)
 /// 各自决定折叠/着色;未命中工具走 renderGenericFold(现有逐行折叠,Bash 等用)。
@@ -1101,10 +1099,10 @@ fn langFromPath(path: []const u8) []const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "";
     const ext = path[dot + 1 ..];
     const map = .{
-        .{ "zig", "zig" },     .{ "py", "python" }, .{ "js", "js" },   .{ "ts", "ts" },
-        .{ "jsx", "jsx" },     .{ "tsx", "tsx" },   .{ "rs", "rust" }, .{ "go", "go" },
-        .{ "c", "c" },         .{ "h", "c" },       .{ "cpp", "cpp" }, .{ "cc", "cpp" },
-        .{ "hpp", "cpp" },     .{ "java", "java" }, .{ "sh", "bash" }, .{ "bash", "bash" },
+        .{ "zig", "zig" },   .{ "py", "python" }, .{ "js", "js" },   .{ "ts", "ts" },
+        .{ "jsx", "jsx" },   .{ "tsx", "tsx" },   .{ "rs", "rust" }, .{ "go", "go" },
+        .{ "c", "c" },       .{ "h", "c" },       .{ "cpp", "cpp" }, .{ "cc", "cpp" },
+        .{ "hpp", "cpp" },   .{ "java", "java" }, .{ "sh", "bash" }, .{ "bash", "bash" },
         .{ "json", "json" },
     };
     inline for (map) |m| {
@@ -1188,14 +1186,15 @@ fn renderReadSummary(alloc: std.mem.Allocator, th: Theme, output_text: []const u
 /// WebFetch 结果:人话摘要 `Received N bytes[ (truncated)]`(对齐 cc `Received N bytes (status)`,
 /// zig 结果 JSON 无 HTTP status 故略);verbose/transcript 展开正文 content。**绝不裸吐 JSON。**
 fn renderWebFetchSummary(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
-    // 小页:{...,"bytes":N,...};大页被 tool_exec 落盘换成 persisted 信封 → 读 original_bytes(全文字节)。
+    // 小页:{...,"bytes":N,...};大页是统一无路径 CAS envelope → 读 original_bytes。
     const bytes = extractNumberField(output_text, "bytes") orelse extractNumberField(output_text, "original_bytes");
-    const persisted = std.mem.indexOf(u8, output_text, "\"persisted\":true") != null;
+    const recoverable = std.mem.indexOf(u8, output_text, "\"projection\":\"artifact\"") != null and
+        std.mem.indexOf(u8, output_text, "\"tool\":\"ReadArtifact\"") != null;
     try out.appendSlice(alloc, "  ");
     try out.appendSlice(alloc, th.success);
     if (bytes) |b| {
         try out.print(alloc, "Received {d} bytes", .{b});
-        if (persisted) try out.appendSlice(alloc, " (saved to file — Read the path for full content)");
+        if (recoverable) try out.appendSlice(alloc, " (full result available via ReadArtifact)");
     } else {
         // 无 bytes/original_bytes 字段(异常结果)→ 仍给人话,不裸吐 JSON。
         try out.appendSlice(alloc, "Fetched");
@@ -1724,9 +1723,7 @@ test "renderProgress: 显示 spinner + 耗时" {
 test "VISUAL demo: tool_card(TUI_DEMO=1)" {
     if (std.c.getenv("TUI_DEMO") == null) return error.SkipZigTest;
     const th = theme_mod.dark;
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"git status\"}",
-        "On branch master\nnothing to commit, working tree clean\n",
-        .ok, 423, .{ .cols = 60 });
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"git status\"}", "On branch master\nnothing to commit, working tree clean\n", .ok, 423, .{ .cols = 60 });
     defer testing.allocator.free(s);
     std.debug.print("\n{s}\n", .{s});
 }
@@ -1872,14 +1869,14 @@ test "renderResult: WebFetch 小页摘要 + verbose 展开正文" {
     try testing.expect(std.mem.indexOf(u8, s, "\"content\"") == null); // 仍不裸吐字段名
 }
 
-test "renderResult: WebFetch 大页(persisted 信封)读 original_bytes + 落盘标注" {
+test "renderResult: WebFetch 大页读统一 artifact envelope without exposing a path" {
     const th = theme_mod.monochrome;
-    // 大页被 tool_exec 落盘换成 persisted 信封;卡读 original_bytes,标注已落盘。
-    const out = "{\"persisted\":true,\"original_bytes\":123456,\"path\":\"/tmp/x/.metacodes/tool-results/ab.txt\",\"preview\":\"start of page\"}";
+    const out = "{\"schema_version\":\"metacodes.tool-result-projection.v1\",\"projection\":\"artifact\",\"artifact_id\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"original_bytes\":123456,\"recoverable\":true,\"read\":{\"tool\":\"ReadArtifact\",\"offset\":0,\"limit_max\":32768}}";
     const s = try renderResult(testing.allocator, th, "WebFetch", "{\"url\":\"http://x\"}", out, .ok, 80, .{});
     defer testing.allocator.free(s);
     try capture.expectContains(s, "Received 123456 bytes"); // 不再退化成裸 Fetched
-    try capture.expectContains(s, "saved to file");
+    try capture.expectContains(s, "ReadArtifact");
+    try testing.expect(std.mem.indexOf(u8, s, "/tmp/") == null);
 }
 
 test "renderResult: Bash 仍走通用折叠(无专用渲染器)" {
@@ -2350,5 +2347,3 @@ test "actionLabel: 超长 CJK 参数按显示宽截断且不切碎 UTF-8" {
     try testing.expect(std.mem.startsWith(u8, s, "Read("));
     try testing.expect(std.mem.endsWith(u8, s, ")"));
 }
-
-

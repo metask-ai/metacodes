@@ -24,6 +24,7 @@ const ToolContext = @import("context.zig").ToolContext;
 const util_time = @import("../util/time.zig");
 
 const DEFAULT_MAX_BYTES: usize = 64 * 1024;
+const MAX_MAX_BYTES: usize = 256 * 1024;
 const LONG_POLL_MS: i64 = 30_000;
 const ABORT_SLICE_MS: i64 = 250;
 
@@ -42,6 +43,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const since_arg = parseUsizeArg(args, "since_byte");
     const since = since_arg orelse 0;
     const max_bytes = parseUsizeArg(args, "max_bytes") orelse DEFAULT_MAX_BYTES;
+    if (max_bytes == 0 or max_bytes > MAX_MAX_BYTES) {
+        common.setErrorDetail(ctx.error_detail, allocator, "TaskOutput max_bytes must be in 1..{d}", .{MAX_MAX_BYTES});
+        return error.InvalidMaxBytes;
+    }
 
     // A status read with no unseen output is a long-poll, not a zero-wait
     // snapshot. Otherwise a fast model can issue three identical TaskOutput
@@ -77,7 +82,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         snap.turns = e.turns;
         snap.tool_calls = e.tool_calls;
         snap.err_name = e.err_name;
-        if (e.final_text) |ft| snap.final_text = try allocator.dupe(u8, ft);
+        // `output` is the paged recovery plane. final_text is only a small
+        // convenience duplicate; never copy an arbitrarily large completed
+        // agent response a second time merely to serialize this status row.
+        if (e.final_text) |ft| {
+            if (ft.len <= max_bytes) snap.final_text = try allocator.dupe(u8, ft);
+        }
         if (e.worktree_path.len > 0) snap.worktree_path = try allocator.dupe(u8, e.worktree_path);
         snap.worktree_kept = e.worktree_kept;
         snap.worktree_cleanup_complete = e.worktree_cleanup_complete;

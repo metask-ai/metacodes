@@ -94,7 +94,7 @@ test "L2: 建连断一次 → 重试包装第2次成功(短退避)" {
     try std.testing.expect(resp.done);
 }
 
-test "L2 evaluation gate makes one physical provider attempt and never retries outside receipt" {
+test "L2 evaluation gate retries transient connect failure inside one semantic request" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.startFlaky(OK_SSE, 1);
     defer srv.stop();
@@ -107,7 +107,7 @@ test "L2 evaluation gate makes one physical provider attempt and never retries o
     defer client.deinit();
 
     const empty: []const cc.types_mod.ApiMessage = &.{};
-    const result = client.sendMessageStreamFullRetry(
+    var response = try client.sendMessageStreamFullRetry(
         empty,
         null,
         null,
@@ -118,8 +118,9 @@ test "L2 evaluation gate makes one physical provider attempt and never retries o
         1,
         null,
     );
-    try std.testing.expectError(error.TransientNetwork, result);
-    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    defer response.deinit();
+    try drainStream(&response);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
     try std.testing.expectEqual(
         cc.client_mod.defaultMaxRetries(),
         cc.agent_loop.providerAttemptLimit(false),

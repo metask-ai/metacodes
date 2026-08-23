@@ -246,6 +246,7 @@ fn replacedAndRebound(
 const LocalFixture = struct {
     session_dir: []u8,
     evidence: projection.DerivedGenerationEvidence,
+    generation_evidence: [1]projection.GenerationEvidence,
     held: [1]projection.HeldOutCommitment,
     held_members: [1][]const u8,
     held_commitment: [64]u8,
@@ -298,6 +299,7 @@ fn localFixture(
     return .{
         .session_dir = session_dir,
         .evidence = evidence,
+        .generation_evidence = .{evidence.value},
         .held = .{.{
             .commitment_sha256 = undefined,
             .suite_sha256 = HELD_OUT_SUITE[0..],
@@ -322,7 +324,7 @@ fn requestFor(value: *LocalFixture, project_node_id: u64) adapter.Request {
         .project_sha256 = PROJECT,
         .project_key = PROJECT_KEY,
         .active_rules = .{ .bundle_revision = 0, .bundle_sha256 = ZERO },
-        .generation_evidence = &.{value.evidence.value},
+        .generation_evidence = &value.generation_evidence,
         .held_out_commitments = &value.held,
     };
 }
@@ -986,6 +988,7 @@ const EvolutionFixture = struct {
     project: [64]u8,
     project_key: []const u8,
     evidence: projection.DerivedGenerationEvidence,
+    generation_evidence: [1]projection.GenerationEvidence,
     held: [1]projection.HeldOutCommitment,
     held_members: [1][]const u8,
     held_commitment: [64]u8,
@@ -1047,6 +1050,7 @@ fn evolutionFixture(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, root
         .project = project,
         .project_key = project_key,
         .evidence = evidence,
+        .generation_evidence = .{evidence.value},
         .held = .{.{
             // Rebound after the fixture reaches its final address. These
             // slices must never point into this returning stack frame.
@@ -1090,7 +1094,7 @@ fn evolutionPrepareInput(fixture: *EvolutionFixture, source: evolution.ProjectOn
             .cache_read_microusd_per_mtok = 300_000,
             .cache_write_microusd_per_mtok = 3_750_000,
         },
-        .generation_evidence = &.{fixture.evidence.value},
+        .generation_evidence = &fixture.generation_evidence,
         .held_out_commitments = &fixture.held,
     };
 }

@@ -484,7 +484,7 @@ fn Slot.takeContent(self: *Slot) ?[]u8;                  // 转移即置 null
 ```
 
 agent loop 以单个 defer 遍历 `slots` 调 `Slot.deinit`，转移过的字段已 null 则天然跳过。
-对已由 `maybePersist()` 落盘但尚未产生引用的 transient result：**persistence 延迟到
+对尚未产生 Conversation 引用的 transient result：**CAS publish 延迟到
 batch 确认无 fatal 之后**（首选），或追踪并在 fatal 清理时删除——不制造孤儿文件。
 
 **Host 工具并发判定去猜名化（诚实的生产路径）**：现状 `slotSafe` 按工具名判定并发

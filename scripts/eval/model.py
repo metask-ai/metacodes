@@ -288,6 +288,22 @@ def validate_suite(data: Dict[str, Any], root: Path) -> List[str]:
         required_tools = _require(tools, "required", list, f"{where}.tools")
         if not all(isinstance(item, str) and item for item in required_tools):
             raise ValidationError(f"{where}.tools.required: expected tool-name strings")
+        allowed_tools = tools.get("allowed")
+        if allowed_tools is not None:
+            if (
+                not isinstance(allowed_tools, list)
+                or not allowed_tools
+                or not all(isinstance(item, str) and item for item in allowed_tools)
+                or len(set(allowed_tools)) != len(allowed_tools)
+            ):
+                raise ValidationError(
+                    f"{where}.tools.allowed: expected distinct tool-name strings"
+                )
+            missing_required = sorted(set(required_tools) - set(allowed_tools))
+            if missing_required:
+                raise ValidationError(
+                    f"{where}.tools.allowed: missing required tools {missing_required}"
+                )
         constraints = _require(task, "constraints", dict, where)
         timeout = _require(constraints, "timeout_seconds", int, f"{where}.constraints")
         if timeout <= 0:

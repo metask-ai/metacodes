@@ -18,7 +18,9 @@
 //! - 类比:Django ORM 的 SQL dialect。
 //!
 //! 借用契约(同 Provider):Dialect 值是廉价值(fn-ptr+指针),按值传;ctx 借用底层实例,
-//! 底层必须比 Dialect 值活得久。
+//! 底层必须比 Dialect 值活得久。Runtime 插件提供的 callback 还必须是输入确定的纯投影：
+//! 不得把时间、随机数、generation、plugin id 或加载路径写入请求，否则会主动破坏
+//! provider prefix cache。Snapshot 固定生命周期，但不会替不可信 callback 伪造确定性。
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -26,11 +28,136 @@ const model_adapter = @import("model_adapter.zig");
 const openai_dialects = @import("dialects/openai.zig");
 const claude_dialects = @import("dialects/claude.zig");
 const gemini_dialects = @import("dialects/gemini.zig");
+const util_json = @import("../util/json.zig");
 const sync = @import("platform").sync;
 
 pub const ProviderKind = model_adapter.ProviderKind;
 pub const ModelProfile = model_adapter.ModelProfile;
 pub const ReasoningEffort = types.ReasoningEffort;
+
+/// Provider-visible, request-scoped capabilities. This is deliberately typed:
+/// a dialect must not infer active tools by scraping prose from the system
+/// prompt. New fields default false so existing dialect plugins remain source
+/// compatible and only opt into presentation changes they understand.
+pub const VisibleCapabilities = struct {
+    skill_tool: bool = false,
+    /// Present only when exactly one visible tool requests deterministic
+    /// first-turn routing. Multiple requests fail closed to ordinary model
+    /// choice instead of depending on plugin enumeration order.
+    required_first: ?RequiredFirst = null,
+
+    pub const RequiredFirst = struct {
+        tool_name: []const u8,
+        argument_name: ?[]const u8 = null,
+        argument_value: ?[]const u8 = null,
+        /// Host-only request state; excluded from tool schemas and capability
+        /// prompt text. It only releases provider routing after compaction has
+        /// removed the paired call/result from the active API window.
+        satisfied: bool = false,
+    };
+
+    pub fn requiredSkillInvocation(self: VisibleCapabilities) ?[]const u8 {
+        const route = self.required_first orelse return null;
+        if (!std.mem.eql(u8, route.tool_name, "Skill")) return null;
+        if (!std.mem.eql(u8, route.argument_name orelse return null, "name")) return null;
+        const value = route.argument_value orelse return null;
+        if (!validInvocationName(value)) return null;
+        return value;
+    }
+};
+
+fn validInvocationName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (!std.ascii.isAlphanumeric(name[0]) and name[0] != '_') return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '_' and byte != ':' and byte != '-') return false;
+    }
+    return true;
+}
+
+/// Derive the typed capability projection from any optional ToolDefinition
+/// slice without importing a provider-specific request module here.
+pub fn visibleCapabilities(tools: anytype) VisibleCapabilities {
+    var out: VisibleCapabilities = .{};
+    var required_count: usize = 0;
+    if (tools) |definitions| for (definitions) |definition| {
+        if (std.mem.eql(u8, definition.name, "Skill")) out.skill_tool = true;
+        if (definition.model_activation) |activation| switch (activation.mode) {
+            .required_first => {
+                required_count += 1;
+                if (required_count == 1) out.required_first = .{
+                    .tool_name = definition.name,
+                    .argument_name = activation.argument_name,
+                    .argument_value = activation.argument_value,
+                    .satisfied = activation.satisfied,
+                } else out.required_first = null;
+            },
+        };
+    };
+    return out;
+}
+
+/// Exact typed route match. `required_first` is a Host invariant, so merely
+/// calling the right tool with the wrong Skill name must not release it.
+/// Canonical invocation names cannot contain JSON escapes; the lightweight
+/// field extractor is therefore exact for the only argument-bearing route
+/// currently admitted by the Runtime.
+pub fn matchesRequiredFirst(
+    route: VisibleCapabilities.RequiredFirst,
+    tool_name: []const u8,
+    input_json: []const u8,
+) bool {
+    if (!std.mem.eql(u8, route.tool_name, tool_name)) return false;
+    if (route.argument_name == null and route.argument_value == null) return true;
+    const argument_name = route.argument_name orelse return false;
+    const argument_value = route.argument_value orelse return false;
+    const observed = util_json.extractStringField(input_json, argument_name) orelse
+        return false;
+    return std.mem.eql(u8, observed, argument_value);
+}
+
+/// A required-first route is satisfied only by an exact call followed by its
+/// successful paired tool_result. A guessed/wrong Skill name, permission
+/// denial, dispatch error, or orphan tool_use keeps the route active.
+pub fn hasSuccessfulRequiredFirst(
+    messages: []const types.ApiMessage,
+    route: VisibleCapabilities.RequiredFirst,
+) bool {
+    for (messages, 0..) |message, message_index| {
+        for (message.content) |content| {
+            const tool_use = switch (content) {
+                .tool_use => |value| value,
+                else => continue,
+            };
+            if (!matchesRequiredFirst(route, tool_use.name, tool_use.input)) continue;
+            for (messages[message_index + 1 ..]) |later| {
+                for (later.content) |later_content| switch (later_content) {
+                    .tool_result => |result| {
+                        if (std.mem.eql(u8, result.tool_use_id, tool_use.id) and
+                            !result.is_error) return true;
+                    },
+                    else => {},
+                };
+            }
+        }
+    }
+    return false;
+}
+
+/// Shared opt-in route for dialects whose provider wire supports forcing one
+/// named function. Caller intent wins; ambiguity has already collapsed to
+/// `required_first=null` in `visibleCapabilities`.
+pub fn routeRequiredFirst(
+    capabilities: VisibleCapabilities,
+    already_invoked: bool,
+    requested: ?ToolChoice,
+) ?ToolChoice {
+    if (requested != null or already_invoked) return requested;
+    const route = capabilities.required_first orelse return null;
+    if (route.satisfied) return null;
+    return .{ .type = "tool", .name = route.tool_name };
+}
 
 /// 模型方言接口。ctx 是 type-erased 的 dialect 实例指针(如 *GlmDialect)。
 /// 方法签名全中立类型(ReasoningEffort / ModelProfile / ArrayList),不出现任何 provider 具体类型。
@@ -69,6 +196,30 @@ pub const Dialect = struct {
         system_buf: *std.ArrayList(u8),
         allocator: std.mem.Allocator,
     ) anyerror!void = defaultInjectSystemMods,
+
+    /// Request-side capability projection. Unlike `injectSystemModsFn`, this
+    /// receives the exact tool surface selected for this request, allowing a
+    /// model dialect to add deterministic guidance only when the capability is
+    /// actually visible. The default is a no-op.
+    activateCapabilitiesFn: *const fn (
+        ctx: *anyopaque,
+        profile: ModelProfile,
+        capabilities: VisibleCapabilities,
+        system_buf: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+    ) anyerror!void = defaultActivateCapabilities,
+
+    /// Select a provider-facing tool choice from immutable typed metadata.
+    /// Explicit caller choice always remains available to the dialect. The
+    /// default returns it unchanged; model-specific dialects may opt into a
+    /// required-first route only while the named tool has not been called.
+    routeToolChoiceFn: *const fn (
+        ctx: *anyopaque,
+        profile: ModelProfile,
+        capabilities: VisibleCapabilities,
+        already_invoked: bool,
+        requested: ?ToolChoice,
+    ) ?ToolChoice = defaultRouteToolChoice,
 
     /// 响应侧:从原始 chunk 提取 thinking/reasoning 增量(可为 null)。
     /// 调用方负责 free 返回的非 null slice。
@@ -165,6 +316,12 @@ pub const Dialect = struct {
     pub fn injectSystemMods(self: Dialect, p: ModelProfile, effort: ?ReasoningEffort, sys: *std.ArrayList(u8), a: std.mem.Allocator) !void {
         try self.injectSystemModsFn(self.ctx, p, effort, sys, a);
     }
+    pub fn activateCapabilities(self: Dialect, p: ModelProfile, capabilities: VisibleCapabilities, sys: *std.ArrayList(u8), a: std.mem.Allocator) !void {
+        try self.activateCapabilitiesFn(self.ctx, p, capabilities, sys, a);
+    }
+    pub fn routeToolChoice(self: Dialect, p: ModelProfile, capabilities: VisibleCapabilities, already_invoked: bool, requested: ?ToolChoice) ?ToolChoice {
+        return self.routeToolChoiceFn(self.ctx, p, capabilities, already_invoked, requested);
+    }
     pub fn extractThinkingDelta(self: Dialect, raw: []const u8, a: std.mem.Allocator) !?[]u8 {
         return try self.extractThinkingDeltaFn(self.ctx, raw, a);
     }
@@ -197,6 +354,27 @@ pub const Dialect = struct {
         return copy;
     }
 };
+
+/// Immutable, Runtime-scoped dialect lookup. A Provider client borrows this
+/// value for its whole lifetime, so a RuntimeHost replacement cannot change
+/// the behavior of already-admitted Sessions. The built-in resolver preserves
+/// the pre-plugin lookup table for ordinary CLI/App construction.
+pub const Resolver = struct {
+    ctx: *const anyopaque = @ptrFromInt(@as(usize, 0x1)),
+    resolveFn: *const fn (ctx: *const anyopaque, kind: ProviderKind, model: []const u8) Dialect = resolveBuiltin,
+
+    pub fn resolve(self: Resolver, kind: ProviderKind, model: []const u8) Dialect {
+        return self.resolveFn(self.ctx, kind, model);
+    }
+
+    pub fn builtin() Resolver {
+        return .{};
+    }
+};
+
+fn resolveBuiltin(_: *const anyopaque, kind: ProviderKind, model: []const u8) Dialect {
+    return dialectFor(kind, model);
+}
 
 pub const ToolChoiceKind = enum { none, auto, required, function };
 pub const ResponseFormatKind = enum { none, json_object, json_schema };
@@ -234,6 +412,22 @@ fn defaultInjectSystemMods(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningE
     _ = sys;
     _ = a;
     // no-op:不改 system prompt。
+}
+
+fn defaultActivateCapabilities(ctx: *anyopaque, p: ModelProfile, capabilities: VisibleCapabilities, sys: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
+    _ = ctx;
+    _ = p;
+    _ = capabilities;
+    _ = sys;
+    _ = a;
+}
+
+fn defaultRouteToolChoice(ctx: *anyopaque, p: ModelProfile, capabilities: VisibleCapabilities, already_invoked: bool, requested: ?ToolChoice) ?ToolChoice {
+    _ = ctx;
+    _ = p;
+    _ = capabilities;
+    _ = already_invoked;
+    return requested;
 }
 
 fn defaultExtractThinkingDelta(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
@@ -320,11 +514,12 @@ pub fn dialectFor(kind: ProviderKind, model: []const u8) Dialect {
     };
 }
 
-// ── Registry(运行时留位,comptime 注册走它)─────────────────────────────────
+// ── Standalone registry utility ───────────────────────────────────────────
 //
-// 当前(step 1)无注册项。step 2+ 的 dialect 实现会在 comptime 注册:
-//   registry.register(.openai, "glm-5", &glmDialect);
-// 未来第三方 dialect 可运行时注册(类似 RequestAbortRegistry)。
+// Kept for source compatibility and isolated callers, but deliberately not
+// consulted by `dialectFor` or Runtime providers. A process-global mutable
+// registry would let a hot reload change old Sessions behind their backs.
+// Runtime plugins publish dialects through plugin Snapshot + Resolver instead.
 
 pub const DialectRegistry = struct {
     mutex: sync.Mutex = .{},

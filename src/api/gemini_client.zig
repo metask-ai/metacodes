@@ -42,6 +42,7 @@ const provider_mod = @import("provider.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
+const dialect_mod = @import("dialect.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 const StreamEvent = api_stream.StreamEvent;
@@ -83,6 +84,7 @@ pub const GeminiClient = struct {
     reasoning_effort: ?types.ReasoningEffort = null,
     /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
     overrides: request_overrides.RequestOverrides = .{},
+    dialect_resolver: dialect_mod.Resolver = .{},
 
     /// 有状态缓存句柄表(GeminiClient 私有,不上浮中立契约)。
     /// prepareCache 据 system+tools 的 prefix 哈希查表命中则引用,未命中/过期则(MVP)走隐式。
@@ -209,7 +211,20 @@ pub const GeminiClient = struct {
         // 误命中别的 model 的句柄 → 发 400/404(C 修复)。
         const prefix_hash = hashPrefix(model, system, tools);
         const cached_ref = self.lookupCache(prefix_hash, nowMonoMs());
-        const body = try serializeGeminiRequest(self.allocator, messages, system, tools, cached_ref, model, tool_choice, self.reasoning_effort);
+        var overrides = self.overrides;
+        if (overrides.reasoning_effort == null) overrides.reasoning_effort = self.reasoning_effort;
+        overrides.tool_choice = tool_choice;
+        const dialect = self.dialect_resolver.resolve(.gemini, model);
+        const body = try serializeGeminiRequestWithOverridesAndDialect(
+            self.allocator,
+            messages,
+            system,
+            tools,
+            cached_ref,
+            model,
+            overrides,
+            dialect,
+        );
         defer self.allocator.free(body);
         return self.doStream(model, body, abort);
     }
@@ -575,10 +590,30 @@ pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const ty
 /// Gemini 协议支持:thinking_level(thinking)/response_mime_type(response_format)/temperature/top_p。
 /// 不支持:prompt_cache_key(Gemini 用 cachedContent 机制)/parallel_tool_calls(无此概念)→ 忽略。
 pub fn serializeGeminiRequestWithOverrides(allocator: std.mem.Allocator, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, cached_ref: ?[]const u8, model: []const u8, overrides: request_overrides.RequestOverrides) ![]u8 {
-    const dialect_mod = @import("dialect.zig");
-    const adapter = @import("model_adapter.zig");
-    const dialect = dialect_mod.dialectFor(.gemini, model);
-    const profile = adapter.profileFor(.gemini, model);
+    return serializeGeminiRequestWithOverridesAndDialect(
+        allocator,
+        messages,
+        system,
+        tools,
+        cached_ref,
+        model,
+        overrides,
+        dialect_mod.dialectFor(.gemini, model),
+    );
+}
+
+pub fn serializeGeminiRequestWithOverridesAndDialect(
+    allocator: std.mem.Allocator,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    cached_ref: ?[]const u8,
+    model: []const u8,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+) ![]u8 {
+    const profile = dialect.profileFor(.gemini, model);
+    const visible_capabilities = dialect_mod.visibleCapabilities(tools);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
@@ -589,12 +624,23 @@ pub fn serializeGeminiRequestWithOverrides(allocator: std.mem.Allocator, message
         try util_json.serializeString(cn, &out, allocator);
         first_top = false;
     }
-    // systemInstruction:{parts:[{text}]}
-    if (system) |sys| {
+    // systemInstruction:{parts:[{text}]}. Capability activation is typed and
+    // deterministic; ordinary Gemini dialects keep the default no-op.
+    var system_buf: std.ArrayList(u8) = .empty;
+    defer system_buf.deinit(allocator);
+    if (system) |sys| try system_buf.appendSlice(allocator, sys);
+    try dialect.injectSystemMods(profile, overrides.reasoning_effort, &system_buf, allocator);
+    try dialect.activateCapabilities(
+        profile,
+        visible_capabilities,
+        &system_buf,
+        allocator,
+    );
+    if (system_buf.items.len != 0) {
         if (!first_top) try out.append(allocator, ',');
         first_top = false;
         try out.appendSlice(allocator, "\"systemInstruction\":{\"parts\":[{\"text\":");
-        try util_json.serializeString(sys, &out, allocator);
+        try util_json.serializeString(system_buf.items, &out, allocator);
         try out.appendSlice(allocator, "}]}");
     }
     // contents:[{role, parts:[...]}]
@@ -619,7 +665,17 @@ pub fn serializeGeminiRequestWithOverrides(allocator: std.mem.Allocator, message
         }
     }
     // tool_choice:委托给 GeminiDialect 翻成 tool_config.function_calling_config。
-    if (overrides.tool_choice) |tc| {
+    const route_already_invoked = if (visible_capabilities.required_first) |route|
+        route.satisfied or dialect_mod.hasSuccessfulRequiredFirst(messages, route)
+    else
+        false;
+    const effective_tool_choice = dialect.routeToolChoice(
+        profile,
+        visible_capabilities,
+        route_already_invoked,
+        overrides.tool_choice,
+    );
+    if (effective_tool_choice) |tc| {
         _ = try dialect.serializeToolChoice(profile, tc, &out, allocator);
     }
     // generation_config:合并 thinking_level + response_mime_type + temperature + top_p。

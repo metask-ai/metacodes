@@ -7,6 +7,144 @@ const ToolContext = @import("context.zig").ToolContext;
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
 const util_json = @import("../util/json.zig");
+const ToolResultBody = @import("context.zig").ToolResultBody;
+const artifact_store = @import("../core/tool_result_artifact.zig");
+
+const STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+
+/// Production path: ripgrep writes to a private Session capture from byte
+/// zero, then only the first 100 bounded path rows are materialized.
+pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    if (ctx.artifact_root.len == 0)
+        return ToolResultBody.initInline(try execute(ctx, args));
+
+    const allocator = ctx.allocator;
+    const pattern = common.extractJsonArg(args, "pattern") orelse return error.MissingPattern;
+    const path_raw = common.extractJsonArg(args, "path") orelse ".";
+    if (pattern.len == 0) return error.EmptyPattern;
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{
+        .home = ctx.home_dir,
+        .base_dir = ctx.cwd_abs,
+        .resolve_relative = ctx.resolve_relative_paths,
+    });
+    defer allocator.free(path);
+    _ = read_state.statPath(path) catch {
+        common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
+        return error.PathNotFound;
+    };
+
+    const rg_path = try toolchain.ripgrepPath();
+    const pattern_z = try allocator.dupeZ(u8, pattern);
+    defer allocator.free(pattern_z);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    var argv = [_]?[*:0]const u8{
+        rg_path.ptr,
+        "--files",
+        "--no-messages",
+        "--glob",
+        pattern_z.ptr,
+        path_z.ptr,
+        null,
+    };
+    var spawned = try common.spawnCaptureToSpoolTimed(
+        argv[0..],
+        allocator,
+        ctx.artifact_root,
+        ctx.abort,
+        0,
+        ctx.spawn_tick_fn,
+        artifact_store.MAX_ARTIFACT_BYTES,
+        STDERR_CAPTURE_BYTES,
+        null,
+    );
+    defer spawned.deinit();
+
+    const startup_failure = spawned.exit_code < 0 or spawned.exit_code > 2 or
+        (spawned.exit_code == 2 and spawned.stderr.bytes > 0);
+    if (spawned.stdout.bytes == 0 and startup_failure) {
+        const detail = try spawned.stderr.readRangeAlloc(
+            allocator,
+            0,
+            @intCast(@min(spawned.stderr.bytes, 300)),
+        );
+        defer allocator.free(detail);
+        common.setErrorDetail(ctx.error_detail, allocator, "ripgrep failed (exit {d}): {s}", .{
+            spawned.exit_code,
+            detail,
+        });
+        return error.GlobExecFailed;
+    }
+
+    var summary = try summarizeCapture(allocator, &spawned.stdout, spawned.capture_complete);
+    defer summary.deinit(allocator);
+    return ToolResultBody.initInline(try renderSummary(allocator, summary));
+}
+
+const CaptureSummary = struct {
+    files: std.ArrayList([]u8) = .empty,
+    count: usize = 0,
+    truncated: bool = false,
+
+    fn deinit(self: *CaptureSummary, allocator: std.mem.Allocator) void {
+        for (self.files.items) |file| allocator.free(file);
+        self.files.deinit(allocator);
+    }
+};
+
+fn summarizeCapture(
+    allocator: std.mem.Allocator,
+    capture: *artifact_store.Capture,
+    capture_complete: bool,
+) !CaptureSummary {
+    var summary = CaptureSummary{ .truncated = !capture_complete };
+    errdefer summary.deinit(allocator);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+    try capture.rewind();
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const read_count = try capture.read(&buffer);
+        if (read_count == 0) break;
+        for (buffer[0..read_count]) |byte| {
+            if (byte == '\n') {
+                if (line.items.len != 0) {
+                    summary.count += 1;
+                    if (summary.files.items.len < 100)
+                        try summary.files.append(allocator, try allocator.dupe(u8, line.items));
+                }
+                line.clearRetainingCapacity();
+                continue;
+            }
+            if (line.items.len >= std.fs.max_path_bytes) return error.ResultLineTooLong;
+            try line.append(allocator, byte);
+        }
+    }
+    if (line.items.len != 0) {
+        summary.count += 1;
+        if (summary.files.items.len < 100)
+            try summary.files.append(allocator, try allocator.dupe(u8, line.items));
+    }
+    summary.truncated = summary.truncated or summary.count > summary.files.items.len;
+    return summary;
+}
+
+fn renderSummary(allocator: std.mem.Allocator, summary: CaptureSummary) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"filenames\":[");
+    for (summary.files.items, 0..) |file, index| {
+        if (index > 0) try out.append(allocator, ',');
+        try util_json.serializeString(file, &out, allocator);
+    }
+    try out.appendSlice(allocator, "],\"numFiles\":");
+    var number: [32]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&number, "{d}", .{summary.count}));
+    try out.appendSlice(allocator, ",\"truncated\":");
+    try out.appendSlice(allocator, if (summary.truncated) "true" else "false");
+    try out.appendSlice(allocator, ",\"durationMs\":0}");
+    return out.toOwnedSlice(allocator);
+}
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;

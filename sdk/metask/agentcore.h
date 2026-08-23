@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 9 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 12 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 9 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 12 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate version, revision, table size, and capabilities together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 9u
+#define METASK_AGENTCORE_ABI_REVISION 12u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -77,6 +77,8 @@ extern "C" {
 #define METASK_AGENTCORE_MAX_TOOL_SCHEMA_PROPERTIES_V1 1024ULL
 #define METASK_AGENTCORE_MAX_UI_RESPONSE_BYTES_V1 1048576ULL
 #define METASK_AGENTCORE_MAX_HOST_TOOL_RESULT_BYTES_V1 16777216ULL
+#define METASK_AGENTCORE_MAX_HOST_STREAM_ARTIFACT_BYTES_V1 134217728ULL
+#define METASK_AGENTCORE_MAX_MCP_TOOL_RESPONSE_BYTES_V1 135266304ULL
 #define METASK_AGENTCORE_MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 1048576ULL
 #define METASK_AGENTCORE_MAX_SESSION_ID_BYTES_V1 64ULL
 #define METASK_AGENTCORE_MAX_METADATA_STRING_BYTES_V1 1048576ULL
@@ -120,7 +122,14 @@ extern "C" {
 #define METASK_AGENTCORE_MAX_COMPLETION_RESULT_BYTES_V1 16777216ULL
 #define METASK_AGENTCORE_MAX_SKILL_SOURCES_V1 64ULL
 #define METASK_AGENTCORE_MAX_SKILL_SOURCE_ID_BYTES_V1 128ULL
+#define METASK_AGENTCORE_MAX_PROCESS_PLUGIN_SOURCES_V1 64ULL
 #define METASK_AGENTCORE_MAX_TURNS_V1 1000u
+
+#define METASK_AGENTCORE_PLUGIN_LAYER_BUILTIN 1u
+#define METASK_AGENTCORE_PLUGIN_LAYER_PERSONAL 2u
+#define METASK_AGENTCORE_PLUGIN_LAYER_PROJECT 3u
+#define METASK_AGENTCORE_PLUGIN_LAYER_SESSION 4u
+#define METASK_AGENTCORE_PLUGIN_LAYER_MANAGED 5u
 
 #define METASK_AGENTCORE_RUN_INPUT_TEXT 1u
 #define METASK_AGENTCORE_RUN_INPUT_SKILL 2u
@@ -202,6 +211,14 @@ extern "C" {
 #define METASK_AGENTCORE_HOST_FAILED 1u
 #define METASK_AGENTCORE_HOST_REJECTED 2u
 #define METASK_AGENTCORE_HOST_FATAL 3u
+#define METASK_AGENTCORE_HOST_STREAM_MEDIA_TEXT_UTF8 1u
+#define METASK_AGENTCORE_HOST_STREAM_MEDIA_JSON 2u
+#define METASK_AGENTCORE_HOST_STREAM_MEDIA_BINARY 3u
+#define METASK_AGENTCORE_HOST_SINK_OK 0u
+#define METASK_AGENTCORE_HOST_SINK_ABORTED 1u
+#define METASK_AGENTCORE_HOST_SINK_TOO_LARGE 2u
+#define METASK_AGENTCORE_HOST_SINK_FAILED 3u
+#define METASK_AGENTCORE_HOST_SINK_CLOSED 4u
 
 #define METASK_AGENTCORE_CAP_RUNTIME (1ULL << 0)
 #define METASK_AGENTCORE_CAP_BUILTIN_TOOLS (1ULL << 1)
@@ -225,7 +242,10 @@ extern "C" {
 #define METASK_AGENTCORE_CAP_RUN_STATE_OBSERVATION (1ULL << 19)
 #define METASK_AGENTCORE_CAP_WORKSPACE_SKILL_CATALOG (1ULL << 20)
 #define METASK_AGENTCORE_CAP_TEXT_COMPLETION (1ULL << 21)
-#define METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ((1ULL << 22) - 1ULL)
+#define METASK_AGENTCORE_CAP_PROCESS_PLUGIN_TOOLS (1ULL << 22)
+#define METASK_AGENTCORE_CAP_HOST_STREAM_TOOLS (1ULL << 23)
+#define METASK_AGENTCORE_CAP_MCP_TOOL_STREAM (1ULL << 24)
+#define METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ((1ULL << 25) - 1ULL)
 
 typedef struct metask_agentcore_runtime metask_agentcore_runtime;
 typedef struct metask_agentcore_session metask_agentcore_session;
@@ -270,6 +290,38 @@ typedef struct {
     uint64_t reserved[2];
 } metask_agentcore_host_tool_v1;
 
+typedef uint32_t (*metask_agentcore_host_result_write_fn_v1)(
+    void *, metask_agentcore_bytes_view_v1);
+
+/* Borrowed for one synchronous callback. The Host must not retain this sink;
+ * AgentCore alone commits or rolls back the streamed artifact. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    void *ctx;
+    metask_agentcore_host_result_write_fn_v1 write;
+    uint64_t max_bytes;
+    uint64_t reserved[3];
+} metask_agentcore_host_result_sink_v1;
+
+typedef uint32_t (*metask_agentcore_host_stream_execute_fn_v1)(
+    void *, const metask_agentcore_run_context_v1 *,
+    metask_agentcore_bytes_view_v1,
+    const metask_agentcore_host_result_sink_v1 *, uint32_t *,
+    metask_agentcore_owned_bytes_v1 *);
+
+typedef struct {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    void *ctx;
+    metask_agentcore_bytes_view_v1 name;
+    metask_agentcore_bytes_view_v1 description;
+    metask_agentcore_bytes_view_v1 input_schema_json;
+    metask_agentcore_host_stream_execute_fn_v1 execute_stream;
+    metask_agentcore_host_release_fn_v1 release_detail;
+    uint64_t reserved[2];
+} metask_agentcore_host_stream_tool_v1;
+
 typedef uint32_t (*metask_agentcore_mcp_is_cancelled_fn_v1)(const void *);
 typedef struct {
     uint32_t struct_size;
@@ -294,6 +346,10 @@ typedef uint32_t (*metask_agentcore_mcp_request_fn_v1)(
     void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
     const metask_agentcore_mcp_cancellation_v1 *,
     metask_agentcore_owned_bytes_v1 *);
+typedef uint32_t (*metask_agentcore_mcp_request_tool_stream_fn_v1)(
+    void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
+    const metask_agentcore_mcp_cancellation_v1 *,
+    const metask_agentcore_host_result_sink_v1 *);
 typedef uint32_t (*metask_agentcore_mcp_notify_fn_v1)(
     void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
     const metask_agentcore_mcp_cancellation_v1 *);
@@ -307,14 +363,16 @@ typedef void (*metask_agentcore_mcp_release_connector_fn_v1)(void *);
  * retain_connector and release_connector are mandatory and must be thread-safe;
  * they keep ctx alive across Runtime calls. Every successful open is closed
  * exactly once. Every non-empty response descriptor is released exactly once,
- * independent of request status. AgentCore copies successful response bytes
- * before release. */
+ * independent of request status. `request` is only for bounded MCP control
+ * frames. `request_tool_stream` is mandatory for tools/call and must write the
+ * complete JSON-RPC response from byte zero to the borrowed kernel sink. */
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;
     void *ctx;
     metask_agentcore_mcp_open_fn_v1 open;
     metask_agentcore_mcp_request_fn_v1 request;
+    metask_agentcore_mcp_request_tool_stream_fn_v1 request_tool_stream;
     metask_agentcore_mcp_notify_fn_v1 notify;
     metask_agentcore_mcp_close_fn_v1 close;
     metask_agentcore_mcp_release_response_fn_v1 release_response;
@@ -396,6 +454,28 @@ typedef struct {
     const metask_agentcore_mcp_catalog_limits_v1 *mcp_catalog_limits;
     uint64_t reserved[4];
 } metask_agentcore_runtime_config_v1;
+
+/* Explicit executable authority. root is an absolute package directory with
+ * strict plugin.json/process.json metadata. AgentCore copies retained state
+ * before runtime_create_with_plugins returns. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t layer_code;
+    metask_agentcore_bytes_view_v1 root;
+    uint64_t reserved[3];
+} metask_agentcore_process_plugin_source_v1;
+
+/* Kept separate from runtime_config_v1 so executable extensions never
+ * reinterpret fields that an earlier revision required to be zero. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    const metask_agentcore_process_plugin_source_v1 *process_plugins;
+    uint64_t process_plugin_count;
+    const metask_agentcore_host_stream_tool_v1 *host_stream_tools;
+    uint64_t host_stream_tool_count;
+    uint64_t reserved[4];
+} metask_agentcore_runtime_plugin_config_v1;
 
 typedef uint32_t (*metask_agentcore_on_event_fn_v1)(
     void *, const metask_agentcore_run_context_v1 *, metask_agentcore_bytes_view_v1);
@@ -682,6 +762,10 @@ typedef struct {
 typedef uint32_t (*metask_agentcore_runtime_create_fn_v1)(
     const metask_agentcore_runtime_config_v1 *, metask_agentcore_runtime **,
     metask_agentcore_owned_bytes_v1 *);
+typedef uint32_t (*metask_agentcore_runtime_create_with_plugins_fn_v1)(
+    const metask_agentcore_runtime_config_v1 *,
+    const metask_agentcore_runtime_plugin_config_v1 *,
+    metask_agentcore_runtime **, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_runtime_destroy_fn_v1)(
     metask_agentcore_runtime *, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_runtime_query_skill_catalog_fn_v1)(
@@ -765,7 +849,7 @@ typedef uint32_t (*metask_agentcore_session_export_checkpoint_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 9. No earlier revision layout
+/* Function-table order is fixed within Revision 12. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct {
     uint32_t struct_size;
@@ -802,7 +886,8 @@ typedef struct {
     metask_agentcore_completion_stream_next_fn_v1 completion_stream_next;
     metask_agentcore_completion_stream_abort_fn_v1 completion_stream_abort;
     metask_agentcore_completion_stream_destroy_fn_v1 completion_stream_destroy;
-    uint64_t reserved[3];
+    metask_agentcore_runtime_create_with_plugins_fn_v1 runtime_create_with_plugins;
+    uint64_t reserved[2];
 } metask_agentcore_api_v1;
 
 /* The final owned-bytes output of AgentCore calls is optional and write-only.
@@ -880,8 +965,9 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
                (metask_agentcore_completion_stream_abort_fn_v1)0 &&
            api->completion_stream_destroy !=
                (metask_agentcore_completion_stream_destroy_fn_v1)0 &&
-           api->reserved[0] == 0 && api->reserved[1] == 0 &&
-           api->reserved[2] == 0;
+           api->runtime_create_with_plugins !=
+               (metask_agentcore_runtime_create_with_plugins_fn_v1)0 &&
+           api->reserved[0] == 0 && api->reserved[1] == 0;
 }
 
 static inline const metask_agentcore_api_v1 *
@@ -916,8 +1002,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 9u,
-                               "AgentCore revision 9");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 12u,
+                               "AgentCore revision 12");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -939,14 +1025,18 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_bytes_view_v1, 16);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_owned_bytes_v1, 16);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_run_context_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_host_tool_v1, 96);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_host_result_sink_v1, 56);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_host_stream_tool_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_cancellation_v1, 40);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_connector_v1, 80);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_connector_v1, 88);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_protocol_limits_v1, 96);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_server_v1, 224);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_server_v1, 232);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_configuration_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_apply_report_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_catalog_limits_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_runtime_config_v1, 96);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_process_plugin_source_v1, 48);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_runtime_plugin_config_v1, 72);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_callbacks_v1, 72);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_policy_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_permission_rule_set_v1, 88);
@@ -979,12 +1069,17 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, session, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, run_id, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, session_id, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_host_tool_v1, ctx, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_host_result_sink_v1, ctx, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_host_stream_tool_v1, ctx, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_connector_v1, ctx, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, connector, 104);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, protocol_limits, 184);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, configuration_fingerprint, 192);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, protocol_limits, 192);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, configuration_fingerprint, 200);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, mcp_servers, 40);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, mcp_catalog_limits, 56);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_process_plugin_source_v1, root, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_plugin_config_v1, process_plugins, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_plugin_config_v1, host_stream_tools, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, api_key, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, allowed_tools, 80);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, skill_catalog, 96);
@@ -1015,9 +1110,10 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_run_input, 136);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_export_checkpoint, 168);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, buffer_release, 176);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, runtime_apply_mcp_configuration, 184);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, runtime_create_with_plugins, 256);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, completion_create, 192);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, completion_stream_destroy, 248);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, reserved, 256);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, reserved, 264);
 
 #undef METASK_AGENTCORE_ASSERT_OFFSET
 #undef METASK_AGENTCORE_ASSERT_SIZE

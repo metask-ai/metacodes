@@ -189,12 +189,12 @@ test "L2: shared Runtime fork sends rendered body to child" {
     defer fixture.deinit(allocator);
     var ctx = fixture.context(allocator, root, &client);
     const entry = fixture.registry.find("Skill").?;
-    const output = try entry.execute(
+    var output_body = try entry.execute(
         &ctx,
         "{\"name\":\"forky\"}",
-        entry.ctx_ptr,
     );
-    defer allocator.free(output);
+    defer output_body.deinit(allocator);
+    const output = output_body.@"inline".bytes;
 
     try std.testing.expect(std.mem.indexOf(u8, output, "(forked)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "forked-reply") != null);
@@ -238,12 +238,12 @@ test "L2: shared Runtime inline does not spawn child" {
     defer fixture.deinit(allocator);
     var ctx = fixture.context(allocator, root, &client);
     const entry = fixture.registry.find("Skill").?;
-    const output = try entry.execute(
+    var output_body = try entry.execute(
         &ctx,
         "{\"name\":\"inliney\"}",
-        entry.ctx_ptr,
     );
-    defer allocator.free(output);
+    defer output_body.deinit(allocator);
+    const output = output_body.@"inline".bytes;
 
     try std.testing.expect(std.mem.indexOf(u8, output, "INLINE_BODY") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "(forked)") == null);
@@ -280,12 +280,12 @@ test "L2: shared Runtime fork honors model override" {
     defer fixture.deinit(allocator);
     var ctx = fixture.context(allocator, root, &client);
     const entry = fixture.registry.find("Skill").?;
-    const output = try entry.execute(
+    var output_body = try entry.execute(
         &ctx,
         "{\"name\":\"haikufork\"}",
-        entry.ctx_ptr,
     );
-    defer allocator.free(output);
+    defer output_body.deinit(allocator);
+    try std.testing.expect(output_body == .@"inline");
     const capture = server.lastRequest() orelse return error.NoRequestCaptured;
     const model = capture.jsonField("model") orelse return error.ModelFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, model, "haiku") != null);
@@ -307,7 +307,7 @@ test "L2: unsupported agent binding fails before child execution" {
     const entry = fixture.registry.find("Skill").?;
     try std.testing.expectError(
         error.SkillUnavailable,
-        entry.execute(&ctx, "{\"name\":\"agentfork\"}", entry.ctx_ptr),
+        entry.execute(&ctx, "{\"name\":\"agentfork\"}"),
     );
 }
 
@@ -327,7 +327,7 @@ test "L2: fork without child runner fails closed and never falls back inline" {
     const entry = fixture.registry.find("Skill").?;
     try std.testing.expectError(
         error.ForkUnavailable,
-        entry.execute(&ctx, "{\"name\":\"nofork\"}", entry.ctx_ptr),
+        entry.execute(&ctx, "{\"name\":\"nofork\"}"),
     );
     try std.testing.expect(fixture.runtime.currentPolicyFrame() == null);
 }

@@ -52,6 +52,32 @@ def suite():
 
 
 class E2EAdapterTest(unittest.TestCase):
+    def test_runtime_metadata_wires_the_suite_tool_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scenario.txt").write_text("write answer", encoding="utf-8")
+            binary = root / "metacodes"
+            binary.write_bytes(b"candidate-binary")
+            frozen_suite = suite()
+            frozen_suite["tasks"][0]["tools"]["allowed"] = ["Read", "Write"]
+            metadata = prepare_runtime_metadata(
+                frozen_suite,
+                root,
+                "smoke",
+                output=root / "eval-metadata.json",
+                events_path=str(root / "events.jsonl"),
+                run_id="native:tool-ceiling:0",
+                trial=0,
+                model_provider="test",
+                model_id="model-a",
+                harness_config_id="candidate",
+                harness_revision="abc",
+                permission_mode="default",
+                binary_path=binary,
+            )
+        assert metadata is not None
+        self.assertEqual(metadata["allowed_tools"], ["Read", "Write"])
+
     def test_runtime_metadata_seals_rollout_budget_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -174,6 +200,7 @@ class E2EAdapterTest(unittest.TestCase):
         dropped_events=0,
         request_outcome="success",
         tool_error_code=None,
+        watchdog_timeout=False,
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -207,19 +234,43 @@ class E2EAdapterTest(unittest.TestCase):
                 "runtime_model_id": "model-a",
                 "runtime_permission_mode": "default",
             }
-            events = [
-                {"run_started": {"trace_id": "trace", "metadata": runtime}},
-                {
-                    "model_request_finished": {
-                        "trace_id": "trace",
-                        "depth": 0,
-                        "turn": 1,
-                        "attempt": 0,
-                        "elapsed_ms": 5,
-                        "outcome": request_outcome,
+            events = [{"run_started": {"trace_id": "trace", "metadata": runtime}}]
+            if watchdog_timeout:
+                events.extend(
+                    [
+                        {
+                            "turn_started": {
+                                "trace_id": "trace",
+                                "depth": 0,
+                                "turn": 1,
+                            }
+                        },
+                        {
+                            "usage": {
+                                "trace_id": "trace",
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_read_tokens": 0,
+                                "cache_write_tokens": 0,
+                                "estimated_cost_usd": 0.0,
+                                "pricing_provenance": "test",
+                            }
+                        },
+                    ]
+                )
+            else:
+                events.append(
+                    {
+                        "model_request_finished": {
+                            "trace_id": "trace",
+                            "depth": 0,
+                            "turn": 1,
+                            "attempt": 0,
+                            "elapsed_ms": 5,
+                            "outcome": request_outcome,
+                        }
                     }
-                },
-            ]
+                )
             if tool_error_code is not None:
                 events.extend(
                     [
@@ -270,19 +321,20 @@ class E2EAdapterTest(unittest.TestCase):
                         }
                     }
                 )
-            events.append(
-                {
-                    "run_finished": {
-                        "trace_id": "trace",
-                        "depth": 0,
-                        "turns": 1,
-                        "tool_calls": 1 if tool_error_code is not None else 0,
-                        "stop_reason": stop_reason,
-                        "wall_time_ms": 6,
-                        "dropped_events": dropped_events,
+            if not watchdog_timeout:
+                events.append(
+                    {
+                        "run_finished": {
+                            "trace_id": "trace",
+                            "depth": 0,
+                            "turns": 1,
+                            "tool_calls": 1 if tool_error_code is not None else 0,
+                            "stop_reason": stop_reason,
+                            "wall_time_ms": 6,
+                            "dropped_events": dropped_events,
+                        }
                     }
-                }
-            )
+                )
             (workspace / "events.jsonl").write_text(
                 "".join(
                     json.dumps(
@@ -300,11 +352,14 @@ class E2EAdapterTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (workspace / "answer.txt").write_text("done\n", encoding="utf-8")
+            if not watchdog_timeout:
+                (workspace / "answer.txt").write_text("done\n", encoding="utf-8")
             (run / "smoke.log").write_text("finished\n", encoding="utf-8")
             (run / "smoke.debug.log").write_text("native trace\n", encoding="utf-8")
             (run / "REPORT.md").write_text(
-                "## 场景: smoke\n\n- session 退出码: `0`\n", encoding="utf-8"
+                "- 单段超时: 600s\n\n## 场景: smoke\n\n"
+                f"- session 退出码: `{'124' if watchdog_timeout else '0'}`\n",
+                encoding="utf-8",
             )
             return import_run(suite(), root, run)[0]
 
@@ -945,6 +1000,24 @@ class E2EAdapterTest(unittest.TestCase):
         self.assertEqual(rollout["metrics"]["harness_errors"], 1)
         self.assertEqual(rollout["metrics"]["network_errors"], 1)
         self.assertFalse(rollout["judgement"]["trustworthy_success"])
+
+    def test_runner_watchdog_during_open_model_turn_is_valid_scored_failure(self):
+        rollout = self._native_terminal_rollout(watchdog_timeout=True)
+        self.assertEqual(rollout["execution"]["status"], "completed")
+        self.assertEqual(rollout["execution"]["exit_code"], 124)
+        self.assertEqual(rollout["readiness"]["status"], "pass")
+        self.assertEqual(rollout["outcome"]["status"], "fail")
+        self.assertTrue(rollout["judgement"]["valid_for_scoring"])
+        self.assertFalse(rollout["judgement"]["trustworthy_success"])
+        self.assertEqual(rollout["metrics"]["wall_time_ms"], 600_000)
+        self.assertEqual(
+            rollout["metrics"]["model_request_outcomes"],
+            {"watchdog_timeout": 1},
+        )
+        timeout = next(
+            item for item in rollout["attribution"] if item["code"] == "rollout_timeout"
+        )
+        self.assertEqual(timeout["source"], "model")
 
     def test_native_dropped_events_are_invalid(self):
         rollout = self._native_terminal_rollout(dropped_events=3)

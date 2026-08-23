@@ -35,11 +35,15 @@ fn configure() -> Result<(), String> {
         "cargo:rustc-link-search=native={}",
         library_path.parent().unwrap().display()
     );
-    // The Windows GNU bundle deliberately uses the `.lib` artifact name as
-    // part of the published manifest.  Ask rustc to keep that filename
-    // verbatim; otherwise its GNU naming probe only looks for
-    // `libmetask_agentcore.a` and rejects the valid bundle.
-    println!("cargo:rustc-link-lib=static:+verbatim={library_file}");
+    // Unix bundles already use the conventional `lib<name>.a` spelling, so
+    // pass the logical library name. Using `+verbatim` there makes the crate's
+    // own unit-test link emit `-llibmetask_agentcore.a` on Apple ld. Windows
+    // bundles deliberately publish the exact `.lib` filename instead.
+    if cargo_target.contains("windows") {
+        println!("cargo:rustc-link-lib=static:+verbatim={library_file}");
+    } else {
+        println!("cargo:rustc-link-lib=static=metask_agentcore");
+    }
     for (kind, name) in link_directives {
         match kind {
             "library" => println!("cargo:rustc-link-lib={name}"),

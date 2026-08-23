@@ -718,7 +718,7 @@ pub fn executeOne(
         log.warnId("agent", rid, "tool.exec FAILED(par) name={s} err={s} duration_ms={d} input={s}", .{ name, @errorName(err), elapsed, input[0..@min(input.len, 200)] });
         return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
     };
-    // outcome slice 挂 job_ctx.allocator(= 本函数 arena) → 随 arena 回收,无单独释放点。
+    // outcome body 挂 job_ctx.allocator(= 本函数 arena) → 随 arena 回收。
     switch (r) {
         .host_fatal => {
             _ = dispatch_observation.finish(.host_fatal, "HostToolFatal", null);
@@ -737,10 +737,24 @@ pub fn executeOne(
         },
         .ok => {},
     }
-    const ok_bytes = r.ok;
-    if (!dispatch_observation.finish(.succeeded, null, ok_bytes)) {
+    var rendered = try r.ok.render(job_ctx.allocator);
+    defer rendered.deinit(job_ctx.allocator);
+    const ok_bytes = rendered.bytes;
+    if (!dispatch_observation.finish(
+        if (rendered.is_error) .tool_error else .succeeded,
+        if (rendered.is_error) "StructuredToolError" else null,
+        ok_bytes,
+    )) {
         log.warnId("agent", rid, "tool observation rejected dispatch finish name={s} id={s}", .{ name, id });
         return .host_fatal;
+    }
+    if (rendered.is_error) {
+        const content = try parent_allocator.dupe(u8, ok_bytes);
+        return .{ .done = .{
+            .content = content,
+            .is_error = true,
+            .elapsed_ms = @intCast(@max(util_time.nowMs() - t_start, 0)),
+        } };
     }
     // A successful persistent-task claim is the first decision point for that
     // task. Feed verified, execution-grounded history back through the same
@@ -1220,7 +1234,7 @@ const StubDispatcher = struct {
     /// 名字以 "Fatal" 开头 → host_fatal;否则 .ok(内容为 input 的拷贝)。
     fn dispatch(_: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, name: []const u8, args: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
         if (std.mem.startsWith(u8, name, "Fatal")) return .host_fatal;
-        return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+        return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
     }
     fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
         return false;
@@ -1237,6 +1251,59 @@ const StubDispatcher = struct {
     var sentinel: u8 = 0;
 };
 
+test "typed structured Tool result is wired to an error Conversation block" {
+    const StructuredDispatcher = struct {
+        fn dispatch(
+            _: *const anyopaque,
+            tool_ctx: *const tools_mod.ToolContext,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!tools_mod.ToolDispatchOutcome {
+            return .{ .ok = try tools_mod.ToolResultBody.initStructuredError(
+                tool_ctx.allocator,
+                "{\"error\":{\"code\":\"bounded_fixture\",\"recoverable\":true}}",
+            ) };
+        }
+        fn no(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn noName(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn dispatcher() tools_mod.ToolDispatcher {
+            return .{
+                .ctx = @ptrCast(&sentinel),
+                .dispatchFn = dispatch,
+                .prefetchSafeFn = no,
+                .nameAtFn = noName,
+                .hostSyncFn = no,
+            };
+        }
+        var sentinel: u8 = 0;
+    };
+    const allocator = std.testing.allocator;
+    var ctx = tools_mod.ToolContext{
+        .allocator = allocator,
+        .tool_dispatcher = StructuredDispatcher.dispatcher(),
+    };
+    const result = try executeOne(
+        &ctx,
+        "TypedError",
+        "{}",
+        "typed-error",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |content| allocator.free(content);
+            try std.testing.expect(done.is_error);
+            try std.testing.expect(std.mem.indexOf(u8, done.content orelse "", "bounded_fixture") != null);
+        },
+        else => return error.UnexpectedToolOutcome,
+    }
+}
+
 test "execution policy denies before the single dispatch choke point" {
     const Probe = struct {
         calls: usize = 0,
@@ -1249,7 +1316,7 @@ test "execution policy denies before the single dispatch choke point" {
         ) anyerror!tools_mod.ToolDispatchOutcome {
             const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             self.calls += 1;
-            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+            return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
         fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
             return false;
@@ -1373,7 +1440,7 @@ test "thread spawn fallback observes fatal before starting the next job" {
             const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             self.calls += 1;
             if (std.mem.eql(u8, name, "FatalFirst")) return .host_fatal;
-            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+            return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
 
         fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
@@ -1422,7 +1489,7 @@ test "serial host fatal stops before the next slot" {
             const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             self.calls += 1;
             if (std.mem.eql(u8, name, "FatalSerial")) return .host_fatal;
-            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+            return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
         fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
             return false;
@@ -1460,11 +1527,11 @@ test "concurrent host fatal joins started workers and skips the next window" {
             if (std.mem.startsWith(u8, name, "Slow")) {
                 platform.sync.sleepMs(20);
                 self.slow_done.store(true, .release);
-                return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+                return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
             }
             if (std.mem.eql(u8, name, "FatalConcurrent")) return .host_fatal;
             if (std.mem.eql(u8, name, "AfterWindow")) self.after_started.store(true, .release);
-            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+            return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
         fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
             return false;
@@ -1533,7 +1600,7 @@ test "Host error detail bypasses result persistence and aggregate budget" {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             if (self.fail or std.mem.eql(u8, tool_name, "HostFailureProbe"))
                 return .{ .host_failed = try tool_ctx.allocator.dupe(u8, self.detail) };
-            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+            return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
 
         fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
@@ -1865,7 +1932,7 @@ test "tool observation: sink rejection blocks before actual dispatcher invocatio
         fn dispatch(raw: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, _: []const u8, _: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
             const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             self.calls += 1;
-            return .{ .ok = try tool_ctx.allocator.dupe(u8, "unexpected") };
+            return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, "unexpected")) };
         }
         fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
             return false;

@@ -7,7 +7,7 @@ const sync = @import("platform").sync;
 fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const u8) ![]u8 {
     var outcome = try cc.tools.dispatch(ctx, name, args);
     return switch (outcome) {
-        .ok => |bytes| bytes,
+        .ok => |*body| (try body.takeModelBytes(ctx.allocator)).bytes,
         else => {
             outcome.deinit(ctx.allocator);
             return error.UnexpectedDispatchOutcome;
@@ -135,6 +135,10 @@ test "MCP P0.3: 无 elicitation handler → 自动 decline,tool 仍完成(不 ha
 
 test "MCP: dispatch via DynRegistry routes mock__echo to MCP server" {
     const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
     const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
     const argv = [_]?[*:0]const u8{ mock_path, null };
 
@@ -149,10 +153,50 @@ test "MCP: dispatch via DynRegistry routes mock__echo to MCP server" {
 
     // 现在 dispatch 应当能找到 mock__echo 并调用,得到包含 "hi via dispatch" 的结果
     var ctx = cc.tools.ToolContext.simple(a);
+    ctx.artifact_root = root;
     ctx.dyn_registry = &dyn;
     const out = try dispatchOk(&ctx, "mock__echo", "{\"message\":\"hi via dispatch\"}");
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "hi via dispatch") != null);
+}
+
+test "MCP: CLI stdio captures 17MiB from byte zero and dispatch preserves typed artifact" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
+    const argv = [_]?[*:0]const u8{ mock_path, null };
+    var client = try cc.mcp_client.McpClient.connect(a, argv[0..]);
+    defer client.close();
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    var session = cc.mcp_registry_bridge.McpSession.init(a, &client);
+    defer session.deinit();
+    try session.registerTools(&dyn, "mock");
+    const entry = dyn.find("mock__large") orelse return error.MissingLargeMcpTool;
+    try std.testing.expect(entry.executor == .result_body);
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.artifact_root = root;
+    var body = try entry.execute(&ctx, "{}");
+    defer body.deinit(a);
+    try std.testing.expect(body == .artifact);
+    try std.testing.expect(body.artifact.stored.bytes > 17 * 1024 * 1024);
+    var first = try cc.tool_result_artifact.readChunk(
+        a,
+        root,
+        body.artifact.stored.id(),
+        0,
+        128,
+    );
+    defer first.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, first.bytes, "{\"content\""));
+    try std.testing.expect(std.mem.indexOf(u8, first.bytes, "jsonrpc") == null);
+    var rendered = try body.render(a);
+    defer rendered.deinit(a);
+    try std.testing.expect(rendered.bytes.len < 16 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "ReadArtifact") != null);
 }
 
 test "MCP: registerResourceTools adds list_resources + read_resource" {
@@ -171,4 +215,65 @@ test "MCP: registerResourceTools adds list_resources + read_resource" {
 
     try std.testing.expect(dyn.find("mock__list_resources") != null);
     try std.testing.expect(dyn.find("mock__read_resource") != null);
+}
+
+test "MCP: static resource tools preserve byte-zero artifact recovery" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
+    const argv = [_]?[*:0]const u8{ mock_path, null };
+    var client = try cc.mcp_client.McpClient.connect(a, argv[0..]);
+    defer client.close();
+
+    const server_name = try a.dupe(u8, "mock");
+    defer a.free(server_name);
+    var entries = [_]cc.mcp_session.McpSessionEntry{.{
+        .name = server_name,
+        .client = &client,
+        .session = cc.mcp_registry_bridge.McpSession.init(a, &client),
+    }};
+    defer entries[0].session.deinit();
+    var sessions: []cc.mcp_session.McpSessionEntry = entries[0..];
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.artifact_root = root;
+    ctx.mcp_sessions = &sessions;
+
+    var listed = try cc.tools.dispatch(&ctx, "ListMcpResourcesTool", "{}");
+    defer listed.deinit(a);
+    switch (listed) {
+        .ok => |body| switch (body) {
+            .@"inline" => |result| {
+                try std.testing.expect(std.mem.indexOf(u8, result.bytes, "mock://large") != null);
+                try std.testing.expect(std.mem.indexOf(u8, result.bytes, "\"server\":\"mock\"") != null);
+            },
+            else => return error.UnexpectedResourceListBody,
+        },
+        else => return error.UnexpectedResourceListOutcome,
+    }
+
+    var read = try cc.tools.dispatch(
+        &ctx,
+        "ReadMcpResourceTool",
+        "{\"uri\":\"mock://large\",\"server\":\"mock\"}",
+    );
+    defer read.deinit(a);
+    const body = switch (read) {
+        .ok => |*value| value,
+        else => return error.UnexpectedResourceReadOutcome,
+    };
+    try std.testing.expect(body.* == .artifact);
+    try std.testing.expect(body.artifact.stored.bytes > 17 * 1024 * 1024);
+    try std.testing.expect(body.artifact.stored.capture_complete);
+    var tail = try cc.tool_result_artifact.readChunk(
+        a,
+        root,
+        body.artifact.stored.id(),
+        body.artifact.stored.bytes - 64,
+        64,
+    );
+    defer tail.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "RESOURCE_TAIL") != null);
 }

@@ -6,10 +6,13 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 9 must not retain historical callback aliases"
+#error "revision 12 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 9u || \
+#if METASK_AGENTCORE_ABI_REVISION != 12u || \
+    METASK_AGENTCORE_CAP_PROCESS_PLUGIN_TOOLS != (1ULL << 22) || \
+    METASK_AGENTCORE_CAP_HOST_STREAM_TOOLS != (1ULL << 23) || \
+    METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 != 0x1ffffffULL || \
     METASK_AGENTCORE_MCP_NEGOTIATION_AUTO != 1u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY != 2u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY != 3u || \
@@ -20,7 +23,7 @@
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
     METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 9 MCP codes must match the public contract"
+#error "source-free Revision 12 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -307,6 +310,35 @@ static int release_error(const metask_agentcore_api_v1 *api,
     return code;
 }
 
+static uint32_t host_stream(
+    void *ctx, const metask_agentcore_run_context_v1 *run,
+    metask_agentcore_bytes_view_v1 arguments,
+    const metask_agentcore_host_result_sink_v1 *sink, uint32_t *media_code,
+    metask_agentcore_owned_bytes_v1 *detail) {
+    (void)ctx;
+    (void)run;
+    (void)arguments;
+    if (sink == NULL || sink->struct_size != sizeof(*sink) ||
+        sink->write == NULL ||
+        sink->max_bytes != METASK_AGENTCORE_MAX_HOST_STREAM_ARTIFACT_BYTES_V1 ||
+        media_code == NULL || detail == NULL) {
+        return METASK_AGENTCORE_HOST_FATAL;
+    }
+    metask_agentcore_bytes_view_v1 bytes = view("c-stream");
+    if (sink->write(sink->ctx, bytes) != METASK_AGENTCORE_HOST_SINK_OK) {
+        return METASK_AGENTCORE_HOST_FAILED;
+    }
+    *media_code = METASK_AGENTCORE_HOST_STREAM_MEDIA_TEXT_UTF8;
+    *detail = (metask_agentcore_owned_bytes_v1){0};
+    return METASK_AGENTCORE_HOST_OK;
+}
+
+static void host_stream_release(void *ctx,
+                                metask_agentcore_owned_bytes_v1 *detail) {
+    (void)ctx;
+    if (detail != NULL) *detail = (metask_agentcore_owned_bytes_v1){0};
+}
+
 int main(void) {
     const metask_agentcore_api_v1 *api = metask_agentcore_api_v1_discover();
     if (api == NULL) {
@@ -325,8 +357,22 @@ int main(void) {
     metask_agentcore_owned_bytes_v1 diagnostic = {0};
     metask_agentcore_runtime_config_v1 runtime_config = {0};
     runtime_config.struct_size = sizeof(runtime_config);
+    metask_agentcore_host_stream_tool_v1 stream_tool = {0};
+    stream_tool.struct_size = sizeof(stream_tool);
+    stream_tool.name = view("HostStreamC");
+    stream_tool.description = view("C source-free Host streaming descriptor");
+    stream_tool.input_schema_json =
+        view("{\"type\":\"object\",\"properties\":{},\"required\":[]}");
+    stream_tool.execute_stream = host_stream;
+    stream_tool.release_detail = host_stream_release;
+    metask_agentcore_runtime_plugin_config_v1 plugin_config = {0};
+    plugin_config.struct_size = sizeof(plugin_config);
+    plugin_config.host_stream_tools = &stream_tool;
+    plugin_config.host_stream_tool_count = 1;
     metask_agentcore_runtime *runtime = NULL;
-    if (api->runtime_create(&runtime_config, &runtime, &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
+    if (api->runtime_create_with_plugins(
+            &runtime_config, &plugin_config, &runtime, &diagnostic) !=
+            METASK_AGENTCORE_STATUS_OK ||
         runtime == NULL) {
         return release_error(api, &diagnostic, 12);
     }
@@ -371,6 +417,9 @@ int main(void) {
     session_host.base_url = view(base_url);
     session_host.workspace_root = view(cwd);
     session_host.workspace_home = view(cwd);
+    metask_agentcore_bytes_view_v1 allowed_tools[] = {view("HostStreamC")};
+    session_host.allowed_tools = allowed_tools;
+    session_host.allowed_tool_count = 1;
     metask_agentcore_session_create_config_v1 session_config = {0};
     session_config.struct_size = sizeof(session_config);
     session_config.host = &session_host;

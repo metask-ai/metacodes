@@ -11,25 +11,70 @@
 const std = @import("std");
 const json = @import("../json.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const ToolResultBody = @import("context.zig").ToolResultBody;
+const ToolCategory = @import("../permission/category.zig").ToolCategory;
 
-/// 动态工具执行函数：多一个 `ctx_ptr` 让闭包式实现能恢复状态。
-pub const DynExecuteFn = *const fn (
+/// Legacy dynamic-tool callback. `register` and `registerMcp` are the explicit
+/// compatibility adapters that lift its owned bytes into `ToolResultBody`.
+pub const DynLegacyExecuteFn = *const fn (
     ctx: *const ToolContext,
     args: []const u8,
     ctx_ptr: ?*anyopaque,
 ) anyerror![]u8;
 
+/// Typed dynamic-tool callback. It can transfer any legal result state without
+/// reconstructing or flattening an artifact envelope.
+pub const DynExecuteBodyFn = *const fn (
+    ctx: *const ToolContext,
+    args: []const u8,
+    ctx_ptr: ?*anyopaque,
+) anyerror!ToolResultBody;
+
+/// Source compatibility name for callers that still register owned bytes.
+pub const DynExecuteFn = DynLegacyExecuteFn;
+
+pub const DynExecutor = union(enum) {
+    legacy_inline: DynLegacyExecuteFn,
+    result_body: DynExecuteBodyFn,
+
+    pub fn run(
+        self: DynExecutor,
+        ctx: *const ToolContext,
+        args: []const u8,
+        ctx_ptr: ?*anyopaque,
+    ) anyerror!ToolResultBody {
+        return switch (self) {
+            .legacy_inline => |execute| ToolResultBody.initInline(try execute(ctx, args, ctx_ptr)),
+            .result_body => |execute| execute(ctx, args, ctx_ptr),
+        };
+    }
+};
+
 pub const DynToolEntry = struct {
     name: []const u8, // owned
     description: []const u8, // owned
     required_fields: []const []const u8 = &.{}, // owned（每个 entry + slice）
-    execute: DynExecuteFn,
+    executor: DynExecutor,
     ctx_ptr: ?*anyopaque = null,
     /// deferred(对齐 cc isMcp→defer):MCP 工具 true → 不进默认 tools 数组,经 ToolSearch
     /// 激活才发。Skill 工具 false(它是单个常驻工具)。
     deferred: bool = false,
     /// owned when non-null; explicit provenance for AgentDef MCP filtering.
     mcp_server: ?[]const u8 = null,
+    /// Optional full schema borrowed from a Runtime snapshot. The registrar
+    /// must keep that snapshot alive until this registry is deinitialized.
+    borrowed_input_schema: ?json.InputSchema = null,
+    /// Explicit native permission classification. Null preserves the legacy
+    /// name-based behavior for Skill/MCP tools.
+    category: ?ToolCategory = null,
+
+    pub fn execute(
+        self: *const DynToolEntry,
+        ctx: *const ToolContext,
+        args: []const u8,
+    ) anyerror!ToolResultBody {
+        return self.executor.run(ctx, args, self.ctx_ptr);
+    }
 };
 
 pub const DynRegistry = struct {
@@ -74,7 +119,19 @@ pub const DynRegistry = struct {
         ctx_ptr: ?*anyopaque,
         deferred: bool,
     ) !void {
-        return self.registerImpl(name, description, required_fields, execute, ctx_ptr, deferred, null);
+        return self.registerImpl(name, description, required_fields, .{ .legacy_inline = execute }, ctx_ptr, deferred, null);
+    }
+
+    pub fn registerBody(
+        self: *DynRegistry,
+        name: []const u8,
+        description: []const u8,
+        required_fields: []const []const u8,
+        execute: DynExecuteBodyFn,
+        ctx_ptr: ?*anyopaque,
+        deferred: bool,
+    ) !void {
+        return self.registerImpl(name, description, required_fields, .{ .result_body = execute }, ctx_ptr, deferred, null);
     }
 
     pub fn registerMcp(
@@ -87,7 +144,72 @@ pub const DynRegistry = struct {
         server_name: []const u8,
     ) !void {
         if (server_name.len == 0) return error.InvalidMcpServerName;
-        return self.registerImpl(name, description, required_fields, execute, ctx_ptr, true, server_name);
+        return self.registerImpl(name, description, required_fields, .{ .legacy_inline = execute }, ctx_ptr, true, server_name);
+    }
+
+    pub fn registerMcpBody(
+        self: *DynRegistry,
+        name: []const u8,
+        description: []const u8,
+        required_fields: []const []const u8,
+        execute: DynExecuteBodyFn,
+        ctx_ptr: ?*anyopaque,
+        server_name: []const u8,
+    ) !void {
+        if (server_name.len == 0) return error.InvalidMcpServerName;
+        return self.registerImpl(name, description, required_fields, .{ .result_body = execute }, ctx_ptr, true, server_name);
+    }
+
+    /// Register a definition owned by an immutable plugin snapshot. Strings
+    /// used for lookup/display are still copied; nested schema storage remains
+    /// borrowed so arbitrary JSON Schema can be advertised without a lossy
+    /// required-fields projection.
+    pub fn registerBorrowedDefinition(
+        self: *DynRegistry,
+        definition: json.ToolDefinition,
+        execute: DynExecuteFn,
+        ctx_ptr: ?*anyopaque,
+        native_category: ToolCategory,
+    ) !void {
+        if (definition.server_type != null or definition.deferred or
+            !std.mem.eql(u8, definition.input_schema.type, "object"))
+            return error.InvalidDynamicDefinition;
+        try self.registerImpl(
+            definition.name,
+            definition.description,
+            definition.input_schema.required orelse &.{},
+            .{ .legacy_inline = execute },
+            ctx_ptr,
+            false,
+            null,
+        );
+        const entry = &self.entries.items[self.entries.items.len - 1];
+        entry.borrowed_input_schema = definition.input_schema;
+        entry.category = native_category;
+    }
+
+    pub fn registerBorrowedDefinitionBody(
+        self: *DynRegistry,
+        definition: json.ToolDefinition,
+        execute: DynExecuteBodyFn,
+        ctx_ptr: ?*anyopaque,
+        native_category: ToolCategory,
+    ) !void {
+        if (definition.server_type != null or definition.deferred or
+            !std.mem.eql(u8, definition.input_schema.type, "object"))
+            return error.InvalidDynamicDefinition;
+        try self.registerImpl(
+            definition.name,
+            definition.description,
+            definition.input_schema.required orelse &.{},
+            .{ .result_body = execute },
+            ctx_ptr,
+            false,
+            null,
+        );
+        const entry = &self.entries.items[self.entries.items.len - 1];
+        entry.borrowed_input_schema = definition.input_schema;
+        entry.category = native_category;
     }
 
     fn registerImpl(
@@ -95,7 +217,7 @@ pub const DynRegistry = struct {
         name: []const u8,
         description: []const u8,
         required_fields: []const []const u8,
-        execute: DynExecuteFn,
+        executor: DynExecutor,
         ctx_ptr: ?*anyopaque,
         deferred: bool,
         mcp_server: ?[]const u8,
@@ -122,7 +244,7 @@ pub const DynRegistry = struct {
             .name = name_owned,
             .description = desc_owned,
             .required_fields = req_owned,
-            .execute = execute,
+            .executor = executor,
             .ctx_ptr = ctx_ptr,
             .deferred = deferred,
             .mcp_server = server_owned,
@@ -136,6 +258,11 @@ pub const DynRegistry = struct {
         return null;
     }
 
+    pub fn category(self: *const DynRegistry, name: []const u8) ?ToolCategory {
+        const entry = self.find(name) orelse return null;
+        return entry.category;
+    }
+
     /// 把动态工具的定义追加到 `defs` 列表（给 API tools 参数使用）。
     /// 调用方负责 defs 生命周期；本函数只往里 append。
     pub fn appendDefinitions(
@@ -147,7 +274,7 @@ pub const DynRegistry = struct {
             try defs.append(allocator, .{
                 .name = e.name,
                 .description = e.description,
-                .input_schema = .{
+                .input_schema = e.borrowed_input_schema orelse .{
                     .type = "object",
                     .properties = null,
                     .required = e.required_fields,
@@ -205,6 +332,37 @@ test "DynRegistry: appendDefinitions appends" {
     try testing.expectEqualStrings("t1", defs.items[0].name);
 }
 
+test "DynRegistry: borrowed native definition preserves full schema and category" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        "{\"text\":{\"type\":\"string\",\"description\":\"payload\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+    const required = [_][]const u8{"text"};
+    var registry = DynRegistry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.registerBorrowedDefinition(.{
+        .name = "native_process_tool",
+        .description = "native process tool",
+        .input_schema = .{
+            .properties = parsed.value.object,
+            .required = &required,
+        },
+    }, dummyExec, null, .execute);
+
+    try testing.expectEqual(ToolCategory.execute, registry.category("native_process_tool").?);
+    var definitions: std.ArrayList(json.ToolDefinition) = .empty;
+    defer definitions.deinit(testing.allocator);
+    try registry.appendDefinitions(&definitions, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), definitions.items.len);
+    const text_schema = definitions.items[0].input_schema.properties.?.get("text").?.object;
+    try testing.expectEqualStrings("string", text_schema.get("type").?.string);
+    try testing.expectEqualStrings("payload", text_schema.get("description").?.string);
+    try testing.expectEqualStrings("text", definitions.items[0].input_schema.required.?[0]);
+}
+
 test "DynRegistry: MCP provenance is owned and propagated" {
     var r = DynRegistry.init(testing.allocator);
     defer r.deinit();
@@ -229,7 +387,7 @@ test "DynRegistry: execute dispatches to fn" {
     try r.register("dummy", "d", &.{}, dummyExec, null, false);
     const e = r.find("dummy").?;
     const ctx = ToolContext.simple(testing.allocator);
-    const out = try e.execute(&ctx, "{}", e.ctx_ptr);
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("dummy-result", out);
+    var out = try e.execute(&ctx, "{}");
+    defer out.deinit(testing.allocator);
+    try testing.expectEqualStrings("dummy-result", out.@"inline".bytes);
 }

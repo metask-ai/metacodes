@@ -4,7 +4,10 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 9 or
+    if (wire.ABI_REVISION != 12 or
+        wire.CAP_PROCESS_PLUGIN_TOOLS != 1 << 22 or
+        wire.CAP_HOST_STREAM_TOOLS != 1 << 23 or
+        wire.REQUIRED_CAPABILITIES_V1 != 0x1ffffff or
         wire.MCP_NEGOTIATION_AUTO != 1 or
         wire.MCP_NEGOTIATION_MODERN_ONLY != 2 or
         wire.MCP_NEGOTIATION_LEGACY_ONLY != 3 or
@@ -15,10 +18,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 9 MCP codes must match the public contract");
+        @compileError("source-free Revision 12 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 9 must not expose the removed catalog refresh entry");
+        @compileError("revision 12 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -44,6 +47,22 @@ const HOST_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m3\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"host\",\"name\":\"HostEcho\",\"input\":{}}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"text\\\":\\\"hello\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const HOST_STREAM_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m_stream\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"stream\",\"name\":\"HostStream\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const READ_ARTIFACT_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m_read_artifact\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"read_artifact\",\"name\":\"ReadArtifact\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"artifact_id\\\":\\\"sha256:9ca0f6d6ecaa02f28448fadfba21f7fada5244afdc3bc247ceaf96ce2d82f00c\\\",\\\"offset\\\":0,\\\"limit\\\":64}\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
@@ -79,8 +98,13 @@ const Probe = struct {
     ui_releases: usize = 0,
     host_calls: usize = 0,
     host_releases: usize = 0,
+    host_stream_calls: usize = 0,
+    host_stream_writes: usize = 0,
+    host_stream_max_chunk_bytes: usize = 0,
     saw_read_result: bool = false,
     saw_host_result: bool = false,
+    saw_stream_envelope: bool = false,
+    saw_artifact_recovery: bool = false,
     saw_final_text: bool = false,
 
     fn registerSession(self: *Probe, session: *wire.SessionHandle) !void {
@@ -141,6 +165,13 @@ const Probe = struct {
                     if (std.mem.eql(u8, result.name, "HostEcho") and !result.is_error and
                         std.mem.eql(u8, result.content, "artifact-host-ok"))
                         self.saw_host_result = true;
+                    if (std.mem.eql(u8, result.name, "HostStream") and !result.is_error and
+                        std.mem.indexOf(u8, result.content, "metacodes.tool-result-projection.v1") != null and
+                        std.mem.indexOf(u8, result.content, "ReadArtifact") != null)
+                        self.saw_stream_envelope = true;
+                    if (std.mem.eql(u8, result.name, "ReadArtifact") and !result.is_error and
+                        std.mem.indexOf(u8, result.content, "aaaaaaaaaaaaaaaa") != null)
+                        self.saw_artifact_recovery = true;
                 },
                 .text_chunk => |text| {
                     if (std.mem.eql(u8, text, "artifact done")) self.saw_final_text = true;
@@ -204,6 +235,41 @@ const Probe = struct {
         const self: *Probe = @ptrCast(@alignCast(raw orelse return));
         self.host_releases += 1;
         if (out) |value| value.* = .{ .ptr = null, .len = 0 };
+    }
+
+    fn hostStream(
+        raw: ?*anyopaque,
+        run: ?*const wire.RunContextV1,
+        _: wire.BytesViewV1,
+        sink_ptr: ?*const wire.HostResultSinkV1,
+        out_media_code: ?*u32,
+        out_detail: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.HOST_FATAL));
+        if (!self.acceptContext(run)) return wire.HOST_FATAL;
+        const sink = sink_ptr orelse return wire.HOST_FATAL;
+        if (sink.struct_size != @sizeOf(wire.HostResultSinkV1) or
+            sink.write == null or sink.max_bytes != wire.MAX_HOST_STREAM_ARTIFACT_BYTES_V1)
+            return wire.HOST_FATAL;
+        (out_detail orelse return wire.HOST_FATAL).* = .{ .ptr = null, .len = 0 };
+        self.host_stream_calls += 1;
+        var chunk: [64 * 1024]u8 = undefined;
+        @memset(&chunk, 'a');
+        var remaining: usize = 17 * 1024 * 1024 + 19;
+        while (remaining != 0) {
+            const count = @min(remaining, chunk.len);
+            if (sink.write.?(sink.ctx, sdk.bytesView(chunk[0..count])) != wire.HOST_SINK_OK)
+                return wire.HOST_FAILED;
+            self.host_stream_writes += 1;
+            self.host_stream_max_chunk_bytes = @max(self.host_stream_max_chunk_bytes, count);
+            remaining -= count;
+        }
+        (out_media_code orelse return wire.HOST_FATAL).* = wire.HOST_STREAM_MEDIA_TEXT_UTF8;
+        return wire.HOST_OK;
+    }
+
+    fn hostStreamRelease(_: ?*anyopaque, detail: ?*wire.OwnedBytesV1) callconv(.c) void {
+        if (detail) |value| value.* = .{ .ptr = null, .len = 0 };
     }
 };
 
@@ -332,6 +398,8 @@ pub fn main(init: std.process.Init) !void {
         ASK_SSE,
         read_sse,
         HOST_SSE,
+        HOST_STREAM_SSE,
+        READ_ARTIFACT_SSE,
         FINAL_SSE,
         FINAL_SSE,
         FINAL_SSE,
@@ -362,7 +430,27 @@ pub fn main(init: std.process.Init) !void {
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    try expectStatus(.ok, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic), diagnostic);
+    var plugin_config = std.mem.zeroes(wire.RuntimePluginConfigV1);
+    plugin_config.struct_size = @sizeOf(wire.RuntimePluginConfigV1);
+    var host_stream = wire.HostStreamToolV1{
+        .struct_size = @sizeOf(wire.HostStreamToolV1),
+        .reserved0 = 0,
+        .ctx = &probe,
+        .name = sdk.bytesView("HostStream"),
+        .description = sdk.bytesView("Source-free Host byte-zero streaming fixture"),
+        .input_schema_json = sdk.bytesView("{\"type\":\"object\",\"properties\":{},\"required\":[]}"),
+        .execute_stream = Probe.hostStream,
+        .release_detail = Probe.hostStreamRelease,
+        .reserved = [_]u64{0} ** 2,
+    };
+    plugin_config.host_stream_tools = @ptrCast(&host_stream);
+    plugin_config.host_stream_tool_count = 1;
+    try expectStatus(.ok, api.runtimeCreateWithPlugins()(
+        &runtime_config,
+        &plugin_config,
+        &runtime,
+        &diagnostic,
+    ), diagnostic);
     defer if (runtime) |handle| {
         _ = api.runtimeDestroy()(handle, &diagnostic);
     };
@@ -426,7 +514,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidCatalogDescriptor;
     api.bufferRelease()(&descriptor);
 
-    const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("HostEcho") };
+    const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("HostEcho"), sdk.bytesView("HostStream") };
     const granted_skill_ids = [_]wire.BytesViewV1{
         sdk.bytesView(identities.skill_id),
         sdk.bytesView(workctl_identities.skill_id),
@@ -527,9 +615,14 @@ pub fn main(init: std.process.Init) !void {
         &diagnostic,
     ), diagnostic);
     try probe.endRun(1);
-    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.tool_calls != 3) return error.UnexpectedRunResult;
+    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.tool_calls != 5) return error.UnexpectedRunResult;
     if (probe.ui_calls != 1 or probe.ui_releases != 1 or probe.host_calls != 1 or probe.host_releases != 1) return error.CallbackContractFailed;
-    if (!probe.saw_read_result or !probe.saw_host_result or !probe.saw_final_text) return error.MissingCoreEvent;
+    if (probe.host_stream_calls != 1 or probe.host_stream_writes <= 1 or
+        probe.host_stream_max_chunk_bytes != 64 * 1024)
+        return error.StreamCallbackContractFailed;
+    if (!probe.saw_read_result or !probe.saw_host_result or !probe.saw_stream_envelope or
+        !probe.saw_artifact_recovery or !probe.saw_final_text)
+        return error.MissingCoreEvent;
     try probe.beginRun(2);
     try expectStatus(.ok, api.sessionRunSkill(
         session,
@@ -575,7 +668,12 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    try expectStatus(.ok, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic), diagnostic);
+    try expectStatus(.ok, api.runtimeCreateWithPlugins()(
+        &runtime_config,
+        &plugin_config,
+        &runtime,
+        &diagnostic,
+    ), diagnostic);
     var restored_catalog: ?*wire.SkillCatalogHandle = null;
     defer if (restored_catalog) |handle| {
         _ = api.skillCatalogRelease()(handle, &diagnostic);
@@ -700,7 +798,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.completionDestroy()(completion, &diagnostic), diagnostic);
     completion = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 9 Workspace Skill Catalog, Completion, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 12 Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, Completion, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

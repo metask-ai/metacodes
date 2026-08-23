@@ -1,0 +1,115 @@
+{
+  "schema": "metacodes.plugin-paid-failure-receipt/v1",
+  "recorded_at_utc": "2026-08-22T12:46:47Z",
+  "authorized_limit": {
+    "cost_usd": 30.0,
+    "metered_tokens": 30000000
+  },
+  "quality_evidence": false,
+  "release_status": "blocked_inconclusive_paid_pair",
+  "public_benchmark_claim": "not_permitted",
+  "failed_frozen_run": {
+    "protocol_sha256": "33d3404257a2812a84a6b6385c026fec50dd58f8a64cd33d537a3d9b6ce8f6a8",
+    "implementation_fingerprint": "67d90b814f3d967d7873d3c552e012d41b7de187cfc51013073d1fa16957e8e6",
+    "runtime_binary_sha256": "e2e6db2d2de44844187482fa06aecd1e8bfd18a10a990ecf3fd87b0fdf9914d6",
+    "model": "anthropic/glm-5.2",
+    "scheduled_rollouts": 36,
+    "committed_rollouts": 2,
+    "valid_for_scoring": 1,
+    "invalid_for_scoring": 1,
+    "unexecuted_rollouts": 34,
+    "actual_cost_usd": 0.56614,
+    "actual_metered_tokens": 290917,
+    "model_request_count": 10,
+    "model_request_outcomes": {
+      "success": 9,
+      "api_error": 1
+    },
+    "stop_policy": "fail_closed_on_first_non_scoring_rollout",
+    "resume_policy": "forbidden_when_a_persisted_checkpoint_is_not_valid_for_scoring",
+    "invalid_rollout": {
+      "run_id": "plugin-v1:baseline:02_html_game:0",
+      "arm": "baseline",
+      "task_id": "02_html_game",
+      "trial": 0,
+      "deterministic_grader_status": "pass",
+      "deterministic_checks_passed": 4,
+      "deterministic_checks_total": 4,
+      "valid_for_scoring": false,
+      "terminal_stop_reasons": [
+        "end_turn",
+        "api_error",
+        "budget"
+      ],
+      "provider_error": "TlsInitializationFailed",
+      "provider_error_class": "provider_or_network_failure",
+      "provider_retry_count": 0,
+      "cost_usd": 0.40767,
+      "metered_tokens": 206365,
+      "policy_violations": 0,
+      "model_tool_errors": 0,
+      "invalid_reasons": [
+        "nonzero_exit:1",
+        "harness_or_provider_error",
+        "native_terminal_failure:end_turn,api_error,budget",
+        "native_model_request_failed:1"
+      ]
+    }
+  },
+  "cumulative_authorized_session": {
+    "attempts": [
+      {
+        "protocol_sha256": "39d03b8f66400971debc3d578e9124bd9b24125b03eefe0fafee00b4b29adb77",
+        "committed_rollouts": 1,
+        "actual_cost_usd": 0.0,
+        "actual_metered_tokens": 0,
+        "terminal_reason": "request_budget_pre_provider"
+      },
+      {
+        "protocol_sha256": "39519d3c220e87e85a11df387054b2bd5b5f35a4210b84a5174dfa42b5772797",
+        "committed_rollouts": 2,
+        "actual_cost_usd": 0.293169,
+        "actual_metered_tokens": 216909,
+        "terminal_reason": "request_budget_after_deterministic_grader_pass"
+      },
+      {
+        "protocol_sha256": "d407294b04439f72f01820503ffc38dffd09cf84fe839087fb033dd1a0426b3e",
+        "committed_rollouts": 2,
+        "actual_cost_usd": 0.461132,
+        "actual_metered_tokens": 243419,
+        "terminal_reason": "request_budget_after_deterministic_grader_pass"
+      },
+      {
+        "protocol_sha256": "33d3404257a2812a84a6b6385c026fec50dd58f8a64cd33d537a3d9b6ce8f6a8",
+        "committed_rollouts": 2,
+        "actual_cost_usd": 0.56614,
+        "actual_metered_tokens": 290917,
+        "terminal_reason": "tls_initialization_failure_then_request_budget"
+      }
+    ],
+    "actual_cost_usd": 1.320441,
+    "actual_metered_tokens": 751245,
+    "remaining_cost_authority_usd": 28.679559,
+    "remaining_metered_token_authority": 29248755,
+    "fresh_36_rollout_worst_case_cost_usd": 28.8,
+    "fresh_36_rollout_worst_case_metered_tokens": 28800000,
+    "fresh_schedule_cost_shortfall_usd": 0.120441,
+    "cap_compliant": true,
+    "additional_provider_requests_after_stop": 0
+  },
+  "artifact_integrity": {
+    "private_artifact_root": "/Users/david/.metacodes/evals",
+    "failed_run_rollout_sha256": "c69099eb4daebf76c0d5acb362d48531dc3155c03fffd956de33a130b4ea60a4",
+    "failed_run_budget_journal_sha256": "7bddcdb26fdeeeaf38cc6f7766d47fce62e306d062f89c6828e2474310f72d91",
+    "failed_run_budget_journal_head_sha256": "e2657548f01ed524e43a68e18f11758af6ae6a4e57d67963ce06fbc2c47eb15a",
+    "secret_files_scanned": 20,
+    "secret_leak_hits": 0
+  },
+  "postmortem_hardening": {
+    "paid_resume_revalidates_every_checkpoint": true,
+    "runner_sha256": "cbaeb45b3aff8295ecdc3ac7c9004b7d9d231e4a2cbf92e416cdfebc8240e59f",
+    "regression_test_sha256": "3b5a7d3f9dd63dad6c39cb6e97444450dbfb4169af86013419e32c4eed138d4a",
+    "postmortem_protocol_sha256": "d96ca0b4d0f58367f2ba6ef2d0ae37acef07e5acdbb27e808c8ab907c07904ac"
+  },
+  "interpretation": "The paid paired benchmark did not produce a complete or scoreable 18-pair cohort. The passing deterministic artifact checks are not substituted for a valid paired result. No coding-quality, plugin-improvement, DSH-parity, or public benchmark claim is supported."
+}

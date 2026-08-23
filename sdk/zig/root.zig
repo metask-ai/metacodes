@@ -137,6 +137,7 @@ pub const Api = struct {
             raw.completion_describe == null or raw.completion_complete == null or
             raw.completion_stream_start == null or raw.completion_stream_next == null or
             raw.completion_stream_abort == null or raw.completion_stream_destroy == null or
+            raw.runtime_create_with_plugins == null or
             raw.buffer_release == null)
             return error.UnsupportedAbi;
         return .{ .raw = raw };
@@ -144,6 +145,9 @@ pub const Api = struct {
 
     pub fn runtimeCreate(self: Api) types.RuntimeCreateFnV1 {
         return self.raw.runtime_create.?;
+    }
+    pub fn runtimeCreateWithPlugins(self: Api) types.RuntimeCreateWithPluginsFnV1 {
+        return self.raw.runtime_create_with_plugins.?;
     }
     pub fn runtimeDestroy(self: Api) types.RuntimeDestroyFnV1 {
         return self.raw.runtime_destroy.?;
@@ -319,7 +323,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 9 SDK rejects an earlier table from the stable prefix" {
+test "Revision 12 SDK rejects an earlier table from the stable prefix" {
     const Revision5Api = extern struct {
         struct_size: u32,
         abi_version: u32,

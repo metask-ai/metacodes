@@ -13,6 +13,7 @@ const types = @import("../../types.zig");
 const util_json = @import("../../util/json.zig");
 const model_adapter = @import("../model_adapter.zig");
 const dialect_mod = @import("../dialect.zig");
+const capability_activation = @import("../capability_activation.zig");
 
 const Dialect = dialect_mod.Dialect;
 const ModelProfile = model_adapter.ModelProfile;
@@ -206,9 +207,21 @@ const Glm = struct {
         return null;
     }
 
+    fn activateCapabilities(ctx: *anyopaque, p: ModelProfile, capabilities: @import("../dialect.zig").VisibleCapabilities, system: *std.ArrayList(u8), allocator: std.mem.Allocator) anyerror!void {
+        _ = ctx;
+        _ = p;
+        try capability_activation.injectStrictSkillToolFirst(
+            system,
+            capabilities.skill_tool,
+            capabilities.requiredSkillInvocation(),
+            allocator,
+        );
+    }
+
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
+        .activateCapabilitiesFn = activateCapabilities,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
@@ -302,10 +315,12 @@ const DeepSeek = struct {
         try util_json.serializeString(if (enable) "enabled" else "disabled", out, a);
         try out.append(a, '}');
         if (enable) {
-            if (model_adapter.deepseekEffortMap(effort.?)) |mapped| {
+            // null means "use the provider default", so thinking remains enabled
+            // without inventing an explicit reasoning_effort value.
+            if (effort) |explicit| if (model_adapter.deepseekEffortMap(explicit)) |mapped| {
                 try out.appendSlice(a, ",\"reasoning_effort\":");
                 try util_json.serializeString(mapped, out, a);
-            }
+            };
         }
     }
 
@@ -489,6 +504,13 @@ test "openaiDialectFor: DeepSeek V4 返 DeepSeek dialect(thinking+reasoning_effo
     out.clearRetainingCapacity();
     try d.serializeThinking(.{}, .xhigh, &out, a);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"max\"") != null);
+
+    // null is a valid public override state: preserve provider-default thinking
+    // without dereferencing or fabricating an explicit effort.
+    out.clearRetainingCapacity();
+    try d.serializeThinking(.{}, null, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":") == null);
 }
 
 test "openaiDialectFor: Qwen3 返 Qwen dialect" {
@@ -511,16 +533,20 @@ test "openaiDialectFor: GPT-4o 返 OpenAI native dialect" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":") == null);
 }
 
-test "openaiDialectFor: GLM-5.2 不再注入 system 标签(已改顶层 reasoning_effort)" {
+test "openaiDialectFor: GLM-5.2 uses capability guidance without legacy effort tag" {
     const d = openaiDialectFor("glm-5.2");
     const a = std.testing.allocator;
     var sys: std.ArrayList(u8) = .empty;
     defer sys.deinit(a);
-    try sys.appendSlice(a, "base system");
-    try d.injectSystemMods(.{}, .high, &sys, a);
+    try sys.appendSlice(a, "base system\n\n# Available skills\n- verify: bounded review");
+    try d.activateCapabilities(.{}, .{ .skill_tool = true }, &sys, a);
     // GLM-5.2 改用顶层 reasoning_effort body 字段,不再注入 system 标签
     try std.testing.expect(std.mem.indexOf(u8, sys.items, "<reasoning_effort>") == null);
-    try std.testing.expectEqualStrings("base system", sys.items);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sys.items,
+        capability_activation.STRICT_SKILL_SECTION_MARKER,
+    ) != null);
 }
 
 test "openaiDialectFor: GPT-4o 不注入 system 标签(default no-op)" {
@@ -529,7 +555,7 @@ test "openaiDialectFor: GPT-4o 不注入 system 标签(default no-op)" {
     var sys: std.ArrayList(u8) = .empty;
     defer sys.deinit(a);
     try sys.appendSlice(a, "base");
-    try d.injectSystemMods(.{}, .high, &sys, a);
+    try d.activateCapabilities(.{}, .{ .skill_tool = true }, &sys, a);
     try std.testing.expectEqualStrings("base", sys.items);
 }
 

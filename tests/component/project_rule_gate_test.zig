@@ -1305,7 +1305,7 @@ const Probe = struct {
     ) anyerror!cc.tools.ToolDispatchOutcome {
         const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
         self.calls += 1;
-        return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+        return .{ .ok = cc.tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
     }
     fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
         return false;
@@ -2915,7 +2915,7 @@ const VanishingWrite = struct {
         const effect = cc.tools.tool_observation.fileMutation(self.path, .missing, bytes).file_mutation_v1;
         tool_ctx.effect_slot.?.recordFileMutation(self.path, effect);
         try pfs.unlinkPath(self.path.ptr);
-        return .{ .ok = try tool_ctx.allocator.dupe(u8, "claimed-success") };
+        return .{ .ok = cc.tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, "claimed-success")) };
     }
     fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
         return false;

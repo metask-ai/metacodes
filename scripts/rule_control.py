@@ -142,9 +142,11 @@ def task_required_fields(source: str) -> list[str]:
     start = source.find(marker)
     if start < 0:
         raise ControlError("Task tool registry entry not found")
-    stop = source.find(".execute = agent_tool.execute", start)
+    stop = source.find(".execute = .{ .legacy_inline = agent_tool.execute }", start)
     if stop < 0:
-        raise ControlError("Task tool registry entry has no agent_tool.execute boundary")
+        raise ControlError(
+            "Task tool registry entry has no legacy_inline agent_tool.execute boundary"
+        )
     block = source[start:stop]
     match = re.search(r"\.required\s*=\s*&\.\{([^}]*)\}", block, re.DOTALL)
     if match is None:

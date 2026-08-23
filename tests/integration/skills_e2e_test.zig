@@ -18,7 +18,7 @@ fn dispatchOk(
 ) ![]u8 {
     var outcome = try cc.tools.dispatch(ctx, name, args);
     return switch (outcome) {
-        .ok => |bytes| bytes,
+        .ok => |*body| (try body.takeModelBytes(ctx.allocator)).bytes,
         else => {
             outcome.deinit(ctx.allocator);
             return error.UnexpectedDispatchOutcome;
@@ -139,7 +139,7 @@ const Fixture = struct {
         );
         allocator.free(self.tool_defs);
         self.tool_defs = model_defs;
-        if (!cc.skills_cli_adapter.applyModelToolSchema(self.tool_defs))
+        if (!self.runtime.applyModelToolSchema(self.tool_defs))
             return error.SkillSchemaMissing;
     }
 

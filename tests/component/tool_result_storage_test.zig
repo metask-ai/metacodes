@@ -1,80 +1,9 @@
-//! L2 组件测试:大工具结果落盘(批1C,对齐 cc toolResultStorage)。
+//! L2 组件测试：统一 Tool Result CAS 投影、恢复、resume 与 prompt-cache 稳定性。
 
 const std = @import("std");
 const cc = @import("cc");
 const harness = @import("harness");
-const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
-
-const storage = cc.tool_result_storage;
-
-test "L2 落盘: 小结果不落盘(返 null)" {
-    const a = std.testing.allocator;
-    const r = try storage.maybePersist(a, "Grep", "small output", "/tmp/cc-trs-home");
-    try std.testing.expect(r == null);
-}
-
-test "L2 落盘: 超阈值落盘 → preview+path,文件含全量" {
-    const a = std.testing.allocator;
-    _ = std.c.mkdir("/tmp/cc-trs-home", 0o755);
-    // 造一个 > 50000 字符的结果
-    const big = try a.alloc(u8, 60_000);
-    defer a.free(big);
-    @memset(big, 'X');
-    @memcpy(big[0..6], "HEADER");
-
-    const r = (try storage.maybePersist(a, "Grep", big, "/tmp/cc-trs-home")) orelse return error.ShouldPersist;
-    defer a.free(r);
-    try std.testing.expect(std.mem.indexOf(u8, r, "\"persisted\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r, "\"original_bytes\":60000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r, "HEADER") != null); // preview 含开头
-    try std.testing.expect(std.mem.indexOf(u8, r, "/tmp/cc-trs-home/.metacodes/tool-results/") != null);
-
-    // 落盘文件确实含全量(解析出 path,读回比对长度)
-    const key = "\"path\":\"";
-    const i = std.mem.indexOf(u8, r, key).? + key.len;
-    const j = std.mem.indexOfScalarPos(u8, r, i, '"').?;
-    const path = try a.dupeZ(u8, r[i..j]);
-    defer a.free(path);
-    const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDONLY }, 0);
-    try std.testing.expect(fd >= 0);
-    defer pfs.close(fd);
-    var total: usize = 0;
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = pfs.read(fd, &buf);
-        if (n <= 0) break;
-        total += @intCast(n);
-    }
-    try std.testing.expectEqual(@as(usize, 60_000), total);
-    _ = std.c.unlink(path.ptr);
-}
-
-test "L2 落盘: home_dir 空 → 降级 inline 截断(不崩)" {
-    const a = std.testing.allocator;
-    const big = try a.alloc(u8, 60_000);
-    defer a.free(big);
-    @memset(big, 'Y');
-    const r = (try storage.maybePersist(a, "Grep", big, "")) orelse return error.ShouldTruncate;
-    defer a.free(r);
-    try std.testing.expect(std.mem.indexOf(u8, r, "\"truncated\":true") != null);
-    try std.testing.expect(r.len < 60_000); // 截断了
-}
-
-test "L2 落盘: Read 工具不落盘(自限,maxResultChars=max)" {
-    try std.testing.expectEqual(std.math.maxInt(usize), storage.maxResultChars("Read"));
-    try std.testing.expectEqual(storage.DEFAULT_MAX_RESULT_CHARS, storage.maxResultChars("Grep"));
-}
-
-test "L2 落盘: persistForced 无视阈值强制落盘小结果" {
-    const a = std.testing.allocator;
-    _ = std.c.mkdir("/tmp/cc-trs-home", 0o755);
-    // 小结果(< 阈值),maybePersist 不落盘,但 persistForced 强制落盘
-    try std.testing.expect((try storage.maybePersist(a, "Grep", "tiny", "/tmp/cc-trs-home")) == null);
-    const r = (try storage.persistForced(a, "Grep", "tiny but forced", "/tmp/cc-trs-home")) orelse return error.ShouldPersist;
-    defer a.free(r);
-    try std.testing.expect(std.mem.indexOf(u8, r, "\"persisted\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r, "tiny but forced") != null);
-}
+const pfs = @import("platform").fs;
 
 const FINAL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"done\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -129,6 +58,43 @@ fn requestToolResultContent(root: std.json.Value, tool_use_id: []const u8) ?[]co
     return null;
 }
 
+fn expectJsonFieldEqual(
+    allocator: std.mem.Allocator,
+    first_bytes: []const u8,
+    second_bytes: []const u8,
+    field: []const u8,
+) !void {
+    var first = try std.json.parseFromSlice(std.json.Value, allocator, first_bytes, .{});
+    defer first.deinit();
+    var second = try std.json.parseFromSlice(std.json.Value, allocator, second_bytes, .{});
+    defer second.deinit();
+    const first_field = first.value.object.get(field) orelse return error.MissingCacheField;
+    const second_field = second.value.object.get(field) orelse return error.MissingCacheField;
+    const first_encoded = try std.json.Stringify.valueAlloc(allocator, first_field, .{});
+    defer allocator.free(first_encoded);
+    const second_encoded = try std.json.Stringify.valueAlloc(allocator, second_field, .{});
+    defer allocator.free(second_encoded);
+    try std.testing.expectEqualStrings(first_encoded, second_encoded);
+}
+
+fn expectOpenAiSystemEqual(
+    allocator: std.mem.Allocator,
+    first_bytes: []const u8,
+    second_bytes: []const u8,
+) !void {
+    var first = try std.json.parseFromSlice(std.json.Value, allocator, first_bytes, .{});
+    defer first.deinit();
+    var second = try std.json.parseFromSlice(std.json.Value, allocator, second_bytes, .{});
+    defer second.deinit();
+    const first_system = first.value.object.get("messages").?.array.items[0];
+    const second_system = second.value.object.get("messages").?.array.items[0];
+    const first_encoded = try std.json.Stringify.valueAlloc(allocator, first_system, .{});
+    defer allocator.free(first_encoded);
+    const second_encoded = try std.json.Stringify.valueAlloc(allocator, second_system, .{});
+    defer allocator.free(second_encoded);
+    try std.testing.expectEqualStrings(first_encoded, second_encoded);
+}
+
 test "L2 runner projects after raw UI observation and recovers artifact on the next tool turn" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -171,9 +137,9 @@ test "L2 runner projects after raw UI observation and recovers artifact on the n
         fn dispatch(raw: *const anyopaque, ctx: *const cc.tool_context.ToolContext, name: []const u8, args: []const u8) anyerror!cc.tool_context.ToolDispatchOutcome {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             if (std.mem.eql(u8, name, "BigStructured"))
-                return .{ .ok = try ctx.allocator.dupe(u8, self.payload) };
+                return .{ .ok = cc.tools.ToolResultBody.initInline(try ctx.allocator.dupe(u8, self.payload)) };
             if (std.mem.eql(u8, name, "ReadArtifact"))
-                return .{ .ok = try cc.read_artifact.execute(ctx, args) };
+                return .{ .ok = cc.tools.ToolResultBody.initInline(try cc.read_artifact.execute(ctx, args)) };
             return .{ .host_rejected = null };
         }
         fn prefetchSafe(_: *const anyopaque, name: []const u8) bool {
@@ -258,6 +224,7 @@ test "L2 runner projects after raw UI observation and recovers artifact on the n
     try std.testing.expectEqual(@as(u64, 1), observed.artifact_recovery_calls);
     try std.testing.expect(observed.raw_bytes >= payload.len);
 
+    const first_request = (server.requestAt(0) orelse return error.MissingInitialRequest).body();
     const follow_up = (server.requestAt(1) orelse return error.MissingFollowUpRequest).body();
     try std.testing.expect(std.mem.indexOf(u8, follow_up, cc.result_projection.SCHEMA) != null);
     try std.testing.expect(std.mem.indexOf(u8, follow_up, artifact_id) != null);
@@ -269,6 +236,8 @@ test "L2 runner projects after raw UI observation and recovers artifact on the n
     const final_request = (server.requestAt(2) orelse return error.MissingFinalRequest).body();
     try std.testing.expect(std.mem.indexOf(u8, final_request, "metacodes.read-artifact.v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, final_request, "TAIL_SENTINEL") != null);
+    var first_json = try std.json.parseFromSlice(std.json.Value, allocator, first_request, .{});
+    defer first_json.deinit();
     var follow_json = try std.json.parseFromSlice(std.json.Value, allocator, follow_up, .{});
     defer follow_json.deinit();
     var final_json = try std.json.parseFromSlice(std.json.Value, allocator, final_request, .{});
@@ -277,6 +246,32 @@ test "L2 runner projects after raw UI observation and recovers artifact on the n
         requestToolResultContent(follow_json.value, "big-1") orelse return error.MissingProjectedResult,
         requestToolResultContent(final_json.value, "big-1") orelse return error.MissingStableProjectedResult,
     );
+    // Artifact paging adds Conversation messages only. The Session's system
+    // prefix and complete tool schema were frozen before request one, so the
+    // provider cache prefix remains byte-identical across spill and recovery.
+    const first_tools = try std.json.Stringify.valueAlloc(allocator, first_json.value.object.get("tools").?, .{});
+    defer allocator.free(first_tools);
+    const follow_tools = try std.json.Stringify.valueAlloc(allocator, follow_json.value.object.get("tools").?, .{});
+    defer allocator.free(follow_tools);
+    const final_tools = try std.json.Stringify.valueAlloc(allocator, final_json.value.object.get("tools").?, .{});
+    defer allocator.free(final_tools);
+    try std.testing.expectEqualStrings(first_tools, follow_tools);
+    try std.testing.expectEqualStrings(first_tools, final_tools);
+    const first_system_value = first_json.value.object.get("system");
+    const follow_system_value = follow_json.value.object.get("system");
+    const final_system_value = final_json.value.object.get("system");
+    try std.testing.expect((first_system_value == null) == (follow_system_value == null));
+    try std.testing.expect((first_system_value == null) == (final_system_value == null));
+    if (first_system_value) |value| {
+        const first_system = try std.json.Stringify.valueAlloc(allocator, value, .{});
+        defer allocator.free(first_system);
+        const follow_system = try std.json.Stringify.valueAlloc(allocator, follow_system_value.?, .{});
+        defer allocator.free(follow_system);
+        const final_system = try std.json.Stringify.valueAlloc(allocator, final_system_value.?, .{});
+        defer allocator.free(final_system);
+        try std.testing.expectEqualStrings(first_system, follow_system);
+        try std.testing.expectEqualStrings(first_system, final_system);
+    }
 
     const projected = conversation.messages.items[2].blocks[0].tool_result.content;
     try std.testing.expect(cc.result_projection.isRecoverableEnvelope(projected));
@@ -342,4 +337,388 @@ test "L2 transcript resume preserves artifact capability without embedding the r
     var tail = try cc.tool_result_artifact.readChunk(allocator, root, artifact_id, payload.len - 64, 64);
     defer tail.deinit();
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "RESUME_TAIL") != null);
+}
+
+test "L2 dynamic registry preserves every ToolResultBody tag and the legacy bytes adapter" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const Callbacks = struct {
+        fn legacy(ctx: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8 {
+            return ctx.allocator.dupe(u8, "legacy-inline");
+        }
+
+        fn inlineBody(ctx: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque) anyerror!cc.tool_result.ToolResultBody {
+            return cc.tool_result.ToolResultBody.initInline(try ctx.allocator.dupe(u8, "typed-inline"));
+        }
+
+        fn artifactBody(ctx: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque) anyerror!cc.tool_result.ToolResultBody {
+            var spool = try cc.tool_result_artifact.Spool.begin(ctx.allocator, ctx.artifact_root);
+            defer spool.deinit();
+            try spool.write("dynamic-artifact-head-");
+            try spool.write(&([_]u8{'d'} ** (80 * 1024)));
+            try spool.write("-dynamic-artifact-tail");
+            return cc.tool_result.ToolResultBody.fromCompletedSpool(
+                try spool.finish(),
+                .text_utf8,
+            );
+        }
+
+        fn structuredError(ctx: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque) anyerror!cc.tool_result.ToolResultBody {
+            return cc.tool_result.ToolResultBody.initStructuredError(
+                ctx.allocator,
+                "{\"error\":{\"code\":\"dynamic_fixture\",\"recoverable\":true}}",
+            );
+        }
+    };
+
+    var registry = cc.tools_dynamic.DynRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.register("LegacyDynamic", "legacy adapter", &.{}, Callbacks.legacy, null, false);
+    try registry.registerBody("InlineDynamic", "typed inline", &.{}, Callbacks.inlineBody, null, false);
+    try registry.registerBody("ArtifactDynamic", "typed artifact", &.{}, Callbacks.artifactBody, null, false);
+    try registry.registerBody("ErrorDynamic", "typed error", &.{}, Callbacks.structuredError, null, false);
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.dyn_registry = &registry;
+    ctx.artifact_root = root;
+
+    var legacy = try cc.tools.dispatch(&ctx, "LegacyDynamic", "{}");
+    defer legacy.deinit(allocator);
+    try std.testing.expect(legacy == .ok and legacy.ok == .@"inline");
+    try std.testing.expectEqualStrings("legacy-inline", legacy.ok.@"inline".bytes);
+
+    var inline_result = try cc.tools.dispatch(&ctx, "InlineDynamic", "{}");
+    defer inline_result.deinit(allocator);
+    try std.testing.expect(inline_result == .ok and inline_result.ok == .@"inline");
+    try std.testing.expectEqualStrings("typed-inline", inline_result.ok.@"inline".bytes);
+
+    var structured = try cc.tools.dispatch(&ctx, "ErrorDynamic", "{}");
+    defer structured.deinit(allocator);
+    try std.testing.expect(structured == .ok and structured.ok == .structured_error);
+    var structured_rendered = try structured.ok.render(allocator);
+    defer structured_rendered.deinit(allocator);
+    try std.testing.expect(structured_rendered.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, structured_rendered.bytes, "dynamic_fixture") != null);
+
+    var artifact_result = try cc.tools.dispatch(&ctx, "ArtifactDynamic", "{}");
+    defer artifact_result.deinit(allocator);
+    try std.testing.expect(artifact_result == .ok and artifact_result.ok == .artifact);
+    try std.testing.expect(artifact_result.ok.artifact.stored.bytes > 80 * 1024);
+    var rendered = try artifact_result.ok.render(allocator);
+    defer rendered.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "ReadArtifact") != null);
+    var recovered = try cc.tool_result_artifact.readChunk(
+        allocator,
+        root,
+        artifact_result.ok.artifact.stored.id(),
+        artifact_result.ok.artifact.stored.bytes - 32,
+        32,
+    );
+    defer recovered.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, recovered.bytes, "dynamic-artifact-tail") != null);
+}
+
+test "L2 native Grep spools 17MiB from byte zero and keeps the cached tool prefix stable" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/native-grep-17m.txt", .{root}, 0);
+    defer allocator.free(path);
+
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    var line: [1024]u8 = [_]u8{'x'} ** 1024;
+    const marker = "NATIVE_BYTE_ZERO";
+    @memcpy(line[0..marker.len], marker);
+    line[line.len - 1] = '\n';
+    var row: usize = 0;
+    while (row < 17 * 1024) : (row += 1) {
+        var written: usize = 0;
+        while (written < line.len) {
+            const count = pfs.write(fd, line[written..]);
+            if (count <= 0) return error.WriteFailed;
+            written += @intCast(count);
+        }
+    }
+
+    const input = try std.fmt.allocPrint(
+        allocator,
+        "{{\"pattern\":\"NATIVE_BYTE_ZERO\",\"path\":\"{s}\",\"output_mode\":\"content\",\"head_limit\":0}}",
+        .{path[0..path.len]},
+    );
+    defer allocator.free(input);
+    const first_sse = try toolUseSse(allocator, "native-grep-1", "Grep", input);
+    defer allocator.free(first_sse);
+    const responses = [_][]const u8{ first_sse, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&responses, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(allocator);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "stream the native grep result");
+    const permission = cc.permission.createContext(.bypass_permissions, allocator);
+    const definitions = try cc.tools.toToolDefinitions(allocator);
+    defer allocator.free(definitions);
+    const Backend = struct {
+        fn emit(_: *anyopaque, _: cc.session_id.SessionId, _: cc.ui_event.CoreEvent) void {}
+        fn poll(_: *anyopaque, _: cc.session_id.SessionId) ?cc.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var backend_ctx: u8 = 0;
+    const backend = cc.ui_backend.UiBackend{ .ctx = @ptrCast(&backend_ctx), .emit = Backend.emit, .poll = Backend.poll };
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        definitions,
+        &permission,
+        .{
+            .max_turns = 3,
+            .artifact_root = root,
+            .colorize = false,
+        },
+        &backend,
+        allocator,
+    );
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+
+    var envelope_bytes: ?[]const u8 = null;
+    for (conversation.messages.items) |message| {
+        for (message.blocks) |block| switch (block) {
+            .tool_result => |tool_result| {
+                if (std.mem.eql(u8, tool_result.tool_use_id, "native-grep-1"))
+                    envelope_bytes = tool_result.content;
+            },
+            else => {},
+        };
+    }
+    const envelope_text = envelope_bytes orelse return error.MissingProjectedResult;
+    try std.testing.expect(cc.result_projection.isRecoverableEnvelope(envelope_text));
+    try std.testing.expect(envelope_text.len < 8 * 1024);
+    var envelope = try std.json.parseFromSlice(std.json.Value, allocator, envelope_text, .{});
+    defer envelope.deinit();
+    const artifact_id = envelope.value.object.get("artifact_id").?.string;
+    try std.testing.expect(envelope.value.object.get("original_bytes").?.integer > 17 * 1024 * 1024);
+    try std.testing.expect(envelope.value.object.get("capture_complete").?.bool);
+    var recovered = try cc.tool_result_artifact.readChunk(allocator, root, artifact_id, 0, 4096);
+    defer recovered.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, recovered.bytes, "NATIVE_BYTE_ZERO") != null);
+
+    var initial = try std.json.parseFromSlice(std.json.Value, allocator, (server.requestAt(0) orelse return error.MissingInitialRequest).body(), .{});
+    defer initial.deinit();
+    var follow = try std.json.parseFromSlice(std.json.Value, allocator, (server.requestAt(1) orelse return error.MissingFollowUpRequest).body(), .{});
+    defer follow.deinit();
+    const initial_tools = try std.json.Stringify.valueAlloc(allocator, initial.value.object.get("tools").?, .{});
+    defer allocator.free(initial_tools);
+    const follow_tools = try std.json.Stringify.valueAlloc(allocator, follow.value.object.get("tools").?, .{});
+    defer allocator.free(follow_tools);
+    try std.testing.expectEqualStrings(initial_tools, follow_tools);
+}
+
+test "L2 native WebFetch streams download transform and JSON into one typed artifact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const padding = try allocator.alloc(u8, 96 * 1024);
+    defer allocator.free(padding);
+    @memset(padding, 'w');
+    const page = try std.fmt.allocPrint(allocator, "<html><body><h1>WEBFETCH_STREAM_HEAD</h1><p>{s}</p><footer>WEBFETCH_STREAM_TAIL</footer></body></html>", .{padding});
+    defer allocator.free(page);
+    var server = try harness.MockServer.start(page, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+    const args = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{url});
+    defer allocator.free(args);
+
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.artifact_root = root;
+    var outcome = try cc.tools.dispatch(&ctx, "WebFetch", args);
+    defer outcome.deinit(allocator);
+    try std.testing.expect(outcome == .ok);
+    try std.testing.expect(outcome.ok == .artifact);
+    try std.testing.expect(outcome.ok.artifact.stored.bytes > 96 * 1024);
+    try std.testing.expect(outcome.ok.artifact.stored.capture_complete);
+    var head = try cc.tool_result_artifact.readChunk(
+        allocator,
+        root,
+        outcome.ok.artifact.stored.id(),
+        0,
+        4096,
+    );
+    defer head.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, head.bytes, "{\"url\":"));
+    try std.testing.expect(std.mem.indexOf(u8, head.bytes, "WEBFETCH_STREAM_HEAD") != null);
+    var tail = try cc.tool_result_artifact.readChunk(
+        allocator,
+        root,
+        outcome.ok.artifact.stored.id(),
+        outcome.ok.artifact.stored.bytes - 4096,
+        4096,
+    );
+    defer tail.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "WEBFETCH_STREAM_TAIL") != null);
+}
+
+test "L2 artifact paging preserves system and tool cache prefixes for every provider family" {
+    const allocator = std.testing.allocator;
+    const definitions = try cc.tools.toToolDefinitions(allocator);
+    defer allocator.free(definitions);
+    var has_read_artifact = false;
+    for (definitions) |definition| if (std.mem.eql(u8, definition.name, "ReadArtifact")) {
+        has_read_artifact = true;
+        break;
+    };
+    try std.testing.expect(has_read_artifact);
+
+    const initial = [_]cc.types_mod.ApiMessage{.{
+        .role = .user,
+        .content = &.{.{ .text = "inspect a large result" }},
+    }};
+    const after_spill = [_]cc.types_mod.ApiMessage{
+        initial[0],
+        .{
+            .role = .user,
+            .content = &.{.{ .text = "{\"projection\":\"artifact\",\"read\":{\"tool\":\"ReadArtifact\"}}" }},
+        },
+    };
+    const system = "stable metacodes kernel prompt";
+
+    const anthropic_first = try cc.api_request.serializeMessagesRequest(.{
+        .model = "claude-sonnet-4",
+        .messages = &initial,
+        .system = system,
+        .tools = definitions,
+    }, allocator);
+    defer allocator.free(anthropic_first);
+    const anthropic_follow = try cc.api_request.serializeMessagesRequest(.{
+        .model = "claude-sonnet-4",
+        .messages = &after_spill,
+        .system = system,
+        .tools = definitions,
+    }, allocator);
+    defer allocator.free(anthropic_follow);
+    try expectJsonFieldEqual(allocator, anthropic_first, anthropic_follow, "system");
+    try expectJsonFieldEqual(allocator, anthropic_first, anthropic_follow, "tools");
+
+    const openai_first = try cc.api_openai.serializeOpenAIRequest(
+        allocator,
+        "deepseek-chat",
+        &initial,
+        system,
+        definitions,
+        null,
+        null,
+    );
+    defer allocator.free(openai_first);
+    const openai_follow = try cc.api_openai.serializeOpenAIRequest(
+        allocator,
+        "deepseek-chat",
+        &after_spill,
+        system,
+        definitions,
+        null,
+        null,
+    );
+    defer allocator.free(openai_follow);
+    try expectOpenAiSystemEqual(allocator, openai_first, openai_follow);
+    try expectJsonFieldEqual(allocator, openai_first, openai_follow, "tools");
+
+    const gemini_first = try cc.api_gemini.serializeGeminiRequest(
+        allocator,
+        &initial,
+        system,
+        definitions,
+        null,
+        "gemini-2.5-pro",
+        null,
+        null,
+    );
+    defer allocator.free(gemini_first);
+    const gemini_follow = try cc.api_gemini.serializeGeminiRequest(
+        allocator,
+        &after_spill,
+        system,
+        definitions,
+        null,
+        "gemini-2.5-pro",
+        null,
+        null,
+    );
+    defer allocator.free(gemini_follow);
+    try expectJsonFieldEqual(allocator, gemini_first, gemini_follow, "systemInstruction");
+    try expectJsonFieldEqual(allocator, gemini_first, gemini_follow, "tools");
+}
+
+test "L2 BashOutput paging schema fields drive bounded registry dispatch" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const definition = cc.tools.getTool("BashOutput") orelse return error.MissingBashOutput;
+    const specs = definition.input_schema.prop_specs orelse return error.MissingBashOutputSchema;
+    const expected = [_][]const u8{
+        "stdout",
+        "stderr",
+        "stdout_since_byte",
+        "stderr_since_byte",
+        "max_bytes",
+    };
+    for (expected) |name| {
+        var found = false;
+        for (specs) |spec| if (std.mem.eql(u8, spec.name, name)) {
+            found = true;
+            break;
+        };
+        try std.testing.expect(found);
+    }
+
+    var jobs = try cc.job_registry.JobRegistry.init(allocator);
+    defer jobs.deinit();
+    const job = try jobs.spawnBackground("printf 'ABCDEFGHIJ'; exit 0", null);
+    cc.util_time.sleepMs(200);
+    var ctx = cc.tools.ToolContext{ .allocator = allocator, .jobs = &jobs };
+    var input_buffer: [256]u8 = undefined;
+    const input = try std.fmt.bufPrint(
+        &input_buffer,
+        "{{\"job_id\":\"{s}\",\"stdout_since_byte\":3,\"stderr\":false,\"max_bytes\":3}}",
+        .{job.id[0..]},
+    );
+    var outcome = try cc.tools.dispatch(&ctx, "BashOutput", input);
+    defer outcome.deinit(allocator);
+    const body = switch (outcome) {
+        .ok => |value| value,
+        else => return error.UnexpectedBashOutputOutcome,
+    };
+    const encoded = switch (body) {
+        .@"inline" => |result| result.bytes,
+        else => return error.UnexpectedBashOutputBody,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"stdout\":\"DEF\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"stdout_truncated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"stderr\":") == null);
+
+    const invalid = try std.fmt.bufPrint(
+        &input_buffer,
+        "{{\"job_id\":\"{s}\",\"max_bytes\":262145}}",
+        .{job.id[0..]},
+    );
+    try std.testing.expectError(error.InvalidMaxBytes, cc.tools.dispatch(&ctx, "BashOutput", invalid));
 }

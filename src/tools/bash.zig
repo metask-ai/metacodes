@@ -6,6 +6,7 @@ const security = @import("security.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const ToolResultBody = @import("context.zig").ToolResultBody;
 const artifact = @import("../core/tool_result_artifact.zig");
 const ResultMetrics = @import("../core/tool_result_metrics.zig").Metrics;
 
@@ -417,6 +418,27 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         );
     }
 
+    // Source embedders may provide artifact storage without a long-lived job
+    // registry. Preserve the byte-zero contract by using a transient registry
+    // for this synchronous call; never fall back to the 16MiB pipe buffer when
+    // the kernel has a recoverable result plane available.
+    if (ctx.artifact_root.len != 0) {
+        var transient_jobs = try @import("../core/job_registry.zig").JobRegistry.init(allocator);
+        defer transient_jobs.deinit();
+        const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+        return try runAutoBackgroundable(
+            allocator,
+            &transient_jobs,
+            command,
+            timeout_ms,
+            ctx.abort,
+            cwd_opt,
+            ctx.artifact_root,
+            false,
+            ctx.tool_result_metrics,
+        );
+    }
+
     // 可移植 shell(复刻 codex):POSIX /bin/sh -c;Windows 原生 PowerShell/cmd,零 git-bash。
     // wrapCommand:PowerShell 前置 UTF-8 输出编码(否则非 ASCII 输出乱码/stringify 失败)。
     const shell = shell_mod.detectDefault();
@@ -431,6 +453,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 截断到 MAX_OUTPUT_BYTES(保留头部),防大输出撑爆上下文。
     return try formatCompletedOutput(allocator, out.stdout, out.stderr, out.exit_code, ctx.artifact_root, out.capture_complete, ctx.tool_result_metrics);
+}
+
+/// Bash already redirects stdout/stderr to JobRegistry files before the child
+/// emits byte zero. Its model-visible completion is bounded JSON containing
+/// per-channel CAS receipts/previews, so the typed boundary remains inline.
+pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    return ToolResultBody.initInline(try execute(ctx, args));
 }
 
 /// 新路径：总是 spawn 到 job_registry（stdout/stderr 落盘），父端轮询等待。
@@ -668,6 +697,37 @@ test "completed job output becomes a bounded recoverable channel artifact" {
     var tail = try artifact.readChunk(allocator, root, artifact_id, 39_990, 32);
     defer tail.deinit();
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "BASH_TAIL") != null);
+}
+
+test "BashTool embedding without JobRegistry still spools from byte zero" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    // Deliberately omit `jobs`: an embedding that supplies the artifact plane
+    // must still enter the file-backed process path before the first byte.
+    const ctx = ToolContext{ .allocator = allocator, .artifact_root = root };
+    var body = try executeBody(&ctx, "{\"command\":\"awk 'BEGIN { for(i=0;i<40000;i++) printf \\\"x\\\"; printf \\\"EMBED_TAIL\\\" }'\"}");
+    defer body.deinit(allocator);
+    const encoded = switch (body) {
+        .@"inline" => |result| result.bytes,
+        else => return error.UnexpectedResultBody,
+    };
+    try std.testing.expect(encoded.len < 8 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, root) == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, encoded, .{});
+    defer parsed.deinit();
+    const artifact_id = parsed.value.object.get("stdout_artifact_id").?.string;
+    try std.testing.expect(parsed.value.object.get("stdout_recoverable").?.bool);
+    try std.testing.expectEqual(@as(i64, 40_010), parsed.value.object.get("stdout_original_bytes").?.integer);
+    var tail = try artifact.readChunk(allocator, root, artifact_id, 39_990, 32);
+    defer tail.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "EMBED_TAIL") != null);
 }
 
 test "over-limit completed spool reports true size without a false commitment" {
