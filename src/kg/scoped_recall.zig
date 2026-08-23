@@ -395,9 +395,12 @@ pub fn artifactSupersededSymbols(
             break;
         }
     };
-    // v43 重放自证伪:声明不可复现 → 已解语义失效,supersede 通道随
-    // 压力栈一起回到未解形态。
-    if (ever_solved and gate.claimNotReproduced(history.items)) ever_solved = false;
+    // v44 更正(v43 潜在缺陷, 由收紧宽限后的 artifact-task pin 暴露):
+    // supersede **不随声明失信关闭**。它不是静默决策而是**证据位阶**决策——
+    // host_run 全过裁决所证明的工件, 其定义符号压过存量声明这件事, 与"本轮
+    // 是否复现成功"无关。v43 曾把失信一并用在这里, 结果是:复现失败 → 失信
+    // → supersede 关闭 → 冲突记忆恢复全力, 而复现失败往往**正是**冲突记忆
+    // 造成的(etag: node 698 的 async 版赢过逐字工件)。那会把下滑环再加一档。
     if (!ever_solved) return 0;
     const best = bestHistoryRow(history.items, newest) orelse newest;
     const marker = std.mem.indexOf(u8, best, "best-attempt artifact") orelse return 0;
@@ -476,6 +479,11 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
         out.appendSlice(allocator, "# 历史最佳尝试(host 声明;先复现它的构型,再只修它剩下的败点)\n") catch return null;
         out.appendSlice(allocator, best) catch return null;
         out.appendSlice(allocator, "\n") catch return null;
+        // v44:引用了最佳工件就必须附上机械化的写入指令。此前逐字令只挂在
+        // 已解静默的回归分支上, 于是"声明失信 → 回到未解路径"会连同指令一起
+        // 丢掉已证工件——失信的正确回应是**加压**, 不是丢掉唯一已证配置。
+        // (同一类错误在 v43 出现三处:supersede 通道、逐字令、这里。)
+        appendVerbatimDirective(&out, allocator, best);
     }
     // 已解决静默(p33/p34 取证):键**曾经全过**(最佳行或最新行)。
     // 最新行回归时仍静默——已证配置存在,正确剂量="复现最佳",重新

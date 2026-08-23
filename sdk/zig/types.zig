@@ -312,13 +312,7 @@ pub const MCP_EXCHANGE_CANCELLED: u32 = 6;
 pub const MCP_EXCHANGE_INDETERMINATE: u32 = 7;
 pub const MCP_EXCHANGE_FATAL: u32 = 8;
 pub const MCP_NOTIFY_OK: u32 = 0;
-pub const MCP_NOTIFY_TIMEOUT: u32 = 1;
-pub const MCP_NOTIFY_NETWORK_ERROR: u32 = 2;
-pub const MCP_NOTIFY_AUTH_ERROR: u32 = 3;
-pub const MCP_NOTIFY_SERVER_ERROR: u32 = 4;
-pub const MCP_NOTIFY_CHILD_EXIT: u32 = 5;
-pub const MCP_NOTIFY_CANCELLED: u32 = 6;
-pub const MCP_NOTIFY_FATAL: u32 = 7;
+pub const MCP_NOTIFY_FAILED: u32 = 1;
 
 pub const CHECKPOINT_IO_OK: u32 = 0;
 pub const CHECKPOINT_IO_FAILED: u32 = 1;
@@ -483,7 +477,9 @@ pub const HostStreamToolV1 = extern struct {
 /// `MCP-Session-Id` in this connection context. Probe, actual, and reopened
 /// exact-era connections must not share session identifiers or mutable
 /// protocol state. Credentials and transport handles never enter AgentCore
-/// checkpoints.
+/// checkpoints. The cancellation descriptor, its context, and callback are
+/// borrowed only for the synchronous request/notify callback invocation. A
+/// Host must not retain or poll them after that callback returns.
 pub const McpIsCancelledFnV1 = *const fn (
     cancellation_ctx: ?*const anyopaque,
 ) callconv(.c) u32;
@@ -493,6 +489,13 @@ pub const McpCancellationV1 = extern struct {
     reserved0: u32,
     ctx: ?*const anyopaque,
     is_cancelled: ?McpIsCancelledFnV1,
+    reserved: [2]u64,
+};
+
+pub const McpResponseV1 = extern struct {
+    struct_size: u32,
+    http_status: u32,
+    body: OwnedBytesV1,
     reserved: [2]u64,
 };
 
@@ -509,7 +512,7 @@ pub const McpRequestFnV1 = *const fn (
     request_json: BytesViewV1,
     timeout_ms: u32,
     cancellation: ?*const McpCancellationV1,
-    out_response_json: ?*OwnedBytesV1,
+    out_response: ?*McpResponseV1,
 ) callconv(.c) u32;
 /// Streaming `tools/call` exchange. The sink is borrowed for the duration of
 /// this callback and must receive the complete JSON-RPC response frame from
@@ -534,6 +537,9 @@ pub const McpCloseFnV1 = *const fn (
     connector_ctx: ?*anyopaque,
     connection_ctx: ?*anyopaque,
 ) callconv(.c) void;
+/// `release_response` is called exactly once for every non-canonical-empty
+/// response token, including an invalid `{ ptr != null, len == 0 }` token.
+/// AgentCore passes the address of `McpResponseV1.body` itself.
 pub const McpReleaseResponseFnV1 = *const fn (
     connector_ctx: ?*anyopaque,
     connection_ctx: ?*anyopaque,
@@ -1191,6 +1197,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(HostResultSinkV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(HostStreamToolV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpCancellationV1));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpResponseV1));
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(McpConnectorV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(McpProtocolLimitsV1));
     try std.testing.expectEqual(@as(usize, 232), @sizeOf(McpServerV1));
@@ -1234,6 +1241,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostResultSinkV1, "ctx"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostStreamToolV1, "ctx"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(McpConnectorV1, "ctx"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(McpResponseV1, "body"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(McpResponseV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 104), @offsetOf(McpServerV1, "connector"));
     try std.testing.expectEqual(@as(usize, 192), @offsetOf(McpServerV1, "protocol_limits"));
     try std.testing.expectEqual(@as(usize, 200), @offsetOf(McpServerV1, "configuration_fingerprint"));

@@ -833,6 +833,10 @@ const PublicMcpProbe = struct {
     tool_count: u8 = 1,
     probe_open_status: u32 = wire.MCP_OPEN_OK,
     probe_exchange_status: ?u32 = null,
+    probe_response_body: ?[]const u8 = null,
+    probe_http_status: u32 = 0,
+    actual_http_status: u32 = 0,
+    notify_status: u32 = wire.MCP_NOTIFY_OK,
     connections: [8]Connection = [_]Connection{.{}} ** 8,
     connection_count: usize = 0,
     open_attempts: u32 = 0,
@@ -942,13 +946,18 @@ const PublicMcpProbe = struct {
         request_json: wire.BytesViewV1,
         _: u32,
         _: ?*const wire.McpCancellationV1,
-        out_response: ?*wire.OwnedBytesV1,
+        out_response: ?*wire.McpResponseV1,
     ) callconv(.c) u32 {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_EXCHANGE_FATAL));
         const connection = liveConnection(raw, connection_ctx) orelse
             return wire.MCP_EXCHANGE_FATAL;
         const out = out_response orelse return wire.MCP_EXCHANGE_FATAL;
-        out.* = .{ .ptr = null, .len = 0 };
+        out.* = .{
+            .struct_size = @sizeOf(wire.McpResponseV1),
+            .http_status = 0,
+            .body = .{ .ptr = null, .len = 0 },
+            .reserved = [_]u64{0} ** 2,
+        };
         self.request_attempts += 1;
         if (connection.purpose_code == wire.MCP_CONNECTION_DISPOSABLE_PROBE)
             if (self.probe_exchange_status) |status| return status;
@@ -957,6 +966,9 @@ const PublicMcpProbe = struct {
         const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null) blk: {
             if (connection.era_code != wire.MCP_ERA_2026_07_28)
                 return wire.MCP_EXCHANGE_FATAL;
+            if (connection.purpose_code == wire.MCP_CONNECTION_DISPOSABLE_PROBE and
+                self.probe_response_body != null)
+                break :blk std.heap.c_allocator.dupe(u8, self.probe_response_body.?);
             break :blk if (self.server_era_code == wire.MCP_ERA_2026_07_28) std.fmt.allocPrint(
                 std.heap.c_allocator,
                 "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
@@ -1032,7 +1044,11 @@ const PublicMcpProbe = struct {
         } else return wire.MCP_EXCHANGE_FATAL;
         const owned = response catch return wire.MCP_EXCHANGE_FATAL;
         self.requests += 1;
-        out.* = .{ .ptr = owned.ptr, .len = owned.len };
+        out.http_status = if (connection.purpose_code == wire.MCP_CONNECTION_DISPOSABLE_PROBE)
+            self.probe_http_status
+        else
+            self.actual_http_status;
+        out.body = .{ .ptr = owned.ptr, .len = owned.len };
         return wire.MCP_EXCHANGE_RESPONSE;
     }
 
@@ -1087,7 +1103,12 @@ const PublicMcpProbe = struct {
             self.call_requests += 1;
             return wire.MCP_EXCHANGE_RESPONSE;
         }
-        var response = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+        var response = wire.McpResponseV1{
+            .struct_size = @sizeOf(wire.McpResponseV1),
+            .http_status = 0,
+            .body = .{ .ptr = null, .len = 0 },
+            .reserved = [_]u64{0} ** 2,
+        };
         const status = request(
             raw,
             connection_ctx,
@@ -1096,13 +1117,13 @@ const PublicMcpProbe = struct {
             cancellation,
             &response,
         );
-        defer releaseResponse(raw, connection_ctx, &response);
+        defer releaseResponse(raw, connection_ctx, &response.body);
         if (status != wire.MCP_EXCHANGE_RESPONSE) return status;
         const destination = sink orelse return wire.MCP_EXCHANGE_FATAL;
         if (destination.struct_size != @sizeOf(wire.HostResultSinkV1) or
-            destination.write == null or response.ptr == null)
+            destination.write == null or response.body.ptr == null)
             return wire.MCP_EXCHANGE_FATAL;
-        const bytes = response.ptr.?[0..@intCast(response.len)];
+        const bytes = response.body.ptr.?[0..@intCast(response.body.len)];
         var offset: usize = 0;
         while (offset != bytes.len) {
             const count = @min(bytes.len - offset, 4096);
@@ -1127,20 +1148,21 @@ const PublicMcpProbe = struct {
         _: u32,
         _: ?*const wire.McpCancellationV1,
     ) callconv(.c) u32 {
-        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_NOTIFY_FATAL));
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_NOTIFY_FAILED));
         const connection = liveConnection(raw, connection_ctx) orelse
-            return wire.MCP_NOTIFY_FATAL;
+            return wire.MCP_NOTIFY_FAILED;
         if (connection.purpose_code != wire.MCP_CONNECTION_ACTUAL or
             connection.era_code == wire.MCP_ERA_2026_07_28)
-            return wire.MCP_NOTIFY_FATAL;
+            return wire.MCP_NOTIFY_FAILED;
         const encoded = sdk.borrowedBytes(notification_json) catch
-            return wire.MCP_NOTIFY_FATAL;
+            return wire.MCP_NOTIFY_FAILED;
         if (std.mem.indexOf(u8, encoded, "notifications/initialized") == null)
-            return wire.MCP_NOTIFY_FATAL;
+            return wire.MCP_NOTIFY_FAILED;
+        if (self.notify_status != wire.MCP_NOTIFY_OK) return self.notify_status;
         self.notifications += 1;
         self.notifications_by_era[
             eraIndex(connection.era_code) orelse
-                return wire.MCP_NOTIFY_FATAL
+                return wire.MCP_NOTIFY_FAILED
         ] += 1;
         return wire.MCP_NOTIFY_OK;
     }
@@ -1208,6 +1230,212 @@ const PublicMcpProbe = struct {
             wire.MCP_ERA_2025_06_18 => "2025-06-18",
             else => null,
         };
+    }
+};
+
+const PublicHttpMcpConnector = struct {
+    url: []const u8,
+    releases: u32 = 0,
+    closes: u32 = 0,
+
+    const Connection = struct {
+        owner: *PublicHttpMcpConnector,
+        era_code: u32,
+    };
+
+    const HttpResult = struct {
+        status: u32,
+        body: []u8,
+    };
+
+    fn connector(self: *@This()) wire.McpConnectorV1 {
+        var result = std.mem.zeroes(wire.McpConnectorV1);
+        result.struct_size = @sizeOf(wire.McpConnectorV1);
+        result.ctx = self;
+        result.open = open;
+        result.request = request;
+        result.request_tool_stream = requestToolStream;
+        result.notify = notify;
+        result.close = close;
+        result.release_response = releaseResponse;
+        result.retain_connector = retainConnector;
+        result.release_connector = releaseConnector;
+        return result;
+    }
+
+    fn retainConnector(_: ?*anyopaque) callconv(.c) void {}
+    fn releaseConnector(_: ?*anyopaque) callconv(.c) void {}
+
+    fn open(
+        raw: ?*anyopaque,
+        _: u32,
+        era_code: u32,
+        _: u32,
+        out_connection_ctx: ?*?*anyopaque,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_OPEN_FATAL));
+        const out = out_connection_ctx orelse return wire.MCP_OPEN_FATAL;
+        out.* = null;
+        _ = PublicMcpProbe.mcpVersion(era_code) orelse return wire.MCP_OPEN_FATAL;
+        const connection = std.heap.c_allocator.create(Connection) catch
+            return wire.MCP_OPEN_FATAL;
+        connection.* = .{ .owner = self, .era_code = era_code };
+        out.* = connection;
+        return wire.MCP_OPEN_OK;
+    }
+
+    fn request(
+        raw: ?*anyopaque,
+        connection_ctx: ?*anyopaque,
+        request_json: wire.BytesViewV1,
+        _: u32,
+        _: ?*const wire.McpCancellationV1,
+        out_response: ?*wire.McpResponseV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_EXCHANGE_FATAL));
+        const connection: *Connection = @ptrCast(@alignCast(connection_ctx orelse
+            return wire.MCP_EXCHANGE_FATAL));
+        if (connection.owner != self) return wire.MCP_EXCHANGE_FATAL;
+        const out = out_response orelse return wire.MCP_EXCHANGE_FATAL;
+        out.* = .{
+            .struct_size = @sizeOf(wire.McpResponseV1),
+            .http_status = 0,
+            .body = .{ .ptr = null, .len = 0 },
+            .reserved = [_]u64{0} ** 2,
+        };
+        const body = sdk.borrowedBytes(request_json) catch return wire.MCP_EXCHANGE_FATAL;
+        const result = self.post(connection.era_code, body) catch
+            return wire.MCP_EXCHANGE_NETWORK_ERROR;
+        out.http_status = result.status;
+        if (result.body.len == 0) {
+            std.heap.c_allocator.free(result.body);
+        } else {
+            out.body = .{ .ptr = result.body.ptr, .len = result.body.len };
+        }
+        return wire.MCP_EXCHANGE_RESPONSE;
+    }
+
+    fn requestToolStream(
+        raw: ?*anyopaque,
+        connection_ctx: ?*anyopaque,
+        request_json: wire.BytesViewV1,
+        timeout_ms: u32,
+        cancellation: ?*const wire.McpCancellationV1,
+        sink: ?*const wire.HostResultSinkV1,
+    ) callconv(.c) u32 {
+        var response = wire.McpResponseV1{
+            .struct_size = @sizeOf(wire.McpResponseV1),
+            .http_status = 0,
+            .body = .{ .ptr = null, .len = 0 },
+            .reserved = [_]u64{0} ** 2,
+        };
+        const status = request(
+            raw,
+            connection_ctx,
+            request_json,
+            timeout_ms,
+            cancellation,
+            &response,
+        );
+        defer releaseResponse(raw, connection_ctx, &response.body);
+        if (status != wire.MCP_EXCHANGE_RESPONSE) return status;
+        if (response.http_status == 401 or response.http_status == 403)
+            return wire.MCP_EXCHANGE_AUTH_ERROR;
+        if (response.http_status < 200 or response.http_status >= 300)
+            return wire.MCP_EXCHANGE_SERVER_ERROR;
+        const destination = sink orelse return wire.MCP_EXCHANGE_FATAL;
+        if (destination.struct_size != @sizeOf(wire.HostResultSinkV1) or
+            destination.write == null or response.body.ptr == null)
+            return wire.MCP_EXCHANGE_FATAL;
+        const bytes = response.body.ptr.?[0..@intCast(response.body.len)];
+        return if (destination.write.?(destination.ctx, sdk.bytesView(bytes)) == wire.HOST_SINK_OK)
+            wire.MCP_EXCHANGE_RESPONSE
+        else
+            wire.MCP_EXCHANGE_FATAL;
+    }
+
+    fn notify(
+        raw: ?*anyopaque,
+        connection_ctx: ?*anyopaque,
+        notification_json: wire.BytesViewV1,
+        _: u32,
+        _: ?*const wire.McpCancellationV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_NOTIFY_FAILED));
+        const connection: *Connection = @ptrCast(@alignCast(connection_ctx orelse
+            return wire.MCP_NOTIFY_FAILED));
+        if (connection.owner != self) return wire.MCP_NOTIFY_FAILED;
+        const body = sdk.borrowedBytes(notification_json) catch return wire.MCP_NOTIFY_FAILED;
+        const result = self.post(connection.era_code, body) catch
+            return wire.MCP_NOTIFY_FAILED;
+        defer std.heap.c_allocator.free(result.body);
+        return if (result.status >= 200 and result.status < 300)
+            wire.MCP_NOTIFY_OK
+        else
+            wire.MCP_NOTIFY_FAILED;
+    }
+
+    fn post(self: *@This(), era_code: u32, body: []const u8) !HttpResult {
+        var io_runtime = std.Io.Threaded.init(std.heap.c_allocator, .{});
+        defer io_runtime.deinit();
+        var client = std.http.Client{
+            .allocator = std.heap.c_allocator,
+            .io = io_runtime.io(),
+        };
+        defer client.deinit();
+        const uri = try std.Uri.parse(self.url);
+        var request_value = try client.request(.POST, uri, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = "accept", .value = "application/json, text/event-stream" },
+                .{
+                    .name = "MCP-Protocol-Version",
+                    .value = PublicMcpProbe.mcpVersion(era_code) orelse return error.InvalidEra,
+                },
+            },
+        });
+        defer request_value.deinit();
+        try request_value.sendBodyComplete(@constCast(body));
+        var redirect_buf: [4096]u8 = undefined;
+        const response = try request_value.receiveHead(&redirect_buf);
+        var transfer_buf: [8192]u8 = undefined;
+        const reader = request_value.reader.bodyReader(
+            &transfer_buf,
+            response.head.transfer_encoding,
+            response.head.content_length,
+        );
+        return .{
+            .status = core.api_http_status.ResponseStatus.capture(&response).code,
+            .body = try reader.allocRemaining(
+                std.heap.c_allocator,
+                std.Io.Limit.limited(1024 * 1024),
+            ),
+        };
+    }
+
+    fn close(raw: ?*anyopaque, connection_ctx: ?*anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        const connection: *Connection = @ptrCast(@alignCast(connection_ctx orelse return));
+        if (connection.owner != self) return;
+        self.closes += 1;
+        std.heap.c_allocator.destroy(connection);
+    }
+
+    fn releaseResponse(
+        raw: ?*anyopaque,
+        connection_ctx: ?*anyopaque,
+        response: ?*wire.OwnedBytesV1,
+    ) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        const connection: *Connection = @ptrCast(@alignCast(connection_ctx orelse return));
+        if (connection.owner != self) return;
+        const out = response orelse return;
+        if (out.ptr) |ptr| {
+            const len = std.math.cast(usize, out.len) orelse return;
+            std.heap.c_allocator.free(ptr[0..len]);
+            self.releases += 1;
+        }
+        out.* = .{ .ptr = null, .len = 0 };
     }
 };
 
@@ -1309,6 +1537,164 @@ const PublicCheckpointBuffer = struct {
         return wire.CHECKPOINT_IO_OK;
     }
 };
+
+test "L2 Revision 9 hard-cut real HTTP Connector AUTO downgrades a bare 400 probe" {
+    const bodies = [_][]const u8{
+        "",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"http-test\",\"version\":\"1\"}}}",
+        "",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"weather\",\"inputSchema\":{\"type\":\"object\"}}]}}",
+    };
+    const statuses = [_][]const u8{
+        "HTTP/1.1 400 Bad Request",
+        "HTTP/1.1 200 OK",
+        "HTTP/1.1 202 Accepted",
+        "HTTP/1.1 200 OK",
+    };
+    var http_server = try harness.MockServer.startHttpCassette(&bodies, &statuses);
+    defer http_server.stop();
+    const url = try http_server.urlOwned(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    var connector = PublicHttpMcpConnector{ .url = url };
+
+    var server = std.mem.zeroes(wire.McpServerV1);
+    server.struct_size = @sizeOf(wire.McpServerV1);
+    server.transport_code = wire.MCP_TRANSPORT_STREAMABLE_HTTP;
+    server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
+    server.server_binding_identity = [_]u8{0x71} ** 32;
+    server.configuration_fingerprint = [_]u8{0x72} ** 32;
+    server.namespace = sdk.bytesView("http_auto");
+    server.client_name = sdk.bytesView("agentcore-hardcut-test");
+    server.client_version = sdk.bytesView("9");
+    server.timeout_ms = 5000;
+    server.connector = connector.connector();
+    const servers = [_]wire.McpServerV1{server};
+    var config = std.mem.zeroes(wire.RuntimeConfigV1);
+    config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    config.mcp_servers = &servers;
+    config.mcp_server_count = servers.len;
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    const create_status = api.runtimeCreate()(&config, &runtime, &diagnostic);
+    if (create_status != wire.STATUS_OK) {
+        const message = sdk.borrowedBytes(.{ .ptr = diagnostic.ptr, .len = diagnostic.len }) catch "";
+        std.debug.print("real HTTP MCP runtime_create failed: {s}\n", .{message});
+    }
+    try std.testing.expectEqual(wire.STATUS_OK, create_status);
+    var generation: u64 = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+    );
+    try std.testing.expectEqual(@as(u64, 1), generation);
+
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+    );
+    const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    if (decoded.value.servers.len == 0)
+        std.debug.print("real HTTP MCP catalog: {s}\n", .{encoded});
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.servers.len);
+    try std.testing.expectEqualStrings(
+        "2025-11-25",
+        decoded.value.servers[0].negotiated_protocol,
+    );
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.tools.len);
+    api.bufferRelease()(&description);
+    try std.testing.expectEqual(@as(usize, 4), http_server.requestCount());
+    try std.testing.expectEqual(@as(u32, 2), connector.releases);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeDestroy()(runtime, &diagnostic),
+    );
+    runtime = null;
+    try std.testing.expectEqual(@as(u32, 2), connector.closes);
+}
+
+test "L2 Revision 9 hard-cut real HTTP Connector AUTO preserves a Modern server" {
+    const discover =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{},\"ttlMs\":1000,\"cacheScope\":\"private\"}}";
+    const bodies = [_][]const u8{
+        discover,
+        discover,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"weather\",\"inputSchema\":{\"type\":\"object\"}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}",
+    };
+    const statuses = [_][]const u8{
+        "HTTP/1.1 200 OK",
+        "HTTP/1.1 200 OK",
+        "HTTP/1.1 200 OK",
+    };
+    var http_server = try harness.MockServer.startHttpCassette(&bodies, &statuses);
+    defer http_server.stop();
+    const url = try http_server.urlOwned(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    var connector = PublicHttpMcpConnector{ .url = url };
+
+    var server = std.mem.zeroes(wire.McpServerV1);
+    server.struct_size = @sizeOf(wire.McpServerV1);
+    server.transport_code = wire.MCP_TRANSPORT_STREAMABLE_HTTP;
+    server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
+    server.server_binding_identity = [_]u8{0x73} ** 32;
+    server.configuration_fingerprint = [_]u8{0x74} ** 32;
+    server.namespace = sdk.bytesView("http_modern");
+    server.client_name = sdk.bytesView("agentcore-hardcut-test");
+    server.client_version = sdk.bytesView("9");
+    server.timeout_ms = 5000;
+    server.connector = connector.connector();
+    const servers = [_]wire.McpServerV1{server};
+    var config = std.mem.zeroes(wire.RuntimeConfigV1);
+    config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    config.mcp_servers = &servers;
+    config.mcp_server_count = servers.len;
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&config, &runtime, &diagnostic),
+    );
+    var generation: u64 = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+    );
+
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+    );
+    const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.servers.len);
+    try std.testing.expectEqualStrings(
+        "2026-07-28",
+        decoded.value.servers[0].negotiated_protocol,
+    );
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.tools.len);
+    api.bufferRelease()(&description);
+    try std.testing.expectEqual(@as(usize, 3), http_server.requestCount());
+    try std.testing.expectEqual(@as(u32, 3), connector.releases);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeDestroy()(runtime, &diagnostic),
+    );
+    try std.testing.expectEqual(@as(u32, 2), connector.closes);
+}
 
 test "L2 Revision 7 public MCP exact 2025-06 and AUTO reopen reach one canonical catalog" {
     const cases = [_]struct {
@@ -1626,6 +2012,7 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
         transport: u32,
         probe_open_status: u32 = wire.MCP_OPEN_OK,
         probe_exchange_status: ?u32 = null,
+        notify_status: u32 = wire.MCP_NOTIFY_OK,
         expected_servers: usize,
         expected_issue: ?[]const u8,
         expected_actual_attempts: u32,
@@ -1698,6 +2085,14 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
             .expected_protocol = "2025-11-25",
         },
         .{
+            .transport = wire.MCP_TRANSPORT_STDIO,
+            .notify_status = wire.MCP_NOTIFY_FAILED,
+            .expected_servers = 0,
+            .expected_issue = "connection_failed",
+            .expected_actual_attempts = 1,
+            .expected_request_attempts = 2,
+        },
+        .{
             .transport = wire.MCP_TRANSPORT_STREAMABLE_HTTP,
             .probe_exchange_status = wire.MCP_EXCHANGE_NETWORK_ERROR,
             .expected_servers = 0,
@@ -1747,6 +2142,7 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
             .server_era_code = wire.MCP_ERA_2025_11_25,
             .probe_open_status = case.probe_open_status,
             .probe_exchange_status = case.probe_exchange_status,
+            .notify_status = case.notify_status,
         };
         var server = std.mem.zeroes(wire.McpServerV1);
         server.struct_size = @sizeOf(wire.McpServerV1);
@@ -2709,7 +3105,7 @@ test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
     );
 }
 
-test "L2 Revision 7 public MCP checkpoint restore facade preserves Conversation under narrower current authority" {
+test "L2 public MCP checkpoint restore facade preserves Conversation under narrower current authority" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

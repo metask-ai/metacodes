@@ -201,6 +201,127 @@ pub fn parseDiscoverResponse(
     return .{ .value = owned };
 }
 
+/// Probe parsing preserves a strictly validated -32022 response as version
+/// evidence. Other callers keep using `parseDiscoverResponse`, where every
+/// remote error remains a diagnostic.
+pub fn parseDiscoverProbeResponse(
+    backing: std.mem.Allocator,
+    encoded: []const u8,
+    expected_id: u64,
+    limits: canonical.Limits,
+) error{OutOfMemory}!canonical.Outcome(canonical.OwnedHandshake) {
+    var owned = canonical.OwnedHandshake.init(backing, .modern_2026_07_28);
+    const allocator = owned.allocator();
+    const envelope = wire.parseResponseEnvelope(
+        allocator,
+        encoded,
+        expected_id,
+        .discovery,
+        limits,
+    ) catch |err| {
+        owned.deinit();
+        return err;
+    };
+    const value = switch (envelope) {
+        .diagnostic => |diagnostic| {
+            owned.deinit();
+            return .{ .diagnostic = diagnostic };
+        },
+        .value => |value| value,
+    };
+    switch (value) {
+        .result => {
+            owned.deinit();
+            return parseDiscoverResponse(backing, encoded, expected_id, limits);
+        },
+        .remote_error => |remote_error| {
+            if (remote_error.code == wire.METHOD_NOT_FOUND) {
+                owned.deinit();
+                return .{ .diagnostic = .{
+                    .code = .method_not_found,
+                    .phase = .discovery,
+                    .rpc_code = remote_error.code,
+                } };
+            }
+            if (remote_error.code != wire.UNSUPPORTED_PROTOCOL_VERSION) {
+                owned.deinit();
+                return .{ .diagnostic = .{
+                    .code = .remote_error,
+                    .phase = .discovery,
+                    .rpc_code = remote_error.code,
+                } };
+            }
+            const data = remote_error.data orelse {
+                owned.deinit();
+                return unsupportedVersionFieldFailure();
+            };
+            if (data != .object) {
+                owned.deinit();
+                return unsupportedVersionFieldFailure();
+            }
+            const requested = data.object.get("requested") orelse {
+                owned.deinit();
+                return unsupportedVersionFieldFailure();
+            };
+            const supported = data.object.get("supported") orelse {
+                owned.deinit();
+                return unsupportedVersionFieldFailure();
+            };
+            if (requested != .string or
+                !std.mem.eql(u8, requested.string, canonical.MODERN_VERSION) or
+                supported != .array or supported.array.items.len == 0 or
+                supported.array.items.len > limits.max_versions)
+            {
+                owned.deinit();
+                return unsupportedVersionFieldFailure();
+            }
+            canonical.validateText(requested.string, limits.max_text_bytes) catch {
+                owned.deinit();
+                return unsupportedVersionFieldFailure();
+            };
+            const versions = allocator.alloc([]const u8, supported.array.items.len) catch {
+                owned.deinit();
+                return error.OutOfMemory;
+            };
+            for (supported.array.items, 0..) |version, index| {
+                if (version != .string or version.string.len == 0 or
+                    version.string.len > limits.max_text_bytes)
+                {
+                    owned.deinit();
+                    return unsupportedVersionFieldFailure();
+                }
+                canonical.validateText(version.string, limits.max_text_bytes) catch {
+                    owned.deinit();
+                    return unsupportedVersionFieldFailure();
+                };
+                // An unsupported-version response cannot coherently advertise
+                // the exact requested version as supported.
+                if (std.mem.eql(u8, version.string, requested.string)) {
+                    owned.deinit();
+                    return unsupportedVersionFieldFailure();
+                }
+                for (versions[0..index]) |existing| {
+                    if (std.mem.eql(u8, existing, version.string)) {
+                        owned.deinit();
+                        return unsupportedVersionFieldFailure();
+                    }
+                }
+                versions[index] = version.string;
+            }
+            owned.supported_versions = versions;
+            return .{ .value = owned };
+        },
+    }
+}
+
+fn unsupportedVersionFieldFailure() canonical.Outcome(canonical.OwnedHandshake) {
+    return .{ .diagnostic = .{
+        .code = .invalid_field,
+        .phase = .discovery,
+        .rpc_code = wire.UNSUPPORTED_PROTOCOL_VERSION,
+    } };
+}
+
 pub fn parseListToolsResponse(
     backing: std.mem.Allocator,
     encoded: []const u8,
@@ -460,6 +581,38 @@ test "server discover does not require list-result cache metadata" {
     try std.testing.expect(parsed == .value);
     try std.testing.expect(parsed.value.cache.ttl_ms == null);
     try std.testing.expectEqual(canonical.CacheScope.private, parsed.value.cache.scope);
+}
+
+test "unsupported-version error rejects a supported list containing the requested era" {
+    var parsed = try parseDiscoverProbeResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"error\":{\"code\":-32022,\"message\":\"unsupported\",\"data\":{\"requested\":\"2026-07-28\",\"supported\":[\"2026-07-28\",\"2025-11-25\"]}}}",
+        6,
+        .{},
+    );
+    defer if (parsed == .value) parsed.value.deinit();
+    try std.testing.expect(parsed == .diagnostic);
+    try std.testing.expectEqual(canonical.DiagnosticCode.invalid_field, parsed.diagnostic.code);
+    try std.testing.expectEqual(@as(?i64, wire.UNSUPPORTED_PROTOCOL_VERSION), parsed.diagnostic.rpc_code);
+}
+
+test "discover handshake owns parsed text after the response buffer is released" {
+    const allocator = std.testing.allocator;
+    const response = try allocator.dupe(
+        u8,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{" ++
+            "\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"]," ++
+            "\"capabilities\":{},\"instructions\":\"persist me\"}}",
+    );
+    var parsed = try parseDiscoverResponse(allocator, response, 6, .{});
+    try std.testing.expect(parsed == .value);
+
+    @memset(response, 0xaa);
+    allocator.free(response);
+    defer parsed.value.deinit();
+
+    try std.testing.expectEqualStrings("2026-07-28", parsed.value.supported_versions[0]);
+    try std.testing.expectEqualStrings("persist me", parsed.value.instructions.?);
 }
 
 test "modern tools list preserves full schemas and derives bound identity" {

@@ -375,13 +375,18 @@ fn appendDerived(
 /// p33 取证:filterwarnings 史上全 1.0,陈年 author 义务仍每轮 nudge,
 /// agent 被推去修鬼问题把好代码改坏(1.0→0.5)。棘轮在未解决时救命、
 /// 在已解决时投毒——已解决 ⇒ 零义务(Lean 镜面 solved_quiescence)。
-/// v43 重放自证伪:已解静默的前提是"声明的最佳可复现"。历史存在已解行
-/// (claimed),而尾部连续 REPRO_GRACE_ROUNDS 行全部未达 → 声明对当前环境
-/// 不可复现(p44b/p45 取证:声明 1.0 的工件重放两轮逐字节 0.4545——工件
-/// 通道曾只载新建文件,既有文件的接线 hunks 丢失,静默又拒载全部压力针,
-/// 平台自锁)。第一次回归保留静默(REGRESSED 重放一次机会);连续两轮未达
-/// 才解除,恢复满压力栈。Lean 镜面 claimInvalidated/one_regression_keeps_grace。
-pub const REPRO_GRACE_ROUNDS: usize = 2;
+/// v43 重放自证伪:已解静默的前提是"声明的最佳可复现"。历史存在带工件的
+/// 已解行(claimed),而尾部连续 REPRO_GRACE_ROUNDS 行未达 → 声明对当前环境
+/// 不可复现(p44b/p45 取证:声明 1.0 的工件重放两轮逐字节 0.4545)。
+///
+/// v44 收紧到 1 轮(etag 取证 KG 12738):带工件的声明是**机械可执行**的复现
+/// 指令——工件逐字给出、路径明确,一次执行未达就已经是"复现失败"的完整
+/// 证据,不需要第二次确认。而 2 轮宽限制造了自反馈下滑环:成功→静默→压力
+/// 降为仅复现针→失手→仍在宽限→压力再降到 0→更差(etag 实测 nudge 3→1→0,
+/// 分数 1.0→0.5455→0.2727)。宽限期的每一轮都是在无压力状态下重复失败。
+/// 无工件的文本型声明不适用(见下方 solved_with_artifact 前置)。
+/// Lean 镜面 claimInvalidated/first_miss_invalidates。
+pub const REPRO_GRACE_ROUNDS: usize = 1;
 
 pub fn claimNotReproduced(history: []const []u8) bool {
     // 失信仅适用于**带工件的声明**:工件重放是机械可执行的复现指令,
@@ -488,6 +493,13 @@ pub fn load(
                     _ = appendArtifactFirst(a, &combined, self_evolution.taskIdentity(task_hint), history1.items, newest_row);
                 }
             }
+            // v44 压力兜底的归宿(实测推演 + 红检验证):本分支曾打算在
+            // "已解静默 + 最新行回归"时补挂派生针, 但收紧宽限(REPRO_GRACE_ROUNDS=1)
+            // 后该状态**不可达**——最新行回归即构成 1 连败, 带工件的声明立刻失信,
+            // 控制流转入下方满压力栈, 根本不进 reproduce_only。故不留死代码:
+            // 零压力回归由失信路径消除, 而非由此处兜底。若将来放宽宽限, 需同时
+            // 恢复此兜底(Lean pressureNeedles 仍保留该形状与 no_artifact_stays_silent
+            // 守卫, 作为放宽时的规格)。
             if (combined.items.len == 0) {
                 arena.deinit();
                 return null;

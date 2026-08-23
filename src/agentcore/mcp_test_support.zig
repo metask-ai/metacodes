@@ -13,6 +13,9 @@ pub const Server = struct {
     output_schema_json: []const u8 =
         "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"]}",
     result_padding_bytes: usize = 0,
+    ttl_ms: u64 = 1000,
+    paginate: bool = false,
+    required_task: bool = false,
     opens: u32 = 0,
     closes: u32 = 0,
     calls: u32 = 0,
@@ -56,8 +59,8 @@ pub const Server = struct {
         const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null)
             try std.fmt.allocPrint(
                 allocator,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
-                .{id},
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
+                .{ id, self.ttl_ms },
             )
         else if (std.mem.indexOf(u8, encoded, "initialize") != null)
             try std.fmt.allocPrint(
@@ -65,20 +68,36 @@ pub const Server = struct {
                 "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"agentcore-test\",\"version\":\"1\"}}}}}}",
                 .{ id, self.era.version() },
             )
-        else if (std.mem.indexOf(u8, encoded, "tools/list") != null)
-            switch (self.era) {
+        else if (std.mem.indexOf(u8, encoded, "tools/list") != null) blk: {
+            if (self.paginate) {
+                if (self.era != .modern_2026_07_28) return .server_error;
+                break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"{s}\",\"inputSchema\":{s},\"outputSchema\":{s}}}],\"nextCursor\":\"again\",\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
+                    .{ id, self.tool_name, self.input_schema_json, self.output_schema_json, self.ttl_ms },
+                );
+            }
+            if (self.required_task) {
+                if (self.era != .modern_2026_07_28) return .server_error;
+                break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"tasked\",\"inputSchema\":{{\"type\":\"object\"}},\"execution\":{{\"taskSupport\":\"required\"}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
+                    .{ id, self.ttl_ms },
+                );
+            }
+            break :blk switch (self.era) {
                 .modern_2026_07_28 => try std.fmt.allocPrint(
                     allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"{s}\",\"inputSchema\":{s},\"outputSchema\":{s}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
-                    .{ id, self.tool_name, self.input_schema_json, self.output_schema_json },
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"{s}\",\"inputSchema\":{s},\"outputSchema\":{s}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
+                    .{ id, self.tool_name, self.input_schema_json, self.output_schema_json, self.ttl_ms },
                 ),
                 .classic_2025_11_25, .classic_2025_06_18 => try std.fmt.allocPrint(
                     allocator,
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"tools\":[{{\"name\":\"{s}\",\"inputSchema\":{s},\"outputSchema\":{s}}}]}}}}",
                     .{ id, self.tool_name, self.input_schema_json, self.output_schema_json },
                 ),
-            }
-        else if (std.mem.indexOf(u8, encoded, "tools/call") != null) blk: {
+            };
+        } else if (std.mem.indexOf(u8, encoded, "tools/call") != null) blk: {
             self.calls += 1;
             const padding = try allocator.alloc(u8, self.result_padding_bytes);
             defer allocator.free(padding);
@@ -96,7 +115,7 @@ pub const Server = struct {
                 ),
             };
         } else return .server_error;
-        return .{ .response = response };
+        return .{ .response = .{ .http_status = 0, .body = response } };
     }
 
     fn notify(_: *anyopaque, _: []const u8, _: u32, _: runtime.Cancellation) anyerror!void {}

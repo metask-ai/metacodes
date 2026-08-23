@@ -31,6 +31,9 @@ pub const Limits = struct {
     max_servers: usize = 64,
     max_namespace_bytes: usize = MAX_NAMESPACE_BYTES,
     max_issues: usize = 4096,
+    /// Logical bytes retained by one published generation, including its
+    /// ServerInstance catalogs and immutable snapshot projection.
+    max_snapshot_bytes: usize = 64 * 1024 * 1024,
     legacy_ttl_ms: u64 = 30_000,
     max_ttl_ms: u64 = 300_000,
 };
@@ -80,6 +83,7 @@ pub const ToolIssue = union(enum) {
 pub const IssueKind = union(enum) {
     connection: runtime.ConnectFailure,
     tool: ToolIssue,
+    truncated,
 };
 
 pub const CatalogIssue = struct {
@@ -93,6 +97,7 @@ pub const ServerRecord = struct {
     server_binding_identity: [32]u8,
     instance_id: instance_pool.InstanceId,
     era: canonical.Era,
+    protocol_limits: canonical.Limits,
     fingerprint: [32]u8,
     expires_at_ns: util_time.Nanos,
     cache_scope: canonical.CacheScope,
@@ -223,6 +228,9 @@ pub const Snapshot = struct {
     pub fn describe(
         self: *const Snapshot,
         backing: std.mem.Allocator,
+        desired_revision: u64,
+        active_revision: u64,
+        convergence: Convergence,
     ) Error!Description {
         var arena = std.heap.ArenaAllocator.init(backing);
         errdefer arena.deinit();
@@ -296,9 +304,9 @@ pub const Snapshot = struct {
         return .{
             .arena = arena,
             .generation = self.generation,
-            .desired_revision = 0,
-            .active_revision = 0,
-            .convergence = .converged,
+            .desired_revision = desired_revision,
+            .active_revision = active_revision,
+            .convergence = convergence,
             .fingerprint = self.fingerprint,
             .servers = servers,
             .tools = tools,
@@ -311,6 +319,14 @@ fn issueParts(kind: IssueKind) struct { []const u8, []const u8 } {
     return switch (kind) {
         .connection => |failure| switch (failure) {
             .diagnostic => |diagnostic| .{ @tagName(diagnostic.code), @tagName(diagnostic.phase) },
+            .timeout => .{ "connection_timeout", "" },
+            .network_error => .{ "connection_network_error", "" },
+            .auth_error => .{ "connection_auth_error", "" },
+            .server_error => .{ "connection_server_error", "" },
+            .child_exit => .{ "connection_child_exit", "" },
+            .cancelled => .{ "connection_cancelled", "" },
+            .indeterminate => .{ "connection_indeterminate", "" },
+            .fatal => .{ "connection_fatal", "" },
             .resource_limit => .{ "server_resource_limit", "" },
             .out_of_memory => .{ "runtime_out_of_memory", "" },
         },
@@ -321,6 +337,7 @@ fn issueParts(kind: IssueKind) struct { []const u8, []const u8 } {
             },
             .task_required_unsupported => .{ "task_required_unsupported", "execution.taskSupport" },
         },
+        .truncated => .{ "issues_truncated", "max_issues" },
     };
 }
 
@@ -335,7 +352,7 @@ const OwnedSpec = struct {
     timeout_ms: u32,
     protocol_limits: canonical.Limits,
 
-    fn runtimeConfig(self: OwnedSpec) runtime.Config {
+    fn runtimeConfig(self: OwnedSpec, max_catalog_bytes: usize) runtime.Config {
         return .{
             .connector = self.connector,
             .transport = self.transport,
@@ -344,6 +361,7 @@ const OwnedSpec = struct {
             .client = self.client,
             .timeout_ms = self.timeout_ms,
             .limits = self.protocol_limits,
+            .max_catalog_bytes = max_catalog_bytes,
         };
     }
 };
@@ -406,8 +424,14 @@ fn findOwnedSpec(specs: []const OwnedSpec, binding: *const [32]u8) ?*const Owned
 
 fn snapshotCoversSpecs(snapshot: ?*const Snapshot, specs: []const OwnedSpec) bool {
     const current = snapshot orelse return false;
-    for (specs) |spec|
-        if (current.findServer(&spec.binding) == null) return false;
+    if (current.servers.len != specs.len) return false;
+    const now_ns = current.now();
+    for (specs) |spec| {
+        const server = current.findServer(&spec.binding) orelse return false;
+        if (!std.mem.eql(u8, server.namespace, spec.namespace) or
+            !server.isFreshAt(now_ns) or
+            !current.instances.isUsable(server.instance_id)) return false;
+    }
     return true;
 }
 
@@ -483,7 +507,8 @@ pub const Manager = struct {
         clock: Clock,
     ) Error!Manager {
         if (limits.max_servers == 0 or limits.max_namespace_bytes == 0 or
-            limits.max_issues == 0 or limits.legacy_ttl_ms == 0 or
+            limits.max_issues == 0 or limits.max_snapshot_bytes == 0 or
+            limits.legacy_ttl_ms == 0 or
             limits.max_ttl_ms == 0 or limits.legacy_ttl_ms > limits.max_ttl_ms or
             specs.len > limits.max_servers)
             return error.InvalidConfig;
@@ -699,11 +724,12 @@ pub const Manager = struct {
         const convergence = self.convergence;
         self.current_mutex.unlock();
         defer retained.release();
-        var description = try retained.describe(backing);
-        description.desired_revision = desired_revision;
-        description.active_revision = active_revision;
-        description.convergence = convergence;
-        return description;
+        return retained.describe(
+            backing,
+            desired_revision,
+            active_revision,
+            convergence,
+        );
     }
 
     fn beginReconcile(self: *Manager) ControlError!void {
@@ -751,6 +777,7 @@ pub const Manager = struct {
         defer instance_owners.deinit(self.allocator);
         errdefer for (instance_owners.items) |id|
             self.instances.releaseId(id);
+        var retained_bytes: usize = @sizeOf(Snapshot);
         for (specs) |spec| {
             var strict_server = strict_candidate;
             if (reuse_from) |previous| {
@@ -758,27 +785,49 @@ pub const Manager = struct {
                 const prior_server = previous.findServer(&spec.binding);
                 const unchanged = prior_spec != null and
                     instanceSpecEqual(prior_spec.?.*, spec);
-                if (unchanged and prior_server != null) {
-                    const cloned = try cloneServerRecord(
-                        a,
-                        prior_server.?,
-                        spec.namespace,
-                    );
-                    self.instances.retainId(cloned.instance_id) catch |err|
-                        return switch (err) {
-                            error.OutOfMemory => error.OutOfMemory,
-                            error.InstanceUnavailable => error.CandidateRejected,
-                            error.ResourceLimit => error.ResourceLimit,
-                        };
-                    instance_owners.append(
-                        self.allocator,
-                        cloned.instance_id,
-                    ) catch {
-                        self.instances.releaseId(cloned.instance_id);
-                        return error.OutOfMemory;
+                if (unchanged and prior_server != null and
+                    prior_server.?.isFreshAt(previous.now()))
+                {
+                    var reuse_lease: ?instance_pool.Lease = self.instances.retain(
+                        prior_server.?.instance_id,
+                    ) catch |err| switch (err) {
+                        error.InstanceUnavailable => null,
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ResourceLimit => return error.ResourceLimit,
                     };
-                    servers.append(a, cloned) catch return error.OutOfMemory;
-                    continue;
+                    if (reuse_lease) |*lease| {
+                        defer lease.deinit();
+                        const cloned = try cloneServerRecord(
+                            a,
+                            prior_server.?,
+                            spec.namespace,
+                        );
+                        try chargeBytes(
+                            &retained_bytes,
+                            catalogLogicalBytes(lease.client().catalog),
+                            self.limits.max_snapshot_bytes,
+                        );
+                        try chargeBytes(
+                            &retained_bytes,
+                            serverRecordLogicalBytes(cloned),
+                            self.limits.max_snapshot_bytes,
+                        );
+                        self.instances.retainId(cloned.instance_id) catch |err|
+                            return switch (err) {
+                                error.OutOfMemory => error.OutOfMemory,
+                                error.InstanceUnavailable => error.CandidateRejected,
+                                error.ResourceLimit => error.ResourceLimit,
+                            };
+                        instance_owners.append(
+                            self.allocator,
+                            cloned.instance_id,
+                        ) catch {
+                            self.instances.releaseId(cloned.instance_id);
+                            return error.OutOfMemory;
+                        };
+                        servers.append(a, cloned) catch return error.OutOfMemory;
+                        continue;
+                    }
                 }
                 // A server may be absent from the previous generation because
                 // its last refresh failed. It is still an unchanged desired
@@ -786,13 +835,16 @@ pub const Manager = struct {
                 // server-scoped issue and cannot reject unrelated additions.
                 if (unchanged) strict_server = false;
             }
-            const connected = runtime.connectServer(self.allocator, spec.runtimeConfig());
+            const connected = runtime.connectServer(
+                self.allocator,
+                spec.runtimeConfig(self.limits.max_snapshot_bytes),
+            );
             const client = switch (connected) {
                 .client => |value| value,
                 .failed => |failure| {
                     switch (failure) {
                         .out_of_memory => return error.OutOfMemory,
-                        .resource_limit, .diagnostic => {},
+                        else => {},
                     }
                     if (strict_server) return error.CandidateRejected;
                     try appendIssue(&issues, a, self.limits, .{
@@ -802,18 +854,30 @@ pub const Manager = struct {
                     continue;
                 },
             };
+            var client_owned = true;
+            errdefer if (client_owned) client.deinit();
+            try chargeBytes(
+                &retained_bytes,
+                catalogLogicalBytes(client.catalog),
+                self.limits.max_snapshot_bytes,
+            );
             const instance_id = self.instances.adopt(client) catch |err| {
-                client.deinit();
                 return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.ResourceLimit, error.InstanceUnavailable => error.ResourceLimit,
                 };
             };
+            client_owned = false;
             instance_owners.append(self.allocator, instance_id) catch {
                 self.instances.releaseId(instance_id);
                 return error.OutOfMemory;
             };
             const namespace = a.dupe(u8, spec.namespace) catch return error.OutOfMemory;
+            try chargeBytes(
+                &retained_bytes,
+                @sizeOf(ServerRecord) + namespace.len,
+                self.limits.max_snapshot_bytes,
+            );
             var admitted_tools: std.ArrayList(AdmittedTool) = .empty;
             defer admitted_tools.deinit(a);
             for (client.catalog.tools) |*source_tool| {
@@ -829,10 +893,21 @@ pub const Manager = struct {
                     error.InvalidSelection => error.InvalidConfig,
                     error.ResourceLimit => error.ResourceLimit,
                 };
-                const inspected = try inspectTool(self.allocator, model_name, tool);
+                const inspected = try inspectTool(
+                    self.allocator,
+                    model_name,
+                    tool,
+                    spec.protocol_limits,
+                );
                 switch (inspected) {
-                    .admitted => |admitted| admitted_tools.append(a, admitted) catch
-                        return error.OutOfMemory,
+                    .admitted => |admitted| {
+                        try chargeBytes(
+                            &retained_bytes,
+                            @sizeOf(AdmittedTool) + toolLogicalBytes(tool) + model_name.len,
+                            self.limits.max_snapshot_bytes,
+                        );
+                        admitted_tools.append(a, admitted) catch return error.OutOfMemory;
+                    },
                     .unavailable => |issue| try appendIssue(&issues, a, self.limits, .{
                         .server_binding_identity = spec.binding,
                         .tool_name = tool.identity.name,
@@ -847,6 +922,7 @@ pub const Manager = struct {
                 .server_binding_identity = spec.binding,
                 .instance_id = instance_id,
                 .era = client.era,
+                .protocol_limits = spec.protocol_limits,
                 .fingerprint = serverFingerprint(
                     self.allocator,
                     &spec.binding,
@@ -867,6 +943,12 @@ pub const Manager = struct {
             }) catch return error.OutOfMemory;
         }
         sortServers(servers.items);
+        try chargeBytes(
+            &retained_bytes,
+            std.math.mul(usize, issues.items.len, @sizeOf(CatalogIssue)) catch
+                return error.ResourceLimit,
+            self.limits.max_snapshot_bytes,
+        );
         const owned_servers = servers.toOwnedSlice(a) catch return error.OutOfMemory;
         const owned_issues = issues.toOwnedSlice(a) catch return error.OutOfMemory;
         snapshot.* = .{
@@ -911,6 +993,7 @@ fn cloneServerRecord(
         .server_binding_identity = source.server_binding_identity,
         .instance_id = source.instance_id,
         .era = source.era,
+        .protocol_limits = source.protocol_limits,
         .fingerprint = source.fingerprint,
         .expires_at_ns = source.expires_at_ns,
         .cache_scope = source.cache_scope,
@@ -959,10 +1042,16 @@ fn inspectTool(
     scratch_backing: std.mem.Allocator,
     model_name: []const u8,
     tool: canonical.Tool,
+    protocol_limits: canonical.Limits,
 ) error{OutOfMemory}!Inspection {
     if (tool.execution_mode == .task_required)
         return .{ .unavailable = .task_required_unsupported };
-    var admission = try schema.prepareTool(scratch_backing, model_name, &tool, .{});
+    var admission = try schema.prepareTool(
+        scratch_backing,
+        model_name,
+        &tool,
+        schema.Limits.fromProtocol(protocol_limits),
+    );
     return switch (admission) {
         .unavailable => |issue| .{ .unavailable = .{ .schema = issue } },
         .available => |*prepared| blk: {
@@ -981,12 +1070,13 @@ fn inspectTool(
 pub fn materializeAdmittedTool(
     backing: std.mem.Allocator,
     admitted: *const AdmittedTool,
+    protocol_limits: canonical.Limits,
 ) MaterializeError!schema.PreparedTool {
     const admission = schema.prepareTool(
         backing,
         admitted.model_name,
         &admitted.canonical,
-        .{},
+        schema.Limits.fromProtocol(protocol_limits),
     ) catch return error.OutOfMemory;
     return switch (admission) {
         .unavailable => error.AdmissionInvariantViolation,
@@ -1048,7 +1138,14 @@ fn appendIssue(
     limits: Limits,
     issue: CatalogIssue,
 ) Error!void {
-    if (issues.items.len == limits.max_issues) return error.ResourceLimit;
+    if (issues.items.len == limits.max_issues) return;
+    if (issues.items.len + 1 == limits.max_issues) {
+        issues.append(allocator, .{
+            .server_binding_identity = issue.server_binding_identity,
+            .kind = .truncated,
+        }) catch return error.OutOfMemory;
+        return;
+    }
     issues.append(allocator, issue) catch return error.OutOfMemory;
 }
 
@@ -1074,8 +1171,47 @@ fn deriveIssueId(
 fn validNamespace(value: []const u8, max_bytes: usize) bool {
     if (value.len == 0 or value.len > max_bytes or
         !std.ascii.isAlphabetic(value[0])) return false;
+    if (std.mem.indexOf(u8, value, "__") != null) return false;
     for (value) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
     return true;
+}
+
+fn chargeBytes(used: *usize, amount: usize, maximum: usize) error{ResourceLimit}!void {
+    const next = std.math.add(usize, used.*, amount) catch return error.ResourceLimit;
+    if (next > maximum) return error.ResourceLimit;
+    used.* = next;
+}
+
+fn optionalLen(value: ?[]const u8) usize {
+    return if (value) |bytes| bytes.len else 0;
+}
+
+fn toolLogicalBytes(tool: canonical.Tool) usize {
+    return @sizeOf(canonical.Tool) +
+        tool.identity.name.len +
+        optionalLen(tool.title) +
+        optionalLen(tool.description) +
+        tool.input_schema_json.len +
+        optionalLen(tool.output_schema_json) +
+        optionalLen(tool.annotations_json) +
+        optionalLen(tool.icons_json) +
+        optionalLen(tool.meta_json) +
+        optionalLen(tool.execution_json) +
+        tool.raw_json.len;
+}
+
+fn catalogLogicalBytes(owned: canonical.OwnedCatalog) usize {
+    var total: usize = @sizeOf(canonical.OwnedCatalog) + optionalLen(owned.meta_json);
+    for (owned.tools) |tool| total +|= toolLogicalBytes(tool);
+    return total;
+}
+
+fn serverRecordLogicalBytes(server: ServerRecord) usize {
+    var total: usize = @sizeOf(ServerRecord) + server.namespace.len;
+    for (server.admitted_tools) |admitted|
+        total +|= @sizeOf(AdmittedTool) + admitted.model_name.len +
+            toolLogicalBytes(admitted.canonical);
+    return total;
 }
 
 fn serverFingerprint(
@@ -1147,13 +1283,10 @@ fn allZero(value: []const u8) bool {
     return true;
 }
 
+const test_support = @import("mcp_test_support.zig");
+
 const Fake = struct {
-    opens: u8 = 0,
-    closes: u8 = 0,
-    ttl_ms: u64 = 1000,
-    tool_count: u8 = 1,
-    paginate: bool = false,
-    required_task: bool = false,
+    server: test_support.Server = .{},
     fail_open_oom: bool = false,
     fail_open: bool = false,
     reenter_manager: ?*Manager = null,
@@ -1163,13 +1296,15 @@ const Fake = struct {
     block_open: bool = false,
     open_waiting: bool = false,
 
-    const Conn = struct { owner: *Fake };
-
     fn connector(self: *Fake) runtime.Connector {
         return .{ .ctx = self, .open_fn = open };
     }
 
-    fn open(raw: *anyopaque, _: runtime.ConnectionPurpose, _: canonical.Era) anyerror!runtime.OpenOutcome {
+    fn open(
+        raw: *anyopaque,
+        purpose: runtime.ConnectionPurpose,
+        era: canonical.Era,
+    ) anyerror!runtime.OpenOutcome {
         const self: *Fake = @ptrCast(@alignCast(raw));
         if (self.reenter_manager) |manager| {
             self.reenter_manager = null;
@@ -1187,77 +1322,7 @@ const Fake = struct {
         self.block_mutex.unlock();
         if (self.fail_open_oom) return error.OutOfMemory;
         if (self.fail_open) return .server_error;
-        const connection = try std.heap.c_allocator.create(Conn);
-        connection.* = .{ .owner = self };
-        self.opens += 1;
-        return .{ .connection = .{
-            .ctx = connection,
-            .request_fn = request,
-            .tool_request = .{ .completed = request },
-            .notify_fn = notify,
-            .close_fn = close,
-        } };
-    }
-
-    fn request(
-        raw: *anyopaque,
-        allocator: std.mem.Allocator,
-        encoded: []const u8,
-        _: u32,
-        _: runtime.Cancellation,
-    ) anyerror!runtime.ExchangeOutcome {
-        const connection: *Conn = @ptrCast(@alignCast(raw));
-        const id = requestId(encoded) orelse return .server_error;
-        const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null)
-            try std.fmt.allocPrint(
-                allocator,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                .{ id, connection.owner.ttl_ms },
-            )
-        else if (std.mem.indexOf(u8, encoded, "tools/list") != null)
-            if (connection.owner.paginate)
-                try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"nextCursor\":\"again\",\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                    .{ id, connection.owner.ttl_ms },
-                )
-            else if (connection.owner.required_task)
-                try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"tasked\",\"inputSchema\":{{\"type\":\"object\"}},\"execution\":{{\"taskSupport\":\"required\"}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                    .{ id, connection.owner.ttl_ms },
-                )
-            else if (connection.owner.tool_count == 1)
-                try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}}}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                    .{ id, connection.owner.ttl_ms },
-                )
-            else
-                try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\"}}}},{{\"name\":\"alerts\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                    .{ id, connection.owner.ttl_ms },
-                )
-        else
-            return .server_error;
-        return .{ .response = response };
-    }
-
-    fn notify(_: *anyopaque, _: []const u8, _: u32, _: runtime.Cancellation) anyerror!void {}
-
-    fn close(raw: *anyopaque) void {
-        const connection: *Conn = @ptrCast(@alignCast(raw));
-        connection.owner.closes += 1;
-        std.heap.c_allocator.destroy(connection);
-    }
-
-    fn requestId(encoded: []const u8) ?u64 {
-        const marker = "\"id\":";
-        const start = (std.mem.indexOf(u8, encoded, marker) orelse return null) + marker.len;
-        var end = start;
-        while (end < encoded.len and std.ascii.isDigit(encoded[end])) : (end += 1) {}
-        return std.fmt.parseInt(u64, encoded[start..end], 10) catch null;
+        return self.server.connector().open(purpose, era);
     }
 };
 
@@ -1318,10 +1383,10 @@ test "catalog refresh publishes generations while retained Run snapshot remains 
         &description.tools[0].permission_binding,
         0,
     ));
-    try std.testing.expectEqual(@as(u8, 4), fake.opens);
+    try std.testing.expectEqual(@as(u32, 4), fake.server.opens);
     // Each disposable probe and the Manager's released generation-1 owner are
     // closed; the explicit `first` retain keeps its actual connection alive.
-    try std.testing.expectEqual(@as(u8, 2), fake.closes);
+    try std.testing.expectEqual(@as(u32, 2), fake.server.closes);
 }
 
 test "Connector callback reentry is rejected instead of deadlocking" {
@@ -1462,7 +1527,7 @@ test "declarative apply reuses unchanged instances and rejects failed candidates
     const no_op = try manager.apply(1, &initial);
     try std.testing.expectEqual(ApplyDisposition.applied, no_op.disposition);
     try std.testing.expectEqual(@as(u64, 1), no_op.catalog_generation);
-    try std.testing.expectEqual(@as(u8, 2), stable.opens);
+    try std.testing.expectEqual(@as(u32, 2), stable.server.opens);
 
     const expanded = [_]ServerSpec{
         initial[0],
@@ -1483,8 +1548,8 @@ test "declarative apply reuses unchanged instances and rejects failed candidates
         stable_instance,
         second.findServer(&stable_binding).?.instance_id,
     );
-    try std.testing.expectEqual(@as(u8, 2), stable.opens);
-    try std.testing.expectEqual(@as(u8, 2), added.opens);
+    try std.testing.expectEqual(@as(u32, 2), stable.server.opens);
+    try std.testing.expectEqual(@as(u32, 2), added.server.opens);
 
     const rejected_specs = [_]ServerSpec{
         .{
@@ -1571,7 +1636,7 @@ test "unchanged unavailable server does not reject an unrelated addition" {
     defer description.deinit();
     try std.testing.expectEqual(@as(usize, 2), description.servers.len);
     try std.testing.expectEqual(@as(usize, 1), description.issues.len);
-    try std.testing.expectEqual(@as(u32, 2), added.opens);
+    try std.testing.expectEqual(@as(u32, 2), added.server.opens);
 }
 
 test "reapplying an unchanged desired set reconnects a missing server" {
@@ -1632,8 +1697,8 @@ test "rejected candidate releases instances acquired before the failure" {
     const report = try manager.apply(1, &candidate);
     try std.testing.expectEqual(ApplyDisposition.rejected, report.disposition);
     try std.testing.expectEqual(@as(u64, 1), report.catalog_generation);
-    try std.testing.expect(admitted_first.opens != 0);
-    try std.testing.expectEqual(admitted_first.opens, admitted_first.closes);
+    try std.testing.expect(admitted_first.server.opens != 0);
+    try std.testing.expectEqual(admitted_first.server.opens, admitted_first.server.closes);
     var current = try manager.describeCurrent(std.testing.allocator);
     defer current.deinit();
     try std.testing.expectEqual(@as(usize, 0), current.servers.len);
@@ -1684,7 +1749,7 @@ test "catalog description uses an exact destination window for every server" {
 }
 
 test "catalog freshness is clocked bounded and visible through description" {
-    var fake = Fake{ .ttl_ms = 1000 };
+    var fake = Fake{ .server = .{ .ttl_ms = 1000 } };
     var clock = TestClock{ .now_ns = 10 * std.time.ns_per_s };
     const specs = [_]ServerSpec{.{
         .binding = [_]u8{0x37} ** 32,
@@ -1716,7 +1781,7 @@ test "catalog freshness is clocked bounded and visible through description" {
 }
 
 test "one server resource limit does not suppress unrelated catalog entries" {
-    var over_limit = Fake{ .paginate = true };
+    var over_limit = Fake{ .server = .{ .paginate = true } };
     var healthy = Fake{};
     const specs = [_]ServerSpec{
         .{
@@ -1860,11 +1925,10 @@ test "catalog description resolves stable issue identity without live handles" {
 }
 
 test "Catalog excludes broken Provider projections and required-task tools" {
-    const fixture = @import("mcp_test_support.zig");
-    var opaque_schema = fixture.Server{
+    var opaque_schema = test_support.Server{
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
     };
-    var required_task = Fake{ .required_task = true };
+    var required_task = Fake{ .server = .{ .required_task = true } };
     const invalid_binding = [_]u8{0x51} ** 32;
     const required_binding = [_]u8{0x52} ** 32;
     const specs = [_]ServerSpec{
@@ -1894,7 +1958,7 @@ test "Catalog excludes broken Provider projections and required-task tools" {
     try std.testing.expectEqual(@as(usize, 0), required_server.admitted_tools.len);
     try std.testing.expect(snapshot.findTool(&required_binding, "tasked") == null);
 
-    var description = try snapshot.describe(std.testing.allocator);
+    var description = try snapshot.describe(std.testing.allocator, 0, 0, .converged);
     defer description.deinit();
     try std.testing.expectEqual(@as(usize, 0), description.tools.len);
     try std.testing.expectEqual(@as(usize, 2), description.issues.len);
@@ -1907,6 +1971,62 @@ test "Catalog excludes broken Provider projections and required-task tools" {
             saw_required_task = true;
     }
     try std.testing.expect(saw_projection_loss and saw_required_task);
+}
+
+test "issue overflow is truncated without aborting healthy catalog publication" {
+    var opaque_schema = test_support.Server{
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
+    };
+    var required_task = Fake{ .server = .{ .required_task = true } };
+    const specs = [_]ServerSpec{
+        .{
+            .binding = [_]u8{0x61} ** 32,
+            .namespace = "invalid",
+            .connector = opaque_schema.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+        .{
+            .binding = [_]u8{0x62} ** 32,
+            .namespace = "tasked",
+            .connector = required_task.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    var manager = try Manager.init(
+        std.testing.allocator,
+        &specs,
+        .{ .max_issues = 1 },
+    );
+    defer manager.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try manager.refresh());
+    var description = try manager.describeCurrent(std.testing.allocator);
+    defer description.deinit();
+    try std.testing.expectEqual(@as(usize, 2), description.servers.len);
+    try std.testing.expectEqual(@as(usize, 1), description.issues.len);
+    try std.testing.expectEqualStrings("issues_truncated", description.issues[0].kind);
+}
+
+test "aggregate snapshot byte budget preserves the last published generation" {
+    var fake = Fake{};
+    const binding = [_]u8{0x63} ** 32;
+    const specs = [_]ServerSpec{.{
+        .binding = binding,
+        .namespace = "bounded",
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try manager.refresh());
+    manager.limits.max_snapshot_bytes = 1;
+    try std.testing.expectError(error.ResourceLimit, manager.refresh());
+    const retained = try manager.retainCurrent();
+    defer retained.release();
+    try std.testing.expectEqual(@as(u64, 1), retained.generation);
+    try std.testing.expect(retained.findTool(&binding, "weather") != null);
 }
 
 test "catalog configuration rejects duplicate identity and unsafe namespace" {
@@ -1924,6 +2044,14 @@ test "catalog configuration rejects duplicate identity and unsafe namespace" {
         .client = .{ .name = "x", .version = "1" },
     }};
     try std.testing.expectError(error.InvalidConfig, Manager.init(std.testing.allocator, &unsafe, .{}));
+    const ambiguous = [_]ServerSpec{.{
+        .binding = [_]u8{5} ** 32,
+        .namespace = "bad__name",
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "x", .version = "1" },
+    }};
+    try std.testing.expectError(error.InvalidConfig, Manager.init(std.testing.allocator, &ambiguous, .{}));
 
     var boundary_fake = Fake{};
     const boundary_namespace = "abcdefghijklmnopqrstuvwx";
@@ -1960,5 +2088,5 @@ test "catalog configuration rejects duplicate identity and unsafe namespace" {
             .{ .max_namespace_bytes = MAX_NAMESPACE_BYTES + 8 },
         ),
     );
-    try std.testing.expectEqual(@as(u8, 0), fake.opens);
+    try std.testing.expectEqual(@as(u32, 0), fake.server.opens);
 }

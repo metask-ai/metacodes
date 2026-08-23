@@ -190,13 +190,7 @@ extern "C" {
 #define METASK_AGENTCORE_MCP_EXCHANGE_INDETERMINATE 7u
 #define METASK_AGENTCORE_MCP_EXCHANGE_FATAL 8u
 #define METASK_AGENTCORE_MCP_NOTIFY_OK 0u
-#define METASK_AGENTCORE_MCP_NOTIFY_TIMEOUT 1u
-#define METASK_AGENTCORE_MCP_NOTIFY_NETWORK_ERROR 2u
-#define METASK_AGENTCORE_MCP_NOTIFY_AUTH_ERROR 3u
-#define METASK_AGENTCORE_MCP_NOTIFY_SERVER_ERROR 4u
-#define METASK_AGENTCORE_MCP_NOTIFY_CHILD_EXIT 5u
-#define METASK_AGENTCORE_MCP_NOTIFY_CANCELLED 6u
-#define METASK_AGENTCORE_MCP_NOTIFY_FATAL 7u
+#define METASK_AGENTCORE_MCP_NOTIFY_FAILED 1u
 #define METASK_AGENTCORE_CHECKPOINT_IO_OK 0u
 #define METASK_AGENTCORE_CHECKPOINT_IO_FAILED 1u
 #define METASK_AGENTCORE_CHECKPOINT_IO_FATAL 2u
@@ -323,6 +317,9 @@ typedef struct {
 } metask_agentcore_host_stream_tool_v1;
 
 typedef uint32_t (*metask_agentcore_mcp_is_cancelled_fn_v1)(const void *);
+/* The cancellation descriptor, its ctx, and callback are borrowed only for
+ * the synchronous request/notify invocation. The Host MUST NOT retain or poll
+ * them after that callback returns. */
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;
@@ -330,6 +327,13 @@ typedef struct {
     metask_agentcore_mcp_is_cancelled_fn_v1 is_cancelled;
     uint64_t reserved[2];
 } metask_agentcore_mcp_cancellation_v1;
+
+typedef struct {
+    uint32_t struct_size;
+    uint32_t http_status;
+    metask_agentcore_owned_bytes_v1 body;
+    uint64_t reserved[2];
+} metask_agentcore_mcp_response_v1;
 
 /* Each successful open binds its opaque connection context permanently to
  * purpose_code and requested_era_code. For Streamable HTTP, the Host owns
@@ -345,11 +349,13 @@ typedef uint32_t (*metask_agentcore_mcp_open_fn_v1)(
 typedef uint32_t (*metask_agentcore_mcp_request_fn_v1)(
     void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
     const metask_agentcore_mcp_cancellation_v1 *,
-    metask_agentcore_owned_bytes_v1 *);
+    metask_agentcore_mcp_response_v1 *);
 typedef uint32_t (*metask_agentcore_mcp_request_tool_stream_fn_v1)(
     void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
     const metask_agentcore_mcp_cancellation_v1 *,
     const metask_agentcore_host_result_sink_v1 *);
+/* Notifications have one committed-success outcome. Any transport, protocol,
+ * cancellation, or Host failure returns MCP_NOTIFY_FAILED. */
 typedef uint32_t (*metask_agentcore_mcp_notify_fn_v1)(
     void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
     const metask_agentcore_mcp_cancellation_v1 *);
@@ -362,9 +368,15 @@ typedef void (*metask_agentcore_mcp_release_connector_fn_v1)(void *);
 /* Host owns connector ctx, credentials, and live connection contexts.
  * retain_connector and release_connector are mandatory and must be thread-safe;
  * they keep ctx alive across Runtime calls. Every successful open is closed
- * exactly once. Every non-empty response descriptor is released exactly once,
- * independent of request status. `request` is only for bounded MCP control
- * frames. `request_tool_stream` is mandatory for tools/call and must write the
+ * exactly once. For a completed Streamable HTTP response, request returns
+ * MCP_EXCHANGE_RESPONSE and reports its status and body through
+ * metask_agentcore_mcp_response_v1. Stdio responses use http_status == 0.
+ * Non-response outcomes use http_status == 0 and an empty body. Every
+ * non-canonical-empty body token is released exactly once by passing
+ * &response.body to release_response, independent of status. This includes an
+ * invalid { ptr != NULL, len == 0 } token. AgentCore copies valid response
+ * bytes before release. `request` is only for bounded MCP control frames.
+ * `request_tool_stream` is mandatory for tools/call and must write the
  * complete JSON-RPC response from byte zero to the borrowed kernel sink. */
 typedef struct {
     uint32_t struct_size;
@@ -1028,6 +1040,7 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_host_tool_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_host_result_sink_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_host_stream_tool_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_cancellation_v1, 40);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_response_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_connector_v1, 88);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_protocol_limits_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_server_v1, 232);
@@ -1072,6 +1085,8 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_host_tool_v1, ctx, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_host_result_sink_v1, ctx, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_host_stream_tool_v1, ctx, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_connector_v1, ctx, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_response_v1, body, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_response_v1, reserved, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, connector, 104);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, protocol_limits, 192);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, configuration_fingerprint, 200);

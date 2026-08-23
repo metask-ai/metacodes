@@ -27,8 +27,9 @@ revision cut while v1 remains experimental.
 The current experimental bundle is **ABI v1 revision 12**. Revision 12 is a
 hard-cut replacement for every earlier revision. In addition to the Revision
 11 surface, it makes `tools/call` streaming a mandatory, distinct MCP connector
-operation. The function table and original `RuntimeConfigV1` remain unchanged;
-the nested MCP connector/server POD layouts change:
+operation while retaining the full HTTP response facts required for control
+plane protocol negotiation. The function table and original `RuntimeConfigV1`
+remain unchanged; the nested MCP connector/server POD layouts change:
 
 - `metask_agentcore_api_v1` is 280 bytes and requires `abi_revision == 12`;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
@@ -39,6 +40,8 @@ the nested MCP connector/server POD layouts change:
   96 bytes; `runtime_create_with_plugins` is mandatory while the original
   `runtime_create` remains valid for a Runtime with no process packages;
 - `McpConnectorV1` and `McpServerV1` are respectively 88 and 232 bytes;
+  `McpResponseV1` is 40 bytes and carries the final HTTP status beside its
+  Host-owned bounded control-frame body;
   `request` remains the bounded control-frame operation and
   `request_tool_stream` is mandatory for `tools/call`;
 - checkpoint, restore, describe, MCP refresh/describe/apply/selection,
@@ -46,7 +49,7 @@ the nested MCP connector/server POD layouts change:
 - `SkillSourceV1`, `SkillPolicyV1`, and `SkillCatalogQueryV1` are respectively
   64, 56, and 80 bytes; `CompletionConfigV1`, `CompletionMessageV1`,
   `CompletionRequestV1`, `CompletionResultV1`, `CompletionInfoV1`, and
-  `CompletionEventV1` are respectively 88, 88, 40, 72, 72, 48, and 80 bytes;
+  `CompletionEventV1` are respectively 88, 40, 72, 72, 48, and 80 bytes;
 - the exact required capability set is `0x1ffffff`, including
   `CAP_MCP_TOOL_STREAM = 1 << 24`;
 - `manifest.json` records revision 12, table size 280, and that exact capability
@@ -779,11 +782,17 @@ environment. Credentials, live connections, and request state never enter a
 Session checkpoint.
 
 `auto` probes Modern first. A validated `MethodNotFound` may enter Classic;
-stdio probe timeout or child exit may also enter Classic, while HTTP timeout,
-network, authentication, and server failures fail closed. Classic starts with
-an exact 2025-11 request. If that response selects 2025-06, Runtime closes the
-connection and reopens exact 2025-06 once. Only the final exact-era handshake
-may publish capabilities or create the operational client.
+stdio probe timeout or child exit may also enter Classic. For Streamable HTTP,
+a completed response is reported as `MCP_EXCHANGE_RESPONSE` with its final HTTP
+status and body. A bare HTTP 400 from the disposable `server/discover` probe is
+Classic evidence; a complete, request-id-matching JSON-RPC response overrides
+that default. Strictly valid `-32022` data contributes its `supported` versions,
+and malformed typed `-32022`, other JSON-RPC errors, 401/403, every status other
+than 2xx/400, and transport failures do not downgrade. No body-shape or string
+heuristic is used. Classic starts with an exact 2025-11 request. If that response
+selects 2025-06, Runtime closes the connection and reopens exact 2025-06 once.
+Only the final exact-era handshake may publish capabilities or create the
+operational client.
 
 The Host-owned Connector is also the MCP transport compliance boundary. Every
 successful `open` must create a connection context permanently bound to the
@@ -799,22 +808,40 @@ only within the same authentication context. The Host must never change an
 existing connection's era after inspecting an initialize response: AgentCore
 closes a mismatch and performs the exact-era reopen itself.
 
+The `metask_agentcore_mcp_cancellation_v1` descriptor, its `ctx`, and its poll
+callback are borrowed only for the synchronous request or notification callback
+invocation. A Host must not retain the descriptor or poll it after that callback
+returns.
+
 | Responsibility | Owner |
 |---|---|
 | Candidate selection and validation of the server-selected protocol | AgentCore |
 | Closing a mismatch and performing an exact-era reopen | AgentCore |
 | JSON-RPC request bodies and Classic lifecycle ordering | AgentCore |
+| Probe HTTP status gate, JSON-RPC validation, and era selection | AgentCore |
 | HTTP headers, authentication, cookies, session IDs, and connection pooling | Host Connector |
+| Reporting every completed HTTP response's final status and body | Host Connector |
 | Binding one connection context to `purpose_code` and `requested_era_code` | Host Connector |
 
 Revision 12 separates MCP control and result traffic in the type system.
-`McpConnectorV1.request` returns an owned, completed response only for bounded
-discovery/initialize/catalog control frames. `request_tool_stream` is the sole
-`tools/call` operation: AgentCore creates a private Session capture before the
-callback, lends a synchronous `HostResultSinkV1`, and requires the Host to
-write the complete JSON-RPC response from byte zero. The sink advertises a
-129MiB response-frame ceiling; the final model-visible result remains subject
-to the 128MiB artifact ceiling.
+`McpConnectorV1.request` writes a 40-byte `McpResponseV1` only for bounded
+discovery/initialize/catalog control frames. Stdio responses use
+`http_status == 0`; Streamable HTTP completed responses use their final status
+in the range 200..599. Non-response outcomes use status zero and an empty body.
+`release_response` keeps its signature: canonical `{NULL,0}` is never released;
+for every other body token AgentCore calls it exactly once with
+`&response.body`, including an invalid `{ ptr != NULL, len == 0 }` token. On
+actual connections, stdio and HTTP 2xx enter the era parser, HTTP 401/403 map
+to `auth_error`, and every other HTTP status maps to `server_error` before
+protocol parsing. These failures never switch era or replay `tools/call`.
+`MCP_EXCHANGE_FATAL` permanently retires the connection from dispatch; a later
+catalog refresh must open a replacement.
+
+`request_tool_stream` is the sole `tools/call` operation: AgentCore creates a
+private Session capture before the callback, lends a synchronous
+`HostResultSinkV1`, and requires the Host to write the complete JSON-RPC
+response from byte zero. The sink advertises a 129MiB response-frame ceiling;
+the final model-visible result remains subject to the 128MiB artifact ceiling.
 
 After the callback returns `MCP_EXCHANGE_RESPONSE`, AgentCore seals the private
 capture and performs streaming UTF-8/JSON, depth, node, duplicate-key,
@@ -827,6 +854,12 @@ with `ReadArtifact`. Remote JSON-RPC errors, `isError=true` business results,
 malformed frames, cancellation, overflow, and partial connector failures are
 bounded structured errors or typed call failures and never publish the private
 capture. A connector must not retain the borrowed sink or call it after return.
+
+`metask_agentcore_mcp_notify_fn_v1` has only two outcomes:
+`MCP_NOTIFY_OK` means the notification was committed, and `MCP_NOTIFY_FAILED`
+means it was not. AgentCore does not branch on a Host-side failure category and
+does not retry or replay a failed notification; detailed transport outcomes
+belong to `open` and `request`, where AgentCore can act on them.
 
 `runtime_describe_mcp` returns `agentcore.mcp-catalog/v1`. Every server entry
 contains `server_binding_identity`, namespace, negotiated protocol,
@@ -882,12 +915,10 @@ destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
 outside Revision 12.
 
-The value-only MCP checkpoint section writes `R7MCP` state revision 2. Its
-decoder accepts only the exact `R6MCP`/revision 1 and `R7MCP`/revision 2 pairs;
-the new 2025-06 era value is appended and era remains provenance rather than a
-selection fingerprint input. This does not make AgentCore ABI Revision 6
-checkpoints loadable through Revision 12 discovery—the outer ABI remains a hard
-cut.
+The value-only MCP checkpoint section has one current `MCPSEL` format and no
+independent revision axis. Its decoder rejects every earlier `R6MCP`/`R7MCP`
+encoding. Era remains provenance rather than a selection fingerprint input.
+The outer AgentCore ABI Revision 12 remains the sole compatibility boundary.
 
 ### Model-visible MCP diagnostics
 
@@ -971,6 +1002,7 @@ ABI v1 has three ownership classes:
 |---|---|---|
 | `metask_agentcore_bytes_view_v1` inputs and event/request views | Borrowed for the current synchronous call or callback | Never released |
 | Host tool results and UI responses | Host-owned callback output | Canonical `{NULL,0}` is never released; every other descriptor is passed to its paired Host release callback exactly once, independent of status |
+| MCP response bodies | Host-owned callback output inside `metask_agentcore_mcp_response_v1` | Canonical `{NULL,0}` is never released; every other body is passed as `&response.body` to `release_response` exactly once, independent of exchange status or descriptor validity |
 | AgentCore catalog descriptors, Completion model/text/event payloads, and API diagnostics | Library-owned output | Released only with the discovered `buffer_release` function |
 
 Status controls whether callback output is consumed, not whether it is

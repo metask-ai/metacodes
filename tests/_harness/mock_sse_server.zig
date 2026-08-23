@@ -41,6 +41,10 @@ pub const MockServer = struct {
     capture_mutex: psync.Mutex = .{},
     /// cassette 模式:多轮 SSE bodies(每个连接回一条,按序)。null = 单 body 模式。
     cassette: ?[]const []const u8 = null,
+    /// Optional status line paired with each cassette body. This lets protocol
+    /// component tests exercise a non-2xx probe followed by successful exact
+    /// requests against the same endpoint.
+    cassette_status_lines: ?[]const []const u8 = null,
     /// cassette 当前轮游标(serveLoop 递增)。
     cassette_pos: usize = 0,
     /// 流中期截断:该 0-based 响应序号只发一半 SSE body 就断连(模拟正文流
@@ -121,6 +125,17 @@ pub const MockServer = struct {
             .cassette = bodies,
         };
         self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
+        return self;
+    }
+
+    pub fn startHttpCassette(
+        bodies: []const []const u8,
+        status_lines: []const []const u8,
+    ) !*MockServer {
+        if (bodies.len == 0 or bodies.len != status_lines.len)
+            return error.InvalidCassette;
+        const self = try startCassette(bodies, 0);
+        self.cassette_status_lines = status_lines;
         return self;
     }
 
@@ -264,6 +279,8 @@ pub const MockServer = struct {
             const bodies = self.cassette orelse &[_][]const u8{self.body};
             const idx = @min(self.cassette_pos, bodies.len - 1);
             self.body = bodies[idx];
+            if (self.cassette_status_lines) |status_lines|
+                self.status_line = status_lines[@min(self.cassette_pos, status_lines.len - 1)];
             const response_index = self.cassette_pos;
             self.cassette_pos += 1;
             self.current_response_cut = if (self.midstream_cut_index) |cut|

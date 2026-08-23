@@ -4,12 +4,10 @@ const std = @import("std");
 const canonical = @import("mcp_canonical.zig");
 const mcp_session = @import("mcp_session.zig");
 
-pub const STATE_REVISION: u16 = 2;
 pub const MAX_ENTRIES: usize = (canonical.Limits{}).max_tools;
 pub const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 
-const r6_magic = "R6MCP\x00\x00\x00";
-const r7_magic = "R7MCP\x00\x00\x00";
+const magic = "MCPSEL\x00\x00";
 const header_bytes: usize = 96;
 const entry_bytes: usize = 72;
 
@@ -111,8 +109,7 @@ pub fn encode(allocator: std.mem.Allocator, state: StateView) Error![]u8 {
     const bytes = allocator.alloc(u8, total) catch return error.OutOfMemory;
     errdefer allocator.free(bytes);
     @memset(bytes, 0);
-    @memcpy(bytes[0..r7_magic.len], r7_magic);
-    std.mem.writeInt(u16, bytes[8..10], STATE_REVISION, .little);
+    @memcpy(bytes[0..magic.len], magic);
     std.mem.writeInt(u64, bytes[16..24], state.catalog_generation, .little);
     @memcpy(bytes[24..56], &state.catalog_fingerprint);
     @memcpy(bytes[56..88], &state.selection_fingerprint);
@@ -135,11 +132,8 @@ pub fn decode(allocator: std.mem.Allocator, encoded: []const u8) Error!?DecodedS
     if (encoded.len == 0) return null;
     if (encoded.len < header_bytes or encoded.len > MAX_STATE_BYTES)
         return error.Corrupt;
-    const revision = std.mem.readInt(u16, encoded[8..10], .little);
-    const known_pair = (std.mem.eql(u8, encoded[0..r6_magic.len], r6_magic) and revision == 1) or
-        (std.mem.eql(u8, encoded[0..r7_magic.len], r7_magic) and revision == STATE_REVISION);
-    if (!known_pair or
-        !allZero(encoded[10..16]) or !allZero(encoded[92..96]))
+    if (!std.mem.eql(u8, encoded[0..magic.len], magic) or
+        !allZero(encoded[8..16]) or !allZero(encoded[92..96]))
         return error.Corrupt;
     const generation = std.mem.readInt(u64, encoded[16..24], .little);
     const count: usize = @intCast(std.mem.readInt(u32, encoded[88..92], .little));
@@ -156,7 +150,7 @@ pub fn decode(allocator: std.mem.Allocator, encoded: []const u8) Error!?DecodedS
         const era: canonical.Era = switch (encoded[offset + 68]) {
             0 => .modern_2026_07_28,
             1 => .classic_2025_11_25,
-            2 => if (revision == STATE_REVISION) .classic_2025_06_18 else return error.Corrupt,
+            2 => .classic_2025_06_18,
             else => return error.Corrupt,
         };
         if (!allZero(encoded[offset + 69 .. fixed_end])) return error.Corrupt;
@@ -209,9 +203,8 @@ pub fn computeSelectionFingerprint(entries: []const PersistedEntry) [32]u8 {
         }
     }.lessThan);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    // Selection identity intentionally excludes era and remains stable when a
-    // Revision 6 MCP section is decoded by Revision 7.
-    hasher.update("agentcore-r6-mcp-session-selection\x00");
+    // Era is provenance and intentionally does not affect selection identity.
+    hasher.update("agentcore-mcp-session-selection\x00");
     for (digests[0..entries.len]) |digest| hasher.update(&digest);
     var result: [32]u8 = undefined;
     hasher.final(&result);
@@ -259,15 +252,10 @@ test "MCP checkpoint state is value-only deterministic and corruption checked" {
     corrupt[56] ^= 1;
     try std.testing.expectError(error.Corrupt, decode(std.testing.allocator, corrupt));
 
-    const r7_revision_1 = try std.testing.allocator.dupe(u8, encoded);
-    defer std.testing.allocator.free(r7_revision_1);
-    std.mem.writeInt(u16, r7_revision_1[8..10], 1, .little);
-    try std.testing.expectError(error.Corrupt, decode(std.testing.allocator, r7_revision_1));
-
-    const r6_revision_2 = try std.testing.allocator.dupe(u8, encoded);
-    defer std.testing.allocator.free(r6_revision_2);
-    @memcpy(r6_revision_2[0..r6_magic.len], r6_magic);
-    try std.testing.expectError(error.Corrupt, decode(std.testing.allocator, r6_revision_2));
+    const nonzero_reserved = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(nonzero_reserved);
+    nonzero_reserved[8] = 1;
+    try std.testing.expectError(error.Corrupt, decode(std.testing.allocator, nonzero_reserved));
 
     const unknown_magic = try std.testing.allocator.dupe(u8, encoded);
     defer std.testing.allocator.free(unknown_magic);
@@ -279,16 +267,20 @@ test "MCP checkpoint state is value-only deterministic and corruption checked" {
     unknown_era[header_bytes + 68] = 3;
     try std.testing.expectError(error.Corrupt, decode(std.testing.allocator, unknown_era));
 
-    const r6 = try std.testing.allocator.dupe(u8, encoded);
-    defer std.testing.allocator.free(r6);
-    @memcpy(r6[0..r6_magic.len], r6_magic);
-    std.mem.writeInt(u16, r6[8..10], 1, .little);
-    var migrated = (try decode(std.testing.allocator, r6)).?;
-    defer migrated.deinit();
-    try std.testing.expectEqual(canonical.Era.classic_2025_11_25, migrated.entries[1].era);
+    const legacy_r6 = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(legacy_r6);
+    @memcpy(legacy_r6[0..8], "R6MCP\x00\x00\x00");
+    std.mem.writeInt(u16, legacy_r6[8..10], 1, .little);
+    try std.testing.expectError(error.Corrupt, decode(std.testing.allocator, legacy_r6));
+
+    const legacy_r7 = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(legacy_r7);
+    @memcpy(legacy_r7[0..8], "R7MCP\x00\x00\x00");
+    std.mem.writeInt(u16, legacy_r7[8..10], 2, .little);
+    try std.testing.expectError(error.Corrupt, decode(std.testing.allocator, legacy_r7));
 }
 
-test "R7 checkpoint appends 2025-06 era and encoder never emits R6" {
+test "MCP checkpoint single format supports every current era" {
     const entries = [_]PersistedEntry{.{
         .server_binding_identity = [_]u8{5} ** 32,
         .schema_fingerprint = [_]u8{6} ** 32,
@@ -302,15 +294,9 @@ test "R7 checkpoint appends 2025-06 era and encoder never emits R6" {
         .entries = &entries,
     });
     defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings(r7_magic, encoded[0..r7_magic.len]);
-    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, encoded[8..10], .little));
+    try std.testing.expectEqualStrings(magic, encoded[0..magic.len]);
+    try std.testing.expect(allZero(encoded[8..16]));
     var decoded = (try decode(std.testing.allocator, encoded)).?;
     defer decoded.deinit();
     try std.testing.expectEqual(canonical.Era.classic_2025_06_18, decoded.entries[0].era);
-
-    const forged_r6 = try std.testing.allocator.dupe(u8, encoded);
-    defer std.testing.allocator.free(forged_r6);
-    @memcpy(forged_r6[0..r6_magic.len], r6_magic);
-    std.mem.writeInt(u16, forged_r6[8..10], 1, .little);
-    try std.testing.expectError(error.Corrupt, decode(std.testing.allocator, forged_r6));
 }

@@ -292,6 +292,11 @@ pub fn validateText(value: []const u8, max_bytes: usize) Error!void {
     }
 }
 
+fn validateJsonText(value: []const u8, max_bytes: usize) Error!void {
+    if (value.len > max_bytes) return error.ResourceLimit;
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidValue;
+}
+
 pub fn validateToolName(value: []const u8, limits: Limits) Error!void {
     if (value.len == 0 or value.len > limits.max_tool_name_bytes)
         return error.InvalidValue;
@@ -303,9 +308,28 @@ pub fn encodeValue(
     value: std.json.Value,
     max_bytes: usize,
 ) Error![]const u8 {
-    const encoded = std.json.Stringify.valueAlloc(allocator, value, .{}) catch
+    // Count the escaped representation before allocating it. A small input
+    // string can expand substantially when JSON escaping is applied, so an
+    // allocate-then-check implementation would let the configured wire limit
+    // be exceeded transiently.
+    var count_buffer: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&count_buffer);
+    std.json.Stringify.value(value, .{}, &discarding.writer) catch
         return error.OutOfMemory;
-    if (encoded.len > max_bytes) return error.ResourceLimit;
+    const encoded_len_u64 = discarding.fullCount();
+    if (encoded_len_u64 > max_bytes or encoded_len_u64 > std.math.maxInt(usize))
+        return error.ResourceLimit;
+    const encoded_len: usize = @intCast(encoded_len_u64);
+
+    var allocating = std.Io.Writer.Allocating.initCapacity(
+        allocator,
+        encoded_len,
+    ) catch return error.OutOfMemory;
+    defer allocating.deinit();
+    std.json.Stringify.value(value, .{}, &allocating.writer) catch
+        return error.OutOfMemory;
+    const encoded = allocating.toOwnedSlice() catch return error.OutOfMemory;
+    std.debug.assert(encoded.len == encoded_len);
     return encoded;
 }
 
@@ -324,13 +348,15 @@ fn validateJsonValueAt(
         return error.ResourceLimit;
     nodes.* += 1;
     switch (value) {
-        .string, .number_string => |text_value| try validateText(text_value, limits.max_frame_bytes),
+        // Arbitrary JSON content may legally contain escaped C0 characters.
+        // Protocol fields apply `validateText` explicitly at their own boundary.
+        .string, .number_string => |text_value| try validateJsonText(text_value, limits.max_frame_bytes),
         .array => |array| for (array.items) |child|
             try validateJsonValueAt(child, depth + 1, nodes, limits),
         .object => |object| {
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
-                try validateText(entry.key_ptr.*, limits.max_text_bytes);
+                try validateJsonText(entry.key_ptr.*, limits.max_text_bytes);
                 try validateJsonValueAt(entry.value_ptr.*, depth + 1, nodes, limits);
             }
         },
@@ -608,4 +634,16 @@ test "MCP permission identity binds server name and schema" {
     try std.testing.expect(!allZero(&base.permissionBinding()));
     try std.testing.expect(!std.mem.eql(u8, &base.permissionBinding(), &renamed.permissionBinding()));
     try std.testing.expect(!std.mem.eql(u8, &base.permissionBinding(), &other_server.permissionBinding()));
+}
+
+test "canonical encoding rejects escaped output before allocating" {
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.ResourceLimit,
+        encodeValue(failing.allocator(), .{ .string = "\x00\x01\x02" }, 4),
+    );
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }

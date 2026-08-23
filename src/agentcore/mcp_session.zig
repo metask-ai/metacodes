@@ -249,6 +249,7 @@ pub const View = struct {
             const prepared = catalog.materializeAdmittedTool(
                 backing,
                 resolved.admitted,
+                resolved.server.protocol_limits,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.AdmissionInvariantViolation => return error.AdmissionInvariantViolation,
@@ -319,12 +320,12 @@ pub const View = struct {
         model_name: []const u8,
         arguments_json: []const u8,
     ) schema.Validation {
-        if (self.findModelTool(model_name) == null)
+        const entry = self.findModelTool(model_name) orelse
             return .{ .invalid = .not_object };
         return schema.validateArguments(
             self.allocator,
             arguments_json,
-            .{},
+            schema.Limits.fromProtocol(entry.server.protocol_limits),
         );
     }
 
@@ -443,12 +444,12 @@ pub const Environment = struct {
         name: []const u8,
         arguments_json: []const u8,
     ) schema.Validation {
-        if (self.findModelTool(name) == null)
+        const entry = self.findModelTool(name) orelse
             return .{ .invalid = .not_object };
         return schema.validateArguments(
             self.allocator,
             arguments_json,
-            .{},
+            schema.Limits.fromProtocol(entry.server.protocol_limits),
         );
     }
 
@@ -603,8 +604,8 @@ fn selectionFingerprint(
         }
     }.lessThan);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    // Must match mcp_checkpoint.zig and remain stable for R6MCP migration.
-    hasher.update("agentcore-r6-mcp-session-selection\x00");
+    // Must match mcp_checkpoint.zig.
+    hasher.update("agentcore-mcp-session-selection\x00");
     for (digests) |digest| hasher.update(&digest);
     var result: [32]u8 = undefined;
     hasher.final(&result);

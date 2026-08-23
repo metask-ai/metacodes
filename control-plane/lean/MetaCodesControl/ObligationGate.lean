@@ -208,7 +208,7 @@ invalidated claim also suspends retirement Rule B: the telemetry `best`
 field carries the unreproducible claim, and judging "no gain" against it
 would retire the historically proven breakthrough needle. -/
 
-def reproGrace : Nat := 2
+def reproGrace : Nat := 1
 
 /-- Claim invalidation: a solved row **carrying an artifact** exists and the
 trailing failure streak has exhausted the grace budget.  Artifact-backed
@@ -224,17 +224,22 @@ cap-task pin ("solved without artifact stays truly silent"). -/
 theorem textual_claim_never_invalidates (k : Nat) :
     claimInvalidated false k = false := by rfl
 
-/-- The first regression after a solved round keeps quiescence — the
-REGRESSED replay directive gets one chance before pressure returns.
-Zig mirror: "one regression keeps the replay grace". -/
-theorem one_regression_keeps_grace (s : Bool) :
-    claimInvalidated s 1 = false := by
-  cases s <;> rfl
+/-- v44: the FIRST missed replay invalidates an artifact-backed claim.
+An artifact claim is a mechanically executable instruction (verbatim body,
+explicit path), so one failed execution is already complete evidence of
+non-reproducibility — a second confirmation buys nothing and costs a round
+run at zero pressure.  etag forensics (KG 12738): the 2-round grace created
+a self-reinforcing descent — success → quiescence → pressure falls to the
+reproduce needle alone → miss → still inside grace → pressure falls to zero
+→ worse (nudges 3→1→0, score 1.0→0.5455→0.2727).
+Zig mirror: "one missed replay lifts quiescence and reloads pressure". -/
+theorem first_miss_invalidates :
+    claimInvalidated true 1 = true := by rfl
 
-/-- Two consecutive unreproduced rounds invalidate the claim.
-Zig mirror: "two failed replays restore the pressure stack". -/
-theorem invalidated_restores_pressure :
-    claimInvalidated true 2 = true := by rfl
+/-- A standing (never-missed) claim still quiesces — the gate is inert on
+the good path. -/
+theorem unbroken_claim_keeps_quiescence :
+    claimInvalidated true 0 = false := by rfl
 
 /-- Quiescence holds only while the claim stands. -/
 def quiesce (everSolved claimInvalid : Bool) : Bool :=
@@ -258,6 +263,74 @@ theorem invalid_claim_never_retires (m g : Bool) :
 
 theorem standing_claim_keeps_rule_b :
     ruleBRetire true true true = true := by rfl
+
+/-! ## v44 reproduce-mode pressure floor
+
+Quiescence swaps the needle (v35); it must never reduce total pressure to
+zero.  e2-dev forensics: the reproduce needle alone was either satisfiable
+by inspection or not loaded at all, the obligation channel logged nothing,
+and the correctly-delivered artifact directive lost to a contradicting
+stored memory.  When the newest row is a *regression* (ever-solved task,
+newest attempt failing), the derived needles of that newest row load
+alongside the reproduce needle: those needles come from the currently real
+failing set, not from the stale ghosts v35/p33 removed.  A still-passing
+newest row keeps pure needle-swap semantics. -/
+
+def pressureNeedles (everSolved newestSolved : Bool) (artifact derived : Nat) : Nat :=
+  if everSolved then
+    (if newestSolved then min artifact 1
+     else if artifact = 0 then 0 else min artifact 1 + derived)
+  else artifact + derived
+
+/-- A regressed solved task never runs at zero pressure while its newest
+row yields any derived needle.  Zig mirror: "regression under quiescence
+loads the newest row's derived needles". -/
+theorem regression_keeps_pressure (artifact derived : Nat)
+    (ha : 1 ≤ artifact) (h : 1 ≤ derived) :
+    2 ≤ pressureNeedles true false artifact derived := by
+  unfold pressureNeedles
+  have : min artifact 1 = 1 := Nat.min_eq_right ha
+  simp [Nat.not_eq_zero_of_lt ha, this]
+  omega
+
+/-- The floor never fires without a reproduce needle to back up: an
+ever-solved task whose best row carries no artifact stays truly silent even
+when the newest row regressed.  This is the p33 ghost-chasing guard (stale
+failing names pushed an all-green task to 0.5) and the existing solved-task
+pin depends on it.  Zig mirror: "solved task without artifact stays silent
+after a regression". -/
+theorem no_artifact_stays_silent (derived : Nat) :
+    pressureNeedles true false 0 derived = 0 := by rfl
+
+/-- A still-passing task keeps pure v35 needle-swap: at most one needle,
+whatever the derived count.  The p33 ghost-chasing regression cannot
+return through this door. -/
+theorem passing_task_keeps_swap (artifact derived : Nat) :
+    pressureNeedles true true artifact derived ≤ 1 := by
+  simpa [pressureNeedles] using Nat.min_le_right artifact 1
+
+/-- Unsolved work is untouched by the floor — the full ratchet still
+applies. -/
+theorem unsolved_unchanged (artifact derived : Nat) :
+    pressureNeedles false false artifact derived = artifact + derived := by rfl
+
+/-! ## v44 superseded-memory withdrawal
+
+v36 stamped a provenance caveat on stored memories that a host-run proven
+artifact contradicts, leaving the adjudication to the model.  Twice (p35,
+e2-dev) the model read the caveat, recited "the proven configuration wins",
+then followed the contradicting memory anyway — the identical 0.2727 wall.
+A host-run all-passing verdict outranks a stored claim, so the read plane
+now withholds the body and returns a withdrawal stub; the memory itself is
+untouched in the store and remains fetchable by node_id. -/
+
+def recallBodyCarriesClaim (superseded : Bool) : Bool := !superseded
+
+theorem withdrawn_carries_no_claim :
+    recallBodyCarriesClaim true = false := by rfl
+
+theorem unsuperseded_body_intact :
+    recallBodyCarriesClaim false = true := by rfl
 
 end MetaCodesControl.ObligationGate
 
