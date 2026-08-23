@@ -65,6 +65,11 @@ DSH 的全部动态 plugin capability、全新 provider transport、UI 插件或
 
 规范：`evals/plugin-v1/protocol.json`。
 
+下列 `91e959b…` 身份、零-provider 收据和付费收据严格绑定历史实现提交
+`c3399bb7cdd3e4ea7e9b1bf8a6db015ab4b63ad0`。后续 artifact/CAS 与 Host-stream
+复审实现不得复用这份质量证据；它只生成独立的
+`zero-provider-receipt-review-v2.json`，且不重跑付费 pair 或外部 WorkBuddy。
+
 当前零 provider 收据：
 `evals/runs/2026-08-23-plugin-v1/zero-provider-receipt-91e959b2.json`。
 
@@ -300,7 +305,7 @@ tokens，低于用户 US$1,000 总上限。尚未运行外部 WorkBuddy。
 
 ## 6. 发布结论
 
-当前 `1.2.0` 已有完整付费质量收据，内部 `release_status` 是
+历史 benchmark candidate `1.2.0` 已有完整付费质量收据，内部 `release_status` 是
 `candidate_rejected`；`c316d074` 仍只是历史 fail-closed 诊断证据：
 
 - 插件内核与 Provider dialect 的确定性契约、隔离、cache-byte stability 和 embedding

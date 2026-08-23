@@ -159,6 +159,12 @@ Static plugins use the same validated descriptor programmatically. Process
 plugins use the common identity/dependency descriptor plus their process
 configuration, whose fields are enforced end-to-end.
 
+A static `host_tool` contribution has two disjoint executor declarations:
+`tools` for bounded completed UTF-8 buffers and `stream_tools` for a borrowed
+byte-zero sink committed by the kernel into Session CAS. Both are projected
+through the same immutable snapshot and collision namespace; declaring the
+same local name in both modes rejects the entire candidate generation.
+
 ## 6. Capability negotiation
 
 Known capability names are:

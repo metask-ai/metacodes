@@ -57,6 +57,11 @@ Read/Write/Bash 等热路径增加 callback 或进程 hop。
 Host tool 的结果带显式 `releaseFn`；Runtime 深拷贝描述符，但不拥有 callback
 context。不同 Session 的 callback 可以并发，锁由 Host 自己负责。Session 内同一
 时刻只允许一个 mutating/run/checkpoint 操作，非法并发返回 typed lifecycle error。
+同一个 `host_tool` capability 可以通过 `StaticPlugin.tools` 提供有界 UTF-8 完成缓冲，
+也可以通过 `StaticPlugin.stream_tools` 提供 byte-zero `HostStreamTool`；两者在同一
+immutable snapshot 中统一命名、判重、广告、权限和 CAS 接线。顶层
+`RuntimeConfig.host_sync_tools/host_stream_tools` 只是保留全局名字的 compatibility
+plugin 投影，不再绕过插件目录。
 
 `StaticPlugin.activation` 是源码级可信扩展的事务边界。回调只能通过借用的
 `EffectScope.Registrar` 登记 `{label, context, CleanupFn}`，不能取得可变 AgentLoop、
@@ -141,7 +146,9 @@ MCP stdio、大型 WebFetch/curl、ripgrep 与代码索引输出都在子进程/
 不能与 byte-zero 迁移缺口混为一谈。
 
 Spool 在固定内存中增量计算 SHA-256、保存 1152-byte head 与 384-byte rolling tail，
-并原子发布到 Session 级 CAS；单 artifact 上限 128 MiB，Session 上限 1 GiB。
+并以 no-replace 原语原子发布到 Session 级 CAS；POSIX hard-link 发布会在 receipt
+逃逸前同时持久化源/目标目录，竞争者不能覆盖同名 CAS 对象，失败路径只回滚本次精确
+文件身份。单 artifact 上限 128 MiB，Session 上限 1 GiB。
 `ReadArtifact` 每次最多恢复 32 KiB。结果的模型可见 envelope 是确定性的，不包含临时
 路径、plugin generation、时间或随机数。
 

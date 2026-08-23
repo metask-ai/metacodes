@@ -243,6 +243,7 @@ pub const Capture = struct {
         offset: u64,
         length: usize,
     ) ![]u8 {
+        if (self.state != .sealed) return error.ArtifactCaptureNotSealed;
         if (offset > self.bytes or length > self.bytes - offset)
             return error.InvalidReadOffset;
         const out = try allocator.alloc(u8, length);
@@ -332,8 +333,21 @@ pub const Spool = struct {
     }
 
     pub fn finish(self: *Spool) !CompletedSpool {
+        return self.finishWithMode(.normal);
+    }
+
+    const PublishMode = enum {
+        normal,
+        inject_failure_after_install,
+        inject_competing_destination,
+    };
+
+    fn finishWithMode(self: *Spool, mode: PublishMode) !CompletedSpool {
         if (!self.fd_open or self.published) return error.ArtifactSpoolClosed;
         try pfs.fsyncChecked(self.fd);
+        const temp_identity = pfs.fileInfo(self.fd) catch return error.ArtifactStatFailed;
+        if (!safeArtifactInfo(temp_identity) or temp_identity.size != self.preview.total_bytes)
+            return error.ArtifactSourceChanged;
         _ = pfs.close(self.fd);
         self.fd_open = false;
 
@@ -352,21 +366,25 @@ pub const Spool = struct {
         const final_path = try artifactPath(self.allocator, artifact_directory, digest);
         defer self.allocator.free(final_path);
         if (try verifyExisting(self.allocator, final_path, digest, @intCast(snapshot.bytes))) {
-            pfs.unlinkPath(self.temp_path.ptr) catch {};
+            pfs.unlinkPath(self.temp_path.ptr) catch return error.ArtifactSpoolCleanupFailed;
+            try fsyncDirectory(self.allocator, self.directory);
             self.published = true;
             return .{ .receipt = receiptFor(snapshot), .preview = self.preview };
         }
         const used = try directoryBytes(self.allocator, artifact_directory);
         if (snapshot.bytes > MAX_SESSION_BYTES -| used) return error.SessionQuotaExceeded;
 
-        const final_z = try self.allocator.dupeZ(u8, final_path);
-        defer self.allocator.free(final_z);
-        if (pfs.renameReplace(self.temp_path.ptr, final_z.ptr) != 0)
-            return error.ArtifactPublishFailed;
+        try publishPreparedFile(
+            self.allocator,
+            self.temp_path,
+            final_path,
+            artifact_directory,
+            self.directory,
+            snapshot,
+            temp_identity,
+            mode,
+        );
         self.published = true;
-        try fsyncDirectory(self.allocator, artifact_directory);
-        if (!(try verifyExisting(self.allocator, final_path, digest, @intCast(snapshot.bytes))))
-            return error.ArtifactPublishVerificationFailed;
         return .{ .receipt = receiptFor(snapshot), .preview = self.preview };
     }
 
@@ -425,27 +443,26 @@ pub const ExternalSpool = struct {
     }
 
     pub fn finish(self: *ExternalSpool) !CompletedSpool {
+        return self.finishWithMode(.normal);
+    }
+
+    const FinishMode = enum {
+        normal,
+        inject_failure_after_publish,
+    };
+
+    fn finishWithMode(self: *ExternalSpool, mode: FinishMode) !CompletedSpool {
         if (self.finished) return error.ArtifactSpoolClosed;
         const snapshot = try inspectFile(self.allocator, self.path());
-        const receipt = try persistInspectedFile(
+        const completed = try persistExternalInspectedFile(
             self.allocator,
             self.session_root,
             self.path(),
             snapshot,
+            mode,
         );
-        // Preview the verified CAS object, never the mutable plugin path. This
-        // binds the model-visible head/tail to the exact receipt even if an
-        // untrusted descendant keeps the source file open after its parent
-        // exits and races the import.
-        const directory = try artifactDirectory(self.allocator, self.session_root);
-        defer self.allocator.free(directory);
-        const stored_path = try artifactPath(self.allocator, directory, snapshot.sha256);
-        defer self.allocator.free(stored_path);
-        const preview = try previewFile(self.allocator, stored_path);
-        if (preview.total_bytes != receipt.bytes) return error.ArtifactSourceChanged;
-        pfs.unlinkPath(self.path_z.ptr) catch return error.ArtifactSpoolCleanupFailed;
         self.finished = true;
-        return .{ .receipt = receipt, .preview = preview };
+        return completed;
     }
 
     pub fn deinit(self: *ExternalSpool) void {
@@ -474,6 +491,17 @@ pub const FileSnapshot = struct {
     bytes: u64,
 };
 
+const ImportMode = enum {
+    receipt_only,
+    external_completed,
+    external_inject_cleanup_failure,
+};
+
+const ImportResult = union(enum) {
+    receipt: Receipt,
+    completed: CompletedSpool,
+};
+
 pub fn persist(allocator: std.mem.Allocator, session_root: []const u8, bytes: []const u8) !Receipt {
     var spool = try Spool.begin(allocator, session_root);
     defer spool.deinit();
@@ -500,6 +528,47 @@ pub fn persistInspectedFile(
     source_path: []const u8,
     expected: FileSnapshot,
 ) !Receipt {
+    return switch (try persistInspectedFileInternal(
+        allocator,
+        session_root,
+        source_path,
+        expected,
+        .receipt_only,
+    )) {
+        .receipt => |receipt| receipt,
+        .completed => unreachable,
+    };
+}
+
+fn persistExternalInspectedFile(
+    allocator: std.mem.Allocator,
+    session_root: []const u8,
+    source_path: []const u8,
+    expected: FileSnapshot,
+    mode: ExternalSpool.FinishMode,
+) !CompletedSpool {
+    return switch (try persistInspectedFileInternal(
+        allocator,
+        session_root,
+        source_path,
+        expected,
+        if (mode == .inject_failure_after_publish)
+            .external_inject_cleanup_failure
+        else
+            .external_completed,
+    )) {
+        .completed => |completed| completed,
+        .receipt => unreachable,
+    };
+}
+
+fn persistInspectedFileInternal(
+    allocator: std.mem.Allocator,
+    session_root: []const u8,
+    source_path: []const u8,
+    expected: FileSnapshot,
+    mode: ImportMode,
+) !ImportResult {
     if (session_root.len == 0) return error.ArtifactRootUnavailable;
     if (expected.bytes > MAX_ARTIFACT_BYTES) return error.ArtifactTooLarge;
     const directory = try artifactDirectory(allocator, session_root);
@@ -509,18 +578,34 @@ pub fn persistInspectedFile(
     persist_mutex.lock();
     defer persist_mutex.unlock();
 
+    const source_z = try allocator.dupeZ(u8, source_path);
+    defer allocator.free(source_z);
     const final_path = try artifactPath(allocator, directory, expected.sha256);
     defer allocator.free(final_path);
-    if (try verifyExisting(allocator, final_path, expected.sha256, @intCast(expected.bytes)))
-        return receiptFor(expected);
+    if (try verifyExisting(allocator, final_path, expected.sha256, @intCast(expected.bytes))) {
+        return switch (mode) {
+            .receipt_only => .{ .receipt = receiptFor(expected) },
+            .external_completed, .external_inject_cleanup_failure => blk: {
+                const preview = try previewVerifiedFile(allocator, final_path, expected);
+                pfs.unlinkPath(source_z.ptr) catch return error.ArtifactSpoolCleanupFailed;
+                try fsyncParentDirectory(allocator, source_path);
+                break :blk .{ .completed = .{
+                    .receipt = receiptFor(expected),
+                    .preview = preview,
+                } };
+            },
+        };
+    }
     const used = try directoryBytes(allocator, directory);
     if (expected.bytes > MAX_SESSION_BYTES -| used) return error.SessionQuotaExceeded;
 
-    const source_z = try allocator.dupeZ(u8, source_path);
-    defer allocator.free(source_z);
     const source_fd = pfs.open(source_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (source_fd < 0) return error.ArtifactSourceOpenFailed;
-    defer _ = pfs.close(source_fd);
+    var source_open = true;
+    defer {
+        if (source_open) _ = pfs.close(source_fd);
+    }
+    try pfs.makeCloseOnExec(source_fd);
     const source_before = pfs.fileInfo(source_fd) catch return error.ArtifactStatFailed;
     if (!safeArtifactInfo(source_before) or source_before.size != expected.bytes)
         return error.ArtifactSourceChanged;
@@ -545,34 +630,184 @@ pub fn persistInspectedFile(
     if (!safeArtifactInfo(temp_info)) return error.ArtifactUnsafeFile;
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var preview = Preview{};
     var copied: u64 = 0;
     var buffer: [64 * 1024]u8 = undefined;
     while (true) {
         const count = pfs.readZ(source_fd, &buffer) catch return error.ArtifactReadFailed;
         if (count == 0) break;
         hasher.update(buffer[0..count]);
+        if (mode != .receipt_only) preview.append(buffer[0..count]);
         try writeAll(temp_fd, buffer[0..count]);
         copied +|= count;
     }
     const source_after = pfs.fileInfo(source_fd) catch return error.ArtifactSourceChanged;
     if (!sameFile(source_before, source_after) or copied != expected.bytes)
         return error.ArtifactSourceChanged;
+    _ = pfs.close(source_fd);
+    source_open = false;
     var digest_bytes: [32]u8 = undefined;
     hasher.final(&digest_bytes);
     const copied_digest = std.fmt.bytesToHex(digest_bytes, .lower);
     if (!std.mem.eql(u8, copied_digest[0..], expected.sha256[0..]))
         return error.ArtifactSourceChanged;
     try pfs.fsyncChecked(temp_fd);
+    const temp_identity = pfs.fileInfo(temp_fd) catch return error.ArtifactStatFailed;
+    if (!safeArtifactInfo(temp_identity) or temp_identity.size != expected.bytes)
+        return error.ArtifactSourceChanged;
     _ = pfs.close(temp_fd);
     temp_open = false;
 
+    try publishPreparedFile(
+        allocator,
+        temp_z,
+        final_path,
+        directory,
+        directory,
+        expected,
+        temp_identity,
+        .normal,
+    );
+    if (mode != .receipt_only) {
+        if (mode == .external_inject_cleanup_failure) {
+            rollbackPublishedFile(allocator, final_path, directory, temp_identity) catch
+                return error.ArtifactPublishRollbackFailed;
+            return error.ArtifactSpoolCleanupInjectedFailure;
+        }
+        pfs.unlinkPath(source_z.ptr) catch {
+            rollbackPublishedFile(allocator, final_path, directory, temp_identity) catch
+                return error.ArtifactPublishRollbackFailed;
+            return error.ArtifactSpoolCleanupFailed;
+        };
+        fsyncParentDirectory(allocator, source_path) catch |err| {
+            rollbackPublishedFile(allocator, final_path, directory, temp_identity) catch
+                return error.ArtifactPublishRollbackFailed;
+            return err;
+        };
+    }
+    return switch (mode) {
+        .receipt_only => .{ .receipt = receiptFor(expected) },
+        .external_completed, .external_inject_cleanup_failure => .{ .completed = .{
+            .receipt = receiptFor(expected),
+            .preview = preview,
+        } },
+    };
+}
+
+/// Install one completely written private file into the CAS and return only after
+/// the directory entry is durable and the final pathname re-verifies. A
+/// post-install failure must not leave an unreceipted object consuming Session
+/// quota: rollback removes the final pathname only when it still names the
+/// exact inode/file-id that this call moved there.
+fn publishPreparedFile(
+    allocator: std.mem.Allocator,
+    temp_path: [:0]const u8,
+    final_path: []const u8,
+    directory: []const u8,
+    source_directory: []const u8,
+    expected: FileSnapshot,
+    temp_identity: pfs.FileInfo,
+    mode: Spool.PublishMode,
+) !void {
     const final_z = try allocator.dupeZ(u8, final_path);
     defer allocator.free(final_z);
-    if (pfs.renameReplace(temp_z.ptr, final_z.ptr) != 0) return error.ArtifactPublishFailed;
+    if (mode == .inject_competing_destination) {
+        {
+            const competing_fd = pfs.open(final_z.ptr, .{
+                .ACCMODE = .WRONLY,
+                .CREAT = true,
+                .EXCL = true,
+                .NOFOLLOW = true,
+            }, 0o600);
+            if (competing_fd < 0) return error.ArtifactPublishInjectedFailure;
+            defer _ = pfs.close(competing_fd);
+            try pfs.makeCloseOnExec(competing_fd);
+            try writeAll(competing_fd, "competing-cas-object");
+            try pfs.fsyncChecked(competing_fd);
+        }
+    }
+
+    const installed = pfs.installNoReplace(temp_path.ptr, final_z.ptr) catch
+        return error.ArtifactPublishFailed;
+    switch (installed) {
+        .already_exists => {
+            if (!(try verifyExisting(
+                allocator,
+                final_path,
+                expected.sha256,
+                @intCast(expected.bytes),
+            ))) return error.ArtifactPublishVerificationFailed;
+            pfs.unlinkPath(temp_path.ptr) catch return error.ArtifactSpoolCleanupFailed;
+            // Dedup has no new final directory entry, but removing the private
+            // source must be durable before its successful receipt escapes.
+            try fsyncDirectory(allocator, source_directory);
+            return;
+        },
+        .linked => {
+            pfs.unlinkPath(temp_path.ptr) catch {
+                rollbackPublishedFile(allocator, final_path, directory, temp_identity) catch
+                    return error.ArtifactPublishRollbackFailed;
+                return error.ArtifactSpoolCleanupFailed;
+            };
+            // `link(2)` and unlink may touch different directories. The final
+            // directory is synced by postPublishVerify below; sync the source
+            // directory separately so a crash cannot resurrect the private
+            // hardlink and invalidate the published object's link_count=1.
+            if (!std.mem.eql(u8, source_directory, directory)) {
+                fsyncDirectory(allocator, source_directory) catch |err| {
+                    rollbackPublishedFile(allocator, final_path, directory, temp_identity) catch
+                        return error.ArtifactPublishRollbackFailed;
+                    return err;
+                };
+            }
+        },
+        .moved => {},
+    }
+
+    postPublishVerify(allocator, final_path, directory, expected, mode) catch |err| {
+        rollbackPublishedFile(allocator, final_path, directory, temp_identity) catch
+            return error.ArtifactPublishRollbackFailed;
+        return err;
+    };
+}
+
+fn postPublishVerify(
+    allocator: std.mem.Allocator,
+    final_path: []const u8,
+    directory: []const u8,
+    expected: FileSnapshot,
+    mode: Spool.PublishMode,
+) !void {
+    if (mode == .inject_failure_after_install)
+        return error.ArtifactPublishInjectedFailure;
     try fsyncDirectory(allocator, directory);
     if (!(try verifyExisting(allocator, final_path, expected.sha256, @intCast(expected.bytes))))
         return error.ArtifactPublishVerificationFailed;
-    return receiptFor(expected);
+}
+
+fn rollbackPublishedFile(
+    allocator: std.mem.Allocator,
+    final_path: []const u8,
+    directory: []const u8,
+    expected_identity: pfs.FileInfo,
+) !void {
+    const final_z = try allocator.dupeZ(u8, final_path);
+    defer allocator.free(final_z);
+    if (!pfs.exists(final_z.ptr)) return;
+    const fd = pfs.open(final_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactPublishRollbackFailed;
+    pfs.makeCloseOnExec(fd) catch {
+        _ = pfs.close(fd);
+        return error.ArtifactPublishRollbackFailed;
+    };
+    const observed = pfs.fileInfo(fd) catch {
+        _ = pfs.close(fd);
+        return error.ArtifactPublishRollbackFailed;
+    };
+    _ = pfs.close(fd);
+    if (!sameIdentity(expected_identity, observed)) return;
+    pfs.unlinkPath(final_z.ptr) catch return error.ArtifactPublishRollbackFailed;
+    fsyncDirectory(allocator, directory) catch return error.ArtifactPublishRollbackFailed;
 }
 
 pub fn inspectFile(allocator: std.mem.Allocator, source_path: []const u8) !FileSnapshot {
@@ -581,6 +816,7 @@ pub fn inspectFile(allocator: std.mem.Allocator, source_path: []const u8) !FileS
     const fd = pfs.open(source_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.ArtifactSourceOpenFailed;
     defer _ = pfs.close(fd);
+    try pfs.makeCloseOnExec(fd);
     const before = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
     if (!safeArtifactInfo(before)) return error.ArtifactUnsafeFile;
     if (before.size > MAX_ARTIFACT_BYTES) return error.ArtifactTooLarge;
@@ -599,29 +835,46 @@ pub fn observeFileBytes(allocator: std.mem.Allocator, source_path: []const u8) !
     const fd = pfs.open(source_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.ArtifactSourceOpenFailed;
     defer _ = pfs.close(fd);
+    try pfs.makeCloseOnExec(fd);
     const info = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
     if (!safeArtifactInfo(info)) return error.ArtifactUnsafeFile;
     return info.size;
 }
 
-fn previewFile(allocator: std.mem.Allocator, source_path: []const u8) !Preview {
+/// Read the preview and digest in one stable descriptor pass. This is used for
+/// deduplication: a path verified before this call is not enough because an
+/// equal-size in-place rewrite between the hash and preview would otherwise
+/// pair a stale receipt with unrelated model-visible head/tail bytes.
+fn previewVerifiedFile(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    expected: FileSnapshot,
+) !Preview {
     const source_z = try allocator.dupeZ(u8, source_path);
     defer allocator.free(source_z);
     const fd = pfs.open(source_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.ArtifactSourceOpenFailed;
     defer _ = pfs.close(fd);
+    try pfs.makeCloseOnExec(fd);
     const before = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
-    if (!safeArtifactInfo(before) or before.size > MAX_ARTIFACT_BYTES)
+    if (!safeArtifactInfo(before) or before.size != expected.bytes)
         return error.ArtifactUnsafeFile;
     var preview = Preview{};
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     while (true) {
         const count = pfs.readZ(fd, &buffer) catch return error.ArtifactReadFailed;
         if (count == 0) break;
+        hasher.update(buffer[0..count]);
         preview.append(buffer[0..count]);
     }
     const after = pfs.fileInfo(fd) catch return error.ArtifactSourceChanged;
     if (!sameFile(before, after) or preview.total_bytes != before.size)
+        return error.ArtifactSourceChanged;
+    var digest_bytes: [32]u8 = undefined;
+    hasher.final(&digest_bytes);
+    const digest = std.fmt.bytesToHex(digest_bytes, .lower);
+    if (!std.mem.eql(u8, digest[0..], expected.sha256[0..]))
         return error.ArtifactSourceChanged;
     return preview;
 }
@@ -793,6 +1046,7 @@ fn directoryBytes(allocator: std.mem.Allocator, directory: []const u8) !u64 {
         const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
         if (fd < 0) return error.ArtifactDirectoryUntrusted;
         defer _ = pfs.close(fd);
+        pfs.makeCloseOnExec(fd) catch return error.ArtifactDirectoryUntrusted;
         const info = pfs.fileInfo(fd) catch return error.ArtifactDirectoryUntrusted;
         if (!info.is_regular or info.link_count != 1) return error.ArtifactDirectoryUntrusted;
         total +|= info.size;
@@ -807,6 +1061,7 @@ fn verifyExisting(allocator: std.mem.Allocator, path: []const u8, digest: [ID_HE
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.ArtifactExistingOpenFailed;
     defer _ = pfs.close(fd);
+    try pfs.makeCloseOnExec(fd);
     const before = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
     if (!safeArtifactInfo(before) or before.size != expected_bytes) return error.ArtifactExistingMismatch;
     const actual = try hashFd(fd);
@@ -823,7 +1078,13 @@ fn safeArtifactInfo(info: pfs.FileInfo) bool {
 
 fn sameFile(before: pfs.FileInfo, after: pfs.FileInfo) bool {
     return safeArtifactInfo(after) and before.size == after.size and
-        before.device == after.device and before.inode == after.inode;
+        sameIdentity(before, after);
+}
+
+fn sameIdentity(before: pfs.FileInfo, after: pfs.FileInfo) bool {
+    return after.is_regular and before.size == after.size and
+        before.device == after.device and
+        before.inode == after.inode;
 }
 
 fn hashFd(fd: pfs.Fd) ![ID_HEX_BYTES]u8 {
@@ -858,7 +1119,13 @@ fn fsyncDirectory(allocator: std.mem.Allocator, directory: []const u8) !void {
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.ArtifactDirectoryOpenFailed;
     defer _ = pfs.close(fd);
+    try pfs.makeCloseOnExec(fd);
     try pfs.fsyncChecked(fd);
+}
+
+fn fsyncParentDirectory(allocator: std.mem.Allocator, path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return error.ArtifactDirectoryOpenFailed;
+    try fsyncDirectory(allocator, parent);
 }
 
 fn parseArtifactId(raw: []const u8) ?[ID_HEX_BYTES]u8 {
@@ -900,6 +1167,7 @@ test "file import hashes and preserves the complete byte-zero spool" {
     defer allocator.free(source);
     const fd = pfs.open(source.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     if (fd < 0) return error.ArtifactTempOpenFailed;
+    try pfs.makeCloseOnExec(fd);
     const prefix = [_]u8{'p'} ** (80 * 1024);
     try writeAll(fd, &prefix);
     try writeAll(fd, "FILE_TAIL_SENTINEL");
@@ -950,6 +1218,7 @@ test "external spool imports only the kernel-created private path" {
     defer spool.deinit();
     const fd = pfs.open(spool.path_z.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.ArtifactTempOpenFailed;
+    try pfs.makeCloseOnExec(fd);
     try writeAll(fd, "PLUGIN_HEAD-");
     const middle = [_]u8{'p'} ** (70 * 1024);
     try writeAll(fd, &middle);
@@ -962,6 +1231,67 @@ test "external spool imports only the kernel-created private path" {
     var recovered = try readChunk(allocator, root, completed.receipt.id(), 0, 16);
     defer recovered.deinit();
     try std.testing.expect(std.mem.startsWith(u8, recovered.bytes, "PLUGIN_HEAD-"));
+}
+
+test "external spool dedup removes its private source only after verified preview" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const payload = "DEDUP_HEAD-body-DEDUP_TAIL";
+    const existing = try persist(allocator, root, payload);
+    var spool = try ExternalSpool.begin(allocator, root);
+    const private_path = try allocator.dupeZ(u8, spool.path_z);
+    defer allocator.free(private_path);
+    const fd = pfs.open(spool.path_z.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactTempOpenFailed;
+    try pfs.makeCloseOnExec(fd);
+    try writeAll(fd, payload);
+    try pfs.fsyncChecked(fd);
+    _ = pfs.close(fd);
+
+    const completed = try spool.finish();
+    try std.testing.expectEqualStrings(existing.id(), completed.receipt.id());
+    try std.testing.expectEqualStrings(payload, completed.preview.headSlice());
+    try std.testing.expect(!pfs.exists(private_path.ptr));
+    spool.deinit();
+}
+
+test "external spool post-publish failure rolls back CAS before withholding receipt" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var spool = try ExternalSpool.begin(allocator, root);
+    const private_path = try allocator.dupeZ(u8, spool.path_z);
+    defer allocator.free(private_path);
+    const payload = "external-transaction-rollback";
+    const fd = pfs.open(spool.path_z.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactTempOpenFailed;
+    try pfs.makeCloseOnExec(fd);
+    try writeAll(fd, payload);
+    try pfs.fsyncChecked(fd);
+    _ = pfs.close(fd);
+
+    try std.testing.expectError(
+        error.ArtifactSpoolCleanupInjectedFailure,
+        spool.finishWithMode(.inject_failure_after_publish),
+    );
+    const digest = sha256Hex(payload);
+    const directory = try artifactDirectory(allocator, root);
+    defer allocator.free(directory);
+    const final_path = try artifactPath(allocator, directory, digest);
+    defer allocator.free(final_path);
+    const final_z = try allocator.dupeZ(u8, final_path);
+    defer allocator.free(final_z);
+    try std.testing.expect(!pfs.exists(final_z.ptr));
+    try std.testing.expect(pfs.exists(private_path.ptr));
+    spool.deinit();
+    try std.testing.expect(!pfs.exists(private_path.ptr));
 }
 
 test "artifact reader rejects traversal, hardlinks, and tampering" {
@@ -988,6 +1318,7 @@ test "artifact reader rejects traversal, hardlinks, and tampering" {
 
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.SkipZigTest;
+    try pfs.makeCloseOnExec(fd);
     try writeAll(fd, "altered"); // same length as "trusted": hash, not size, detects it
     _ = pfs.close(fd);
     try std.testing.expectError(error.ArtifactHashMismatch, readChunk(allocator, root, receipt.id(), 0, 4));
@@ -1032,6 +1363,83 @@ test "unfinished spool rollback removes private bytes before publication" {
     try std.testing.expect(!pfs.exists(private_path.ptr));
 }
 
+test "capture range reads require the sealed state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    var capture = try Capture.begin(allocator, root_buffer[0..root_len], 1024);
+    defer capture.deinit();
+    try capture.write("still-writing");
+    try std.testing.expectError(
+        error.ArtifactCaptureNotSealed,
+        capture.readRangeAlloc(allocator, 0, 1),
+    );
+    try capture.seal();
+    const recovered = try capture.readRangeAlloc(allocator, 0, capture.bytes);
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings("still-writing", recovered);
+}
+
+test "post-install publication failure removes the unreceipted CAS object" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var spool = try Spool.begin(allocator, root);
+    defer spool.deinit();
+    try spool.write("rollback-after-install");
+    try std.testing.expectError(
+        error.ArtifactPublishInjectedFailure,
+        spool.finishWithMode(.inject_failure_after_install),
+    );
+
+    const digest = sha256Hex("rollback-after-install");
+    const directory = try artifactDirectory(allocator, root);
+    defer allocator.free(directory);
+    const final_path = try artifactPath(allocator, directory, digest);
+    defer allocator.free(final_path);
+    const final_z = try allocator.dupeZ(u8, final_path);
+    defer allocator.free(final_z);
+    try std.testing.expect(!pfs.exists(final_z.ptr));
+    try std.testing.expectEqual(@as(u64, 0), try directoryBytes(allocator, directory));
+}
+
+test "atomic CAS install never replaces a competing content address" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var spool = try Spool.begin(allocator, root);
+    defer spool.deinit();
+    const payload = "must-not-overwrite-racing-publisher";
+    try spool.write(payload);
+    try std.testing.expectError(
+        error.ArtifactExistingMismatch,
+        spool.finishWithMode(.inject_competing_destination),
+    );
+
+    const directory = try artifactDirectory(allocator, root);
+    defer allocator.free(directory);
+    const final_path = try artifactPath(allocator, directory, sha256Hex(payload));
+    defer allocator.free(final_path);
+    const final_z = try allocator.dupeZ(u8, final_path);
+    defer allocator.free(final_z);
+    const fd = pfs.open(final_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactSourceOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.makeCloseOnExec(fd);
+    var observed: ["competing-cas-object".len]u8 = undefined;
+    const count = try pfs.readZ(fd, &observed);
+    try std.testing.expectEqual(observed.len, count);
+    try std.testing.expectEqualStrings("competing-cas-object", &observed);
+}
+
 test "session quota rejects publication and rollback leaves no receipt" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1052,6 +1460,7 @@ test "session quota rejects publication and rollback leaves no receipt" {
         .NOFOLLOW = true,
     }, 0o600);
     if (fd < 0) return error.ArtifactTempOpenFailed;
+    try pfs.makeCloseOnExec(fd);
     try pfs.setSize(fd, MAX_SESSION_BYTES);
     _ = pfs.close(fd);
 

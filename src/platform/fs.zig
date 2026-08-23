@@ -293,6 +293,113 @@ pub fn renameReplace(from: [*:0]const u8, to: [*:0]const u8) c_int {
 }
 extern "kernel32" fn MoveFileExW(lpExistingFileName: [*:0]const u16, lpNewFileName: [*:0]const u16, dwFlags: u32) callconv(.winapi) c_int;
 
+/// Atomically install `from` at an absent `to` without ever replacing an
+/// existing pathname. Content-addressed stores need this stronger primitive:
+/// a verify-then-`renameReplace` sequence has a cross-process race in which a
+/// newly published object can be overwritten after the verification.
+///
+/// POSIX has no portable rename-no-replace operation, so use the same-filesystem
+/// `link(2)` primitive. The caller must unlink `from` after `.linked`; until it
+/// does, readers see link_count=2 and security-sensitive CAS readers fail
+/// closed. Windows `MoveFileExW` without REPLACE_EXISTING moves the source and
+/// fails atomically when the destination already exists.
+pub const InstallNoReplaceResult = enum {
+    moved,
+    linked,
+    already_exists,
+};
+
+pub fn installNoReplace(
+    from: [*:0]const u8,
+    to: [*:0]const u8,
+) error{InstallFailed}!InstallNoReplaceResult {
+    if (is_windows) {
+        var fbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        var tbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const fl = std.unicode.utf8ToUtf16Le(&fbuf, std.mem.span(from)) catch
+            return error.InstallFailed;
+        const tl = std.unicode.utf8ToUtf16Le(&tbuf, std.mem.span(to)) catch
+            return error.InstallFailed;
+        if (fl >= fbuf.len or tl >= tbuf.len) return error.InstallFailed;
+        fbuf[fl] = 0;
+        tbuf[tl] = 0;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        if (MoveFileExW(@ptrCast(&fbuf), @ptrCast(&tbuf), MOVEFILE_WRITE_THROUGH) != 0)
+            return .moved;
+        const code = GetLastError();
+        return switch (code) {
+            80, // ERROR_FILE_EXISTS
+            183, // ERROR_ALREADY_EXISTS
+            => .already_exists,
+            else => error.InstallFailed,
+        };
+    } else {
+        if (posix_install.link(from, to) == 0) return .linked;
+        const code = std.c._errno().*;
+        if (code == @intFromEnum(std.c.E.EXIST)) return .already_exists;
+        return error.InstallFailed;
+    }
+}
+
+const posix_install = struct {
+    extern "c" fn link(from: [*:0]const u8, to: [*:0]const u8) c_int;
+};
+
+test "installNoReplace preserves an existing destination and installs only when absent" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const source = try std.fmt.allocPrintSentinel(allocator, "{s}/source", .{root}, 0);
+    defer allocator.free(source);
+    const destination = try std.fmt.allocPrintSentinel(allocator, "{s}/destination", .{root}, 0);
+    defer allocator.free(destination);
+
+    for ([_]struct { path: [:0]const u8, bytes: []const u8 }{
+        .{ .path = source, .bytes = "source-bytes" },
+        .{ .path = destination, .bytes = "destination-bytes" },
+    }) |fixture| {
+        const fd = open(fixture.path.ptr, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+        }, 0o600);
+        if (fd < 0) return error.TestFileOpenFailed;
+        defer close(fd);
+        if (write(fd, fixture.bytes) != fixture.bytes.len) return error.TestFileWriteFailed;
+    }
+
+    try std.testing.expectEqual(
+        InstallNoReplaceResult.already_exists,
+        try installNoReplace(source.ptr, destination.ptr),
+    );
+    var observed: ["destination-bytes".len]u8 = undefined;
+    const existing_fd = open(destination.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    if (existing_fd < 0) return error.TestFileOpenFailed;
+    const observed_count = read(existing_fd, &observed);
+    close(existing_fd);
+    try std.testing.expectEqual(@as(isize, observed.len), observed_count);
+    try std.testing.expectEqualStrings("destination-bytes", &observed);
+    try unlinkPath(destination.ptr);
+
+    switch (try installNoReplace(source.ptr, destination.ptr)) {
+        .linked => try unlinkPath(source.ptr),
+        .moved => {},
+        .already_exists => return error.UnexpectedDestination,
+    }
+    try std.testing.expect(!exists(source.ptr));
+    try std.testing.expect(exists(destination.ptr));
+    var installed: ["source-bytes".len]u8 = undefined;
+    const installed_fd = open(destination.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    if (installed_fd < 0) return error.TestFileOpenFailed;
+    const installed_count = read(installed_fd, &installed);
+    close(installed_fd);
+    try std.testing.expectEqual(@as(isize, installed.len), installed_count);
+    try std.testing.expectEqualStrings("source-bytes", &installed);
+}
+
 /// 路径是否存在(文件**或目录**)。POSIX access(F_OK) / Windows GetFileAttributesW。
 /// **勿用 open() 判存在**:Windows `_open` 打不开目录(返 -1),会把存在的目录误判成不存在。
 pub fn exists(path: [*:0]const u8) bool {

@@ -47,6 +47,9 @@ else
 comptime {
     if (wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 != @as(u64, core.tool_exec.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1))
         @compileError("AgentCore wire and core encoded Host-error limits must match");
+    if (wire.MAX_HOST_TOOL_RESULT_BYTES_V1 != @as(u64, core.tool_catalog.MAX_HOST_SYNC_RESULT_BYTES) or
+        wire.MAX_HOST_STREAM_ARTIFACT_BYTES_V1 != @as(u64, core.tool_result_artifact.MAX_ARTIFACT_BYTES))
+        @compileError("AgentCore wire and core Host result limits must match");
     const catalog_limits = skill_catalog.Limits{};
     if (catalog_limits.max_slots != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_SKILLS_V1)) or
         catalog_limits.max_descriptor_bytes != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1)) or
@@ -83,8 +86,9 @@ const AbiHostTool = struct {
     binding: [32]u8 = [_]u8{1} ** 32,
 
     /// HOST_FATAL and unknown statuses are infrastructure-fatal. FAILED and
-    /// REJECTED may carry bounded UTF-8 detail; malformed detail degrades to a
-    /// null-detail business failure. An invalid HOST_OK descriptor is fatal.
+    /// REJECTED may carry bounded UTF-8 detail; malformed text payloads,
+    /// including malformed HOST_OK text, degrade to a null-detail business
+    /// failure. A structurally invalid HOST_OK ownership descriptor is fatal.
     fn execute(raw: *anyopaque, identity: core.agent_session.HostRunIdentity, args: []const u8) error{OutOfMemory}!core.agent_session.HostToolOutcome {
         const self: *AbiHostTool = @ptrCast(@alignCast(raw));
         const session: *wire.SessionHandle = @ptrCast(identity.host_session_ctx);

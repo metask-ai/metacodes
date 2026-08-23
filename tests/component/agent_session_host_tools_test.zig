@@ -29,6 +29,14 @@ const HOST_STREAM_TOOL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const PLUGIN_STREAM_TOOL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_plugin_stream\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_plugin_stream\",\"name\":\"acme_dstream__HostStream\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const PLUGIN_TOOL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_plugin\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_plugin\",\"name\":\"acme_dreview__HostEcho\",\"input\":{}}}\n\n" ++
@@ -107,6 +115,7 @@ const Probe = struct {
 };
 
 const StreamProbe = struct {
+    bytes_to_write: usize = 17 * 1024 * 1024 + 17,
     calls: usize = 0,
     writes: usize = 0,
     max_chunk_bytes: usize = 0,
@@ -121,7 +130,7 @@ const StreamProbe = struct {
         self.calls += 1;
         var chunk: [64 * 1024]u8 = undefined;
         @memset(&chunk, 'v');
-        var remaining: usize = 17 * 1024 * 1024 + 17;
+        var remaining = self.bytes_to_write;
         while (remaining != 0) {
             const count = @min(remaining, chunk.len);
             try sink.write(chunk[0..count]);
@@ -361,6 +370,27 @@ fn rootPath(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     return buffer[0..len];
 }
 
+fn requestToolResultContent(root: std.json.Value, tool_use_id: []const u8) ?[]const u8 {
+    if (root != .object) return null;
+    const messages = root.object.get("messages") orelse return null;
+    if (messages != .array) return null;
+    for (messages.array.items) |message| {
+        if (message != .object) continue;
+        const blocks = message.object.get("content") orelse continue;
+        if (blocks != .array) continue;
+        for (blocks.array.items) |block| {
+            if (block != .object) continue;
+            const kind = block.object.get("type") orelse continue;
+            const id = block.object.get("tool_use_id") orelse continue;
+            const content = block.object.get("content") orelse continue;
+            if (kind == .string and id == .string and content == .string and
+                std.mem.eql(u8, kind.string, "tool_result") and
+                std.mem.eql(u8, id.string, tool_use_id)) return content.string;
+        }
+    }
+    return null;
+}
+
 test "L2 selected Host sync tool is advertised, executed and released exactly once" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -443,6 +473,67 @@ test "L2 selected Host stream tool publishes a recoverable envelope without requ
     try std.testing.expect(std.mem.indexOf(u8, body, cc.tool_result.PROJECTION_SCHEMA) != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "ReadArtifact") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "17825809") != null);
+}
+
+test "L2 static plugin Host stream contribution is namespaced advertised and executed through CAS" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ PLUGIN_STREAM_TOOL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    var probe = StreamProbe{ .bytes_to_write = 70 * 1024 };
+    const plugins = [_]cc.agent_session.StaticPlugin{.{
+        .descriptor = .{
+            .id = try cc.plugin.contract.PluginId.parse("acme.stream"),
+            .version = try cc.plugin.contract.Version.parse("1.0.0"),
+            .form = .static_trusted,
+            .capabilities = cc.plugin.contract.CapabilitySet.from(&.{.host_tool}),
+        },
+        .stream_tools = &.{probe.tool()},
+    }};
+    const runtime = try cc.agent_session.AgentRuntime.create(allocator, .{
+        .builtin_tools = &.{},
+        .static_plugins = &plugins,
+    });
+    defer runtime.destroy() catch unreachable;
+    const record = runtime.plugin_snapshot.find("acme.stream") orelse return error.PluginMissing;
+    try std.testing.expectEqual(@as(usize, 1), record.contribution_count);
+    try std.testing.expectEqual(@as(usize, 1), runtime.plugin_snapshot.host_stream_tools.len);
+
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .home = root },
+        .artifact_store = .{ .exact_root = root },
+        .allowed_tools = &.{"acme_dstream__HostStream"},
+        .host_identity_ctx = &probe,
+    });
+    defer session.destroy() catch unreachable;
+
+    var sink_state: u8 = 0;
+    const result = try session.runText(1, "stream through the plugin", 4, .{ .ctx = &sink_state, .emit = Sink.emit });
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(probe.writes > 1);
+    const initial = (server.requestAt(0) orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, initial, "acme_dstream__HostStream") != null);
+    const follow_up = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, follow_up, .{});
+    defer parsed.deinit();
+    const projected = requestToolResultContent(parsed.value, "tu_plugin_stream") orelse
+        return error.MissingProjectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, projected, cc.tool_result.PROJECTION_SCHEMA) != null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "ReadArtifact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, root) == null);
 }
 
 test "L2 Host stream selection fails admission when artifact storage is disabled" {

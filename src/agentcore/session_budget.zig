@@ -646,6 +646,9 @@ pub const ToolEnvironment = struct {
             reservation.release();
             return err;
         };
+        var outcome_live = true;
+        errdefer if (outcome_live) outcome.deinit(tool_ctx.allocator);
+        errdefer reservation.release();
         const payload_cap = switch (kind) {
             .tool => self.controller.profile.tool_result_cap_bytes,
             .mcp => self.controller.profile.mcp_result_cap_bytes,
@@ -659,11 +662,11 @@ pub const ToolEnvironment = struct {
                 tool_ctx.artifact_root,
             ) catch |err| {
                 const required = outcome.ok.rawBytes();
-                outcome.deinit(tool_ctx.allocator);
                 if (err == error.OutOfMemory) {
-                    reservation.release();
                     return error.OutOfMemory;
                 }
+                outcome.deinit(tool_ctx.allocator);
+                outcome_live = false;
                 reservation.failResourceLimit(required);
                 return boundedToolOutcome(tool_ctx.allocator, RESOURCE_LIMIT_MARKER);
             };
@@ -683,6 +686,7 @@ pub const ToolEnvironment = struct {
             std.math.maxInt(u64);
         reservation.settleSuccess(payload_bytes, durable_delta) catch {
             outcome.deinit(tool_ctx.allocator);
+            outcome_live = false;
             return boundedToolOutcome(tool_ctx.allocator, RESOURCE_LIMIT_MARKER);
         };
         return outcome;
@@ -1661,6 +1665,100 @@ test "oversized inline Tool result is promoted before the AgentCore raw cap" {
     );
     defer recovered.deinit();
     try std.testing.expectEqual(@as(usize, 16 * 1024), recovered.bytes.len);
+}
+
+test "artifact envelope allocation failure releases the Tool reservation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const receipt = try core.tool_result_artifact.persist(allocator, root, "render-oom");
+
+    const ArtifactDispatcher = struct {
+        receipt: core.tool_result_artifact.Receipt,
+
+        fn dispatch(
+            raw: *const anyopaque,
+            _: *const core.tool_context.ToolContext,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!core.tools.ToolDispatchOutcome {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return .{ .ok = core.tools.ToolResultBody.fromCompletedSpool(
+                .{ .receipt = self.receipt, .preview = .{} },
+                .text_utf8,
+            ) };
+        }
+
+        fn no(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+
+        fn noName(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+
+        fn dispatcher(self: *const @This()) core.tools.ToolDispatcher {
+            return .{
+                .ctx = self,
+                .dispatchFn = dispatch,
+                .prefetchSafeFn = no,
+                .nameAtFn = noName,
+                .hostSyncFn = no,
+            };
+        }
+    };
+
+    var artifact_dispatcher = ArtifactDispatcher{ .receipt = receipt };
+    const profile = smallTestProfile();
+    var controller = Controller.init(allocator, profile, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 1000,
+        .minimum_required_bytes = 1000,
+    });
+    var environment = ToolEnvironment{
+        .controller = &controller,
+        .base = .{ .definitions = &.{}, .dispatcher = artifact_dispatcher.dispatcher() },
+    };
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const tool_ctx = core.tool_context.ToolContext{
+        .allocator = failing.allocator(),
+        .artifact_root = root,
+    };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        environment.surface().dispatcher.dispatch(&tool_ctx, "Artifact", "{}"),
+    );
+    try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+}
+
+test "bounded replacement allocation failure does not double-free the settled Tool outcome" {
+    const allocator = std.testing.allocator;
+    var profile = smallTestProfile();
+    profile.tool_result_cap_bytes = 16;
+    var controller = Controller.init(allocator, profile, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 1000,
+        .minimum_required_bytes = 1000,
+    });
+    var base = TestDispatcher{ .payload_bytes = 17 };
+    var environment = ToolEnvironment{
+        .controller = &controller,
+        .base = .{ .definitions = &.{}, .dispatcher = base.dispatcher() },
+    };
+    // Allocation zero constructs the original inline body. Allocation one is
+    // the bounded resource-limit replacement after settleSuccess rejects it.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    const tool_ctx = core.tool_context.ToolContext{ .allocator = failing.allocator() };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        environment.surface().dispatcher.dispatch(&tool_ctx, "TooLarge", "{}"),
+    );
+    try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+    try std.testing.expectEqual(Outcome.resource_limit, controller.outcome());
 }
 
 test "MCP reservation failure occurs before connector invocation" {

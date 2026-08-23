@@ -69,6 +69,10 @@ pub const StaticPlugin = struct {
     descriptor: contract.Descriptor,
     layer: Layer = .builtin,
     tools: []const tool_catalog.HostSyncTool = &.{},
+    /// Byte-zero Host producers share the same `host_tool` capability and
+    /// namespace as completed-buffer tools, but retain a distinct executor
+    /// type; staging rejects duplicate local names across the two arrays.
+    stream_tools: []const tool_catalog.HostStreamTool = &.{},
     /// First-party native tools keep their original global provider names and
     /// builtin executor/category. Only a static trusted descriptor carrying
     /// `builtin_tool_bundle` may publish these names.
@@ -106,6 +110,7 @@ pub const Config = struct {
     /// Legacy AgentRuntime host tools become one explicit builtin compatibility
     /// contribution and retain their existing global names.
     compatibility_host_tools: []const tool_catalog.HostSyncTool = &.{},
+    compatibility_host_stream_tools: []const tool_catalog.HostStreamTool = &.{},
     static_plugins: []const StaticPlugin = &.{},
     /// Executable authority is a distinct loading channel. A data package can
     /// never promote itself to this form through manifest contents.
@@ -151,6 +156,7 @@ pub const Snapshot = struct {
     generation: contract.GenerationId,
     plugins: []PluginRecord,
     host_tools: []tool_catalog.HostSyncTool,
+    host_stream_tools: []tool_catalog.HostStreamTool,
     builtin_tools: []const []const u8,
     process_tools: []tool_catalog.IsolatedTool,
     advisory_policies: []tool_context.ToolExecutionPolicy,
@@ -166,7 +172,8 @@ pub const Snapshot = struct {
         const candidate_count = std.math.add(
             usize,
             explicit_count,
-            @intFromBool(config.compatibility_host_tools.len != 0),
+            @intFromBool(config.compatibility_host_tools.len != 0 or
+                config.compatibility_host_stream_tools.len != 0),
         ) catch return error.TooManyPlugins;
         if (candidate_count > MAX_PLUGIN_CANDIDATES) return error.TooManyPlugins;
         const self = try allocator.create(Snapshot);
@@ -181,7 +188,9 @@ pub const Snapshot = struct {
         defer if (!effects_published) effects.destroy();
 
         var candidates: std.ArrayList(Candidate) = .empty;
-        if (config.compatibility_host_tools.len != 0) {
+        if (config.compatibility_host_tools.len != 0 or
+            config.compatibility_host_stream_tools.len != 0)
+        {
             var caps: contract.CapabilitySet = .{};
             caps.insert(.host_tool) catch unreachable;
             try candidates.append(owned, .{
@@ -255,6 +264,7 @@ pub const Snapshot = struct {
 
         var records: std.ArrayList(PluginRecord) = .empty;
         var host_tools: std.ArrayList(tool_catalog.HostSyncTool) = .empty;
+        var host_stream_tools: std.ArrayList(tool_catalog.HostStreamTool) = .empty;
         var builtin_tools: std.ArrayList([]const u8) = .empty;
         var process_tools: std.ArrayList(tool_catalog.IsolatedTool) = .empty;
         var advisory_policies: std.ArrayList(tool_context.ToolExecutionPolicy) = .empty;
@@ -268,7 +278,22 @@ pub const Snapshot = struct {
                 .compatibility => {
                     for (config.compatibility_host_tools) |tool| {
                         try validateHostTool(tool);
-                        try appendUniqueHostTool(owned, &host_tools, try tool_catalog.cloneHostTool(owned, tool));
+                        try appendUniqueHostTool(
+                            owned,
+                            &host_tools,
+                            &host_stream_tools,
+                            try tool_catalog.cloneHostTool(owned, tool),
+                        );
+                        contribution_count += 1;
+                    }
+                    for (config.compatibility_host_stream_tools) |tool| {
+                        try validateHostStreamTool(tool);
+                        try appendUniqueHostStreamTool(
+                            owned,
+                            &host_tools,
+                            &host_stream_tools,
+                            try tool_catalog.cloneHostStreamTool(owned, tool),
+                        );
                         contribution_count += 1;
                     }
                 },
@@ -282,7 +307,8 @@ pub const Snapshot = struct {
                     const contributes_services = candidate.descriptor.capabilities.contains(.service);
                     const contributes_builtins = candidate.descriptor.capabilities.contains(.builtin_tool_bundle);
                     const contributes_dialects = candidate.descriptor.capabilities.contains(.provider_dialect);
-                    if (contributes_tools != (plugin.tools.len != 0)) return error.UnsupportedContribution;
+                    if (contributes_tools != (plugin.tools.len != 0 or plugin.stream_tools.len != 0))
+                        return error.UnsupportedContribution;
                     if (contributes_builtins != (plugin.builtin_tools.len != 0)) return error.UnsupportedContribution;
                     if (contributes_advisory != (plugin.advisory_policy != null)) return error.UnsupportedContribution;
                     if (contributes_dialects != (plugin.provider_dialects.len != 0)) return error.UnsupportedContribution;
@@ -296,7 +322,18 @@ pub const Snapshot = struct {
                             };
                             var owned_tool = try tool_catalog.cloneHostTool(owned, tool);
                             owned_tool.definition.name = global_name;
-                            try appendUniqueHostTool(owned, &host_tools, owned_tool);
+                            try appendUniqueHostTool(owned, &host_tools, &host_stream_tools, owned_tool);
+                            contribution_count += 1;
+                        }
+                        for (plugin.stream_tools) |tool| {
+                            try validateHostStreamTool(tool);
+                            const global_name = contract.toolName(owned, candidate.descriptor.id, tool.definition.name) catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => return error.InvalidStaticTool,
+                            };
+                            var owned_tool = try tool_catalog.cloneHostStreamTool(owned, tool);
+                            owned_tool.definition.name = global_name;
+                            try appendUniqueHostStreamTool(owned, &host_tools, &host_stream_tools, owned_tool);
                             contribution_count += 1;
                         }
                     }
@@ -376,14 +413,24 @@ pub const Snapshot = struct {
         // tool already checks the host list when it is appended, but a later
         // compatibility/static contribution must not be able to introduce the
         // same provider-visible name after that check has run.
-        try validateNoCrossChannelToolCollisions(host_tools.items, process_tools.items);
-        try validateNoBuiltinToolCollisions(builtin_tools.items, host_tools.items, process_tools.items);
+        try validateNoCrossChannelToolCollisions(
+            host_tools.items,
+            host_stream_tools.items,
+            process_tools.items,
+        );
+        try validateNoBuiltinToolCollisions(
+            builtin_tools.items,
+            host_tools.items,
+            host_stream_tools.items,
+            process_tools.items,
+        );
 
         // Finish every fallible projection/allocation before trusted activation.
         // If activation fails, `effects` rolls back all prior registrations and
         // the immutable Snapshot is never published.
         const published_plugins = try records.toOwnedSlice(owned);
         const published_host_tools = try host_tools.toOwnedSlice(owned);
+        const published_host_stream_tools = try host_stream_tools.toOwnedSlice(owned);
         const published_builtin_tools = try builtin_tools.toOwnedSlice(owned);
         const published_process_tools = try process_tools.toOwnedSlice(owned);
         const published_advisory_policies = try advisory_policies.toOwnedSlice(owned);
@@ -422,6 +469,7 @@ pub const Snapshot = struct {
             .generation = config.generation,
             .plugins = published_plugins,
             .host_tools = published_host_tools,
+            .host_stream_tools = published_host_stream_tools,
             .builtin_tools = published_builtin_tools,
             .process_tools = published_process_tools,
             .advisory_policies = published_advisory_policies,
@@ -730,6 +778,13 @@ fn validateHostTool(tool: tool_catalog.HostSyncTool) Error!void {
         return error.InvalidStaticTool;
 }
 
+fn validateHostStreamTool(tool: tool_catalog.HostStreamTool) Error!void {
+    if (tool.definition.name.len == 0 or
+        !std.mem.eql(u8, tool.definition.input_schema.type, "object") or
+        tool.definition.server_type != null or tool.definition.deferred)
+        return error.InvalidStaticTool;
+}
+
 fn validateAndAppendProviderDialect(
     allocator: std.mem.Allocator,
     dialects: *std.ArrayList(ProviderDialectBinding),
@@ -757,13 +812,35 @@ fn validateAndAppendProviderDialect(
 fn appendUniqueHostTool(
     allocator: std.mem.Allocator,
     tools: *std.ArrayList(tool_catalog.HostSyncTool),
+    stream_tools: *const std.ArrayList(tool_catalog.HostStreamTool),
     candidate: tool_catalog.HostSyncTool,
 ) Error!void {
     for (tools.items) |existing| {
         if (std.mem.eql(u8, existing.definition.name, candidate.definition.name))
             return error.DuplicateToolName;
     }
+    for (stream_tools.items) |existing| {
+        if (std.mem.eql(u8, existing.definition.name, candidate.definition.name))
+            return error.DuplicateToolName;
+    }
     try tools.append(allocator, candidate);
+}
+
+fn appendUniqueHostStreamTool(
+    allocator: std.mem.Allocator,
+    tools: *const std.ArrayList(tool_catalog.HostSyncTool),
+    stream_tools: *std.ArrayList(tool_catalog.HostStreamTool),
+    candidate: tool_catalog.HostStreamTool,
+) Error!void {
+    for (tools.items) |existing| {
+        if (std.mem.eql(u8, existing.definition.name, candidate.definition.name))
+            return error.DuplicateToolName;
+    }
+    for (stream_tools.items) |existing| {
+        if (std.mem.eql(u8, existing.definition.name, candidate.definition.name))
+            return error.DuplicateToolName;
+    }
+    try stream_tools.append(allocator, candidate);
 }
 
 fn appendUniqueProcessTool(
@@ -785,9 +862,16 @@ fn appendUniqueProcessTool(
 
 fn validateNoCrossChannelToolCollisions(
     host_tools: []const tool_catalog.HostSyncTool,
+    host_stream_tools: []const tool_catalog.HostStreamTool,
     process_tools: []const tool_catalog.IsolatedTool,
 ) Error!void {
     for (host_tools) |host_tool| {
+        for (process_tools) |process_tool| {
+            if (std.mem.eql(u8, host_tool.definition.name, process_tool.definition.name))
+                return error.DuplicateToolName;
+        }
+    }
+    for (host_stream_tools) |host_tool| {
         for (process_tools) |process_tool| {
             if (std.mem.eql(u8, host_tool.definition.name, process_tool.definition.name))
                 return error.DuplicateToolName;
@@ -798,6 +882,7 @@ fn validateNoCrossChannelToolCollisions(
 fn validateNoBuiltinToolCollisions(
     builtin_tools: []const []const u8,
     host_tools: []const tool_catalog.HostSyncTool,
+    host_stream_tools: []const tool_catalog.HostStreamTool,
     process_tools: []const tool_catalog.IsolatedTool,
 ) Error!void {
     for (builtin_tools) |builtin_name| {
@@ -807,6 +892,10 @@ fn validateNoBuiltinToolCollisions(
         }
         for (process_tools) |process_tool| {
             if (std.mem.eql(u8, builtin_name, process_tool.definition.name))
+                return error.DuplicateToolName;
+        }
+        for (host_stream_tools) |host_tool| {
+            if (std.mem.eql(u8, builtin_name, host_tool.definition.name))
                 return error.DuplicateToolName;
         }
     }
@@ -928,6 +1017,56 @@ test "static builtin bundles reject provider-visible name collisions" {
         .generation = @enumFromInt(1),
         .supported_capabilities = contract.CapabilitySet.from(&.{.builtin_tool_bundle}),
         .static_plugins = &.{ first, second },
+    }));
+}
+
+test "static host plugin rejects one local name in sync and stream executor modes" {
+    const Probe = struct {
+        fn syncExecute(
+            _: *anyopaque,
+            _: tool_catalog.HostRunIdentity,
+            _: []const u8,
+        ) error{OutOfMemory}!tool_catalog.HostToolOutcome {
+            return .fatal;
+        }
+
+        fn streamExecute(
+            _: *anyopaque,
+            _: tool_catalog.HostRunIdentity,
+            _: []const u8,
+            _: *const tool_catalog.HostResultSink,
+        ) tool_catalog.HostStreamExecuteError!tool_catalog.HostStreamOutcome {
+            return .fatal;
+        }
+    };
+    var context: u8 = 0;
+    const definition = @import("../json.zig").ToolDefinition{
+        .name = "Echo",
+        .description = "Duplicate executor-mode probe",
+        .input_schema = .{ .type = "object" },
+    };
+    const plugin = StaticPlugin{
+        .descriptor = .{
+            .id = try contract.PluginId.parse("acme.executor-modes"),
+            .version = try contract.Version.parse("1.0.0"),
+            .form = .static_trusted,
+            .capabilities = contract.CapabilitySet.from(&.{.host_tool}),
+        },
+        .tools = &.{.{
+            .definition = definition,
+            .ctx = &context,
+            .execute = Probe.syncExecute,
+        }},
+        .stream_tools = &.{.{
+            .definition = definition,
+            .ctx = &context,
+            .execute = Probe.streamExecute,
+        }},
+    };
+    try std.testing.expectError(error.DuplicateToolName, Snapshot.create(std.testing.allocator, .{
+        .generation = @enumFromInt(1),
+        .supported_capabilities = contract.CapabilitySet.from(&.{.host_tool}),
+        .static_plugins = &.{plugin},
     }));
 }
 

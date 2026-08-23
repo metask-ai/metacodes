@@ -12,6 +12,13 @@ const permission_category = @import("../permission/category.zig");
 const artifact_store = @import("tool_result_artifact.zig");
 const tool_result = @import("tool_result.zig");
 
+/// Legacy completed Host results are model-visible text and deliberately
+/// bounded. Larger or binary producers must use `HostStreamTool`, which starts
+/// a kernel-owned CAS spool before byte zero and carries an explicit media type.
+/// This matches the public AgentCore ABI instead of letting source-level Zig
+/// plugins bypass the same data-plane contract.
+pub const MAX_HOST_SYNC_RESULT_BYTES: usize = 16 * 1024 * 1024;
+
 pub const CatalogError = error{
     UnknownBuiltinTool,
     DuplicateToolName,
@@ -57,7 +64,9 @@ pub const HostSyncExecuteFn = *const fn (
 /// `ctx` locking.
 /// `args` is the provider-produced JSON envelope; the Host owns its validation.
 /// Session lifecycle locks are not held, but abort is the only supported
-/// reentrant AgentSession operation.
+/// reentrant AgentSession operation. Returned bytes must be valid UTF-8 and no
+/// larger than `MAX_HOST_SYNC_RESULT_BYTES`; larger/binary producers must use
+/// `HostStreamTool`.
 pub const HostSyncTool = struct {
     definition: json.ToolDefinition,
     ctx: *anyopaque,
@@ -330,6 +339,15 @@ pub fn cloneHostTool(allocator: std.mem.Allocator, source: HostSyncTool) std.mem
     };
 }
 
+pub fn cloneHostStreamTool(allocator: std.mem.Allocator, source: HostStreamTool) std.mem.Allocator.Error!HostStreamTool {
+    return .{
+        .definition = try cloneDefinition(allocator, source.definition),
+        .ctx = source.ctx,
+        .execute = source.execute,
+        .category = source.category,
+    };
+}
+
 fn cloneInputSchema(allocator: std.mem.Allocator, source: json.InputSchema) std.mem.Allocator.Error!json.InputSchema {
     return .{
         .type = try allocator.dupe(u8, source.type),
@@ -492,6 +510,8 @@ pub const Selection = struct {
                 switch (outcome) {
                     .ok => |result| {
                         defer result.release();
+                        if (!validHostSyncText(result.bytes))
+                            return .{ .host_failed = null };
                         return .{ .ok = tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, result.bytes)) };
                     },
                     .failed => |maybe| {
@@ -564,7 +584,13 @@ pub const Selection = struct {
     fn copyDetail(allocator: std.mem.Allocator, maybe: ?HostToolResult) error{OutOfMemory}!?[]u8 {
         const result = maybe orelse return null;
         defer result.release();
+        if (!validHostSyncText(result.bytes)) return null;
         return try allocator.dupe(u8, result.bytes);
+    }
+
+    fn validHostSyncText(bytes: []const u8) bool {
+        return bytes.len <= MAX_HOST_SYNC_RESULT_BYTES and
+            std.unicode.utf8ValidateSlice(bytes);
     }
 
     const StreamFailure = enum {
@@ -818,6 +844,48 @@ const HostStreamFailureProbe = struct {
     }
 };
 
+const HostTextContractProbe = struct {
+    payload: []const u8,
+    status: enum { ok, failed },
+    calls: usize = 0,
+    releases: usize = 0,
+
+    fn execute(
+        raw: *anyopaque,
+        _: HostRunIdentity,
+        _: []const u8,
+    ) error{OutOfMemory}!HostToolOutcome {
+        const self: *HostTextContractProbe = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        const result = HostToolResult{
+            .bytes = self.payload,
+            .release_ctx = self,
+            .releaseFn = release,
+        };
+        return switch (self.status) {
+            .ok => .{ .ok = result },
+            .failed => .{ .failed = result },
+        };
+    }
+
+    fn release(raw: *anyopaque, _: []const u8) void {
+        const self: *HostTextContractProbe = @ptrCast(@alignCast(raw));
+        self.releases += 1;
+    }
+
+    fn tool(self: *HostTextContractProbe, name: []const u8) HostSyncTool {
+        return .{
+            .definition = .{
+                .name = name,
+                .description = "Exercise the legacy Host text contract",
+                .input_schema = .{ .type = "object", .required = &.{} },
+            },
+            .ctx = self,
+            .execute = execute,
+        };
+    }
+};
+
 fn testIdentity(anchor: *anyopaque) HostRunIdentity {
     return .{
         .identity = .{ .session_id = @import("session_id.zig").SessionId.single, .run_id = 7 },
@@ -869,6 +937,58 @@ test "Host sync entry is Runtime-owned, selected once and released once" {
     // 身份缺失是接线 bug,不是工具错误——独立错误码,不落模型可见面。
     ctx.host_run = null;
     try std.testing.expectError(error.HostRunIdentityMissing, tools.dispatch(&ctx, "HostEcho", "{\"text\":\"x\"}"));
+}
+
+test "Host sync boundary rejects invalid UTF-8 and oversized legacy buffers before copy" {
+    const allocator = std.testing.allocator;
+    const invalid_utf8 = [_]u8{0xff};
+    var invalid = HostTextContractProbe{ .payload = &invalid_utf8, .status = .ok };
+    const oversized = try allocator.alloc(u8, MAX_HOST_SYNC_RESULT_BYTES + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 'x');
+    var too_large = HostTextContractProbe{ .payload = oversized, .status = .ok };
+    var invalid_failure = HostTextContractProbe{ .payload = &invalid_utf8, .status = .failed };
+    var catalog = try Catalog.init(
+        allocator,
+        &.{},
+        &.{
+            invalid.tool("InvalidUtf8Host"),
+            too_large.tool("OversizedHost"),
+            invalid_failure.tool("InvalidFailureDetail"),
+        },
+    );
+    defer catalog.deinit();
+    var selection = try Selection.init(
+        allocator,
+        &catalog,
+        &.{ "InvalidUtf8Host", "OversizedHost", "InvalidFailureDetail" },
+    );
+    defer selection.deinit();
+    var ctx = tools.ToolContext{
+        .allocator = allocator,
+        .host_run = testIdentity(@ptrCast(&invalid)),
+        .tool_dispatcher = selection.dispatcher(),
+    };
+
+    var invalid_outcome = try tools.dispatch(&ctx, "InvalidUtf8Host", "{}");
+    defer invalid_outcome.deinit(allocator);
+    try std.testing.expect(invalid_outcome == .host_failed);
+    try std.testing.expect(invalid_outcome.host_failed == null);
+
+    ctx.host_run = testIdentity(@ptrCast(&too_large));
+    var oversized_outcome = try tools.dispatch(&ctx, "OversizedHost", "{}");
+    defer oversized_outcome.deinit(allocator);
+    try std.testing.expect(oversized_outcome == .host_failed);
+    try std.testing.expect(oversized_outcome.host_failed == null);
+
+    ctx.host_run = testIdentity(@ptrCast(&invalid_failure));
+    var failure_outcome = try tools.dispatch(&ctx, "InvalidFailureDetail", "{}");
+    defer failure_outcome.deinit(allocator);
+    try std.testing.expect(failure_outcome == .host_failed);
+    try std.testing.expect(failure_outcome.host_failed == null);
+    try std.testing.expectEqual(@as(usize, 1), invalid.releases);
+    try std.testing.expectEqual(@as(usize, 1), too_large.releases);
+    try std.testing.expectEqual(@as(usize, 1), invalid_failure.releases);
 }
 
 test "Host stream entry writes byte zero into CAS and returns no full inline buffer" {

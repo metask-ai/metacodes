@@ -211,6 +211,7 @@ pub const AgentRuntime = struct {
             .generation = generation,
             .supported_capabilities = plugin_support.acceptedCapabilities(.agent_core_static),
             .compatibility_host_tools = config.host_sync_tools,
+            .compatibility_host_stream_tools = config.host_stream_tools,
             .static_plugins = static_plugins.items,
             .process_packages = config.process_plugins,
         });
@@ -231,7 +232,7 @@ pub const AgentRuntime = struct {
             allocator,
             builtin_tools.items,
             plugin_snapshot.host_tools,
-            config.host_stream_tools,
+            plugin_snapshot.host_stream_tools,
             plugin_snapshot.process_tools,
         );
         self.* = .{ .allocator = allocator, .plugin_snapshot = plugin_snapshot, .catalog = catalog };
