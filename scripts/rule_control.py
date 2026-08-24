@@ -313,10 +313,10 @@ def observe_release_gate(
     expected_strings = {
         "build_file": "control-plane/build.zig",
         "build_step": "rule-check",
-        "workflow_file": ".github/workflows/cross-platform.yml",
+        "workflow_file": ".github/workflows/rule-control.yml",
         "workflow_job": "rule-control",
-        "workflow_workdir": "metacodes",
-        "telemetry_path": "metacodes/zig-out/reports/rule-control.json",
+        "workflow_workdir": ".",
+        "telemetry_path": "zig-out/reports/rule-control.json",
     }
     for key, expected in expected_strings.items():
         if observation.get(key) != expected:
@@ -1367,12 +1367,12 @@ def observe_build_test_throughput(repo: Path) -> Observation:
             "dev_step.dependOn(&install_debug.step)" in dev_step
             and "dev_step.dependOn(&exe.step)" not in dev_step
             and "installArtifact(exe)" not in dev_step
-            and "vendor_tinykg_step" not in dev_step
+            and "tinykg_stage_step" not in dev_step
         ),
         "full development path explicitly includes TinyKG": (
             'b.step("dev:full"' in sources["build"]
             and "dev_full_step.dependOn(&install_debug.step)" in sources["build"]
-            and "dev_full_step.dependOn(vendor_tinykg_step)" in sources["build"]
+            and "dev_full_step.dependOn(tinykg_stage_step)" in sources["build"]
         ),
         "core gates expose sharded monolithic timing and harness paths": all(
             f'b.step("{step}"' in sources["build"]
@@ -1405,25 +1405,30 @@ def observe_build_test_throughput(repo: Path) -> Observation:
     }
 
     tinykg_artifact_repro_checks = {
-        "shipped TinyKG strips location-bearing debug symbols": (
-            "tinykg_exe.root_module.strip = true" in sources["build"]
-        ),
-        "feedback builds two isolated locations concurrently": all(
-            marker in sources["artifact_repro"]
+        "TinyKG path and digest must be supplied together": all(
+            marker in sources["build"]
             for marker in (
-                "ThreadPoolExecutor(max_workers=2)",
-                "executor.map(build, roots)",
-                '"vendor:tinykg"',
-                '"--cache-dir"',
-                '"--prefix"',
+                '"tinykg-bin"',
+                '"tinykg-sha256"',
+                "must be supplied together",
             )
         ),
-        "feedback compares full bytes and SHA-256": all(
+        "feedback stages one attested input into two isolated locations": all(
+            marker in sources["artifact_repro"]
+            for marker in (
+                "for root in roots:",
+                "stage(",
+                "expected_sha256=expected_sha256",
+                'target="native-test"',
+            )
+        ),
+        "feedback compares full bytes, SHA-256, and receipts": all(
             marker in sources["artifact_repro"]
             for marker in (
                 "hashlib.sha256(payloads[0])",
                 "hashlib.sha256(payloads[1])",
                 "self.assertEqual(payloads[0], payloads[1])",
+                "self.assertEqual(receipts[0].read_bytes(), receipts[1].read_bytes())",
             )
         ),
         "feedback executes both resulting artifacts": all(
@@ -1560,7 +1565,7 @@ def observe_build_test_throughput(repo: Path) -> Observation:
                 "unittest": (
                     "scripts.tests.test_artifact_reproducibility."
                     "TinyKgArtifactReproducibilityTest."
-                    "test_two_isolated_vendor_builds_are_byte_identical_and_runnable"
+                    "test_two_isolated_stages_preserve_attested_bytes_and_receipts"
                 )
             },
             {
@@ -2862,6 +2867,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
         "workbuddy_preflight": "scripts/eval/workbuddy/environment_preflight.py",
         "workbuddy_launch_tests": "scripts/eval/tests/test_workbuddy_launch_gate.py",
         "workbuddy_adapter_tests": "scripts/eval/tests/test_workbuddy_adapter.py",
+        "workbuddy_release_suite": "scripts/eval/workbuddy_release_suite.py",
         "e2e_lib": "tests/e2e/lib.sh",
         "retry_test": "tests/component/stream_retry_test.zig",
     }
@@ -3599,11 +3605,18 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 marker in authority_test
                 for marker in ("2000.01", "must not exceed", "explicit paid-rollout authority")
             ),
-            "quality flag and single physical provider attempt remain gated": (
+            "quality flag and every physical provider attempt remain gated": (
                 '"quality_evidence": False' in sources["runner"]
                 and 'value["quality_evidence"] is not False' in sources["replay"]
-                and 'test "L2 evaluation gate makes one physical provider attempt and never retries outside receipt"'
-                in sources["retry_test"]
+                and all(
+                    marker in sources["retry_test"]
+                    for marker in (
+                        'test "L2 AgentLoop journals every physical provider attempt before retry"',
+                        "loaded.provider_attempts.len",
+                        "first.physical_attempt",
+                        "second.physical_attempt",
+                    )
+                )
             ),
             "multi-arm credential crosses only an anonymous one-shot FD": all(
                 marker in multi_once_source
@@ -3662,7 +3675,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
             {"unittest": "scripts.eval.tests.test_experiment"},
             {"unittest": "scripts.eval.tests.test_paid_multi_arm_fd"},
             {"unittest": "scripts.eval.tests.test_workbuddy_launch_gate"},
-            {"unittest": "scripts.eval.tests.test_workbuddy_adapter"},
+            {"unittest": "scripts.eval.workbuddy_release_suite"},
             {"step": "test:new", "filter": "L2 evaluation gate makes one physical provider attempt"},
         ],
         errors=errors,
@@ -4044,8 +4057,9 @@ def link_topology(
         and len(command) > 3
         for command in feedback_commands
     )
-    has_tinykg_build = commands_are_arrays and any(
-        command[0] == "zig" and "vendor:tinykg" in command[1:]
+    has_tinykg_attestation = commands_are_arrays and any(
+        command[0] in {"python", "python3"}
+        and command[1:] == ["scripts/verify_tinykg_binary.py"]
         for command in feedback_commands
     )
     feedback_kind = feedback.get("kind") if isinstance(feedback, dict) else None
@@ -4058,7 +4072,7 @@ def link_topology(
         "eval.treatment-activation.l2",
         "eval.memory-local-store-isolation.l2",
     }:
-        feedback_runner_ok = feedback_runner_ok and has_tinykg_build
+        feedback_runner_ok = feedback_runner_ok and has_tinykg_attestation
     if rule.get("id") == "tinykg.daemon-transport.l2":
         feedback_runner_ok = feedback_runner_ok and has_python_unittest and has_zig_test
     feedback_ok = (

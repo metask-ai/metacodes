@@ -143,10 +143,10 @@ run_session() {
   # --- TinyKG 夹具:只向本场景 fake HOME 的全新 store 写入,以 global project 供任意
   # workdir domain 只读召回。fixture 路径同时在 eval suite environment.fixtures 中冻结。---
   if [[ -n "$CONF_KG_SEED" ]]; then
-    local tinykg_bin="$ZIG_ROOT/zig-out/vendor/tinykg/tinykg"
+    local tinykg_bin="${METACODES_TEST_TINYKG_BIN:-${METACODES_KG_BIN:-}}"
     local kg_fixture="$E2E_DIR/$CONF_KG_SEED"
     if [[ ! -x "$tinykg_bin" || ! -f "$kg_fixture" ]]; then
-      echo "KG fixture dependency missing: $tinykg_bin or $kg_fixture" >&2
+      echo "KG fixture dependency missing: explicit TinyKG binary or $kg_fixture" >&2
       echo 94
       return 0
     fi

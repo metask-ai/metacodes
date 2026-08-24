@@ -462,7 +462,7 @@ fn runInjection(allocator: std.mem.Allocator, cmd: []const u8, opts: RenderOptio
         return try allocator.dupe(u8, "[shell command execution disabled by policy]");
     }
     if (std.mem.eql(u8, opts.shell, "powershell")) {
-        return try allocator.dupe(u8, "[powershell shell not supported in cc-zig]");
+        return try allocator.dupe(u8, "[powershell shell not supported in metacodes]");
     }
     // 沙箱包裹（task#25:防 Write→SKILL.md→activate 自造 skill 经注入 shell 逃逸沙箱）。
     // 复用 Bash/Monitor 同款 wrapAsShellString 范式:enabled → sandbox-exec 包;

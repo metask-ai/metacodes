@@ -2160,7 +2160,7 @@ fn switchModel(
 }
 
 fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
-    std.debug.print("\x1b[1mcc-zig doctor\x1b[0m\n", .{});
+    std.debug.print("\x1b[1mmetacodes doctor\x1b[0m\n", .{});
     std.debug.print("  model:            {s}\n", .{app.activeModel()});
     std.debug.print("  permission mode:  {s}\n", .{@tagName(app.permission_ctx.modeValue())});
     std.debug.print("  auth token:       {s}\n", .{if (app.api_key.len > 0) "set" else "MISSING"});
@@ -2282,7 +2282,7 @@ pub fn parseGoalCommand(rest_raw: []const u8) GoalCommand {
 /// 无参=状态;`mem`=最近记忆;`forget <id>`=删除(投毒自救);`export`=导出 markdown。
 fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     const kg = if (app.kg) |*k| k else {
-        std.debug.print("KG 未配置(缺 tinykg 二进制)。运行 `zig build`(从 lib/tinykg 源交叉编译生成)。\n", .{});
+        std.debug.print("KG 未配置。配置 authenticated tinykgd，或为隔离 CLI 模式设置 METACODES_KG_BIN；见 doc/TINYKG_INTEGRATION.md。\n", .{});
         return;
     };
     if (!kg.ready) {
@@ -3347,7 +3347,7 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 fn printStartupBanner(app: *const app_mod.App) void {
     const th = app.theme;
     if (!platform_term.isatty(1)) {
-        std.debug.print("cc-zig\nType your message or /help for commands\n\n", .{});
+        std.debug.print("metacodes\nType your message or /help for commands\n\n", .{});
         return;
     }
     const cols: usize = blk: {
@@ -3361,8 +3361,8 @@ fn printStartupBanner(app: *const app_mod.App) void {
     // 去掉旧的 64 封顶——宽窗口下旧版框 64 列、分隔线满宽,两条线不等长(用户实测割裂)。
     const inner: usize = if (cols > 3) cols - 3 else 60;
 
-    const title = " cc-zig ";
-    // 顶边框:╭─ cc-zig ───…──╮
+    const title = " metacodes ";
+    // 顶边框:╭─ metacodes ───…──╮
     std.debug.print("{s}{s}{s}{s}", .{ th.accent, th.box_tl, th.box_h, title });
     var filled: usize = 1 + displayWidthAscii(title); // box_h(1) + title
     while (filled < inner) : (filled += 1) std.debug.print("{s}", .{th.box_h});

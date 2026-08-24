@@ -988,7 +988,8 @@ def main():
     compressed = zlib.compress(bytes(blob), 9)
 
     # 写压缩 blob
-    blob_path = Path("/Users/david/prj/cc-t2z/hl-zig/src/rules_blob.zlib")
+    project_root = Path(__file__).resolve().parents[1]
+    blob_path = project_root / "src/rules_blob.zlib"
     blob_path.write_bytes(compressed)
     print(f"blob: {len(blob)} bytes → zlib {len(compressed)} bytes")
 
@@ -1277,7 +1278,7 @@ pub fn ruleAt(i: usize) ?*const LangRule {
 }
 '''
 
-    out_path = Path("/Users/david/prj/cc-t2z/hl-zig/src/rules.zig")
+    out_path = project_root / "src/rules.zig"
     out_path.write_text(zig_code)
     print(f"生成 {len(entries)} 语言 → {out_path}")
     print(f"跳过 {len(skipped)}: {', '.join(skipped[:30])}")

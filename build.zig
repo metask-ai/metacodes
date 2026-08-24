@@ -62,6 +62,52 @@ fn addNestedBuildCacheArgs(b: *std.Build, run: *std.Build.Step.Run) void {
     });
 }
 
+const TinyKgBinaryInput = union(enum) {
+    absent,
+    explicit: struct {
+        path: []const u8,
+        sha256: []const u8,
+    },
+};
+
+fn isLowerSha256(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
+/// TinyKG is an external, manually maintained native artifact.  Requiring the
+/// path and the operator-observed digest together makes an ambient binary or a
+/// stale checkout unrepresentable in the build graph.
+fn tinyKgBinaryInput(b: *std.Build) TinyKgBinaryInput {
+    const legacy = b.option(bool, "tinykg", "Deprecated compatibility flag; only false is accepted");
+    if (legacy == true) @panic("-Dtinykg=true was removed; use -Dtinykg-bin=<absolute path> and -Dtinykg-sha256=<digest>");
+
+    const path = b.option([]const u8, "tinykg-bin", "Absolute path to a maintainer-supplied native TinyKG binary");
+    const sha256 = b.option([]const u8, "tinykg-sha256", "Observed SHA-256 of -Dtinykg-bin");
+    if (path == null and sha256 == null) return .absent;
+    const resolved_path = path orelse @panic("-Dtinykg-bin and -Dtinykg-sha256 must be supplied together");
+    const resolved_sha256 = sha256 orelse @panic("-Dtinykg-bin and -Dtinykg-sha256 must be supplied together");
+    if (!std.fs.path.isAbsolute(resolved_path)) @panic("-Dtinykg-bin must be an absolute path");
+    if (!isLowerSha256(resolved_sha256)) @panic("-Dtinykg-sha256 must be 64 lowercase hex characters");
+    return .{ .explicit = .{ .path = resolved_path, .sha256 = resolved_sha256 } };
+}
+
+const StagedTinyKg = struct {
+    install_step: *std.Build.Step,
+    artifact: std.Build.LazyPath,
+    installed_path: []const u8,
+    source_sha256: []const u8,
+};
+
+fn wireTinyKgTestInput(run: *std.Build.Step.Run, staged: ?StagedTinyKg) void {
+    const tinykg = staged orelse return;
+    run.step.dependOn(tinykg.install_step);
+    run.setEnvironmentVariable("METACODES_TEST_TINYKG_BIN", tinykg.installed_path);
+}
+
 const aggregate_test_exclusions = [_][]const u8{
     // Has a dedicated ABI artifact/consumer gate with a different module graph.
     "component/agentcore_abi_test.zig",
@@ -258,43 +304,59 @@ pub fn build(b: *std.Build) void {
     );
     project_harness_shadow_step.dependOn(&install_project_harness_shadow.step);
 
-    // tinykg —— KG 记忆/计划/任务 DAG 引擎(subprocess CLI)。从 **vendored 源**(lib/tinykg,
-    // 源码快照非 submodule → plain clone 即可构建)交叉编译到当前 -Dtarget,装到
-    // <prefix>/vendor/tinykg/tinykg —— KgClient 从 exe 目录向上逐级搜此相对路径(见 kg/client.zig
-    // resolveBinPath)。跨平台随 target 自动对齐;数据完整性工具恒 ReleaseSafe(不随 app optimize)。
-    // 版本 pin 见 lib/tinykg/SOURCE.txt;格式版本门在 kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION 运行时守。
-    //
-    // Windows 已解锁:KgClient 运行时解析已 windows 化(findVendoredUpward 搜 tinykg.exe、
-    // isExecutable 走 F_OK、selfExeDir 走 platform.paths.selfExePath/GetModuleFileNameW),
-    // 三端均构建并可被 app 找到。跳过构建用 -Dtinykg=false。
-    const build_tinykg = b.option(bool, "tinykg", "Build & install the vendored tinykg KG engine (default true)") orelse true;
-    // install step 提到外层:kg/swarm 集成测试需要真 tinykg 二进制,故 test step 也依赖它
-    // (让 `zig build test` 自包含地把 tinykg 建到 zig-out/vendor/tinykg/tinykg,测试候选路径命中)。
-    var tinykg_install_step: ?*std.Build.Step = null;
-    var tinykg_artifact: ?*std.Build.Step.Compile = null;
-    const vendor_tinykg_step = b.step("vendor:tinykg", "Build and install the vendored TinyKG engine");
-    if (build_tinykg) {
-        const tinykg_exe = b.addExecutable(.{
-            .name = "tinykg",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("lib/tinykg/src/main.zig"),
-                .target = target,
-                .optimize = .ReleaseSafe,
-                .link_libc = true,
-            }),
-        });
-        // ReleaseSafe keeps absolute source paths in Mach-O debug symbols,
-        // which makes otherwise identical TinyKG builds differ by worktree.
-        tinykg_exe.root_module.strip = true;
-        const install_tinykg = b.addInstallArtifact(tinykg_exe, .{
-            .dest_dir = .{ .override = .{ .custom = "vendor/tinykg" } },
-        });
-        b.getInstallStep().dependOn(&install_tinykg.step);
-        tinykg_install_step = &install_tinykg.step;
-        tinykg_artifact = tinykg_exe;
-        vendor_tinykg_step.dependOn(&install_tinykg.step);
-    } else {
-        vendor_tinykg_step.dependOn(&b.addFail("vendor:tinykg requires -Dtinykg=true").step);
+    // TinyKG is deliberately outside the Metacodes source/build graph.  A
+    // maintainer may stage one native binary by supplying an absolute path and
+    // its observed digest.  The staging program validates version plus a fresh
+    // store's storage/schema contract before the bytes enter zig-out.
+    const tinykg_input = tinyKgBinaryInput(b);
+    var staged_tinykg: ?StagedTinyKg = null;
+    const tinykg_stage_step = b.step("tinykg:stage", "Validate and install an explicit maintainer-supplied TinyKG binary");
+    switch (tinykg_input) {
+        .absent => tinykg_stage_step.dependOn(&b.addFail(
+            "tinykg:stage requires -Dtinykg-bin=<absolute path> and -Dtinykg-sha256=<digest>",
+        ).step),
+        .explicit => |input| {
+            if (target.result.os.tag != b.graph.host.result.os.tag or
+                target.result.cpu.arch != b.graph.host.result.cpu.arch or
+                target.result.abi != b.graph.host.result.abi)
+            {
+                @panic("a TinyKG binary can only be staged on its native target runner");
+            }
+            const python = if (@import("builtin").os.tag == .windows) "python" else "python3";
+            const stage = b.addSystemCommand(&.{ python, "scripts/stage_tinykg_binary.py", "--binary" });
+            stage.addFileArg(.{ .cwd_relative = input.path });
+            stage.addArgs(&.{ "--expected-sha256", input.sha256, "--contract" });
+            stage.addFileArg(b.path("deps/tinykg.json"));
+            stage.addArgs(&.{
+                "--target",
+                target.result.zigTriple(b.allocator) catch @panic("OOM"),
+                "--output",
+            });
+            const bin_name = if (target.result.os.tag == .windows) "tinykg.exe" else "tinykg";
+            const staged_binary = stage.addOutputFileArg(bin_name);
+            stage.addArg("--receipt");
+            const staged_receipt = stage.addOutputFileArg("tinykg.provenance.json");
+            const install_binary = b.addInstallFileWithDir(
+                staged_binary,
+                .{ .custom = "vendor/tinykg" },
+                bin_name,
+            );
+            const install_receipt = b.addInstallFileWithDir(
+                staged_receipt,
+                .{ .custom = "vendor/tinykg" },
+                "tinykg.provenance.json",
+            );
+            b.getInstallStep().dependOn(&install_binary.step);
+            b.getInstallStep().dependOn(&install_receipt.step);
+            tinykg_stage_step.dependOn(&install_binary.step);
+            tinykg_stage_step.dependOn(&install_receipt.step);
+            staged_tinykg = .{
+                .install_step = &install_binary.step,
+                .artifact = staged_binary,
+                .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, bin_name),
+                .source_sha256 = input.sha256,
+            };
+        },
     }
 
     const debug_mod = b.createModule(.{
@@ -312,9 +374,9 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_debug.step);
     const dev_step = b.step("dev", "Install only the runnable Debug app (fast edit loop)");
     dev_step.dependOn(&install_debug.step);
-    const dev_full_step = b.step("dev:full", "Install the Debug app and vendored TinyKG without compiling ReleaseSmall");
+    const dev_full_step = b.step("dev:full", "Install the Debug app and an explicitly staged TinyKG binary");
     dev_full_step.dependOn(&install_debug.step);
-    dev_full_step.dependOn(vendor_tinykg_step);
+    dev_full_step.dependOn(tinykg_stage_step);
 
     // ── 共享测试模块────────────────────────────────────────────────────────
     // cc(全 src 树)与 harness(mock SSE server)被单测/spike/integ/new/mem/agentcore/
@@ -1212,14 +1274,26 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(http_status_gate_step);
+    const tinykg_contract_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_stage_tinykg_binary",
+        "-v",
+    });
+    const tinykg_contract_test_step = b.step(
+        "test:tinykg-binary",
+        "Test the explicit manually maintained TinyKG binary boundary",
+    );
+    tinykg_contract_test_step.dependOn(&tinykg_contract_test_cmd.step);
+    test_step.dependOn(&tinykg_contract_test_cmd.step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     const test_run = addTestRunArtifact(b, test_obj, windows_test_prelude);
-    // kg/swarm 集成测试用真 tinykg → 先把它建到 zig-out/vendor/tinykg/tinykg(测试候选路径)。
-    if (tinykg_install_step) |s| test_run.step.dependOn(s);
+    wireTinyKgTestInput(test_run, staged_tinykg);
     test_step.dependOn(&test_run.step);
 
     // Two independent Metacodes processes share one authenticated StoreActor.
@@ -1266,12 +1340,14 @@ pub fn build(b: *std.Build) void {
         target.result.os.tag == @import("builtin").os.tag and
         target.result.cpu.arch == @import("builtin").cpu.arch;
     if (runtime_tests_can_execute_target) {
-        if (tinykg_artifact) |tinykg_exe| {
+        if (staged_tinykg) |tinykg| {
             // Native Python cases discover the installed TinyKG by path.  On
             // a clean checkout they must wait for installation; otherwise
             // test discovery races the build and silently turns coverage into
             // machine-state-dependent skips.
-            if (tinykg_install_step) |install| eval_test_cmd.step.dependOn(install);
+            eval_test_cmd.step.dependOn(tinykg.install_step);
+            eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_BIN", tinykg.installed_path);
+            eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_SHA256", tinykg.source_sha256);
             const arm_smoke = b.addSystemCommand(&.{
                 eval_python_exe,
                 "scripts/eval/runtime_arm_smoke.py",
@@ -1279,7 +1355,7 @@ pub fn build(b: *std.Build) void {
             });
             arm_smoke.addArtifactArg(exe);
             arm_smoke.addArg("--tinykg-binary");
-            arm_smoke.addArtifactArg(tinykg_exe);
+            arm_smoke.addFileArg(tinykg.artifact);
             eval_test_step.dependOn(&arm_smoke.step);
             test_step.dependOn(&arm_smoke.step);
 
@@ -1294,7 +1370,7 @@ pub fn build(b: *std.Build) void {
             });
             memory_runtime_smoke.addArtifactArg(exe);
             memory_runtime_smoke.addArg("--tinykg-binary");
-            memory_runtime_smoke.addArtifactArg(tinykg_exe);
+            memory_runtime_smoke.addFileArg(tinykg.artifact);
             eval_test_step.dependOn(&memory_runtime_smoke.step);
             test_step.dependOn(&memory_runtime_smoke.step);
         }
@@ -1361,7 +1437,7 @@ pub fn build(b: *std.Build) void {
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
         run_shard.expectExitCode(0);
         run_shard.step.dependOn(&install_mock_mcp.step);
-        if (tinykg_install_step) |step| run_shard.step.dependOn(step);
+        wireTinyKgTestInput(run_shard, staged_tinykg);
         integration_reports[shard_index] = run_shard.captureStdOut(.{
             .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
         });
@@ -1374,7 +1450,7 @@ pub fn build(b: *std.Build) void {
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
     integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
-    if (tinykg_install_step) |step| integration_monolithic_run.step.dependOn(step);
+    wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
     integration_monolithic_step.dependOn(&integration_monolithic_run.step);
 
@@ -1389,7 +1465,7 @@ pub fn build(b: *std.Build) void {
     });
     const integration_timed_run = addTestRunArtifact(b, integration_timed_test, windows_test_prelude);
     integration_timed_run.step.dependOn(&install_mock_mcp.step);
-    if (tinykg_install_step) |step| integration_timed_run.step.dependOn(step);
+    wireTinyKgTestInput(integration_timed_run, staged_tinykg);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
 
@@ -1596,7 +1672,7 @@ pub fn build(b: *std.Build) void {
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG governance:"},
         });
         const run_t = addTestRunArtifact(b, t, windows_test_prelude);
-        if (tinykg_install_step) |s| run_t.step.dependOn(s);
+        wireTinyKgTestInput(run_t, staged_tinykg);
         kg_governance_step.dependOn(&run_t.step);
     }
 
@@ -1620,7 +1696,7 @@ pub fn build(b: *std.Build) void {
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG ontology feedback:"},
         });
         const run_t = addTestRunArtifact(b, t, windows_test_prelude);
-        if (tinykg_install_step) |s| run_t.step.dependOn(s);
+        wireTinyKgTestInput(run_t, staged_tinykg);
         kg_ontology_feedback_step.dependOn(&run_t.step);
     }
 
@@ -1644,7 +1720,7 @@ pub fn build(b: *std.Build) void {
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG experience feedback:"},
         });
         const run_t = addTestRunArtifact(b, t, windows_test_prelude);
-        if (tinykg_install_step) |s| run_t.step.dependOn(s);
+        wireTinyKgTestInput(run_t, staged_tinykg);
         kg_experience_feedback_step.dependOn(&run_t.step);
     }
 

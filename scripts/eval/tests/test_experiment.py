@@ -1338,7 +1338,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
             )
 
     @unittest.skipUnless(
-        REAL_TINYKG.is_file(), "build the vendored TinyKG binary first"
+        REAL_TINYKG.is_file(), "set METACODES_TEST_TINYKG_BIN"
     )
     def test_multi_arm_attaches_real_tinykg_receipt_before_checkpoint(self):
         experiment = copy.deepcopy(self.experiment)
@@ -1551,7 +1551,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 )
 
     @unittest.skipUnless(
-        REAL_TINYKG.is_file(), "build the vendored TinyKG binary first"
+        REAL_TINYKG.is_file(), "set METACODES_TEST_TINYKG_BIN"
     )
     def test_promotion_reverifies_all_raw_treatment_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:

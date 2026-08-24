@@ -115,6 +115,11 @@ class SuiteValidationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, "safe paths"):
                     validate_suite(noncanonical, ROOT)
 
+        escaped_prefix = copy.deepcopy(suite)
+        escaped_prefix["tasks"][0]["environment"]["repository_snapshot"]["prefix"] = ".."
+        with self.assertRaisesRegex(ValidationError, "expected '.' or a safe"):
+            validate_suite(escaped_prefix, ROOT)
+
         escaped_validator = copy.deepcopy(suite)
         escaped_validator["tasks"][0]["success"]["checks"][0]["validator"] = "../validator.py"
         with self.assertRaisesRegex(ValidationError, "below evals/validators"):

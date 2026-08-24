@@ -18,12 +18,9 @@ from scripts.eval.treatment_activation import (
 
 
 ROOT = Path(__file__).resolve().parents[3]
-TINYKG = Path(
-    os.environ.get(
-        "METACODES_TEST_TINYKG_BIN",
-        ROOT / "zig-out/vendor/tinykg/tinykg",
-    )
-)
+TINYKG = Path(os.environ["METACODES_TEST_TINYKG_BIN"]) if os.environ.get(
+    "METACODES_TEST_TINYKG_BIN"
+) else ROOT / ".missing-explicit-tinykg"
 
 
 def compact(value):
@@ -376,7 +373,7 @@ def append_baseline_invocation(
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-@unittest.skipUnless(TINYKG.is_file(), "build the vendored TinyKG binary first")
+@unittest.skipUnless(TINYKG.is_file(), "set METACODES_TEST_TINYKG_BIN")
 class TreatmentActivationTest(unittest.TestCase):
     def setUp(self):
         self.binary = TINYKG.resolve()

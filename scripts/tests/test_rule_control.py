@@ -689,12 +689,12 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         )
         (root / "scripts/tests").mkdir(parents=True, exist_ok=True)
         (root / "scripts/tests/test_artifact_reproducibility.py").write_text(
-            'with ThreadPoolExecutor(max_workers=2) as executor:\n'
-            '    executor.map(build, roots)\n'
-            'command = ["vendor:tinykg", "--cache-dir", "--prefix"]\n'
+            'for root in roots:\n'
+            '    stage(binary=binary, expected_sha256=expected_sha256, target="native-test")\n'
             'left = hashlib.sha256(payloads[0])\n'
             'right = hashlib.sha256(payloads[1])\n'
             'self.assertEqual(payloads[0], payloads[1])\n'
+            'self.assertEqual(receipts[0].read_bytes(), receipts[1].read_bytes())\n'
             'versions = [run([str(artifact), "version"]) for artifact in artifacts]\n'
             'self.assertEqual(versions[0].stdout, versions[1].stdout)\n'
             'class FormalKernelArtifactIdentityReproducibilityTest:\n'
@@ -754,7 +754,7 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             "dev_step.dependOn(&install_debug.step);\n"
             'const dev_full_step = b.step("dev:full", "fixture");\n'
             "dev_full_step.dependOn(&install_debug.step);\n"
-            "dev_full_step.dependOn(vendor_tinykg_step);\n"
+            "dev_full_step.dependOn(tinykg_stage_step);\n"
             'const spike_step = b.step("test:spike", "fixture");\n'
             'const core_test_step = b.step("test:lib", "fixture");\n'
             'const core_test_monolithic_step = b.step("test:lib-monolithic", "fixture");\n'
@@ -772,8 +772,9 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             'const shard_bound = "must be between 1 and 64";\n'
             "const lib_default = value orelse 4;\n"
             "const integration_default = value orelse 8;\n"
-            "const tinykg_exe = artifact;\n"
-            "tinykg_exe.root_module.strip = true;\n",
+            'const tinykg_bin = b.option([]const u8, "tinykg-bin", "fixture");\n'
+            'const tinykg_sha = b.option([]const u8, "tinykg-sha256", "fixture");\n'
+            'const paired = "must be supplied together";\n',
             encoding="utf-8",
         )
         return temporary, root
@@ -793,7 +794,7 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             [
                 "scripts.tests.test_artifact_reproducibility."
                 "TinyKgArtifactReproducibilityTest."
-                "test_two_isolated_vendor_builds_are_byte_identical_and_runnable",
+                "test_two_isolated_stages_preserve_attested_bytes_and_receipts",
                 "scripts.tests.test_artifact_reproducibility."
                 "FormalKernelArtifactIdentityReproducibilityTest."
                 "test_two_isolated_complete_builds_share_identity_and_bind_time_receipts",
@@ -877,13 +878,13 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         self.assertFalse(observation.sensor_ok)
         self.assertIn("fast_and_full_build_paths", observation.missing_declarations)
 
-    def test_location_dependent_shipped_artifact_is_observed(self) -> None:
+    def test_unattested_shipped_artifact_is_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
         build = root / "build.zig"
         build.write_text(
             build.read_text(encoding="utf-8").replace(
-                "tinykg_exe.root_module.strip = true;", ""
+                'const tinykg_sha = b.option([]const u8, "tinykg-sha256", "fixture");', ""
             ),
             encoding="utf-8",
         )
@@ -1411,6 +1412,7 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
         "scripts/eval/workbuddy/environment_preflight.py",
         "scripts/eval/tests/test_workbuddy_launch_gate.py",
         "scripts/eval/tests/test_workbuddy_adapter.py",
+        "scripts/eval/workbuddy_release_suite.py",
         "tests/e2e/lib.sh",
         "tests/component/stream_retry_test.zig",
     )
@@ -1929,17 +1931,17 @@ class TopologyTests(unittest.TestCase):
                 "schema_version": 1,
                 "build_file": "control-plane/build.zig",
                 "build_step": "rule-check",
-                "workflow_file": ".github/workflows/cross-platform.yml",
+                "workflow_file": ".github/workflows/rule-control.yml",
                 "workflow_job": "rule-control",
-                "workflow_workdir": "metacodes",
-                "telemetry_path": "metacodes/zig-out/reports/rule-control.json",
+                "workflow_workdir": ".",
+                "telemetry_path": "zig-out/reports/rule-control.json",
             },
         }
 
     def make_actuator_workspace(self) -> tuple[tempfile.TemporaryDirectory[str], Path, Path, dict]:
         temporary = tempfile.TemporaryDirectory()
         workspace = Path(temporary.name)
-        repo = workspace / "metacodes"
+        repo = workspace
         (workspace / ".git").mkdir()
         (workspace / ".github/workflows").mkdir(parents=True)
         (repo / "control-plane").mkdir(parents=True)
@@ -1949,10 +1951,10 @@ class TopologyTests(unittest.TestCase):
             "rule_step.dependOn(&check.step);\n",
             encoding="utf-8",
         )
-        (workspace / ".github/workflows/cross-platform.yml").write_text(
+        (workspace / ".github/workflows/rule-control.yml").write_text(
             "defaults:\n"
             "  run:\n"
-            "    working-directory: metacodes\n"
+            "    working-directory: .\n"
             "jobs:\n"
             "  rule-control:\n"
             "    runs-on: ubuntu-latest\n"
@@ -1963,7 +1965,7 @@ class TopologyTests(unittest.TestCase):
             "        if: always()\n"
             "        uses: actions/upload-artifact@v4\n"
             "        with:\n"
-            "          path: metacodes/zig-out/reports/rule-control.json\n"
+            "          path: zig-out/reports/rule-control.json\n"
             "          if-no-files-found: error\n",
             encoding="utf-8",
         )
@@ -2144,7 +2146,7 @@ class TopologyTests(unittest.TestCase):
             "kind": "python_l2_then_reobserve",
             "reobserve": True,
             "commands": [
-                ["zig", "build", "vendor:tinykg"],
+                ["python", "scripts/verify_tinykg_binary.py"],
                 [
                     "python",
                     "-m",
@@ -2209,7 +2211,7 @@ class TopologyTests(unittest.TestCase):
             "kind": "python_l2_then_reobserve",
             "reobserve": True,
             "commands": [
-                ["zig", "build", "vendor:tinykg"],
+                ["python", "scripts/verify_tinykg_binary.py"],
                 [
                     "python",
                     "-m",
@@ -2272,7 +2274,7 @@ class TopologyTests(unittest.TestCase):
                     "scripts.eval.tests.test_experiment",
                     "scripts.eval.tests.test_paid_multi_arm_fd",
                     "scripts.eval.tests.test_workbuddy_launch_gate",
-                    "scripts.eval.tests.test_workbuddy_adapter",
+                    "scripts.eval.workbuddy_release_suite",
                 ],
                 [
                     "zig",
@@ -2375,7 +2377,7 @@ class TopologyTests(unittest.TestCase):
     def test_manifest_actuator_cannot_hide_a_disconnected_ci_gate(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()
         self.addCleanup(temporary.cleanup)
-        workflow = workspace / ".github/workflows/cross-platform.yml"
+        workflow = workspace / ".github/workflows/rule-control.yml"
         workflow.write_text(
             workflow.read_text(encoding="utf-8").replace(
                 "run: zig build --build-file control-plane/build.zig rule-check",
@@ -2420,7 +2422,7 @@ class TopologyTests(unittest.TestCase):
     def test_missing_telemetry_must_fail_the_ci_job(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()
         self.addCleanup(temporary.cleanup)
-        workflow = workspace / ".github/workflows/cross-platform.yml"
+        workflow = workspace / ".github/workflows/rule-control.yml"
         workflow.write_text(
             workflow.read_text(encoding="utf-8").replace(
                 "if-no-files-found: error",
@@ -2435,7 +2437,7 @@ class TopologyTests(unittest.TestCase):
     def test_rule_control_label_outside_jobs_is_not_a_ci_actuator(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()
         self.addCleanup(temporary.cleanup)
-        workflow = workspace / ".github/workflows/cross-platform.yml"
+        workflow = workspace / ".github/workflows/rule-control.yml"
         workflow.write_text(
             workflow.read_text(encoding="utf-8").replace(
                 "jobs:\n  rule-control:",

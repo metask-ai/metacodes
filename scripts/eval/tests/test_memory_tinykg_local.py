@@ -20,7 +20,9 @@ from scripts.eval.model import ValidationError
 ROOT = Path(__file__).resolve().parents[3]
 PROCEDURAL_SOURCE = ROOT / "evals/memory/fixtures/procedural-coding-source.json"
 PROCEDURAL_EXECUTION = ROOT / "evals/memory/fixtures/procedural-adapter-smoke-execution.json"
-NATIVE_TINYKG = ROOT / "zig-out/vendor/tinykg/tinykg"
+NATIVE_TINYKG = Path(os.environ["METACODES_TEST_TINYKG_BIN"]) if os.environ.get(
+    "METACODES_TEST_TINYKG_BIN"
+) else ROOT / ".missing-explicit-tinykg"
 
 
 def procedural_artifacts(root: Path) -> tuple[Path, Path]:
@@ -160,7 +162,7 @@ class LocalTinyKgBatchTest(unittest.TestCase):
         self.assertIn("Reusable procedure learned", batch.decode("utf-8"))
 
 
-@unittest.skipUnless(NATIVE_TINYKG.is_file(), "build the vendored TinyKG binary first")
+@unittest.skipUnless(NATIVE_TINYKG.is_file(), "set METACODES_TEST_TINYKG_BIN")
 class LocalTinyKgNativeTest(unittest.TestCase):
     def test_execution_episode_import_and_project_membership_are_native(self):
         with tempfile.TemporaryDirectory() as directory:

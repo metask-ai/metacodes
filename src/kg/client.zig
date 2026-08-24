@@ -9,12 +9,12 @@
 //! 纪律(全部实证,见设计 §9 原语核对表):
 //! - spawn 超时 35s **必须大于** tinykg 30s 目录锁超时——绝不在锁等待中 killpg
 //!   制造无主锁(无主锁要等满 30s 才能被下一个调用者回收)。
-//! - 版本门:store-info 的 storage_format_version 必须 = 2、schema_version 必须 = 3;
+//! - 版本门:store-info 的 storage_format_version 必须 = 3、schema_version 必须 = 3;
 //!   manifest-less legacy store 在 host migration lock 下自动 copy-on-write 迁移并保留
 //!   rollback backup；其它不匹配（包括 schema v2）仍明确 degraded。
 //!   绝不用不匹配的二进制碰 store(格式 skew 实证:直接 FileNotFound/损坏风险)。
 //! - degraded 后不再 spawn:后续调用直接返回降级说明(防反复失败撞熔断器)。
-//! - KG 是增强非依赖:任何失败都不影响 cc-zig 其余功能。
+//! - KG 是增强非依赖:任何失败都不影响 metacodes 其余功能。
 //!
 //! 错误三类(设计 §6):transient(锁竞争/spawn 失败,重试 2 次)、
 //! permanent(二进制缺/版本不符 → degraded)、data(环/NotFound → 透传模型改参)。
@@ -277,8 +277,6 @@ pub const KgClient = struct {
         /// 测试注入:覆盖 env 读取(null = 读真实 env)。
         env_bin: ?[]const u8 = null,
         env_store: ?[]const u8 = null,
-        /// dev 兜底 opt-in 开关(METACODES_KG_DEV);测试注入,null = 读真实 env。
-        env_dev: ?[]const u8 = null,
         /// 测试注入:覆盖 exe 目录(null = selfExeDirPath 真实定位,不再依赖 argv[0])。
         exe_dir: ?[]const u8 = null,
         /// App supplies process IO for authenticated Web transport.
@@ -360,7 +358,6 @@ pub const KgClient = struct {
             .config_store = self.store_path,
             .env_bin = "", // 屏蔽 env 重解析,直接用 self 已解析的路径
             .env_store = "",
-            .env_dev = "",
             .exclusive_cli = true,
         });
     }
@@ -438,13 +435,13 @@ pub const KgClient = struct {
         return std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/store.kg", .{opts.home});
     }
 
-    /// bin 查找顺序:env METACODES_KG_BIN > config kg_bin > **vendored**(自真实 exe 目录
-    /// 向上逐级找 vendor/tinykg/tinykg)> dev 兜底(**仅 METACODES_KG_DEV 显式 opt-in**)。
+    /// bin 查找顺序:env METACODES_KG_BIN > config kg_bin > 由维护者显式 staged 的
+    /// 相邻 `vendor/tinykg/tinykg`。没有 PATH、源码树或开发 checkout 回退。
     /// 每候选 access 检查,全失败返 null(→ ensureReady 判 degraded)。
     ///
     /// PM review 修:旧版① vendored 用调用方传的 exe_dir(argv[0] 派生),裸名经 PATH 启动
     /// 时 exe_dir=null → 跳过 vendored;② 相对偏移写死 `../vendor`,从 zig-out/bin 启动时
-    /// 算成 zig-out/vendor(不存在,真 vendored 在 cc-zig/vendor 上溯两级)→ 两者叠加 → 静默
+    /// 算成错误的 zig-out/vendor 位置→ 与 staged artifact 分离 → 静默
     /// 落到会漂移的 dev 树 → "dev degraded"。新版:selfExeDirPath 真实定位(不依赖 argv[0])
     /// + 向上逐级搜(兼容 zig-out/bin 与 <prefix>/bin 布局)+ dev 兜底改 opt-in(默认绝不静默落 dev)。
     fn resolveBinPath(allocator: std.mem.Allocator, opts: ResolveOptions) !?[]u8 {
@@ -456,23 +453,12 @@ pub const KgClient = struct {
             if (v.len > 0 and isExecutable(v)) return try allocator.dupe(u8, v);
             if (v.len > 0) return null;
         }
-        // vendored:真实 exe 目录(opts.exe_dir 为测试注入覆盖;否则 OS 级 selfExeDir)向上搜。
+        // staged:真实 exe 目录(opts.exe_dir 为测试注入覆盖;否则 OS 级 selfExeDir)向上搜。
         var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
         const exe_dir: ?[]const u8 = opts.exe_dir orelse selfExeDir(&exe_buf);
         if (exe_dir) |dir| {
-            if (try findVendoredUpward(allocator, dir)) |p| return p;
+            if (try findStagedUpward(allocator, dir)) |p| return p;
         }
-        // dev 兜底:仅显式 opt-in(METACODES_KG_DEV,非空非 "0")。默认绝不静默落 dev——那是
-        // 会漂移的 live 树,正是 dev-degraded 痛点根源(PM review)。
-        if (opts.env_dev orelse envGet("METACODES_KG_DEV")) |v| {
-            if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
-                const dev = try std.fmt.allocPrint(allocator, "{s}/prj/tinykg/zig-out/bin/tinykg", .{opts.home});
-                if (isExecutable(dev)) return dev;
-                allocator.free(dev);
-            }
-        }
-        // tinykg 已内置:build.zig 从 lib/tinykg/src/ 编译到 <prefix>/vendor/tinykg/tinykg,
-        // findVendoredUpward 已能找到。不再兜底 $PATH(内置即基础特性,无需 PATH 查找)。
         return null;
     }
 
@@ -496,8 +482,8 @@ pub const KgClient = struct {
     }
 
     /// 自 start_dir 向上逐级(≤6 级)找 `<dir>/vendor/tinykg/tinykg[.exe]`。
-    /// zig-out/bin 布局需上溯两级到 cc-zig/vendor;安装布局 <prefix>/bin 上溯一级到 <prefix>/vendor。
-    fn findVendoredUpward(allocator: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
+    /// zig-out/bin 布局需上溯两级到 prefix;安装布局 <prefix>/bin 上溯一级到 <prefix>/vendor。
+    fn findStagedUpward(allocator: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
         const bin_name = if (@import("builtin").os.tag == .windows) "tinykg.exe" else "tinykg";
         var cur: []const u8 = start_dir;
         var level: usize = 0;
@@ -652,7 +638,7 @@ pub const KgClient = struct {
             .exclusive_cli => {},
         }
         const bin = self.bin_path orelse {
-            self.setDegraded("tinykg 二进制未找到。已查找:vendored(<exe_dir>/vendor/tinykg/,build.zig 从 lib/tinykg/src/ 编译)、METACODES_KG_BIN、METACODES_KG_DEV。修复:跑 `zig build`(从 lib/tinykg 源编译到 vendor/tinykg/),或设 METACODES_KG_BIN=<path>", .{});
+            self.setDegraded("tinykg 二进制未找到。只接受 METACODES_KG_BIN、config kg_bin 或维护者显式 staged 的 <prefix>/vendor/tinykg/tinykg。源码仓库不构建 TinyKG；见 doc/TINYKG_INTEGRATION.md", .{});
             return;
         };
         // store 缺 → init(先建父目录)。
@@ -711,10 +697,10 @@ pub const KgClient = struct {
         }
         // storage_format 不符:仅 legacy 自动 migrate,其它版本直接 degraded
         if (!std.mem.eql(u8, ver, "legacy")) {
-            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});手动跑 `tinykg upgrade {s} <new-store>` 核验后替换,见 lib/tinykg/SOURCE.txt", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, self.store_path, self.store_path });
+            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});手动跑 `tinykg upgrade {s} <new-store>` 核验后替换,见 deps/tinykg.json", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, self.store_path, self.store_path });
             return false;
         }
-        // legacy → v2 自动 migrate(本机 KG 是基础特性,不应让用户手动跑 tinykg 命令)
+        // legacy → current format 自动 migrate(本机 KG 是基础特性,不应让用户手动跑 tinykg 命令)
         if (!self.autoMigrateLegacyStore()) {
             self.setDegraded("store legacy→v2 自动 migrate 失败(bin={s} store={s});手动跑 `tinykg migrate-store-v2 {s} <new> --task-status-v1 --verify` 后替换", .{ bin, self.store_path, self.store_path });
             return false;
@@ -1599,12 +1585,12 @@ pub const KgClient = struct {
         // 只可能由我们写入;恒等写入幂等,快照端仍做最终匹配校验。
         {
             const bind_sha = try self.runChecked(&.{
-                "set-node-property", self.store_path, id_str,
+                "set-node-property", self.store_path,              id_str,
                 "project_sha256",    expected_project_sha256[0..],
             });
             self.freeOut(bind_sha);
             const bind_key = try self.runChecked(&.{
-                "set-node-property", self.store_path, id_str,
+                "set-node-property", self.store_path,      id_str,
                 "project_key",       expected_project_key,
             });
             self.freeOut(bind_key);
@@ -3005,34 +2991,18 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
     try testing.expectEqualStrings("/home/u/.metacodes/kg/store.kg", c3.store_path);
 }
 
-test "bin 解析:dev 兜底默认关(opt-in),vendored 缺失不静默落 dev" {
+test "bin 解析:没有 staged artifact 时绝不回退 PATH 或开发 checkout" {
     const a = testing.allocator;
-    // exe_dir 指向无 vendored 的目录 + dev 未 opt-in(env_dev="")→ bin_path null——
-    // **即便本机 ~/prj/tinykg 有 dev 树也绝不静默落**(旧 bug:静默落漂移 dev 树 = degraded 根源)。
+    // 即便本机存在 TinyKG checkout，无显式路径或 staged artifact 也必须为 null。
     var c = try KgClient.init(a, .{
         .home = "/home/u",
         .domain = "p",
         .env_bin = "",
         .env_store = "",
-        .env_dev = "", // dev 兜底关
         .exe_dir = "/tmp/definitely-no-vendor-xyzzy/bin",
     });
     defer c.deinit();
     try testing.expect(c.bin_path == null);
-
-    // "0" 也算关。
-    var c0 = try KgClient.init(a, .{
-        .home = "/home/u",
-        .domain = "p",
-        .env_bin = "",
-        .env_store = "",
-        .env_dev = "0",
-        .exe_dir = "/tmp/definitely-no-vendor-xyzzy/bin",
-    });
-    defer c0.deinit();
-    try testing.expect(c0.bin_path == null);
-    // 注:vendored 向上搜的正确性由真机验证(metacodes 从 zig-out/bin 启动解析到
-    // cc-zig/vendor/tinykg/tinykg)——比 mock 文件系统更强的证据。
 }
 
 test "classifyCliError 三类归一" {

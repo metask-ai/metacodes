@@ -1,111 +1,128 @@
 # metacodes
 
-> **s = super** —— 用 Zig 从零重写的 agentic 编码 CLI(Claude Code 同级),原生编译、零运行时、编译期类型安全。
+Metacodes is an embeddable, low-resource agent core and coding CLI written in Zig.
+It owns a fixed agent loop, deterministic provider projection, permission and
+sandbox enforcement, durable tool-result artifacts, Lean-backed governance, and
+optional TinyKG memory/task coordination. Hosts can extend tools, provider
+dialects, UI, MCP, and process plugins without replacing those kernel boundaries.
 
-单二进制、亚百毫秒启动的终端 agent:驱动 Anthropic / OpenAI / Gemini 模型跑工具循环,做真实的读写代码、执行命令、多 agent 协作。
+> Repository status: pre-publication. The history has been extracted from the
+> original monorepo, but the project license is still an owner decision. Keep the
+> repository private until [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md)
+> is cleared.
 
-## 状态
+## Why metacodes
 
-✅ **可用** —— 完整 agent 循环 + 工具系统 + 权限沙箱 + TUI + 多 provider,~1900 单测 + 组件/e2e 测试全绿。
+- One native binary, no language runtime, fast startup, and explicit allocators.
+- A built-in coding agent loop rather than a framework that delegates correctness
+  to arbitrary hooks.
+- Immutable plugin generations and append-only provider context, preserving prompt
+  cache stability when the effective model-visible configuration is unchanged.
+- Tool results share one typed inline/artifact/error data plane across CLI,
+  plugins, MCP, and AgentCore embedding.
+- Formal decisions stay in the kernel; TinyKG stores governed memory, task DAGs,
+  receipts, and provenance but does not become the agent loop.
+- Source-level Zig embedding and a source-free C ABI bundle for C, C++, Zig, Rust,
+  Go, and other native hosts.
 
-## 构建与运行
+## Build
 
-```bash
-git clone <repo>                             # 无 submodule:依赖源码已 vendored 在 lib/
+The checked-in toolchain contract currently requires Zig 0.16.0 or newer within
+the 0.16 development line used by CI.
+
+```sh
+git clone https://github.com/shuzuan-org/metacodes.git
 cd metacodes
-zig build                                     # 产出 zig-out/bin/metacodes + zig-out/vendor/tinykg/tinykg
-./zig-out/bin/metacodes --api-key <KEY>
+zig build
+./zig-out/bin/metacodes --help
 ```
 
-**零下载依赖**:`highlight-zig`(高亮)与 `tinykg`(KG 记忆引擎)的源码作为**快照 vendored 在 `lib/`**(非 submodule,因更新频度低——plain clone 即可构建)。主构建从 `lib/tinykg/src/main.zig` 编译兼容 CLI，不依赖上游仓库的 `build.zig`。`zig build` 随 `-Dtarget` **交叉编译**它们:tinykg 装到 `zig-out/vendor/tinykg/tinykg`。更新依赖用 `scripts/vendor-deps.sh`。跳过 tinykg 构建:`-Dtinykg=false`。
+The default build does not download or compile TinyKG. `highlight-zig` is the only
+checked-in source dependency. See [TinyKG integration](doc/TINYKG_INTEGRATION.md)
+to stage a manually maintained native TinyKG binary with an observed SHA-256.
 
-Metacodes 的本地 runtime TinyKG Store 默认只经 authenticated Web → `tinykgd` → 单一
-`StoreActor` 访问。其配置由 Metacodes 自己拥有：`~/.metacodes/kg/daemon.json`（或
-`METACODES_KG_CONFIG`），也可完整设置 `METACODES_KG_URL`、`METACODES_KG_API_KEY` 和
-`METACODES_KG_EXPECTED_BUILD_ID`。build identity 必须已 pin，schema digest 在首次认证
-响应后锁定到本进程。无安全配置会 fail closed 为 KG degraded，不会回退为直接打开共享 Store。
+Common gates:
 
-TinyKG Skill 的远程 Store 是另一实例：只用于跨设备 roadmap、长期记忆和精炼 provenance。
-Metacodes runtime 不读取 Skill 的 `remote.json` 或 `TINYKG_REMOTE_*`，两类 Store 分别绑定
-identity/generation；memory benchmark 仍只使用 fresh 隔离本地 Store。仅隔离的单进程
-开发 Store 可显式设置 `METACODES_KG_TRANSPORT=cli-exclusive`，并用
-`METACODES_KG_BIN` / `METACODES_KG_STORE` 指向该独占实例；不要把 canonical Store
-用于这个兼容模式。
-
-事务边界仍在 Metacodes：`snapshot → proposal → Lean → re-observe → commit/rollback → receipt`。
-`tinykgd` 只提供多客户端共享 Store 所需的单命令串行、generation、commit receipt 和版本化
-存储原语；它不替 Metacodes 决定业务 proposal、恢复歧义写入或完成整条事务闭环。多个
-Metacodes 并发提交受治理迁移时，仍需 TinyKG 提供窄的 `expected_generation`/revision-CAS
-条件写入作为最后执行点；协议与判定始终由 Metacodes 拥有。
-
-常用构建目标:
-
-| 目标 | 作用 |
-|------|------|
-| `zig build` | 主二进制 `metacodes` |
-| `zig build test` | 全量单测 + 组件测试 |
-| `zig build test -Dtfilter="<子串>"` | 隔离单测 |
-| `zig build test:lib` | 验证 `metacodes-core` 库的 UI 隔离(编译器证明) |
-| `zig build agentcore:test` | AgentCore 二进制 ABI v1 契约测试 |
-
-## 功能
-
-- **Agent 循环** —— 多轮工具调用、流式 SSE、auto-compact、熔断
-- **工具** —— Read / Write / Edit / Bash / Grep / Glob / WebSearch / WebFetch / MCP / LSP / NotebookEdit / Task(子 agent) 等
-- **权限 + 沙箱** —— 6 模式 + Tool(specifier) 细粒度规则 + 5 层 settings;macOS Seatbelt 真沙箱拦 cwd 外写
-- **TUI** —— 工具卡两态、diff 语法高亮、状态行、plan 审批、AskUserQuestion 向导、Ctrl+O inline 视图
-- **多 provider** —— Anthropic / OpenAI / Gemini 经中立 Provider vtable + capability 门控,三家缓存范式归一
-- **Agent swarm** —— teams / teammates,文件邮箱传消息 + tinykg DAG 协调任务;进程内线程 + 进程外 worktree 两种 teammate
-- **形态** —— 交互 REPL / headless `-p` / `--web` 浏览器前端 / daemon serve;皆驱动同一 agent 循环
-- **跨会话记忆** —— tinykg 图数据库集成(记忆 / 计划 / 任务 DAG)
-
-## 架构
-
-```
-metacodes/
-├── build.zig / build.zig.zon   # 构建 + 包清单
-├── src/
-│   ├── core/                   # agent 循环、协议、transcript、记忆…(库核心)
-│   ├── tools/  tools.zig       # 工具实现 + 注册表
-│   ├── permission/  sandbox/   # 权限决策链 + Seatbelt 沙箱
-│   ├── api/  client.zig        # provider 客户端(HTTP + streaming)
-│   ├── repl/                   # TUI / 输入 / 状态机(仅表达层)
-│   ├── swarm/                  # teams / teammates 子系统
-│   ├── daemon/  web/           # 进程外形态
-│   ├── lsp/  mcp/  kg/         # 协议集成
-│   ├── platform/               # 可移植系统抽象(POSIX + NT 双后端)
-│   ├── agentcore/              # C ABI v1 边界(见下)
-│   └── lib.zig                 # metacodes-core 库 root
-├── lib/                        # vendored 依赖【源码快照】(非 submodule),build.zig 交叉编译
-│   ├── highlight-zig/          #   纯 Zig 语法高亮库
-│   └── tinykg/                 #   完整 Zig package 快照；KG 记忆/计划/DAG CLI
-├── sdk/                        # AgentCore C 头 + Zig SDK
-└── example/                    # metacodes-core 内部 dogfood 示例
+```sh
+zig build test
+zig build test:lib -Doptimize=ReleaseSafe
+zig build agentcore:test -Doptimize=ReleaseSafe
+zig build agentcore:gate -Dtarget=<native-target> -Doptimize=ReleaseSafe
 ```
 
-## 库形态:外部只交付 AgentCore 二进制
+Tests that require TinyKG must receive an explicitly attested binary:
 
-第三方 Host 不直接编译 metacodes core 源码；Zig Host 也使用 source-free SDK：
+```sh
+tinykg_bin=/absolute/path/to/tinykg
+tinykg_sha=$(shasum -a 256 "$tinykg_bin" | awk '{print $1}')
+zig build test \
+  -Dtinykg-bin="$tinykg_bin" \
+  -Dtinykg-sha256="$tinykg_sha"
+```
 
-| 消费方 | 受支持的交付物 | 序列化开销 |
-|--------|----------------|-----------|
-| Zig | `metacodes_agentcore` 静态库 + typed Zig SDK | AgentCore protocol v1 JSON |
-| C / C++ | `metacodes_agentcore` 静态库 + C 头文件 | 富数据 JSON,配置 POD 结构 |
-| Rust / Go / 其他语言 | 经 C ABI 绑定 AgentCore bundle | 富数据 JSON,配置 POD 结构 |
+No test or release gate searches `PATH`, a sibling checkout, or an old `zig-out`
+directory for TinyKG.
 
-仓库内的 `metacodes-core` module 只服务内部模块化、UI 隔离验证和 dogfood；它不是
-第三方发行物，也不承诺源码兼容。交付布局、Windows 工具链边界与发布门禁见
-`doc/LIB_API.md`。
+## Supported surfaces
 
-C ABI(`sdk/metacodes_agentcore.h`)刻意只导出单入口 `metacodes_agentcore_get_api(abi_version)`,返回函数指针表(vtable):`runtime_create/destroy`、`session_create/destroy`、`session_run`(agent 循环)、`session_abort`、`buffer_release`。ABI v1 为实验版（2026-07-17 的冻结已撤回、短期不复冻，原因与复冻门槛见 `doc/AGENTCORE_BINARY_ABI.md` Status 节），要求精确结构体大小与 reserved 全零；实验期不承诺稳定，布局与语义可能不兼容变更，消费者应 pin 具体 bundle（manifest 记录源码 commit）。事件/UI JSON 由独立 AgentCore protocol v1 定义，不直接暴露内部 frontend/daemon `CoreEvent`；未知观察事件可忽略，UI/control 消息严格校验。完整契约见 `doc/AGENTCORE_BINARY_ABI.md`。
+| Surface | Audience | Compatibility |
+|---|---|---|
+| CLI / headless / Web host | Operators and local products | Pre-1.0 command surface |
+| `metacodes-core` Zig module | Same-toolchain Zig hosts | Source API, experimental |
+| AgentCore C ABI v1 revision 13 | Source-free native hosts | Exact-revision bundle pinning |
+| Static and process plugins | Trusted in-process and isolated tools | Versioned plugin contracts |
+| Provider dialects | Model-family request/response adaptation | Deterministic, trusted plugins only |
 
-## 技术栈
+Start at [doc/API.md](doc/API.md). The normative AgentCore ABI contract is
+[doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md); the plugin contracts
+are indexed in [doc/README.md](doc/README.md).
 
-| 组件 | 技术 |
-|------|------|
-| 语言 | Zig 0.16-dev |
-| 内存 | 命名 allocators(gpa / arena / scratch / c_allocator) |
-| 高亮 | highlight-zig(纯 Zig submodule,取代 tree-sitter) |
-| 记忆 | 本地 runtime tinykgd + 独立远程 TinyKG Skill；隔离开发可显式 CLI |
-| 沙箱 | macOS Seatbelt SBPL |
-| 跨平台 | platform/ 抽象层(POSIX + NT),Windows 交叉编译门 |
+## Architecture
+
+```text
+Host / CLI / Web / native SDK
+              |
+      immutable Runtime generation
+              |
+  +-----------+--------------------+
+  | fixed AgentLoop and Conversation|
+  | permission / sandbox / budget   |
+  | tool artifact and durable effect|
+  | Lean governance / TinyKG boundary|
+  +-----------+--------------------+
+              |
+  tools / MCP / plugins / provider dialects
+```
+
+The model-visible request is a deterministic projection of effective tools,
+conversation state, and provider dialect. Plugin ids, load paths, generations,
+timestamps, journals, and TinyKG receipts do not enter the prompt. An equivalent
+runtime replacement therefore keeps provider-visible bytes stable; only a real
+capability or context change invalidates the cache prefix.
+
+## TinyKG boundary
+
+TinyKG is a separately maintained executable and storage engine. Metacodes owns:
+
+- when memory or task evidence is proposed;
+- Lean/policy admission and re-observation;
+- commit, rollback, budget, and user-visible receipts;
+- runtime transport selection and degraded behavior.
+
+TinyKG owns its binary/storage implementation, authenticated daemon protocol,
+generation/CAS primitives, and graph persistence. Metacodes never imports TinyKG
+source and never silently falls back from the daemon to a shared raw store.
+
+## Contributing and security
+
+Read [AGENTS.md](AGENTS.md) before changing code, then
+[CONTRIBUTING.md](CONTRIBUTING.md). Security reports must follow
+[SECURITY.md](SECURITY.md), not public issues. Paid benchmark runs require explicit
+authorization and are never part of the default development loop.
+
+## 中文简介
+
+metacodes 是一个可嵌入、极低资源占用、内置 coding agent loop 的 Zig agent core。
+插件可以扩展工具、MCP、provider 方言和宿主形态，但不能绕过权限、预算、形式化判定、
+TinyKG 治理与因果边界。TinyKG 采用独立维护的二进制契约，不再把源码复制进本仓库。
+项目目前处于开源发布前准备阶段；在许可证由项目所有者明确选定前，仓库应保持私有。

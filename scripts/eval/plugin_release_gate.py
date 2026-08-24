@@ -523,7 +523,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--deepseek-harness",
         type=Path,
-        default=Path("/Users/david/prj/deepseek-harness"),
+        default=(
+            Path(os.environ["DEEPSEEK_HARNESS_ROOT"])
+            if os.environ.get("DEEPSEEK_HARNESS_ROOT")
+            else None
+        ),
+        help="explicit DeepSeek Harness checkout (or DEEPSEEK_HARNESS_ROOT)",
     )
     parser.add_argument(
         "--runtime-binary",
@@ -554,6 +559,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.runtime_binary is None:
             raise PluginGateError(
                 "--runtime-binary is required unless --validate-only is used"
+            )
+        if args.deepseek_harness is None:
+            raise PluginGateError(
+                "--deepseek-harness is required unless --validate-only is used"
             )
         receipt = run_gate(
             root,

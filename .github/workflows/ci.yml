@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Zig and contract tests (${{ matrix.os }})
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Install ripgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rg >/dev/null 2>&1; then
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              brew install ripgrep
+            else
+              sudo apt-get update
+              sudo apt-get install -y ripgrep
+            fi
+          fi
+      - name: TinyKG binary-contract unit tests
+        run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
+      - name: Full offline test suite
+        run: zig build test -Dtinykg=false
+      - name: ReleaseSafe core gate
+        if: runner.os == 'Linux'
+        run: zig build test:lib -Doptimize=ReleaseSafe -Dtinykg=false
+      - name: Repository coverage audit
+        if: runner.os == 'Linux'
+        run: scripts/test_coverage_audit.sh
+
+  platform-runtime:
+    name: platform runtime (${{ matrix.os }})
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Native platform modules
+        shell: bash
+        env:
+          METACODES_PROC_TEST: "1"
+        run: |
+          set -euo pipefail
+          for module in sync fs rng paths signal process net dir; do
+            zig test "src/platform/${module}.zig" -lc
+          done

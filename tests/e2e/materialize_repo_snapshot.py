@@ -30,20 +30,26 @@ def _safe_relative(value: str, label: str) -> PurePosixPath:
     return path
 
 
+def _safe_prefix(value: str) -> PurePosixPath:
+    if value == ".":
+        return PurePosixPath(".")
+    return _safe_relative(value, "repository_snapshot prefix")
+
+
 def materialize(repo_root: Path, workspace: Path, snapshot: dict) -> None:
     if set(snapshot) != {"revision", "prefix", "paths"}:
         raise ValueError("repository_snapshot must contain exactly revision, prefix, and paths")
     revision = snapshot["revision"]
     if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         raise ValueError("repository_snapshot revision must be a full lowercase commit id")
-    prefix = _safe_relative(snapshot["prefix"], "repository_snapshot prefix")
+    prefix = _safe_prefix(snapshot["prefix"])
     paths = snapshot["paths"]
     if not isinstance(paths, list) or not paths or len(paths) > 64:
         raise ValueError("repository_snapshot paths must contain 1-64 entries")
     archive_paths = []
     for item in paths:
         relative = _safe_relative(item, "repository_snapshot path")
-        archive_paths.append(str(prefix / relative))
+        archive_paths.append(str(relative if prefix == PurePosixPath(".") else prefix / relative))
 
     git_root = Path(
         subprocess.run(

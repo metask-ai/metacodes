@@ -11,26 +11,10 @@ const harness = @import("harness");
 const observation = cc.tools.tool_observation;
 const self_evolution = cc.self_evolution;
 const journal_mod = cc.tool_observation_journal;
+const tinykg_binary = @import("tinykg_binary.zig");
 
 fn findKgBin(allocator: std.mem.Allocator) ?[]u8 {
-    if (std.c.getenv("METACODES_KG_BIN")) |v| {
-        return allocator.dupe(u8, std.mem.span(v)) catch null;
-    }
-    const cwd = cc.util_fs.getCwd(allocator) catch return null;
-    defer allocator.free(cwd);
-    const local = std.fmt.allocPrint(
-        allocator,
-        "{s}/zig-out/vendor/tinykg/tinykg",
-        .{cwd},
-    ) catch return null;
-    const local_z = allocator.dupeZ(u8, local) catch {
-        allocator.free(local);
-        return null;
-    };
-    defer allocator.free(local_z);
-    if (std.c.access(local_z.ptr, 1) == 0) return local; // X_OK
-    allocator.free(local);
-    return null;
+    return tinykg_binary.find(allocator);
 }
 
 /// 与生产同形的观察日志:一个成功 dispatch 对 + 2 个弱化候选 +
@@ -727,17 +711,13 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         var attempt: usize = 0;
         while (attempt < 2) : (attempt += 1) {
             if (attempt > 0) try rows.appendSlice(",");
-            const head = try std.fmt.allocPrint(a,
-                "{{\"task\":\"long-wall-task\",\"attempt_key\":\"la{d}\",\"reward\":0.27,\"tests_passed\":3,\"tests_total\":11,\"failing_tests\":[",
-                .{attempt});
+            const head = try std.fmt.allocPrint(a, "{{\"task\":\"long-wall-task\",\"attempt_key\":\"la{d}\",\"reward\":0.27,\"tests_passed\":3,\"tests_total\":11,\"failing_tests\":[", .{attempt});
             defer a.free(head);
             try rows.appendSlice(head);
             var i: usize = 0;
             while (i < 8) : (i += 1) {
                 if (i > 0) try rows.appendSlice(",");
-                const name = try std.fmt.allocPrint(a,
-                    "\"tests/test_static_utils_prehistoric_standalone_verification.py::TestExtremelyDescriptiveEtagClassName::test_case_number_{d}_with_a_very_long_descriptive_behavior_suffix (skipped)\"",
-                    .{i});
+                const name = try std.fmt.allocPrint(a, "\"tests/test_static_utils_prehistoric_standalone_verification.py::TestExtremelyDescriptiveEtagClassName::test_case_number_{d}_with_a_very_long_descriptive_behavior_suffix (skipped)\"", .{i});
                 defer a.free(name);
                 try rows.appendSlice(name);
             }
@@ -750,9 +730,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
                 try rows.appendSlice("conceptually verified ");
             try rows.appendSlice("\"}");
         }
-        const payload_long = try std.fmt.allocPrint(a,
-            "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[{s}]}}",
-            .{rows.items});
+        const payload_long = try std.fmt.allocPrint(a, "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[{s}]}}", .{rows.items});
         defer a.free(payload_long);
         const pfs = @import("platform").fs;
         const zl = try a.dupeZ(u8, outcomes_path);
@@ -939,12 +917,10 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         var bi: usize = 0;
         while (big_art.items.len < 2100) : (bi += 1)
             try big_art.appendSlice("    x = 1\\n");
-        const payload_t = try std.fmt.allocPrint(a,
-            "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
-                "{{\"task\":\"trunc-task\",\"attempt_key\":\"t1\",\"reward\":0.9,\"tests_passed\":9,\"tests_total\":10," ++
-                "\"failing_tests\":[\"tests/t.py::TestT::test_last (skipped: widget._case not available)\"]," ++
-                "\"best_artifact\":\"{s}\"}}]}}",
-            .{big_art.items});
+        const payload_t = try std.fmt.allocPrint(a, "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{{\"task\":\"trunc-task\",\"attempt_key\":\"t1\",\"reward\":0.9,\"tests_passed\":9,\"tests_total\":10," ++
+            "\"failing_tests\":[\"tests/t.py::TestT::test_last (skipped: widget._case not available)\"]," ++
+            "\"best_artifact\":\"{s}\"}}]}}", .{big_art.items});
         defer a.free(payload_t);
         const pfs = @import("platform").fs;
         const zt = try a.dupeZ(u8, outcomes_path);
@@ -1180,7 +1156,6 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         try std.testing.expect(std.mem.indexOf(u8, text_vb, "byte-for-byte UNCHANGED") != null);
     }
 
-
     // v41 L2(针效能折叠,撤修复必红——旧码无遥测/无退休,二次 load 原样):
     // Rule A 惰性:同 cid 三轮 nudged=1 dispatched=0 遥测 → 针退休;
     // Rule B 非因果:met=1 且 best 无增 → 退休;增益行入店后针复活。
@@ -1220,9 +1195,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         // Rule A:三轮惰性遥测(不同 run id,nudged=1 dispatched=0)。
         var round: usize = 0;
         while (round < 3) : (round += 1) {
-            const trow = try std.fmt.allocPrint(a,
-                "metacodes-needle-telemetry-v1: cid={s} task=ret-task run=ra{d} nudged=1 dispatched=0 met=0 best=0.3000 needle=x",
-                .{ cid_buf[0..64], round });
+            const trow = try std.fmt.allocPrint(a, "metacodes-needle-telemetry-v1: cid={s} task=ret-task run=ra{d} nudged=1 dispatched=0 met=0 best=0.3000 needle=x", .{ cid_buf[0..64], round });
             defer a.free(trow);
             _ = kg.remember(.observation, trow, "obligation_telemetry", false) catch {};
         }
@@ -1301,9 +1274,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         // ③ Rule B 豁免:met=1 且 best 记录声明值(1.0)→ 无豁免时
         // current_best(1.0)≤best_at+ε 必退;声明失信下针必须存活。
         {
-            const trow = try std.fmt.allocPrint(a,
-                "metacodes-needle-telemetry-v1: cid={s} task=repro-task run=rb0 nudged=0 dispatched=1 met=1 best=1.0000 needle=pkg/repro_mod.py",
-                .{repro_cid[0..64]});
+            const trow = try std.fmt.allocPrint(a, "metacodes-needle-telemetry-v1: cid={s} task=repro-task run=rb0 nudged=0 dispatched=1 met=1 best=1.0000 needle=pkg/repro_mod.py", .{repro_cid[0..64]});
             defer a.free(trow);
             _ = kg.remember(.observation, trow, "obligation_telemetry", false) catch {};
             const rt_b = cc.obligation_gate.load(a, &kg, "repro-task") orelse return error.TestExpectedRuntime;
@@ -1435,15 +1406,13 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         var attempt: usize = 0;
         while (attempt < 9) : (attempt += 1) {
             const payload_cap = if (attempt == 0)
-                try std.fmt.allocPrint(a,
-                    "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
-                        "{{\"task\":\"cap-task\",\"attempt_key\":\"c{d}\",\"reward\":1.0,\"tests_passed\":2,\"tests_total\":2," ++
-                        "\"failing_tests\":[],\"final_note\":\"proven early\"}}]}}", .{attempt})
+                try std.fmt.allocPrint(a, "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+                    "{{\"task\":\"cap-task\",\"attempt_key\":\"c{d}\",\"reward\":1.0,\"tests_passed\":2,\"tests_total\":2," ++
+                    "\"failing_tests\":[],\"final_note\":\"proven early\"}}]}}", .{attempt})
             else
-                try std.fmt.allocPrint(a,
-                    "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
-                        "{{\"task\":\"cap-task\",\"attempt_key\":\"c{d}\",\"reward\":0.5,\"tests_passed\":1,\"tests_total\":2," ++
-                        "\"failing_tests\":[\"tests/cap.py::T::t_late (failed: assert)\"]}}]}}", .{attempt});
+                try std.fmt.allocPrint(a, "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+                    "{{\"task\":\"cap-task\",\"attempt_key\":\"c{d}\",\"reward\":0.5,\"tests_passed\":1,\"tests_total\":2," ++
+                    "\"failing_tests\":[\"tests/cap.py::T::t_late (failed: assert)\"]}}]}}", .{attempt});
             defer a.free(payload_cap);
             const zc = try a.dupeZ(u8, outcomes_path);
             defer a.free(zc);
@@ -1477,11 +1446,9 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         defer long_note.deinit();
         var i: usize = 0;
         while (i < 120) : (i += 1) try long_note.appendSlice("判定结论");
-        const payload4 = try std.fmt.allocPrint(a,
-            "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
-                "{{\"task\":\"utf8-task\",\"attempt_key\":\"a1\",\"reward\":0.1,\"tests_passed\":1,\"tests_total\":2," ++
-                "\"failing_tests\":[\"some named check\"],\"final_note\":\"{s}\"}}]}}",
-            .{long_note.items});
+        const payload4 = try std.fmt.allocPrint(a, "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{{\"task\":\"utf8-task\",\"attempt_key\":\"a1\",\"reward\":0.1,\"tests_passed\":1,\"tests_total\":2," ++
+            "\"failing_tests\":[\"some named check\"],\"final_note\":\"{s}\"}}]}}", .{long_note.items});
         defer a.free(payload4);
         const pfs = @import("platform").fs;
         const z4 = try a.dupeZ(u8, outcomes_path);

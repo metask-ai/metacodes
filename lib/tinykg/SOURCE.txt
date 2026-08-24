@@ -1,9 +1,0 @@
-vendored from: https://github.com/shuzuan-org/tinykg.git
-commit: bacedc2154e74c584c40667f709c82d877cbdb5c (branch vendor/metacodes-20260816, parent b8bcadb)
-content_sha256: ecf6694b4aff4eb6537448fe4300a268088b85b204df6a7132263c72f17f460b  # sha256 over sorted per-file sha256 of src/
-note: 源码快照(非 submodule)。更新用 scripts/vendor-deps.sh。
-note: 该 provenance 提交用 git plumbing 从 b8bcadb 创建,树 == 本快照,逐文件核验一致。
-      不用上游 main HEAD 的原因:main 工作树在本次 vendor 之后被并发工作流继续编辑
-      (incremental backup/restore),那些改动未随本快照验证,不应混入 metacodes 的 pin。
-storage_format_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION
-schema_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_SCHEMA_VERSION

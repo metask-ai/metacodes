@@ -33,7 +33,7 @@ def env_for_variant(variant_slots):
 def first_tool(home):
     """该 session 第一个被调用的工具名(模型首选),无则 None。
     transcript.jsonl 每行 message JSON,blocks 里 tool_use,按文件内行序取最早。"""
-    pat = os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")
+    pat = os.path.join(home, ".metacodes", "projects", "*", "*", "transcript.jsonl")
     seq = []
     for path in glob.glob(pat):
         try:

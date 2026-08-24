@@ -6,6 +6,7 @@
 const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
+const tinykg_binary = @import("tinykg_binary.zig");
 
 const swctx = cc.swarm_context;
 const swtools = cc.swarm_tools;
@@ -14,35 +15,7 @@ const team = cc.swarm_team;
 const KgClient = cc.kg_client.KgClient;
 
 fn findBin(a: std.mem.Allocator) ?[]u8 {
-    if (std.c.getenv("METACODES_KG_BIN")) |v| {
-        const p = std.mem.span(v);
-        if (isX(p)) return a.dupe(u8, p) catch null;
-    }
-    // 本构建的 vendored 二进制优先:主仓路径可能存着旧格式版本的陈旧二进制,
-    // 命中它会让 L2 因版本门静默 skip。
-    if (cc.util_fs.getCwd(a) catch null) |cwd| {
-        defer a.free(cwd);
-        if (std.fmt.allocPrint(a, "{s}/zig-out/vendor/tinykg/tinykg", .{cwd}) catch null) |local| {
-            if (isX(local)) return local;
-            a.free(local);
-        }
-    }
-    const home_c = std.c.getenv("HOME") orelse return null;
-    const home = std.mem.span(home_c);
-    const cands = [_][]const u8{ "prj/cc-t2z/metacodes/zig-out/vendor/tinykg/tinykg", "prj/tinykg/zig-out/bin/tinykg", "bin/tinykg" };
-    for (cands) |rel| {
-        const full = std.fmt.allocPrint(a, "{s}/{s}", .{ home, rel }) catch continue;
-        if (isX(full)) return full;
-        a.free(full);
-    }
-    return null;
-}
-fn isX(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= buf.len) return false;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    return std.c.access(buf[0..path.len :0].ptr, std.c.X_OK) == 0;
+    return tinykg_binary.find(a);
 }
 fn sleepMs(ms: u32) void {
     cc.util_time.sleepMs(ms); // 可移植(POSIX nanosleep / Windows Sleep)

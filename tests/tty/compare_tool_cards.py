@@ -13,11 +13,11 @@ tasks: read | bash | write | grep | edit | ls
 import os, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, ROOT)
 from cc_compare_recorder import record_steps  # noqa: E402
 
-NAPICC = "/Users/david/bin/napicc"
+NAPICC = os.environ.get("NAPICC", "napicc")
 ZIG = os.path.join(os.path.dirname(os.path.dirname(HERE)), "zig-out", "bin", "metacodes-debug")
 
 PROMPTS = {

@@ -1,0 +1,8 @@
+{
+  "contract_schema": "metacodes.tinykg-binary/v1",
+  "license": "Apache-2.0",
+  "source_repository": "https://github.com/metask-ai/tinykg",
+  "storage_format_version": "3",
+  "store_schema_version": "3",
+  "tinykg_version": "0.2.0"
+}

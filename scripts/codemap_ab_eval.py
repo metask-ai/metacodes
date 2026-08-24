@@ -104,7 +104,7 @@ def make_cwd():
 def first_tool(home):
     """返回该 session 里**第一个被调用**的工具名(模型的首选),没有则 None。
     transcript.jsonl: 每行 message JSON,blocks 里有 tool_use。按文件+行顺序取最早。"""
-    pat = os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")
+    pat = os.path.join(home, ".metacodes", "projects", "*", "*", "transcript.jsonl")
     seq = []
     for path in glob.glob(pat):
         try:

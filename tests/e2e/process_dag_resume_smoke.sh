@@ -6,10 +6,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${METACODES_PROCESS_E2E_BIN:-$ROOT/zig-out/bin/metacodes-debug}"
-TINYKG="${METACODES_KG_BIN:-$ROOT/zig-out/vendor/tinykg/tinykg}"
+TINYKG="${METACODES_TEST_TINYKG_BIN:-${METACODES_KG_BIN:-}}"
 
 [[ -x "$BIN" ]] || { echo "missing metacodes binary: $BIN" >&2; exit 2; }
-[[ -x "$TINYKG" ]] || { echo "missing tinykg binary: $TINYKG" >&2; exit 2; }
+[[ -n "$TINYKG" && -x "$TINYKG" ]] || {
+  echo "missing explicit TinyKG binary; set METACODES_TEST_TINYKG_BIN or METACODES_KG_BIN" >&2
+  exit 2
+}
 
 tmp="$(mktemp -d)"
 cleanup() {

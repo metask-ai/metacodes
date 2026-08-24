@@ -1,0 +1,43 @@
+name: Maintainer rule control
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: .
+
+jobs:
+  rule-control:
+    runs-on: [self-hosted, metacodes-release]
+    timeout-minutes: 30
+    env:
+      METACODES_TEST_TINYKG_BIN: ${{ vars.METACODES_TEST_TINYKG_BIN }}
+      METACODES_TEST_TINYKG_SHA256: ${{ vars.METACODES_TEST_TINYKG_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Setup pinned Lean toolchain
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: control-plane/lean
+          auto-config: false
+          build: false
+          test: false
+          lint: false
+      - name: Verify manually maintained TinyKG artifact
+        run: python scripts/verify_tinykg_binary.py
+      - name: Run closed-loop release gate
+        run: zig build --build-file control-plane/build.zig rule-check
+      - name: Upload rule-control telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metacodes-rule-control
+          path: zig-out/reports/rule-control.json
+          if-no-files-found: error

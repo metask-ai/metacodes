@@ -1,13 +1,27 @@
 .zig/
+.zig-cache/
 .lake/
 zig-out/
 *.zig.zon
 !build.zig.zon
+.DS_Store
+.home/
+.metacodes/
+.pytest_cache/
+.ruff_cache/
+.tinykg*.lock
 
 # e2e 测试产物(真实模型跑出的临时项目 + 日志)
 tests/e2e/runs/
+evals/reports/
+evals/runs/
 __pycache__/
 *.pyc
 
 # 分析/架构报告 scratch
 output/
+
+# TinyKG is staged from a maintainer-attested external binary. Never commit it.
+vendor/tinykg/tinykg
+vendor/tinykg/tinykg.exe
+vendor/tinykg/tinykg.provenance.json

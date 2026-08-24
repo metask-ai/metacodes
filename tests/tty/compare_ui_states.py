@@ -18,12 +18,12 @@ import argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))  # cc-t2z 根
+ROOT = os.path.dirname(os.path.dirname(HERE))  # metacodes 仓库根
 sys.path.insert(0, ROOT)
 
 from cc_compare_recorder import record_steps  # noqa: E402
 
-NAPICC = "/Users/david/bin/napicc"
+NAPICC = os.environ.get("NAPICC", "napicc")
 ZIG = os.path.join(os.path.dirname(os.path.dirname(HERE)), "zig-out", "bin", "metacodes-debug")
 
 # 真 cc 首次进新目录有 "trust this folder?" 门,先 enter 信任再进主 REPL。

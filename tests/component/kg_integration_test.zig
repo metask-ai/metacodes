@@ -1,51 +1,18 @@
 //! L2 组件测试:KgClient 端到端打真 tinykg 二进制 + 临时 store(设计 v3-final §8 P1)。
 //!
 //! DoD(声明=接线=测试):每条断言把"KgClient 方法 X → tinykg store 状态 Y"焊死。
-//! 用真 tinykg(非 mock)——本地可得,格式版本由 lib/tinykg 源快照 pin(zig build 交叉编译)。
+//! 用真 tinykg(非 mock)——只接受 build.zig 验真后注入或维护者显式注入的二进制。
 //! 找不到二进制(CI 无 tinykg)→ SkipZigTest(不是失败:KG 是增强非依赖)。
 
 const std = @import("std");
 const builtin = @import("builtin");
 const cc = @import("cc");
+const tinykg_binary = @import("tinykg_binary.zig");
 
 const KgClient = cc.kg_client.KgClient;
 
-/// 定位 tinykg 二进制:env METACODES_KG_BIN > 本构建 zig-out vendor > 主仓 vendor > dev(~/prj/tinykg)。
-/// 本构建的 vendored 二进制优先:worktree/CI 里主仓路径可能存着旧格式版本的陈旧
-/// 二进制,命中它会让整族 KG L2 因版本门静默 skip(覆盖悄悄消失)。
 fn findBin(allocator: std.mem.Allocator) ?[]u8 {
-    if (std.c.getenv("METACODES_KG_BIN")) |v| {
-        const p = std.mem.span(v);
-        if (isX(p)) return allocator.dupe(u8, p) catch null;
-    }
-    if (cc.util_fs.getCwd(allocator) catch null) |cwd| {
-        defer allocator.free(cwd);
-        const local = std.fmt.allocPrint(allocator, "{s}/zig-out/vendor/tinykg/tinykg", .{cwd}) catch null;
-        if (local) |full| {
-            if (isX(full)) return full;
-            allocator.free(full);
-        }
-    }
-    const home_c = std.c.getenv("HOME") orelse return null;
-    const home = std.mem.span(home_c);
-    const candidates = [_][]const u8{
-        "prj/cc-t2z/metacodes/zig-out/vendor/tinykg/tinykg",
-        "prj/tinykg/zig-out/bin/tinykg",
-    };
-    for (candidates) |rel| {
-        const full = std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, rel }) catch continue;
-        if (isX(full)) return full;
-        allocator.free(full);
-    }
-    return null;
-}
-
-fn isX(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= buf.len) return false;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    return std.c.access(buf[0..path.len :0].ptr, std.c.X_OK) == 0;
+    return tinykg_binary.find(allocator);
 }
 
 fn overwriteFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {

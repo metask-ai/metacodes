@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const harness = @import("harness");
 const cc = @import("cc");
+const tinykg_binary = @import("tinykg_binary.zig");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -139,7 +140,6 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
         .config_store = store_path,
         .env_bin = "",
         .env_store = "",
-        .env_dev = "",
     });
     defer kg.deinit();
     kg.ensureReady();
@@ -419,7 +419,6 @@ test "L2 native formal audit consumes a real TinyKG task snapshot" {
         .config_store = store_path,
         .env_bin = "",
         .env_store = "",
-        .env_dev = "",
     });
     defer kg.deinit();
     kg.ensureReady();
@@ -636,31 +635,7 @@ fn overwriteFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const 
 }
 
 fn findTinyKg(allocator: std.mem.Allocator) ?[]u8 {
-    if (std.c.getenv("METACODES_KG_BIN")) |raw| {
-        const path = std.mem.span(raw);
-        if (isExecutable(path)) return allocator.dupe(u8, path) catch null;
-    }
-    // 本构建的 vendored 二进制优先:主仓路径可能存着旧格式版本的陈旧二进制,
-    // 命中它会让 L2 因版本门静默 skip。
-    if (cc.util_fs.getCwd(allocator) catch null) |cwd| {
-        defer allocator.free(cwd);
-        if (std.fmt.allocPrint(allocator, "{s}/zig-out/vendor/tinykg/tinykg", .{cwd}) catch null) |local| {
-            if (isExecutable(local)) return local;
-            allocator.free(local);
-        }
-    }
-    const raw_home = std.c.getenv("HOME") orelse return null;
-    const home = std.mem.span(raw_home);
-    const candidates = [_][]const u8{
-        "prj/cc-t2z/metacodes/zig-out/vendor/tinykg/tinykg",
-        "prj/tinykg/zig-out/bin/tinykg",
-    };
-    for (candidates) |relative| {
-        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, relative }) catch continue;
-        if (isExecutable(path)) return path;
-        allocator.free(path);
-    }
-    return null;
+    return tinykg_binary.find(allocator);
 }
 
 fn isExecutable(path: []const u8) bool {

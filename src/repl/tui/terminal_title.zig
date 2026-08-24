@@ -200,8 +200,8 @@ test "composeTitle renders all three phases" {
 }
 
 test "basename extracts last path segment" {
-    try std.testing.expectEqualStrings("metacodes", basename("/Users/david/prj/cc-t2z/metacodes"));
-    try std.testing.expectEqualStrings("metacodes", basename("/Users/david/prj/cc-t2z/metacodes/"));
+    try std.testing.expectEqualStrings("metacodes", basename("/work/metacodes"));
+    try std.testing.expectEqualStrings("metacodes", basename("/work/metacodes/"));
     try std.testing.expectEqualStrings("metacodes", basename(""));
     try std.testing.expectEqualStrings("root", basename("root"));
 }

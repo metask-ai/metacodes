@@ -98,7 +98,9 @@ ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "evals/memory/fixtures"
 TEST_RIPGREP = Path(sys.executable).resolve()
 TEST_RIPGREP_SHA256 = hashlib.sha256(TEST_RIPGREP.read_bytes()).hexdigest()
-REAL_TINYKG = ROOT / "zig-out/vendor/tinykg/tinykg"
+REAL_TINYKG = Path(os.environ["METACODES_TEST_TINYKG_BIN"]) if os.environ.get(
+    "METACODES_TEST_TINYKG_BIN"
+) else ROOT / ".missing-explicit-tinykg"
 
 
 def digest(label: str) -> str:

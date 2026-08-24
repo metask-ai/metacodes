@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
-# 重新 vendor 依赖源码快照到 lib/(highlight-zig / tinykg)。
+# 重新 vendor highlight-zig 源码快照到 lib/。
 #
 # 设计:这些依赖更新频度低,故**不用 git submodule**(避免其他开发者 clone 后还要
 # `submodule update --init` 的摩擦)。改为在 lib/ 里 commit 一份**源码快照**——plain
-# `git clone` + `zig build` 直接能跑,跨平台随 -Dtarget 由 build.zig 交叉编译。
+# `git clone` + `zig build` 直接能跑。TinyKG 不属于源码 vendoring；它由
+# 维护者以显式路径 + SHA-256 提供，并通过 tinykg:stage 验证。
 # 各依赖仍有独立上游 repo(自身开发用),本脚本从上游拉最新源码覆盖进 lib/。
 #
 # 用法:
-#   scripts/vendor-deps.sh              # 全部依赖,从各自 github 上游最新 main
+#   scripts/vendor-deps.sh              # 从 github 上游更新 highlight-zig
 #   scripts/vendor-deps.sh highlight    # 只 highlight-zig
-#   scripts/vendor-deps.sh tinykg       # 只 tinykg
-#   HL_SRC=~/prj/hl-zig TK_SRC=~/prj/tinykg scripts/vendor-deps.sh   # 用本地源码目录代替 clone
+#   HL_SRC=~/prj/hl-zig scripts/vendor-deps.sh   # 用本地源码目录代替 clone
 #
-# 更新后务必:① zig build 验证 ② 跑 lib/tinykg 的 store-info 确认 storage_format_version
-# 未变(变了要同步 src/kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION);③ commit lib/ 改动。
+# 更新后务必:① zig build 验证 ② commit lib/highlight-zig 改动。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-WHICH="${1:-all}"
+WHICH="${1:-highlight}"
+
+if [[ "$WHICH" != "all" && "$WHICH" != "highlight" ]]; then
+  echo "error: 仅支持 highlight；TinyKG 请用 zig build tinykg:stage -Dtinykg-bin=... -Dtinykg-sha256=..." >&2
+  exit 2
+fi
 
 vendor_one() {
   local name="$1" url="$2" src_override="$3" dest="$4" subpath="$5"
@@ -55,12 +59,4 @@ EOF
 if [ "$WHICH" = all ] || [ "$WHICH" = highlight ]; then
   vendor_one highlight-zig "https://github.com/shuzuan-org/highlight-zig.git" "${HL_SRC:-}" "$HERE/lib/highlight-zig" ""
 fi
-if [ "$WHICH" = all ] || [ "$WHICH" = tinykg ]; then
-  # tinykg 只需 src/(build.zig 直接指 lib/tinykg/src/main.zig)。
-  vendor_one tinykg "https://github.com/shuzuan-org/tinykg.git" "${TK_SRC:-}" "$HERE/lib/tinykg" "src"
-  # 补 tinykg SOURCE.txt 的格式/schema 版本行(kg 门用)。
-  echo "storage_format_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION" >> "$HERE/lib/tinykg/SOURCE.txt"
-  echo "schema_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_SCHEMA_VERSION" >> "$HERE/lib/tinykg/SOURCE.txt"
-fi
-
 echo "完成。跑 'zig build' 验证,再 commit lib/ 改动。"

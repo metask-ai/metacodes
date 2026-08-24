@@ -132,7 +132,7 @@ Codebase and user instructions are shown below. Be sure to adhere to these instr
 
 - `memoryBase` = `$CLAUDE_CODE_REMOTE_MEMORY_DIR`（cc）→ zig-cc 用 `~/.cc-zig`（与现有 transcript/plans 同根）。
 - `<sanitized-git-root>` = git 仓库根路径净化（`/` → `-` 之类）。zig-cc 复用现有 cwd_hash 或路径净化逻辑（transcript 已有 `<cwd_hash>`，可直接复用）。
-- **本会话实证路径**（用户机）：`/Users/david/.claude/projects/-Users-david-prj-cc-t2z/memory/` —— 即 `~/.claude/projects/<净化路径>/memory/`，净化规则 = 绝对路径每个 `/` 换 `-`，前导 `/` 也换。zig-cc 对齐此净化规则（`-Users-david-prj-cc-t2z`），落盘 `~/.cc-zig/projects/<净化>/memory/`。
+- **路径投影**：`~/.claude/projects/<净化路径>/memory/`，净化规则是把绝对路径中每个 `/` 换为 `-`（包括前导 `/`）。metacodes 保持相同投影语义，自身数据写入 `~/.metacodes/projects/<净化>/memory/`。
 
 ### 2.2 四类记忆 + frontmatter
 

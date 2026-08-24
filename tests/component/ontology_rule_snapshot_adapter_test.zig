@@ -1,12 +1,13 @@
 //! L2 for the production read-only TinyKG ontology snapshot adapter.
 //!
 //! The fake transport models one consistent TinyKG snapshot command. No provider is
-//! constructed or called; the real current vendored TinyKG negative test uses
+//! constructed or called; the real maintainer-attested TinyKG negative test uses
 //! only a private temporary store.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const cc = @import("cc");
+const tinykg_binary = @import("tinykg_binary.zig");
 
 const adapter = cc.kg_ontology_rule_snapshot_adapter;
 const projection = cc.ontology_rule_projection;
@@ -372,35 +373,7 @@ fn completedFailureRun(session_dir: []const u8) !cc.tool_observation_journal.Run
 }
 
 fn findVendoredTinyKg(allocator: std.mem.Allocator) ?[]u8 {
-    if (builtin.os.tag == .windows) return null;
-    const cwd = cc.util_fs.getCwd(allocator) catch return null;
-    defer allocator.free(cwd);
-    const local = std.fmt.allocPrint(
-        allocator,
-        "{s}/zig-out/vendor/tinykg/tinykg",
-        .{cwd},
-    ) catch return null;
-    if (isExecutable(allocator, local)) return local;
-    allocator.free(local);
-
-    if (std.c.getenv("METACODES_TEST_TINYKG_BIN")) |configured_c| {
-        const configured = allocator.dupe(u8, std.mem.span(configured_c)) catch return null;
-        if (isExecutable(allocator, configured)) return configured;
-        allocator.free(configured);
-    }
-
-    const home_c = std.c.getenv("HOME") orelse return null;
-    const home = std.mem.span(home_c);
-    const fallbacks = [_][]const u8{
-        "prj/tinykg/zig-out/bin/tinykg",
-        "prj/cc-t2z/metacodes/zig-out/vendor/tinykg/tinykg",
-    };
-    for (fallbacks) |relative| {
-        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, relative }) catch continue;
-        if (isExecutable(allocator, path)) return path;
-        allocator.free(path);
-    }
-    return null;
+    return tinykg_binary.find(allocator);
 }
 
 fn isExecutable(allocator: std.mem.Allocator, path: []const u8) bool {

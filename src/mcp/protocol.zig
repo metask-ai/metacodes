@@ -232,7 +232,7 @@ pub fn initializeParams(allocator: std.mem.Allocator) ![]u8 {
     // protocolVersion 用 2025-06-18(elicitation 引入的版本)——与所声明的 elicitation capability 一致
     // (旧的 2024-11-05 无 elicitation,两者矛盾;server 会协商降级到它支持的版本)。
     return try std.fmt.allocPrint(allocator,
-        \\{{"protocolVersion":"2025-06-18","capabilities":{{"elicitation":{{}}}},"clientInfo":{{"name":"cc-zig","version":"0.1.0"}}}}
+        \\{{"protocolVersion":"2025-06-18","capabilities":{{"elicitation":{{}}}},"clientInfo":{{"name":"metacodes","version":"0.1.0"}}}}
     , .{});
 }
 

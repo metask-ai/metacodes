@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — standalone repository and embedding boundary
+
+### Changed
+
+- Extracted `metacodes` as a history-preserving standalone repository whose
+  primary branch is `main`.
+- Replaced vendored TinyKG source compilation with a manually maintained native
+  binary contract: explicit absolute path, operator-observed SHA-256, exact CLI
+  version, fresh-store format/schema probe, atomic staging, and deterministic
+  provenance receipt.
+- Removed ambient TinyKG discovery from runtime and tests. TinyKG-dependent gates
+  now fail closed or skip explicitly when no attested binary is injected.
+- Added public API, contribution, security, governance, support, third-party, and
+  open-source readiness documentation.
+- Removed generated evaluation-run artifacts from the published source tree;
+  local copies remain ignored and recoverable from the pre-extraction history.
+
+### Security
+
+- Prepared the extracted history for removal of a legacy hard-coded provider token
+  before any remote publication. Public visibility remains blocked on an
+  independent full-history scan and owner-selected project license.
+
 ## Unreleased — Stage 3 parity (2026-05-29)
 
 REPL / TUI 体验追齐。

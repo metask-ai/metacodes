@@ -45,9 +45,9 @@ class RepositorySnapshotTest(unittest.TestCase):
 
     def test_historical_fixes_pass_hidden_validators(self):
         fixed_revisions = {
-            "83_repo_posix_hup_drain": "01a8a0342eb5e6b9465528154af8a8242fb68db5",
-            "84_repo_windows_lock_liveness": "d929f3f691d5b250322aecfa98c59febcf743d26",
-            "85_repo_skill_catalog_identity": "94b9fcc941ea069893efdeed1433e853feefe0db",
+            "83_repo_posix_hup_drain": "269eb59259df88dc8dcccc4d59341e6ce4cf6289",
+            "84_repo_windows_lock_liveness": "1de6efc310da0b7cb011e1c7b32164419e6f9af2",
+            "85_repo_skill_catalog_identity": "3bfd787377424793b879bc70a81cec33c8183c58",
         }
         handoffs = {
             "83_repo_posix_hup_drain": "POLLHUP buffered-bytes-before-EOF negative-read=ReadError",

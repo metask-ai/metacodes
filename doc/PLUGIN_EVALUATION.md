@@ -70,8 +70,8 @@ DSH 的全部动态 plugin capability、全新 provider transport、UI 插件或
 复审实现不得复用这份质量证据；它只生成独立的
 `zero-provider-receipt-review-v2.json`，且不重跑付费 pair 或外部 WorkBuddy。
 
-当前零 provider 收据：
-`evals/runs/2026-08-23-plugin-v1/zero-provider-receipt-91e959b2.json`。
+当前零-provider 收据名为 `zero-provider-receipt-91e959b2.json`。运行工件含开发机
+路径与内部评测数据，不随开源源码分发；下面保留内容/文件哈希供私有证据库核对。
 
 - protocol SHA-256：
   `91e959b22a813995a9b9675649098961a1dee57dff350e4266bacd328fd52050`
@@ -160,8 +160,8 @@ committed budget receipt 和 treatment attestation；即使门禁通过，也只
 
 用户最初授权 US$30，早期冻结尝试按 fail-closed 暴露并修复了 inventory 投影、
 原生 request reserve、tool ceiling、thinking-only assistant continuation、实现/二进制
-身份绑定和连接阶段 retry policy 等问题。历史失败收据仍保留在
-`evals/runs/2026-08-22-plugin-v1/paid-pair-failure-receipt-33d34042.json`，其 SHA-256
+身份绑定和连接阶段 retry policy 等问题。历史失败收据保留在私有证据库，名称为
+`paid-pair-failure-receipt-33d34042.json`，其 SHA-256
 为 `cd67951a54858579e1cc748f03710f3a9bd399a07faafd75783b639b1e2a4795`；旧协议已授权
 请求均未被静默重放。用户随后把跨尝试费用上限提高到 US$1,000。
 
@@ -182,12 +182,11 @@ committed budget receipt 和 treatment attestation；即使门禁通过，也只
   fail-closed 尝试的预算 journal 总计 US$25.927915 / 23,559,954 tokens，远低于
   US$1,000 上限。
 
-付费质量收据：
-`evals/runs/2026-08-22-plugin-v1/paid-pair-receipt-df04fb0f.json`，文件 SHA-256
+付费质量收据 `paid-pair-receipt-df04fb0f.json` 不随源码分发；文件 SHA-256
 `ac6a93ac10be5a36b25a10c1e082937ab42ece8e0791d91f0acc3fdd08717b7e`，内容 SHA-256
 `6db6307a4060c4398cbe3510050d5677f87d54b902dec06789d47a3bdabceda7`。原始 rollout、
 授权文件和 budget journal 保存在私有 `~/.metacodes/evals/plugin-v1-df04fb0f/`，
-仓库只保存 hash-pinned 收据。
+公开源码树只保存这里列出的 hash pin。
 
 ### 5.2 2026-08-23 当前实现重新冻结结果
 
@@ -204,7 +203,7 @@ Provider dialect、工具/核心能力提示词投影和 cache contract 落地�
 - 失败门：成功率回归 5.56pp、配对成本 +US$0.041464/rollout、model tool error
   +0.055556/rollout；
 - 观测成本 US$13.531737 / 13,757,059 metered tokens；
-- 收据 `evals/runs/2026-08-23-plugin-v1/paid-pair-receipt-c5e73a99.json`，文件
+- 私有收据 `paid-pair-receipt-c5e73a99.json`，文件
   SHA-256 `9513279a6ea189d49d74a9131a5029eea7c8956e4dd1c7f98b5c2f20a2ae32a1`，
   内容 SHA-256 `bea9ec17e51974d8e3eed1e83de3a3bfce79d38131b1ce39e73a377a71a066f6`。
 
@@ -226,7 +225,7 @@ Provider dialect、工具/核心能力提示词投影和 cache contract 落地�
 - candidate 的工具遥测中 `Skill` 调用为 **0**。因此结果只能归因于“加载该插件未造成
   净回退”，不能归因于 `verify-change` 工作流实际改善了编码；
 - 观测成本 US$14.635418 / 14,324,212 metered tokens；
-- 收据 `evals/runs/2026-08-23-plugin-v1/paid-pair-receipt-8833622a.json`，文件
+- 私有收据 `paid-pair-receipt-8833622a.json`，文件
   SHA-256 `a89eb8f0103b341d1c36b9c04c4c528be66868c1721717f86cd42ea9195472a6`，
   内容 SHA-256 `fc5bc589cde8ff9c09fa3e8c14b8f72d0467c811c8ec3072897ccaba469872c9`。
 
@@ -255,8 +254,8 @@ modifier。因此 `8833622a…` 只保留为历史结果，不能证明静态 di
   tokens。这是随机轨迹观测，不改变请求字节契约：同一 Session pin 的等价 generation
   会生成 byte-identical request；只有真实 tool/dialect/model/system 变化才建立新 cache
   boundary；
-- 本 cohort 观测成本 US$13.101860 / 12,809,274 metered tokens；付费收据
-  `evals/runs/2026-08-23-plugin-v1/paid-pair-receipt-6ae57380.json`，文件 SHA-256
+- 本 cohort 观测成本 US$13.101860 / 12,809,274 metered tokens；私有付费收据
+  `paid-pair-receipt-6ae57380.json` 的文件 SHA-256
   `d1dbdb14d4bcb33e1c824b062603104d656dc625bfc9d000789d4e6c64667962`，内容
   SHA-256 `308aa9186a47c6834b5d10761720023448628860ec1c96c286291bd989382e8c`。
 
@@ -302,8 +301,8 @@ AgentLoop 的 provider-neutral 不变量：激活前禁止其他工具、无工�
 - candidate 最后一条 `04_modify_feature` 使用 30 次工具调用、34 turns，超过冻结的
   24-turn trajectory 上限；该真实 regression 与 baseline trial 2 的 timeout improvement
   对消，不能删除或后验重跑；
-- 观测总成本 `US$14.7192174`、12,461,461 metered tokens。质量收据为
-  `evals/runs/2026-08-23-plugin-v1/paid-pair-receipt-91e959b2.json`，文件 SHA-256
+- 观测总成本 `US$14.7192174`、12,461,461 metered tokens。私有质量收据
+  `paid-pair-receipt-91e959b2.json` 的文件 SHA-256
   `51c64d7ccea9b4a17335c9436380c4c296521d6cfcbbb3c631d4e795f8283280`，内容 SHA-256
   `a433699cef12026653d069df835dc136e693615c12d4f76b9bf8d05ec54bca13`。
 

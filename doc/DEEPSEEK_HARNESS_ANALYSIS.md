@@ -3,7 +3,7 @@
 ## 1. 固定样本与验证
 
 - 上游：`https://github.com/deepseek-ai/deepseek-harness`
-- 本地副本：`/Users/david/prj/deepseek-harness`
+- 本地副本：通过 `--deepseek-harness <path>` 显式提供，不猜测维护者目录
 - 固定提交：`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`
 - 提交日期：2026-08-21
 - package version：`0.1.1-rc.2`

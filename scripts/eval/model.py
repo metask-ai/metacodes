@@ -236,16 +236,17 @@ def validate_suite(data: Dict[str, Any], root: Path) -> List[str]:
                     "expected a full lowercase Git commit id"
                 )
             prefix = snapshot.get("prefix")
-            try:
-                safe_posix_relative_path(
-                    prefix,
-                    f"{where}.environment.repository_snapshot.prefix",
-                )
-            except ValidationError:
-                raise ValidationError(
-                    f"{where}.environment.repository_snapshot.prefix: "
-                    "expected a safe repository-relative path"
-                )
+            if prefix != ".":
+                try:
+                    safe_posix_relative_path(
+                        prefix,
+                        f"{where}.environment.repository_snapshot.prefix",
+                    )
+                except ValidationError:
+                    raise ValidationError(
+                        f"{where}.environment.repository_snapshot.prefix: "
+                        "expected '.' or a safe repository-relative path"
+                    )
             paths = snapshot.get("paths")
             if (
                 not isinstance(paths, list)

@@ -230,9 +230,10 @@ next runner calls when raw artifacts no longer attest, while promotion rereads
 all 18 calibration rollouts and rejects transcript mutation. Thus Lean owns the
 legal ordering and admission cardinality, while executable sensors establish
 the actual I/O and TinyKG facts represented by those abstract events.
-The feedback topology also requires `zig build vendor:tinykg` before the Python
-L2 command, so a clean checkout cannot turn missing native coverage into a
-machine-local skip.
+The feedback topology also requires `python scripts/verify_tinykg_binary.py`
+before the Python L2 command. Maintainers inject an explicit binary path and
+observed SHA-256, so a clean checkout cannot turn missing native coverage into a
+machine-local skip or silently consume an ambient artifact.
 
 `eval.memory-local-store-isolation.l2` makes the memory-benchmark storage
 boundary a release rule rather than a convention. Its seven fixed obligations

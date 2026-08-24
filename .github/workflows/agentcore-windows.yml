@@ -1,0 +1,43 @@
+name: AgentCore Windows
+
+on:
+  pull_request:
+    paths:
+      - "build.zig"
+      - "scripts/agentcore_manifest.zig"
+      - "scripts/windows_test_prelude.zig"
+      - "src/agentcore/**"
+      - "src/core/**"
+      - "src/platform/**"
+      - "sdk/**"
+      - "tests/component/agentcore_abi_test.zig"
+      - "tests/agentcore_artifact_consumer/**"
+      - ".github/workflows/agentcore-windows.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-windows-gate:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Native AgentCore delivery gate
+        shell: pwsh
+        run: |
+          zig version
+          zig build agentcore:gate `
+            -Dtarget=x86_64-windows-msvc `
+            -Doptimize=ReleaseSafe `
+            -Dtinykg=false `
+            -j12
+      - name: Native Windows platform gate
+        shell: pwsh
+        run: zig build windows:gate -Dtarget=x86_64-windows-gnu -Dtinykg=false -j12
