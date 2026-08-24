@@ -11,7 +11,7 @@
         "kind": "isolated_git_workspace",
         "reset": "fresh_home_workdir_and_repository_snapshot",
         "repository_snapshot": {
-          "revision": "ee6222d9e02c01af46dd19ca456fdbe75ba736d8",
+          "revision": "e4eddb59375c4fdabde7ab442a2aa220045afe21",
           "prefix": ".",
           "paths": ["src/platform/process.zig"]
         }
@@ -37,7 +37,7 @@
         "kind": "isolated_git_workspace",
         "reset": "fresh_home_workdir_and_repository_snapshot",
         "repository_snapshot": {
-          "revision": "7f20528eda16647e3fb1a3e95eb1b2300db5d088",
+          "revision": "e1bead28f8cb48091151edaed548dda2cabefa2f",
           "prefix": ".",
           "paths": ["src/swarm/file_lock.zig", "src/swarm/teammate.zig", "tests/component/teammate_runtime_test.zig"]
         }
@@ -63,7 +63,7 @@
         "kind": "isolated_git_workspace",
         "reset": "fresh_home_workdir_and_repository_snapshot",
         "repository_snapshot": {
-          "revision": "1691d56cd78e5bbe5d68bf62a95a441e738c1644",
+          "revision": "738b20e0d78cbc39eedcd68845c9025ee38131f3",
           "prefix": ".",
           "paths": ["src/skills/runtime/catalog.zig", "sdk/zig/protocol.zig", "sdk/zig/types.zig", "src/agentcore/abi_v1.zig", "tests/component/agentcore_abi_test.zig"]
         }
