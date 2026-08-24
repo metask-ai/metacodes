@@ -30,13 +30,10 @@ jobs:
         with:
           version: 0.16.0
       - name: Native AgentCore delivery gate
-        shell: pwsh
+        shell: cmd
         run: |
           zig version
-          zig build agentcore:gate `
-            -Dtarget=x86_64-windows-msvc `
-            -Doptimize=ReleaseSafe `
-            -j12
+          zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe -j12
       - name: Native Windows platform gate
-        shell: pwsh
+        shell: cmd
         run: zig build windows:gate -Dtarget=x86_64-windows-gnu -j12
