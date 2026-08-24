@@ -445,6 +445,72 @@ test "L2 provider dialect plugin is generation-pinned and equivalent replacement
     try std.testing.expectEqual(@as(u64, 3), @intFromEnum(equivalent_session.pluginGeneration()));
 }
 
+test "L2 durable effect journal preserves exact provider request cache bytes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    const journal_root = try std.fmt.allocPrint(a, "{s}/durable-journal", .{root});
+    defer a.free(journal_root);
+
+    var ephemeral_server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer ephemeral_server.stop();
+    var durable_server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer durable_server.stop();
+    const ephemeral_url = try ephemeral_server.urlOwned(a);
+    defer a.free(ephemeral_url);
+    const durable_url = try durable_server.urlOwned(a);
+    defer a.free(durable_url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .core_profile = .none });
+    defer runtime.destroy() catch unreachable;
+    const ephemeral = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "cache-stable-model",
+        .base_url = ephemeral_url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{},
+    });
+    defer ephemeral.destroy() catch unreachable;
+    const durable = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "cache-stable-model",
+        .base_url = durable_url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{},
+        .run_journal = .{ .exact_root = journal_root },
+    });
+    defer durable.destroy() catch unreachable;
+
+    var sink_state: u8 = 0;
+    _ = try ephemeral.runText(1, "identical durable prompt", 1, .{
+        .ctx = &sink_state,
+        .emit = Sink.emit,
+    });
+    _ = try durable.runText(1, "identical durable prompt", 1, .{
+        .ctx = &sink_state,
+        .emit = Sink.emit,
+    });
+
+    const ephemeral_body = (ephemeral_server.lastRequest() orelse
+        return error.NoRequestCaptured).body();
+    const durable_body = (durable_server.lastRequest() orelse
+        return error.NoRequestCaptured).body();
+    try std.testing.expectEqualStrings(ephemeral_body, durable_body);
+    const summary = try cc.tool_observation_journal.validate(
+        journal_root,
+        durable.session_id,
+    );
+    try std.testing.expect(summary.complete);
+    try std.testing.expectEqual(@as(u64, 4), summary.records);
+}
+
 test "L2 Anthropic GLM sees typed Skill capability activation in the real AgentSession request" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

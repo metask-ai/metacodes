@@ -11,6 +11,7 @@ const tools = @import("../tools.zig");
 const permission_category = @import("../permission/category.zig");
 const artifact_store = @import("tool_result_artifact.zig");
 const tool_result = @import("tool_result.zig");
+const execution_effect = @import("execution_effect.zig");
 
 /// Legacy completed Host results are model-visible text and deliberately
 /// bounded. Larger or binary producers must use `HostStreamTool`, which starts
@@ -74,6 +75,7 @@ pub const HostSyncTool = struct {
     /// Conservative by default: a Host callback is executable authority unless
     /// its trusted registrar explicitly proves a narrower read/write effect.
     category: permission_category.ToolCategory = .execute,
+    replay: execution_effect.ReplayDeclaration = .never,
 };
 
 /// Errors observable by a streaming Host producer. The sink is borrowed for
@@ -128,6 +130,7 @@ pub const HostStreamTool = struct {
     ctx: *anyopaque,
     execute: HostStreamExecuteFn,
     category: permission_category.ToolCategory = .execute,
+    replay: execution_effect.ReplayDeclaration = .never,
 };
 
 pub const HostSyncExecutor = struct {
@@ -159,6 +162,7 @@ pub const IsolatedTool = struct {
     /// adapters use it to bind Session permission memory and checkpoints to
     /// this exact isolated implementation instead of only its display name.
     authority_binding: [32]u8,
+    replay: execution_effect.ReplayDeclaration = .never,
 };
 
 pub const IsolatedExecutor = struct {
@@ -179,6 +183,7 @@ pub const Entry = struct {
     executor: Executor,
     prefetch_safe: bool,
     category: permission_category.ToolCategory,
+    replay: execution_effect.ReplayDeclaration,
 };
 
 pub const Catalog = struct {
@@ -241,6 +246,7 @@ pub const Catalog = struct {
                 // unselected entries out of the prefetch path.
                 .prefetch_safe = true,
                 .category = permission_category.getToolCategory(builtin.name),
+                .replay = builtin.replay,
             });
         }
 
@@ -255,6 +261,7 @@ pub const Catalog = struct {
                 .executor = .{ .host_sync = .{ .ctx = host.ctx, .execute = host.execute } },
                 .prefetch_safe = false,
                 .category = host.category,
+                .replay = host.replay,
             });
         }
         for (host_stream_tools) |host| {
@@ -268,6 +275,7 @@ pub const Catalog = struct {
                 .executor = .{ .host_stream = .{ .ctx = host.ctx, .execute = host.execute } },
                 .prefetch_safe = false,
                 .category = host.category,
+                .replay = host.replay,
             });
         }
         for (isolated_tools) |isolated| {
@@ -288,6 +296,7 @@ pub const Catalog = struct {
                 // Process manifests cannot self-classify into a weaker native
                 // permission category. Executable authority is conservative.
                 .category = .execute,
+                .replay = isolated.replay,
             });
         }
         return .{ .allocator = allocator, .arena = arena, .entries = try entries.toOwnedSlice(owned) };
@@ -336,6 +345,7 @@ pub fn cloneHostTool(allocator: std.mem.Allocator, source: HostSyncTool) std.mem
         .ctx = source.ctx,
         .execute = source.execute,
         .category = source.category,
+        .replay = source.replay,
     };
 }
 
@@ -345,6 +355,7 @@ pub fn cloneHostStreamTool(allocator: std.mem.Allocator, source: HostStreamTool)
         .ctx = source.ctx,
         .execute = source.execute,
         .category = source.category,
+        .replay = source.replay,
     };
 }
 
@@ -487,7 +498,7 @@ pub const Selection = struct {
     }
 
     pub fn dispatcher(self: *const Selection) tools.ToolDispatcher {
-        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync, .builtinFn = isBuiltinEntry, .categoryFn = category };
+        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync, .builtinFn = isBuiltinEntry, .categoryFn = category, .replayDeclarationFn = replayDeclaration };
     }
 
     fn dispatch(raw: *const anyopaque, tool_ctx: *const tools.ToolContext, name: []const u8, args: []const u8) anyerror!tools.ToolDispatchOutcome {
@@ -664,6 +675,12 @@ pub const Selection = struct {
         return entry.category;
     }
 
+    fn replayDeclaration(raw: *const anyopaque, name: []const u8) execution_effect.ReplayDeclaration {
+        const self: *const Selection = @ptrCast(@alignCast(raw));
+        const entry = self.find(name) orelse return .never;
+        return entry.replay;
+    }
+
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {
         const self: *const Selection = @ptrCast(@alignCast(raw));
         if (index >= self.entries.len) return null;
@@ -681,6 +698,8 @@ test "Selection rejects names outside Runtime and dispatches only selected entri
     try std.testing.expect(!selection.contains("Grep"));
     try std.testing.expect(selection.dispatcher().isBuiltin("Read"));
     try std.testing.expect(!selection.dispatcher().isBuiltin("Grep"));
+    try std.testing.expect(selection.dispatcher().replayDeclaration("Read") == .read_only);
+    try std.testing.expect(selection.dispatcher().replayDeclaration("Grep") == .never);
     try std.testing.expectError(error.ToolNotInRuntime, Selection.init(std.testing.allocator, &catalog, &.{"Bash"}));
 
     var ctx = tools.ToolContext{ .allocator = std.testing.allocator, .tool_dispatcher = selection.dispatcher() };

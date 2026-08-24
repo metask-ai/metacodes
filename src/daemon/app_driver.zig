@@ -114,6 +114,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
 
         var options = web_session.buildWebOptions(app, dctx.wb, scoped_recall);
         options.tool_observer = if (run_control) |control| control.observer() else null;
+        options.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
         options.project_rule_gate = if (run_control) |control| control.formalGate() else null;
         const result = agent_loop.run(
             &app.conversation,

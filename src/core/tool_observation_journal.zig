@@ -13,17 +13,26 @@ const observation = @import("../tools/observation.zig");
 const session_id_mod = @import("session_id.zig");
 const util_time = @import("../util/time.zig");
 const util_fs = @import("../util/fs.zig");
+const execution_effect = @import("execution_effect.zig");
+const run_recovery = @import("run_recovery.zig");
 
-pub const SCHEMA_VERSION = "metacodes-tool-observation-journal-v1";
+pub const SCHEMA_VERSION_V1 = "metacodes-tool-observation-journal-v1";
+pub const SCHEMA_VERSION = "metacodes-tool-observation-journal-v2";
 pub const FILE_NAME = "tool-observations.jsonl";
 pub const LOCK_FILE_NAME = "tool-observations.lock";
 pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum simultaneously open effects in one durable root Run. This is a
+/// logical guard only: the reducer allocates in proportion to actual overlap.
+/// 8192 covers MAX_AGENT_DEPTH=3 nested 8-way fanout plus each leaf agent's
+/// 8-way tool window without imposing that memory cost on ordinary sessions.
+pub const MAX_PENDING_EFFECTS: usize = 8192;
 
 pub const JournalEvent = union(enum) {
     run_started: struct {
         started_wall_ns: i128,
     },
     tool_observation: observation.Event,
+    provider_attempt: execution_effect.ProviderAttemptEvent,
     run_finished: struct {
         stop_reason: []const u8,
         finished_wall_ns: i128,
@@ -74,10 +83,25 @@ pub const RunDispatch = struct {
     agent_depth: u8,
     input_bytes: usize,
     input_sha256: [64]u8,
+    replay: execution_effect.ReplayPolicy,
     file_target_state: observation.FileTargetState,
     outcome: observation.Outcome,
     effect: ?observation.Effect,
     effect_valid: bool,
+};
+
+pub const RunProviderAttempt = struct {
+    attempt_id: [64]u8,
+    actor_id: [24]u8,
+    started_sequence: u64,
+    finished_sequence: u64,
+    request_sha256: [64]u8,
+    logical_turn: u32,
+    context_generation: u32,
+    physical_attempt: u32,
+    max_attempts: u32,
+    outcome: execution_effect.ProviderAttemptOutcome,
+    metering: execution_effect.Metering,
 };
 
 pub const RunFormalDecision = struct {
@@ -142,6 +166,7 @@ pub const LoadedRunDispatches = struct {
     interval_sha256: [64]u8,
     stop_reason: []const u8,
     dispatches: []const RunDispatch,
+    provider_attempts: []const RunProviderAttempt,
     formal_decisions: []const RunFormalDecision,
     rule_filters: []const RunRuleFilter,
     process_signals: ProcessSignals = .{},
@@ -164,6 +189,7 @@ pub const Journal = struct {
     sequence: u64,
     file_bytes: usize,
     started_ns: i128,
+    recovery: run_recovery.Reducer,
     finished: bool = false,
     failed: bool = false,
     release_requested: bool = false,
@@ -225,7 +251,9 @@ pub const Journal = struct {
             .sequence = summary.records,
             .file_bytes = summary.bytes,
             .started_ns = util_time.nowNs(),
+            .recovery = run_recovery.Reducer.init(std.heap.c_allocator, MAX_PENDING_EFFECTS),
         };
+        errdefer journal.recovery.deinit();
         try journal.appendEvent(.{ .run_started = .{
             .started_wall_ns = util_time.nowWallNs(),
         } });
@@ -234,6 +262,7 @@ pub const Journal = struct {
     }
 
     pub fn deinit(self: *Journal) void {
+        self.recovery.deinit();
         if (self.fd >= 0) _ = pfs.close(self.fd);
         self.fd = -1;
         if (self.lock_fd >= 0) _ = pfs.close(self.lock_fd);
@@ -247,6 +276,13 @@ pub const Journal = struct {
 
     pub fn sink(self: *Journal) observation.Sink {
         return .{ .ctx = @ptrCast(self), .emitFn = emitThunk };
+    }
+
+    /// Provider attempts share this journal with tool dispatches. Tool boundary
+    /// events are already persisted by `sink()` and therefore remain a no-op
+    /// here instead of creating a second authoritative record.
+    pub fn executionBoundary(self: *Journal) execution_effect.Boundary {
+        return .{ .ctx = @ptrCast(self), .emitFn = boundaryThunk };
     }
 
     pub fn runId(self: *const Journal) []const u8 {
@@ -285,10 +321,13 @@ pub const Journal = struct {
         defer self.mutex.unlock();
         if (self.failed) return error.JournalFailed;
         if (self.finished) return error.RunAlreadyFinished;
-        try self.appendEventLocked(.{ .run_finished = .{
+        self.appendEventLocked(.{ .run_finished = .{
             .stop_reason = stop_reason,
             .finished_wall_ns = util_time.nowWallNs(),
-        } });
+        } }) catch |err| {
+            self.failed = true;
+            return err;
+        };
         self.finished = true;
     }
 
@@ -317,6 +356,30 @@ pub const Journal = struct {
         return true;
     }
 
+    fn boundaryThunk(raw: *anyopaque, event: execution_effect.BoundaryEvent) bool {
+        const self: *Journal = @ptrCast(@alignCast(raw));
+        const provider_event: ?execution_effect.ProviderAttemptEvent = switch (event) {
+            .before => |intent| switch (intent) {
+                .provider_request => |started| .{ .started = started },
+                .tool_dispatch => null,
+            },
+            .after => |result| switch (result) {
+                .provider_request => |finished| .{ .finished = finished },
+                .tool_dispatch => null,
+            },
+        };
+        const provider = provider_event orelse return true;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.failed or self.finished or
+            !execution_effect.validateProviderAttemptEvent(provider)) return false;
+        self.appendEventLocked(.{ .provider_attempt = provider }) catch {
+            self.failed = true;
+            return false;
+        };
+        return true;
+    }
+
     fn appendEvent(self: *Journal, event: JournalEvent) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -325,6 +388,11 @@ pub const Journal = struct {
 
     fn appendEventLocked(self: *Journal, event: JournalEvent) !void {
         if (self.failed) return error.JournalFailed;
+        // Validate the transition before making it durable. A failed write
+        // poisons this Journal, so advancing the in-memory reducer first cannot
+        // authorize later work; it only lets illegal live sequences fail now
+        // instead of on the next process's validation pass.
+        try applyRecoveryEvent(&self.recovery, self.run_id, event);
         const envelope = Envelope{
             .sequence = self.sequence,
             .monotonic_elapsed_ns = elapsedNs(self.started_ns),
@@ -442,11 +510,13 @@ pub fn loadRunDispatches(
 
     var interval_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var records: std.ArrayList(RunDispatch) = .empty;
+    var provider_attempts: std.ArrayList(RunProviderAttempt) = .empty;
     var formal_decisions: std.ArrayList(RunFormalDecision) = .empty;
     var process_signals = ProcessSignals{};
     var rule_filters: std.ArrayList(RunRuleFilter) = .empty;
     var stop_reason: ?[]const u8 = null;
     var open = std.AutoHashMap([32]u8, usize).init(a);
+    var open_provider_attempts = std.AutoHashMap([32]u8, usize).init(a);
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -469,6 +539,35 @@ pub fn loadRunDispatches(
                 if (envelope.sequence != binding.last_sequence or stop_reason != null)
                     return error.InvalidRunBinding;
                 stop_reason = finished.stop_reason;
+            },
+            .provider_attempt => |provider_event| switch (provider_event) {
+                .started => |started| {
+                    const key = dispatchKey(&started.attempt_id);
+                    if (open_provider_attempts.contains(key)) return error.InvalidRecord;
+                    const index = provider_attempts.items.len;
+                    try provider_attempts.append(a, .{
+                        .attempt_id = started.attempt_id,
+                        .actor_id = started.actor_id,
+                        .started_sequence = envelope.sequence,
+                        .finished_sequence = envelope.sequence,
+                        .request_sha256 = started.request_sha256,
+                        .logical_turn = started.logical_turn,
+                        .context_generation = started.context_generation,
+                        .physical_attempt = started.physical_attempt,
+                        .max_attempts = started.max_attempts,
+                        .outcome = .api_error,
+                        .metering = .unknown,
+                    });
+                    try open_provider_attempts.put(key, index);
+                },
+                .finished => |finished| {
+                    const index = open_provider_attempts.fetchRemove(dispatchKey(&finished.attempt_id)) orelse
+                        return error.InvalidRecord;
+                    const record = &provider_attempts.items[index.value];
+                    record.finished_sequence = envelope.sequence;
+                    record.outcome = finished.outcome;
+                    record.metering = finished.metering;
+                },
             },
             .tool_observation => |event| switch (event) {
                 // Diagnostic-only: a coverage gap binds no rule identity and
@@ -569,6 +668,7 @@ pub fn loadRunDispatches(
                         .agent_depth = started.agent_depth,
                         .input_bytes = started.input_bytes,
                         .input_sha256 = started.input_sha256,
+                        .replay = started.replay,
                         .file_target_state = started.file_target_state,
                         .outcome = .host_fatal,
                         .effect = null,
@@ -593,7 +693,7 @@ pub fn loadRunDispatches(
             },
         }
     }
-    if (open.count() != 0) return error.InvalidRecord;
+    if (open.count() != 0 or open_provider_attempts.count() != 0) return error.InvalidRecord;
     var raw_digest: [32]u8 = undefined;
     interval_hasher.final(&raw_digest);
     const interval_sha256 = std.fmt.bytesToHex(raw_digest, .lower);
@@ -604,6 +704,7 @@ pub fn loadRunDispatches(
         .interval_sha256 = interval_sha256,
         .stop_reason = stop_reason orelse return error.InvalidRunBinding,
         .dispatches = try records.toOwnedSlice(a),
+        .provider_attempts = try provider_attempts.toOwnedSlice(a),
         .formal_decisions = try formal_decisions.toOwnedSlice(a),
         .rule_filters = try rule_filters.toOwnedSlice(a),
         .process_signals = process_signals,
@@ -641,6 +742,45 @@ pub fn runContainsBlockedVerdict(
     return false;
 }
 
+fn applyRecoveryEvent(
+    reducer: *run_recovery.Reducer,
+    run_id: session_id_mod.SessionId,
+    event: JournalEvent,
+) !void {
+    switch (event) {
+        .run_started => try reducer.apply(.{
+            .run_started = run_recovery.EffectKey.fromBytes(run_id.asSlice()),
+        }),
+        .provider_attempt => |provider_event| switch (provider_event) {
+            .started => |started| try reducer.apply(.{
+                .provider_intent = .{
+                    .key = try run_recovery.EffectKey.fromSha256Hex(started.attempt_id),
+                    // A process crash never blindly repeats a provider request.
+                    // In-process connect retries receive a distinct durable intent.
+                    .replay = .never,
+                },
+            }),
+            .finished => |finished| try reducer.apply(.{
+                .provider_result = try run_recovery.EffectKey.fromSha256Hex(finished.attempt_id),
+            }),
+        },
+        .tool_observation => |tool_event| switch (tool_event) {
+            .dispatch_started => |started| try reducer.apply(.{ .tool_intent = .{
+                .key = run_recovery.EffectKey.fromBytes(started.id),
+                .replay = started.replay,
+            } }),
+            .dispatch_finished => |finished| try reducer.apply(.{
+                .tool_result = run_recovery.EffectKey.fromBytes(finished.id),
+            }),
+            else => {},
+        },
+        .run_finished => {
+            try reducer.apply(.run_closing);
+            try reducer.apply(.run_finished);
+        },
+    }
+}
+
 fn validateFd(
     fd: pfs.Fd,
     expected_session: session_id_mod.SessionId,
@@ -665,12 +805,18 @@ fn validateFd(
 
     var expected_sequence: u64 = 0;
     var active_run: ?session_id_mod.SessionId = null;
+    var recovery = run_recovery.Reducer.init(std.heap.c_allocator, MAX_PENDING_EFFECTS);
+    defer recovery.deinit();
     var active_elapsed_ns: u64 = 0;
     var binding_started = false;
     var binding_finished = false;
     var binding_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var open_dispatches = std.AutoHashMap([32]u8, OpenDispatch).init(std.heap.c_allocator);
     defer open_dispatches.deinit();
+    var open_provider_attempts = std.AutoHashMap([32]u8, void).init(std.heap.c_allocator);
+    defer open_provider_attempts.deinit();
+    var seen_provider_attempts = std.AutoHashMap([32]u8, void).init(std.heap.c_allocator);
+    defer seen_provider_attempts.deinit();
     var seen_dispatches = std.AutoHashMap([32]u8, u8).init(std.heap.c_allocator);
     defer seen_dispatches.deinit();
     var formal_events = std.AutoHashMap([32]u8, u8).init(std.heap.c_allocator);
@@ -706,13 +852,17 @@ fn validateFd(
         const envelope = parsed.value;
         const run_id = session_id_mod.SessionId.fromSlice(envelope.run_id) orelse
             return error.InvalidRecord;
-        if (!std.mem.eql(u8, envelope.schema_version, SCHEMA_VERSION) or
+        if ((!std.mem.eql(u8, envelope.schema_version, SCHEMA_VERSION) and
+            !std.mem.eql(u8, envelope.schema_version, SCHEMA_VERSION_V1)) or
             envelope.sequence != expected_sequence or
             !std.mem.eql(u8, envelope.session_id, expected_session.asSlice()))
+            return error.InvalidRecord;
+        applyRecoveryEvent(&recovery, run_id, envelope.event) catch
             return error.InvalidRecord;
         switch (envelope.event) {
             .run_started => {
                 if (active_run != null or open_dispatches.count() != 0 or
+                    open_provider_attempts.count() != 0 or
                     pending_rule_filters.count() != 0)
                     return error.InvalidRecord;
                 active_run = run_id;
@@ -725,6 +875,36 @@ fn validateFd(
                         binding_hasher.update(line);
                         binding_hasher.update("\n");
                     }
+                }
+            },
+            .provider_attempt => |provider_event| {
+                const current = active_run orelse return error.InvalidRecord;
+                if (!std.mem.eql(u8, envelope.schema_version, SCHEMA_VERSION) or
+                    !std.mem.eql(u8, current.asSlice(), run_id.asSlice()) or
+                    envelope.monotonic_elapsed_ns < active_elapsed_ns or
+                    !execution_effect.validateProviderAttemptEvent(provider_event))
+                    return error.InvalidRecord;
+                active_elapsed_ns = envelope.monotonic_elapsed_ns;
+                if (expected_binding) |binding| {
+                    if (binding_started and !binding_finished and
+                        std.mem.eql(u8, binding.run_id.asSlice(), run_id.asSlice()))
+                    {
+                        binding_hasher.update(line);
+                        binding_hasher.update("\n");
+                    }
+                }
+                switch (provider_event) {
+                    .started => |started| {
+                        const key = dispatchKey(&started.attempt_id);
+                        if (seen_provider_attempts.contains(key)) return error.InvalidRecord;
+                        try seen_provider_attempts.put(key, {});
+                        const entry = try open_provider_attempts.getOrPut(key);
+                        if (entry.found_existing) return error.InvalidRecord;
+                    },
+                    .finished => |finished| {
+                        if (open_provider_attempts.fetchRemove(dispatchKey(&finished.attempt_id)) == null)
+                            return error.InvalidRecord;
+                    },
                 }
             },
             .tool_observation => |tool_event| {
@@ -865,8 +1045,10 @@ fn validateFd(
                         }
                     },
                     .dispatch_started => |started| {
-                        if (!std.mem.eql(u8, started.schema_version, observation.SCHEMA_VERSION))
+                        if (!std.mem.eql(u8, started.schema_version, observation.SCHEMA_VERSION) and
+                            !std.mem.eql(u8, started.schema_version, observation.SCHEMA_VERSION_V1))
                             return error.InvalidRecord;
+                        if (!validReplayPolicy(started.replay)) return error.InvalidRecord;
                         const key = dispatchKey(started.id);
                         if (seen_dispatches.contains(key)) return error.InvalidRecord;
                         if (pending_rule_filters.fetchRemove(ruleFilterKey(
@@ -908,7 +1090,8 @@ fn validateFd(
                         };
                     },
                     .dispatch_finished => |finished| {
-                        if (!std.mem.eql(u8, finished.schema_version, observation.SCHEMA_VERSION))
+                        if (!std.mem.eql(u8, finished.schema_version, observation.SCHEMA_VERSION) and
+                            !std.mem.eql(u8, finished.schema_version, observation.SCHEMA_VERSION_V1))
                             return error.InvalidRecord;
                         const entry = open_dispatches.fetchRemove(dispatchKey(finished.id)) orelse
                             return error.InvalidRecord;
@@ -942,7 +1125,8 @@ fn validateFd(
                 const current = active_run orelse return error.InvalidRecord;
                 if (!std.mem.eql(u8, current.asSlice(), run_id.asSlice()) or
                     envelope.monotonic_elapsed_ns < active_elapsed_ns or
-                    open_dispatches.count() != 0 or pending_rule_filters.count() != 0)
+                    open_dispatches.count() != 0 or open_provider_attempts.count() != 0 or
+                    pending_rule_filters.count() != 0)
                     return error.InvalidRecord;
                 var formal_states = formal_dispatches.valueIterator();
                 while (formal_states.next()) |state| {
@@ -969,6 +1153,7 @@ fn validateFd(
                 pre_decisions.clearRetainingCapacity();
                 formal_dispatches.clearRetainingCapacity();
                 rule_filter_identities.clearRetainingCapacity();
+                seen_provider_attempts.clearRetainingCapacity();
             },
         }
         expected_sequence += 1;
@@ -980,10 +1165,12 @@ fn validateFd(
         binding_hasher.final(&raw);
         out.* = std.fmt.bytesToHex(raw, .lower);
     }
+    const reducer_complete = recovery.state == .idle;
+    if (reducer_complete != (active_run == null)) return error.InvalidRecord;
     return .{
         .records = expected_sequence,
         .bytes = size,
-        .complete = active_run == null,
+        .complete = reducer_complete,
         .artifact_sha256 = observation.sha256Hex(bytes),
     };
 }
@@ -1043,6 +1230,15 @@ fn validHex(value: [64]u8) bool {
         if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
     }
     return true;
+}
+
+fn validReplayPolicy(policy: execution_effect.ReplayPolicy) bool {
+    return switch (policy) {
+        .never, .read_only => true,
+        .idempotent => |key| validHex(key.bytes) and !std.mem.allEqual(u8, &key.bytes, '0'),
+        .reobservable => |receipt| validHex(receipt.receipt_sha256) and
+            !std.mem.allEqual(u8, &receipt.receipt_sha256, '0'),
+    };
 }
 
 fn validCheckerFailure(value: ?[]const u8) bool {
@@ -2500,6 +2696,98 @@ test "tool observation journal durably appends, validates, and resumes sequence"
     try std.testing.expect(!std.mem.eql(u8, &second.artifact_sha256, &first.artifact_sha256));
     const rebound = try validateRunBinding(root, first_binding);
     try std.testing.expectEqualSlices(u8, &bound.interval_sha256, &rebound.interval_sha256);
+}
+
+test "provider physical attempt shares run journal and preserves unknown versus known usage" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    var journal = try Journal.init(root, sid);
+    defer journal.deinit();
+    const boundary = journal.executionBoundary();
+    const request_sha256 = execution_effect.sha256Hex(&.{"canonical-request"});
+    const first_id = execution_effect.providerAttemptId(sid.bytes, request_sha256, 1, 0, 1);
+    const second_id = execution_effect.providerAttemptId(sid.bytes, request_sha256, 1, 0, 2);
+    try std.testing.expect(boundary.emit(.{ .before = .{ .provider_request = .{
+        .attempt_id = first_id,
+        .actor_id = sid.bytes,
+        .request_sha256 = request_sha256,
+        .logical_turn = 1,
+        .context_generation = 0,
+        .physical_attempt = 1,
+        .max_attempts = 2,
+    } } }));
+    try std.testing.expect(boundary.emit(.{ .after = .{ .provider_request = .{
+        .attempt_id = first_id,
+        .outcome = .api_error,
+        .metering = .unknown,
+    } } }));
+    try std.testing.expect(boundary.emit(.{ .before = .{ .provider_request = .{
+        .attempt_id = second_id,
+        .actor_id = sid.bytes,
+        .request_sha256 = request_sha256,
+        .logical_turn = 1,
+        .context_generation = 0,
+        .physical_attempt = 2,
+        .max_attempts = 2,
+    } } }));
+    try std.testing.expect(boundary.emit(.{ .after = .{ .provider_request = .{
+        .attempt_id = second_id,
+        .outcome = .succeeded,
+        .metering = .{ .known = .{
+            .input_tokens = 11,
+            .output_tokens = 7,
+            .cache_read_input_tokens = 5,
+            .cache_creation_input_tokens = 3,
+        } },
+    } } }));
+    try journal.finishRun("end_turn");
+
+    var loaded = try loadRunDispatches(std.testing.allocator, root, try journal.runBinding());
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.provider_attempts.len);
+    try std.testing.expect(loaded.provider_attempts[0].outcome == .api_error);
+    try std.testing.expect(loaded.provider_attempts[0].metering == .unknown);
+    try std.testing.expect(loaded.provider_attempts[1].outcome == .succeeded);
+    const metering = switch (loaded.provider_attempts[1].metering) {
+        .known => |usage| usage,
+        .unknown => return error.ExpectedKnownMetering,
+    };
+    try std.testing.expectEqual(@as(u64, 11), metering.input_tokens);
+    try std.testing.expectEqual(@as(u64, 5), metering.cache_read_input_tokens);
+    try std.testing.expectEqualSlices(
+        u8,
+        &loaded.provider_attempts[0].request_sha256,
+        &loaded.provider_attempts[1].request_sha256,
+    );
+}
+
+test "run cannot seal while a provider intent has no durable result" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var journal = try Journal.init(root_buffer[0..root_len], sid);
+    defer journal.deinit();
+    const boundary = journal.executionBoundary();
+    const request_sha256 = execution_effect.sha256Hex(&.{"request"});
+    try std.testing.expect(boundary.emit(.{ .before = .{ .provider_request = .{
+        .attempt_id = execution_effect.providerAttemptId(sid.bytes, request_sha256, 1, 0, 1),
+        .actor_id = sid.bytes,
+        .request_sha256 = request_sha256,
+        .logical_turn = 1,
+        .context_generation = 0,
+        .physical_attempt = 1,
+        .max_attempts = 1,
+    } } }));
+    try std.testing.expectError(error.RunHasPendingEffects, journal.sealRun("end_turn"));
+    const summary = try validate(root_buffer[0..root_len], sid);
+    try std.testing.expect(!summary.complete);
 }
 
 test "tool observation journal lease rejects a concurrent writer" {

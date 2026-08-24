@@ -3381,6 +3381,7 @@ const ForkExecutorContext = struct {
         identity: core.agent_session.RunIdentity,
         downstream: *const core.protocol.ui_backend.UiBackend,
         abort: *const core.util_abort.AbortSignal,
+        evidence: core.agent_session.RunExecutionEvidence,
         out_final_text: *std.ArrayList(u8),
     ) anyerror!core.agent_loop.RunResult {
         const self: *ForkExecutorContext = @ptrCast(@alignCast(raw));
@@ -3511,6 +3512,8 @@ const ForkExecutorContext = struct {
                 .agent_depth = child_depth,
                 .tool_dispatcher = child_surface.dispatcher,
                 .execution_policy = execution_policy,
+                .tool_observer = evidence.tool_observer,
+                .execution_boundary = evidence.execution_boundary,
                 .host_run = host_run,
                 // SubagentResult has no resumable suspend payload. Allowing a
                 // child UI request here would lose that payload at this
@@ -3955,6 +3958,14 @@ fn shellPolicy(code: u32) ?core.agent_session.ShellPolicy {
         wire.SHELL_DISABLED => .disabled,
         wire.SHELL_SANDBOXED => .sandboxed,
         wire.SHELL_UNRESTRICTED => .unrestricted,
+        else => null,
+    };
+}
+
+fn runJournalMode(code: u32) ?core.agent_session.RunJournalConfig {
+    return switch (code) {
+        wire.RUN_JOURNAL_EPHEMERAL => .ephemeral,
+        wire.RUN_JOURNAL_DURABLE_WORKSPACE => .session_under_workspace_home,
         else => null,
     };
 }
@@ -5315,6 +5326,7 @@ const SessionBuildConfig = struct {
     mcp_invalidated_without_view: u32 = 0,
     authority_issue_seeds: []const session_authority.AuthorityIssueSeed = &.{},
     budget_profile: session_budget.Profile = .{},
+    run_journal: core.agent_session.RunJournalConfig = .ephemeral,
 };
 
 const RestoreHostConfig = struct {
@@ -5329,6 +5341,7 @@ const RestoreHostConfig = struct {
     mcp_selectors: []const mcp_session.Selector = &.{},
     workspace_scope_id: [64]u8,
     budget_profile: session_budget.Profile = .{},
+    run_journal: core.agent_session.RunJournalConfig = .ephemeral,
 };
 
 const InternalRestoreResult = struct {
@@ -5569,6 +5582,7 @@ fn buildAbiSession(
         .permission_rules = config.permission_rules,
         .workspace = config.workspace,
         .artifact_store = .session_under_workspace_home,
+        .run_journal = config.run_journal,
         .allowed_tools = config.allowed_tools,
         // Always attach the AgentCore requester. A missing Host callback is a
         // typed `unavailable` outcome with provenance, never an implicit
@@ -5881,6 +5895,7 @@ fn restoreCheckpoint(
         .mcp_invalidated_without_view = mcp_invalidated_without_view,
         .authority_issue_seeds = authority_issue_seeds.items,
         .budget_profile = config.budget_profile,
+        .run_journal = config.run_journal,
     });
     keep_binding = true;
     return .{
@@ -6138,7 +6153,8 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const callbacks = callbacks_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session callbacks are required", out_error);
     const out = out_session orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_session is required", out_error);
     if (config.struct_size != @sizeOf(wire.SessionCreateConfigV1) or config.reserved0 != 0 or !allZero(config.reserved) or
-        host.struct_size != @sizeOf(wire.SessionHostConfigV1) or !allZero(host.reserved) or
+        host.struct_size != @sizeOf(wire.SessionHostConfigV1) or host.reserved0 != 0 or
+        !allZero(host.reserved) or
         callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or callbacks.reserved0 != 0 or
         !allZero(callbacks.reserved) or callbacks.on_event == null or
         (callbacks.on_ui_request != null and callbacks.release_response == null))
@@ -6146,6 +6162,8 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const kind = provider(host.provider_kind_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown provider", out_error);
     const mode = permissionMode(host.permission_mode_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
     const shell = shellPolicy(host.shell_policy_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown shell policy", out_error);
+    const run_journal = runJournalMode(host.run_journal_mode_code) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "unknown Run journal mode", out_error);
     var session_metadata: u64 = 0;
     for ([_]wire.BytesViewV1{
         host.api_key,
@@ -6244,6 +6262,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .skill_binding = initial_binding,
         .mcp_selectors = initial_mcp_selection,
         .budget_profile = budget_profile,
+        .run_journal = run_journal,
     }) catch |err| {
         return failError(
             if (err == error.OutOfMemory)
@@ -6293,7 +6312,7 @@ fn sessionRestore(
     if (config.struct_size != @sizeOf(wire.SessionRestoreConfigV1) or
         config.reserved0 != 0 or !allZero(config.reserved) or
         host.struct_size != @sizeOf(wire.SessionHostConfigV1) or
-        !allZero(host.reserved) or
+        host.reserved0 != 0 or !allZero(host.reserved) or
         callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or
         callbacks.reserved0 != 0 or !allZero(callbacks.reserved) or
         callbacks.on_event == null or
@@ -6311,6 +6330,8 @@ fn sessionRestore(
         return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
     const shell = shellPolicy(host.shell_policy_code) orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "unknown shell policy", out_error);
+    const run_journal = runJournalMode(host.run_journal_mode_code) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "unknown Run journal mode", out_error);
     var session_metadata: u64 = 0;
     for ([_]wire.BytesViewV1{
         host.api_key,
@@ -6412,6 +6433,7 @@ fn sessionRestore(
             .mcp_selectors = mcp_selectors,
             .workspace_scope_id = workspace_scope_id,
             .budget_profile = budget_profile,
+            .run_journal = run_journal,
         },
         &current_skill_binding,
         source.interface(),

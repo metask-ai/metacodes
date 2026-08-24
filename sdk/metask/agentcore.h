@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 12 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 13 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 12 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 13 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate version, revision, table size, and capabilities together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 12u
+#define METASK_AGENTCORE_ABI_REVISION 13u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -59,6 +59,10 @@ extern "C" {
 #define METASK_AGENTCORE_SHELL_DISABLED 1u
 #define METASK_AGENTCORE_SHELL_SANDBOXED 2u
 #define METASK_AGENTCORE_SHELL_UNRESTRICTED 3u
+/* Run journal mode is Session-stable. Durable records never enter model
+ * Conversation/request bytes and do not imply automatic active-Run replay. */
+#define METASK_AGENTCORE_RUN_JOURNAL_EPHEMERAL 0u
+#define METASK_AGENTCORE_RUN_JOURNAL_DURABLE_WORKSPACE 1u
 #define METASK_AGENTCORE_ABORT_USER_REQUEST 1u
 #define METASK_AGENTCORE_ABORT_TIMEOUT 2u
 
@@ -239,7 +243,8 @@ extern "C" {
 #define METASK_AGENTCORE_CAP_PROCESS_PLUGIN_TOOLS (1ULL << 22)
 #define METASK_AGENTCORE_CAP_HOST_STREAM_TOOLS (1ULL << 23)
 #define METASK_AGENTCORE_CAP_MCP_TOOL_STREAM (1ULL << 24)
-#define METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ((1ULL << 25) - 1ULL)
+#define METASK_AGENTCORE_CAP_ACTIVE_RUN_JOURNAL (1ULL << 25)
+#define METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ((1ULL << 26) - 1ULL)
 
 typedef struct metask_agentcore_runtime metask_agentcore_runtime;
 typedef struct metask_agentcore_session metask_agentcore_session;
@@ -583,7 +588,11 @@ typedef struct {
     const metask_agentcore_permission_rule_set_v1 *permission_rules;
     const metask_agentcore_mcp_selection_v1 *mcp_selection;
     const metask_agentcore_durable_budget_profile_v1 *durable_budget;
-    uint64_t reserved[4];
+    /* One METASK_AGENTCORE_RUN_JOURNAL_* value. Durable mode writes the
+     * unified provider/tool intent-result journal below workspace_home. */
+    uint32_t run_journal_mode_code;
+    uint32_t reserved0;
+    uint64_t reserved[3];
 } metask_agentcore_session_host_config_v1;
 
 typedef struct {
@@ -861,7 +870,7 @@ typedef uint32_t (*metask_agentcore_session_export_checkpoint_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 12. No earlier revision layout
+/* Function-table order is fixed within Revision 13. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct {
     uint32_t struct_size;
@@ -1014,8 +1023,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 12u,
-                               "AgentCore revision 12");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 13u,
+                               "AgentCore revision 13");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1102,6 +1111,9 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, skill_po
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, permission_rules, 112);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, mcp_selection, 120);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, durable_budget, 128);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, run_journal_mode_code, 136);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved0, 140);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved, 144);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, host, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, model, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_sources, 56);

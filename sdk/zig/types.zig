@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 12;
+pub const ABI_REVISION: u32 = 13;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 12 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 13 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -118,6 +118,10 @@ pub const PERMISSION_FULL_ACCESS: u32 = 5;
 pub const SHELL_DISABLED: u32 = 1;
 pub const SHELL_SANDBOXED: u32 = 2;
 pub const SHELL_UNRESTRICTED: u32 = 3;
+/// Session-stable execution evidence profile. Journal records are outside
+/// Conversation/request projection and do not grant automatic replay.
+pub const RUN_JOURNAL_EPHEMERAL: u32 = 0;
+pub const RUN_JOURNAL_DURABLE_WORKSPACE: u32 = 1;
 
 pub const ABORT_USER_REQUEST: u32 = 1;
 pub const ABORT_TIMEOUT: u32 = 2;
@@ -362,7 +366,8 @@ pub const CAP_TEXT_COMPLETION: u64 = 1 << 21;
 pub const CAP_PROCESS_PLUGIN_TOOLS: u64 = 1 << 22;
 pub const CAP_HOST_STREAM_TOOLS: u64 = 1 << 23;
 pub const CAP_MCP_TOOL_STREAM: u64 = 1 << 24;
-pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_POLICY | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY | CAP_RUN_STATE_OBSERVATION | CAP_WORKSPACE_SKILL_CATALOG | CAP_TEXT_COMPLETION | CAP_PROCESS_PLUGIN_TOOLS | CAP_HOST_STREAM_TOOLS | CAP_MCP_TOOL_STREAM;
+pub const CAP_ACTIVE_RUN_JOURNAL: u64 = 1 << 25;
+pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_POLICY | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY | CAP_RUN_STATE_OBSERVATION | CAP_WORKSPACE_SKILL_CATALOG | CAP_TEXT_COMPLETION | CAP_PROCESS_PLUGIN_TOOLS | CAP_HOST_STREAM_TOOLS | CAP_MCP_TOOL_STREAM | CAP_ACTIVE_RUN_JOURNAL;
 
 /// Each published v1 revision is rigid: every struct_size is exact and every
 /// reserved field is zero. A Host pins version, revision, table size, and
@@ -777,7 +782,10 @@ pub const SessionHostConfigV1 = extern struct {
     permission_rules: ?*const PermissionRuleSetV1,
     mcp_selection: ?*const McpSelectionV1,
     durable_budget: ?*const DurableBudgetProfileV1,
-    reserved: [4]u64,
+    /// One RUN_JOURNAL_* value; durable mode writes below workspace_home.
+    run_journal_mode_code: u32,
+    reserved0: u32,
+    reserved: [3]u64,
 };
 
 pub const SessionCreateConfigV1 = extern struct {
@@ -1126,7 +1134,7 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 12 accepts
+/// Runs the canonical default best-effort compact policy. Revision 13 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1258,6 +1266,9 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 112), @offsetOf(SessionHostConfigV1, "permission_rules"));
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(SessionHostConfigV1, "mcp_selection"));
     try std.testing.expectEqual(@as(usize, 128), @offsetOf(SessionHostConfigV1, "durable_budget"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(SessionHostConfigV1, "run_journal_mode_code"));
+    try std.testing.expectEqual(@as(usize, 140), @offsetOf(SessionHostConfigV1, "reserved0"));
+    try std.testing.expectEqual(@as(usize, 144), @offsetOf(SessionHostConfigV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SessionCreateConfigV1, "host"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionCreateConfigV1, "model"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillPolicyV1, "granted_skill_ids"));
@@ -1335,14 +1346,15 @@ test "typed status and stop reason validate every public code" {
     );
 }
 
-test "Revision 12 capabilities add Host and MCP byte-zero streaming without weakening prior surfaces" {
+test "Revision 13 capabilities add active Run journal without weakening prior surfaces" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 12), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 13), ABI_REVISION);
     try std.testing.expectEqual(@as(u64, 1 << 20), CAP_WORKSPACE_SKILL_CATALOG);
     try std.testing.expectEqual(@as(u64, 1 << 21), CAP_TEXT_COMPLETION);
     try std.testing.expectEqual(@as(u64, 1 << 22), CAP_PROCESS_PLUGIN_TOOLS);
     try std.testing.expectEqual(@as(u64, 1 << 23), CAP_HOST_STREAM_TOOLS);
     try std.testing.expectEqual(@as(u64, 1 << 24), CAP_MCP_TOOL_STREAM);
+    try std.testing.expectEqual(@as(u64, 1 << 25), CAP_ACTIVE_RUN_JOURNAL);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

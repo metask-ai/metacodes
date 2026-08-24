@@ -470,6 +470,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .tool_defs_override = if (filtered_owned != null) effective_tool_defs else null,
             .execution_policy = child_execution_policy,
             .tool_observer = ctx.tool_observer,
+            .execution_boundary = ctx.execution_boundary,
             .project_rule_gate = ctx.project_rule_gate,
             .permission_mode_override = perm_override,
             .model_override = model_override,

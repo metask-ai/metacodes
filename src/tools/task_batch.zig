@@ -233,6 +233,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         .tool_defs_override = sub_tool_defs, // 始终 override(含剥 TaskBatch);spawnAgentSink 内 override 赢
         .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
         .tool_observer = ctx.tool_observer,
+        .execution_boundary = ctx.execution_boundary,
         .project_rule_gate = ctx.project_rule_gate,
         .project_dir = ctx.project_dir,
         .kg = ctx.kg,

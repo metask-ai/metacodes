@@ -539,7 +539,13 @@ const PublicSessionFixture = struct {
     diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
 
     fn init(root: []const u8, base_url: []const u8, model: []const u8) !PublicSessionFixture {
-        return initWithBudget(root, base_url, model, null);
+        return initConfigured(
+            root,
+            base_url,
+            model,
+            null,
+            wire.RUN_JOURNAL_EPHEMERAL,
+        );
     }
 
     fn initWithBudget(
@@ -547,6 +553,37 @@ const PublicSessionFixture = struct {
         base_url: []const u8,
         model: []const u8,
         budget: ?*const wire.DurableBudgetProfileV1,
+    ) !PublicSessionFixture {
+        return initConfigured(
+            root,
+            base_url,
+            model,
+            budget,
+            wire.RUN_JOURNAL_EPHEMERAL,
+        );
+    }
+
+    fn initWithRunJournal(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        run_journal_mode_code: u32,
+    ) !PublicSessionFixture {
+        return initConfigured(
+            root,
+            base_url,
+            model,
+            null,
+            run_journal_mode_code,
+        );
+    }
+
+    fn initConfigured(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        budget: ?*const wire.DurableBudgetProfileV1,
+        run_journal_mode_code: u32,
     ) !PublicSessionFixture {
         const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
             return error.MissingApi;
@@ -572,6 +609,7 @@ const PublicSessionFixture = struct {
         host_config.workspace_root = sdk.bytesView(root);
         host_config.workspace_home = sdk.bytesView(root);
         host_config.durable_budget = budget;
+        host_config.run_journal_mode_code = run_journal_mode_code;
         var session_config = sessionCreateConfig(&host_config, model);
         var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
         callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
@@ -626,6 +664,111 @@ const PublicSessionFixture = struct {
         return result;
     }
 };
+
+test "L2 public AgentCore durable Run journal records the physical provider effect" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var fixture = try PublicSessionFixture.initWithRunJournal(
+        root,
+        url,
+        "test-model",
+        wire.RUN_JOURNAL_DURABLE_WORKSPACE,
+    );
+    defer fixture.deinit();
+
+    const result = try fixture.runText(1, "durably execute one provider request");
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionDescribe()(
+            fixture.session,
+            &description,
+            &fixture.diagnostic,
+        ),
+    );
+    defer fixture.api.bufferRelease()(&description);
+    const encoded = try sdk.borrowedBytes(.{
+        .ptr = description.ptr,
+        .len = description.len,
+    });
+    const decoded = try sdk.decodeSessionDescription(a, encoded);
+    defer decoded.deinit();
+    const session_id = core.session_id.SessionId.fromSlice(decoded.value.session_id) orelse
+        return error.InvalidSessionId;
+    const journal_root = try std.fmt.allocPrint(
+        a,
+        "{s}/.metacodes/agentcore/sessions/{s}",
+        .{ root, decoded.value.session_id },
+    );
+    defer a.free(journal_root);
+
+    const summary = try core.tool_observation_journal.validate(journal_root, session_id);
+    try std.testing.expect(summary.complete);
+    try std.testing.expectEqual(@as(u64, 4), summary.records);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
+test "Revision 13 public Session rejects unknown Run journal mode and nonzero replacement reserve" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView("http://127.0.0.1:1");
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.run_journal_mode_code = std.math.maxInt(u32);
+    var create = sessionCreateConfig(&host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.sessionCreate()(runtime, &create, &callbacks, &session, &diagnostic),
+    );
+    try std.testing.expect(session == null);
+    api.bufferRelease()(&diagnostic);
+
+    host.run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL;
+    host.reserved0 = 1;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.sessionCreate()(runtime, &create, &callbacks, &session, &diagnostic),
+    );
+    try std.testing.expect(session == null);
+}
 
 test "L2 durable budget profile crosses the public wire and rejects before Run admission" {
     const a = std.testing.allocator;
@@ -3389,7 +3532,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 12), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 13), wire.ABI_REVISION);
     try std.testing.expectEqual(
         @as(u32, 8),
         std.mem.readInt(u32, &abi_revision_bytes, .little),
@@ -6344,7 +6487,9 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .permission_rules = null,
         .mcp_selection = null,
         .durable_budget = null,
-        .reserved = [_]u64{0} ** 4,
+        .run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL,
+        .reserved0 = 0,
+        .reserved = [_]u64{0} ** 3,
     };
     var session_config = sessionCreateConfig(&host_config, "test-model");
     var callbacks = wire.SessionCallbacksV1{

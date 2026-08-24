@@ -23,6 +23,7 @@ const project_gate_protocol = @import("../tools/project_rule_gate.zig");
 const project_rule_signal = @import("../tools/project_rule_signal.zig");
 const file_reference = @import("file_reference.zig");
 const tool_catalog = @import("tool_catalog.zig");
+const execution_effect = @import("execution_effect.zig");
 
 /// 给任意 allocator 加互斥视图。ArenaAllocator 只隔离自己的链表元数据，它增长时仍会
 /// 调后备 allocator；多个 worker 直接以同一个 session arena 为后备会破坏 arena 状态。
@@ -163,6 +164,7 @@ fn emitDispatchStarted(
     requested_name: []const u8,
     dispatched_name: []const u8,
     input: []const u8,
+    replay: execution_effect.ReplayPolicy,
     file_target_state: tool_observation.FileTargetState,
     within_root: bool,
 ) bool {
@@ -175,6 +177,7 @@ fn emitDispatchStarted(
         .agent_depth = ctx.agent_depth,
         .input_bytes = input.len,
         .input_sha256 = tool_observation.sha256Hex(input),
+        .replay = replay,
         .file_target_state = file_target_state,
         .within_root = within_root,
     } });
@@ -231,6 +234,8 @@ const DispatchObservation = struct {
     // /tmp 根外拦截被记成 within_root=true,内核判对了但审计字段说谎)。
     within_root: bool = true,
     project_pre_signal: ?project_gate_protocol.PreSignal = null,
+    replay: execution_effect.ReplayPolicy = .never,
+    boundary_started: bool = false,
 
     fn start(self: *DispatchObservation, input: []const u8) bool {
         if (!emitDispatchStarted(
@@ -239,11 +244,23 @@ const DispatchObservation = struct {
             self.requested_name,
             self.dispatched_name,
             input,
+            self.replay,
             self.file_target_state,
             self.within_root,
         )) return false;
         self.input_bytes = input.len;
         self.started = true;
+        if (self.ctx.execution_boundary) |boundary| {
+            if (!boundary.emit(.{ .before = .{ .tool_dispatch = .{
+                .id_sha256 = tool_observation.sha256Hex(self.id),
+                .input_sha256 = tool_observation.sha256Hex(input),
+                .replay = self.replay,
+            } } })) {
+                _ = self.finish(.host_fatal, "ExecutionBoundaryRejected", null);
+                return false;
+            }
+            self.boundary_started = true;
+        }
         return true;
     }
 
@@ -282,7 +299,23 @@ const DispatchObservation = struct {
             result,
             self.effect_slot.*,
         );
-        return observed and formal == .admit;
+        var boundary_observed = true;
+        if (self.boundary_started) {
+            const boundary = self.ctx.execution_boundary.?;
+            const boundary_outcome: @FieldType(execution_effect.ToolDispatchFinished, "outcome") = switch (outcome) {
+                .succeeded => .succeeded,
+                .pending => .pending,
+                .tool_error, .host_failed, .host_rejected, .host_fatal => .failed,
+            };
+            boundary_observed = boundary.emit(.{ .after = .{ .tool_dispatch = .{
+                .id_sha256 = tool_observation.sha256Hex(self.id),
+                .outcome = boundary_outcome,
+            } } });
+        }
+        // The effect result is evidence about what actually happened. Formal
+        // admission is a later governance verdict and must not erase that
+        // terminal boundary when it blocks or faults.
+        return observed and boundary_observed and formal == .admit;
     }
 
     fn ensureTerminal(self: *DispatchObservation) void {
@@ -468,6 +501,12 @@ pub fn executeOne(
         .dispatched_name = dispatched_name,
         .started_at_ms = t_start,
         .effect_slot = &effect_slot,
+        .replay = execution_effect.resolveWithoutEvidence(if (job_ctx.tool_dispatcher) |dispatcher|
+            dispatcher.replayDeclaration(dispatched_name)
+        else if (tools_mod.getTool(dispatched_name)) |entry|
+            entry.replay
+        else
+            .never),
     };
     const builtin_file_tool = isBuiltinFileTool(&job_ctx, dispatched_name);
 
@@ -1881,6 +1920,33 @@ test "project post gate runs before terminal observation and block preserves act
             return .{ .ctx = @ptrCast(self), .emitFn = emit };
         }
     };
+    const BoundaryCapture = struct {
+        starts: usize = 0,
+        finishes: usize = 0,
+        outcome: ?@FieldType(execution_effect.ToolDispatchFinished, "outcome") = null,
+
+        fn emit(raw: *anyopaque, event: execution_effect.BoundaryEvent) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .before => |intent| switch (intent) {
+                    .tool_dispatch => self.starts += 1,
+                    .provider_request => return false,
+                },
+                .after => |result| switch (result) {
+                    .tool_dispatch => |finished| {
+                        self.finishes += 1;
+                        self.outcome = finished.outcome;
+                    },
+                    .provider_request => return false,
+                },
+            }
+            return true;
+        }
+
+        fn boundary(self: *@This()) execution_effect.Boundary {
+            return .{ .ctx = @ptrCast(self), .emitFn = emit };
+        }
+    };
 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1903,9 +1969,11 @@ test "project post gate runs before terminal observation and block preserves act
 
     var gate_probe = GateProbe{};
     var capture = TerminalCapture{ .gate_probe = &gate_probe };
+    var boundary_capture = BoundaryCapture{};
     var ctx = tools_mod.ToolContext.simple(allocator);
     ctx.project_rule_gate = gate_probe.gate();
     ctx.tool_observer = capture.sink();
+    ctx.execution_boundary = boundary_capture.boundary();
     const result = try executeOne(
         &ctx,
         "Write",
@@ -1922,6 +1990,9 @@ test "project post gate runs before terminal observation and block preserves act
     try std.testing.expectEqual(@as(usize, 1), capture.finishes);
     try std.testing.expect(capture.finish_saw_post);
     try std.testing.expect(capture.effect != null);
+    try std.testing.expectEqual(@as(usize, 1), boundary_capture.starts);
+    try std.testing.expectEqual(@as(usize, 1), boundary_capture.finishes);
+    try std.testing.expect(boundary_capture.outcome.? == .succeeded);
     try std.testing.expect(platform.fs.exists(path.ptr));
 }
 

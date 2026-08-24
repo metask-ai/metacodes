@@ -23,7 +23,8 @@ const Capture = struct {
     result_present: bool = false,
     result_bytes: usize = 0,
     names_are_write: bool = false,
-    schema_is_v1: bool = false,
+    replay: cc.execution_effect.ReplayPolicy = .read_only,
+    schema_is_current: bool = false,
 
     fn sink(self: *Capture) cc.tools.ToolObservationSink {
         return .{ .ctx = @ptrCast(self), .emitFn = emit };
@@ -42,9 +43,10 @@ const Capture = struct {
                 self.input_bytes = started.input_bytes;
                 self.input_sha256 = started.input_sha256;
                 self.file_target_state = started.file_target_state;
+                self.replay = started.replay;
                 self.names_are_write = std.mem.eql(u8, started.requested_name, "Write") and
                     std.mem.eql(u8, started.dispatched_name, "Write");
-                self.schema_is_v1 = std.mem.eql(u8, started.schema_version, observation.SCHEMA_VERSION);
+                self.schema_is_current = std.mem.eql(u8, started.schema_version, observation.SCHEMA_VERSION);
             },
             .dispatch_finished => |finished| {
                 self.finishes += 1;
@@ -57,7 +59,7 @@ const Capture = struct {
                 self.names_are_write = self.names_are_write and
                     std.mem.eql(u8, finished.requested_name, "Write") and
                     std.mem.eql(u8, finished.dispatched_name, "Write");
-                self.schema_is_v1 = self.schema_is_v1 and
+                self.schema_is_current = self.schema_is_current and
                     std.mem.eql(u8, finished.schema_version, observation.SCHEMA_VERSION);
             },
         }
@@ -183,6 +185,7 @@ test "L2 actual tool observation is independent of UI projection and depth" {
             .emit_tool_cards = false,
             .event_projection = .legacy,
             .tool_observer = fanout.sink(),
+            .execution_boundary = journal.executionBoundary(),
             .cwd_abs = root_buffer[0..root_len],
             .home_dir = root_buffer[0..root_len],
         },
@@ -204,7 +207,8 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     try std.testing.expect(capture.result_present);
     try std.testing.expect(capture.result_bytes > 0);
     try std.testing.expect(capture.names_are_write);
-    try std.testing.expect(capture.schema_is_v1);
+    try std.testing.expect(capture.replay == .never);
+    try std.testing.expect(capture.schema_is_current);
     const effect = capture.effect orelse return error.MissingToolEffect;
     const observed = switch (effect) {
         .file_mutation_v1 => return error.MissingPostReobservation,
@@ -217,7 +221,18 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     try std.testing.expect(observed.reobservation.state == .matched);
     try std.testing.expectEqualSlices(u8, &mutation.after_sha256, &observed.reobservation.observed_sha256);
     const summary = try observation_journal.validate(root_buffer[0..root_len], sid);
-    try std.testing.expectEqual(@as(u64, 4), summary.records);
+    try std.testing.expectEqual(@as(u64, 8), summary.records);
+    var loaded = try observation_journal.loadRunDispatches(
+        allocator,
+        root_buffer[0..root_len],
+        try journal.runBinding(),
+    );
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.dispatches.len);
+    try std.testing.expect(loaded.dispatches[0].replay == .never);
+    try std.testing.expectEqual(@as(usize, 2), loaded.provider_attempts.len);
+    try std.testing.expect(loaded.provider_attempts[0].outcome == .succeeded);
+    try std.testing.expect(loaded.provider_attempts[0].metering == .known);
     const artifact = try readJournalArtifact(allocator, root_buffer[0..root_len]);
     defer allocator.free(artifact);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "dispatch_started") != null);
@@ -229,4 +244,93 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     const provider_body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, provider_body, "file_target_state") == null);
     try std.testing.expect(std.mem.indexOf(u8, provider_body, "project_rule") == null);
+}
+
+test "L2 builtin replay declaration reaches durable dispatch intent" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "read-replay.txt",
+        .data = "durable read fixture",
+    });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/read-replay.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    const arguments = try std.fmt.allocPrint(allocator, "{{\"file_path\":\"{s}\"}}", .{path});
+    defer allocator.free(arguments);
+    const encoded_arguments = try std.json.Stringify.valueAlloc(allocator, arguments, .{});
+    defer allocator.free(encoded_arguments);
+    const tool_sse = try std.fmt.allocPrint(
+        allocator,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"tool\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"read-l2\",\"name\":\"Read\",\"input\":{{}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{encoded_arguments},
+    );
+    defer allocator.free(tool_sse);
+
+    const responses = [_][]const u8{ tool_sse, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&responses, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(
+        allocator,
+        io_runtime.io(),
+        "test-key",
+        "claude-sonnet-4-20250514",
+        url,
+    );
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(allocator);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "read the fixture");
+    const permission = cc.permission.createContext(.bypass_permissions, allocator);
+    const definitions = try cc.tools.toToolDefinitions(allocator);
+    defer allocator.free(definitions);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const sid = cc.session_id.SessionId.fromSlice("1123456789abcdef01234567").?;
+    var journal = try observation_journal.Journal.init(root_buffer[0..root_len], sid);
+    defer journal.deinit();
+
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        definitions,
+        &permission,
+        .{
+            .max_turns = 4,
+            .emit_tool_cards = false,
+            .tool_observer = journal.sink(),
+            .execution_boundary = journal.executionBoundary(),
+            .cwd_abs = root_buffer[0..root_len],
+            .home_dir = root_buffer[0..root_len],
+        },
+        &backend,
+        allocator,
+    );
+    try journal.finishRun(@tagName(result.stop_reason));
+    var loaded = try observation_journal.loadRunDispatches(
+        allocator,
+        root_buffer[0..root_len],
+        try journal.runBinding(),
+    );
+    defer loaded.deinit();
+    try std.testing.expect(result.stop_reason == .end_turn);
+    try std.testing.expectEqual(@as(usize, 1), loaded.dispatches.len);
+    try std.testing.expectEqualStrings("Read", loaded.dispatches[0].dispatched_name);
+    try std.testing.expect(loaded.dispatches[0].replay == .read_only);
+    try std.testing.expectEqual(@as(usize, 2), loaded.provider_attempts.len);
 }

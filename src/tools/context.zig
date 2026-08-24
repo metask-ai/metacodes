@@ -23,6 +23,7 @@ const Client = @import("../client.zig").Client;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
 const DynRegistry = @import("dynamic.zig").DynRegistry;
 pub const ToolCategory = @import("../permission/category.zig").ToolCategory;
+pub const ReplayDeclaration = @import("../core/execution_effect.zig").ReplayDeclaration;
 
 /// Shared recursion ceiling for every child-agent/fork mechanism.
 pub const MAX_AGENT_DEPTH: u8 = 3;
@@ -212,6 +213,8 @@ pub const ToolDispatcher = struct {
     /// process registries on name-based classification; Session catalogs
     /// provide it for every built-in and Host tool.
     categoryFn: ?*const fn (ctx: *const anyopaque, name: []const u8) ?ToolCategory = null,
+    /// Static candidate only. Missing metadata is always conservative.
+    replayDeclarationFn: ?*const fn (ctx: *const anyopaque, name: []const u8) ReplayDeclaration = null,
 
     pub fn dispatch(self: ToolDispatcher, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome {
         return self.dispatchFn(self.ctx, tool_ctx, name, args);
@@ -236,6 +239,11 @@ pub const ToolDispatcher = struct {
 
     pub fn category(self: ToolDispatcher, name: []const u8) ?ToolCategory {
         const f = self.categoryFn orelse return null;
+        return f(self.ctx, name);
+    }
+
+    pub fn replayDeclaration(self: ToolDispatcher, name: []const u8) ReplayDeclaration {
+        const f = self.replayDeclarationFn orelse return .never;
         return f(self.ctx, name);
     }
 };
@@ -455,6 +463,10 @@ pub const ToolContext = struct {
     /// rule-promotion capability. `effect_slot` is installed by executeOne for
     /// one synchronous dispatch and must never escape that call.
     tool_observer: ?ToolObservationSink = null,
+    /// Optional deterministic/durable execution boundary. It is invoked only
+    /// after a tool intent has been accepted by `tool_observer`, immediately
+    /// before dispatch, and again after the terminal observation is accepted.
+    execution_boundary: ?@import("../core/execution_effect.zig").Boundary = null,
     /// Hash-pinned project-specific formal gate. Unlike permission policy it
     /// is evaluated inside executeOne at the actual dispatch seam, so TUI,
     /// headless, Web, subagents, TaskBatch, and prefetch cannot bypass it.

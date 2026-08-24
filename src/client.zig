@@ -617,10 +617,17 @@ pub const Client = struct {
                     return err;
                 }
                 const delay = retry_hint.delay_ms orelse retryDelayMs(attempt, base_ms);
-                if (reporter) |rep| rep.report(rep.state, attempt, effective_max_attempts, delay);
+                if (reporter) |rep| {
+                    if (!rep.failed(attempt, effective_max_attempts, delay))
+                        return error.Aborted;
+                }
                 log.warn("client", "stream connect retry {d}/{d} after {s}; sleeping {d}ms", .{ attempt, effective_max_attempts, @errorName(err), delay });
                 // 可中断 sleep:每 50ms 查一次 abort。
                 if (!interruptibleSleepMs(delay, abort)) return error.Aborted;
+                if (reporter) |rep| {
+                    if (!rep.beforeAttempt(attempt + 1, effective_max_attempts))
+                        return error.Aborted;
+                }
             }
         }
     }

@@ -48,6 +48,7 @@ pub const ToolObservationSink = @import("tools/context.zig").ToolObservationSink
 pub const ProjectRuleGate = @import("tools/context.zig").ProjectRuleGate;
 pub const ToolObservationOrigin = @import("tools/context.zig").ToolObservationOrigin;
 pub const tool_observation = @import("tools/observation.zig");
+pub const ReplayDeclaration = @import("core/execution_effect.zig").ReplayDeclaration;
 pub const PromptContext = @import("tools/prompt_context.zig").PromptContext;
 pub const descriptions = @import("tools/descriptions.zig");
 
@@ -97,6 +98,9 @@ pub const ToolEntry = struct {
     describe_fn: ?DescribeFn = null,
     input_schema: json.InputSchema,
     execute: ToolExecutor,
+    /// Candidate recovery class. The kernel resolves this per invocation and
+    /// may always downgrade it; extensions cannot grant their own replay.
+    replay: ReplayDeclaration = .never,
     result_production: ResultProduction = .bounded_inline,
     /// deferred(对齐 cc ToolSearch):true = 不进默认 tools 数组,只在 prompt 列名;
     /// 模型须先调 ToolSearch 激活才可调。降低工具菜单稀释(弱后端会乱抓 Bash 的根因)。
@@ -135,6 +139,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "outline", .type = "boolean", .description = "Return a symbol outline (functions/types with line numbers) instead of file contents. Requires --lsp and an installed language server for the file's language; falls back to normal reading otherwise." },
         }, .required = &.{"file_path"} },
         .execute = .{ .legacy_inline = read_tool.execute },
+        .replay = .read_only,
     },
     .{
         .name = "Write",
@@ -178,6 +183,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "path", .type = "string", .description = "The directory to search in (defaults to cwd)" },
         }, .required = &.{"pattern"} },
         .execute = .{ .result_body = glob_tool.executeBody },
+        .replay = .read_only,
         .result_production = .byte_zero_spool,
     },
     .{
@@ -193,6 +199,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "-n", .type = "boolean", .description = "Show line numbers (content mode)" },
         }, .required = &.{"pattern"} },
         .execute = .{ .result_body = grep_tool.executeBody },
+        .replay = .read_only,
         .result_production = .byte_zero_spool,
     },
     // CodeMap:代码结构大纲(LSP documentSymbol,Y2 砍 tree-sitter 后)。排在搜索工具之后、Bash
@@ -210,6 +217,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "path", .type = "string", .description = "A file path OR a glob pattern (e.g. src/**/*)" },
         }, .required = &.{"path"} },
         .execute = .{ .result_body = code_map_tool.executeBody },
+        .replay = .read_only,
         .result_production = .byte_zero_spool,
     },
     // FindSymbol:跨文件找符号*定义*(LSP documentSymbol)。常驻默认工具菜单——A/B 实验(2026-06-08,
@@ -228,6 +236,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "path", .type = "string", .description = "Optional directory/glob to scope the search (defaults to cwd)" },
         }, .required = &.{"name"} },
         .execute = .{ .result_body = find_symbol_tool.executeBody },
+        .replay = .read_only,
         .result_production = .byte_zero_spool,
     },
     // Bash 排在所有文件/搜索专用工具(Read/Write/Edit/Glob/Grep)之后,对齐 mecode 的
@@ -259,6 +268,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "max_bytes", .type = "integer", .description = "Maximum bytes per selected channel (1..262144; default 65536)" },
         }, .required = &.{"job_id"} },
         .execute = .{ .legacy_inline = bash_output_tool.execute },
+        .replay = .read_only,
     },
     .{
         .name = "ReadArtifact",
@@ -269,6 +279,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "limit", .type = "integer", .description = "Maximum bytes to return (default 16384, maximum 32768)" },
         }, .required = &.{"artifact_id"} },
         .execute = .{ .legacy_inline = read_artifact_tool.execute },
+        .replay = .read_only,
     },
     .{
         .name = "KillShell",

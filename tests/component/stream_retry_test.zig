@@ -16,11 +16,11 @@ const harness = @import("harness");
 const cc = @import("cc");
 
 const OK_SSE =
-    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
-    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
 fn drainStream(resp: *cc.client_mod.StreamResponse) !void {
@@ -127,6 +127,76 @@ test "L2 evaluation gate retries transient connect failure inside one semantic r
     );
 }
 
+test "L2 AgentLoop journals every physical provider attempt before retry" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startFlaky(OK_SSE, 1);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "return ok");
+    const permission = cc.permission.createContext(.bypass_permissions, a);
+    const definitions: []const cc.json_mod.ToolDefinition = &.{};
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const sid = cc.session_id.SessionId.fromSlice("2123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(root, sid);
+    defer journal.deinit();
+
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        definitions,
+        &permission,
+        .{
+            .max_turns = 1,
+            .emit_tool_cards = false,
+            .execution_boundary = journal.executionBoundary(),
+            .cwd_abs = root,
+            .home_dir = root,
+        },
+        &backend,
+        a,
+    );
+    try journal.finishRun(@tagName(result.stop_reason));
+    var loaded = try cc.tool_observation_journal.loadRunDispatches(
+        a,
+        root,
+        try journal.runBinding(),
+    );
+    defer loaded.deinit();
+
+    try std.testing.expect(result.stop_reason == .end_turn);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 2), loaded.provider_attempts.len);
+    const first = loaded.provider_attempts[0];
+    const second = loaded.provider_attempts[1];
+    try std.testing.expectEqual(@as(u32, 1), first.physical_attempt);
+    try std.testing.expect(first.outcome == .api_error);
+    try std.testing.expect(first.metering == .unknown);
+    try std.testing.expectEqual(@as(u32, 2), second.physical_attempt);
+    try std.testing.expect(second.outcome == .succeeded);
+    try std.testing.expect(second.metering == .known);
+    const known_zero = switch (second.metering) {
+        .known => |usage| usage,
+        .unknown => return error.ExpectedKnownZeroMetering,
+    };
+    try std.testing.expectEqual(@as(u64, 0), known_zero.input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), known_zero.output_tokens);
+    try std.testing.expectEqualSlices(u8, &first.request_sha256, &second.request_sha256);
+}
+
 // ③ 退避公式:min(base*2^(n-1),32000)+jitter(0~25%)。
 test "L2: retryDelayMs 指数退避 + cap + jitter 范围" {
     const base: u64 = 500;
@@ -179,14 +249,22 @@ test "L2 #6: 429 Retry-After header 覆盖本地退避并进入第二次请求" 
     const Report = struct {
         calls: u32 = 0,
         delay_ms: u64 = std.math.maxInt(u64),
-        fn report(raw: *anyopaque, _: u32, _: u32, delay_ms: u64) void {
+        fn report(raw: *anyopaque, _: u32, _: u32, delay_ms: u64) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             self.delay_ms = delay_ms;
+            return true;
+        }
+        fn beforeAttempt(_: *anyopaque, _: u32, _: u32) bool {
+            return true;
         }
     };
     var report = Report{};
-    const reporter = cc.client_mod.RetryReporter{ .state = @ptrCast(&report), .report = Report.report };
+    const reporter = cc.client_mod.RetryReporter{
+        .state = @ptrCast(&report),
+        .failedFn = Report.report,
+        .beforeAttemptFn = Report.beforeAttempt,
+    };
     const empty: []const cc.types_mod.ApiMessage = &.{};
     const result = client.sendMessageStreamFullRetry(empty, null, null, null, null, null, 2, 500, reporter);
     try std.testing.expectError(error.RateLimited, result);

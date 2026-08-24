@@ -231,6 +231,7 @@ pub fn run(
         // tool_start/tool_result 事件流,单开也要点亮。
         eval_be != null or app.config.stream_json,
         if (run_control) |control| control.observer() else null,
+        if (run_control) |control| control.executionBoundary() else null,
         if (provisional_gate) |pg|
             pg.gate()
         else if (run_control) |control|
@@ -378,6 +379,7 @@ fn buildOptions(
     execution_policy: ?tool_context_mod.ToolExecutionPolicy,
     emit_semantic_tool_events: bool,
     tool_observer: ?@import("../tools/context.zig").ToolObservationSink,
+    execution_boundary: ?@import("../core/execution_effect.zig").Boundary,
     project_rule_gate: ?@import("../tools/context.zig").ProjectRuleGate,
 ) agent_loop.Options {
     return .{
@@ -391,6 +393,7 @@ fn buildOptions(
         .request_gate = request_gate,
         .execution_policy = execution_policy,
         .tool_observer = tool_observer,
+        .execution_boundary = execution_boundary,
         .project_rule_gate = project_rule_gate,
         .verification_checkpoint = app.config.verification_checkpoint,
         .verification_final_gate = app.config.verification_final_gate,
@@ -518,7 +521,7 @@ pub fn resumeSuspended(
         state.tool_use_id,
         response_json,
         crs,
-        buildOptions(app, null, null, execution_policy, false, run_control.observer(), run_control.formalGate()), // resume 不重新召回;fresh eval metadata 已在原进程消费
+        buildOptions(app, null, null, execution_policy, false, run_control.observer(), run_control.executionBoundary(), run_control.formalGate()), // resume 不重新召回;fresh eval metadata 已在原进程消费
         &be,
         allocator,
     ) catch |err| {

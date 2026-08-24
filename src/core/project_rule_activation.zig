@@ -77,6 +77,10 @@ pub const RunControl = struct {
         return self.journal.sink();
     }
 
+    pub fn executionBoundary(self: *RunControl) @import("execution_effect.zig").Boundary {
+        return self.journal.executionBoundary();
+    }
+
     pub fn formalGate(self: *RunControl) ?protocol.Gate {
         return if (self.project_gate) |gate| gate.gate() else null;
     }

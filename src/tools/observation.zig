@@ -10,8 +10,10 @@
 //! permission, promote a Lean rule, or authorize a follow-up mutation.
 
 const std = @import("std");
+const execution_effect = @import("../core/execution_effect.zig");
 
-pub const SCHEMA_VERSION = "metacodes-tool-observation-v1";
+pub const SCHEMA_VERSION_V1 = "metacodes-tool-observation-v1";
+pub const SCHEMA_VERSION = "metacodes-tool-observation-v2";
 pub const FORMAL_SCHEMA_VERSION_V1 = "metacodes-project-formal-decision-v1";
 pub const FORMAL_BATCH_SCHEMA_VERSION_V1 = "metacodes-project-formal-decision-batch-v1";
 pub const FORMAL_SCHEMA_VERSION = "metacodes-project-formal-decision-v2";
@@ -369,6 +371,7 @@ pub const Event = union(enum) {
         agent_depth: u8,
         input_bytes: usize,
         input_sha256: [64]u8,
+        replay: execution_effect.ReplayPolicy = .never,
         file_target_state: FileTargetState = .unobserved,
         within_root: bool = true,
     },

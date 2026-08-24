@@ -158,6 +158,21 @@ Spool 在固定内存中增量计算 SHA-256、保存 1152-byte head 与 384-byt
 `<workspace.home|root>/.metacodes/agentcore/sessions/<logical_session_id>`，restore 复用
 同一路径，因此模型收到的恢复指令在 Host-only、MCP 和 process-plugin 会话中都闭合。
 
+### Durable execution profile
+
+源码级 `SessionConfig.run_journal` 是 tagged union：`ephemeral`（默认、零 journal
+I/O）、`exact_root` 或 `session_under_workspace_home`。durable profile 使用已有
+`tool_observation_journal` 作为唯一 provider/tool execution evidence，不创建第二套
+Operation log。每个物理 provider attempt 和实际 tool dispatch 都形成先 intent、后
+result 的闭合对；fork Skill 也通过 `RunExecutionEvidence` 进入同一边界。
+
+工具 catalog 的 `ReplayDeclaration` 只是候选分类。内核只自动保留 `read_only`；
+`idempotent`/`reobservable` 没有 invocation-bound operation key 或 receipt 时降级为
+`never`。`run_recovery.Reducer` 对任意 crash prefix 给出确定性 retry/probe/interrupted
+方向，但当前公开 API 只负责 durable evidence 与 fail-closed 检测，不执行 active-Run
+原地恢复。journal、replay metadata 和 effect driver 都不进入 Conversation、system
+prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
+
 ## 2. 插件清单协议
 
 同一份只读 JSON 可从三种 Host 入口获取：
@@ -193,22 +208,26 @@ AgentCore 面向不把 metacodes 源码加入构建图的原生 Host：
 const metask_agentcore_api_v1 *metask_agentcore_get_api(uint32_t abi_version);
 ```
 
-当前是实验性的 ABI v1 revision 12。Host 必须同时校验 abi version、精确
+当前是实验性的 ABI v1 revision 13。Host 必须同时校验 abi version、精确
 revision、table size、capability bitset、reserved fields 和 manifest hash；不存在
 静默降级或旧 revision shim。该表已经覆盖 Runtime/Session、同步 run、跨线程
 abort、流式事件、typed UI request/response、checkpoint/restore、权限规则、MCP、
 Workspace Skill 与独立 Completion。ownership、回调重入、Session poison、并发和
 持久化语义只以同 revision Header 与 `AGENTCORE_BINARY_ABI.md` 为准。
 
-revision 12 的 `runtime_create_with_plugins` 接受显式、绝对路径的
+revision 13 的 `runtime_create_with_plugins` 接受显式、绝对路径的
 `ProcessPluginSourceV1` 数组。AgentCore 在返回前完成 strict manifest/process 配置、
 entrypoint SHA-256、握手与工具 schema 校验，并复制不可变 Runtime 状态；原有
 `RuntimeConfigV1` 仍保持 96 字节，旧 `runtime_create` 继续表示“无进程插件”。
 同一配置还接受独立的 `HostStreamToolV1` 数组；内核在回调前创建 Session CAS
-spool，Host 只持有同步、借用、只写 sink，不能提交、回滚或保留它。Revision 12
+spool，Host 只持有同步、借用、只写 sink，不能提交、回滚或保留它。Revision 13
 还要求每个 `McpConnectorV1` 提供 `request_tool_stream`：普通 `request` 只处理有界
 控制帧，`tools/call` 的完整 JSON-RPC 响应从 byte zero 写入内核 capture，经流式
 校验后仅成功 `result` 区间可进入同一 CAS。
+`SessionHostConfigV1.run_journal_mode_code` 另行选择零 I/O 的 ephemeral
+profile，或把 provider/tool intent-result 对写入 Session 目录的 durable profile；
+该数据面不进入 Conversation，因此不会改变 provider-visible bytes 或 prompt cache。
+当前 journal 在崩溃前缀不完整时 fail closed，尚不宣称原地 active-Run resume。
 该表尚不暴露通用 data/static plugin grouping 或 inventory 查询；完整插件清单仍通过
 上节 JSON 协议暴露，reserved 字段不能充当隐式扩展通道。
 

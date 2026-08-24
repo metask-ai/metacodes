@@ -10,28 +10,28 @@ stateful AgentSession execution. It does not expose or define a host product
 model.
 
 **Status: experimental.** The premature 2026-07-17 freeze was retracted after
-consumer feedback exposed a dangling callback-identity contract. Revision 12
+consumer feedback exposed a dangling callback-identity contract. Revision 13
 now defines one exact hard-cut wire shape after Permission authority,
 checkpoint/restore, durable budget, MCP Runtime/Session seams, Workspace Skill
 source/identity/policy binding, independent text Completion, explicit
-hash-pinned process-tool package configuration, Host byte-zero Tool Result
-streaming, and MCP byte-zero JSON-RPC result projection were implemented and
-tested;
-this is not a general v1 stability promise.
+hash-pinned process-tool package configuration, Host/MCP byte-zero Tool Result
+streaming, and the optional active-Run intent/result journal were implemented
+and tested. This is not a general v1 stability promise.
 
 Consumers must pin an exact bundle (the manifest records the source commit)
 and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 12**. Revision 12 is a
-hard-cut replacement for every earlier revision. In addition to the Revision
-11 surface, it makes `tools/call` streaming a mandatory, distinct MCP connector
-operation while retaining the full HTTP response facts required for control
-plane protocol negotiation. The function table and original `RuntimeConfigV1`
-remain unchanged; the nested MCP connector/server POD layouts change:
+The current experimental bundle is **ABI v1 revision 13**. Revision 13 is a
+hard-cut replacement for every earlier revision. It retains Revision 12's
+mandatory, distinct MCP `tools/call` stream operation and adds an explicit
+Session durability mode for the unified provider/tool journal. The function
+table, `RuntimeConfigV1`, and the 168-byte `SessionHostConfigV1` size remain
+unchanged; revision 13 assigns the former Host-config reserved bytes at offsets
+136..143 to `run_journal_mode_code` plus a required-zero `reserved0`:
 
-- `metask_agentcore_api_v1` is 280 bytes and requires `abi_revision == 12`;
+- `metask_agentcore_api_v1` is 280 bytes and requires `abi_revision == 13`;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
   `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
   96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
@@ -50,12 +50,12 @@ remain unchanged; the nested MCP connector/server POD layouts change:
   64, 56, and 80 bytes; `CompletionConfigV1`, `CompletionMessageV1`,
   `CompletionRequestV1`, `CompletionResultV1`, `CompletionInfoV1`, and
   `CompletionEventV1` are respectively 88, 40, 72, 72, 48, and 80 bytes;
-- the exact required capability set is `0x1ffffff`, including
-  `CAP_MCP_TOOL_STREAM = 1 << 24`;
-- `manifest.json` records revision 12, table size 280, and that exact capability
+- the exact required capability set is `0x3ffffff`, including
+  `CAP_MCP_TOOL_STREAM = 1 << 24` and `CAP_ACTIVE_RUN_JOURNAL = 1 << 25`;
+- `manifest.json` records revision 13, table size 280, and that exact capability
   set.
 
-Revision 12 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
+Revision 13 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then require
@@ -64,13 +64,13 @@ matches. Every per-Run callback validates and copies any retained `RunContext`
 fields during the callback, and Host registries bind/compare `session_id`
 atomically under their per-Session lock.
 
-Revision 12 deliberately exposes explicit process-package sources, their
+Revision 13 deliberately exposes explicit process-package sources, their
 namespaced `host_tool` contributions, and explicit Host stream-tool
 descriptors. It does not expose the generic
 data/static plugin grouping model or `metacodes.plugin-inventory/v1`; those
 remain available through the source-level Zig Runtime plus CLI/Web JSON Host
 interfaces. Projecting generic inventory into this binary table requires a
-later explicit ABI revision. A revision-12 consumer must not infer plugin
+later explicit ABI revision. A revision-13 consumer must not infer plugin
 identity from tool or Skill names, and every reserved field remains zero.
 
 A future stability freeze first requires closure of the open items tracked in
@@ -186,11 +186,11 @@ Current delivery status is intentionally target-specific:
 
 | Target | Bundle/archive | Native source-free consumption |
 |---|---|---|
-| `x86_64-windows-msvc` | previously verified; current Homebrew Zig host cannot re-link without Windows SDK/import libraries | earlier C/C++/Zig/Rust source-free gate evidence retained; current revision-12 change not revalidated on this host |
-| `x86_64-windows-gnu` | revision-12 ReleaseSafe source-free bundle and full CLI cross-build/link verified | pending native Windows gate |
-| `x86_64-linux-gnu` | revision-12 ReleaseSafe source-free bundle and full CLI cross-build/link verified | pending native Linux gate |
-| `x86_64-macos` | revision-12 ReleaseSafe source-free bundle cross-build/link verified | pending native Intel macOS gate |
-| `aarch64-macos` | verified | C/C++/Zig/Rust verified natively with revision 12 ReleaseSafe gate, including process-plugin Runtime configuration and Host byte-zero streaming |
+| `x86_64-windows-msvc` | previously verified; current Homebrew Zig host cannot re-link without Windows SDK/import libraries | earlier revision-12 C/C++/Zig/Rust source-free evidence retained; revision 13 not revalidated on this host |
+| `x86_64-windows-gnu` | previous revision-12 ReleaseSafe source-free bundle and full CLI cross-build/link verified | revision 13 pending cross-build and native Windows gate |
+| `x86_64-linux-gnu` | previous revision-12 ReleaseSafe source-free bundle and full CLI cross-build/link verified | revision 13 pending cross-build and native Linux gate |
+| `x86_64-macos` | previous revision-12 ReleaseSafe source-free bundle cross-build/link verified | revision 13 pending cross-build and native Intel macOS gate |
+| `aarch64-macos` | verified | revision 13 C/C++/Zig/Rust source-free ReleaseSafe gate passed, including durable journal creation across fresh/restore and continued Runs |
 
 Cross-build success is not a support claim. In particular, the empty macOS
 framework list remains provisional until the corresponding native gates pass.
@@ -225,10 +225,10 @@ remain valid until `deinit`; consumers must not copy an owner and deinitialize
 both copies.
 
 `decodeSkillCatalog` returns an owned `ParsedSkillCatalog` for
-`metask.skill-catalog/v1`. Revision 12 hard-cuts the current experimental shape
+`metask.skill-catalog/v1`. Revision 13 hard-cuts the current experimental shape
 of that schema: every earlier unreleased experimental shape bearing the same
 token is void, and consumers must interpret the descriptor only with the exact
-Revision 12 bundle they pin. The decoder validates the
+Revision 13 bundle they pin. The decoder validates the
 schema, the 1024-Skill limit, identity forms, duplicate concrete `skill_id` or
 `skill_policy_key` records, health and issue consistency, and each Skill
 argument schema. AgentCore remains the canonical producer and independently
@@ -298,7 +298,7 @@ Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
 loop.
 
-`on_event` is mandatory in Revision 12. `run_state` is emitted for admitted-run
+`on_event` is mandatory in Revision 13. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
 and advances only for emitted RunState snapshots. Usage remains authoritative
@@ -318,7 +318,7 @@ checked arithmetic.
 decode it through the `unknown` observation path and ignore or retain it in
 accordance with the forward-compatibility rules above.
 
-`tool_result.file_refs` is an optional Revision 12 observation field. It is
+`tool_result.file_refs` is an optional Revision 13 observation field. It is
 present only for successful selected built-in file-tool executions and contains
 at most 32 entries. Each entry has one locator union (`workspace_path`,
 `absolute_path`, or `uri`), an open-ended bounded `kind` string, a bounded
@@ -345,7 +345,7 @@ their `ctx` and keeps it valid until Session destruction succeeds.
 
 ### Process-plugin Runtime configuration
 
-Revision 12 uses `runtime_create_with_plugins(runtime_config, plugin_config,
+Revision 13 uses `runtime_create_with_plugins(runtime_config, plugin_config,
 out_runtime, out_diagnostic)`. Both config pointers are required; an empty,
 well-formed `RuntimePluginConfigV1` creates the same no-process Runtime shape as
 the original `runtime_create`. Descriptor arrays and path bytes are borrowed
@@ -403,7 +403,7 @@ version, pinned executable SHA-256, global tool name and validated reserialized
 input schema.
 The binding—not the display name alone—enters Permission provenance and
 checkpoint authority resolution. Process tools deliberately have no
-`allow_session`/`deny_session` candidate in revision 12, so a Host may answer
+`allow_session`/`deny_session` candidate in revision 13, so a Host may answer
 only the offered one-shot choices unless an independent native rule decides
 first. Changing executable/package/schema authority invalidates a restored
 binding instead of silently reauthorizing the new implementation.
@@ -498,7 +498,7 @@ not define status precedence when multiple other input or admission errors are
 present in the same call.
 
 ABI v1 provides no in-place recovery or mutation of a poisoned Session. The
-Host must destroy that physical handle. Revision 12 checkpoint/restore creates
+Host must destroy that physical handle. Revision 13 checkpoint/restore creates
 a new handle from a previously exported committed checkpoint; it does not
 reconstruct state that was never successfully exported or resume an active
 Run.
@@ -506,7 +506,7 @@ Run.
 When facade poison occurs after Core has returned to an inspectable idle state,
 `session_describe` succeeds and reports lifecycle `poisoned`; it must not report
 `idle`. An active ordinary Session activity makes `session_describe` return
-`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 12 description does not
+`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 13 description does not
 emit lifecycle `busy`.
 
 A checkpoint is resumable model state, not a raw transcript archive. Before
@@ -531,7 +531,7 @@ requests cooperative abort and any other value returns
 ### Manual compact
 
 `session_compact` runs the canonical default compact policy as a best-effort
-Conversation maintenance operation. Revision 12 has no Host-supplied target
+Conversation maintenance operation. Revision 13 has no Host-supplied target
 token budget and does not guarantee that the result fits the context window of
 the current or a future model. `session_set_model` and `session_compact` are
 independent primitives, not a compound model-migration transaction.
@@ -540,7 +540,7 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 `after_context_tokens` are context-size estimates for UI and policy decisions;
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
-reason in Revision 12, and a Host must not infer one by parsing diagnostics.
+reason in Revision 13, and a Host must not infer one by parsing diagnostics.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
@@ -557,6 +557,35 @@ shell tool selected under the disabled shell policy fail Session creation with
 `METASK_AGENTCORE_STATUS_INVALID_ARGUMENT` and do not publish a Session handle.
 `workspace_home` may be empty, in which case it defaults to the canonicalized
 `workspace_root`; a non-empty value must be absolute.
+
+### Active-Run intent/result journal
+
+`SessionHostConfigV1.run_journal_mode_code` is part of the exact revision-13
+wire contract and accepts only:
+
+- `METASK_AGENTCORE_RUN_JOURNAL_EPHEMERAL` (`0`): the default, zero-journal-I/O
+  embedded profile;
+- `METASK_AGENTCORE_RUN_JOURNAL_DURABLE_WORKSPACE` (`1`): append and fsync the
+  unified journal under
+  `<workspace_home>/.metacodes/agentcore/sessions/<session_id>/`.
+
+The durable profile writes the Run start before provider/tool execution, one
+intent/result pair for every physical provider attempt and actual tool
+dispatch, then the terminal Run record. Failed provider attempts remain
+billable evidence even when no assistant message is committed; absence of a
+provider usage object is encoded as unknown, not synthetic zero. Built-in,
+Host, process-plugin, MCP, and fork-Skill tools converge on the same journal.
+Replay classification is kernel-owned: read-only built-ins may be classified
+safe, while Host/plugin declarations without an invocation-bound receipt are
+downgraded to never.
+
+The journal is outside Conversation and provider request projection. Enabling
+it therefore does not insert prompt bytes, reorder history, or invalidate a
+warm prompt-cache prefix. An unfinished pair or retained crash marker fails
+closed; revision 13 does **not** expose in-place active-Run resume, automatic
+tool replay, or exactly-once external effects. It provides durable evidence
+and deterministic recovery classification for a later explicit recovery API,
+not authority to guess whether an external side effect occurred.
 
 ### Skill catalog and typed input
 
@@ -621,14 +650,14 @@ published once, not that the Host filesystem is transactional.
 AgentCore does not implicitly read `/etc/metacodes/skills`, `.claude/skills`,
 `.codex/skills`, or `.metacodes/skills`. A Host may explicitly register any
 local directory only when its contents already use the canonical Agent Skill
-format. Directory names do not select a parser; Revision 12 has no Claude/Codex
+format. Directory names do not select a parser; Revision 13 has no Claude/Codex
 format adapter or public Provider Registry. The projected provider id is
 `agents.directory`.
 
 Each valid `skills[]` entry exposes separate identities:
 
 - `skill_policy_key`: the logical invocation slot, equal to
-  `invocation_name` in Revision 12;
+  `invocation_name` in Revision 13;
 - `provider_id`, `source_scope`, `source_instance_id`, and `contribution_id`:
   source identity;
 - `content_revision`: body/resources identity;
@@ -760,7 +789,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 12. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 13. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -772,7 +801,7 @@ product decision.
 
 ### MCP Runtime catalog and Session view
 
-Revision 12 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
+Revision 13 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
 connections. Public negotiation codes preserve Revision 6 meanings:
 `auto=1`, `modern_only=2`, and exact `legacy_only=3`; exact
 `legacy_2025_06_only=4` is appended. Runtime owns negotiation,
@@ -823,7 +852,7 @@ returns.
 | Reporting every completed HTTP response's final status and body | Host Connector |
 | Binding one connection context to `purpose_code` and `requested_era_code` | Host Connector |
 
-Revision 12 separates MCP control and result traffic in the type system.
+Revision 13 separates MCP control and result traffic in the type system.
 `McpConnectorV1.request` writes a 40-byte `McpResponseV1` only for bounded
 discovery/initialize/catalog control frames. Stdio responses use
 `http_status == 0`; Streamable HTTP completed responses use their final status
@@ -913,12 +942,12 @@ materializes a provider
 with the recorded envelope admission is an invariant violation. View
 destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
-outside Revision 12.
+outside Revision 13.
 
 The value-only MCP checkpoint section has one current `MCPSEL` format and no
 independent revision axis. Its decoder rejects every earlier `R6MCP`/`R7MCP`
 encoding. Era remains provenance rather than a selection fingerprint input.
-The outer AgentCore ABI Revision 12 remains the sole compatibility boundary.
+The outer AgentCore ABI Revision 13 remains the sole compatibility boundary.
 
 ### Model-visible MCP diagnostics
 
@@ -963,7 +992,7 @@ prompt-outcome contract replaces that seam.
 
 ### Independent text Completion
 
-Revision 12 exposes Completion as an opaque handle independent of Runtime,
+Revision 13 exposes Completion as an opaque handle independent of Runtime,
 Session, Conversation, AgentLoop, Host tools, and MCP. `completion_create`
 copies provider kind, API key, base URL, and model before returning; the Host
 may release or overwrite every configuration buffer immediately afterward.
@@ -1198,7 +1227,7 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. While Revision 12 remains
+`struct_size`; every reserved field must be zero. While Revision 13 remains
 unreleased and experimental, an explicitly approved hard cut may replace its
 wire shape in place only when the library, headers, SDKs, consumers, tests, and
 documentation move atomically; the replaced bundle is void and no compatibility
@@ -1210,12 +1239,12 @@ or control-message extensions require `metask_agentcore_get_api(2)` and v2
 types. Assigning a meaning or non-zero value to a reserved field is always an
 explicit wire-contract decision, never an inferred compatible extension.
 
-Revision 12's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 13's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
 `capabilities` reports the API surface implemented by the returned library
-table. Revision 12 consumers require exact equality with
+table. Revision 13 consumers require exact equality with
 `METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1`; it is not an extensible superset
 check. It is not per-Runtime or per-Session negotiation; concrete Runtime and
 Session configuration still determines which tools and callbacks are active.

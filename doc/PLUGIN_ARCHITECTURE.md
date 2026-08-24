@@ -370,11 +370,11 @@ static plugin, replaces the first-party core profile from minimal to coding,
 and inventories both generations before optionally running a stateful
 `AgentSession`. The exact core capability/Host support matrix is
 `doc/CORE_PLUGIN_HOTSWAP.md`. The
-source-free AgentCore C/C++/Zig/Rust bundle is ABI v1 revision 12. Its explicit
+source-free AgentCore C/C++/Zig/Rust bundle is ABI v1 revision 13. Its explicit
 `runtime_create_with_plugins` constructor loads strict process packages and
 binds their executable/package/schema digest into native Permission and
 checkpoint identity. The original `runtime_create` remains the no-process path
-with an unchanged 96-byte `RuntimeConfigV1`. Revision 12 additionally exposes a
+with an unchanged 96-byte `RuntimeConfigV1`. Revision 13 additionally exposes a
 distinct `HostStreamToolV1` descriptor whose borrowed write-only sink spools
 from byte zero into the Session CAS, and makes the distinct
 `McpConnectorV1.request_tool_stream` callback mandatory for byte-zero MCP
@@ -383,3 +383,11 @@ from byte zero into the Session CAS, and makes the distinct
 generic data/static plugin grouping or inventory; adding those fields requires
 another explicit revision, and reserved fields are not an informal extension
 channel.
+
+Revision 13 also lets an embedded Host select the kernel-owned durable Run
+journal. Process, MCP, Host, built-in, and fork-Skill dispatches all emit into
+that same provider/tool intent-result plane; plugin metadata remains only a
+candidate replay declaration and cannot grant automatic replay authority.
+Journal records are outside Conversation/request projection, preserving prompt
+cache identity. Crash-prefix classification is implemented; in-place active-Run
+resume remains outside the current public ABI.

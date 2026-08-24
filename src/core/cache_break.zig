@@ -22,6 +22,10 @@ pub const ResponseUsage = struct {
     output_tokens: u64 = 0,
     cache_read_tokens: u64 = 0,
     cache_write_tokens: u64 = 0,
+    /// At least one provider usage event was present, even when every counter
+    /// was explicitly zero. Durable metering uses this bit to distinguish a
+    /// known zero report from an absent report.
+    reported: bool = false,
     has_metering: bool = false,
 
     pub fn observe(
@@ -31,6 +35,7 @@ pub const ResponseUsage = struct {
         cache_read_tokens: u64,
         cache_write_tokens: u64,
     ) void {
+        self.reported = true;
         self.input_tokens = @max(self.input_tokens, input_tokens);
         self.output_tokens = @max(self.output_tokens, output_tokens);
         self.cache_read_tokens = @max(self.cache_read_tokens, cache_read_tokens);
@@ -85,3 +90,13 @@ pub const CacheBreakDetector = struct {
         return "prompt unchanged (likely TTL expiry or server-side)";
     }
 };
+
+test "ResponseUsage distinguishes an explicit zero report from absent metering" {
+    var usage = ResponseUsage{};
+    try std.testing.expect(!usage.reported);
+    try std.testing.expect(!usage.has_metering);
+    usage.observe(0, 0, 0, 0);
+    try std.testing.expect(usage.reported);
+    // Keep cache-break anchoring conservative for preliminary all-zero events.
+    try std.testing.expect(!usage.has_metering);
+}

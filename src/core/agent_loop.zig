@@ -13,6 +13,7 @@ const client_mod = @import("../client.zig");
 const provider_mod = @import("../api/provider.zig");
 const dialect_mod = @import("../api/dialect.zig");
 const request_gate_mod = @import("request_gate.zig");
+const execution_effect = @import("execution_effect.zig");
 const json_mod = @import("../json.zig");
 const tools_mod = @import("../tools.zig");
 const permission_mod = @import("../permission.zig");
@@ -225,6 +226,9 @@ pub const Options = struct {
     /// summaries and same-turn context-recovery retries. A denial happens
     /// before network I/O and returns stop_reason=budget.
     request_gate: ?request_gate_mod.Gate = null,
+    /// Optional execution-effect boundary. Null preserves the direct embedded
+    /// path; durable Hosts and deterministic tests install an explicit adapter.
+    execution_boundary: ?execution_effect.Boundary = null,
     /// 本次 run 归属的会话(emit/poll 路由用)。默认 .single(N=1/TUI);M6 多 Session 时
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
@@ -939,13 +943,108 @@ pub fn run(
         const RetryUi = struct {
             be: *const UiBackend,
             session: @import("session_id.zig").SessionId,
-            fn report(state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) void {
+            boundary: ?execution_effect.Boundary,
+            actor_id: @import("session_id.zig").SessionId,
+            request_sha256: [64]u8 = [_]u8{'0'} ** 64,
+            logical_turn: u32 = 0,
+            context_generation: u32 = 0,
+            active_attempt: u32 = 0,
+            max_attempts: u32 = 0,
+
+            fn prepare(
+                self: *@This(),
+                request_sha256: [64]u8,
+                logical_turn: u32,
+                context_generation: u32,
+                max_attempts: u32,
+            ) bool {
+                if (self.active_attempt != 0 or max_attempts == 0) return false;
+                self.request_sha256 = request_sha256;
+                self.logical_turn = logical_turn;
+                self.context_generation = context_generation;
+                self.max_attempts = max_attempts;
+                return self.startAttempt(1);
+            }
+
+            fn failed(state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) bool {
                 const self: *@This() = @ptrCast(@alignCast(state));
+                if (attempt != self.active_attempt or max == 0 or
+                    max > self.max_attempts or attempt >= max) return false;
+                if (!self.finishAttempt(.api_error, .unknown)) return false;
+                // TLS setup failures can tighten the generic retry ceiling.
+                self.max_attempts = max;
                 self.be.emitEvent(self.session, .{ .retry_notice = .{ .attempt = attempt, .max = max, .delay_ms = delay_ms } });
+                return true;
+            }
+
+            fn beforeAttempt(state: *anyopaque, attempt: u32, max: u32) bool {
+                const self: *@This() = @ptrCast(@alignCast(state));
+                if (self.active_attempt != 0 or max == 0 or max > self.max_attempts)
+                    return false;
+                self.max_attempts = max;
+                return self.startAttempt(attempt);
+            }
+
+            fn startAttempt(self: *@This(), physical_attempt: u32) bool {
+                if (physical_attempt == 0 or physical_attempt > self.max_attempts) return false;
+                const boundary = self.boundary orelse {
+                    self.active_attempt = physical_attempt;
+                    return true;
+                };
+                if (!boundary.emit(.{ .before = .{ .provider_request = .{
+                    .attempt_id = self.attemptId(physical_attempt),
+                    .actor_id = self.actor_id.bytes,
+                    .request_sha256 = self.request_sha256,
+                    .logical_turn = self.logical_turn,
+                    .context_generation = self.context_generation,
+                    .physical_attempt = physical_attempt,
+                    .max_attempts = self.max_attempts,
+                } } })) return false;
+                self.active_attempt = physical_attempt;
+                return true;
+            }
+
+            fn finishAttempt(
+                self: *@This(),
+                outcome: execution_effect.ProviderAttemptOutcome,
+                metering: execution_effect.Metering,
+            ) bool {
+                const physical_attempt = self.active_attempt;
+                if (physical_attempt == 0) return false;
+                self.active_attempt = 0;
+                const boundary = self.boundary orelse return true;
+                return boundary.emit(.{ .after = .{ .provider_request = .{
+                    .attempt_id = self.attemptId(physical_attempt),
+                    .outcome = outcome,
+                    .metering = metering,
+                } } });
+            }
+
+            fn hasActiveAttempt(self: *const @This()) bool {
+                return self.active_attempt != 0;
+            }
+
+            fn attemptId(self: *const @This(), physical_attempt: u32) [64]u8 {
+                return execution_effect.providerAttemptId(
+                    self.actor_id.bytes,
+                    self.request_sha256,
+                    self.logical_turn,
+                    self.context_generation,
+                    physical_attempt,
+                );
             }
         };
-        var retry_ui = RetryUi{ .be = backend, .session = sess };
-        const reporter = provider_mod.RetryReporter{ .state = @ptrCast(&retry_ui), .report = RetryUi.report };
+        var retry_ui = RetryUi{
+            .be = backend,
+            .session = sess,
+            .boundary = opts.execution_boundary,
+            .actor_id = opts.agent_ident orelse sess,
+        };
+        const reporter = provider_mod.RetryReporter{
+            .state = @ptrCast(&retry_ui),
+            .failedFn = RetryUi.failed,
+            .beforeAttemptFn = RetryUi.beforeAttempt,
+        };
 
         // 1+2. 构造当前这一轮的 API 请求并发送。若建连/收头阶段或 SSE error
         // 明确报 context-window-exceeded,按 Rust compact recovery 路径逐步删最老
@@ -1011,6 +1110,7 @@ pub fn run(
             .tool_dispatcher = opts.tool_dispatcher,
             .execution_policy = opts.execution_policy,
             .tool_observer = opts.tool_observer,
+            .execution_boundary = opts.execution_boundary,
             .project_rule_gate = opts.project_rule_gate,
             .tool_observation_origin = .speculative_prefetch,
             .host_services = opts.host_services,
@@ -1074,6 +1174,33 @@ pub fn run(
                 );
             }
 
+            const max_provider_attempts = providerAttemptLimit(opts.request_gate != null);
+            const request_sha256 = if (opts.execution_boundary != null)
+                canonicalAgentRequestSha256(
+                    allocator,
+                    provider,
+                    api_messages.items,
+                    effective_system_prompt,
+                    provider_tool_defs,
+                    opts.model_override,
+                ) catch return finishRun(backend, sess, trace_id, depth, .{
+                    .stop_reason = .api_error,
+                    .turns = turns,
+                    .tool_calls = total_tool_calls,
+                })
+            else
+                [_]u8{'0'} ** 64;
+            if (!retry_ui.prepare(
+                request_sha256,
+                turns + 1,
+                @intCast(@min(context_recovery_attempts, std.math.maxInt(u32))),
+                max_provider_attempts,
+            )) return finishRun(backend, sess, trace_id, depth, .{
+                .stop_reason = .api_error,
+                .turns = turns,
+                .tool_calls = total_tool_calls,
+            });
+
             stream = provider.sendStreamRetry(
                 api_messages.items,
                 effective_system_prompt,
@@ -1081,11 +1208,19 @@ pub fn run(
                 opts.abort,
                 opts.model_override,
                 null,
-                providerAttemptLimit(opts.request_gate != null),
+                max_provider_attempts,
                 0, // base_ms=0 → 用默认 RETRY_BASE_MS(500)
                 reporter,
                 latestUserText(conversation), // web_search 显示用:用户原话(P1:作请求参数传, 不再 post-set)
             ) catch |err| {
+                const attempt_outcome: execution_effect.ProviderAttemptOutcome = switch (err) {
+                    error.ContextWindowExceeded => .context_window_exceeded,
+                    error.Aborted => .aborted,
+                    else => .api_error,
+                };
+                if (retry_ui.hasActiveAttempt() and
+                    !retry_ui.finishAttempt(attempt_outcome, .unknown))
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
                 backend.emitEvent(sess, .{ .diag_model_request = .{
                     .trace_id = trace_id,
                     .depth = depth,
@@ -1241,6 +1376,26 @@ pub fn run(
                     .done => {},
                 }
             }
+
+            const provider_metering: execution_effect.Metering = if (response_usage.reported)
+                .{ .known = .{
+                    .input_tokens = response_usage.input_tokens,
+                    .output_tokens = response_usage.output_tokens,
+                    .cache_read_input_tokens = response_usage.cache_read_tokens,
+                    .cache_creation_input_tokens = response_usage.cache_write_tokens,
+                } }
+            else
+                .unknown;
+            const provider_outcome: execution_effect.ProviderAttemptOutcome = if (aborted_during_stream)
+                .aborted
+            else if (stream_context_window_exceeded)
+                .context_window_exceeded
+            else if (stream_error)
+                .stream_error
+            else
+                .succeeded;
+            if (!retry_ui.finishAttempt(provider_outcome, provider_metering))
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
 
             // message_start/message_delta usage 是同一个 provider response 的片段，而不是
             // 两个请求。只在成功收完整条响应后更新 token anchor 和 cache detector；否则
@@ -1807,6 +1962,7 @@ pub fn run(
             .tool_dispatcher = opts.tool_dispatcher,
             .execution_policy = opts.execution_policy,
             .tool_observer = opts.tool_observer,
+            .execution_boundary = opts.execution_boundary,
             .project_rule_gate = opts.project_rule_gate,
             .tool_observation_origin = .authoritative,
             .host_services = opts.host_services,
@@ -2505,6 +2661,30 @@ fn serializedRequestInputTokenReserve(
     const doubled_estimate = estimated *| 2;
     const byte_reserve = (@as(u64, @intCast(req_body.len)) +| 1) / 2;
     return @max(doubled_estimate, byte_reserve) +| 4096;
+}
+
+/// Provider-neutral identity of the exact AgentLoop request IR. Concrete
+/// transports may serialize different wire dialects, but retries and restored
+/// runs compare this canonical projection before any provider I/O.
+fn canonicalAgentRequestSha256(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    messages: []const types.ApiMessage,
+    system_prompt: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) ![64]u8 {
+    const req_body = try json_mod.serializeMessagesRequest(.{
+        .model = model_override orelse provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = messages,
+        .system = system_prompt,
+        .stream = true,
+        .tools = tool_defs,
+        .reasoning_effort = provider.reasoningEffort(),
+    }, allocator);
+    defer allocator.free(req_body);
+    return execution_effect.sha256Hex(&.{req_body});
 }
 
 fn estimateNextRequestTokensOrFallback(

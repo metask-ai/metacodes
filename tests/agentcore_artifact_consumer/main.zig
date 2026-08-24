@@ -4,10 +4,12 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 12 or
+    if (wire.ABI_REVISION != 13 or
         wire.CAP_PROCESS_PLUGIN_TOOLS != 1 << 22 or
         wire.CAP_HOST_STREAM_TOOLS != 1 << 23 or
-        wire.REQUIRED_CAPABILITIES_V1 != 0x1ffffff or
+        wire.CAP_MCP_TOOL_STREAM != 1 << 24 or
+        wire.CAP_ACTIVE_RUN_JOURNAL != 1 << 25 or
+        wire.REQUIRED_CAPABILITIES_V1 != 0x3ffffff or
         wire.MCP_NEGOTIATION_AUTO != 1 or
         wire.MCP_NEGOTIATION_MODERN_ONLY != 2 or
         wire.MCP_NEGOTIATION_LEGACY_ONLY != 3 or
@@ -18,10 +20,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 12 codes must match the public contract");
+        @compileError("source-free Revision 13 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 12 must not expose the removed catalog refresh entry");
+        @compileError("revision 13 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -541,7 +543,9 @@ pub fn main(init: std.process.Init) !void {
         .permission_rules = &initial_rules,
         .mcp_selection = null,
         .durable_budget = null,
-        .reserved = [_]u64{0} ** 4,
+        .run_journal_mode_code = wire.RUN_JOURNAL_DURABLE_WORKSPACE,
+        .reserved0 = 0,
+        .reserved = [_]u64{0} ** 3,
     };
     var config = wire.SessionCreateConfigV1{
         .struct_size = @sizeOf(wire.SessionCreateConfigV1),
@@ -798,7 +802,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.completionDestroy()(completion, &diagnostic), diagnostic);
     completion = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 12 Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, Completion, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 13 active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, Completion, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

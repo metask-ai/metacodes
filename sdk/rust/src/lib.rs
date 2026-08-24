@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 12 function table. Discovery rejects every earlier
+/// Validated Revision 13 function table. Discovery rejects every earlier
 /// revision; there is no legacy probe or alternate layout.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -480,11 +480,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_twelve_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 12);
+    fn revision_thirteen_layout_codes_and_host_buffer_helpers_are_exact() {
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 13);
         assert_eq!(raw::METASK_AGENTCORE_CAP_PROCESS_PLUGIN_TOOLS, 1 << 22);
         assert_eq!(raw::METASK_AGENTCORE_CAP_HOST_STREAM_TOOLS, 1 << 23);
-        assert_eq!(raw::METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1, 0x1ff_ffff);
+        assert_eq!(raw::METASK_AGENTCORE_CAP_MCP_TOOL_STREAM, 1 << 24);
+        assert_eq!(raw::METASK_AGENTCORE_CAP_ACTIVE_RUN_JOURNAL, 1 << 25);
+        assert_eq!(raw::METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1, 0x3ff_ffff);
+        assert_eq!(raw::METASK_AGENTCORE_RUN_JOURNAL_EPHEMERAL, 0);
+        assert_eq!(raw::METASK_AGENTCORE_RUN_JOURNAL_DURABLE_WORKSPACE, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_AUTO, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY, 3);

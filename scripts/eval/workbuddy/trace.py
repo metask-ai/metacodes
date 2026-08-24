@@ -29,8 +29,19 @@ CONTROL_METRICS_SCHEMAS = frozenset(
         CONTROL_METRICS_SCHEMA,
     }
 )
+# Compatibility aliases retained for historical fixture builders. Production
+# parsing accepts the closed roster and treats the v2 values as current.
 OBSERVATION_JOURNAL_SCHEMA = "metacodes-tool-observation-journal-v1"
+CURRENT_OBSERVATION_JOURNAL_SCHEMA = "metacodes-tool-observation-journal-v2"
+OBSERVATION_JOURNAL_SCHEMAS = frozenset(
+    {OBSERVATION_JOURNAL_SCHEMA, CURRENT_OBSERVATION_JOURNAL_SCHEMA}
+)
 TOOL_OBSERVATION_SCHEMA = "metacodes-tool-observation-v1"
+CURRENT_TOOL_OBSERVATION_SCHEMA = "metacodes-tool-observation-v2"
+TOOL_OBSERVATION_SCHEMAS = frozenset(
+    {TOOL_OBSERVATION_SCHEMA, CURRENT_TOOL_OBSERVATION_SCHEMA}
+)
+EXECUTION_EFFECT_SCHEMA = "metacodes-execution-effect-v1"
 RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
 # Closed historical roster, like FORMAL_DECISION_SCHEMAS below: the theorem was
 # renamed when rule targets became a tool|effect_class union, and the auditor
@@ -67,6 +78,28 @@ _MASK64 = (1 << 64) - 1
 
 class TraceError(ValueError):
     """The captured headless output cannot support an auditable trajectory."""
+
+
+def _provider_attempt_id(
+    actor_id: str,
+    request_sha256: str,
+    logical_turn: int,
+    context_generation: int,
+    physical_attempt: int,
+) -> str:
+    parts = (
+        b"metacodes-provider-attempt-v1",
+        actor_id.encode("ascii"),
+        request_sha256.encode("ascii"),
+        logical_turn.to_bytes(4, "little"),
+        context_generation.to_bytes(4, "little"),
+        physical_attempt.to_bytes(4, "little"),
+    )
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "little"))
+        digest.update(part)
+    return digest.hexdigest()
 
 
 def anthropic_messages_endpoint(proxy_url: str) -> str:
@@ -1109,8 +1142,10 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
     actuations = set()
     run_started = 0
     run_finished = 0
+    open_provider_attempts: set[str] = set()
+    seen_provider_attempts: set[str] = set()
     for expected_sequence, row in enumerate(records):
-        if row.get("schema_version") != OBSERVATION_JOURNAL_SCHEMA:
+        if row.get("schema_version") not in OBSERVATION_JOURNAL_SCHEMAS:
             raise TraceError("tool observation journal schema is unsupported")
         if row.get("sequence") != expected_sequence:
             raise TraceError("tool observation journal sequence is not contiguous")
@@ -1144,6 +1179,96 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
             run_finished += 1
             if expected_sequence != len(records) - 1:
                 raise TraceError("run_finished is not the last journal event")
+        elif kind == "provider_attempt":
+            if (
+                row.get("schema_version") != CURRENT_OBSERVATION_JOURNAL_SCHEMA
+                or len(payload) != 1
+            ):
+                raise TraceError("provider attempt payload is malformed")
+            phase, attempt = next(iter(payload.items()))
+            if not isinstance(attempt, dict):
+                raise TraceError("provider attempt payload is not an object")
+            attempt_id = attempt.get("attempt_id")
+            if (
+                attempt.get("schema_version") != EXECUTION_EFFECT_SCHEMA
+                or not isinstance(attempt_id, str)
+                or _HEX64.fullmatch(attempt_id) is None
+            ):
+                raise TraceError("provider attempt identity is invalid")
+            if phase == "started":
+                actor_id = attempt.get("actor_id")
+                request_sha256 = attempt.get("request_sha256")
+                logical_turn = attempt.get("logical_turn")
+                context_generation = attempt.get("context_generation")
+                physical_attempt = attempt.get("physical_attempt")
+                max_attempts = attempt.get("max_attempts")
+                if (
+                    attempt_id in seen_provider_attempts
+                    or not isinstance(actor_id, str)
+                    or re.fullmatch(r"[0-9a-f]{24}", actor_id) is None
+                    or not isinstance(request_sha256, str)
+                    or _HEX64.fullmatch(request_sha256) is None
+                    or not isinstance(logical_turn, int)
+                    or isinstance(logical_turn, bool)
+                    or logical_turn <= 0
+                    or logical_turn > 0xFFFFFFFF
+                    or not isinstance(context_generation, int)
+                    or isinstance(context_generation, bool)
+                    or context_generation < 0
+                    or context_generation > 0xFFFFFFFF
+                    or not isinstance(physical_attempt, int)
+                    or isinstance(physical_attempt, bool)
+                    or physical_attempt <= 0
+                    or physical_attempt > 0xFFFFFFFF
+                    or not isinstance(max_attempts, int)
+                    or isinstance(max_attempts, bool)
+                    or max_attempts > 0xFFFFFFFF
+                    or physical_attempt > max_attempts
+                    or attempt_id
+                    != _provider_attempt_id(
+                        actor_id,
+                        request_sha256,
+                        logical_turn,
+                        context_generation,
+                        physical_attempt,
+                    )
+                ):
+                    raise TraceError("provider attempt start is invalid")
+                seen_provider_attempts.add(attempt_id)
+                open_provider_attempts.add(attempt_id)
+            elif phase == "finished":
+                if attempt_id not in open_provider_attempts or attempt.get(
+                    "outcome"
+                ) not in {
+                    "succeeded",
+                    "api_error",
+                    "context_window_exceeded",
+                    "stream_error",
+                    "aborted",
+                }:
+                    raise TraceError("provider attempt finish is invalid")
+                metering = attempt.get("metering")
+                if not isinstance(metering, dict) or len(metering) != 1:
+                    raise TraceError("provider attempt metering is invalid")
+                metering_kind, counters = next(iter(metering.items()))
+                if metering_kind == "known":
+                    if not isinstance(counters, dict) or any(
+                        not isinstance(counters.get(name), int)
+                        or isinstance(counters.get(name), bool)
+                        or counters.get(name) < 0
+                        for name in (
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                        )
+                    ):
+                        raise TraceError("known provider metering is invalid")
+                elif metering_kind != "unknown" or counters not in ({}, None):
+                    raise TraceError("provider attempt metering kind is invalid")
+                open_provider_attempts.remove(attempt_id)
+            else:
+                raise TraceError("provider attempt phase is unsupported")
         elif kind != "tool_observation":
             raise TraceError("tool observation journal event kind is unsupported")
         else:
@@ -1153,7 +1278,7 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
             if not isinstance(observation, dict):
                 raise TraceError("tool observation payload is not an object")
             if observation_kind == "dispatch_started":
-                if observation.get("schema_version") != TOOL_OBSERVATION_SCHEMA:
+                if observation.get("schema_version") not in TOOL_OBSERVATION_SCHEMAS:
                     raise TraceError("dispatch observation schema is unsupported")
                 dispatch_id = observation.get("id")
                 if not isinstance(dispatch_id, str) or not dispatch_id or dispatch_id in started:
@@ -1170,7 +1295,7 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     raise TraceError("filtered dispatch is missing its pre authorization path")
                 started[dispatch_id] = observation
             elif observation_kind == "dispatch_finished":
-                if observation.get("schema_version") != TOOL_OBSERVATION_SCHEMA:
+                if observation.get("schema_version") not in TOOL_OBSERVATION_SCHEMAS:
                     raise TraceError("dispatch observation schema is unsupported")
                 dispatch_id = observation.get("id")
                 if not isinstance(dispatch_id, str) or not dispatch_id or dispatch_id in finished:
@@ -1434,6 +1559,8 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
         raise TraceError("tool observation journal must contain one complete run")
     if set(started) != set(finished):
         raise TraceError("tool dispatch observation pairs are incomplete")
+    if open_provider_attempts:
+        raise TraceError("provider attempt pairs are incomplete")
     if rule_filters:
         raise TraceError("project rule filter was not consumed by checker or dispatch")
     for dispatch_id in started:

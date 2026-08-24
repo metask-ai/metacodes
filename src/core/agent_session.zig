@@ -34,6 +34,8 @@ const SessionRules = @import("../permission/session_rules.zig").SessionRules;
 const ToolExecutionPolicy = @import("../tools.zig").ToolExecutionPolicy;
 const ToolDispatcher = @import("../tools.zig").ToolDispatcher;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
+const tool_observation_journal = @import("tool_observation_journal.zig");
+const util_fs = @import("../util/fs.zig");
 
 pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_party_plugins.ARTIFACT_TOOLS;
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
@@ -546,6 +548,43 @@ pub const ArtifactStoreConfig = union(enum) {
     }
 };
 
+/// Optional active-Run durability for the embedded Session. Ephemeral is the
+/// zero-I/O/default profile. Durable locations contain the existing unified
+/// tool/provider journal; no SQLite or second evidence store enters the core.
+pub const RunJournalConfig = union(enum) {
+    ephemeral,
+    exact_root: []const u8,
+    session_under_workspace_home,
+
+    pub fn enabled(self: RunJournalConfig) bool {
+        return self != .ephemeral;
+    }
+
+    fn resolve(
+        self: RunJournalConfig,
+        allocator: std.mem.Allocator,
+        workspace: workspace_mod.WorkspacePolicy,
+        session_id: SessionId,
+    ) ![]u8 {
+        return switch (self) {
+            .ephemeral => allocator.dupe(u8, ""),
+            .exact_root => |root| if (root.len == 0)
+                error.InvalidRunJournalConfig
+            else
+                allocator.dupe(u8, root),
+            .session_under_workspace_home => blk: {
+                const base = if (workspace.home.len != 0) workspace.home else workspace.root;
+                if (base.len == 0) return error.InvalidRunJournalConfig;
+                break :blk std.fmt.allocPrint(
+                    allocator,
+                    "{s}/.metacodes/agentcore/sessions/{s}",
+                    .{ base, session_id.asSlice() },
+                );
+            },
+        };
+    }
+};
+
 pub const SessionConfig = struct {
     provider_kind: types.ProviderKind,
     api_key: []const u8,
@@ -558,6 +597,10 @@ pub const SessionConfig = struct {
     /// `session_under_workspace_home`; CLI callers that already own a
     /// transcript directory use `exact_root` at the lower agent-loop seam.
     artifact_store: ArtifactStoreConfig = .disabled,
+    /// Active-Run intent/result durability. This is independent of checkpoint
+    /// export: checkpoints preserve committed model state; the Run journal
+    /// preserves effects that may be in flight across a process crash.
+    run_journal: RunJournalConfig = .ephemeral,
     /// Explicit Host authority ceiling. The kernel adds only ReadArtifact when
     /// `artifact_store` is enabled; no other global built-in fallback exists.
     allowed_tools: []const []const u8,
@@ -724,6 +767,7 @@ pub const IsolatedRunExecutor = struct {
         identity: RunIdentity,
         backend: *const ui_backend.UiBackend,
         abort: *const AbortSignal,
+        evidence: RunExecutionEvidence,
         out_final_text: *std.ArrayList(u8),
     ) anyerror!agent_loop.RunResult,
 
@@ -733,6 +777,7 @@ pub const IsolatedRunExecutor = struct {
         identity: RunIdentity,
         backend: *const ui_backend.UiBackend,
         abort: *const AbortSignal,
+        evidence: RunExecutionEvidence,
         out_final_text: *std.ArrayList(u8),
     ) anyerror!agent_loop.RunResult {
         return self.executeFn(
@@ -741,9 +786,18 @@ pub const IsolatedRunExecutor = struct {
             identity,
             backend,
             abort,
+            evidence,
             out_final_text,
         );
     }
+};
+
+/// Borrowed execution evidence for one admitted Run. Both seams point at the
+/// same unified journal when durability is enabled; ephemeral Sessions carry
+/// the canonical all-null value and pay no journal I/O.
+pub const RunExecutionEvidence = struct {
+    tool_observer: ?@import("../tools/context.zig").ToolObservationSink = null,
+    execution_boundary: ?@import("execution_effect.zig").Boundary = null,
 };
 
 /// Exactly-once capability returned after Run admission but before any
@@ -904,13 +958,30 @@ pub const AdmittedRun = struct {
             .emit = AgentSession.backendEmit,
             .poll = AgentSession.backendPoll,
         };
+        var run_journal: ?tool_observation_journal.Journal = if (self.session.run_journal_root.len == 0)
+            null
+        else
+            tool_observation_journal.Journal.init(
+                self.session.run_journal_root,
+                self.identity_value.session_id,
+            ) catch |err| {
+                _ = self.session.poisonRun();
+                return err;
+            };
+        defer if (run_journal) |*journal| journal.deinit();
+        const evidence = RunExecutionEvidence{
+            .tool_observer = if (run_journal) |*journal| journal.sink() else null,
+            .execution_boundary = if (run_journal) |*journal| journal.executionBoundary() else null,
+        };
         var native_result = executor.execute(
             self.session.allocator,
             self.identity_value,
             &backend,
             &self.session.abort_signal,
+            evidence,
             &final_text,
         ) catch |err| {
+            if (run_journal) |*journal| journal.finishRun(@errorName(err)) catch {};
             const callback_failed = self.session.poisonRun();
             if (callback_failed) return error.CallbackFailed;
             return err;
@@ -925,6 +996,12 @@ pub const AdmittedRun = struct {
                 return err;
             };
         }
+
+        if (run_journal) |*journal| journal.finishRun(@tagName(native_result.stop_reason)) catch {
+            if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
+            _ = self.session.poisonRun();
+            return error.RunJournalFailed;
+        };
 
         const completion = self.session.finishRunLifecycle();
         if (completion.callback_failed) {
@@ -951,6 +1028,7 @@ pub const AgentSession = struct {
     conversation: Conversation,
     workspace: workspace_mod.WorkspacePolicy,
     artifact_root: []u8,
+    run_journal_root: []u8,
     tool_result_metrics: @import("tool_result_metrics.zig").Metrics = .{},
     tools: tool_catalog.Selection,
     read_state: ReadState,
@@ -1107,6 +1185,9 @@ pub const AgentSession = struct {
         try hooks.afterIdRegistered();
         const artifact_root = try config.artifact_store.resolve(allocator, workspace, session_id);
         errdefer allocator.free(artifact_root);
+        const run_journal_root = try config.run_journal.resolve(allocator, workspace, session_id);
+        errdefer allocator.free(run_journal_root);
+        if (config.run_journal.enabled()) try util_fs.mkdirParents(run_journal_root);
         var permission_ctx = permission.createContext(config.permission_mode, allocator);
         permission_ctx.session = session_id;
 
@@ -1121,6 +1202,7 @@ pub const AgentSession = struct {
             .conversation = conversation,
             .workspace = workspace,
             .artifact_root = artifact_root,
+            .run_journal_root = run_journal_root,
             .tools = selected_tools,
             .read_state = ReadState.init(allocator),
             .jobs = jobs,
@@ -1200,6 +1282,7 @@ pub const AgentSession = struct {
         self.tools.deinit();
         self.workspace.deinit();
         allocator.free(self.artifact_root);
+        allocator.free(self.run_journal_root);
         if (self.base_url) |url| allocator.free(url);
         allocator.free(self.model);
         secureFree(allocator, self.api_key);
@@ -1681,6 +1764,18 @@ pub const AgentSession = struct {
         ) catch null;
         defer if (system_prompt) |sp| self.allocator.free(sp);
 
+        var run_journal: ?tool_observation_journal.Journal = if (self.run_journal_root.len == 0)
+            null
+        else
+            tool_observation_journal.Journal.init(
+                self.run_journal_root,
+                identity.session_id,
+            ) catch |err| {
+                _ = self.poisonRun();
+                return err;
+            };
+        defer if (run_journal) |*journal| journal.deinit();
+
         var native_result = agent_loop.run(
             &self.conversation,
             provider_override orelse self.provider.provider(),
@@ -1697,6 +1792,9 @@ pub const AgentSession = struct {
                 .tool_defs = tool_definitions,
                 .tool_dispatcher = tool_dispatcher,
                 .execution_policy = effective_execution_policy,
+                .tool_observer = if (run_journal) |*journal| journal.sink() else null,
+                .execution_boundary = if (run_journal) |*journal| journal.executionBoundary() else null,
+                .agent_ident = identity.session_id,
                 // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
                 .host_run = if (self.host_identity_ctx) |hctx| .{
                     .identity = identity,
@@ -1718,6 +1816,7 @@ pub const AgentSession = struct {
             &backend,
             self.allocator,
         ) catch |err| {
+            if (run_journal) |*journal| journal.finishRun(@errorName(err)) catch {};
             if (err == error.HostToolFatal) {
                 self.mutex.lock();
                 self.callback_failed = true;
@@ -1726,6 +1825,12 @@ pub const AgentSession = struct {
             const callback_failed = self.poisonRun();
             if (callback_failed) return error.CallbackFailed;
             return err;
+        };
+
+        if (run_journal) |*journal| journal.finishRun(@tagName(native_result.stop_reason)) catch {
+            if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
+            _ = self.poisonRun();
+            return error.RunJournalFailed;
         };
 
         const completion = self.finishRunLifecycle();
@@ -2174,6 +2279,7 @@ test "AgentSession model mutation is idle-only and preserves Session state" {
             _: RunIdentity,
             _: *const ui_backend.UiBackend,
             _: *const AbortSignal,
+            _: RunExecutionEvidence,
             _: *std.ArrayList(u8),
         ) anyerror!agent_loop.RunResult {
             return .{ .stop_reason = .api_error, .turns = 1, .tool_calls = 0 };
@@ -2666,6 +2772,125 @@ test "AdmittedRun uses a borrowed Provider override without mutating Session own
     try std.testing.expectEqualStrings("override reply", last.blocks[0].text);
 }
 
+test "AgentSession durable profile wires provider effects into unified run journal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .permission_mode = .default,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"Read"},
+        .run_journal = .{ .exact_root = root },
+    });
+    defer self.destroy() catch unreachable;
+    var sink = SinkProbe{};
+    var override = RunOverrideTestProvider{ .allocator = std.testing.allocator };
+    var admitted = try self.admitRun(1, sink.sink());
+    const result = try admitted.runUserMessagesWithToolSurfaceUsingProvider(
+        &.{"hello durable core"},
+        1,
+        null,
+        null,
+        override.provider(),
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    const summary = try tool_observation_journal.validate(root, self.session_id);
+    try std.testing.expect(summary.complete);
+    // run_started + provider intent + provider result + run_finished.
+    try std.testing.expectEqual(@as(u64, 4), summary.records);
+}
+
+test "AgentSession durable profile crosses isolated executor boundary" {
+    const execution_effect = @import("execution_effect.zig");
+    const Executor = struct {
+        saw_observer: bool = false,
+        saw_boundary: bool = false,
+
+        fn run(
+            raw: *anyopaque,
+            allocator: std.mem.Allocator,
+            identity: RunIdentity,
+            _: *const ui_backend.UiBackend,
+            _: *const AbortSignal,
+            evidence: RunExecutionEvidence,
+            out_final_text: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.saw_observer = evidence.tool_observer != null;
+            const boundary = evidence.execution_boundary orelse
+                return error.MissingExecutionBoundary;
+            self.saw_boundary = true;
+            const request_sha256 = execution_effect.sha256Hex(&.{"isolated-request"});
+            const attempt_id = execution_effect.providerAttemptId(
+                identity.session_id.bytes,
+                request_sha256,
+                1,
+                0,
+                1,
+            );
+            if (!boundary.emit(.{ .before = .{ .provider_request = .{
+                .attempt_id = attempt_id,
+                .actor_id = identity.session_id.bytes,
+                .request_sha256 = request_sha256,
+                .logical_turn = 1,
+                .context_generation = 0,
+                .physical_attempt = 1,
+                .max_attempts = 1,
+            } } })) return error.ExecutionBoundaryRejected;
+            if (!boundary.emit(.{ .after = .{ .provider_request = .{
+                .attempt_id = attempt_id,
+                .outcome = .succeeded,
+                .metering = .{ .known = .{
+                    .input_tokens = 1,
+                    .output_tokens = 1,
+                    .cache_read_input_tokens = 0,
+                    .cache_creation_input_tokens = 0,
+                } },
+            } } })) return error.ExecutionBoundaryRejected;
+            try out_final_text.appendSlice(allocator, "isolated final");
+            return .{ .stop_reason = .end_turn, .turns = 1, .tool_calls = 0 };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .permission_mode = .default,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"Read"},
+        .run_journal = .{ .exact_root = root },
+    });
+    defer self.destroy() catch unreachable;
+    var sink = SinkProbe{};
+    var executor = Executor{};
+    var admitted = try self.admitRun(1, sink.sink());
+    const result = try admitted.runIsolated(
+        &.{"isolated durable core"},
+        .{ .ctx = &executor, .executeFn = Executor.run },
+    );
+    try std.testing.expect(result.stop_reason == .end_turn);
+    try std.testing.expect(executor.saw_observer);
+    try std.testing.expect(executor.saw_boundary);
+    const summary = try tool_observation_journal.validate(root, self.session_id);
+    try std.testing.expect(summary.complete);
+    try std.testing.expectEqual(@as(u64, 4), summary.records);
+}
+
 test "AgentSession compact admission consumes only admitted operation ids" {
     const runtime = try createTestRuntime(std.testing.allocator);
     defer runtime.destroy() catch unreachable;
@@ -3009,6 +3234,7 @@ test "AdmittedRun isolated executor shares identity and commits only final assis
             identity: RunIdentity,
             backend: *const ui_backend.UiBackend,
             _: *const AbortSignal,
+            _: RunExecutionEvidence,
             out_final_text: *std.ArrayList(u8),
         ) anyerror!agent_loop.RunResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -3065,6 +3291,7 @@ test "AdmittedRun isolated callback failure poisons and does not commit final te
             identity: RunIdentity,
             backend: *const ui_backend.UiBackend,
             _: *const AbortSignal,
+            _: RunExecutionEvidence,
             out_final_text: *std.ArrayList(u8),
         ) anyerror!agent_loop.RunResult {
             backend.emitEvent(identity.session_id, .{ .text_chunk = "rejected" });
@@ -3109,6 +3336,7 @@ test "AdmittedRun isolated executor shares outer abort and closes cleanly" {
             identity: RunIdentity,
             _: *const ui_backend.UiBackend,
             abort: *const AbortSignal,
+            _: RunExecutionEvidence,
             out_final_text: *std.ArrayList(u8),
         ) anyerror!agent_loop.RunResult {
             const self: *@This() = @ptrCast(@alignCast(raw));

@@ -77,6 +77,37 @@ fn expectJsonFieldEqual(
     try std.testing.expectEqualStrings(first_encoded, second_encoded);
 }
 
+/// Raw request JSON cannot be a literal prefix because a later request must
+/// close and reopen its messages array. The provider-visible cache contract is
+/// the ordered sequence inside that array: every previously emitted element
+/// must remain byte-identical and new elements may appear only at the tail.
+fn expectJsonArrayPrefix(
+    allocator: std.mem.Allocator,
+    first_bytes: []const u8,
+    second_bytes: []const u8,
+    field: []const u8,
+) !void {
+    var first = try std.json.parseFromSlice(std.json.Value, allocator, first_bytes, .{});
+    defer first.deinit();
+    var second = try std.json.parseFromSlice(std.json.Value, allocator, second_bytes, .{});
+    defer second.deinit();
+    const first_array = first.value.object.get(field) orelse return error.MissingCacheField;
+    const second_array = second.value.object.get(field) orelse return error.MissingCacheField;
+    if (first_array != .array or second_array != .array) return error.InvalidCacheField;
+    try std.testing.expect(first_array.array.items.len <= second_array.array.items.len);
+    for (first_array.array.items, 0..) |value, index| {
+        const left = try std.json.Stringify.valueAlloc(allocator, value, .{});
+        defer allocator.free(left);
+        const right = try std.json.Stringify.valueAlloc(
+            allocator,
+            second_array.array.items[index],
+            .{},
+        );
+        defer allocator.free(right);
+        try std.testing.expectEqualStrings(left, right);
+    }
+}
+
 fn expectOpenAiSystemEqual(
     allocator: std.mem.Allocator,
     first_bytes: []const u8,
@@ -246,6 +277,8 @@ test "L2 runner projects after raw UI observation and recovers artifact on the n
         requestToolResultContent(follow_json.value, "big-1") orelse return error.MissingProjectedResult,
         requestToolResultContent(final_json.value, "big-1") orelse return error.MissingStableProjectedResult,
     );
+    try expectJsonArrayPrefix(allocator, first_request, follow_up, "messages");
+    try expectJsonArrayPrefix(allocator, follow_up, final_request, "messages");
     // Artifact paging adds Conversation messages only. The Session's system
     // prefix and complete tool schema were frozen before request one, so the
     // provider cache prefix remains byte-identical across spill and recovery.
@@ -619,6 +652,7 @@ test "L2 artifact paging preserves system and tool cache prefixes for every prov
     defer allocator.free(anthropic_follow);
     try expectJsonFieldEqual(allocator, anthropic_first, anthropic_follow, "system");
     try expectJsonFieldEqual(allocator, anthropic_first, anthropic_follow, "tools");
+    try expectJsonArrayPrefix(allocator, anthropic_first, anthropic_follow, "messages");
 
     const openai_first = try cc.api_openai.serializeOpenAIRequest(
         allocator,
@@ -642,6 +676,7 @@ test "L2 artifact paging preserves system and tool cache prefixes for every prov
     defer allocator.free(openai_follow);
     try expectOpenAiSystemEqual(allocator, openai_first, openai_follow);
     try expectJsonFieldEqual(allocator, openai_first, openai_follow, "tools");
+    try expectJsonArrayPrefix(allocator, openai_first, openai_follow, "messages");
 
     const gemini_first = try cc.api_gemini.serializeGeminiRequest(
         allocator,
@@ -667,6 +702,7 @@ test "L2 artifact paging preserves system and tool cache prefixes for every prov
     defer allocator.free(gemini_follow);
     try expectJsonFieldEqual(allocator, gemini_first, gemini_follow, "systemInstruction");
     try expectJsonFieldEqual(allocator, gemini_first, gemini_follow, "tools");
+    try expectJsonArrayPrefix(allocator, gemini_first, gemini_follow, "contents");
 }
 
 test "L2 BashOutput paging schema fields drive bounded registry dispatch" {

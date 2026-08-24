@@ -716,6 +716,7 @@ pub fn handleSlash(
             .dyn_registry = &app.dyn_registry,
             .host_services = app.hostServices(),
             .tool_observer = if (run_control) |control| control.observer() else null,
+            .execution_boundary = if (run_control) |control| control.executionBoundary() else null,
             .project_rule_gate = if (run_control) |control| control.formalGate() else null,
             .project_dir = app.project_dir_or_empty(),
             .sandbox = app.sandboxPtr(),

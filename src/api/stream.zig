@@ -808,10 +808,21 @@ pub const StreamHandle = struct {
     }
 };
 
-/// 建连重试的 UI 回调(provider 无关:退避时通知前端)。从 client.zig 下沉到中立层。
+/// Provider-neutral connect-retry boundary. Failure is reported immediately,
+/// while the next intent is committed only after the delay and immediately
+/// before the next physical request.
 pub const RetryReporter = struct {
     state: *anyopaque,
-    report: *const fn (state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) void,
+    failedFn: *const fn (state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) bool,
+    beforeAttemptFn: *const fn (state: *anyopaque, attempt: u32, max: u32) bool,
+
+    pub fn failed(self: RetryReporter, attempt: u32, max: u32, delay_ms: u64) bool {
+        return self.failedFn(self.state, attempt, max, delay_ms);
+    }
+
+    pub fn beforeAttempt(self: RetryReporter, attempt: u32, max: u32) bool {
+        return self.beforeAttemptFn(self.state, attempt, max);
+    }
 };
 
 pub const EventIterator = struct {

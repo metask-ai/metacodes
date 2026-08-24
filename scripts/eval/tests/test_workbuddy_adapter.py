@@ -38,7 +38,10 @@ from scripts.eval.workbuddy.trace import (
     FILTER_BINDING_BATCH_SCHEMAS,
     RULE_FILTER_PROOFS,
     OBSERVATION_JOURNAL_SCHEMA,
+    CURRENT_OBSERVATION_JOURNAL_SCHEMA,
     TOOL_OBSERVATION_SCHEMA,
+    EXECUTION_EFFECT_SCHEMA,
+    _provider_attempt_id,
     TraceError,
     anthropic_messages_endpoint,
     final_result,
@@ -773,6 +776,75 @@ class WorkBuddyTraceTest(unittest.TestCase):
             if value not in trace_source
         }
         self.assertEqual(missing, {})
+
+    def test_current_journal_validates_provider_attempt_pairs(self):
+        attempt_id = _provider_attempt_id("1" * 24, "b" * 64, 1, 0, 1)
+        started = {
+            "schema_version": EXECUTION_EFFECT_SCHEMA,
+            "attempt_id": attempt_id,
+            "actor_id": "1" * 24,
+            "request_sha256": "b" * 64,
+            "logical_turn": 1,
+            "context_generation": 0,
+            "physical_attempt": 1,
+            "max_attempts": 1,
+        }
+        finished = {
+            "schema_version": EXECUTION_EFFECT_SCHEMA,
+            "attempt_id": attempt_id,
+            "outcome": "succeeded",
+            "metering": {
+                "known": {
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                }
+            },
+        }
+        events = [
+            {"run_started": {}},
+            {"provider_attempt": {"started": started}},
+            {"provider_attempt": {"finished": finished}},
+            {"run_finished": {}},
+        ]
+        rows = [
+            {
+                "schema_version": CURRENT_OBSERVATION_JOURNAL_SCHEMA,
+                "sequence": sequence,
+                "monotonic_elapsed_ns": sequence,
+                "session_id": "1" * 24,
+                "run_id": "2" * 24,
+                "event": event,
+            }
+            for sequence, event in enumerate(events)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            self._write_jsonl(observation, rows)
+            metrics = load_control_metrics(transcript, observation)
+            self.assertEqual(metrics["source"]["observation_journal_records"], 4)
+            self.assertEqual(metrics["tool_runtime"]["dispatch_started"], 0)
+            self._write_jsonl(observation, [rows[0], rows[1], rows[3]])
+            with self.assertRaises(TraceError):
+                load_control_metrics(transcript, observation)
+
+            forged_rows = json.loads(json.dumps(rows))
+            forged_rows[1]["event"]["provider_attempt"]["started"]["attempt_id"] = "a" * 64
+            forged_rows[2]["event"]["provider_attempt"]["finished"]["attempt_id"] = "a" * 64
+            self._write_jsonl(observation, forged_rows)
+            with self.assertRaises(TraceError):
+                load_control_metrics(transcript, observation)
+
+            legacy_rows = json.loads(json.dumps(rows))
+            for row in legacy_rows:
+                row["schema_version"] = OBSERVATION_JOURNAL_SCHEMA
+            self._write_jsonl(observation, legacy_rows)
+            with self.assertRaises(TraceError):
+                load_control_metrics(transcript, observation)
 
     def test_zig_rule_filter_proof_literal_is_in_the_python_roster(self):
         zig = (
