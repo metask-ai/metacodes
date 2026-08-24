@@ -29,7 +29,7 @@ jobs:
           test: false
           lint: false
       - name: Verify checked-in TinyKG bundle
-        run: python scripts/verify_tinykg_binary.py
+        run: python3 scripts/verify_tinykg_binary.py
       - name: Run closed-loop release gate
         run: zig build --build-file control-plane/build.zig rule-check
       - name: Upload rule-control telemetry

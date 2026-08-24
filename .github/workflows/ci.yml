@@ -127,7 +127,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          python scripts/verify_tinykg_binary.py
+          python3 scripts/verify_tinykg_binary.py
           zig build tinykg:stage
       - name: Verify native bundle and fresh-store contract (Windows)
         if: runner.os == 'Windows'
