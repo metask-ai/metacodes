@@ -59,9 +59,9 @@
       "04_modify_feature": "fd7959aa1bc504df7bf8059a65b1e37b46372cc00503c720d4a7bafb9a259572"
     },
     "baseline_executable": "scripts/eval/fixtures/plugin_baseline.py",
-    "baseline_executable_sha256": "7e8e0d82eec7dd85c0e173fd37336402314a6cec9b7ccc37fe72f2341e45a02b",
+    "baseline_executable_sha256": "bf1c89f3257b99f1e78dee6e785c4b69e92c689c4782f70c66a95ddd77511466",
     "treatment_executable": "scripts/eval/fixtures/plugin_candidate.py",
-    "treatment_executable_sha256": "5344e549f7b4cac493f5a19885ad8834cfc35e84c5cbaf77c028f6e395474ba4",
+    "treatment_executable_sha256": "1a80f4f240e80df798521cb4cacd9a59d12d494cbee06468412b4fe751f28a61",
     "single_factor": "one namespaced Skill data package",
     "implementation_fingerprint": "b90adf55f3aa5e73c646f0ab9acc34b74b1a86a2b03d4d30c1b09d66d10dff75",
     "runtime_binary_sha256": "fd330c2e4c4120a129fb8148091011f014d29d2c496f4a24ffdd8232c5cce054",
@@ -113,7 +113,7 @@
     "interpretation": "The 18 paired observations are a development gate. They may reject the plugin candidate but cannot establish a general coding-benchmark advantage or a public leaderboard claim. Promotion still requires the repository release contract and then an external WorkBuddy development cohort."
   },
   "pinned_evaluator_files": {
-    "scripts/eval/paired_runner.py": "42f1350772508e08d4c0f0e39601c45f41ab89e7252c27b5556822cb9e552fcf",
+    "scripts/eval/paired_runner.py": "6ddaf9f5ea6c34cf75537c5282bab7a85c759676f7c6273200c5074ab7970f59",
     "scripts/eval/analysis.py": "4d93d9fc83a38804dd41e587178fff299cff911b584d9a46dad021c9e9a08516",
     "scripts/eval/e2e_adapter.py": "3ec295e1fd2eef3b1ccf6b0397cd1b3282e92fc9e59ddbbc405af05fb6291dad",
     "scripts/eval/model.py": "97abdb07ad594656a8d6ac8d50d5b12e83c3c3dbdceb455e147060c5ebf313b4",
@@ -124,9 +124,9 @@
     "scripts/eval/promotion.py": "65f566244d3880b367a0c9adee858b2160ed63d5b1644ea38202e79a34fb79f3",
     "scripts/eval/treatment_activation.py": "28b976feaf8caab1d03a42d58794b067b9ca892de248e72a2f4ab22eebe769b0",
     "scripts/eval/cli.py": "5646573271b8280dc3ad644ee477c22daa3059f36445686235d166c3e87afb0b",
-    "scripts/eval/plugin_release_gate.py": "05d7461d6fe947c732b80297c5badeedfecf1d5eb946809e062b52da1696999d",
-    "scripts/eval/plugin_pair_runner.py": "cbaeb45b3aff8295ecdc3ac7c9004b7d9d231e4a2cbf92e416cdfebc8240e59f",
-    "scripts/eval/plugin_pair_analysis.py": "de25d5d9fe4e3748d6d70ce5007e6f30938508c5f2cf44adf91dbb41158a9b08",
+    "scripts/eval/plugin_release_gate.py": "4231966e76db0a4d0cb2f9bb8eea3659489c20a7942abb28059566e709258fb5",
+    "scripts/eval/plugin_pair_runner.py": "08713fcdc417e7bf81315c6024c3d911192adc407d08c8259dc1f3a4d6ac709b",
+    "scripts/eval/plugin_pair_analysis.py": "7aa81f79d843f52b8de96a1f33f533a18f699bd6205255356187604f604126ff",
     "tests/e2e/run_e2e.sh": "38b21bdc939682e870846cc57731c90b2a114aec285b8df6d8019ba7a59314f3",
     "tests/e2e/lib.sh": "6c92791c9eb17312e2fc979cc399489b3511225a096a395b34b9b5b16405b88d",
     "evals/gates/default.json": "542ea99c4576cf585bccdd9470a87482b9f308de69cb4f197be7434d466a2faa"

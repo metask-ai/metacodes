@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 from scripts.eval.plugin_release_gate import (
     PluginGateError,
     _benchmark_row,
     _median_int,
+    attest_runtime_artifact,
     implementation_fingerprint,
     load_protocol,
+    main,
 )
 
 
@@ -40,14 +46,38 @@ class PluginReleaseGateTest(unittest.TestCase):
         )
         self.assertEqual(64, len(protocol["coding_pair"]["runtime_binary_sha256"]))
 
-    def test_paid_protocol_rejects_runtime_identity_drift(self) -> None:
+    def test_static_protocol_rejects_malformed_runtime_identity(self) -> None:
         protocol = load_protocol(ROOT, PROTOCOL)
-        protocol["coding_pair"]["runtime_binary_sha256"] = "0" * 64
+        protocol["coding_pair"]["runtime_binary_sha256"] = "0" * 63
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "protocol.json"
             path.write_text(json.dumps(protocol), encoding="utf-8")
-            with self.assertRaisesRegex(PluginGateError, "runtime drifted"):
+            with self.assertRaisesRegex(PluginGateError, "lowercase SHA-256"):
                 load_protocol(ROOT, path)
+
+    def test_runtime_attestation_uses_only_the_explicit_artifact(self) -> None:
+        protocol = load_protocol(ROOT, PROTOCOL)
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "metacodes-release-small"
+            runtime.write_bytes(b"portable-runtime-fixture")
+            os.chmod(runtime, 0o700)
+            with self.assertRaisesRegex(PluginGateError, "ReleaseSmall runtime drifted"):
+                attest_runtime_artifact(protocol, runtime)
+
+            expected = hashlib.sha256(runtime.read_bytes()).hexdigest()
+            matching = copy.deepcopy(protocol)
+            matching["coding_pair"]["runtime_binary_sha256"] = expected
+            attestation = attest_runtime_artifact(matching, runtime)
+            self.assertEqual(runtime.resolve(), attestation.path)
+            self.assertEqual(expected, attestation.sha256)
+
+    def test_validate_only_needs_no_runtime_artifact(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(0, main(["--validate-only"]))
+        value = json.loads(output.getvalue())
+        self.assertEqual("metacodes.plugin-evaluation/v1", value["schema"])
+        self.assertEqual(0, value["provider_requests"])
 
     def test_candidate_hash_drift_fails_closed(self) -> None:
         protocol = load_protocol(ROOT, PROTOCOL)

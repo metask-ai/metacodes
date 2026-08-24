@@ -53,6 +53,7 @@ if __package__ in {None, ""}:
     )
     from scripts.eval.plugin_release_gate import (  # type: ignore
         PluginGateError,
+        attest_runtime_artifact,
         implementation_fingerprint,
         load_protocol,
     )
@@ -80,6 +81,7 @@ else:
     )
     from .plugin_release_gate import (
         PluginGateError,
+        attest_runtime_artifact,
         implementation_fingerprint,
         load_protocol,
     )
@@ -152,7 +154,12 @@ def _pair_fields(protocol: Mapping[str, Any]) -> tuple[float, int, float, int]:
     return float(rollout_cost), rollout_tokens, float(total_cost), total_tokens
 
 
-def build_plan(root: Path, protocol_path: Path) -> dict[str, Any]:
+def build_plan(
+    root: Path,
+    protocol_path: Path,
+    *,
+    runtime_binary: Path | None = None,
+) -> dict[str, Any]:
     protocol = load_protocol(root, protocol_path)
     pair = protocol["coding_pair"]
     rollout_cost, rollout_tokens, total_cost, total_tokens = _pair_fields(protocol)
@@ -170,16 +177,26 @@ def build_plan(root: Path, protocol_path: Path) -> dict[str, Any]:
     ]
     if len(schedule) != pair["rollouts"]:
         raise ValidationError("planned plugin schedule length drifted")
-    runtime_binary = root / "zig-out/bin/metacodes"
+    if runtime_binary is None:
+        runtime = {
+            "state": "not_attested",
+            "expected_sha256": pair["runtime_binary_sha256"],
+        }
+    else:
+        attestation = attest_runtime_artifact(protocol, runtime_binary)
+        runtime = {
+            "state": "attested",
+            "path": str(attestation.path),
+            "sha256": attestation.sha256,
+        }
     return {
-        "schema": "metacodes.plugin-paid-plan/v1",
+        "schema": "metacodes.plugin-paid-plan/v2",
         "provider_requests": 0,
         "quality_evidence": False,
         "protocol_sha256": _sha256(protocol_path),
         "implementation_fingerprint": implementation_fingerprint(root, protocol),
         "model": pair["model"],
-        "runtime_binary": str(runtime_binary),
-        "runtime_binary_sha256": _sha256(runtime_binary) if runtime_binary.is_file() else None,
+        "runtime": runtime,
         "fixed_rollout_budget": {
             "max_cost_usd": rollout_cost,
             "max_metered_tokens": rollout_tokens,
@@ -277,7 +294,11 @@ def load_user_authority(
     return value
 
 
-def _inventory(root: Path, executable: Path) -> dict[str, Any]:
+def _inventory(
+    root: Path,
+    executable: Path,
+    runtime_binary: Path,
+) -> dict[str, Any]:
     clean_env = {
         key: value
         for key, value in os.environ.items()
@@ -285,6 +306,7 @@ def _inventory(root: Path, executable: Path) -> dict[str, Any]:
         and not key.startswith("METASK_")
         and not key.startswith("E2E_")
     }
+    clean_env["METACODES_PLUGIN_RUNTIME_BINARY"] = str(runtime_binary)
     completed = subprocess.run(
         [str(executable), "--dump-plugins"],
         cwd=root,
@@ -312,8 +334,11 @@ def _verify_arm_inventory(
     protocol: Mapping[str, Any],
     arm: str,
     executable: Path,
+    runtime_binary: Path,
 ) -> str:
-    value = _inventory(root, executable)
+    attest_runtime_artifact(protocol, runtime_binary)
+    value = _inventory(root, executable, runtime_binary)
+    attest_runtime_artifact(protocol, runtime_binary)
     plugins = value.get("plugins")
     if value.get("contract_version") != 1 or not isinstance(plugins, list):
         raise ValidationError(f"{arm} plugin inventory has an invalid contract")
@@ -407,12 +432,16 @@ def run_paid_pair(
     root: Path,
     protocol_path: Path,
     *,
+    runtime_binary: Path,
     output_dir: Path,
     budget_journal_path: Path,
     provider_auth_file: Path,
     user_authority_file: Path,
 ) -> dict[str, Any]:
     protocol = load_protocol(root, protocol_path)
+    runtime = attest_runtime_artifact(protocol, runtime_binary)
+    runtime_binary = runtime.path
+    runtime_sha256 = runtime.sha256
     pair = protocol["coding_pair"]
     rollout_cost, rollout_tokens, total_cost, total_tokens = _pair_fields(protocol)
     protocol_sha256 = _sha256(protocol_path)
@@ -444,12 +473,14 @@ def run_paid_pair(
         if not executable.is_file() or not os.access(executable, os.X_OK):
             raise ValidationError(f"{arm} wrapper is not executable")
     wrapper_hashes = {arm: _sha256(path) for arm, path in wrappers.items()}
-    runtime_binary = root / "zig-out/bin/metacodes"
-    if not runtime_binary.is_file() or not os.access(runtime_binary, os.X_OK):
-        raise ValidationError("ReleaseSafe metacodes binary is missing")
-    runtime_sha256 = _sha256(runtime_binary)
     inventory_hashes = {
-        arm: _verify_arm_inventory(root, protocol, arm, executable)
+        arm: _verify_arm_inventory(
+            root,
+            protocol,
+            arm,
+            executable,
+            runtime_binary,
+        )
         for arm, executable in wrappers.items()
     }
     revision = f"{_git_head(root)}+{implementation_fingerprint(root, protocol)[:16]}"
@@ -584,10 +615,17 @@ def run_paid_pair(
             for task_id in sorted(expected_tasks):
                 if (task_id, trial) in completed[arm]:
                     continue
-                load_protocol(root, protocol_path)
-                if _sha256(runtime_binary) != runtime_sha256 or _sha256(wrappers[arm]) != wrapper_hashes[arm]:
+                live_protocol = load_protocol(root, protocol_path)
+                attest_runtime_artifact(live_protocol, runtime_binary)
+                if _sha256(wrappers[arm]) != wrapper_hashes[arm]:
                     raise ValidationError("plugin experiment executable drifted before request")
-                observed_inventory = _verify_arm_inventory(root, protocol, arm, wrappers[arm])
+                observed_inventory = _verify_arm_inventory(
+                    root,
+                    protocol,
+                    arm,
+                    wrappers[arm],
+                    runtime_binary,
+                )
                 if observed_inventory != inventory_hashes[arm]:
                     raise ValidationError("plugin inventory drifted before request")
                 transaction = _transaction(
@@ -633,10 +671,14 @@ def run_paid_pair(
                     max_metered_tokens=rollout_tokens,
                     max_cost_usd=rollout_cost,
                     runtime_api_key=runtime_api_key,
+                    runtime_env={
+                        "METACODES_PLUGIN_RUNTIME_BINARY": str(runtime_binary),
+                    },
                 )
-                if _sha256(runtime_binary) != runtime_sha256 or _sha256(wrappers[arm]) != wrapper_hashes[arm]:
+                live_protocol = load_protocol(root, protocol_path)
+                attest_runtime_artifact(live_protocol, runtime_binary)
+                if _sha256(wrappers[arm]) != wrapper_hashes[arm]:
                     raise ValidationError("plugin experiment executable drifted during request")
-                load_protocol(root, protocol_path)
                 imported = import_run(suite, root, run_dir)
                 selected = [
                     row
@@ -675,6 +717,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol", type=Path, default=root / "evals/plugin-v1/protocol.json")
+    parser.add_argument(
+        "--runtime-binary",
+        type=Path,
+        help="explicit protocol-pinned ReleaseSmall metacodes artifact",
+    )
     parser.add_argument("--allow-paid-rollouts", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--budget-journal", type=Path)
@@ -682,7 +729,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--user-authority", type=Path)
     args = parser.parse_args(argv)
     try:
-        plan = build_plan(root, args.protocol.resolve())
+        runtime_binary = (
+            args.runtime_binary.expanduser() if args.runtime_binary is not None else None
+        )
+        plan = build_plan(
+            root,
+            args.protocol.resolve(),
+            runtime_binary=runtime_binary,
+        )
         if not args.allow_paid_rollouts:
             print(json.dumps(plan, sort_keys=True))
             return 0
@@ -693,6 +747,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ("--budget-journal", args.budget_journal),
                 ("--auth-file", args.auth_file),
                 ("--user-authority", args.user_authority),
+                ("--runtime-binary", runtime_binary),
             )
             if value is None
         ]
@@ -701,6 +756,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = run_paid_pair(
             root,
             args.protocol.resolve(),
+            runtime_binary=runtime_binary,
             output_dir=args.output_dir,
             budget_journal_path=args.budget_journal,
             provider_auth_file=args.auth_file,

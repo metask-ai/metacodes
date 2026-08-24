@@ -15,6 +15,7 @@ import os
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
@@ -25,6 +26,14 @@ RECEIPT_SCHEMA = "metacodes.plugin-zero-provider-receipt/v1"
 
 class PluginGateError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class RuntimeArtifactAttestation:
+    """A protocol-pinned executable observed at an explicit host path."""
+
+    path: Path
+    sha256: str
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -83,6 +92,50 @@ def _require_hashes(root: Path, rows: Mapping[str, Any], label: str) -> None:
             )
 
 
+def _require_sha256(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise PluginGateError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def attest_runtime_artifact(
+    protocol: Mapping[str, Any],
+    runtime_binary: Path,
+) -> RuntimeArtifactAttestation:
+    """Bind a caller-selected ReleaseSmall executable to the frozen protocol.
+
+    The path is intentionally not inferred from ``zig-out``. Release and paid
+    callers must name the artifact they intend to execute, so stale build-tree
+    state cannot silently select or reject a runtime.
+    """
+
+    if runtime_binary.is_symlink():
+        raise PluginGateError("plugin runtime artifact must not be a symlink")
+    try:
+        resolved = runtime_binary.resolve(strict=True)
+    except OSError as exc:
+        raise PluginGateError(f"cannot resolve plugin runtime artifact: {exc}") from exc
+    if not resolved.is_file():
+        raise PluginGateError("plugin runtime artifact is not a regular file")
+    if not os.access(resolved, os.X_OK):
+        raise PluginGateError("plugin ReleaseSmall runtime is not executable")
+    expected = _require_sha256(
+        protocol.get("coding_pair", {}).get("runtime_binary_sha256"),
+        "coding pair runtime_binary_sha256",
+    )
+    observed = _sha256(resolved)
+    if observed != expected:
+        raise PluginGateError(
+            "coding pair ReleaseSmall runtime drifted: "
+            f"expected {expected}, observed {observed}"
+        )
+    return RuntimeArtifactAttestation(path=resolved, sha256=observed)
+
+
 def load_protocol(root: Path, path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -139,9 +192,10 @@ def load_protocol(root: Path, path: Path) -> dict[str, Any]:
         raise PluginGateError("coding pair token authority changed")
     if pair.get("implementation_fingerprint") != implementation_fingerprint(root, value):
         raise PluginGateError("coding pair implementation fingerprint drifted")
-    runtime_binary = _safe_file(root, "zig-out/bin/metacodes")
-    if pair.get("runtime_binary_sha256") != _sha256(runtime_binary):
-        raise PluginGateError("coding pair ReleaseSafe runtime drifted")
+    _require_sha256(
+        pair.get("runtime_binary_sha256"),
+        "coding pair runtime_binary_sha256",
+    )
     pinned_pair_files = {
         str(pair.get("suite")): pair.get("suite_sha256"),
         str(pair.get("baseline_executable")): pair.get("baseline_executable_sha256"),
@@ -271,8 +325,14 @@ def _git_head(path: Path) -> str:
     return completed.stdout.strip()
 
 
-def run_gate(root: Path, protocol_path: Path, dsh: Path) -> dict[str, Any]:
+def run_gate(
+    root: Path,
+    protocol_path: Path,
+    dsh: Path,
+    runtime_binary: Path,
+) -> dict[str, Any]:
     protocol = load_protocol(root, protocol_path)
+    runtime = attest_runtime_artifact(protocol, runtime_binary)
     expected_dsh = protocol["upstream"]["deepseek_harness_commit"]
     observed_dsh = _git_head(dsh)
     if observed_dsh != expected_dsh:
@@ -347,8 +407,10 @@ def run_gate(root: Path, protocol_path: Path, dsh: Path) -> dict[str, Any]:
         )
 
     with tempfile.TemporaryDirectory(prefix="metacodes-plugin-gate-home-") as home:
+        runtime = attest_runtime_artifact(protocol, runtime.path)
         inventory_env = dict(clean_env)
         inventory_env["HOME"] = home
+        inventory_env["METACODES_PLUGIN_RUNTIME_BINARY"] = str(runtime.path)
         baseline = _run(
             root,
             [str(root / "scripts/eval/fixtures/plugin_baseline.py"), "--dump-plugins"],
@@ -359,6 +421,7 @@ def run_gate(root: Path, protocol_path: Path, dsh: Path) -> dict[str, Any]:
             [str(root / "scripts/eval/fixtures/plugin_candidate.py"), "--dump-plugins"],
             env=inventory_env,
         )
+        runtime = attest_runtime_artifact(protocol, runtime.path)
     baseline_inventory = _inventory(baseline["output"])
     candidate_inventory = _inventory(candidate["output"])
     if baseline_inventory.get("plugins") != []:
@@ -430,6 +493,7 @@ def run_gate(root: Path, protocol_path: Path, dsh: Path) -> dict[str, Any]:
             "quality_claim": "none",
             "authorized_cost_usd": 0.0,
             "provider_requests": 0,
+            "runtime_binary_sha256": runtime.sha256,
         },
         "release_status": "blocked_pending_paid_coding_pair",
     }
@@ -461,6 +525,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=Path("/Users/david/prj/deepseek-harness"),
     )
+    parser.add_argument(
+        "--runtime-binary",
+        type=Path,
+        help="explicit protocol-pinned ReleaseSmall metacodes artifact",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
@@ -482,7 +551,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.output is None:
             raise PluginGateError("--output is required unless --validate-only is used")
-        receipt = run_gate(root, args.protocol.resolve(), args.deepseek_harness.resolve())
+        if args.runtime_binary is None:
+            raise PluginGateError(
+                "--runtime-binary is required unless --validate-only is used"
+            )
+        receipt = run_gate(
+            root,
+            args.protocol.resolve(),
+            args.deepseek_harness.resolve(),
+            args.runtime_binary.expanduser(),
+        )
         _write_new(args.output.resolve(), receipt)
     except (OSError, subprocess.SubprocessError, PluginGateError) as exc:
         parser.error(str(exc))

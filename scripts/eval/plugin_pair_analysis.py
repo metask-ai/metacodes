@@ -23,7 +23,11 @@ if __package__ in {None, ""}:
         _metered_tokens,
         _verify_arm_inventory,
     )
-    from scripts.eval.plugin_release_gate import PluginGateError, load_protocol  # type: ignore
+    from scripts.eval.plugin_release_gate import (  # type: ignore
+        PluginGateError,
+        attest_runtime_artifact,
+        load_protocol,
+    )
 else:
     from .analysis import gate
     from .memory_budget_journal import usd_to_microusd_ceiling
@@ -34,7 +38,11 @@ else:
         _metered_tokens,
         _verify_arm_inventory,
     )
-    from .plugin_release_gate import PluginGateError, load_protocol
+    from .plugin_release_gate import (
+        PluginGateError,
+        attest_runtime_artifact,
+        load_protocol,
+    )
 
 
 RECEIPT_SCHEMA = "metacodes.plugin-paid-quality-receipt/v1"
@@ -96,11 +104,13 @@ def validate_paid_row(
 def analyze(
     root: Path,
     protocol_path: Path,
+    runtime_binary: Path,
     baseline_path: Path,
     candidate_path: Path,
     budget_journal_path: Path,
 ) -> dict[str, Any]:
     protocol = load_protocol(root, protocol_path)
+    runtime = attest_runtime_artifact(protocol, runtime_binary)
     protocol_sha256 = _sha256(protocol_path)
     baseline = load_rollouts(baseline_path)
     candidate = load_rollouts(candidate_path)
@@ -115,7 +125,13 @@ def analyze(
         "candidate": root / pair["treatment_executable"],
     }
     inventory_hashes = {
-        arm: _verify_arm_inventory(root, protocol, arm, executable)
+        arm: _verify_arm_inventory(
+            root,
+            protocol,
+            arm,
+            executable,
+            runtime.path,
+        )
         for arm, executable in wrappers.items()
     }
     for arm, rows in (("baseline", baseline), ("candidate", candidate)):
@@ -206,6 +222,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol", type=Path, default=root / "evals/plugin-v1/protocol.json")
+    parser.add_argument(
+        "--runtime-binary",
+        type=Path,
+        required=True,
+        help="explicit protocol-pinned ReleaseSmall metacodes artifact",
+    )
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--budget-journal", type=Path, required=True)
@@ -215,6 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         receipt = analyze(
             root,
             args.protocol.resolve(),
+            args.runtime_binary.expanduser(),
             args.baseline.resolve(),
             args.candidate.resolve(),
             args.budget_journal.expanduser().resolve(),

@@ -77,7 +77,7 @@ DSH 的全部动态 plugin capability、全新 provider transport、UI 插件或
   `91e959b22a813995a9b9675649098961a1dee57dff350e4266bacd328fd52050`
 - implementation fingerprint：
   `de963f39fb471d4e118e3647120d7a94ed278bf1b062120134169630e2b3ea5c`
-- ReleaseSafe binary SHA-256：
+- ReleaseSmall binary SHA-256：
   `471650a06284f82e3388b7d5d8045c829d79a5a7025d086b74951e97eddcd7e0`
 - receipt content SHA-256：
   `1aa1cc2c65f23656fe68230be51c8f5ac55d20a0e5500f04a2e3417cb6e33813`
@@ -116,7 +116,7 @@ system 变化则有意形成新的 cache boundary。
 
 唯一 treatment 是一个 namespaced `skill_bundle` 数据包
 `metacodes.benchmark-coding`（历史运行是 `1.0.0`/`1.1.0`；当前零-provider candidate 为
-带 `model-activation: required-first` 的 `1.2.0`）。每个冻结 protocol 的两臂都使用同一个 ReleaseSafe metacodes 二进制、
+带 `model-activation: required-first` 的 `1.2.0`）。每个冻结 protocol 的两臂都使用同一个 ReleaseSmall metacodes 二进制、
 同一 `anthropic/glm-5.2`、同一任务与 grader；baseline 不加载插件，candidate 只多
 一个 `verify-change` Skill。
 
@@ -141,6 +141,13 @@ policy violation 为 0。
 2. 0600 私有用户授权文件，绑定精确 protocol hash 和预算；
 3. 0600 provider auth 文件；
 4. 位于输出目录之外的独占、崩溃保守 budget journal。
+5. `--runtime-binary <path>` 显式指定与 protocol SHA-256 pin 一致的
+   ReleaseSmall artifact；不得从环境中的 `zig-out` 隐式选择。
+
+无 `--runtime-binary` 的计划使用 `metacodes.plugin-paid-plan/v2` 的
+`runtime.state = not_attested`，只报告期望 hash，不读取本机构建目录。传入 artifact 后
+才变为 `attested`。零-provider release receipt 和付费结果 analysis 同样要求显式
+`--runtime-binary`；静态 `--validate-only` 不需要二进制。
 
 每个 rollout 在请求前持久化 authorization，运行时再由 metacodes 原生 evaluation
 backend 强制 token/cost 双限额。任何已授权但未形成 checkpoint 的请求都会阻止自动
@@ -162,7 +169,7 @@ committed budget receipt 和 treatment attestation；即使门禁通过，也只
 
 - protocol SHA-256：
   `df04fb0f5badd87e6499a30b4dafd07f662b9249910ebb8e87a370e50bc56764`；
-- ReleaseSafe binary SHA-256：
+- ReleaseSmall binary SHA-256：
   `fc15e0fc7e436e79252488b6d992db7379338681cfc0d341ea9838b661acbf17`；
 - 18 个 baseline 与 18 个 candidate rollout 全部有效、可评分，policy violation 为 0；
 - 两臂 outcome success 均为 18/18，trustworthy success 均为 17/18（94.44%）；
@@ -207,7 +214,7 @@ Provider dialect、工具/核心能力提示词投影和 cache contract 落地�
   `8833622a7fdff137f0e6f5705e27139d3feea545f9b5ac4f43351ab180bce0b9`；
 - implementation fingerprint：
   `131a5a40cb9c8be2c714bab5e9206bafc8e7e645f20812c720315542a04e9802`；
-- ReleaseSafe binary SHA-256：
+- ReleaseSmall binary SHA-256：
   `cfc394013abd97c7e9889e48bd5e7e82e871598d9bf3698ffd655d45f88b55ca`；
 - 18 个 baseline 与 18 个 candidate 全部 outcome pass、有效且无 policy violation；
   两臂 trustworthy success 均为 17/18；
@@ -233,7 +240,7 @@ modifier。因此 `8833622a…` 只保留为历史结果，不能证明静态 di
   `6ae5738030db59cbb5f331e3ebbec72f71a93a3b05b0209cef0d21695acd7849`；
 - implementation fingerprint：
   `bfdaa9f4fb4e7f3db853454490be632ce477eec1d2052a5ded5a12101bcc0bac`；
-- ReleaseSafe binary SHA-256：
+- ReleaseSmall binary SHA-256：
   `0142b09da02952d202e760d62b4938e10921eb1a7af7cac4ffec39fb98606899`；
 - 18 个 baseline 与 18 个 candidate 全部 outcome/trustworthy pass、有效且无 policy
   violation；discordant improvement/regression 均为 0，McNemar exact `p = 1.0`；
