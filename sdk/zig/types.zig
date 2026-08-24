@@ -105,9 +105,24 @@ pub const STATUS_INVALID_MCP_SELECTION: u32 = @intFromEnum(Status.invalid_mcp_se
 pub const STATUS_COMPLETION_UNSUPPORTED_RESPONSE: u32 = @intFromEnum(Status.completion_unsupported_response);
 pub const STATUS_SKILL_CATALOG_INCOMPLETE: u32 = @intFromEnum(Status.skill_catalog_incomplete);
 
-pub const PROVIDER_ANTHROPIC: u32 = 1;
-pub const PROVIDER_OPENAI: u32 = 2;
-pub const PROVIDER_GEMINI: u32 = 3;
+pub const ProviderKind = enum(u32) {
+    anthropic = 1,
+    openai = 2,
+    gemini = 3,
+
+    pub fn fromCode(code: u32) error{UnknownProviderKind}!ProviderKind {
+        return switch (code) {
+            @intFromEnum(ProviderKind.anthropic) => .anthropic,
+            @intFromEnum(ProviderKind.openai) => .openai,
+            @intFromEnum(ProviderKind.gemini) => .gemini,
+            else => error.UnknownProviderKind,
+        };
+    }
+};
+
+pub const PROVIDER_ANTHROPIC: u32 = @intFromEnum(ProviderKind.anthropic);
+pub const PROVIDER_OPENAI: u32 = @intFromEnum(ProviderKind.openai);
+pub const PROVIDER_GEMINI: u32 = @intFromEnum(ProviderKind.gemini);
 
 pub const PERMISSION_DEFAULT: u32 = 1;
 pub const PERMISSION_ACCEPT_EDITS: u32 = 2;
@@ -1332,6 +1347,20 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectError(
         error.UnknownCompletionStopReason,
         CompletionStopReason.fromCode(7),
+    );
+}
+
+test "typed provider kind validates every public code" {
+    const std = @import("std");
+    inline for (std.meta.fields(ProviderKind)) |field| {
+        const value: ProviderKind = @enumFromInt(field.value);
+        try std.testing.expectEqual(value, try ProviderKind.fromCode(field.value));
+    }
+    try std.testing.expectError(error.UnknownProviderKind, ProviderKind.fromCode(0));
+    try std.testing.expectError(error.UnknownProviderKind, ProviderKind.fromCode(4));
+    try std.testing.expectError(
+        error.UnknownProviderKind,
+        ProviderKind.fromCode(std.math.maxInt(u32)),
     );
 }
 

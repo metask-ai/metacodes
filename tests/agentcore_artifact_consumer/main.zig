@@ -764,6 +764,23 @@ pub fn main(init: std.process.Init) !void {
     defer if (completion) |handle| {
         _ = api.completionDestroy()(handle, &diagnostic);
     };
+    var completion_info = std.mem.zeroes(wire.CompletionInfoV1);
+    try expectStatus(.ok, api.completionDescribe()(
+        completion,
+        &completion_info,
+        &diagnostic,
+    ), diagnostic);
+    defer api.bufferRelease()(&completion_info.model);
+    if (try sdk.ProviderKind.fromCode(completion_info.provider_kind_code) != .anthropic or
+        !std.mem.eql(
+            u8,
+            try sdk.borrowedBytes(.{
+                .ptr = completion_info.model.ptr,
+                .len = completion_info.model.len,
+            }),
+            "artifact-completion-model",
+        ))
+        return error.InvalidCompletionDescription;
     var completion_message = wire.CompletionMessageV1{
         .struct_size = @sizeOf(wire.CompletionMessageV1),
         .role_code = wire.COMPLETION_ROLE_USER,
