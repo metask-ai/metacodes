@@ -30,7 +30,24 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust toolchain (Windows)
+        shell: cmd
+        run: |
+          where rustup >nul 2>nul
+          if errorlevel 1 (
+            curl.exe --proto "=https" --tlsv1.2 --retry 10 --retry-connrefused --fail --silent --show-error https://win.rustup.rs/x86_64 -o "%RUNNER_TEMP%\rustup-init.exe"
+            if errorlevel 1 exit /b 1
+            "%RUNNER_TEMP%\rustup-init.exe" --default-toolchain none --profile minimal --no-modify-path -y
+            if errorlevel 1 exit /b 1
+          )
+          echo %USERPROFILE%\.cargo\bin>>"%GITHUB_PATH%"
+          set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+          rustup toolchain install stable --profile minimal --no-self-update
+          if errorlevel 1 exit /b 1
+          rustup default stable
+          if errorlevel 1 exit /b 1
+          rustc --version
+          cargo --version
       - name: Native AgentCore delivery gate
         shell: cmd
         run: |
