@@ -48,8 +48,8 @@ def main() -> int:
             file=os.sys.stderr,
         )
         return 2
-    contract = TinyKgContract.load(PROJECT_ROOT / "deps/tinykg.json")
     try:
+        contract = TinyKgContract.load(PROJECT_ROOT / "deps/tinykg.json")
         if path is not None and sha256 is not None:
             identity = inspect_binary(Path(path), sha256, contract)
             source = "explicit"
@@ -62,7 +62,7 @@ def main() -> int:
             identity = inspect_binary(binary, artifact.sha256, contract)
             source = f"bundled:{artifact.key}"
         validate_store_contract(identity, contract)
-    except StageError as exc:
+    except (OSError, StageError) as exc:
         print(f"verify-tinykg: error: {exc}", file=os.sys.stderr)
         return 1
     print(

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
@@ -162,11 +162,17 @@ class TinyKgBundle:
             if (
                 not isinstance(relative, str)
                 or not relative
+                or "\\" in relative
+                or ":" in relative
+                or relative == "."
                 or Path(relative).is_absolute()
-                or ".." in Path(relative).parts
+                or PurePosixPath(relative).as_posix() != relative
+                or ".." in PurePosixPath(relative).parts
                 or relative in paths
             ):
-                raise StageError("TinyKG bundle artifact paths must be unique and relative")
+                raise StageError(
+                    "TinyKG bundle artifact paths must be unique portable POSIX paths"
+                )
             if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
                 raise StageError("TinyKG bundle artifact SHA-256 is invalid")
             if binary_format not in ARTIFACT_FORMATS:
@@ -287,7 +293,13 @@ def inspect_binary(
 
 
 def _validate_elf(data: bytes, architectures: tuple[str, ...]) -> None:
-    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+    if (
+        len(data) < 64
+        or data[:7] != b"\x7fELF\x02\x01\x01"
+        or struct.unpack("<H", data[16:18])[0] != 2
+        or struct.unpack("<I", data[20:24])[0] != 1
+        or struct.unpack("<H", data[52:54])[0] != 64
+    ):
         raise StageError("TinyKG bundle expected a 64-bit little-endian ELF binary")
     expected_machine = {"x86_64": 62, "aarch64": 183}
     if len(architectures) != 1 or struct.unpack("<H", data[18:20])[0] != expected_machine[
@@ -297,15 +309,33 @@ def _validate_elf(data: bytes, architectures: tuple[str, ...]) -> None:
     program_offset = struct.unpack("<Q", data[32:40])[0]
     entry_size = struct.unpack("<H", data[54:56])[0]
     entry_count = struct.unpack("<H", data[56:58])[0]
-    if entry_size != 56 or program_offset + entry_size * entry_count > len(data):
+    if (
+        entry_size != 56
+        or entry_count == 0
+        or program_offset + entry_size * entry_count > len(data)
+    ):
         raise StageError("TinyKG ELF program-header table is invalid")
+    saw_load = False
     for index in range(entry_count):
         offset = program_offset + index * entry_size
-        if struct.unpack("<I", data[offset : offset + 4])[0] == 3:
-            raise StageError("TinyKG Linux bundle must be static and contain no PT_INTERP")
+        program_type = struct.unpack("<I", data[offset : offset + 4])[0]
+        file_offset = struct.unpack("<Q", data[offset + 8 : offset + 16])[0]
+        file_size = struct.unpack("<Q", data[offset + 32 : offset + 40])[0]
+        if file_offset + file_size > len(data):
+            raise StageError("TinyKG ELF program segment exceeds the file")
+        saw_load = saw_load or program_type == 1
+        if program_type in {2, 3}:
+            raise StageError(
+                "TinyKG Linux bundle must be static and contain no PT_DYNAMIC/PT_INTERP"
+            )
+    if not saw_load:
+        raise StageError("TinyKG Linux bundle contains no loadable program segment")
 
 
-def _validate_mach_o_universal(data: bytes, architectures: tuple[str, ...]) -> None:
+def _validate_mach_o_universal(
+    data: bytes,
+    architectures: tuple[str, ...],
+) -> tuple[tuple[int, int], ...]:
     if len(data) < 48 or data[:4] != b"\xca\xfe\xba\xbe":
         raise StageError("TinyKG bundle expected a universal Mach-O binary")
     count = struct.unpack(">I", data[4:8])[0]
@@ -313,15 +343,61 @@ def _validate_mach_o_universal(data: bytes, architectures: tuple[str, ...]) -> N
         raise StageError("TinyKG universal Mach-O header is invalid")
     cpu_names = {0x01000007: "x86_64", 0x0100000C: "aarch64"}
     observed: set[str] = set()
+    slices: list[tuple[int, int]] = []
     for index in range(count):
         entry = 8 + index * 20
         cpu = struct.unpack(">I", data[entry : entry + 4])[0]
         slice_offset, slice_size = struct.unpack(">II", data[entry + 8 : entry + 16])
-        if cpu not in cpu_names or slice_size == 0 or slice_offset + slice_size > len(data):
+        alignment = struct.unpack(">I", data[entry + 16 : entry + 20])[0]
+        if (
+            cpu not in cpu_names
+            or slice_size < 32
+            or slice_offset + slice_size > len(data)
+            or alignment > 30
+            or slice_offset % (1 << alignment) != 0
+        ):
             raise StageError("TinyKG universal Mach-O slice is invalid")
+        if data[slice_offset : slice_offset + 4] != b"\xcf\xfa\xed\xfe":
+            raise StageError("TinyKG universal Mach-O slice is not a 64-bit Mach-O")
+        if struct.unpack("<I", data[slice_offset + 4 : slice_offset + 8])[0] != cpu:
+            raise StageError("TinyKG universal Mach-O slice CPU disagrees with its fat table")
+        if struct.unpack("<I", data[slice_offset + 12 : slice_offset + 16])[0] != 2:
+            raise StageError("TinyKG universal Mach-O slice is not an executable")
+        command_count = struct.unpack(
+            "<I", data[slice_offset + 16 : slice_offset + 20]
+        )[0]
+        command_bytes = struct.unpack(
+            "<I", data[slice_offset + 20 : slice_offset + 24]
+        )[0]
+        command_start = slice_offset + 32
+        command_end = command_start + command_bytes
+        if command_count == 0 or command_end > slice_offset + slice_size:
+            raise StageError("TinyKG universal Mach-O load-command table is invalid")
+        cursor = command_start
+        macos_build = False
+        for _ in range(command_count):
+            if cursor + 8 > command_end:
+                raise StageError("TinyKG universal Mach-O load command is truncated")
+            command, command_size = struct.unpack("<II", data[cursor : cursor + 8])
+            if command_size < 8 or command_size % 8 != 0 or cursor + command_size > command_end:
+                raise StageError("TinyKG universal Mach-O load command is invalid")
+            if command == 0x32:
+                if command_size < 24 or struct.unpack(
+                    "<I", data[cursor + 8 : cursor + 12]
+                )[0] != 1:
+                    raise StageError("TinyKG universal Mach-O build target is not macOS")
+                macos_build = True
+            cursor += command_size
+        if cursor != command_end or not macos_build:
+            raise StageError("TinyKG universal Mach-O lacks a canonical macOS build command")
         observed.add(cpu_names[cpu])
+        slices.append((slice_offset, slice_offset + slice_size))
+    slices.sort()
+    if any(left[1] > right[0] for left, right in zip(slices, slices[1:])):
+        raise StageError("TinyKG universal Mach-O slices overlap")
     if observed != set(architectures) or count != len(architectures):
         raise StageError("TinyKG universal Mach-O architectures do not match its manifest")
+    return tuple(slices)
 
 
 def _validate_pe(data: bytes, architectures: tuple[str, ...]) -> None:
@@ -332,11 +408,22 @@ def _validate_pe(data: bytes, architectures: tuple[str, ...]) -> None:
         raise StageError("TinyKG Windows PE signature is invalid")
     if struct.unpack("<H", data[pe_offset + 4 : pe_offset + 6])[0] != 0x8664:
         raise StageError("TinyKG Windows PE architecture is not x86_64")
+    section_count = struct.unpack("<H", data[pe_offset + 6 : pe_offset + 8])[0]
     optional_size = struct.unpack("<H", data[pe_offset + 20 : pe_offset + 22])[0]
-    if optional_size < 2 or pe_offset + 24 + optional_size > len(data):
+    characteristics = struct.unpack("<H", data[pe_offset + 22 : pe_offset + 24])[0]
+    if (
+        section_count == 0
+        or characteristics & 0x0002 == 0
+        or optional_size < 2
+        or pe_offset + 24 + optional_size + section_count * 40 > len(data)
+    ):
         raise StageError("TinyKG Windows PE optional header is invalid")
     if struct.unpack("<H", data[pe_offset + 24 : pe_offset + 26])[0] != 0x20B:
         raise StageError("TinyKG Windows binary is not PE32+")
+    if optional_size < 70 or struct.unpack(
+        "<H", data[pe_offset + 92 : pe_offset + 94]
+    )[0] != 3:
+        raise StageError("TinyKG Windows binary is not a console executable")
 
 
 def validate_bundle_bytes(
@@ -345,17 +432,26 @@ def validate_bundle_bytes(
     contract: TinyKgContract,
 ) -> BinaryIdentity:
     _validate_regular_binary(binary, artifact.sha256)
-    data = binary.read_bytes()
+    try:
+        data = binary.read_bytes()
+    except OSError as exc:
+        raise StageError(f"cannot read TinyKG bundle binary: {exc}") from exc
+    mach_slices: tuple[tuple[int, int], ...] = ()
     if artifact.binary_format == "elf-static":
         _validate_elf(data, artifact.architectures)
     elif artifact.binary_format == "mach-o-universal":
-        _validate_mach_o_universal(data, artifact.architectures)
+        mach_slices = _validate_mach_o_universal(data, artifact.architectures)
     elif artifact.binary_format == "pe":
         _validate_pe(data, artifact.architectures)
     else:  # TinyKgBundle.load makes this state unrepresentable.
         raise AssertionError(artifact.binary_format)
     version_line = f"tinykg {contract.tinykg_version}"
-    if version_line.encode("utf-8") not in data:
+    version_marker = version_line.encode("utf-8")
+    if mach_slices and any(
+        version_marker not in data[start:end] for start, end in mach_slices
+    ):
+        raise StageError(f"TinyKG version marker is missing from a Mach-O slice: {version_line}")
+    if not mach_slices and version_marker not in data:
         raise StageError(f"TinyKG version marker is missing: {version_line}")
     return BinaryIdentity(binary, artifact.sha256, version_line)
 
@@ -397,7 +493,7 @@ def validate_store_contract(identity: BinaryIdentity, contract: TinyKgContract) 
             )
 
 
-def _atomic_copy(source: Path, destination: Path) -> None:
+def _atomic_copy(source: Path, destination: Path, expected_sha256: str) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", dir=destination.parent
@@ -410,6 +506,12 @@ def _atomic_copy(source: Path, destination: Path) -> None:
             os.fsync(target.fileno())
         if os.name != "nt":
             temporary.chmod(source.stat().st_mode & 0o777)
+        observed = sha256_file(temporary)
+        if observed != expected_sha256:
+            raise StageError(
+                "TinyKG source changed while staging: "
+                f"expected {expected_sha256}, observed {observed}"
+            )
         os.replace(temporary, destination)
     finally:
         try:
@@ -448,9 +550,7 @@ def _publish(
     bundle_key: str | None = None,
     source_commit: str | None = None,
 ) -> None:
-    _atomic_copy(identity.path, output)
-    if sha256_file(output) != identity.sha256:
-        raise StageError("staged TinyKG bytes changed during copy")
+    _atomic_copy(identity.path, output, identity.sha256)
     value: dict[str, object] = {
         "binary_sha256": identity.sha256,
         "binary_version": identity.version_line,
@@ -580,7 +680,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output=args.output,
                 receipt=args.receipt,
             )
-    except StageError as exc:
+    except (OSError, StageError) as exc:
         print(f"stage-tinykg: error: {exc}", file=os.sys.stderr)
         return 1
     return 0

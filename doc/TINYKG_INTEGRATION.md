@@ -39,9 +39,13 @@ Every stage verifies:
 1. regular, non-symlink executable input;
 2. build-table digest equals the bundle manifest digest;
 3. complete SHA-256 of the asset;
-4. executable format and declared architectures;
+4. executable format and declared architectures: static ELF rejects dynamic
+   program headers, universal Mach-O validates each non-overlapping slice, and
+   Windows requires an x86_64 PE32+ console subsystem;
 5. an embedded exact `tinykg 0.2.0` version marker;
-6. target-family ownership.
+6. target-family ownership;
+7. a second digest over the private staging temporary before atomic replacement,
+   so a source-path race cannot replace the last known-good output.
 
 When the selected bundle can execute on the build host, staging additionally runs
 `tinykg version`, initializes a fresh temporary store, and checks storage/schema
@@ -123,6 +127,9 @@ export METACODES_KG_STORE=/fresh/private/store.kg
 ```
 
 The exclusive CLI mode must not point at the canonical shared store.
+Automatic staged lookup is limited to `<prefix>/bin` and
+`<prefix>/eval/bin` executable layouts. It never walks arbitrary ancestors in
+search of a `vendor/` directory.
 
 ## Ownership and prompt-cache boundary
 

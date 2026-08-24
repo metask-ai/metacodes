@@ -9,9 +9,14 @@ import tempfile
 import unittest
 
 from scripts.stage_tinykg_binary import (
+    BinaryIdentity,
+    BundleArtifact,
     StageError,
     TinyKgBundle,
     TinyKgContract,
+    _publish,
+    _validate_mach_o_universal,
+    _validate_pe,
     stage,
     stage_bundled,
     validate_bundle_bytes,
@@ -54,16 +59,25 @@ class TinyKgBinaryStageTest(unittest.TestCase):
         path.write_text(json.dumps(value), encoding="utf-8")
         return path
 
-    def bundled_elf(self, root: Path, *, machine: int = 62) -> Path:
+    def bundled_elf(
+        self,
+        root: Path,
+        *,
+        machine: int = 62,
+        program_type: int = 1,
+    ) -> Path:
         binary = root / "bin/tinykg-linux-x86_64"
         binary.parent.mkdir(parents=True)
         data = bytearray(256)
-        data[:6] = b"\x7fELF\x02\x01"
+        data[:7] = b"\x7fELF\x02\x01\x01"
+        data[16:18] = struct.pack("<H", 2)
         data[18:20] = struct.pack("<H", machine)
+        data[20:24] = struct.pack("<I", 1)
         data[32:40] = struct.pack("<Q", 64)
+        data[52:54] = struct.pack("<H", 64)
         data[54:56] = struct.pack("<H", 56)
         data[56:58] = struct.pack("<H", 1)
-        data[64:68] = struct.pack("<I", 1)
+        data[64:68] = struct.pack("<I", program_type)
         data[160 : 160 + len(b"tinykg 0.2.0")] = b"tinykg 0.2.0"
         binary.write_bytes(data)
         binary.chmod(0o700)
@@ -270,6 +284,89 @@ class TinyKgBinaryStageTest(unittest.TestCase):
                     receipt=root / "out/receipt.json",
                 )
 
+    def test_bundled_elf_rejects_dynamic_program_header(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = self.bundled_elf(root, program_type=2)
+            artifact = BundleArtifact(
+                key="linux-x86_64",
+                path="bin/tinykg-linux-x86_64",
+                sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                binary_format="elf-static",
+                architectures=("x86_64",),
+                targets=("x86_64-linux",),
+            )
+            with self.assertRaisesRegex(StageError, "PT_DYNAMIC"):
+                validate_bundle_bytes(
+                    binary.resolve(),
+                    artifact,
+                    TinyKgContract.load(self.contract(root)),
+                )
+
+    def test_mach_o_fat_table_cannot_impersonate_slice_cpu(self) -> None:
+        data = bytearray(512)
+        data[:8] = b"\xca\xfe\xba\xbe" + struct.pack(">I", 1)
+        data[8:28] = struct.pack(">IIIII", 0x01000007, 3, 256, 64, 8)
+        data[256:260] = b"\xcf\xfa\xed\xfe"
+        data[260:264] = struct.pack("<I", 0x0100000C)
+        data[268:272] = struct.pack("<I", 2)
+        with self.assertRaisesRegex(StageError, "CPU disagrees"):
+            _validate_mach_o_universal(bytes(data), ("x86_64",))
+
+    def test_mach_o_overlapping_slices_are_rejected(self) -> None:
+        data = bytearray(1024)
+        data[:8] = b"\xca\xfe\xba\xbe" + struct.pack(">I", 2)
+        data[8:28] = struct.pack(">IIIII", 0x01000007, 3, 256, 512, 8)
+        data[28:48] = struct.pack(">IIIII", 0x0100000C, 0, 512, 256, 8)
+        for offset, cpu in ((256, 0x01000007), (512, 0x0100000C)):
+            data[offset : offset + 4] = b"\xcf\xfa\xed\xfe"
+            data[offset + 4 : offset + 8] = struct.pack("<I", cpu)
+            data[offset + 12 : offset + 16] = struct.pack("<I", 2)
+            data[offset + 16 : offset + 20] = struct.pack("<I", 1)
+            data[offset + 20 : offset + 24] = struct.pack("<I", 24)
+            data[offset + 32 : offset + 56] = struct.pack(
+                "<IIIIII", 0x32, 24, 1, 0x000B0000, 0, 0
+            )
+        with self.assertRaisesRegex(StageError, "overlap"):
+            _validate_mach_o_universal(bytes(data), ("x86_64", "aarch64"))
+
+    def test_windows_gui_subsystem_is_rejected(self) -> None:
+        data = bytearray(512)
+        data[:2] = b"MZ"
+        data[0x3C:0x40] = struct.pack("<I", 128)
+        data[128:132] = b"PE\0\0"
+        data[132:134] = struct.pack("<H", 0x8664)
+        data[134:136] = struct.pack("<H", 1)
+        data[148:150] = struct.pack("<H", 112)
+        data[150:152] = struct.pack("<H", 0x0002)
+        data[152:154] = struct.pack("<H", 0x20B)
+        data[220:222] = struct.pack("<H", 2)
+        with self.assertRaisesRegex(StageError, "console"):
+            _validate_pe(bytes(data), ("x86_64",))
+
+    def test_publish_rejects_source_drift_without_replacing_last_good_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "tinykg"
+            source.write_bytes(b"changed-after-inspection")
+            source.chmod(0o700)
+            output = root / "out/tinykg"
+            output.parent.mkdir(parents=True)
+            output.write_bytes(b"last-good")
+            receipt = root / "out/receipt.json"
+            identity = BinaryIdentity(source, "0" * 64, "tinykg 0.2.0")
+            with self.assertRaisesRegex(StageError, "changed while staging"):
+                _publish(
+                    identity,
+                    TinyKgContract.load(self.contract(root)),
+                    "native",
+                    output,
+                    receipt,
+                    "explicit",
+                )
+            self.assertEqual(b"last-good", output.read_bytes())
+            self.assertFalse(receipt.exists())
+
     def test_bundle_manifest_rejects_duplicate_target_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -305,6 +402,37 @@ class TinyKgBinaryStageTest(unittest.TestCase):
             manifest.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(StageError, "target and architecture"):
                 TinyKgBundle.load(manifest)
+
+    def test_bundle_manifest_rejects_nonportable_artifact_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = self.bundled_elf(root)
+            manifest = self.manifest(root, binary)
+            value = json.loads(manifest.read_text(encoding="utf-8"))
+            value["artifacts"][0]["path"] = "bin\\tinykg"
+            manifest.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(StageError, "portable POSIX"):
+                TinyKgBundle.load(manifest)
+
+    def test_bundle_manifest_rejects_windows_drive_path_on_every_host(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = self.bundled_elf(root)
+            manifest = self.manifest(root, binary)
+            value = json.loads(manifest.read_text(encoding="utf-8"))
+            value["artifacts"][0]["path"] = "C:/tinykg.exe"
+            manifest.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(StageError, "portable POSIX"):
+                TinyKgBundle.load(manifest)
+
+    def test_checked_in_universal_contains_version_marker_in_every_slice(self) -> None:
+        manifest_path = PROJECT_ROOT / "vendor/tinykg/manifest.json"
+        bundle = TinyKgBundle.load(manifest_path)
+        artifact = bundle.artifact("macos-universal")
+        binary = (manifest_path.parent / artifact.path).read_bytes()
+        slices = _validate_mach_o_universal(binary, artifact.architectures)
+        marker = b"tinykg 0.2.0"
+        self.assertTrue(all(marker in binary[start:end] for start, end in slices))
 
 
 class CheckedInTinyKgBundleTest(unittest.TestCase):

@@ -4314,23 +4314,26 @@ def prepare_feedback_environment(repo: Path) -> dict[str, str]:
     """Bind every feedback process to one verified native TinyKG input."""
 
     try:
-        from scripts.stage_tinykg_binary import (
-            TinyKgBundle,
-            TinyKgContract,
-            inspect_binary,
-            validate_bundle_bytes,
-            validate_store_contract,
-        )
-        from scripts.verify_tinykg_binary import native_bundle_key
-    except ModuleNotFoundError:  # Direct `python scripts/rule_control.py` execution.
-        from stage_tinykg_binary import (  # type: ignore[no-redef]
-            TinyKgBundle,
-            TinyKgContract,
-            inspect_binary,
-            validate_bundle_bytes,
-            validate_store_contract,
-        )
-        from verify_tinykg_binary import native_bundle_key  # type: ignore[no-redef]
+        try:
+            from scripts.stage_tinykg_binary import (
+                TinyKgBundle,
+                TinyKgContract,
+                inspect_binary,
+                validate_bundle_bytes,
+                validate_store_contract,
+            )
+            from scripts.verify_tinykg_binary import native_bundle_key
+        except ModuleNotFoundError:  # Direct `python scripts/rule_control.py` execution.
+            from stage_tinykg_binary import (  # type: ignore[no-redef]
+                TinyKgBundle,
+                TinyKgContract,
+                inspect_binary,
+                validate_bundle_bytes,
+                validate_store_contract,
+            )
+            from verify_tinykg_binary import native_bundle_key  # type: ignore[no-redef]
+    except ImportError as exc:
+        raise ControlError(f"TinyKG feedback verifier cannot be imported: {exc}") from exc
 
     env = os.environ.copy()
     path_raw = env.get("METACODES_TEST_TINYKG_BIN") or None

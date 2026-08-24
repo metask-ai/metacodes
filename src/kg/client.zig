@@ -435,7 +435,7 @@ pub const KgClient = struct {
         return std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/store.kg", .{opts.home});
     }
 
-    /// bin 查找顺序:env METACODES_KG_BIN > config kg_bin > 由维护者显式 staged 的
+    /// bin 查找顺序:env METACODES_KG_BIN > config kg_bin > 构建时 staged 的
     /// 相邻 `vendor/tinykg/tinykg`（由目标匹配的 checked-in bundle staged）。
     /// 没有 PATH、源码树或开发 checkout 回退。
     /// 每候选 access 检查,全失败返 null(→ ensureReady 判 degraded)。
@@ -454,11 +454,12 @@ pub const KgClient = struct {
             if (v.len > 0 and isExecutable(v)) return try allocator.dupe(u8, v);
             if (v.len > 0) return null;
         }
-        // staged:真实 exe 目录(opts.exe_dir 为测试注入覆盖;否则 OS 级 selfExeDir)向上搜。
+        // staged:真实 exe 目录(opts.exe_dir 为测试注入覆盖;否则 OS 级 selfExeDir)
+        // 只接受已声明的 install/eval 相邻布局，不做开放式祖先搜索。
         var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
         const exe_dir: ?[]const u8 = opts.exe_dir orelse selfExeDir(&exe_buf);
         if (exe_dir) |dir| {
-            if (try findStagedUpward(allocator, dir)) |p| return p;
+            if (try findStagedAdjacent(allocator, dir)) |p| return p;
         }
         return null;
     }
@@ -482,17 +483,28 @@ pub const KgClient = struct {
         return buf[0..dir.len];
     }
 
-    /// 自 start_dir 向上逐级(≤6 级)找 `<dir>/vendor/tinykg/tinykg[.exe]`。
-    /// zig-out/bin 布局需上溯两级到 prefix;安装布局 <prefix>/bin 上溯一级到 <prefix>/vendor。
-    fn findStagedUpward(allocator: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
+    /// 仅接受两种构建声明的布局：
+    /// - `<prefix>/bin/metacodes` → `<prefix>/vendor/tinykg/tinykg`
+    /// - `<prefix>/eval/bin/metacodes-*` → 同一 `<prefix>/vendor/...`
+    /// 不继续走向任意祖先，避免系统 `/vendor` 或相邻项目冒充 staged artifact。
+    fn stagedSearchRoots(start_dir: []const u8, roots: *[2][]const u8) usize {
+        const parent = std.fs.path.dirname(start_dir) orelse return 0;
+        roots[0] = parent;
+        if (std.mem.eql(u8, std.fs.path.basename(parent), "eval")) {
+            roots[1] = std.fs.path.dirname(parent) orelse return 1;
+            return 2;
+        }
+        return 1;
+    }
+
+    fn findStagedAdjacent(allocator: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
         const bin_name = if (@import("builtin").os.tag == .windows) "tinykg.exe" else "tinykg";
-        var cur: []const u8 = start_dir;
-        var level: usize = 0;
-        while (level < 6) : (level += 1) {
-            const cand = try std.fmt.allocPrint(allocator, "{s}/vendor/tinykg/{s}", .{ cur, bin_name });
+        var roots: [2][]const u8 = undefined;
+        const root_count = stagedSearchRoots(start_dir, &roots);
+        for (roots[0..root_count]) |root| {
+            const cand = try std.fmt.allocPrint(allocator, "{s}/vendor/tinykg/{s}", .{ root, bin_name });
             if (isExecutable(cand)) return cand;
             allocator.free(cand);
-            cur = std.fs.path.dirname(cur) orelse break;
         }
         return null;
     }
@@ -3004,6 +3016,22 @@ test "bin 解析:没有 staged artifact 时绝不回退 PATH 或开发 checkout"
     });
     defer c.deinit();
     try testing.expect(c.bin_path == null);
+}
+
+test "staged TinyKG 搜索只接受 install 和 eval 两种相邻布局" {
+    var roots: [2][]const u8 = undefined;
+    var count = KgClient.stagedSearchRoots("/opt/metacodes/bin", &roots);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqualStrings("/opt/metacodes", roots[0]);
+
+    count = KgClient.stagedSearchRoots("/opt/metacodes/eval/bin", &roots);
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqualStrings("/opt/metacodes/eval", roots[0]);
+    try testing.expectEqualStrings("/opt/metacodes", roots[1]);
+
+    count = KgClient.stagedSearchRoots("/tmp/a/b/c/bin", &roots);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqualStrings("/tmp/a/b/c", roots[0]);
 }
 
 test "classifyCliError 三类归一" {
