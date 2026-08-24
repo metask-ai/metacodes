@@ -435,6 +435,10 @@ pub const ToolContext = struct {
     /// Optional UI-independent counters shared by all execution depths in a
     /// session. Atomic fields make parallel tools/subagents safe observers.
     tool_result_metrics: ?*@import("../core/tool_result_metrics.zig").Metrics = null,
+    /// Run-level file-change journal (see core/file_change.zig). Carried here
+    /// only so that sub executions (Agent / Skill / TaskBatch) inherit the
+    /// parent's journal — a subagent's edits are still this Run's edits.
+    file_change_journal: ?*@import("../core/file_change.zig").Journal = null,
     /// 当前 session plan 文件全路径(ExitPlanMode 模型未传 plan 时从此读回兜底)。空=无。
     plan_file_path: []const u8 = "",
     /// 末轮助手消息里提取的 `<proposed_plan>` 内容(agent_loop 在 plan 模式末轮填;
@@ -473,6 +477,11 @@ pub const ToolContext = struct {
     project_rule_gate: ?ProjectRuleGate = null,
     tool_observation_origin: ToolObservationOrigin = .authoritative,
     effect_slot: ?*@import("observation.zig").EffectSlot = null,
+    /// Stable file-modification reporting channel (see core/file_change.zig).
+    /// `executeOne` installs one per dispatch; a file tool publishes one draft
+    /// per affected file. Absent (direct unit calls / legacy embedders) this is
+    /// a no-op, exactly like `effect_slot`.
+    file_change_sink: ?@import("../core/file_change.zig").Sink = null,
     /// executeOne sets this only after a formal gate admits a Write whose
     /// target was observed missing.  Write then uses O_EXCL so a file created
     /// in the observation-to-open window is not silently truncated.
@@ -535,6 +544,15 @@ pub const ToolContext = struct {
         const slot = self.effect_slot orelse return;
         const effect = @import("observation.zig").fileMutation(path, before, after).file_mutation_v1;
         slot.recordFileMutation(path, effect);
+    }
+
+    /// Publish one file's actual modification on the supported contract. This
+    /// is a report, not an authorization: it grants nothing and it does not
+    /// replace the tool's own result rendering. Slices may live in the tool's
+    /// arena — the collector copies what it keeps before returning.
+    pub fn reportFileChange(self: *const ToolContext, draft: @import("../core/file_change.zig").Draft) void {
+        const sink = self.file_change_sink orelse return;
+        sink.publish(draft);
     }
 
     pub fn isPrefetchSafe(self: *const ToolContext, name: []const u8) bool {

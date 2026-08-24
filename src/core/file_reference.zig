@@ -87,6 +87,20 @@ pub fn resolveFileTarget(
         common.extractJsonArg(input, "path") orelse return null;
     const raw = try json_util.unescapeString(escaped, allocator);
     defer allocator.free(raw);
+    return classifyPath(allocator, ctx, raw, state);
+}
+
+/// Classify one already-unescaped path string under the same normalization
+/// policy as the native tools. Split out of `resolveFileTarget` so that a
+/// producer holding a resolved path (rather than a tool-input JSON blob) —
+/// notably the file-change contract — classifies locators identically instead
+/// of re-deriving the rule.
+pub fn classifyPath(
+    allocator: std.mem.Allocator,
+    ctx: *const ToolContext,
+    raw: []const u8,
+    state: @import("../tools/observation.zig").FileTargetState,
+) !?ResolvedFileTarget {
     if (raw.len == 0) return null;
 
     if (std.mem.indexOf(u8, raw, "://")) |_| {

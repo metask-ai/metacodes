@@ -316,6 +316,14 @@ pub const App = struct {
     /// Internal-only large-result projection/recovery counters. Evaluation
     /// and formal observation adapters may snapshot these; no UI owns them.
     tool_result_metrics: @import("core/tool_result_metrics.zig").Metrics = .{},
+    /// 本 session 的文件修改结果账本(见 core/file_change.zig)。Run 及其子执行产生的每条
+    /// 文件修改都记这里,上层无需解析 tool_result 里工具私有的 gitDiff。
+    ///
+    /// **c_allocator 而非 app.allocator**:后台 subagent / swarm teammate 线程共享这个账本指针
+    /// 并会往里写(见 agent.zig 三处 spawn 的 file_change_journal 透传)。Journal 的 mutex 只
+    /// 串行化它自己的调用,串行化不了 allocator;App GPA 非线程安全(teammate.zig 头注已立此
+    /// 铁律),拿它给 teammate 线程用就是堆损坏。init 在下面补上。
+    file_change_journal: @import("core/file_change.zig").Journal = .{ .allocator = undefined },
     /// 从 config.json 加载的细粒度权限规则；null 时仅靠四模式兜底
     rule_set: ?permission_mod.RuleSet = null,
     /// 5 层 settings 聚合(allow/ask/deny + additionalDirectories + disable flags)。
@@ -428,6 +436,7 @@ pub const App = struct {
             else
                 @import("core/session_id.zig").gen(),
             .conversation = Conversation.init(allocator),
+            .file_change_journal = @import("core/file_change.zig").Journal.init(std.heap.c_allocator),
             .api_client = client_mod.Client.initWithBaseUrl(allocator, io, api_key, config.model, config.base_url),
             .tool_defs = &.{}, // 占位，下面重建
             .permission_ctx = permission_mod.createContext(config.permission_mode, allocator),
@@ -791,6 +800,7 @@ pub const App = struct {
         if (app.pending_previous_model_for_compact) |m| app.allocator.free(m);
         if (app.openai_client) |*oc| oc.deinit();
         if (app.gemini_client) |*gc| gc.deinit();
+        app.file_change_journal.deinit();
         app.conversation.deinit();
         if (app.kg) |*k| k.deinit();
         if (app.kg_projects_dir.len > 0) app.allocator.free(app.kg_projects_dir);
@@ -2249,6 +2259,7 @@ test "U2 S1: compactWindow 结构化返回 {dropped,before,after}(loop/web 共�
     const a = std.testing.allocator;
     var app: App = undefined;
     app.conversation = Conversation.init(a);
+    app.file_change_journal = @import("core/file_change.zig").Journal.init(std.heap.c_allocator);
     defer app.conversation.deinit();
     // 空对话:compact 无可丢 → dropped=0, before=after=0(投影语义,活跃计数)
     const r = app.compactWindow();

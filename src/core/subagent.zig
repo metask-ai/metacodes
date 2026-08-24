@@ -110,6 +110,7 @@ pub const SpawnOptions = struct {
     /// must pass a job-owned copy.
     artifact_root: []const u8 = "",
     tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
+    file_change_journal: ?*@import("file_change.zig").Journal = null,
     additional_dirs: []const []const u8 = &.{},
     /// AgentDef.mcpServers 过滤后的 session 视图。
     mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
@@ -251,6 +252,7 @@ pub fn spawnAgentSink(
             .home_dir = opts.home_dir,
             .artifact_root = opts.artifact_root,
             .tool_result_metrics = opts.tool_result_metrics,
+            .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
             .mcp_sessions = opts.mcp_sessions,
         },

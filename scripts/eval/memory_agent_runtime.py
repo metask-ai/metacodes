@@ -1351,18 +1351,70 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
         "text",
     }
     cache_fields = {"cache_read_input_tokens", "cache_creation_input_tokens"}
+    # Output semantics (text_kind) and the file-change contract are emitted by
+    # every current build. Older receipts predate them, so replay fills the
+    # defaults rather than rejecting the row -- same rule as cache telemetry.
+    semantic_fields = {"text_kind", "file_changes"}
+
+    def _semantic_defaults(row):
+        # A pre-contract receipt carries text but no classification. Defaulting
+        # it to "none" would make the row claim there was no visible output
+        # while carrying some -- exactly the self-contradiction the check below
+        # rejects. "unclassified" is the honest label for it.
+        return {
+            "text_kind": "unclassified" if row.get("text") else "none",
+            "file_changes": {
+                "schema_version": "metacodes-file-change-v1",
+                "truncated": False,
+                "changes": [],
+            },
+        }
+
     observed_fields = set(result)
-    if observed_fields == legacy_fields:
+    if observed_fields in (legacy_fields, legacy_fields | cache_fields):
         # Historical receipts predate public cache telemetry. Preserve replay
         # compatibility without accepting a partially upgraded schema.
         result = dict(result)
+        result.update({key: 0 for key in cache_fields if key not in result})
+        result.update(_semantic_defaults(result))
+    elif observed_fields == legacy_fields | semantic_fields:
+        result = dict(result)
         result.update({key: 0 for key in cache_fields})
-    elif observed_fields != legacy_fields | cache_fields:
-        expected = legacy_fields | cache_fields
+    elif observed_fields != legacy_fields | cache_fields | semantic_fields:
+        expected = legacy_fields | cache_fields | semantic_fields
         _fail(
             "native metacodes result",
             f"unexpected fields: {sorted(observed_fields ^ expected)}",
         )
+    if not isinstance(result["text_kind"], str) or result["text_kind"] not in (
+        "final",
+        "partial",
+        "unclassified",
+        "none",
+    ):
+        _fail(
+            "native metacodes result.text_kind",
+            "expected one of final/partial/unclassified/none",
+        )
+    if result["text_kind"] == "none" and result["text"]:
+        # "none" claims there was no visible output; emitting text alongside it
+        # would make the receipt contradict itself.
+        _fail(
+            "native metacodes result.text_kind",
+            "text_kind=none but text is non-empty",
+        )
+    changes = result["file_changes"]
+    if not isinstance(changes, dict):
+        _fail("native metacodes result.file_changes", "expected envelope object")
+    if changes.get("schema_version") != "metacodes-file-change-v1":
+        _fail(
+            "native metacodes result.file_changes.schema_version",
+            "expected metacodes-file-change-v1",
+        )
+    if not isinstance(changes.get("truncated"), bool):
+        _fail("native metacodes result.file_changes.truncated", "expected bool")
+    if not isinstance(changes.get("changes"), list):
+        _fail("native metacodes result.file_changes.changes", "expected array")
     if not isinstance(result["stop_reason"], str) or not result["stop_reason"]:
         _fail("native metacodes result.stop_reason", "expected non-empty string")
     for key in (

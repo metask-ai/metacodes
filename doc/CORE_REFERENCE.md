@@ -126,6 +126,12 @@ pub const CoreEvent = union(enum) {
     auto_compact: struct { dropped, kept },       // 自动压缩历史
     retry_notice: struct { attempt, max, delay_ms }, // 流式建连重试
     ui_request_pending: struct { tool_use_id, request_json }, // 可挂起 UI 请求(异步前端,见 §5.3)
+
+    // 输出语义(见 §3.2.1)
+    output_segment_begin: struct { index, turn, group },
+    output_segment_end: struct { index, turn, group, disposition, bytes },
+    // 文件修改结果(见 §3.2.2)
+    file_changes: struct { id, name, changes, overflow, lost },
 };
 ```
 
@@ -133,6 +139,52 @@ pub const CoreEvent = union(enum) {
 TTS 会话、LED 可亮灯),`set_current_tool` = "正在执行某工具"(语音可播报、按钮设备可亮工作灯)。
 命名带历史 TUI 味,但语义中立。**前端只处理自己关心的变体,其余 `=> {}`**(参考 WriterBackend
 no-op 了 set_current_tool/tool_progress/usage 等)。新增变体不会破坏现有 backend(各自 no-op)。
+
+#### 3.2.1 输出语义:哪段文本才是答案(`core/output_semantics.zig`)
+
+`text_chunk` 只说"有文本到了";`stream_done` 只说"一次 provider stream 结束"——**它从来不是
+完成信号**(每轮工具调用、每次续写、每次流内重试都会发一个)。前端若只看这两者,必须自建
+"什么算 final"的状态机,而且每个前端会得出不同答案。
+
+core 因此把它**已经知道**的判定发出来。一个 **段** = 一次 provider stream 的可见文本,
+`output_segment_begin` 开、`output_segment_end` 关(严格配对,至多一个打开),关闭时带定性:
+
+| disposition | 含义 |
+|-------------|------|
+| `commentary` | 可见过程信息(本轮跟着工具调用,或主机拒绝了这次"过早的最终答案") |
+| `final` | Run 的完成结果 |
+| `continued` | 被 max_tokens 截断,与**同 `group`** 的下一段合成一个结果 |
+| `partial` | 可见但未完成(abort / 预算终止 / 二次拒绝) |
+| `discarded` | 从未进入 Conversation(流内失败回滚),前端须丢弃已缓冲的该段字节 |
+
+`index` 在 Run 内单调,**被丢弃的段也占一个索引**("回滚过"与"没发生过"必须可区分)。
+`thinking_chunk` 不属于任何段——思考永不进入结果。
+
+不想消费事件的调用方挂 `Options.output_ledger: ?*output_semantics.Ledger`,run() 返回后直接
+`ledger.finalText()` / `partialText()`(续写组已拼好)。**账本不传给 subagent**:子 agent 的
+输出是父 Run 的工具结果,不是父 Run 的答案。
+
+#### 3.2.2 文件修改结果:实际改了什么(`core/file_change.zig`)
+
+`file_refs` 只说"碰了哪些文件";`tool_result.content` 里的 `gitDiff` 是**工具私有渲染字段**
+(Read 没有、各工具形状不同、结果落盘成 artifact 时会被信封替换)。要展示实际改动请用
+`file_changes` 事件,它**无条件发**(证据不是渲染——headless / subagent /
+`emit_tool_cards=false` 时同样发)。
+
+**时序**:本轮工具全部执行完后**一次性发**,早于本轮任何 `tool_result`——不是紧邻配对。
+挂起(UiPending)、host fatal、结果组装失败都可能发生在盘已经真的改过之后,证据放在所有分支
+之前才不会静默丢失。消费者按 `id` 与 tool_result 配对,不靠相邻。
+
+每条 `Record` 带 locator(与 `FileReference` 同一归一化)、`kind`(created/modified/deleted/
+moved)、`status`(applied/no_change/failed/rejected/partial)、`tool`+`tool_use_id`(与工具卡
+配对)、`agent_depth`(>0 = 子执行)、前后字节数、`unified_diff` 与 `diff_complete`。
+事件的 `overflow`/`lost` 表示本次报告不完整。
+
+`Options.file_change_journal: ?*file_change.Journal` 是 Run 级账本,**经 SpawnOptions 下传给
+子执行**(子 agent 的修改仍是本 Run 的修改)。带锁,读用 `acquire()/release()` 成对。
+`file_change.writeJsonEnvelope` 是进程外消费者的稳定线格式(`{schema_version, truncated, changes[]}`——版本由模块自己盖,不靠调用方约定)。
+
+**不覆盖** `Bash` 等任意命令造成的文件系统变化——本契约只管类型化文件工具,并明说这一点。
 
 ### 3.3 UiEvent — 前端告诉 core"用户做了什么"
 
@@ -227,7 +279,7 @@ stream ABI 都复用同一 CAS/receipt/`ReadArtifact` 恢复面。
   `model_override` `explicit_invocation` …
 - **DEPS(注入的依赖句柄)**:`abort` `read_state` `edit_hl_cache` `jobs` `agent_jobs` `tasks`
   `api_client` `tool_defs` `dyn_registry` `agents` `skills_set` `cron_registry` `sandbox`
-  `mcp_sessions` …
+  `mcp_sessions` `output_ledger`(§3.2.1) `file_change_journal`(§3.2.2) …
 - **SESSION/身份**:`session: SessionId` `session_id` `project_dir` `cwd_abs` `home_dir`
   `parent_model` `plan_file_path` `artifact_root` …
 - **接口回调(类型安全,见 §4.2)**:`usage_sink` `progress_reporter` `ui_requester`
@@ -340,6 +392,20 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
 - **输出粒度**:`text_chunk` 按 token 流。语音要整句、IM 要整条(限流)、LED 要终态——backend 可
   缓冲到 `stream_done` 再出(加性,backend 私事)。
 - **permission 门不可挂起**:权限确认是 `executeSlots` 前的同步门,异步挂起暂不覆盖(out of scope)。
+- **文件修改契约只覆盖类型化文件工具**(Write/Edit/NotebookEdit/ApplyPatch,§3.2.2)。`Bash` 或
+  任意终端命令改动文件系统**不会**产生 `file_changes`——要覆盖它需要文件系统级观测,不在本契约内。
+- **输出段兜底定性排在 `diag_run_end` 之后**(§3.2.1)。所有显式定性路径都在 run 收口前关闭段;
+  兜底(`defer` 把仍打开的段记为 `partial`)只在遗漏时生效,顺序因此靠后。
+- **`--stream-json` 已投影输出段定性**(`output_segment_begin/end` 行),但**未投影 file_changes**
+  ——那条事件带整段 diff,塞进逐行时间线会把流撑爆;需要文件修改的消费者走 `--json` 结果行的
+  `file_changes` 数组或直接消费 CoreEvent。TUI 对两组事件都 no-op(边流边渲染,不需要事后重标)。
+- **AgentCore 公共 C ABI 不导出这三条事件**(`output_segment_begin/end`、`file_changes`)。
+  facade 内部的 A1 projector **已经**消费 `output_segment_end` 来正确重建最终答案(它此前用
+  `stream_done` 收段,会把回滚重试的文本重复计入),消费者观察到的行为因此已修好;把原始事件
+  也导出去要动冻结的 C header + symbol gate + 版本与消费方签字,不在本次范围。
+- **ApplyPatch phase-1 校验失败**(解析错/定位不到/Add 撞已存在)只对**已建好计划**的文件报
+  `rejected`;触发失败的那个文件还没进计划表,只出现在工具错误 detail 里。整批零落盘,故没有
+  谎报,但目标清单不完整——登记而非假装完整。
 
 ---
 

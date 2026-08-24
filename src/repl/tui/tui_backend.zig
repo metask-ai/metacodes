@@ -288,6 +288,12 @@ pub const TuiBackend = struct {
                 // TUI 是同步前端(走阻塞 requestUi,恒 .answered,从不挂起)→ 此事件不会发给它,no-op。
             },
             .ui_request_resolved => {},
+            // 文件修改契约:TUI 的 diff 工具卡走既有 tool_result 渲染路径(见 tool_card),
+            // 这条是给进程外/程序化消费者的证据流,TUI no-op。
+            .file_changes => {},
+            // 输出语义定性:TUI 边流边渲染,已把文字写进 scrollback,不需要事后重标;
+            // 这两条是给需要区分 commentary/final 的消费者(web/headless/评测)的。
+            .output_segment_begin, .output_segment_end => {},
             // L4 诊断事件:DiagnosticsBackend 专属(经 TeeBackend 旁挂),TUI 不渲染,no-op。
             .diag_turn_begin, .diag_turn_end, .diag_model_request, .diag_compact_request, .diag_compact_begin, .diag_compact_end, .diag_tool_stage, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .context_projection, .policy_decision, .diag_run_end => {},
         }

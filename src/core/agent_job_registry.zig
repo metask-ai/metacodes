@@ -238,6 +238,7 @@ pub const SpawnParams = struct {
     home_dir: []const u8 = "",
     artifact_root: []const u8 = "",
     tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
+    file_change_journal: ?*@import("file_change.zig").Journal = null,
     additional_dirs: []const []const u8 = &.{},
     /// AgentDef.mcpServers 过滤后的 session 视图；registry 复制外层 slice，entry 本体借 App。
     mcp_sessions: []const @import("mcp_session.zig").McpSessionEntry = &.{},
@@ -282,6 +283,7 @@ const JobInput = struct {
     home_dir: []u8,
     artifact_root: []u8,
     tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics,
+    file_change_journal: ?*@import("file_change.zig").Journal,
     additional_dirs: [][]u8,
     memdir_owned: []u8,
     mcp_sessions_owned: []@import("mcp_session.zig").McpSessionEntry,
@@ -595,6 +597,7 @@ pub const AgentJobRegistry = struct {
             .home_dir = home_owned,
             .artifact_root = artifact_root_owned,
             .tool_result_metrics = p.tool_result_metrics,
+            .file_change_journal = p.file_change_journal,
             .additional_dirs = adirs_owned,
             .memdir_owned = memdir_owned,
             .mcp_sessions_owned = mcp_sessions_owned,
@@ -1067,6 +1070,7 @@ fn jobThreadMain(input: *JobInput) void {
         .home_dir = input.home_dir,
         .artifact_root = input.artifact_root,
         .tool_result_metrics = input.tool_result_metrics,
+        .file_change_journal = input.file_change_journal,
         .additional_dirs = input.additional_dirs,
         .mcp_sessions = &input.mcp_sessions_owned,
         // Ctrl+B 转后台:move 预建对话给 spawnAgentSink(它 defer deinit)。**move 后立即置 null**:

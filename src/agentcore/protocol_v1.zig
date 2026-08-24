@@ -112,6 +112,16 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
         .tasks_changed,
         .ui_request_pending,
         .ui_request_resolved,
+        // Output-semantics and file-change evidence stay internal **for now**.
+        // The AgentCore facade's own projector already consumes
+        // `output_segment_end` to reconstruct the final answer correctly, which
+        // is the behavior consumers actually observe. Exporting the raw events
+        // would widen a frozen C ABI (public header, symbol gate, version bump,
+        // consumer sign-off) — deliberately out of scope here, and registered as
+        // such in doc/CORE_REFERENCE.md §7 rather than left silent.
+        .output_segment_begin,
+        .output_segment_end,
+        .file_changes,
         => null,
     };
 }

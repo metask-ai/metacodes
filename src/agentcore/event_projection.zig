@@ -70,8 +70,11 @@ pub const Projector = struct {
         };
     }
 
-    /// Copy the last answer-group's closed segments. Any text in an unclosed
-    /// segment is provisional and is deliberately excluded.
+    /// Copy the last answer-group's closed segments — the segments the agent
+    /// loop classified as part of the completed result (`final` / `continued`).
+    /// Commentary written before a tool call, output from an interrupted Run,
+    /// and text from a rolled-back stream are all deliberately excluded, as is
+    /// any text in a still-open segment.
     pub fn appendFinalText(
         self: *Projector,
         out: *std.ArrayList(u8),
@@ -128,14 +131,23 @@ pub const Projector = struct {
                     self.reconstruction_error = error.OutOfMemory;
                 };
             },
-            .stream_done => {
-                self.closed_segments.appendSlice(
-                    self.allocator,
-                    self.current_segment.items,
-                ) catch {
-                    self.reconstruction_error = error.OutOfMemory;
-                    return;
-                };
+            // `stream_done` is NOT a completion signal: the loop emits one per
+            // provider stream, including for a turn it then rolls back and
+            // retries. Closing on it appended the rolled-back text *and* the
+            // retry's text, so the reconstructed answer contained a stale
+            // duplicate. Close on the loop's own classification instead — it is
+            // the only place that knows which segments are part of the answer.
+            .output_segment_end => |segment| {
+                if (segment.disposition.contributesToFinal()) {
+                    self.closed_segments.appendSlice(
+                        self.allocator,
+                        self.current_segment.items,
+                    ) catch {
+                        self.reconstruction_error = error.OutOfMemory;
+                        return;
+                    };
+                }
+                // commentary / partial / discarded are never the answer.
                 self.current_segment.clearRetainingCapacity();
             },
             .tool_start => |tool| {
@@ -269,6 +281,29 @@ fn feedFixture(backend: *const UiBackend) void {
     } });
 }
 
+
+/// Emit one visible segment exactly as `agent_loop` does: open, stream text,
+/// then close with the disposition the loop decided.
+fn feedSegment(
+    backend: *const UiBackend,
+    index: u32,
+    turn: u32,
+    group: u32,
+    text: []const u8,
+    disposition: core.output_semantics.Disposition,
+) void {
+    backend.emitEvent(.single, .{ .output_segment_begin = .{ .index = index, .turn = turn, .group = group } });
+    if (text.len > 0) backend.emitEvent(.single, .{ .text_chunk = text });
+    backend.emitEvent(.single, .stream_done);
+    backend.emitEvent(.single, .{ .output_segment_end = .{
+        .index = index,
+        .turn = turn,
+        .group = group,
+        .disposition = disposition,
+        .bytes = text.len,
+    } });
+}
+
 test "A1 joins continuation segments and ignores an unclosed tail" {
     var probe = EventProbe{};
     const downstream = probe.backend();
@@ -280,16 +315,52 @@ test "A1 joins continuation segments and ignores an unclosed tail" {
     defer projector.deinit();
     const backend = projector.backend();
 
-    backend.emitEvent(.single, .{ .text_chunk = "head" });
-    backend.emitEvent(.single, .stream_done);
-    backend.emitEvent(.single, .{ .text_chunk = "tail" });
-    backend.emitEvent(.single, .stream_done);
+    // max_tokens continuation: one logical answer split across two streams.
+    feedSegment(&backend, 0, 1, 0, "head", .continued);
+    feedSegment(&backend, 1, 1, 0, "tail", .final);
+    // A segment that is still open is provisional and must not be counted.
+    backend.emitEvent(.single, .{ .output_segment_begin = .{ .index = 2, .turn = 2, .group = 1 } });
     backend.emitEvent(.single, .{ .text_chunk = "provisional" });
 
     var final = std.ArrayList(u8).empty;
     defer final.deinit(std.testing.allocator);
     try projector.appendFinalText(&final);
     try std.testing.expectEqualStrings("headtail", final.items);
+}
+
+test "A1 a rolled-back stream does not duplicate text into the answer" {
+    // Regression: `stream_done` fires for a turn the loop then discards and
+    // re-issues. Closing on it appended the rolled-back bytes *and* the retry's,
+    // so the reported answer was "half-writclean answer". Only the loop's own
+    // classification distinguishes them.
+    var probe = EventProbe{};
+    const downstream = probe.backend();
+    var projector = Projector.init(std.testing.allocator, .external_run_root, &downstream);
+    defer projector.deinit();
+    const backend = projector.backend();
+
+    feedSegment(&backend, 0, 1, 0, "half-writ", .discarded);
+    feedSegment(&backend, 1, 1, 0, "clean answer", .final);
+
+    var final = std.ArrayList(u8).empty;
+    defer final.deinit(std.testing.allocator);
+    try projector.appendFinalText(&final);
+    try std.testing.expectEqualStrings("clean answer", final.items);
+}
+
+test "A1 an interrupted Run reports no completed answer" {
+    var probe = EventProbe{};
+    const downstream = probe.backend();
+    var projector = Projector.init(std.testing.allocator, .external_run_root, &downstream);
+    defer projector.deinit();
+    const backend = projector.backend();
+
+    feedSegment(&backend, 0, 1, 0, "partly written", .partial);
+
+    var final = std.ArrayList(u8).empty;
+    defer final.deinit(std.testing.allocator);
+    try projector.appendFinalText(&final);
+    try std.testing.expectEqualStrings("", final.items);
 }
 
 test "A1 tool boundaries discard closed and unclosed segments" {
@@ -303,16 +374,17 @@ test "A1 tool boundaries discard closed and unclosed segments" {
     defer projector.deinit();
     const backend = projector.backend();
 
-    backend.emitEvent(.single, .{ .text_chunk = "old-closed" });
-    backend.emitEvent(.single, .stream_done);
+    // Text written before a tool call is commentary — the loop closes the
+    // segment that way before it emits tool_start.
+    feedSegment(&backend, 0, 1, 0, "old-closed", .commentary);
+    backend.emitEvent(.single, .{ .output_segment_begin = .{ .index = 1, .turn = 1, .group = 1 } });
     backend.emitEvent(.single, .{ .text_chunk = "old-open" });
     backend.emitEvent(.single, .{ .tool_start = .{
         .id = "tool-1",
         .name = "Read",
         .input = "{}",
     } });
-    backend.emitEvent(.single, .{ .text_chunk = "between-boundaries" });
-    backend.emitEvent(.single, .stream_done);
+    feedSegment(&backend, 2, 2, 1, "between-boundaries", .commentary);
     backend.emitEvent(.single, .{ .tool_result = .{
         .id = "tool-1",
         .name = "Read",
@@ -324,10 +396,8 @@ test "A1 tool boundaries discard closed and unclosed segments" {
         .id = "tool-1",
         .text = "not-a-boundary",
     } });
-    backend.emitEvent(.single, .{ .text_chunk = "final-1" });
-    backend.emitEvent(.single, .stream_done);
-    backend.emitEvent(.single, .{ .text_chunk = "final-2" });
-    backend.emitEvent(.single, .stream_done);
+    feedSegment(&backend, 3, 3, 2, "final-1", .continued);
+    feedSegment(&backend, 4, 3, 2, "final-2", .final);
 
     var final = std.ArrayList(u8).empty;
     defer final.deinit(std.testing.allocator);
@@ -450,8 +520,7 @@ test "model-tool hides internal boundaries without losing them for A1 reconstruc
     defer projector.deinit();
     const backend = projector.backend();
 
-    backend.emitEvent(.single, .{ .text_chunk = "pre-tool" });
-    backend.emitEvent(.single, .stream_done);
+    feedSegment(&backend, 0, 1, 0, "pre-tool", .commentary);
     backend.emitEvent(.single, .{ .tool_start = .{
         .id = "tool-1",
         .name = "Read",
@@ -464,13 +533,14 @@ test "model-tool hides internal boundaries without losing them for A1 reconstruc
         .content = "ok",
         .is_error = false,
     } });
-    backend.emitEvent(.single, .{ .text_chunk = "final" });
-    backend.emitEvent(.single, .stream_done);
+    feedSegment(&backend, 1, 2, 1, "final", .final);
 
     var final = std.ArrayList(u8).empty;
     defer final.deinit(std.testing.allocator);
     try projector.appendFinalText(&final);
     try std.testing.expectEqualStrings("final", final.items);
+    // model_tool forwards only the public subset: text and stream_done reach
+    // the downstream, the segment protocol and tool boundaries do not.
     try std.testing.expectEqual(@as(usize, 2), probe.text);
     try std.testing.expectEqual(@as(usize, 2), probe.stream_done);
     try std.testing.expectEqual(@as(usize, 0), probe.tool_start);

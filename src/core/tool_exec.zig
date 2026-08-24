@@ -22,6 +22,7 @@ const pfs = platform.fs;
 const project_gate_protocol = @import("../tools/project_rule_gate.zig");
 const project_rule_signal = @import("../tools/project_rule_signal.zig");
 const file_reference = @import("file_reference.zig");
+const file_change = @import("file_change.zig");
 const tool_catalog = @import("tool_catalog.zig");
 const execution_effect = @import("execution_effect.zig");
 
@@ -95,6 +96,16 @@ pub const Slot = struct {
     pending_payload: ?[]u8 = null,
     /// Successful built-in file references owned by the parent allocator.
     file_refs: ?[]file_reference.FileReference = null,
+    /// Actual per-file modifications produced by this slot's dispatch (owned by
+    /// the parent allocator). See core/file_change.zig.
+    file_changes: ?[]file_change.Record = null,
+    file_changes_overflow: bool = false,
+    file_changes_lost: bool = false,
+    /// This slot's file-change evidence has already been delivered (event +
+    /// journal) and released. Makes the agent loop's drain genuinely idempotent
+    /// rather than relying on `file_changes == null`, which a denied slot would
+    /// otherwise re-synthesize on a second pass.
+    file_changes_drained: bool = false,
     /// P0.4:该 slot 的结果已由流式预取(stream_prefetch)填好 → executeSlots 跳过,不重复执行。
     prefetched: bool = false,
     /// Typed effect copied from the real dispatch observation. It is consumed
@@ -117,6 +128,8 @@ pub const Slot = struct {
             allocator.free(refs);
         }
         self.file_refs = null;
+        if (self.file_changes) |changes| file_change.freeRecords(allocator, changes);
+        self.file_changes = null;
     }
 
     /// 转移 content ownership 给调用方并置 null——转移即置空,杜绝与 deinit 双释放。
@@ -150,13 +163,47 @@ pub const OneResult = union(enum) {
         file_refs: ?[]file_reference.FileReference = null,
         effect: ?tool_observation.Effect = null,
         effect_valid: bool = true,
+        /// Actual per-file modifications on the supported contract (owned by
+        /// the parent allocator). Null = this dispatch changed no file.
+        file_changes: ?[]file_change.Record = null,
+        /// The dispatch modified more files than it could report, or a copy
+        /// failed. Travels with the result so a consumer says "incomplete".
+        file_changes_overflow: bool = false,
+        file_changes_lost: bool = false,
     },
     /// L3 挂起:工具发起 custom UI(error.UiPending)。kind/payload owned by parent_allocator。
     pending: struct { kind: ?[]u8, payload: ?[]u8, elapsed_ms: u64 },
-    /// Host 工具 fatal:类型化控制信号,无 payload——不组装 tool_result,逐层显式传递
-    /// 至 agent loop 映射为 error.HostToolFatal(→ poisonRun)。
-    host_fatal,
+    /// Host 工具 fatal:不组装 tool_result,逐层显式传递至 agent loop 映射为
+    /// error.HostToolFatal(→ poisonRun)。盘上的 effect 可能已经发生，因此该终态必须
+    /// 携带已收集的 file-change evidence，不能用无 payload tag 抹掉事实。
+    host_fatal: struct {
+        file_changes: ?[]file_change.Record = null,
+        file_changes_overflow: bool = false,
+        file_changes_lost: bool = false,
+    },
+
+    /// Release the file-change records a `.done` result carries. `Slot.deinit`
+    /// does this for the agent-loop path; direct `executeOne` consumers (tests,
+    /// embedders) call it themselves.
+    pub fn freeFileChanges(self: OneResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .done => |d| if (d.file_changes) |changes| file_change.freeRecords(allocator, changes),
+            .host_fatal => |fatal| if (fatal.file_changes) |changes| file_change.freeRecords(allocator, changes),
+            .pending => {},
+        }
+    }
 };
+
+fn hostFatalResult(collector: *file_change.Collector) OneResult {
+    // `toOwnedSlice` can set `lost`, so take first and snapshot flags only
+    // afterwards. Do not rely on struct-field evaluation order here.
+    const changes = collector.toOwnedSlice();
+    return .{ .host_fatal = .{
+        .file_changes = changes,
+        .file_changes_overflow = collector.overflow,
+        .file_changes_lost = collector.lost,
+    } };
+}
 
 fn emitDispatchStarted(
     ctx: *const ToolContext,
@@ -486,6 +533,18 @@ pub fn executeOne(
     job_ctx.pending_request = &pending_req;
     var effect_slot = tool_observation.EffectSlot{};
     job_ctx.effect_slot = &effect_slot;
+    // Per-dispatch file-change collector. It copies into `parent_allocator`, so
+    // records outlive the arena above; `defer deinit` covers every early return
+    // and `takeFileChanges` empties it on the paths that hand ownership on.
+    var change_collector = file_change.Collector{
+        .allocator = parent_allocator,
+        .ctx = &job_ctx,
+        .tool = name,
+        .tool_use_id = id,
+        .agent_depth = base_ctx.agent_depth,
+    };
+    defer change_collector.deinit();
+    job_ctx.file_change_sink = change_collector.sink();
     // Built-in/dynamic dispatch performs deterministic name normalization;
     // host Session dispatch deliberately receives the exact advertised name.
     // Preserve both so evidence never attributes a repaired call to the model.
@@ -526,10 +585,23 @@ pub fn executeOne(
                 "tool.exec POLICY-DENIED name={s} duration_ms={d}",
                 .{ name, elapsed },
             );
+            synthesizeFileChange(
+                &change_collector,
+                &job_ctx,
+                dispatched_name,
+                builtin_file_tool,
+                dispatch_input,
+                dispatch_observation.file_target_state,
+                effect_slot.effect != null,
+                .rejected,
+            );
             return .{ .done = .{
                 .content = denied,
                 .is_error = true,
                 .elapsed_ms = elapsed,
+                .file_changes = change_collector.toOwnedSlice(),
+                .file_changes_overflow = change_collector.overflow,
+                .file_changes_lost = change_collector.lost,
             } };
         }
     }
@@ -602,7 +674,7 @@ pub fn executeOne(
                 if (!std.mem.eql(u8, dispatched_name, "Edit")) {
                     _ = gate.cancelPre(project_pre_signal.?);
                     log.warnId("agent", rid, "project formal gate returned exact-edit admission for non-Edit name={s} id={s}", .{ name, id });
-                    return .host_fatal;
+                    return hostFatalResult(&change_collector);
                 }
                 job_ctx.project_edit_mode = .whole_file_exact;
             },
@@ -613,7 +685,7 @@ pub fn executeOne(
                 // second Lean admission before exposing any dispatch event.
                 if (!std.mem.eql(u8, dispatched_name, "Write")) {
                     log.warnId("agent", rid, "project formal gate requested exact-Edit synthesis for non-Write name={s} id={s}", .{ name, id });
-                    return .host_fatal;
+                    return hostFatalResult(&change_collector);
                 }
                 const exact_input = project_rule_signal.synthesizeExactEditInput(
                     &job_ctx,
@@ -664,7 +736,7 @@ pub fn executeOne(
                     },
                     .admit, .synthesize_exact_edit, .fault => {
                         log.warnId("agent", rid, "project synthesized exact Edit lacked recovery admission name={s} id={s}", .{ name, id });
-                        return .host_fatal;
+                        return hostFatalResult(&change_collector);
                     },
                 }
                 project_pre_signal = exact_signal;
@@ -695,18 +767,18 @@ pub fn executeOne(
             },
             .fault => {
                 log.warnId("agent", rid, "project formal gate failed closed before dispatch name={s} id={s}", .{ name, id });
-                return .host_fatal;
+                return hostFatalResult(&change_collector);
             },
         }
     }
     if (!dispatch_observation.start(dispatch_input)) {
         if (job_ctx.project_edit_mode == .whole_file_exact) {
-            const gate = job_ctx.project_rule_gate orelse return .host_fatal;
+            const gate = job_ctx.project_rule_gate orelse return hostFatalResult(&change_collector);
             if (!gate.cancelPre(project_pre_signal.?))
                 log.warnId("agent", rid, "project exact-edit pre-state cancellation failed after observation start rejection name={s} id={s}", .{ name, id });
         }
         log.warnId("agent", rid, "tool observation rejected dispatch start name={s} id={s}", .{ name, id });
-        return .host_fatal;
+        return hostFatalResult(&change_collector);
     }
     defer dispatch_observation.ensureTerminal();
     const r = (if (job_ctx.project_edit_mode == .whole_file_exact)
@@ -716,13 +788,13 @@ pub fn executeOne(
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
         if (err == error.OutOfMemory) {
             if (!dispatch_observation.finish(.host_fatal, @errorName(err), null))
-                return .host_fatal;
+                return hostFatalResult(&change_collector);
             return error.OutOfMemory;
         }
         // L3:UiPending 是控制信号(非工具错误)——kind/payload dupe 到父 allocator 逃逸 arena。
         if (err == error.UiPending) {
             if (!dispatch_observation.finish(.pending, @errorName(err), null))
-                return .host_fatal;
+                return hostFatalResult(&change_collector);
             log.infoId("agent", rid, "tool.exec PENDING(par) name={s} id={s} kind={s}", .{ name, id, if (pending_req) |pr| pr.kind else "" });
             const kind = if (pending_req) |pr| try parent_allocator.dupe(u8, pr.kind) else null;
             errdefer if (kind) |bytes| parent_allocator.free(bytes);
@@ -735,7 +807,7 @@ pub fn executeOne(
         }
         const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
         if (!dispatch_observation.finish(.tool_error, code, null))
-            return .host_fatal;
+            return hostFatalResult(&change_collector);
         const tool_error = @import("tool_error.zig");
         // 错误 json 用父 allocator(逃逸 arena)。工具填了 detail 用之,否则通用文案。
         // P0.6:UnknownTool 附可用工具清单(hermes 式引导),弱模型据此自纠而非空转烧 turn。
@@ -755,24 +827,61 @@ pub fn executeOne(
         // source bytes that were never model-visible. Preserve the historical
         // model-input diagnostic without leaking that host-only snapshot.
         log.warnId("agent", rid, "tool.exec FAILED(par) name={s} err={s} duration_ms={d} input={s}", .{ name, @errorName(err), elapsed, input[0..@min(input.len, 200)] });
-        return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
+        // A file tool that failed before publishing anything still owes the
+        // consumer an answer for its target; silence would read as "no file was
+        // involved".
+        synthesizeFileChange(
+            &change_collector,
+            &job_ctx,
+            dispatched_name,
+            builtin_file_tool,
+            dispatch_input,
+            dispatch_observation.file_target_state,
+            effect_slot.effect != null,
+            .failed,
+        );
+        return .{ .done = .{
+            .content = ej,
+            .is_error = true,
+            .elapsed_ms = elapsed,
+            .file_changes = change_collector.toOwnedSlice(),
+            .file_changes_overflow = change_collector.overflow,
+            .file_changes_lost = change_collector.lost,
+        } };
     };
     // outcome body 挂 job_ctx.allocator(= 本函数 arena) → 随 arena 回收。
     switch (r) {
         .host_fatal => {
             _ = dispatch_observation.finish(.host_fatal, "HostToolFatal", null);
             log.warnId("agent", rid, "tool.exec HOST-FATAL name={s} id={s}", .{ name, id });
-            return .host_fatal;
+            return hostFatalResult(&change_collector);
         },
         .host_failed, .host_rejected => |maybe_detail| {
             const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
             const code: []const u8 = if (r == .host_failed) "HostToolFailed" else "HostToolRejected";
             const outcome: tool_observation.Outcome = if (r == .host_failed) .host_failed else .host_rejected;
             if (!dispatch_observation.finish(outcome, code, maybe_detail))
-                return .host_fatal;
+                return hostFatalResult(&change_collector);
             const ej = try hostToolErrorJson(code, name, maybe_detail, parent_allocator);
             log.warnId("agent", rid, "tool.exec HOST-{s}(par) name={s} duration_ms={d}", .{ code, name, elapsed });
-            return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
+            synthesizeFileChange(
+                &change_collector,
+                &job_ctx,
+                dispatched_name,
+                builtin_file_tool,
+                dispatch_input,
+                dispatch_observation.file_target_state,
+                effect_slot.effect != null,
+                if (r == .host_failed) .failed else .rejected,
+            );
+            return .{ .done = .{
+                .content = ej,
+                .is_error = true,
+                .elapsed_ms = elapsed,
+                .file_changes = change_collector.toOwnedSlice(),
+                .file_changes_overflow = change_collector.overflow,
+                .file_changes_lost = change_collector.lost,
+            } };
         },
         .ok => {},
     }
@@ -785,7 +894,7 @@ pub fn executeOne(
         ok_bytes,
     )) {
         log.warnId("agent", rid, "tool observation rejected dispatch finish name={s} id={s}", .{ name, id });
-        return .host_fatal;
+        return hostFatalResult(&change_collector);
     }
     if (rendered.is_error) {
         const content = try parent_allocator.dupe(u8, ok_bytes);
@@ -835,7 +944,127 @@ pub fn executeOne(
         .file_refs = refs,
         .effect = effect_slot.effect,
         .effect_valid = effect_slot.valid,
+        .file_changes = change_collector.toOwnedSlice(),
+        .file_changes_overflow = change_collector.overflow,
+        .file_changes_lost = change_collector.lost,
     } };
+}
+
+/// Record a file tool's outcome when the tool itself never got far enough to
+/// publish. The path comes from the same resolution the native tools use, and
+/// the record explicitly claims no disk change.
+fn synthesizeFileChange(
+    collector: *file_change.Collector,
+    ctx: *const ToolContext,
+    name: []const u8,
+    is_builtin_file_tool: bool,
+    input: []const u8,
+    state: tool_observation.FileTargetState,
+    /// Did the tool report an actual file mutation before it failed? A tool can
+    /// write its bytes and then fail while rendering its result; calling that
+    /// `failed` would tell the consumer the file is untouched when it is not.
+    mutation_observed: bool,
+    status: file_change.Status,
+) void {
+    if (collector.items.items.len != 0) return; // the tool already spoke for itself
+    // Same gate as `buildFileReferences`: a host-dispatched tool that merely
+    // shares the name "Write" is not a native file tool, and must not be
+    // reported as one.
+    if (!is_builtin_file_tool or !isMutatingFileToolName(name)) return;
+    const target = (file_reference.resolveFileTarget(collector.allocator, ctx, name, input, state) catch return) orelse return;
+    defer collector.allocator.free(target.path);
+    // Bytes may already be on disk → `partial`, not `failed`. Erring toward
+    // "something may have changed" is the safe direction; the reverse tells the
+    // consumer a modified file is untouched.
+    const effective = if (mutation_observed and status != .rejected) file_change.Status.partial else status;
+    collector.publish(.{
+        .path = target.path,
+        // `kind` is the change the tool was making. With a non-applied status
+        // nothing landed, so this is the *intended* kind — reported from the
+        // host's own pre-dispatch observation rather than guessed.
+        .kind = if (state == .missing) .created else .modified,
+        .status = effective,
+        .before_bytes = 0,
+        .after_bytes = 0,
+        .unified_diff = null,
+        // Nothing landed → "no diff" is the whole truth. Bytes may have landed
+        // → we have no diff for them, and must say the evidence is incomplete.
+        .diff_complete = effective != .partial,
+    });
+}
+
+/// Build the file-change record for a mutating file tool that a permission or
+/// policy decision refused **before dispatch**. `executeOne` never runs for
+/// those, so the agent loop calls this; without it a denied Write would be
+/// invisible on the contract and read as "no file was involved".
+pub const RejectedFileChanges = struct {
+    records: ?[]file_change.Record = null,
+    /// The refusal touched more files than the per-call cap, or a copy failed.
+    /// Carried out so the caller reports "incomplete" instead of under-reporting.
+    overflow: bool = false,
+    lost: bool = false,
+};
+
+pub fn rejectedFileChanges(
+    allocator: std.mem.Allocator,
+    ctx: *const ToolContext,
+    name: []const u8,
+    id: []const u8,
+    input: []const u8,
+) RejectedFileChanges {
+    const is_patch = isApplyPatchTool(ctx, name);
+    if (!is_patch and (!isBuiltinFileTool(ctx, name) or !isMutatingFileToolName(name))) return .{};
+    var collector = file_change.Collector{
+        .allocator = allocator,
+        .ctx = ctx,
+        .tool = name,
+        .tool_use_id = id,
+        .agent_depth = ctx.agent_depth,
+    };
+    // `defer`, not `errdefer`: this function returns a value (never an error),
+    // so an errdefer would never fire and the collector's list capacity would
+    // leak. After `toOwnedSlice` the collector is empty, so deinit is exactly
+    // "free the leftover list storage".
+    defer collector.deinit();
+    if (is_patch) {
+        // ApplyPatch 的目标藏在不透明信封里。让**拥有该格式的工具**自己交代,而不是让这里
+        // 去解析工具私有格式——那正是本契约要消灭的事。
+        var patch_ctx = ctx.*;
+        patch_ctx.allocator = allocator;
+        patch_ctx.file_change_sink = collector.sink();
+        @import("../tools/apply_patch.zig").publishRejectedTargets(&patch_ctx, input);
+        return .{
+            .records = collector.toOwnedSlice(),
+            .overflow = collector.overflow,
+            .lost = collector.lost,
+        };
+    }
+    // No dispatch happened, so there is no host observation to inherit; look at
+    // the target here so `created` vs `modified` is observed, not guessed.
+    const observed = @import("../tools/project_rule_signal.zig").observeFileTarget(ctx, name, input).state;
+    // Nothing was dispatched, so no mutation can have been observed.
+    synthesizeFileChange(&collector, ctx, name, true, input, observed, false, .rejected);
+    return .{
+        .records = collector.toOwnedSlice(),
+        .overflow = collector.overflow,
+        .lost = collector.lost,
+    };
+}
+
+fn isApplyPatchTool(ctx: *const ToolContext, name: []const u8) bool {
+    if (!std.mem.eql(u8, name, "ApplyPatch")) return false;
+    if (ctx.tool_dispatcher) |dispatcher| return dispatcher.isBuiltin(name);
+    return tools_mod.getTool(name) != null;
+}
+
+/// The typed file-modifying tools this contract covers. `Read` is a file tool
+/// but never mutates, and `ApplyPatch` resolves its paths from an opaque patch
+/// envelope rather than a `file_path` argument, so it is not synthesizable here
+/// — it publishes per file itself.
+pub fn isMutatingFileToolName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "Write") or
+        std.mem.eql(u8, name, "Edit") or
+        std.mem.eql(u8, name, "NotebookEdit");
 }
 
 fn isBuiltinFileTool(ctx: *const ToolContext, name: []const u8) bool {
@@ -935,9 +1164,17 @@ fn runJob(job: *Job) void {
             s.file_refs = d.file_refs;
             s.effect = d.effect;
             s.effect_valid = d.effect_valid;
+            s.file_changes = d.file_changes;
+            s.file_changes_overflow = d.file_changes_overflow;
+            s.file_changes_lost = d.file_changes_lost;
         },
         // fatal 不组装 tool_result:slot 不填 content,信号经 Job.fatal 上传。
-        .host_fatal => job.fatal = true,
+        .host_fatal => |fatal| {
+            s.file_changes = fatal.file_changes;
+            s.file_changes_overflow = fatal.file_changes_overflow;
+            s.file_changes_lost = fatal.file_changes_lost;
+            job.fatal = true;
+        },
     }
     job.done = true;
 }
@@ -1055,10 +1292,86 @@ test "executeSlots 跳过 prefetched slot(不重复执行,P0.4 无双执行铁�
     try std.testing.expect(!slots[0].is_error);
 }
 
+test "file change: 写盘成功但结果渲染失败时报 partial 而非 failed" {
+    // 真实窗口:Write 已经把字节落到盘上,随后 gitDiff/结构化 patch 渲染 OOM → 工具抛错。
+    // 若这时缝合成 .failed,消费者会以为文件没动过——盘上却已经变了。dispatch 缝合处拿
+    // effect_slot(工具自报的真实 mutation)判定,是则升级成 partial。
+    const a = std.testing.allocator;
+    var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var collector = file_change.Collector{
+        .allocator = a,
+        .ctx = &ctx,
+        .tool = "Write",
+        .tool_use_id = "tu-partial",
+        .agent_depth = 0,
+    };
+    defer collector.deinit();
+
+    synthesizeFileChange(
+        &collector,
+        &ctx,
+        "Write",
+        true,
+        "{\"file_path\":\"/work/half.txt\",\"content\":\"x\"}",
+        .regular_existing,
+        true, // 工具已上报真实 mutation
+        .failed,
+    );
+    try std.testing.expectEqual(@as(usize, 1), collector.items.items.len);
+    const escalated = collector.items.items[0];
+    try std.testing.expectEqual(file_change.Status.partial, escalated.status);
+    try std.testing.expect(!escalated.diff_complete); // 有改动但拿不到 diff = 证据不完整
+    try std.testing.expect(escalated.status.changedDisk());
+}
+
+test "file change: 没有观察到 mutation 的失败仍是 failed,拒绝仍是 rejected" {
+    const a = std.testing.allocator;
+    var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    const input = "{\"file_path\":\"/work/none.txt\",\"content\":\"x\"}";
+
+    {
+        var collector = file_change.Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t1", .agent_depth = 0 };
+        defer collector.deinit();
+        synthesizeFileChange(&collector, &ctx, "Write", true, input, .missing, false, .failed);
+        const rec = collector.items.items[0];
+        try std.testing.expectEqual(file_change.Status.failed, rec.status);
+        try std.testing.expectEqual(file_change.Kind.created, rec.kind); // 观察到目标不存在 → 意图是新建
+        try std.testing.expect(rec.diff_complete);
+    }
+    {
+        // 被拒 = 绝对没写过。即使 effect 槽有残留也不能被升级成 partial。
+        var collector = file_change.Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t2", .agent_depth = 0 };
+        defer collector.deinit();
+        synthesizeFileChange(&collector, &ctx, "Write", true, input, .regular_existing, true, .rejected);
+        const rec = collector.items.items[0];
+        try std.testing.expectEqual(file_change.Status.rejected, rec.status);
+        try std.testing.expect(!rec.status.changedDisk());
+    }
+}
+
+test "file change: host 派发的同名工具不冒充原生文件工具" {
+    const a = std.testing.allocator;
+    var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var collector = file_change.Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t", .agent_depth = 0 };
+    defer collector.deinit();
+    synthesizeFileChange(
+        &collector,
+        &ctx,
+        "Write",
+        false, // 非原生:host dispatcher 自己的 "Write"
+        "{\"file_path\":\"/work/x.txt\",\"content\":\"x\"}",
+        .regular_existing,
+        false,
+        .failed,
+    );
+    try std.testing.expectEqual(@as(usize, 0), collector.items.items.len);
+}
+
 test "executeOne:成功路径返回 done+content(与 executeSlots 同一入口)" {
     const a = std.testing.allocator;
     var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "." };
     const r = try executeOne(&ctx, "Glob", "{\"pattern\":\"*.zig\"}", "gid", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    defer r.freeFileChanges(a);
     switch (r) {
         .done => |d| {
             try std.testing.expect(!d.is_error);
@@ -1079,6 +1392,7 @@ test "executeOne: built-in Write emits a created file reference without a gate" 
     var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = root, .resolve_relative_paths = true };
     const input = "{\"file_path\":\"ref-target.txt\",\"content\":\"hello\"}";
     const result = try executeOne(&ctx, "Write", input, "write-ref", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    defer result.freeFileChanges(a);
     switch (result) {
         .done => |done| {
             defer if (done.content) |content| a.free(content);
@@ -1140,6 +1454,7 @@ test "executeOne: AgentCore Session Host Read does not emit a builtin file refer
         },
     };
     const result = try executeOne(&ctx, "Read", "{\"file_path\":\"outside.txt\"}", "host-read", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    defer result.freeFileChanges(a);
     switch (result) {
         .done => |done| {
             defer if (done.content) |content| a.free(content);
@@ -1171,6 +1486,7 @@ test "executeOne:UnknownTool → 富错误引导(prefetch/executeSlots 共享此
     const a = std.testing.allocator;
     var ctx = tools_mod.ToolContext{ .allocator = a };
     const r = try executeOne(&ctx, "NoSuchTool", "{}", "x", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    defer r.freeFileChanges(a);
     switch (r) {
         .done => |d| {
             try std.testing.expect(d.is_error);
@@ -1409,6 +1725,7 @@ test "execution policy denies before the single dispatch choke point" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer denied.freeFileChanges(allocator);
     switch (denied) {
         .done => |result| {
             defer if (result.content) |content| allocator.free(content);
@@ -1431,6 +1748,7 @@ test "execution policy denies before the single dispatch choke point" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer allowed.freeFileChanges(allocator);
     switch (allowed) {
         .done => |result| {
             defer if (result.content) |content| allocator.free(content);
@@ -1788,6 +2106,7 @@ test "tool observation: actual Write dispatch emits UI-independent typed effect 
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1862,8 +2181,16 @@ test "tool observation: finish rejection poisons dispatch after preserving actua
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
 
     try std.testing.expect(result == .host_fatal);
+    const fatal = switch (result) {
+        .host_fatal => |value| value,
+        else => unreachable,
+    };
+    const changes = fatal.file_changes orelse return error.MissingFileChangeEvidence;
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expect(changes[0].status == .applied);
     try std.testing.expectEqual(@as(usize, 1), capture.starts);
     try std.testing.expectEqual(@as(usize, 1), capture.finishes);
     try std.testing.expect(capture.outcome == .succeeded);
@@ -1982,8 +2309,16 @@ test "project post gate runs before terminal observation and block preserves act
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
 
     try std.testing.expect(result == .host_fatal);
+    const fatal = switch (result) {
+        .host_fatal => |value| value,
+        else => unreachable,
+    };
+    const changes = fatal.file_changes orelse return error.MissingFileChangeEvidence;
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expect(changes[0].status == .applied);
     try std.testing.expect(gate_probe.post_called);
     try std.testing.expect(gate_probe.saw_matched_reobservation);
     try std.testing.expectEqual(@as(usize, 1), capture.starts);
@@ -2038,6 +2373,7 @@ test "tool observation: sink rejection blocks before actual dispatcher invocatio
         std.testing.allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(std.testing.allocator);
     try std.testing.expect(result == .host_fatal);
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     try std.testing.expectEqual(@as(usize, 1), capture.starts);

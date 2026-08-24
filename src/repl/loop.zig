@@ -695,7 +695,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .request_gate = eval_request_gate, .execution_boundary = if (run_control) |control| control.executionBoundary() else null, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .execution_policy = eval_execution_policy, .tool_observer = if (run_control) |control| control.observer() else null, .project_rule_gate = if (run_control) |control| control.formalGate() else null, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .artifact_root = app.sessionDir() orelse "", .tool_result_metrics = &app.tool_result_metrics, .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .request_gate = eval_request_gate, .execution_boundary = if (run_control) |control| control.executionBoundary() else null, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .execution_policy = eval_execution_policy, .tool_observer = if (run_control) |control| control.observer() else null, .project_rule_gate = if (run_control) |control| control.formalGate() else null, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .artifact_root = app.sessionDir() orelse "", .tool_result_metrics = &app.tool_result_metrics, .file_change_journal = &app.file_change_journal, .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
@@ -832,6 +832,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
         .home_dir = app.homeDir(),
         .artifact_root = app.sessionDir() orelse "",
         .tool_result_metrics = &app.tool_result_metrics,
+        .file_change_journal = &app.file_change_journal,
         .additional_dirs = app.additionalDirs(),
         .prebuilt_conversation = copy,
     });
@@ -1811,7 +1812,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .artifact_root = app.sessionDir() orelse "", .tool_result_metrics = &app.tool_result_metrics, .additional_dirs = app.additionalDirs() }, // task#12:辅助 REPL 路径也套 sandbox
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .artifact_root = app.sessionDir() orelse "", .tool_result_metrics = &app.tool_result_metrics, .file_change_journal = &app.file_change_journal, .additional_dirs = app.additionalDirs() }, // task#12:辅助 REPL 路径也套 sandbox
         backend,
         allocator,
     ) catch |err| {
@@ -3496,6 +3497,7 @@ fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []c
         .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
         .artifact_root = app.sessionDir() orelse "",
         .tool_result_metrics = &app.tool_result_metrics,
+        .file_change_journal = &app.file_change_journal,
     };
     // 组 args JSON
     var args_buf: std.Io.Writer.Allocating = .init(allocator);
@@ -3565,7 +3567,7 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .artifact_root = app.sessionDir() orelse "", .tool_result_metrics = &app.tool_result_metrics, .additional_dirs = app.additionalDirs() }, // task#12:injected/synthetic 路径也套 sandbox
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .artifact_root = app.sessionDir() orelse "", .tool_result_metrics = &app.tool_result_metrics, .file_change_journal = &app.file_change_journal, .additional_dirs = app.additionalDirs() }, // task#12:injected/synthetic 路径也套 sandbox
         backend,
         allocator,
     ) catch |err| {
@@ -3681,6 +3683,9 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     if (app.transcript_writer) |*w| w.deinit();
     app.transcript_writer = new_writer;
     app.loadGoalFromSessionDir(path);
+    // 账本是**本 session 的**文件修改记录。会话身份在下面被切走,留着被放弃会话的条目
+    // 会把它们误报成 resumed session 的改动。
+    app.file_change_journal.reset();
 
     // #16:切换会话身份——路由键(permission_ctx.session)与 transcript 落点必须一致。resume 前
     // app.session_id 是启动时 gen 的旧 id,writer 已指向 resumed 目录,但 session_id 没变 → 后续

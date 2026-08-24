@@ -33,6 +33,9 @@ const verification_progress_mod = @import("verification_progress.zig");
 const requirement_ledger_mod = @import("requirement_ledger.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
+const output_semantics = @import("output_semantics.zig");
+const file_change_mod = @import("file_change.zig");
+const tool_exec_mod = @import("tool_exec.zig");
 const ui_backend = @import("protocol/ui_backend.zig");
 const ui_event = @import("protocol/ui_event.zig");
 const UiBackend = ui_backend.UiBackend;
@@ -324,6 +327,16 @@ pub const Options = struct {
     /// artifact envelope never exposes this path to the model.
     artifact_root: []const u8 = "",
     tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
+    /// **Run 输出语义账本**(见 core/output_semantics.zig)。挂上后 run() 把每个可见输出段
+    /// 连同它的定性(commentary/final/continued/partial/discarded)记进来,并把最终结果
+    /// 组装好——调用方直接 `ledger.finalText()`,不必再从 Conversation 尾部猜"什么算 final"。
+    /// null → 只发 output_segment_* 事件,不留账本。**不传给 subagent**:子 agent 的输出是
+    /// 父 Run 的工具结果,不是父 Run 的最终答案。
+    output_ledger: ?*@import("output_semantics.zig").Ledger = null,
+    /// **文件修改结果账本**(见 core/file_change.zig)。挂上后本 Run 及其子执行
+    /// (Agent/Skill/TaskBatch)产生的每条文件修改都记进来,上层无需解析 tool_result 里的
+    /// 工具私有 `gitDiff` 字段。null → 只发 file_changes 事件,不留账本。
+    file_change_journal: ?*@import("file_change.zig").Journal = null,
     /// 额外工作目录(--add-dir / additionalDirectories,绝对路径;sandbox 可写白名单)。
     additional_dirs: []const []const u8 = &.{},
     /// 当前 session plan 文件路径(ExitPlanMode 读盘兜底用;仅顶层接)。
@@ -617,6 +630,109 @@ fn finishRun(backend: *const UiBackend, sess: @import("session_id.zig").SessionI
     return result;
 }
 
+/// Run 级输出语义通道:开/关一个可见输出段,并把定性同时投到事件流与账本。
+///
+/// 关键不变式由 `output_semantics.Tracker` 保证:同一时刻至多一个段打开,每段恰关闭一次
+/// (重复关闭是 no-op,不会造出配不上对的 `output_segment_end`)。因此调用点可以无条件
+/// 调 `close`,不用先判断"现在到底开着没"。
+const OutputChannel = struct {
+    backend: *const UiBackend,
+    session: @import("session_id.zig").SessionId,
+    ledger: ?*output_semantics.Ledger,
+    tracker: output_semantics.Tracker = .{},
+    /// 本段已流出的可见字节数。**权威计数**:兜底关闭时 assistant_text 缓冲已随 turn 作用域
+    /// 释放,拿不到文本,但字节数仍必须如实上报。
+    pending_bytes: u64 = 0,
+
+    fn begin(self: *OutputChannel, turn: u32) void {
+        const seg = self.tracker.begin(turn);
+        self.pending_bytes = 0;
+        self.backend.emitEvent(self.session, .{ .output_segment_begin = .{
+            .index = seg.index,
+            .turn = seg.turn,
+            .group = seg.group,
+        } });
+    }
+
+    fn note(self: *OutputChannel, bytes: usize) void {
+        self.pending_bytes +|= bytes;
+    }
+
+    /// `text` 是本段已流出的可见字节(借用;record 内立即拷贝需要保留的部分)。段的 bytes
+    /// 取自权威计数器而非 text.len——兜底路径传 "" 但字节数照报。
+    fn close(self: *OutputChannel, disposition: output_semantics.Disposition, text: []const u8) void {
+        const seg = self.tracker.close(disposition, self.pending_bytes) orelse return;
+        self.pending_bytes = 0;
+        self.backend.emitEvent(self.session, .{ .output_segment_end = .{
+            .index = seg.index,
+            .turn = seg.turn,
+            .group = seg.group,
+            .disposition = seg.disposition,
+            .bytes = seg.bytes,
+        } });
+        if (self.ledger) |l| l.record(seg, text);
+    }
+};
+
+/// 把本轮所有 slot 的文件修改证据一次性投出去(事件 + Run 级账本),并交出所有权。
+///
+/// **必须在工具阶段任何可能提前返回的分支之前调**——挂起(UiPending)、host fatal、
+/// result_blocks 为空都发生在**盘可能已经真的改过**之后。让 `Slot.deinit` 静默回收这些
+/// 记录,等于对上层谎报"这一轮没动文件"。
+///
+/// **幂等**:靠 slot 上的 `file_changes_drained` 标记,不靠 `file_changes == null`——被拒的
+/// slot 本来就是 null,只看 null 会在第二次调用时重新缝合并重复上报。
+fn drainFileChanges(
+    slots: []tool_exec_mod.Slot,
+    base_ctx: *const @import("../tools/context.zig").ToolContext,
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    journal: ?*file_change_mod.Journal,
+    allocator: std.mem.Allocator,
+) void {
+    for (slots) |*s| {
+        if (s.file_changes_drained) continue;
+        s.file_changes_drained = true;
+        // 权限/策略在 dispatch **之前**拒掉的文件工具:executeOne 从没跑过,没人替它说话。
+        // 沉默会被读成"没涉及文件",所以在这里补一条 rejected。
+        if (s.decision == .denied and s.file_changes == null) {
+            const rejected = tool_exec_mod.rejectedFileChanges(allocator, base_ctx, s.name, s.id, s.input);
+            s.file_changes = rejected.records;
+            s.file_changes_overflow = rejected.overflow;
+            s.file_changes_lost = rejected.lost;
+        }
+        const changes = s.file_changes orelse continue;
+        backend.emitEvent(sess, .{ .file_changes = .{
+            .id = s.id,
+            .name = s.name,
+            .changes = changes,
+            .overflow = s.file_changes_overflow,
+            .lost = s.file_changes_lost,
+        } });
+        if (journal) |j| {
+            j.recordAll(changes);
+            if (s.file_changes_overflow or s.file_changes_lost) j.noteTruncated();
+        }
+        // 投递完即释放:账本收的是克隆,事件是同步消费的借用,留着只是占内存到 turn 末。
+        // 置 null 是与外层 `Slot.deinit` 的交接——两边都释放就是双重释放。
+        file_change_mod.freeRecords(allocator, changes);
+        s.file_changes = null;
+    }
+}
+
+/// L2 用:证明 drain 的幂等性(重复调不重复上报)。生产路径每轮只调一次,但幂等是这个
+/// 收口点的正确性前提之一,得能被测到。
+pub fn drainFileChangesForTest(
+    slots: []tool_exec_mod.Slot,
+    base_ctx: *const @import("../tools/context.zig").ToolContext,
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    journal: ?*file_change_mod.Journal,
+    allocator: std.mem.Allocator,
+) void {
+    drainFileChanges(slots, base_ctx, backend, sess, journal, allocator);
+}
+
 fn stopReasonForAbort(abort: ?*const AbortSignal) StopReason {
     return if (abort) |signal|
         if (signal.reason() == .evaluation_budget) .budget else .aborted
@@ -652,6 +768,11 @@ pub fn run(
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
+    // 输出语义通道:每个 provider stream 一个可见输出段,定性在 loop **真正知道**时才发。
+    // defer 是兜底——任何忘记定性的退出路径把仍打开的段记为 partial(诚实读法:Run 结束了,
+    // 但从没判定这段是答案)。显式定性发生在前,兜底只在遗漏时生效。
+    var output_channel = OutputChannel{ .backend = backend, .session = sess, .ledger = opts.output_ledger };
+    defer output_channel.close(.partial, "");
     var verification_nudges: u8 = 0;
     var required_first_repairs: u8 = 0;
     const MAX_VERIFICATION_NUDGES: u8 = 2;
@@ -1125,6 +1246,7 @@ pub fn run(
             .home_dir = opts.home_dir,
             .artifact_root = opts.artifact_root,
             .tool_result_metrics = opts.tool_result_metrics,
+            .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,
             .agents = opts.agents,
@@ -1270,6 +1392,7 @@ pub fn run(
             // color hint. Consumers that observe lifecycle state must see it
             // after a retry succeeds even when colorization is disabled.
             backend.emitEvent(sess, .stream_begin);
+            output_channel.begin(turns + 1);
             var aborted_during_stream = false;
             var stream_error = false;
             var stream_context_window_exceeded = false;
@@ -1297,6 +1420,7 @@ pub fn run(
                 switch (ev) {
                     .text => |text| {
                         backend.emitEvent(sess, .{ .text_chunk = text });
+                        output_channel.note(text.len);
                         try assistant_text.appendSlice(allocator, text);
                         log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
                         // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
@@ -1356,6 +1480,7 @@ pub fn run(
                         // ui_text 是预渲染的可见 assistant 内容(例外:含 ANSI 但属"可见输出")。
                         // content_json(结构化结果)主对话不消费(仅 web_search.zig 子请求用)。
                         backend.emitEvent(sess, .{ .text_chunk = w.ui_text });
+                        output_channel.note(w.ui_text.len);
                         try assistant_text.appendSlice(allocator, w.ui_text);
                         allocator.free(w.ui_text);
                         allocator.free(w.content_json);
@@ -1443,7 +1568,9 @@ pub fn run(
 
             if (aborted_during_stream) {
                 // 保留已流出的 partial assistant text（对齐 TS 原版 `onCancel` 行为）：
-                // 让用户看到已生成的内容；下次用 /retry 能继续。
+                // 让用户看到已生成的内容；下次用 /retry 能继续。**语义**:可见但未完成 → partial,
+                // 绝不能被上层当成最终结果。
+                output_channel.close(.partial, assistant_text.items);
                 // **先 join 预取线程**:它们 borrow tool_uses 的 id/name/input 字节,必须在下面 free
                 // 之前 join,否则在飞 Read/Grep 读已释放内存(Linus HIGH-1 UAF)。
                 prefetch.joinAll();
@@ -1474,6 +1601,9 @@ pub fn run(
             // context-window-exceeded 若发生在任何 assistant payload 之前，可以安全删老
             // history 并重开同一 turn；一旦已经流出内容，就不能假装 UI 可回滚。
             if (stream_error) {
+                // 残缺 assistant_text 下面会被整体丢弃(不 commit 到 conversation)→ discarded。
+                // 消费者据此丢掉已缓冲的该段字节,不会把残片误当结果。
+                output_channel.close(.discarded, assistant_text.items);
                 const can_recover_context_error = stream_context_window_exceeded and
                     assistant_text.items.len == 0 and
                     tool_uses.items.len == 0 and
@@ -1563,6 +1693,9 @@ pub fn run(
             has_tool_use = true;
             break;
         };
+        // 本轮跟着工具调用 → 这段文字是执行过程中的可见说明,不是最终答案。
+        if (has_tool_use) output_channel.close(.commentary, assistant_text.items);
+
         if (!has_tool_use) {
             // Some Anthropic-compatible gateways accept but ignore a forced
             // tool_choice. `required_first` is stronger than a prompt hint:
@@ -1595,6 +1728,9 @@ pub fn run(
             // 注入 continue 提示让它接着写,而不是当作完成。最多 MAX_CONTINUATIONS 次。
             if (turn_stop_reason == .max_tokens and continuations < MAX_CONTINUATIONS) {
                 continuations += 1;
+                // 被 token 上限截断 → 本段与同 group 的下一段合成一个完整结果,单独任何一段
+                // 都不是 final(`stream_done` 更不是)。
+                output_channel.close(.continued, assistant_text.items);
                 log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d}", .{ continuations, MAX_CONTINUATIONS });
                 // L4 诊断:续写。
                 backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations, .max = MAX_CONTINUATIONS } });
@@ -1614,6 +1750,8 @@ pub fn run(
                 };
                 if (repair_attempts.* == 0) {
                     repair_attempts.* = 1;
+                    // 主机判定这次"结论"覆盖不足并要求补检索 → 它不是最终答案,是过程信息。
+                    output_channel.close(.commentary, assistant_text.items);
                     // A rejected batch-final may still need batch + context +
                     // final; a rejected context-final needs context + final.
                     // Budget/request gates still guard every provider boundary.
@@ -1633,6 +1771,8 @@ pub fn run(
                 // A second premature final is not accepted as a valid answer.
                 // Preserve the trace for audit and fail closed as a controlled
                 // tool loop rather than laundering an uncovered conclusion.
+                // 第二次未覆盖的"结论"不被接受为有效答案 → 已产出文本是 partial,不是 final。
+                output_channel.close(.partial, assistant_text.items);
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
@@ -1647,6 +1787,7 @@ pub fn run(
             {
                 _ = host_injection_meter.tryConsume();
                 verification_nudges += 1;
+                output_channel.close(.commentary, assistant_text.items);
                 log.infoId("agent", rid, "verification final gate nudge {d}/{d}", .{ verification_nudges, MAX_VERIFICATION_NUDGES });
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                 try conversation.appendText(.user, if (verification_progress.known_failing)
@@ -1674,6 +1815,7 @@ pub fn run(
                     .open_items => {
                         _ = host_injection_meter.tryConsume();
                         requirement_ledger_state.nudges += 1;
+                        output_channel.close(.commentary, assistant_text.items);
                         log.infoId("agent", rid, "requirement ledger nudge {d}/{d} open={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.open });
                         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                         const nudge = try std.fmt.allocPrint(
@@ -1688,6 +1830,7 @@ pub fn run(
                     .coverage => {
                         _ = host_injection_meter.tryConsume();
                         requirement_ledger_state.nudges += 1;
+                        output_channel.close(.commentary, assistant_text.items);
                         requirement_ledger_state.coverage_nudge_used = true;
                         log.infoId("agent", rid, "requirement ledger coverage nudge {d}/{d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES });
                         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
@@ -1697,6 +1840,7 @@ pub fn run(
                     .shallow => {
                         _ = host_injection_meter.tryConsume();
                         requirement_ledger_state.nudges += 1;
+                        output_channel.close(.commentary, assistant_text.items);
                         requirement_ledger_state.shallow_nudge_used = true;
                         log.infoId("agent", rid, "requirement ledger shallow nudge {d}/{d} total={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.total });
                         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
@@ -1716,6 +1860,7 @@ pub fn run(
                     const envelope = obligation_runtime.envelopes[obligation_index];
                     _ = host_injection_meter.tryConsume();
                     obligation_runtime.noteNudged(obligation_index);
+                    output_channel.close(.commentary, assistant_text.items);
                     log.warnId("agent", rid, "task obligation nudge {d}/{d} needle={s}", .{ obligation_runtime.nudges_used, @import("obligation_gate.zig").MAX_OBLIGATION_NUDGES, envelope.command_needle });
                     backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                     const nudge = try std.fmt.allocPrint(
@@ -1731,6 +1876,8 @@ pub fn run(
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
             backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+            // 自然 end_turn 且无任何主机异议 → 这一段(连同同 group 的续写段)就是最终结果。
+            output_channel.close(.final, assistant_text.items);
             // Stop hook:顶层 agent 自然结束 → 触发(记忆提取挂载点)。
             fireStopHook(permission_ctx.hooks, allocator, conversation, "end_turn", depth);
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
@@ -1977,6 +2124,7 @@ pub fn run(
             .home_dir = opts.home_dir,
             .artifact_root = opts.artifact_root,
             .tool_result_metrics = opts.tool_result_metrics,
+            .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,
             .last_proposed_plan = if (proposed_plan_buf) |p| p else "",
@@ -2045,6 +2193,9 @@ pub fn run(
             if (prefetch.take(s.id)) |pf| {
                 s.content = pf.content;
                 s.file_refs = pf.file_refs;
+                s.file_changes = pf.file_changes;
+                s.file_changes_overflow = pf.file_changes_overflow;
+                s.file_changes_lost = pf.file_changes_lost;
                 s.is_error = pf.is_error;
                 s.elapsed_ms = pf.elapsed_ms;
                 s.effect = pf.effect;
@@ -2054,7 +2205,10 @@ pub fn run(
         }
         // Host 工具 fatal → 直接上抛:不组装 tool_result(errdefer 释放 result_blocks,
         // slot payload 由上方 defer 回收),AgentSession.runLoop 捕获后 poisonRun。
-        try tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        const exec_outcome = tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
+        drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
+        try exec_outcome;
         // 成功条件义务 2.0:结果侧回填 met——只有执行成功(!is_error 且
         // exit_code=0,bash.zig 序列化以 `"exit_code":N}` 收尾)才算履约。
         if (opts.obligations) |obligation_runtime| {

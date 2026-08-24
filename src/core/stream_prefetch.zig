@@ -20,6 +20,7 @@ const ToolContext = tools_mod.ToolContext;
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 const file_reference = @import("file_reference.zig");
+const file_change = @import("file_change.zig");
 
 /// 可流式执行的工具:除 **WebSearch** 外的一切。WebSearch 在其隔离子请求里发子 LLM 请求,
 /// 是重量级付费调用——主 stream 后续还可能取消/改写本轮工具,投机预取的浪费远高于 Read/Grep
@@ -45,6 +46,12 @@ const Entry = struct {
     elapsed_ms: u64 = 0,
     effect: ?@import("../tools/observation.zig").Effect = null,
     effect_valid: bool = true,
+    /// Speculative prefetch is restricted to concurrency-safe tools, which do
+    /// not mutate files. Mirrored anyway so that if that gate ever widens, the
+    /// evidence transfers with the result instead of being dropped in silence.
+    file_changes: ?[]file_change.Record = null,
+    file_changes_overflow: bool = false,
+    file_changes_lost: bool = false,
     taken: bool = false, // 已被 executeSlots 取走(所有权转移)
     skip: bool = false, // 预取遇 UiPending(并发安全工具不该发生)→ 丢弃,take 返 null 让 executeSlots 重跑
 };
@@ -81,6 +88,9 @@ fn runJob(job: *Job) void {
             job.entry.elapsed_ms = d.elapsed_ms;
             job.entry.effect = d.effect;
             job.entry.effect_valid = d.effect_valid;
+            job.entry.file_changes = d.file_changes;
+            job.entry.file_changes_overflow = d.file_changes_overflow;
+            job.entry.file_changes_lost = d.file_changes_lost;
         },
         // Host 工具不进流式预取(prefetch_safe=false + isStreamable 白名单),此分支
         // 防御性兜底:标 skip 让 executeSlots 正常路径重跑并走完整 fatal 控制流。
@@ -144,6 +154,9 @@ pub const Prefetch = struct {
         elapsed_ms: u64,
         effect: ?@import("../tools/observation.zig").Effect,
         effect_valid: bool,
+        file_changes: ?[]file_change.Record,
+        file_changes_overflow: bool,
+        file_changes_lost: bool,
     } {
         for (self.entries.items) |e| {
             if (e.taken) continue;
@@ -162,6 +175,8 @@ pub const Prefetch = struct {
             e.content = null; // 所有权转移给调用方
             const refs = e.file_refs;
             e.file_refs = null;
+            const changes = e.file_changes;
+            e.file_changes = null;
             return .{
                 .content = content,
                 .file_refs = refs,
@@ -169,6 +184,9 @@ pub const Prefetch = struct {
                 .elapsed_ms = e.elapsed_ms,
                 .effect = e.effect,
                 .effect_valid = e.effect_valid,
+                .file_changes = changes,
+                .file_changes_overflow = e.file_changes_overflow,
+                .file_changes_lost = e.file_changes_lost,
             };
         }
         return null;
@@ -191,6 +209,8 @@ pub const Prefetch = struct {
                     self.allocator.free(refs);
                 }
                 e.file_refs = null;
+                if (e.file_changes) |changes| file_change.freeRecords(self.allocator, changes);
+                e.file_changes = null;
             }
         }
     }

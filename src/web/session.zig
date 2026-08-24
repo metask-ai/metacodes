@@ -240,7 +240,7 @@ pub fn buildWebOptions(app: *app_mod.App, wb: *WebBackend, scoped_recall: ?[]con
         .additional_dirs = app.additionalDirs(),
         .home_dir = app.homeDir(),
         .artifact_root = app.sessionDir() orelse "",
-        .tool_result_metrics = &app.tool_result_metrics,
+        .tool_result_metrics = &app.tool_result_metrics, .file_change_journal = &app.file_change_journal,
         .agents = &app.agents,
         .parent_model = app.activeModel(),
         .model_switch_compact = app.pendingModelSwitchCompact(),
