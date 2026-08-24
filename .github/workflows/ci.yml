@@ -23,11 +23,9 @@ jobs:
         include:
           - os: Linux
             arch: X64
-            runner: patron
           - os: macOS
             arch: ARM64
-            runner: YuankundeMac-mini
-    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}", "${{ matrix.runner }}"]
+    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}"]
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -68,14 +66,11 @@ jobs:
         include:
           - os: Linux
             arch: X64
-            runner: patron
           - os: macOS
             arch: ARM64
-            runner: YuankundeMac-mini
           - os: Windows
             arch: X64
-            runner: metask-pc
-    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}", "${{ matrix.runner }}"]
+    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}"]
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -100,14 +95,11 @@ jobs:
         include:
           - os: Linux
             arch: X64
-            runner: patron
           - os: macOS
             arch: ARM64
-            runner: YuankundeMac-mini
           - os: Windows
             arch: X64
-            runner: metask-pc
-    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}", "${{ matrix.runner }}"]
+    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}"]
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
