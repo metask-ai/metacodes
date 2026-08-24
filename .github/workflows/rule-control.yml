@@ -12,7 +12,10 @@ defaults:
 
 jobs:
   rule-control:
-    runs-on: [self-hosted, Linux, X64, patron]
+    # The paid-budget L2 exercises the production macOS Seatbelt boundary;
+    # running the closed-loop controller on Linux would skip those tests and
+    # correctly fail the fail-closed release decision.
+    runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

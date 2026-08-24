@@ -48,7 +48,7 @@
         "timeout_seconds": 300,
         "commands": [
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control",
@@ -126,7 +126,7 @@
         "timeout_seconds": 300,
         "commands": [
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control.MemoryGovernanceSensorTests",
@@ -196,7 +196,7 @@
         "timeout_seconds": 300,
         "commands": [
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control.ExecutionOntologySensorTests",
@@ -267,7 +267,7 @@
         "timeout_seconds": 300,
         "commands": [
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control.ExperienceFeedbackSensorTests",
@@ -338,7 +338,7 @@
         "timeout_seconds": 600,
         "commands": [
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control.BuildTestThroughputSensorTests",
@@ -366,7 +366,7 @@
             "-j8"
           ],
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_artifact_reproducibility.TinyKgArtifactReproducibilityTest.test_two_isolated_stages_preserve_attested_bytes_and_receipts",
@@ -432,7 +432,7 @@
         "timeout_seconds": 300,
         "commands": [
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control.EvalBudgetCheckpointSensorTests",
@@ -507,11 +507,11 @@
         "timeout_seconds": 300,
         "commands": [
           [
-            "python",
+            "python3",
             "scripts/verify_tinykg_binary.py"
           ],
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control.TreatmentActivationSensorTests",
@@ -578,11 +578,11 @@
         "timeout_seconds": 300,
         "commands": [
           [
-            "python",
+            "python3",
             "scripts/verify_tinykg_binary.py"
           ],
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control.MemoryLocalStoreIsolationSensorTests",
@@ -655,7 +655,7 @@
         "timeout_seconds": 600,
         "commands": [
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control.PaidBudgetJournalSensorTests",
@@ -733,7 +733,7 @@
         "timeout_seconds": 300,
         "commands": [
           [
-            "python",
+            "python3",
             "-m",
             "unittest",
             "scripts.tests.test_rule_control.DaemonTransportSensorTests",
