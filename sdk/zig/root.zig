@@ -6,6 +6,7 @@ pub const protocol = @import("metask_agentcore_protocol");
 
 pub const Status = types.Status;
 pub const StopReason = types.StopReason;
+pub const ProviderKind = types.ProviderKind;
 pub const CoreEvent = protocol.CoreEvent;
 pub const FileReference = protocol.FileReference;
 pub const FileReferenceLocator = protocol.FileReferenceLocator;
