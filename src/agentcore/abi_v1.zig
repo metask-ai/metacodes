@@ -712,7 +712,11 @@ const AbiSession = struct {
     permission_audit: ?session_permission.AuditTrail = null,
     permission_request_sequence: u64 = 0,
     pending_permission: ?PendingPermission = null,
-    run_state_projector: run_state.Projector = undefined,
+    // Keep narrow ABI fixtures safe by default as well as production sessions.
+    // An omitted projector must still be a valid empty projector; otherwise
+    // ReleaseSafe on Windows can interpret stack garbage as ArrayList state
+    // when the first Run boundary calls begin().
+    run_state_projector: run_state.Projector = run_state.Projector.init(allocator),
     /// A bounded RunState projection is an observation aid, not the run's
     /// execution channel.  Once its owned tool set cannot represent a new
     /// tool, stop projecting this run but keep delivering canonical events
