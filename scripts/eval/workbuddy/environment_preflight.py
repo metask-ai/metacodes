@@ -205,11 +205,22 @@ def _run(
             timeout=timeout,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        stderr = getattr(exc, "stderr", "") or ""
-        stdout = getattr(exc, "stdout", "") or ""
+        # TimeoutExpired carries **bytes** for stdout/stderr even under
+        # text=True (CPython does not decode on the timeout path), so the
+        # naive str concat raised TypeError and destroyed the diagnostic
+        # exactly when it mattered most — a 30-minute build stall reported
+        # itself as "can only concatenate str (not bytes) to str" with no
+        # hint of which command hung.  Normalize both streams first.
+        def _as_text(value: object) -> str:
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            return value if isinstance(value, str) else ""
+
+        stderr = _as_text(getattr(exc, "stderr", None))
+        stdout = _as_text(getattr(exc, "stdout", None))
+        detail = (stdout + stderr)[-4000:] or f"<no output> ({type(exc).__name__})"
         raise EnvironmentPreflightError(
-            f"environment preflight command failed: {' '.join(argv)}: "
-            f"{(stdout + stderr)[-4000:]}"
+            f"environment preflight command failed: {' '.join(argv)}: {detail}"
         ) from exc
 
 
