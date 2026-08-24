@@ -36,7 +36,7 @@ pub fn write(session_dir: []const u8, state: SuspendState, allocator: std.mem.Al
     defer _ = pfs.close(fd);
     var off: usize = 0;
     while (off < json.len) {
-        const n = pfs.write(fd, json[off..][0..json.len - off]);
+        const n = pfs.write(fd, json[off..][0 .. json.len - off]);
         if (n <= 0) return error.WriteFailed;
         off += @intCast(n);
     }

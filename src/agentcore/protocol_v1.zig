@@ -47,19 +47,21 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
             .tool_input = v.tool_input,
             .tool_calls = v.tool_calls,
         } },
-        .tool_result => |v| .{ .tool_result = .{
-            .id = v.id,
-            .name = v.name,
-            .input = v.input,
-            .content = v.content,
-            .is_error = v.is_error,
-            .elapsed_ms = v.elapsed_ms,
-            // Internal and public DTOs intentionally have identical frozen
-            // field layouts but live in separate modules. The slice is
-            // borrowed for the synchronous event call; no allocation or UI
-            // policy is introduced at this ABI adapter boundary.
-            .file_refs = if (v.file_refs) |refs| @ptrCast(refs) else null,
-        } },
+        .tool_result => |v| .{
+            .tool_result = .{
+                .id = v.id,
+                .name = v.name,
+                .input = v.input,
+                .content = v.content,
+                .is_error = v.is_error,
+                .elapsed_ms = v.elapsed_ms,
+                // Internal and public DTOs intentionally have identical frozen
+                // field layouts but live in separate modules. The slice is
+                // borrowed for the synchronous event call; no allocation or UI
+                // policy is introduced at this ABI adapter boundary.
+                .file_refs = if (v.file_refs) |refs| @ptrCast(refs) else null,
+            },
+        },
         .usage => |v| .{ .usage = .{
             .input_tokens = v.input_tokens,
             .output_tokens = v.output_tokens,

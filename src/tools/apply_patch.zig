@@ -699,7 +699,7 @@ fn writeFileMkParents(content: []const u8, abs: []const u8) !void {
     // 文件却报成功(对齐 write.zig 的正确写法)。
     var pos: usize = 0;
     while (pos < content.len) {
-        const n = pfs.write(fd, content[pos..][0..content.len - pos]);
+        const n = pfs.write(fd, content[pos..][0 .. content.len - pos]);
         if (n < 0) {
             if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
             return error.WriteError;

@@ -126,7 +126,6 @@ pub const StatusBar = struct {
     /// golden=tmp/tty_golden/napicc_gen_single_step.raw(样本 (2s·thinking)/(3s·↓40 tokens))。
     const SHOW_TOKENS_AFTER_MS: u64 = 2_000;
 
-
     /// 把含 SGR 的字符串按可见显示宽 max_w 截断后写出。ANSI 转义(\x1b[...m 等)不计宽且原样保留;
     /// 截断点后剩余的可见字符丢弃,但补一个 reset 防染色泄漏。
     fn writeTruncated(writer: anytype, s: []const u8, max_w: usize) !void {
@@ -217,7 +216,6 @@ pub fn modeColor(theme: Theme, m: types.PermissionMode) []const u8 {
         .auto => theme.warn,
     };
 }
-
 
 /// token 数紧凑格式:<1K 原样;<1M "1.2K";>=1M "1.23M"。(从 statusline.zig 收敛)
 pub fn formatTokens(buf: []u8, n: u64) []const u8 {

@@ -146,7 +146,7 @@ pub fn project(
     };
     const title = if (target.locator_kind == .uri)
         try allocator.dupe(u8, "")
-        else
+    else
         try allocator.dupe(u8, std.fs.path.basename(target.path));
     if (title.len > MAX_FILE_REF_TITLE_BYTES_V1) {
         allocator.free(title);

@@ -118,9 +118,9 @@ test "L2: --allowedTools + --disallowedTools 同时 → deny 优先" {
     const cli_layer = try builder.buildInlineLayer(
         a,
         .cli,
-        "Bash(git *)",      // allow git *
+        "Bash(git *)", // allow git *
         null,
-        "Bash(git push)",   // deny git push 具体
+        "Bash(git push)", // deny git push 具体
         null,
     );
     defer {

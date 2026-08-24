@@ -1,5 +1,9 @@
 # DeepSeek Harness 源码分析与 metacodes 取舍
 
+> 历史设计分析（非当前状态契约）。其中的阶段编号、能力矩阵和“当前”描述来自
+> 早期提取时点；请以 [API 总览](API.md)、[LIB_API](LIB_API.md)、
+> [AgentCore ABI](AGENTCORE_BINARY_ABI.md) 和源码为准。
+
 ## 1. 固定样本与验证
 
 - 上游：`https://github.com/deepseek-ai/deepseek-harness`
@@ -96,7 +100,7 @@ metacodes 并非从零开始：
 - WorkBuddy/paired runner 已能冻结数据集、模型、预算、缓存、grader 与原始 receipt。
 
 首轮改造已补统一 PluginId/Version/Capability、strict manifest、显式发现、依赖、
-generation、inventory 和静态/数据/进程工具组合根；进程包也已进入 AgentCore rev10，
+generation、inventory 和静态/数据/进程工具组合根；进程包也已进入 AgentCore v1 revision 13，
 可被 source-free C/C++/Zig/Rust Host 显式配置。静态可信插件现已有通用 EffectScope：
 依赖序 activation、逆序幂等 cleanup、失败原子回滚，并由 Runtime/Session 所有权约束。
 其 typed service graph 又补齐 provider/local key、精确类型、声明依赖访问和

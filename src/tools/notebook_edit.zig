@@ -253,7 +253,7 @@ fn writeFile(path: []const u8, content: []const u8) !void {
     defer _ = pfs.close(fd);
     var pos: usize = 0;
     while (pos < content.len) {
-        const n = pfs.write(fd, content[pos..][0..content.len - pos]);
+        const n = pfs.write(fd, content[pos..][0 .. content.len - pos]);
         if (n <= 0) return error.WriteError;
         pos += @intCast(n);
     }
@@ -324,8 +324,7 @@ test "NotebookEdit: insert cell at start" {
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
-    const out = try execute(&ctx,
-        "{\"notebook_path\":\"/tmp/cc-zig-nbedit-insert-start.ipynb\",\"edit_mode\":\"insert\",\"new_source\":\"import numpy as np\",\"cell_type\":\"code\"}");
+    const out = try execute(&ctx, "{\"notebook_path\":\"/tmp/cc-zig-nbedit-insert-start.ipynb\",\"edit_mode\":\"insert\",\"new_source\":\"import numpy as np\",\"cell_type\":\"code\"}");
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"cells_after\":3") != null);
 
@@ -341,8 +340,7 @@ test "NotebookEdit: insert cell after cell_id" {
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
-    const out = try execute(&ctx,
-        "{\"notebook_path\":\"/tmp/cc-zig-nbedit-insert-after.ipynb\",\"cell_id\":\"c1\",\"edit_mode\":\"insert\",\"new_source\":\"y = 2\",\"cell_type\":\"code\"}");
+    const out = try execute(&ctx, "{\"notebook_path\":\"/tmp/cc-zig-nbedit-insert-after.ipynb\",\"cell_id\":\"c1\",\"edit_mode\":\"insert\",\"new_source\":\"y = 2\",\"cell_type\":\"code\"}");
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"cells_after\":3") != null);
 }
@@ -354,8 +352,7 @@ test "NotebookEdit: delete cell" {
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
-    const out = try execute(&ctx,
-        "{\"notebook_path\":\"/tmp/cc-zig-nbedit-delete.ipynb\",\"cell_id\":\"m1\",\"edit_mode\":\"delete\",\"new_source\":\"\"}");
+    const out = try execute(&ctx, "{\"notebook_path\":\"/tmp/cc-zig-nbedit-delete.ipynb\",\"cell_id\":\"m1\",\"edit_mode\":\"delete\",\"new_source\":\"\"}");
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"cells_after\":1") != null);
 
@@ -372,6 +369,5 @@ test "NotebookEdit: cell_id not found errors" {
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
-    try testing.expectError(error.CellNotFound, execute(&ctx,
-        "{\"notebook_path\":\"/tmp/cc-zig-nbedit-notfound.ipynb\",\"cell_id\":\"nope\",\"new_source\":\"y\"}"));
+    try testing.expectError(error.CellNotFound, execute(&ctx, "{\"notebook_path\":\"/tmp/cc-zig-nbedit-notfound.ipynb\",\"cell_id\":\"nope\",\"new_source\":\"y\"}"));
 }

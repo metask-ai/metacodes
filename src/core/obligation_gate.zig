@@ -556,8 +556,7 @@ pub fn load(
         if (superseded) continue;
         combined.append(envelope) catch continue;
     }
-    {
-    }
+    {}
     // v41 针效能折叠:装配完成后按遥测退休(Rule A 惰性/Rule B 非因果)。
     // 解决态换针(reproduce_only)不受折叠——复现针的价值由最佳行证据背书。
     if (!reproduce_only and combined.items.len > 0 and task_hint.len > 0 and task_hint.len <= 200) {
@@ -626,7 +625,6 @@ pub fn load(
     };
     return runtime;
 }
-
 
 // ============================================================================
 // v41 机制遥测 + 针效能折叠(自进化路线图 v36/v37 两级)

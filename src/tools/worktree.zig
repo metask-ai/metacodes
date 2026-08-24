@@ -46,8 +46,7 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try chdir(path);
         try pushWorktree(ctx, path, old_cwd);
         a.free(old_cwd);
-        return try std.fmt.allocPrint(a,
-            "{{\"worktree\":\"{s}\",\"entered\":true,\"created\":false}}", .{path});
+        return try std.fmt.allocPrint(a, "{{\"worktree\":\"{s}\",\"entered\":true,\"created\":false}}", .{path});
     }
 
     // 创建新 worktree
@@ -95,15 +94,14 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer a.free(out.stdout);
     defer a.free(out.stderr);
     if (out.exit_code != 0) {
-        return try std.fmt.allocPrint(a,
-            "{{\"error\":\"git_worktree_add_failed\",\"exit_code\":{d},\"stderr\":\"{s}\"}}",
-            .{ out.exit_code, out.stderr });
+        return try std.fmt.allocPrint(a, "{{\"error\":\"git_worktree_add_failed\",\"exit_code\":{d},\"stderr\":\"{s}\"}}", .{ out.exit_code, out.stderr });
     }
 
     try chdir(wt_path);
     try pushWorktree(ctx, wt_path, cwd);
 
-    return try std.fmt.allocPrint(a,
+    return try std.fmt.allocPrint(
+        a,
         "{{\"worktree\":\"{s}\",\"branch\":\"{s}\",\"entered\":true,\"created\":true}}",
         .{ wt_path, name },
     );
@@ -151,7 +149,8 @@ pub fn exitExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
     }
 
-    return try std.fmt.allocPrint(a,
+    return try std.fmt.allocPrint(
+        a,
         "{{\"left\":\"{s}\",\"removed\":{},\"original_cwd\":\"{s}\"}}",
         .{ entry.worktree_path, removed, entry.original_cwd },
     );

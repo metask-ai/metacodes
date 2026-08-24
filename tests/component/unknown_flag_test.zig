@@ -74,11 +74,16 @@ test "every overlay VALUE flag parses with a legitimate value" {
     // that the strict value parsing accepts the exact values the overlay sends.
     const argv = [_][*:0]const u8{
         "metacodes",
-        "--model",             "glm-5.2",
-        "--model-display-name", "glm-5.2",
-        "--permission",        "bypassPermissions",
-        "--disallowed-tools",  "WebFetch,WebSearch",
-        "--max-tokens",        "32768",
+        "--model",
+        "glm-5.2",
+        "--model-display-name",
+        "glm-5.2",
+        "--permission",
+        "bypassPermissions",
+        "--disallowed-tools",
+        "WebFetch,WebSearch",
+        "--max-tokens",
+        "32768",
     };
     const config = cc.parseArgsForTest(&argv, a);
     try std.testing.expect(config.parse_error == null);

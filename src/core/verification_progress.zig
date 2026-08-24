@@ -304,8 +304,8 @@ fn tierTwoCommandShape(command: []const u8) bool {
     }
     const head = basename(first);
     const display_heads = [_][]const u8{
-        "cat",  "echo", "ls",   "head", "tail", "less",
-        "more", "printf", "true", "stat", "wc", "grep",
+        "cat",  "echo",   "ls",   "head", "tail", "less",
+        "more", "printf", "true", "stat", "wc",   "grep",
         "find", "rg",
     };
     for (display_heads) |d| {

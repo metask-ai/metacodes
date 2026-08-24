@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   native-windows-gate:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, metask-pc]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4

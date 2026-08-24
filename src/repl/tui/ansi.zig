@@ -199,7 +199,7 @@ pub const cursor = struct {
     pub const hide = "\x1b[?25l";
     pub const show = "\x1b[?25h";
     pub const home = "\x1b[H"; // (1, 1)
-    pub const save = "\x1b7";   // DECSC(更可靠,save SCO 用 \x1b[s 不所有终端兼容)
+    pub const save = "\x1b7"; // DECSC(更可靠,save SCO 用 \x1b[s 不所有终端兼容)
     pub const restore = "\x1b8"; // DECRC
 
     /// 移动到 (row, col),1-based。`\x1b[{R};{C}H`。
@@ -241,7 +241,7 @@ pub const clear = struct {
     pub const to_end_of_screen = "\x1b[0J";
     pub const to_start_of_screen = "\x1b[1J";
 
-    pub const line = "\x1b[2K";       // 整行
+    pub const line = "\x1b[2K"; // 整行
     pub const to_end_of_line = "\x1b[0K";
     pub const to_start_of_line = "\x1b[1K";
 };
@@ -308,7 +308,7 @@ test "cursor.move 编码" {
 
 test "cursor.up/down/forward/back" {
     var buf: [16]u8 = undefined;
-    try testing.expectEqualStrings("", cursor.up(0, &buf));     // 0 → 空(避免无效转义)
+    try testing.expectEqualStrings("", cursor.up(0, &buf)); // 0 → 空(避免无效转义)
     try testing.expectEqualStrings("\x1b[1A", cursor.up(1, &buf));
     try testing.expectEqualStrings("\x1b[5B", cursor.down(5, &buf));
     try testing.expectEqualStrings("\x1b[10C", cursor.forward(10, &buf));

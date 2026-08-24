@@ -27,8 +27,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const sent = sendNotification(a, truncated, ctx.abort) catch false;
 
-    return try std.fmt.allocPrint(a,
-        "{{\"sent\":{},\"message\":\"(notification dispatched)\"}}", .{sent});
+    return try std.fmt.allocPrint(a, "{{\"sent\":{},\"message\":\"(notification dispatched)\"}}", .{sent});
 }
 
 fn sendNotification(a: std.mem.Allocator, message: []const u8, abort: ?*const @import("../util/abort.zig").AbortSignal) !bool {
@@ -38,8 +37,7 @@ fn sendNotification(a: std.mem.Allocator, message: []const u8, abort: ?*const @i
             // 把 message 里的 " 转义成 \"
             const escaped = try escapeForAppleScript(a, message);
             defer a.free(escaped);
-            const script = try std.fmt.allocPrintSentinel(a,
-                "display notification \"{s}\" with title \"MetaCode\"", .{escaped}, 0);
+            const script = try std.fmt.allocPrintSentinel(a, "display notification \"{s}\" with title \"MetaCode\"", .{escaped}, 0);
             defer a.free(script);
             const argv = [_]?[*:0]const u8{ "/usr/bin/osascript", "-e", script.ptr, null };
             const out = common.spawnCaptureStdoutAbortableTimed(argv[0..], a, abort, 5_000) catch return false;

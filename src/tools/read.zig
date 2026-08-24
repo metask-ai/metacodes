@@ -169,9 +169,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (total_lines > 150 and !already) {
             if (ctx.read_state) |rs| rs.markHinted(path);
             defer allocator.free(rendered);
-            return try std.fmt.allocPrint(allocator,
-                "{s}\n\n<system-reminder>This is a {d}-line source file. If you only need to find where something is defined, CodeMap (a structural outline) or FindSymbol (jump to a named definition) would be faster and cheaper than reading the whole file.</system-reminder>",
-                .{ rendered, total_lines });
+            return try std.fmt.allocPrint(allocator, "{s}\n\n<system-reminder>This is a {d}-line source file. If you only need to find where something is defined, CodeMap (a structural outline) or FindSymbol (jump to a named definition) would be faster and cheaper than reading the whole file.</system-reminder>", .{ rendered, total_lines });
         }
     }
     return rendered;
@@ -285,7 +283,6 @@ fn readOutlineFromFd(allocator: std.mem.Allocator, ctx: *const ToolContext, path
     defer allocator.free(source);
     return try code_map.renderOutlineForSource(ctx, allocator, path, source);
 }
-
 
 /// 把切片按行加 "%6d\t" 前缀（对齐 TS cat -n）。
 /// 输入 slice 可能以 \n 结尾或不以 \n 结尾；尾行不足时仍带前缀，尾部不强制补 \n。

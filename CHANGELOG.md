@@ -1,5 +1,10 @@
 # Changelog
 
+> 本文件下方包含从历史 `cc-zig` 线提取的记录；其中的旧版本号和日期是历史标签，
+> 不是当前 standalone 仓库的已发布版本承诺。当前状态、兼容边界和可用入口以
+> [README](README.md)、[API 总览](doc/API.md) 和 [Open Source Readiness](OPEN_SOURCE_READINESS.md)
+> 为准。
+
 ## Unreleased — standalone repository and embedding boundary
 
 ### Changed

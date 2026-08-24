@@ -110,7 +110,7 @@ fn writeFile(path: []const u8, bytes: []const u8) !void {
     defer _ = pfs.close(fd);
     var written: usize = 0;
     while (written < bytes.len) {
-        const n = pfs.write(fd, bytes[written..][0..bytes.len - written]);
+        const n = pfs.write(fd, bytes[written..][0 .. bytes.len - written]);
         if (n < 0) return error.WriteFailed;
         if (n == 0) break;
         written += @intCast(n);

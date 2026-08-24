@@ -81,7 +81,6 @@ test "gen 产 24-char id,全 hex 字符" {
     }
 }
 
-
 test "fromSlice round-trip:gen → asSlice → fromSlice 复原,非 24-char 返 null" {
     const id = gen();
     const back = SessionId.fromSlice(id.asSlice()).?;

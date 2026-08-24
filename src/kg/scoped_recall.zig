@@ -318,32 +318,28 @@ fn appendVerbatimDirective(out: *std.ArrayList(u8), allocator: std.mem.Allocator
     if (truncated) {
         out.appendSlice(allocator, "FIRST EDIT: rebuild the complete file at `") catch return;
         out.appendSlice(allocator, path) catch return;
-        out.appendSlice(allocator,
-            "` using the quoted artifact above as the authoritative reference for " ++
-                "signature, imports and shape (it is HOST-TRUNCATED — do not copy it " ++
-                "verbatim). Only then apply the expected-side fixes the reports demand.\n") catch return;
+        out.appendSlice(allocator, "` using the quoted artifact above as the authoritative reference for " ++
+            "signature, imports and shape (it is HOST-TRUNCATED — do not copy it " ++
+            "verbatim). Only then apply the expected-side fixes the reports demand.\n") catch return;
         return;
     }
     if (first_is_diff) {
         out.appendSlice(allocator, "FIRST EDIT: apply the diff hunks quoted above to `") catch return;
         out.appendSlice(allocator, path) catch return;
-        out.appendSlice(allocator,
-            "` exactly as written — every hunk, no re-derivation. Then apply every " ++
-                "other quoted section the same way before anything else.\n") catch return;
+        out.appendSlice(allocator, "` exactly as written — every hunk, no re-derivation. Then apply every " ++
+            "other quoted section the same way before anything else.\n") catch return;
         return;
     }
     out.appendSlice(allocator, "FIRST EDIT: write the artifact quoted above to `") catch return;
     out.appendSlice(allocator, path) catch return;
-    out.appendSlice(allocator,
-        "` byte-for-byte UNCHANGED — do not retype it from memory, do not adjust " ++
-            "signatures, file modes or imports; every free-hand rewrite so far has " ++
-            "regressed an already-solved facet. Only after that file is in place " ++
-            "apply the expected-side fixes the reports demand.\n") catch return;
+    out.appendSlice(allocator, "` byte-for-byte UNCHANGED — do not retype it from memory, do not adjust " ++
+        "signatures, file modes or imports; every free-hand rewrite so far has " ++
+        "regressed an already-solved facet. Only after that file is in place " ++
+        "apply the expected-side fixes the reports demand.\n") catch return;
     if (has_diff_sections) {
-        out.appendSlice(allocator,
-            "The sections marked (apply-diff) are unified-diff hunks against " ++
-                "existing files — apply every quoted hunk exactly (do not re-derive " ++
-                "the change) before running checks.\n") catch return;
+        out.appendSlice(allocator, "The sections marked (apply-diff) are unified-diff hunks against " ++
+            "existing files — apply every quoted hunk exactly (do not re-derive " ++
+            "the change) before running checks.\n") catch return;
     }
 }
 
@@ -511,14 +507,13 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
                     out.appendSlice(allocator, "\n") catch return null;
                     best_for_directive = best;
                 }
-                out.appendSlice(allocator,
-                    "The newest attempt REGRESSED from an already-proven configuration. " ++
-                        "Reproduce the all-passing best attempt above exactly; treat the newest " ++
-                        "failing names as damage introduced by that regression, not as new " ++
-                        "requirements. Where a stored memory, note, or correction contradicts " ++
-                        "the proven configuration above, the proven configuration wins — treat " ++
-                        "the contradicting memory as stale. Re-run your whole check suite to " ++
-                        "confirm.\n") catch return null;
+                out.appendSlice(allocator, "The newest attempt REGRESSED from an already-proven configuration. " ++
+                    "Reproduce the all-passing best attempt above exactly; treat the newest " ++
+                    "failing names as damage introduced by that regression, not as new " ++
+                    "requirements. Where a stored memory, note, or correction contradicts " ++
+                    "the proven configuration above, the proven configuration wins — treat " ++
+                    "the contradicting memory as stale. Re-run your whole check suite to " ++
+                    "confirm.\n") catch return null;
                 // v37(p37 取证):VERBATIM 逐字指令原先只挂在 nudge 文本里——
                 // agent 提前自己碰了工件路径 → 义务提前 met → nudge 永不触发
                 // → 指令丢失,模型第三次徒手重打实现(漏 'rb',6×TypeError)。
@@ -528,13 +523,12 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
                 out.appendSlice(allocator, "</system-reminder>\n") catch return null;
                 return out.toOwnedSlice(allocator) catch null;
             }
-            out.appendSlice(allocator,
-                "This task's best configuration is already proven by the verdict above: " ++
-                    "reproduce that approach, re-run your whole check suite to confirm, and " ++
-                    "do not innovate beyond what the task statement asks. Where a stored " ++
-                    "memory, note, or correction contradicts the proven configuration above, " ++
-                    "the proven configuration wins — treat the contradicting memory as stale.\n" ++
-                    "</system-reminder>\n") catch return null;
+            out.appendSlice(allocator, "This task's best configuration is already proven by the verdict above: " ++
+                "reproduce that approach, re-run your whole check suite to confirm, and " ++
+                "do not innovate beyond what the task statement asks. Where a stored " ++
+                "memory, note, or correction contradicts the proven configuration above, " ++
+                "the proven configuration wins — treat the contradicting memory as stale.\n" ++
+                "</system-reminder>\n") catch return null;
             return out.toOwnedSlice(allocator) catch null;
         }
     }
@@ -545,35 +539,33 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
     // 新针/reward 动/失败集动)都会打破键、恢复全额压力——etag 式破墙
     // 靠的是新剂量内容,不会被冷却误杀)。Lean 镜面 plateau_caps_pressure。
     if (max_streak >= 3 and stuckPlateau(history.items)) {
-        out.appendSlice(allocator,
-            "COOLED. This task's reward and failing set have been unchanged across " ++
-                "the last attempts while the full pressure playbook ran — that playbook " ++
-                "is proven non-causal here, so it is withdrawn this attempt. Work from " ++
-                "the task statement and the verdict facts above; make ONE deliberately " ++
-                "different attempt instead of re-executing the previous playbook. " ++
-                "Re-run your whole check suite before closing.\n" ++
-                "</system-reminder>\n") catch return null;
+        out.appendSlice(allocator, "COOLED. This task's reward and failing set have been unchanged across " ++
+            "the last attempts while the full pressure playbook ran — that playbook " ++
+            "is proven non-causal here, so it is withdrawn this attempt. Work from " ++
+            "the task statement and the verdict facts above; make ONE deliberately " ++
+            "different attempt instead of re-executing the previous playbook. " ++
+            "Re-run your whole check suite before closing.\n" ++
+            "</system-reminder>\n") catch return null;
         return out.toOwnedSlice(allocator) catch null;
     }
     if (max_streak >= 3) {
         // 升级态瘦身(提示饱和对策):union/invert 级别的点在场时,九层
         // 说教稀释关键指令——只留判决+模式+三行硬约束,短促命令式。
-        out.appendSlice(allocator,
-            "ESCALATED. The mandated modes above are orders, not suggestions — execute them " ++
-                "literally this attempt. FIRST ACTION: enter every point above — each " ++
-                "failing name, each verifier reason, each artifact it names — into your " ++
-                "task ledger (TaskCreate) as acceptance criteria; work that displaces " ++
-                "these items repeats the last failure. Constraints: the verifier runs OUTSIDE this workspace " ++
-                "and scores ONLY its own tests — equivalent checks you write yourself do not " ++
-                "score, so \"conceptually verified\" is worth zero. A referenced-but-absent " ++
-                "artifact (module, file, function) is something the verifier expects YOU to " ++
-                "have created; creating it at the location its name implies is compliance, " ++
-                "not gaming. One verdict per attempt — an unchanged approach is a wasted " ++
-                "attempt. The quoted note above is a FAILING attempt's own words: where " ++
-                "it claims completion or success, the reward on the same line refutes " ++
-                "it — never inherit its claims. " ++
-                "Re-run your whole check suite before closing.\n" ++
-                "</system-reminder>\n") catch return null;
+        out.appendSlice(allocator, "ESCALATED. The mandated modes above are orders, not suggestions — execute them " ++
+            "literally this attempt. FIRST ACTION: enter every point above — each " ++
+            "failing name, each verifier reason, each artifact it names — into your " ++
+            "task ledger (TaskCreate) as acceptance criteria; work that displaces " ++
+            "these items repeats the last failure. Constraints: the verifier runs OUTSIDE this workspace " ++
+            "and scores ONLY its own tests — equivalent checks you write yourself do not " ++
+            "score, so \"conceptually verified\" is worth zero. A referenced-but-absent " ++
+            "artifact (module, file, function) is something the verifier expects YOU to " ++
+            "have created; creating it at the location its name implies is compliance, " ++
+            "not gaming. One verdict per attempt — an unchanged approach is a wasted " ++
+            "attempt. The quoted note above is a FAILING attempt's own words: where " ++
+            "it claims completion or success, the reward on the same line refutes " ++
+            "it — never inherit its claims. " ++
+            "Re-run your whole check suite before closing.\n" ++
+            "</system-reminder>\n") catch return null;
         return out.toOwnedSlice(allocator) catch null;
     }
     out.appendSlice(allocator,

@@ -31,7 +31,7 @@ The checked-in toolchain contract currently requires Zig 0.16.0 or newer within
 the 0.16 development line used by CI.
 
 ```sh
-git clone https://github.com/shuzuan-org/metacodes.git
+git clone https://github.com/metask-ai/metacodes.git
 cd metacodes
 zig build
 ./zig-out/bin/metacodes --help

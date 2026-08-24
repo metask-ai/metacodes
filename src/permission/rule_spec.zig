@@ -312,11 +312,23 @@ fn hasCompoundSep(s: []const u8) bool {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         const c = s[i];
-        if (!in_d and !in_b and c == '\'') { in_s = !in_s; continue; }
-        if (!in_s and !in_b and c == '"')  { in_d = !in_d; continue; }
-        if (!in_s and !in_d and c == '`')  { in_b = !in_b; continue; }
+        if (!in_d and !in_b and c == '\'') {
+            in_s = !in_s;
+            continue;
+        }
+        if (!in_s and !in_b and c == '"') {
+            in_d = !in_d;
+            continue;
+        }
+        if (!in_s and !in_d and c == '`') {
+            in_b = !in_b;
+            continue;
+        }
         if (in_s or in_d or in_b) continue;
-        if (c == '\\' and i + 1 < s.len) { i += 1; continue; }
+        if (c == '\\' and i + 1 < s.len) {
+            i += 1;
+            continue;
+        }
         if (c == ';' or c == '\n' or c == '|') return true;
         if (c == '&') {
             if (i + 1 < s.len and s[i + 1] == '&') return true;

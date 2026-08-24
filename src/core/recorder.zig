@@ -98,7 +98,7 @@ fn writeFile(path: []const u8, bytes: []const u8) void {
     defer _ = pfs.close(fd);
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = pfs.write(fd, bytes[off..][0..bytes.len - off]);
+        const n = pfs.write(fd, bytes[off..][0 .. bytes.len - off]);
         if (n <= 0) break;
         off += @intCast(n);
     }

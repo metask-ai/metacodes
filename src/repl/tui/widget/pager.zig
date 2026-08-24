@@ -250,7 +250,7 @@ test "renderFrame: 百分比正确" {
 }
 
 test "renderFrame: 内容少于窗口高度" {
-    const lines = [_][]const u8{ "only" };
+    const lines = [_][]const u8{"only"};
     const s = try renderFrame(testing.allocator, theme_mod.dark, &lines, 0, 10, 80);
     defer testing.allocator.free(s);
     try capture.expectContains(s, "1-1/1");
@@ -270,9 +270,16 @@ test "VISUAL demo: pager(TUI_DEMO=1)" {
     if (std.c.getenv("TUI_DEMO") == null) return error.SkipZigTest;
     const th = theme_mod.dark;
     const lines = [_][]const u8{
-        "Line 1 — hello", "Line 2",  "Line 3",  "Line 4",
-        "Line 5 — world", "Line 6",  "Line 7",  "Line 8",
-        "Line 9",         "Line 10",
+        "Line 1 — hello",
+        "Line 2",
+        "Line 3",
+        "Line 4",
+        "Line 5 — world",
+        "Line 6",
+        "Line 7",
+        "Line 8",
+        "Line 9",
+        "Line 10",
     };
     const s = try renderFrame(testing.allocator, th, &lines, 0, 6, 40);
     defer testing.allocator.free(s);

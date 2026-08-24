@@ -12,7 +12,7 @@ defaults:
 
 jobs:
   rule-control:
-    runs-on: [self-hosted, metacodes-release]
+    runs-on: [self-hosted, Linux, X64, patron]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
