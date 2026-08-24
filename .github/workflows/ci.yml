@@ -28,10 +28,20 @@ jobs:
     runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
           use-cache: false
+      - name: Setup pinned Lean toolchain
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: control-plane/lean
+          auto-config: false
+          build: true
+          test: false
+          lint: false
       - name: Zig format check
         if: runner.os == 'Linux'
         run: zig fmt --check build.zig src tests
