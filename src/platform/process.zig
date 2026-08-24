@@ -1064,8 +1064,12 @@ test "capture cwd:子进程 pwd 在指定 cwd 而非父进程 cwd" {
     if (!procSpawnTestsEnabled()) return error.SkipZigTest;
     const a = std.testing.allocator;
     // 选一个肯定存在、非当前 cwd 的目录:/tmp(POSIX) 或 %TEMP%(Windows)。
-    const target_dir: []const u8 = if (is_windows) std.process.getEnvVarOwned(a, "TEMP") catch "/Temp" else "/tmp";
-    defer if (is_windows) a.free(target_dir);
+    var target_dir_owned: ?[]u8 = null;
+    const target_dir: []const u8 = if (is_windows) blk: {
+        target_dir_owned = (std.process.Environ{ .block = .global }).getAlloc(a, "TEMP") catch null;
+        break :blk target_dir_owned orelse "/Temp";
+    } else "/tmp";
+    defer if (target_dir_owned) |value| a.free(value);
     const argv: []const ?[*:0]const u8 = if (is_windows)
         &.{ "cmd.exe", "/c", "cd", null }
     else
