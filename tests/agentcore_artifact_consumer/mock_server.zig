@@ -1,24 +1,21 @@
 const std = @import("std");
-
-const net = std.Io.net;
+const net = @import("platform").net;
 
 pub const Server = struct {
-    io: std.Io,
-    listener: net.Server,
+    listener: net.Socket,
     port: u16,
     bodies: []const []const u8,
     thread: std.Thread,
+    closing: std.atomic.Value(bool) = .init(false),
 
-    pub fn start(io: std.Io, bodies: []const []const u8) !*Server {
-        const address = net.IpAddress{ .ip4 = .loopback(0) };
-        var listener = try address.listen(io, .{ .reuse_address = true });
-        errdefer listener.deinit(io);
+    pub fn start(_: std.Io, bodies: []const []const u8) !*Server {
+        const listener = try net.listenLoopback(0, 16);
+        errdefer net.closeSocket(listener.sock);
         const self = try std.heap.page_allocator.create(Server);
         errdefer std.heap.page_allocator.destroy(self);
         self.* = .{
-            .io = io,
-            .port = listener.socket.address.getPort(),
-            .listener = listener,
+            .listener = listener.sock,
+            .port = listener.port,
             .bodies = bodies,
             .thread = undefined,
         };
@@ -31,29 +28,45 @@ pub const Server = struct {
     }
 
     pub fn stop(self: *Server) void {
-        self.listener.deinit(self.io);
+        self.closing.store(true, .release);
+        // Closing a socket does not reliably wake accept on every supported
+        // Windows build. A loopback connection is a deterministic wake-up.
+        if (net.connectLoopback(self.port)) |wake| net.closeSocket(wake) else |_| {}
+        net.closeSocket(self.listener);
         self.thread.join();
         std.heap.page_allocator.destroy(self);
     }
 
     fn serve(self: *Server) void {
         for (self.bodies) |body| {
-            var stream = self.listener.accept(self.io) catch return;
-            serveResponse(self.io, stream, body);
-            stream.close(self.io);
+            if (self.closing.load(.acquire)) return;
+            const conn = net.acceptConn(self.listener) orelse return;
+            if (self.closing.load(.acquire)) {
+                net.closeSocket(conn);
+                return;
+            }
+            serveResponse(conn, body);
+            net.closeSocket(conn);
         }
     }
 };
 
-fn serveResponse(io: std.Io, stream: net.Stream, body: []const u8) void {
-    var recv_buffer: [4096]u8 = undefined;
-    var send_buffer: [4096]u8 = undefined;
-    var reader = stream.reader(io, &recv_buffer);
-    var writer = stream.writer(io, &send_buffer);
-    var server: std.http.Server = .init(&reader.interface, &writer.interface);
-    var request = server.receiveHead() catch return;
-    request.respond(body, .{
-        .keep_alive = false,
-        .extra_headers = &.{.{ .name = "content-type", .value = "text/event-stream" }},
-    }) catch return;
+fn serveResponse(conn: net.Socket, body: []const u8) void {
+    var header: [256]u8 = undefined;
+    const header_bytes = std.fmt.bufPrint(
+        &header,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{body.len},
+    ) catch return;
+    sendAll(conn, header_bytes);
+    sendAll(conn, body);
+}
+
+fn sendAll(conn: net.Socket, bytes: []const u8) void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = net.send(conn, bytes[offset..]);
+        if (written <= 0) return;
+        offset += @intCast(written);
+    }
 }

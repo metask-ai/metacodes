@@ -205,6 +205,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     app.addImport("metask_agentcore", sdk);
+    app.addImport("platform", b.createModule(.{
+        .root_source_file = b.path("../../src/platform/platform.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     app.addObjectFile(.{ .cwd_relative = lib_path });
     applySystemLinkInputs(app, manifest.value);
     const exe = b.addExecutable(.{ .name = "agentcore-artifact-consumer", .root_module = app });
