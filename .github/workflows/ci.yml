@@ -77,6 +77,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Native platform modules
+        if: runner.os != 'Windows'
         shell: bash
         env:
           METACODES_PROC_TEST: "1"
@@ -85,6 +86,20 @@ jobs:
           for module in sync fs rng paths signal process net dir; do
             zig test "src/platform/${module}.zig" -lc
           done
+      - name: Native platform modules (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        env:
+          METACODES_PROC_TEST: "1"
+        run: >-
+          zig test src/platform/sync.zig -lc &&
+          zig test src/platform/fs.zig -lc &&
+          zig test src/platform/rng.zig -lc &&
+          zig test src/platform/paths.zig -lc &&
+          zig test src/platform/signal.zig -lc &&
+          zig test src/platform/process.zig -lc &&
+          zig test src/platform/net.zig -lc &&
+          zig test src/platform/dir.zig -lc
 
   tinykg-bundle:
     name: bundled TinyKG (${{ matrix.os }})
@@ -106,10 +121,15 @@ jobs:
         with:
           version: 0.16.0
       - name: Verify native bundle and fresh-store contract
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           python scripts/verify_tinykg_binary.py
           zig build tinykg:stage
+      - name: Verify native bundle and fresh-store contract (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: python scripts/verify_tinykg_binary.py && zig build tinykg:stage
       - name: Verify Linux arm64 cross-stage contract
         if: runner.os == 'Linux'
         run: zig build tinykg:stage -Dtarget=aarch64-linux-musl
