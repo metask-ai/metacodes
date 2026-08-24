@@ -102,7 +102,7 @@ Bundle replacement is an explicit release operation, never part of `zig build`:
    `deps/tinykg.json` if CLI/storage/schema compatibility changed.
 6. Scan printable strings in every executable (and both universal Mach-O slices)
    for personal paths and secret-shaped data.
-7. Run `python scripts/verify_tinykg_binary.py`, the bundle unit tests,
+7. Run `python3 scripts/verify_tinykg_binary.py`, the bundle unit tests,
    `zig build tinykg:stage`, cross-target staging for all four target families,
    and the full ReleaseSafe/L2 gates.
 
