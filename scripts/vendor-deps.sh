@@ -3,8 +3,8 @@
 #
 # 设计:这些依赖更新频度低,故**不用 git submodule**(避免其他开发者 clone 后还要
 # `submodule update --init` 的摩擦)。改为在 lib/ 里 commit 一份**源码快照**——plain
-# `git clone` + `zig build` 直接能跑。TinyKG 不属于源码 vendoring；它由
-# 维护者以显式路径 + SHA-256 提供，并通过 tinykg:stage 验证。
+# `git clone` + `zig build` 直接能跑。TinyKG 不属于源码 vendoring；其
+# checked-in binary bundle 由独立的人工 release 流程维护并通过 tinykg:stage 验证。
 # 各依赖仍有独立上游 repo(自身开发用),本脚本从上游拉最新源码覆盖进 lib/。
 #
 # 用法:
@@ -19,7 +19,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WHICH="${1:-highlight}"
 
 if [[ "$WHICH" != "all" && "$WHICH" != "highlight" ]]; then
-  echo "error: 仅支持 highlight；TinyKG 请用 zig build tinykg:stage -Dtinykg-bin=... -Dtinykg-sha256=..." >&2
+  echo "error: 仅支持 highlight；TinyKG bundle 更新见 doc/TINYKG_INTEGRATION.md" >&2
   exit 2
 fi
 

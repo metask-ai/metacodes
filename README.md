@@ -37,9 +37,11 @@ zig build
 ./zig-out/bin/metacodes --help
 ```
 
-The default build does not download or compile TinyKG. `highlight-zig` is the only
-checked-in source dependency. See [TinyKG integration](doc/TINYKG_INTEGRATION.md)
-to stage a manually maintained native TinyKG binary with an observed SHA-256.
+The default build does not download or compile TinyKG. It selects one
+manifest-pinned CLI from the checked-in cross-platform binary bundle and stages
+it beside Metacodes. `highlight-zig` remains the only checked-in source
+dependency. See [TinyKG integration](doc/TINYKG_INTEGRATION.md) for the supported
+matrix, provenance contract, explicit override, and manual update procedure.
 
 Common gates:
 
@@ -50,7 +52,7 @@ zig build agentcore:test -Doptimize=ReleaseSafe
 zig build agentcore:gate -Dtarget=<native-target> -Doptimize=ReleaseSafe
 ```
 
-Tests that require TinyKG must receive an explicitly attested binary:
+Maintainers can audit a candidate binary instead of the bundled one:
 
 ```sh
 tinykg_bin=/absolute/path/to/tinykg
@@ -60,8 +62,9 @@ zig build test \
   -Dtinykg-sha256="$tinykg_sha"
 ```
 
-No test or release gate searches `PATH`, a sibling checkout, or an old `zig-out`
-directory for TinyKG.
+Normal tests use the native bundled artifact automatically. No build, test, or
+release gate searches `PATH`, downloads TinyKG, inspects a sibling checkout, or
+uses an old `zig-out` artifact.
 
 ## Supported surfaces
 
@@ -124,5 +127,6 @@ authorization and are never part of the default development loop.
 
 metacodes 是一个可嵌入、极低资源占用、内置 coding agent loop 的 Zig agent core。
 插件可以扩展工具、MCP、provider 方言和宿主形态，但不能绕过权限、预算、形式化判定、
-TinyKG 治理与因果边界。TinyKG 采用独立维护的二进制契约，不再把源码复制进本仓库。
+TinyKG 治理与因果边界。TinyKG 采用独立维护、跨平台、哈希锁定的二进制 bundle，
+不再把源码复制进本仓库，也不会在构建时下载或隐式寻找开发目录。
 项目目前处于开源发布前准备阶段；在许可证由项目所有者明确选定前，仓库应保持私有。

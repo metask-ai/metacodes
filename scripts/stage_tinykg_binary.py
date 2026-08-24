@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Validate and stage one explicitly supplied TinyKG binary.
+"""Validate and stage one explicit or repository-bundled TinyKG binary.
 
-Metacodes does not build TinyKG from source.  A maintainer supplies a native
-binary plus its observed SHA-256.  This program validates that immutable input
-before copying it into the Metacodes install graph.
+Metacodes never builds TinyKG from source. An operator may supply an absolute
+binary plus its observed SHA-256, while normal builds select a checked-in native
+artifact from the manually maintained cross-platform bundle.
 """
 
 from __future__ import annotations
@@ -17,14 +17,26 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
 from typing import Mapping, Sequence
 
 
 CONTRACT_SCHEMA = "metacodes.tinykg-binary/v1"
-RECEIPT_SCHEMA = "metacodes.tinykg-binary-receipt/v1"
+BUNDLE_SCHEMA = "metacodes.tinykg-bundle/v1"
+RECEIPT_SCHEMA = "metacodes.tinykg-binary-receipt/v2"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+ARTIFACT_FORMATS = {"elf-static", "mach-o-universal", "pe"}
+ARCHITECTURES = {"aarch64", "x86_64"}
+TARGET_CONTRACTS = {
+    "aarch64-linux": ("elf-static", "aarch64"),
+    "x86_64-linux": ("elf-static", "x86_64"),
+    "aarch64-macos": ("mach-o-universal", "aarch64"),
+    "x86_64-macos": ("mach-o-universal", "x86_64"),
+    "x86_64-windows": ("pe", "x86_64"),
+}
 
 
 class StageError(RuntimeError):
@@ -72,6 +84,142 @@ class TinyKgContract:
 
 
 @dataclass(frozen=True)
+class BundleArtifact:
+    key: str
+    path: str
+    sha256: str
+    binary_format: str
+    architectures: tuple[str, ...]
+    targets: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TinyKgBundle:
+    source_commit: str
+    zig_version: str
+    optimize: str
+    strip: bool
+    artifacts: tuple[BundleArtifact, ...]
+
+    @classmethod
+    def load(cls, path: Path) -> "TinyKgBundle":
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise StageError(f"cannot read TinyKG bundle manifest: {exc}") from exc
+        if not isinstance(raw, dict) or set(raw) != {
+            "artifacts",
+            "build",
+            "bundle_schema",
+            "source_commit",
+        }:
+            raise StageError("TinyKG bundle manifest has missing or unknown fields")
+        if raw["bundle_schema"] != BUNDLE_SCHEMA:
+            raise StageError("unsupported TinyKG bundle schema")
+        if not isinstance(raw["source_commit"], str) or not COMMIT_RE.fullmatch(
+            raw["source_commit"]
+        ):
+            raise StageError("TinyKG source commit must be 40 lowercase hex characters")
+        build = raw["build"]
+        if not isinstance(build, dict) or set(build) != {
+            "optimize",
+            "strip",
+            "zig_version",
+        }:
+            raise StageError("TinyKG bundle build contract has missing or unknown fields")
+        if (
+            not isinstance(build["zig_version"], str)
+            or not build["zig_version"]
+            or build["optimize"] != "ReleaseSafe"
+            or build["strip"] is not True
+        ):
+            raise StageError("TinyKG bundle must be a stripped ReleaseSafe build")
+        artifacts_raw = raw["artifacts"]
+        if not isinstance(artifacts_raw, list) or not artifacts_raw:
+            raise StageError("TinyKG bundle must declare at least one artifact")
+        artifacts: list[BundleArtifact] = []
+        keys: set[str] = set()
+        paths: set[str] = set()
+        targets: set[str] = set()
+        for value in artifacts_raw:
+            if not isinstance(value, dict) or set(value) != {
+                "architectures",
+                "format",
+                "key",
+                "path",
+                "sha256",
+                "targets",
+            }:
+                raise StageError("TinyKG bundle artifact has missing or unknown fields")
+            key = value["key"]
+            relative = value["path"]
+            digest = value["sha256"]
+            binary_format = value["format"]
+            architectures = value["architectures"]
+            artifact_targets = value["targets"]
+            if not isinstance(key, str) or not key or key in keys:
+                raise StageError("TinyKG bundle artifact keys must be unique")
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or Path(relative).is_absolute()
+                or ".." in Path(relative).parts
+                or relative in paths
+            ):
+                raise StageError("TinyKG bundle artifact paths must be unique and relative")
+            if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+                raise StageError("TinyKG bundle artifact SHA-256 is invalid")
+            if binary_format not in ARTIFACT_FORMATS:
+                raise StageError("TinyKG bundle artifact format is unsupported")
+            if (
+                not isinstance(architectures, list)
+                or not architectures
+                or len(set(architectures)) != len(architectures)
+                or any(arch not in ARCHITECTURES for arch in architectures)
+            ):
+                raise StageError("TinyKG bundle architectures are invalid")
+            if (
+                not isinstance(artifact_targets, list)
+                or not artifact_targets
+                or len(set(artifact_targets)) != len(artifact_targets)
+                or any(target not in TARGET_CONTRACTS for target in artifact_targets)
+                or any(target in targets for target in artifact_targets)
+            ):
+                raise StageError("TinyKG bundle targets must be supported and unique")
+            target_contracts = [TARGET_CONTRACTS[target] for target in artifact_targets]
+            if any(format_name != binary_format for format_name, _ in target_contracts):
+                raise StageError("TinyKG bundle target and executable format disagree")
+            if {arch for _, arch in target_contracts} != set(architectures):
+                raise StageError("TinyKG bundle target and architecture declarations disagree")
+            keys.add(key)
+            paths.add(relative)
+            targets.update(artifact_targets)
+            artifacts.append(
+                BundleArtifact(
+                    key=key,
+                    path=relative,
+                    sha256=digest,
+                    binary_format=binary_format,
+                    architectures=tuple(architectures),
+                    targets=tuple(artifact_targets),
+                )
+            )
+        return cls(
+            source_commit=raw["source_commit"],
+            zig_version=build["zig_version"],
+            optimize=build["optimize"],
+            strip=build["strip"],
+            artifacts=tuple(artifacts),
+        )
+
+    def artifact(self, key: str) -> BundleArtifact:
+        matches = [artifact for artifact in self.artifacts if artifact.key == key]
+        if len(matches) != 1:
+            raise StageError(f"TinyKG bundle key is not declared exactly once: {key}")
+        return matches[0]
+
+
+@dataclass(frozen=True)
 class BinaryIdentity:
     path: Path
     sha256: str
@@ -100,11 +248,7 @@ def _run(binary: Path, arguments: Sequence[str]) -> subprocess.CompletedProcess[
         raise StageError(f"TinyKG probe failed: {exc}") from exc
 
 
-def inspect_binary(
-    binary: Path,
-    expected_sha256: str,
-    contract: TinyKgContract,
-) -> BinaryIdentity:
+def _validate_regular_binary(binary: Path, expected_sha256: str) -> None:
     if not binary.is_absolute():
         raise StageError("TinyKG binary path must be absolute")
     try:
@@ -117,13 +261,19 @@ def inspect_binary(
         raise StageError("TinyKG binary is not executable")
     if not SHA256_RE.fullmatch(expected_sha256):
         raise StageError("expected TinyKG SHA-256 must be 64 lowercase hex characters")
-
     observed = sha256_file(binary)
     if observed != expected_sha256:
         raise StageError(
             f"TinyKG SHA-256 mismatch: expected {expected_sha256}, observed {observed}"
         )
 
+
+def inspect_binary(
+    binary: Path,
+    expected_sha256: str,
+    contract: TinyKgContract,
+) -> BinaryIdentity:
+    _validate_regular_binary(binary, expected_sha256)
     version = _run(binary, ("version",))
     if version.returncode != 0:
         raise StageError(f"TinyKG version probe failed: {version.stdout.strip()}")
@@ -133,7 +283,81 @@ def inspect_binary(
             f"TinyKG version mismatch: expected {contract.tinykg_version}, "
             f"observed {version_line or '<empty>'}"
         )
-    return BinaryIdentity(binary, observed, version_line)
+    return BinaryIdentity(binary, expected_sha256, version_line)
+
+
+def _validate_elf(data: bytes, architectures: tuple[str, ...]) -> None:
+    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+        raise StageError("TinyKG bundle expected a 64-bit little-endian ELF binary")
+    expected_machine = {"x86_64": 62, "aarch64": 183}
+    if len(architectures) != 1 or struct.unpack("<H", data[18:20])[0] != expected_machine[
+        architectures[0]
+    ]:
+        raise StageError("TinyKG ELF architecture does not match its manifest")
+    program_offset = struct.unpack("<Q", data[32:40])[0]
+    entry_size = struct.unpack("<H", data[54:56])[0]
+    entry_count = struct.unpack("<H", data[56:58])[0]
+    if entry_size != 56 or program_offset + entry_size * entry_count > len(data):
+        raise StageError("TinyKG ELF program-header table is invalid")
+    for index in range(entry_count):
+        offset = program_offset + index * entry_size
+        if struct.unpack("<I", data[offset : offset + 4])[0] == 3:
+            raise StageError("TinyKG Linux bundle must be static and contain no PT_INTERP")
+
+
+def _validate_mach_o_universal(data: bytes, architectures: tuple[str, ...]) -> None:
+    if len(data) < 48 or data[:4] != b"\xca\xfe\xba\xbe":
+        raise StageError("TinyKG bundle expected a universal Mach-O binary")
+    count = struct.unpack(">I", data[4:8])[0]
+    if count == 0 or 8 + count * 20 > len(data):
+        raise StageError("TinyKG universal Mach-O header is invalid")
+    cpu_names = {0x01000007: "x86_64", 0x0100000C: "aarch64"}
+    observed: set[str] = set()
+    for index in range(count):
+        entry = 8 + index * 20
+        cpu = struct.unpack(">I", data[entry : entry + 4])[0]
+        slice_offset, slice_size = struct.unpack(">II", data[entry + 8 : entry + 16])
+        if cpu not in cpu_names or slice_size == 0 or slice_offset + slice_size > len(data):
+            raise StageError("TinyKG universal Mach-O slice is invalid")
+        observed.add(cpu_names[cpu])
+    if observed != set(architectures) or count != len(architectures):
+        raise StageError("TinyKG universal Mach-O architectures do not match its manifest")
+
+
+def _validate_pe(data: bytes, architectures: tuple[str, ...]) -> None:
+    if len(data) < 256 or data[:2] != b"MZ" or architectures != ("x86_64",):
+        raise StageError("TinyKG bundle expected an x86_64 Windows PE binary")
+    pe_offset = struct.unpack("<I", data[0x3C:0x40])[0]
+    if pe_offset + 26 > len(data) or data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        raise StageError("TinyKG Windows PE signature is invalid")
+    if struct.unpack("<H", data[pe_offset + 4 : pe_offset + 6])[0] != 0x8664:
+        raise StageError("TinyKG Windows PE architecture is not x86_64")
+    optional_size = struct.unpack("<H", data[pe_offset + 20 : pe_offset + 22])[0]
+    if optional_size < 2 or pe_offset + 24 + optional_size > len(data):
+        raise StageError("TinyKG Windows PE optional header is invalid")
+    if struct.unpack("<H", data[pe_offset + 24 : pe_offset + 26])[0] != 0x20B:
+        raise StageError("TinyKG Windows binary is not PE32+")
+
+
+def validate_bundle_bytes(
+    binary: Path,
+    artifact: BundleArtifact,
+    contract: TinyKgContract,
+) -> BinaryIdentity:
+    _validate_regular_binary(binary, artifact.sha256)
+    data = binary.read_bytes()
+    if artifact.binary_format == "elf-static":
+        _validate_elf(data, artifact.architectures)
+    elif artifact.binary_format == "mach-o-universal":
+        _validate_mach_o_universal(data, artifact.architectures)
+    elif artifact.binary_format == "pe":
+        _validate_pe(data, artifact.architectures)
+    else:  # TinyKgBundle.load makes this state unrepresentable.
+        raise AssertionError(artifact.binary_format)
+    version_line = f"tinykg {contract.tinykg_version}"
+    if version_line.encode("utf-8") not in data:
+        raise StageError(f"TinyKG version marker is missing: {version_line}")
+    return BinaryIdentity(binary, artifact.sha256, version_line)
 
 
 def _parse_store_info(output: str) -> Mapping[str, str]:
@@ -214,6 +438,39 @@ def _atomic_json(destination: Path, value: Mapping[str, object]) -> None:
             pass
 
 
+def _publish(
+    identity: BinaryIdentity,
+    contract: TinyKgContract,
+    target: str,
+    output: Path,
+    receipt: Path,
+    distribution: str,
+    bundle_key: str | None = None,
+    source_commit: str | None = None,
+) -> None:
+    _atomic_copy(identity.path, output)
+    if sha256_file(output) != identity.sha256:
+        raise StageError("staged TinyKG bytes changed during copy")
+    value: dict[str, object] = {
+        "binary_sha256": identity.sha256,
+        "binary_version": identity.version_line,
+        "contract_schema": CONTRACT_SCHEMA,
+        "distribution": distribution,
+        "license": contract.license,
+        "receipt_schema": RECEIPT_SCHEMA,
+        "source_repository": contract.source_repository,
+        "storage_format_version": contract.storage_format_version,
+        "store_schema_version": contract.store_schema_version,
+        "target": target,
+    }
+    if distribution == "bundled":
+        if bundle_key is None or source_commit is None:
+            raise AssertionError("bundled provenance requires key and source commit")
+        value["bundle_key"] = bundle_key
+        value["source_commit"] = source_commit
+    _atomic_json(receipt, value)
+
+
 def stage(
     binary: Path,
     expected_sha256: str,
@@ -227,47 +484,102 @@ def stage(
     contract = TinyKgContract.load(contract_path)
     identity = inspect_binary(binary, expected_sha256, contract)
     validate_store_contract(identity, contract)
-    _atomic_copy(identity.path, output)
-    if sha256_file(output) != identity.sha256:
-        raise StageError("staged TinyKG bytes changed during copy")
-    _atomic_json(
+    _publish(identity, contract, target, output, receipt, "explicit")
+
+
+def stage_bundled(
+    binary: Path,
+    manifest_path: Path,
+    bundle_key: str,
+    expected_sha256: str,
+    target_family: str,
+    runtime_probe: bool,
+    contract_path: Path,
+    target: str,
+    output: Path,
+    receipt: Path,
+) -> None:
+    if not target or not target_family:
+        raise StageError("target triple and family must be non-empty")
+    contract = TinyKgContract.load(contract_path)
+    bundle = TinyKgBundle.load(manifest_path)
+    artifact = bundle.artifact(bundle_key)
+    if artifact.sha256 != expected_sha256:
+        raise StageError("TinyKG build selection digest does not match its manifest")
+    expected = (manifest_path.parent / artifact.path).resolve()
+    if binary.resolve() != expected:
+        raise StageError("TinyKG bundle binary path does not match its manifest")
+    if target_family not in artifact.targets:
+        raise StageError(
+            f"TinyKG bundle {bundle_key} does not support target {target_family}"
+        )
+    identity = validate_bundle_bytes(binary, artifact, contract)
+    if runtime_probe:
+        probed = inspect_binary(binary, artifact.sha256, contract)
+        validate_store_contract(probed, contract)
+        identity = probed
+    _publish(
+        identity,
+        contract,
+        target,
+        output,
         receipt,
-        {
-            "binary_sha256": identity.sha256,
-            "binary_version": identity.version_line,
-            "contract_schema": CONTRACT_SCHEMA,
-            "license": contract.license,
-            "receipt_schema": RECEIPT_SCHEMA,
-            "source_repository": contract.source_repository,
-            "storage_format_version": contract.storage_format_version,
-            "store_schema_version": contract.store_schema_version,
-            "target": target,
-        },
+        "bundled",
+        bundle_key=bundle_key,
+        source_commit=bundle.source_commit,
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--expected-sha256", required=True)
+def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--contract", type=Path, required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_subparsers(dest="mode", required=True)
+    explicit = modes.add_parser("explicit", help="stage an operator-supplied binary")
+    explicit.add_argument("--binary", type=Path, required=True)
+    explicit.add_argument("--expected-sha256", required=True)
+    _add_common_arguments(explicit)
+    bundled = modes.add_parser("bundled", help="stage a checked-in bundle artifact")
+    bundled.add_argument("--binary", type=Path, required=True)
+    bundled.add_argument("--manifest", type=Path, required=True)
+    bundled.add_argument("--bundle-key", required=True)
+    bundled.add_argument("--expected-sha256", required=True)
+    bundled.add_argument("--target-family", required=True)
+    bundled.add_argument("--runtime-probe", action="store_true")
+    _add_common_arguments(bundled)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        stage(
-            binary=args.binary,
-            expected_sha256=args.expected_sha256,
-            contract_path=args.contract,
-            target=args.target,
-            output=args.output,
-            receipt=args.receipt,
-        )
+        if args.mode == "explicit":
+            stage(
+                binary=args.binary,
+                expected_sha256=args.expected_sha256,
+                contract_path=args.contract,
+                target=args.target,
+                output=args.output,
+                receipt=args.receipt,
+            )
+        else:
+            stage_bundled(
+                binary=args.binary,
+                manifest_path=args.manifest,
+                bundle_key=args.bundle_key,
+                expected_sha256=args.expected_sha256,
+                target_family=args.target_family,
+                runtime_probe=args.runtime_probe,
+                contract_path=args.contract,
+                target=args.target,
+                output=args.output,
+                receipt=args.receipt,
+            )
     except StageError as exc:
         print(f"stage-tinykg: error: {exc}", file=os.sys.stderr)
         return 1

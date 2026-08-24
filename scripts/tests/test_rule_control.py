@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts import rule_control
 
@@ -705,6 +706,22 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             '        self.assertEqual(identities[0]["artifact_fingerprint"], identities[1]["artifact_fingerprint"])\n',
             encoding="utf-8",
         )
+        (root / "vendor/tinykg").mkdir(parents=True, exist_ok=True)
+        (root / "vendor/tinykg/manifest.json").write_text(
+            '{"bundle_schema":"metacodes.tinykg-bundle/v1",'
+            '"source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            '"build":{"optimize":"ReleaseSafe","strip": true},'
+            '"artifacts":[{"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+            '"targets":["x86_64-linux"],"format":"elf-static"}]}\n',
+            encoding="utf-8",
+        )
+        (root / "scripts/stage_tinykg_binary.py").write_text(
+            "if artifact.sha256 != expected_sha256: fail()\n"
+            "identity = validate_bundle_bytes(binary, artifact, contract)\n"
+            "if target_family not in artifact.targets: fail()\n"
+            "validate_store_contract(probed, contract)\n",
+            encoding="utf-8",
+        )
         (root / "scripts/build-formal-kernel.sh").write_text(
             'manifest="metacodes-formal-artifact-v4"\n'
             'receipt="metacodes-formal-build-receipt-v1"\n'
@@ -774,6 +791,11 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             "const integration_default = value orelse 8;\n"
             'const tinykg_bin = b.option([]const u8, "tinykg-bin", "fixture");\n'
             'const tinykg_sha = b.option([]const u8, "tinykg-sha256", "fixture");\n'
+            'const tinykg_bundle = b.option(bool, "tinykg-bundled", "fixture");\n'
+            'const selected = bundledTinyKgForTarget(target);\n'
+            'const manifest = b.path("vendor/tinykg/manifest.json");\n'
+            'const binary = b.path(input.path);\n'
+            'const digest_arg = "--expected-sha256";\n'
             'const paired = "must be supplied together";\n',
             encoding="utf-8",
         )
@@ -884,7 +906,7 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         build = root / "build.zig"
         build.write_text(
             build.read_text(encoding="utf-8").replace(
-                'const tinykg_sha = b.option([]const u8, "tinykg-sha256", "fixture");', ""
+                'const manifest = b.path("vendor/tinykg/manifest.json");', ""
             ),
             encoding="utf-8",
         )
@@ -1753,6 +1775,32 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
 
 
 class FeedbackExecutionTests(unittest.TestCase):
+    def test_default_feedback_environment_binds_verified_native_bundle(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "METACODES_TEST_TINYKG_BIN": "",
+                "METACODES_TEST_TINYKG_SHA256": "",
+            },
+            clear=False,
+        ):
+            env = rule_control.prepare_feedback_environment(PROJECT_ROOT)
+        self.assertTrue(Path(env["METACODES_TEST_TINYKG_BIN"]).is_absolute())
+        self.assertEqual(64, len(env["METACODES_TEST_TINYKG_SHA256"]))
+        self.assertEqual("1", env["METACODES_RULE_CONTROL"])
+
+    def test_partial_feedback_override_fails_closed(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "METACODES_TEST_TINYKG_BIN": "/tmp/tinykg",
+                "METACODES_TEST_TINYKG_SHA256": "",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(rule_control.ControlError, "must be set together"):
+                rule_control.prepare_feedback_environment(PROJECT_ROOT)
+
     def test_shard_key_value_summary_does_not_impersonate_skipped_feedback(self) -> None:
         passed, results = rule_control.run_feedback(
             Path.cwd(),

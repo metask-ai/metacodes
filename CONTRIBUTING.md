@@ -21,9 +21,10 @@ zig build test:lib
 zig build test
 ```
 
-TinyKG-dependent work must use the explicit binary contract documented in
-[doc/TINYKG_INTEGRATION.md](doc/TINYKG_INTEGRATION.md). Do not add a TinyKG source
-snapshot, download-on-build step, `PATH` lookup, or sibling-repository fallback.
+TinyKG-dependent work uses the native checked-in bundle by default. Follow the
+manual binary contract in [doc/TINYKG_INTEGRATION.md](doc/TINYKG_INTEGRATION.md)
+when auditing or replacing it. Do not add a TinyKG source snapshot,
+download-on-build step, `PATH` lookup, or sibling-repository fallback.
 
 Every public field or capability needs declaration, runtime wiring, and an L2
 test that observes the downstream effect. Update API documentation and source-free
@@ -38,7 +39,8 @@ consumer fixtures in the same pull request as an API change.
 - Run `git diff --check`, formatting, ReleaseSafe tests proportional to risk, and
   `scripts/test_coverage_audit.sh`.
 - Do not include credentials, personal absolute paths, generated benchmark runs,
-  local stores, or compiled binaries.
+  local stores, or compiled binaries. The reviewed TinyKG assets declared by
+  `vendor/tinykg/manifest.json` are the only binary exception.
 
 By contributing, you agree that your contribution will be distributed under the
 project license selected before public launch. Until that license is published,

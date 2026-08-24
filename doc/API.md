@@ -13,6 +13,7 @@ artifact store, and TinyKG admission are not replaceable extensions.
 | AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 13 | exact revision, sizes, capabilities, and bundle manifest |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
 | Plugin inventory | `--dump-plugins`, Zig, Web state | versioned v1 | additive observation fields only where specified |
+| TinyKG executable distribution | `vendor/tinykg/manifest.json` | bundle v1 | exact target, format, source commit, and SHA-256 pinning |
 
 There is no general HTTP service API promise yet. The Web and daemon hosts are
 product surfaces built over the same core protocols.
@@ -84,6 +85,11 @@ of the next request until deliberate compaction. These are never model-visible:
 A real tool schema, system instruction, dialect output, conversation append, or
 compaction may change the cache key. Tests compare serialized provider requests,
 not internal object identity.
+
+Selecting, staging, or explicitly overriding a TinyKG executable does not change
+provider-visible bytes. TinyKG receipts and bundle identities remain execution
+metadata; only governed memory content deliberately appended at a checkpoint can
+change the subsequent request.
 
 ## Errors and ownership
 

@@ -7,10 +7,10 @@ authoritative.
 |---|---|---|---|
 | highlight-zig | checked-in Zig source snapshot | `lib/highlight-zig/SOURCE.txt` | retain its bundled license |
 | ripgrep | distributed helper binary | `vendor/ripgrep/` | review and ship upstream notices/license |
-| TinyKG | optional external native binary | `deps/tinykg.json` | Apache-2.0 dependency; not part of repository source |
+| TinyKG 0.2.0 | checked-in target-specific CLI binaries | `vendor/tinykg/manifest.json` | Apache-2.0; license retained at `vendor/tinykg/LICENSE` and source commit pinned |
 | Zig standard library/toolchain | build toolchain | ziglang.org | governed by Zig distribution terms |
 
 Historical tree-sitter and TinyKG source snapshots remain in Git history but are
-not part of the current source tree or release bundle. Before public launch, run a
-complete history and release-artifact license scan and update this inventory with
-exact versions and license-file paths.
+not part of the current source tree. Before public launch, run a complete history
+and release-artifact license scan and confirm that the binary manifest, upstream
+source link, and retained Apache-2.0 text satisfy the intended distribution.

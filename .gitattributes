@@ -1,1 +1,2 @@
 sdk/rust/src/raw.rs text eol=lf
+vendor/tinykg/bin/* -diff

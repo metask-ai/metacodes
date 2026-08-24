@@ -7,8 +7,9 @@ The repository is prepared for review but is **not approved for public visibilit
 - standalone Git history with `main` as the primary branch;
 - independent build/package root and repository documentation;
 - public API and embedding-surface inventory;
-- TinyKG source removed and replaced by an explicit binary attestation contract;
-- local artifacts, evaluation runs, stores, and binaries ignored;
+- TinyKG source removed and replaced by a cross-platform, SHA-256-pinned binary
+  bundle plus an explicit override contract;
+- local artifacts, evaluation runs, stores, and undeclared binaries ignored;
 - contribution, governance, conduct, support, and security drafts;
 - CI definitions scoped to the standalone repository;
 - current-tree and targeted history credential review.
@@ -30,7 +31,8 @@ The repository is prepared for review but is **not approved for public visibilit
 ## Final launch gate
 
 - [ ] Run an independent full-history scanner such as gitleaks.
-- [ ] Review `THIRD_PARTY_NOTICES.md` and every distributed asset/license.
+- [ ] Review `THIRD_PARTY_NOTICES.md`, `vendor/tinykg/manifest.json`, and every
+      distributed asset/license.
 - [ ] Run native ReleaseSafe tests and AgentCore source-free consumer gates on the
       supported matrix.
 - [ ] Verify public examples use placeholders and no paid endpoint by default.

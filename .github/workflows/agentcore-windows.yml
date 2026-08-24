@@ -36,8 +36,7 @@ jobs:
           zig build agentcore:gate `
             -Dtarget=x86_64-windows-msvc `
             -Doptimize=ReleaseSafe `
-            -Dtinykg=false `
             -j12
       - name: Native Windows platform gate
         shell: pwsh
-        run: zig build windows:gate -Dtarget=x86_64-windows-gnu -Dtinykg=false -j12
+        run: zig build windows:gate -Dtarget=x86_64-windows-gnu -j12

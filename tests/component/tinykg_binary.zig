@@ -1,8 +1,9 @@
-//! Test-only resolver for the manually maintained TinyKG binary.
+//! Test-only resolver for the staged manually maintained TinyKG binary.
 //!
 //! Tests never inspect a developer checkout, PATH, or a stale zig-out tree.
-//! The build graph wires METACODES_TEST_TINYKG_BIN only after the staging
-//! contract succeeds; direct maintainers may set the same variable explicitly.
+//! The build graph selects the checked-in target bundle and wires
+//! METACODES_TEST_TINYKG_BIN only after staging succeeds; maintainers may set
+//! the same variable explicitly while auditing an override.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -30,7 +31,7 @@ fn isExecutable(path: []const u8) bool {
     return std.c.access(buffer[0..path.len :0].ptr, mode) == 0;
 }
 
-test "missing explicit TinyKG test input is absent" {
+test "missing staged TinyKG test input is absent" {
     // The production assertion is the lack of any filesystem/PATH fallback in
     // find(). Environment-bearing positive behavior is covered by component
     // L2 when build.zig wires the attested binary.

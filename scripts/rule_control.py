@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
@@ -1245,6 +1245,8 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         "suite": "tests/integration_suite.zig",
         "build": "build.zig",
         "artifact_repro": "scripts/tests/test_artifact_reproducibility.py",
+        "tinykg_bundle": "vendor/tinykg/manifest.json",
+        "tinykg_stage": "scripts/stage_tinykg_binary.py",
         "formal_build": "scripts/build-formal-kernel.sh",
         "experiment": "scripts/eval/experiment.py",
     }
@@ -1405,12 +1407,43 @@ def observe_build_test_throughput(repo: Path) -> Observation:
     }
 
     tinykg_artifact_repro_checks = {
-        "TinyKG path and digest must be supplied together": all(
+        "TinyKG explicit override path and digest must be supplied together": all(
             marker in sources["build"]
             for marker in (
                 '"tinykg-bin"',
                 '"tinykg-sha256"',
                 "must be supplied together",
+            )
+        ),
+        "normal builds select a checked-in target bundle": all(
+            marker in sources["build"]
+            for marker in (
+                "bundledTinyKgForTarget",
+                '"tinykg-bundled"',
+                'b.path("vendor/tinykg/manifest.json")',
+                'b.path(input.path)',
+                '"--expected-sha256"',
+            )
+        ),
+        "bundle manifest pins source build target format and digest": all(
+            marker in sources["tinykg_bundle"]
+            for marker in (
+                '"metacodes.tinykg-bundle/v1"',
+                '"source_commit"',
+                '"ReleaseSafe"',
+                '"strip": true',
+                '"sha256"',
+                '"targets"',
+                '"format"',
+            )
+        ),
+        "bundle staging enforces digest format target and native store probes": all(
+            marker in sources["tinykg_stage"]
+            for marker in (
+                "artifact.sha256 != expected_sha256",
+                "validate_bundle_bytes",
+                "target_family not in artifact.targets",
+                "validate_store_contract(probed, contract)",
             )
         ),
         "feedback stages one attested input into two isolated locations": all(
@@ -4277,15 +4310,70 @@ def feedback_binding_errors(observation: Observation, feedback: dict[str, Any]) 
     return errors
 
 
-def run_feedback(repo: Path, feedback: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]]:
+def prepare_feedback_environment(repo: Path) -> dict[str, str]:
+    """Bind every feedback process to one verified native TinyKG input."""
+
+    try:
+        from scripts.stage_tinykg_binary import (
+            TinyKgBundle,
+            TinyKgContract,
+            inspect_binary,
+            validate_bundle_bytes,
+            validate_store_contract,
+        )
+        from scripts.verify_tinykg_binary import native_bundle_key
+    except ModuleNotFoundError:  # Direct `python scripts/rule_control.py` execution.
+        from stage_tinykg_binary import (  # type: ignore[no-redef]
+            TinyKgBundle,
+            TinyKgContract,
+            inspect_binary,
+            validate_bundle_bytes,
+            validate_store_contract,
+        )
+        from verify_tinykg_binary import native_bundle_key  # type: ignore[no-redef]
+
+    env = os.environ.copy()
+    path_raw = env.get("METACODES_TEST_TINYKG_BIN") or None
+    sha_raw = env.get("METACODES_TEST_TINYKG_SHA256") or None
+    if bool(path_raw) != bool(sha_raw):
+        raise ControlError(
+            "METACODES_TEST_TINYKG_BIN and METACODES_TEST_TINYKG_SHA256 "
+            "must be set together"
+        )
+    try:
+        contract = TinyKgContract.load(repo / "deps/tinykg.json")
+        if path_raw is not None and sha_raw is not None:
+            identity = inspect_binary(Path(path_raw), sha_raw, contract)
+        else:
+            manifest_path = repo / "vendor/tinykg/manifest.json"
+            bundle = TinyKgBundle.load(manifest_path)
+            artifact = bundle.artifact(native_bundle_key())
+            binary = (manifest_path.parent / artifact.path).resolve()
+            identity = validate_bundle_bytes(binary, artifact, contract)
+            identity = inspect_binary(binary, artifact.sha256, contract)
+        validate_store_contract(identity, contract)
+    except (OSError, RuntimeError) as exc:
+        raise ControlError(f"TinyKG feedback input is invalid: {exc}") from exc
+    env["METACODES_TEST_TINYKG_BIN"] = str(identity.path.resolve())
+    env["METACODES_TEST_TINYKG_SHA256"] = identity.sha256
+    env["METACODES_RULE_CONTROL"] = "1"
+    return env
+
+
+def run_feedback(
+    repo: Path,
+    feedback: dict[str, Any],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[bool, list[dict[str, Any]]]:
     commands = feedback.get("commands", [])
     timeout = feedback.get("timeout_seconds", 900)
     if not isinstance(timeout, int) or timeout < 1 or timeout > 3600:
         raise ControlError("feedback.timeout_seconds must be between 1 and 3600")
     results: list[dict[str, Any]] = []
     all_passed = True
-    env = os.environ.copy()
-    env["METACODES_RULE_CONTROL"] = "1"
+    child_env = dict(env) if env is not None else prepare_feedback_environment(repo)
+    child_env["METACODES_RULE_CONTROL"] = "1"
     for raw in commands:
         command = normalize_command(raw)
         started_ns = time.monotonic_ns()
@@ -4293,7 +4381,7 @@ def run_feedback(repo: Path, feedback: dict[str, Any]) -> tuple[bool, list[dict[
             result = subprocess.run(
                 command,
                 cwd=repo,
-                env=env,
+                env=child_env,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -4400,6 +4488,7 @@ def run_check(repo: Path, manifest_path: Path, report_path: Path) -> int:
                 if isinstance(values, list):
                     theorem_names.extend(value for value in values if isinstance(value, str))
         report["lean_sources"] = kernel.verify_sources(sorted(set(theorem_names)))
+        feedback_env = prepare_feedback_environment(repo)
     except (ControlError, OSError, subprocess.SubprocessError) as exc:
         return report_failure(report_path, str(exc), report)
 
@@ -4462,7 +4551,7 @@ def run_check(repo: Path, manifest_path: Path, report_path: Path) -> int:
                 overall_allowed = False
                 continue
 
-            feedback_ok, feedback_results = run_feedback(repo, feedback)
+            feedback_ok, feedback_results = run_feedback(repo, feedback, env=feedback_env)
             rule_report["feedback_runs"] = feedback_results
 
             after = observe_rule(repo, raw_rule)

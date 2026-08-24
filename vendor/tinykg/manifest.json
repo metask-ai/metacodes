@@ -1,0 +1,61 @@
+{
+  "artifacts": [
+    {
+      "architectures": [
+        "aarch64",
+        "x86_64"
+      ],
+      "format": "mach-o-universal",
+      "key": "macos-universal",
+      "path": "bin/tinykg-macos-universal",
+      "sha256": "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af",
+      "targets": [
+        "aarch64-macos",
+        "x86_64-macos"
+      ]
+    },
+    {
+      "architectures": [
+        "x86_64"
+      ],
+      "format": "elf-static",
+      "key": "linux-x86_64",
+      "path": "bin/tinykg-linux-x86_64",
+      "sha256": "5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba",
+      "targets": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "architectures": [
+        "aarch64"
+      ],
+      "format": "elf-static",
+      "key": "linux-aarch64",
+      "path": "bin/tinykg-linux-aarch64",
+      "sha256": "9cfe7bf551463068c1bcaa49dea69dce53be6fdf5b9428f39081fcad67e461aa",
+      "targets": [
+        "aarch64-linux"
+      ]
+    },
+    {
+      "architectures": [
+        "x86_64"
+      ],
+      "format": "pe",
+      "key": "windows-x86_64",
+      "path": "bin/tinykg-windows-x86_64.exe",
+      "sha256": "27f72f74babdcc60c327228673f9eb042092b6c82b156e241c66c0acea081e1b",
+      "targets": [
+        "x86_64-windows"
+      ]
+    }
+  ],
+  "build": {
+    "optimize": "ReleaseSafe",
+    "strip": true,
+    "zig_version": "0.16.0"
+  },
+  "bundle_schema": "metacodes.tinykg-bundle/v1",
+  "source_commit": "a0544788aeadb3b92c69e539834be54850792285"
+}

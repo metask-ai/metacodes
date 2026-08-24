@@ -17,7 +17,9 @@ These rules apply to the entire repository.
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
   journals, timestamps, and equivalent configuration churn must not enter prompts.
-- TinyKG is an explicit external binary. Never add source vendoring, `PATH` search,
+- TinyKG is a separately built external binary dependency. The repository owns one
+  manually reviewed cross-platform binary bundle, selected by target and pinned
+  by SHA-256. Never add TinyKG source vendoring, download-on-build, `PATH` search,
   sibling-checkout discovery, or stale build-output fallback.
 
 ## Definition of done
@@ -37,14 +39,16 @@ scripts/test_coverage_audit.sh
 git diff --check
 ```
 
-Supply `-Dtinykg-bin` and `-Dtinykg-sha256` only when the changed tests require
-TinyKG. Do not run paid or provider-backed benchmarks without explicit user
-authorization, a dollar cap, and the durable budget journal.
+The native bundled TinyKG is wired into tests by default. Supply
+`-Dtinykg-bin` and `-Dtinykg-sha256` together only to audit an explicit override.
+Do not run paid or provider-backed benchmarks without explicit user authorization,
+a dollar cap, and the durable budget journal.
 
 ## Repository hygiene
 
 - Keep secrets, personal paths, generated evaluation runs, binaries, and local
-  TinyKG stores out of Git.
+  TinyKG stores out of Git. The manifest-pinned release assets under
+  `vendor/tinykg/bin/` are the sole binary exception.
 - Use `rg`/`rg --files` for discovery and `apply_patch` for source edits.
 - Do not overwrite unrelated worktree changes. Destructive Git commands require
   explicit authorization.

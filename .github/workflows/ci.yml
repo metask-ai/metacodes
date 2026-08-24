@@ -42,10 +42,10 @@ jobs:
       - name: TinyKG binary-contract unit tests
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
       - name: Full offline test suite
-        run: zig build test -Dtinykg=false
+        run: zig build test
       - name: ReleaseSafe core gate
         if: runner.os == 'Linux'
-        run: zig build test:lib -Doptimize=ReleaseSafe -Dtinykg=false
+        run: zig build test:lib -Doptimize=ReleaseSafe
       - name: Repository coverage audit
         if: runner.os == 'Linux'
         run: scripts/test_coverage_audit.sh
@@ -72,3 +72,25 @@ jobs:
           for module in sync fs rng paths signal process net dir; do
             zig test "src/platform/${module}.zig" -lc
           done
+
+  tinykg-bundle:
+    name: bundled TinyKG (${{ matrix.os }})
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Verify native bundle and fresh-store contract
+        shell: bash
+        run: |
+          python scripts/verify_tinykg_binary.py
+          zig build tinykg:stage
+      - name: Verify Linux arm64 cross-stage contract
+        if: runner.os == 'Linux'
+        run: zig build tinykg:stage -Dtarget=aarch64-linux-musl

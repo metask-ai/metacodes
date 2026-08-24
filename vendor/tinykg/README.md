@@ -1,8 +1,21 @@
-# TinyKG staging directory
+# TinyKG binary bundle
 
-`zig build tinykg:stage -Dtinykg-bin=... -Dtinykg-sha256=...` installs a
-validated native binary and provenance receipt under `zig-out/vendor/tinykg/`.
+This directory contains the manually maintained TinyKG CLI bundle consumed by a
+normal Metacodes build. It contains no TinyKG source code and no runtime store.
 
-This source-tree directory is documentation only. Do not copy or commit a TinyKG
-binary here. The accepted contract is `deps/tinykg.json`; operational details are
-in `doc/TINYKG_INTEGRATION.md`.
+`manifest.json` binds every asset to its target family, executable format,
+architectures, SHA-256, upstream commit, Zig version, and ReleaseSafe/strip build
+profile. `deps/tinykg.json` independently pins the CLI and store contract.
+
+Supported assets:
+
+- `bin/tinykg-macos-universal`: macOS arm64 and x86_64;
+- `bin/tinykg-linux-x86_64`: static-musl x86_64 Linux;
+- `bin/tinykg-linux-aarch64`: static-musl arm64 Linux;
+- `bin/tinykg-windows-x86_64.exe`: x86_64 Windows.
+
+The default build selects exactly one target-compatible asset, verifies the
+manifest digest and executable format, and installs it as
+`zig-out/vendor/tinykg/tinykg[.exe]`. A native build additionally executes the
+version and fresh-store probes. See `doc/TINYKG_INTEGRATION.md` before manually
+replacing any asset.

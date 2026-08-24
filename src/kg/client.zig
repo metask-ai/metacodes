@@ -436,7 +436,8 @@ pub const KgClient = struct {
     }
 
     /// bin 查找顺序:env METACODES_KG_BIN > config kg_bin > 由维护者显式 staged 的
-    /// 相邻 `vendor/tinykg/tinykg`。没有 PATH、源码树或开发 checkout 回退。
+    /// 相邻 `vendor/tinykg/tinykg`（由目标匹配的 checked-in bundle staged）。
+    /// 没有 PATH、源码树或开发 checkout 回退。
     /// 每候选 access 检查,全失败返 null(→ ensureReady 判 degraded)。
     ///
     /// PM review 修:旧版① vendored 用调用方传的 exe_dir(argv[0] 派生),裸名经 PATH 启动
@@ -638,7 +639,7 @@ pub const KgClient = struct {
             .exclusive_cli => {},
         }
         const bin = self.bin_path orelse {
-            self.setDegraded("tinykg 二进制未找到。只接受 METACODES_KG_BIN、config kg_bin 或维护者显式 staged 的 <prefix>/vendor/tinykg/tinykg。源码仓库不构建 TinyKG；见 doc/TINYKG_INTEGRATION.md", .{});
+            self.setDegraded("tinykg 二进制未找到。只接受 METACODES_KG_BIN、config kg_bin 或构建时从 checked-in bundle staged 的 <prefix>/vendor/tinykg/tinykg。源码仓库不构建 TinyKG；见 doc/TINYKG_INTEGRATION.md", .{});
             return;
         };
         // store 缺 → init(先建父目录)。

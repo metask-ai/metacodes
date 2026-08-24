@@ -63,12 +63,66 @@ fn addNestedBuildCacheArgs(b: *std.Build, run: *std.Build.Step.Run) void {
 }
 
 const TinyKgBinaryInput = union(enum) {
-    absent,
+    disabled,
+    unavailable,
+    bundled: BundledTinyKg,
     explicit: struct {
         path: []const u8,
         sha256: []const u8,
     },
 };
+
+const BundledTinyKg = struct {
+    key: []const u8,
+    path: []const u8,
+    sha256: []const u8,
+    target_family: []const u8,
+};
+
+fn bundledTinyKgForTarget(target: std.Target) ?BundledTinyKg {
+    return switch (target.os.tag) {
+        .macos => switch (target.cpu.arch) {
+            .aarch64 => .{
+                .key = "macos-universal",
+                .path = "vendor/tinykg/bin/tinykg-macos-universal",
+                .sha256 = "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af",
+                .target_family = "aarch64-macos",
+            },
+            .x86_64 => .{
+                .key = "macos-universal",
+                .path = "vendor/tinykg/bin/tinykg-macos-universal",
+                .sha256 = "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af",
+                .target_family = "x86_64-macos",
+            },
+            else => null,
+        },
+        .linux => switch (target.cpu.arch) {
+            .aarch64 => .{
+                .key = "linux-aarch64",
+                .path = "vendor/tinykg/bin/tinykg-linux-aarch64",
+                .sha256 = "9cfe7bf551463068c1bcaa49dea69dce53be6fdf5b9428f39081fcad67e461aa",
+                .target_family = "aarch64-linux",
+            },
+            .x86_64 => .{
+                .key = "linux-x86_64",
+                .path = "vendor/tinykg/bin/tinykg-linux-x86_64",
+                .sha256 = "5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba",
+                .target_family = "x86_64-linux",
+            },
+            else => null,
+        },
+        .windows => switch (target.cpu.arch) {
+            .x86_64 => .{
+                .key = "windows-x86_64",
+                .path = "vendor/tinykg/bin/tinykg-windows-x86_64.exe",
+                .sha256 = "27f72f74babdcc60c327228673f9eb042092b6c82b156e241c66c0acea081e1b",
+                .target_family = "x86_64-windows",
+            },
+            else => null,
+        },
+        else => null,
+    };
+}
 
 fn isLowerSha256(value: []const u8) bool {
     if (value.len != 64) return false;
@@ -78,16 +132,24 @@ fn isLowerSha256(value: []const u8) bool {
     return true;
 }
 
-/// TinyKG is an external, manually maintained native artifact.  Requiring the
-/// path and the operator-observed digest together makes an ambient binary or a
-/// stale checkout unrepresentable in the build graph.
-fn tinyKgBinaryInput(b: *std.Build) TinyKgBinaryInput {
+/// TinyKG is an external, manually maintained native artifact. Normal builds
+/// select one manifest-pinned repository asset; an explicit override still
+/// requires path and operator-observed digest together. Ambient binaries and
+/// stale checkouts remain unrepresentable in the build graph.
+fn tinyKgBinaryInput(b: *std.Build, target: std.Target) TinyKgBinaryInput {
     const legacy = b.option(bool, "tinykg", "Deprecated compatibility flag; only false is accepted");
     if (legacy == true) @panic("-Dtinykg=true was removed; use -Dtinykg-bin=<absolute path> and -Dtinykg-sha256=<digest>");
 
-    const path = b.option([]const u8, "tinykg-bin", "Absolute path to a maintainer-supplied native TinyKG binary");
-    const sha256 = b.option([]const u8, "tinykg-sha256", "Observed SHA-256 of -Dtinykg-bin");
-    if (path == null and sha256 == null) return .absent;
+    const bundled_option = b.option(bool, "tinykg-bundled", "Install the checked-in target-specific TinyKG binary (default true)");
+    if (legacy != null and bundled_option != null) @panic("-Dtinykg and -Dtinykg-bundled cannot be combined");
+
+    const path = b.option([]const u8, "tinykg-bin", "Absolute path to a maintainer-supplied TinyKG override");
+    const sha256 = b.option([]const u8, "tinykg-sha256", "Observed SHA-256 of the TinyKG override");
+    if (path == null and sha256 == null) {
+        const enabled = bundled_option orelse if (legacy) |value| value else true;
+        if (!enabled) return .disabled;
+        return if (bundledTinyKgForTarget(target)) |bundle| .{ .bundled = bundle } else .unavailable;
+    }
     const resolved_path = path orelse @panic("-Dtinykg-bin and -Dtinykg-sha256 must be supplied together");
     const resolved_sha256 = sha256 orelse @panic("-Dtinykg-bin and -Dtinykg-sha256 must be supplied together");
     if (!std.fs.path.isAbsolute(resolved_path)) @panic("-Dtinykg-bin must be an absolute path");
@@ -304,17 +366,70 @@ pub fn build(b: *std.Build) void {
     );
     project_harness_shadow_step.dependOn(&install_project_harness_shadow.step);
 
-    // TinyKG is deliberately outside the Metacodes source/build graph.  A
-    // maintainer may stage one native binary by supplying an absolute path and
-    // its observed digest.  The staging program validates version plus a fresh
-    // store's storage/schema contract before the bytes enter zig-out.
-    const tinykg_input = tinyKgBinaryInput(b);
+    // TinyKG source remains outside the Metacodes graph. Normal builds select a
+    // checked-in, manifest-pinned target binary. A maintainer may override it
+    // with an absolute path plus digest. Native staging validates version and a
+    // fresh store; cross staging validates digest, format, arch, and version bytes.
+    const tinykg_input = tinyKgBinaryInput(b, target.result);
     var staged_tinykg: ?StagedTinyKg = null;
-    const tinykg_stage_step = b.step("tinykg:stage", "Validate and install an explicit maintainer-supplied TinyKG binary");
+    const tinykg_stage_step = b.step("tinykg:stage", "Validate and install the selected TinyKG binary");
     switch (tinykg_input) {
-        .absent => tinykg_stage_step.dependOn(&b.addFail(
-            "tinykg:stage requires -Dtinykg-bin=<absolute path> and -Dtinykg-sha256=<digest>",
+        .disabled => tinykg_stage_step.dependOn(&b.addFail(
+            "tinykg:stage is disabled by -Dtinykg-bundled=false or legacy -Dtinykg=false",
         ).step),
+        .unavailable => tinykg_stage_step.dependOn(&b.addFail(
+            "the checked-in TinyKG bundle does not support this target; use a native explicit -Dtinykg-bin/-Dtinykg-sha256 override",
+        ).step),
+        .bundled => |input| {
+            const python = if (@import("builtin").os.tag == .windows) "python" else "python3";
+            const stage = b.addSystemCommand(&.{ python, "scripts/stage_tinykg_binary.py", "bundled", "--binary" });
+            stage.addFileArg(b.path(input.path));
+            stage.addArgs(&.{"--manifest"});
+            stage.addFileArg(b.path("vendor/tinykg/manifest.json"));
+            stage.addArgs(&.{
+                "--bundle-key",
+                input.key,
+                "--expected-sha256",
+                input.sha256,
+                "--target-family",
+                input.target_family,
+            });
+            const host_bundle = bundledTinyKgForTarget(b.graph.host.result);
+            if (host_bundle != null and std.mem.eql(u8, host_bundle.?.key, input.key)) {
+                stage.addArg("--runtime-probe");
+            }
+            stage.addArgs(&.{"--contract"});
+            stage.addFileArg(b.path("deps/tinykg.json"));
+            stage.addArgs(&.{
+                "--target",
+                target.result.zigTriple(b.allocator) catch @panic("OOM"),
+                "--output",
+            });
+            const bin_name = if (target.result.os.tag == .windows) "tinykg.exe" else "tinykg";
+            const staged_binary = stage.addOutputFileArg(bin_name);
+            stage.addArg("--receipt");
+            const staged_receipt = stage.addOutputFileArg("tinykg.provenance.json");
+            const install_binary = b.addInstallFileWithDir(
+                staged_binary,
+                .{ .custom = "vendor/tinykg" },
+                bin_name,
+            );
+            const install_receipt = b.addInstallFileWithDir(
+                staged_receipt,
+                .{ .custom = "vendor/tinykg" },
+                "tinykg.provenance.json",
+            );
+            b.getInstallStep().dependOn(&install_binary.step);
+            b.getInstallStep().dependOn(&install_receipt.step);
+            tinykg_stage_step.dependOn(&install_binary.step);
+            tinykg_stage_step.dependOn(&install_receipt.step);
+            staged_tinykg = .{
+                .install_step = &install_binary.step,
+                .artifact = staged_binary,
+                .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, bin_name),
+                .source_sha256 = input.sha256,
+            };
+        },
         .explicit => |input| {
             if (target.result.os.tag != b.graph.host.result.os.tag or
                 target.result.cpu.arch != b.graph.host.result.cpu.arch or
@@ -323,7 +438,7 @@ pub fn build(b: *std.Build) void {
                 @panic("a TinyKG binary can only be staged on its native target runner");
             }
             const python = if (@import("builtin").os.tag == .windows) "python" else "python3";
-            const stage = b.addSystemCommand(&.{ python, "scripts/stage_tinykg_binary.py", "--binary" });
+            const stage = b.addSystemCommand(&.{ python, "scripts/stage_tinykg_binary.py", "explicit", "--binary" });
             stage.addFileArg(.{ .cwd_relative = input.path });
             stage.addArgs(&.{ "--expected-sha256", input.sha256, "--contract" });
             stage.addFileArg(b.path("deps/tinykg.json"));
@@ -374,7 +489,7 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_debug.step);
     const dev_step = b.step("dev", "Install only the runnable Debug app (fast edit loop)");
     dev_step.dependOn(&install_debug.step);
-    const dev_full_step = b.step("dev:full", "Install the Debug app and an explicitly staged TinyKG binary");
+    const dev_full_step = b.step("dev:full", "Install the Debug app and selected TinyKG binary");
     dev_full_step.dependOn(&install_debug.step);
     dev_full_step.dependOn(tinykg_stage_step);
 
@@ -1283,7 +1398,7 @@ pub fn build(b: *std.Build) void {
     });
     const tinykg_contract_test_step = b.step(
         "test:tinykg-binary",
-        "Test the explicit manually maintained TinyKG binary boundary",
+        "Test the bundled and explicit manually maintained TinyKG boundary",
     );
     tinykg_contract_test_step.dependOn(&tinykg_contract_test_cmd.step);
     test_step.dependOn(&tinykg_contract_test_cmd.step);

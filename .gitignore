@@ -21,7 +21,8 @@ __pycache__/
 # 分析/架构报告 scratch
 output/
 
-# TinyKG is staged from a maintainer-attested external binary. Never commit it.
+# Runtime-staged TinyKG outputs do not belong in the source bundle. The four
+# reviewed release assets under vendor/tinykg/bin/ are intentional exceptions.
 vendor/tinykg/tinykg
 vendor/tinykg/tinykg.exe
 vendor/tinykg/tinykg.provenance.json
