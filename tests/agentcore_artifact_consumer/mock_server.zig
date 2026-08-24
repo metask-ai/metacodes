@@ -52,6 +52,13 @@ pub const Server = struct {
 };
 
 fn serveResponse(conn: net.Socket, body: []const u8) void {
+    // Winsock resets a connection that is closed while request bytes remain
+    // unread.  The reset can discard an already-sent response, so consume the
+    // complete fixed-length provider request before returning the SSE body.
+    net.setRecvTimeoutMs(conn, 10_000);
+    net.setSendTimeoutMs(conn, 10_000);
+    if (!drainRequest(conn)) return;
+
     var header: [256]u8 = undefined;
     const header_bytes = std.fmt.bufPrint(
         &header,
@@ -60,6 +67,47 @@ fn serveResponse(conn: net.Socket, body: []const u8) void {
     ) catch return;
     sendAll(conn, header_bytes);
     sendAll(conn, body);
+}
+
+fn drainRequest(conn: net.Socket) bool {
+    var header: [16 * 1024]u8 = undefined;
+    var total: usize = 0;
+    var header_end: ?usize = null;
+    var content_length: usize = 0;
+    while (total < header.len and header_end == null) {
+        const received = net.recv(conn, header[total..]);
+        if (received <= 0) return false;
+        total += @intCast(received);
+        if (std.mem.indexOf(u8, header[0..total], "\r\n\r\n")) |index| {
+            header_end = index + 4;
+            content_length = parseContentLength(header[0..index]) orelse 0;
+        }
+    }
+
+    const body_start = header_end orelse return false;
+    const buffered_body = total - body_start;
+    if (buffered_body >= content_length) return true;
+
+    var remaining = content_length - buffered_body;
+    var discard: [16 * 1024]u8 = undefined;
+    while (remaining > 0) {
+        const received = net.recv(conn, discard[0..@min(remaining, discard.len)]);
+        if (received <= 0) return false;
+        remaining -= @intCast(received);
+    }
+    return true;
+}
+
+fn parseContentLength(header: []const u8) ?usize {
+    var lines = std.mem.splitSequence(u8, header, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.fmt.parseInt(usize, value, 10) catch null;
+    }
+    return null;
 }
 
 fn sendAll(conn: net.Socket, bytes: []const u8) void {
