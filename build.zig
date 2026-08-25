@@ -1,5 +1,9 @@
 const std = @import("std");
 
+// 包清单是版本声明的仓库层权威;代码侧唯一拷贝在 src/version.zig。两者一致性由
+// runtime_arm_smoke 的 --expected-version 在 `zig build test` 中用真实二进制强制。
+const manifest = @import("build.zig.zon");
+
 // highlight-zig 轻量高亮库(Y2:已取代 tree-sitter 做 diff 高亮)。纯 Zig + 嵌入 rules_blob.zlib,
 // 零 C 依赖,200+ 语言。作为 git submodule 位于 lib/highlight-zig(独立 repo
 // github.com/shuzuan-org/highlight-zig),纯 Zig 模块方式消费其源(每个 root 各按自身
@@ -1031,7 +1035,7 @@ pub fn build(b: *std.Build) void {
     });
     consumer_cmd.setCwd(b.path("."));
     consumer_cmd.step.dependOn(&manifest_cmd.step);
-    const agentcore_consumer_step = b.step("agentcore:consumer", "Run the source-free AgentCore bundle consumer");
+    const agentcore_consumer_step = b.step("agentcore:consumer", "Run the AgentCore bundle consumer (source-free linking proven by agentcore:bundle's link probes)");
     const host_agentcore_target = b.graph.host.result;
     const agentcore_cpu_is_native = switch (target.query.cpu_model) {
         .baseline, .determined_by_arch_os, .native => true,
@@ -1471,6 +1475,7 @@ pub fn build(b: *std.Build) void {
             arm_smoke.addArtifactArg(exe);
             arm_smoke.addArg("--tinykg-binary");
             arm_smoke.addFileArg(tinykg.artifact);
+            arm_smoke.addArgs(&.{ "--expected-version", manifest.version });
             eval_test_step.dependOn(&arm_smoke.step);
             test_step.dependOn(&arm_smoke.step);
 

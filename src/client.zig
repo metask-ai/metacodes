@@ -16,8 +16,6 @@ const rng = @import("platform").rng;
 const connection_gate = @import("api/connection_gate.zig");
 const dialect_mod = @import("api/dialect.zig");
 
-pub const VERSION = "0.1.0";
-
 /// P0:AnthropicProvider 复用中立 Provider 接口(非 generic)。Client.provider() 产出它
 /// (thunk 转调 + StreamResponse.handle() 中立化)。P1 起 agent_loop 等收 Provider 类型。
 pub const AnthropicProvider = provider_mod.Provider;

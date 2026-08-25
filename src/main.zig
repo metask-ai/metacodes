@@ -11,7 +11,7 @@ const auth = @import("core/auth.zig");
 const api_keys_mod = @import("api/api_keys.zig");
 const catalog_mod = @import("api/catalog.zig");
 
-pub const VERSION = "0.1.0";
+pub const VERSION = @import("version.zig").semver;
 
 // Public re-exports for tests and future consumers.
 pub const api_stream = @import("api/stream.zig");
