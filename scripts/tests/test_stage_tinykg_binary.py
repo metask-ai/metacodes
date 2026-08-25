@@ -459,6 +459,33 @@ class CheckedInTinyKgBundleTest(unittest.TestCase):
             self.assertEqual(artifact.sha256, identity.sha256)
             self.assertEqual("tinykg 0.2.0", identity.version_line)
 
+    def test_bundle_inventory_rejects_undeclared_and_missing_binaries(self) -> None:
+        from scripts.verify_tinykg_binary import validate_bundle_inventory
+
+        real_manifest = PROJECT_ROOT / "vendor/tinykg/manifest.json"
+        bundle = TinyKgBundle.load(real_manifest)
+        # The checked-in bundle itself must be inventory-clean.
+        validate_bundle_inventory(real_manifest, bundle)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(
+                real_manifest.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            for artifact in bundle.artifacts:
+                (root / artifact.path).write_bytes(b"placeholder")
+            validate_bundle_inventory(manifest_path, bundle)
+            extra = bin_dir / "tinykg-helper"
+            extra.write_bytes(b"unattested")
+            with self.assertRaisesRegex(StageError, "undeclared=\\['tinykg-helper'\\]"):
+                validate_bundle_inventory(manifest_path, bundle)
+            extra.unlink()
+            (root / bundle.artifacts[0].path).unlink()
+            with self.assertRaisesRegex(StageError, "missing="):
+                validate_bundle_inventory(manifest_path, bundle)
+
 
 if __name__ == "__main__":
     unittest.main()

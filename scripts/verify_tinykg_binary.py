@@ -20,6 +20,39 @@ from scripts.stage_tinykg_binary import (
 )
 
 
+def validate_bundle_inventory(manifest_path: Path, bundle: TinyKgBundle) -> None:
+    """The bin directory must contain exactly the manifest-declared binaries.
+
+    Per-binary SHA-256 attestation cannot see an EXTRA file dropped next to
+    the attested ones; without this inventory an unlisted executable would
+    ship in the tree while every gate stays green.
+    """
+
+    bin_dir = manifest_path.parent / "bin"
+    declared: set[Path] = set()
+    for artifact in bundle.artifacts:
+        resolved = (manifest_path.parent / artifact.path).resolve()
+        if resolved.parent != bin_dir.resolve():
+            raise StageError(
+                f"manifest artifact escapes the bundle bin directory: {artifact.path}"
+            )
+        declared.add(resolved)
+    present: set[Path] = set()
+    for entry in sorted(bin_dir.iterdir()):
+        if entry.is_symlink() or not entry.is_file():
+            raise StageError(
+                f"bundle bin directory contains a non-regular entry: {entry.name}"
+            )
+        present.add(entry.resolve())
+    extras = sorted(p.name for p in present - declared)
+    missing = sorted(p.name for p in declared - present)
+    if extras or missing:
+        raise StageError(
+            "bundle inventory drift: "
+            f"undeclared={extras or 'none'} missing={missing or 'none'}"
+        )
+
+
 def native_bundle_key() -> str:
     machine = platform.machine().lower()
     arch = {
@@ -50,12 +83,15 @@ def main() -> int:
         return 2
     try:
         contract = TinyKgContract.load(PROJECT_ROOT / "deps/tinykg.json")
+        manifest_path = PROJECT_ROOT / "vendor/tinykg/manifest.json"
+        bundle = TinyKgBundle.load(manifest_path)
+        # Repository hygiene holds regardless of an explicit override: the
+        # checked-in bundle directory may contain only attested binaries.
+        validate_bundle_inventory(manifest_path, bundle)
         if path is not None and sha256 is not None:
             identity = inspect_binary(Path(path), sha256, contract)
             source = "explicit"
         else:
-            manifest_path = PROJECT_ROOT / "vendor/tinykg/manifest.json"
-            bundle = TinyKgBundle.load(manifest_path)
             artifact = bundle.artifact(native_bundle_key())
             binary = (manifest_path.parent / artifact.path).resolve()
             identity = validate_bundle_bytes(binary, artifact, contract)
