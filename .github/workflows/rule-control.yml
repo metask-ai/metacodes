@@ -23,7 +23,12 @@ jobs:
     # isolated or re-imaged runner; see OPEN_SOURCE_READINESS.md
     # "Final launch gate".
     runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 30
+    # The closed-loop gate replays every rule's feedback suite (multiple full
+    # zig build test-class runs plus Lean kernel work); a 30-minute budget was
+    # measured structurally insufficient (killed at 30m with feedback still
+    # executing, run 32842098328). Dispatch-only, so the long ceiling costs
+    # nothing on the PR path.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
