@@ -32,6 +32,14 @@ RULE_FLAVORS = frozenset({"evolved", "static", "effect_class"})
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 RUNTIME_SESSION_ID = "fedcba9876543210fedcba98"
+# Single source of truth for the compiled project-rule SDK layout.  The test
+# suite imports SDK_OLEAN_RELATIVE for its skip guard, so a Lake layout change
+# cannot leave a stale test-side copy that turns the manifest tests into
+# permanent skips.
+SDK_SOURCE_RELATIVE = Path("control-plane/lean/MetaCodesControl/ProjectRule.lean")
+SDK_OLEAN_RELATIVE = Path(
+    "control-plane/lean/.lake/build/lib/MetaCodesControl/ProjectRule.olean"
+)
 
 
 class EvolutionError(RuntimeError):
@@ -228,8 +236,8 @@ def freeze_manifest(
         "kernel": kernel.resolve(strict=True),
         "lake": lake.resolve(strict=True),
         "builder": builder.resolve(strict=True),
-        "sdk_source": repo / "control-plane/lean/MetaCodesControl/ProjectRule.lean",
-        "sdk_olean": repo / "control-plane/lean/.lake/build/lib/MetaCodesControl/ProjectRule.olean",
+        "sdk_source": repo / SDK_SOURCE_RELATIVE,
+        "sdk_olean": repo / SDK_OLEAN_RELATIVE,
     }
     for name, path in artifacts.items():
         if not path.is_file():

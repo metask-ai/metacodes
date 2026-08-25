@@ -1081,11 +1081,14 @@ test "capture cwd:子进程 pwd 在指定 cwd 而非父进程 cwd" {
     // trailing separator. Compare the canonical text case-insensitively after
     // trimming those presentation differences.
     const observed = std.mem.trim(u8, r.stdout, " \r\n");
-    const expected = std.mem.trim(u8, target_dir, "\\/");
     if (is_windows) {
+        const expected = std.mem.trim(u8, target_dir, "\\/");
         try std.testing.expect(std.ascii.eqlIgnoreCase(observed, expected));
     } else {
-        try std.testing.expect(std.mem.indexOf(u8, observed, expected) != null);
+        // 保留前导 '/' 锚定路径边界:macOS chdir("/tmp") 解析符号链接后 pwd 打
+        // /private/tmp,endsWith("/tmp") 仍成立;裸 "tmp" 子串任何含 tmp 的 cwd
+        // 都能满足,会漏掉 chdir 回归。
+        try std.testing.expect(std.mem.endsWith(u8, observed, target_dir));
     }
 }
 

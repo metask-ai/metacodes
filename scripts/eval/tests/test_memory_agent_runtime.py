@@ -4799,7 +4799,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "memory_write_events"):
                 validate_runtime_artifacts(receipt, root)
 
-    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS production Seatbelt")
     def test_v7_receipt_binds_host_recall_and_consolidation_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
