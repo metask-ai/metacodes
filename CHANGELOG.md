@@ -55,6 +55,11 @@ compatibility boundaries, and entry points are defined by
   runners as a fallback matrix (tracked in ROADMAP M1). Pull-request jobs
   carry a fork-isolation guard, and Zig caches live in persistent per-runner
   storage so checkout's workspace clean no longer forces cold rebuilds.
+- The CI workflow runs one consolidated `Gates (<platform>)` job per platform
+  instead of three jobs queueing on each platform's single runner (the macOS
+  test job previously waited ~5 minutes behind its sibling jobs), and Lean
+  `.lake` build products persist per runner alongside the Zig caches so the
+  kernel stops cold-building every run.
 - Eight paid-runner L2 cases (seven in
   `scripts/eval/tests/test_memory_budget_runtime.py`, one v7-receipt case in
   `test_memory_agent_runtime.py`) that exercise the production macOS Seatbelt
