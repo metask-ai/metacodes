@@ -60,13 +60,26 @@ jobs:
       - name: Zig format check
         if: runner.os == 'Linux'
         run: zig fmt --check build.zig src tests
-      # control-plane/lean/.lake is inside the workspace and wiped by the
-      # checkout clean, so the Lean kernel cold-builds every run without this.
-      # Lake verifies its build products by hash, so a stale or torn copy
-      # self-heals into a rebuild rather than wrong results.
-      - name: Restore persistent Lean build products
+      # Lean kernel build without lean-action: the action re-ran an unpinned
+      # `curl .../elan/master/elan-init.sh | sh` on every run (mutable script
+      # executed on a persistent runner, ~40 s, and the reinstall invalidated
+      # Lake's toolchain traces so the kernel cold-built each time despite the
+      # restored .lake). elan is a presence-checked runner prerequisite like
+      # rg; the pinned toolchain in control-plane/lean/lean-toolchain installs
+      # once into the persistent ~/.elan via elan's own resolver.
+      # control-plane/lean/.lake sits in the workspace and is wiped by the
+      # checkout clean; Lake hash-verifies restored products, so a stale or
+      # torn copy self-heals into a rebuild rather than wrong results.
+      - name: Build pinned Lean kernel
         shell: bash
         run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/.elan/bin/elan" ] && ! command -v lake >/dev/null 2>&1; then
+            echo "elan is a runner prerequisite (see ROADMAP M1); install it once:" >&2
+            echo "  https://github.com/leanprover/elan  (or: brew install elan-init)" >&2
+            exit 1
+          fi
+          export PATH="$HOME/.elan/bin:$PATH"
           if [ -d "$HOME/.cache/metacodes-lean/lake" ]; then
             mkdir -p control-plane/lean/.lake
             if command -v rsync >/dev/null 2>&1; then
@@ -75,17 +88,7 @@ jobs:
               cp -a "$HOME/.cache/metacodes-lean/lake/." control-plane/lean/.lake/ || true
             fi
           fi
-      - name: Setup pinned Lean toolchain
-        uses: leanprover/lean-action@50fcf42d2e460296f1a34b402e990d1b24f8b596 # v1
-        with:
-          lake-package-directory: control-plane/lean
-          auto-config: false
-          build: true
-          test: false
-          lint: false
-      - name: Save persistent Lean build products
-        shell: bash
-        run: |
+          (cd control-plane/lean && lake build)
           mkdir -p "$HOME/.cache/metacodes-lean/lake"
           if command -v rsync >/dev/null 2>&1; then
             rsync -a --delete control-plane/lean/.lake/ "$HOME/.cache/metacodes-lean/lake/"

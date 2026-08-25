@@ -60,6 +60,15 @@ compatibility boundaries, and entry points are defined by
   test job previously waited ~5 minutes behind its sibling jobs), and Lean
   `.lake` build products persist per runner alongside the Zig caches so the
   kernel stops cold-building every run.
+- `leanprover/lean-action` removed from all workflows: on every run it
+  executed an unpinned installer streamed from elan's `master` branch on the
+  persistent runners (the same class of mutable-fetch-and-execute the rustup
+  bootstrap fix closed), cost ~40 s, and the per-run elan reinstall
+  invalidated Lake's traces so the kernel rebuilt despite the restored
+  `.lake`. elan is now a presence-checked runner prerequisite and CI drives
+  `lake build` directly; this also removes two per-run action-tarball
+  downloads from job setup, which the macOS runner's GitHub connectivity made
+  expensive (a single action download was measured at 2m16s).
 - Eight paid-runner L2 cases (seven in
   `scripts/eval/tests/test_memory_budget_runtime.py`, one v7-receipt case in
   `test_memory_agent_runtime.py`) that exercise the production macOS Seatbelt

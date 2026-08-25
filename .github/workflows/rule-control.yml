@@ -41,14 +41,19 @@ jobs:
         run: |
           echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
           echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
-      - name: Setup pinned Lean toolchain
-        uses: leanprover/lean-action@50fcf42d2e460296f1a34b402e990d1b24f8b596 # v1
-        with:
-          lake-package-directory: control-plane/lean
-          auto-config: false
-          build: false
-          test: false
-          lint: false
+      # elan is a presence-checked runner prerequisite (see ci.yml's Lean
+      # step for why lean-action was dropped: it executed an unpinned
+      # installer from elan's master branch on every run).
+      - name: Put pinned Lean toolchain on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            echo "elan is a runner prerequisite (see ROADMAP M1); install it once:" >&2
+            echo "  https://github.com/leanprover/elan  (or: brew install elan-init)" >&2
+            exit 1
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: Verify checked-in TinyKG bundle
         run: python3 scripts/verify_tinykg_binary.py
       - name: Run closed-loop release gate

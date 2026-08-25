@@ -64,7 +64,9 @@ CI targets self-hosted runners (Linux X64, macOS ARM64, Windows X64).
       before public visibility, give it a dedicated or ephemeral runner so
       PR-authored code cannot precondition the machine that produces release
       decisions.
-- Runner prerequisites: `python3`, `git`, and either preinstalled `rg` or
+- Runner prerequisites: `python3`, `git`, `elan` in `~/.elan` on the
+  Linux/macOS runners (the pinned toolchain then installs once via
+  `control-plane/lean/lean-toolchain`), and either preinstalled `rg` or
   passwordless `sudo apt-get` (Linux) / Homebrew (macOS) for ci.yml's
   presence-guarded ripgrep install; missing prerequisites fail the job loudly.
 - Owner alternative: restoring GitHub-hosted billing would re-enable
