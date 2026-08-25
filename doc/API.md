@@ -18,6 +18,17 @@ artifact store, and TinyKG admission are not replaceable extensions.
 There is no general HTTP service API promise yet. The Web and daemon hosts are
 product surfaces built over the same core protocols.
 
+## CLI surface
+
+`metacodes --help` enumerates the current flag set and is the authoritative
+pre-1.0 surface; `metacodes --version` prints `metacodes <semver>`. The flag
+surface is fail-closed: an unknown flag or positional argument exits with code
+2 and names the offender — nothing is silently ignored, because evaluation
+harnesses pass treatment configuration through this surface. Headless
+automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
+NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`. Flag
+removals or semantic changes require a changelog entry.
+
 ## Zig source embedding
 
 `src/lib.zig` exports the UI-neutral core. In a consumer, these types are reached
@@ -73,7 +84,7 @@ The source-free bundle contains:
 - one target-specific static library;
 - a manifest whose file allow-list and SHA-256 values are mandatory.
 
-Consumers call only `metask_agentcore_get_api(METASK_AGENTCORE_ABI_VERSION)` and
+Consumers call only `metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and
 must validate ABI revision 13, table size, capability bits, reserved zeros, and
 the bundle manifest. Runtime/session, sync run, abort, event/UI callbacks,
 checkpoint/restore, host streaming tools, MCP streaming, process plugins, and

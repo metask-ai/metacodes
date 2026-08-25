@@ -1,11 +1,40 @@
 # Changelog
 
-> 本文件下方包含从历史 `cc-zig` 线提取的记录；其中的旧版本号和日期是历史标签，
-> 不是当前 standalone 仓库的已发布版本承诺。当前状态、兼容边界和可用入口以
-> [README](README.md)、[API 总览](doc/API.md) 和 [Open Source Readiness](OPEN_SOURCE_READINESS.md)
-> 为准。
+The standalone repository is versioned from `0.1.0` (`build.zig.zon`); no
+release has been tagged yet. Entries under **Historical record** were imported
+from the pre-extraction `cc-zig` line — their version numbers and dates are
+historical labels, not release promises of this repository. Current status,
+compatibility boundaries, and entry points are defined by
+[README](README.md), [ROADMAP](ROADMAP.md), [doc/API.md](doc/API.md), and
+[OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md).
 
-## Unreleased — standalone repository and embedding boundary
+## Unreleased
+
+### Added
+
+- `metacodes --version` prints `metacodes <semver>`; help banner now names the
+  project instead of the legacy internal product name.
+- [ROADMAP.md](ROADMAP.md): project status tracked as milestones with exit
+  criteria and evidence links.
+- [doc/BENCHMARKS.md](doc/BENCHMARKS.md): consolidated benchmark index —
+  local performance gates, internal paired evidence, and the external
+  WorkBuddy-Bench mainline with ladder status.
+
+### Changed
+
+- CI migrated to self-hosted runners (Linux X64, macOS ARM64, Windows X64)
+  with a pinned Lean toolchain build; GitHub-hosted runners remain a fallback
+  once account billing is restored.
+- Documentation governance pass: superseded per-revision AgentCore design
+  iterations, dated TUI progress transcripts, and unreferenced U-series drafts
+  removed (recoverable from git history); doc index now covers the living
+  document set; dangling references from source comments to removed docs
+  repaired; `tests/README.md` rewritten to match the real build-step surface.
+- `zig build test` now passes on a clean checkout without a Lean toolchain:
+  eval cases that require the compiled Lean SDK skip explicitly when
+  `control-plane/lean/.lake` is absent (CI still builds Lean and runs them).
+
+## Unreleased — standalone extraction and embedding boundary
 
 ### Changed
 
@@ -28,7 +57,7 @@
   before any remote publication. Public visibility remains blocked on an
   independent full-history scan and owner-selected project license.
 
-## Unreleased — Stage 3 parity (2026-05-29)
+## Historical — Stage 3 parity (2026-05-29, cc-zig line)
 
 REPL / TUI 体验追齐。
 
@@ -40,7 +69,7 @@ REPL / TUI 体验追齐。
 - **粘贴检测 + 外部存储**：bracketed paste mode；大粘贴（>12 行或 >1600 字节）存 `~/.cc-zig/pastes/<N>.txt` + 插入 `[Pasted text #N +M lines]` 占位符，提交前展开为真实内容（paste.zig）。
 - **`/agents` / `/permissions` / `/memory`**：列 sub-agent 能力 / 显示权限模式+规则 / 跨 session 记忆（`~/.cc-zig/memory.md`，`/memory add`）。
 
-## Unreleased — Stage 2 parity (2026-05-29)
+## Historical — Stage 2 parity (2026-05-29, cc-zig line)
 
 工具层 P1 语义对齐。
 
@@ -53,9 +82,9 @@ REPL / TUI 体验追齐。
 - **Skill `allowed_tools` 软约束**：激活带 allowed_tools 的 skill 时在指令顶部注入工具白名单声明（硬隔离待 forked-subagent）。
 - **MCP `resources/list` + `resources/read`**：client 方法 + `<server>__list_resources` / `<server>__read_resource` 工具。
 
-## Unreleased — Stage 0+1 parity (2026-05-29)
+## Historical — Stage 0+1 parity (2026-05-29, cc-zig line)
 
-macOS 移植 + Phase A/B 残留补齐（见 `../doc/SURVEY_2026-05-28.md`）。
+macOS 移植 + Phase A/B 残留补齐（当时的 survey 文档已移出仓库，见 git 历史）。
 
 ### Fixed
 - **macOS 编译**：`job_registry.zig` 的 `std.c.getrandom`（macOS libc 无此调用）改为读 `/dev/urandom`。
@@ -69,9 +98,11 @@ macOS 移植 + Phase A/B 残留补齐（见 `../doc/SURVEY_2026-05-28.md`）。
 - **`/model [name]`**：无参列当前 + 服务端 catalog；有参切换并重建 system prompt + 重算 max_tokens。
 - **Grep 全局分页**：`offset` + 全局 `head_limit`（替代之前每文件 `-m`）+ `appliedLimit` 翻页提示。
 
-## v1.0.0 — 2026-04-20
+## Historical — cc-zig v1.0.0 (2026-04-20, legacy internal numbering)
 
-首个对外可用版本。从 TypeScript 版 Claude Code 完整移植到 Zig 0.17-dev（向下兼容 0.16 稳定版的目标字符集）。
+cc-zig 线的首个内部可用版本；该版本号属于历史 cc-zig 项目，与本仓库的
+`0.1.0` semver 无关。从 TypeScript 版 Claude Code 移植到当时的 Zig dev 工具链
+（现行工具链契约见 `build.zig.zon`）。
 
 ### Highlights
 
@@ -119,6 +150,5 @@ macOS 移植 + Phase A/B 残留补齐（见 `../doc/SURVEY_2026-05-28.md`）。
 
 ### 参考
 
-- 架构计划：`doc/PLAN.md`
-- 工作记忆：`CLAUDE.md`
-- TypeScript 原版：`cc/src/`（只读参考）
+当时引用的架构计划、工作记忆与 TypeScript 原版参考均属 pre-extraction
+monorepo,已不在本仓库;需要时从提取前的历史仓库查阅。

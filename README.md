@@ -6,10 +6,11 @@ sandbox enforcement, durable tool-result artifacts, Lean-backed governance, and
 optional TinyKG memory/task coordination. Hosts can extend tools, provider
 dialects, UI, MCP, and process plugins without replacing those kernel boundaries.
 
-> Repository status: pre-publication. The history has been extracted from the
-> original monorepo, but the project license is still an owner decision. Keep the
-> repository private until [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md)
-> is cleared.
+> Repository status: pre-publication, version `0.1.0`. The history has been
+> extracted from the original monorepo, but the project license is still an
+> owner decision. Keep the repository private until
+> [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md) is cleared. Project
+> status is tracked as milestones in [ROADMAP.md](ROADMAP.md).
 
 ## Why metacodes
 
@@ -115,6 +116,16 @@ TinyKG is a separately maintained executable and storage engine. Metacodes owns:
 TinyKG owns its binary/storage implementation, authenticated daemon protocol,
 generation/CAS primitives, and graph persistence. Metacodes never imports TinyKG
 source and never silently falls back from the daemon to a shared raw store.
+
+## Benchmarks
+
+[doc/BENCHMARKS.md](doc/BENCHMARKS.md) indexes how metacodes is measured: local
+performance gates, the internal paired-evaluation control plane and its
+receipt-bound results so far, and the external WorkBuddy-Bench mainline
+(pinned framework, anti-contamination cohorts, W0–W10 ladder with current
+status). No external quality score is claimed until the corresponding ladder
+stage has actually run; paid evaluation runs are never part of the default
+development loop.
 
 ## Contributing and security
 
