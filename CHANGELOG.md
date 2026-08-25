@@ -38,11 +38,13 @@ compatibility boundaries, and entry points are defined by
   runners as a fallback matrix (tracked in ROADMAP M1). Pull-request jobs
   carry a fork-isolation guard, and Zig caches live in persistent per-runner
   storage so checkout's workspace clean no longer forces cold rebuilds.
-- Seven paid-runner L2 cases in `scripts/eval/tests/test_memory_budget_runtime.py`
-  that execute the production macOS Seatbelt runner now skip explicitly off
-  macOS (previously they errored on non-macOS hosts, and the child-signal case
-  was mis-gated to POSIX). The macOS CI leg still executes them, and the
-  maintainer rule-control gate fails closed on any skipped test.
+- Eight paid-runner L2 cases (seven in
+  `scripts/eval/tests/test_memory_budget_runtime.py`, one v7-receipt case in
+  `test_memory_agent_runtime.py`) that exercise the production macOS Seatbelt
+  runner now skip explicitly off macOS (previously they errored on non-macOS
+  hosts, and the child-signal case was mis-gated to POSIX). The macOS CI leg
+  still executes them, and the maintainer rule-control gate fails closed on
+  any skipped test.
 - Documentation governance pass: superseded per-revision AgentCore design
   iterations, dated TUI progress transcripts, and unreferenced U-series drafts
   removed (recoverable from git history); doc index now covers the living

@@ -520,8 +520,9 @@ def refresh_implementation_fingerprint(root: Path, protocol_path: Path) -> dict[
     before it could report the fresh value), recomputes the fingerprint over
     implementation_paths, and text-replaces the single pinned digest so the
     file keeps its exact formatting.  It never runs implicitly and never
-    weakens the gate: every validate/run path still goes through
-    load_protocol, which is re-run here on the resulting file.
+    weakens the gate: the repinned candidate is verified with load_protocol in
+    a staging file before atomically replacing the real one, so a protocol
+    with any other drift is left untouched.
     pinned_evaluator_files stays deliberately out of scope — a gate that
     repins its own code hash would be a self-attestation loophole.
     """
@@ -560,15 +561,27 @@ def refresh_implementation_fingerprint(root: Path, protocol_path: Path) -> dict[
                 "refusing to rewrite: pinned fingerprint occurs "
                 f"{raw.count(pinned)} times in {protocol_path}"
             )
-        protocol_path.write_text(raw.replace(pinned, fresh), encoding="utf-8")
+        # Verify the repinned candidate BEFORE touching the real file: if
+        # anything else in the protocol still drifts (e.g. a stale
+        # pinned_evaluator_files hash), the caller's working tree keeps the
+        # original protocol untouched instead of a half-refreshed state.
+        staged = protocol_path.with_name(protocol_path.name + ".refresh-staging")
+        staged.write_text(raw.replace(pinned, fresh), encoding="utf-8")
+        try:
+            load_protocol(root, staged)
+            os.replace(staged, protocol_path)
+        finally:
+            staged.unlink(missing_ok=True)
         result = {
             "status": "refreshed",
             "previous_implementation_fingerprint": pinned,
             "implementation_fingerprint": fresh,
             "protocol": str(protocol_path),
         }
-    # Fail closed if anything else in the (re)pinned protocol still drifts;
-    # refresh must never leave a file the gate loader would reject silently.
+        return result
+    # Already current: still fail closed if anything else in the pinned
+    # protocol drifts; refresh must never report already_current for a file
+    # the gate loader would reject.
     load_protocol(root, protocol_path)
     return result
 

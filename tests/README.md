@@ -36,8 +36,10 @@ zig build agentcore:test         # AgentCore 二进制 ABI v1 测试
 zig build dev                    # 仅 Debug app;保存即编的最快编辑环
 zig build dev:full               # Debug app + TinyKG;首次安装或 TinyKG 变更后运行
 
-# 单测试调试
-zig test src/core/agent_loop.zig --test-filter "max_turns"
+# 单测试调试:图内文件经主套件 + -Dtfilter 过滤(直接 zig test 单文件会因
+# 模块内相对 import 失败);自包含的平台层文件可以单测
+zig build test:lib -Dtfilter="max_turns"
+METACODES_PROC_TEST=1 zig test src/platform/process.zig -lc --test-filter "capture cwd"
 
 # 性能基线
 hyperfine --warmup 3 './zig-out/bin/metacodes --help'

@@ -42,9 +42,11 @@ CI targets self-hosted runners (Linux X64, macOS ARM64, Windows X64).
 
 - [x] Self-hosted workflow migration implemented and validated by dispatch runs
       (all CI jobs green at validation time).
-- [x] `zig build test` passes on a clean checkout without a Lean toolchain
-      (Lean-dependent eval cases skip explicitly; CI builds Lean, runs them,
-      and escalates the skip to a failure via `METACODES_TEST_REQUIRE_LEAN_SDK`).
+- [x] `zig build test` passes on a clean checkout without a Lean toolchain:
+      the olean-gated manifest cases skip explicitly, and CI builds Lean, runs
+      them, and escalates that skip to a failure via
+      `METACODES_TEST_REQUIRE_LEAN_SDK` (the native-driver Lean lifecycle
+      cases remain opt-in via their `METACODES_TEST_PROJECT_*` env fixtures).
 - [x] Zig caches persist per runner (checkout's workspace clean no longer
       forces cold rebuilds); pull-request jobs carry a fork-isolation guard.
 - [ ] CI green on `main` push (needs this migration merged, runners online).

@@ -50,6 +50,11 @@ fn addTestRunArtifact(
     windows_prelude: ?*std.Build.Step.Run,
 ) *std.Build.Step.Run {
     const run = b.addRunArtifact(artifact);
+    // A test gate must execute on every invocation; a warm build cache may
+    // skip recompilation but never test execution. Zig 0.16 re-runs .zig_test
+    // steps regardless, but state the doctrine here so a future caching change
+    // cannot silently turn cached test binaries into stale green evidence.
+    run.has_side_effects = true;
     if (windows_prelude) |prelude| run.step.dependOn(&prelude.step);
     return run;
 }

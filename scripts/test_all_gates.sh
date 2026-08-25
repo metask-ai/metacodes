@@ -9,7 +9,11 @@ cd "$(dirname "$0")/.."
 
 : "${METACODES_WB_CORPUS:=/private/tmp/workbuddy-full-20260816/results}"
 : "${METACODES_WORKBUDDY_CHECKOUT:=/private/tmp/workbuddy-full-20260816}"
-export METACODES_WB_CORPUS METACODES_WORKBUDDY_CHECKOUT
+# Default-strict like CI: a missing compiled Lean SDK is a coverage hole, not
+# a pass. Hosts without a Lean toolchain fail loudly here; run
+# `lake build` in control-plane/lean, or export the var as 0 to accept skips.
+: "${METACODES_TEST_REQUIRE_LEAN_SDK:=1}"
+export METACODES_WB_CORPUS METACODES_WORKBUDDY_CHECKOUT METACODES_TEST_REQUIRE_LEAN_SDK
 
 fail=0
 run() { echo "== $*"; "$@" || { echo "GATE FAILED: $*"; fail=1; }; }

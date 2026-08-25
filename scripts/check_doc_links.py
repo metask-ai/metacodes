@@ -34,11 +34,20 @@ SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*:")
 
 
 def iter_markdown(root: str):
-    listed = subprocess.run(
-        ["git", "-C", root, "ls-files", "-z", "--", "*.md"],
-        check=True,
-        capture_output=True,
-    ).stdout
+    try:
+        completed = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z", "--", "*.md"],
+            check=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        raise SystemExit("check_doc_links: git is required but not on PATH")
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", "replace").strip()
+        raise SystemExit(
+            f"check_doc_links: git ls-files failed in {root}: {detail or exc}"
+        )
+    listed = completed.stdout
     for rel in listed.decode("utf-8", "replace").split("\0"):
         if not rel or rel.split("/", 1)[0] in SKIP_TOP_DIRS:
             continue
