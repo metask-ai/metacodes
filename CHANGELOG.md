@@ -14,15 +14,18 @@ compatibility boundaries, and entry points are defined by
 
 - Third-party GitHub Actions are pinned to full commit SHAs, and the Windows
   Rust bootstrap downloads a version-pinned `rustup-init` verified by SHA-256
-  before execution — nothing unpinned executes on the persistent self-hosted
-  runners.
+  before execution — the action set and the installer are no longer mutable at
+  fetch time. (The Rust `stable` toolchain itself stays rustup-managed behind
+  the presence guard: it installs once and is not re-resolved per run.)
 - `scripts/verify_tinykg_binary.py` now inventories `vendor/tinykg/bin/`:
   an executable not declared by the manifest fails the gate (per-binary
   hashes cannot see extra files).
 - The rule-control telemetry artifact no longer records the runner's absolute
-  workspace path, and feedback child processes run with secret-shaped
-  environment variables (`*API_KEY*`, `*TOKEN*`, `*SECRET*`, …) removed, so
-  echoed child output cannot leak credentials into uploaded artifacts.
+  workspace path, and feedback child processes run with secret-named
+  environment variables removed (name denylist: `*API_KEY*`, `*ACCESS_KEY*`,
+  `*PRIVATE_KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`), so
+  echoed child environments do not carry those variables into uploaded
+  artifacts.
 
 ### Added
 

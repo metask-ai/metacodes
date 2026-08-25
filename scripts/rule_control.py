@@ -4310,6 +4310,39 @@ def feedback_binding_errors(observation: Observation, feedback: dict[str, Any]) 
     return errors
 
 
+SECRET_ENV_MARKERS = (
+    "API_KEY",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+)
+
+
+def scrub_secret_environment(env: dict[str, str]) -> None:
+    """Drop secret-shaped variables from a child-environment copy.
+
+    Feedback children never need credentials, and their raw output tails are
+    uploaded as workflow telemetry: a child that echoes its environment must
+    not carry secret-named variables into the artifact.  This is a name
+    denylist, not proof that no secret can transit a child in other forms.
+    """
+
+    for key in [k for k in env if any(m in k.upper() for m in SECRET_ENV_MARKERS)]:
+        env.pop(key, None)
+
+
+def redacted_workspace(workspace: Path) -> str:
+    """Report-safe workspace label without the runner account's absolute path."""
+
+    try:
+        return "~/" + str(workspace.relative_to(Path.home()))
+    except (ValueError, RuntimeError):
+        return workspace.name
+
+
 def prepare_feedback_environment(repo: Path) -> dict[str, str]:
     """Bind every feedback process to one verified native TinyKG input."""
 
@@ -4336,12 +4369,7 @@ def prepare_feedback_environment(repo: Path) -> dict[str, str]:
         raise ControlError(f"TinyKG feedback verifier cannot be imported: {exc}") from exc
 
     env = os.environ.copy()
-    # Feedback children never need credentials, and their raw output tails are
-    # uploaded as workflow telemetry: drop secret-shaped variables so a child
-    # that echoes its environment cannot leak them into the artifact.
-    secret_markers = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
-    for key in [k for k in env if any(m in k.upper() for m in secret_markers)]:
-        env.pop(key, None)
+    scrub_secret_environment(env)
     path_raw = env.get("METACODES_TEST_TINYKG_BIN") or None
     sha_raw = env.get("METACODES_TEST_TINYKG_SHA256") or None
     if bool(path_raw) != bool(sha_raw):
@@ -4473,10 +4501,7 @@ def run_check(repo: Path, manifest_path: Path, report_path: Path) -> int:
     workspace = discover_workspace_root(repo)
     # The report is uploaded as a workflow artifact; keep the runner account's
     # filesystem layout out of it (repo hygiene: no personal absolute paths).
-    try:
-        report["workspace"] = "~/" + str(workspace.relative_to(Path.home()))
-    except ValueError:
-        report["workspace"] = workspace.name
+    report["workspace"] = redacted_workspace(workspace)
     controller_inputs = (
         "scripts/rule_control.py",
         "scripts/tests/test_rule_control.py",
