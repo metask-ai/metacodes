@@ -56,9 +56,12 @@ CI targets self-hosted runners (Linux X64, macOS ARM64, Windows X64).
       wall, dominated by the macOS test job queueing ~5 min behind its
       sibling jobs on the single macOS runner; after consolidating to one
       `Gates` job per platform plus persistent Lean products (94c20ee):
-      **wall 9:14** — Linux 5:18, macOS 9:12 (critical path, zero queueing),
-      Windows 0:40. Keep it there — heavyweight gates (`rule-control`,
-      AgentCore Windows) stay in their own workflows.
+      wall 9:14; after dropping lean-action's per-run elan reinstall
+      (795bdb3), steady-state **execution** is Linux 1:39 / macOS 5:59 /
+      Windows 0:41 with the Lean step at 2 s (cache hit). Wall clock beyond
+      that is runner availability (queueing), not workflow cost. Keep it
+      there — heavyweight gates (`rule-control`, AgentCore Windows) stay in
+      their own workflows.
 - [ ] Release-gate isolation: `rule-control` currently shares the
       `[self-hosted, macOS, ARM64]` label set with pull_request CI jobs;
       before public visibility, give it a dedicated or ephemeral runner so
