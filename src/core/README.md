@@ -1,12 +1,22 @@
 # core/
 
-对话核心：消息类型、历史管理、主 agent 循环。
+内核:固定 agent loop、Conversation 投影、Runtime/Session 生命周期、
+压缩、工具结果数据面与治理边界。本目录是 `metacodes-core` 的主体。
 
-| 文件 | 职责 | 来源（迁移后） |
-|---|---|---|
-| `message.zig` | Message / Content (tagged union `.text \| .tool_use \| .tool_result`) / ToolUse / ToolResult | `src/types.zig:12-52` 重构 |
-| `conversation.zig` | 历史管理、token 估算、compact 接口（compact 本期仅 stub） | `src/types.zig::App.messages` + `src/client.zig::estimateTokens` |
-| `agent_loop.zig` | `AgentLoop.run`：send → stream → tool_use → tool_result → send。停止条件：stop_reason / max_turns / abort | `src/main.zig:225-345 runSession` 重写 |
-| `system_prompt.zig` | system prompt 常量 | `src/main.zig:160-223` |
+代表性入口(完整清单以目录为准,共 80+ 文件):
 
-占位目录 — M0.4/M0.5 开始填充。**禁止**使用 `__TOOL_RESULT__:` 字符串前缀（现状 hack）。
+- `agent_loop.zig` — 固定 agent 循环(send → stream → tool → send;
+  stop_reason / max_turns / abort 终止)。
+- `agent_session.zig` — `AgentRuntime` / `RuntimeHost` / `AgentSession`
+  (不可变 generation 语义,见 [doc/LIB_API.md](../../doc/LIB_API.md))。
+- `conversation.zig` — 历史与 token 管理;压缩已完整实现于
+  `compact_kernel.zig` + `compact_summary.zig`(非 stub)。
+- `message.zig` — Message/Content tagged union。
+- `system_prompt.zig` / `tool_catalog.zig` / `tool_exec.zig` — 提示词与
+  工具目录/执行链。
+- `tool_result.zig` / `tool_result_artifact.zig` — inline/artifact/error
+  三态工具结果数据面(CAS/spool)。
+- `execution_effect.zig` — 持久执行 effect journal。
+- `obligation_gate.zig` / `formal` 邻接 — 治理门。
+
+权威架构文档:[doc/CORE_REFERENCE.md](../../doc/CORE_REFERENCE.md)。

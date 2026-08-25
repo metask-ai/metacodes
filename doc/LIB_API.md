@@ -239,7 +239,9 @@ AgentCore 面向不把 metacodes 源码加入构建图的原生 Host：
 消费入口只有：
 
 ```c
-const metask_agentcore_api_v1 *metask_agentcore_get_api(uint32_t abi_version);
+/* Returns const void *; cast to const metask_agentcore_api_v1 * after
+ * validating version, revision, table size, and capabilities. */
+const void *metask_agentcore_get_api(uint32_t requested_abi);
 ```
 
 当前是实验性的 ABI v1 revision 13。Host 必须同时校验 abi version、精确

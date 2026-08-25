@@ -297,6 +297,17 @@ detected and blocked rather than claimed recoverable. The rule is a release
 gate for the pilot mechanism, not proof of filesystem power-loss semantics or
 memory quality.
 
+`tinykg.daemon-transport.l2` governs how Metacodes shares TinyKG: every process
+must use the Metacodes-owned local authenticated, build-pinned Web transport to
+one daemon-owned StoreActor — never the remote TinyKG Skill configuration and
+never a shared raw-Store fallback. Its sensor is the real two-process L2 in
+`scripts/test_kg_daemon_transport.py` (session-pinned schema, generation-bound
+queries, zero transport-level write retries, the cross-session ambiguity fence,
+and content-bound Markdown uploads).
+
+This section enumerates every active rule; keep it in sync with
+`control-plane/rules.json` when adding or retiring one.
+
 ## Commands
 
 From `metacodes/`:

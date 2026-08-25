@@ -1,12 +1,15 @@
 # repl/
 
-REPL 终端交互。
+终端交互层:REPL 主循环、行编辑、渲染与 headless 模式。
 
-| 文件 | 职责 | 本期状态 |
-|---|---|---|
-| `loop.zig` | REPL 主循环 | M0.5 从 `src/main.zig:84-149` 迁入（瘦身版） |
-| `input.zig` | `readLine`（M0 临时，逐字节 posix.read）；M4 重写为 termios raw mode + 行编辑 + 历史 | M0 临时版 + M4 重写 |
-| `render.zig` | Markdown 子集渲染 + ANSI 颜色 + 分页 | M4 |
-| `commands.zig` | `/help /exit /clear /tools /retry /compact /history /mode` 派发 | M0 迁入 /help,/exit,/clear,/tools；M4 补齐 /retry, /history 等 |
-
-占位目录。
+- `loop.zig` — REPL 主循环;slash 命令(`/help` `/compact` `/model` …)
+  直接在此派发(没有独立 commands.zig)。
+- `input.zig` / `multiline.zig` / `paste.zig` / `vim.zig` / `complete.zig` /
+  `history.zig` — termios raw mode 行编辑、多行、粘贴检测、vim 键位、
+  补全与历史。
+- `render.zig` / `progress.zig` / `statusline.zig` / `transcript_viewer.zig`
+  — Markdown/ANSI 渲染与状态显示。
+- `headless.zig` / `stream_json_backend.zig` — `-p/--print` 无 REPL 运行与
+  NDJSON 输出。
+- `tui/` — 状态驱动 TUI(架构见
+  [doc/TUI_STATE_ARCHITECTURE.md](../../doc/TUI_STATE_ARCHITECTURE.md))。
