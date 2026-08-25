@@ -1,6 +1,6 @@
 //! L2 组件测试:Task* 工具缺必需字段时返回**具名** error(e2e triage 修复)。
 //!
-//! 背景(doc/E2E_FRAMEWORK_DESIGN.md §8 + 全 17 场景 e2e):
+//! 背景(E2E 框架设计阶段 §8 + 全 17 场景 e2e;见 tests/e2e/):
 //!   MiniMax 模型常对 Task/TaskCreate 发空参 {},cc-zig 原先返回笼统 error.MissingField
 //!   → agent_loop 给模型的现场是 "TaskCreate failed with MissingField"(不说缺哪个字段)
 //!   → 模型原地空参重试 40+ 次(input={} 风暴)。

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# perf_baseline.sh —— cc-zig 性能/内存基线对比(见 doc/PERF_MEMORY_PRINCIPLES.md §2 红线)。
+# perf_baseline.sh —— metacodes 性能/内存基线对比(见 doc/PERF_MEMORY_PRINCIPLES.md §2 红线)。
 #
 # 量:① ReleaseSmall 二进制体积 ② 暖启动时间(--help) ③ --help 常驻内存峰值(RSS)。
 # 对比红线,任一超标 exit 1(可用于 CI 守门)。

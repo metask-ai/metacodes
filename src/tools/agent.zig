@@ -1,6 +1,6 @@
 //! Task 工具(Agent 兼容别名):父 agent spawn 子 agent。
 //!
-//! 完整规范见 doc/SUBAGENT_DESIGN.md(第 5 节)。
+//! 行为规范以本模块与 tests/integration/agents_e2e_test.zig 为准。
 //!
 //! Schema(已实现):
 //! - subagent_type:str (必需) — Explore / Plan / general-purpose / <custom name>

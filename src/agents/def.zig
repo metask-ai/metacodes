@@ -1,5 +1,5 @@
 //! AgentDef:subagent 定义。对齐 Claude Code 官方 frontmatter 字段集。
-//! 详细设计见 doc/SUBAGENT_DESIGN.md。
+//! 运行时字段语义见 src/tools/agent.zig 与 test:agentdef-fields L2 测试。
 //!
 //! 来源:`.metacodes/agents/<name>.md` 或 `~/.claude/agents/<name>.md` 等。
 //! 关键:**身份只看 frontmatter `name` 字段**,文件名/子目录路径仅控制位置发现,不影响调用名。

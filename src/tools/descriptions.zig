@@ -11,7 +11,7 @@
 //! - describeBash 按 ctx.include_git 增删 Git 协议段。
 //! - 只读 agent(ctx.isReadonlyAgent)的 Bash 描述加只读提醒。
 //!
-//! 见 doc/PROMPT_TOOL_RELATIONSHIP.md 第五节(原文素材)。
+//! 工具描述原文与 prompt 的耦合守卫见 tests/component/prompt_tool_coupling_test.zig。
 
 const std = @import("std");
 const PromptContext = @import("prompt_context.zig").PromptContext;

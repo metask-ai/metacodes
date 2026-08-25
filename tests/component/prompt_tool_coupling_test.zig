@@ -1,6 +1,6 @@
 //! L2 组件测试:提示词 × 工具关系 — 动态描述耦合端到端贯穿。
 //!
-//! 设计目标(doc/PROMPT_TOOL_RELATIONSHIP.md):
+//! 设计目标(prompt/tool 耦合守卫,原始设计稿已移出仓库):
 //!   ① 核心工具用动态长描述(对应 cc tool.prompt(ctx)),进请求体 tools[].description
 //!   ② 动态耦合:工具集变化 → USING_TOOLS 段 + 工具描述相应增删
 //!   ③ Bash 描述按 include_git 增删 Git 协议段

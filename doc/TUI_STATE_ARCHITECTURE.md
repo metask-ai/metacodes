@@ -1,7 +1,7 @@
 # TUI_STATE_ARCHITECTURE — cc-zig TUI 状态驱动架构(UiState + Event + dispatch + 纯函数 render)
 
 > 来源:2026-06-05 session。用户连续指出 cc-zig TUI 的架构病根(Ctrl+O 是旁路非视图、状态流转无法测试、加 CC 功能靠散点硬接线),决策做**状态驱动架构重构**。本文是目标架构设计 + 分阶段迁移计划。
-> 关联现有图谱根:TUI_DESIGN、TUI_COMPONENTS、UI_LAYER_DESIGN、TUI_PARITY_PLAN、TUI_ALIGNMENT_CC_2026-06-04。
+> 关联设计文档:[UI_DECOUPLE_BACKEND_FRAMEWORK](UI_DECOUPLE_BACKEND_FRAMEWORK.md)、[CORE_REFERENCE](CORE_REFERENCE.md)。早期 TUI 设计稿(TUI_DESIGN、UI_LAYER_DESIGN、TUI_ALIGNMENT 等)已随过程文档清理移出仓库,见 git 历史。
 > 状态:设计稿(2026-06-05),供逐阶段实施依据。
 
 ## §0 病根(为何重构)

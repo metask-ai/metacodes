@@ -1,6 +1,6 @@
 //! L1 测试基础设施:CaptureWriter + ANSI strip + snapshot 断言。
 //!
-//! 用途(doc/E2E_TESTING.md §一 L1):组件渲染时,把输出累到 buffer,然后:
+//! 用途(tests/README.md L1 单元层):组件渲染时,把输出累到 buffer,然后:
 //! - assertContains:断言含某段字节
 //! - assertNoAnsi:断言输出无 ANSI(monochrome 主题测试)
 //! - stripAnsi:剥 ANSI 后比对纯文本(主题无关测试)

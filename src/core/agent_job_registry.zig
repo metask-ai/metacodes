@@ -4,7 +4,7 @@
 //! 后台 subagent 是**同进程线程**模型——每个 job 在自己的 std.Thread 里跑
 //! subagent.spawnAgent(网络 + 工具循环),不是 fork 子进程。
 //!
-//! 设计(见 doc plan / SUBAGENT_DESIGN):
+//! 设计:
 //! - **每 job 独立 Client + 独立 std.Io.Threaded**:Client 构造 O(1) 无共享,
 //!   彻底规避多线程共享 App.api_client 的 http.Client 竞争。
 //! - **每 job 独立 AbortSignal**:TaskStop / deinit 时 abort 打断在途网络读。

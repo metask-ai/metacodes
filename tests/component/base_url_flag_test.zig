@@ -1,6 +1,6 @@
 //! L2 组件测试:Stage 7 — --base-url CLI flag 端到端贯穿。
 //!
-//! 设计目标(doc/E2E_FRAMEWORK_DESIGN.md Stage 7):
+//! 设计目标(E2E 框架 Stage 7):
 //!   CLI `--base-url <url>` → Config.base_url → app.zig:152 Client.initWithBaseUrl
 //!   → 请求打到指定端点(record/replay 指向 mock 用)。
 //!

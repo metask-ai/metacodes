@@ -1,6 +1,6 @@
 //! L2 组件测试:WebSearch 工具两阶段子请求端到端(对齐 cc WebSearchTool)。
 //!
-//! 覆盖(doc/E2E_TESTING.md "声明=接线=测试"):
+//! 覆盖("声明=接线=测试" L2 原则,见 tests/README.md):
 //!   1. 子请求请求体带 forced tool_choice {type:tool,name:web_search}(声明的字段真上线)。
 //!   2. 子请求带 web_search server tool(异形只在子请求,不进主工具集)。
 //!   3. 两阶段 SSE(server_tool_use → web_search_tool_result 含 content → text 摘要)

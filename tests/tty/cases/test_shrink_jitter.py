@@ -24,7 +24,7 @@ def test_T32_multiline_shrink_to_one(bin_path):
 
 def test_T33_grow_then_shrink_top_anchored(bin_path):
     # 增长(1→3 行)再收缩(→1 行):本实现是**上边框锚定**(top 恒定,框向下铺/
-    # 收缩时下边框回弹)。这与 UI_LAYER_DESIGN "底部锚定" 不矛盾——"底部锚定"指
+    # 收缩时下边框回弹)。这与 render_region 的"底部锚定"不矛盾——"底部锚定"指
     # 固定区相对消息流末尾锚定(不碰 scrollback),框内部上锚向下长,与 cc 的 Ink
     # 流式布局一致(已核实非 bug)。断言上边框行号逐帧恒定(不抖)。
     raw = run(bin_path, [

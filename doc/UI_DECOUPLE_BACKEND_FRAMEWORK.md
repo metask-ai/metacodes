@@ -1,8 +1,8 @@
 # UI 解耦框架:UiBackend vtable + CoreEvent 协议
 
 > 状态:已实现(2026-06-05,commit acb21c4)。阶段 A–E 全部落地。
-> 关联:[[TUI_STATE_ARCHITECTURE]](状态驱动渲染,本框架的下游消费者之一)、
-> [[PERF_MEMORY_PRINCIPLES]](热路径零堆分配约束)、[[TUI_ALIGNMENT_CC]](TUI 表现层对齐)。
+> 关联:[TUI_STATE_ARCHITECTURE](TUI_STATE_ARCHITECTURE.md)(状态驱动渲染,本框架的下游消费者之一)、
+> [PERF_MEMORY_PRINCIPLES](PERF_MEMORY_PRINCIPLES.md)(热路径零堆分配约束)。
 
 ## 1. 动机
 

@@ -1,4 +1,4 @@
-# cc-zig 系统化 TTY 测试框架
+# metacodes 系统化 TTY 测试框架
 
 把 RenderRegion(底部锚定输入框)emit 的 ANSI 字节流**回放成虚拟屏幕网格**,
 从而像人眼一样断言 TUI 布局/光标/钉底,自动发现渲染 bug(跳动/错位/残留/resize 不生效)。
@@ -58,4 +58,4 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
 - **提交后用户输入消失**(T13):commit 只清框不回显 → 加 `❯ <输入>` 回显到 scrollback。
 - (澄清)中文 `�` 是旧 pty_probe 逐字节 write 拆断 UTF-8 所致,非 cc-zig bug。
 
-新增/改渲染逻辑后,跑本框架 + 真机确认。详见 `doc/UI_LAYER_DESIGN.md` §8。
+新增/改渲染逻辑后,跑本框架 + 真机确认。渲染架构见 `doc/TUI_STATE_ARCHITECTURE.md`。

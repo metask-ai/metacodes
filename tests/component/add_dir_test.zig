@@ -13,7 +13,7 @@
 //!     `(allow file-write* (subpath <add-dir>))`。
 //!
 //! 跨 ≥3 模块(settings/rule_spec/decision/permission shim + sandbox/profile),
-//! 符合 doc/E2E_TESTING.md §3.2 L2 必要条件。
+//! 符合 tests/README.md 的 L2 必要条件。
 
 const std = @import("std");
 const cc = @import("cc");
