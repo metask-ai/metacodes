@@ -15,6 +15,13 @@ jobs:
     # The paid-budget L2 exercises the production macOS Seatbelt boundary;
     # running the closed-loop controller on Linux would skip those tests and
     # correctly fail the fail-closed release decision.
+    #
+    # NOTE: [self-hosted, macOS, ARM64] is the same label set as the CI
+    # pull_request jobs, so this release gate can land on a machine that has
+    # just executed PR-authored code. Before the repository becomes public,
+    # restore a dedicated release label (e.g. metacodes-release) on an
+    # isolated or re-imaged runner; see OPEN_SOURCE_READINESS.md
+    # "Final launch gate".
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
@@ -23,6 +30,12 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
+      # Keep Zig caches outside the workspace; see ci.yml's `test` job.
+      - name: Point Zig caches at persistent per-runner storage
+        shell: bash
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
       - name: Setup pinned Lean toolchain
         uses: leanprover/lean-action@v1
         with:

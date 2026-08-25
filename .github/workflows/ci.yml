@@ -17,6 +17,13 @@ jobs:
   test:
     name: Zig and contract tests (${{ matrix.os }})
     timeout-minutes: 25
+    # Self-hosted isolation guard: never schedule fork-PR code onto the
+    # persistent self-hosted runners. Same-repo PRs, pushes to main, and
+    # workflow_dispatch runs are unaffected (github.event.pull_request is
+    # null for non-PR events, so the first clause passes them). Remove only
+    # when public CI moves to GitHub-hosted or ephemeral runners
+    # (OPEN_SOURCE_READINESS.md, "Final launch gate").
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +41,20 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
+      # checkout's default `git clean -ffdx` wipes the workspace .zig-cache
+      # that setup-zig points both cache env vars at, so without this every
+      # run recompiles the world cold. Zig's cache is content-addressed,
+      # folds the compiler version into every hash, and takes advisory locks,
+      # so a shared per-runner directory is safe; test execution is not
+      # affected because test Run steps are has_side_effects in build.zig.
+      - name: Point Zig caches at persistent per-runner storage
+        shell: bash
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
+      - name: Zig format check
+        if: runner.os == 'Linux'
+        run: zig fmt --check build.zig src tests
       - name: Setup pinned Lean toolchain
         uses: leanprover/lean-action@v1
         with:
@@ -42,9 +63,6 @@ jobs:
           build: true
           test: false
           lint: false
-      - name: Zig format check
-        if: runner.os == 'Linux'
-        run: zig fmt --check build.zig src tests
       - name: Install ripgrep
         shell: bash
         run: |
@@ -60,6 +78,11 @@ jobs:
       - name: TinyKG binary-contract unit tests
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
       - name: Full offline test suite
+        env:
+          # Both legs build control-plane/lean above (lean-action, build: true),
+          # so a missing/mislocated ProjectRule.olean is a regression, not an
+          # environment gap: fail instead of skip.
+          METACODES_TEST_REQUIRE_LEAN_SDK: "1"
         run: zig build test
       - name: ReleaseSafe core gate
         if: runner.os == 'Linux'
@@ -74,6 +97,8 @@ jobs:
   platform-runtime:
     name: platform runtime (${{ matrix.os }})
     timeout-minutes: 15
+    # Self-hosted isolation guard; see the `test` job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -91,6 +116,21 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
+      # See the `test` job for why; per-OS because the Windows runner is not
+      # guaranteed to provide bash, and Git-Bash $HOME would be a POSIX-style
+      # path that native zig.exe cannot use.
+      - name: Point Zig caches at persistent per-runner storage
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
+      - name: Point Zig caches at persistent per-runner storage (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
+          echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
       - name: Native platform modules
         if: runner.os != 'Windows'
         shell: bash
@@ -119,6 +159,8 @@ jobs:
   tinykg-bundle:
     name: bundled TinyKG (${{ matrix.os }})
     timeout-minutes: 10
+    # Self-hosted isolation guard; see the `test` job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -136,6 +178,19 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
+      # See the `test` job for why; per-OS split as in platform-runtime.
+      - name: Point Zig caches at persistent per-runner storage
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
+      - name: Point Zig caches at persistent per-runner storage (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
+          echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
       - name: Verify native bundle and fresh-store contract
         if: runner.os != 'Windows'
         shell: bash
