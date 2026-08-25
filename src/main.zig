@@ -286,6 +286,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    if (config.show_version) {
+        dumpWrite("metacodes " ++ VERSION ++ "\n");
+        return;
+    }
+
     // 捕获 argv[0] 解析可执行文件目录(供 KgClient 定位 vendor/tinykg;H1)。
     // argv[0] 含 '/' 才可定位;裸命令名(PATH 启动)→ null,回落 env/dev。realpath 解 symlink。
     {
@@ -924,6 +929,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            config.show_version = true;
         } else if (std.mem.eql(u8, arg, "--model")) {
             if (args.next()) |m| {
                 config.model = allocator.dupe(u8, m) catch m;
@@ -1197,8 +1204,9 @@ fn appendNulList(allocator: std.mem.Allocator, prev: ?[]const u8, item: []const 
 
 fn printHelp() void {
     std.debug.print(
-        \\Metacode Super
+        \\metacodes — embeddable agent core and coding CLI
         \\Usage: metacodes [options]
+        \\  --version             Print version and exit
         \\  -p, --print <prompt>  Headless: run one prompt and exit (no REPL)
         \\  -                     Headless: read prompt from stdin
         \\  --json                Headless: emit NDJSON result event

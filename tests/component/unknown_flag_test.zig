@@ -47,6 +47,15 @@ test "parse stops at the first unknown argument" {
     try std.testing.expect(!config.verbose);
 }
 
+test "--version parses cleanly and requests the version exit path" {
+    const a = std.testing.allocator;
+    const argv = [_][*:0]const u8{ "metacodes", "--version" };
+    const config = cc.parseArgsForTest(&argv, a);
+    defer freeErr(a, config);
+    try std.testing.expect(config.parse_error == null);
+    try std.testing.expect(config.show_version);
+}
+
 test "every known evaluation treatment flag still parses cleanly" {
     const a = std.testing.allocator;
     // The exact boolean flag set the WorkBuddy overlay passes
