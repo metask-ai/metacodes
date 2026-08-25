@@ -25,8 +25,8 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
@@ -37,7 +37,7 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
           echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
       - name: Setup pinned Lean toolchain
-        uses: leanprover/lean-action@v1
+        uses: leanprover/lean-action@50fcf42d2e460296f1a34b402e990d1b24f8b596 # v1
         with:
           lake-package-directory: control-plane/lean
           auto-config: false
@@ -50,7 +50,7 @@ jobs:
         run: zig build --build-file control-plane/build.zig rule-check
       - name: Upload rule-control telemetry
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: metacodes-rule-control
           path: zig-out/reports/rule-control.json
