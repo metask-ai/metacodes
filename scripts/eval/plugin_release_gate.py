@@ -566,8 +566,8 @@ def refresh_implementation_fingerprint(root: Path, protocol_path: Path) -> dict[
         # pinned_evaluator_files hash), the caller's working tree keeps the
         # original protocol untouched instead of a half-refreshed state.
         staged = protocol_path.with_name(protocol_path.name + ".refresh-staging")
-        staged.write_text(raw.replace(pinned, fresh), encoding="utf-8")
         try:
+            staged.write_text(raw.replace(pinned, fresh), encoding="utf-8")
             load_protocol(root, staged)
             os.replace(staged, protocol_path)
         finally:

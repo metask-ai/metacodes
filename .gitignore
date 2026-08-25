@@ -10,6 +10,7 @@ zig-out/
 .pytest_cache/
 .ruff_cache/
 .tinykg*.lock
+*.refresh-staging
 
 # e2e 测试产物(真实模型跑出的临时项目 + 日志)
 tests/e2e/runs/

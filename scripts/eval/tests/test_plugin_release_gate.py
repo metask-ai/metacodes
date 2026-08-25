@@ -18,6 +18,7 @@ from scripts.eval.plugin_release_gate import (
     implementation_fingerprint,
     load_protocol,
     main,
+    refresh_implementation_fingerprint,
 )
 
 
@@ -175,6 +176,26 @@ class PluginReleaseGateTest(unittest.TestCase):
     def test_refresh_mode_refuses_other_modes(self) -> None:
         with self.assertRaises(SystemExit):
             main(["--refresh-implementation-fingerprint", "--validate-only"])
+
+    def test_refresh_with_unrelated_drift_leaves_protocol_untouched(self) -> None:
+        raw = PROTOCOL.read_text(encoding="utf-8")
+        pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
+        gate_hash = json.loads(raw)["pinned_evaluator_files"][
+            "scripts/eval/plugin_release_gate.py"
+        ]
+        # Stale fingerprint AND a corrupted evaluator hash: refresh must fail
+        # closed on the evaluator drift and leave the file byte-identical,
+        # with no staging residue.
+        tampered = raw.replace(pinned, "0f" * 32).replace(gate_hash, "0e" * 32)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "protocol.json"
+            path.write_text(tampered, encoding="utf-8")
+            with self.assertRaisesRegex(PluginGateError, "drift"):
+                refresh_implementation_fingerprint(ROOT, path)
+            self.assertEqual(tampered, path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [], list(Path(directory).glob("*.refresh-staging"))
+            )
 
 
 if __name__ == "__main__":
