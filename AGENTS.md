@@ -36,6 +36,7 @@ zig fmt --check build.zig src tests
 zig build test:lib -Doptimize=ReleaseSafe
 zig build test -Doptimize=ReleaseSafe
 scripts/test_coverage_audit.sh
+python3 scripts/check_doc_links.py
 git diff --check
 ```
 

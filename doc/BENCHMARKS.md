@@ -22,10 +22,10 @@ for the full framework.
 | Plugin snapshot regression | `zig build plugin:bench` | Zero-provider immutable plugin snapshot benchmark |
 | Test-throughput integrity | `python3 scripts/rule_control.py check` | Lean-pinned five-point coverage/failure semantics for the sharded test graph |
 
-Build/test performance experiments must record compile wall, test critical
-path, wall/CPU/max RSS, pass/skip/fail/leak counts, shard count, platform, Zig
-version, and cache state; cold and warm cache are different experimental
-conditions ([tests/README.md](../tests/README.md)).
+Build/test performance experiments follow the recording discipline normatively
+listed in [tests/README.md](../tests/README.md) — timings, resource ceilings,
+result counts, shard/platform/toolchain, and cache state, with cold and warm
+cache as separate experimental conditions.
 
 ## 2. Internal evaluation control plane
 
@@ -86,17 +86,18 @@ AgentIF-OneDay (decision 2026-08-11). The operational integration lives in
 [scripts/eval/workbuddy/README.md](../scripts/eval/workbuddy/README.md); the
 protocol facts:
 
-- **Pinned framework**: commit `b516950be5b56eb3be406c2f76ee1c5111dcb57f`;
-  dataset archives pinned by SHA-256 in
-  `scripts/eval/workbuddy/manifests/workbuddy-v1-cohorts.json`. metacodes ships
+- **Pinned framework**: commit `b516950be5b56eb3be406c2f76ee1c5111dcb57f`
+  (authority: `workbuddy_commit` and the SHA-256 dataset pins in
+  `scripts/eval/workbuddy/manifests/workbuddy-v1-cohorts.json`). metacodes ships
   a **separable overlay** installed into an externally acquired checkout — the
   upstream benchmark is never forked or vendored into this tree (its license
   carries geographic restrictions and derivative-notice requirements).
 - **Anti-contamination cohorts**, frozen 2026-08-11 before any task body was
-  read: dev 52 / promotion-A 26 / promotion-B 26 / sealed 156 across the
-  Code/Web/Office/Security subsets, assigned by salted SHA-256 over task slugs
-  only. dev is the only iteration surface; promotion batches run frozen;
-  sealed stays unread until the final held-out run.
+  read: dev 52 / promotion-A 26 / promotion-B 26 / sealed 156 (the manifest's
+  `cohort_totals`) across the Code/Web/Office/Security subsets, assigned by
+  salted SHA-256 over task slugs only. dev is the only iteration surface;
+  promotion batches run frozen; sealed stays unread until the final held-out
+  run.
 - **Budget doctrine**: every provider request requires a persistent
   `request_authorized` journal entry; `WBBENCH_PROXY_MAX_RETRIES=0`;
   concurrency starts at 1; a 503/crash after authorization writes an

@@ -38,6 +38,13 @@ The repository is prepared for review but is **not approved for public visibilit
 - [ ] Verify public examples use placeholders and no paid endpoint by default.
 - [ ] Enable branch protection, required CI, private vulnerability reporting,
       Dependabot, and least-privilege GitHub Actions permissions.
+- [ ] Resolve self-hosted runner exposure before visibility flips: keep the
+      fork-PR isolation guard on every `pull_request` job, set Actions fork
+      approval to "Require approval for all outside collaborators", and either
+      move public-facing CI to GitHub-hosted or ephemeral runners or record an
+      explicit owner decision that persistent runners may execute contributor
+      PR code. Give the `rule-control` release gate a runner label separate
+      from the PR pool.
 - [ ] Tag an immutable pre-release and publish its checksums/SBOM/provenance.
 
 Removing this warning or making the repository public requires all blocking owner

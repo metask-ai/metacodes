@@ -5,8 +5,9 @@
 >
 > 字段级 API 以源码为准（本次审计更新于 2026-08-24）；模块名 `metacodes-core`,
 > 本文仅描述仓库内部模块边界，不是第三方稳定源码 API。外部 Host 可选择源码级
-> `metacodes-core` 或预编译 AgentCore bundle；交付契约见 `doc/LIB_API.md`。内部 module 名为
-> `lib.VERSION = "0.1.0"`。
+> `metacodes-core` 或预编译 AgentCore bundle；交付契约见 `doc/LIB_API.md`。
+> 版本常量 `lib.VERSION` 单源自 `src/version.zig`,与 `build.zig.zon` 的一致性
+> 由 `zig build test` 用真实二进制的 `--version` 输出强制。
 
 ---
 

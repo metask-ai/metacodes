@@ -6,11 +6,11 @@ sandbox enforcement, durable tool-result artifacts, Lean-backed governance, and
 optional TinyKG memory/task coordination. Hosts can extend tools, provider
 dialects, UI, MCP, and process plugins without replacing those kernel boundaries.
 
-> Repository status: pre-publication, version `0.1.0`. The history has been
-> extracted from the original monorepo, but the project license is still an
-> owner decision. Keep the repository private until
-> [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md) is cleared. Project
-> status is tracked as milestones in [ROADMAP.md](ROADMAP.md).
+> Repository status: pre-publication, pre-1.0 (version declared in
+> `build.zig.zon`). The history has been extracted from the original monorepo,
+> but the project license is still an owner decision. Keep the repository
+> private until [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md) is
+> cleared. Project status is tracked as milestones in [ROADMAP.md](ROADMAP.md).
 
 ## Why metacodes
 
