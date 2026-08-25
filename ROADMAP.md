@@ -49,9 +49,12 @@ CI targets self-hosted runners (Linux X64, macOS ARM64, Windows X64).
       cases remain opt-in via their `METACODES_TEST_PROJECT_*` env fixtures).
 - [x] Zig caches persist per runner (checkout's workspace clean no longer
       forces cold rebuilds); pull-request jobs carry a fork-isolation guard.
-- [ ] CI green on `main` push (needs this migration merged, runners online).
-- [ ] Keep the default CI wall-clock under ~15 min per platform; heavyweight
-      gates (`rule-control`, AgentCore Windows) stay in their own workflows.
+- [x] CI green on `main` push (merge commit af1ea06: CI and AgentCore Windows
+      both succeeded on the self-hosted fleet).
+- [x] Default CI wall-clock under ~15 min per platform with warm caches
+      (post-cache-fix: Linux ≈ 4.5 min, macOS ≈ 9 min, Windows gates ≈ 2 min);
+      keep it there — heavyweight gates (`rule-control`, AgentCore Windows)
+      stay in their own workflows.
 - [ ] Release-gate isolation: `rule-control` currently shares the
       `[self-hosted, macOS, ARM64]` label set with pull_request CI jobs;
       before public visibility, give it a dedicated or ephemeral runner so
