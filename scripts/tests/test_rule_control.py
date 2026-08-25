@@ -2557,6 +2557,15 @@ class TelemetryHygieneTests(unittest.TestCase):
             set(env),
         )
 
+    def test_output_tail_home_redaction(self) -> None:
+        home = str(Path.home())
+        text = f"error at {home}/work/x.zig:1:1 and again {home}/y"
+        redacted = rule_control.redact_home_text(text)
+        self.assertNotIn(home, redacted)
+        self.assertEqual("error at ~/work/x.zig:1:1 and again ~/y", redacted)
+        with mock.patch.object(Path, "home", side_effect=RuntimeError("no home")):
+            self.assertEqual("as-is", rule_control.redact_home_text("as-is"))
+
     def test_workspace_redaction_never_emits_the_account_absolute_path(self) -> None:
         home = Path.home()
         inside = home / "work" / "metacodes"

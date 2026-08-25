@@ -4343,6 +4343,22 @@ def redacted_workspace(workspace: Path) -> str:
         return workspace.name
 
 
+def redact_home_text(text: str) -> str:
+    """Replace the runner account's home prefix in captured child output.
+
+    Feedback tools print absolute paths (compilers, test runners); the report
+    is an uploaded artifact, so the account-revealing prefix becomes "~".
+    """
+
+    try:
+        home = str(Path.home())
+    except RuntimeError:
+        return text
+    if len(home) < 2:
+        return text
+    return text.replace(home, "~")
+
+
 def prepare_feedback_environment(repo: Path) -> dict[str, str]:
     """Bind every feedback process to one verified native TinyKG input."""
 
@@ -4436,7 +4452,7 @@ def run_feedback(
                     "elapsed_ns": elapsed_ns,
                     "skipped_tests": skipped,
                     "passed": passed,
-                    "output_tail": output[-12000:],
+                    "output_tail": redact_home_text(output[-12000:]),
                 }
             )
         except subprocess.TimeoutExpired as exc:
@@ -4450,7 +4466,9 @@ def run_feedback(
                     "skipped_tests": 0,
                     "passed": False,
                     "error": f"feedback timed out after {timeout}s",
-                    "output_tail": (exc.stdout or "")[-12000:] if isinstance(exc.stdout, str) else "",
+                    "output_tail": redact_home_text(
+                        (exc.stdout or "")[-12000:] if isinstance(exc.stdout, str) else ""
+                    ),
                 }
             )
         all_passed = all_passed and passed
