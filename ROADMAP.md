@@ -51,11 +51,14 @@ CI targets self-hosted runners (Linux X64, macOS ARM64, Windows X64).
       forces cold rebuilds); pull-request jobs carry a fork-isolation guard.
 - [x] CI green on `main` push (merge commit af1ea06: CI and AgentCore Windows
       both succeeded on the self-hosted fleet).
-- [x] Default CI wall-clock under ~15 min per platform with warm caches
-      (post-cache-fix, af1ea06: Linux ≈ 4.5 min; macOS ≈ 14 min serialized
-      across its three jobs on one runner, ≈ 9 min for the test job alone;
-      Windows gates ≈ 2 min); keep it there — heavyweight gates
-      (`rule-control`, AgentCore Windows) stay in their own workflows.
+- [x] Default CI wall-clock under ~15 min per platform with warm caches.
+      Evidence trail: af1ea06 (three jobs per platform) measured ≈ 13 min
+      wall, dominated by the macOS test job queueing ~5 min behind its
+      sibling jobs on the single macOS runner; after consolidating to one
+      `Gates` job per platform plus persistent Lean products (94c20ee):
+      **wall 9:14** — Linux 5:18, macOS 9:12 (critical path, zero queueing),
+      Windows 0:40. Keep it there — heavyweight gates (`rule-control`,
+      AgentCore Windows) stay in their own workflows.
 - [ ] Release-gate isolation: `rule-control` currently shares the
       `[self-hosted, macOS, ARM64]` label set with pull_request CI jobs;
       before public visibility, give it a dedicated or ephemeral runner so
