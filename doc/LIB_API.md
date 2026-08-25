@@ -19,6 +19,40 @@ CLI、TUI 或 Web 实现。
 核心能力从 `minimal` 热替换为 `coding`，读取两代不可变插件清单，创建 Session，
 并通过 `EventSink` 消费流式事件。
 
+### 外部 Zig 项目的 build 接线
+
+把仓库作为 `build.zig.zon` 的 Git 或本地路径依赖后，在宿主 `build.zig` 中取得
+同一个 `metacodes-core` 模块；不要重新导入 `src/` 下的内部文件，也不要手工复制
+`highlight-zig`。下面的接线方式适用于 Zig 0.16：
+
+宿主先在自己的 `build.zig.zon` 中声明依赖别名（本地开发示例）：
+
+```zig
+.dependencies = .{
+    .metacodes = .{ .path = "../metacodes" },
+};
+```
+
+发布构建应把同一个 `.metacodes` 别名改为固定 Git commit 的 URL/hash。
+
+```zig
+const metacodes = b.dependency("metacodes", .{
+    .target = target,
+    .optimize = optimize,
+});
+const app_mod = b.createModule(.{
+    .root_source_file = b.path("src/main.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+app_mod.addImport("metacodes-core", metacodes.module("metacodes-core"));
+```
+
+`build.zig.zon` 中的依赖必须固定到审计过的 Git commit 或组织内部的路径版本；发布
+包的 URL/hash 由宿主自己的供应链策略决定，不应使用浮动分支。完成接线后，宿主代码
+通过 `@import("metacodes-core")` 访问 `agent_session`、`agent_loop`、`protocol` 等
+命名空间；`zig build example` 是可运行的同仓消费者 fixture。
+
 ```sh
 # 无密钥也会完成 Runtime/插件组装并打印清单
 env -u METACODES_API_KEY zig build example
@@ -74,7 +108,7 @@ dylib 加载，也不把活跃 Session 的 catalog 改写为新代。
 `Registrar.provide(T, local_name, pointer, cleanup)`，consumer 只有在 descriptor 的
 `requires` 明确包含 provider 时，才能用相同 `T` 与 key 调用 `require`。解析发生在
 依赖拓扑序 activation 中；consumer 把返回指针注入自己的 Host tool/context，commit
-之后没有可变 service lookup。该能力不进入 AgentCore rev10 C ABI，也不暴露任何内核
+之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 13 C ABI，也不暴露任何内核
 service。
 
 `advisory_hook` capability 接受一个 `StaticPlugin.advisory_policy`。它是同步、借用、
@@ -261,7 +295,7 @@ Windows 使用 `metask_agentcore.lib`，Linux/macOS 使用
 | 审计当前数据插件组合 | plugin inventory JSON |
 | 浏览器/桌面壳 | Web HTTP + SSE + typed request 回填 |
 | 不带源码的 C/C++/Zig/Rust 原生产品 | 精确 pinned AgentCore bundle |
-| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore rev10 `runtime_create_with_plugins`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
+| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 13 `runtime_create_with_plugins`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
 | 不可信/多租户可执行插件 | 暂不支持；process v1 是故障/资源边界，不是 OS sandbox |
 
 这些入口改变的是 Host 表达和扩展组合，不是 agent loop 的因果所有权。

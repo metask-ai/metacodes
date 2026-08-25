@@ -1,6 +1,6 @@
 //! L2 组件测试:--allowedTools/--disallowedTools CLI flag 端到端贯穿。
 //!
-//! 设计目标(doc/E2E_TESTING.md §3.1):
+//! 设计目标(tests/README.md L2 组件层):
 //!   `metacodes --allowedTools "Bash(git *),Read"` →
 //!   permission.decision.check(Bash, "git status") = .allow(命中 CLI 层 allow)
 //!   `--disallowedTools "Bash(rm *)"` →
@@ -9,7 +9,7 @@
 //! 本测试不发 HTTP — 它是"跨模块字段贯穿"型 L2:CLI parseArgs → Config →
 //! permission/loader buildInlineLayer → settings.evaluate → decision.check。
 //!
-//! 跨 ≥3 模块,符合 doc/E2E_TESTING.md §3.2 L2 必要条件。
+//! 跨 ≥3 模块,符合 tests/README.md 的 L2 必要条件。
 
 const std = @import("std");
 const cc = @import("cc");
@@ -118,9 +118,9 @@ test "L2: --allowedTools + --disallowedTools 同时 → deny 优先" {
     const cli_layer = try builder.buildInlineLayer(
         a,
         .cli,
-        "Bash(git *)",      // allow git *
+        "Bash(git *)", // allow git *
         null,
-        "Bash(git push)",   // deny git push 具体
+        "Bash(git push)", // deny git push 具体
         null,
     );
     defer {

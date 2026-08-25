@@ -4799,6 +4799,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "memory_write_events"):
                 validate_runtime_artifacts(receipt, root)
 
+    # CI 实证(run 32826949215, Linux):_v7 fixture 的 consolidation 链在非 macOS
+    # 上不会产出 sealed-home/memory/MEMORY.md → FileNotFoundError;该门是必要的,
+    # 不是过度收窄。
+    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS production Seatbelt")
     def test_v7_receipt_binds_host_recall_and_consolidation_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

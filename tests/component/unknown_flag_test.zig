@@ -47,6 +47,15 @@ test "parse stops at the first unknown argument" {
     try std.testing.expect(!config.verbose);
 }
 
+test "--version parses cleanly and requests the version exit path" {
+    const a = std.testing.allocator;
+    const argv = [_][*:0]const u8{ "metacodes", "--version" };
+    const config = cc.parseArgsForTest(&argv, a);
+    defer freeErr(a, config);
+    try std.testing.expect(config.parse_error == null);
+    try std.testing.expect(config.show_version);
+}
+
 test "every known evaluation treatment flag still parses cleanly" {
     const a = std.testing.allocator;
     // The exact boolean flag set the WorkBuddy overlay passes
@@ -74,11 +83,16 @@ test "every overlay VALUE flag parses with a legitimate value" {
     // that the strict value parsing accepts the exact values the overlay sends.
     const argv = [_][*:0]const u8{
         "metacodes",
-        "--model",             "glm-5.2",
-        "--model-display-name", "glm-5.2",
-        "--permission",        "bypassPermissions",
-        "--disallowed-tools",  "WebFetch,WebSearch",
-        "--max-tokens",        "32768",
+        "--model",
+        "glm-5.2",
+        "--model-display-name",
+        "glm-5.2",
+        "--permission",
+        "bypassPermissions",
+        "--disallowed-tools",
+        "WebFetch,WebSearch",
+        "--max-tokens",
+        "32768",
     };
     const config = cc.parseArgsForTest(&argv, a);
     try std.testing.expect(config.parse_error == null);

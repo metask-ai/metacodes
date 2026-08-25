@@ -186,11 +186,11 @@ Current delivery status is intentionally target-specific:
 
 | Target | Bundle/archive | Native source-free consumption |
 |---|---|---|
-| `x86_64-windows-msvc` | previously verified; current Homebrew Zig host cannot re-link without Windows SDK/import libraries | earlier revision-12 C/C++/Zig/Rust source-free evidence retained; revision 13 not revalidated on this host |
-| `x86_64-windows-gnu` | previous revision-12 ReleaseSafe source-free bundle and full CLI cross-build/link verified | revision 13 pending cross-build and native Windows gate |
-| `x86_64-linux-gnu` | previous revision-12 ReleaseSafe source-free bundle and full CLI cross-build/link verified | revision 13 pending cross-build and native Linux gate |
-| `x86_64-macos` | previous revision-12 ReleaseSafe source-free bundle cross-build/link verified | revision 13 pending cross-build and native Intel macOS gate |
-| `aarch64-macos` | verified | revision 13 C/C++/Zig/Rust source-free ReleaseSafe gate passed, including durable journal creation across fresh/restore and continued Runs |
+| `x86_64-windows-msvc` | not revalidated on the macOS Homebrew host: Windows SDK/import libraries are unavailable | earlier revision-12 evidence is retained; revision 13 requires a native Windows gate |
+| `x86_64-windows-gnu` | revision 13 ReleaseSafe source-free bundle and full CLI cross-build/link verified locally (2026-08-24) | cross-build only; native Windows gate remains pending |
+| `x86_64-linux-gnu` | revision 13 ReleaseSafe source-free bundle and full CLI cross-build/link verified locally (2026-08-24) | cross-build only; native Linux gate remains pending |
+| `x86_64-macos` | revision 13 ReleaseSafe source-free bundle cross-build/link verified locally (2026-08-24) | cross-build only; native Intel macOS gate remains pending |
+| `aarch64-macos` | revision 13 bundle verified | C/C++/Zig/Rust source-free ReleaseSafe gate passed locally, including durable journal creation across fresh/restore and continued Runs |
 
 Cross-build success is not a support claim. In particular, the empty macOS
 framework list remains provisional until the corresponding native gates pass.

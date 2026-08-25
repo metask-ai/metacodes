@@ -1,5 +1,9 @@
 const std = @import("std");
 
+// 包清单是版本声明的仓库层权威;代码侧唯一拷贝在 src/version.zig。两者一致性由
+// runtime_arm_smoke 的 --expected-version 在 `zig build test` 中用真实二进制强制。
+const manifest = @import("build.zig.zon");
+
 // highlight-zig 轻量高亮库(Y2:已取代 tree-sitter 做 diff 高亮)。纯 Zig + 嵌入 rules_blob.zlib,
 // 零 C 依赖,200+ 语言。作为 git submodule 位于 lib/highlight-zig(独立 repo
 // github.com/shuzuan-org/highlight-zig),纯 Zig 模块方式消费其源(每个 root 各按自身
@@ -46,6 +50,11 @@ fn addTestRunArtifact(
     windows_prelude: ?*std.Build.Step.Run,
 ) *std.Build.Step.Run {
     const run = b.addRunArtifact(artifact);
+    // A test gate must execute on every invocation; a warm build cache may
+    // skip recompilation but never test execution. Zig 0.16 re-runs .zig_test
+    // steps regardless, but state the doctrine here so a future caching change
+    // cannot silently turn cached test binaries into stale green evidence.
+    run.has_side_effects = true;
     if (windows_prelude) |prelude| run.step.dependOn(&prelude.step);
     return run;
 }
@@ -1031,7 +1040,7 @@ pub fn build(b: *std.Build) void {
     });
     consumer_cmd.setCwd(b.path("."));
     consumer_cmd.step.dependOn(&manifest_cmd.step);
-    const agentcore_consumer_step = b.step("agentcore:consumer", "Run the source-free AgentCore bundle consumer");
+    const agentcore_consumer_step = b.step("agentcore:consumer", "Run the AgentCore bundle consumer (source-free linking proven by agentcore:bundle's link probes)");
     const host_agentcore_target = b.graph.host.result;
     const agentcore_cpu_is_native = switch (target.query.cpu_model) {
         .baseline, .determined_by_arch_os, .native => true,
@@ -1471,6 +1480,7 @@ pub fn build(b: *std.Build) void {
             arm_smoke.addArtifactArg(exe);
             arm_smoke.addArg("--tinykg-binary");
             arm_smoke.addFileArg(tinykg.artifact);
+            arm_smoke.addArgs(&.{ "--expected-version", manifest.version });
             eval_test_step.dependOn(&arm_smoke.step);
             test_step.dependOn(&arm_smoke.step);
 
@@ -1848,7 +1858,7 @@ pub fn build(b: *std.Build) void {
     // test:e2e-tty —— tty 真模型工具 e2e(cases/test_e2e_*.py)。与渲染测试不同:这些用例
     // 自建 PTY、断言靠落盘的 transcript.jsonl(非 build-runner 捕获的屏幕字节),所以经
     // SystemCommand 跑不受 PTY 时序假失败影响(已实测 stdin=/dev/null 下通过)。
-    // 打真模型(napi.metask-ai.com,client.zig 硬编码 token)→ 默认应设 TTY_SKIP_MODEL=1
+    // 打真模型(凭证来自 ~/.metacodes/auth.json 或 METASK_API_KEY,无硬编码)→ 默认应设 TTY_SKIP_MODEL=1
     // 跳过(CI/离线);显式 `TTY_SKIP_MODEL= zig build test:e2e-tty` 才真打模型、真副作用
     // (真联网/真排程/真发通知/真改 git)。先 build debug 二进制 + mock_mcp_server。
     const e2e_tty_step = b.step("test:e2e-tty", "Run tty real-model tool e2e (打真模型, 设 TTY_SKIP_MODEL=1 跳过)");

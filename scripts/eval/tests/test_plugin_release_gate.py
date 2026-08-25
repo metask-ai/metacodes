@@ -18,6 +18,7 @@ from scripts.eval.plugin_release_gate import (
     implementation_fingerprint,
     load_protocol,
     main,
+    refresh_implementation_fingerprint,
 )
 
 
@@ -130,6 +131,71 @@ class PluginReleaseGateTest(unittest.TestCase):
             path.write_text(json.dumps(protocol), encoding="utf-8")
             with self.assertRaises(PluginGateError):
                 load_protocol(ROOT, path)
+
+    def test_refresh_mode_repins_stale_fingerprint_without_weakening_gate(self) -> None:
+        raw = PROTOCOL.read_text(encoding="utf-8")
+        pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
+        fresh = implementation_fingerprint(ROOT, json.loads(raw))
+        stale = "0f" * 32
+        self.assertNotEqual(stale, pinned)
+        self.assertEqual(1, raw.count(pinned))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "protocol.json"
+            path.write_text(raw.replace(pinned, stale), encoding="utf-8")
+            # Unrefreshed drift stays fail-closed on every validate path.
+            with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+                load_protocol(ROOT, path)
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    0,
+                    main(
+                        ["--refresh-implementation-fingerprint", "--protocol", str(path)]
+                    ),
+                )
+            row = json.loads(output.getvalue())
+            self.assertEqual("refreshed", row["status"])
+            self.assertEqual(stale, row["previous_implementation_fingerprint"])
+            self.assertEqual(fresh, row["implementation_fingerprint"])
+            # Text replacement preserved every other byte of the file.
+            self.assertEqual(raw.replace(pinned, fresh), path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                fresh,
+                load_protocol(ROOT, path)["coding_pair"]["implementation_fingerprint"],
+            )
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    0,
+                    main(
+                        ["--refresh-implementation-fingerprint", "--protocol", str(path)]
+                    ),
+                )
+            self.assertEqual("already_current", json.loads(output.getvalue())["status"])
+
+    def test_refresh_mode_refuses_other_modes(self) -> None:
+        with self.assertRaises(SystemExit):
+            main(["--refresh-implementation-fingerprint", "--validate-only"])
+
+    def test_refresh_with_unrelated_drift_leaves_protocol_untouched(self) -> None:
+        raw = PROTOCOL.read_text(encoding="utf-8")
+        pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
+        gate_hash = json.loads(raw)["pinned_evaluator_files"][
+            "scripts/eval/plugin_release_gate.py"
+        ]
+        # Stale fingerprint AND a corrupted evaluator hash: refresh must fail
+        # closed on the evaluator drift and leave the file byte-identical,
+        # with no staging residue.
+        tampered = raw.replace(pinned, "0f" * 32).replace(gate_hash, "0e" * 32)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "protocol.json"
+            path.write_text(tampered, encoding="utf-8")
+            with self.assertRaisesRegex(PluginGateError, "drift"):
+                refresh_implementation_fingerprint(ROOT, path)
+            self.assertEqual(tampered, path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [], list(Path(directory).glob("*.refresh-staging"))
+            )
 
 
 if __name__ == "__main__":

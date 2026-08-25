@@ -205,6 +205,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     app.addImport("metask_agentcore", sdk);
+    // The Zig test's loopback mock server (mock_server.zig) uses the repo's
+    // src/platform sockets for deterministic Windows accept/close behavior.
+    // This is runner scaffolding, not an AgentCore bundle input: the
+    // source-free link attestation lives in the `link` step's probes, which
+    // build from the installed bundle alone.
+    app.addImport("platform", b.createModule(.{
+        .root_source_file = b.path("../../src/platform/platform.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     app.addObjectFile(.{ .cwd_relative = lib_path });
     applySystemLinkInputs(app, manifest.value);
     const exe = b.addExecutable(.{ .name = "agentcore-artifact-consumer", .root_module = app });
@@ -230,7 +240,7 @@ pub fn build(b: *std.Build) void {
     link_step.dependOn(&c_link_exe.step);
     link_step.dependOn(&cpp_link_exe.step);
 
-    const test_step = b.step("test", "Link and run using only the installed AgentCore bundle");
+    const test_step = b.step("test", "Run consumers against the installed AgentCore bundle");
     test_step.dependOn(&run.step);
     test_step.dependOn(&c_run.step);
     test_step.dependOn(&cpp_run.step);

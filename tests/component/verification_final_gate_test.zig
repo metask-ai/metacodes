@@ -638,7 +638,6 @@ test "L2 a test-file edit after a failed verification emits a hot weakening cand
     try std.testing.expect(record.last_failed_flags[1]);
 }
 
-
 // PO-V2 M4(observe 传感器):义务闭合后的再验证 = "绿灯重跑"计数;
 // 闭合证据级记录最终一次闭合靠的层(1=tier1 测试命令)。
 // fstack-r2 实测:freshness nudge 三次触发全部只产生已绿检查的重跑,

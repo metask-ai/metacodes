@@ -268,13 +268,13 @@ fn keywordsFor(kind: LangKind) []const []const u8 {
 
 /// 通用关键字集（generic 语言用;覆盖各语言高频词的并集）。
 const KEYWORDS = [_][]const u8{
-    "if",     "else",      "for",     "while",   "switch",   "case",      "default",  "break",    "continue",
-    "return", "match",     "loop",    "do",      "try",      "catch",     "finally",  "throw",    "defer",
-    "const",  "var",       "let",     "fn",      "func",     "function",  "def",      "class",    "struct",
-    "enum",   "union",     "interface", "type",  "trait",    "impl",      "pub",      "static",
-    "import", "export",    "from",    "use",     "package",  "mod",       "extern",   "comptime",
-    "inline", "async",     "await",   "new",     "void",     "true",      "false",    "null",     "nil",
-    "self",   "this",      "int",     "bool",    "string",   "and",       "or",       "not",      "in",
+    "if",     "else",  "for",       "while",   "switch", "case",     "default",  "break",  "continue",
+    "return", "match", "loop",      "do",      "try",    "catch",    "finally",  "throw",  "defer",
+    "const",  "var",   "let",       "fn",      "func",   "function", "def",      "class",  "struct",
+    "enum",   "union", "interface", "type",    "trait",  "impl",     "pub",      "static", "import",
+    "export", "from",  "use",       "package", "mod",    "extern",   "comptime", "inline", "async",
+    "await",  "new",   "void",      "true",    "false",  "null",     "nil",      "self",   "this",
+    "int",    "bool",  "string",    "and",     "or",     "not",      "in",
 };
 
 fn isKeywordIn(word: []const u8, kws: []const []const u8) bool {

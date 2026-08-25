@@ -291,15 +291,46 @@ def _require(condition: bool, message: str) -> None:
         raise SystemExit(message)
 
 
+def _version_output_smoke(binary: Path, expected_semver: str) -> None:
+    """`--version` is a documented public surface (doc/API.md): assert the real
+    binary prints exactly `metacodes <semver>` on stdout and exits 0.  The
+    expected value comes from build.zig.zon via build.zig, so a version bump
+    that misses src/version.zig (or vice versa) fails here instead of
+    shipping a binary that mislabels itself."""
+    completed = subprocess.run(
+        [str(binary), "--version"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    _require(
+        completed.returncode == 0,
+        f"--version exited {completed.returncode}: {completed.stderr[:200]}",
+    )
+    expected = f"metacodes {expected_semver}\n"
+    _require(
+        completed.stdout == expected,
+        f"--version stdout {completed.stdout!r} != {expected!r} "
+        "(src/version.zig and build.zig.zon must agree)",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--tinykg-binary", required=True, type=Path)
+    parser.add_argument(
+        "--expected-version",
+        required=True,
+        help="semver declared by build.zig.zon; asserted against `--version` output",
+    )
     args = parser.parse_args()
     binary = args.binary.resolve()
     tinykg_binary = args.tinykg_binary.resolve()
     for label, path in (("metacodes", binary), ("TinyKG", tinykg_binary)):
         _require(path.is_file() and os.access(path, os.X_OK), f"{label} is not executable: {path}")
+
+    _version_output_smoke(binary, args.expected_version)
 
     dumps = {arm: _dump(binary, tinykg_binary, arm) for arm in ARMS}
     for arm, output in dumps.items():

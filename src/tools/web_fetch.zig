@@ -18,6 +18,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
+
+// 出站 User-Agent 与产品版本同源;不再附带早期误标的第三方主页。
+const user_agent = "metacodes/" ++ @import("../version.zig").semver;
 const ToolResultBody = @import("context.zig").ToolResultBody;
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const result_spool = @import("result_spool.zig");
@@ -75,7 +78,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
         "--max-time",
         "15",
         "--user-agent",
-        "metacodes/0.1 (+https://anthropic.com)",
+        user_agent,
         url_z.ptr,
         null,
     };
@@ -287,7 +290,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         "--max-time",
         "15",
         "--user-agent",
-        "metacodes/0.1 (+https://anthropic.com)",
+        user_agent,
         url_z.ptr,
         null,
     };

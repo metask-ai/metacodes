@@ -47,7 +47,7 @@ pub const Overlay = struct {
 fn writeAll(fd: c_int, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
-        const n = pfs.write(fd, bytes[total..][0..bytes.len - total]);
+        const n = pfs.write(fd, bytes[total..][0 .. bytes.len - total]);
         if (n <= 0) return; // 终端关闭等异常:静默放弃
         total += @as(usize, @intCast(n));
     }
@@ -63,7 +63,9 @@ const testing = std.testing;
 test "Overlay: 双 enter 幂等" {
     // 用 /dev/null fd 避免污染终端
     const dev_null = pfs.open(@import("platform").paths.null_device, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-    defer { if (dev_null >= 0) _ = pfs.close(dev_null); }
+    defer {
+        if (dev_null >= 0) _ = pfs.close(dev_null);
+    }
     if (dev_null < 0) return error.SkipZigTest;
 
     var ov = Overlay{ .fd = dev_null };
@@ -80,7 +82,9 @@ test "Overlay: 双 enter 幂等" {
 
 test "Overlay: hide_cursor=false 不写 hide/show" {
     const dev_null = pfs.open(@import("platform").paths.null_device, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-    defer { if (dev_null >= 0) _ = pfs.close(dev_null); }
+    defer {
+        if (dev_null >= 0) _ = pfs.close(dev_null);
+    }
     if (dev_null < 0) return error.SkipZigTest;
 
     var ov = Overlay{ .fd = dev_null, .hide_cursor = false };

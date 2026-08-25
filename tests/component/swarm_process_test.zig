@@ -77,8 +77,8 @@ test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {
 test "L2 SW6 A: --teammate 身份 args 解析进 config" {
     const a = std.testing.allocator;
     const argv = [_][*:0]const u8{
-        "metacodes", "--teammate", "--agent-name", "bob", "--team-name", "proj",
-        "--parent-session-id", "sess9", "--teammate-cwd", "/tmp/wt7",
+        "metacodes",           "--teammate", "--agent-name",   "bob",      "--team-name", "proj",
+        "--parent-session-id", "sess9",      "--teammate-cwd", "/tmp/wt7",
     };
     const cfg = cc.parseArgsForTest(&argv, a);
     // 注:parseArgsForTest 用 arena/allocator dupe;这里 testing.allocator 会报泄漏若 dupe 未 free。

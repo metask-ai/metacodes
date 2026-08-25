@@ -1,9 +1,10 @@
 # AgentCore ABI v1 实验期工作台账
 
 > 来源：2026-07-18 评审方 v1 整体审计（RunContext 之外的解冻期应修项）。
-> RunContext 批次（`AGENTCORE_RUN_CONTEXT_DESIGN.md`）已作为 ABI v1 revision 2
-> 实施；仓内 source-free Zig/C/C++ 消费端已通过迁移门禁，但它们仍由库作者维护，
-> 不冒充下述“真实消费者门禁”。本台账继续记录复冻前尚未关闭的整体问题。
+> RunContext 批次已作为 ABI v1 revision 2 实施（逐修订设计稿已随过程文档清理
+> 移出仓库，见 git 历史）；仓内 source-free Zig/C/C++ 消费端已通过迁移门禁，
+> 但它们仍由库作者维护，不冒充下述“真实消费者门禁”。
+> 本台账继续记录复冻前尚未关闭的整体问题。
 > 复冻前置条件（全部满足才形成候选）：
 > ① A 组四项关闭；② B 组**逐项形成明确 disposition**，其中 **B1、B3 必须修复或给出
 > 不修的正式论证**（歧义 wire format 与 schema 静默吞字段冻结后再修就是 breaking，

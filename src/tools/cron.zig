@@ -33,8 +33,7 @@ pub fn createExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return try std.fmt.allocPrint(a, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
     };
 
-    return try std.fmt.allocPrint(a,
-        "{{\"id\":\"{s}\",\"recurring\":{},\"scheduled\":true}}", .{ id[0..], recurring });
+    return try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"recurring\":{},\"scheduled\":true}}", .{ id[0..], recurring });
 }
 
 pub fn deleteExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {

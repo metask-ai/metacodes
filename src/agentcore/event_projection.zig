@@ -281,7 +281,6 @@ fn feedFixture(backend: *const UiBackend) void {
     } });
 }
 
-
 /// Emit one visible segment exactly as `agent_loop` does: open, stream text,
 /// then close with the disposition the loop decided.
 fn feedSegment(

@@ -3,7 +3,7 @@
 //! 对应 cc/src/utils/api.ts 的 toolToAPISchema() 传给 tool.prompt(ctx) 的对象——
 //! 让每个工具的 description 能按权限模式、当前工具集、agent 类型动态变化(动态耦合)。
 //!
-//! 见 doc/PROMPT_TOOL_RELATIONSHIP.md 第二/四节。
+//! prompt 与工具集耦合的回归守卫见 tests/component/prompt_tool_coupling_test.zig。
 
 const std = @import("std");
 const PermissionMode = @import("../types.zig").PermissionMode;

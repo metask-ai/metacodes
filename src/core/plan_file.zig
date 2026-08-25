@@ -14,18 +14,18 @@ const fs = @import("../util/fs.zig");
 
 /// 形容词词库(slug 第一段)。自建精简版。
 const adjectives = [_][]const u8{
-    "cozy",   "brave",  "calm",   "clever", "eager",  "gentle", "jolly",  "keen",
-    "lively", "merry",  "nimble", "proud",  "quiet",  "rapid",  "sunny",  "swift",
-    "tidy",   "vivid",  "warm",   "witty",  "bold",   "crisp",  "deft",   "fair",
-    "glad",   "humble", "ideal",  "lucid",  "noble",  "plush",  "round",  "sleek",
+    "cozy",   "brave",  "calm",   "clever", "eager", "gentle", "jolly", "keen",
+    "lively", "merry",  "nimble", "proud",  "quiet", "rapid",  "sunny", "swift",
+    "tidy",   "vivid",  "warm",   "witty",  "bold",  "crisp",  "deft",  "fair",
+    "glad",   "humble", "ideal",  "lucid",  "noble", "plush",  "round", "sleek",
 };
 
 /// 名词词库(slug 第二段)。
 const nouns = [_][]const u8{
-    "canyon", "meadow", "harbor", "summit", "river",  "forest", "valley", "ridge",
-    "lagoon", "orchard", "garden", "island", "prairie", "glacier", "delta", "fjord",
-    "grove",  "marsh",  "basin",  "plateau", "cove",   "dune",   "reef",   "bay",
-    "creek",  "knoll",  "vale",   "wold",    "heath",  "moor",   "strand", "shoal",
+    "canyon", "meadow",  "harbor", "summit",  "river",   "forest",  "valley", "ridge",
+    "lagoon", "orchard", "garden", "island",  "prairie", "glacier", "delta",  "fjord",
+    "grove",  "marsh",   "basin",  "plateau", "cove",    "dune",    "reef",   "bay",
+    "creek",  "knoll",   "vale",   "wold",    "heath",   "moor",    "strand", "shoal",
 };
 
 /// 由 seed 生成双词 slug,写进 buf,返回 slug slice(借 buf)。

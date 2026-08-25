@@ -38,7 +38,7 @@ pub fn truncate(alloc: std.mem.Allocator, s: []const u8, max_cols: usize, ellips
     var cols: usize = 0;
     while (byte_end < s.len) {
         const next = nextCharBytes(s, byte_end);
-        const ch_w = term.displayWidth(s[byte_end..byte_end + next]);
+        const ch_w = term.displayWidth(s[byte_end .. byte_end + next]);
         if (cols + ch_w > want_cols) break;
         cols += ch_w;
         byte_end += next;

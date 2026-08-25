@@ -191,13 +191,13 @@ fn looksLikeCommand(tok: []const u8) bool {
 /// 默认 readonly 命令:在 default 模式不询问,在 sandbox 下不需要专门白名单。
 /// 对齐官方默认 allowUnsandboxedCommands 列表(粗集)。
 pub const READONLY_BASH = [_][]const u8{
-    "ls",     "cat",     "pwd",   "echo",  "printf",
-    "head",   "tail",    "grep",  "egrep", "fgrep",
-    "find",   "wc",      "which", "type",  "diff",
-    "stat",   "du",      "df",    "file",  "sort",
-    "uniq",   "cut",     "tr",    "awk",   "sed",
-    "cd",     "true",    "false", "id",    "whoami",
-    "uname",  "hostname",
+    "ls",    "cat",      "pwd",   "echo",  "printf",
+    "head",  "tail",     "grep",  "egrep", "fgrep",
+    "find",  "wc",       "which", "type",  "diff",
+    "stat",  "du",       "df",    "file",  "sort",
+    "uniq",  "cut",      "tr",    "awk",   "sed",
+    "cd",    "true",     "false", "id",    "whoami",
+    "uname", "hostname",
 };
 
 /// 检查 cmd(已 stripWrappers)的第一个 token 是否在 readonly 清单。
@@ -215,9 +215,8 @@ pub fn isReadonlyCommand(cmd: []const u8) bool {
         const sp2 = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
         const sub = rest[0..sp2];
         const READONLY_GIT = [_][]const u8{
-            "status",    "log",      "diff",    "show", "branch",
-            "rev-parse", "ls-files", "ls-tree", "describe",
-            "blame",
+            "status",    "log",      "diff",    "show",     "branch",
+            "rev-parse", "ls-files", "ls-tree", "describe", "blame",
         };
         inline for (READONLY_GIT) |g| {
             if (std.mem.eql(u8, sub, g)) return true;

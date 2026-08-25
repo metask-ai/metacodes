@@ -227,7 +227,7 @@ fn writeTempProfile(alloc: std.mem.Allocator, content: []const u8) ![]u8 {
 
     var written: usize = 0;
     while (written < content.len) {
-        const n2 = pfs.write(fd, content[written..][0..content.len - written]);
+        const n2 = pfs.write(fd, content[written..][0 .. content.len - written]);
         if (n2 <= 0) return error.WriteProfileFailed;
         written += @intCast(n2);
     }
@@ -325,9 +325,7 @@ test "e2e: sandbox blocks write outside cwd, allows inside" {
 
     const sb = config_mod.SandboxSettings{ .enabled = true };
     // 命令:cwd 内写 OK;cwd 外(/private/tmp/cczig_sbe2e_OUTSIDE)写应被拦
-    const cmd = try std.fmt.allocPrint(alloc,
-        "echo in > {s}/ok.txt && echo INSIDE_OK; (echo x > /private/etc/cczig_hack_{d} 2>/dev/null && echo OUTSIDE_BAD || echo OUTSIDE_BLOCKED)",
-        .{ dir, pid });
+    const cmd = try std.fmt.allocPrint(alloc, "echo in > {s}/ok.txt && echo INSIDE_OK; (echo x > /private/etc/cczig_hack_{d} 2>/dev/null && echo OUTSIDE_BAD || echo OUTSIDE_BLOCKED)", .{ dir, pid });
     defer alloc.free(cmd);
 
     const w = try wrapAsShellString(alloc, cmd, .{ .cwd = dir, .home = "/Users/x", .sandbox = &sb });

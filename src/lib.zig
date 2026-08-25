@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-pub const VERSION = "0.1.0";
+pub const VERSION = @import("version.zig").semver;
 pub const util_fs = @import("util/fs.zig");
 pub const plugin = @import("plugin/root.zig");
 

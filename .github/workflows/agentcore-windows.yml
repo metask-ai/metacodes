@@ -22,21 +22,58 @@ permissions:
 
 jobs:
   native-windows-gate:
-    runs-on: windows-latest
+    # Self-hosted isolation guard: never schedule fork-PR code onto the
+    # persistent self-hosted runners; see OPEN_SOURCE_READINESS.md
+    # "Final launch gate".
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Pinned to metask-pc: this gate provisions a persistent Rust toolchain in
+    # the runner user's profile, so it stays on one known machine, unlike
+    # ci.yml's generic [self-hosted, Windows, X64] pool. Owner: confirm or
+    # align the label if the fleet has a single Windows runner.
+    runs-on: [self-hosted, Windows, X64, metask-pc]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          use-cache: false
+      # checkout's default clean wipes the workspace .zig-cache both cache env
+      # vars point at; keep the content-addressed caches outside the workspace
+      # so the ReleaseSafe gates stop cold-compiling every run.
+      - name: Point Zig caches at persistent per-runner storage
+        shell: cmd
+        run: |
+          echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
+          echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
+      - name: Setup Rust toolchain (Windows)
+        shell: cmd
+        env:
+          # Force the missing-toolchain case through the explicit install
+          # branch below instead of rustup's silent auto-install inside
+          # `rustup which`.
+          RUSTUP_AUTO_INSTALL: "0"
+        run: |
+          where rustup >nul 2>nul
+          if errorlevel 1 (
+            curl.exe --proto "=https" --tlsv1.2 --retry 10 --retry-connrefused --fail --silent --show-error https://win.rustup.rs/x86_64 -o "%RUNNER_TEMP%\rustup-init.exe"
+            if errorlevel 1 exit /b 1
+            "%RUNNER_TEMP%\rustup-init.exe" --default-toolchain none --profile minimal --no-modify-path -y
+            if errorlevel 1 exit /b 1
+          )
+          echo %USERPROFILE%\.cargo\bin>>"%GITHUB_PATH%"
+          set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+          rustup which --toolchain stable rustc >nul 2>nul || rustup toolchain install stable --profile minimal --no-self-update
+          if errorlevel 1 exit /b 1
+          rustup default stable
+          if errorlevel 1 exit /b 1
+          rustc --version
+          cargo --version
       - name: Native AgentCore delivery gate
-        shell: pwsh
+        shell: cmd
         run: |
           zig version
-          zig build agentcore:gate `
-            -Dtarget=x86_64-windows-msvc `
-            -Doptimize=ReleaseSafe `
-            -j12
+          zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe -j12
       - name: Native Windows platform gate
-        shell: pwsh
+        shell: cmd
         run: zig build windows:gate -Dtarget=x86_64-windows-gnu -j12

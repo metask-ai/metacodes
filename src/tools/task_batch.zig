@@ -16,7 +16,7 @@
 //! 无 registry(headless)→ 主线程串行(用 ctx 的 provider),行为一致只是不并发。
 //! per-item deadline watchdog(MAX_ITEM_SECONDS=300)防单个子 agent 跑飞拖垮整批 join。
 //!
-//! **已知差距(未实现,登记非沉默;完整差距矩阵见 metaknow E2E_TESTING §3.1)**:
+//! **已知差距(未实现,登记非沉默)**:
 //!  - **结果落文件/summary 模式**:codex 结果落 CSV 只回 summary 防撑爆父 context;本实现 N 个 final_text
 //!    会先在 TaskBatch 聚合器内构造完整返回；随后统一投影能把超限结果保存到 Session CAS 并经
 //!    ReadArtifact 完整恢复，所以 Conversation 不再丢正文，但生成期峰值仍是 O(聚合结果)。未做

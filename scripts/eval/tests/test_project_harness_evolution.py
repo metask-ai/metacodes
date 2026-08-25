@@ -9,14 +9,35 @@ import unittest
 
 from scripts.eval.project_harness_evolution import (
     EvolutionError,
+    SDK_OLEAN_RELATIVE,
     analyze_lifecycle,
     freeze_manifest,
     run_evolution,
 )
 
 
+_REPO = Path(__file__).resolve().parents[3]
+_SDK_OLEAN = _REPO / SDK_OLEAN_RELATIVE
+
+
 class ProjectHarnessEvolutionTest(unittest.TestCase):
+    def _require_built_lean_sdk(self) -> None:
+        # freeze_manifest 冻结的是 checked-in 源加上已编译 SDK olean;干净 checkout
+        # 未构建 control-plane/lean 时按环境缺失显式 skip,与本文件其它 native 门一致。
+        # CI 在运行本套件前用 leanprover/lean-action 构建,并设
+        # METACODES_TEST_REQUIRE_LEAN_SDK=1 把缺失升级为失败,防止路径漂移把
+        # 这两个测试永久变成 skip 却仍显示绿色。
+        if not _SDK_OLEAN.is_file():
+            message = (
+                f"compiled Lean SDK missing at {_SDK_OLEAN} "
+                "(run `lake build` in control-plane/lean to enable)"
+            )
+            if os.environ.get("METACODES_TEST_REQUIRE_LEAN_SDK") == "1":
+                self.fail(message)
+            self.skipTest(message)
+
     def test_manifest_freezes_e2_without_claiming_model_quality(self) -> None:
+        self._require_built_lean_sdk()
         repo = Path(__file__).resolve().parents[3]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -38,6 +59,7 @@ class ProjectHarnessEvolutionTest(unittest.TestCase):
             self.assertEqual(str((root / "home").resolve()), manifest["runtime_contract"]["home_root"])
 
     def test_manifest_freezes_external_project_path_but_keeps_home_local(self) -> None:
+        self._require_built_lean_sdk()
         repo = Path(__file__).resolve().parents[3]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -34,7 +34,6 @@ pub fn pick(seed: u64) []const u8 {
     return verbs[@intCast(seed % verbs.len)];
 }
 
-
 /// 按 frame 序号取动画字符。use_unicode=false 用 ASCII 降级集。
 pub fn frame(idx: u8, use_unicode: bool) []const u8 {
     if (use_unicode) {

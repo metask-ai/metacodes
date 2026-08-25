@@ -230,7 +230,7 @@ next runner calls when raw artifacts no longer attest, while promotion rereads
 all 18 calibration rollouts and rejects transcript mutation. Thus Lean owns the
 legal ordering and admission cardinality, while executable sensors establish
 the actual I/O and TinyKG facts represented by those abstract events.
-The feedback topology also requires `python scripts/verify_tinykg_binary.py`
+The feedback topology also requires `python3 scripts/verify_tinykg_binary.py`
 before the Python L2 command. A clean checkout verifies the native target from
 the checked-in manifest-pinned bundle; maintainers may instead inject an explicit
 binary path and observed SHA-256. Neither route can turn missing native coverage

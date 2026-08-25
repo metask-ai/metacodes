@@ -1,4 +1,4 @@
-//! 预置应答队列(Stage 3,doc/E2E_FRAMEWORK_DESIGN.md)。
+//! 预置应答队列(E2E 框架 Stage 3)。
 //!
 //! 问题:e2e 框架用 stdin 管道喂 REPL 行流,**独占了 fd 0**。权限 `.ask`
 //! (permission/prompt.zig)和 AskUserQuestion(tools/ask_user.zig)在非 tty 时

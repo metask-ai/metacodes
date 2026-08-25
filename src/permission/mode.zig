@@ -1,6 +1,6 @@
 //! 权限模式(Mode):对齐 Claude Code 6 模式 + cc-zig 历史别名。
 //!
-//! 6 个官方模式见 doc/PERMISSION_DESIGN.md 第三节。
+//! 对齐 Claude Code 的 6 个官方权限模式;语义以本模块枚举与其测试为准。
 //! 解析支持驼峰(acceptEdits)和下划线(accept_edits)两种写法。
 
 const std = @import("std");

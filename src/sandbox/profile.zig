@@ -2,7 +2,7 @@
 //!
 //! 生成 SBPL(Sandbox Profile Language)字符串,喂给 `sandbox-exec -p '<profile>' <cmd>`。
 //!
-//! 模型(对齐 Claude Code doc/PERMISSION_DESIGN.md 第 9 节):
+//! 模型(对齐 Claude Code 沙箱语义):
 //!   - (allow default)         先全放行(读 / exec / 网络 / sysctl 不限)
 //!   - (deny file-write*)      然后禁止所有写
 //!   - (allow file-write* ...) 再 allow 回工作目录 + 标准设备 + TMPDIR + allowWrite 列表

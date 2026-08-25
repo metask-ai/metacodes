@@ -2,7 +2,7 @@
 //!
 //! 用途：
 //!   L3 集成测试（http_stream_e2e_test 等）已用 — 发响应,不验证请求体。
-//!   L2 组件测试（doc/E2E_TESTING.md）— 用 lastRequest()/CapturedRequest 断言请求体字段贯穿。
+//!   L2 组件测试（tests/README.md）— 用 lastRequest()/CapturedRequest 断言请求体字段贯穿。
 //!
 //! 设计：同步，在调用线程起个辅助 std.Thread 跑 accept 循环；调用方拿到 port 后连接它。
 //! 本期最小可用——不支持多连接、不支持请求路由（所有请求返回同一 body）、不支持 keep-alive。

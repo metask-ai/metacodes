@@ -343,7 +343,7 @@ test "ledger: a continuation group concatenates into one result" {
     var ledger = Ledger.init(a);
     defer ledger.deinit();
 
-    ledger.record(.{ .index = 0, .turn = 1, .group = 0, .disposition = .continued, .bytes = 5 }, "part " );
+    ledger.record(.{ .index = 0, .turn = 1, .group = 0, .disposition = .continued, .bytes = 5 }, "part ");
     ledger.record(.{ .index = 1, .turn = 1, .group = 0, .disposition = .continued, .bytes = 4 }, "two ");
     ledger.record(.{ .index = 2, .turn = 1, .group = 0, .disposition = .final, .bytes = 3 }, "end");
 

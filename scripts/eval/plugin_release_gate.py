@@ -512,6 +512,80 @@ def _write_new(path: Path, value: Mapping[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def refresh_implementation_fingerprint(root: Path, protocol_path: Path) -> dict[str, Any]:
+    """Explicitly repin coding_pair.implementation_fingerprint in place.
+
+    The supported write path after an intentional implementation change.  It
+    reads the protocol leniently (load_protocol fails closed on the stale pin
+    before it could report the fresh value), recomputes the fingerprint over
+    implementation_paths, and text-replaces the single pinned digest so the
+    file keeps its exact formatting.  It never runs implicitly and never
+    weakens the gate: the repinned candidate is verified with load_protocol in
+    a staging file before atomically replacing the real one, so a protocol
+    with any other drift is left untouched.
+    pinned_evaluator_files stays deliberately out of scope — a gate that
+    repins its own code hash would be a self-attestation loophole.
+    """
+
+    try:
+        raw = protocol_path.read_text(encoding="utf-8")
+        value = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
+    if not isinstance(value, dict) or value.get("schema") != SCHEMA:
+        raise PluginGateError("unsupported plugin evaluation protocol")
+    pair = value.get("coding_pair")
+    if not isinstance(pair, dict):
+        raise PluginGateError("coding pair is missing")
+    pinned = _require_sha256(
+        pair.get("implementation_fingerprint"),
+        "coding pair implementation_fingerprint",
+    )
+    paths = value.get("implementation_paths")
+    if (
+        not isinstance(paths, list)
+        or not paths
+        or len(paths) != len(set(paths))
+        or not all(isinstance(item, str) for item in paths)
+    ):
+        raise PluginGateError("implementation_paths must be distinct path strings")
+    fresh = implementation_fingerprint(root, value)
+    result: dict[str, Any] = {
+        "status": "already_current",
+        "implementation_fingerprint": fresh,
+        "protocol": str(protocol_path),
+    }
+    if fresh != pinned:
+        if raw.count(pinned) != 1:
+            raise PluginGateError(
+                "refusing to rewrite: pinned fingerprint occurs "
+                f"{raw.count(pinned)} times in {protocol_path}"
+            )
+        # Verify the repinned candidate BEFORE touching the real file: if
+        # anything else in the protocol still drifts (e.g. a stale
+        # pinned_evaluator_files hash), the caller's working tree keeps the
+        # original protocol untouched instead of a half-refreshed state.
+        staged = protocol_path.with_name(protocol_path.name + ".refresh-staging")
+        try:
+            staged.write_text(raw.replace(pinned, fresh), encoding="utf-8")
+            load_protocol(root, staged)
+            os.replace(staged, protocol_path)
+        finally:
+            staged.unlink(missing_ok=True)
+        result = {
+            "status": "refreshed",
+            "previous_implementation_fingerprint": pinned,
+            "implementation_fingerprint": fresh,
+            "protocol": str(protocol_path),
+        }
+        return result
+    # Already current: still fail closed if anything else in the pinned
+    # protocol drifts; refresh must never report already_current for a file
+    # the gate loader would reject.
+    load_protocol(root, protocol_path)
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -537,8 +611,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--refresh-implementation-fingerprint",
+        action="store_true",
+        help=(
+            "repin coding_pair.implementation_fingerprint in the protocol "
+            "file after an intentional implementation change; rewrites the "
+            "file in place and never runs the gate"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
+        if args.refresh_implementation_fingerprint:
+            if args.validate_only or args.output is not None or args.runtime_binary is not None:
+                raise PluginGateError(
+                    "--refresh-implementation-fingerprint cannot be combined "
+                    "with --validate-only, --output, or --runtime-binary"
+                )
+            print(
+                json.dumps(
+                    refresh_implementation_fingerprint(root, args.protocol.resolve()),
+                    sort_keys=True,
+                )
+            )
+            return 0
         protocol = load_protocol(root, args.protocol.resolve())
         if args.validate_only:
             print(

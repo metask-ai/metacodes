@@ -1,6 +1,7 @@
 //! Tool(specifier) 规则字符串解析 + 匹配。
 //!
-//! 完整对齐 Claude Code 规则语法,详见 doc/PERMISSION_DESIGN.md 第四节。
+//! 完整对齐 Claude Code 规则语法;规则语义以本模块类型与
+//! tests/component 权限测试为准(早期 PERMISSION_DESIGN 设计稿已移出仓库)。
 //!
 //! 入口 API:
 //!   parseRule("Bash(npm run *)") → RuleSpec{ .tool="Bash", .spec=.{ .bash_pattern="npm run *" } }
@@ -192,7 +193,7 @@ pub fn matches(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []co
     return matchesMode(spec, mctx, tool_name, args, .deny);
 }
 
-/// 规则的 allow/deny 语义影响 symlink 处理(对齐 PERMISSION_DESIGN §4.3):
+/// 规则的 allow/deny 语义影响 symlink 处理:
 ///   allow:路径规则要求 [原路径] 和 [realpath 解析后] **都**匹配(指向区外的链接也 prompt)
 ///   deny :路径规则 [原路径] 或 [realpath] **任一**匹配即触发(指向 denied 文件的链接也 deny)
 /// 非路径规则不受影响。
@@ -312,11 +313,23 @@ fn hasCompoundSep(s: []const u8) bool {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         const c = s[i];
-        if (!in_d and !in_b and c == '\'') { in_s = !in_s; continue; }
-        if (!in_s and !in_b and c == '"')  { in_d = !in_d; continue; }
-        if (!in_s and !in_d and c == '`')  { in_b = !in_b; continue; }
+        if (!in_d and !in_b and c == '\'') {
+            in_s = !in_s;
+            continue;
+        }
+        if (!in_s and !in_b and c == '"') {
+            in_d = !in_d;
+            continue;
+        }
+        if (!in_s and !in_d and c == '`') {
+            in_b = !in_b;
+            continue;
+        }
         if (in_s or in_d or in_b) continue;
-        if (c == '\\' and i + 1 < s.len) { i += 1; continue; }
+        if (c == '\\' and i + 1 < s.len) {
+            i += 1;
+            continue;
+        }
         if (c == ';' or c == '\n' or c == '|') return true;
         if (c == '&') {
             if (i + 1 < s.len and s[i + 1] == '&') return true;

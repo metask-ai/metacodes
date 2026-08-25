@@ -60,7 +60,6 @@ pub const Rendered = struct {
     rows: usize, // frame 占的终端行数(= frame 内 '\n' 数),run 用它 cursor.up 回顶
 };
 
-
 /// 多问导航信息(阶段2):画顶部 `←  chip… ✔ Submit  →` 导航条。
 /// headers/answered 长度 == 问题数;current = 当前视图(== 问题数 时是 Submit 视图)。
 pub const NavInfo = struct {
@@ -445,7 +444,6 @@ fn boxFold(alloc: std.mem.Allocator, th: Theme, hidden: usize, inner: usize) ![]
     return try b.toOwnedSlice(alloc);
 }
 
-
 /// all_answered=false 时显警告行。sel:0=Submit answers,1=Cancel。
 pub fn renderSubmit(
     alloc: std.mem.Allocator,
@@ -819,7 +817,6 @@ fn finalizeAll(alloc: std.mem.Allocator, questions: []const ctx.AskQuestion, qs:
     }
 }
 
-
 /// note 编辑态 Ctrl+G:暂退 raw → 唤起 $EDITOR/Vim 编辑当前选项 note → 重进 raw → 回填。
 /// 终端模式:对话框运行在生成期 raw(gen_raw_orig)下;编辑器需 cooked,故 save→restore→editor→re-enter。
 /// 失败(无 $EDITOR/spawn 失败)静默忽略(note 保持原样,不崩)。
@@ -1000,7 +997,6 @@ test "render: 少量问题仍画全部 chip(不误退紧凑)" {
     try capture.expectContains(r.frame, "C2");
     try testing.expect(std.mem.indexOf(u8, r.frame, "(2/2)") == null); // 没退紧凑
 }
-
 
 test "render: 多问导航条 ←  chip  ✔ Submit  →(当前问高亮)" {
     const th = theme_mod.monochrome;

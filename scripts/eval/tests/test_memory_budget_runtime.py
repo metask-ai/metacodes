@@ -341,6 +341,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             resume_paid_run=resume_paid_run,
         )
 
+    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS production Seatbelt")
     def test_mock_provider_observes_durable_authorization_on_real_runner_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -389,6 +390,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, "out-of-policy tool 'Task'"):
                     validate_runtime_artifacts(forged, root / "run-success")
 
+    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS production Seatbelt")
     def test_crash_windows_remain_authorized_and_cannot_retry(self):
         for crash_stage, expected_requests in (
             ("after_request_authorized", 0),
@@ -446,6 +448,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                                 )
                         self.assertEqual(provider.requests, expected_requests)
 
+    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS production Seatbelt")
     def test_rollout_checkpoint_resume_skips_already_committed_provider_request(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -511,6 +514,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             self.assertEqual(len(observations), 2)
             validate_runtime_artifacts(receipt, root / run_name)
 
+    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS production Seatbelt")
     def test_resume_rejects_journal_advance_without_replaying_provider(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -577,6 +581,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                         )
                 self.assertEqual(provider.requests, 1)
 
+    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS production Seatbelt")
     def test_external_ripgrep_may_disappear_after_run_snapshot_without_spending_gap(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -644,7 +649,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "permissions must remain 0500"):
                 validate_runtime_artifacts(receipt, root / "run-snapshotted-toolchain")
 
-    @unittest.skipUnless(os.name == "posix", "requires POSIX signal return codes")
+    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS production Seatbelt")
     def test_hard_child_signal_after_provider_persists_authorized_diagnostic(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -808,6 +813,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             load_key.assert_not_called()
             self.assertFalse(missing_auth.exists())
 
+    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS production Seatbelt")
     def test_pre_authorization_os_failure_aborts_without_provider_request(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

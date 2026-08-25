@@ -1063,9 +1063,13 @@ test "capture cwd:子进程 pwd 在指定 cwd 而非父进程 cwd" {
     // 缺陷 B 回归测试:capture opts.cwd 非 null → 子进程 chdir 后再 exec。
     if (!procSpawnTestsEnabled()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    // 选一个肯定存在、非当前 cwd 的目录:/tmp(POSIX) 或 %TEMP%(Windows)。
-    const target_dir: []const u8 = if (is_windows) std.process.getEnvVarOwned(a, "TEMP") catch "/Temp" else "/tmp";
-    defer if (is_windows) a.free(target_dir);
+    // 选一个肯定存在、非当前 cwd 的目录:/tmp(POSIX) 或 %SystemRoot%(Windows)。
+    var target_dir_owned: ?[]u8 = null;
+    const target_dir: []const u8 = if (is_windows) blk: {
+        target_dir_owned = (std.process.Environ{ .block = .global }).getAlloc(a, "SystemRoot") catch null;
+        break :blk target_dir_owned orelse "C:\\Windows";
+    } else "/tmp";
+    defer if (target_dir_owned) |value| a.free(value);
     const argv: []const ?[*:0]const u8 = if (is_windows)
         &.{ "cmd.exe", "/c", "cd", null }
     else
@@ -1073,8 +1077,19 @@ test "capture cwd:子进程 pwd 在指定 cwd 而非父进程 cwd" {
     const r = try capture(argv, a, .{ .cwd = target_dir, .want_stderr = false, .timeout_ms = 10_000 });
     defer a.free(r.stdout);
     defer a.free(r.stderr);
-    // stdout 应含 target_dir(子进程在 target_dir 下跑 pwd)。
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, target_dir) != null);
+    // Windows `cmd /c cd` may normalize drive-letter case and append a
+    // trailing separator. Compare the canonical text case-insensitively after
+    // trimming those presentation differences.
+    const observed = std.mem.trim(u8, r.stdout, " \r\n");
+    if (is_windows) {
+        const expected = std.mem.trim(u8, target_dir, "\\/");
+        try std.testing.expect(std.ascii.eqlIgnoreCase(observed, expected));
+    } else {
+        // 保留前导 '/' 锚定路径边界:macOS chdir("/tmp") 解析符号链接后 pwd 打
+        // /private/tmp,endsWith("/tmp") 仍成立;裸 "tmp" 子串任何含 tmp 的 cwd
+        // 都能满足,会漏掉 chdir 回归。
+        try std.testing.expect(std.mem.endsWith(u8, observed, target_dir));
+    }
 }
 
 test "capture 超时返 error.Timeout（有缓冲输出，验不 double-free）" {

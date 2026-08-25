@@ -63,6 +63,9 @@ pub const Config = struct {
     dump_prompt: bool = false,
     /// `--dump-plugins`:打印版本化 immutable plugin inventory JSON 后退出。
     dump_plugins: bool = false,
+    /// `--version`:打印 `metacodes <semver>` 到 stdout 后退出(parse 只置位,
+    /// main 早退打印,保持 parseArgsForTest 可测)。
+    show_version: bool = false,
     /// `--web [port]`:起 web UI(HTTP+SSE)驱动 agent loop,不进 TUI REPL。
     /// null = 不启用;0 = 内核分配端口(启动时打印真实端口)。
     web_port: ?u16 = null,

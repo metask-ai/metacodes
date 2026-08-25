@@ -3559,7 +3559,10 @@ result = {
         manifest_path = self._manifest(root)
         manifest = validate_launch_manifest(manifest_path)
         workbuddy = root / "workbuddy"
-        started_ns = time.time_ns() - 1_000_000
+        # Self-hosted filesystems may expose coarse mtimes. Keep a clock-skew
+        # window so fixtures remain attributable to this run on ext4, APFS,
+        # and network-backed volumes.
+        started_ns = time.time_ns() - 5_000_000_000
         self._exception_trial(workbuddy, with_trajectory=attempt1_trajectory)
         self._instance_fixture(workbuddy)
         journal_path = root / "budget.json"

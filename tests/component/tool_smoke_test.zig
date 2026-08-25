@@ -11,7 +11,7 @@
 //! 不可在纯 L2 自动化执行的工具(WebFetch 需网络、Cron 需时钟、PushNotification 发
 //! 系统通知、AskUserQuestion 需 TTY、Monitor 长驻、Worktree 改 cwd+git、MCP 需 server)
 //! 不在此造执行冒烟——它们的 schema 由 tool_schema_coverage_test 覆盖,执行覆盖缺口
-//! 在 doc/E2E_TESTING.md 差距矩阵登记。详见该文档。
+//! 已在测试差距清单登记(见 tests/README.md)。
 
 const std = @import("std");
 const cc = @import("cc");

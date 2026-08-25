@@ -218,8 +218,7 @@ test "L2 web: 跨域 POST 被 403 拒绝(CSRF 防线),同源/无 Origin 放行" 
 
     // 恶意跨域:403,inbox 保持空
     {
-        const resp = try roundtrip(a, fx.srv.port,
-            "POST /message HTTP/1.1\r\nOrigin: http://evil.com\r\nContent-Length: 14\r\n\r\n{\"text\":\"pwn\"}", null);
+        const resp = try roundtrip(a, fx.srv.port, "POST /message HTTP/1.1\r\nOrigin: http://evil.com\r\nContent-Length: 14\r\n\r\n{\"text\":\"pwn\"}", null);
         defer a.free(resp);
         try std.testing.expect(std.mem.indexOf(u8, resp, "403") != null);
     }
@@ -227,8 +226,7 @@ test "L2 web: 跨域 POST 被 403 拒绝(CSRF 防线),同源/无 Origin 放行" 
 
     // 无 Origin(CLI):放行,消息入队
     {
-        const resp = try roundtrip(a, fx.srv.port,
-            "POST /message HTTP/1.1\r\nContent-Length: 14\r\n\r\n{\"text\":\"cli\"}", null);
+        const resp = try roundtrip(a, fx.srv.port, "POST /message HTTP/1.1\r\nContent-Length: 14\r\n\r\n{\"text\":\"cli\"}", null);
         defer a.free(resp);
         try std.testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
     }
@@ -260,7 +258,9 @@ test "L2 web: /command 端点经 commandFn 入队 + extractStringKey" {
     var sig = cc.util_abort.AbortSignal.init();
     const S = struct {
         var box: *MsgQueue = undefined;
-        fn state(_: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 { return allocator.dupe(u8, "{}"); }
+        fn state(_: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+            return allocator.dupe(u8, "{}");
+        }
         fn command(_: *anyopaque, allocator: std.mem.Allocator, c: []const u8) anyerror![]u8 {
             _ = box.push(c);
             return std.json.Stringify.valueAlloc(allocator, .{ .ok = true, .message = "queued" }, .{});
@@ -269,14 +269,18 @@ test "L2 web: /command 端点经 commandFn 入队 + extractStringKey" {
     S.box = &cmdbox;
     var dummy: u8 = 0;
     const srv = try WebServer.start(a, 0, .{
-        .journal = &j, .web_backend = &wb, .inbox = &inbox, .abort = &sig,
-        .state_ctx = @ptrCast(&dummy), .state_fn = &S.state, .command_fn = &S.command,
+        .journal = &j,
+        .web_backend = &wb,
+        .inbox = &inbox,
+        .abort = &sig,
+        .state_ctx = @ptrCast(&dummy),
+        .state_fn = &S.state,
+        .command_fn = &S.command,
     });
     defer srv.stop();
     defer j.close();
 
-    const resp = try roundtrip(a, srv.port,
-        "POST /command HTTP/1.1\r\nContent-Length: 15\r\n\r\n{\"cmd\":\"/mode\"}", null);
+    const resp = try roundtrip(a, srv.port, "POST /command HTTP/1.1\r\nContent-Length: 15\r\n\r\n{\"cmd\":\"/mode\"}", null);
     defer a.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "queued") != null);
@@ -292,8 +296,7 @@ test "L2 web: /command 无 handler → 501" {
     var fx = Fixture.init(a);
     defer fx.deinit();
     try fx.start(a); // Fixture 不接 command_fn
-    const resp = try roundtrip(a, fx.srv.port,
-        "POST /command HTTP/1.1\r\nContent-Length: 15\r\n\r\n{\"cmd\":\"/mode\"}", null);
+    const resp = try roundtrip(a, fx.srv.port, "POST /command HTTP/1.1\r\nContent-Length: 15\r\n\r\n{\"cmd\":\"/mode\"}", null);
     defer a.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "501") != null);
 }

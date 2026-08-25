@@ -12,13 +12,30 @@ defaults:
 
 jobs:
   rule-control:
-    runs-on: [self-hosted, metacodes-release]
+    # The paid-budget L2 exercises the production macOS Seatbelt boundary;
+    # running the closed-loop controller on Linux would skip those tests and
+    # correctly fail the fail-closed release decision.
+    #
+    # NOTE: [self-hosted, macOS, ARM64] is the same label set as the CI
+    # pull_request jobs, so this release gate can land on a machine that has
+    # just executed PR-authored code. Before the repository becomes public,
+    # restore a dedicated release label (e.g. metacodes-release) on an
+    # isolated or re-imaged runner; see OPEN_SOURCE_READINESS.md
+    # "Final launch gate".
+    runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          use-cache: false
+      # Keep Zig caches outside the workspace; see ci.yml's `test` job.
+      - name: Point Zig caches at persistent per-runner storage
+        shell: bash
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
       - name: Setup pinned Lean toolchain
         uses: leanprover/lean-action@v1
         with:
@@ -28,7 +45,7 @@ jobs:
           test: false
           lint: false
       - name: Verify checked-in TinyKG bundle
-        run: python scripts/verify_tinykg_binary.py
+        run: python3 scripts/verify_tinykg_binary.py
       - name: Run closed-loop release gate
         run: zig build --build-file control-plane/build.zig rule-check
       - name: Upload rule-control telemetry

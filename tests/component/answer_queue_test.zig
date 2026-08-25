@@ -1,6 +1,6 @@
 //! L2 组件测试:Stage 3 — 预置应答通道端到端贯穿。
 //!
-//! 设计目标(doc/E2E_FRAMEWORK_DESIGN.md Stage 3):
+//! 设计目标(E2E 框架 Stage 3):
 //!   非 tty 下权限 .ask 从 answer_queue 按序弹应答,而非读 fd 0(被 REPL 行流独占)。
 //!
 //! 这里测真实链路 `answer_queue.load → permission.promptUser → prompt.ask →

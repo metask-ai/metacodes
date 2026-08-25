@@ -59,8 +59,7 @@ test "Subagents E2E: custom personal-level agent loaded" {
         rmAgent(dir, "code-reviewer.md");
         rmDir(dir);
     }
-    try makeAgent(dir, "code-reviewer.md",
-        "---\nname: code-reviewer\ndescription: review code\ntools: Read, Grep\nmodel: haiku\n---\nYou review.\n");
+    try makeAgent(dir, "code-reviewer.md", "---\nname: code-reviewer\ndescription: review code\ntools: Read, Grep\nmodel: haiku\n---\nYou review.\n");
 
     var set = cc.agents_set.AgentSet.init(a);
     defer set.deinit();
@@ -76,7 +75,12 @@ test "Subagents E2E: project overrides personal" {
     const a = std.testing.allocator;
     const p1 = "/tmp/cc-zig-ag-prio1";
     const p2 = "/tmp/cc-zig-ag-prio2";
-    defer { rmAgent(p1, "x.md"); rmDir(p1); rmAgent(p2, "x.md"); rmDir(p2); }
+    defer {
+        rmAgent(p1, "x.md");
+        rmDir(p1);
+        rmAgent(p2, "x.md");
+        rmDir(p2);
+    }
     try makeAgent(p1, "x.md", "---\nname: shared\ndescription: personal\n---\nA\n");
     try makeAgent(p2, "x.md", "---\nname: shared\ndescription: project\n---\nB\n");
 

@@ -1,6 +1,6 @@
 //! L2 组件测试:subagent model 字段端到端贯穿。
 //!
-//! 设计目标(doc/E2E_TESTING.md §3.1):
+//! 设计目标(tests/README.md L2 组件层):
 //!   当 Task 工具 spawn subagent 且子 agent 配置了 model=haiku(例如 Explore agent),
 //!   实际 HTTP 请求体里 "model" 字段应该是 haiku-* 而非父 agent 的 model。
 //!

@@ -1,6 +1,6 @@
 //! RenderRegion —— 底部锚定固定重绘区(复刻 Claude Code 观感,不进 alt-screen)。
 //!
-//! 见 doc/UI_LAYER_DESIGN.md。核心:屏幕底部维护固定高度的几行(StatusBar +
+//! 见 doc/TUI_STATE_ARCHITECTURE.md。核心:屏幕底部维护固定高度的几行(StatusBar +
 //! InputBox + 占位),只在变化时光标上移+逐行清+重画那几行,**绝不碰 scrollback**
 //! (绝不用 \x1b[2J)。上方消息正常流入终端原生 scrollback。
 //!
@@ -296,7 +296,7 @@ pub const RenderRegion = struct {
     /// 末尾把光标停在 content 供编辑,并记 input_cursor_row。
     /// TaskTab:输入框上方显示首个 in_progress 任务的 active_form(无则 subject)。
     /// 无 in_progress 任务 → 不画,返回 0 行。画一行返回 1。`◐ <text>`(截断到 cols)。
-    /// 对齐 UI_LAYER_DESIGN 阶段 4。另:有运行中后台 subagent 时,即便无 todo 也画一行
+    /// 另:有运行中后台 subagent 时,即便无 todo 也画一行
     /// `◐ N subagents running`(用户曾反馈看不到并发 subagent 进度)。
     fn drawTaskTab(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
         return self.drawPanel(w, app);

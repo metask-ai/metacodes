@@ -1,6 +1,6 @@
 # highlight-zig
 
-轻量语法高亮引擎，纯 Zig，零 C 依赖。为 [metacodes](https://github.com/shuzuan-org/metacodes) 的 diff / 源码高亮而生，也可独立使用。
+轻量语法高亮引擎，纯 Zig，零 C 依赖。为 [metacodes](https://github.com/metask-ai/metacodes) 的 diff / 源码高亮而生，也可独立使用。
 
 - **纯 Zig**：规则表以 zlib 压缩 blob 嵌入二进制（`src/rules_blob.zlib`），200+ 语言，demand-paging 零常驻内存代价。
 - **无 tree-sitter**：取代早期 tree-sitter 集成做 diff 高亮，无 grammar 编译、无 scanner。

@@ -153,7 +153,7 @@ filesystem/process package 不能把自己升级为 in-process dialect callback�
 | Zig `RuntimeHost` | 是 | 是 | 完整 stage/publish、Session pinning、失败保留旧代 |
 | CLI/TUI App | 否 | 否 | data/process plugin 可在启动时组合；App 主 Provider、后台 Task 与 in-process Swarm 共用启动时 immutable Resolver；核心工具仍由 App 固定组装 |
 | Web backend | 否 | 否 | 复用 App snapshot 和 inventory；没有 Web 热替换控制面 |
-| AgentCore C/Zig/Rust ABI rev10 | 显式工具列表 | 否 | 保持 96-byte ABI；process plugin 可在 create 时加载 |
+| AgentCore C/Zig/Rust ABI v1 rev13 | 显式工具列表 | 否 | 固定 280-byte API table；`runtime_create_with_plugins` 可在 create 时加载 process package；不支持运行中代际替换 |
 | Provider transport | 每 Session 可选 | 新 Session 可选 | 认证/HTTP/SSE 仍是 Host plane seam |
 | Provider dialect | 是（static trusted） | 是 | Snapshot-scoped longest-prefix resolver + typed visible-capability projection；旧 Session 固定旧代 |
 | UI backend | 每 Run/Session 注入 | 新 Run/Session 可选 | typed `CoreEvent` / `UiRequest` seam，不替换 AgentLoop |
@@ -161,8 +161,9 @@ filesystem/process package 不能把自己升级为 in-process dialect callback�
 | Formal/TinyKG | 受治理输入 | 不允许替换裁决/写入器 | evidence adapter 可扩展，verdict/provenance/CAS 永属 TCB |
 
 因此，“首方核心能力热插拔”当前是 Zig 嵌入 Runtime 的已实现能力。CLI/Web live
-control plane、AgentCore 新 ABI revision，以及 Skill/Agent profile 投影是后续明确工作，
-不能从保留字段或现有 inventory 接口推断为已支持。
+control plane、AgentCore 通用 generation 投影，以及 Skill/Agent profile 投影仍是后续明确
+工作；不能从 revision 13 的 process-package 入口、保留字段或现有 inventory 接口推断为
+AgentCore 运行中热替换。
 
 ## 5. 自我迭代如何进入插件代际
 

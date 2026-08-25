@@ -3,10 +3,11 @@
 > 面向 metacodes 仓库内部维护者，说明 TUI、Web、daemon 等 frontend 与 core 的模块边界。
 > 本文是**内部架构契约 + 设计不变式**参考；第三方接入见 `doc/LIB_API.md`。
 >
-> 字段级 API 以源码为准(本文与源码同步于 2026-06-09);模块名 `metacodes_core`,
-> 本文仅描述仓库内部模块边界，不是第三方源码 API。外部 Host 只消费预编译
-> AgentCore bundle；交付契约见 `doc/LIB_API.md`。内部 module 版本为
-> `lib.VERSION = "0.1.0"`。
+> 字段级 API 以源码为准（本次审计更新于 2026-08-24）；模块名 `metacodes-core`,
+> 本文仅描述仓库内部模块边界，不是第三方稳定源码 API。外部 Host 可选择源码级
+> `metacodes-core` 或预编译 AgentCore bundle；交付契约见 `doc/LIB_API.md`。
+> 版本常量 `lib.VERSION` 单源自 `src/version.zig`,与 `build.zig.zon` 的一致性
+> 由 `zig build test` 用真实二进制的 `--version` 输出强制。
 
 ---
 
@@ -228,9 +229,10 @@ pub fn serializeUiRequest(allocator, req) ![]u8; // 给异步前端投递用
 ## 4. 主循环契约:agent_loop.run()
 
 ```zig
+// `api_provider` is the `mc.api_provider` namespace exported by `src/lib.zig`.
 pub fn run(
     conversation: *Conversation,
-    api_client: *Client,
+    provider: api_provider.Provider,
     tool_defs: []const ToolDefinition,
     permission_ctx: *const PermissionContext,
     opts: Options,
@@ -238,9 +240,24 @@ pub fn run(
     allocator: std.mem.Allocator,
 ) !RunResult
 
-pub const RunResult = struct { stop_reason: StopReason, turns: u32, tool_calls: u32 };
-pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended };
+pub const RunResult = struct {
+    stop_reason: StopReason,
+    turns: u32,
+    tool_calls: u32,
+    suspend_info: ?SuspendInfo = null,
+};
+pub const StopReason = enum {
+    end_turn, max_turns, aborted, tool_error, api_error, tool_loop,
+    suspended, backgrounded, budget,
+};
 ```
+
+`provider` 是按值传递的轻量 vtable；它借用具体 client 的 context，client 必须活到
+本次 `run` 以及所有并发工具工作结束。源码 Host 通常使用
+`agent_session.RuntimeHost`/`AgentSession`（见 §6 和 `example/main.zig`）；只有需要
+直接驱动低层循环时，才从具体 client 取得 `client.provider()`。
+当 `stop_reason == .suspended` 时，`suspend_info` 由调用方拥有；写入持久状态或完成
+投递后调用其 `deinit()`。
 
 **一回合做什么**:流式发当前 conversation → 收集 assistant 文本 + tool_use blocks(经 backend
 emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工具(`tool_exec.executeSlots`)→
@@ -272,32 +289,34 @@ stream ABI 都复用同一 CAS/receipt/`ReadArtifact` 恢复面。
 
 ### 4.1 Options(全可选,`.{}` 即最简跑)
 
-~45 字段,分四类——理解分类比记字段重要:
+字段较多,分四类——理解分类比记字段重要:
 
-- **CONFIG(纯标量旋钮)**:`max_turns=50` `system_prompt` `verbose` `auto_compact_threshold`
+- **CONFIG(纯标量旋钮)**:`max_turns=400` `cost_budget_usd` `system_prompt` `verbose`
+  `auto_compact_threshold`
   `auto_compact_keep_recent=10` `agent_depth=0` `colorize=true` `emit_tool_cards=false`
   `model_override` `explicit_invocation` …
 - **DEPS(注入的依赖句柄)**:`abort` `read_state` `edit_hl_cache` `jobs` `agent_jobs` `tasks`
-  `api_client` `tool_defs` `dyn_registry` `agents` `skills_set` `cron_registry` `sandbox`
+  `api_client`(仅 Anthropic `web_search` 专用) `provider_factory` `tool_defs` `dyn_registry`
+  `agents` `skills_set` `cron_registry` `sandbox`
   `mcp_sessions` `output_ledger`(§3.2.1) `file_change_journal`(§3.2.2) …
 - **SESSION/身份**:`session: SessionId` `session_id` `project_dir` `cwd_abs` `home_dir`
   `parent_model` `plan_file_path` `artifact_root` …
-- **接口回调(类型安全,见 §4.2)**:`usage_sink` `progress_reporter` `ui_requester`
-  `skill_activator` `tool_activator` `worktree_hook` + `spawn_tick_fn`(无状态,裸 fn)
+- **接口回调/观察(类型安全,见 §4.2)**:`ui_requester` `host_services` `tool_observer`
+  `spawn_tick_fn`；usage/progress 由 `CoreEvent`/`EventSink` 投影，不再注入私有 sink。
 
-### 4.2 接口回调结构(宿主接 core 的类型安全面)
+### 4.2 接口/事件结构(宿主接 core 的类型安全面)
 
-全部形如 `{ctx: *anyopaque, fn} + method`(仿 `UsageSink`),接错配对编译失败:
+回调接口统一把 context 与函数指针收进类型安全的 value；usage/progress 则走
+`CoreEvent`，不是已经移除的私有 `UsageSink`/`ProgressReporter` 回调:
 
 | 接口 | 定义于 | 作用 |
 |------|--------|------|
-| `UsageSink` | agent_loop | 每个 usage event 回写 token 计数 |
-| `ProgressReporter` | agent_loop | 轮/工具级进度(turn, tool_name, tool_input, tool_calls)——subagent 进度树用 |
-| `UiRequester` | protocol/ui_request | 交互式 UI 请求(§3.4) |
-| `SkillActivator` | tools/context | Skill 工具激活 → 把白/黑名单挂宿主 |
-| `ToolActivator` | tools/context | ToolSearch 激活 deferred 工具 |
-| `WorktreeHook` | tools/context | Enter/ExitWorktree 的 push/pop |
-| `ToolProgressReporter` | tools/context | 工具执行内进度(id, phase, text, count;WebSearch 用) |
+| `EventSink` | `agent_session` | Session 级 `CoreEvent` 消费（文本、工具、usage、progress、诊断） |
+| `UiBackend` | `protocol/ui_backend` | 低层 `agent_loop.run` 的 emit/poll 事件面 |
+| `UiRequester` | `protocol/ui_request` | 交互式 UI 请求(§3.4)，可返回 answered/pending/unavailable |
+| `HostServices` | `tools/context` | Skill/ToolSearch 激活与 Worktree push/pop 的宿主 RPC |
+| `ToolProgressReporter` | `tools/context` | 工具执行内进度(id, phase, text, count;WebSearch 用) |
+| `ToolObservationSink` | `tools/observation` | UI-independent 的实际 dispatch 观察 |
 
 ---
 
@@ -317,7 +336,7 @@ session)。这是 `requestUi`/`promptUser` 当前的全部行为。
 (AskUserQuestion→NotATty;plan→answer_queue/reject)。参考 `WriterBackend.initNull()` /
 `HeadlessBackend`。
 
-### 5.3 异步前端(IM / 邮件 / 工作流)— 可挂起路径(协议已预留,全链待实施)
+### 5.3 异步前端(IM / 邮件 / 工作流)— 可挂起路径
 
 人类响应延迟 >> 进程寿命(几小时 + 跨重启),活线程无法存活那么久。**协议层已预留**:
 - `RequestOutcome.pending`:异步 requester 不阻塞——stash 请求、out-of-band 投递、返回 `.pending`。
@@ -325,10 +344,11 @@ session)。这是 `requestUi`/`promptUser` 当前的全部行为。
 - `StopReason.suspended`:run() 检测到 pending 即挂起返回(不再调 API)。
 - `serializeUiRequest`:把 UiRequest 序列化给前端渲染。
 
-**当前状态(2026-06-09)**:协议形状已落地且 sync 路径字节不变(所有现有 requester 返
-`.answered`,所有 backend no-op `ui_request_pending`,`.suspended` 无人产生)。**挂起检测 +
-checkpoint + `resumeWithResponse`(响应到达后注入 tool_result 续跑)的全链未实施**——设计见
-`doc/` 计划文档,建议接第一个真实异步前端时连同前端一并实现验证。
+当前同步 requester 仍返回 `.answered`；异步 requester 可以返回 `.pending`，由
+`run()` 产出 `.suspended` 和 `RunResult.suspend_info`。CLI/headless 已把该信息写入
+`suspend.json`，`--resume-response` 通过 `resumeSuspended` 读取 transcript 与挂起状态，
+调用 `resumeRun` 注入成对的 `tool_result` 并继续运行（再次挂起时链式重写状态）。真正的
+Slack/邮件投递器仍属于宿主职责，core 不负责网络传输。
 
 ---
 
@@ -360,10 +380,14 @@ const MyBackend = struct {
 
 ```zig
 var client = mc.client.Client.init(a, init.io, api_key, "claude-3-5-haiku-20241022");
+defer client.deinit();
+const provider = client.provider(); // value vtable; client/context must outlive run()
 var conv = mc.conversation.Conversation.init(a);
+defer conv.deinit();
 try conv.appendText(.user, "Reply with a single word: hello");
 var be = MyBackend{};
-const result = try mc.agent_loop.run(&conv, &client, tool_defs, &perm_ctx, .{}, &be.backend(), a);
+const backend = be.backend();
+const result = try mc.agent_loop.run(&conv, provider, tool_defs, &perm_ctx, .{}, &backend, a);
 ```
 
 ### 6.3 多 session(GUI 多视图 / IM 多对话)
@@ -415,7 +439,7 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
 zig build                 # 主二进制(含 TUI 前端)
 zig build test            # 全单测(含协议/工具/权限)
 zig build test:lib        # ★ refAllDecls 编 core 全图 = core↔UI 物理隔离的编译器证明
-zig build example         # 跑 example/ 最小前端(真端点;离线见 LIB_API.md §9)
+zig build example         # 跑 example/ 最小前端(真端点;离线见 LIB_API.md §1)
 ```
 
 **`zig build test:lib` 绿 = core 不依赖任何前端**——这是平台内核最该守的不变式,每次改 core 后必跑。
@@ -428,4 +452,4 @@ zig build example         # 跑 example/ 最小前端(真端点;离线见 LIB_AP
 - 最小前端示例:`example/main.zig`(`zig build example`)
 - 多 session 设计:metaknow scope metask_business `MULTI_SESSION_REFACTOR`
 - 设计文档总入口:metaknow scope `metask_business`(PLAN/SUBAGENT/PERMISSION/TOOLS 等根)
-- 操作命令/API 规范:`doc/L2.md`
+- 操作命令/API 规范:`doc/API.md`

@@ -1,6 +1,6 @@
 //! 解析 settings.json 的 `sandbox` 段 → SandboxSettings。
 //!
-//! Schema(对齐 doc/PERMISSION_DESIGN.md 9.4):
+//! Schema(对齐 Claude Code settings 的 sandbox 段):
 //!   "sandbox": {
 //!     "enabled": true,
 //!     "failIfUnavailable": false,

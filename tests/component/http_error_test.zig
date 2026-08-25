@@ -1,6 +1,6 @@
 //! L2 组件测试:Stage 6 — HTTP/SSE 错误现场。
 //!
-//! 设计目标(doc/E2E_FRAMEWORK_DESIGN.md Stage 6):
+//! 设计目标(E2E 框架 Stage 6):
 //!   1. HTTP 401/429/5xx 在 return error 前读 body 进日志(不再"零现场")。
 //!   2. SSE `event: error` 帧被识别为 error_event,上抛**区分性** error.ApiError
 //!      (不塌缩成 RequestFailed),让 agent_loop/测试能区分"API 主动报错" vs "网络失败"。
