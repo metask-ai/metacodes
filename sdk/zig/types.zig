@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 13;
+pub const ABI_REVISION: u32 = 14;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 13 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 14 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -356,38 +356,10 @@ pub const HOST_SINK_TOO_LARGE: u32 = 2;
 pub const HOST_SINK_FAILED: u32 = 3;
 pub const HOST_SINK_CLOSED: u32 = 4;
 
-pub const CAP_RUNTIME: u64 = 1 << 0;
-pub const CAP_BUILTIN_TOOLS: u64 = 1 << 1;
-pub const CAP_HOST_SYNC_TOOLS: u64 = 1 << 2;
-pub const CAP_HOST_UI: u64 = 1 << 3;
-pub const CAP_CORE_EVENTS_JSON: u64 = 1 << 4;
-pub const CAP_ABORT: u64 = 1 << 5;
-pub const CAP_SKILL_CATALOG: u64 = 1 << 6;
-pub const CAP_TYPED_RUN_INPUT: u64 = 1 << 7;
-pub const CAP_SESSION_MODEL_MUTATION: u64 = 1 << 8;
-pub const CAP_MANUAL_COMPACT: u64 = 1 << 9;
-pub const CAP_SKILL_POLICY: u64 = 1 << 10;
-pub const CAP_HOST_PERMISSION_RULES: u64 = 1 << 11;
-pub const CAP_SESSION_CHECKPOINT: u64 = 1 << 12;
-pub const CAP_SESSION_RESTORE: u64 = 1 << 13;
-pub const CAP_SESSION_DESCRIBE: u64 = 1 << 14;
-pub const CAP_MCP_RUNTIME_CATALOG: u64 = 1 << 15;
-pub const CAP_MCP_SESSION_SELECTION: u64 = 1 << 16;
-pub const CAP_DURABLE_BUDGET: u64 = 1 << 17;
-pub const CAP_SESSION_PERMISSION_AUTHORITY: u64 = 1 << 18;
-pub const CAP_RUN_STATE_OBSERVATION: u64 = 1 << 19;
-pub const CAP_WORKSPACE_SKILL_CATALOG: u64 = 1 << 20;
-pub const CAP_TEXT_COMPLETION: u64 = 1 << 21;
-pub const CAP_PROCESS_PLUGIN_TOOLS: u64 = 1 << 22;
-pub const CAP_HOST_STREAM_TOOLS: u64 = 1 << 23;
-pub const CAP_MCP_TOOL_STREAM: u64 = 1 << 24;
-pub const CAP_ACTIVE_RUN_JOURNAL: u64 = 1 << 25;
-pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_POLICY | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY | CAP_RUN_STATE_OBSERVATION | CAP_WORKSPACE_SKILL_CATALOG | CAP_TEXT_COMPLETION | CAP_PROCESS_PLUGIN_TOOLS | CAP_HOST_STREAM_TOOLS | CAP_MCP_TOOL_STREAM | CAP_ACTIVE_RUN_JOURNAL;
-
 /// Each published v1 revision is rigid: every struct_size is exact and every
-/// reserved field is zero. A Host pins version, revision, table size, and
-/// capabilities together; revisions may intentionally be breaking while v1
-/// remains experimental.
+/// reserved field is zero. A Host pins version, revision, and every table size
+/// together; revisions may intentionally be breaking while v1 remains
+/// experimental.
 pub const RuntimeHandle = opaque {};
 pub const SessionHandle = opaque {};
 pub const SkillCatalogHandle = opaque {};
@@ -673,7 +645,7 @@ pub const ProcessPluginSourceV1 = extern struct {
     reserved: [3]u64,
 };
 
-/// Optional executable contribution set for `runtime_create_with_plugins`.
+/// Optional executable contribution set for `RuntimeApiV1.create`.
 /// RuntimeConfigV1 remains byte-for-byte unchanged so executable authority
 /// cannot be smuggled through a field that revision 9 required to be zero.
 pub const RuntimePluginConfigV1 = extern struct {
@@ -1011,8 +983,7 @@ pub const SessionRestoreConfigV1 = extern struct {
 /// its variable. Diagnostic allocation is best-effort and never changes the
 /// operation's primary status. Text is human-readable, non-normative, and
 /// unstable; consumers must not parse it or branch on its wording.
-pub const RuntimeCreateFnV1 = *const fn (?*const RuntimeConfigV1, ?*?*RuntimeHandle, ?*OwnedBytesV1) callconv(.c) u32;
-pub const RuntimeCreateWithPluginsFnV1 = *const fn (
+pub const RuntimeCreateFnV1 = *const fn (
     config: ?*const RuntimeConfigV1,
     plugins: ?*const RuntimePluginConfigV1,
     out_runtime: ?*?*RuntimeHandle,
@@ -1149,7 +1120,7 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 13 accepts
+/// Runs the canonical default best-effort compact policy. Revision 14 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1172,43 +1143,62 @@ pub const SessionExportCheckpointFnV1 = *const fn (
 /// callback buffers.
 pub const BufferReleaseFnV1 = *const fn (?*OwnedBytesV1) callconv(.c) void;
 
+pub const RuntimeApiV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    create: ?RuntimeCreateFnV1,
+    destroy: ?RuntimeDestroyFnV1,
+};
+
+pub const SessionApiV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    create: ?SessionCreateFnV1,
+    destroy: ?SessionDestroyFnV1,
+    run_input: ?SessionRunInputFnV1,
+    abort: ?SessionAbortFnV1,
+};
+
+pub const SessionControlApiV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    restore: ?SessionRestoreFnV1,
+    describe: ?SessionDescribeFnV1,
+    set_model: ?SessionSetModelFnV1,
+    update_permission_rules: ?SessionUpdatePermissionRulesFnV1,
+    compact: ?SessionCompactFnV1,
+    abort_compact: ?SessionAbortCompactFnV1,
+    export_checkpoint: ?SessionExportCheckpointFnV1,
+};
+
+pub const SkillApiV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    resolve_catalog: ?RuntimeQuerySkillCatalogFnV1,
+    release_catalog: ?SkillCatalogReleaseFnV1,
+    bind_policy: ?SessionBindSkillsFnV1,
+};
+
+pub const McpApiV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    apply_configuration: ?RuntimeApplyMcpConfigurationFnV1,
+    refresh: ?RuntimeRefreshMcpFnV1,
+    describe: ?RuntimeDescribeMcpFnV1,
+    update_selection: ?SessionUpdateMcpFnV1,
+};
+
 pub const ApiV1 = extern struct {
     struct_size: u32,
     abi_version: u32,
     abi_revision: u32,
     reserved0: u32,
-    capabilities: u64,
-    runtime_create: ?RuntimeCreateFnV1,
-    runtime_destroy: ?RuntimeDestroyFnV1,
-    runtime_query_skill_catalog: ?RuntimeQuerySkillCatalogFnV1,
-    skill_catalog_release: ?SkillCatalogReleaseFnV1,
-    runtime_refresh_mcp: ?RuntimeRefreshMcpFnV1,
-    runtime_describe_mcp: ?RuntimeDescribeMcpFnV1,
-    session_create: ?SessionCreateFnV1,
-    session_restore: ?SessionRestoreFnV1,
-    session_destroy: ?SessionDestroyFnV1,
-    session_describe: ?SessionDescribeFnV1,
-    session_set_model: ?SessionSetModelFnV1,
-    session_update_skills: ?SessionBindSkillsFnV1,
-    session_update_permission_rules: ?SessionUpdatePermissionRulesFnV1,
-    session_update_mcp: ?SessionUpdateMcpFnV1,
-    session_run_input: ?SessionRunInputFnV1,
-    session_abort: ?SessionAbortFnV1,
-    session_compact: ?SessionCompactFnV1,
-    session_abort_compact: ?SessionAbortCompactFnV1,
-    session_export_checkpoint: ?SessionExportCheckpointFnV1,
     buffer_release: ?BufferReleaseFnV1,
-    runtime_apply_mcp_configuration: ?RuntimeApplyMcpConfigurationFnV1,
-    completion_create: ?CompletionCreateFnV1,
-    completion_destroy: ?CompletionDestroyFnV1,
-    completion_describe: ?CompletionDescribeFnV1,
-    completion_complete: ?CompletionCompleteFnV1,
-    completion_stream_start: ?CompletionStreamStartFnV1,
-    completion_stream_next: ?CompletionStreamNextFnV1,
-    completion_stream_abort: ?CompletionStreamAbortFnV1,
-    completion_stream_destroy: ?CompletionStreamDestroyFnV1,
-    runtime_create_with_plugins: ?RuntimeCreateWithPluginsFnV1,
-    reserved: [2]u64,
+    runtime: ?*const RuntimeApiV1,
+    session: ?*const SessionApiV1,
+    session_control: ?*const SessionControlApiV1,
+    skill: ?*const SkillApiV1,
+    mcp: ?*const McpApiV1,
 };
 
 test "ABI v1 public layouts are fixed on supported 64-bit targets" {
@@ -1256,7 +1246,12 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(CheckpointExportConfigV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(CheckpointExportResultV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionRestoreConfigV1));
-    try std.testing.expectEqual(@as(usize, 280), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(RuntimeApiV1));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(SessionApiV1));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionControlApiV1));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(SkillApiV1));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpApiV1));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(ApiV1));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunContextV1, "session"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunContextV1, "run_id"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunContextV1, "session_id"));
@@ -1299,34 +1294,14 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillCatalogQueryV1, "workspace_epoch"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(SkillCatalogQueryV1, "additional_sources"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(SkillCatalogQueryV1, "additional_source_count"));
-    try std.testing.expectEqual(@as(usize, 40), @offsetOf(CompletionConfigV1, "model"));
-    try std.testing.expectEqual(@as(usize, 8), @offsetOf(CompletionMessageV1, "text"));
-    try std.testing.expectEqual(@as(usize, 24), @offsetOf(CompletionRequestV1, "system"));
-    try std.testing.expectEqual(@as(usize, 24), @offsetOf(CompletionResultV1, "input_tokens"));
-    try std.testing.expectEqual(@as(usize, 8), @offsetOf(CompletionInfoV1, "model"));
-    try std.testing.expectEqual(@as(usize, 56), @offsetOf(CompletionEventV1, "stop_reason_code"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(RunInputV1, "arguments_json"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(ApiV1, "abi_revision"));
-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "capabilities"));
-    try std.testing.expectEqual(@as(usize, 24), @offsetOf(ApiV1, "runtime_create"));
-    try std.testing.expectEqual(@as(usize, 40), @offsetOf(ApiV1, "runtime_query_skill_catalog"));
-    try std.testing.expectEqual(@as(usize, 56), @offsetOf(ApiV1, "runtime_refresh_mcp"));
-    try std.testing.expectEqual(@as(usize, 72), @offsetOf(ApiV1, "session_create"));
-    try std.testing.expectEqual(@as(usize, 80), @offsetOf(ApiV1, "session_restore"));
-    try std.testing.expectEqual(@as(usize, 104), @offsetOf(ApiV1, "session_set_model"));
-    try std.testing.expectEqual(@as(usize, 112), @offsetOf(ApiV1, "session_update_skills"));
-    try std.testing.expectEqual(@as(usize, 120), @offsetOf(ApiV1, "session_update_permission_rules"));
-    try std.testing.expectEqual(@as(usize, 128), @offsetOf(ApiV1, "session_update_mcp"));
-    try std.testing.expectEqual(@as(usize, 136), @offsetOf(ApiV1, "session_run_input"));
-    try std.testing.expectEqual(@as(usize, 152), @offsetOf(ApiV1, "session_compact"));
-    try std.testing.expectEqual(@as(usize, 160), @offsetOf(ApiV1, "session_abort_compact"));
-    try std.testing.expectEqual(@as(usize, 168), @offsetOf(ApiV1, "session_export_checkpoint"));
-    try std.testing.expectEqual(@as(usize, 176), @offsetOf(ApiV1, "buffer_release"));
-    try std.testing.expectEqual(@as(usize, 184), @offsetOf(ApiV1, "runtime_apply_mcp_configuration"));
-    try std.testing.expectEqual(@as(usize, 192), @offsetOf(ApiV1, "completion_create"));
-    try std.testing.expectEqual(@as(usize, 248), @offsetOf(ApiV1, "completion_stream_destroy"));
-    try std.testing.expectEqual(@as(usize, 256), @offsetOf(ApiV1, "runtime_create_with_plugins"));
-    try std.testing.expectEqual(@as(usize, 264), @offsetOf(ApiV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "buffer_release"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(ApiV1, "runtime"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(ApiV1, "session"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(ApiV1, "session_control"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(ApiV1, "skill"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(ApiV1, "mcp"));
 }
 
 test "typed status and stop reason validate every public code" {
@@ -1375,15 +1350,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 13 capabilities add active Run journal without weakening prior surfaces" {
+test "Revision 14 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 13), ABI_REVISION);
-    try std.testing.expectEqual(@as(u64, 1 << 20), CAP_WORKSPACE_SKILL_CATALOG);
-    try std.testing.expectEqual(@as(u64, 1 << 21), CAP_TEXT_COMPLETION);
-    try std.testing.expectEqual(@as(u64, 1 << 22), CAP_PROCESS_PLUGIN_TOOLS);
-    try std.testing.expectEqual(@as(u64, 1 << 23), CAP_HOST_STREAM_TOOLS);
-    try std.testing.expectEqual(@as(u64, 1 << 24), CAP_MCP_TOOL_STREAM);
-    try std.testing.expectEqual(@as(u64, 1 << 25), CAP_ACTIVE_RUN_JOURNAL);
+    try std.testing.expectEqual(@as(u32, 14), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

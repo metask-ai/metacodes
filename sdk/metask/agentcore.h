@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 13 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 14 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 13 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 14 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
- * must validate version, revision, table size, and capabilities together. */
+ * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 13u
+#define METASK_AGENTCORE_ABI_REVISION 14u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -217,34 +217,6 @@ extern "C" {
 #define METASK_AGENTCORE_HOST_SINK_TOO_LARGE 2u
 #define METASK_AGENTCORE_HOST_SINK_FAILED 3u
 #define METASK_AGENTCORE_HOST_SINK_CLOSED 4u
-
-#define METASK_AGENTCORE_CAP_RUNTIME (1ULL << 0)
-#define METASK_AGENTCORE_CAP_BUILTIN_TOOLS (1ULL << 1)
-#define METASK_AGENTCORE_CAP_HOST_SYNC_TOOLS (1ULL << 2)
-#define METASK_AGENTCORE_CAP_HOST_UI (1ULL << 3)
-#define METASK_AGENTCORE_CAP_CORE_EVENTS_JSON (1ULL << 4)
-#define METASK_AGENTCORE_CAP_ABORT (1ULL << 5)
-#define METASK_AGENTCORE_CAP_SKILL_CATALOG (1ULL << 6)
-#define METASK_AGENTCORE_CAP_TYPED_RUN_INPUT (1ULL << 7)
-#define METASK_AGENTCORE_CAP_SESSION_MODEL_MUTATION (1ULL << 8)
-#define METASK_AGENTCORE_CAP_MANUAL_COMPACT (1ULL << 9)
-#define METASK_AGENTCORE_CAP_SKILL_POLICY (1ULL << 10)
-#define METASK_AGENTCORE_CAP_HOST_PERMISSION_RULES (1ULL << 11)
-#define METASK_AGENTCORE_CAP_SESSION_CHECKPOINT (1ULL << 12)
-#define METASK_AGENTCORE_CAP_SESSION_RESTORE (1ULL << 13)
-#define METASK_AGENTCORE_CAP_SESSION_DESCRIBE (1ULL << 14)
-#define METASK_AGENTCORE_CAP_MCP_RUNTIME_CATALOG (1ULL << 15)
-#define METASK_AGENTCORE_CAP_MCP_SESSION_SELECTION (1ULL << 16)
-#define METASK_AGENTCORE_CAP_DURABLE_BUDGET (1ULL << 17)
-#define METASK_AGENTCORE_CAP_SESSION_PERMISSION_AUTHORITY (1ULL << 18)
-#define METASK_AGENTCORE_CAP_RUN_STATE_OBSERVATION (1ULL << 19)
-#define METASK_AGENTCORE_CAP_WORKSPACE_SKILL_CATALOG (1ULL << 20)
-#define METASK_AGENTCORE_CAP_TEXT_COMPLETION (1ULL << 21)
-#define METASK_AGENTCORE_CAP_PROCESS_PLUGIN_TOOLS (1ULL << 22)
-#define METASK_AGENTCORE_CAP_HOST_STREAM_TOOLS (1ULL << 23)
-#define METASK_AGENTCORE_CAP_MCP_TOOL_STREAM (1ULL << 24)
-#define METASK_AGENTCORE_CAP_ACTIVE_RUN_JOURNAL (1ULL << 25)
-#define METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ((1ULL << 26) - 1ULL)
 
 typedef struct metask_agentcore_runtime metask_agentcore_runtime;
 typedef struct metask_agentcore_session metask_agentcore_session;
@@ -474,7 +446,7 @@ typedef struct {
 
 /* Explicit executable authority. root is an absolute package directory with
  * strict plugin.json/process.json metadata. AgentCore copies retained state
- * before runtime_create_with_plugins returns. */
+ * before RuntimeApiV1.create returns. */
 typedef struct {
     uint32_t struct_size;
     uint32_t layer_code;
@@ -781,9 +753,6 @@ typedef struct {
 } metask_agentcore_session_restore_config_v1;
 
 typedef uint32_t (*metask_agentcore_runtime_create_fn_v1)(
-    const metask_agentcore_runtime_config_v1 *, metask_agentcore_runtime **,
-    metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_runtime_create_with_plugins_fn_v1)(
     const metask_agentcore_runtime_config_v1 *,
     const metask_agentcore_runtime_plugin_config_v1 *,
     metask_agentcore_runtime **, metask_agentcore_owned_bytes_v1 *);
@@ -841,8 +810,8 @@ typedef uint32_t (*metask_agentcore_session_describe_fn_v1)(
 typedef uint32_t (*metask_agentcore_session_set_model_fn_v1)(
     metask_agentcore_session *, metask_agentcore_bytes_view_v1,
     metask_agentcore_owned_bytes_v1 *);
-/* Raw table slot remains session_update_skills for ABI stability. SDKs expose
- * this atomic Catalog + Policy transaction as sessionBindSkillPolicy. */
+/* The Skill table exposes this atomic Catalog + Policy transaction as
+ * bind_policy. */
 typedef uint32_t (*metask_agentcore_session_bind_skills_fn_v1)(
     metask_agentcore_session *, metask_agentcore_skill_catalog *,
     const metask_agentcore_skill_policy_v1 *, metask_agentcore_owned_bytes_v1 *);
@@ -870,45 +839,64 @@ typedef uint32_t (*metask_agentcore_session_export_checkpoint_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 13. No earlier revision layout
+/* Function-table order is fixed within Revision 14. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
-typedef struct {
+typedef struct metask_agentcore_runtime_api_v1 {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    metask_agentcore_runtime_create_fn_v1 create;
+    metask_agentcore_runtime_destroy_fn_v1 destroy;
+} metask_agentcore_runtime_api_v1;
+
+typedef struct metask_agentcore_session_api_v1 {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    metask_agentcore_session_create_fn_v1 create;
+    metask_agentcore_session_destroy_fn_v1 destroy;
+    metask_agentcore_session_run_input_fn_v1 run_input;
+    metask_agentcore_session_abort_fn_v1 abort;
+} metask_agentcore_session_api_v1;
+
+typedef struct metask_agentcore_session_control_api_v1 {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    metask_agentcore_session_restore_fn_v1 restore;
+    metask_agentcore_session_describe_fn_v1 describe;
+    metask_agentcore_session_set_model_fn_v1 set_model;
+    metask_agentcore_session_update_permission_rules_fn_v1 update_permission_rules;
+    metask_agentcore_session_compact_fn_v1 compact;
+    metask_agentcore_session_abort_compact_fn_v1 abort_compact;
+    metask_agentcore_session_export_checkpoint_fn_v1 export_checkpoint;
+} metask_agentcore_session_control_api_v1;
+
+typedef struct metask_agentcore_skill_api_v1 {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    metask_agentcore_runtime_query_skill_catalog_fn_v1 resolve_catalog;
+    metask_agentcore_skill_catalog_release_fn_v1 release_catalog;
+    metask_agentcore_session_bind_skills_fn_v1 bind_policy;
+} metask_agentcore_skill_api_v1;
+
+typedef struct metask_agentcore_mcp_api_v1 {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    metask_agentcore_runtime_apply_mcp_configuration_fn_v1 apply_configuration;
+    metask_agentcore_runtime_refresh_mcp_fn_v1 refresh;
+    metask_agentcore_runtime_describe_mcp_fn_v1 describe;
+    metask_agentcore_session_update_mcp_fn_v1 update_selection;
+} metask_agentcore_mcp_api_v1;
+
+typedef struct metask_agentcore_api_v1 {
     uint32_t struct_size;
     uint32_t abi_version;
     uint32_t abi_revision;
     uint32_t reserved0;
-    uint64_t capabilities;
-    metask_agentcore_runtime_create_fn_v1 runtime_create;
-    metask_agentcore_runtime_destroy_fn_v1 runtime_destroy;
-    metask_agentcore_runtime_query_skill_catalog_fn_v1 runtime_query_skill_catalog;
-    metask_agentcore_skill_catalog_release_fn_v1 skill_catalog_release;
-    metask_agentcore_runtime_refresh_mcp_fn_v1 runtime_refresh_mcp;
-    metask_agentcore_runtime_describe_mcp_fn_v1 runtime_describe_mcp;
-    metask_agentcore_session_create_fn_v1 session_create;
-    metask_agentcore_session_restore_fn_v1 session_restore;
-    metask_agentcore_session_destroy_fn_v1 session_destroy;
-    metask_agentcore_session_describe_fn_v1 session_describe;
-    metask_agentcore_session_set_model_fn_v1 session_set_model;
-    metask_agentcore_session_bind_skills_fn_v1 session_update_skills;
-    metask_agentcore_session_update_permission_rules_fn_v1 session_update_permission_rules;
-    metask_agentcore_session_update_mcp_fn_v1 session_update_mcp;
-    metask_agentcore_session_run_input_fn_v1 session_run_input;
-    metask_agentcore_session_abort_fn_v1 session_abort;
-    metask_agentcore_session_compact_fn_v1 session_compact;
-    metask_agentcore_session_abort_compact_fn_v1 session_abort_compact;
-    metask_agentcore_session_export_checkpoint_fn_v1 session_export_checkpoint;
     metask_agentcore_buffer_release_fn_v1 buffer_release;
-    metask_agentcore_runtime_apply_mcp_configuration_fn_v1 runtime_apply_mcp_configuration;
-    metask_agentcore_completion_create_fn_v1 completion_create;
-    metask_agentcore_completion_destroy_fn_v1 completion_destroy;
-    metask_agentcore_completion_describe_fn_v1 completion_describe;
-    metask_agentcore_completion_complete_fn_v1 completion_complete;
-    metask_agentcore_completion_stream_start_fn_v1 completion_stream_start;
-    metask_agentcore_completion_stream_next_fn_v1 completion_stream_next;
-    metask_agentcore_completion_stream_abort_fn_v1 completion_stream_abort;
-    metask_agentcore_completion_stream_destroy_fn_v1 completion_stream_destroy;
-    metask_agentcore_runtime_create_with_plugins_fn_v1 runtime_create_with_plugins;
-    uint64_t reserved[2];
+    const metask_agentcore_runtime_api_v1 *runtime;
+    const metask_agentcore_session_api_v1 *session;
+    const metask_agentcore_session_control_api_v1 *session_control;
+    const metask_agentcore_skill_api_v1 *skill;
+    const metask_agentcore_mcp_api_v1 *mcp;
 } metask_agentcore_api_v1;
 
 /* The final owned-bytes output of AgentCore calls is optional and write-only.
@@ -934,61 +922,66 @@ metask_agentcore_owned_bytes_v1_empty(void) {
 
 static inline int
 metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
-    return api != (const metask_agentcore_api_v1 *)0 && api->struct_size == sizeof(*api) &&
+    return api != (const metask_agentcore_api_v1 *)0 &&
+           ((uintptr_t)api % sizeof(void *)) == 0 &&
+           api->struct_size == sizeof(*api) &&
            api->abi_version == METASK_AGENTCORE_ABI_V1 &&
            api->abi_revision == METASK_AGENTCORE_ABI_REVISION &&
            api->reserved0 == 0 &&
-           api->capabilities == METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 &&
-           api->runtime_create != (metask_agentcore_runtime_create_fn_v1)0 &&
-           api->runtime_destroy != (metask_agentcore_runtime_destroy_fn_v1)0 &&
-           api->runtime_query_skill_catalog !=
-               (metask_agentcore_runtime_query_skill_catalog_fn_v1)0 &&
-           api->skill_catalog_release !=
-               (metask_agentcore_skill_catalog_release_fn_v1)0 &&
-           api->runtime_refresh_mcp !=
-               (metask_agentcore_runtime_refresh_mcp_fn_v1)0 &&
-           api->runtime_describe_mcp !=
-               (metask_agentcore_runtime_describe_mcp_fn_v1)0 &&
-           api->runtime_apply_mcp_configuration !=
-               (metask_agentcore_runtime_apply_mcp_configuration_fn_v1)0 &&
-           api->session_create != (metask_agentcore_session_create_fn_v1)0 &&
-           api->session_restore != (metask_agentcore_session_restore_fn_v1)0 &&
-           api->session_destroy != (metask_agentcore_session_destroy_fn_v1)0 &&
-           api->session_describe != (metask_agentcore_session_describe_fn_v1)0 &&
-           api->session_set_model != (metask_agentcore_session_set_model_fn_v1)0 &&
-           api->session_update_skills !=
-               (metask_agentcore_session_bind_skills_fn_v1)0 &&
-           api->session_update_permission_rules !=
-               (metask_agentcore_session_update_permission_rules_fn_v1)0 &&
-           api->session_update_mcp !=
-               (metask_agentcore_session_update_mcp_fn_v1)0 &&
-           api->session_run_input != (metask_agentcore_session_run_input_fn_v1)0 &&
-           api->session_abort != (metask_agentcore_session_abort_fn_v1)0 &&
-           api->session_compact != (metask_agentcore_session_compact_fn_v1)0 &&
-           api->session_abort_compact !=
-               (metask_agentcore_session_abort_compact_fn_v1)0 &&
-           api->session_export_checkpoint !=
-               (metask_agentcore_session_export_checkpoint_fn_v1)0 &&
            api->buffer_release != (metask_agentcore_buffer_release_fn_v1)0 &&
-           api->completion_create !=
-               (metask_agentcore_completion_create_fn_v1)0 &&
-           api->completion_destroy !=
-               (metask_agentcore_completion_destroy_fn_v1)0 &&
-           api->completion_describe !=
-               (metask_agentcore_completion_describe_fn_v1)0 &&
-           api->completion_complete !=
-               (metask_agentcore_completion_complete_fn_v1)0 &&
-           api->completion_stream_start !=
-               (metask_agentcore_completion_stream_start_fn_v1)0 &&
-           api->completion_stream_next !=
-               (metask_agentcore_completion_stream_next_fn_v1)0 &&
-           api->completion_stream_abort !=
-               (metask_agentcore_completion_stream_abort_fn_v1)0 &&
-           api->completion_stream_destroy !=
-               (metask_agentcore_completion_stream_destroy_fn_v1)0 &&
-           api->runtime_create_with_plugins !=
-               (metask_agentcore_runtime_create_with_plugins_fn_v1)0 &&
-           api->reserved[0] == 0 && api->reserved[1] == 0;
+           api->runtime != (const metask_agentcore_runtime_api_v1 *)0 &&
+           ((uintptr_t)api->runtime % sizeof(void *)) == 0 &&
+           api->runtime->struct_size == sizeof(*api->runtime) &&
+           api->runtime->reserved0 == 0 &&
+           api->runtime->create != (metask_agentcore_runtime_create_fn_v1)0 &&
+           api->runtime->destroy != (metask_agentcore_runtime_destroy_fn_v1)0 &&
+           api->session != (const metask_agentcore_session_api_v1 *)0 &&
+           ((uintptr_t)api->session % sizeof(void *)) == 0 &&
+           api->session->struct_size == sizeof(*api->session) &&
+           api->session->reserved0 == 0 &&
+           api->session->create != (metask_agentcore_session_create_fn_v1)0 &&
+           api->session->destroy != (metask_agentcore_session_destroy_fn_v1)0 &&
+           api->session->run_input != (metask_agentcore_session_run_input_fn_v1)0 &&
+           api->session->abort != (metask_agentcore_session_abort_fn_v1)0 &&
+           api->session_control !=
+               (const metask_agentcore_session_control_api_v1 *)0 &&
+           ((uintptr_t)api->session_control % sizeof(void *)) == 0 &&
+           api->session_control->struct_size == sizeof(*api->session_control) &&
+           api->session_control->reserved0 == 0 &&
+           api->session_control->restore !=
+               (metask_agentcore_session_restore_fn_v1)0 &&
+           api->session_control->describe !=
+               (metask_agentcore_session_describe_fn_v1)0 &&
+           api->session_control->set_model !=
+               (metask_agentcore_session_set_model_fn_v1)0 &&
+           api->session_control->update_permission_rules !=
+               (metask_agentcore_session_update_permission_rules_fn_v1)0 &&
+           api->session_control->compact !=
+               (metask_agentcore_session_compact_fn_v1)0 &&
+           api->session_control->abort_compact !=
+               (metask_agentcore_session_abort_compact_fn_v1)0 &&
+           api->session_control->export_checkpoint !=
+               (metask_agentcore_session_export_checkpoint_fn_v1)0 &&
+           api->skill != (const metask_agentcore_skill_api_v1 *)0 &&
+           ((uintptr_t)api->skill % sizeof(void *)) == 0 &&
+           api->skill->struct_size == sizeof(*api->skill) &&
+           api->skill->reserved0 == 0 &&
+           api->skill->resolve_catalog !=
+               (metask_agentcore_runtime_query_skill_catalog_fn_v1)0 &&
+           api->skill->release_catalog !=
+               (metask_agentcore_skill_catalog_release_fn_v1)0 &&
+           api->skill->bind_policy !=
+               (metask_agentcore_session_bind_skills_fn_v1)0 &&
+           api->mcp != (const metask_agentcore_mcp_api_v1 *)0 &&
+           ((uintptr_t)api->mcp % sizeof(void *)) == 0 &&
+           api->mcp->struct_size == sizeof(*api->mcp) &&
+           api->mcp->reserved0 == 0 &&
+           api->mcp->apply_configuration !=
+               (metask_agentcore_runtime_apply_mcp_configuration_fn_v1)0 &&
+           api->mcp->refresh != (metask_agentcore_runtime_refresh_mcp_fn_v1)0 &&
+           api->mcp->describe != (metask_agentcore_runtime_describe_mcp_fn_v1)0 &&
+           api->mcp->update_selection !=
+               (metask_agentcore_session_update_mcp_fn_v1)0;
 }
 
 static inline const metask_agentcore_api_v1 *
@@ -1023,8 +1016,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 13u,
-                               "AgentCore revision 13");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 14u,
+                               "AgentCore revision 14");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1085,7 +1078,12 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_checkpoint_source_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_checkpoint_export_config_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_checkpoint_export_result_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_restore_config_v1, 64);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_api_v1, 280);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_runtime_api_v1, 24);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_api_v1, 40);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 64);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_api_v1, 32);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_api_v1, 40);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_api_v1, 64);
 
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, session, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, run_id, 16);
@@ -1118,29 +1116,16 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, host, 
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, model, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_sources, 56);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_source_count, 64);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_completion_config_v1, model, 40);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_completion_message_v1, text, 8);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_completion_request_v1, system, 24);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_completion_result_v1, input_tokens, 24);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_completion_info_v1, model, 8);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_completion_event_v1, stop_reason_code, 56);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_selector_v1, tool_name, 40);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, durable_usage_bytes, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, required_checkpoint_bytes, 32);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_checkpoint_export_result_v1, digest, 32);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, runtime_refresh_mcp, 56);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_create, 72);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_restore, 80);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_set_model, 104);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_update_mcp, 128);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_run_input, 136);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_export_checkpoint, 168);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, buffer_release, 176);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, runtime_apply_mcp_configuration, 184);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, runtime_create_with_plugins, 256);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, completion_create, 192);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, completion_stream_destroy, 248);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, reserved, 264);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, buffer_release, 16);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, runtime, 24);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session, 32);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_control, 40);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, skill, 48);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, mcp, 56);
 
 #undef METASK_AGENTCORE_ASSERT_OFFSET
 #undef METASK_AGENTCORE_ASSERT_SIZE

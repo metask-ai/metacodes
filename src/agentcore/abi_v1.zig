@@ -4522,21 +4522,12 @@ fn parseProcessPluginSources(
     return result;
 }
 
-fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
-    return runtimeCreateImpl(config_ptr, null, out_runtime, out_error);
-}
-
-fn runtimeCreateWithPlugins(
+fn runtimeCreate(
     config_ptr: ?*const wire.RuntimeConfigV1,
     plugins_ptr: ?*const wire.RuntimePluginConfigV1,
     out_runtime: ?*?*wire.RuntimeHandle,
     out_error: ?*wire.OwnedBytesV1,
 ) callconv(.c) u32 {
-    if (plugins_ptr == null) {
-        if (out_runtime) |out| out.* = null;
-        emptyError(out_error);
-        return fail(wire.STATUS_INVALID_ARGUMENT, "plugin runtime config is required", out_error);
-    }
     return runtimeCreateImpl(config_ptr, plugins_ptr, out_runtime, out_error);
 }
 
@@ -6983,43 +6974,62 @@ fn bufferRelease(buffer: ?*wire.OwnedBytesV1) callconv(.c) void {
     out.* = .{ .ptr = null, .len = 0 };
 }
 
+const runtime_api_v1 = wire.RuntimeApiV1{
+    .struct_size = @sizeOf(wire.RuntimeApiV1),
+    .reserved0 = 0,
+    .create = runtimeCreate,
+    .destroy = runtimeDestroy,
+};
+
+const session_api_v1 = wire.SessionApiV1{
+    .struct_size = @sizeOf(wire.SessionApiV1),
+    .reserved0 = 0,
+    .create = sessionCreate,
+    .destroy = sessionDestroy,
+    .run_input = sessionRunInput,
+    .abort = sessionAbort,
+};
+
+const session_control_api_v1 = wire.SessionControlApiV1{
+    .struct_size = @sizeOf(wire.SessionControlApiV1),
+    .reserved0 = 0,
+    .restore = sessionRestore,
+    .describe = sessionDescribe,
+    .set_model = sessionSetModel,
+    .update_permission_rules = sessionUpdatePermissionRules,
+    .compact = sessionCompact,
+    .abort_compact = sessionAbortCompact,
+    .export_checkpoint = sessionExportCheckpoint,
+};
+
+const skill_api_v1 = wire.SkillApiV1{
+    .struct_size = @sizeOf(wire.SkillApiV1),
+    .reserved0 = 0,
+    .resolve_catalog = runtimeQuerySkillCatalog,
+    .release_catalog = skillCatalogRelease,
+    .bind_policy = sessionUpdateSkills,
+};
+
+const mcp_api_v1 = wire.McpApiV1{
+    .struct_size = @sizeOf(wire.McpApiV1),
+    .reserved0 = 0,
+    .apply_configuration = runtimeApplyMcpConfiguration,
+    .refresh = runtimeRefreshMcp,
+    .describe = runtimeDescribeMcp,
+    .update_selection = sessionUpdateMcp,
+};
+
 const api_v1 = wire.ApiV1{
     .struct_size = @sizeOf(wire.ApiV1),
     .abi_version = wire.ABI_VERSION_V1,
     .abi_revision = wire.ABI_REVISION,
     .reserved0 = 0,
-    .capabilities = wire.REQUIRED_CAPABILITIES_V1,
-    .runtime_create = runtimeCreate,
-    .runtime_destroy = runtimeDestroy,
-    .runtime_query_skill_catalog = runtimeQuerySkillCatalog,
-    .skill_catalog_release = skillCatalogRelease,
-    .runtime_refresh_mcp = runtimeRefreshMcp,
-    .runtime_describe_mcp = runtimeDescribeMcp,
-    .runtime_apply_mcp_configuration = runtimeApplyMcpConfiguration,
-    .session_create = sessionCreate,
-    .session_restore = sessionRestore,
-    .session_destroy = sessionDestroy,
-    .session_describe = sessionDescribe,
-    .session_set_model = sessionSetModel,
-    .session_update_skills = sessionUpdateSkills,
-    .session_update_permission_rules = sessionUpdatePermissionRules,
-    .session_update_mcp = sessionUpdateMcp,
-    .session_run_input = sessionRunInput,
-    .session_abort = sessionAbort,
-    .session_compact = sessionCompact,
-    .session_abort_compact = sessionAbortCompact,
-    .session_export_checkpoint = sessionExportCheckpoint,
     .buffer_release = bufferRelease,
-    .completion_create = completionCreate,
-    .completion_destroy = completionDestroy,
-    .completion_describe = completionDescribe,
-    .completion_complete = completionComplete,
-    .completion_stream_start = completionStreamStart,
-    .completion_stream_next = completionStreamNext,
-    .completion_stream_abort = completionStreamAbort,
-    .completion_stream_destroy = completionStreamDestroy,
-    .runtime_create_with_plugins = runtimeCreateWithPlugins,
-    .reserved = [_]u64{0} ** 2,
+    .runtime = &runtime_api_v1,
+    .session = &session_api_v1,
+    .session_control = &session_control_api_v1,
+    .skill = &skill_api_v1,
+    .mcp = &mcp_api_v1,
 };
 
 pub export fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque {
@@ -7220,7 +7230,13 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(wire.REQUIRED_CAPABILITIES_V1, api.capabilities);
+    try std.testing.expectEqual(@as(u32, 14), api.abi_revision);
+    try std.testing.expectEqual(@as(usize, 64), api.struct_size);
+    try std.testing.expect(api.runtime != null);
+    try std.testing.expect(api.session != null);
+    try std.testing.expect(api.session_control != null);
+    try std.testing.expect(api.skill != null);
+    try std.testing.expect(api.mcp != null);
 }
 
 test "UI response parser owns AskUserQuestion answers" {
@@ -10250,7 +10266,7 @@ test "ABI Runtime rejects process-only built-ins as invalid input" {
     var runtime: ?*wire.RuntimeHandle = null;
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer bufferRelease(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, runtimeCreate(&config, null, &runtime, &diagnostic));
     try std.testing.expect(runtime == null);
 }
 
@@ -10264,7 +10280,7 @@ test "ABI Runtime accepts Session-owned WebSearch and WebFetch built-ins" {
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer bufferRelease(&diagnostic);
 
-    try std.testing.expectEqual(wire.STATUS_OK, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, runtimeCreate(&config, null, &runtime, &diagnostic));
     try std.testing.expect(runtime != null);
     try std.testing.expectEqual(wire.STATUS_OK, runtimeDestroy(runtime, &diagnostic));
 }
@@ -10288,7 +10304,7 @@ test "ABI Runtime applies tool-name grammar to built-ins and Host tools" {
     runtime_config.builtin_tool_count = invalid_builtin_names.len;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        runtimeCreate(&runtime_config, &runtime, &diagnostic),
+        runtimeCreate(&runtime_config, null, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
     bufferRelease(&diagnostic);
@@ -10306,7 +10322,7 @@ test "ABI Runtime applies tool-name grammar to built-ins and Host tools" {
     runtime_config.host_tool_count = 1;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        runtimeCreate(&runtime_config, &runtime, &diagnostic),
+        runtimeCreate(&runtime_config, null, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
     bufferRelease(&diagnostic);
@@ -10314,7 +10330,7 @@ test "ABI Runtime applies tool-name grammar to built-ins and Host tools" {
     host.name = view(model_skill_tool.TOOL_NAME);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        runtimeCreate(&runtime_config, &runtime, &diagnostic),
+        runtimeCreate(&runtime_config, null, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
 }
@@ -10346,7 +10362,7 @@ test "ABI Runtime reports oversized Host schemas as resource limits" {
     var runtime: ?*wire.RuntimeHandle = null;
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer bufferRelease(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, runtimeCreate(&config, null, &runtime, &diagnostic));
     try std.testing.expect(runtime == null);
 }
 
