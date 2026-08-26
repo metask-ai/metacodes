@@ -108,7 +108,7 @@ dylib 加载，也不把活跃 Session 的 catalog 改写为新代。
 `Registrar.provide(T, local_name, pointer, cleanup)`，consumer 只有在 descriptor 的
 `requires` 明确包含 provider 时，才能用相同 `T` 与 key 调用 `require`。解析发生在
 依赖拓扑序 activation 中；consumer 把返回指针注入自己的 Host tool/context，commit
-之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 13 C ABI，也不暴露任何内核
+之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 14 C ABI，也不暴露任何内核
 service。
 
 `advisory_hook` capability 接受一个 `StaticPlugin.advisory_policy`。它是同步、借用、
@@ -242,19 +242,21 @@ AgentCore 面向不把 metacodes 源码加入构建图的原生 Host：
 const metask_agentcore_api_v1 *metask_agentcore_get_api(uint32_t abi_version);
 ```
 
-当前是实验性的 ABI v1 revision 13。Host 必须同时校验 abi version、精确
-revision、table size、capability bitset、reserved fields 和 manifest hash；不存在
-静默降级或旧 revision shim。该表已经覆盖 Runtime/Session、同步 run、跨线程
-abort、流式事件、typed UI request/response、checkpoint/restore、权限规则、MCP、
-Workspace Skill 与独立 Completion。ownership、回调重入、Session poison、并发和
-持久化语义只以同 revision Header 与 `AGENTCORE_BINARY_ABI.md` 为准。
+当前是实验性的 ABI v1 revision 14。Host 必须同时校验 abi version、精确
+revision、64 字节根表、五张必选 typed 子表、reserved fields 和 manifest hash；
+不存在静默降级或旧 revision shim。五张表按 Runtime、Session、Session Control、
+Skill、MCP 划分，但不是可选能力：discovery 必须一次性验证全部表，消费方只调用
+自己需要的领域。公共边界覆盖同步 run、跨线程 abort、流式事件、typed UI、
+checkpoint/restore、权限规则、MCP 和 Workspace Skill，不再暴露独立 Completion。
+ownership、回调重入、Session poison、并发和持久化语义只以同 revision Header 与
+`AGENTCORE_BINARY_ABI.md` 为准。
 
-revision 13 的 `runtime_create_with_plugins` 接受显式、绝对路径的
-`ProcessPluginSourceV1` 数组。AgentCore 在返回前完成 strict manifest/process 配置、
-entrypoint SHA-256、握手与工具 schema 校验，并复制不可变 Runtime 状态；原有
-`RuntimeConfigV1` 仍保持 96 字节，旧 `runtime_create` 继续表示“无进程插件”。
+revision 14 只有一个 `runtime->create`。其 nullable `plugins` 参数接受显式、绝对
+路径的 `ProcessPluginSourceV1` 数组；null 和空 `RuntimePluginConfigV1` 都表示无额外
+插件。AgentCore 在返回前完成 strict manifest/process 配置、entrypoint SHA-256、
+握手与工具 schema 校验，并复制不可变 Runtime 状态；失败不发布 partial generation。
 同一配置还接受独立的 `HostStreamToolV1` 数组；内核在回调前创建 Session CAS
-spool，Host 只持有同步、借用、只写 sink，不能提交、回滚或保留它。Revision 13
+spool，Host 只持有同步、借用、只写 sink，不能提交、回滚或保留它。Revision 14
 还要求每个 `McpConnectorV1` 提供 `request_tool_stream`：普通 `request` 只处理有界
 控制帧，`tools/call` 的完整 JSON-RPC 响应从 byte zero 写入内核 capture，经流式
 校验后仅成功 `result` 区间可进入同一 CAS。
@@ -295,7 +297,7 @@ Windows 使用 `metask_agentcore.lib`，Linux/macOS 使用
 | 审计当前数据插件组合 | plugin inventory JSON |
 | 浏览器/桌面壳 | Web HTTP + SSE + typed request 回填 |
 | 不带源码的 C/C++/Zig/Rust 原生产品 | 精确 pinned AgentCore bundle |
-| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 13 `runtime_create_with_plugins`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
+| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 14 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
 | 不可信/多租户可执行插件 | 暂不支持；process v1 是故障/资源边界，不是 OS sandbox |
 
 这些入口改变的是 Host 表达和扩展组合，不是 agent loop 的因果所有权。

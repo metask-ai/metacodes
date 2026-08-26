@@ -10,7 +10,7 @@ artifact store, and TinyKG admission are not replaceable extensions.
 |---|---|---|---|
 | CLI | `zig-out/bin/metacodes` | pre-1.0 | flags may evolve with changelog notice |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 13 | exact revision, sizes, capabilities, and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 14 | exact root/child layouts and bundle manifest |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
 | Plugin inventory | `--dump-plugins`, Zig, Web state | versioned v1 | additive observation fields only where specified |
 | TinyKG executable distribution | `vendor/tinykg/manifest.json` | bundle v1 | exact target, format, source commit, and SHA-256 pinning |
@@ -85,10 +85,13 @@ The source-free bundle contains:
 - a manifest whose file allow-list and SHA-256 values are mandatory.
 
 Consumers call only `metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and
-must validate ABI revision 13, table size, capability bits, reserved zeros, and
-the bundle manifest. Runtime/session, sync run, abort, event/UI callbacks,
-checkpoint/restore, host streaming tools, MCP streaming, process plugins, and
-durable journal profiles are covered by the current table.
+must validate ABI revision 14, the exact 64-byte root, all five mandatory typed
+tables, reserved zeros, function slots, and the schema-1 bundle manifest.
+Runtime/Session, sync run, abort, event/UI callbacks, checkpoint/restore, Host
+streaming tools, MCP streaming, process plugins, and durable journal profiles
+are covered. Independent Completion is deliberately not part of AgentCore: a
+Host owns product-level model calls and exposes only semantically bounded Tools
+when an Agent must invoke one.
 
 The ABI is experimental: there is no compatibility shim between revisions. Pin a
 bundle, not only a semantic version. See [AGENTCORE_BINARY_ABI.md](AGENTCORE_BINARY_ABI.md).
