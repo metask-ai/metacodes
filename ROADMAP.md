@@ -72,6 +72,17 @@ CI targets self-hosted runners (Linux X64, macOS ARM64, Windows X64).
   `control-plane/lean/lean-toolchain`), and either preinstalled `rg` or
   passwordless `sudo apt-get` (Linux) / Homebrew (macOS) for ci.yml's
   presence-guarded ripgrep install; missing prerequisites fail the job loudly.
+- [x] Fleet topology (2026-08-26): the macOS machine runs two runner
+      instances — `YuankundeMac-mini-metacodes` (repository-level, a
+      dedicated lane so this repo's ~6-minute CI never queues behind other
+      org repos' long jobs) and `YuankundeMac-mini` (organization-level,
+      shared). Both share the persistent Zig/Lean caches, which are
+      concurrency-safe by design; validated by a dispatch run landing
+      `Gates (macOS)` on the dedicated instance (first run 9:49 including
+      the one-time full clone; steady state ≈ 6 min). Concurrent jobs share
+      the machine's CPU — acceptable at these durations. The release-gate
+      isolation item above still applies: both instances currently match
+      `rule-control`'s labels.
 - Owner alternative: restoring GitHub-hosted billing would re-enable
   `ubuntu-latest`/`macos-latest` as a fallback matrix.
 
