@@ -45,7 +45,6 @@ extern "C" {
 #define METASK_AGENTCORE_STATUS_LOGICAL_SESSION_CONFLICT 23u
 #define METASK_AGENTCORE_STATUS_MCP_NOT_REFRESHED 24u
 #define METASK_AGENTCORE_STATUS_INVALID_MCP_SELECTION 25u
-#define METASK_AGENTCORE_STATUS_COMPLETION_UNSUPPORTED_RESPONSE 26u
 #define METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE 27u
 
 #define METASK_AGENTCORE_PROVIDER_ANTHROPIC 1u
@@ -120,10 +119,6 @@ extern "C" {
 #define METASK_AGENTCORE_MAX_CHECKPOINT_BYTES_V1 1073741824ULL
 #define METASK_AGENTCORE_MAX_CHECKPOINT_CHUNK_BYTES_V1 1048576u
 #define METASK_AGENTCORE_MAX_DESCRIPTION_JSON_BYTES_V1 16777216ULL
-#define METASK_AGENTCORE_MAX_COMPLETION_CONFIG_BYTES_V1 1048576ULL
-#define METASK_AGENTCORE_MAX_COMPLETION_MESSAGES_V1 4096ULL
-#define METASK_AGENTCORE_MAX_COMPLETION_REQUEST_BYTES_V1 16777216ULL
-#define METASK_AGENTCORE_MAX_COMPLETION_RESULT_BYTES_V1 16777216ULL
 #define METASK_AGENTCORE_MAX_SKILL_SOURCES_V1 64ULL
 #define METASK_AGENTCORE_MAX_SKILL_SOURCE_ID_BYTES_V1 128ULL
 #define METASK_AGENTCORE_MAX_PROCESS_PLUGIN_SOURCES_V1 64ULL
@@ -149,19 +144,6 @@ extern "C" {
 #define METASK_AGENTCORE_RUN_CHECKPOINT_RESOURCE_LIMIT 3u
 #define METASK_AGENTCORE_RUN_RESULT_COMPACTION_RECOMMENDED (1u << 0)
 
-#define METASK_AGENTCORE_COMPLETION_ROLE_USER 1u
-#define METASK_AGENTCORE_COMPLETION_ROLE_ASSISTANT 2u
-#define METASK_AGENTCORE_COMPLETION_STOP_UNKNOWN 0u
-#define METASK_AGENTCORE_COMPLETION_STOP_END_TURN 1u
-#define METASK_AGENTCORE_COMPLETION_STOP_MAX_TOKENS 2u
-#define METASK_AGENTCORE_COMPLETION_STOP_STOP_SEQUENCE 3u
-#define METASK_AGENTCORE_COMPLETION_STOP_PAUSE_TURN 4u
-#define METASK_AGENTCORE_COMPLETION_STOP_REFUSAL 5u
-#define METASK_AGENTCORE_COMPLETION_STOP_ABORTED 6u
-#define METASK_AGENTCORE_COMPLETION_EVENT_TEXT 1u
-#define METASK_AGENTCORE_COMPLETION_EVENT_THINKING 2u
-#define METASK_AGENTCORE_COMPLETION_EVENT_USAGE 3u
-#define METASK_AGENTCORE_COMPLETION_EVENT_DONE 4u
 
 #define METASK_AGENTCORE_MCP_TRANSPORT_STDIO 1u
 #define METASK_AGENTCORE_MCP_TRANSPORT_STREAMABLE_HTTP 2u
@@ -221,8 +203,6 @@ extern "C" {
 typedef struct metask_agentcore_runtime metask_agentcore_runtime;
 typedef struct metask_agentcore_session metask_agentcore_session;
 typedef struct metask_agentcore_skill_catalog metask_agentcore_skill_catalog;
-typedef struct metask_agentcore_completion metask_agentcore_completion;
-typedef struct metask_agentcore_completion_stream metask_agentcore_completion_stream;
 
 typedef struct {
     const uint8_t *ptr;
@@ -598,62 +578,6 @@ typedef struct {
 
 typedef struct {
     uint32_t struct_size;
-    uint32_t provider_kind_code;
-    metask_agentcore_bytes_view_v1 api_key;
-    metask_agentcore_bytes_view_v1 base_url;
-    metask_agentcore_bytes_view_v1 model;
-    uint64_t reserved[4];
-} metask_agentcore_completion_config_v1;
-
-typedef struct {
-    uint32_t struct_size;
-    uint32_t role_code;
-    metask_agentcore_bytes_view_v1 text;
-    uint64_t reserved[2];
-} metask_agentcore_completion_message_v1;
-
-typedef struct {
-    uint32_t struct_size;
-    uint32_t reserved0;
-    const metask_agentcore_completion_message_v1 *messages;
-    uint64_t message_count;
-    metask_agentcore_bytes_view_v1 system;
-    uint64_t reserved[4];
-} metask_agentcore_completion_request_v1;
-
-typedef struct {
-    uint32_t struct_size;
-    uint32_t stop_reason_code;
-    metask_agentcore_owned_bytes_v1 text;
-    uint64_t input_tokens;
-    uint64_t output_tokens;
-    uint64_t cache_read_input_tokens;
-    uint64_t cache_creation_input_tokens;
-    uint64_t reserved[2];
-} metask_agentcore_completion_result_v1;
-
-typedef struct {
-    uint32_t struct_size;
-    uint32_t provider_kind_code;
-    metask_agentcore_owned_bytes_v1 model;
-    uint64_t reserved[3];
-} metask_agentcore_completion_info_v1;
-
-typedef struct {
-    uint32_t struct_size;
-    uint32_t kind_code;
-    metask_agentcore_owned_bytes_v1 payload;
-    uint64_t input_tokens;
-    uint64_t output_tokens;
-    uint64_t cache_read_input_tokens;
-    uint64_t cache_creation_input_tokens;
-    uint32_t stop_reason_code;
-    uint32_t reserved0;
-    uint64_t reserved[2];
-} metask_agentcore_completion_event_v1;
-
-typedef struct {
-    uint32_t struct_size;
     uint32_t kind_code;
     metask_agentcore_bytes_view_v1 text;
     metask_agentcore_bytes_view_v1 skill_id;
@@ -764,28 +688,6 @@ typedef uint32_t (*metask_agentcore_runtime_query_skill_catalog_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_skill_catalog_release_fn_v1)(
     metask_agentcore_skill_catalog *, metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_completion_create_fn_v1)(
-    const metask_agentcore_completion_config_v1 *, metask_agentcore_completion **,
-    metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_completion_destroy_fn_v1)(
-    metask_agentcore_completion *, metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_completion_describe_fn_v1)(
-    metask_agentcore_completion *, metask_agentcore_completion_info_v1 *,
-    metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_completion_complete_fn_v1)(
-    metask_agentcore_completion *, const metask_agentcore_completion_request_v1 *,
-    metask_agentcore_completion_result_v1 *, metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_completion_stream_start_fn_v1)(
-    metask_agentcore_completion *, const metask_agentcore_completion_request_v1 *,
-    metask_agentcore_completion_stream **, metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_completion_stream_next_fn_v1)(
-    metask_agentcore_completion_stream *, metask_agentcore_completion_event_v1 *,
-    metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_completion_stream_abort_fn_v1)(
-    metask_agentcore_completion_stream *, uint32_t,
-    metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_completion_stream_destroy_fn_v1)(
-    metask_agentcore_completion_stream *, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_runtime_refresh_mcp_fn_v1)(
     metask_agentcore_runtime *, uint64_t *, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_runtime_describe_mcp_fn_v1)(
@@ -1062,12 +964,6 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_host_config_v1, 168);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_create_config_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_source_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_catalog_query_v1, 80);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_completion_config_v1, 88);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_completion_message_v1, 40);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_completion_request_v1, 72);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_completion_result_v1, 72);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_completion_info_v1, 48);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_completion_event_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_run_input_v1, 104);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_run_options_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_run_result_v1, 72);

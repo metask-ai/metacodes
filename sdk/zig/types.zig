@@ -38,7 +38,6 @@ pub const Status = enum(u32) {
     logical_session_conflict = 23,
     mcp_not_refreshed = 24,
     invalid_mcp_selection = 25,
-    completion_unsupported_response = 26,
     skill_catalog_incomplete = 27,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
@@ -69,7 +68,6 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.logical_session_conflict) => .logical_session_conflict,
             @intFromEnum(Status.mcp_not_refreshed) => .mcp_not_refreshed,
             @intFromEnum(Status.invalid_mcp_selection) => .invalid_mcp_selection,
-            @intFromEnum(Status.completion_unsupported_response) => .completion_unsupported_response,
             @intFromEnum(Status.skill_catalog_incomplete) => .skill_catalog_incomplete,
             else => error.UnknownStatus,
         };
@@ -102,7 +100,6 @@ pub const STATUS_CHECKPOINT_IO: u32 = @intFromEnum(Status.checkpoint_io);
 pub const STATUS_LOGICAL_SESSION_CONFLICT: u32 = @intFromEnum(Status.logical_session_conflict);
 pub const STATUS_MCP_NOT_REFRESHED: u32 = @intFromEnum(Status.mcp_not_refreshed);
 pub const STATUS_INVALID_MCP_SELECTION: u32 = @intFromEnum(Status.invalid_mcp_selection);
-pub const STATUS_COMPLETION_UNSUPPORTED_RESPONSE: u32 = @intFromEnum(Status.completion_unsupported_response);
 pub const STATUS_SKILL_CATALOG_INCOMPLETE: u32 = @intFromEnum(Status.skill_catalog_incomplete);
 
 pub const ProviderKind = enum(u32) {
@@ -222,10 +219,6 @@ pub const MAX_MCP_PROTOCOL_VERSIONS_V1: u64 = 16;
 pub const MAX_CHECKPOINT_BYTES_V1: u64 = 1024 * 1024 * 1024;
 pub const MAX_CHECKPOINT_CHUNK_BYTES_V1: u32 = 1024 * 1024;
 pub const MAX_DESCRIPTION_JSON_BYTES_V1: u64 = 16 * 1024 * 1024;
-pub const MAX_COMPLETION_CONFIG_BYTES_V1: u64 = 1024 * 1024;
-pub const MAX_COMPLETION_MESSAGES_V1: u64 = 4096;
-pub const MAX_COMPLETION_REQUEST_BYTES_V1: u64 = 16 * 1024 * 1024;
-pub const MAX_COMPLETION_RESULT_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_SKILL_SOURCES_V1: u64 = 64;
 pub const MAX_SKILL_SOURCE_ID_BYTES_V1: u64 = 128;
 pub const MAX_PROCESS_PLUGIN_SOURCES_V1: u64 = 64;
@@ -253,52 +246,6 @@ pub const RUN_CHECKPOINT_BUDGET_REQUIRED: u32 = 1;
 pub const RUN_CHECKPOINT_BUDGET_EXHAUSTED: u32 = 2;
 pub const RUN_CHECKPOINT_RESOURCE_LIMIT: u32 = 3;
 pub const RUN_RESULT_COMPACTION_RECOMMENDED: u32 = 1 << 0;
-
-pub const COMPLETION_ROLE_USER: u32 = 1;
-pub const COMPLETION_ROLE_ASSISTANT: u32 = 2;
-
-pub const CompletionStopReason = enum(u32) {
-    unknown = 0,
-    end_turn = 1,
-    max_tokens = 2,
-    stop_sequence = 3,
-    pause_turn = 4,
-    refusal = 5,
-    aborted = 6,
-
-    pub fn fromCode(code: u32) error{UnknownCompletionStopReason}!CompletionStopReason {
-        return switch (code) {
-            0 => .unknown,
-            1 => .end_turn,
-            2 => .max_tokens,
-            3 => .stop_sequence,
-            4 => .pause_turn,
-            5 => .refusal,
-            6 => .aborted,
-            else => error.UnknownCompletionStopReason,
-        };
-    }
-};
-
-pub const COMPLETION_STOP_UNKNOWN: u32 = @intFromEnum(CompletionStopReason.unknown);
-pub const COMPLETION_STOP_END_TURN: u32 = @intFromEnum(CompletionStopReason.end_turn);
-pub const COMPLETION_STOP_MAX_TOKENS: u32 = @intFromEnum(CompletionStopReason.max_tokens);
-pub const COMPLETION_STOP_STOP_SEQUENCE: u32 = @intFromEnum(CompletionStopReason.stop_sequence);
-pub const COMPLETION_STOP_PAUSE_TURN: u32 = @intFromEnum(CompletionStopReason.pause_turn);
-pub const COMPLETION_STOP_REFUSAL: u32 = @intFromEnum(CompletionStopReason.refusal);
-pub const COMPLETION_STOP_ABORTED: u32 = @intFromEnum(CompletionStopReason.aborted);
-
-pub const CompletionEventKind = enum(u32) {
-    text = 1,
-    thinking = 2,
-    usage = 3,
-    done = 4,
-};
-
-pub const COMPLETION_EVENT_TEXT: u32 = @intFromEnum(CompletionEventKind.text);
-pub const COMPLETION_EVENT_THINKING: u32 = @intFromEnum(CompletionEventKind.thinking);
-pub const COMPLETION_EVENT_USAGE: u32 = @intFromEnum(CompletionEventKind.usage);
-pub const COMPLETION_EVENT_DONE: u32 = @intFromEnum(CompletionEventKind.done);
 
 pub const MCP_TRANSPORT_STDIO: u32 = 1;
 pub const MCP_TRANSPORT_STREAMABLE_HTTP: u32 = 2;
@@ -363,8 +310,6 @@ pub const HOST_SINK_CLOSED: u32 = 4;
 pub const RuntimeHandle = opaque {};
 pub const SessionHandle = opaque {};
 pub const SkillCatalogHandle = opaque {};
-pub const CompletionHandle = opaque {};
-pub const CompletionStreamHandle = opaque {};
 
 pub const BytesViewV1 = extern struct {
     ptr: ?[*]const u8,
@@ -807,62 +752,6 @@ pub const SkillCatalogQueryV1 = extern struct {
     reserved: [1]u64,
 };
 
-pub const CompletionConfigV1 = extern struct {
-    struct_size: u32,
-    provider_kind_code: u32,
-    api_key: BytesViewV1,
-    base_url: BytesViewV1,
-    model: BytesViewV1,
-    reserved: [4]u64,
-};
-
-pub const CompletionMessageV1 = extern struct {
-    struct_size: u32,
-    role_code: u32,
-    text: BytesViewV1,
-    reserved: [2]u64,
-};
-
-pub const CompletionRequestV1 = extern struct {
-    struct_size: u32,
-    reserved0: u32,
-    messages: ?[*]const CompletionMessageV1,
-    message_count: u64,
-    system: BytesViewV1,
-    reserved: [4]u64,
-};
-
-pub const CompletionResultV1 = extern struct {
-    struct_size: u32,
-    stop_reason_code: u32,
-    text: OwnedBytesV1,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
-    reserved: [2]u64,
-};
-
-pub const CompletionInfoV1 = extern struct {
-    struct_size: u32,
-    provider_kind_code: u32,
-    model: OwnedBytesV1,
-    reserved: [3]u64,
-};
-
-pub const CompletionEventV1 = extern struct {
-    struct_size: u32,
-    kind_code: u32,
-    payload: OwnedBytesV1,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
-    stop_reason_code: u32,
-    reserved0: u32,
-    reserved: [2]u64,
-};
-
 pub const RunInputV1 = extern struct {
     struct_size: u32,
     kind_code: u32,
@@ -998,46 +887,6 @@ pub const RuntimeQuerySkillCatalogFnV1 = *const fn (
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
 pub const SkillCatalogReleaseFnV1 = *const fn (?*SkillCatalogHandle, ?*OwnedBytesV1) callconv(.c) u32;
-pub const CompletionCreateFnV1 = *const fn (
-    config: ?*const CompletionConfigV1,
-    out_completion: ?*?*CompletionHandle,
-    out_diagnostic: ?*OwnedBytesV1,
-) callconv(.c) u32;
-pub const CompletionDestroyFnV1 = *const fn (
-    completion: ?*CompletionHandle,
-    out_diagnostic: ?*OwnedBytesV1,
-) callconv(.c) u32;
-pub const CompletionDescribeFnV1 = *const fn (
-    completion: ?*CompletionHandle,
-    out_info: ?*CompletionInfoV1,
-    out_diagnostic: ?*OwnedBytesV1,
-) callconv(.c) u32;
-pub const CompletionCompleteFnV1 = *const fn (
-    completion: ?*CompletionHandle,
-    request: ?*const CompletionRequestV1,
-    out_result: ?*CompletionResultV1,
-    out_diagnostic: ?*OwnedBytesV1,
-) callconv(.c) u32;
-pub const CompletionStreamStartFnV1 = *const fn (
-    completion: ?*CompletionHandle,
-    request: ?*const CompletionRequestV1,
-    out_stream: ?*?*CompletionStreamHandle,
-    out_diagnostic: ?*OwnedBytesV1,
-) callconv(.c) u32;
-pub const CompletionStreamNextFnV1 = *const fn (
-    stream: ?*CompletionStreamHandle,
-    out_event: ?*CompletionEventV1,
-    out_diagnostic: ?*OwnedBytesV1,
-) callconv(.c) u32;
-pub const CompletionStreamAbortFnV1 = *const fn (
-    stream: ?*CompletionStreamHandle,
-    reason_code: u32,
-    out_diagnostic: ?*OwnedBytesV1,
-) callconv(.c) u32;
-pub const CompletionStreamDestroyFnV1 = *const fn (
-    stream: ?*CompletionStreamHandle,
-    out_diagnostic: ?*OwnedBytesV1,
-) callconv(.c) u32;
 pub const RuntimeRefreshMcpFnV1 = *const fn (
     runtime: ?*RuntimeHandle,
     out_catalog_generation: ?*u64,
@@ -1230,12 +1079,6 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionCreateConfigV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SkillSourceV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(SkillCatalogQueryV1));
-    try std.testing.expectEqual(@as(usize, 88), @sizeOf(CompletionConfigV1));
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(CompletionMessageV1));
-    try std.testing.expectEqual(@as(usize, 72), @sizeOf(CompletionRequestV1));
-    try std.testing.expectEqual(@as(usize, 72), @sizeOf(CompletionResultV1));
-    try std.testing.expectEqual(@as(usize, 48), @sizeOf(CompletionInfoV1));
-    try std.testing.expectEqual(@as(usize, 80), @sizeOf(CompletionEventV1));
     try std.testing.expectEqual(@as(usize, 104), @sizeOf(RunInputV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(RunOptionsV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(RunResultV1));
@@ -1318,7 +1161,7 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectEqual(Status.skill_unavailable, try Status.fromCode(16));
     try std.testing.expectEqual(Status.stale_compact, try Status.fromCode(17));
     try std.testing.expectEqual(Status.invalid_mcp_selection, try Status.fromCode(25));
-    try std.testing.expectEqual(Status.completion_unsupported_response, try Status.fromCode(26));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(26));
     try std.testing.expectEqual(Status.skill_catalog_incomplete, try Status.fromCode(27));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(28));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
@@ -1326,14 +1169,6 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectEqual(StopReason.checkpoint_resource_limit, try StopReason.fromCode(8));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(9));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(std.math.maxInt(u32)));
-    inline for (std.meta.fields(CompletionStopReason)) |field| {
-        const value: CompletionStopReason = @enumFromInt(field.value);
-        try std.testing.expectEqual(value, try CompletionStopReason.fromCode(field.value));
-    }
-    try std.testing.expectError(
-        error.UnknownCompletionStopReason,
-        CompletionStopReason.fromCode(7),
-    );
 }
 
 test "typed provider kind validates every public code" {

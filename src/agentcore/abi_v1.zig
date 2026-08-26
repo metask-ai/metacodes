@@ -28,7 +28,6 @@ const skill_runtime = core.skills_runtime;
 pub const skill_catalog = skill_runtime.catalog;
 pub const skill_availability = skill_runtime.availability;
 pub const skill_catalog_handles = @import("skill_catalog_handles.zig");
-pub const completion_handles = @import("completion_handles.zig");
 pub const skill_activation = skill_runtime.activation;
 pub const skill_materialization = skill_runtime.materialization;
 pub const policy_frame = skill_runtime.policy_frame;
@@ -3642,18 +3641,6 @@ fn catalogFrom(handle: *wire.SkillCatalogHandle) *skill_catalog_handles.HostCata
 fn catalogHandle(catalog: *skill_catalog_handles.HostCatalog) *wire.SkillCatalogHandle {
     return @ptrCast(catalog);
 }
-fn completionFrom(handle: *wire.CompletionHandle) *completion_handles.Completion {
-    return @ptrCast(@alignCast(handle));
-}
-fn completionHandle(value: *completion_handles.Completion) *wire.CompletionHandle {
-    return @ptrCast(value);
-}
-fn completionStreamFrom(handle: *wire.CompletionStreamHandle) *completion_handles.Stream {
-    return @ptrCast(@alignCast(handle));
-}
-fn completionStreamHandle(value: *completion_handles.Stream) *wire.CompletionStreamHandle {
-    return @ptrCast(value);
-}
 
 fn view(bytes: []const u8) wire.BytesViewV1 {
     return .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = bytes.len };
@@ -3741,7 +3728,6 @@ fn statusText(status: u32) []const u8 {
         wire.STATUS_LOGICAL_SESSION_CONFLICT => "logical Session conflict",
         wire.STATUS_MCP_NOT_REFRESHED => "MCP catalog not refreshed",
         wire.STATUS_INVALID_MCP_SELECTION => "invalid MCP selection",
-        wire.STATUS_COMPLETION_UNSUPPORTED_RESPONSE => "unsupported Completion response",
         else => "AgentCore error",
     };
 }
@@ -3812,18 +3798,6 @@ fn catalogQueryStatus(err: anyerror) u32 {
         error.RuntimeBusy => wire.STATUS_BUSY,
         error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
         error.InvalidWorkspace, error.InvalidSource => wire.STATUS_INVALID_ARGUMENT,
-        else => wire.STATUS_CORE_ERROR,
-    };
-}
-
-fn completionStatus(err: anyerror) u32 {
-    return switch (err) {
-        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
-        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
-        error.Busy => wire.STATUS_BUSY,
-        error.TooLate => wire.STATUS_TOO_LATE,
-        error.InvalidState => wire.STATUS_INVALID_STATE,
-        error.UnsupportedResponse => wire.STATUS_COMPLETION_UNSUPPORTED_RESPONSE,
         else => wire.STATUS_CORE_ERROR,
     };
 }
@@ -3914,34 +3888,6 @@ fn provider(code: u32) ?core.types.ProviderKind {
         wire.PROVIDER_ANTHROPIC => .anthropic,
         wire.PROVIDER_OPENAI => .openai,
         wire.PROVIDER_GEMINI => .gemini,
-        else => null,
-    };
-}
-
-fn providerCode(kind: core.types.ProviderKind) u32 {
-    return switch (kind) {
-        .anthropic => wire.PROVIDER_ANTHROPIC,
-        .openai => wire.PROVIDER_OPENAI,
-        .gemini => wire.PROVIDER_GEMINI,
-    };
-}
-
-fn completionStopCode(reason: completion_handles.StopReason) u32 {
-    return switch (reason) {
-        .unknown => wire.COMPLETION_STOP_UNKNOWN,
-        .end_turn => wire.COMPLETION_STOP_END_TURN,
-        .max_tokens => wire.COMPLETION_STOP_MAX_TOKENS,
-        .stop_sequence => wire.COMPLETION_STOP_STOP_SEQUENCE,
-        .pause_turn => wire.COMPLETION_STOP_PAUSE_TURN,
-        .refusal => wire.COMPLETION_STOP_REFUSAL,
-        .aborted => wire.COMPLETION_STOP_ABORTED,
-    };
-}
-
-fn completionAbortReason(code: u32) ?core.util_abort.Reason {
-    return switch (code) {
-        wire.ABORT_USER_REQUEST => .user_interrupt,
-        wire.ABORT_TIMEOUT => .timeout,
         else => null,
     };
 }
@@ -4821,260 +4767,6 @@ fn skillCatalogRelease(
         return fail(wire.STATUS_INVALID_ARGUMENT, "Skill catalog is required", out_error));
     catalog.release() catch |err|
         return failError(catalogLifecycleStatus(err), err, out_error);
-    return wire.STATUS_OK;
-}
-
-fn parseCompletionRequest(
-    scratch: std.mem.Allocator,
-    request_ptr: ?*const wire.CompletionRequestV1,
-) !completion_handles.Request {
-    const request = request_ptr orelse return error.InvalidArgument;
-    if (request.struct_size != @sizeOf(wire.CompletionRequestV1) or
-        request.reserved0 != 0 or !allZero(request.reserved))
-        return error.InvalidArgument;
-    if (request.message_count == 0)
-        return error.InvalidArgument;
-    if (request.message_count > wire.MAX_COMPLETION_MESSAGES_V1)
-        return error.ResourceLimit;
-    const count = std.math.cast(usize, request.message_count) orelse
-        return error.Overflow;
-    const source = (request.messages orelse return error.InvalidArgument)[0..count];
-    const messages = try scratch.alloc(completion_handles.TextMessage, count);
-    var total_bytes: u64 = 0;
-    for (source, messages) |input, *output| {
-        if (input.struct_size != @sizeOf(wire.CompletionMessageV1) or
-            !allZero(input.reserved))
-            return error.InvalidArgument;
-        const role: core.types.MessageRole = switch (input.role_code) {
-            wire.COMPLETION_ROLE_USER => .user,
-            wire.COMPLETION_ROLE_ASSISTANT => .assistant,
-            else => return error.InvalidArgument,
-        };
-        const message_text = try text(input.text);
-        total_bytes = std.math.add(u64, total_bytes, input.text.len) catch
-            return error.ResourceLimit;
-        if (total_bytes > wire.MAX_COMPLETION_REQUEST_BYTES_V1)
-            return error.ResourceLimit;
-        output.* = .{ .role = role, .text = message_text };
-    }
-    const system_text = try text(request.system);
-    total_bytes = std.math.add(u64, total_bytes, request.system.len) catch
-        return error.ResourceLimit;
-    if (total_bytes > wire.MAX_COMPLETION_REQUEST_BYTES_V1)
-        return error.ResourceLimit;
-    return .{
-        .messages = messages,
-        .system = if (system_text.len == 0) null else system_text,
-    };
-}
-
-fn completionCreate(
-    config_ptr: ?*const wire.CompletionConfigV1,
-    out_completion: ?*?*wire.CompletionHandle,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_completion) |out| out.* = null;
-    emptyError(out_error);
-    const config = config_ptr orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "CompletionConfigV1 is required", out_error);
-    const output = out_completion orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_completion is required", out_error);
-    if (config.struct_size != @sizeOf(wire.CompletionConfigV1) or
-        !allZero(config.reserved))
-        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid CompletionConfigV1", out_error);
-    const provider_kind = provider(config.provider_kind_code) orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid Completion provider", out_error);
-    var total_bytes: u64 = 0;
-    for ([_]wire.BytesViewV1{ config.api_key, config.base_url, config.model }) |value| {
-        addMetadata(&total_bytes, value.len, wire.MAX_COMPLETION_CONFIG_BYTES_V1) catch |err|
-            return failError(inputErrorStatus(err), err, out_error);
-    }
-    const api_key = text(config.api_key) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    const base_url = text(config.base_url) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    const model = text(config.model) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    if (api_key.len == 0 or model.len == 0)
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion api_key and model are required", out_error);
-    const completion = completion_handles.Completion.create(
-        allocator,
-        provider_kind,
-        api_key,
-        model,
-        if (base_url.len == 0) null else base_url,
-    ) catch |err| return failError(completionStatus(err), err, out_error);
-    output.* = completionHandle(completion);
-    return wire.STATUS_OK;
-}
-
-fn completionDestroy(
-    handle: ?*wire.CompletionHandle,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    emptyError(out_error);
-    const completion = completionFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion is required", out_error));
-    completion.destroy() catch |err|
-        return failError(completionStatus(err), err, out_error);
-    return wire.STATUS_OK;
-}
-
-fn completionDescribe(
-    handle: ?*wire.CompletionHandle,
-    out_info: ?*wire.CompletionInfoV1,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_info) |out| out.* = std.mem.zeroes(wire.CompletionInfoV1);
-    emptyError(out_error);
-    const completion = completionFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion is required", out_error));
-    const output = out_info orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_info is required", out_error);
-    const model = allocator.dupe(u8, completion.configuredModel()) catch
-        return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Completion model failed", out_error);
-    output.* = .{
-        .struct_size = @sizeOf(wire.CompletionInfoV1),
-        .provider_kind_code = providerCode(completion.providerKind()),
-        .model = .{ .ptr = model.ptr, .len = model.len },
-        .reserved = [_]u64{0} ** 3,
-    };
-    return wire.STATUS_OK;
-}
-
-fn completionComplete(
-    handle: ?*wire.CompletionHandle,
-    request_ptr: ?*const wire.CompletionRequestV1,
-    out_result: ?*wire.CompletionResultV1,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_result) |out| out.* = std.mem.zeroes(wire.CompletionResultV1);
-    emptyError(out_error);
-    const completion = completionFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion is required", out_error));
-    const output = out_result orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    const request = parseCompletionRequest(scratch.allocator(), request_ptr) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    const result = completion.complete(request) catch |err|
-        return failError(completionStatus(err), err, out_error);
-    output.* = .{
-        .struct_size = @sizeOf(wire.CompletionResultV1),
-        .stop_reason_code = completionStopCode(result.stop_reason),
-        .text = .{
-            .ptr = if (result.text.len == 0) null else result.text.ptr,
-            .len = result.text.len,
-        },
-        .input_tokens = result.usage.input_tokens,
-        .output_tokens = result.usage.output_tokens,
-        .cache_read_input_tokens = result.usage.cache_read_input_tokens,
-        .cache_creation_input_tokens = result.usage.cache_creation_input_tokens,
-        .reserved = [_]u64{0} ** 2,
-    };
-    return wire.STATUS_OK;
-}
-
-fn completionStreamStart(
-    handle: ?*wire.CompletionHandle,
-    request_ptr: ?*const wire.CompletionRequestV1,
-    out_stream: ?*?*wire.CompletionStreamHandle,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_stream) |out| out.* = null;
-    emptyError(out_error);
-    const completion = completionFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion is required", out_error));
-    const output = out_stream orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_stream is required", out_error);
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    const request = parseCompletionRequest(scratch.allocator(), request_ptr) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    const stream = completion.startStream(request) catch |err|
-        return failError(completionStatus(err), err, out_error);
-    output.* = completionStreamHandle(stream);
-    return wire.STATUS_OK;
-}
-
-fn completionStreamNext(
-    handle: ?*wire.CompletionStreamHandle,
-    out_event: ?*wire.CompletionEventV1,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_event) |out| out.* = std.mem.zeroes(wire.CompletionEventV1);
-    emptyError(out_error);
-    const stream = completionStreamFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion stream is required", out_error));
-    const output = out_event orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_event is required", out_error);
-    const event = stream.next() catch |err|
-        return failError(completionStatus(err), err, out_error);
-    output.* = .{
-        .struct_size = @sizeOf(wire.CompletionEventV1),
-        .kind_code = switch (event) {
-            .text => wire.COMPLETION_EVENT_TEXT,
-            .thinking => wire.COMPLETION_EVENT_THINKING,
-            .usage => wire.COMPLETION_EVENT_USAGE,
-            .done => wire.COMPLETION_EVENT_DONE,
-        },
-        .payload = switch (event) {
-            .text, .thinking => |payload| .{
-                .ptr = if (payload.len == 0) null else payload.ptr,
-                .len = payload.len,
-            },
-            .usage, .done => .{ .ptr = null, .len = 0 },
-        },
-        .input_tokens = switch (event) {
-            .usage => |usage| usage.input_tokens,
-            else => 0,
-        },
-        .output_tokens = switch (event) {
-            .usage => |usage| usage.output_tokens,
-            else => 0,
-        },
-        .cache_read_input_tokens = switch (event) {
-            .usage => |usage| usage.cache_read_input_tokens,
-            else => 0,
-        },
-        .cache_creation_input_tokens = switch (event) {
-            .usage => |usage| usage.cache_creation_input_tokens,
-            else => 0,
-        },
-        .stop_reason_code = switch (event) {
-            .done => |reason| completionStopCode(reason),
-            else => wire.COMPLETION_STOP_UNKNOWN,
-        },
-        .reserved0 = 0,
-        .reserved = [_]u64{0} ** 2,
-    };
-    return wire.STATUS_OK;
-}
-
-fn completionStreamAbort(
-    handle: ?*wire.CompletionStreamHandle,
-    reason_code: u32,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    emptyError(out_error);
-    const stream = completionStreamFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion stream is required", out_error));
-    const reason = completionAbortReason(reason_code) orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid Completion abort reason", out_error);
-    stream.abort(reason) catch |err|
-        return failError(completionStatus(err), err, out_error);
-    return wire.STATUS_OK;
-}
-
-fn completionStreamDestroy(
-    handle: ?*wire.CompletionStreamHandle,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    emptyError(out_error);
-    const stream = completionStreamFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion stream is required", out_error));
-    stream.destroy();
     return wire.STATUS_OK;
 }
 
