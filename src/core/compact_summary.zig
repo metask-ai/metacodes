@@ -13,7 +13,6 @@ const msg = @import("message.zig");
 const log = @import("../util/log.zig");
 const json_mod = @import("../json.zig");
 const provider_mod = @import("../api/provider.zig");
-const completion_mod = @import("../api/completion.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const UsageDelta = @import("../api/stream.zig").UsageDelta;
 
@@ -83,12 +82,12 @@ pub fn summarizeWithModel(
         .role = .user,
         .content = &[_]types.ApiContent{.{ .text = user_text }},
     }};
-    var completion = completion_mod.CompletionRuntime.init(provider);
-    const resp = completion.complete(.{
-        .messages = &api_msgs,
-        .system = system_prompt,
-        .model_override = model_override,
-    }) catch |err| {
+    const resp = provider.sendWithModel(
+        &api_msgs,
+        system_prompt,
+        null,
+        model_override,
+    ) catch |err| {
         log.warn("compact", "summarize API call failed: {s} (falling back to keep-recent)", .{@errorName(err)});
         return null;
     };
@@ -152,13 +151,15 @@ pub fn summarizeAbortable(
         .role = .user,
         .content = &[_]types.ApiContent{.{ .text = user_text }},
     }};
-    var completion = completion_mod.CompletionRuntime.init(provider);
-    var stream = completion.stream(.{
-        .messages = &api_msgs,
-        .system = system_prompt,
-        .model_override = model_override,
-        .abort = abort,
-    }) catch |err| {
+    var stream = provider.sendStream(
+        &api_msgs,
+        system_prompt,
+        null,
+        abort,
+        model_override,
+        null,
+        "",
+    ) catch |err| {
         if (abort.isAborted() or err == error.Aborted) return error.Aborted;
         log.warn("compact", "summary stream failed: {s} (falling back to keep-recent)", .{@errorName(err)});
         return null;

@@ -1038,9 +1038,9 @@ Revision 14 exposes no Completion handle, DTO, status, or function slot.
 Independent title, summary, classification, and other product-level model calls
 belong to the Host or a product plugin. If the Agent itself must invoke such a
 capability, the Host exposes a semantically bounded Tool; a generic Completion
-Tool is not an AgentCore escape hatch. AgentCore's internal CompletionRuntime
-remains an implementation detail used by governed Runtime paths such as compact
-summary and does not define a consumer plugin contract.
+Tool is not an AgentCore escape hatch. No internal Completion facade remains;
+governed Runtime paths such as compact summary call the neutral Provider
+interface directly and define no consumer plugin contract.
 
 ABI v1 has three ownership classes:
 

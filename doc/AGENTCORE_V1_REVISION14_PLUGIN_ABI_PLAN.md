@@ -39,8 +39,8 @@ metask_agentcore_get_api(1)
    插件配置允许为 null。
 6. Runtime 创建期间完成插件 staging 和原子发布。发布后的 generation 不可变；没有
    install、uninstall、reload、HMR、watcher 或 live registry。
-7. 公共 Completion facade、handle、DTO、status 和 SDK surface 从 R14 删除。
-   内部 `CompletionRuntime` 保留，继续服务 compact summary 等内核流程。
+7. 公共 Completion facade、handle、DTO、status 和 SDK surface 从 R14 删除。后续清理也
+   删除了内部薄封装；compact summary 直接复用中立 Provider 接口。
 8. 不修改 AgentLoop、Provider、Permission、Sandbox、budget、formal verdict、TinyKG、
    artifact CAS、提示词或持久化格式。
 9. Revision 14 是 hard cut，不保留 Revision 13 或旧 R14 的 shim、alias、fallback、
@@ -320,11 +320,8 @@ R14 从公共投影删除：
 - `completion_unsupported_response` public status；
 - C/Zig/Rust safe SDK wrapper 和 source-free consumer 调用。
 
-不删除或修改：
-
-- `src/api/completion.zig`；
-- `src/core/compact_summary.zig` 对内部 `CompletionRuntime` 的使用；
-- Provider 实现和 AgentLoop 请求路径。
+R14 hard cut 当时不修改 Provider 实现和 AgentLoop 请求路径。后续内部清理只移除了
+Completion 薄封装，compact summary 保持原有请求语义并直接调用中立 Provider。
 
 `completion_unsupported_response` 的符号和公共语义删除，但其 status code 26 永久废弃，
 不得分配给其他状态。`skill_catalog_incomplete` 保持编号 27。R14 SDK 解码数值 26 时必须返回
@@ -462,7 +459,7 @@ artifact consumer 验证 schema 1、ABI revision 14、64-byte 根表和 bundle f
 - 修改 MetaCode 身份或系统提示词；
 - 开放任意 Session system prompt；
 - 修改 AgentLoop、Provider、Permission、MCP canonical 或 Skill runtime 业务语义；
-- 删除或重写内部 CompletionRuntime；
+- 修改 compact summary 的模型请求语义；
 - 修改 checkpoint、journal、artifact、TinyKG 或数据库表；
 - 暴露完整 Zig plugin service graph；
 - 加载任意动态库或同进程不可信代码；
@@ -499,7 +496,6 @@ journal 和 timestamp 不得进入 prompt。MetaCode 身份和现有 prompt gold
 
 - `src/core/system_prompt.zig`；
 - `src/core/agent_loop.zig`；
-- `src/api/completion.zig`；
 - `src/core/compact_summary.zig`；
 - Provider、Permission、MCP canonical、Skill runtime；
 - `src/formal/**`、TinyKG bundle、artifact CAS；
@@ -580,7 +576,7 @@ C compatibility helper、Zig safe SDK 和 Rust safe SDK 分别使用每槽唯一
 - Skill resolve -> bind -> model-visible tool -> execute 闭环；
 - MCP apply/refresh -> select -> tool call -> streamed artifact 闭环；
 - Permission、Sandbox、formal verdict、budget 和 TinyKG admission 拒绝测试保持通过；
-- 内部 compact summary 继续通过 CompletionRuntime 复用 Provider；
+- 内部 compact summary 继续直接复用中立 Provider；
 - 公共 header/SDK/manifest 不再声明 Completion surface。
 
 ### 14.5 Prompt 与持久化零变化
@@ -613,7 +609,7 @@ budget journal。
 - Revision 编号审计通过；
 - root/table/header/SDK/manifest 布局一致；
 - Runtime create 统一且 plugin generation 原子、不可变；
-- 公共 Completion 完整删除，内部 CompletionRuntime 回归通过；
+- 公共和内部 Completion facade 均删除，compact summary 的 Provider 回归通过；
 - 除明确删除的 Completion 外，R13 Agent Runtime 能力全部迁移；
 - AgentLoop、安全治理、提示词和持久化格式无行为变化；
 - C/C++/Zig/Rust source-free consumer 与真实 L2 全部通过；
