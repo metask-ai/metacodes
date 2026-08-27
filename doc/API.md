@@ -92,7 +92,8 @@ streaming tools, MCP streaming, process plugins, and durable journal profiles
 are covered. `on_event` is the per-Session serialized, non-durable Run
 observation stream. Its typed events include authoritative visible-output
 segment boundaries and `commentary` / `final` / `continued` / `partial` /
-`discarded` classifications as additive Revision 14 observation tags.
+`discarded` classifications, plus structured `file_changes` evidence for
+typed file tools, as additive Revision 14 observation tags.
 Independent Completion is deliberately not part of AgentCore: a
 Host owns product-level model calls and exposes only semantically bounded Tools
 when an Agent must invoke one.

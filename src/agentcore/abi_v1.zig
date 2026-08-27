@@ -664,6 +664,74 @@ fn createInitialMcpSelection(
     return try mcp_session.Selection.init(allocator, snapshot, selectors, mode);
 }
 
+/// Return the complete valid UTF-8 prefix only when the invalidity is an
+/// incomplete final code point. An invalid lead byte, continuation byte, or
+/// complete malformed sequence means the source itself is not UTF-8 and must
+/// not be exposed as displayable text.
+fn truncatedUtf8Prefix(bytes: []const u8) ?usize {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const width: usize = std.unicode.utf8ByteSequenceLength(bytes[index]) catch return null;
+        if (width > bytes.len - index) return index;
+        _ = std.unicode.utf8Decode(bytes[index..][0..width]) catch return null;
+        index += width;
+    }
+    return bytes.len;
+}
+
+/// AgentCore's JSON boundary owns the UTF-8 constraint; Core file-change
+/// evidence remains byte-preserving for its non-JSON consumers. Keep the
+/// common path borrowed and allocation-free. Only a batch containing an
+/// invalid unified diff receives a shallow record-array copy: an incomplete
+/// trailing code point is removed, while intrinsically non-UTF-8 content is
+/// omitted. In both cases `diff_complete` makes the evidence loss explicit.
+fn sanitizeFileChangeRecords(
+    event_allocator: std.mem.Allocator,
+    changes: []const public_protocol.FileChangeRecord,
+) error{OutOfMemory}!?[]public_protocol.FileChangeRecord {
+    var has_invalid_diff = false;
+    for (changes) |change| {
+        if (change.unified_diff) |diff| {
+            if (!std.unicode.utf8ValidateSlice(diff)) {
+                has_invalid_diff = true;
+                break;
+            }
+        }
+    }
+    if (!has_invalid_diff) return null;
+
+    const sanitized = try event_allocator.dupe(public_protocol.FileChangeRecord, changes);
+    for (sanitized) |*change| {
+        const diff = change.unified_diff orelse continue;
+        if (std.unicode.utf8ValidateSlice(diff)) continue;
+
+        change.diff_complete = false;
+        change.unified_diff = if (truncatedUtf8Prefix(diff)) |end|
+            if (end == 0) null else diff[0..end]
+        else
+            null;
+    }
+    return sanitized;
+}
+
+fn encodePublicEventJson(
+    event_allocator: std.mem.Allocator,
+    event: public_protocol.CoreEvent,
+) error{OutOfMemory}![]u8 {
+    var normalized = event;
+    var sanitized_changes: ?[]public_protocol.FileChangeRecord = null;
+    defer if (sanitized_changes) |records| event_allocator.free(records);
+
+    switch (normalized) {
+        .file_changes => |*batch| {
+            sanitized_changes = try sanitizeFileChangeRecords(event_allocator, batch.changes);
+            if (sanitized_changes) |records| batch.changes = records;
+        },
+        else => {},
+    }
+    return std.json.Stringify.valueAlloc(event_allocator, normalized, .{});
+}
+
 const AbiSession = struct {
     const CallState = enum { idle, running, compacting, mutating, checkpointing, destroying };
 
@@ -1355,7 +1423,7 @@ const AbiSession = struct {
             return false;
         const callback = self.callbacks.on_event orelse return true;
         const public_event = protocol_v1.event(event) orelse return true;
-        const json = std.json.Stringify.valueAlloc(allocator, public_event, .{}) catch {
+        const json = encodePublicEventJson(allocator, public_event) catch {
             self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
             return false;
         };
@@ -8737,6 +8805,101 @@ test "checkpoint restores compatible MCP view and exact Session grant" {
         &changed_description.authority_issues[0].issue_id,
     );
     try std.testing.expectEqual(@as(usize, 0), changed_description.mcp_tools.len);
+}
+
+test "AgentCore event JSON sanitizes only invalid file-change diffs" {
+    const clean_diff = "--- a/clean.txt\n+++ b/clean.txt\n+中文\n";
+    const truncated_prefix = "--- a/truncated.txt\n+++ b/truncated.txt\n+prefix-";
+    const truncated_diff = truncated_prefix ++ "\xe4\xb8";
+    const non_utf8_diff = "--- a/binary.dat\n+++ b/binary.dat\n+prefix-\xff-tail\n";
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clean_diff));
+    try std.testing.expect(!std.unicode.utf8ValidateSlice(truncated_diff));
+    try std.testing.expect(!std.unicode.utf8ValidateSlice(non_utf8_diff));
+
+    const changes = [_]public_protocol.FileChangeRecord{
+        .{
+            .locator = .{ .workspace_path = "clean.txt" },
+            .kind = .modified,
+            .status = .applied,
+            .tool = "Edit",
+            .tool_use_id = "clean",
+            .agent_depth = 0,
+            .before_bytes = 1,
+            .after_bytes = 2,
+            .unified_diff = clean_diff,
+            .diff_complete = true,
+        },
+        .{
+            .locator = .{ .workspace_path = "truncated.txt" },
+            .kind = .modified,
+            .status = .applied,
+            .tool = "Edit",
+            .tool_use_id = "truncated",
+            .agent_depth = 1,
+            .before_bytes = 3,
+            .after_bytes = 4,
+            .unified_diff = truncated_diff,
+            .diff_complete = true,
+        },
+        .{
+            .locator = .{ .workspace_path = "binary.dat" },
+            .kind = .modified,
+            .status = .partial,
+            .tool = "ApplyPatch",
+            .tool_use_id = "binary",
+            .agent_depth = 2,
+            .before_bytes = 5,
+            .after_bytes = 6,
+            .unified_diff = non_utf8_diff,
+            .diff_complete = true,
+        },
+    };
+    try std.testing.expect((try sanitizeFileChangeRecords(
+        std.testing.allocator,
+        changes[0..1],
+    )) == null);
+    const encoded = try encodePublicEventJson(std.testing.allocator, .{ .file_changes = .{
+        .id = "batch",
+        .name = "ApplyPatch",
+        .changes = &changes,
+        .overflow = true,
+        .lost = true,
+    } });
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
+
+    var decoded = try public_protocol.decodeCoreEvent(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    const event = switch (decoded.value) {
+        .known => |value| value,
+        .unknown => return error.TestUnexpectedResult,
+    };
+    const batch = switch (event) {
+        .file_changes => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("batch", batch.id);
+    try std.testing.expect(batch.overflow and batch.lost);
+    try std.testing.expectEqual(@as(usize, 3), batch.changes.len);
+
+    try std.testing.expectEqualStrings(clean_diff, batch.changes[0].unified_diff.?);
+    try std.testing.expect(batch.changes[0].diff_complete);
+    try std.testing.expectEqualStrings("clean", batch.changes[0].tool_use_id);
+
+    try std.testing.expectEqualStrings(truncated_prefix, batch.changes[1].unified_diff.?);
+    try std.testing.expect(!batch.changes[1].diff_complete);
+    try std.testing.expectEqual(@as(u64, 4), batch.changes[1].after_bytes);
+
+    try std.testing.expect(batch.changes[2].unified_diff == null);
+    try std.testing.expect(!batch.changes[2].diff_complete);
+    try std.testing.expectEqual(public_protocol.FileChangeStatus.partial, batch.changes[2].status);
+    try std.testing.expectEqualStrings("binary.dat", batch.changes[2].locator.workspace_path);
+
+    // Sanitization is a temporary shallow projection; Core-owned records stay
+    // byte-identical for journals and other non-JSON consumers.
+    try std.testing.expectEqualStrings(truncated_diff, changes[1].unified_diff.?);
+    try std.testing.expectEqualStrings(non_utf8_diff, changes[2].unified_diff.?);
+    try std.testing.expect(changes[1].diff_complete and changes[2].diff_complete);
 }
 
 test "oversized Host tool results are released exactly once" {

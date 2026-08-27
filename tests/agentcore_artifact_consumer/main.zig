@@ -49,6 +49,14 @@ const HOST_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const WRITE_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m_write\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"write\",\"name\":\"Write\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"artifact-write.txt\\\",\\\"content\\\":\\\"artifact-write-ok\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const HOST_STREAM_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m_stream\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"stream\",\"name\":\"HostStream\",\"input\":{}}}\n\n" ++
@@ -103,6 +111,7 @@ const Probe = struct {
     saw_host_result: bool = false,
     saw_stream_envelope: bool = false,
     saw_artifact_recovery: bool = false,
+    saw_file_change: bool = false,
     saw_final_text: bool = false,
     saw_final_output_segment: bool = false,
     output_segment_open: bool = false,
@@ -185,6 +194,28 @@ const Probe = struct {
                     if (std.mem.eql(u8, result.name, "ReadArtifact") and !result.is_error and
                         std.mem.indexOf(u8, result.content, "aaaaaaaaaaaaaaaa") != null)
                         self.saw_artifact_recovery = true;
+                },
+                .file_changes => |batch| {
+                    if (!std.mem.eql(u8, batch.id, "write") or
+                        !std.mem.eql(u8, batch.name, "Write") or
+                        batch.changes.len != 1 or batch.overflow or batch.lost)
+                        return wire.EVENT_FATAL;
+                    const change = batch.changes[0];
+                    const path = switch (change.locator) {
+                        .workspace_path => |value| value,
+                        else => return wire.EVENT_FATAL,
+                    };
+                    if (!std.mem.eql(u8, path, "artifact-write.txt") or
+                        change.from_locator != null or
+                        change.kind != .created or change.status != .applied or
+                        !std.mem.eql(u8, change.tool, "Write") or
+                        !std.mem.eql(u8, change.tool_use_id, "write") or
+                        change.agent_depth != 0 or change.before_bytes != 0 or
+                        change.after_bytes != "artifact-write-ok".len or
+                        !change.diff_complete or change.unified_diff == null or
+                        std.mem.indexOf(u8, change.unified_diff.?, "+artifact-write-ok") == null)
+                        return wire.EVENT_FATAL;
+                    self.saw_file_change = true;
                 },
                 .text_chunk => |text| {
                     if (!self.output_segment_open) return wire.EVENT_FATAL;
@@ -427,6 +458,7 @@ pub fn main(init: std.process.Init) !void {
     const bodies = [_][]const u8{
         ASK_SSE,
         read_sse,
+        WRITE_SSE,
         HOST_SSE,
         HOST_STREAM_SSE,
         READ_ARTIFACT_SSE,
@@ -439,7 +471,7 @@ pub fn main(init: std.process.Init) !void {
     const url = try server.url(a);
 
     var probe = Probe{};
-    const builtins = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read") };
+    const builtins = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("Write") };
     var host = wire.HostToolV1{
         .struct_size = @sizeOf(wire.HostToolV1),
         .reserved0 = 0,
@@ -544,7 +576,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidCatalogDescriptor;
     api.bufferRelease()(&descriptor);
 
-    const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("HostEcho"), sdk.bytesView("HostStream") };
+    const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("Write"), sdk.bytesView("HostEcho"), sdk.bytesView("HostStream") };
     const granted_skill_ids = [_]wire.BytesViewV1{
         sdk.bytesView(identities.skill_id),
         sdk.bytesView(workctl_identities.skill_id),
@@ -629,7 +661,7 @@ pub fn main(init: std.process.Init) !void {
         diagnostic,
     );
     api.bufferRelease()(&diagnostic);
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 6, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 7, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
     const encoded_arguments = try sdk.encodeSkillArguments(
         a,
@@ -647,12 +679,12 @@ pub fn main(init: std.process.Init) !void {
         &diagnostic,
     ), diagnostic);
     try probe.endRun(1);
-    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.tool_calls != 5) return error.UnexpectedRunResult;
+    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.tool_calls != 6) return error.UnexpectedRunResult;
     if (probe.ui_calls != 1 or probe.ui_releases != 1 or probe.host_calls != 1 or probe.host_releases != 1) return error.CallbackContractFailed;
     if (probe.host_stream_calls != 1 or probe.host_stream_writes <= 1 or
         probe.host_stream_max_chunk_bytes != 64 * 1024)
         return error.StreamCallbackContractFailed;
-    if (!probe.saw_read_result or !probe.saw_host_result or !probe.saw_stream_envelope or
+    if (!probe.saw_read_result or !probe.saw_file_change or !probe.saw_host_result or !probe.saw_stream_envelope or
         !probe.saw_artifact_recovery or !probe.saw_final_text or !probe.saw_final_output_segment)
         return error.MissingCoreEvent;
     try probe.beginRun(2);

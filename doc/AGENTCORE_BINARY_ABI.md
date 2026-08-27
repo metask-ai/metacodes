@@ -330,6 +330,7 @@ The v1 observation set is:
 | Tool execution observation | `tool_start` | Tool invocation identity, name, and input |
 | Tool execution observation | `tool_progress` | Incremental progress text for one tool call |
 | Tool execution observation | `tool_result` | Completed tool result, error flag, elapsed time, and optional successful file observations |
+| Workspace modification evidence | `file_changes` | Per-file outcomes, locators, byte counts, and bounded unified diffs from one typed file-tool call |
 | Run state and coarse progress | `run_state` | Root Run phase snapshot, per-Run transition sequence, turn/tool-call sample, and owned in-flight tool identities |
 | Run state and coarse progress | `progress` | Current 1-based turn and cumulative tool-call progress sample; not a lifecycle boundary |
 | Context management and accounting | `usage` | Token-usage delta |
@@ -375,9 +376,32 @@ classifies an output segment. Hosts must not reconstruct final-output semantics
 from Tool boundaries or Provider stop edges. Usage events are exact deltas and
 must use checked arithmetic.
 
+`file_changes` is emitted once for each typed file-tool call after the turn's
+Tools have completed and before the corresponding `tool_result`. Its `id` is
+the Tool-use identity used to correlate the two events. Each record carries a
+typed destination locator, an optional source locator for moves, `kind`,
+`status`, Tool identity, agent depth, before/after byte counts, and an optional
+bounded unified diff. `rejected`, `failed`, and `no_change` records are evidence
+of an attempted outcome, not claims that disk contents changed. `overflow` or
+`lost` makes incomplete batch evidence explicit. This contract covers typed
+file Tools only; filesystem mutations performed through `Bash` are not
+observed by it.
+
+Core file-change evidence may retain arbitrary file bytes, but AgentCore's JSON
+boundary publishes `unified_diff` only as valid UTF-8. A diff whose only
+invalidity is an incomplete trailing code point is shortened to its complete
+UTF-8 prefix; any other non-UTF-8 diff is omitted. Both cases set
+`diff_complete` to false while preserving the record, locator, outcome, byte
+counts, and batch completeness flags. This normalization affects only the
+serialized AgentCore observation and does not mutate Core-owned evidence.
+
 `output_segment_begin` and `output_segment_end` are additive ABI-v1 observation
 tags. Older Hosts decode them through the `unknown` observation path; no C ABI
 layout, function table, or Revision 14 change is involved.
+
+`file_changes` is likewise an additive ABI-v1 observation tag. Its JSON bytes
+are borrowed only for the synchronous callback; the Zig SDK decoder returns an
+owned typed value. Older Hosts retain the event through the `unknown` path.
 
 `thinking_chunk` is an additive ABI-v1 observation event. An older Host may
 decode it through the `unknown` observation path and ignore or retain it in
@@ -1193,6 +1217,7 @@ allocations or unbounded work:
 | MCP legacy default TTL / maximum accepted TTL | 30 s / 300 s |
 | one Run | 1000 turns |
 | one tool_result file_refs array / path / URI / title / kind | 32 / 4096 / 8192 / 256 / 64 bytes |
+| one file_changes array / retained unified diff per file | 64 records / 256 KiB |
 
 MCP schema and invocation JSON cross the depth/node/container/work admission
 gate before a dynamic JSON tree is allocated. Invocation JSON must have an

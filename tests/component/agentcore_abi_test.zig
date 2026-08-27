@@ -444,6 +444,62 @@ fn acceptEvent(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1
     return wire.EVENT_CONTINUE;
 }
 
+const PublicFileChangesProbe = struct {
+    expected_session: ?*wire.SessionHandle = null,
+    expected_run_id: u64 = 0,
+    rejected: u32 = 0,
+    applied: u32 = 0,
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        if (run.session != self.expected_session or run.run_id != self.expected_run_id)
+            return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const known = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        const value = switch (known) {
+            .file_changes => |changes| changes,
+            else => return wire.EVENT_CONTINUE,
+        };
+        if (!std.mem.eql(u8, value.id, "tu_write") or
+            !std.mem.eql(u8, value.name, "Write") or
+            value.changes.len != 1 or value.overflow or value.lost)
+            return wire.EVENT_FATAL;
+        const change = value.changes[0];
+        const path = switch (change.locator) {
+            .workspace_path => |path| path,
+            else => return wire.EVENT_FATAL,
+        };
+        if (!std.mem.eql(u8, path, "blocked.txt") or
+            !std.mem.eql(u8, change.tool, "Write") or
+            !std.mem.eql(u8, change.tool_use_id, "tu_write") or
+            change.kind != .created or change.agent_depth != 0)
+            return wire.EVENT_FATAL;
+        switch (change.status) {
+            .rejected => {
+                if (change.before_bytes != 0 or change.after_bytes != 0 or
+                    change.unified_diff != null or !change.diff_complete)
+                    return wire.EVENT_FATAL;
+                self.rejected += 1;
+            },
+            .applied => {
+                if (change.before_bytes != 0 or change.after_bytes == 0 or
+                    !change.diff_complete or
+                    std.mem.indexOf(u8, change.unified_diff orelse return wire.EVENT_FATAL, "+must-not-write") == null)
+                    return wire.EVENT_FATAL;
+                self.applied += 1;
+            },
+            else => return wire.EVENT_FATAL,
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
 const UiFailureProbe = struct {
     mode: UiFailureMode,
     api: ?sdk.Api = null,
@@ -4022,14 +4078,17 @@ test "L2 Revision 7 imported permission rules control the next Run" {
     host_config.allowed_tool_count = builtins.len;
     host_config.permission_rules = &initial_rules;
     var config = sessionCreateConfig(&host_config, "test-model");
+    var probe = PublicFileChangesProbe{};
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
-    callbacks.on_event = acceptEvent;
+    callbacks.ctx = &probe;
+    callbacks.on_event = PublicFileChangesProbe.event;
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
         api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
     );
+    probe.expected_session = session;
     defer if (session) |handle| {
         _ = api.session().destroy()(handle, &diagnostic);
     };
@@ -4038,6 +4097,7 @@ test "L2 Revision 7 imported permission rules control the next Run" {
     options.struct_size = @sizeOf(wire.RunOptionsV1);
     options.max_turns = 3;
     var result = std.mem.zeroes(wire.RunResultV1);
+    probe.expected_run_id = 1;
     try std.testing.expectEqual(
         wire.STATUS_OK,
         api.session().runText(
@@ -4055,6 +4115,7 @@ test "L2 Revision 7 imported permission rules control the next Run" {
         error.FileNotFound,
         std.Io.Dir.cwd().access(std.testing.io, written_path, .{}),
     );
+    try std.testing.expectEqual(@as(u32, 0), probe.applied);
 
     const allow_write = [_]wire.BytesViewV1{sdk.bytesView("Write")};
     var replacement_rules = std.mem.zeroes(wire.PermissionRuleSetV1);
@@ -4065,6 +4126,7 @@ test "L2 Revision 7 imported permission rules control the next Run" {
         wire.STATUS_OK,
         api.sessionControl().updatePermissionRules()(session, &replacement_rules, &diagnostic),
     );
+    probe.expected_run_id = 2;
     try std.testing.expectEqual(
         wire.STATUS_OK,
         api.session().runText(
@@ -4076,6 +4138,7 @@ test "L2 Revision 7 imported permission rules control the next Run" {
             &diagnostic,
         ),
     );
+    try std.testing.expectEqual(@as(u32, 1), probe.applied);
     try std.Io.Dir.cwd().access(std.testing.io, written_path, .{});
 }
 
@@ -7220,6 +7283,48 @@ test "L2 every public AgentCoreEventV1 mapping preserves its complete payload" {
             .content = "result-content",
             .is_error = true,
             .elapsed_ms = 33,
+        } },
+    );
+    const internal_changes = [_]core.file_change.Record{.{
+        .locator = .{ .workspace_path = "src/new.zig" },
+        .from_locator = .{ .workspace_path = "src/old.zig" },
+        .kind = .moved,
+        .status = .partial,
+        .tool = "ApplyPatch",
+        .tool_use_id = "change-id",
+        .agent_depth = 2,
+        .before_bytes = 11,
+        .after_bytes = 22,
+        .unified_diff = "-old\n+new\n",
+        .diff_complete = false,
+    }};
+    const public_changes = [_]sdk.FileChangeRecord{.{
+        .locator = .{ .workspace_path = "src/new.zig" },
+        .from_locator = .{ .workspace_path = "src/old.zig" },
+        .kind = .moved,
+        .status = .partial,
+        .tool = "ApplyPatch",
+        .tool_use_id = "change-id",
+        .agent_depth = 2,
+        .before_bytes = 11,
+        .after_bytes = 22,
+        .unified_diff = "-old\n+new\n",
+        .diff_complete = false,
+    }};
+    try expectMappedEventEquals(
+        .{ .file_changes = .{
+            .id = "change-id",
+            .name = "ApplyPatch",
+            .changes = &internal_changes,
+            .overflow = true,
+            .lost = true,
+        } },
+        .{ .file_changes = .{
+            .id = "change-id",
+            .name = "ApplyPatch",
+            .changes = &public_changes,
+            .overflow = true,
+            .lost = true,
         } },
     );
     try expectMappedEventEquals(

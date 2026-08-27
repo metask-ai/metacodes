@@ -169,6 +169,42 @@ pub const MAX_FILE_REF_URI_BYTES_V1: usize = 8192;
 pub const MAX_FILE_REF_TITLE_BYTES_V1: usize = 256;
 pub const MAX_FILE_REF_KIND_BYTES_V1: usize = 64;
 
+/// What happened to one target in a typed file-tool invocation.
+pub const FileChangeKind = enum {
+    created,
+    modified,
+    deleted,
+    moved,
+};
+
+/// Whether the intended per-file change reached the filesystem.
+pub const FileChangeStatus = enum {
+    applied,
+    no_change,
+    failed,
+    rejected,
+    partial,
+};
+
+/// One actual file-tool outcome. Every slice is owned by the
+/// `ParsedCoreEvent` returned by `decodeCoreEvent`.
+pub const FileChangeRecord = struct {
+    locator: FileReferenceLocator,
+    from_locator: ?FileReferenceLocator = null,
+    kind: FileChangeKind,
+    status: FileChangeStatus,
+    tool: []const u8,
+    tool_use_id: []const u8,
+    agent_depth: u8,
+    before_bytes: u64,
+    after_bytes: u64,
+    unified_diff: ?[]const u8 = null,
+    diff_complete: bool = true,
+};
+
+pub const MAX_FILE_CHANGES_PER_TOOL_RESULT_V1: usize = 64;
+pub const MAX_UNIFIED_DIFF_BYTES_V1: usize = 256 * 1024;
+
 /// AgentLoop's authoritative classification of one closed visible-output
 /// segment. Consumers must not infer these states from Provider stream edges.
 pub const OutputSegmentDisposition = enum {
@@ -217,6 +253,13 @@ pub const CoreEvent = union(enum) {
         is_error: bool,
         elapsed_ms: u64 = 0,
         file_refs: ?[]const FileReference = null,
+    },
+    file_changes: struct {
+        id: []const u8,
+        name: []const u8,
+        changes: []const FileChangeRecord,
+        overflow: bool = false,
+        lost: bool = false,
     },
     usage: UsageDelta,
     context_warning: struct {
@@ -611,6 +654,7 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
         switch (known) {
             .permission_provenance => |value| try validatePermissionProvenance(value),
             .tool_result => |value| try validateFileReferences(value.file_refs),
+            .file_changes => |value| try validateFileChanges(value.changes),
             else => {},
         }
         return .{ .arena = arena, .value = .{ .known = known } };
@@ -641,14 +685,7 @@ fn validateFileReferences(refs: ?[]const FileReference) DecodeError!void {
     for (values) |ref| {
         if (ref.title.len > MAX_FILE_REF_TITLE_BYTES_V1 or ref.kind.len > MAX_FILE_REF_KIND_BYTES_V1)
             return error.InvalidPayload;
-        switch (ref.locator) {
-            .workspace_path, .absolute_path => |path| {
-                if (path.len > MAX_FILE_REF_PATH_BYTES_V1) return error.InvalidPayload;
-            },
-            .uri => |uri| {
-                if (uri.len > MAX_FILE_REF_URI_BYTES_V1) return error.InvalidPayload;
-            },
-        }
+        try validateFileLocator(ref.locator);
         if (ref.range) |range| {
             if (range.start.line == 0 or range.end.line == 0 or
                 range.start.column == 0 or range.end.column == 0)
@@ -656,6 +693,28 @@ fn validateFileReferences(refs: ?[]const FileReference) DecodeError!void {
             if (range.end.line < range.start.line or
                 (range.end.line == range.start.line and range.end.column < range.start.column))
                 return error.InvalidPayload;
+        }
+    }
+}
+
+fn validateFileLocator(locator: FileReferenceLocator) DecodeError!void {
+    switch (locator) {
+        .workspace_path, .absolute_path => |path| {
+            if (path.len > MAX_FILE_REF_PATH_BYTES_V1) return error.InvalidPayload;
+        },
+        .uri => |uri| {
+            if (uri.len > MAX_FILE_REF_URI_BYTES_V1) return error.InvalidPayload;
+        },
+    }
+}
+
+fn validateFileChanges(changes: []const FileChangeRecord) DecodeError!void {
+    if (changes.len > MAX_FILE_CHANGES_PER_TOOL_RESULT_V1) return error.InvalidPayload;
+    for (changes) |change| {
+        try validateFileLocator(change.locator);
+        if (change.from_locator) |locator| try validateFileLocator(locator);
+        if (change.unified_diff) |diff| {
+            if (diff.len > MAX_UNIFIED_DIFF_BYTES_V1) return error.InvalidPayload;
         }
     }
 }
@@ -1259,6 +1318,7 @@ test "CoreEvent decoder covers every ABI v1 tag" {
         "{\"tool_progress\":{\"id\":\"t1\",\"text\":\"working\"}}",
         "{\"progress\":{\"turn\":1,\"tool_name\":\"Read\",\"tool_input\":\"{}\",\"tool_calls\":2}}",
         "{\"tool_result\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false,\"elapsed_ms\":18446744073709551615}}",
+        "{\"file_changes\":{\"id\":\"t2\",\"name\":\"Edit\",\"changes\":[{\"locator\":{\"workspace_path\":\"src/main.zig\"},\"from_locator\":null,\"kind\":\"modified\",\"status\":\"applied\",\"tool\":\"Edit\",\"tool_use_id\":\"t2\",\"agent_depth\":0,\"before_bytes\":1,\"after_bytes\":2,\"unified_diff\":\"+x\\n\",\"diff_complete\":true}],\"overflow\":false,\"lost\":false}}",
         "{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4}}",
         "{\"context_warning\":{\"current_tokens\":1,\"warning_threshold\":2,\"auto_compact_threshold\":3,\"blocking_limit\":4,\"level\":\"medium\"}}",
         "{\"auto_compact\":{\"dropped\":1,\"kept\":2,\"before_tokens\":3,\"after_tokens\":4,\"cause\":\"trigger\"}}",
@@ -1357,6 +1417,45 @@ test "CoreEvent decoder accepts bounded file references and rejects oversized on
         std.testing.allocator,
         "{\"tool_result\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false,\"file_refs\":[{\"locator\":{\"workspace_path\":\"x\"},\"title\":\"x\",\"kind\":\"read\",\"range\":{\"start\":{\"line\":3,\"column\":1},\"end\":{\"line\":2,\"column\":1}}}]}}",
     ));
+}
+
+test "CoreEvent decoder accepts bounded file changes and rejects oversized ones" {
+    var parsed = try decodeCoreEvent(
+        std.testing.allocator,
+        "{\"file_changes\":{\"id\":\"t1\",\"name\":\"ApplyPatch\",\"changes\":[{\"locator\":{\"workspace_path\":\"src/new.zig\"},\"from_locator\":{\"workspace_path\":\"src/old.zig\"},\"kind\":\"moved\",\"status\":\"applied\",\"tool\":\"ApplyPatch\",\"tool_use_id\":\"t1\",\"agent_depth\":1,\"before_bytes\":3,\"after_bytes\":4,\"unified_diff\":\"-old\\n+new\\n\",\"diff_complete\":true}],\"overflow\":false,\"lost\":false}}",
+    );
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .known => |event| switch (event) {
+            .file_changes => |value| {
+                try std.testing.expectEqual(@as(usize, 1), value.changes.len);
+                try std.testing.expectEqual(FileChangeKind.moved, value.changes[0].kind);
+                try std.testing.expectEqual(FileChangeStatus.applied, value.changes[0].status);
+                try std.testing.expectEqualStrings("src/old.zig", value.changes[0].from_locator.?.workspace_path);
+                try std.testing.expectEqualStrings("-old\n+new\n", value.changes[0].unified_diff.?);
+            },
+            else => return error.UnexpectedEvent,
+        },
+        .unknown => return error.UnexpectedEvent,
+    }
+
+    var too_many = std.ArrayList(u8).empty;
+    defer too_many.deinit(std.testing.allocator);
+    try too_many.appendSlice(std.testing.allocator, "{\"file_changes\":{\"id\":\"t1\",\"name\":\"Edit\",\"changes\":[");
+    var i: usize = 0;
+    while (i < MAX_FILE_CHANGES_PER_TOOL_RESULT_V1 + 1) : (i += 1) {
+        if (i != 0) try too_many.append(std.testing.allocator, ',');
+        try too_many.appendSlice(std.testing.allocator, "{\"locator\":{\"workspace_path\":\"x\"},\"kind\":\"modified\",\"status\":\"applied\",\"tool\":\"Edit\",\"tool_use_id\":\"t1\",\"agent_depth\":0,\"before_bytes\":1,\"after_bytes\":2}");
+    }
+    try too_many.appendSlice(std.testing.allocator, "]}}");
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(std.testing.allocator, too_many.items));
+
+    var oversized_diff = std.ArrayList(u8).empty;
+    defer oversized_diff.deinit(std.testing.allocator);
+    try oversized_diff.appendSlice(std.testing.allocator, "{\"file_changes\":{\"id\":\"t1\",\"name\":\"Edit\",\"changes\":[{\"locator\":{\"workspace_path\":\"x\"},\"kind\":\"modified\",\"status\":\"applied\",\"tool\":\"Edit\",\"tool_use_id\":\"t1\",\"agent_depth\":0,\"before_bytes\":1,\"after_bytes\":2,\"unified_diff\":\"");
+    try oversized_diff.appendNTimes(std.testing.allocator, 'x', MAX_UNIFIED_DIFF_BYTES_V1 + 1);
+    try oversized_diff.appendSlice(std.testing.allocator, "\"}]}}");
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(std.testing.allocator, oversized_diff.items));
 }
 
 test "CoreEvent decoder normalizes malformed and invalid inputs" {

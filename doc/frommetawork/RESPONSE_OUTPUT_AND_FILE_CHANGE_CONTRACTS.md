@@ -182,9 +182,10 @@ changes[]}`——版本由模块自己盖进信封(对齐仓库惯例：只声�
   串行化的是账本自己的调用，串行化不了 allocator，而 App GPA 非线程安全。
 - 工具写完盘却在渲染结果时失败(如 gitDiff OOM)：dispatch 缝合处看 `effect_slot` 是否已有真实
   mutation，有则报 `partial` 而非 `failed`——宁可说"可能改了"，不能说"没改"。
-- AgentCore 通过既有 `on_event` JSON 观察流导出 `output_segment_begin/end`，完整保留段标识、
-  定性和字节数；这是可前向兼容的新观察 tag，不改变 C 布局或 Revision 14。`file_changes` 仍不
-  导出。ApplyPatch phase-1 校验失败只对**已建好计划**的文件报 `rejected`，触发失败的那个文件
+- AgentCore 通过既有 `on_event` JSON 观察流导出 `output_segment_begin/end` 与
+  `file_changes`。输出段事件完整保留段标识、定性和字节数；文件变更事件直接保留 Core 的
+  批次与逐文件证据。它们都是可前向兼容的新观察 tag，不改变 C 布局或 Revision 14。
+  ApplyPatch phase-1 校验失败只对**已建好计划**的文件报 `rejected`，触发失败的那个文件
   还没进计划表(整批零落盘，故没有谎报，但目标清单不完整)。
 - `--stream-json` 已投影输出段定性(新增 `output_segment_begin/end` 两种 type，按该模块声明的
   前向兼容约定增量加行)，但**未投影 `file_changes`**——那条事件带整段 diff，塞进逐行时间线

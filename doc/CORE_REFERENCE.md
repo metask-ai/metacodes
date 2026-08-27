@@ -424,9 +424,10 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
 - **`--stream-json` 已投影输出段定性**(`output_segment_begin/end` 行),但**未投影 file_changes**
   ——那条事件带整段 diff,塞进逐行时间线会把流撑爆;需要文件修改的消费者走 `--json` 结果行的
   `file_changes` 数组或直接消费 CoreEvent。TUI 对两组事件都 no-op(边流边渲染,不需要事后重标)。
-- **AgentCore 的既有 `on_event` JSON 观察流已导出 `output_segment_begin/end`**，完整携带
-  `index/turn/group/disposition/bytes`。这是新增可前向兼容的观察 tag，不改变 C 布局、函数表或
-  Revision 14；旧 SDK 会把它们保留为 `unknown`。`file_changes` 仍不导出。
+- **AgentCore 的既有 `on_event` JSON 观察流已导出 `output_segment_begin/end` 与
+  `file_changes`**。前者完整携带段标识、定性和字节数；后者直接保留 Core 的批次、逐文件
+  结果、定位符、字节数和有界 diff。它们都是 Revision 14 下可前向兼容的新增观察 tag；旧
+  SDK 会把它们保留为 `unknown`。
 - **ApplyPatch phase-1 校验失败**(解析错/定位不到/Add 撞已存在)只对**已建好计划**的文件报
   `rejected`;触发失败的那个文件还没进计划表,只出现在工具错误 detail 里。整批零落盘,故没有
   谎报,但目标清单不完整——登记而非假装完整。
