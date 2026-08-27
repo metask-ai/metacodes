@@ -319,41 +319,65 @@ are explicitly mapped or excluded.
 
 The v1 observation set is:
 
-| Event | Meaning |
-|---|---|
-| `text_chunk` | Assistant text delta |
-| `thinking_chunk` | Model reasoning delta, separate from visible assistant text and final-output reconstruction |
-| `stream_done` | One provider stream completed |
-| `tool_start` | Tool invocation identity, name, and input |
-| `tool_progress` | Incremental progress text for one tool call |
-| `progress` | Current 1-based turn and cumulative tool-call progress |
-| `tool_result` | Completed tool result, error flag, elapsed time, and optional successful file observations |
-| `usage` | Token-usage delta |
-| `context_warning` | Context-pressure thresholds and level |
-| `auto_compact` | Conversation compaction summary |
-| `retry_notice` | Provider retry attempt and delay |
-| `run_state` | Root Run phase snapshot, per-Run transition sequence, turn/tool-call sample, and owned in-flight tool identities |
-| `permission_provenance` | Final Permission decision, canonical source, request binding, generation, and typed callback outcome |
+| Semantic group | Event | Meaning |
+|---|---|---|
+| Assistant visible-output segment protocol | `output_segment_begin` | Opens one visible-output segment and identifies its Run-local index, turn, and continuation group |
+| Assistant visible-output segment protocol | `text_chunk` | UTF-8 data delta belonging to the currently open visible-output segment |
+| Assistant visible-output segment protocol | `output_segment_end` | Closes that segment with the authoritative `commentary` / `final` / `continued` / `partial` / `discarded` disposition and byte count |
+| Model reasoning-channel observation | `thinking_chunk` | Model reasoning delta, outside visible-output segments and final-output reconstruction |
+| Provider stream boundary and retry | `stream_done` | One Provider stream completed; not a segment, turn, or Run completion signal |
+| Provider stream boundary and retry | `retry_notice` | Provider retry attempt and delay |
+| Tool execution observation | `tool_start` | Tool invocation identity, name, and input |
+| Tool execution observation | `tool_progress` | Incremental progress text for one tool call |
+| Tool execution observation | `tool_result` | Completed tool result, error flag, elapsed time, and optional successful file observations |
+| Run state and coarse progress | `run_state` | Root Run phase snapshot, per-Run transition sequence, turn/tool-call sample, and owned in-flight tool identities |
+| Run state and coarse progress | `progress` | Current 1-based turn and cumulative tool-call progress sample; not a lifecycle boundary |
+| Context management and accounting | `usage` | Token-usage delta |
+| Context management and accounting | `context_warning` | Context-pressure thresholds and level |
+| Context management and accounting | `auto_compact` | Conversation compaction summary |
+| Permission-decision evidence | `permission_provenance` | Final Permission decision, canonical source, request binding, generation, and typed callback outcome |
 
 Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
 loop.
 
+`on_event` is a non-durable Run observation stream delivered serially per
+Session. A Host processes one Session's events in callback-arrival order, and
+the callback is not concurrently re-entered for that Session even when events
+originate from concurrent Tool workers. Different Sessions have no global
+ordering and may invoke their callbacks concurrently. The stream has no common
+event sequence number, cursor, replay, or exactly-once contract; only
+`run_state.transition_seq` orders RunState snapshots.
+
 `on_event` is mandatory in Revision 14. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
 and advances only for emitted RunState snapshots. Usage remains authoritative
-in the existing usage event stream. To reconstruct final visible assistant
-output, a Host accumulates only closed segments: `text_chunk` appends to the
-current segment and `stream_done` closes it. `tool_start` and `tool_result` are
-semantic boundaries that discard any unclosed segment and all previously
-closed accumulated segments; consecutive boundaries are idempotent and
-`tool_progress` and `thinking_chunk` are not boundaries. The final output is
-the concatenation of all closed segments after the last boundary, or all closed
-segments when no boundary occurred. This preserves max-token continuations
-while excluding pre-tool drafts. `thinking_chunk` never contributes to the
-current segment or final output. Usage events are exact deltas and must use
-checked arithmetic.
+in the existing usage event stream.
+
+Visible assistant output is bracketed by `output_segment_begin` and
+`output_segment_end`. Their `index`, `turn`, and `group` match, at most one
+segment is open in a Run, and `index` increases within that Run. Every
+`text_chunk` belongs to the currently open segment. `thinking_chunk` is an
+independent reasoning channel and never contributes to a visible segment or
+final output. The closing `bytes` is the segment's UTF-8 byte count and its
+disposition is authoritative:
+
+- `commentary`: visible process output, not part of the completed answer;
+- `continued`: retained pending another segment in the same `group`;
+- `final`: completes the answer together with preceding `continued` segments
+  in that group;
+- `partial`: visible but incomplete output;
+- `discarded`: rolled-back bytes that the Host must remove or ignore.
+
+`stream_done` means only that one Provider stream ended; it neither closes nor
+classifies an output segment. Hosts must not reconstruct final-output semantics
+from Tool boundaries or Provider stop edges. Usage events are exact deltas and
+must use checked arithmetic.
+
+`output_segment_begin` and `output_segment_end` are additive ABI-v1 observation
+tags. Older Hosts decode them through the `unknown` observation path; no C ABI
+layout, function table, or Revision 14 change is involved.
 
 `thinking_chunk` is an additive ABI-v1 observation event. An older Host may
 decode it through the `unknown` observation path and ignore or retain it in

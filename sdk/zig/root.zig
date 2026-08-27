@@ -8,6 +8,7 @@ pub const Status = types.Status;
 pub const StopReason = types.StopReason;
 pub const ProviderKind = types.ProviderKind;
 pub const CoreEvent = protocol.CoreEvent;
+pub const OutputSegmentDisposition = protocol.OutputSegmentDisposition;
 pub const FileReference = protocol.FileReference;
 pub const FileReferenceLocator = protocol.FileReferenceLocator;
 pub const FileReferencePosition = protocol.FileReferencePosition;

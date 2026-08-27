@@ -135,16 +135,30 @@ const CONTINUATION_TAIL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
-/// Independent Host-side oracle for the public A1 recipe. It deliberately
-/// knows nothing about Conversation internals.
+/// Independent Host-side oracle for the public visible-output segment
+/// protocol. It deliberately knows nothing about Conversation or AgentLoop
+/// internals.
 const ReconstructionProbe = struct {
     current: [128]u8 = undefined,
     current_len: usize = 0,
+    group: [256]u8 = undefined,
+    group_len: usize = 0,
+    group_id: u32 = 0,
     answer: [256]u8 = undefined,
     answer_len: usize = 0,
     thinking: [128]u8 = undefined,
     thinking_len: usize = 0,
     stream_done_count: usize = 0,
+    segment_begin_count: usize = 0,
+    commentary_count: usize = 0,
+    final_count: usize = 0,
+    continued_count: usize = 0,
+    partial_count: usize = 0,
+    discarded_count: usize = 0,
+    segment_open: bool = false,
+    segment_index: u32 = 0,
+    segment_turn: u32 = 0,
+    segment_group: u32 = 0,
     usage: sdk.protocol.UsageDelta = .{},
 
     fn checkedAdd(dst: *u64, value: u64) bool {
@@ -162,7 +176,18 @@ const ReconstructionProbe = struct {
             .unknown => return wire.EVENT_CONTINUE,
         };
         switch (event_value) {
+            .output_segment_begin => |segment| {
+                if (self.segment_open or (self.group_len != 0 and self.group_id != segment.group))
+                    return wire.EVENT_FATAL;
+                self.current_len = 0;
+                self.segment_open = true;
+                self.segment_index = segment.index;
+                self.segment_turn = segment.turn;
+                self.segment_group = segment.group;
+                self.segment_begin_count += 1;
+            },
             .text_chunk => |text| {
+                if (!self.segment_open) return wire.EVENT_FATAL;
                 if (text.len > self.current.len - self.current_len) return wire.EVENT_FATAL;
                 @memcpy(self.current[self.current_len..][0..text.len], text);
                 self.current_len += text.len;
@@ -173,14 +198,44 @@ const ReconstructionProbe = struct {
                 self.thinking_len += text.len;
             },
             .stream_done => {
-                if (self.current_len > self.answer.len - self.answer_len) return wire.EVENT_FATAL;
-                @memcpy(self.answer[self.answer_len..][0..self.current_len], self.current[0..self.current_len]);
-                self.answer_len += self.current_len;
-                self.current_len = 0;
                 self.stream_done_count += 1;
             },
-            .tool_start, .tool_result => {
-                self.answer_len = 0;
+            .output_segment_end => |segment| {
+                if (!self.segment_open or
+                    self.segment_index != segment.index or
+                    self.segment_turn != segment.turn or
+                    self.segment_group != segment.group or
+                    segment.bytes != @as(u64, @intCast(self.current_len)))
+                    return wire.EVENT_FATAL;
+                self.segment_open = false;
+
+                switch (segment.disposition) {
+                    .continued, .final => {
+                        if (self.group_len == 0) self.group_id = segment.group;
+                        if (self.group_id != segment.group or self.current_len > self.group.len - self.group_len)
+                            return wire.EVENT_FATAL;
+                        @memcpy(self.group[self.group_len..][0..self.current_len], self.current[0..self.current_len]);
+                        self.group_len += self.current_len;
+                        if (segment.disposition == .continued) {
+                            self.continued_count += 1;
+                        } else {
+                            if (self.group_len > self.answer.len) return wire.EVENT_FATAL;
+                            @memcpy(self.answer[0..self.group_len], self.group[0..self.group_len]);
+                            self.answer_len = self.group_len;
+                            self.group_len = 0;
+                            self.final_count += 1;
+                        }
+                    },
+                    .commentary => {
+                        self.group_len = 0;
+                        self.commentary_count += 1;
+                    },
+                    .partial => {
+                        self.group_len = 0;
+                        self.partial_count += 1;
+                    },
+                    .discarded => self.discarded_count += 1,
+                }
                 self.current_len = 0;
             },
             .usage => |usage| {
@@ -196,16 +251,25 @@ const ReconstructionProbe = struct {
     }
 };
 
-test "Host reconstruction oracle resets at public tool boundaries" {
+test "Host reconstruction oracle follows public output segment dispositions" {
     var probe = ReconstructionProbe{};
     const events = [_][]const u8{
+        "{\"output_segment_begin\":{\"index\":1,\"turn\":1,\"group\":1}}",
         "{\"text_chunk\":\"provisional\"}",
         "{\"stream_done\":{}}",
-        "{\"text_chunk\":\"unclosed\"}",
-        "{\"tool_start\":{\"id\":\"t\",\"name\":\"Read\",\"input\":\"{}\"}}",
-        "{\"tool_result\":{\"id\":\"t\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false}}",
-        "{\"text_chunk\":\"final\"}",
+        "{\"output_segment_end\":{\"index\":1,\"turn\":1,\"group\":1,\"disposition\":\"commentary\",\"bytes\":11}}",
+        "{\"output_segment_begin\":{\"index\":2,\"turn\":2,\"group\":2}}",
+        "{\"text_chunk\":\"head\"}",
         "{\"stream_done\":{}}",
+        "{\"output_segment_end\":{\"index\":2,\"turn\":2,\"group\":2,\"disposition\":\"continued\",\"bytes\":4}}",
+        "{\"output_segment_begin\":{\"index\":3,\"turn\":2,\"group\":2}}",
+        "{\"text_chunk\":\"discarded\"}",
+        "{\"stream_done\":{}}",
+        "{\"output_segment_end\":{\"index\":3,\"turn\":2,\"group\":2,\"disposition\":\"discarded\",\"bytes\":9}}",
+        "{\"output_segment_begin\":{\"index\":4,\"turn\":2,\"group\":2}}",
+        "{\"text_chunk\":\"tail\"}",
+        "{\"stream_done\":{}}",
+        "{\"output_segment_end\":{\"index\":4,\"turn\":2,\"group\":2,\"disposition\":\"final\",\"bytes\":4}}",
     };
     for (events) |encoded| {
         try std.testing.expectEqual(
@@ -213,7 +277,12 @@ test "Host reconstruction oracle resets at public tool boundaries" {
             ReconstructionProbe.event(&probe, null, sdk.bytesView(encoded)),
         );
     }
-    try std.testing.expectEqualStrings("final", probe.answer[0..probe.answer_len]);
+    try std.testing.expectEqualStrings("headtail", probe.answer[0..probe.answer_len]);
+    try std.testing.expectEqual(@as(usize, 4), probe.segment_begin_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.commentary_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.continued_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.discarded_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.final_count);
 }
 
 /// Test Host registry implementing the consumer-side §4 contract. The binding
@@ -4231,6 +4300,12 @@ test "L2 public events reconstruct continuation output and observable run usage"
     try std.testing.expectEqualStrings("headtail", probe.answer[0..probe.answer_len]);
     try std.testing.expectEqualStrings("private reasoning", probe.thinking[0..probe.thinking_len]);
     try std.testing.expectEqual(@as(usize, 2), probe.stream_done_count);
+    try std.testing.expectEqual(@as(usize, 2), probe.segment_begin_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.continued_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.final_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.commentary_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.partial_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.discarded_count);
     try std.testing.expectEqual(@as(u64, 11), probe.usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 5), probe.usage.output_tokens);
 }
@@ -7083,9 +7158,40 @@ fn expectMappedEventEquals(event: core.protocol.ui_event.CoreEvent, expected: sd
     }
 }
 
+fn expectOutputSegmentEndMapping(
+    disposition: core.output_semantics.Disposition,
+    expected_disposition: sdk.OutputSegmentDisposition,
+) !void {
+    try expectMappedEventEquals(
+        .{ .output_segment_end = .{
+            .index = 17,
+            .turn = 18,
+            .group = 19,
+            .disposition = disposition,
+            .bytes = 20,
+        } },
+        .{ .output_segment_end = .{
+            .index = 17,
+            .turn = 18,
+            .group = 19,
+            .disposition = expected_disposition,
+            .bytes = 20,
+        } },
+    );
+}
+
 test "L2 every public AgentCoreEventV1 mapping preserves its complete payload" {
     try expectMappedEventEquals(.{ .text_chunk = "text-sentinel" }, .{ .text_chunk = "text-sentinel" });
     try expectMappedEventEquals(.{ .thinking_chunk = "thinking-sentinel" }, .{ .thinking_chunk = "thinking-sentinel" });
+    try expectMappedEventEquals(
+        .{ .output_segment_begin = .{ .index = 7, .turn = 8, .group = 9 } },
+        .{ .output_segment_begin = .{ .index = 7, .turn = 8, .group = 9 } },
+    );
+    try expectOutputSegmentEndMapping(.commentary, .commentary);
+    try expectOutputSegmentEndMapping(.final, .final);
+    try expectOutputSegmentEndMapping(.continued, .continued);
+    try expectOutputSegmentEndMapping(.partial, .partial);
+    try expectOutputSegmentEndMapping(.discarded, .discarded);
     try expectMappedEventEquals(
         .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },
         .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },

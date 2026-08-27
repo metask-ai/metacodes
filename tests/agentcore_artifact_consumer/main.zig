@@ -104,6 +104,12 @@ const Probe = struct {
     saw_stream_envelope: bool = false,
     saw_artifact_recovery: bool = false,
     saw_final_text: bool = false,
+    saw_final_output_segment: bool = false,
+    output_segment_open: bool = false,
+    output_segment_index: u32 = 0,
+    output_segment_turn: u32 = 0,
+    output_segment_group: u32 = 0,
+    output_segment_bytes: u64 = 0,
 
     fn registerSession(self: *Probe, session: *wire.SessionHandle) !void {
         self.identity_mutex.lock();
@@ -130,7 +136,8 @@ const Probe = struct {
     fn endRun(self: *Probe, run_id: u64) !void {
         self.identity_mutex.lock();
         defer self.identity_mutex.unlock();
-        if (self.active_run_id != run_id) return error.InvalidHostLifecycle;
+        if (self.active_run_id != run_id or self.output_segment_open)
+            return error.InvalidHostLifecycle;
         self.active_run_id = 0;
     }
 
@@ -156,6 +163,14 @@ const Probe = struct {
         defer parsed.deinit();
         switch (parsed.value) {
             .known => |known_event| switch (known_event) {
+                .output_segment_begin => |segment| {
+                    if (self.output_segment_open) return wire.EVENT_FATAL;
+                    self.output_segment_open = true;
+                    self.output_segment_index = segment.index;
+                    self.output_segment_turn = segment.turn;
+                    self.output_segment_group = segment.group;
+                    self.output_segment_bytes = 0;
+                },
                 .tool_result => |result| {
                     if (std.mem.eql(u8, result.name, "Read") and !result.is_error and
                         std.mem.indexOf(u8, result.content, "artifact-read-ok") != null)
@@ -172,7 +187,24 @@ const Probe = struct {
                         self.saw_artifact_recovery = true;
                 },
                 .text_chunk => |text| {
+                    if (!self.output_segment_open) return wire.EVENT_FATAL;
+                    self.output_segment_bytes = std.math.add(
+                        u64,
+                        self.output_segment_bytes,
+                        @intCast(text.len),
+                    ) catch return wire.EVENT_FATAL;
                     if (std.mem.eql(u8, text, "artifact done")) self.saw_final_text = true;
+                },
+                .output_segment_end => |segment| {
+                    if (!self.output_segment_open or
+                        segment.index != self.output_segment_index or
+                        segment.turn != self.output_segment_turn or
+                        segment.group != self.output_segment_group or
+                        segment.bytes != self.output_segment_bytes)
+                        return wire.EVENT_FATAL;
+                    self.output_segment_open = false;
+                    if (segment.disposition == .final and segment.bytes == "artifact done".len)
+                        self.saw_final_output_segment = true;
                 },
                 else => {},
             },
@@ -621,7 +653,7 @@ pub fn main(init: std.process.Init) !void {
         probe.host_stream_max_chunk_bytes != 64 * 1024)
         return error.StreamCallbackContractFailed;
     if (!probe.saw_read_result or !probe.saw_host_result or !probe.saw_stream_envelope or
-        !probe.saw_artifact_recovery or !probe.saw_final_text)
+        !probe.saw_artifact_recovery or !probe.saw_final_text or !probe.saw_final_output_segment)
         return error.MissingCoreEvent;
     try probe.beginRun(2);
     try expectStatus(.ok, api.session().runSkill(

@@ -89,7 +89,11 @@ must validate ABI revision 14, the exact 64-byte root, all five mandatory typed
 tables, reserved zeros, function slots, and the schema-1 bundle manifest.
 Runtime/Session, sync run, abort, event/UI callbacks, checkpoint/restore, Host
 streaming tools, MCP streaming, process plugins, and durable journal profiles
-are covered. Independent Completion is deliberately not part of AgentCore: a
+are covered. `on_event` is the per-Session serialized, non-durable Run
+observation stream. Its typed events include authoritative visible-output
+segment boundaries and `commentary` / `final` / `continued` / `partial` /
+`discarded` classifications as additive Revision 14 observation tags.
+Independent Completion is deliberately not part of AgentCore: a
 Host owns product-level model calls and exposes only semantically bounded Tools
 when an Agent must invoke one.
 

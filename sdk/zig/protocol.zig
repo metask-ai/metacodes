@@ -169,9 +169,31 @@ pub const MAX_FILE_REF_URI_BYTES_V1: usize = 8192;
 pub const MAX_FILE_REF_TITLE_BYTES_V1: usize = 256;
 pub const MAX_FILE_REF_KIND_BYTES_V1: usize = 64;
 
+/// AgentLoop's authoritative classification of one closed visible-output
+/// segment. Consumers must not infer these states from Provider stream edges.
+pub const OutputSegmentDisposition = enum {
+    commentary,
+    final,
+    continued,
+    partial,
+    discarded,
+};
+
 pub const CoreEvent = union(enum) {
     text_chunk: []const u8,
     thinking_chunk: []const u8,
+    output_segment_begin: struct {
+        index: u32,
+        turn: u32,
+        group: u32,
+    },
+    output_segment_end: struct {
+        index: u32,
+        turn: u32,
+        group: u32,
+        disposition: OutputSegmentDisposition,
+        bytes: u64,
+    },
     tool_start: struct {
         id: []const u8,
         name: []const u8,
@@ -1231,6 +1253,8 @@ test "CoreEvent decoder covers every ABI v1 tag" {
     const cases = [_][]const u8{
         "{\"text_chunk\":\"hello\"}",
         "{\"thinking_chunk\":\"private reasoning\"}",
+        "{\"output_segment_begin\":{\"index\":1,\"turn\":2,\"group\":3}}",
+        "{\"output_segment_end\":{\"index\":1,\"turn\":2,\"group\":3,\"disposition\":\"final\",\"bytes\":4}}",
         "{\"tool_start\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\"}}",
         "{\"tool_progress\":{\"id\":\"t1\",\"text\":\"working\"}}",
         "{\"progress\":{\"turn\":1,\"tool_name\":\"Read\",\"tool_input\":\"{}\",\"tool_calls\":2}}",
