@@ -1326,22 +1326,19 @@ const Probe = struct {
         self.calls += 1;
         return .{ .ok = cc.tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
     }
-    fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-        return false;
+    fn metadata(_: *const anyopaque, _: []const u8) ?cc.tools.ToolMeta {
+        // 与内置 Write 共名的自定义 executor:显式 .external,不冒充内置身份。
+        return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
     }
     fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
         return null;
-    }
-    fn hostSync(_: *const anyopaque, _: []const u8) bool {
-        return false;
     }
     fn dispatcher(self: *Probe) cc.tools.ToolDispatcher {
         return .{
             .ctx = @ptrCast(self),
             .dispatchFn = dispatch,
-            .prefetchSafeFn = prefetchSafe,
+            .metadataFn = metadata,
             .nameAtFn = nameAt,
-            .hostSyncFn = hostSync,
         };
     }
 };
@@ -2950,22 +2947,19 @@ const VanishingWrite = struct {
         try pfs.unlinkPath(self.path.ptr);
         return .{ .ok = cc.tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, "claimed-success")) };
     }
-    fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-        return false;
+    fn metadata(_: *const anyopaque, _: []const u8) ?cc.tools.ToolMeta {
+        // 与内置 Write 共名的自定义 executor:显式 .external,不冒充内置身份。
+        return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
     }
     fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
         return null;
-    }
-    fn hostSync(_: *const anyopaque, _: []const u8) bool {
-        return false;
     }
     fn dispatcher(self: *@This()) cc.tools.ToolDispatcher {
         return .{
             .ctx = @ptrCast(self),
             .dispatchFn = dispatch,
-            .prefetchSafeFn = prefetchSafe,
+            .metadataFn = metadata,
             .nameAtFn = nameAt,
-            .hostSyncFn = hostSync,
         };
     }
 };

@@ -88,6 +88,15 @@ Runtime。`RuntimeHost.destroy` 停止新会话接纳，但已存在的 Session 
 旧默认工具面。profile 通过 `builtin_tool_bundle` 投影成原生 `ToolEntry`，不会给
 Read/Write/Bash 等热路径增加 callback 或进程 hop。
 
+自定义 `tools.ToolDispatcher` 实现者注意（breaking）：vtable 收敛为一个必填的
+`metadataFn`（`fn (ctx, name) ?ToolMeta`），原 `prefetchSafeFn` / `hostSyncFn` /
+`builtinFn` / `categoryFn` / `replayDeclarationFn` 五个字段已删除。一次 per-name
+解析同时回答执行器身份（builtin/host/external）、权限类别、replay 声明与预取
+标志，dispatch 与 metadata 因此无法接到不同的表；返回 `null` 表示该名在此目录
+不可选，dispatch 必须以 UnknownTool 失败，绝不执行。派生查询方法
+（`isBuiltin`/`isHostSync`/`category`/`replayDeclaration`/`prefetchSafe`）签名
+不变。AgentCore C ABI 不受影响——二进制包不暴露 ToolDispatcher 结构。
+
 Host tool 的结果带显式 `releaseFn`；Runtime 深拷贝描述符，但不拥有 callback
 context。不同 Session 的 callback 可以并发，锁由 Host 自己负责。Session 内同一
 时刻只允许一个 mutating/run/checkpoint 操作，非法并发返回 typed lifecycle error。

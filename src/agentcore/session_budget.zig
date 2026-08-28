@@ -609,12 +609,8 @@ pub const ToolEnvironment = struct {
             .dispatcher = .{
                 .ctx = self,
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = prefetchSafe,
+                .metadataFn = metadata,
                 .nameAtFn = nameAt,
-                .hostSyncFn = hostSync,
-                .builtinFn = isBuiltin,
-                .categoryFn = category,
-                .replayDeclarationFn = replayDeclaration,
             },
         };
     }
@@ -695,34 +691,17 @@ pub const ToolEnvironment = struct {
         return outcome;
     }
 
-    fn prefetchSafe(raw: *const anyopaque, name: []const u8) bool {
+    /// Budgeting is a pure dispatch decorator: name-level execution metadata
+    /// is delegated wholesale, so the base resolution (builtin identity,
+    /// category, replay, scheduling flags) survives this layer unmodified.
+    fn metadata(raw: *const anyopaque, name: []const u8) ?core.tools.ToolMeta {
         const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.prefetchSafe(name);
+        return self.base.dispatcher.metadata(name);
     }
 
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {
         const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
         return self.base.dispatcher.nameAt(index);
-    }
-
-    fn hostSync(raw: *const anyopaque, name: []const u8) bool {
-        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.isHostSync(name);
-    }
-
-    fn isBuiltin(raw: *const anyopaque, name: []const u8) bool {
-        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.isBuiltin(name);
-    }
-
-    fn category(raw: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
-        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.category(name);
-    }
-
-    fn replayDeclaration(raw: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
-        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.replayDeclaration(name);
     }
 };
 
@@ -1459,12 +1438,8 @@ const TestDispatcher = struct {
         return .{
             .ctx = self,
             .dispatchFn = dispatch,
-            .prefetchSafeFn = prefetchSafe,
+            .metadataFn = metadata,
             .nameAtFn = noName,
-            .hostSyncFn = hostSync,
-            .builtinFn = isBuiltin,
-            .categoryFn = category,
-            .replayDeclarationFn = replayDeclaration,
         };
     }
 
@@ -1481,24 +1456,14 @@ const TestDispatcher = struct {
         return .{ .ok = core.tools.ToolResultBody.initInline(bytes) };
     }
 
-    fn prefetchSafe(_: *const anyopaque, name: []const u8) bool {
-        return std.mem.eql(u8, name, "Read");
-    }
-
-    fn hostSync(_: *const anyopaque, _: []const u8) bool {
-        return false;
-    }
-
-    fn isBuiltin(_: *const anyopaque, name: []const u8) bool {
-        return std.mem.eql(u8, name, "Read");
-    }
-
-    fn category(_: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
-        return if (std.mem.eql(u8, name, "Read")) .read else null;
-    }
-
-    fn replayDeclaration(_: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
-        return if (std.mem.eql(u8, name, "Read")) .read_only else .never;
+    fn metadata(_: *const anyopaque, name: []const u8) ?core.tools.ToolMeta {
+        if (std.mem.eql(u8, name, "Read")) return .{
+            .kind = .builtin,
+            .category = .read,
+            .replay = .read_only,
+            .prefetch_safe = true,
+        };
+        return null;
     }
 
     fn noName(_: *const anyopaque, _: usize) ?[]const u8 {
@@ -1737,8 +1702,13 @@ test "artifact envelope allocation failure releases the Tool reservation" {
             ) };
         }
 
-        fn no(_: *const anyopaque, _: []const u8) bool {
-            return false;
+        fn metadata(_: *const anyopaque, _: []const u8) ?core.tools.ToolMeta {
+            return .{
+                .kind = .external,
+                .category = .execute,
+                .replay = .never,
+                .prefetch_safe = false,
+            };
         }
 
         fn noName(_: *const anyopaque, _: usize) ?[]const u8 {
@@ -1749,9 +1719,8 @@ test "artifact envelope allocation failure releases the Tool reservation" {
             return .{
                 .ctx = self,
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = no,
+                .metadataFn = metadata,
                 .nameAtFn = noName,
-                .hostSyncFn = no,
             };
         }
     };

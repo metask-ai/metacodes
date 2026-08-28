@@ -1991,8 +1991,15 @@ pub fn run(
                     continue;
                 }
             };
+            // With a Session dispatcher present, the directory is the only
+            // classification authority. A name it cannot resolve is not a
+            // known-read tool — default it to `.execute` (deny in plan, ask
+            // in default) instead of the legacy name-based read fallback;
+            // dispatch of such a name still fails as UnknownTool and feeds
+            // the existing guidance loop. The dyn_registry and
+            // null-dispatcher branches keep their legacy semantics.
             const classified = if (opts.tool_dispatcher) |dispatcher|
-                dispatcher.category(tu.name)
+                dispatcher.category(tu.name) orelse .execute
             else if (opts.dyn_registry) |registry|
                 registry.category(tu.name)
             else

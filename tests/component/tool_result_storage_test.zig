@@ -173,8 +173,14 @@ test "L2 runner projects after raw UI observation and recovers artifact on the n
                 return .{ .ok = cc.tools.ToolResultBody.initInline(try cc.read_artifact.execute(ctx, args)) };
             return .{ .host_rejected = null };
         }
-        fn prefetchSafe(_: *const anyopaque, name: []const u8) bool {
-            return std.mem.eql(u8, name, "ReadArtifact");
+        fn metadata(_: *const anyopaque, name: []const u8) ?cc.tool_context.ToolMeta {
+            // 镜像旧 per-fn 语义:全部按 host 声明,仅 ReadArtifact 可预取。
+            return .{
+                .kind = .host,
+                .category = .execute,
+                .replay = .never,
+                .prefetch_safe = std.mem.eql(u8, name, "ReadArtifact"),
+            };
         }
         fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
             return switch (index) {
@@ -183,16 +189,12 @@ test "L2 runner projects after raw UI observation and recovers artifact on the n
                 else => null,
             };
         }
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return true;
-        }
         fn asDispatcher(self: *const @This()) cc.tool_context.ToolDispatcher {
             return .{
                 .ctx = @ptrCast(self),
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = prefetchSafe,
+                .metadataFn = metadata,
                 .nameAtFn = nameAt,
-                .hostSyncFn = hostSync,
             };
         }
     };

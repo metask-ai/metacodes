@@ -1584,24 +1584,22 @@ fn runConcurrentBatchWithSpawner(
 
 // —— T1 矩阵测试:fatal 清理(24)与 host 并发 metadata(25) ——
 
-/// 测试用 dispatcher stub:按工具名返回 ok/fatal,并声明 host_sync metadata。
+/// 测试用 dispatcher stub:按工具名返回 ok/fatal,并声明 host executor metadata。
 const StubDispatcher = struct {
     /// 名字以 "Fatal" 开头 → host_fatal;否则 .ok(内容为 input 的拷贝)。
     fn dispatch(_: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, name: []const u8, args: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
         if (std.mem.startsWith(u8, name, "Fatal")) return .host_fatal;
         return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
     }
-    fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-        return false;
-    }
     fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
         return null;
     }
-    fn hostSync(_: *const anyopaque, _: []const u8) bool {
-        return true; // 全部按 host_sync 声明 → 并发判定走 metadata,不看名字
+    fn metadata(_: *const anyopaque, _: []const u8) ?tools_mod.ToolMeta {
+        // 全部声明 kind .host → 并发判定走 executor metadata,不看名字(矩阵25)。
+        return .{ .kind = .host, .category = .execute, .replay = .never, .prefetch_safe = false };
     }
     fn dispatcher() tools_mod.ToolDispatcher {
-        return .{ .ctx = @ptrCast(&sentinel), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+        return .{ .ctx = @ptrCast(&sentinel), .dispatchFn = dispatch, .metadataFn = metadata, .nameAtFn = nameAt };
     }
     var sentinel: u8 = 0;
 };
@@ -1619,8 +1617,8 @@ test "typed structured Tool result is wired to an error Conversation block" {
                 "{\"error\":{\"code\":\"bounded_fixture\",\"recoverable\":true}}",
             ) };
         }
-        fn no(_: *const anyopaque, _: []const u8) bool {
-            return false;
+        fn metadata(_: *const anyopaque, _: []const u8) ?tools_mod.ToolMeta {
+            return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
         }
         fn noName(_: *const anyopaque, _: usize) ?[]const u8 {
             return null;
@@ -1629,9 +1627,8 @@ test "typed structured Tool result is wired to an error Conversation block" {
             return .{
                 .ctx = @ptrCast(&sentinel),
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = no,
+                .metadataFn = metadata,
                 .nameAtFn = noName,
-                .hostSyncFn = no,
             };
         }
         var sentinel: u8 = 0;
@@ -1673,22 +1670,20 @@ test "execution policy denies before the single dispatch choke point" {
             self.calls += 1;
             return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
-        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-            return false;
+        fn metadata(_: *const anyopaque, _: []const u8) ?tools_mod.ToolMeta {
+            // 该 probe 只是与内置 Write 共名的自定义实现:显式声明 .external →
+            // isBuiltin=false,不触发内置文件工具证据面("共名不共身份"契约)。
+            return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
         }
         fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
             return null;
-        }
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return false;
         }
         fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
             return .{
                 .ctx = @ptrCast(self),
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = prefetchSafe,
+                .metadataFn = metadata,
                 .nameAtFn = nameAt,
-                .hostSyncFn = hostSync,
             };
         }
         fn allowsTool(_: *const anyopaque, _: []const u8) bool {
@@ -1800,20 +1795,16 @@ test "thread spawn fallback observes fatal before starting the next job" {
             return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
 
-        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-            return false;
-        }
-
         fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
             return null;
         }
 
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return true;
+        fn metadata(_: *const anyopaque, _: []const u8) ?tools_mod.ToolMeta {
+            return .{ .kind = .host, .category = .execute, .replay = .never, .prefetch_safe = false };
         }
 
         fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
-            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .metadataFn = metadata, .nameAtFn = nameAt };
         }
     };
     const alwaysFailSpawn = struct {
@@ -1848,17 +1839,15 @@ test "serial host fatal stops before the next slot" {
             if (std.mem.eql(u8, name, "FatalSerial")) return .host_fatal;
             return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
-        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-            return false;
-        }
         fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
             return null;
         }
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return false; // force the serial path
+        fn metadata(_: *const anyopaque, _: []const u8) ?tools_mod.ToolMeta {
+            // kind .external → isHostSync=false, force the serial path
+            return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
         }
         fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
-            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .metadataFn = metadata, .nameAtFn = nameAt };
         }
     };
 
@@ -1890,17 +1879,14 @@ test "concurrent host fatal joins started workers and skips the next window" {
             if (std.mem.eql(u8, name, "AfterWindow")) self.after_started.store(true, .release);
             return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
-        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-            return false;
-        }
         fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
             return null;
         }
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return true;
+        fn metadata(_: *const anyopaque, _: []const u8) ?tools_mod.ToolMeta {
+            return .{ .kind = .host, .category = .execute, .replay = .never, .prefetch_safe = false };
         }
         fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
-            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .metadataFn = metadata, .nameAtFn = nameAt };
         }
     };
 
@@ -1960,20 +1946,16 @@ test "Host error detail bypasses result persistence and aggregate budget" {
             return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, args)) };
         }
 
-        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-            return false;
-        }
-
         fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
             return null;
         }
 
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return true;
+        fn metadata(_: *const anyopaque, _: []const u8) ?tools_mod.ToolMeta {
+            return .{ .kind = .host, .category = .execute, .replay = .never, .prefetch_safe = false };
         }
 
         fn dispatcher(self: *const @This()) tools_mod.ToolDispatcher {
-            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .metadataFn = metadata, .nameAtFn = nameAt };
         }
     };
 
@@ -2340,22 +2322,18 @@ test "tool observation: sink rejection blocks before actual dispatcher invocatio
             self.calls += 1;
             return .{ .ok = tools_mod.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, "unexpected")) };
         }
-        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-            return false;
-        }
         fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
             return null;
         }
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return false;
+        fn metadata(_: *const anyopaque, _: []const u8) ?tools_mod.ToolMeta {
+            return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
         }
         fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
             return .{
                 .ctx = @ptrCast(self),
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = prefetchSafe,
+                .metadataFn = metadata,
                 .nameAtFn = nameAt,
-                .hostSyncFn = hostSync,
             };
         }
     };
