@@ -127,6 +127,18 @@ compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Plan-mode classification escape on the CLI (no-dispatcher) path: a model
+  emitting a case-variant builtin name (e.g. `bash`) was classified by the
+  unknown-name read fallback and allowed in plan mode, then deterministically
+  repaired to `Bash` at dispatch and really executed. Permission
+  classification and rule matching now normalize with the same resolver the
+  dispatcher uses, so plan mode denies what will actually run; truly unknown
+  names keep the read fallback and the UnknownTool guidance.
+- `/retry` after an auto-compact could roll the conversation back past the
+  compact boundary, leaving the active window projecting empty (the request
+  contained only the compact summary — no user message — and later turns
+  stayed hidden behind the stale boundary). The rollback now clamps the
+  boundary to the retried user message under the snapshot lock.
 - OpenAI-compatible streaming now decodes the JSON string escapes of SSE
   fragments: `delta.content` and `reasoning_content` (GLM/Kimi/DeepSeek/Qwen/
   Mistral) previously reached the conversation and thinking stream as raw
