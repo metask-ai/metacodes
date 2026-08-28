@@ -32,9 +32,13 @@ pub const DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP: usize = 2;
 pub const Conversation = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(msg.Message),
-    /// P1.5 纯投影压缩:**原始消息永不删除**(供 transcript/resume/查看历史全量保留)。压缩=推进
+    /// P1.5 纯投影压缩:boundary 型压缩**不删除原始消息**。压缩=推进
     /// 这个 boundary 游标 + 存一条 compact_summary。发给模型 / token 估算都只看 [boundary..] + summary
     /// (见 activeStart/totalTokens/buildApiMessages)。对齐 cc 的 getMessagesAfterCompactBoundary。
+    /// **持久化语义(R2/F1 后)**:transcript 是**活态镜像**——前缀破坏性变更(/retry 回卷、
+    /// compact 的 replaceWithOwned)触发全量重写,resume == 当时的活对话。微压缩/截断把
+    /// 已 flush 的 tool_result 原地改成 stub 后,一旦发生重写,盘上也定格为 stub(模型
+    /// 视角的真实状态);不再承诺盘上永远保留 stub 化之前的完整原文。
     /// **一致性铁律**:任何"发给模型"的投影和"token 估算"的投影必须用同一 boundary+summary,否则
     /// 压缩后估算不降→死循环,或估算降了实际发全量→爆 context。
     compact_boundary: usize = 0,
@@ -188,13 +192,16 @@ pub const Conversation = struct {
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
         std.debug.assert(user_idx < self.messages.items.len);
+        const popped = self.messages.items.len > user_idx + 1;
         while (self.messages.items.len > user_idx + 1) {
             const m = self.messages.pop().?;
             m.deinit(self.allocator);
         }
-        if (self.compact_boundary > user_idx) self.compact_boundary = user_idx;
+        const clamped = self.compact_boundary > user_idx;
+        if (clamped) self.compact_boundary = user_idx;
         self.mutation_version +%= 1;
-        self.shrink_epoch +%= 1;
+        // 无 pop 且无 clamp(如中止 run 后立即 /retry)= 前缀未破坏,不触发全量重写(R3-3)。
+        if (popped or clamped) self.shrink_epoch +%= 1;
     }
 
     /// 深拷贝整个对话到 dst allocator(转后台续跑用)。返回的 Conversation 与源 **0 共享指针**

@@ -2059,8 +2059,10 @@ pub fn run(
             try slots.append(allocator, slot);
             // 任务义务观察:获准执行的 Bash 命令喂给义务运行时(needle 子串
             // 命中即 met)。denied 的调用不算——义务要的是"真的跑过"。
+            // R3-4:按 canonical 名判——"bash" 会被 P0.6 修名真执行,raw 名判失配
+            // 会让真跑过的义务停在 unmet(有界误提醒,同 R2-3 键分裂族)。
             if (opts.obligations) |obligation_runtime| {
-                if (slot.decision == .run and std.mem.eql(u8, slot.name, "Bash")) {
+                if (slot.decision == .run and std.mem.eql(u8, canonical_name, "Bash")) {
                     if (@import("../util/json.zig").extractStringField(slot.input, "command")) |command|
                         obligation_runtime.observeDispatch(slot.id, command);
                 }

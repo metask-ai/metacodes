@@ -204,3 +204,29 @@ test "U11 parity: run Options 装配单源(web 只比 canonical 多 ui_requester
     web_opts.ui_requester = canonical.ui_requester;
     try std.testing.expect(std.meta.eql(canonical, web_opts));
 }
+
+test "R3-1回归: Ctrl+B 身份轮换 —— 新 session_id + 新 transcript 目录,权限路由同步" {
+    // 缺陷形态:转后台后前台开新空会话(shrink_epoch=0)却复用旧 writer(seen>=1,
+    // flushed=N)→ 下一次 flush 把旧 transcript 整个重写成新会话数条(历史被毁)。
+    // 修复:App.rotateSessionIdentity 换 id + 新目录 writer,旧 transcript 封存。
+    var fx: AppFixture = undefined;
+    try fx.setup();
+    defer fx.deinit();
+    const app = fx.app;
+
+    const old_id = app.session_id;
+    var old_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const old_dir: ?[]const u8 = if (app.transcript_writer) |*w| blk: {
+        @memcpy(old_dir_buf[0..w.dir.len], w.dir);
+        break :blk old_dir_buf[0..w.dir.len];
+    } else null;
+
+    app.rotateSessionIdentity();
+
+    try std.testing.expect(!std.meta.eql(old_id, app.session_id));
+    try std.testing.expect(std.meta.eql(app.permission_ctx.session, app.session_id));
+    if (old_dir) |d| {
+        try std.testing.expect(app.transcript_writer != null);
+        try std.testing.expect(!std.mem.eql(u8, d, app.transcript_writer.?.dir));
+    }
+}

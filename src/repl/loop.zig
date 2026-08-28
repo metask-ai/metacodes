@@ -890,6 +890,9 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
     // ③ reset 前台开新空会话(对齐 cc:转后台后前台清空)。后台拿的是副本,前台 deinit 不影响它。
     app.conversation.deinit();
     app.conversation = Conversation.init(app.allocator);
+    // R3-1:前台同步换会话身份 + transcript writer——旧 writer 复用会让下一次 flush
+    // 把旧历史的 transcript 毁掉重写成新会话(见 App.rotateSessionIdentity doc)。
+    app.rotateSessionIdentity();
     std.debug.print("\x1b[36m⤳ 已转后台续跑(agent tree 可见进度);前台开新会话\x1b[0m\n", .{});
 }
 

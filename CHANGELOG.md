@@ -175,6 +175,16 @@ compatibility boundaries, and entry points are defined by
   and resuming the session revived the discarded pre-retry turn. Prefix-
   destroying mutations (retry rollback, compact's wholesale replacement) now
   bump a shrink epoch and the writer atomically rewrites the transcript.
+  Semantics note: the transcript is a live-state mirror — after a rewrite,
+  tool results that microcompact/truncation had already stubbed in memory
+  are stubbed on disk too (resume reproduces what the model actually saw;
+  previously resume could resurrect large tool outputs the session had
+  deliberately shed, at inconsistent indexing).
+- Ctrl+B (background the current session) now rotates the foreground to a
+  fresh session id and transcript writer. Previously the fresh conversation
+  kept the old session's writer, corrupting the old transcript (misaligned
+  appends before the rewrite fix; wholesale overwrite after it). The old
+  session's transcript is now sealed as-is and stays resumable.
 - `/resume` now clears the active skill before switching session identity:
   previously the next run in the resumed session (e.g. an immediate
   `/retry`) executed under the previous session's skill tool policy, and the

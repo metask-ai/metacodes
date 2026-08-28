@@ -1064,6 +1064,22 @@ pub const App = struct {
         };
     }
 
+    /// 前台开新空会话时轮换会话身份:新 session_id + 指向新目录的 transcript writer,
+    /// 权限路由键同步(R3-1,Ctrl+B 转后台路径用)。**必须换 writer**:旧 writer 的
+    /// flushed_count/seen_shrink_epoch 属于旧历史,fresh conversation(epoch=0)复用它
+    /// 会在下一次 flush 把旧 transcript 整个重写成新会话的寥寥数条(历史被毁;修前则是
+    /// 错位追加)。换 id + 新 writer 后旧 transcript 目录原样封存(仍可 /resume)。
+    /// writer 重建失败非致命(warn,transcript 停写——与启动失败同语义)。
+    pub fn rotateSessionIdentity(app: *App) void {
+        app.session_id = transcript.genSessionId();
+        app.permission_ctx.session = app.session_id;
+        if (app.transcript_writer) |*w| w.deinit();
+        app.transcript_writer = null;
+        app.initTranscriptWriter() catch |err| {
+            @import("util/log.zig").warn("transcript", "rotate writer failed: {s}", .{@errorName(err)});
+        };
+    }
+
     fn initTranscriptWriter(app: *App) !void {
         // HOME
         const home = @import("platform").paths.homeDir() orelse return error.NoHome;
