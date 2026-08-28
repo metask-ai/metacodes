@@ -67,17 +67,32 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
     const be = dctx.wb.backend();
 
     while (!host.stopRequested()) {
-        const msg = host.inbox.popFront() orelse {
-            reapAgentDone(app, &be, host.id, infra); // 空闲期也 reap:后台 job 可能在无新消息时完成
-            time.sleepMs(50);
-            continue;
-        };
-        defer infra.free(msg); // msg 来自 host.inbox(infra alloc)
+        // U11:斜杠命令(host.cmdbox,transport 只入队)在 driver 独占点执行——与 web run()
+        // 同一 execCommand(execLine canonical 命令面)。带 run 计划的命令(/commit /review
+        // /init /retry;append 已在 service 内完成)→ 本轮直接跑 agent_loop,不等 inbox。
+        var pending_run = false;
+        while (host.cmdbox.popFront()) |c| {
+            defer infra.free(c);
+            if (web_session.execCommand(app, &host.journal, infra, c) != null) pending_run = true;
+        }
 
-        app.conversation.appendText(.user, msg) catch |e| {
-            log.warn("daemon", "appendText failed: {s}", .{@errorName(e)});
-            continue;
-        };
+        if (!pending_run) {
+            const msg = host.inbox.popFront() orelse {
+                reapAgentDone(app, &be, host.id, infra); // 空闲期也 reap:后台 job 可能在无新消息时完成
+                time.sleepMs(50);
+                continue;
+            };
+            defer infra.free(msg); // msg 来自 host.inbox(infra alloc)
+
+            // U11:prompt 提交经 service.submitPrompt(clearActiveSkill + append 与 TUI/web
+            // 同源;此前 daemon 直 appendText 漏 clearActiveSkill)。空文本/失败 → 无 run。
+            var svc = @import("../session_service.zig").SessionService.init(app);
+            const d = svc.submitPrompt(msg);
+            if (d.run == null) {
+                if (!d.outcome.ok) log.warn("daemon", "submitPrompt failed", .{});
+                continue;
+            }
+        }
 
         const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
             project_activation.RunControl.init(

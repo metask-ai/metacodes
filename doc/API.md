@@ -18,6 +18,35 @@ artifact store, and TinyKG admission are not replaceable extensions.
 There is no general HTTP service API promise yet. The Web and daemon hosts are
 product surfaces built over the same core protocols.
 
+## Session command surface (UI-neutral)
+
+All three interactive hosts (terminal REPL, `--web`, `serve`/`serve --sessions N`)
+share one input pipeline (`src/session_intent.zig` + `src/session_service.zig`):
+
+    raw input → session_intent.parse → InputIntent
+      → SessionService.dispatch (validate → mutate → optional RunPlan)
+      → host submits the run via session_service.buildRunOptions
+
+- **Intent classes.** `!cmd` is the shell lane; `/verb …` resolves against the
+  built-in verb table (`session_intent.BUILTIN_VERBS`, built-ins win over
+  same-named skills); an unknown `/head` is a skill candidate; anything else is
+  a prompt. The verb table is the single registry — hosts do not parse slash
+  commands themselves.
+- **Service verbs** (equivalent across hosts): `/model use <id>`, `/mode
+  [name]`, `/effort <level>`, `/compact`, `/add-dir <path>`, `/theme <v>`,
+  `/vim`, `/retry`, `/commit`, `/review`, `/init`, plus prompt and `!cmd`
+  submission. Web/daemon reach them via `POST /command` (queued to the driver
+  thread; result arrives as a `command_result` journal event, run-producing
+  commands then execute a normal agent run). Display-only verbs (`/help`,
+  `/tools`, …) are terminal-rendered; web/daemon report them as unsupported.
+- **Run assembly.** `session_service.buildRunOptions` is the only place App
+  state is projected into `agent_loop.Options`; hosts add only host-specific
+  fields (UI requester, run-control observers, budgets).
+- Equivalence is locked by `tests/component/session_api_parity_test.zig`.
+
+This is an internal-consistency contract, not yet a wire-protocol stability
+promise: the HTTP endpoint shapes remain pre-1.0.
+
 ## CLI surface
 
 `metacodes --help` enumerates the current flag set and is the authoritative

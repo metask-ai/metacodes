@@ -59,18 +59,21 @@ pub fn journalSessionLifecycle(journal: *EventJournal, alloc: std.mem.Allocator,
 }
 
 /// /state 快照的数据源:driver 拥有,server 经回调读(HTTP 线程)。
-const StateSource = struct {
+/// U11:pub + generating 改指针——daemon serve/serve_multi 复用同一 StateSource
+/// (rich /state + /command 入队),不再各自 trivialState "{}" / 501。
+pub const StateSource = struct {
     app: *app_mod.App,
     wb: *WebBackend,
     cmdbox: *MsgQueue, // 斜杠命令队列(HTTP 入队,driver 执行)
     journal: *EventJournal, // U5 B1:快照带 seq(锁内 count())供附着握手
-    generating: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// 生成期标志(driver 维护;web run 持有自己的,daemon 指 host.generating)。
+    generating: *std.atomic.Value(bool),
 
     /// **U5 B1:附着快照**（HTTP 线程调）。核心：
     /// - **seq = journal.count()（锁内，Linus ① 定死）**：语义=下界，客户端订阅 `?since=seq` 严格续接。
     /// - **slice 字段(model/dirs) 经 app.snapshotSlices 锁内 dup 读**：避免撞 driver free 的 UAF(§1.4)。
     /// - 标量(mode/usage/generating)直读(值语义良性 skew)。
-    fn snapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    pub fn snapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
         const self: *StateSource = @ptrCast(@alignCast(ctx));
         const seq = self.journal.count(); // 锁内取（Linus ①：seq 定序 + 跨线程可见性）
         // slice-safe 读（cache mutex 内 dup）：model + dirs。
@@ -170,7 +173,7 @@ const StateSource = struct {
     /// **为什么不在 HTTP 线程执行**:generating flag 只保护 agent_loop.run,不保护 driver
     /// 空闲循环里的 appendText/allocator——那些在 flag 窗口外照样改 App。HTTP 线程直接
     /// 改 conversation 会与 driver 的 appendText 并发 mutate 同一 ArrayList(堆损坏)。
-    fn command(ctx: *anyopaque, allocator: std.mem.Allocator, cmd: []const u8) anyerror![]u8 {
+    pub fn command(ctx: *anyopaque, allocator: std.mem.Allocator, cmd: []const u8) anyerror![]u8 {
         const self: *StateSource = @ptrCast(@alignCast(ctx));
         if (!self.cmdbox.push(cmd)) return reply(allocator, false, "command queue full");
         return reply(allocator, true, "queued");
@@ -185,73 +188,37 @@ fn reply(allocator: std.mem.Allocator, ok: bool, msg: []const u8) ![]u8 {
 /// driver 线程执行一个命令(独占 conversation/config/app.allocator,无并发)。
 /// 结果经 journal `{"command_result":{ok,message}}` 事件发回浏览器(异步)。
 ///
-/// U2 S3:**不再有独立命令实现**——全走共享 SessionService.exec(与 loop.zig 同一命令面)。
-/// 旧版手抄的 /mode /compact /model 4 条已废(逐字重复的存量债)。web 由此还白捡了
-/// /add-dir /theme /vim + /model 的 provider 守卫(旧 web /model 漏守卫)。
-fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.Allocator, cmd: []const u8) void {
-    const session_service = @import("../session_service.zig");
+/// U2 S3 → U11:**不再有独立命令实现,也不再有独立解析**——整行进共享
+/// SessionService.execLine(session_intent.parse → dispatch,与 loop.zig 同一命令面/
+/// 同一解析)。web 由此白捡 /commit /review /init /retry /mode 与 `!cmd`(带 run 计划,
+/// caller 提交)。终端表达类动词(/help /tools…)按设计返回 unsupported 文案。
+/// 返回 dispatch 的 run 计划:非 null 时 caller(driver 循环)须跑一轮 agent_loop。
+pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.Allocator, cmd: []const u8) ?session_service_mod.RunPlan {
     const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
-    // 拆 verb / args:去前导 `/`,首个空格分界。
-    const body = if (std.mem.startsWith(u8, trimmed, "/")) trimmed[1..] else trimmed;
-    const sp = std.mem.indexOfScalar(u8, body, ' ');
-    const verb = if (sp) |i| body[0..i] else body;
-    const args = if (sp) |i| std.mem.trim(u8, body[i + 1 ..], " \t") else "";
-
-    var svc = session_service.SessionService.init(app);
-    const outcome = svc.exec(app.allocator, verb, args);
+    var svc = session_service_mod.SessionService.init(app);
+    const d = session_service_mod.execLine(&svc, app.allocator, trimmed);
     var buf: [256]u8 = undefined;
-    const msg: []const u8 = switch (outcome.kind) {
-        .unhandled => std.fmt.bufPrint(&buf, "unknown command: {s}", .{trimmed}) catch "unknown command",
-        else => outcome.render(&buf),
+    const msg: []const u8 = switch (d.outcome.kind) {
+        .unhandled => std.fmt.bufPrint(&buf, "unsupported here: {s}", .{trimmed}) catch "unsupported command",
+        .noop => if (d.run != null) "queued for run" else d.outcome.render(&buf),
+        else => d.outcome.render(&buf),
     };
-    const ok = outcome.ok and outcome.kind != .unhandled;
-    const line = std.json.Stringify.valueAlloc(web_alloc, .{ .command_result = .{ .ok = ok, .message = msg } }, .{}) catch return;
+    const ok = d.outcome.ok and d.outcome.kind != .unhandled;
+    const line = std.json.Stringify.valueAlloc(web_alloc, .{ .command_result = .{ .ok = ok, .message = msg } }, .{}) catch return d.run;
     defer web_alloc.free(line);
     journal.append(line);
+    return d.run;
 }
+const session_service_mod = @import("../session_service.zig");
 
-/// **U10-D**:构造 web/daemon session 的 agent_loop.Options(web run() 与 daemon app_driver 共用
-/// 一份,消两份漂移)。wb=该 session 的 WebBackend(ui_requester 用);scoped_recall=本轮尾注入召回。
+/// **U10-D → U11**:构造 web/daemon session 的 agent_loop.Options(web run() 与 daemon
+/// app_driver 共用)。字段装配走 canonical session_service.buildRunOptions——此前本函数
+/// 手抄一份且缺 lsp/swarm/background_request(web run 里模型能力被静默削弱的漂移),
+/// 收敛后只补 web 宿主专属的 ui_requester(WebBackend 对话框)。
 pub fn buildWebOptions(app: *app_mod.App, wb: *WebBackend, scoped_recall: ?[]const u8) agent_loop.Options {
-    return .{
-        .session = app.session_id,
-        .verbose = app.config.verbose,
-        .abort = &app.abort,
-        .read_state = &app.read_state,
-        .edit_hl_cache = &app.edit_hl_cache,
-        .jobs = if (app.jobs) |*j| j else null,
-        .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
-        .plan_prev_mode = &app.plan_prev_mode,
-        .tasks = &app.tasks,
-        .kg = if (app.kg) |*k| k else null,
-        .kg_projects_dir = app.kg_projects_dir,
-        .memdir_abs = app.memdir_abs,
-        .api_client = app.anthropicClientOrNull(),
-        .tool_defs = app.tool_defs,
-        .system_prompt = app.system_prompt,
-        .inject_user_context = app.user_context,
-        .synthetic_user_input = scoped_recall,
-        .dyn_registry = &app.dyn_registry,
-        .host_services = app.hostServices(),
-        .activated_tools = &app.activated_tools,
-        .project_dir = app.project_dir_or_empty(),
-        .sandbox = app.sandboxPtr(),
-        .cwd_abs = app.cwdAbs(),
-        .additional_dirs = app.additionalDirs(),
-        .home_dir = app.homeDir(),
-        .artifact_root = app.sessionDir() orelse "",
-        .tool_result_metrics = &app.tool_result_metrics,
-        .file_change_journal = &app.file_change_journal,
-        .agents = &app.agents,
-        .parent_model = app.activeModel(),
-        .model_switch_compact = app.pendingModelSwitchCompact(),
-        .skills_set = &app.skills,
-        .ui_requester = wb.requester(),
-        .mcp_sessions = &app.mcp_sessions.items,
-        .cron_registry = &app.cron_registry,
-        .plan_file_path = app.plan_file_path,
-        .emit_tool_cards = true,
-    };
+    var options = session_service_mod.buildRunOptions(app, scoped_recall);
+    options.ui_requester = wb.requester();
+    return options;
 }
 
 /// 跑 web 会话直到退出(空闲期 SIGINT)。返回进程退出码。
@@ -273,7 +240,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     defer inbox.deinit();
     var cmdbox = MsgQueue.init(web_alloc);
     defer cmdbox.deinit();
-    var state_src = StateSource{ .app = app, .wb = &wb, .cmdbox = &cmdbox, .journal = &journal };
+    var generating_flag = std.atomic.Value(bool).init(false);
+    var state_src = StateSource{ .app = app, .wb = &wb, .cmdbox = &cmdbox, .journal = &journal, .generating = &generating_flag };
 
     // U4 A4:装配 config 变更 sink(model/mode/dirs/reasoning 变更 → journal → SSE)。
     // setConfigEventSink 同步设 App sink + permission_ctx.event_sink(mode),并 **seed snapshot_cache**。
@@ -292,7 +260,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         .abort = &app.abort,
         // /interrupt 只在生成期放行:空闲期的 abort 是本 driver 的"优雅退出"信号
         // (终端 SIGINT 专属),不能让浏览器 Stop 按钮误杀 daemon。
-        .generating = &state_src.generating,
+        .generating = &generating_flag,
         .state_ctx = @ptrCast(&state_src),
         .state_fn = &StateSource.snapshot,
         .command_fn = &StateSource.command,
@@ -317,28 +285,35 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     outer: while (true) {
         // ── 斜杠命令:driver 线程独占执行(唯一 conversation/allocator toucher,无并发)。
         // HTTP 线程只入队(见 StateSource.command);此处执行 → journal command_result。
+        // U11:命令可携带 run 计划(/commit /review /init /retry;append 已在 service 内
+        // 完成)→ 本轮直接跑 agent_loop,不等 inbox;多条计划合并一轮 run(对话已含全部注入)。
+        var pending_run = false;
         while (cmdbox.popFront()) |c| {
             defer web_alloc.free(c);
-            execCommand(app, &journal, web_alloc, c);
+            if (execCommand(app, &journal, web_alloc, c) != null) pending_run = true;
         }
 
-        // ── 空闲期:等消息 ──────────────────────────────────────────────────
-        // abort 二义:user_ctrl_c=真 SIGINT(退出进程)vs user_interrupt=浏览器 Stop
-        // (只中断 run)。空闲期若 flag 亮:SIGINT → 退出;残留的 interrupt(门 race 漏进
-        // 来的)→ 复位丢弃,继续等。
-        const msg = inbox.popFront() orelse {
-            if (app.abort.isAborted()) {
-                if (app.abort.reason() == .user_ctrl_c) break :outer;
-                app.abort.resetForTesting(); // 残留 interrupt,不退出
-            }
-            time.sleepMs(50);
-            continue;
-        };
-        defer web_alloc.free(msg);
-
-        try app.conversation.appendText(.user, msg);
-        state_src.generating.store(true, .release);
-        defer state_src.generating.store(false, .release);
+        if (!pending_run) {
+            // ── 空闲期:等消息 ──────────────────────────────────────────────
+            // abort 二义:user_ctrl_c=真 SIGINT(退出进程)vs user_interrupt=浏览器 Stop
+            // (只中断 run)。空闲期若 flag 亮:SIGINT → 退出;残留的 interrupt(门 race 漏进
+            // 来的)→ 复位丢弃,继续等。
+            const msg = inbox.popFront() orelse {
+                if (app.abort.isAborted()) {
+                    if (app.abort.reason() == .user_ctrl_c) break :outer;
+                    app.abort.resetForTesting(); // 残留 interrupt,不退出
+                }
+                time.sleepMs(50);
+                continue;
+            };
+            defer web_alloc.free(msg);
+            // U11:prompt 提交经 service.submitPrompt(clearActiveSkill + append 与 TUI
+            // 同源;此前 web 直 appendText 漏 clearActiveSkill)。空文本 → 无 run,回等待。
+            var svc = session_service_mod.SessionService.init(app);
+            if (svc.submitPrompt(msg).run == null) continue;
+        }
+        generating_flag.store(true, .release);
+        defer generating_flag.store(false, .release);
 
         const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
             project_activation.RunControl.init(
@@ -517,7 +492,8 @@ test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
 
     var cmdbox = MsgQueue.init(a);
     defer cmdbox.deinit();
-    var src = StateSource{ .app = &app, .wb = &wb, .cmdbox = &cmdbox, .journal = &journal };
+    var generating_flag = std.atomic.Value(bool).init(false);
+    var src = StateSource{ .app = &app, .wb = &wb, .cmdbox = &cmdbox, .journal = &journal, .generating = &generating_flag };
 
     const json = try StateSource.snapshot(@ptrCast(&src), a);
     defer a.free(json);

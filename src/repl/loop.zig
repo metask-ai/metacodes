@@ -45,6 +45,7 @@ const dialect_mod = @import("../api/dialect.zig");
 const request_overrides = @import("../api/request_overrides.zig");
 const util_time = @import("../util/time.zig");
 const model_command = @import("model_command.zig");
+const session_service = @import("../session_service.zig");
 const skill_cli_adapter = @import("../skills/cli_adapter.zig");
 
 /// 把 CoreEvent 的字节写到 std.debug.print(stderr)——非 TTY 交互 / cron / skill 等场景。
@@ -78,6 +79,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     // 主对话路径在生成期单独构造 TuiBackend/WriterBackend(见下)。
     var aux_wb = debugBackend(app.config.verbose, true, &app.usage);
     const aux_be = aux_wb.backend();
+    // U11(issue #3):config/会话 mutation 统一走 SessionService(web/daemon 同一命令面);
+    // 渲染仍留 TUI。借 *App、不持 backend,方法只在本(driver)线程调。
+    var svc = session_service.SessionService.init(app);
     var history = history_mod.History.init(allocator);
     defer history.deinit();
 
@@ -178,6 +182,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /skills          List installed skills
                 \\  /history         Show recent commands
                 \\  /model [name]    Show or switch the active model
+                \\  /mode [name]     Cycle or set permission mode (default|accept-edits|plan|auto|dont-ask|bypass)
+                \\  /effort [level]  Show or set reasoning effort (none|minimal|low|medium|high|xhigh)
                 \\  /resume [id]     List recent sessions, or resume one by id
                 \\  /retry           Resend the last user message
                 \\  /compact         Compact oldest messages when over threshold
@@ -364,9 +370,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/compact")) {
-            // U2 S1:压缩逻辑下沉 App.compactWindow(与 web 共用),渲染留此。
+            // U11:经 SessionService.compact(canonical 命令面),渲染留此。
             // 投影:len() 不变(原始不删),真正收缩的是活跃窗口 → 显示活跃计数,否则 N→N 误导用户。
-            const r = app.compactWindow();
+            const r = svc.compact().data.compact;
             std.debug.print("Compacted {d} old messages ({d} → {d} active).\n", .{ r.dropped, r.before, r.after });
             continue;
         }
@@ -381,7 +387,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/retry")) {
-            try retryLast(app, allocator, &aux_be);
+            // U11:回卷(丢弃最后 user 之后的回合)经 service;run 提交留宿主。
+            if (svc.prepareRetry().run != null) {
+                try runInjectedAgent(app, allocator, &aux_be);
+            } else {
+                std.debug.print("\x1b[33mNo user message to retry\x1b[0m\n", .{});
+            }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/kg") or std.mem.startsWith(u8, trimmed, "/kg ")) {
@@ -419,6 +430,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             try handleEffort(app, allocator, rest);
             continue;
         }
+        // /mode [name] —— 无参轮换权限模式(同 Shift+Tab);有参命名设置
+        // (default|accept-edits|plan|auto|dont-ask|bypass)。U11 新增:与 web/daemon 同一命令面。
+        if (std.mem.eql(u8, trimmed, "/mode") or std.mem.startsWith(u8, trimmed, "/mode ")) {
+            const rest = std.mem.trim(u8, trimmed[5..], " \t");
+            const o = if (rest.len == 0) svc.cyclePermMode() else svc.setPermModeNamed(rest);
+            var obuf: [128]u8 = undefined;
+            std.debug.print("{s}\n", .{o.render(&obuf)});
+            continue;
+        }
         // /overrides [field value | clear] —— 查看/清/单字段设方言覆盖
         if (std.mem.eql(u8, trimmed, "/overrides") or std.mem.startsWith(u8, trimmed, "/overrides ")) {
             const rest = std.mem.trim(u8, trimmed[10..], " \t");
@@ -442,8 +462,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/init")) {
             // 对齐 cc:prompt 型命令——注入指令让模型扫码库写 CLAUDE.md(走正常 agent_loop)。
-            try app.conversation.appendText(.user, INIT_PROMPT);
-            try runInjectedAgent(app, allocator, &aux_be);
+            if (svc.submitMacro(session_service.INIT_PROMPT).run != null)
+                try runInjectedAgent(app, allocator, &aux_be);
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/mcp")) {
@@ -461,8 +481,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/vim")) {
-            const on = app.toggleVim(); // U2 S1:状态下沉 App.toggleVim,渲染留此
-            std.debug.print("editor mode: \x1b[36m{s}\x1b[0m\n", .{if (on) "vim" else "emacs"});
+            const o = svc.toggleVim(); // U11:经 service,渲染留此
+            std.debug.print("editor mode: \x1b[36m{s}\x1b[0m\n", .{if (o.data.vim) "vim" else "emacs"});
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/agents")) {
@@ -483,11 +503,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             if (rest.len == 0) {
                 std.debug.print("usage: /add-dir <path>\n", .{});
             } else {
-                app.addDirectory(rest) catch |e| {
-                    std.debug.print("/add-dir failed: {s}\n", .{@errorName(e)});
-                    continue;
-                };
-                std.debug.print("added directory: {s}\n", .{rest});
+                const o = svc.addDirectory(rest); // U11:经 service
+                if (o.ok) {
+                    std.debug.print("added directory: {s}\n", .{rest});
+                } else {
+                    std.debug.print("/add-dir failed: {s}\n", .{o.data.err_name});
+                }
             }
             continue;
         }
@@ -503,15 +524,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         // /commit 和 /review：把预置 prompt 注入为 user message，走正常 agent_loop 路径
+        // (U11:注入经 service.submitMacro,prompt 常量归 session_service——web/daemon 同源)
         if (std.mem.eql(u8, trimmed, "/commit")) {
-            try app.conversation.appendText(.user, COMMIT_PROMPT);
-            // 不 continue，让下面主流程跑一轮
-            try runInjectedAgent(app, allocator, &aux_be);
+            if (svc.submitMacro(session_service.COMMIT_PROMPT).run != null)
+                try runInjectedAgent(app, allocator, &aux_be);
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/review")) {
-            try app.conversation.appendText(.user, REVIEW_PROMPT);
-            try runInjectedAgent(app, allocator, &aux_be);
+            if (svc.submitMacro(session_service.REVIEW_PROMPT).run != null)
+                try runInjectedAgent(app, allocator, &aux_be);
             continue;
         }
         // 用户显式 /<skill-name> [args] 触发。所有内建 Command 已先消费，
@@ -579,7 +600,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         const gen_raw_orig = if (tty) input.enterRawMode(stdin_fd) else null; // ?platform.terminal.SavedMode
         defer if (gen_raw_orig) |o| input.restoreMode(stdin_fd, o);
 
-        const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*j| j else null;
         // UI backend:TUI 路径用 TuiBackend(包 region,渲染工具卡 + 颜色 + owns 生成期键盘输入);
         // 非 TTY 用 WriterBackend(走 std.debug.print)。两者实现同一 UiBackend vtable。
         // 阶段 C:生成期 stdin watcher 线程归 TuiBackend(startInput/stopInput),loop 不再硬编码。
@@ -690,12 +710,24 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
         const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
+        // U11:App 可导出字段统一走 canonical buildRunOptions(五处前端装配漂移的收敛点);
+        // 宿主专属字段(eval gate/policy、run_control 三件套、预算、UI requester、心跳)在此补。
+        var run_opts = session_service.buildRunOptions(app, scoped_recall);
+        run_opts.request_gate = eval_request_gate;
+        run_opts.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
+        run_opts.max_turns = maxTurnsFromEnv();
+        run_opts.cost_budget_usd = costBudgetFromEnv();
+        run_opts.execution_policy = eval_execution_policy;
+        run_opts.tool_observer = if (run_control) |control| control.observer() else null;
+        run_opts.project_rule_gate = if (run_control) |control| control.formalGate() else null;
+        run_opts.ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null;
+        run_opts.spawn_tick_fn = spawn_tick;
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .request_gate = eval_request_gate, .execution_boundary = if (run_control) |control| control.executionBoundary() else null, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .execution_policy = eval_execution_policy, .tool_observer = if (run_control) |control| control.observer() else null, .project_rule_gate = if (run_control) |control| control.formalGate() else null, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .artifact_root = app.sessionDir() orelse "", .tool_result_metrics = &app.tool_result_metrics, .file_change_journal = &app.file_change_journal, .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            run_opts,
             effective_be,
             allocator,
         ) catch |err| {
@@ -1778,57 +1810,6 @@ fn printHistory(history: *const history_mod.History) void {
     }
 }
 
-/// /retry：找 conversation 里最后一条 user text，重发 agent_loop（不追加重复消息）。
-fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
-    // 找最后一条 user 消息——删除所有后面的 assistant/user 回合，回到上一次 user 发出前的状态
-    var idx: ?usize = null;
-    var i = app.conversation.messages.items.len;
-    while (i > 0) {
-        i -= 1;
-        if (app.conversation.messages.items[i].role == .user) {
-            idx = i;
-            break;
-        }
-    }
-    if (idx == null) {
-        std.debug.print("\x1b[33mNo user message to retry\x1b[0m\n", .{});
-        return;
-    }
-
-    // 丢弃从 idx+1 起的所有消息
-    var j = app.conversation.messages.items.len;
-    while (j > idx.? + 1) {
-        j -= 1;
-        const m = app.conversation.messages.orderedRemove(j);
-        m.deinit(app.conversation.allocator);
-    }
-
-    const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
-    const usage_before = app.usage;
-    const mode_before = app.permission_ctx.modeValue();
-    const started_ns = util_time.nowNs();
-    const result = agent_loop.run(
-        &app.conversation,
-        app.provider(),
-        app.tool_defs,
-        &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .artifact_root = app.sessionDir() orelse "", .tool_result_metrics = &app.tool_result_metrics, .file_change_journal = &app.file_change_journal, .additional_dirs = app.additionalDirs() }, // task#12:辅助 REPL 路径也套 sandbox
-        backend,
-        allocator,
-    ) catch |err| {
-        std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
-        app.clearPendingModelSwitchCompact();
-        return;
-    };
-    app.clearPendingModelSwitchCompact();
-    accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
-    app.persistTranscript();
-    if (result.stop_reason == .aborted) {
-        std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
-        app.abort.resetForTesting();
-    }
-}
-
 fn historyPath(allocator: std.mem.Allocator) ![]u8 {
     const home = @import("platform").paths.homeDir() orelse return error.NoHome;
     return std.fmt.allocPrint(allocator, "{s}/.metacodes/history", .{home});
@@ -1838,53 +1819,7 @@ fn historyPath(allocator: std.mem.Allocator) ![]u8 {
 // /doctor /config /init /mcp /commit /review handlers
 // ============================================================================
 
-const COMMIT_PROMPT =
-    \\Please help create a git commit for the current working tree.
-    \\
-    \\Steps you should follow:
-    \\  1) Run `git status` and `git diff --stat` (via the Bash tool) to see what changed.
-    \\  2) Run `git log -n 5 --oneline` to match the project's commit style.
-    \\  3) Draft a concise, conventional commit message summarising the WHY of the change.
-    \\  4) Stage the intended files with `git add <path> ...` (do NOT use `git add -A`; skip secrets).
-    \\  5) Run `git commit -m "..."`.
-    \\  6) Show `git status` at the end to confirm.
-    \\
-    \\Do NOT push. If the diff is empty, say so and stop.
-;
-
-const REVIEW_PROMPT =
-    \\Please review the current change set (unstaged + staged diff against HEAD).
-    \\
-    \\Steps:
-    \\  1) Run `git diff HEAD` (via Bash) to see all pending changes.
-    \\  2) Identify bugs, edge cases, missing error handling, broken invariants, style issues.
-    \\  3) Group findings by severity: blockers → warnings → nits.
-    \\  4) Quote the specific lines you are commenting on.
-    \\  5) End with a one-line verdict: ready to merge / needs fixes.
-;
-
-/// /init:对齐 cc OLD_INIT_PROMPT——让**模型**扫码库后写 CLAUDE.md(prompt 型命令,
-/// 不是本地建 config.json)。注入为 user message 走正常 agent_loop。
-const INIT_PROMPT =
-    \\Please analyze this codebase and create a CLAUDE.md file in the repository root, which will be
-    \\provided to future Claude Code sessions as project memory.
-    \\
-    \\What to do:
-    \\  1) Explore the codebase (use Read/Glob/Grep/CodeMap and the Bash tool for `git`/build files) to
-    \\     understand: build & test & lint commands, the high-level architecture, key modules and how they
-    \\     fit together, and any non-obvious conventions.
-    \\  2) If a CLAUDE.md already exists, improve it rather than overwrite — preserve anything still correct.
-    \\  3) Also incorporate any existing rules files if present (e.g. .cursorrules, .github/copilot-instructions.md)
-    \\     and useful pointers from README.
-    \\  4) Write CLAUDE.md with the Write tool. Begin the file with this exact header:
-    \\
-    \\     # CLAUDE.md
-    \\
-    \\     This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-    \\
-    \\Keep it concise and high-signal: commands a developer actually runs, the architecture a newcomer needs,
-    \\and conventions that are NOT obvious from reading a single file. Do not pad it with restated source code.
-;
+// COMMIT/REVIEW/INIT 宏 prompt 常量已归 session_service(U11:web/daemon 同源注入)。
 
 /// /model：按分组/能力浏览模型，或切换当前 provider 内的模型。
 fn handleEffort(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
@@ -1901,10 +1836,13 @@ fn handleEffort(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
         std.debug.print("\x1b[31minvalid effort '{s}'. Valid: none|minimal|low|medium|high|xhigh\x1b[0m\n", .{rest});
         return;
     };
-    app.setReasoningEffort(effort) catch |err| {
-        std.debug.print("\x1b[31m/effort failed: {s}\x1b[0m\n", .{@errorName(err)});
+    // U11:设置经 service,渲染留此。
+    var svc = session_service.SessionService.init(app);
+    const o = svc.setReasoningEffort(effort);
+    if (!o.ok) {
+        std.debug.print("\x1b[31m/effort failed: {s}\x1b[0m\n", .{o.data.err_name});
         return;
-    };
+    }
     std.debug.print("reasoning effort set to {s}\n", .{@tagName(effort)});
 }
 
@@ -2134,7 +2072,6 @@ fn switchModel(
     candidates: []const model_command.Candidate,
     model: []const u8,
 ) !void {
-    _ = allocator;
     if (!model_command.canUseInCurrentProvider(app.config.provider_kind, candidates, model)) {
         if (model_command.providerForModel(model)) |p| {
             std.debug.print(
@@ -2148,11 +2085,19 @@ fn switchModel(
         return;
     }
 
-    app.switchModel(model) catch |err| {
-        std.debug.print("\x1b[33mwarn: model sync failed ({s})\x1b[0m\n", .{@errorName(err)});
+    // U11:切换+持久化经 SessionService.setModel(canonical;含别名解析与 provider 守卫
+    // 的第二道校验),丰富的拒绝文案留上方 TUI 渲染。
+    var svc = session_service.SessionService.init(app);
+    const o = svc.setModel(allocator, model);
+    if (!o.ok) {
+        const why = switch (o.data) {
+            .err_name => |e| e,
+            .text => |t| t,
+            else => "unknown",
+        };
+        std.debug.print("\x1b[33mwarn: model sync failed ({s})\x1b[0m\n", .{why});
         return;
-    };
-    app.persistLoginSelection();
+    }
 
     std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
     if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{effort.name()});
@@ -3199,17 +3144,19 @@ fn handleTheme(app: *app_mod.App, rest: []const u8) void {
         std.debug.print("\nusage: /theme <variant>\n", .{});
         return;
     }
-    const variant = theme_mod.parseVariant(rest) orelse {
+    // U11:解析+设置经 SessionService.setTheme(canonical),渲染留此。
+    var svc = session_service.SessionService.init(app);
+    const o = svc.setTheme(rest);
+    if (o.kind == .err) {
         std.debug.print("unknown theme '{s}'. try: auto, dark, light, mono\n", .{rest});
         return;
-    };
-    // U2 S1:状态操作(变体/theme/持久化)下沉 App.setTheme,渲染留此。
-    std.debug.print("theme switched to \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(variant)});
-    const persisted = app.setTheme(variant) catch |e| {
-        std.debug.print("\x1b[2m(persist failed: {s})\x1b[0m\n", .{@errorName(e)});
-        return;
-    };
-    if (persisted) std.debug.print("\x1b[2m(saved to ~/.metacodes/config.json)\x1b[0m\n", .{});
+    }
+    std.debug.print("theme switched to \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(app.theme_variant)});
+    switch (o.data) {
+        .err_name => |e| std.debug.print("\x1b[2m(persist failed: {s})\x1b[0m\n", .{e}),
+        .theme => |t| if (t.persisted) std.debug.print("\x1b[2m(saved to ~/.metacodes/config.json)\x1b[0m\n", .{}),
+        else => {},
+    }
 }
 
 /// libc system(3)(0.16 std.c 无绑定):fork + /bin/sh -c + waitpid,stdio 继承父进程。
@@ -3488,27 +3435,10 @@ fn printTaskList(app: *app_mod.App) void {
 /// ! shell mode:执行 shell 命令,实时输出 + 加入对话上下文(不经模型审批/解释)。
 fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []const u8) !void {
     if (command.len == 0) return;
-    // 直接调 Bash 工具 execute(走 bypass — 用户显式 ! 等于授权)
-    const bash = @import("../tools/bash.zig");
-    var tool_ctx = @import("../tools.zig").ToolContext{
-        .allocator = allocator,
-        .abort = &app.abort,
-        .jobs = if (app.jobs) |*j| j else null,
-        .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
-        .artifact_root = app.sessionDir() orelse "",
-        .tool_result_metrics = &app.tool_result_metrics,
-        .file_change_journal = &app.file_change_journal,
-    };
-    // 组 args JSON
-    var args_buf: std.Io.Writer.Allocating = .init(allocator);
-    defer args_buf.deinit();
-    try args_buf.writer.writeAll("{\"command\":");
-    try std.json.Stringify.encodeJsonString(command, .{}, &args_buf.writer);
-    try args_buf.writer.writeByte('}');
-    const args_json = try args_buf.toOwnedSlice();
-    defer allocator.free(args_json);
-
-    const result = bash.execute(&tool_ctx, args_json) catch |err| {
+    // U11:业务核(Bash execute + 输出进对话上下文)经 SessionService.shellExec
+    // (用户显式 ! = 授权;web/daemon 同源),stdout/stderr 渲染留此。
+    var svc = session_service.SessionService.init(app);
+    const result = svc.shellExec(allocator, command) catch |err| {
         std.debug.print("\x1b[31m! error: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
@@ -3530,11 +3460,6 @@ fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []c
             if (u.len > 0) std.debug.print("\x1b[33m{s}\x1b[0m", .{u});
         }
     }
-
-    // 把命令 + 输出加入对话上下文(让模型后续能引用)
-    const ctx_msg = try std.fmt.allocPrint(allocator, "[shell] $ {s}\n{s}", .{ command, result });
-    defer allocator.free(ctx_msg);
-    try app.conversation.appendText(.user, ctx_msg);
 }
 
 /// 检查到期 cron,逐个把其 prompt 作为 user message 注入并跑一轮 agent_loop。
@@ -3557,17 +3482,22 @@ fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *c
 }
 
 fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend, synthetic_user_input: ?[]const u8) !void {
-    const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
-    // 辅助路径(skill 调用 / cron 注入),非用户盯着的主交互循环 → 不接 spawn_tick_fn(默认 null,Bash 长命令静默,故意不传非遗漏)。
+    // 辅助路径(cron 注入 / retry / commit 等宏),非用户盯着的主交互循环 → 不接
+    // spawn_tick_fn(默认 null,Bash 长命令静默,故意不传非遗漏)。
+    // U11:字段装配走 canonical buildRunOptions(此前本路径缺 agents/skills_set/mcp/
+    // cron/host_services 等字段——注入 run 里模型能力被静默削弱的漂移在此修复);
+    // emit_tool_cards 维持本路径既有关闭状态(WriterBackend 文本流,卡片会刷屏)。
     const usage_before = app.usage;
     const mode_before = app.permission_ctx.modeValue();
     const started_ns = util_time.nowNs();
+    var run_opts = session_service.buildRunOptions(app, synthetic_user_input);
+    run_opts.emit_tool_cards = false;
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .artifact_root = app.sessionDir() orelse "", .tool_result_metrics = &app.tool_result_metrics, .file_change_journal = &app.file_change_journal, .additional_dirs = app.additionalDirs() }, // task#12:injected/synthetic 路径也套 sandbox
+        run_opts,
         backend,
         allocator,
     ) catch |err| {

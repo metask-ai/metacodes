@@ -29,6 +29,18 @@ compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- UI-neutral session command surface (issue #3): all raw input now flows
+  through one typed pipeline (`session_intent.parse` →
+  `SessionService.dispatch` → `RunPlan`), shared verbatim by the terminal
+  REPL, `--web`, and the daemon. Web/daemon gain `/commit` `/review` `/init`
+  `/retry` `/mode` and `!cmd` over `POST /command` (single- and multi-session
+  daemons previously answered 501; they now serve the rich `/state` snapshot
+  too), the REPL gains `/mode [name]`, and run-option assembly collapses into
+  one canonical `session_service.buildRunOptions` — fixing silent capability
+  loss where skill-triggered and injected runs were missing
+  agents/skills/MCP/cron wiring, and web runs were missing
+  LSP/swarm/background-request wiring. Locked by
+  `tests/component/session_api_parity_test.zig`.
 - `metacodes --version` prints `metacodes <semver>`; help banner now names the
   project instead of the legacy internal product name. The semver has one
   in-source authority (`src/version.zig`, consumed by the CLI, `lib.VERSION`,

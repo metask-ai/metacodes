@@ -59,6 +59,8 @@ const SessionSlot = struct {
     wb: WebBackend,
     config_sink: web_session.WebConfigSink,
     dctx: app_driver.DriverCtx,
+    /// U11:per-session rich /state + /command 数据源(地址稳:slots 固定数组)。
+    state_src: web_session.StateSource,
 };
 
 const MultiDaemon = struct {
@@ -66,7 +68,7 @@ const MultiDaemon = struct {
     dummy: u8 = 0, // trivialState 的 state_ctx 占位(MVP 无 rich attach)
 };
 
-/// trivial /state:rich attach(seq/roster/config)= 后续迭代。MVP 返回空对象。
+/// trivial /state:仅作 Deps 必填占位(resolver 存在时单 session 分支永不被读)。
 fn trivialState(_: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, "{}");
 }
@@ -113,8 +115,11 @@ fn resolveSession(ctx: *anyopaque, id: []const u8) ?SessionView {
                 .inbox = &slot.host.inbox,
                 .abort = &slot.app.abort,
                 .generating = &slot.host.generating, // S1:/interrupt 生成期门(driver 维护)
-                .state_ctx = @ptrCast(&md.dummy),
-                .state_fn = &trivialState,
+                // U11:rich /state + /command(per-slot StateSource,与 --web 同一份实现;
+                // 命令 HTTP 线程只入 host.cmdbox,driver 独占执行 → 旧 501 已废)。
+                .state_ctx = @ptrCast(&slot.state_src),
+                .state_fn = &web_session.StateSource.snapshot,
+                .command_fn = &web_session.StateSource.command,
             };
         }
     }
@@ -162,6 +167,7 @@ fn wireSlot(slot: *SessionSlot, reg: *SessionRegistry, web_alloc: std.mem.Alloca
     slot.wb.usage_totals = &slot.app.usage;
     slot.dctx = .{ .app = slot.app, .wb = &slot.wb };
     slot.config_sink = .{ .journal = &host.journal, .alloc = web_alloc };
+    slot.state_src = .{ .app = slot.app, .wb = &slot.wb, .cmdbox = &host.cmdbox, .journal = &host.journal, .generating = &host.generating };
     slot.app.setConfigEventSink(slot.config_sink.sink());
     slot.app.permission_ctx.ui_requester = slot.wb.requester();
     // (Ewb)先注册 → LIFO 最后跑:host 已 join 后才 deinit wb(顺序对)。
@@ -231,7 +237,7 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
         if (i == 0) {
             // slot[0]:复用 main 预建 app(arena/io=main 的,不释放);但 **owns_app=true**——main 走
             // process.exit 跳过 defer app.deinit,serveMulti 须 deinit 它(reap 子进程,消 slot0 孤儿不对称)。
-            slot.* = .{ .arena = null, .io_rt = null, .app = app0, .owns_app = true, .wired = false, .host = undefined, .wb = undefined, .config_sink = undefined, .dctx = undefined };
+            slot.* = .{ .arena = null, .io_rt = null, .app = app0, .owns_app = true, .wired = false, .host = undefined, .wb = undefined, .config_sink = undefined, .dctx = undefined, .state_src = undefined };
         } else {
             // 全新 App:独立 arena(page-backed)+ 独立 io_runtime(c_allocator backing,线程安全)。
             const arena = try web_alloc.create(std.heap.ArenaAllocator);
@@ -244,7 +250,7 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
             errdefer io_rt.deinit();
             const app = try app_mod.App.init(arena.allocator(), io_rt.io(), config, api_key);
             // App.init 成功 → app 归本 slot;上面 errdefer 只覆盖 App.init 之前的失败(io_rt/arena)。
-            slot.* = .{ .arena = arena, .io_rt = io_rt, .app = app, .owns_app = true, .wired = false, .host = undefined, .wb = undefined, .config_sink = undefined, .dctx = undefined };
+            slot.* = .{ .arena = arena, .io_rt = io_rt, .app = app, .owns_app = true, .wired = false, .host = undefined, .wb = undefined, .config_sink = undefined, .dctx = undefined, .state_src = undefined };
         }
         // 接线 host/driver。失败:wireSlot 已 destroy host+deinit wb+reset 钩子 → 只剩 app/io/arena。
         wireSlot(slot, &reg, web_alloc) catch |err| {
