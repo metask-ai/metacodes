@@ -33,6 +33,14 @@ const HOST_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const HOST_READ_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_host_read\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_host_read\",\"name\":\"Read\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"decoy.txt\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const HOST_STREAM_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_stream\",\"name\":\"HostStream\",\"input\":{}}}\n\n" ++
@@ -449,6 +457,8 @@ const PublicFileChangesProbe = struct {
     expected_run_id: u64 = 0,
     rejected: u32 = 0,
     applied: u32 = 0,
+    denied_tool_results: u32 = 0,
+    applied_tool_results: u32 = 0,
 
     fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
@@ -463,6 +473,31 @@ const PublicFileChangesProbe = struct {
             .unknown => return wire.EVENT_CONTINUE,
         };
         const value = switch (known) {
+            .tool_result => |result| {
+                if (!std.mem.eql(u8, result.id, "tu_write") or
+                    !std.mem.eql(u8, result.name, "Write"))
+                    return wire.EVENT_CONTINUE;
+                if (run.run_id == 1) {
+                    if (result.file_refs != null) return wire.EVENT_FATAL;
+                    self.denied_tool_results += 1;
+                    return wire.EVENT_CONTINUE;
+                }
+                if (run.run_id != 2) return wire.EVENT_FATAL;
+                const refs = result.file_refs orelse return wire.EVENT_FATAL;
+                if (refs.len != 1) return wire.EVENT_FATAL;
+                const file_ref = refs[0];
+                const path = switch (file_ref.locator) {
+                    .workspace_path => |path| path,
+                    else => return wire.EVENT_FATAL,
+                };
+                if (!std.mem.eql(u8, path, "blocked.txt") or
+                    !std.mem.eql(u8, file_ref.title, "blocked.txt") or
+                    !std.mem.eql(u8, file_ref.kind, "created") or
+                    file_ref.range != null)
+                    return wire.EVENT_FATAL;
+                self.applied_tool_results += 1;
+                return wire.EVENT_CONTINUE;
+            },
             .file_changes => |changes| changes,
             else => return wire.EVENT_CONTINUE,
         };
@@ -497,6 +532,61 @@ const PublicFileChangesProbe = struct {
             else => return wire.EVENT_FATAL,
         }
         return wire.EVENT_CONTINUE;
+    }
+};
+
+const HostReadRefsProbe = struct {
+    expected_session: ?*wire.SessionHandle = null,
+    host_calls: u32 = 0,
+    host_releases: u32 = 0,
+    tool_results: u32 = 0,
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        if (run.session != self.expected_session or run.run_id != 1) return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const known = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        const result = switch (known) {
+            .tool_result => |value| value,
+            else => return wire.EVENT_CONTINUE,
+        };
+        if (!std.mem.eql(u8, result.id, "tu_host_read") or
+            !std.mem.eql(u8, result.name, "Read"))
+            return wire.EVENT_CONTINUE;
+        if (result.is_error or result.file_refs != null or
+            !std.mem.eql(u8, result.content, "host-read-ok"))
+            return wire.EVENT_FATAL;
+        self.tool_results += 1;
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn host(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        _: wire.BytesViewV1,
+        out: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.HOST_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.HOST_FATAL;
+        if (run.session != self.expected_session or run.run_id != 1) return wire.HOST_FATAL;
+        const result = "host-read-ok";
+        (out orelse return wire.HOST_FATAL).* = .{ .ptr = @constCast(result.ptr), .len = result.len };
+        self.host_calls += 1;
+        return wire.HOST_OK;
+    }
+
+    fn releaseHost(raw: ?*anyopaque, result: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        if (result) |out| {
+            if (out.ptr != null) self.host_releases += 1;
+            out.* = .{ .ptr = null, .len = 0 };
+        }
     }
 };
 
@@ -4116,6 +4206,9 @@ test "L2 Revision 7 imported permission rules control the next Run" {
         std.Io.Dir.cwd().access(std.testing.io, written_path, .{}),
     );
     try std.testing.expectEqual(@as(u32, 0), probe.applied);
+    try std.testing.expectEqual(@as(u32, 1), probe.rejected);
+    try std.testing.expectEqual(@as(u32, 1), probe.denied_tool_results);
+    try std.testing.expectEqual(@as(u32, 0), probe.applied_tool_results);
 
     const allow_write = [_]wire.BytesViewV1{sdk.bytesView("Write")};
     var replacement_rules = std.mem.zeroes(wire.PermissionRuleSetV1);
@@ -4139,7 +4232,112 @@ test "L2 Revision 7 imported permission rules control the next Run" {
         ),
     );
     try std.testing.expectEqual(@as(u32, 1), probe.applied);
+    try std.testing.expectEqual(@as(u32, 1), probe.applied_tool_results);
     try std.Io.Dir.cwd().access(std.testing.io, written_path, .{});
+}
+
+test "L2 Host tool named Read cannot acquire builtin file references" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_READ_SSE, FINAL_SSE };
+    var provider = try harness.MockServer.startCassette(&bodies, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var probe = HostReadRefsProbe{};
+    var host_tool = std.mem.zeroes(wire.HostToolV1);
+    host_tool.struct_size = @sizeOf(wire.HostToolV1);
+    host_tool.ctx = &probe;
+    host_tool.name = sdk.bytesView("Read");
+    host_tool.description = sdk.bytesView("Host-owned Read name collision fixture");
+    host_tool.input_schema_json = sdk.bytesView(
+        "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"}},\"required\":[\"file_path\"]}",
+    );
+    host_tool.execute = HostReadRefsProbe.host;
+    host_tool.release_result = HostReadRefsProbe.releaseHost;
+    const host_tools = [_]wire.HostToolV1{host_tool};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.host_tools = &host_tools;
+    runtime_config.host_tool_count = host_tools.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    const allowed_tools = [_]wire.BytesViewV1{sdk.bytesView("Read")};
+    const allow_read = [_]wire.BytesViewV1{sdk.bytesView("Read")};
+    var rules = std.mem.zeroes(wire.PermissionRuleSetV1);
+    rules.struct_size = @sizeOf(wire.PermissionRuleSetV1);
+    rules.allow = &allow_read;
+    rules.allow_count = allow_read.len;
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_DEFAULT;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.allowed_tools = &allowed_tools;
+    host.allowed_tool_count = allowed_tools.len;
+    host.permission_rules = &rules;
+    var config = sessionCreateConfig(&host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = HostReadRefsProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
+    );
+    probe.expected_session = session;
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 3;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(
+            session,
+            1,
+            sdk.bytesView("invoke Host Read"),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_releases);
+    try std.testing.expectEqual(@as(u32, 1), probe.tool_results);
+
+    const decoy_path = try std.fs.path.join(a, &.{ root, "decoy.txt" });
+    defer a.free(decoy_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(std.testing.io, decoy_path, .{}),
+    );
 }
 
 test "L2 invalid Session configuration publishes no handle and diagnostics never leak credentials" {

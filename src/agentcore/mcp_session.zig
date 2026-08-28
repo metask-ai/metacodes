@@ -472,7 +472,20 @@ pub const Environment = struct {
             .prefetchSafeFn = prefetchSafe,
             .nameAtFn = nameAt,
             .hostSyncFn = hostSync,
+            .builtinFn = isBuiltin,
+            .categoryFn = category,
+            .replayDeclarationFn = replayDeclaration,
         };
+    }
+
+    const ResolvedTool = union(enum) {
+        mcp: *const Entry,
+        base,
+    };
+
+    fn resolveTool(self: *const Environment, name: []const u8) ResolvedTool {
+        if (self.findModelTool(name)) |entry| return .{ .mcp = entry };
+        return .base;
     }
 
     fn dispatch(
@@ -482,8 +495,10 @@ pub const Environment = struct {
         arguments_json: []const u8,
     ) anyerror!core.tools.ToolDispatchOutcome {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        const entry = self.findModelTool(name) orelse
-            return self.base_dispatcher.dispatch(tool_ctx, name, arguments_json);
+        const entry = switch (self.resolveTool(name)) {
+            .mcp => |entry| entry,
+            .base => return self.base_dispatcher.dispatch(tool_ctx, name, arguments_json),
+        };
         switch (self.validateInvocation(name, arguments_json)) {
             .valid => {},
             .invalid => |issue| switch (issue) {
@@ -525,8 +540,10 @@ pub const Environment = struct {
 
     fn prefetchSafe(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (self.findModelTool(name) != null) return false;
-        return self.base_dispatcher.prefetchSafe(name);
+        return switch (self.resolveTool(name)) {
+            .mcp => false,
+            .base => self.base_dispatcher.prefetchSafe(name),
+        };
     }
 
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {
@@ -539,8 +556,34 @@ pub const Environment = struct {
 
     fn hostSync(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (self.findModelTool(name) != null) return false;
-        return self.base_dispatcher.isHostSync(name);
+        return switch (self.resolveTool(name)) {
+            .mcp => false,
+            .base => self.base_dispatcher.isHostSync(name),
+        };
+    }
+
+    fn isBuiltin(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const Environment = @ptrCast(@alignCast(raw));
+        return switch (self.resolveTool(name)) {
+            .mcp => false,
+            .base => self.base_dispatcher.isBuiltin(name),
+        };
+    }
+
+    fn category(raw: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
+        const self: *const Environment = @ptrCast(@alignCast(raw));
+        return switch (self.resolveTool(name)) {
+            .mcp => null,
+            .base => self.base_dispatcher.category(name),
+        };
+    }
+
+    fn replayDeclaration(raw: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
+        const self: *const Environment = @ptrCast(@alignCast(raw));
+        return switch (self.resolveTool(name)) {
+            .mcp => .never,
+            .base => self.base_dispatcher.replayDeclaration(name),
+        };
     }
 
     fn allowsTool(raw: *const anyopaque, name: []const u8) bool {
@@ -799,14 +842,23 @@ test "Session MCP view binds identity validates argument envelope and retains ge
         ) anyerror!core.tools.ToolDispatchOutcome {
             return .host_fatal;
         }
-        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-            return false;
+        fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
+            return if (index == 0) "Read" else null;
         }
-        fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
-            return null;
+        fn prefetchSafe(_: *const anyopaque, name: []const u8) bool {
+            return std.mem.eql(u8, name, "Read");
         }
         fn hostSync(_: *const anyopaque, _: []const u8) bool {
             return false;
+        }
+        fn isBuiltin(_: *const anyopaque, name: []const u8) bool {
+            return std.mem.eql(u8, name, "Read");
+        }
+        fn category(_: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
+            return if (std.mem.eql(u8, name, "Read")) .read else null;
+        }
+        fn replayDeclaration(_: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
+            return if (std.mem.eql(u8, name, "Read")) .read_only else .never;
         }
         fn dispatcher() core.tools.ToolDispatcher {
             return .{
@@ -815,6 +867,9 @@ test "Session MCP view binds identity validates argument envelope and retains ge
                 .prefetchSafeFn = prefetchSafe,
                 .nameAtFn = nameAt,
                 .hostSyncFn = hostSync,
+                .builtinFn = isBuiltin,
+                .categoryFn = category,
+                .replayDeclarationFn = replayDeclaration,
             };
         }
         const unit: u8 = 0;
@@ -871,14 +926,32 @@ test "Session MCP view binds identity validates argument envelope and retains ge
     try std.testing.expect(first.validatesInvocation(model_name, "{\"city\":7}"));
     try std.testing.expect(!first.validatesInvocation(model_name, "[]"));
 
+    const base_definition = core.json.ToolDefinition{
+        .name = "Read",
+        .description = "Base metadata fixture",
+        .input_schema = .{ .type = "object", .required = &.{} },
+    };
     var environment = try Environment.init(
         std.testing.allocator,
         &first,
-        &.{},
+        &.{base_definition},
         Base.dispatcher(),
         Deny.policy(),
     );
     defer environment.deinit();
+    const dispatcher = environment.surface().dispatcher;
+    try std.testing.expect(!dispatcher.prefetchSafe(model_name));
+    try std.testing.expect(!dispatcher.isHostSync(model_name));
+    try std.testing.expect(!dispatcher.isBuiltin(model_name));
+    try std.testing.expect(dispatcher.category(model_name) == null);
+    try std.testing.expectEqual(core.tools.ReplayDeclaration.never, dispatcher.replayDeclaration(model_name));
+    try std.testing.expect(dispatcher.prefetchSafe("Read"));
+    try std.testing.expect(dispatcher.isBuiltin("Read"));
+    try std.testing.expect(!dispatcher.isHostSync("Read"));
+    try std.testing.expectEqual(core.tool_context.ToolCategory.read, dispatcher.category("Read").?);
+    try std.testing.expectEqual(core.tools.ReplayDeclaration.read_only, dispatcher.replayDeclaration("Read"));
+    try std.testing.expect(!dispatcher.isBuiltin("unknown"));
+    try std.testing.expect(dispatcher.category("unknown") == null);
     try std.testing.expect(!environment.executionPolicy().allowsTool(model_name));
     try std.testing.expect(!environment.executionPolicy().allowsInvocation(
         model_name,
@@ -957,11 +1030,11 @@ test "MCP expiry excludes new Runs without mutating an admitted Run environment"
         ) anyerror!core.tools.ToolDispatchOutcome {
             return .host_fatal;
         }
-        fn no(_: *const anyopaque, _: []const u8) bool {
-            return false;
-        }
         fn name(_: *const anyopaque, _: usize) ?[]const u8 {
             return null;
+        }
+        fn no(_: *const anyopaque, _: []const u8) bool {
+            return false;
         }
         fn dispatcher() core.tools.ToolDispatcher {
             return .{
@@ -1132,11 +1205,11 @@ test "all three protocol eras enter the same Session identity and dispatch seam"
             ) anyerror!core.tools.ToolDispatchOutcome {
                 return .host_fatal;
             }
-            fn no(_: *const anyopaque, _: []const u8) bool {
-                return false;
-            }
             fn name(_: *const anyopaque, _: usize) ?[]const u8 {
                 return null;
+            }
+            fn no(_: *const anyopaque, _: []const u8) bool {
+                return false;
             }
             fn dispatcher() core.tools.ToolDispatcher {
                 return .{
