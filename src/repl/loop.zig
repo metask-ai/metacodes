@@ -462,8 +462,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/init")) {
             // 对齐 cc:prompt 型命令——注入指令让模型扫码库写 CLAUDE.md(走正常 agent_loop)。
-            if (svc.submitMacro(session_service.INIT_PROMPT).run != null)
+            const d = svc.submitMacro(session_service.INIT_PROMPT);
+            if (d.run != null) {
                 try runInjectedAgent(app, allocator, &aux_be);
+            } else {
+                var obuf: [96]u8 = undefined;
+                std.debug.print("\x1b[31m/init failed: {s}\x1b[0m\n", .{d.outcome.render(&obuf)});
+            }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/mcp")) {
@@ -526,13 +531,23 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // /commit 和 /review：把预置 prompt 注入为 user message，走正常 agent_loop 路径
         // (U11:注入经 service.submitMacro,prompt 常量归 session_service——web/daemon 同源)
         if (std.mem.eql(u8, trimmed, "/commit")) {
-            if (svc.submitMacro(session_service.COMMIT_PROMPT).run != null)
+            const d = svc.submitMacro(session_service.COMMIT_PROMPT);
+            if (d.run != null) {
                 try runInjectedAgent(app, allocator, &aux_be);
+            } else {
+                var obuf: [96]u8 = undefined;
+                std.debug.print("\x1b[31m/commit failed: {s}\x1b[0m\n", .{d.outcome.render(&obuf)});
+            }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/review")) {
-            if (svc.submitMacro(session_service.REVIEW_PROMPT).run != null)
+            const d = svc.submitMacro(session_service.REVIEW_PROMPT);
+            if (d.run != null) {
                 try runInjectedAgent(app, allocator, &aux_be);
+            } else {
+                var obuf: [96]u8 = undefined;
+                std.debug.print("\x1b[31m/review failed: {s}\x1b[0m\n", .{d.outcome.render(&obuf)});
+            }
             continue;
         }
         // 用户显式 /<skill-name> [args] 触发。所有内建 Command 已先消费，
@@ -713,6 +728,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // U11:App 可导出字段统一走 canonical buildRunOptions(五处前端装配漂移的收敛点);
         // 宿主专属字段(eval gate/policy、run_control 三件套、预算、UI requester、心跳)在此补。
         var run_opts = session_service.buildRunOptions(app, scoped_recall);
+        // 宿主契约:主 REPL 是唯一消化 .backgrounded(下方尾声)并复位 flag 的宿主,
+        // 故 background_request 在此接——canonical 不带(见 buildRunOptions 注)。
+        run_opts.background_request = &app.background_request;
         run_opts.request_gate = eval_request_gate;
         run_opts.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
         run_opts.max_turns = maxTurnsFromEnv();

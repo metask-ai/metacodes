@@ -1318,19 +1318,23 @@ pub const App = struct {
         return app.permission_ctx.modeValue();
     }
 
-    /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
-    /// **只写 permission_ctx.mode(单一源,U2 S2)**;所有读方(footer/statusline/web /state)走 permMode()。
-    pub fn cyclePermMode(app: *App) void {
+    /// 设置权限模式 + 维护 plan_prev_mode 簿记:进 plan 记 from(ExitPlanMode approve 据此
+    /// 恢复真实前态),离开 plan 清。Shift+Tab 轮换与 `/mode` 命名设置(U11)**必须共用此路**
+    /// ——命名路径若直写 setMode 会漏簿记,stale prev 可让 plan approve 恢复到更宽的历史模式
+    /// (如 bypass)。**只写 permission_ctx.mode(单一源,U2 S2)**;读方走 permMode()。
+    pub fn setPermModeTracked(app: *App, to: types.PermissionMode) void {
         const from = app.permMode();
-        const to = nextPermMode(from);
-        // 经 Shift+Tab 进/出 plan 时同步维护 plan_prev_mode,使 ExitPlanMode(approve)能恢复
-        // 到进 plan 前的真实模式(否则回退 default)。进 plan:记 from;离开 plan:清。
         if (to == .plan and from != .plan) {
             app.plan_prev_mode = from;
         } else if (from == .plan and to != .plan) {
             app.plan_prev_mode = null;
         }
         app.permission_ctx.setMode(to);
+    }
+
+    /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
+    pub fn cyclePermMode(app: *App) void {
+        app.setPermModeTracked(nextPermMode(app.permMode()));
     }
 
     /// 设置 TUI 主题(变体 → 派生 theme → 持久化 ~/.metacodes/config.json)。U2 S1:抽出

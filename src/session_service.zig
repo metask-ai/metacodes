@@ -163,7 +163,9 @@ pub const SessionService = struct {
     }
 
     pub fn setPermMode(self: *SessionService, mode: types.PermissionMode) CommandOutcome {
-        self.app.permission_ctx.setMode(mode);
+        // 经 App.setPermModeTracked:进/出 plan 的 plan_prev_mode 簿记与 Shift+Tab 同源
+        // (直写 setMode 会漏簿记 → ExitPlanMode approve 恢复到 stale 的更宽模式)。
+        self.app.setPermModeTracked(mode);
         return .{ .kind = .mode_changed, .ok = true, .data = .{ .mode = self.app.permMode() } };
     }
 
@@ -287,6 +289,15 @@ pub fn dispatchIntent(svc: *SessionService, alloc: std.mem.Allocator, intent: se
         .command => |c| {
             if (c.class == .local) return .{ .outcome = .{ .kind = .unhandled, .ok = true } };
             const eql = std.mem.eql;
+            // 无参动词带参 → 拒绝(fail-closed):web/daemon 不静默吞参执行("/compact now"
+            // 不是 /compact);TUI 链对这些动词只做精确匹配(带参落 skill 兜底),两侧一致
+            // 地"带参不执行"。
+            const argless = eql(u8, c.verb, "compact") or eql(u8, c.verb, "vim") or
+                eql(u8, c.verb, "retry") or eql(u8, c.verb, "commit") or
+                eql(u8, c.verb, "review") or eql(u8, c.verb, "init");
+            if (argless and c.args.len > 0) {
+                return .{ .outcome = .{ .kind = .err, .ok = false, .data = .{ .text = "command takes no arguments" } } };
+            }
             if (eql(u8, c.verb, "commit")) return svc.submitMacro(COMMIT_PROMPT);
             if (eql(u8, c.verb, "review")) return svc.submitMacro(REVIEW_PROMPT);
             if (eql(u8, c.verb, "init")) return svc.submitMacro(INIT_PROMPT);
@@ -329,7 +340,8 @@ pub fn submitMacroImpl(self: *SessionService, macro_prompt: []const u8) Dispatch
 }
 
 /// /retry:回卷到最后一条 user 消息(丢弃其后所有回合)→ run 计划。
-/// 无 user 消息 → err outcome,零 mutation。
+/// 无 user 消息 → err outcome,零 mutation。回卷本体在 Conversation.rollbackForRetry
+/// (持快照锁 + bump mutation + compact_boundary 钳制——见其 doc)。
 pub fn prepareRetryImpl(self: *SessionService) Dispatched {
     var idx: ?usize = null;
     var i = self.app.conversation.messages.items.len;
@@ -343,12 +355,7 @@ pub fn prepareRetryImpl(self: *SessionService) Dispatched {
     if (idx == null) {
         return .{ .outcome = .{ .kind = .err, .ok = false, .data = .{ .text = "no user message to retry" } } };
     }
-    var j = self.app.conversation.messages.items.len;
-    while (j > idx.? + 1) {
-        j -= 1;
-        const m = self.app.conversation.messages.orderedRemove(j);
-        m.deinit(self.app.conversation.allocator);
-    }
+    self.app.conversation.rollbackForRetry(idx.?);
     return .{
         .outcome = .{ .kind = .noop, .ok = true },
         .run = .{ .kind = .retry },
@@ -403,7 +410,10 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .session = app.session_id,
         .verbose = app.config.verbose,
         .abort = &app.abort,
-        .background_request = &app.background_request,
+        // background_request 是**宿主契约字段**(.backgrounded 停由宿主尾声消化 + 复位,
+        // 目前只有主 REPL 实现,见 loop.zig 主 run 后的 .backgrounded 分支)——由该宿主自补。
+        // 注入/skill/web 路径不接:接了而不消化,残留 flag 会让后续注入 run 在第 1 轮前
+        // 静默 .backgrounded(宏 append 了却永不执行)。
         .read_state = &app.read_state,
         .edit_hl_cache = &app.edit_hl_cache,
         .lsp = app.lsp_service,
@@ -493,14 +503,19 @@ test "U11: /mode 命名设置(含连字符归一)与非法名" {
     var app: app_mod.App = undefined;
     app.config = types.Config{};
     app.permission_ctx = @import("permission.zig").createContext(.default, testing.allocator);
+    app.plan_prev_mode = null;
     var svc = SessionService.init(&app);
 
     const o1 = svc.exec(testing.allocator, "mode", "plan");
     try testing.expectEqual(CommandOutcome.Kind.mode_changed, o1.kind);
     try testing.expectEqual(types.PermissionMode.plan, o1.data.mode);
+    // 进 plan 记录前态(ExitPlanMode approve 据此恢复;命名路径与 Shift+Tab 同簿记)。
+    try testing.expectEqual(types.PermissionMode.default, app.plan_prev_mode.?);
 
     const o2 = svc.exec(testing.allocator, "mode", "accept-edits");
     try testing.expectEqual(types.PermissionMode.accept_edits, o2.data.mode);
+    // 离开 plan 清簿记:stale prev 绝不能残留(否则下次 approve 恢复到历史宽模式)。
+    try testing.expect(app.plan_prev_mode == null);
 
     const o3 = svc.exec(testing.allocator, "mode", "nonsense");
     try testing.expectEqual(CommandOutcome.Kind.err, o3.kind);
@@ -567,6 +582,44 @@ test "U11: /retry 回卷到最后一条 user;空对话 err 零 mutation" {
     try testing.expectEqual(RunPlan.Kind.retry, d1.run.?.kind);
     // 回卷:只剩 q1/a1/q2(q2 之后的 assistant 被丢弃)。
     try testing.expectEqual(@as(usize, 3), app.conversation.len());
+}
+
+test "U11: /retry 回卷穿过 compact_boundary → boundary 钳制,重发的 user 仍在活跃窗口" {
+    // 回归(review round 1):auto-compact 可把 boundary 推到最后一条 user 之后;旧回卷不钳
+    // boundary → activeStart 逐读 clamp 到 len,活跃窗口投影为**空**(请求只剩 summary,
+    // 无 user 消息),其后追加的消息也隐形。修复后 boundary ≤ user_idx。
+    const a = testing.allocator;
+    var app: app_mod.App = undefined;
+    app.conversation = @import("core/conversation.zig").Conversation.init(a);
+    defer app.conversation.deinit();
+    var svc = SessionService.init(&app);
+
+    try app.conversation.appendText(.user, "q1");
+    try app.conversation.appendText(.assistant, "a1");
+    try app.conversation.appendText(.user, "q2"); // idx=2:要重发的最后一条 user
+    try app.conversation.appendText(.assistant, "tool churn 1");
+    try app.conversation.appendText(.assistant, "tool churn 2");
+    // 模拟 auto-compact 把 boundary 推过最后一条 user(保留窗只剩工具回合的情形)。
+    try app.conversation.restoreCompactState(4, "summary of q1..churn");
+
+    const d = execLine(&svc, a, "/retry");
+    try testing.expectEqual(RunPlan.Kind.retry, d.run.?.kind);
+    try testing.expectEqual(@as(usize, 3), app.conversation.len());
+    // boundary 钳到 user_idx=2:活跃窗口非空,且首条就是重发的 q2。
+    const active = app.conversation.activeMessages();
+    try testing.expect(active.len >= 1);
+    try testing.expectEqualStrings("q2", active[0].blocks[0].text);
+}
+
+test "U11: 无参动词带参 → err(不静默吞参执行)" {
+    var app: app_mod.App = undefined;
+    var svc = SessionService.init(&app);
+    const d = execLine(&svc, testing.allocator, "/compact now");
+    try testing.expectEqual(CommandOutcome.Kind.err, d.outcome.kind);
+    try testing.expect(d.run == null);
+    const d2 = execLine(&svc, testing.allocator, "/retry please");
+    try testing.expectEqual(CommandOutcome.Kind.err, d2.outcome.kind);
+    try testing.expect(d2.run == null);
 }
 
 test "SessionService: model 无参 → unhandled(列候选归 caller)" {

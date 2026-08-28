@@ -91,6 +91,7 @@ test {
     _ = @import("component/swarm_kg_degraded_test.zig");
     _ = @import("component/add_dir_test.zig");
     _ = @import("component/session_api_parity_test.zig");
+    _ = @import("component/permission_name_normalization_test.zig");
     _ = @import("component/dialect_matrix_test.zig");
     _ = @import("component/overrides_test.zig");
     _ = @import("component/ontology_rule_projection_test.zig");

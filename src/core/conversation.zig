@@ -172,6 +172,25 @@ pub const Conversation = struct {
         return self.messages.items.len;
     }
 
+    /// /retry 的回卷:丢弃 messages[user_idx+1..](user_idx = 要重发的最后一条 user 下标)。
+    /// 持快照锁(与并发 transcript 快照/append 互斥)+ bump mutation_version(前缀变了,
+    /// 旧快照必须失效)。**compact_boundary 钳到 ≤ user_idx**:回卷穿过 boundary 时,若不钳,
+    /// activeStart 的逐读 clamp 会让活跃窗口投影为空——重发的 user 消息被藏在 boundary 之下,
+    /// 请求只剩 compact_summary、无 user 消息;其后追加的消息也一直隐形到 len 重新超过
+    /// stale boundary。钳到 user_idx(而非 len)保证重发消息本身在窗口内;它与 summary 的
+    /// 内容重叠是可接受的冗余(模型必须逐字看到要重答的 user 消息)。
+    pub fn rollbackForRetry(self: *Conversation, user_idx: usize) void {
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
+        std.debug.assert(user_idx < self.messages.items.len);
+        while (self.messages.items.len > user_idx + 1) {
+            const m = self.messages.pop().?;
+            m.deinit(self.allocator);
+        }
+        if (self.compact_boundary > user_idx) self.compact_boundary = user_idx;
+        self.mutation_version +%= 1;
+    }
+
     /// 深拷贝整个对话到 dst allocator(转后台续跑用)。返回的 Conversation 与源 **0 共享指针**
     /// (每 message/block 的字节都 dupe 到 dst),可安全交给后台线程,源在前台被 reset 不影响它。
     /// 持快照锁:防拷贝遍历时被并发 append realloc 抽走 items(同 transcript 快照纪律)。

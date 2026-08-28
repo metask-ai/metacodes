@@ -1994,17 +1994,32 @@ pub fn run(
             // With a Session dispatcher present, the directory is the only
             // classification authority. A name it cannot resolve is not a
             // known-read tool — default it to `.execute` (deny in plan, ask
-            // in default) instead of the legacy name-based read fallback;
-            // dispatch of such a name still fails as UnknownTool and feeds
-            // the existing guidance loop. The dyn_registry and
-            // null-dispatcher branches keep their legacy semantics.
+            // in default) instead of the legacy name-based read fallback.
+            // Dispatch of such a name still fails as UnknownTool; note the
+            // deny happens before dispatch, so the UnknownTool "did you
+            // mean X" guidance does not fire on the denied path.
+            //
+            // Legacy (no-dispatcher) branch: classification/rule matching
+            // must see the SAME name executeOne will actually run. P0.6
+            // deterministically repairs weak-model casings ("bash"→"Bash")
+            // at dispatch time — classifying the raw name would let an
+            // unknown-name read fallback allow, in plan mode, a call that
+            // then really executes Bash (classification/dispatch looking at
+            // different names). Resolve with the same normalizer up front;
+            // a truly unknown name keeps the legacy read fallback and still
+            // fails dispatch as UnknownTool.
+            var name_probe_ctx = tools_mod.ToolContext{ .allocator = allocator, .dyn_registry = opts.dyn_registry };
+            const canonical_name = if (opts.tool_dispatcher != null)
+                tu.name // dispatcher universe: exact-name policy, no repair
+            else
+                tools_mod.resolveToolNameExact(&name_probe_ctx, tu.name) orelse tu.name;
             const classified = if (opts.tool_dispatcher) |dispatcher|
                 dispatcher.category(tu.name) orelse .execute
             else if (opts.dyn_registry) |registry|
-                registry.category(tu.name)
+                registry.category(canonical_name)
             else
                 null;
-            const perm_result = permission_mod.checkPermissionClassified(&pc_nohooks, tu.name, eff_input, classified);
+            const perm_result = permission_mod.checkPermissionClassified(&pc_nohooks, canonical_name, eff_input, classified);
             log.infoId("permission", rid, "tool={s} decision={s}", .{ tu.name, @tagName(perm_result) });
             var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = eff_input };
             var policy_allowed = perm_result == .allow;
