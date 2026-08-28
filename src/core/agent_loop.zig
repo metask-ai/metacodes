@@ -2241,7 +2241,10 @@ pub fn run(
         if (opts.obligations) |obligation_runtime| {
             for (slots.items) |*result_slot| {
                 if (result_slot.decision != .run) continue;
-                if (!std.mem.eql(u8, result_slot.name, "Bash")) continue;
+                // R4-1:结果侧**不按名过滤**——slot 带 raw 名("bash" 经 P0.6 修名后真
+                // 执行),按名筛会漏掉 case-variant 的成功回填(dispatch 侧已按 canonical
+                // 记账,两侧键分裂 → 义务永不 met)。observeResult 本就按 pending id 精确
+                // 匹配:非 Bash slot 的 id 永不命中已记账槽,无误报,无需名闸。
                 const body = result_slot.content orelse continue;
                 const ok = !result_slot.is_error and
                     std.mem.indexOf(u8, body, "\"exit_code\":0}") != null;

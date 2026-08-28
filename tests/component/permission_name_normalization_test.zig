@@ -146,3 +146,68 @@ test "L2 D1回归: 真未知名(typo)保持遗留 read 兜底 → plan 下仍 Un
     capture.content = null;
     try std.testing.expect(std.mem.indexOf(u8, content, "does not exist") != null);
 }
+
+test "L2 R4-1回归: 小写 bash 成功执行后义务 met(dispatch 记账与结果回填同键)" {
+    // 两相义务:observeDispatch 记 pending id(canonical 名闸),observeResult 按 id
+    // 回填 met。缺陷:结果侧曾按 raw slot 名筛 "Bash"——小写 "bash" 修名真执行后
+    // 回填被滤掉,义务永不 met(有界误提醒)。修复:结果侧撤名闸,id 精确匹配。
+    const a = std.testing.allocator;
+    const responses = [_][]const u8{ LOWERCASE_BASH_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&responses, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "run the obligation command");
+
+    // 手工构造单义务 Runtime(needle 命中 cassette 的 echo 命令)。
+    var arena = std.heap.ArenaAllocator.init(a);
+    const aa = arena.allocator();
+    const envelopes = try aa.alloc(cc.self_evolution.ObligationEnvelope, 1);
+    envelopes[0] = .{
+        .candidate_id = "00" ** 32,
+        .task_sha256 = "11" ** 32,
+        .command_needle = "echo PLAN_ESCAPE_MARKER",
+        .reason = "test obligation",
+    };
+    const met = try aa.alloc(bool, 1);
+    const nudged = try aa.alloc(bool, 1);
+    const pending_ids = try aa.alloc([64]u8, 1);
+    const pending_lens = try aa.alloc(usize, 1);
+    @memset(met, false);
+    @memset(nudged, false);
+    @memset(pending_lens, 0);
+    var runtime = cc.obligation_gate.Runtime{
+        .arena = arena,
+        .envelopes = envelopes,
+        .met = met,
+        .nudged = nudged,
+        .pending_ids = pending_ids,
+        .pending_lens = pending_lens,
+    };
+    defer runtime.deinit();
+
+    var permission = cc.permission.createContext(.bypass_permissions, a);
+    var capture = ToolResultCapture{ .allocator = a };
+    errdefer capture.deinit();
+    const backend = capture.backend();
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        &.{},
+        &permission,
+        .{ .max_turns = 4, .emit_tool_cards = true, .colorize = false, .obligations = &runtime },
+        &backend,
+        a,
+    );
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    if (capture.content) |c| a.free(c);
+    capture.content = null;
+    // 小写 "bash" 的 echo 成功执行 → 义务 met(修前:结果侧名闸滤掉,永 false)。
+    try std.testing.expect(runtime.met[0]);
+}

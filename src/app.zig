@@ -1078,6 +1078,14 @@ pub const App = struct {
         app.initTranscriptWriter() catch |err| {
             @import("util/log.zig").warn("transcript", "rotate writer failed: {s}", .{@errorName(err)});
         };
+        // R4-3:goal 属于被转走的旧会话——不清则旧 goal 记进新会话目录、用量记错账,
+        // /resume 旧会话时又读到陈旧快照。新会话从无 goal 起步(对齐"新空会话"语义)。
+        app.goal_state.clearInMemory();
+        // 已知残留(R4-2,存量收窄未闭):Ctrl+B 时若有 active skill,其 ExecutionState
+        // 仍挂在旧 id 下(后续 clearActiveSkill 用新 id 注销不到 → 泄漏到 App deinit);
+        // 且后台 job 按值拷走的 permission_ctx.active_skill 借着该投影——此处**不能**
+        // 注销旧 id(会毁掉后台正读的投影 = UAF)。正确修法是 spawn 时深拷/引用计数
+        // 投影,见 follow-up。
     }
 
     fn initTranscriptWriter(app: *App) !void {

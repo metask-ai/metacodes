@@ -178,13 +178,22 @@ compatibility boundaries, and entry points are defined by
   Semantics note: the transcript is a live-state mirror — after a rewrite,
   tool results that microcompact/truncation had already stubbed in memory
   are stubbed on disk too (resume reproduces what the model actually saw;
-  previously resume could resurrect large tool outputs the session had
-  deliberately shed, at inconsistent indexing).
+  previously microcompacted outputs came back verbatim on resume, and
+  combined with a retry rollback the restored history could misalign). A
+  no-op retry (nothing rolled back, no boundary clamp) does not trigger a
+  rewrite.
 - Ctrl+B (background the current session) now rotates the foreground to a
-  fresh session id and transcript writer. Previously the fresh conversation
-  kept the old session's writer, corrupting the old transcript (misaligned
-  appends before the rewrite fix; wholesale overwrite after it). The old
-  session's transcript is now sealed as-is and stays resumable.
+  fresh session id, transcript writer, and cleared goal state. Previously
+  the fresh conversation kept the old session's writer and corrupted the
+  old transcript (misaligned appends; after the rewrite fix, a prior
+  retry/compact in the old session would have made the next flush replace
+  it wholesale). The old session's transcript is now sealed as-is and
+  stays resumable.
+- Task-obligation tracking survives case-variant tool names end to end:
+  both the dispatch-side accounting and the result-side met-confirmation
+  now key on the canonical name / pending id (a lowercase `bash` call that
+  really executed previously left the obligation unmet with a bounded
+  spurious nudge).
 - `/resume` now clears the active skill before switching session identity:
   previously the next run in the resumed session (e.g. an immediate
   `/retry`) executed under the previous session's skill tool policy, and the
