@@ -182,6 +182,11 @@ fn wireTinyKgTestInput(run: *std.Build.Step.Run, staged: ?StagedTinyKg) void {
 const aggregate_test_exclusions = [_][]const u8{
     // Has a dedicated ABI artifact/consumer gate with a different module graph.
     "component/agentcore_abi_test.zig",
+    // Consumes AgentCore wrapper modules (session_budget/mcp_session/
+    // model_skill_tool) through metacodes-core (lib.zig root). The aggregate
+    // suite imports cc (main.zig root); one compilation cannot own the same
+    // src files under both roots, so this file gets its own module graph.
+    "component/tool_dispatcher_metadata_test.zig",
 };
 
 fn isAggregateTestExclusion(path: []const u8) bool {
@@ -1600,6 +1605,30 @@ pub fn build(b: *std.Build) void {
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
+
+    // ToolDispatcher metadata 验收(issue #5):直接消费 AgentCore 包装层
+    // (session_budget/mcp_session/model_skill_tool)与 metacodes-core 目录的
+    // 组合。cc(main.zig 根)与 metacodes-core(lib.zig 根)不能共存于同一个
+    // 编译图,故此文件从 aggregate 套件排除(见 aggregate_test_exclusions),
+    // 走独立 artifact 并挂进主 test gate。
+    const dispatcher_metadata_mod = b.createModule(.{
+        .root_source_file = b.path("tests/component/tool_dispatcher_metadata_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    dispatcher_metadata_mod.addImport("harness", test_harness_mod);
+    dispatcher_metadata_mod.addImport("metacodes-core", core_mod);
+    dispatcher_metadata_mod.addImport("agentcore-abi", agentcore_abi_test_mod);
+    const dispatcher_metadata_test = b.addTest(.{
+        .name = "tool-dispatcher-metadata",
+        .root_module = dispatcher_metadata_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
+    const dispatcher_metadata_run = addTestRunArtifact(b, dispatcher_metadata_test, windows_test_prelude);
+    const dispatcher_metadata_step = b.step("test:dispatcher-metadata", "Run the ToolDispatcher metadata acceptance suite");
+    dispatcher_metadata_step.dependOn(&dispatcher_metadata_run.step);
+    test_step.dependOn(&dispatcher_metadata_run.step);
 
     // Focused Skill Runtime gate. Keep this work independently
     // runnable instead of forcing every unrelated spike/component artifact

@@ -61,6 +61,21 @@ compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- `tools.ToolDispatcher` now resolves every per-name execution metadata query
+  through one required `metadataFn` returning `?ToolMeta` (executor kind,
+  permission category, replay declaration, prefetch flag); the five per-field
+  callbacks (`prefetchSafeFn`/`hostSyncFn`/`builtinFn`/`categoryFn`/
+  `replayDeclarationFn`) are removed. Dispatch and metadata share one entry
+  lookup, so builtin identity, classification, replay and scheduling flags can
+  no longer drift apart across the AgentCore wrapper layers
+  (budget/Skill/MCP). Consistency consequences: builtin file tools keep their
+  `file_refs`/file-change evidence and Read resolves to a `.read_only` replay
+  through wrapped Run surfaces, and Host/MCP tools carry their declared
+  executable categories through wrappers (ask in default mode, deny in plan,
+  instead of a silent name-based allow). With a Session dispatcher present, a
+  name the directory cannot resolve now conservatively classifies as
+  `.execute` — never the legacy unknown-name read fallback — and dispatching
+  it still fails as UnknownTool. The AgentCore C ABI is unaffected.
 - CI migrated to self-hosted runners (Linux X64, macOS ARM64, Windows X64)
   with a pinned Lean toolchain build. No GitHub-hosted path remains in the
   workflows; restoring account billing would allow reintroducing hosted

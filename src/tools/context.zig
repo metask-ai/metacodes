@@ -191,6 +191,28 @@ test "ToolDispatchOutcome.deinit releases every owned payload branch" {
     fatal.deinit(allocator);
 }
 
+/// Exact executor identity of a resolvable directory entry. `builtin` is the
+/// native in-process registry implementation; `host` covers the embedder
+/// callback executors (host_sync/host_stream), which are declared
+/// concurrency-capable by kind (shipped header contract), never guessed from
+/// tool names; `external` is every other executor (isolated processes, MCP
+/// connectors, run-local overlay tools).
+pub const ToolExecutorKind = enum { builtin, host, external };
+
+/// Admission-fixed per-name execution metadata. One resolution answers every
+/// metadata query, so builtin identity / permission category / replay
+/// declaration / scheduling flags come from the same lookup and cannot drift
+/// apart. `null` from `ToolDispatcher.metadata` means the name is not
+/// selectable in this directory: dispatch must fail (UnknownTool) and must
+/// never execute.
+pub const ToolMeta = struct {
+    kind: ToolExecutorKind,
+    category: ToolCategory,
+    /// Static candidate only. Missing metadata is always conservative.
+    replay: ReplayDeclaration,
+    prefetch_safe: bool,
+};
+
 /// Session-scoped tool directory used by embedders. The directory owns the
 /// advertised definitions and routes execution back to the exact selected
 /// entry, so a provider cannot escape a Session allowlist through the global
@@ -199,52 +221,52 @@ test "ToolDispatchOutcome.deinit releases every owned payload branch" {
 pub const ToolDispatcher = struct {
     ctx: *const anyopaque,
     dispatchFn: *const fn (ctx: *const anyopaque, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome,
-    prefetchSafeFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
+    /// Required single metadata resolver. Every per-name query below derives
+    /// from the one `ToolMeta` it returns, so dispatch and metadata are
+    /// structurally forced through the same entry lookup — an implementation
+    /// cannot answer `isBuiltin` from one table and dispatch from another.
+    metadataFn: *const fn (ctx: *const anyopaque, name: []const u8) ?ToolMeta,
     nameAtFn: *const fn (ctx: *const anyopaque, index: usize) ?[]const u8,
-    /// Explicit concurrency metadata: host_sync entries are declared
-    /// concurrency-capable by executor kind (shipped header contract), never
-    /// guessed from tool names.
-    hostSyncFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
-    /// Exact executor identity from the selected catalog entry. This is
-    /// intentionally separate from dispatcher presence: AgentCore Sessions
-    /// dispatch built-ins through a non-null dispatcher too.
-    builtinFn: ?*const fn (ctx: *const anyopaque, name: []const u8) bool = null,
-    /// Permission classification for selected entries. Null keeps legacy
-    /// process registries on name-based classification; Session catalogs
-    /// provide it for every built-in and Host tool.
-    categoryFn: ?*const fn (ctx: *const anyopaque, name: []const u8) ?ToolCategory = null,
-    /// Static candidate only. Missing metadata is always conservative.
-    replayDeclarationFn: ?*const fn (ctx: *const anyopaque, name: []const u8) ReplayDeclaration = null,
 
     pub fn dispatch(self: ToolDispatcher, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome {
         return self.dispatchFn(self.ctx, tool_ctx, name, args);
     }
 
-    pub fn prefetchSafe(self: ToolDispatcher, name: []const u8) bool {
-        return self.prefetchSafeFn(self.ctx, name);
+    pub fn metadata(self: ToolDispatcher, name: []const u8) ?ToolMeta {
+        return self.metadataFn(self.ctx, name);
     }
 
     pub fn nameAt(self: ToolDispatcher, index: usize) ?[]const u8 {
         return self.nameAtFn(self.ctx, index);
     }
 
+    // Unresolvable names take the conservative default of each derived query:
+    // never prefetched, not host-sync, not builtin, no category claim, replay
+    // `.never`.
+
+    pub fn prefetchSafe(self: ToolDispatcher, name: []const u8) bool {
+        const meta = self.metadata(name) orelse return false;
+        return meta.prefetch_safe;
+    }
+
     pub fn isHostSync(self: ToolDispatcher, name: []const u8) bool {
-        return self.hostSyncFn(self.ctx, name);
+        const meta = self.metadata(name) orelse return false;
+        return meta.kind == .host;
     }
 
     pub fn isBuiltin(self: ToolDispatcher, name: []const u8) bool {
-        const f = self.builtinFn orelse return false;
-        return f(self.ctx, name);
+        const meta = self.metadata(name) orelse return false;
+        return meta.kind == .builtin;
     }
 
     pub fn category(self: ToolDispatcher, name: []const u8) ?ToolCategory {
-        const f = self.categoryFn orelse return null;
-        return f(self.ctx, name);
+        const meta = self.metadata(name) orelse return null;
+        return meta.category;
     }
 
     pub fn replayDeclaration(self: ToolDispatcher, name: []const u8) ReplayDeclaration {
-        const f = self.replayDeclarationFn orelse return .never;
-        return f(self.ctx, name);
+        const meta = self.metadata(name) orelse return .never;
+        return meta.replay;
     }
 };
 

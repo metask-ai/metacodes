@@ -148,8 +148,8 @@ const RequiredFirstProbe = struct {
         return .{ .ok = cc.tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, "unexpected")) };
     }
 
-    fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-        return false;
+    fn metadata(_: *const anyopaque, _: []const u8) ?cc.tools.ToolMeta {
+        return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
     }
 
     fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
@@ -160,17 +160,12 @@ const RequiredFirstProbe = struct {
         };
     }
 
-    fn hostSync(_: *const anyopaque, _: []const u8) bool {
-        return false;
-    }
-
     fn dispatcher(self: *RequiredFirstProbe) cc.tools.ToolDispatcher {
         return .{
             .ctx = @ptrCast(self),
             .dispatchFn = dispatch,
-            .prefetchSafeFn = prefetchSafe,
+            .metadataFn = metadata,
             .nameAtFn = nameAt,
-            .hostSyncFn = hostSync,
         };
     }
 };
