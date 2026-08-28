@@ -16,11 +16,17 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 13 function table. Discovery rejects every earlier
-/// revision; there is no legacy probe or alternate layout.
+/// Validated Revision 14 root plus mandatory domain tables. Discovery rejects
+/// every other layout; there is no legacy probe or alternate dispatch.
 #[derive(Clone, Copy)]
 pub struct Api {
     raw: NonNull<raw::metask_agentcore_api_v1>,
+}
+
+#[repr(C)]
+struct AbiPrefixV1 {
+    struct_size: u32,
+    abi_version: u32,
 }
 
 impl Api {
@@ -33,47 +39,27 @@ impl Api {
     /// `metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and remain valid for
     /// the process lifetime.
     pub unsafe fn from_raw(ptr: *const raw::metask_agentcore_api_v1) -> Result<Self, AbiError> {
-        if (ptr as usize) % std::mem::align_of::<raw::metask_agentcore_api_v1>() != 0 {
+        if ptr.is_null()
+            || (ptr as usize) % std::mem::align_of::<raw::metask_agentcore_api_v1>() != 0
+        {
+            return Err(AbiError::UnsupportedAbi);
+        }
+        let prefix = unsafe { &*ptr.cast::<AbiPrefixV1>() };
+        if prefix.struct_size as usize != size_of::<raw::metask_agentcore_api_v1>()
+            || prefix.abi_version != raw::METASK_AGENTCORE_ABI_V1
+        {
             return Err(AbiError::UnsupportedAbi);
         }
         let raw = NonNull::new(ptr.cast_mut()).ok_or(AbiError::UnsupportedAbi)?;
         let table = unsafe { raw.as_ref() };
-        if table.struct_size as usize != size_of::<raw::metask_agentcore_api_v1>()
-            || table.abi_version != raw::METASK_AGENTCORE_ABI_V1
-            || table.abi_revision != raw::METASK_AGENTCORE_ABI_REVISION
+        if table.abi_revision != raw::METASK_AGENTCORE_ABI_REVISION
             || table.reserved0 != 0
-            || table.capabilities != raw::METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 as u64
-            || table.reserved.iter().any(|value| *value != 0)
-            || table.runtime_create.is_none()
-            || table.runtime_create_with_plugins.is_none()
-            || table.runtime_destroy.is_none()
-            || table.runtime_query_skill_catalog.is_none()
-            || table.skill_catalog_release.is_none()
-            || table.runtime_refresh_mcp.is_none()
-            || table.runtime_describe_mcp.is_none()
-            || table.runtime_apply_mcp_configuration.is_none()
-            || table.session_create.is_none()
-            || table.session_restore.is_none()
-            || table.session_destroy.is_none()
-            || table.session_describe.is_none()
-            || table.session_set_model.is_none()
-            || table.session_update_skills.is_none()
-            || table.session_update_permission_rules.is_none()
-            || table.session_update_mcp.is_none()
-            || table.session_run_input.is_none()
-            || table.session_abort.is_none()
-            || table.session_compact.is_none()
-            || table.session_abort_compact.is_none()
-            || table.session_export_checkpoint.is_none()
-            || table.completion_create.is_none()
-            || table.completion_destroy.is_none()
-            || table.completion_describe.is_none()
-            || table.completion_complete.is_none()
-            || table.completion_stream_start.is_none()
-            || table.completion_stream_next.is_none()
-            || table.completion_stream_abort.is_none()
-            || table.completion_stream_destroy.is_none()
             || table.buffer_release.is_none()
+            || !unsafe { validate_runtime_api(table.runtime) }
+            || !unsafe { validate_session_api(table.session) }
+            || !unsafe { validate_session_control_api(table.session_control) }
+            || !unsafe { validate_skill_api(table.skill) }
+            || !unsafe { validate_mcp_api(table.mcp) }
         {
             return Err(AbiError::UnsupportedAbi);
         }
@@ -92,29 +78,243 @@ impl Api {
         OwnedBuffer::new(self)
     }
 
-    /// Create a Runtime with an explicit, hash-pinned process-plugin source
-    /// set. All descriptor memory is borrowed only for the duration of the
-    /// call; AgentCore owns the resulting Runtime snapshot.
-    pub fn runtime_create_with_plugins(
-        self,
-    ) -> raw::metask_agentcore_runtime_create_with_plugins_fn_v1 {
-        self.table().runtime_create_with_plugins
+    pub fn buffer_release(self) -> raw::metask_agentcore_buffer_release_fn_v1 {
+        self.table().buffer_release
     }
 
-    /// Intent-revealing SDK alias for the raw
-    /// `runtime_query_skill_catalog` function-table slot.
-    pub fn resolve_workspace_skill_catalog(
-        self,
-    ) -> raw::metask_agentcore_runtime_query_skill_catalog_fn_v1 {
-        self.table().runtime_query_skill_catalog
+    pub fn runtime(self) -> RuntimeApi {
+        RuntimeApi {
+            raw: NonNull::new(self.table().runtime.cast_mut()).expect("validated Runtime API"),
+        }
     }
 
-    /// Intent-revealing SDK alias for the raw `session_update_skills` slot.
-    /// The operation atomically binds a complete Catalog plus default-deny
-    /// concrete Skill policy, or replaces only the policy when Catalog is null.
-    pub fn session_bind_skill_policy(self) -> raw::metask_agentcore_session_bind_skills_fn_v1 {
-        self.table().session_update_skills
+    pub fn session(self) -> SessionApi {
+        SessionApi {
+            raw: NonNull::new(self.table().session.cast_mut()).expect("validated Session API"),
+        }
     }
+
+    pub fn session_control(self) -> SessionControlApi {
+        SessionControlApi {
+            raw: NonNull::new(self.table().session_control.cast_mut())
+                .expect("validated Session Control API"),
+        }
+    }
+
+    pub fn skill(self) -> SkillApi {
+        SkillApi {
+            raw: NonNull::new(self.table().skill.cast_mut()).expect("validated Skill API"),
+        }
+    }
+
+    pub fn mcp(self) -> McpApi {
+        McpApi {
+            raw: NonNull::new(self.table().mcp.cast_mut()).expect("validated MCP API"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct RuntimeApi {
+    raw: NonNull<raw::metask_agentcore_runtime_api_v1>,
+}
+
+impl RuntimeApi {
+    fn table(self) -> &'static raw::metask_agentcore_runtime_api_v1 {
+        unsafe { self.raw.as_ref() }
+    }
+
+    pub fn create(self) -> raw::metask_agentcore_runtime_create_fn_v1 {
+        self.table().create
+    }
+
+    pub fn destroy(self) -> raw::metask_agentcore_runtime_destroy_fn_v1 {
+        self.table().destroy
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SessionApi {
+    raw: NonNull<raw::metask_agentcore_session_api_v1>,
+}
+
+impl SessionApi {
+    fn table(self) -> &'static raw::metask_agentcore_session_api_v1 {
+        unsafe { self.raw.as_ref() }
+    }
+
+    pub fn create(self) -> raw::metask_agentcore_session_create_fn_v1 {
+        self.table().create
+    }
+    pub fn destroy(self) -> raw::metask_agentcore_session_destroy_fn_v1 {
+        self.table().destroy
+    }
+    pub fn run_input(self) -> raw::metask_agentcore_session_run_input_fn_v1 {
+        self.table().run_input
+    }
+    pub fn abort(self) -> raw::metask_agentcore_session_abort_fn_v1 {
+        self.table().abort
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SessionControlApi {
+    raw: NonNull<raw::metask_agentcore_session_control_api_v1>,
+}
+
+impl SessionControlApi {
+    fn table(self) -> &'static raw::metask_agentcore_session_control_api_v1 {
+        unsafe { self.raw.as_ref() }
+    }
+
+    pub fn restore(self) -> raw::metask_agentcore_session_restore_fn_v1 {
+        self.table().restore
+    }
+    pub fn describe(self) -> raw::metask_agentcore_session_describe_fn_v1 {
+        self.table().describe
+    }
+    pub fn set_model(self) -> raw::metask_agentcore_session_set_model_fn_v1 {
+        self.table().set_model
+    }
+    pub fn update_permission_rules(
+        self,
+    ) -> raw::metask_agentcore_session_update_permission_rules_fn_v1 {
+        self.table().update_permission_rules
+    }
+    pub fn compact(self) -> raw::metask_agentcore_session_compact_fn_v1 {
+        self.table().compact
+    }
+    pub fn abort_compact(self) -> raw::metask_agentcore_session_abort_compact_fn_v1 {
+        self.table().abort_compact
+    }
+    pub fn export_checkpoint(self) -> raw::metask_agentcore_session_export_checkpoint_fn_v1 {
+        self.table().export_checkpoint
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SkillApi {
+    raw: NonNull<raw::metask_agentcore_skill_api_v1>,
+}
+
+impl SkillApi {
+    fn table(self) -> &'static raw::metask_agentcore_skill_api_v1 {
+        unsafe { self.raw.as_ref() }
+    }
+
+    pub fn resolve_catalog(self) -> raw::metask_agentcore_runtime_query_skill_catalog_fn_v1 {
+        self.table().resolve_catalog
+    }
+    pub fn release_catalog(self) -> raw::metask_agentcore_skill_catalog_release_fn_v1 {
+        self.table().release_catalog
+    }
+    pub fn bind_policy(self) -> raw::metask_agentcore_session_bind_skills_fn_v1 {
+        self.table().bind_policy
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct McpApi {
+    raw: NonNull<raw::metask_agentcore_mcp_api_v1>,
+}
+
+impl McpApi {
+    fn table(self) -> &'static raw::metask_agentcore_mcp_api_v1 {
+        unsafe { self.raw.as_ref() }
+    }
+
+    pub fn apply_configuration(
+        self,
+    ) -> raw::metask_agentcore_runtime_apply_mcp_configuration_fn_v1 {
+        self.table().apply_configuration
+    }
+    pub fn refresh(self) -> raw::metask_agentcore_runtime_refresh_mcp_fn_v1 {
+        self.table().refresh
+    }
+    pub fn describe(self) -> raw::metask_agentcore_runtime_describe_mcp_fn_v1 {
+        self.table().describe
+    }
+    pub fn update_selection(self) -> raw::metask_agentcore_session_update_mcp_fn_v1 {
+        self.table().update_selection
+    }
+}
+
+unsafe fn validate_runtime_api(ptr: *const raw::metask_agentcore_runtime_api_v1) -> bool {
+    if ptr.is_null()
+        || (ptr as usize) % std::mem::align_of::<raw::metask_agentcore_runtime_api_v1>() != 0
+    {
+        return false;
+    }
+    let table = unsafe { &*ptr };
+    table.struct_size as usize == size_of::<raw::metask_agentcore_runtime_api_v1>()
+        && table.reserved0 == 0
+        && table.create.is_some()
+        && table.destroy.is_some()
+}
+
+unsafe fn validate_session_api(ptr: *const raw::metask_agentcore_session_api_v1) -> bool {
+    if ptr.is_null()
+        || (ptr as usize) % std::mem::align_of::<raw::metask_agentcore_session_api_v1>() != 0
+    {
+        return false;
+    }
+    let table = unsafe { &*ptr };
+    table.struct_size as usize == size_of::<raw::metask_agentcore_session_api_v1>()
+        && table.reserved0 == 0
+        && table.create.is_some()
+        && table.destroy.is_some()
+        && table.run_input.is_some()
+        && table.abort.is_some()
+}
+
+unsafe fn validate_session_control_api(
+    ptr: *const raw::metask_agentcore_session_control_api_v1,
+) -> bool {
+    if ptr.is_null()
+        || (ptr as usize) % std::mem::align_of::<raw::metask_agentcore_session_control_api_v1>()
+            != 0
+    {
+        return false;
+    }
+    let table = unsafe { &*ptr };
+    table.struct_size as usize == size_of::<raw::metask_agentcore_session_control_api_v1>()
+        && table.reserved0 == 0
+        && table.restore.is_some()
+        && table.describe.is_some()
+        && table.set_model.is_some()
+        && table.update_permission_rules.is_some()
+        && table.compact.is_some()
+        && table.abort_compact.is_some()
+        && table.export_checkpoint.is_some()
+}
+
+unsafe fn validate_skill_api(ptr: *const raw::metask_agentcore_skill_api_v1) -> bool {
+    if ptr.is_null()
+        || (ptr as usize) % std::mem::align_of::<raw::metask_agentcore_skill_api_v1>() != 0
+    {
+        return false;
+    }
+    let table = unsafe { &*ptr };
+    table.struct_size as usize == size_of::<raw::metask_agentcore_skill_api_v1>()
+        && table.reserved0 == 0
+        && table.resolve_catalog.is_some()
+        && table.release_catalog.is_some()
+        && table.bind_policy.is_some()
+}
+
+unsafe fn validate_mcp_api(ptr: *const raw::metask_agentcore_mcp_api_v1) -> bool {
+    if ptr.is_null()
+        || (ptr as usize) % std::mem::align_of::<raw::metask_agentcore_mcp_api_v1>() != 0
+    {
+        return false;
+    }
+    let table = unsafe { &*ptr };
+    table.struct_size as usize == size_of::<raw::metask_agentcore_mcp_api_v1>()
+        && table.reserved0 == 0
+        && table.apply_configuration.is_some()
+        && table.refresh.is_some()
+        && table.describe.is_some()
+        && table.update_selection.is_some()
 }
 
 /// Library-owned output buffer. Use this only for diagnostics, catalog/session
@@ -173,7 +373,7 @@ impl Drop for OwnedBuffer {
 }
 
 /// Unique Runtime ownership guard. The caller must create it from a successful
-/// `runtime_create` output and must not retain another owner of the handle.
+/// `RuntimeApi::create` output and must not retain another owner of the handle.
 pub struct Runtime {
     api: Api,
     raw: NonNull<raw::metask_agentcore_runtime>,
@@ -204,7 +404,7 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         let mut diagnostic = self.api.owned_buffer();
         unsafe {
-            (self.api.table().runtime_destroy.unwrap())(self.raw.as_ptr(), diagnostic.as_mut_ptr());
+            (self.api.runtime().destroy().unwrap())(self.raw.as_ptr(), diagnostic.as_mut_ptr());
         }
     }
 }
@@ -244,89 +444,7 @@ impl Drop for Session<'_> {
     fn drop(&mut self) {
         let mut diagnostic = self.api.owned_buffer();
         unsafe {
-            (self.api.table().session_destroy.unwrap())(self.raw.as_ptr(), diagnostic.as_mut_ptr());
-        }
-    }
-}
-
-/// Unique independent Completion ownership guard. It does not borrow a
-/// Runtime or Session. The Host must quiesce any direct FFI calls before drop.
-pub struct Completion {
-    api: Api,
-    raw: NonNull<raw::metask_agentcore_completion>,
-}
-
-impl Completion {
-    pub unsafe fn from_owned_raw(
-        api: Api,
-        raw: *mut raw::metask_agentcore_completion,
-    ) -> Result<Self, AbiError> {
-        Ok(Self {
-            api,
-            raw: NonNull::new(raw).ok_or(AbiError::UnsupportedAbi)?,
-        })
-    }
-
-    pub fn as_raw(&self) -> *mut raw::metask_agentcore_completion {
-        self.raw.as_ptr()
-    }
-
-    pub fn into_raw(self) -> *mut raw::metask_agentcore_completion {
-        let this = ManuallyDrop::new(self);
-        this.raw.as_ptr()
-    }
-}
-
-impl Drop for Completion {
-    fn drop(&mut self) {
-        let mut diagnostic = self.api.owned_buffer();
-        unsafe {
-            (self.api.table().completion_destroy.unwrap())(
-                self.raw.as_ptr(),
-                diagnostic.as_mut_ptr(),
-            );
-        }
-    }
-}
-
-/// Unique stream guard tied to its Completion. A caller may invoke abort from
-/// another thread through the raw API, but must not drop while next is active.
-pub struct CompletionStream<'completion> {
-    api: Api,
-    raw: NonNull<raw::metask_agentcore_completion_stream>,
-    _completion: PhantomData<&'completion Completion>,
-}
-
-impl<'completion> CompletionStream<'completion> {
-    pub unsafe fn from_owned_raw(
-        completion: &'completion Completion,
-        raw: *mut raw::metask_agentcore_completion_stream,
-    ) -> Result<Self, AbiError> {
-        Ok(Self {
-            api: completion.api,
-            raw: NonNull::new(raw).ok_or(AbiError::UnsupportedAbi)?,
-            _completion: PhantomData,
-        })
-    }
-
-    pub fn as_raw(&self) -> *mut raw::metask_agentcore_completion_stream {
-        self.raw.as_ptr()
-    }
-
-    pub fn into_raw(self) -> *mut raw::metask_agentcore_completion_stream {
-        let this = ManuallyDrop::new(self);
-        this.raw.as_ptr()
-    }
-}
-
-impl Drop for CompletionStream<'_> {
-    fn drop(&mut self) {
-        let mut diagnostic = self.api.owned_buffer();
-        unsafe {
-            (self.api.table().completion_stream_destroy.unwrap())(
-                self.raw.as_ptr(),
-                diagnostic.as_mut_ptr(),
-            );
+            (self.api.session().destroy().unwrap())(self.raw.as_ptr(), diagnostic.as_mut_ptr());
         }
     }
 }
@@ -480,13 +598,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_thirteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 13);
-        assert_eq!(raw::METASK_AGENTCORE_CAP_PROCESS_PLUGIN_TOOLS, 1 << 22);
-        assert_eq!(raw::METASK_AGENTCORE_CAP_HOST_STREAM_TOOLS, 1 << 23);
-        assert_eq!(raw::METASK_AGENTCORE_CAP_MCP_TOOL_STREAM, 1 << 24);
-        assert_eq!(raw::METASK_AGENTCORE_CAP_ACTIVE_RUN_JOURNAL, 1 << 25);
-        assert_eq!(raw::METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1, 0x3ff_ffff);
+    fn revision_fourteen_layout_codes_and_host_buffer_helpers_are_exact() {
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 14);
+        assert_eq!(raw::METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE, 27);
         assert_eq!(raw::METASK_AGENTCORE_RUN_JOURNAL_EPHEMERAL, 0);
         assert_eq!(raw::METASK_AGENTCORE_RUN_JOURNAL_DURABLE_WORKSPACE, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_AUTO, 1);
@@ -499,13 +613,25 @@ mod tests {
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_APPLIED, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_SUPERSEDED, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_REJECTED, 3);
-        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 280);
-        assert_eq!(size_of::<raw::metask_agentcore_process_plugin_source_v1>(), 48);
-        assert_eq!(size_of::<raw::metask_agentcore_runtime_plugin_config_v1>(), 72);
+        assert_eq!(size_of::<raw::metask_agentcore_runtime_api_v1>(), 24);
+        assert_eq!(size_of::<raw::metask_agentcore_session_api_v1>(), 40);
+        assert_eq!(
+            size_of::<raw::metask_agentcore_session_control_api_v1>(),
+            64
+        );
+        assert_eq!(size_of::<raw::metask_agentcore_skill_api_v1>(), 32);
+        assert_eq!(size_of::<raw::metask_agentcore_mcp_api_v1>(), 40);
+        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 64);
+        assert_eq!(
+            size_of::<raw::metask_agentcore_process_plugin_source_v1>(),
+            48
+        );
+        assert_eq!(
+            size_of::<raw::metask_agentcore_runtime_plugin_config_v1>(),
+            72
+        );
         assert_eq!(size_of::<raw::metask_agentcore_host_result_sink_v1>(), 56);
         assert_eq!(size_of::<raw::metask_agentcore_host_stream_tool_v1>(), 96);
-        assert_eq!(size_of::<raw::metask_agentcore_completion_config_v1>(), 88);
-        assert_eq!(size_of::<raw::metask_agentcore_completion_event_v1>(), 80);
         assert_eq!(size_of::<raw::metask_agentcore_mcp_configuration_v1>(), 64);
         assert_eq!(size_of::<raw::metask_agentcore_mcp_apply_report_v1>(), 64);
         assert_eq!(

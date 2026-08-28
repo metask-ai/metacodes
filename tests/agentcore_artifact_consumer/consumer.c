@@ -6,15 +6,11 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 13 must not retain historical callback aliases"
+#error "revision 14 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 13u || \
-    METASK_AGENTCORE_CAP_PROCESS_PLUGIN_TOOLS != (1ULL << 22) || \
-    METASK_AGENTCORE_CAP_HOST_STREAM_TOOLS != (1ULL << 23) || \
-    METASK_AGENTCORE_CAP_MCP_TOOL_STREAM != (1ULL << 24) || \
-    METASK_AGENTCORE_CAP_ACTIVE_RUN_JOURNAL != (1ULL << 25) || \
-    METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 != 0x3ffffffULL || \
+#if METASK_AGENTCORE_ABI_REVISION != 14u || \
+    METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE != 27u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_AUTO != 1u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY != 2u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY != 3u || \
@@ -25,7 +21,7 @@
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
     METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 13 codes must match the public contract"
+#error "source-free Revision 14 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -346,6 +342,35 @@ int main(void) {
     if (api == NULL) {
         return 10;
     }
+    const metask_agentcore_api_v1 *raw_api =
+        (const metask_agentcore_api_v1 *)metask_agentcore_get_api(
+            METASK_AGENTCORE_ABI_V1);
+    if (raw_api != api || api->buffer_release != raw_api->buffer_release ||
+        api->runtime->create != raw_api->runtime->create ||
+        api->runtime->destroy != raw_api->runtime->destroy ||
+        api->session->create != raw_api->session->create ||
+        api->session->destroy != raw_api->session->destroy ||
+        api->session->run_input != raw_api->session->run_input ||
+        api->session->abort != raw_api->session->abort ||
+        api->session_control->restore != raw_api->session_control->restore ||
+        api->session_control->describe != raw_api->session_control->describe ||
+        api->session_control->set_model != raw_api->session_control->set_model ||
+        api->session_control->update_permission_rules !=
+            raw_api->session_control->update_permission_rules ||
+        api->session_control->compact != raw_api->session_control->compact ||
+        api->session_control->abort_compact !=
+            raw_api->session_control->abort_compact ||
+        api->session_control->export_checkpoint !=
+            raw_api->session_control->export_checkpoint ||
+        api->skill->resolve_catalog != raw_api->skill->resolve_catalog ||
+        api->skill->release_catalog != raw_api->skill->release_catalog ||
+        api->skill->bind_policy != raw_api->skill->bind_policy ||
+        api->mcp->apply_configuration != raw_api->mcp->apply_configuration ||
+        api->mcp->refresh != raw_api->mcp->refresh ||
+        api->mcp->describe != raw_api->mcp->describe ||
+        api->mcp->update_selection != raw_api->mcp->update_selection) {
+        return 10;
+    }
     metask_agentcore_api_v1 prior_revision = *api;
     prior_revision.abi_revision = METASK_AGENTCORE_ABI_REVISION - 1u;
     if (metask_agentcore_api_v1_is_compatible(&prior_revision)) {
@@ -372,7 +397,7 @@ int main(void) {
     plugin_config.host_stream_tools = &stream_tool;
     plugin_config.host_stream_tool_count = 1;
     metask_agentcore_runtime *runtime = NULL;
-    if (api->runtime_create_with_plugins(
+    if (api->runtime->create(
             &runtime_config, &plugin_config, &runtime, &diagnostic) !=
             METASK_AGENTCORE_STATUS_OK ||
         runtime == NULL) {
@@ -382,25 +407,25 @@ int main(void) {
     mcp_configuration.struct_size = sizeof(mcp_configuration);
     mcp_configuration.desired_revision = 1;
     metask_agentcore_mcp_apply_report_v1 mcp_report = {0};
-    if (api->runtime_apply_mcp_configuration(
+    if (api->mcp->apply_configuration(
             runtime, &mcp_configuration, &mcp_report, &diagnostic) !=
             METASK_AGENTCORE_STATUS_OK ||
         mcp_report.struct_size != sizeof(mcp_report) ||
         mcp_report.disposition_code != METASK_AGENTCORE_MCP_APPLY_APPLIED ||
         mcp_report.desired_revision != 1 || mcp_report.active_revision != 1 ||
         mcp_report.catalog_generation != 1) {
-        api->runtime_destroy(runtime, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 40);
     }
 
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        api->runtime_destroy(runtime, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 13);
     }
     struct test_server server;
     if (start_server(&server) != 0) {
-        api->runtime_destroy(runtime, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 14);
     }
     char base_url[128];
@@ -428,48 +453,48 @@ int main(void) {
     session_config.model = view("c-consumer-model");
 
     metask_agentcore_session *session = NULL;
-    if (api->session_create(runtime, &session_config, &callbacks, &session,
+    if (api->session->create(runtime, &session_config, &callbacks, &session,
                             &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
         session == NULL) {
         api->buffer_release(&diagnostic);
         stop_server(&server);
-        api->runtime_destroy(runtime, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 15);
     }
     registered_session = session;
 
-    if (api->session_set_model(session, view("c-consumer-model-v2"),
+    if (api->session_control->set_model(session, view("c-consumer-model-v2"),
                                &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         stop_server(&server);
-        api->session_destroy(session, &diagnostic);
-        api->runtime_destroy(runtime, &diagnostic);
+        api->session->destroy(session, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 16);
     }
     metask_agentcore_permission_rule_set_v1 empty_rules = {0};
     empty_rules.struct_size = sizeof(empty_rules);
-    if (api->session_update_permission_rules(session, &empty_rules,
+    if (api->session_control->update_permission_rules(session, &empty_rules,
                                              &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         stop_server(&server);
-        api->session_destroy(session, &diagnostic);
-        api->runtime_destroy(runtime, &diagnostic);
+        api->session->destroy(session, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 17);
     }
     metask_agentcore_compact_result_v1 compact_result = {0};
-    if (api->session_compact(session, 1, &compact_result,
+    if (api->session_control->compact(session, 1, &compact_result,
                              &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
         compact_result.struct_size != sizeof(compact_result) ||
         compact_result.outcome_code != METASK_AGENTCORE_COMPACT_NO_CHANGE ||
-        api->session_abort_compact(session, 1, &diagnostic) !=
+        api->session_control->abort_compact(session, 1, &diagnostic) !=
             METASK_AGENTCORE_STATUS_TOO_LATE) {
         stop_server(&server);
         api->buffer_release(&diagnostic);
-        api->session_destroy(session, &diagnostic);
-        api->runtime_destroy(runtime, &diagnostic);
+        api->session->destroy(session, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 18);
     }
     api->buffer_release(&diagnostic);
 
-    uint32_t busy_status = api->runtime_destroy(runtime, &diagnostic);
+    uint32_t busy_status = api->runtime->destroy(runtime, &diagnostic);
     if (busy_status != METASK_AGENTCORE_STATUS_BUSY ||
         diagnostic.ptr == NULL || diagnostic.len == 0) {
         stop_server(&server);
@@ -480,9 +505,9 @@ int main(void) {
     if (diagnostic.ptr != NULL || diagnostic.len != 0) {
         diagnostic = (metask_agentcore_owned_bytes_v1){0};
         stop_server(&server);
-        api->session_destroy(session, &diagnostic);
+        api->session->destroy(session, &diagnostic);
         api->buffer_release(&diagnostic);
-        api->runtime_destroy(runtime, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         api->buffer_release(&diagnostic);
         return 17;
     }
@@ -496,24 +521,24 @@ int main(void) {
     input.text = view("exercise C ABI");
     metask_agentcore_run_result_v1 result = {0};
     active_run_id = 1;
-    uint32_t run_status = api->session_run_input(session, 1, &input, &options,
+    uint32_t run_status = api->session->run_input(session, 1, &input, &options,
                                                  &result, &diagnostic);
     active_run_id = 0;
     stop_server(&server);
     if (run_status != METASK_AGENTCORE_STATUS_OK || result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN ||
         event_calls == 0 || server.result != 0) {
         api->buffer_release(&diagnostic);
-        api->session_destroy(session, &diagnostic);
+        api->session->destroy(session, &diagnostic);
         api->buffer_release(&diagnostic);
-        api->runtime_destroy(runtime, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 18);
     }
-    if (api->session_destroy(session, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
+    if (api->session->destroy(session, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         api->buffer_release(&diagnostic);
-        api->runtime_destroy(runtime, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 19);
     }
-    if (api->runtime_destroy(runtime, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
+    if (api->runtime->destroy(runtime, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);

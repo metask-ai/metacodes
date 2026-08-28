@@ -28,7 +28,6 @@ const skill_runtime = core.skills_runtime;
 pub const skill_catalog = skill_runtime.catalog;
 pub const skill_availability = skill_runtime.availability;
 pub const skill_catalog_handles = @import("skill_catalog_handles.zig");
-pub const completion_handles = @import("completion_handles.zig");
 pub const skill_activation = skill_runtime.activation;
 pub const skill_materialization = skill_runtime.materialization;
 pub const policy_frame = skill_runtime.policy_frame;
@@ -663,6 +662,74 @@ fn createInitialMcpSelection(
     const snapshot = try manager.retainCurrent();
     defer snapshot.release();
     return try mcp_session.Selection.init(allocator, snapshot, selectors, mode);
+}
+
+/// Return the complete valid UTF-8 prefix only when the invalidity is an
+/// incomplete final code point. An invalid lead byte, continuation byte, or
+/// complete malformed sequence means the source itself is not UTF-8 and must
+/// not be exposed as displayable text.
+fn truncatedUtf8Prefix(bytes: []const u8) ?usize {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const width: usize = std.unicode.utf8ByteSequenceLength(bytes[index]) catch return null;
+        if (width > bytes.len - index) return index;
+        _ = std.unicode.utf8Decode(bytes[index..][0..width]) catch return null;
+        index += width;
+    }
+    return bytes.len;
+}
+
+/// AgentCore's JSON boundary owns the UTF-8 constraint; Core file-change
+/// evidence remains byte-preserving for its non-JSON consumers. Keep the
+/// common path borrowed and allocation-free. Only a batch containing an
+/// invalid unified diff receives a shallow record-array copy: an incomplete
+/// trailing code point is removed, while intrinsically non-UTF-8 content is
+/// omitted. In both cases `diff_complete` makes the evidence loss explicit.
+fn sanitizeFileChangeRecords(
+    event_allocator: std.mem.Allocator,
+    changes: []const public_protocol.FileChangeRecord,
+) error{OutOfMemory}!?[]public_protocol.FileChangeRecord {
+    var has_invalid_diff = false;
+    for (changes) |change| {
+        if (change.unified_diff) |diff| {
+            if (!std.unicode.utf8ValidateSlice(diff)) {
+                has_invalid_diff = true;
+                break;
+            }
+        }
+    }
+    if (!has_invalid_diff) return null;
+
+    const sanitized = try event_allocator.dupe(public_protocol.FileChangeRecord, changes);
+    for (sanitized) |*change| {
+        const diff = change.unified_diff orelse continue;
+        if (std.unicode.utf8ValidateSlice(diff)) continue;
+
+        change.diff_complete = false;
+        change.unified_diff = if (truncatedUtf8Prefix(diff)) |end|
+            if (end == 0) null else diff[0..end]
+        else
+            null;
+    }
+    return sanitized;
+}
+
+fn encodePublicEventJson(
+    event_allocator: std.mem.Allocator,
+    event: public_protocol.CoreEvent,
+) error{OutOfMemory}![]u8 {
+    var normalized = event;
+    var sanitized_changes: ?[]public_protocol.FileChangeRecord = null;
+    defer if (sanitized_changes) |records| event_allocator.free(records);
+
+    switch (normalized) {
+        .file_changes => |*batch| {
+            sanitized_changes = try sanitizeFileChangeRecords(event_allocator, batch.changes);
+            if (sanitized_changes) |records| batch.changes = records;
+        },
+        else => {},
+    }
+    return std.json.Stringify.valueAlloc(event_allocator, normalized, .{});
 }
 
 const AbiSession = struct {
@@ -1356,7 +1423,7 @@ const AbiSession = struct {
             return false;
         const callback = self.callbacks.on_event orelse return true;
         const public_event = protocol_v1.event(event) orelse return true;
-        const json = std.json.Stringify.valueAlloc(allocator, public_event, .{}) catch {
+        const json = encodePublicEventJson(allocator, public_event) catch {
             self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
             return false;
         };
@@ -3642,18 +3709,6 @@ fn catalogFrom(handle: *wire.SkillCatalogHandle) *skill_catalog_handles.HostCata
 fn catalogHandle(catalog: *skill_catalog_handles.HostCatalog) *wire.SkillCatalogHandle {
     return @ptrCast(catalog);
 }
-fn completionFrom(handle: *wire.CompletionHandle) *completion_handles.Completion {
-    return @ptrCast(@alignCast(handle));
-}
-fn completionHandle(value: *completion_handles.Completion) *wire.CompletionHandle {
-    return @ptrCast(value);
-}
-fn completionStreamFrom(handle: *wire.CompletionStreamHandle) *completion_handles.Stream {
-    return @ptrCast(@alignCast(handle));
-}
-fn completionStreamHandle(value: *completion_handles.Stream) *wire.CompletionStreamHandle {
-    return @ptrCast(value);
-}
 
 fn view(bytes: []const u8) wire.BytesViewV1 {
     return .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = bytes.len };
@@ -3741,7 +3796,6 @@ fn statusText(status: u32) []const u8 {
         wire.STATUS_LOGICAL_SESSION_CONFLICT => "logical Session conflict",
         wire.STATUS_MCP_NOT_REFRESHED => "MCP catalog not refreshed",
         wire.STATUS_INVALID_MCP_SELECTION => "invalid MCP selection",
-        wire.STATUS_COMPLETION_UNSUPPORTED_RESPONSE => "unsupported Completion response",
         else => "AgentCore error",
     };
 }
@@ -3812,18 +3866,6 @@ fn catalogQueryStatus(err: anyerror) u32 {
         error.RuntimeBusy => wire.STATUS_BUSY,
         error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
         error.InvalidWorkspace, error.InvalidSource => wire.STATUS_INVALID_ARGUMENT,
-        else => wire.STATUS_CORE_ERROR,
-    };
-}
-
-fn completionStatus(err: anyerror) u32 {
-    return switch (err) {
-        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
-        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
-        error.Busy => wire.STATUS_BUSY,
-        error.TooLate => wire.STATUS_TOO_LATE,
-        error.InvalidState => wire.STATUS_INVALID_STATE,
-        error.UnsupportedResponse => wire.STATUS_COMPLETION_UNSUPPORTED_RESPONSE,
         else => wire.STATUS_CORE_ERROR,
     };
 }
@@ -3914,34 +3956,6 @@ fn provider(code: u32) ?core.types.ProviderKind {
         wire.PROVIDER_ANTHROPIC => .anthropic,
         wire.PROVIDER_OPENAI => .openai,
         wire.PROVIDER_GEMINI => .gemini,
-        else => null,
-    };
-}
-
-fn providerCode(kind: core.types.ProviderKind) u32 {
-    return switch (kind) {
-        .anthropic => wire.PROVIDER_ANTHROPIC,
-        .openai => wire.PROVIDER_OPENAI,
-        .gemini => wire.PROVIDER_GEMINI,
-    };
-}
-
-fn completionStopCode(reason: completion_handles.StopReason) u32 {
-    return switch (reason) {
-        .unknown => wire.COMPLETION_STOP_UNKNOWN,
-        .end_turn => wire.COMPLETION_STOP_END_TURN,
-        .max_tokens => wire.COMPLETION_STOP_MAX_TOKENS,
-        .stop_sequence => wire.COMPLETION_STOP_STOP_SEQUENCE,
-        .pause_turn => wire.COMPLETION_STOP_PAUSE_TURN,
-        .refusal => wire.COMPLETION_STOP_REFUSAL,
-        .aborted => wire.COMPLETION_STOP_ABORTED,
-    };
-}
-
-fn completionAbortReason(code: u32) ?core.util_abort.Reason {
-    return switch (code) {
-        wire.ABORT_USER_REQUEST => .user_interrupt,
-        wire.ABORT_TIMEOUT => .timeout,
         else => null,
     };
 }
@@ -4522,21 +4536,12 @@ fn parseProcessPluginSources(
     return result;
 }
 
-fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
-    return runtimeCreateImpl(config_ptr, null, out_runtime, out_error);
-}
-
-fn runtimeCreateWithPlugins(
+fn runtimeCreate(
     config_ptr: ?*const wire.RuntimeConfigV1,
     plugins_ptr: ?*const wire.RuntimePluginConfigV1,
     out_runtime: ?*?*wire.RuntimeHandle,
     out_error: ?*wire.OwnedBytesV1,
 ) callconv(.c) u32 {
-    if (plugins_ptr == null) {
-        if (out_runtime) |out| out.* = null;
-        emptyError(out_error);
-        return fail(wire.STATUS_INVALID_ARGUMENT, "plugin runtime config is required", out_error);
-    }
     return runtimeCreateImpl(config_ptr, plugins_ptr, out_runtime, out_error);
 }
 
@@ -4830,260 +4835,6 @@ fn skillCatalogRelease(
         return fail(wire.STATUS_INVALID_ARGUMENT, "Skill catalog is required", out_error));
     catalog.release() catch |err|
         return failError(catalogLifecycleStatus(err), err, out_error);
-    return wire.STATUS_OK;
-}
-
-fn parseCompletionRequest(
-    scratch: std.mem.Allocator,
-    request_ptr: ?*const wire.CompletionRequestV1,
-) !completion_handles.Request {
-    const request = request_ptr orelse return error.InvalidArgument;
-    if (request.struct_size != @sizeOf(wire.CompletionRequestV1) or
-        request.reserved0 != 0 or !allZero(request.reserved))
-        return error.InvalidArgument;
-    if (request.message_count == 0)
-        return error.InvalidArgument;
-    if (request.message_count > wire.MAX_COMPLETION_MESSAGES_V1)
-        return error.ResourceLimit;
-    const count = std.math.cast(usize, request.message_count) orelse
-        return error.Overflow;
-    const source = (request.messages orelse return error.InvalidArgument)[0..count];
-    const messages = try scratch.alloc(completion_handles.TextMessage, count);
-    var total_bytes: u64 = 0;
-    for (source, messages) |input, *output| {
-        if (input.struct_size != @sizeOf(wire.CompletionMessageV1) or
-            !allZero(input.reserved))
-            return error.InvalidArgument;
-        const role: core.types.MessageRole = switch (input.role_code) {
-            wire.COMPLETION_ROLE_USER => .user,
-            wire.COMPLETION_ROLE_ASSISTANT => .assistant,
-            else => return error.InvalidArgument,
-        };
-        const message_text = try text(input.text);
-        total_bytes = std.math.add(u64, total_bytes, input.text.len) catch
-            return error.ResourceLimit;
-        if (total_bytes > wire.MAX_COMPLETION_REQUEST_BYTES_V1)
-            return error.ResourceLimit;
-        output.* = .{ .role = role, .text = message_text };
-    }
-    const system_text = try text(request.system);
-    total_bytes = std.math.add(u64, total_bytes, request.system.len) catch
-        return error.ResourceLimit;
-    if (total_bytes > wire.MAX_COMPLETION_REQUEST_BYTES_V1)
-        return error.ResourceLimit;
-    return .{
-        .messages = messages,
-        .system = if (system_text.len == 0) null else system_text,
-    };
-}
-
-fn completionCreate(
-    config_ptr: ?*const wire.CompletionConfigV1,
-    out_completion: ?*?*wire.CompletionHandle,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_completion) |out| out.* = null;
-    emptyError(out_error);
-    const config = config_ptr orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "CompletionConfigV1 is required", out_error);
-    const output = out_completion orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_completion is required", out_error);
-    if (config.struct_size != @sizeOf(wire.CompletionConfigV1) or
-        !allZero(config.reserved))
-        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid CompletionConfigV1", out_error);
-    const provider_kind = provider(config.provider_kind_code) orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid Completion provider", out_error);
-    var total_bytes: u64 = 0;
-    for ([_]wire.BytesViewV1{ config.api_key, config.base_url, config.model }) |value| {
-        addMetadata(&total_bytes, value.len, wire.MAX_COMPLETION_CONFIG_BYTES_V1) catch |err|
-            return failError(inputErrorStatus(err), err, out_error);
-    }
-    const api_key = text(config.api_key) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    const base_url = text(config.base_url) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    const model = text(config.model) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    if (api_key.len == 0 or model.len == 0)
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion api_key and model are required", out_error);
-    const completion = completion_handles.Completion.create(
-        allocator,
-        provider_kind,
-        api_key,
-        model,
-        if (base_url.len == 0) null else base_url,
-    ) catch |err| return failError(completionStatus(err), err, out_error);
-    output.* = completionHandle(completion);
-    return wire.STATUS_OK;
-}
-
-fn completionDestroy(
-    handle: ?*wire.CompletionHandle,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    emptyError(out_error);
-    const completion = completionFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion is required", out_error));
-    completion.destroy() catch |err|
-        return failError(completionStatus(err), err, out_error);
-    return wire.STATUS_OK;
-}
-
-fn completionDescribe(
-    handle: ?*wire.CompletionHandle,
-    out_info: ?*wire.CompletionInfoV1,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_info) |out| out.* = std.mem.zeroes(wire.CompletionInfoV1);
-    emptyError(out_error);
-    const completion = completionFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion is required", out_error));
-    const output = out_info orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_info is required", out_error);
-    const model = allocator.dupe(u8, completion.configuredModel()) catch
-        return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Completion model failed", out_error);
-    output.* = .{
-        .struct_size = @sizeOf(wire.CompletionInfoV1),
-        .provider_kind_code = providerCode(completion.providerKind()),
-        .model = .{ .ptr = model.ptr, .len = model.len },
-        .reserved = [_]u64{0} ** 3,
-    };
-    return wire.STATUS_OK;
-}
-
-fn completionComplete(
-    handle: ?*wire.CompletionHandle,
-    request_ptr: ?*const wire.CompletionRequestV1,
-    out_result: ?*wire.CompletionResultV1,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_result) |out| out.* = std.mem.zeroes(wire.CompletionResultV1);
-    emptyError(out_error);
-    const completion = completionFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion is required", out_error));
-    const output = out_result orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    const request = parseCompletionRequest(scratch.allocator(), request_ptr) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    const result = completion.complete(request) catch |err|
-        return failError(completionStatus(err), err, out_error);
-    output.* = .{
-        .struct_size = @sizeOf(wire.CompletionResultV1),
-        .stop_reason_code = completionStopCode(result.stop_reason),
-        .text = .{
-            .ptr = if (result.text.len == 0) null else result.text.ptr,
-            .len = result.text.len,
-        },
-        .input_tokens = result.usage.input_tokens,
-        .output_tokens = result.usage.output_tokens,
-        .cache_read_input_tokens = result.usage.cache_read_input_tokens,
-        .cache_creation_input_tokens = result.usage.cache_creation_input_tokens,
-        .reserved = [_]u64{0} ** 2,
-    };
-    return wire.STATUS_OK;
-}
-
-fn completionStreamStart(
-    handle: ?*wire.CompletionHandle,
-    request_ptr: ?*const wire.CompletionRequestV1,
-    out_stream: ?*?*wire.CompletionStreamHandle,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_stream) |out| out.* = null;
-    emptyError(out_error);
-    const completion = completionFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion is required", out_error));
-    const output = out_stream orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_stream is required", out_error);
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    const request = parseCompletionRequest(scratch.allocator(), request_ptr) catch |err|
-        return failError(inputErrorStatus(err), err, out_error);
-    const stream = completion.startStream(request) catch |err|
-        return failError(completionStatus(err), err, out_error);
-    output.* = completionStreamHandle(stream);
-    return wire.STATUS_OK;
-}
-
-fn completionStreamNext(
-    handle: ?*wire.CompletionStreamHandle,
-    out_event: ?*wire.CompletionEventV1,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    if (out_event) |out| out.* = std.mem.zeroes(wire.CompletionEventV1);
-    emptyError(out_error);
-    const stream = completionStreamFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion stream is required", out_error));
-    const output = out_event orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "out_event is required", out_error);
-    const event = stream.next() catch |err|
-        return failError(completionStatus(err), err, out_error);
-    output.* = .{
-        .struct_size = @sizeOf(wire.CompletionEventV1),
-        .kind_code = switch (event) {
-            .text => wire.COMPLETION_EVENT_TEXT,
-            .thinking => wire.COMPLETION_EVENT_THINKING,
-            .usage => wire.COMPLETION_EVENT_USAGE,
-            .done => wire.COMPLETION_EVENT_DONE,
-        },
-        .payload = switch (event) {
-            .text, .thinking => |payload| .{
-                .ptr = if (payload.len == 0) null else payload.ptr,
-                .len = payload.len,
-            },
-            .usage, .done => .{ .ptr = null, .len = 0 },
-        },
-        .input_tokens = switch (event) {
-            .usage => |usage| usage.input_tokens,
-            else => 0,
-        },
-        .output_tokens = switch (event) {
-            .usage => |usage| usage.output_tokens,
-            else => 0,
-        },
-        .cache_read_input_tokens = switch (event) {
-            .usage => |usage| usage.cache_read_input_tokens,
-            else => 0,
-        },
-        .cache_creation_input_tokens = switch (event) {
-            .usage => |usage| usage.cache_creation_input_tokens,
-            else => 0,
-        },
-        .stop_reason_code = switch (event) {
-            .done => |reason| completionStopCode(reason),
-            else => wire.COMPLETION_STOP_UNKNOWN,
-        },
-        .reserved0 = 0,
-        .reserved = [_]u64{0} ** 2,
-    };
-    return wire.STATUS_OK;
-}
-
-fn completionStreamAbort(
-    handle: ?*wire.CompletionStreamHandle,
-    reason_code: u32,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    emptyError(out_error);
-    const stream = completionStreamFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion stream is required", out_error));
-    const reason = completionAbortReason(reason_code) orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid Completion abort reason", out_error);
-    stream.abort(reason) catch |err|
-        return failError(completionStatus(err), err, out_error);
-    return wire.STATUS_OK;
-}
-
-fn completionStreamDestroy(
-    handle: ?*wire.CompletionStreamHandle,
-    out_error: ?*wire.OwnedBytesV1,
-) callconv(.c) u32 {
-    emptyError(out_error);
-    const stream = completionStreamFrom(handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Completion stream is required", out_error));
-    stream.destroy();
     return wire.STATUS_OK;
 }
 
@@ -6983,43 +6734,62 @@ fn bufferRelease(buffer: ?*wire.OwnedBytesV1) callconv(.c) void {
     out.* = .{ .ptr = null, .len = 0 };
 }
 
+const runtime_api_v1 = wire.RuntimeApiV1{
+    .struct_size = @sizeOf(wire.RuntimeApiV1),
+    .reserved0 = 0,
+    .create = runtimeCreate,
+    .destroy = runtimeDestroy,
+};
+
+const session_api_v1 = wire.SessionApiV1{
+    .struct_size = @sizeOf(wire.SessionApiV1),
+    .reserved0 = 0,
+    .create = sessionCreate,
+    .destroy = sessionDestroy,
+    .run_input = sessionRunInput,
+    .abort = sessionAbort,
+};
+
+const session_control_api_v1 = wire.SessionControlApiV1{
+    .struct_size = @sizeOf(wire.SessionControlApiV1),
+    .reserved0 = 0,
+    .restore = sessionRestore,
+    .describe = sessionDescribe,
+    .set_model = sessionSetModel,
+    .update_permission_rules = sessionUpdatePermissionRules,
+    .compact = sessionCompact,
+    .abort_compact = sessionAbortCompact,
+    .export_checkpoint = sessionExportCheckpoint,
+};
+
+const skill_api_v1 = wire.SkillApiV1{
+    .struct_size = @sizeOf(wire.SkillApiV1),
+    .reserved0 = 0,
+    .resolve_catalog = runtimeQuerySkillCatalog,
+    .release_catalog = skillCatalogRelease,
+    .bind_policy = sessionUpdateSkills,
+};
+
+const mcp_api_v1 = wire.McpApiV1{
+    .struct_size = @sizeOf(wire.McpApiV1),
+    .reserved0 = 0,
+    .apply_configuration = runtimeApplyMcpConfiguration,
+    .refresh = runtimeRefreshMcp,
+    .describe = runtimeDescribeMcp,
+    .update_selection = sessionUpdateMcp,
+};
+
 const api_v1 = wire.ApiV1{
     .struct_size = @sizeOf(wire.ApiV1),
     .abi_version = wire.ABI_VERSION_V1,
     .abi_revision = wire.ABI_REVISION,
     .reserved0 = 0,
-    .capabilities = wire.REQUIRED_CAPABILITIES_V1,
-    .runtime_create = runtimeCreate,
-    .runtime_destroy = runtimeDestroy,
-    .runtime_query_skill_catalog = runtimeQuerySkillCatalog,
-    .skill_catalog_release = skillCatalogRelease,
-    .runtime_refresh_mcp = runtimeRefreshMcp,
-    .runtime_describe_mcp = runtimeDescribeMcp,
-    .runtime_apply_mcp_configuration = runtimeApplyMcpConfiguration,
-    .session_create = sessionCreate,
-    .session_restore = sessionRestore,
-    .session_destroy = sessionDestroy,
-    .session_describe = sessionDescribe,
-    .session_set_model = sessionSetModel,
-    .session_update_skills = sessionUpdateSkills,
-    .session_update_permission_rules = sessionUpdatePermissionRules,
-    .session_update_mcp = sessionUpdateMcp,
-    .session_run_input = sessionRunInput,
-    .session_abort = sessionAbort,
-    .session_compact = sessionCompact,
-    .session_abort_compact = sessionAbortCompact,
-    .session_export_checkpoint = sessionExportCheckpoint,
     .buffer_release = bufferRelease,
-    .completion_create = completionCreate,
-    .completion_destroy = completionDestroy,
-    .completion_describe = completionDescribe,
-    .completion_complete = completionComplete,
-    .completion_stream_start = completionStreamStart,
-    .completion_stream_next = completionStreamNext,
-    .completion_stream_abort = completionStreamAbort,
-    .completion_stream_destroy = completionStreamDestroy,
-    .runtime_create_with_plugins = runtimeCreateWithPlugins,
-    .reserved = [_]u64{0} ** 2,
+    .runtime = &runtime_api_v1,
+    .session = &session_api_v1,
+    .session_control = &session_control_api_v1,
+    .skill = &skill_api_v1,
+    .mcp = &mcp_api_v1,
 };
 
 pub export fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque {
@@ -7220,7 +6990,13 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(wire.REQUIRED_CAPABILITIES_V1, api.capabilities);
+    try std.testing.expectEqual(@as(u32, 14), api.abi_revision);
+    try std.testing.expectEqual(@as(usize, 64), api.struct_size);
+    try std.testing.expect(api.runtime != null);
+    try std.testing.expect(api.session != null);
+    try std.testing.expect(api.session_control != null);
+    try std.testing.expect(api.skill != null);
+    try std.testing.expect(api.mcp != null);
 }
 
 test "UI response parser owns AskUserQuestion answers" {
@@ -9031,6 +8807,101 @@ test "checkpoint restores compatible MCP view and exact Session grant" {
     try std.testing.expectEqual(@as(usize, 0), changed_description.mcp_tools.len);
 }
 
+test "AgentCore event JSON sanitizes only invalid file-change diffs" {
+    const clean_diff = "--- a/clean.txt\n+++ b/clean.txt\n+中文\n";
+    const truncated_prefix = "--- a/truncated.txt\n+++ b/truncated.txt\n+prefix-";
+    const truncated_diff = truncated_prefix ++ "\xe4\xb8";
+    const non_utf8_diff = "--- a/binary.dat\n+++ b/binary.dat\n+prefix-\xff-tail\n";
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clean_diff));
+    try std.testing.expect(!std.unicode.utf8ValidateSlice(truncated_diff));
+    try std.testing.expect(!std.unicode.utf8ValidateSlice(non_utf8_diff));
+
+    const changes = [_]public_protocol.FileChangeRecord{
+        .{
+            .locator = .{ .workspace_path = "clean.txt" },
+            .kind = .modified,
+            .status = .applied,
+            .tool = "Edit",
+            .tool_use_id = "clean",
+            .agent_depth = 0,
+            .before_bytes = 1,
+            .after_bytes = 2,
+            .unified_diff = clean_diff,
+            .diff_complete = true,
+        },
+        .{
+            .locator = .{ .workspace_path = "truncated.txt" },
+            .kind = .modified,
+            .status = .applied,
+            .tool = "Edit",
+            .tool_use_id = "truncated",
+            .agent_depth = 1,
+            .before_bytes = 3,
+            .after_bytes = 4,
+            .unified_diff = truncated_diff,
+            .diff_complete = true,
+        },
+        .{
+            .locator = .{ .workspace_path = "binary.dat" },
+            .kind = .modified,
+            .status = .partial,
+            .tool = "ApplyPatch",
+            .tool_use_id = "binary",
+            .agent_depth = 2,
+            .before_bytes = 5,
+            .after_bytes = 6,
+            .unified_diff = non_utf8_diff,
+            .diff_complete = true,
+        },
+    };
+    try std.testing.expect((try sanitizeFileChangeRecords(
+        std.testing.allocator,
+        changes[0..1],
+    )) == null);
+    const encoded = try encodePublicEventJson(std.testing.allocator, .{ .file_changes = .{
+        .id = "batch",
+        .name = "ApplyPatch",
+        .changes = &changes,
+        .overflow = true,
+        .lost = true,
+    } });
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
+
+    var decoded = try public_protocol.decodeCoreEvent(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    const event = switch (decoded.value) {
+        .known => |value| value,
+        .unknown => return error.TestUnexpectedResult,
+    };
+    const batch = switch (event) {
+        .file_changes => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("batch", batch.id);
+    try std.testing.expect(batch.overflow and batch.lost);
+    try std.testing.expectEqual(@as(usize, 3), batch.changes.len);
+
+    try std.testing.expectEqualStrings(clean_diff, batch.changes[0].unified_diff.?);
+    try std.testing.expect(batch.changes[0].diff_complete);
+    try std.testing.expectEqualStrings("clean", batch.changes[0].tool_use_id);
+
+    try std.testing.expectEqualStrings(truncated_prefix, batch.changes[1].unified_diff.?);
+    try std.testing.expect(!batch.changes[1].diff_complete);
+    try std.testing.expectEqual(@as(u64, 4), batch.changes[1].after_bytes);
+
+    try std.testing.expect(batch.changes[2].unified_diff == null);
+    try std.testing.expect(!batch.changes[2].diff_complete);
+    try std.testing.expectEqual(public_protocol.FileChangeStatus.partial, batch.changes[2].status);
+    try std.testing.expectEqualStrings("binary.dat", batch.changes[2].locator.workspace_path);
+
+    // Sanitization is a temporary shallow projection; Core-owned records stay
+    // byte-identical for journals and other non-JSON consumers.
+    try std.testing.expectEqualStrings(truncated_diff, changes[1].unified_diff.?);
+    try std.testing.expectEqualStrings(non_utf8_diff, changes[2].unified_diff.?);
+    try std.testing.expect(changes[1].diff_complete and changes[2].diff_complete);
+}
+
 test "oversized Host tool results are released exactly once" {
     const Probe = struct {
         var byte: u8 = 0;
@@ -10250,7 +10121,7 @@ test "ABI Runtime rejects process-only built-ins as invalid input" {
     var runtime: ?*wire.RuntimeHandle = null;
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer bufferRelease(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, runtimeCreate(&config, null, &runtime, &diagnostic));
     try std.testing.expect(runtime == null);
 }
 
@@ -10264,7 +10135,7 @@ test "ABI Runtime accepts Session-owned WebSearch and WebFetch built-ins" {
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer bufferRelease(&diagnostic);
 
-    try std.testing.expectEqual(wire.STATUS_OK, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, runtimeCreate(&config, null, &runtime, &diagnostic));
     try std.testing.expect(runtime != null);
     try std.testing.expectEqual(wire.STATUS_OK, runtimeDestroy(runtime, &diagnostic));
 }
@@ -10288,7 +10159,7 @@ test "ABI Runtime applies tool-name grammar to built-ins and Host tools" {
     runtime_config.builtin_tool_count = invalid_builtin_names.len;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        runtimeCreate(&runtime_config, &runtime, &diagnostic),
+        runtimeCreate(&runtime_config, null, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
     bufferRelease(&diagnostic);
@@ -10306,7 +10177,7 @@ test "ABI Runtime applies tool-name grammar to built-ins and Host tools" {
     runtime_config.host_tool_count = 1;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        runtimeCreate(&runtime_config, &runtime, &diagnostic),
+        runtimeCreate(&runtime_config, null, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
     bufferRelease(&diagnostic);
@@ -10314,7 +10185,7 @@ test "ABI Runtime applies tool-name grammar to built-ins and Host tools" {
     host.name = view(model_skill_tool.TOOL_NAME);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        runtimeCreate(&runtime_config, &runtime, &diagnostic),
+        runtimeCreate(&runtime_config, null, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
 }
@@ -10346,7 +10217,7 @@ test "ABI Runtime reports oversized Host schemas as resource limits" {
     var runtime: ?*wire.RuntimeHandle = null;
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer bufferRelease(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, runtimeCreate(&config, null, &runtime, &diagnostic));
     try std.testing.expect(runtime == null);
 }
 

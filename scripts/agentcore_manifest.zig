@@ -41,7 +41,6 @@ const Manifest = struct {
         binary_abi_version: u32 = abi_types.ABI_VERSION_V1,
         binary_abi_revision: u32 = abi_types.ABI_REVISION,
         binary_abi_table_size: u32 = @sizeOf(abi_types.ApiV1),
-        capabilities: u64 = abi_types.REQUIRED_CAPABILITIES_V1,
     },
     files: []const FileEntry,
 };
@@ -202,6 +201,10 @@ fn rustTarget(architecture: []const u8, os: []const u8, abi: []const u8) ![]cons
         if (std.mem.eql(u8, abi, "msvc")) return "x86_64-pc-windows-msvc";
         if (std.mem.eql(u8, abi, "gnu")) return "x86_64-pc-windows-gnu";
     }
+    if (std.mem.eql(u8, architecture, "aarch64") and std.mem.eql(u8, os, "windows")) {
+        if (std.mem.eql(u8, abi, "msvc")) return "aarch64-pc-windows-msvc";
+        if (std.mem.eql(u8, abi, "gnu")) return "aarch64-pc-windows-gnullvm";
+    }
     if (std.mem.eql(u8, architecture, "x86_64") and std.mem.eql(u8, os, "linux") and std.mem.eql(u8, abi, "gnu"))
         return "x86_64-unknown-linux-gnu";
     if (std.mem.eql(u8, architecture, "x86_64") and std.mem.eql(u8, os, "macos"))
@@ -233,6 +236,8 @@ fn renderReadme(
         \\
         \\The ABI is experimental and requires an exact revision match. Ownership, lifetime, concurrency,
         \\and failure contracts are defined by `doc/AGENTCORE_BINARY_ABI.md` at the source commit above.
+        \\Revision 14 exposes one 64-byte root plus mandatory Runtime, Session, Session Control, Skill,
+        \\and MCP tables. It has no capability negotiation and no independent public Completion client.
         \\The public header and bindings expose the complete Skill catalog resource contract: 16 MiB per
         \\file, 32 MiB/1024 files/4096 entries per Skill, 64 MiB/16384 files/1024 slots per catalog,
         \\65536 traversal entries, depth 64, 4096-byte relative paths, a 4 MiB descriptor, and
@@ -402,4 +407,19 @@ test "generated development versions fit the Zig package limit" {
     const version = try packageVersion(allocator, "0.1.0-dev", source);
     defer allocator.free(version);
     try std.testing.expect(version.len <= 32);
+}
+
+test "Windows ARM64 targets project to supported Rust targets" {
+    try std.testing.expectEqualStrings(
+        "aarch64-pc-windows-msvc",
+        try rustTarget("aarch64", "windows", "msvc"),
+    );
+    try std.testing.expectEqualStrings(
+        "aarch64-pc-windows-gnullvm",
+        try rustTarget("aarch64", "windows", "gnu"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedAgentCoreTarget,
+        rustTarget("aarch64", "windows", "itanium"),
+    );
 }

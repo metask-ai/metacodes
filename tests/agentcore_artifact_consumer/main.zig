@@ -4,12 +4,8 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 13 or
-        wire.CAP_PROCESS_PLUGIN_TOOLS != 1 << 22 or
-        wire.CAP_HOST_STREAM_TOOLS != 1 << 23 or
-        wire.CAP_MCP_TOOL_STREAM != 1 << 24 or
-        wire.CAP_ACTIVE_RUN_JOURNAL != 1 << 25 or
-        wire.REQUIRED_CAPABILITIES_V1 != 0x3ffffff or
+    if (wire.ABI_REVISION != 14 or
+        @intFromEnum(wire.Status.skill_catalog_incomplete) != 27 or
         wire.MCP_NEGOTIATION_AUTO != 1 or
         wire.MCP_NEGOTIATION_MODERN_ONLY != 2 or
         wire.MCP_NEGOTIATION_LEGACY_ONLY != 3 or
@@ -20,10 +16,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 13 codes must match the public contract");
+        @compileError("source-free Revision 14 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 13 must not expose the removed catalog refresh entry");
+        @compileError("revision 14 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -49,6 +45,14 @@ const HOST_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m3\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"host\",\"name\":\"HostEcho\",\"input\":{}}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"text\\\":\\\"hello\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const WRITE_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m_write\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"write\",\"name\":\"Write\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"artifact-write.txt\\\",\\\"content\\\":\\\"artifact-write-ok\\\"}\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
@@ -107,7 +111,14 @@ const Probe = struct {
     saw_host_result: bool = false,
     saw_stream_envelope: bool = false,
     saw_artifact_recovery: bool = false,
+    saw_file_change: bool = false,
     saw_final_text: bool = false,
+    saw_final_output_segment: bool = false,
+    output_segment_open: bool = false,
+    output_segment_index: u32 = 0,
+    output_segment_turn: u32 = 0,
+    output_segment_group: u32 = 0,
+    output_segment_bytes: u64 = 0,
 
     fn registerSession(self: *Probe, session: *wire.SessionHandle) !void {
         self.identity_mutex.lock();
@@ -134,7 +145,8 @@ const Probe = struct {
     fn endRun(self: *Probe, run_id: u64) !void {
         self.identity_mutex.lock();
         defer self.identity_mutex.unlock();
-        if (self.active_run_id != run_id) return error.InvalidHostLifecycle;
+        if (self.active_run_id != run_id or self.output_segment_open)
+            return error.InvalidHostLifecycle;
         self.active_run_id = 0;
     }
 
@@ -160,6 +172,14 @@ const Probe = struct {
         defer parsed.deinit();
         switch (parsed.value) {
             .known => |known_event| switch (known_event) {
+                .output_segment_begin => |segment| {
+                    if (self.output_segment_open) return wire.EVENT_FATAL;
+                    self.output_segment_open = true;
+                    self.output_segment_index = segment.index;
+                    self.output_segment_turn = segment.turn;
+                    self.output_segment_group = segment.group;
+                    self.output_segment_bytes = 0;
+                },
                 .tool_result => |result| {
                     if (std.mem.eql(u8, result.name, "Read") and !result.is_error and
                         std.mem.indexOf(u8, result.content, "artifact-read-ok") != null)
@@ -175,8 +195,47 @@ const Probe = struct {
                         std.mem.indexOf(u8, result.content, "aaaaaaaaaaaaaaaa") != null)
                         self.saw_artifact_recovery = true;
                 },
+                .file_changes => |batch| {
+                    if (!std.mem.eql(u8, batch.id, "write") or
+                        !std.mem.eql(u8, batch.name, "Write") or
+                        batch.changes.len != 1 or batch.overflow or batch.lost)
+                        return wire.EVENT_FATAL;
+                    const change = batch.changes[0];
+                    const path = switch (change.locator) {
+                        .workspace_path => |value| value,
+                        else => return wire.EVENT_FATAL,
+                    };
+                    if (!std.mem.eql(u8, path, "artifact-write.txt") or
+                        change.from_locator != null or
+                        change.kind != .created or change.status != .applied or
+                        !std.mem.eql(u8, change.tool, "Write") or
+                        !std.mem.eql(u8, change.tool_use_id, "write") or
+                        change.agent_depth != 0 or change.before_bytes != 0 or
+                        change.after_bytes != "artifact-write-ok".len or
+                        !change.diff_complete or change.unified_diff == null or
+                        std.mem.indexOf(u8, change.unified_diff.?, "+artifact-write-ok") == null)
+                        return wire.EVENT_FATAL;
+                    self.saw_file_change = true;
+                },
                 .text_chunk => |text| {
+                    if (!self.output_segment_open) return wire.EVENT_FATAL;
+                    self.output_segment_bytes = std.math.add(
+                        u64,
+                        self.output_segment_bytes,
+                        @intCast(text.len),
+                    ) catch return wire.EVENT_FATAL;
                     if (std.mem.eql(u8, text, "artifact done")) self.saw_final_text = true;
+                },
+                .output_segment_end => |segment| {
+                    if (!self.output_segment_open or
+                        segment.index != self.output_segment_index or
+                        segment.turn != self.output_segment_turn or
+                        segment.group != self.output_segment_group or
+                        segment.bytes != self.output_segment_bytes)
+                        return wire.EVENT_FATAL;
+                    self.output_segment_open = false;
+                    if (segment.disposition == .final and segment.bytes == "artifact done".len)
+                        self.saw_final_output_segment = true;
                 },
                 else => {},
             },
@@ -399,6 +458,7 @@ pub fn main(init: std.process.Init) !void {
     const bodies = [_][]const u8{
         ASK_SSE,
         read_sse,
+        WRITE_SSE,
         HOST_SSE,
         HOST_STREAM_SSE,
         READ_ARTIFACT_SSE,
@@ -411,7 +471,7 @@ pub fn main(init: std.process.Init) !void {
     const url = try server.url(a);
 
     var probe = Probe{};
-    const builtins = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read") };
+    const builtins = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("Write") };
     var host = wire.HostToolV1{
         .struct_size = @sizeOf(wire.HostToolV1),
         .reserved0 = 0,
@@ -447,20 +507,20 @@ pub fn main(init: std.process.Init) !void {
     };
     plugin_config.host_stream_tools = @ptrCast(&host_stream);
     plugin_config.host_stream_tool_count = 1;
-    try expectStatus(.ok, api.runtimeCreateWithPlugins()(
+    try expectStatus(.ok, api.runtime().create()(
         &runtime_config,
         &plugin_config,
         &runtime,
         &diagnostic,
     ), diagnostic);
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
     var mcp_configuration = std.mem.zeroes(wire.McpConfigurationV1);
     mcp_configuration.struct_size = @sizeOf(wire.McpConfigurationV1);
     mcp_configuration.desired_revision = 1;
     var mcp_report = std.mem.zeroes(wire.McpApplyReportV1);
-    try expectStatus(.ok, api.runtimeApplyMcpConfiguration()(
+    try expectStatus(.ok, api.mcp().applyConfiguration()(
         runtime,
         &mcp_configuration,
         &mcp_report,
@@ -484,11 +544,11 @@ pub fn main(init: std.process.Init) !void {
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
-        _ = api.skillCatalogRelease()(handle, &diagnostic);
+        _ = api.skill().releaseCatalog()(handle, &diagnostic);
     };
     var descriptor = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&descriptor);
-    try expectStatus(.ok, api.resolveWorkspaceSkillCatalog()(
+    try expectStatus(.ok, api.skill().resolveCatalog()(
         runtime,
         &query,
         &catalog,
@@ -516,7 +576,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidCatalogDescriptor;
     api.bufferRelease()(&descriptor);
 
-    const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("HostEcho"), sdk.bytesView("HostStream") };
+    const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("Write"), sdk.bytesView("HostEcho"), sdk.bytesView("HostStream") };
     const granted_skill_ids = [_]wire.BytesViewV1{
         sdk.bytesView(identities.skill_id),
         sdk.bytesView(workctl_identities.skill_id),
@@ -564,32 +624,32 @@ pub fn main(init: std.process.Init) !void {
         .reserved = [_]u64{0} ** 4,
     };
     var session: ?*wire.SessionHandle = null;
-    try expectStatus(.ok, api.sessionCreate()(runtime, &config, &callbacks, &session, &diagnostic), diagnostic);
-    try expectStatus(.ok, api.skillCatalogRelease()(catalog, &diagnostic), diagnostic);
+    try expectStatus(.ok, api.session().create()(runtime, &config, &callbacks, &session, &diagnostic), diagnostic);
+    try expectStatus(.ok, api.skill().releaseCatalog()(catalog, &diagnostic), diagnostic);
     catalog = null;
     try probe.registerSession(session.?);
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
     try expectStatus(
         .ok,
-        api.sessionSetModel()(session, sdk.bytesView("artifact-model-v2"), &diagnostic),
+        api.sessionControl().setModel()(session, sdk.bytesView("artifact-model-v2"), &diagnostic),
         diagnostic,
     );
     try expectStatus(
         .ok,
-        api.sessionBindSkillPolicy()(session, null, &skill_policy, &diagnostic),
+        api.skill().bindPolicy()(session, null, &skill_policy, &diagnostic),
         diagnostic,
     );
     try expectStatus(
         .ok,
-        api.sessionUpdatePermissionRules()(session, &initial_rules, &diagnostic),
+        api.sessionControl().updatePermissionRules()(session, &initial_rules, &diagnostic),
         diagnostic,
     );
     var compact_result = std.mem.zeroes(wire.CompactResultV1);
     try expectStatus(
         .ok,
-        api.sessionCompact()(session, 1, &compact_result, &diagnostic),
+        api.sessionControl().compact()(session, 1, &compact_result, &diagnostic),
         diagnostic,
     );
     if (compact_result.struct_size != @sizeOf(wire.CompactResultV1) or
@@ -597,18 +657,18 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidCompactResult;
     try expectStatus(
         .too_late,
-        api.sessionAbortCompact()(session, 1, &diagnostic),
+        api.sessionControl().abortCompact()(session, 1, &diagnostic),
         diagnostic,
     );
     api.bufferRelease()(&diagnostic);
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 6, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 7, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
     const encoded_arguments = try sdk.encodeSkillArguments(
         a,
         &.{"artifact-target"},
     );
     try probe.beginRun(1);
-    try expectStatus(.ok, api.sessionRunSkill(
+    try expectStatus(.ok, api.session().runSkill(
         session,
         1,
         sdk.bytesView(identities.skill_id),
@@ -619,16 +679,16 @@ pub fn main(init: std.process.Init) !void {
         &diagnostic,
     ), diagnostic);
     try probe.endRun(1);
-    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.tool_calls != 5) return error.UnexpectedRunResult;
+    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.tool_calls != 6) return error.UnexpectedRunResult;
     if (probe.ui_calls != 1 or probe.ui_releases != 1 or probe.host_calls != 1 or probe.host_releases != 1) return error.CallbackContractFailed;
     if (probe.host_stream_calls != 1 or probe.host_stream_writes <= 1 or
         probe.host_stream_max_chunk_bytes != 64 * 1024)
         return error.StreamCallbackContractFailed;
-    if (!probe.saw_read_result or !probe.saw_host_result or !probe.saw_stream_envelope or
-        !probe.saw_artifact_recovery or !probe.saw_final_text)
+    if (!probe.saw_read_result or !probe.saw_file_change or !probe.saw_host_result or !probe.saw_stream_envelope or
+        !probe.saw_artifact_recovery or !probe.saw_final_text or !probe.saw_final_output_segment)
         return error.MissingCoreEvent;
     try probe.beginRun(2);
-    try expectStatus(.ok, api.sessionRunSkill(
+    try expectStatus(.ok, api.session().runSkill(
         session,
         2,
         sdk.bytesView(workctl_identities.skill_id),
@@ -654,7 +714,7 @@ pub fn main(init: std.process.Init) !void {
     var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
     try expectStatus(
         .ok,
-        api.sessionExportCheckpoint()(
+        api.sessionControl().exportCheckpoint()(
             session,
             &export_config,
             &export_result,
@@ -667,12 +727,12 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidCheckpoint;
 
     try probe.unregisterSession(session.?);
-    try expectStatus(.ok, api.sessionDestroy()(session, &diagnostic), diagnostic);
+    try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
     session = null;
-    try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
+    try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    try expectStatus(.ok, api.runtimeCreateWithPlugins()(
+    try expectStatus(.ok, api.runtime().create()(
         &runtime_config,
         &plugin_config,
         &runtime,
@@ -680,9 +740,9 @@ pub fn main(init: std.process.Init) !void {
     ), diagnostic);
     var restored_catalog: ?*wire.SkillCatalogHandle = null;
     defer if (restored_catalog) |handle| {
-        _ = api.skillCatalogRelease()(handle, &diagnostic);
+        _ = api.skill().releaseCatalog()(handle, &diagnostic);
     };
-    try expectStatus(.ok, api.resolveWorkspaceSkillCatalog()(
+    try expectStatus(.ok, api.skill().resolveCatalog()(
         runtime,
         &query,
         &restored_catalog,
@@ -699,7 +759,7 @@ pub fn main(init: std.process.Init) !void {
     restore_config.limits = &checkpoint_limits;
     var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&restore_report);
-    try expectStatus(.ok, api.sessionRestore()(
+    try expectStatus(.ok, api.sessionControl().restore()(
         runtime,
         &restore_config,
         &callbacks,
@@ -709,7 +769,7 @@ pub fn main(init: std.process.Init) !void {
     ), diagnostic);
     try expectStatus(
         .ok,
-        api.skillCatalogRelease()(restored_catalog, &diagnostic),
+        api.skill().releaseCatalog()(restored_catalog, &diagnostic),
         diagnostic,
     );
     restored_catalog = null;
@@ -729,7 +789,7 @@ pub fn main(init: std.process.Init) !void {
     api.bufferRelease()(&restore_report);
 
     try probe.beginRun(3);
-    try expectStatus(.ok, api.sessionRunText(
+    try expectStatus(.ok, api.session().runText(
         session,
         3,
         sdk.bytesView("continue after source-free restore"),
@@ -742,84 +802,12 @@ pub fn main(init: std.process.Init) !void {
         return error.UnexpectedRunResult;
 
     try probe.unregisterSession(session.?);
-    try expectStatus(.ok, api.sessionDestroy()(session, &diagnostic), diagnostic);
+    try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
     session = null;
-    try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
+    try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    const completion_bodies = [_][]const u8{FINAL_SSE};
-    const completion_server = try Server.start(init.io, &completion_bodies);
-    defer completion_server.stop();
-    const completion_url = try completion_server.url(a);
-    var completion_config = wire.CompletionConfigV1{
-        .struct_size = @sizeOf(wire.CompletionConfigV1),
-        .provider_kind_code = wire.PROVIDER_ANTHROPIC,
-        .api_key = sdk.bytesView("artifact-completion-key"),
-        .base_url = sdk.bytesView(completion_url),
-        .model = sdk.bytesView("artifact-completion-model"),
-        .reserved = [_]u64{0} ** 4,
-    };
-    var completion: ?*wire.CompletionHandle = null;
-    try expectStatus(.ok, api.completionCreate()(
-        &completion_config,
-        &completion,
-        &diagnostic,
-    ), diagnostic);
-    defer if (completion) |handle| {
-        _ = api.completionDestroy()(handle, &diagnostic);
-    };
-    var completion_info = std.mem.zeroes(wire.CompletionInfoV1);
-    try expectStatus(.ok, api.completionDescribe()(
-        completion,
-        &completion_info,
-        &diagnostic,
-    ), diagnostic);
-    defer api.bufferRelease()(&completion_info.model);
-    if (try sdk.ProviderKind.fromCode(completion_info.provider_kind_code) != .anthropic or
-        !std.mem.eql(
-            u8,
-            try sdk.borrowedBytes(.{
-                .ptr = completion_info.model.ptr,
-                .len = completion_info.model.len,
-            }),
-            "artifact-completion-model",
-        ))
-        return error.InvalidCompletionDescription;
-    var completion_message = wire.CompletionMessageV1{
-        .struct_size = @sizeOf(wire.CompletionMessageV1),
-        .role_code = wire.COMPLETION_ROLE_USER,
-        .text = sdk.bytesView("source-free completion"),
-        .reserved = [_]u64{0} ** 2,
-    };
-    var completion_request = wire.CompletionRequestV1{
-        .struct_size = @sizeOf(wire.CompletionRequestV1),
-        .reserved0 = 0,
-        .messages = @ptrCast(&completion_message),
-        .message_count = 1,
-        .system = sdk.bytesView("artifact completion system"),
-        .reserved = [_]u64{0} ** 4,
-    };
-    var completion_result = std.mem.zeroes(wire.CompletionResultV1);
-    try expectStatus(.ok, api.completionComplete()(
-        completion,
-        &completion_request,
-        &completion_result,
-        &diagnostic,
-    ), diagnostic);
-    if (!std.mem.eql(
-        u8,
-        try sdk.borrowedBytes(.{
-            .ptr = completion_result.text.ptr,
-            .len = completion_result.text.len,
-        }),
-        "artifact done",
-    ) or completion_result.stop_reason_code != wire.COMPLETION_STOP_END_TURN)
-        return error.InvalidCompletionResult;
-    api.bufferRelease()(&completion_result.text);
-    try expectStatus(.ok, api.completionDestroy()(completion, &diagnostic), diagnostic);
-    completion = null;
-
-    std.debug.print("AgentCore source-free consumer: Revision 13 active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, Completion, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 14 Agent Runtime, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

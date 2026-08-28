@@ -1,5 +1,20 @@
 #include <metask/agentcore.h>
 
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 14,
+               "AgentCore revision changed");
+_Static_assert(sizeof(metask_agentcore_api_v1) == 64,
+               "AgentCore root layout changed");
+_Static_assert(sizeof(metask_agentcore_runtime_api_v1) == 24,
+               "Runtime table layout changed");
+_Static_assert(sizeof(metask_agentcore_session_api_v1) == 40,
+               "Session table layout changed");
+_Static_assert(sizeof(metask_agentcore_session_control_api_v1) == 64,
+               "Session Control table layout changed");
+_Static_assert(sizeof(metask_agentcore_skill_api_v1) == 32,
+               "Skill table layout changed");
+_Static_assert(sizeof(metask_agentcore_mcp_api_v1) == 40,
+               "MCP table layout changed");
+
 _Static_assert(METASK_AGENTCORE_MAX_SKILL_FILE_CONTENT_BYTES_V1 == 16777216ULL,
                "Skill file limit changed");
 _Static_assert(METASK_AGENTCORE_MAX_SKILL_CONTENT_BYTES_V1 == 33554432ULL,
@@ -17,7 +32,7 @@ const metask_agentcore_api_v1 *agentcore_header_compile_probe(void) {
     return metask_agentcore_api_v1_discover();
 }
 
-void agentcore_revision_seven_type_probe(void) {
+void agentcore_revision_fourteen_type_probe(void) {
     metask_agentcore_runtime_config_v1 runtime = {0};
     metask_agentcore_session_host_config_v1 host = {0};
     metask_agentcore_session_create_config_v1 create = {0};
@@ -53,4 +68,34 @@ void agentcore_revision_seven_type_probe(void) {
     (void)checkpoint_result;
     metask_agentcore_owned_bytes_v1_release((const metask_agentcore_api_v1 *)0,
                                             &diagnostic);
+}
+
+void agentcore_revision_fourteen_call_shape_probe(
+    const metask_agentcore_api_v1 *api,
+    const metask_agentcore_runtime_config_v1 *runtime_config,
+    const metask_agentcore_runtime_plugin_config_v1 *plugins,
+    metask_agentcore_runtime **runtime,
+    metask_agentcore_owned_bytes_v1 *diagnostic) {
+    if (api == 0) return;
+    (void)api->runtime->create(runtime_config, plugins, runtime, diagnostic);
+    (void)api->runtime->destroy(*runtime, diagnostic);
+    (void)api->session->create;
+    (void)api->session->destroy;
+    (void)api->session->run_input;
+    (void)api->session->abort;
+    (void)api->session_control->restore;
+    (void)api->session_control->describe;
+    (void)api->session_control->set_model;
+    (void)api->session_control->update_permission_rules;
+    (void)api->session_control->compact;
+    (void)api->session_control->abort_compact;
+    (void)api->session_control->export_checkpoint;
+    (void)api->skill->resolve_catalog;
+    (void)api->skill->release_catalog;
+    (void)api->skill->bind_policy;
+    (void)api->mcp->apply_configuration;
+    (void)api->mcp->refresh;
+    (void)api->mcp->describe;
+    (void)api->mcp->update_selection;
+    (void)api->buffer_release;
 }

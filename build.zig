@@ -264,11 +264,18 @@ fn validateAggregateTestInventory(b: *std.Build) void {
 }
 
 fn agentcoreRustTarget(target: std.Target) ?[]const u8 {
-    if (target.cpu.arch == .x86_64 and target.os.tag == .windows) return switch (target.abi) {
-        .msvc => "x86_64-pc-windows-msvc",
-        .gnu => "x86_64-pc-windows-gnu",
-        else => null,
-    };
+    if (target.os.tag == .windows) {
+        if (target.cpu.arch == .x86_64) return switch (target.abi) {
+            .msvc => "x86_64-pc-windows-msvc",
+            .gnu => "x86_64-pc-windows-gnu",
+            else => null,
+        };
+        if (target.cpu.arch == .aarch64) return switch (target.abi) {
+            .msvc => "aarch64-pc-windows-msvc",
+            .gnu => "aarch64-pc-windows-gnullvm",
+            else => null,
+        };
+    }
     if (target.cpu.arch == .x86_64 and target.os.tag == .linux and target.abi == .gnu)
         return "x86_64-unknown-linux-gnu";
     if (target.cpu.arch == .x86_64 and target.os.tag == .macos) return "x86_64-apple-darwin";

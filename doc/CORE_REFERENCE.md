@@ -414,7 +414,8 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
 - **能力协商缺失**:协议未让 backend 声明能力(最大选项数 / 输入模态)。3 按钮设备如何映射 4 选项
   multi-select、语音如何表达 preview——需在接受限输入前端时加 `BackendCapabilities`(加性扩展)。
 - **输出粒度**:`text_chunk` 按 token 流。语音要整句、IM 要整条(限流)、LED 要终态——backend 可
-  缓冲到 `stream_done` 再出(加性,backend 私事)。
+  缓冲当前段到 `output_segment_end`，再按 disposition 决定展示、合并或丢弃；`stream_done` 不是
+  输出终态。
 - **permission 门不可挂起**:权限确认是 `executeSlots` 前的同步门,异步挂起暂不覆盖(out of scope)。
 - **文件修改契约只覆盖类型化文件工具**(Write/Edit/NotebookEdit/ApplyPatch,§3.2.2)。`Bash` 或
   任意终端命令改动文件系统**不会**产生 `file_changes`——要覆盖它需要文件系统级观测,不在本契约内。
@@ -423,10 +424,10 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
 - **`--stream-json` 已投影输出段定性**(`output_segment_begin/end` 行),但**未投影 file_changes**
   ——那条事件带整段 diff,塞进逐行时间线会把流撑爆;需要文件修改的消费者走 `--json` 结果行的
   `file_changes` 数组或直接消费 CoreEvent。TUI 对两组事件都 no-op(边流边渲染,不需要事后重标)。
-- **AgentCore 公共 C ABI 不导出这三条事件**(`output_segment_begin/end`、`file_changes`)。
-  facade 内部的 A1 projector **已经**消费 `output_segment_end` 来正确重建最终答案(它此前用
-  `stream_done` 收段,会把回滚重试的文本重复计入),消费者观察到的行为因此已修好;把原始事件
-  也导出去要动冻结的 C header + symbol gate + 版本与消费方签字,不在本次范围。
+- **AgentCore 的既有 `on_event` JSON 观察流已导出 `output_segment_begin/end` 与
+  `file_changes`**。前者完整携带段标识、定性和字节数；后者直接保留 Core 的批次、逐文件
+  结果、定位符、字节数和有界 diff。它们都是 Revision 14 下可前向兼容的新增观察 tag；旧
+  SDK 会把它们保留为 `unknown`。
 - **ApplyPatch phase-1 校验失败**(解析错/定位不到/Add 撞已存在)只对**已建好计划**的文件报
   `rejected`;触发失败的那个文件还没进计划表,只出现在工具错误 detail 里。整批零落盘,故没有
   谎报,但目标清单不完整——登记而非假装完整。

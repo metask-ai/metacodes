@@ -239,7 +239,16 @@ pub const Environment = struct {
             .prefetchSafeFn = prefetchSafe,
             .nameAtFn = nameAt,
             .hostSyncFn = hostSync,
+            .builtinFn = isBuiltin,
+            .categoryFn = category,
+            .replayDeclarationFn = replayDeclaration,
         };
+    }
+
+    const ToolOwner = enum { skill, base };
+
+    fn resolveTool(name: []const u8) ToolOwner {
+        return if (std.mem.eql(u8, name, TOOL_NAME)) .skill else .base;
     }
 
     fn dispatch(
@@ -249,14 +258,14 @@ pub const Environment = struct {
         arguments_json: []const u8,
     ) anyerror!core.tools.ToolDispatchOutcome {
         const self: *Environment = @ptrCast(@alignCast(@constCast(raw)));
-        if (!std.mem.eql(u8, name, TOOL_NAME)) {
-            return self.base_dispatcher.dispatch(
+        return switch (resolveTool(name)) {
+            .skill => self.invokeSkill(tool_ctx, arguments_json),
+            .base => self.base_dispatcher.dispatch(
                 tool_ctx,
                 name,
                 arguments_json,
-            );
-        }
-        return self.invokeSkill(tool_ctx, arguments_json);
+            ),
+        };
     }
 
     fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
@@ -279,8 +288,34 @@ pub const Environment = struct {
 
     fn hostSync(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (std.mem.eql(u8, name, TOOL_NAME)) return false;
-        return self.base_dispatcher.isHostSync(name);
+        return switch (resolveTool(name)) {
+            .skill => false,
+            .base => self.base_dispatcher.isHostSync(name),
+        };
+    }
+
+    fn isBuiltin(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const Environment = @ptrCast(@alignCast(raw));
+        return switch (resolveTool(name)) {
+            .skill => false,
+            .base => self.base_dispatcher.isBuiltin(name),
+        };
+    }
+
+    fn category(raw: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
+        const self: *const Environment = @ptrCast(@alignCast(raw));
+        return switch (resolveTool(name)) {
+            .skill => null,
+            .base => self.base_dispatcher.category(name),
+        };
+    }
+
+    fn replayDeclaration(raw: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
+        const self: *const Environment = @ptrCast(@alignCast(raw));
+        return switch (resolveTool(name)) {
+            .skill => .never,
+            .base => self.base_dispatcher.replayDeclaration(name),
+        };
     }
 
     fn allowsTool(raw: *const anyopaque, name: []const u8) bool {
@@ -650,6 +685,69 @@ fn childDepth(parent: u8) error{AgentDepthExceeded}!u8 {
     if (parent >= core.tool_context.MAX_AGENT_DEPTH)
         return error.AgentDepthExceeded;
     return parent + 1;
+}
+
+test "Skill metadata preserves base identity category and replay while disabling prefetch" {
+    const Base = struct {
+        fn dispatch(
+            _: *const anyopaque,
+            _: *const core.tool_context.ToolContext,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!core.tools.ToolDispatchOutcome {
+            return .host_fatal;
+        }
+        fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
+            return if (index == 0) "Read" else null;
+        }
+        fn prefetchSafe(_: *const anyopaque, name: []const u8) bool {
+            return std.mem.eql(u8, name, "Read");
+        }
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn isBuiltin(_: *const anyopaque, name: []const u8) bool {
+            return std.mem.eql(u8, name, "Read");
+        }
+        fn category(_: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
+            return if (std.mem.eql(u8, name, "Read")) .read else null;
+        }
+        fn replayDeclaration(_: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
+            return if (std.mem.eql(u8, name, "Read")) .read_only else .never;
+        }
+        fn dispatcher() core.tools.ToolDispatcher {
+            return .{
+                .ctx = &unit,
+                .dispatchFn = dispatch,
+                .prefetchSafeFn = prefetchSafe,
+                .nameAtFn = nameAt,
+                .hostSyncFn = hostSync,
+                .builtinFn = isBuiltin,
+                .categoryFn = category,
+                .replayDeclarationFn = replayDeclaration,
+            };
+        }
+        const unit: u8 = 0;
+    };
+
+    var environment: Environment = undefined;
+    environment.base_dispatcher = Base.dispatcher();
+    const dispatcher = environment.dispatcher();
+
+    try std.testing.expectEqual(Environment.ToolOwner.skill, Environment.resolveTool(TOOL_NAME));
+    try std.testing.expectEqual(Environment.ToolOwner.base, Environment.resolveTool("Read"));
+    try std.testing.expect(!dispatcher.prefetchSafe(TOOL_NAME));
+    try std.testing.expect(!dispatcher.isHostSync(TOOL_NAME));
+    try std.testing.expect(!dispatcher.isBuiltin(TOOL_NAME));
+    try std.testing.expect(dispatcher.category(TOOL_NAME) == null);
+    try std.testing.expectEqual(core.tools.ReplayDeclaration.never, dispatcher.replayDeclaration(TOOL_NAME));
+    try std.testing.expect(!dispatcher.prefetchSafe("Read"));
+    try std.testing.expect(!dispatcher.isHostSync("Read"));
+    try std.testing.expect(dispatcher.isBuiltin("Read"));
+    try std.testing.expectEqual(core.tool_context.ToolCategory.read, dispatcher.category("Read").?);
+    try std.testing.expectEqual(core.tools.ReplayDeclaration.read_only, dispatcher.replayDeclaration("Read"));
+    try std.testing.expect(!dispatcher.isBuiltin("unknown"));
+    try std.testing.expect(dispatcher.category("unknown") == null);
 }
 
 test "Skill execution policy cannot re-authorize a denied MCP base tool" {
