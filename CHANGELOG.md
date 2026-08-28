@@ -153,6 +153,22 @@ compatibility boundaries, and entry points are defined by
   contained only the compact summary — no user message — and later turns
   stayed hidden behind the stale boundary). The rollback now clamps the
   boundary to the retried user message under the snapshot lock.
+- OpenAI streaming hardening (adversarial review of the Responses work): SSE
+  lines longer than the 8KB transfer buffer no longer kill the stream with
+  `StreamTooLong` — `OpenAIStream` now falls back to the same 16MB-capped
+  overflow accumulation the Anthropic path uses, so Responses terminal events
+  carrying the full accumulated payload (`response.output_text.done`,
+  `response.completed`, `response.function_call_arguments.done`) parse instead
+  of forcing a discarded, re-billed turn. Under `protocol=responses`,
+  `--response-format` (as top-level `text.format`), `--prompt-cache-key`, and
+  `--parallel-tool-calls` are serialized instead of silently no-oping.
+  Streamed tool-call `arguments` fragments (chat and Responses) accumulate as
+  raw escaped bytes and decode exactly once at flush, so a `\uXXXX` surrogate
+  pair split across two deltas no longer becomes two U+FFFD. Responses event
+  dispatch no longer trusts the first `"type"` in the raw event (a server
+  serializing `item` before the top-level `type` previously dropped the
+  function call), and parallel/interleaved Responses tool calls are covered by
+  a cassette test.
 - OpenAI-compatible streaming now decodes the JSON string escapes of SSE
   fragments: `delta.content` and `reasoning_content` (GLM/Kimi/DeepSeek/Qwen/
   Mistral) previously reached the conversation and thinking stream as raw

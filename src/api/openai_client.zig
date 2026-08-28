@@ -10,8 +10,9 @@
 //!   - **并行 tool_calls(P0.1 已实现)**:按 delta 的 `index` 分槽累积(ToolCallAcc),done 时
 //!     每槽 flush 一个 tool_use_start,executeSlots 真并发执行;请求侧每个 tool_result 独立
 //!     {role:"tool"} 回传。见 parseChunk tool_calls 分支 / buildFlush / serializeOpenAIMessage。
-//! `function.arguments` 的每个 SSE 字符串片段先解除外层 JSON 转义，再按 tool-call
-//! `index` 拼接；字符串字段、反斜杠和跨 chunk 片段因此以原始 JSON 字节进入工具层。
+//! `function.arguments` 的每个 SSE 字符串片段按**原始转义字节**拼进 tool-call `index`
+//! 槽,flush 时一次解除外层 JSON 转义(decode-once,见 buildFlush)——被 chunk 边界
+//! 拆开的 `\uXXXX` 代理对因此无损,字符串字段和反斜杠以原始 JSON 字节进入工具层。
 //! **诚实登记——以下未做**:
 //!   - **建连重试 / 429 退避**:pSendStreamRetry 忽略 max_retries/reporter,直接发一次;doStream
 //!     遇非 200(含 429/500)直接 error.RequestFailed,无重试。Anthropic 路径有 withRetry,此处没有。
@@ -279,6 +280,11 @@ const OpenAIStream = struct {
     request: *http.Client.Request,
     response: http.Client.Response,
     transfer_buf: [8192]u8 = undefined,
+    /// 单行 SSE 超出 transfer_buf(8KB)时的溢出累积缓冲(port 自 stream.zig 的 takeLine
+    /// 慢路径,同一 16MB 硬上限)。Responses 终止事件(output_text.done / completed /
+    /// function_call_arguments.done)携带整段累积 payload——超 8KB 的行是常态而非异常。
+    /// 复用同一 ArrayList,每次清空再用;deinit 时释放。
+    line_overflow: std.ArrayList(u8) = .empty,
     reader: ?*std.Io.Reader = null,
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
@@ -329,9 +335,56 @@ const OpenAIStream = struct {
             else => {},
         };
         self.flush_q.deinit(self.allocator);
+        self.line_overflow.deinit(self.allocator);
         if (self.abort_registry) |registry| registry.unregister(self.request);
         self.request.deinit();
         self.allocator.destroy(self.request);
+    }
+
+    /// 读一行(到 '\n',不含)。port 自 stream.zig EventIterator.takeLine——同一机制、同一上限。
+    /// 快路径:takeDelimiter 直接借 reader buffer 里的 slice(短行,无分配)。
+    /// 慢路径:行超出 transfer_buf(8KB)→ takeDelimiter 报 StreamTooLong,改用
+    ///   streamDelimiterLimit 把整行累积到 line_overflow,并在读取过程中执行 16MB 硬上限。
+    /// 返回借用 slice(指向 reader buffer 或 self.line_overflow);null = EOF。
+    /// 修复(review F1):Responses 终止事件带完整累积 payload,>8KB 的行曾确定性
+    /// StreamTooLong → agent_loop 丢弃整轮流式结果并重试(双计费)。chat 与 responses
+    /// 协议同走本函数,两条路径一并覆盖。
+    fn takeLine(self: *OpenAIStream, r: *std.Io.Reader) !?[]const u8 {
+        if (r.takeDelimiter('\n')) |line_opt| {
+            if (line_opt) |line| {
+                if (line.len > api_stream.MAX_SSE_LINE_BYTES) return error.StreamTooLong;
+            }
+            return line_opt; // 含 EOF→null 的快路径
+        } else |err| switch (err) {
+            error.StreamTooLong => {
+                // limit 取 max+1:允许恰好 max 字节后紧跟分隔符,同时保证无分隔符的
+                // 恶意流最多只累积 max+1(与 stream.zig 同一契约)。
+                self.line_overflow.clearRetainingCapacity();
+                var alloc_w: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &self.line_overflow);
+                const line_len = r.streamDelimiterLimit(
+                    &alloc_w.writer,
+                    '\n',
+                    .limited(api_stream.MAX_SSE_LINE_BYTES + 1),
+                ) catch |e| {
+                    self.line_overflow = alloc_w.toArrayList();
+                    log.warnId("openai", self.id, "streamDelimiterLimit failed: {s}", .{@errorName(e)});
+                    return switch (e) {
+                        error.StreamTooLong => error.StreamTooLong,
+                        error.ReadFailed => error.ReadFailed,
+                        // Allocating.writer 以 Writer.Error 报分配失败;还原 ArrayList
+                        // 所有权后,向调用方抛可行动的 allocator 错误。
+                        error.WriteFailed => error.OutOfMemory,
+                    };
+                };
+                // streamDelimiterLimit 停在分隔符处(buffer 首字节是 '\n')或 EOF(buffer 空)。
+                // 若还有分隔符,吞掉它,让下次从下一行开始。
+                if (r.bufferedLen() > 0) r.toss(1);
+                self.line_overflow = alloc_w.toArrayList(); // 取回所有权
+                if (line_len > api_stream.MAX_SSE_LINE_BYTES) return error.StreamTooLong;
+                return self.line_overflow.items;
+            },
+            else => return err,
+        }
     }
 
     /// 读下一个中立事件。逐行读 SSE,翻译 OpenAI chunk → StreamEvent。
@@ -355,8 +408,13 @@ const OpenAIStream = struct {
         const r = self.reader.?;
         while (true) {
             if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
-            // takeDelimiter 在 0.16 返回 ?[]const u8(null=流结束),错误集只有 {ReadFailed,StreamTooLong}。
-            const line_opt = try r.takeDelimiter('\n');
+            // takeLine:快路径 takeDelimiter(借 buffer),>8KB 行走 line_overflow 慢路径。
+            const line_opt = self.takeLine(r) catch |err| {
+                // 读取/上限失败可能把传输层留在一行中间;置终态,防调用方再 next()
+                // 把行尾当新 SSE 帧解析(对齐 stream.zig next 的 fail-terminal 契约)。
+                self.done = true;
+                return err;
+            };
             const line = line_opt orelse {
                 self.done = true;
                 return self.finishFlush();
@@ -403,6 +461,8 @@ const OpenAIStream = struct {
         // delta.content → text。OpenAI: {"choices":[{"delta":{"content":"hi"},...}]}
         // SSE string 片段带一层 JSON 转义(\n/\"/\uXXXX):必须解除后再交对话/UI,
         // 否则转义序列以字面量进入 assistant 文本(issue #4)。空片段 free 不发事件。
+        // 已知局限(review F3 登记):文本走逐片段解码,`\uXXXX` 代理对若被 chunk 边界
+        // 拆开会变两个 U+FFFD——修复需跨 chunk 解码状态;arguments 有缓冲故已修,文本暂不。
         if (try util_json.extractAndUnescapeStringField(data, "content", self.allocator)) |content| {
             if (content.len > 0) return StreamEvent{ .text = content };
             self.allocator.free(content);
@@ -433,14 +493,10 @@ const OpenAIStream = struct {
                 if (util_json.extractStringField(elem, "name")) |name| {
                     acc.name.appendSlice(self.allocator, name) catch {};
                 }
-                // arguments 片段先解除一层外层 JSON 转义再按槽拼接:`function.arguments`
-                // 是装在 string 里的 JSON 文档,不解除会让任何 string 参数变成非法 JSON。
-                if (try util_json.extractAndUnescapeStringField(
-                    elem,
-                    "arguments",
-                    self.allocator,
-                )) |args| {
-                    defer self.allocator.free(args);
+                // arguments 片段按**原始转义字节**拼接,flush 时一次解码(decode-once,
+                // 见 buildFlush):片段可在 `\uXXXX` 代理对中间断开,逐片段解码会把拆开
+                // 的高/低代理各变成一个 U+FFFD(review F3)。
+                if (util_json.extractRawStringField(elem, "arguments")) |args| {
                     try acc.args.appendSlice(self.allocator, args);
                 }
             }
@@ -452,9 +508,10 @@ const OpenAIStream = struct {
     /// 返回可 emit 的中立事件,或 null(增量累积/被忽略的事件类型)。
     /// 未识别的事件类型一律忽略(向前兼容:服务端新增事件不破坏既有流)。
     fn parseResponsesChunk(self: *OpenAIStream, data: []const u8) !?StreamEvent {
-        const ev_type = util_json.extractStringField(data, "type") orelse return null;
+        const ev_type = extractResponsesEventType(data) orelse return null;
         // 文本增量:{"type":"response.output_text.delta","delta":"..."}。
         // delta 是 JSON string 片段 → 解除一层转义(同 chat content 分支);空片段 free 不发。
+        // 已知局限(同 chat content,review F3):逐片段解码,拆开的代理对会变 U+FFFD。
         if (std.mem.eql(u8, ev_type, "response.output_text.delta")) {
             if (try util_json.extractAndUnescapeStringField(data, "delta", self.allocator)) |text| {
                 if (text.len > 0) return StreamEvent{ .text = text };
@@ -479,20 +536,19 @@ const OpenAIStream = struct {
             }
             return null;
         }
-        // arguments 增量:片段解除一层转义后按槽拼接(同 chat arguments 契约)。
+        // arguments 增量:片段按**原始转义字节**按槽拼接,flush 时一次解码(同 chat
+        // arguments 的 decode-once 契约,见 buildFlush;review F3 拆代理对场景)。
         if (std.mem.eql(u8, ev_type, "response.function_call_arguments.delta")) {
-            if (try util_json.extractAndUnescapeStringField(data, "delta", self.allocator)) |args| {
-                defer self.allocator.free(args);
+            if (util_json.extractRawStringField(data, "delta")) |args| {
                 const acc = self.accFor(util_json.extractIntField(data, "output_index")) catch return null;
                 try acc.args.appendSlice(self.allocator, args);
             }
             return null;
         }
         // arguments 终值:done 事件携带完整 arguments(authoritative)——整体覆盖已拼片段,
-        // 漏发/重发 delta 都不会造成错拼。
+        // 漏发/重发 delta 都不会造成错拼。同样存原始转义字节,flush 时一次解码。
         if (std.mem.eql(u8, ev_type, "response.function_call_arguments.done")) {
-            if (try util_json.extractAndUnescapeStringField(data, "arguments", self.allocator)) |args| {
-                defer self.allocator.free(args);
+            if (util_json.extractRawStringField(data, "arguments")) |args| {
                 const acc = self.accFor(util_json.extractIntField(data, "output_index")) catch return null;
                 acc.args.clearRetainingCapacity();
                 try acc.args.appendSlice(self.allocator, args);
@@ -570,18 +626,23 @@ const OpenAIStream = struct {
                 a.free(id);
                 continue;
             };
-            const args = if (tc.args.items.len > 0)
-                (tc.args.toOwnedSlice(a) catch {
+            // decode-once(review F3):槽里是原始转义片段的拼接(arguments 自身是装在
+            // string 里的 JSON 文档,恰好一层外层转义)。此处一次性解码——更早逐片段解码
+            // 会毁掉跨 chunk 拆开的 `\uXXXX` 代理对;不解码则任何 string 参数以非法
+            // JSON 进工具层。
+            const args = if (tc.args.items.len > 0) blk: {
+                const decoded = util_json.unescapeString(tc.args.items, a) catch {
                     a.free(id);
                     a.free(name);
                     continue;
-                })
-            else
-                (a.dupe(u8, "{}") catch {
-                    a.free(id);
-                    a.free(name);
-                    continue;
-                });
+                };
+                tc.args.clearAndFree(a);
+                break :blk decoded;
+            } else (a.dupe(u8, "{}") catch {
+                a.free(id);
+                a.free(name);
+                continue;
+            });
             self.flush_q.append(a, StreamEvent{ .tool_use_start = .{ .id = id, .name = name, .input_json = args } }) catch {
                 a.free(id);
                 a.free(name);
@@ -652,6 +713,23 @@ fn findToolCallsArray(data: []const u8) ?[]const u8 {
         }
     }
     return data[arr_open + 1 ..]; // 未闭合:返回剩余
+}
+
+/// Responses 事件类型提取(review F4):取首个值以 "response." 开头(或恰为流级
+/// "error")的 `"type"`。单纯取首个 `"type"` 依赖服务端把顶层 type 序列化在 item 之前
+/// ——若 item 在前,会命中嵌套的 item.type("function_call" 等),整个事件被当未知类型
+/// 丢弃。事件类型词表全部带 "response." 前缀、流级错误恰为 "error",而 item.type 和
+/// 合法 JSON 的 string 内容(引号必转义)都不可能撞上这两种形态——按值过滤等价于
+/// top-level 扫描,且对字段顺序不敏感。
+fn extractResponsesEventType(data: []const u8) ?[]const u8 {
+    var rest: []const u8 = data;
+    while (util_json.extractStringField(rest, "type")) |v| {
+        if (std.mem.startsWith(u8, v, "response.") or std.mem.eql(u8, v, "error")) return v;
+        // 命中嵌套 type:跳过该值,从其后继续扫(每轮严格前进,必终止)。
+        const value_end = (@intFromPtr(v.ptr) - @intFromPtr(rest.ptr)) + v.len;
+        rest = rest[value_end..];
+    }
+    return null;
 }
 
 /// 定位 `"<key>":` 后的 object,返回 `{` 与配对 `}` 之间的内容(深度感知,跳字符串;
@@ -946,6 +1024,8 @@ fn serializeOpenAITool(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t:
 ///   - thinking 控制:顶层 `reasoning:{effort}`(effort 档位上限 high,xhigh→high)——
 ///     不走 dialect.serializeThinking(那是 chat body 的字段形态)。
 ///   - tools 扁平:{"type":"function",name,description,parameters,strict:false}(无嵌套 function)。
+///   - response_format → 顶层 `text:{format:{...}}`(chat 的 response_format 字段形态
+///     Responses 不认);prompt_cache_key / parallel_tool_calls 与 chat 同名顶层字段。
 ///   - `store:false`(agent loop 自管上下文,不用服务端存储);无 max_output_tokens、
 ///     无 stream_options(Responses 流式默认带 usage)。
 pub fn serializeOpenAIResponsesRequest(
@@ -1025,6 +1105,30 @@ pub fn serializeOpenAIResponsesRequest(
         }
     }
     try serializeResponsesToolChoice(overrides.tool_choice, &out, allocator);
+    // response_format → Responses 顶层 text.format(review F2:此前三个 override 在
+    // responses 路径静默 no-op——CLI 传了却不上 wire)。responses-local,不走
+    // dialect.serializeResponseFormat(那是 chat 的 response_format 字段形态;
+    // protocol=responses 是显式 OpenAI 原生配置,无三方兼容端点的能力守门问题)。
+    // 字段用法镜像 chat 序列化:json_object 只发 type;json_schema 内联 schema,
+    // schema 缺失退化 json_object(同 chat 降级语义)。
+    if (overrides.response_format) |rf| {
+        if (rf.kind == .json_schema and rf.schema != null) {
+            try out.appendSlice(allocator, ",\"text\":{\"format\":{\"type\":\"json_schema\",\"schema\":");
+            try out.appendSlice(allocator, rf.schema.?);
+            try out.appendSlice(allocator, "}}");
+        } else if (rf.kind != .none) {
+            try out.appendSlice(allocator, ",\"text\":{\"format\":{\"type\":\"json_object\"}}");
+        }
+    }
+    // prompt_cache_key / parallel_tool_calls:与 chat 同名顶层字段(Responses 同样支持)。
+    if (overrides.prompt_cache_key) |key| {
+        try out.appendSlice(allocator, ",\"prompt_cache_key\":");
+        try util_json.serializeString(key, &out, allocator);
+    }
+    if (overrides.parallel_tool_calls) |b| {
+        try out.appendSlice(allocator, ",\"parallel_tool_calls\":");
+        try out.appendSlice(allocator, if (b) "true" else "false");
+    }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
 }
