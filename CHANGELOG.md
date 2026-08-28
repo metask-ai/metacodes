@@ -86,6 +86,17 @@ compatibility boundaries, and entry points are defined by
   name the directory cannot resolve now conservatively classifies as
   `.execute` — never the legacy unknown-name read fallback — and dispatching
   it still fails as UnknownTool. The AgentCore C ABI is unaffected.
+- ToolDispatcher metadata hardening: `validateMetadataCoverage()` walks the
+  advertised directory and reports the first dispatchable name lacking
+  metadata (asserted in Debug at the composed Run surface, so a wrapper that
+  adds a name but forgets the metadata branch fails loudly); the session
+  budget layer now classifies Tool-vs-MCP operations from the same metadata
+  resolution dispatch uses instead of the unfiltered MCP view (a
+  selected-but-expired alias no longer reserves under MCP caps while dispatch
+  answers UnknownTool; `ToolEnvironment.mcp_view` is removed); and the Skill
+  overlay refuses to build over a base surface that already advertises a tool
+  named `Skill` (`error.SkillToolNameCollision`) instead of silently
+  shadowing it while sending duplicate definitions to the provider.
 - CI migrated to self-hosted runners (Linux X64, macOS ARM64, Windows X64)
   with a pinned Lean toolchain build. No GitHub-hosted path remains in the
   workflows; restoring account billing would allow reintroducing hosted

@@ -3003,8 +3003,19 @@ const AbiSession = struct {
         var budget_tools = session_budget.ToolEnvironment{
             .controller = &budget_controller,
             .base = inner_surface,
-            .mcp_view = if (has_mcp) &mcp_run_view.? else null,
         };
+        // Debug-only structural check on the fully composed Run directory
+        // (budget∘skill∘mcp∘Selection): every advertised name must resolve
+        // metadata, or a wrapper reintroduced split resolution. The Run is
+        // already admitted here, so an error return would bypass admitted-run
+        // cleanup — panic instead, naming the offending tool.
+        if (builtin.mode == .Debug) {
+            if (budget_tools.surface().dispatcher.validateMetadataCoverage()) |uncovered|
+                std.debug.panic(
+                    "composed ToolDispatcher advertises '{s}' without metadata coverage",
+                    .{uncovered},
+                );
+        }
         const result = admitted.runUserMessagesWithToolSurfaceUsingProvider(
             &.{prompt},
             max_turns,
@@ -3299,7 +3310,6 @@ const MaterializedSkillRun = struct {
         var budget_tools = session_budget.ToolEnvironment{
             .controller = budget_controller,
             .base = inner_surface,
-            .mcp_view = if (has_mcp) &self.mcp_view.? else null,
         };
         const result = self.admitted.runUserMessagesWithToolSurfaceUsingProvider(
             &.{ invocation_record, body_record },
@@ -3543,7 +3553,6 @@ const ForkExecutorContext = struct {
         var budget_tools = session_budget.ToolEnvironment{
             .controller = self.budget_controller,
             .base = inner_surface,
-            .mcp_view = if (has_mcp) self.mcp_view else null,
         };
         const child_surface = budget_tools.surface();
         const execution_policy = if (environment) |*env|
