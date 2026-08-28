@@ -171,6 +171,19 @@ fn runCassette(
     abort: ?*cc.util_abort.AbortSignal,
     max_stream_turn_retries: u8,
 ) !Scenario {
+    return runCassetteRouted(allocator, responses, root, abort, max_stream_turn_retries, null);
+}
+
+/// `required_first_tool` 非 null → 给该内置工具打 required_first 激活路由
+/// (无参数对:任一次成功调用即满足),复现 required_first 门与输出段协议的交互。
+fn runCassetteRouted(
+    allocator: std.mem.Allocator,
+    responses: []const []const u8,
+    root: []const u8,
+    abort: ?*cc.util_abort.AbortSignal,
+    max_stream_turn_retries: u8,
+    required_first_tool: ?[]const u8,
+) !Scenario {
     var server = try harness.MockServer.startCassette(responses, 0);
     defer server.stop();
     const url = try server.urlOwned(allocator);
@@ -189,6 +202,11 @@ fn runCassette(
     permission.no_interactive_prompt = true;
     const defs = try cc.tools.toToolDefinitions(allocator);
     defer allocator.free(defs);
+    if (required_first_tool) |tool_name| {
+        for (defs) |*d| {
+            if (std.mem.eql(u8, d.name, tool_name)) d.model_activation = .{ .mode = .required_first };
+        }
+    }
 
     var capture = SegmentCapture{ .allocator = allocator };
     errdefer capture.deinit();
@@ -403,4 +421,84 @@ test "L2 输出语义:headless 结果行按 core 的定性给 text_kind" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("final", parsed.value.object.get("text_kind").?.string);
     try std.testing.expectEqualStrings("answer", parsed.value.object.get("text").?.string);
+}
+
+test "L2 输出语义:required_first 修复轮的文本是 commentary,段协议保持配对" {
+    // 回归:required_first 门的 repair-continue 出口曾不收段 → 段跨轮悬开,
+    // 下一轮 begin 静默覆盖 → 一个 output_segment_begin 永远没有配对的 end
+    // (capture.unbalanced),Ledger 也漏记。修后:与其它 nudge 路径同款,
+    // 主机拒绝的过早"最终答案"定性 .commentary。
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buf);
+
+    // turn1:路由未满足就交"答案"(违约,触发 repair);turn2:补上 Glob 调用
+    // (满足路由);turn3:真正的最终答案。
+    const premature = try textSseAlloc(a, "m1", "I am done now.", "end_turn");
+    defer a.free(premature);
+    const glob_input = try std.fmt.allocPrint(a, "{{\"pattern\":\"*.none\",\"path\":\"{s}\"}}", .{root});
+    defer a.free(glob_input);
+    const comply = try textThenToolSse(a, "m2", "Let me comply.", "Glob", glob_input);
+    defer a.free(comply);
+    const answer = try textSseAlloc(a, "m3", "All set.", "end_turn");
+    defer a.free(answer);
+
+    var scenario = try runCassetteRouted(a, &.{ premature, comply, answer }, root, null, 2, "Glob");
+    defer scenario.deinit();
+
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, scenario.result.stop_reason);
+    try std.testing.expect(!scenario.capture.unbalanced);
+    try std.testing.expectEqual(@as(usize, 3), scenario.capture.closed.items.len);
+
+    const rejected = scenario.capture.closed.items[0];
+    try std.testing.expectEqual(Disposition.commentary, rejected.disposition);
+    try std.testing.expectEqualStrings("I am done now.", rejected.text);
+    try std.testing.expectEqual(@as(u64, "I am done now.".len), rejected.bytes);
+
+    try std.testing.expectEqual(Disposition.commentary, scenario.capture.closed.items[1].disposition);
+    const final = scenario.capture.closed.items[2];
+    try std.testing.expectEqual(Disposition.final, final.disposition);
+    try std.testing.expectEqualStrings("All set.", final.text);
+
+    // Ledger 与事件流同一结论:被拒的"答案"不是答案。
+    try std.testing.expectEqual(@as(usize, 2), scenario.ledger.countOf(.commentary));
+    try std.testing.expectEqualStrings("All set.", scenario.ledger.finalText().?);
+    try std.testing.expect(scenario.ledger.partialText() == null);
+}
+
+test "L2 输出语义:required_first 修复额度耗尽 fail-closed,partial 正文进 Ledger" {
+    // 回归:fail-closed return 出口曾靠 run 顶 defer 兜底收段——定性 .partial 与
+    // 字节数都对,但兜底拿不到正文,Ledger 里这段 partial 是空串。修后显式收段。
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buf);
+
+    const try1 = try textSseAlloc(a, "m1", "try one", "end_turn");
+    defer a.free(try1);
+    const try2 = try textSseAlloc(a, "m2", "try two", "end_turn");
+    defer a.free(try2);
+    const try3 = try textSseAlloc(a, "m3", "try three", "end_turn");
+    defer a.free(try3);
+
+    var scenario = try runCassetteRouted(a, &.{ try1, try2, try3 }, root, null, 2, "Glob");
+    defer scenario.deinit();
+
+    // MAX_REQUIRED_FIRST_REPAIRS=2:两次修复后第三次违约 fail-closed。
+    try std.testing.expectEqual(cc.agent_loop.StopReason.tool_loop, scenario.result.stop_reason);
+    try std.testing.expect(!scenario.capture.unbalanced);
+    try std.testing.expectEqual(@as(usize, 3), scenario.capture.closed.items.len);
+    try std.testing.expectEqual(Disposition.commentary, scenario.capture.closed.items[0].disposition);
+    try std.testing.expectEqual(Disposition.commentary, scenario.capture.closed.items[1].disposition);
+
+    const last = scenario.capture.closed.items[2];
+    try std.testing.expectEqual(Disposition.partial, last.disposition);
+    try std.testing.expectEqual(@as(u64, "try three".len), last.bytes);
+
+    // 核心回归断言:partial 正文必须落进 Ledger(兜底路径只有空串)。
+    try std.testing.expectEqualStrings("try three", scenario.ledger.partialText().?);
+    try std.testing.expect(scenario.ledger.finalText() == null);
 }
