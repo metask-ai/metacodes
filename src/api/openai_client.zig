@@ -365,11 +365,11 @@ const OpenAIStream = struct {
             if (!std.mem.eql(u8, fr, "null")) self.last_stop = mapFinish(fr);
         }
         // delta.content → text。OpenAI: {"choices":[{"delta":{"content":"hi"},...}]}
-        if (extractDeltaContent(data)) |content| {
-            if (content.len > 0) {
-                const owned = try self.allocator.dupe(u8, content);
-                return StreamEvent{ .text = owned };
-            }
+        // SSE string 片段带一层 JSON 转义(\n/\"/\uXXXX):必须解除后再交对话/UI,
+        // 否则转义序列以字面量进入 assistant 文本(issue #4)。空片段 free 不发事件。
+        if (try util_json.extractAndUnescapeStringField(data, "content", self.allocator)) |content| {
+            if (content.len > 0) return StreamEvent{ .text = content };
+            self.allocator.free(content);
         }
         // delta.reasoning_content → thinking(DeepSeek/Kimi/Qwen/GLM-5)。
         // OpenAI 原生不返回此字段(仅 reasoning_tokens 计数);兼容端点把它作为平级字符串返回。
@@ -397,10 +397,12 @@ const OpenAIStream = struct {
                 if (util_json.extractStringField(elem, "name")) |name| {
                     acc.name.appendSlice(self.allocator, name) catch {};
                 }
-                if (try extractDecodedStringField(
-                    self.allocator,
+                // arguments 片段先解除一层外层 JSON 转义再按槽拼接:`function.arguments`
+                // 是装在 string 里的 JSON 文档,不解除会让任何 string 参数变成非法 JSON。
+                if (try util_json.extractAndUnescapeStringField(
                     elem,
                     "arguments",
+                    self.allocator,
                 )) |args| {
                     defer self.allocator.free(args);
                     try acc.args.appendSlice(self.allocator, args);
@@ -522,52 +524,6 @@ fn findToolCallsArray(data: []const u8) ?[]const u8 {
     return data[arr_open + 1 ..]; // 未闭合:返回剩余
 }
 
-/// 提取一个 JSON string 字段并只解除其外层 JSON 转义。
-///
-/// OpenAI 的 `function.arguments` 自身是装在 string 里的 JSON 文档。把
-/// raw escaped slice 交给工具层会让任何 string 参数变成非法 JSON。这个
-/// owned-fragment 契约属于 OpenAI 流累积器，故不下沉到通用 JSON helper。
-fn extractDecodedStringField(
-    allocator: std.mem.Allocator,
-    data: []const u8,
-    field: []const u8,
-) !?[]u8 {
-    var pattern_buf: [256]u8 = undefined;
-    if (field.len >= pattern_buf.len - 3) return null;
-    pattern_buf[0] = '"';
-    @memcpy(pattern_buf[1..][0..field.len], field);
-    pattern_buf[1 + field.len] = '"';
-    pattern_buf[2 + field.len] = ':';
-    const pattern = pattern_buf[0 .. field.len + 3];
-
-    const field_index = std.mem.indexOf(u8, data, pattern) orelse return null;
-    var cursor = field_index + pattern.len;
-    while (cursor < data.len and std.ascii.isWhitespace(data[cursor])) : (cursor += 1) {}
-    if (cursor >= data.len or data[cursor] != '"') return null;
-    cursor += 1;
-    const value_start = cursor;
-    var escaped = false;
-    while (cursor < data.len) : (cursor += 1) {
-        const byte = data[cursor];
-        if (escaped) {
-            escaped = false;
-            continue;
-        }
-        if (byte == '\\') {
-            escaped = true;
-            continue;
-        }
-        if (byte == '"') {
-            return try util_json.unescapeString(
-                data[value_start..cursor],
-                allocator,
-            );
-        }
-        if (byte < 0x20) return null;
-    }
-    return null;
-}
-
 /// 迭代 JSON array slice 里的顶层 `{...}` 对象(深度感知,跳字符串)。
 const ElemIter = struct {
     s: []const u8,
@@ -609,40 +565,6 @@ fn mapFinish(fr: []const u8) StopReason {
     if (std.mem.eql(u8, fr, "tool_calls")) return .tool_use;
     if (std.mem.eql(u8, fr, "length")) return .max_tokens;
     return .unknown;
-}
-
-test "OpenAI arguments decoder removes one JSON layer and handles backslash parity" {
-    const a = std.testing.allocator;
-    const decoded = (try extractDecodedStringField(
-        a,
-        "{\"arguments\":\"{\\\"name\\\":\\\"review\\\",\\\"path\\\":\\\"C:\\\\\\\\tmp\\\"}\"}",
-        "arguments",
-    )) orelse return error.MissingArguments;
-    defer a.free(decoded);
-    try std.testing.expectEqualStrings(
-        "{\"name\":\"review\",\"path\":\"C:\\\\tmp\"}",
-        decoded,
-    );
-
-    const trailing = (try extractDecodedStringField(
-        a,
-        "{\"arguments\":\"fragment\\\\\"}",
-        "arguments",
-    )) orelse return error.MissingArguments;
-    defer a.free(trailing);
-    try std.testing.expectEqualStrings("fragment\\", trailing);
-}
-
-/// 提取 OpenAI delta.content(简易:找 `"content":"..."`,反转义)。null=本 chunk 无 content。
-fn extractDeltaContent(data: []const u8) ?[]const u8 {
-    // delta 里的 content;避免误命中其它 content(本测试 chunk 简单, 取首个 "content")。
-    return util_json.extractStringField(data, "content");
-}
-
-/// 从 OpenAI chat/completions delta 提取 reasoning_content(DeepSeek/Kimi/Qwen/GLM-5)。
-/// 与 content 平级的字符串字段。OpenAI 原生无此字段。
-fn extractDeltaReasoning(data: []const u8) ?[]const u8 {
-    return util_json.extractStringField(data, "reasoning_content");
 }
 
 /// 中立 Conversation/tools → OpenAI chat/completions 请求 body。caller free。
@@ -859,18 +781,6 @@ test "OpenAI 请求翻译:中立 Conversation → chat/completions body" {
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
-}
-
-test "extractDeltaReasoning: 从 chunk 解析 reasoning_content 字段" {
-    const chunk = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking...\"}}]}";
-    const got = extractDeltaReasoning(chunk);
-    try std.testing.expect(got != null);
-    try std.testing.expectEqualStrings("thinking...", got.?);
-}
-
-test "extractDeltaReasoning: 缺失字段返回 null" {
-    const chunk = "{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}";
-    try std.testing.expect(extractDeltaReasoning(chunk) == null);
 }
 
 test "serializeOpenAIRequest: GLM-5.2 effort=high 走顶层 reasoning_effort body(非 system 标签)" {
