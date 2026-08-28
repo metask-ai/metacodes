@@ -43,6 +43,8 @@ pub const SwarmContext = struct {
     base_url: ?[]const u8 = null,
     model: []const u8 = "",
     provider_kind: types_mod.ProviderKind = .anthropic,
+    /// OpenAI wire 协议(仅 provider_kind==.openai 时消费):teammate 继承 lead 的显式选择。
+    openai_protocol: types_mod.OpenAIProtocol = .chat_completions,
     /// Immutable App/Runtime-scoped resolver; in-process teammates drain before
     /// the owning plugin Snapshot is destroyed.
     dialect_resolver: dialect_mod.Resolver = .builtin(),

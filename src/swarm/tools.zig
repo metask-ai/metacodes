@@ -102,6 +102,7 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
         sw.base_url,
         sw.model,
         sw.provider_kind,
+        sw.openai_protocol,
         sw.home,
         sw.dialect_resolver,
     );

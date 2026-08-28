@@ -346,6 +346,8 @@ pub const AgentJobRegistry = struct {
     model: []u8,
     /// P0.5:parent 的 provider 协议 → per-job provider 据此造对应具体 client(子继承父 provider)。
     provider_kind: types_mod.ProviderKind = .anthropic,
+    /// OpenAI wire 协议(仅 provider_kind==.openai 时消费):子 job 继承父的显式选择。
+    openai_protocol: types_mod.OpenAIProtocol = .chat_completions,
     /// Borrowed from the App/Runtime immutable plugin Snapshot. App drains all
     /// jobs before destroying that Snapshot.
     dialect_resolver: dialect_mod.Resolver = .builtin(),
@@ -364,6 +366,7 @@ pub const AgentJobRegistry = struct {
             base_url,
             model,
             provider_kind,
+            .chat_completions,
             .builtin(),
         );
     }
@@ -374,6 +377,7 @@ pub const AgentJobRegistry = struct {
         base_url: ?[]const u8,
         model: []const u8,
         provider_kind: types_mod.ProviderKind,
+        openai_protocol: types_mod.OpenAIProtocol,
         dialect_resolver: dialect_mod.Resolver,
     ) !AgentJobRegistry {
         const key_owned = try allocator.dupe(u8, api_key);
@@ -389,6 +393,7 @@ pub const AgentJobRegistry = struct {
             .base_url = url_owned,
             .model = model_owned,
             .provider_kind = provider_kind,
+            .openai_protocol = openai_protocol,
             .dialect_resolver = dialect_resolver,
         };
     }
@@ -511,6 +516,7 @@ pub const AgentJobRegistry = struct {
             self.api_key,
             self.model,
             self.base_url,
+            self.openai_protocol,
             self.dialect_resolver,
         );
         errdefer if (!committed) owned.deinit();
@@ -870,6 +876,7 @@ pub const AgentJobRegistry = struct {
             self.api_key,
             self.model,
             self.base_url,
+            self.openai_protocol,
             self.dialect_resolver,
         );
     }

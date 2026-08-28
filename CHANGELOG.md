@@ -41,6 +41,16 @@ compatibility boundaries, and entry points are defined by
   agents/skills/MCP/cron wiring, and web runs were missing
   LSP/swarm/background-request wiring. Locked by
   `tests/component/session_api_parity_test.zig`.
+- Explicit OpenAI Responses API support: `--openai-protocol
+  chat_completions|responses` (alias `chat`; env `METACODES_OPENAI_PROTOCOL`)
+  selects the OpenAI wire protocol — never inferred from `--base-url` or the
+  model name, and invalid values fail closed. `responses` speaks
+  `/v1/responses`: typed SSE events (`response.output_text.delta`,
+  `response.output_item.added`, `response.function_call_arguments.*`,
+  `response.completed`/`incomplete`/`failed`), `input` items with
+  `function_call`/`function_call_output` call_id round-trip, top-level
+  `instructions`, flat tools, `reasoning:{effort}` (capped at `high`), and
+  `store:false`. Subagents and teammates inherit the parent's protocol choice.
 - `metacodes --version` prints `metacodes <semver>`; help banner now names the
   project instead of the legacy internal product name. The semver has one
   in-source authority (`src/version.zig`, consumed by the CLI, `lib.VERSION`,
@@ -114,6 +124,15 @@ compatibility boundaries, and entry points are defined by
   `METACODES_TEST_REQUIRE_LEAN_SDK=1`, which turns that skip into a failure so
   an olean path drift cannot become a permanent silent skip; the guard path
   itself is imported from `project_harness_evolution.SDK_OLEAN_RELATIVE`.
+
+### Fixed
+
+- OpenAI-compatible streaming now decodes the JSON string escapes of SSE
+  fragments: `delta.content` and `reasoning_content` (GLM/Kimi/DeepSeek/Qwen/
+  Mistral) previously reached the conversation and thinking stream as raw
+  escaped bytes, so `\n`/`\t`/`\uXXXX` rendered as literals. Both paths (and
+  streamed tool-call `arguments`) now share one unescaping extractor in
+  `util/json.zig`.
 
 ## Unreleased — standalone extraction and embedding boundary
 

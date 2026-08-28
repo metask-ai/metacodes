@@ -159,6 +159,7 @@ test "L2 后台B: TaskOutput running→done 拿到 final_text + stop_reason" {
         url,
         "claude-sonnet-4-20250514",
         .anthropic,
+        .chat_completions,
         backgroundDialectResolver(),
     );
     defer reg.deinit();

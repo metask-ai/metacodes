@@ -344,6 +344,17 @@ pub fn main(init: std.process.Init) !void {
         config.provider_kind = inferProviderKind(config.model);
     }
 
+    // --- OpenAI wire 协议:env METACODES_OPENAI_PROTOCOL 显式覆盖 CLI(同 auth_precedence 约定)。
+    // 词表 responses | chat | chat_completions;词表外 fail-closed(不许静默落默认端点)。
+    // **绝不从 base_url/model 推断**——协议选择是显式配置。
+    if (std.c.getenv("METACODES_OPENAI_PROTOCOL")) |c| {
+        const value = std.mem.span(c);
+        config.openai_protocol = types.OpenAIProtocol.parse(value) orelse {
+            std.debug.print("error: invalid METACODES_OPENAI_PROTOCOL '{s}'\n", .{value});
+            std.process.exit(2);
+        };
+    }
+
     // --- 预置应答队列(Stage 3):--answers-file 优先,METACODES_ANSWERS env 兜底 ---
     if (config.answers_file) |p| {
         answer_queue.loadFromFile(allocator, p) catch |e|
@@ -1029,6 +1040,16 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |s| config.answers_file = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--base-url")) {
             if (args.next()) |s| config.base_url = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--openai-protocol")) {
+            // 值域 fail-closed:拼错的协议名静默落默认 = 请求打到错误端点还不知情。
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --openai-protocol", .{});
+                return;
+            };
+            config.openai_protocol = types.OpenAIProtocol.parse(v) orelse {
+                setParseError(config, allocator, "invalid value '{s}' for --openai-protocol (chat|chat_completions|responses)", .{v});
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--auth-precedence")) {
             if (args.next()) |s| {
                 if (auth.parsePrecedence(s)) |p| config.auth_precedence = p;
@@ -1246,6 +1267,7 @@ fn printHelp() void {
         \\  --process-plugin-dir <path>  Enable a pinned executable plugin package (repeatable)
         \\  --answers-file <path> Preset answers for permission .ask / AskUserQuestion (non-tty)
         \\  --base-url <url>      Override API endpoint (must end with /v1/messages)
+        \\  --openai-protocol <p> OpenAI wire protocol: chat_completions (default; alias "chat") | responses (env METACODES_OPENAI_PROTOCOL)
         \\  --auth-precedence <p> api-key-first | oauth-first
         \\  --record <dir>        Record requests + SSE responses to dir (cassette)
         \\  --no-theme            Disable colors

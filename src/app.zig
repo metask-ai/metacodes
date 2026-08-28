@@ -458,10 +458,12 @@ pub const App = struct {
             .model_context = @import("app/model_context.zig").ModelContext.init(allocator),
         };
 
-        // OpenAI 后端:仅当 provider_kind==.openai 才建(讲 chat/completions 协议)。
-        // base_url 复用 config.base_url(record/replay 指 MockServer);null → OpenAI 官方端点。
+        // OpenAI 后端:仅当 provider_kind==.openai 才建(chat/completions 或 Responses,
+        // 按 config.openai_protocol 显式选择)。base_url 复用 config.base_url(record/replay
+        // 指 MockServer);null → 按 protocol 选 OpenAI 官方端点。
         if (config.provider_kind == .openai) {
             app.openai_client = openai_mod.OpenAIClient.init(allocator, io, api_key, config.model, config.base_url);
+            app.openai_client.?.protocol = config.openai_protocol;
             app.openai_client.?.reasoning_effort = config.reasoning_effort;
             app.openai_client.?.overrides = buildOverridesFromConfig(config);
         }
@@ -674,7 +676,7 @@ pub const App = struct {
         // Background jobs allocate and free from worker threads.  The session
         // arena is not thread-safe; keep the registry and all job-owned state
         // on c_allocator (the provider/agent_loop allocator must match too).
-        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.initWithDialectResolver(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind, app_dialect_resolver) catch |err| blk: {
+        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.initWithDialectResolver(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind, app.config.openai_protocol, app_dialect_resolver) catch |err| blk: {
             @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -688,6 +690,7 @@ pub const App = struct {
             .base_url = config.base_url,
             .model = app.config.model,
             .provider_kind = app.config.provider_kind,
+            .openai_protocol = app.config.openai_protocol,
             .dialect_resolver = app_dialect_resolver,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
         };
