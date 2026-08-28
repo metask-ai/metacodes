@@ -225,6 +225,8 @@ Current delivery status is intentionally target-specific:
 | Target | Bundle/archive | Native source-free consumption |
 |---|---|---|
 | `x86_64-windows-msvc` | revision 14 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-08-26) | C/C++/Zig/Rust source-free native gate passed, including fresh/restore and continued Runs |
+| `aarch64-windows-msvc` | revision 14 ReleaseSafe cross-bundle, schema-1 manifest, public-symbol, and C/C++/Zig source-free link gates passed locally (2026-08-28) | native C/C++/Zig/Rust revision 14 gate pending |
+| `aarch64-windows-gnu` | revision 14 ReleaseSafe cross-bundle, schema-1 manifest, public-symbol, and C/C++/Zig source-free link gates passed locally (2026-08-28) | native C/C++/Zig/Rust revision 14 gate pending |
 | `x86_64-windows-gnu` | revision 13 evidence retained; revision 14 not revalidated | native revision 14 gate pending |
 | `x86_64-linux-gnu` | revision 13 evidence retained; revision 14 not revalidated | native revision 14 gate pending |
 | `x86_64-macos` | revision 13 evidence retained; revision 14 not revalidated | native revision 14 gate pending |

@@ -294,6 +294,48 @@ test "manifest requires target-specific system link inputs" {
     try std.testing.expectError(error.LinkInputsMismatch, validateManifest(windows, expected));
 }
 
+test "manifest accepts Windows ARM64 target identities" {
+    const cases = [_]struct {
+        abi: []const u8,
+        target_id: []const u8,
+        zig_target: []const u8,
+        rust_target: []const u8,
+    }{
+        .{
+            .abi = "msvc",
+            .target_id = "aarch64-windows-msvc",
+            .zig_target = "aarch64-windows.win10...win11_dt-msvc",
+            .rust_target = "aarch64-pc-windows-msvc",
+        },
+        .{
+            .abi = "gnu",
+            .target_id = "aarch64-windows-gnu",
+            .zig_target = "aarch64-windows.win10...win11_dt-gnu",
+            .rust_target = "aarch64-pc-windows-gnullvm",
+        },
+    };
+
+    for (cases) |case| {
+        var manifest = validManifest();
+        manifest.target.id = case.target_id;
+        manifest.target.zig_target = case.zig_target;
+        manifest.target.rust_target = case.rust_target;
+        manifest.target.architecture = "aarch64";
+        manifest.target.os = "windows";
+        manifest.target.abi = case.abi;
+        manifest.link.system_libraries = &windows_system_link_inputs;
+
+        var expected = valid_expected;
+        expected.target_id = case.target_id;
+        expected.resolved_target = case.zig_target;
+        expected.rust_target = case.rust_target;
+        expected.architecture = "aarch64";
+        expected.os = "windows";
+        expected.abi = case.abi;
+        try validateManifest(manifest, expected);
+    }
+}
+
 test "manifest contract rejects toolchain target optimize and ABI drift" {
     var manifest = validManifest();
     manifest.vendor = "other";
