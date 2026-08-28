@@ -179,9 +179,11 @@ test "L2 R4-1回归: 小写 bash 成功执行后义务 met(dispatch 记账与结
     const nudged = try aa.alloc(bool, 1);
     const pending_ids = try aa.alloc([64]u8, 1);
     const pending_lens = try aa.alloc(usize, 1);
+    const dispatched = try aa.alloc(bool, 1);
     @memset(met, false);
     @memset(nudged, false);
     @memset(pending_lens, 0);
+    @memset(dispatched, false);
     var runtime = cc.obligation_gate.Runtime{
         .arena = arena,
         .envelopes = envelopes,
@@ -189,6 +191,7 @@ test "L2 R4-1回归: 小写 bash 成功执行后义务 met(dispatch 记账与结
         .nudged = nudged,
         .pending_ids = pending_ids,
         .pending_lens = pending_lens,
+        .dispatched = dispatched,
     };
     defer runtime.deinit();
 

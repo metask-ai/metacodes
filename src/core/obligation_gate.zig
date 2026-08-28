@@ -41,6 +41,8 @@ pub const Runtime = struct {
     /// 一次早成功 → 义务保持未满足 → 至多多一次 nudge,有界)。
     pending_ids: [][64]u8,
     pending_lens: []usize,
+    /// 曾记账过 dispatch(telemetry 用;pending 失败清账后仍如实报"尝试过")。
+    dispatched: []bool,
     nudges_used: u8 = 0,
 
     pub fn deinit(self: *Runtime) void {
@@ -61,19 +63,26 @@ pub const Runtime = struct {
             if (id.len == 0 or id.len > self.pending_ids[index].len) continue;
             @memcpy(self.pending_ids[index][0..id.len], id);
             self.pending_lens[index] = id.len;
+            self.dispatched[index] = true;
         }
     }
 
     /// 结果观察:待验证 id 的执行成功 → met(单调:met 永不撤销——
-    /// Lean 镜面 met_monotone)。失败结果不满足也不清账(同 id 不复用)。
+    /// Lean 镜面 met_monotone)。**失败即清账**(R5):pending id 不跨命保留——
+    /// 退化 id 提供方(计数器/常量 id)会在后续回合把同 id 用在别的工具上,
+    /// 残留 pending 会让一个恰含 `"exit_code":0}` 的非 Bash 成功槽误置 met。
+    /// dispatched[] 单独记"尝试过",telemetry 不因清账失真。
     pub fn observeResult(self: *Runtime, id: []const u8, success: bool) void {
-        if (!success) return;
         for (self.envelopes, 0..) |_, index| {
             if (self.met[index]) continue;
             const len = self.pending_lens[index];
             if (len == 0 or len != id.len) continue;
             if (!std.mem.eql(u8, self.pending_ids[index][0..len], id)) continue;
-            self.met[index] = true;
+            if (success) {
+                self.met[index] = true;
+            } else {
+                self.pending_lens[index] = 0;
+            }
         }
     }
 
@@ -605,9 +614,14 @@ pub fn load(
         arena.deinit();
         return null;
     };
+    const dispatched = a.alloc(bool, envelopes.len) catch {
+        arena.deinit();
+        return null;
+    };
     @memset(met, false);
     @memset(nudged, false);
     @memset(pending_lens, 0);
+    @memset(dispatched, false);
     const runtime = gpa.create(Runtime) catch {
         arena.deinit();
         return null;
@@ -619,6 +633,7 @@ pub fn load(
         .nudged = nudged,
         .pending_ids = pending_ids,
         .pending_lens = pending_lens,
+        .dispatched = dispatched,
         // v36 冷却:平台态预充预算,只剩 1 次 nudge(压力栈已证非因果时
         // 不再全额施压;新剂量打破平台键即恢复)。
         .nudges_used = if (plateau) MAX_OBLIGATION_NUDGES - 1 else 0,
@@ -672,7 +687,7 @@ pub fn writeTelemetry(
     }
     var written: usize = 0;
     for (runtime.envelopes, 0..) |envelope, i| {
-        const dispatched = runtime.met[i] or runtime.pending_lens[i] > 0;
+        const dispatched = runtime.dispatched[i]; // met ⊂ dispatched(met 只能经 dispatch 置位)
         const text = std.fmt.allocPrint(
             allocator,
             TELEMETRY_MARKER ++ ": cid={s} task={s} run={s} nudged={d} dispatched={d} met={d} best={d:.4} needle={s}",
@@ -768,9 +783,11 @@ fn testRuntime(envelope_count: usize) Runtime {
     const nudged = a.alloc(bool, envelope_count) catch unreachable;
     const pending_ids = a.alloc([64]u8, envelope_count) catch unreachable;
     const pending_lens = a.alloc(usize, envelope_count) catch unreachable;
+    const dispatched = a.alloc(bool, envelope_count) catch unreachable;
     @memset(met, false);
     @memset(nudged, false);
     @memset(pending_lens, 0);
+    @memset(dispatched, false);
     return .{
         .arena = arena,
         .envelopes = envelopes,
@@ -778,6 +795,7 @@ fn testRuntime(envelope_count: usize) Runtime {
         .nudged = nudged,
         .pending_ids = pending_ids,
         .pending_lens = pending_lens,
+        .dispatched = dispatched,
     };
 }
 
@@ -833,4 +851,21 @@ test "unmatched command leaves the obligation open" {
     runtime.observeDispatch("call_x", "ls -la");
     runtime.observeResult("call_x", true);
     try std.testing.expectEqual(@as(?usize, 0), runtime.decide().index);
+}
+
+test "R5: 失败清账 —— 陈旧 pending id 不被后续同 id 的异源成功误置 met" {
+    // 退化 id 提供方(计数器/常量 id)会跨回合复用 id。失败若不清账,残留 pending
+    // 会被后续同 id 的非记账工具成功误认(observeResult 只看 id)。
+    var runtime = testRuntime(1);
+    defer runtime.arena.deinit();
+    runtime.observeDispatch("dup_id", "pytest test_a.py -q");
+    runtime.observeResult("dup_id", false); // 失败 → pending 清账
+    runtime.observeResult("dup_id", true); // 同 id 复用(别家工具成功)
+    try std.testing.expectEqual(@as(?usize, 0), runtime.decide().index); // 义务仍 open
+    // telemetry 的 dispatched 不因清账失真(尝试过 = 真)。
+    try std.testing.expect(runtime.dispatched[0]);
+    // 正道不受影响:重新 dispatch + 成功 → met。
+    runtime.observeDispatch("fresh_id", "pytest test_a.py -q");
+    runtime.observeResult("fresh_id", true);
+    try std.testing.expectEqual(@as(?usize, null), runtime.decide().index);
 }
