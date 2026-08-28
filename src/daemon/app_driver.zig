@@ -73,8 +73,15 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         var pending_run = false;
         while (host.cmdbox.popFront()) |c| {
             defer infra.free(c);
+            // 命令执行期也亮 generating(对齐 web run):`!cmd` 可长时间阻塞,不亮则
+            // /interrupt 被 409 门挡死——daemon session 没有终端 SIGINT 兜底,必须能中断。
+            host.generating.store(true, .seq_cst);
+            defer host.generating.store(false, .seq_cst);
             if (web_session.execCommand(app, &host.journal, infra, c) != null) pending_run = true;
         }
+        // 命令期被打断的残留 interrupt 复位——否则毒化紧随的 pending run / inbox 消息
+        // (already-aborted 即刻吞掉)。host 停机走 stop_flag/user_ctrl_c,不受此影响。
+        if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.resetForTesting();
 
         if (!pending_run) {
             const msg = host.inbox.popFront() orelse {

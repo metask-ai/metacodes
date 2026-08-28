@@ -196,7 +196,24 @@ fn reply(allocator: std.mem.Allocator, ok: bool, msg: []const u8) ![]u8 {
 pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.Allocator, cmd: []const u8) ?session_service_mod.RunPlan {
     const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
     var svc = session_service_mod.SessionService.init(app);
+    // `!cmd` shell 车道单独走:业务核仍是 service.shellExec(执行 + 输出进对话上下文),
+    // 但 web/daemon 用户看不到对话内的追加,故把 stdout/stderr 摘录放进 command_result
+    // (对齐 TUI 的"渲染归各 UI":TUI 打终端,这里进 journal)。
+    const intent = session_service_mod.service_intent.parse(trimmed);
+    if (intent == .shell and intent.shell.len > 0) {
+        shellCommandResult(&svc, journal, web_alloc, intent.shell);
+        return null;
+    }
     const d = session_service_mod.execLine(&svc, app.allocator, trimmed);
+    // prompt 经 /command 提交时补 user_message 回显——与 POST /message 的回显对齐
+    // (server.zig 回显在入队前),否则 attach/重放的 SSE 客户端只见 assistant 回合,
+    // 可见 transcript 与 conversation 脱节。宏注入(/commit 等)不回显,对齐 TUI。
+    if (d.run != null and d.run.?.kind == .user_prompt) {
+        if (std.json.Stringify.valueAlloc(web_alloc, .{ .user_message = trimmed }, .{}) catch null) |echo| {
+            defer web_alloc.free(echo);
+            journal.append(echo);
+        }
+    }
     var buf: [256]u8 = undefined;
     const msg: []const u8 = switch (d.outcome.kind) {
         .unhandled => std.fmt.bufPrint(&buf, "unsupported here: {s}", .{trimmed}) catch "unsupported command",
@@ -210,6 +227,41 @@ pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem
     return d.run;
 }
 const session_service_mod = @import("../session_service.zig");
+
+/// `!cmd` 的 journal 渲染:执行(service 业务核)→ stdout/stderr 摘录进 command_result。
+/// 摘录上限 2 KiB/流(完整输出已在对话上下文里,模型可见;这里只为浏览器用户回显)。
+fn shellCommandResult(svc: *session_service_mod.SessionService, journal: *EventJournal, web_alloc: std.mem.Allocator, command: []const u8) void {
+    const result = session_service_mod.shellExecImpl(svc, web_alloc, command) catch |e| {
+        const line = std.json.Stringify.valueAlloc(web_alloc, .{ .command_result = .{ .ok = false, .message = @errorName(e) } }, .{}) catch return;
+        defer web_alloc.free(line);
+        journal.append(line);
+        return;
+    };
+    defer web_alloc.free(result);
+
+    const common = @import("../tools/common.zig");
+    const json_util = @import("../util/json.zig");
+    var msg_buf: std.ArrayList(u8) = .empty;
+    defer msg_buf.deinit(web_alloc);
+    msg_buf.appendSlice(web_alloc, "$ ") catch return;
+    msg_buf.appendSlice(web_alloc, command) catch return;
+    inline for (.{ "stdout", "stderr" }) |stream| {
+        if (common.extractJsonArg(result, stream)) |raw| {
+            if (json_util.unescapeString(raw, web_alloc) catch null) |text| {
+                defer web_alloc.free(text);
+                if (text.len > 0) {
+                    msg_buf.appendSlice(web_alloc, "\n") catch return;
+                    const cap = @min(text.len, 2048);
+                    msg_buf.appendSlice(web_alloc, text[0..cap]) catch return;
+                    if (text.len > cap) msg_buf.appendSlice(web_alloc, "\n[… truncated]") catch return;
+                }
+            }
+        }
+    }
+    const line = std.json.Stringify.valueAlloc(web_alloc, .{ .command_result = .{ .ok = true, .message = msg_buf.items } }, .{}) catch return;
+    defer web_alloc.free(line);
+    journal.append(line);
+}
 
 /// **U10-D → U11**:构造 web/daemon session 的 agent_loop.Options(web run() 与 daemon
 /// app_driver 共用)。字段装配走 canonical session_service.buildRunOptions——此前本函数
@@ -290,8 +342,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         var pending_run = false;
         while (cmdbox.popFront()) |c| {
             defer web_alloc.free(c);
+            // 命令执行期也亮 generating:`!cmd` 可长时间阻塞 driver,不亮则 /interrupt 被
+            // 409 门挡死(浏览器 Stop 失效)。中断的残留 abort 由既有复位路径消化
+            // (空闲分支的残留 reset / run 后的 user_interrupt reset)。
+            generating_flag.store(true, .release);
+            defer generating_flag.store(false, .release);
             if (execCommand(app, &journal, web_alloc, c) != null) pending_run = true;
         }
+        // 命令期被 Stop 打断(如中断长 `!cmd`)的残留 interrupt 在此复位——否则紧随的
+        // pending run / inbox 消息会被 already-aborted 即刻吞掉(S1 同类)。SIGINT 不复位。
+        if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.resetForTesting();
 
         if (!pending_run) {
             // ── 空闲期:等消息 ──────────────────────────────────────────────
