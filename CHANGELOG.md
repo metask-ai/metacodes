@@ -93,10 +93,13 @@ compatibility boundaries, and entry points are defined by
   budget layer now classifies Tool-vs-MCP operations from the same metadata
   resolution dispatch uses instead of the unfiltered MCP view (a
   selected-but-expired alias no longer reserves under MCP caps while dispatch
-  answers UnknownTool; `ToolEnvironment.mcp_view` is removed); and the Skill
-  overlay refuses to build over a base surface that already advertises a tool
-  named `Skill` (`error.SkillToolNameCollision`) instead of silently
-  shadowing it while sending duplicate definitions to the provider.
+  answers UnknownTool; `ToolEnvironment.mcp_view` is removed). The MCP-class
+  boundary is now the `.external` executor kind, which also covers the Skill
+  overlay tool — with the default equal caps this changes nothing, and the
+  taxonomy question is tracked as ledger item E12. The Skill overlay also
+  refuses to build over a base surface that already advertises a tool named
+  `Skill` (`error.SkillToolNameCollision`) instead of silently shadowing it
+  while sending duplicate definitions to the provider.
 - CI migrated to self-hosted runners (Linux X64, macOS ARM64, Windows X64)
   with a pinned Lean toolchain build. No GitHub-hosted path remains in the
   workflows; restoring account billing would allow reintroducing hosted
