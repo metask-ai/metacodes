@@ -601,7 +601,6 @@ pub const Reservation = struct {
 pub const ToolEnvironment = struct {
     controller: *Controller,
     base: core.agent_session.RunToolSurface,
-    mcp_view: ?*const mcp_session.View = null,
 
     pub fn surface(self: *const ToolEnvironment) core.agent_session.RunToolSurface {
         return .{
@@ -622,8 +621,18 @@ pub const ToolEnvironment = struct {
         arguments_json: []const u8,
     ) anyerror!core.tools.ToolDispatchOutcome {
         const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        const kind: OperationKind = if (self.mcp_view) |view|
-            if (view.findModelTool(name) != null) .mcp else .tool
+        // Classification must share dispatch's resolution authority. The old
+        // unfiltered-View lookup drifted from the freshness-filtered MCP
+        // Environment: a selected-but-expired alias reserved under MCP caps
+        // while dispatch answered UnknownTool. The base metadata resolution
+        // reports MCP aliases (and every other out-of-process executor) as
+        // `.external`, so exactly those reserve under the external/MCP caps;
+        // builtin/host and unresolvable names stay on the Tool caps.
+        const kind: OperationKind = if (self.base.dispatcher.metadata(name)) |meta|
+            switch (meta.kind) {
+                .external => .mcp,
+                .builtin, .host => .tool,
+            }
         else
             .tool;
         const request_bytes = checkedAdd(
@@ -1824,7 +1833,6 @@ test "MCP reservation failure occurs before connector invocation" {
     var budgeted = ToolEnvironment{
         .controller = &controller,
         .base = mcp_environment.surface(),
-        .mcp_view = &view,
     };
     const tool_ctx = core.tool_context.ToolContext{
         .allocator = std.testing.allocator,
@@ -1901,7 +1909,6 @@ test "oversized MCP success is promoted to the shared recoverable artifact plane
     var budgeted = ToolEnvironment{
         .controller = &controller,
         .base = mcp_environment.surface(),
-        .mcp_view = &view,
     };
     const tool_ctx = core.tool_context.ToolContext{
         .allocator = allocator,

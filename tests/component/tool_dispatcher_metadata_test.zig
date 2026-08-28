@@ -559,9 +559,25 @@ test "L2 验收④: budget∘skill∘mcp∘Selection 一次解析贯穿全栈且
     const model_name = view.entries[0].model_name;
 
     // Skill overlay(镜像其 in-file 测试的最小构造:metadata/dispatch 只依赖
-    // base_dispatcher / base_definitions / definitions)。
+    // base_dispatcher / base_definitions / definitions;invokeSkill 的
+    // SkillNotFound 早退还会摸 allocator 与 snapshot,故一并给真值)。
     var no_definitions = [_]core.json.ToolDefinition{};
+    var skill_snapshot = core.skills_runtime.catalog.Snapshot{
+        .owner_allocator = a,
+        .arena = std.heap.ArenaAllocator.init(a),
+        .scope_id = [_]u8{'a'} ** 64,
+        .revision = [_]u8{'b'} ** 64,
+        .health = .healthy,
+        .skills = &.{},
+        .issues = &.{},
+        .descriptor_json = "",
+        .content_bytes = 0,
+        .resident_bytes = 0,
+    };
+    defer skill_snapshot.arena.deinit();
     var skill_environment: model_skill_tool.Environment = undefined;
+    skill_environment.allocator = a;
+    skill_environment.snapshot = &skill_snapshot;
     skill_environment.base_definitions = mcp_environment.surface().definitions;
     skill_environment.base_dispatcher = mcp_environment.surface().dispatcher;
     skill_environment.definitions = &no_definitions;
@@ -570,7 +586,6 @@ test "L2 验收④: budget∘skill∘mcp∘Selection 一次解析贯穿全栈且
     var budget = session_budget.ToolEnvironment{
         .controller = &controller,
         .base = skill_environment.surface(),
-        .mcp_view = &view,
     };
     const dispatcher = budget.surface().dispatcher;
 
@@ -587,13 +602,41 @@ test "L2 验收④: budget∘skill∘mcp∘Selection 一次解析贯穿全栈且
     try std.testing.expect(!dispatcher.prefetchSafe("Read"));
     // 未解析名跨全栈仍是 null。
     try std.testing.expect(dispatcher.metadata("Grep") == null);
+    // 组合面结构自检:每个 nameAt 枚举出的名字都有 metadata 覆盖——未来任何
+    // 包装层新增可派发名却漏掉 metadata 分支,这里(与 abi_v1 Debug 组合点)先红。
+    try std.testing.expect(dispatcher.validateMetadataCoverage() == null);
 
     // dispatch("Read") 穿过 budget→skill→mcp→Selection 执行真实内置 Read。
-    var ctx = core.tool_context.ToolContext{ .allocator = a, .tool_dispatcher = dispatcher };
+    var ctx = core.tool_context.ToolContext{
+        .allocator = a,
+        .tool_dispatcher = dispatcher,
+        .artifact_root = root,
+    };
     var outcome = try dispatcher.dispatch(&ctx, "Read", read_input);
     defer outcome.deinit(a);
     try std.testing.expect(outcome == .ok);
     var rendered = try outcome.ok.render(a);
     defer rendered.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "composed-read-fixture") != null);
+
+    // dispatch(MCP 别名) 穿过同一全栈落到 MCP 执行路径:connector 侧效应
+    // (fixture 计数)证明不是被中间层吞掉或改道。
+    try std.testing.expectEqual(@as(u32, 0), server.calls);
+    var mcp_outcome = try dispatcher.dispatch(&ctx, model_name, "{\"city\":\"Paris\"}");
+    defer mcp_outcome.deinit(a);
+    try std.testing.expect(mcp_outcome == .ok);
+    try std.testing.expectEqual(@as(u32, 1), server.calls);
+
+    // dispatch("Skill") 由 skill 层拦截:空 catalog 下未知 skill 名报
+    // SkillNotFound——若名字漏到底层 Selection 只会是 UnknownTool。
+    try std.testing.expectError(
+        error.SkillNotFound,
+        dispatcher.dispatch(&ctx, model_skill_tool.TOOL_NAME, "{\"name\":\"no-such-skill\"}"),
+    );
+
+    // metadata==null ⇒ dispatch UnknownTool,经包装全栈成立,不只裸 Selection。
+    try std.testing.expectError(
+        error.UnknownTool,
+        dispatcher.dispatch(&ctx, "Grep", "{\"pattern\":\"x\"}"),
+    );
 }

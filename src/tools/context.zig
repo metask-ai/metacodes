@@ -268,6 +268,21 @@ pub const ToolDispatcher = struct {
         const meta = self.metadata(name) orelse return .never;
         return meta.replay;
     }
+
+    /// Structural coverage check for wrapper stacks: nothing in the interface
+    /// forces `dispatchFn`'s resolvable names and `metadataFn` to stay in
+    /// sync, so a future wrapper can add a dispatchable name, forget the
+    /// metadata branch, and silently reintroduce split resolution. Walks the
+    /// advertised directory (`nameAt(0..)`) and returns the first name whose
+    /// `metadata` is null; null means every advertised name resolves.
+    /// Composition sites assert this in Debug so drift fails loudly.
+    pub fn validateMetadataCoverage(self: ToolDispatcher) ?[]const u8 {
+        var index: usize = 0;
+        while (self.nameAt(index)) |name| : (index += 1) {
+            if (self.metadata(name) == null) return name;
+        }
+        return null;
+    }
 };
 
 /// Borrowed, immutable upper bound for one execution context. The owner must
