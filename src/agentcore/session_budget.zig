@@ -612,6 +612,9 @@ pub const ToolEnvironment = struct {
                 .prefetchSafeFn = prefetchSafe,
                 .nameAtFn = nameAt,
                 .hostSyncFn = hostSync,
+                .builtinFn = isBuiltin,
+                .categoryFn = category,
+                .replayDeclarationFn = replayDeclaration,
             },
         };
     }
@@ -705,6 +708,21 @@ pub const ToolEnvironment = struct {
     fn hostSync(raw: *const anyopaque, name: []const u8) bool {
         const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
         return self.base.dispatcher.isHostSync(name);
+    }
+
+    fn isBuiltin(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
+        return self.base.dispatcher.isBuiltin(name);
+    }
+
+    fn category(raw: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
+        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
+        return self.base.dispatcher.category(name);
+    }
+
+    fn replayDeclaration(raw: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
+        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
+        return self.base.dispatcher.replayDeclaration(name);
     }
 };
 
@@ -1441,9 +1459,12 @@ const TestDispatcher = struct {
         return .{
             .ctx = self,
             .dispatchFn = dispatch,
-            .prefetchSafeFn = no,
+            .prefetchSafeFn = prefetchSafe,
             .nameAtFn = noName,
-            .hostSyncFn = no,
+            .hostSyncFn = hostSync,
+            .builtinFn = isBuiltin,
+            .categoryFn = category,
+            .replayDeclarationFn = replayDeclaration,
         };
     }
 
@@ -1460,8 +1481,24 @@ const TestDispatcher = struct {
         return .{ .ok = core.tools.ToolResultBody.initInline(bytes) };
     }
 
-    fn no(_: *const anyopaque, _: []const u8) bool {
+    fn prefetchSafe(_: *const anyopaque, name: []const u8) bool {
+        return std.mem.eql(u8, name, "Read");
+    }
+
+    fn hostSync(_: *const anyopaque, _: []const u8) bool {
         return false;
+    }
+
+    fn isBuiltin(_: *const anyopaque, name: []const u8) bool {
+        return std.mem.eql(u8, name, "Read");
+    }
+
+    fn category(_: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
+        return if (std.mem.eql(u8, name, "Read")) .read else null;
+    }
+
+    fn replayDeclaration(_: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
+        return if (std.mem.eql(u8, name, "Read")) .read_only else .never;
     }
 
     fn noName(_: *const anyopaque, _: usize) ?[]const u8 {
@@ -1575,6 +1612,14 @@ test "Tool reservation failure skips dispatch and oversized payload is replaced"
             .dispatcher = denied_base.dispatcher(),
         },
     };
+    const decorated_dispatcher = denied_tools.surface().dispatcher;
+    try std.testing.expect(decorated_dispatcher.prefetchSafe("Read"));
+    try std.testing.expect(decorated_dispatcher.isBuiltin("Read"));
+    try std.testing.expect(!decorated_dispatcher.isHostSync("Read"));
+    try std.testing.expectEqual(core.tool_context.ToolCategory.read, decorated_dispatcher.category("Read").?);
+    try std.testing.expectEqual(core.tools.ReplayDeclaration.read_only, decorated_dispatcher.replayDeclaration("Read"));
+    try std.testing.expect(!decorated_dispatcher.isBuiltin("unknown"));
+    try std.testing.expect(decorated_dispatcher.category("unknown") == null);
     const tool_ctx = core.tool_context.ToolContext{
         .allocator = std.testing.allocator,
     };

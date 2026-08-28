@@ -8,6 +8,10 @@ pub const Status = types.Status;
 pub const StopReason = types.StopReason;
 pub const ProviderKind = types.ProviderKind;
 pub const CoreEvent = protocol.CoreEvent;
+pub const OutputSegmentDisposition = protocol.OutputSegmentDisposition;
+pub const FileChangeRecord = protocol.FileChangeRecord;
+pub const FileChangeKind = protocol.FileChangeKind;
+pub const FileChangeStatus = protocol.FileChangeStatus;
 pub const FileReference = protocol.FileReference;
 pub const FileReferenceLocator = protocol.FileReferenceLocator;
 pub const FileReferencePosition = protocol.FileReferencePosition;
@@ -112,94 +116,77 @@ pub const Api = struct {
 
     pub fn discover() error{UnsupportedAbi}!Api {
         const ptr = metask_agentcore_get_api(types.ABI_VERSION_V1) orelse return error.UnsupportedAbi;
-        return validate(@ptrCast(@alignCast(ptr)));
+        return validate(ptr);
     }
 
-    pub fn validate(raw: *const types.ApiV1) error{UnsupportedAbi}!Api {
+    pub fn validate(raw_ptr: ?*const anyopaque) error{UnsupportedAbi}!Api {
         // Offsets 0..7 are the stable discovery prefix. Never read revision or
         // later fields from a differently sized table before the exact check.
-        if (raw.struct_size != @sizeOf(types.ApiV1) or raw.abi_version != types.ABI_VERSION_V1)
+        const ptr = raw_ptr orelse return error.UnsupportedAbi;
+        if (@intFromPtr(ptr) % @alignOf(types.ApiV1) != 0) return error.UnsupportedAbi;
+        const prefix: *const AbiPrefixV1 = @ptrCast(@alignCast(ptr));
+        if (prefix.struct_size != @sizeOf(types.ApiV1) or prefix.abi_version != types.ABI_VERSION_V1)
             return error.UnsupportedAbi;
+        const raw: *const types.ApiV1 = @ptrCast(@alignCast(ptr));
         if (raw.abi_revision != types.ABI_REVISION or raw.reserved0 != 0 or
-            raw.capabilities != types.REQUIRED_CAPABILITIES_V1 or
-            !allZero(raw.reserved) or
-            raw.runtime_create == null or raw.runtime_destroy == null or
-            raw.runtime_query_skill_catalog == null or raw.skill_catalog_release == null or
-            raw.runtime_refresh_mcp == null or raw.runtime_describe_mcp == null or
-            raw.runtime_apply_mcp_configuration == null or
-            raw.session_restore == null or raw.session_describe == null or
-            raw.session_create == null or raw.session_destroy == null or
-            raw.session_set_model == null or raw.session_update_skills == null or
-            raw.session_update_permission_rules == null or raw.session_update_mcp == null or
-            raw.session_run_input == null or
-            raw.session_abort == null or raw.session_compact == null or
-            raw.session_abort_compact == null or raw.session_export_checkpoint == null or
-            raw.completion_create == null or raw.completion_destroy == null or
-            raw.completion_describe == null or raw.completion_complete == null or
-            raw.completion_stream_start == null or raw.completion_stream_next == null or
-            raw.completion_stream_abort == null or raw.completion_stream_destroy == null or
-            raw.runtime_create_with_plugins == null or
-            raw.buffer_release == null)
+            raw.buffer_release == null or !validateRuntimeApi(raw.runtime) or
+            !validateSessionApi(raw.session) or
+            !validateSessionControlApi(raw.session_control) or
+            !validateSkillApi(raw.skill) or !validateMcpApi(raw.mcp))
             return error.UnsupportedAbi;
         return .{ .raw = raw };
     }
 
-    pub fn runtimeCreate(self: Api) types.RuntimeCreateFnV1 {
-        return self.raw.runtime_create.?;
+    pub fn runtime(self: Api) RuntimeApi {
+        return .{ .raw = self.raw.runtime.? };
     }
-    pub fn runtimeCreateWithPlugins(self: Api) types.RuntimeCreateWithPluginsFnV1 {
-        return self.raw.runtime_create_with_plugins.?;
+    pub fn session(self: Api) SessionApi {
+        return .{ .raw = self.raw.session.? };
     }
-    pub fn runtimeDestroy(self: Api) types.RuntimeDestroyFnV1 {
-        return self.raw.runtime_destroy.?;
+    pub fn sessionControl(self: Api) SessionControlApi {
+        return .{ .raw = self.raw.session_control.? };
     }
-    /// Safe SDK name for the raw `runtime_query_skill_catalog` ABI slot.
-    pub fn resolveWorkspaceSkillCatalog(self: Api) types.RuntimeQuerySkillCatalogFnV1 {
-        return self.raw.runtime_query_skill_catalog.?;
+    pub fn skill(self: Api) SkillApi {
+        return .{ .raw = self.raw.skill.? };
     }
-    pub fn skillCatalogRelease(self: Api) types.SkillCatalogReleaseFnV1 {
-        return self.raw.skill_catalog_release.?;
+    pub fn mcp(self: Api) McpApi {
+        return .{ .raw = self.raw.mcp.? };
     }
-    pub fn runtimeRefreshMcp(self: Api) types.RuntimeRefreshMcpFnV1 {
-        return self.raw.runtime_refresh_mcp.?;
+    pub fn bufferRelease(self: Api) types.BufferReleaseFnV1 {
+        return self.raw.buffer_release.?;
     }
-    pub fn runtimeDescribeMcp(self: Api) types.RuntimeDescribeMcpFnV1 {
-        return self.raw.runtime_describe_mcp.?;
+};
+
+const AbiPrefixV1 = extern struct {
+    struct_size: u32,
+    abi_version: u32,
+};
+
+pub const RuntimeApi = struct {
+    raw: *const types.RuntimeApiV1,
+
+    pub fn create(self: RuntimeApi) types.RuntimeCreateFnV1 {
+        return self.raw.create.?;
     }
-    pub fn runtimeApplyMcpConfiguration(self: Api) types.RuntimeApplyMcpConfigurationFnV1 {
-        return self.raw.runtime_apply_mcp_configuration.?;
+    pub fn destroy(self: RuntimeApi) types.RuntimeDestroyFnV1 {
+        return self.raw.destroy.?;
     }
-    pub fn sessionCreate(self: Api) types.SessionCreateFnV1 {
-        return self.raw.session_create.?;
+};
+
+pub const SessionApi = struct {
+    raw: *const types.SessionApiV1,
+
+    pub fn create(self: SessionApi) types.SessionCreateFnV1 {
+        return self.raw.create.?;
     }
-    pub fn sessionRestore(self: Api) types.SessionRestoreFnV1 {
-        return self.raw.session_restore.?;
+    pub fn destroy(self: SessionApi) types.SessionDestroyFnV1 {
+        return self.raw.destroy.?;
     }
-    pub fn sessionDestroy(self: Api) types.SessionDestroyFnV1 {
-        return self.raw.session_destroy.?;
+    pub fn runInput(self: SessionApi) types.SessionRunInputFnV1 {
+        return self.raw.run_input.?;
     }
-    pub fn sessionDescribe(self: Api) types.SessionDescribeFnV1 {
-        return self.raw.session_describe.?;
-    }
-    pub fn sessionSetModel(self: Api) types.SessionSetModelFnV1 {
-        return self.raw.session_set_model.?;
-    }
-    /// Atomically binds a complete Catalog plus default-deny policy, or
-    /// replaces only the policy when the Catalog argument is null.
-    pub fn sessionBindSkillPolicy(self: Api) types.SessionBindSkillsFnV1 {
-        return self.raw.session_update_skills.?;
-    }
-    pub fn sessionUpdatePermissionRules(self: Api) types.SessionUpdatePermissionRulesFnV1 {
-        return self.raw.session_update_permission_rules.?;
-    }
-    pub fn sessionUpdateMcp(self: Api) types.SessionUpdateMcpFnV1 {
-        return self.raw.session_update_mcp.?;
-    }
-    pub fn sessionRunInput(self: Api) types.SessionRunInputFnV1 {
-        return self.raw.session_run_input.?;
-    }
-    pub fn sessionRunText(
-        self: Api,
+    pub fn runText(
+        self: SessionApi,
         session: ?*types.SessionHandle,
         run_id: u64,
         prompt: types.BytesViewV1,
@@ -216,7 +203,7 @@ pub const Api = struct {
             .arguments_json = bytesView(""),
             .reserved = [_]u64{0} ** 4,
         };
-        return self.sessionRunInput()(
+        return self.runInput()(
             session,
             run_id,
             &input,
@@ -225,8 +212,8 @@ pub const Api = struct {
             out_diagnostic,
         );
     }
-    pub fn sessionRunSkill(
-        self: Api,
+    pub fn runSkill(
+        self: SessionApi,
         session: ?*types.SessionHandle,
         run_id: u64,
         skill_id: types.BytesViewV1,
@@ -245,7 +232,7 @@ pub const Api = struct {
             .arguments_json = arguments_json,
             .reserved = [_]u64{0} ** 4,
         };
-        return self.sessionRunInput()(
+        return self.runInput()(
             session,
             run_id,
             &input,
@@ -254,46 +241,107 @@ pub const Api = struct {
             out_diagnostic,
         );
     }
-    pub fn sessionAbort(self: Api) types.SessionAbortFnV1 {
-        return self.raw.session_abort.?;
-    }
-    pub fn sessionCompact(self: Api) types.SessionCompactFnV1 {
-        return self.raw.session_compact.?;
-    }
-    pub fn sessionAbortCompact(self: Api) types.SessionAbortCompactFnV1 {
-        return self.raw.session_abort_compact.?;
-    }
-    pub fn sessionExportCheckpoint(self: Api) types.SessionExportCheckpointFnV1 {
-        return self.raw.session_export_checkpoint.?;
-    }
-    pub fn completionCreate(self: Api) types.CompletionCreateFnV1 {
-        return self.raw.completion_create.?;
-    }
-    pub fn completionDestroy(self: Api) types.CompletionDestroyFnV1 {
-        return self.raw.completion_destroy.?;
-    }
-    pub fn completionDescribe(self: Api) types.CompletionDescribeFnV1 {
-        return self.raw.completion_describe.?;
-    }
-    pub fn completionComplete(self: Api) types.CompletionCompleteFnV1 {
-        return self.raw.completion_complete.?;
-    }
-    pub fn completionStreamStart(self: Api) types.CompletionStreamStartFnV1 {
-        return self.raw.completion_stream_start.?;
-    }
-    pub fn completionStreamNext(self: Api) types.CompletionStreamNextFnV1 {
-        return self.raw.completion_stream_next.?;
-    }
-    pub fn completionStreamAbort(self: Api) types.CompletionStreamAbortFnV1 {
-        return self.raw.completion_stream_abort.?;
-    }
-    pub fn completionStreamDestroy(self: Api) types.CompletionStreamDestroyFnV1 {
-        return self.raw.completion_stream_destroy.?;
-    }
-    pub fn bufferRelease(self: Api) types.BufferReleaseFnV1 {
-        return self.raw.buffer_release.?;
+    pub fn abort(self: SessionApi) types.SessionAbortFnV1 {
+        return self.raw.abort.?;
     }
 };
+
+pub const SessionControlApi = struct {
+    raw: *const types.SessionControlApiV1,
+
+    pub fn restore(self: SessionControlApi) types.SessionRestoreFnV1 {
+        return self.raw.restore.?;
+    }
+    pub fn describe(self: SessionControlApi) types.SessionDescribeFnV1 {
+        return self.raw.describe.?;
+    }
+    pub fn setModel(self: SessionControlApi) types.SessionSetModelFnV1 {
+        return self.raw.set_model.?;
+    }
+    pub fn updatePermissionRules(self: SessionControlApi) types.SessionUpdatePermissionRulesFnV1 {
+        return self.raw.update_permission_rules.?;
+    }
+    pub fn compact(self: SessionControlApi) types.SessionCompactFnV1 {
+        return self.raw.compact.?;
+    }
+    pub fn abortCompact(self: SessionControlApi) types.SessionAbortCompactFnV1 {
+        return self.raw.abort_compact.?;
+    }
+    pub fn exportCheckpoint(self: SessionControlApi) types.SessionExportCheckpointFnV1 {
+        return self.raw.export_checkpoint.?;
+    }
+};
+
+pub const SkillApi = struct {
+    raw: *const types.SkillApiV1,
+
+    pub fn resolveCatalog(self: SkillApi) types.RuntimeQuerySkillCatalogFnV1 {
+        return self.raw.resolve_catalog.?;
+    }
+    pub fn releaseCatalog(self: SkillApi) types.SkillCatalogReleaseFnV1 {
+        return self.raw.release_catalog.?;
+    }
+    /// Atomically binds a complete Catalog plus default-deny policy, or
+    /// replaces only the policy when the Catalog argument is null.
+    pub fn bindPolicy(self: SkillApi) types.SessionBindSkillsFnV1 {
+        return self.raw.bind_policy.?;
+    }
+};
+
+pub const McpApi = struct {
+    raw: *const types.McpApiV1,
+
+    pub fn applyConfiguration(self: McpApi) types.RuntimeApplyMcpConfigurationFnV1 {
+        return self.raw.apply_configuration.?;
+    }
+    pub fn refresh(self: McpApi) types.RuntimeRefreshMcpFnV1 {
+        return self.raw.refresh.?;
+    }
+    pub fn describe(self: McpApi) types.RuntimeDescribeMcpFnV1 {
+        return self.raw.describe.?;
+    }
+    pub fn updateSelection(self: McpApi) types.SessionUpdateMcpFnV1 {
+        return self.raw.update_selection.?;
+    }
+};
+
+fn validateRuntimeApi(raw: ?*const types.RuntimeApiV1) bool {
+    const api = raw orelse return false;
+    if (@intFromPtr(api) % @alignOf(types.RuntimeApiV1) != 0) return false;
+    return api.struct_size == @sizeOf(types.RuntimeApiV1) and api.reserved0 == 0 and
+        api.create != null and api.destroy != null;
+}
+
+fn validateSessionApi(raw: ?*const types.SessionApiV1) bool {
+    const api = raw orelse return false;
+    if (@intFromPtr(api) % @alignOf(types.SessionApiV1) != 0) return false;
+    return api.struct_size == @sizeOf(types.SessionApiV1) and api.reserved0 == 0 and
+        api.create != null and api.destroy != null and api.run_input != null and api.abort != null;
+}
+
+fn validateSessionControlApi(raw: ?*const types.SessionControlApiV1) bool {
+    const api = raw orelse return false;
+    if (@intFromPtr(api) % @alignOf(types.SessionControlApiV1) != 0) return false;
+    return api.struct_size == @sizeOf(types.SessionControlApiV1) and api.reserved0 == 0 and
+        api.restore != null and api.describe != null and api.set_model != null and
+        api.update_permission_rules != null and api.compact != null and
+        api.abort_compact != null and api.export_checkpoint != null;
+}
+
+fn validateSkillApi(raw: ?*const types.SkillApiV1) bool {
+    const api = raw orelse return false;
+    if (@intFromPtr(api) % @alignOf(types.SkillApiV1) != 0) return false;
+    return api.struct_size == @sizeOf(types.SkillApiV1) and api.reserved0 == 0 and
+        api.resolve_catalog != null and api.release_catalog != null and api.bind_policy != null;
+}
+
+fn validateMcpApi(raw: ?*const types.McpApiV1) bool {
+    const api = raw orelse return false;
+    if (@intFromPtr(api) % @alignOf(types.McpApiV1) != 0) return false;
+    return api.struct_size == @sizeOf(types.McpApiV1) and api.reserved0 == 0 and
+        api.apply_configuration != null and api.refresh != null and api.describe != null and
+        api.update_selection != null;
+}
 
 fn allZero(values: anytype) bool {
     for (values) |value| if (value != 0) return false;
@@ -324,20 +372,34 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 13 SDK rejects an earlier table from the stable prefix" {
-    const Revision5Api = extern struct {
+test "Revision 14 SDK rejects Revision 13 and old Revision 14 roots" {
+    const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
         abi_revision: u32,
         reserved0: u32,
-        capabilities: u64,
-        tail: [144]u8,
+        tail: [264]u8,
     };
-    var legacy: Revision5Api align(@alignOf(types.ApiV1)) =
-        std.mem.zeroes(Revision5Api);
-    legacy.struct_size = @sizeOf(Revision5Api);
-    legacy.abi_version = types.ABI_VERSION_V1;
-    legacy.abi_revision = 6;
-    const raw: *const types.ApiV1 = @ptrCast(&legacy);
-    try std.testing.expectError(error.UnsupportedAbi, Api.validate(raw));
+    var revision13: Revision13Api align(@alignOf(types.ApiV1)) =
+        std.mem.zeroes(Revision13Api);
+    revision13.struct_size = @sizeOf(Revision13Api);
+    revision13.abi_version = types.ABI_VERSION_V1;
+    revision13.abi_revision = 13;
+    try std.testing.expectEqual(@as(usize, 280), @sizeOf(Revision13Api));
+    try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision13));
+
+    const OldRevision14Api = extern struct {
+        struct_size: u32,
+        abi_version: u32,
+        abi_revision: u32,
+        reserved0: u32,
+        tail: [56]u8,
+    };
+    var old_revision14: OldRevision14Api align(@alignOf(types.ApiV1)) =
+        std.mem.zeroes(OldRevision14Api);
+    old_revision14.struct_size = @sizeOf(OldRevision14Api);
+    old_revision14.abi_version = types.ABI_VERSION_V1;
+    old_revision14.abi_revision = 14;
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(OldRevision14Api));
+    try std.testing.expectError(error.UnsupportedAbi, Api.validate(&old_revision14));
 }

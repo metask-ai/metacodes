@@ -13,6 +13,7 @@ const InternalEvent = core.protocol.ui_event.CoreEvent;
 const InternalUiRequest = core.protocol.ui_request.UiRequest;
 const InternalUiResponse = core.protocol.ui_request.UiResponse;
 const internal_file_reference = core.file_reference;
+const internal_file_change = core.file_change;
 
 // The event adapter borrows the reference slice for the duration of the
 // synchronous callback. Keep the zero-copy cast, but make its safety claim
@@ -29,6 +30,32 @@ comptime {
         @sizeOf(internal_file_reference.Range) != @sizeOf(public.FileReferenceRange) or
         @sizeOf(internal_file_reference.Position) != @sizeOf(public.FileReferencePosition))
         @compileError("AgentCore file-reference nested DTO layout drift");
+    if (@sizeOf(internal_file_change.Kind) != @sizeOf(public.FileChangeKind) or
+        @intFromEnum(internal_file_change.Kind.created) != @intFromEnum(public.FileChangeKind.created) or
+        @intFromEnum(internal_file_change.Kind.modified) != @intFromEnum(public.FileChangeKind.modified) or
+        @intFromEnum(internal_file_change.Kind.deleted) != @intFromEnum(public.FileChangeKind.deleted) or
+        @intFromEnum(internal_file_change.Kind.moved) != @intFromEnum(public.FileChangeKind.moved))
+        @compileError("AgentCore file-change kind DTO layout drift");
+    if (@sizeOf(internal_file_change.Status) != @sizeOf(public.FileChangeStatus) or
+        @intFromEnum(internal_file_change.Status.applied) != @intFromEnum(public.FileChangeStatus.applied) or
+        @intFromEnum(internal_file_change.Status.no_change) != @intFromEnum(public.FileChangeStatus.no_change) or
+        @intFromEnum(internal_file_change.Status.failed) != @intFromEnum(public.FileChangeStatus.failed) or
+        @intFromEnum(internal_file_change.Status.rejected) != @intFromEnum(public.FileChangeStatus.rejected) or
+        @intFromEnum(internal_file_change.Status.partial) != @intFromEnum(public.FileChangeStatus.partial))
+        @compileError("AgentCore file-change status DTO layout drift");
+    if (@sizeOf(internal_file_change.Record) != @sizeOf(public.FileChangeRecord) or
+        @offsetOf(internal_file_change.Record, "locator") != @offsetOf(public.FileChangeRecord, "locator") or
+        @offsetOf(internal_file_change.Record, "from_locator") != @offsetOf(public.FileChangeRecord, "from_locator") or
+        @offsetOf(internal_file_change.Record, "kind") != @offsetOf(public.FileChangeRecord, "kind") or
+        @offsetOf(internal_file_change.Record, "status") != @offsetOf(public.FileChangeRecord, "status") or
+        @offsetOf(internal_file_change.Record, "tool") != @offsetOf(public.FileChangeRecord, "tool") or
+        @offsetOf(internal_file_change.Record, "tool_use_id") != @offsetOf(public.FileChangeRecord, "tool_use_id") or
+        @offsetOf(internal_file_change.Record, "agent_depth") != @offsetOf(public.FileChangeRecord, "agent_depth") or
+        @offsetOf(internal_file_change.Record, "before_bytes") != @offsetOf(public.FileChangeRecord, "before_bytes") or
+        @offsetOf(internal_file_change.Record, "after_bytes") != @offsetOf(public.FileChangeRecord, "after_bytes") or
+        @offsetOf(internal_file_change.Record, "unified_diff") != @offsetOf(public.FileChangeRecord, "unified_diff") or
+        @offsetOf(internal_file_change.Record, "diff_complete") != @offsetOf(public.FileChangeRecord, "diff_complete"))
+        @compileError("AgentCore FileChangeRecord internal/public layout drift; update the explicit ABI adapter");
 }
 
 /// Map an internal event to the frozen ABI v1 event set. Returning null is an
@@ -62,6 +89,18 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
                 .file_refs = if (v.file_refs) |refs| @ptrCast(refs) else null,
             },
         },
+        .file_changes => |v| .{
+            .file_changes = .{
+                .id = v.id,
+                .name = v.name,
+                // The Core owns these records until the synchronous callback
+                // returns. The compile-time assertions above make this borrowed
+                // zero-copy projection fail closed on any DTO layout drift.
+                .changes = @ptrCast(v.changes),
+                .overflow = v.overflow,
+                .lost = v.lost,
+            },
+        },
         .usage => |v| .{ .usage = .{
             .input_tokens = v.input_tokens,
             .output_tokens = v.output_tokens,
@@ -86,6 +125,24 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
             .attempt = v.attempt,
             .max = v.max,
             .delay_ms = v.delay_ms,
+        } },
+        .output_segment_begin => |v| .{ .output_segment_begin = .{
+            .index = v.index,
+            .turn = v.turn,
+            .group = v.group,
+        } },
+        .output_segment_end => |v| .{ .output_segment_end = .{
+            .index = v.index,
+            .turn = v.turn,
+            .group = v.group,
+            .disposition = switch (v.disposition) {
+                .commentary => .commentary,
+                .final => .final,
+                .continued => .continued,
+                .partial => .partial,
+                .discarded => .discarded,
+            },
+            .bytes = v.bytes,
         } },
         .stream_done => .stream_done,
 
@@ -114,16 +171,6 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
         .tasks_changed,
         .ui_request_pending,
         .ui_request_resolved,
-        // Output-semantics and file-change evidence stay internal **for now**.
-        // The AgentCore facade's own projector already consumes
-        // `output_segment_end` to reconstruct the final answer correctly, which
-        // is the behavior consumers actually observe. Exporting the raw events
-        // would widen a frozen C ABI (public header, symbol gate, version bump,
-        // consumer sign-off) — deliberately out of scope here, and registered as
-        // such in doc/CORE_REFERENCE.md §7 rather than left silent.
-        .output_segment_begin,
-        .output_segment_end,
-        .file_changes,
         => null,
     };
 }

@@ -33,6 +33,14 @@ const HOST_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const HOST_READ_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_host_read\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_host_read\",\"name\":\"Read\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"decoy.txt\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const HOST_STREAM_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_stream\",\"name\":\"HostStream\",\"input\":{}}}\n\n" ++
@@ -135,16 +143,30 @@ const CONTINUATION_TAIL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
-/// Independent Host-side oracle for the public A1 recipe. It deliberately
-/// knows nothing about Conversation internals.
+/// Independent Host-side oracle for the public visible-output segment
+/// protocol. It deliberately knows nothing about Conversation or AgentLoop
+/// internals.
 const ReconstructionProbe = struct {
     current: [128]u8 = undefined,
     current_len: usize = 0,
+    group: [256]u8 = undefined,
+    group_len: usize = 0,
+    group_id: u32 = 0,
     answer: [256]u8 = undefined,
     answer_len: usize = 0,
     thinking: [128]u8 = undefined,
     thinking_len: usize = 0,
     stream_done_count: usize = 0,
+    segment_begin_count: usize = 0,
+    commentary_count: usize = 0,
+    final_count: usize = 0,
+    continued_count: usize = 0,
+    partial_count: usize = 0,
+    discarded_count: usize = 0,
+    segment_open: bool = false,
+    segment_index: u32 = 0,
+    segment_turn: u32 = 0,
+    segment_group: u32 = 0,
     usage: sdk.protocol.UsageDelta = .{},
 
     fn checkedAdd(dst: *u64, value: u64) bool {
@@ -162,7 +184,18 @@ const ReconstructionProbe = struct {
             .unknown => return wire.EVENT_CONTINUE,
         };
         switch (event_value) {
+            .output_segment_begin => |segment| {
+                if (self.segment_open or (self.group_len != 0 and self.group_id != segment.group))
+                    return wire.EVENT_FATAL;
+                self.current_len = 0;
+                self.segment_open = true;
+                self.segment_index = segment.index;
+                self.segment_turn = segment.turn;
+                self.segment_group = segment.group;
+                self.segment_begin_count += 1;
+            },
             .text_chunk => |text| {
+                if (!self.segment_open) return wire.EVENT_FATAL;
                 if (text.len > self.current.len - self.current_len) return wire.EVENT_FATAL;
                 @memcpy(self.current[self.current_len..][0..text.len], text);
                 self.current_len += text.len;
@@ -173,14 +206,44 @@ const ReconstructionProbe = struct {
                 self.thinking_len += text.len;
             },
             .stream_done => {
-                if (self.current_len > self.answer.len - self.answer_len) return wire.EVENT_FATAL;
-                @memcpy(self.answer[self.answer_len..][0..self.current_len], self.current[0..self.current_len]);
-                self.answer_len += self.current_len;
-                self.current_len = 0;
                 self.stream_done_count += 1;
             },
-            .tool_start, .tool_result => {
-                self.answer_len = 0;
+            .output_segment_end => |segment| {
+                if (!self.segment_open or
+                    self.segment_index != segment.index or
+                    self.segment_turn != segment.turn or
+                    self.segment_group != segment.group or
+                    segment.bytes != @as(u64, @intCast(self.current_len)))
+                    return wire.EVENT_FATAL;
+                self.segment_open = false;
+
+                switch (segment.disposition) {
+                    .continued, .final => {
+                        if (self.group_len == 0) self.group_id = segment.group;
+                        if (self.group_id != segment.group or self.current_len > self.group.len - self.group_len)
+                            return wire.EVENT_FATAL;
+                        @memcpy(self.group[self.group_len..][0..self.current_len], self.current[0..self.current_len]);
+                        self.group_len += self.current_len;
+                        if (segment.disposition == .continued) {
+                            self.continued_count += 1;
+                        } else {
+                            if (self.group_len > self.answer.len) return wire.EVENT_FATAL;
+                            @memcpy(self.answer[0..self.group_len], self.group[0..self.group_len]);
+                            self.answer_len = self.group_len;
+                            self.group_len = 0;
+                            self.final_count += 1;
+                        }
+                    },
+                    .commentary => {
+                        self.group_len = 0;
+                        self.commentary_count += 1;
+                    },
+                    .partial => {
+                        self.group_len = 0;
+                        self.partial_count += 1;
+                    },
+                    .discarded => self.discarded_count += 1,
+                }
                 self.current_len = 0;
             },
             .usage => |usage| {
@@ -196,16 +259,25 @@ const ReconstructionProbe = struct {
     }
 };
 
-test "Host reconstruction oracle resets at public tool boundaries" {
+test "Host reconstruction oracle follows public output segment dispositions" {
     var probe = ReconstructionProbe{};
     const events = [_][]const u8{
+        "{\"output_segment_begin\":{\"index\":1,\"turn\":1,\"group\":1}}",
         "{\"text_chunk\":\"provisional\"}",
         "{\"stream_done\":{}}",
-        "{\"text_chunk\":\"unclosed\"}",
-        "{\"tool_start\":{\"id\":\"t\",\"name\":\"Read\",\"input\":\"{}\"}}",
-        "{\"tool_result\":{\"id\":\"t\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false}}",
-        "{\"text_chunk\":\"final\"}",
+        "{\"output_segment_end\":{\"index\":1,\"turn\":1,\"group\":1,\"disposition\":\"commentary\",\"bytes\":11}}",
+        "{\"output_segment_begin\":{\"index\":2,\"turn\":2,\"group\":2}}",
+        "{\"text_chunk\":\"head\"}",
         "{\"stream_done\":{}}",
+        "{\"output_segment_end\":{\"index\":2,\"turn\":2,\"group\":2,\"disposition\":\"continued\",\"bytes\":4}}",
+        "{\"output_segment_begin\":{\"index\":3,\"turn\":2,\"group\":2}}",
+        "{\"text_chunk\":\"discarded\"}",
+        "{\"stream_done\":{}}",
+        "{\"output_segment_end\":{\"index\":3,\"turn\":2,\"group\":2,\"disposition\":\"discarded\",\"bytes\":9}}",
+        "{\"output_segment_begin\":{\"index\":4,\"turn\":2,\"group\":2}}",
+        "{\"text_chunk\":\"tail\"}",
+        "{\"stream_done\":{}}",
+        "{\"output_segment_end\":{\"index\":4,\"turn\":2,\"group\":2,\"disposition\":\"final\",\"bytes\":4}}",
     };
     for (events) |encoded| {
         try std.testing.expectEqual(
@@ -213,7 +285,12 @@ test "Host reconstruction oracle resets at public tool boundaries" {
             ReconstructionProbe.event(&probe, null, sdk.bytesView(encoded)),
         );
     }
-    try std.testing.expectEqualStrings("final", probe.answer[0..probe.answer_len]);
+    try std.testing.expectEqualStrings("headtail", probe.answer[0..probe.answer_len]);
+    try std.testing.expectEqual(@as(usize, 4), probe.segment_begin_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.commentary_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.continued_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.discarded_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.final_count);
 }
 
 /// Test Host registry implementing the consumer-side §4 contract. The binding
@@ -375,6 +452,144 @@ fn acceptEvent(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1
     return wire.EVENT_CONTINUE;
 }
 
+const PublicFileChangesProbe = struct {
+    expected_session: ?*wire.SessionHandle = null,
+    expected_run_id: u64 = 0,
+    rejected: u32 = 0,
+    applied: u32 = 0,
+    denied_tool_results: u32 = 0,
+    applied_tool_results: u32 = 0,
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        if (run.session != self.expected_session or run.run_id != self.expected_run_id)
+            return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const known = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        const value = switch (known) {
+            .tool_result => |result| {
+                if (!std.mem.eql(u8, result.id, "tu_write") or
+                    !std.mem.eql(u8, result.name, "Write"))
+                    return wire.EVENT_CONTINUE;
+                if (run.run_id == 1) {
+                    if (result.file_refs != null) return wire.EVENT_FATAL;
+                    self.denied_tool_results += 1;
+                    return wire.EVENT_CONTINUE;
+                }
+                if (run.run_id != 2) return wire.EVENT_FATAL;
+                const refs = result.file_refs orelse return wire.EVENT_FATAL;
+                if (refs.len != 1) return wire.EVENT_FATAL;
+                const file_ref = refs[0];
+                const path = switch (file_ref.locator) {
+                    .workspace_path => |path| path,
+                    else => return wire.EVENT_FATAL,
+                };
+                if (!std.mem.eql(u8, path, "blocked.txt") or
+                    !std.mem.eql(u8, file_ref.title, "blocked.txt") or
+                    !std.mem.eql(u8, file_ref.kind, "created") or
+                    file_ref.range != null)
+                    return wire.EVENT_FATAL;
+                self.applied_tool_results += 1;
+                return wire.EVENT_CONTINUE;
+            },
+            .file_changes => |changes| changes,
+            else => return wire.EVENT_CONTINUE,
+        };
+        if (!std.mem.eql(u8, value.id, "tu_write") or
+            !std.mem.eql(u8, value.name, "Write") or
+            value.changes.len != 1 or value.overflow or value.lost)
+            return wire.EVENT_FATAL;
+        const change = value.changes[0];
+        const path = switch (change.locator) {
+            .workspace_path => |path| path,
+            else => return wire.EVENT_FATAL,
+        };
+        if (!std.mem.eql(u8, path, "blocked.txt") or
+            !std.mem.eql(u8, change.tool, "Write") or
+            !std.mem.eql(u8, change.tool_use_id, "tu_write") or
+            change.kind != .created or change.agent_depth != 0)
+            return wire.EVENT_FATAL;
+        switch (change.status) {
+            .rejected => {
+                if (change.before_bytes != 0 or change.after_bytes != 0 or
+                    change.unified_diff != null or !change.diff_complete)
+                    return wire.EVENT_FATAL;
+                self.rejected += 1;
+            },
+            .applied => {
+                if (change.before_bytes != 0 or change.after_bytes == 0 or
+                    !change.diff_complete or
+                    std.mem.indexOf(u8, change.unified_diff orelse return wire.EVENT_FATAL, "+must-not-write") == null)
+                    return wire.EVENT_FATAL;
+                self.applied += 1;
+            },
+            else => return wire.EVENT_FATAL,
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+const HostReadRefsProbe = struct {
+    expected_session: ?*wire.SessionHandle = null,
+    host_calls: u32 = 0,
+    host_releases: u32 = 0,
+    tool_results: u32 = 0,
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        if (run.session != self.expected_session or run.run_id != 1) return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const known = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        const result = switch (known) {
+            .tool_result => |value| value,
+            else => return wire.EVENT_CONTINUE,
+        };
+        if (!std.mem.eql(u8, result.id, "tu_host_read") or
+            !std.mem.eql(u8, result.name, "Read"))
+            return wire.EVENT_CONTINUE;
+        if (result.is_error or result.file_refs != null or
+            !std.mem.eql(u8, result.content, "host-read-ok"))
+            return wire.EVENT_FATAL;
+        self.tool_results += 1;
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn host(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        _: wire.BytesViewV1,
+        out: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.HOST_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.HOST_FATAL;
+        if (run.session != self.expected_session or run.run_id != 1) return wire.HOST_FATAL;
+        const result = "host-read-ok";
+        (out orelse return wire.HOST_FATAL).* = .{ .ptr = @constCast(result.ptr), .len = result.len };
+        self.host_calls += 1;
+        return wire.HOST_OK;
+    }
+
+    fn releaseHost(raw: ?*anyopaque, result: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        if (result) |out| {
+            if (out.ptr != null) self.host_releases += 1;
+            out.* = .{ .ptr = null, .len = 0 };
+        }
+    }
+};
+
 const UiFailureProbe = struct {
     mode: UiFailureMode,
     api: ?sdk.Api = null,
@@ -412,7 +627,7 @@ const UiFailureProbe = struct {
                 const run = sdk.validateRunContext(run_ptr) catch return wire.UI_FATAL;
                 var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
                 defer api.bufferRelease()(&diagnostic);
-                self.nested_run_status = api.sessionRunText(
+                self.nested_run_status = api.session().runText(
                     run.session,
                     run.run_id + 1,
                     sdk.bytesView("nested callback run"),
@@ -421,11 +636,11 @@ const UiFailureProbe = struct {
                     &diagnostic,
                 );
                 api.bufferRelease()(&diagnostic);
-                self.nested_destroy_status = api.sessionDestroy()(run.session, &diagnostic);
+                self.nested_destroy_status = api.session().destroy()(run.session, &diagnostic);
                 api.bufferRelease()(&diagnostic);
-                self.first_abort_status = api.sessionAbort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+                self.first_abort_status = api.session().abort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
                 api.bufferRelease()(&diagnostic);
-                self.second_abort_status = api.sessionAbort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+                self.second_abort_status = api.session().abort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
                 break :blk wire.UI_UNAVAILABLE;
             },
         };
@@ -484,9 +699,9 @@ const AbortEventProbe = struct {
         if (self.calls == 1) {
             var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
             const wrong_run_id: u64 = 2;
-            self.stale_abort_status = self.api.sessionAbort()(run.session, wrong_run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+            self.stale_abort_status = self.api.session().abort()(run.session, wrong_run_id, wire.ABORT_USER_REQUEST, &diagnostic);
             self.api.bufferRelease()(&diagnostic);
-            self.abort_status = self.api.sessionAbort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+            self.abort_status = self.api.session().abort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
             self.api.bufferRelease()(&diagnostic);
         }
         return wire.EVENT_CONTINUE;
@@ -596,7 +811,7 @@ const PublicSessionFixture = struct {
         runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            self.api.runtimeCreate()(&runtime_config, &self.runtime, &self.diagnostic),
+            self.api.runtime().create()(&runtime_config, null, &self.runtime, &self.diagnostic),
         );
 
         var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
@@ -616,7 +831,7 @@ const PublicSessionFixture = struct {
         callbacks.on_event = acceptEvent;
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            self.api.sessionCreate()(
+            self.api.session().create()(
                 self.runtime,
                 &session_config,
                 &callbacks,
@@ -629,12 +844,12 @@ const PublicSessionFixture = struct {
 
     fn deinit(self: *PublicSessionFixture) void {
         if (self.session) |handle| {
-            _ = self.api.sessionDestroy()(handle, &self.diagnostic);
+            _ = self.api.session().destroy()(handle, &self.diagnostic);
             self.session = null;
             self.releaseDiagnostic();
         }
         if (self.runtime) |handle| {
-            _ = self.api.runtimeDestroy()(handle, &self.diagnostic);
+            _ = self.api.runtime().destroy()(handle, &self.diagnostic);
             self.runtime = null;
             self.releaseDiagnostic();
         }
@@ -652,7 +867,7 @@ const PublicSessionFixture = struct {
         var result = std.mem.zeroes(wire.RunResultV1);
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            self.api.sessionRunText(
+            self.api.session().runText(
                 self.session,
                 run_id,
                 sdk.bytesView(prompt),
@@ -690,7 +905,7 @@ test "L2 public AgentCore durable Run journal records the physical provider effe
     var description = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        fixture.api.sessionDescribe()(
+        fixture.api.sessionControl().describe()(
             fixture.session,
             &description,
             &fixture.diagnostic,
@@ -733,10 +948,10 @@ test "Revision 13 public Session rejects unknown Run journal mode and nonzero re
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var host = std.mem.zeroes(wire.SessionHostConfigV1);
@@ -756,7 +971,7 @@ test "Revision 13 public Session rejects unknown Run journal mode and nonzero re
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionCreate()(runtime, &create, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &create, &callbacks, &session, &diagnostic),
     );
     try std.testing.expect(session == null);
     api.bufferRelease()(&diagnostic);
@@ -765,7 +980,7 @@ test "Revision 13 public Session rejects unknown Run journal mode and nonzero re
     host.reserved0 = 1;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionCreate()(runtime, &create, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &create, &callbacks, &session, &diagnostic),
     );
     try std.testing.expect(session == null);
 }
@@ -806,7 +1021,7 @@ test "L2 durable budget profile crosses the public wire and rejects before Run a
     var description = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        fixture.api.sessionDescribe()(
+        fixture.api.sessionControl().describe()(
             fixture.session,
             &description,
             &fixture.diagnostic,
@@ -838,7 +1053,7 @@ test "L2 durable budget profile crosses the public wire and rejects before Run a
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
-        fixture.api.sessionRunText(
+        fixture.api.session().runText(
             fixture.session,
             1,
             sdk.bytesView(&oversized),
@@ -937,7 +1152,7 @@ fn expectInvalidSessionConfig(
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionCreate()(runtime, config, callbacks, &session, diagnostic),
+        api.session().create()(runtime, config, callbacks, &session, diagnostic),
     );
     try std.testing.expect(session == null);
     try std.testing.expect(diagnostic.ptr != null and diagnostic.len != 0);
@@ -1723,7 +1938,7 @@ test "L2 Revision 9 hard-cut real HTTP Connector AUTO downgrades a bare 400 prob
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    const create_status = api.runtimeCreate()(&config, &runtime, &diagnostic);
+    const create_status = api.runtime().create()(&config, null, &runtime, &diagnostic);
     if (create_status != wire.STATUS_OK) {
         const message = sdk.borrowedBytes(.{ .ptr = diagnostic.ptr, .len = diagnostic.len }) catch "";
         std.debug.print("real HTTP MCP runtime_create failed: {s}\n", .{message});
@@ -1732,14 +1947,14 @@ test "L2 Revision 9 hard-cut real HTTP Connector AUTO downgrades a bare 400 prob
     var generation: u64 = 0;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+        api.mcp().refresh()(runtime, &generation, &diagnostic),
     );
     try std.testing.expectEqual(@as(u64, 1), generation);
 
     var description = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+        api.mcp().describe()(runtime, &description, &diagnostic),
     );
     const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
     const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
@@ -1757,7 +1972,7 @@ test "L2 Revision 9 hard-cut real HTTP Connector AUTO downgrades a bare 400 prob
     try std.testing.expectEqual(@as(u32, 2), connector.releases);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeDestroy()(runtime, &diagnostic),
+        api.runtime().destroy()(runtime, &diagnostic),
     );
     runtime = null;
     try std.testing.expectEqual(@as(u32, 2), connector.closes);
@@ -1807,18 +2022,18 @@ test "L2 Revision 9 hard-cut real HTTP Connector AUTO preserves a Modern server"
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&config, &runtime, &diagnostic),
+        api.runtime().create()(&config, null, &runtime, &diagnostic),
     );
     var generation: u64 = 0;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+        api.mcp().refresh()(runtime, &generation, &diagnostic),
     );
 
     var description = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+        api.mcp().describe()(runtime, &description, &diagnostic),
     );
     const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
     const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
@@ -1834,7 +2049,7 @@ test "L2 Revision 9 hard-cut real HTTP Connector AUTO preserves a Modern server"
     try std.testing.expectEqual(@as(u32, 3), connector.releases);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeDestroy()(runtime, &diagnostic),
+        api.runtime().destroy()(runtime, &diagnostic),
     );
     try std.testing.expectEqual(@as(u32, 2), connector.closes);
 }
@@ -1888,19 +2103,19 @@ test "L2 Revision 7 public MCP exact 2025-06 and AUTO reopen reach one canonical
         var runtime: ?*wire.RuntimeHandle = null;
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            api.runtimeCreate()(&config, &runtime, &diagnostic),
+            api.runtime().create()(&config, null, &runtime, &diagnostic),
         );
         defer api.bufferRelease()(&diagnostic);
         var generation: u64 = 0;
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+            api.mcp().refresh()(runtime, &generation, &diagnostic),
         );
         try std.testing.expectEqual(@as(u64, 1), generation);
         var description = std.mem.zeroes(wire.OwnedBytesV1);
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+            api.mcp().describe()(runtime, &description, &diagnostic),
         );
         const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
         const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
@@ -1955,7 +2170,7 @@ test "L2 Revision 7 public MCP exact 2025-06 and AUTO reopen reach one canonical
         try std.testing.expectEqual(case.closes_before_destroy, probe.closes);
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            api.runtimeDestroy()(runtime, &diagnostic),
+            api.runtime().destroy()(runtime, &diagnostic),
         );
         runtime = null;
         try probe.expectClosedExactlyOnce();
@@ -1973,10 +2188,10 @@ test "L2 Revision 7 public MCP Apply publishes complete sets and replaces change
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var first_probe = PublicMcpProbe{};
@@ -2003,7 +2218,7 @@ test "L2 Revision 7 public MCP Apply publishes complete sets and replaces change
     var report = std.mem.zeroes(wire.McpApplyReportV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+        api.mcp().applyConfiguration()(runtime, &configuration, &report, &diagnostic),
     );
     try std.testing.expectEqual(@as(u32, @sizeOf(wire.McpApplyReportV1)), report.struct_size);
     try std.testing.expectEqual(wire.MCP_APPLY_APPLIED, report.disposition_code);
@@ -2015,7 +2230,7 @@ test "L2 Revision 7 public MCP Apply publishes complete sets and replaces change
     configuration.desired_revision = 2;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+        api.mcp().applyConfiguration()(runtime, &configuration, &report, &diagnostic),
     );
     try std.testing.expectEqual(wire.MCP_APPLY_APPLIED, report.disposition_code);
     try std.testing.expectEqual(@as(u64, 1), report.catalog_generation);
@@ -2026,7 +2241,7 @@ test "L2 Revision 7 public MCP Apply publishes complete sets and replaces change
     configuration.desired_revision = 3;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+        api.mcp().applyConfiguration()(runtime, &configuration, &report, &diagnostic),
     );
     try std.testing.expectEqual(wire.MCP_APPLY_REJECTED, report.disposition_code);
     try std.testing.expectEqual(@as(u64, 3), report.desired_revision);
@@ -2038,7 +2253,7 @@ test "L2 Revision 7 public MCP Apply publishes complete sets and replaces change
     var description = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+        api.mcp().describe()(runtime, &description, &diagnostic),
     );
     const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
     const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
@@ -2054,7 +2269,7 @@ test "L2 Revision 7 public MCP Apply publishes complete sets and replaces change
     servers[0].connector = second_probe.connector();
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+        api.mcp().applyConfiguration()(runtime, &configuration, &report, &diagnostic),
     );
     try std.testing.expectEqual(wire.MCP_APPLY_APPLIED, report.disposition_code);
     try std.testing.expectEqual(@as(u64, 2), report.catalog_generation);
@@ -2066,7 +2281,7 @@ test "L2 Revision 7 public MCP Apply publishes complete sets and replaces change
     configuration.server_count = 0;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+        api.mcp().applyConfiguration()(runtime, &configuration, &report, &diagnostic),
     );
     try std.testing.expectEqual(wire.MCP_APPLY_APPLIED, report.disposition_code);
     try std.testing.expectEqual(@as(u64, 3), report.catalog_generation);
@@ -2075,14 +2290,14 @@ test "L2 Revision 7 public MCP Apply publishes complete sets and replaces change
     configuration.desired_revision = 3;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+        api.mcp().applyConfiguration()(runtime, &configuration, &report, &diagnostic),
     );
     try std.testing.expectEqual(wire.MCP_APPLY_SUPERSEDED, report.disposition_code);
     try std.testing.expectEqual(@as(u64, 4), report.desired_revision);
     try std.testing.expectEqual(@as(u64, 4), report.active_revision);
     try std.testing.expectEqual(@as(u64, 3), report.catalog_generation);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
     try std.testing.expectEqual(first_probe.connector_retains, first_probe.connector_releases);
     try std.testing.expectEqual(rejected_probe.connector_retains, rejected_probe.connector_releases);
@@ -2100,10 +2315,10 @@ test "L2 Revision 7 public MCP Apply requires explicit instance identity and lif
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     const invalid_contracts = [_]enum { zero_fingerprint, retain, release, tool_stream }{
@@ -2141,7 +2356,7 @@ test "L2 Revision 7 public MCP Apply requires explicit instance identity and lif
 
         try std.testing.expectEqual(
             wire.STATUS_INVALID_ARGUMENT,
-            api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+            api.mcp().applyConfiguration()(runtime, &configuration, &report, &diagnostic),
         );
         try std.testing.expectEqual(@as(u32, 0), probe.connector_retains);
         try std.testing.expectEqual(@as(u32, 0), probe.connector_releases);
@@ -2308,17 +2523,17 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
         var runtime: ?*wire.RuntimeHandle = null;
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            api.runtimeCreate()(&config, &runtime, &diagnostic),
+            api.runtime().create()(&config, null, &runtime, &diagnostic),
         );
         var generation: u64 = 0;
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+            api.mcp().refresh()(runtime, &generation, &diagnostic),
         );
         var description = std.mem.zeroes(wire.OwnedBytesV1);
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+            api.mcp().describe()(runtime, &description, &diagnostic),
         );
         const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
         const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
@@ -2341,7 +2556,7 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
         try std.testing.expectEqual(case.expected_request_attempts, probe.request_attempts);
         try std.testing.expectEqual(
             wire.STATUS_OK,
-            api.runtimeDestroy()(runtime, &diagnostic),
+            api.runtime().destroy()(runtime, &diagnostic),
         );
         runtime = null;
         try probe.expectClosedExactlyOnce();
@@ -2386,31 +2601,31 @@ test "L2 MCP admits primary and other string dialects and projects all Tools" {
     var session: ?*wire.SessionHandle = null;
     defer {
         if (session) |handle| {
-            _ = api.sessionDestroy()(handle, &diagnostic);
+            _ = api.session().destroy()(handle, &diagnostic);
             session = null;
             api.bufferRelease()(&diagnostic);
         }
         if (runtime) |handle| {
-            _ = api.runtimeDestroy()(handle, &diagnostic);
+            _ = api.runtime().destroy()(handle, &diagnostic);
             runtime = null;
             api.bufferRelease()(&diagnostic);
         }
     }
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     var generation: u64 = 0;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+        api.mcp().refresh()(runtime, &generation, &diagnostic),
     );
 
     var description = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&description);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+        api.mcp().describe()(runtime, &description, &diagnostic),
     );
     const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
     const decoded = try sdk.decodeMcpCatalog(a, encoded);
@@ -2461,7 +2676,7 @@ test "L2 MCP admits primary and other string dialects and projects all Tools" {
     callbacks.on_event = acceptEvent;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
     );
     var options = std.mem.zeroes(wire.RunOptionsV1);
     options.struct_size = @sizeOf(wire.RunOptionsV1);
@@ -2469,7 +2684,7 @@ test "L2 MCP admits primary and other string dialects and projects all Tools" {
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             sdk.bytesView("inspect available MCP Tools"),
@@ -2524,24 +2739,24 @@ test "L2 MCP server schema Tool error crosses Session and ABI intact" {
     var session: ?*wire.SessionHandle = null;
     defer {
         if (session) |handle| {
-            _ = api.sessionDestroy()(handle, &diagnostic);
+            _ = api.session().destroy()(handle, &diagnostic);
             session = null;
             api.bufferRelease()(&diagnostic);
         }
         if (runtime) |handle| {
-            _ = api.runtimeDestroy()(handle, &diagnostic);
+            _ = api.runtime().destroy()(handle, &diagnostic);
             runtime = null;
             api.bufferRelease()(&diagnostic);
         }
     }
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     var generation: u64 = 0;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+        api.mcp().refresh()(runtime, &generation, &diagnostic),
     );
 
     var selector = std.mem.zeroes(wire.McpSelectorV1);
@@ -2571,14 +2786,14 @@ test "L2 MCP server schema Tool error crosses Session and ABI intact" {
     callbacks.on_event = PublicMcpToolErrorProbe.event;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
     );
 
     var session_description = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&session_description);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionDescribe()(session, &session_description, &diagnostic),
+        api.sessionControl().describe()(session, &session_description, &diagnostic),
     );
     const encoded_description = try sdk.borrowedBytes(.{
         .ptr = session_description.ptr,
@@ -2607,7 +2822,7 @@ test "L2 MCP server schema Tool error crosses Session and ABI intact" {
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             sdk.bytesView("call the MCP weather Tool"),
@@ -2660,17 +2875,17 @@ test "L2 Revision 12 public MCP connector streams 17MiB response into recoverabl
     var runtime: ?*wire.RuntimeHandle = null;
     var session: ?*wire.SessionHandle = null;
     defer {
-        if (session) |handle| _ = api.sessionDestroy()(handle, &diagnostic);
-        if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
     }
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     var generation: u64 = 0;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+        api.mcp().refresh()(runtime, &generation, &diagnostic),
     );
 
     var selector = std.mem.zeroes(wire.McpSelectorV1);
@@ -2698,14 +2913,14 @@ test "L2 Revision 12 public MCP connector streams 17MiB response into recoverabl
     callbacks.on_event = acceptEvent;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
     );
 
     var description = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&description);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionDescribe()(session, &description, &diagnostic),
+        api.sessionControl().describe()(session, &description, &diagnostic),
     );
     const decoded = try sdk.decodeSessionDescription(a, try sdk.borrowedBytes(.{
         .ptr = description.ptr,
@@ -2729,7 +2944,7 @@ test "L2 Revision 12 public MCP connector streams 17MiB response into recoverabl
     options.struct_size = @sizeOf(wire.RunOptionsV1);
     options.max_turns = 2;
     var result = std.mem.zeroes(wire.RunResultV1);
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
         session,
         1,
         sdk.bytesView("call the streamed MCP weather Tool"),
@@ -2788,17 +3003,17 @@ test "L2 public MCP catalog preserves heterogeneous multi-server tool windows" {
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&config, &runtime, &diagnostic),
+        api.runtime().create()(&config, null, &runtime, &diagnostic),
     );
     var generation: u64 = 0;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+        api.mcp().refresh()(runtime, &generation, &diagnostic),
     );
     var description = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+        api.mcp().describe()(runtime, &description, &diagnostic),
     );
     const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
     const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
@@ -2827,7 +3042,7 @@ test "L2 public MCP catalog preserves heterogeneous multi-server tool windows" {
 
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeDestroy()(runtime, &diagnostic),
+        api.runtime().destroy()(runtime, &diagnostic),
     );
     runtime = null;
     try first_probe.expectClosedExactlyOnce();
@@ -2891,11 +3106,11 @@ test "L2 Revision 7 MCP no-tools and required-task peers expose zero executable 
         var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
         defer api.bufferRelease()(&diagnostic);
         var runtime: ?*wire.RuntimeHandle = null;
-        try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&config, &runtime, &diagnostic));
+        try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&config, null, &runtime, &diagnostic));
         var generation: u64 = 0;
-        try std.testing.expectEqual(wire.STATUS_OK, api.runtimeRefreshMcp()(runtime, &generation, &diagnostic));
+        try std.testing.expectEqual(wire.STATUS_OK, api.mcp().refresh()(runtime, &generation, &diagnostic));
         var description = std.mem.zeroes(wire.OwnedBytesV1);
-        try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDescribeMcp()(runtime, &description, &diagnostic));
+        try std.testing.expectEqual(wire.STATUS_OK, api.mcp().describe()(runtime, &description, &diagnostic));
         const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
         const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
         defer decoded.deinit();
@@ -2913,7 +3128,7 @@ test "L2 Revision 7 MCP no-tools and required-task peers expose zero executable 
         try std.testing.expectEqual(case.expected_list_requests, probe.list_requests);
         try std.testing.expectEqual(@as(u32, 0), probe.call_requests);
         api.bufferRelease()(&description);
-        try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+        try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
         runtime = null;
         try probe.expectClosedExactlyOnce();
     }
@@ -3080,9 +3295,18 @@ test "L2 SDK rejects API tables that violate rigid v1 discovery" {
     const actual: *const wire.ApiV1 = @ptrCast(@alignCast(raw_api));
     _ = try sdk.Api.validate(actual);
 
-    var nonzero_reserved = actual.*;
-    nonzero_reserved.reserved[0] = 1;
-    try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&nonzero_reserved));
+    try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(null));
+
+    const misaligned_root: *const anyopaque = @ptrFromInt(@intFromPtr(actual) + 1);
+    try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(misaligned_root));
+
+    var wrong_size = actual.*;
+    wrong_size.struct_size -= 8;
+    try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&wrong_size));
+
+    var wrong_version = actual.*;
+    wrong_version.abi_version += 1;
+    try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&wrong_version));
 
     var wrong_revision = actual.*;
     wrong_revision.abi_revision = wire.ABI_REVISION - 1;
@@ -3092,28 +3316,106 @@ test "L2 SDK rejects API tables that violate rigid v1 discovery" {
     nonzero_header_reserved.reserved0 = 1;
     try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&nonzero_header_reserved));
 
-    inline for (.{
-        wire.CAP_RUNTIME,
-        wire.CAP_BUILTIN_TOOLS,
-        wire.CAP_HOST_SYNC_TOOLS,
-        wire.CAP_HOST_UI,
-        wire.CAP_CORE_EVENTS_JSON,
-        wire.CAP_ABORT,
-        wire.CAP_SKILL_CATALOG,
-        wire.CAP_TYPED_RUN_INPUT,
-        wire.CAP_SESSION_MODEL_MUTATION,
-        wire.CAP_MANUAL_COMPACT,
-        wire.CAP_SKILL_POLICY,
-        wire.CAP_HOST_PERMISSION_RULES,
-    }) |capability| {
-        var missing_capability = actual.*;
-        missing_capability.capabilities &= ~capability;
-        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&missing_capability));
+    var missing_release = actual.*;
+    missing_release.buffer_release = null;
+    try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&missing_release));
+
+    inline for (.{ "runtime", "session", "session_control", "skill", "mcp" }) |field_name| {
+        var missing_subtable = actual.*;
+        @field(missing_subtable, field_name) = null;
+        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&missing_subtable));
     }
 
-    var extra_capability = actual.*;
-    extra_capability.capabilities |= @as(u64, 1) << 63;
-    try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&extra_capability));
+    inline for (std.meta.fields(wire.RuntimeApiV1)[2..]) |field| {
+        var child = actual.runtime.?.*;
+        @field(child, field.name) = null;
+        var root = actual.*;
+        root.runtime = &child;
+        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&root));
+    }
+    inline for (std.meta.fields(wire.SessionApiV1)[2..]) |field| {
+        var child = actual.session.?.*;
+        @field(child, field.name) = null;
+        var root = actual.*;
+        root.session = &child;
+        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&root));
+    }
+    inline for (std.meta.fields(wire.SessionControlApiV1)[2..]) |field| {
+        var child = actual.session_control.?.*;
+        @field(child, field.name) = null;
+        var root = actual.*;
+        root.session_control = &child;
+        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&root));
+    }
+    inline for (std.meta.fields(wire.SkillApiV1)[2..]) |field| {
+        var child = actual.skill.?.*;
+        @field(child, field.name) = null;
+        var root = actual.*;
+        root.skill = &child;
+        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&root));
+    }
+    inline for (std.meta.fields(wire.McpApiV1)[2..]) |field| {
+        var child = actual.mcp.?.*;
+        @field(child, field.name) = null;
+        var root = actual.*;
+        root.mcp = &child;
+        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&root));
+    }
+
+    inline for (.{
+        .{ "runtime", wire.RuntimeApiV1 },
+        .{ "session", wire.SessionApiV1 },
+        .{ "session_control", wire.SessionControlApiV1 },
+        .{ "skill", wire.SkillApiV1 },
+        .{ "mcp", wire.McpApiV1 },
+    }) |entry| {
+        const field_name = entry[0];
+        const Child = entry[1];
+        var child: Child = @field(actual, field_name).?.*;
+        child.struct_size -= 8;
+        var root = actual.*;
+        @field(root, field_name) = &child;
+        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&root));
+
+        child = @field(actual, field_name).?.*;
+        child.reserved0 = 1;
+        @field(root, field_name) = &child;
+        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&root));
+
+        var encoded_root: [@sizeOf(wire.ApiV1)]u8 align(@alignOf(wire.ApiV1)) =
+            std.mem.toBytes(actual.*);
+        const invalid_address = @intFromPtr(@field(actual.*, field_name).?) + 1;
+        const pointer_offset = @offsetOf(wire.ApiV1, field_name);
+        @memcpy(
+            encoded_root[pointer_offset..][0..@sizeOf(usize)],
+            std.mem.asBytes(&invalid_address),
+        );
+        const misaligned_child_root: *const wire.ApiV1 = @ptrCast(&encoded_root);
+        try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(misaligned_child_root));
+    }
+
+    const api = try sdk.Api.validate(actual);
+    try std.testing.expect(api.bufferRelease() == actual.buffer_release.?);
+    try std.testing.expect(api.runtime().create() == actual.runtime.?.create.?);
+    try std.testing.expect(api.runtime().destroy() == actual.runtime.?.destroy.?);
+    try std.testing.expect(api.session().create() == actual.session.?.create.?);
+    try std.testing.expect(api.session().destroy() == actual.session.?.destroy.?);
+    try std.testing.expect(api.session().runInput() == actual.session.?.run_input.?);
+    try std.testing.expect(api.session().abort() == actual.session.?.abort.?);
+    try std.testing.expect(api.sessionControl().restore() == actual.session_control.?.restore.?);
+    try std.testing.expect(api.sessionControl().describe() == actual.session_control.?.describe.?);
+    try std.testing.expect(api.sessionControl().setModel() == actual.session_control.?.set_model.?);
+    try std.testing.expect(api.sessionControl().updatePermissionRules() == actual.session_control.?.update_permission_rules.?);
+    try std.testing.expect(api.sessionControl().compact() == actual.session_control.?.compact.?);
+    try std.testing.expect(api.sessionControl().abortCompact() == actual.session_control.?.abort_compact.?);
+    try std.testing.expect(api.sessionControl().exportCheckpoint() == actual.session_control.?.export_checkpoint.?);
+    try std.testing.expect(api.skill().resolveCatalog() == actual.skill.?.resolve_catalog.?);
+    try std.testing.expect(api.skill().releaseCatalog() == actual.skill.?.release_catalog.?);
+    try std.testing.expect(api.skill().bindPolicy() == actual.skill.?.bind_policy.?);
+    try std.testing.expect(api.mcp().applyConfiguration() == actual.mcp.?.apply_configuration.?);
+    try std.testing.expect(api.mcp().refresh() == actual.mcp.?.refresh.?);
+    try std.testing.expect(api.mcp().describe() == actual.mcp.?.describe.?);
+    try std.testing.expect(api.mcp().updateSelection() == actual.mcp.?.update_selection.?);
 }
 
 test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
@@ -3133,10 +3435,10 @@ test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     const initial_allow = [_]wire.BytesViewV1{sdk.bytesView("Read(*)")};
@@ -3162,7 +3464,7 @@ test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionCreate()(runtime, &config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
     );
     try std.testing.expect(session == null);
     api.bufferRelease()(&diagnostic);
@@ -3170,29 +3472,29 @@ test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
     host_config.skill_policy = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
     );
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionSetModel()(session, sdk.bytesView(""), &diagnostic),
+        api.sessionControl().setModel()(session, sdk.bytesView(""), &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionSetModel()(session, sdk.bytesView("new-model"), &diagnostic),
+        api.sessionControl().setModel()(session, sdk.bytesView("new-model"), &diagnostic),
     );
     try std.testing.expectEqual(
         wire.STATUS_INVALID_STATE,
-        api.sessionBindSkillPolicy()(session, null, &selection, &diagnostic),
+        api.skill().bindPolicy()(session, null, &selection, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionBindSkillPolicy()(session, null, null, &diagnostic),
+        api.skill().bindPolicy()(session, null, null, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
 
@@ -3200,7 +3502,7 @@ test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
     empty_rules.struct_size = @sizeOf(wire.PermissionRuleSetV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionUpdatePermissionRules()(session, &empty_rules, &diagnostic),
+        api.sessionControl().updatePermissionRules()(session, &empty_rules, &diagnostic),
     );
     const malformed_rule = [_]wire.BytesViewV1{sdk.bytesView("Bash(")};
     var malformed_rules = empty_rules;
@@ -3208,19 +3510,19 @@ test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
     malformed_rules.allow_count = malformed_rule.len;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionUpdatePermissionRules()(session, &malformed_rules, &diagnostic),
+        api.sessionControl().updatePermissionRules()(session, &malformed_rules, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
 
     var compact_result = std.mem.zeroes(wire.CompactResultV1);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionCompact()(session, 0, &compact_result, &diagnostic),
+        api.sessionControl().compact()(session, 0, &compact_result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCompact()(session, 1, &compact_result, &diagnostic),
+        api.sessionControl().compact()(session, 1, &compact_result, &diagnostic),
     );
     try std.testing.expectEqual(
         @as(u32, @sizeOf(wire.CompactResultV1)),
@@ -3229,22 +3531,22 @@ test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
     try std.testing.expectEqual(wire.COMPACT_NO_CHANGE, compact_result.outcome_code);
     try std.testing.expectEqual(
         wire.STATUS_STALE_COMPACT,
-        api.sessionCompact()(session, 1, &compact_result, &diagnostic),
+        api.sessionControl().compact()(session, 1, &compact_result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_TOO_LATE,
-        api.sessionAbortCompact()(session, 1, &diagnostic),
+        api.sessionControl().abortCompact()(session, 1, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionAbortCompact()(session, 0, &diagnostic),
+        api.sessionControl().abortCompact()(session, 0, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionAbortCompact()(session, 2, &diagnostic),
+        api.sessionControl().abortCompact()(session, 2, &diagnostic),
     );
 }
 
@@ -3287,25 +3589,25 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     var session: ?*wire.SessionHandle = null;
     defer {
         if (session) |handle| {
-            _ = api.sessionDestroy()(handle, &diagnostic);
+            _ = api.session().destroy()(handle, &diagnostic);
             session = null;
             api.bufferRelease()(&diagnostic);
         }
         if (runtime) |handle| {
-            _ = api.runtimeDestroy()(handle, &diagnostic);
+            _ = api.runtime().destroy()(handle, &diagnostic);
             runtime = null;
             api.bufferRelease()(&diagnostic);
         }
     }
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
 
     var mcp_description = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
         wire.STATUS_MCP_NOT_REFRESHED,
-        api.runtimeDescribeMcp()(runtime, &mcp_description, &diagnostic),
+        api.mcp().describe()(runtime, &mcp_description, &diagnostic),
     );
     try std.testing.expect(mcp_description.ptr == null and mcp_description.len == 0);
     api.bufferRelease()(&diagnostic);
@@ -3313,12 +3615,12 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     var catalog_generation: u64 = 0;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeRefreshMcp()(runtime, &catalog_generation, &diagnostic),
+        api.mcp().refresh()(runtime, &catalog_generation, &diagnostic),
     );
     try std.testing.expectEqual(@as(u64, 1), catalog_generation);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeDescribeMcp()(runtime, &mcp_description, &diagnostic),
+        api.mcp().describe()(runtime, &mcp_description, &diagnostic),
     );
     var catalog_binding: [64]u8 = undefined;
     var catalog_binding_len: usize = 0;
@@ -3375,7 +3677,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     callbacks.on_event = acceptEvent;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
     );
 
     var session_id: [wire.MAX_SESSION_ID_BYTES_V1]u8 = undefined;
@@ -3383,7 +3685,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     var session_description = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionDescribe()(session, &session_description, &diagnostic),
+        api.sessionControl().describe()(session, &session_description, &diagnostic),
     );
     {
         const encoded = try sdk.borrowedBytes(.{
@@ -3407,7 +3709,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     bad_selection.selectors = &bad_selectors;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_MCP_SELECTION,
-        api.sessionUpdateMcp()(session, &bad_selection, &diagnostic),
+        api.mcp().updateSelection()(session, &bad_selection, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
 
@@ -3415,11 +3717,11 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     empty_selection.struct_size = @sizeOf(wire.McpSelectionV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionUpdateMcp()(session, &empty_selection, &diagnostic),
+        api.mcp().updateSelection()(session, &empty_selection, &diagnostic),
     );
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionDescribe()(session, &session_description, &diagnostic),
+        api.sessionControl().describe()(session, &session_description, &diagnostic),
     );
     {
         const encoded = try sdk.borrowedBytes(.{
@@ -3433,7 +3735,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     api.bufferRelease()(&session_description);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionUpdateMcp()(session, &selected_mcp, &diagnostic),
+        api.mcp().updateSelection()(session, &selected_mcp, &diagnostic),
     );
 
     var run_options = std.mem.zeroes(wire.RunOptionsV1);
@@ -3442,7 +3744,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     var run_result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             sdk.bytesView("remember this before restore"),
@@ -3465,20 +3767,20 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     checkpoint.fail_write = true;
     try std.testing.expectEqual(
         wire.STATUS_CHECKPOINT_IO,
-        api.sessionExportCheckpoint()(session, &export_config, &export_result, &diagnostic),
+        api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic),
     );
     try std.testing.expectEqual(@as(usize, 0), checkpoint.bytes.items.len);
     api.bufferRelease()(&diagnostic);
     checkpoint.fail_write = false;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionExportCheckpoint()(session, &export_config, &export_result, &diagnostic),
+        api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic),
     );
     try std.testing.expectEqual(@as(u64, 1), export_result.checkpoint_generation);
     try std.testing.expectEqual(@as(u64, checkpoint.bytes.items.len), export_result.total_bytes);
     try std.testing.expect(export_result.chunk_count != 0 and checkpoint.writes != 0);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
 
     var restore_host = host;
@@ -3497,7 +3799,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     restore_config.source = &source;
     try std.testing.expectEqual(
         wire.STATUS_CHECKPOINT_CORRUPT,
-        api.sessionRestore()(
+        api.sessionControl().restore()(
             runtime,
             &restore_config,
             &callbacks,
@@ -3517,7 +3819,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     restore_config.source = &source;
     try std.testing.expectEqual(
         wire.STATUS_CHECKPOINT_UNSUPPORTED,
-        api.sessionRestore()(
+        api.sessionControl().restore()(
             runtime,
             &restore_config,
             &callbacks,
@@ -3532,7 +3834,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 13), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 14), wire.ABI_REVISION);
     try std.testing.expectEqual(
         @as(u32, 8),
         std.mem.readInt(u32, &abi_revision_bytes, .little),
@@ -3542,7 +3844,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     restore_config.source = &source;
     try std.testing.expectEqual(
         wire.STATUS_CHECKPOINT_INCOMPATIBLE,
-        api.sessionRestore()(
+        api.sessionControl().restore()(
             runtime,
             &restore_config,
             &callbacks,
@@ -3562,7 +3864,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     restore_config.source = &source;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
-        api.sessionRestore()(
+        api.sessionControl().restore()(
             runtime,
             &restore_config,
             &callbacks,
@@ -3578,7 +3880,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     checkpoint.fail_read = true;
     try std.testing.expectEqual(
         wire.STATUS_CHECKPOINT_IO,
-        api.sessionRestore()(
+        api.sessionControl().restore()(
             runtime,
             &restore_config,
             &callbacks,
@@ -3596,7 +3898,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     restore_config.source = &source;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRestore()(
+        api.sessionControl().restore()(
             runtime,
             &restore_config,
             &callbacks,
@@ -3643,7 +3945,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionDescribe()(session, &session_description, &diagnostic),
+        api.sessionControl().describe()(session, &session_description, &diagnostic),
     );
     {
         const encoded = try sdk.borrowedBytes(.{
@@ -3679,7 +3981,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     run_result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             2,
             sdk.bytesView("continue after restore"),
@@ -3690,9 +3992,9 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, run_result.stop_reason_code);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
     try std.testing.expectEqual(@as(u32, 2), mcp_probe.opens);
     try std.testing.expectEqual(@as(u32, 1), mcp_probe.probe_opens);
@@ -3737,10 +4039,10 @@ test "L2 Revision 7 public Permission callback and provenance bind the exact Hos
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     const allowed_tools = [_]wire.BytesViewV1{sdk.bytesView("HostEcho")};
@@ -3765,11 +4067,11 @@ test "L2 Revision 7 public Permission callback and provenance bind the exact Hos
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
     );
     probe.expected_session = session;
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     var options = std.mem.zeroes(wire.RunOptionsV1);
@@ -3778,7 +4080,7 @@ test "L2 Revision 7 public Permission callback and provenance bind the exact Hos
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             sdk.bytesView("invoke the Host echo"),
@@ -3803,7 +4105,7 @@ test "L2 Revision 7 public Permission callback and provenance bind the exact Hos
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_CALLBACK_FAILED,
-        api.sessionRunText(
+        api.session().runText(
             session,
             2,
             sdk.bytesView("invoke the Host echo again"),
@@ -3842,10 +4144,10 @@ test "L2 Revision 7 imported permission rules control the next Run" {
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     const deny_write = [_]wire.BytesViewV1{sdk.bytesView("Write")};
@@ -3866,25 +4168,29 @@ test "L2 Revision 7 imported permission rules control the next Run" {
     host_config.allowed_tool_count = builtins.len;
     host_config.permission_rules = &initial_rules;
     var config = sessionCreateConfig(&host_config, "test-model");
+    var probe = PublicFileChangesProbe{};
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
-    callbacks.on_event = acceptEvent;
+    callbacks.ctx = &probe;
+    callbacks.on_event = PublicFileChangesProbe.event;
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
     );
+    probe.expected_session = session;
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     var options = std.mem.zeroes(wire.RunOptionsV1);
     options.struct_size = @sizeOf(wire.RunOptionsV1);
     options.max_turns = 3;
     var result = std.mem.zeroes(wire.RunResultV1);
+    probe.expected_run_id = 1;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             sdk.bytesView("attempt denied write"),
@@ -3899,6 +4205,10 @@ test "L2 Revision 7 imported permission rules control the next Run" {
         error.FileNotFound,
         std.Io.Dir.cwd().access(std.testing.io, written_path, .{}),
     );
+    try std.testing.expectEqual(@as(u32, 0), probe.applied);
+    try std.testing.expectEqual(@as(u32, 1), probe.rejected);
+    try std.testing.expectEqual(@as(u32, 1), probe.denied_tool_results);
+    try std.testing.expectEqual(@as(u32, 0), probe.applied_tool_results);
 
     const allow_write = [_]wire.BytesViewV1{sdk.bytesView("Write")};
     var replacement_rules = std.mem.zeroes(wire.PermissionRuleSetV1);
@@ -3907,11 +4217,12 @@ test "L2 Revision 7 imported permission rules control the next Run" {
     replacement_rules.allow_count = allow_write.len;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionUpdatePermissionRules()(session, &replacement_rules, &diagnostic),
+        api.sessionControl().updatePermissionRules()(session, &replacement_rules, &diagnostic),
     );
+    probe.expected_run_id = 2;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             2,
             sdk.bytesView("attempt allowed write"),
@@ -3920,7 +4231,113 @@ test "L2 Revision 7 imported permission rules control the next Run" {
             &diagnostic,
         ),
     );
+    try std.testing.expectEqual(@as(u32, 1), probe.applied);
+    try std.testing.expectEqual(@as(u32, 1), probe.applied_tool_results);
     try std.Io.Dir.cwd().access(std.testing.io, written_path, .{});
+}
+
+test "L2 Host tool named Read cannot acquire builtin file references" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_READ_SSE, FINAL_SSE };
+    var provider = try harness.MockServer.startCassette(&bodies, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var probe = HostReadRefsProbe{};
+    var host_tool = std.mem.zeroes(wire.HostToolV1);
+    host_tool.struct_size = @sizeOf(wire.HostToolV1);
+    host_tool.ctx = &probe;
+    host_tool.name = sdk.bytesView("Read");
+    host_tool.description = sdk.bytesView("Host-owned Read name collision fixture");
+    host_tool.input_schema_json = sdk.bytesView(
+        "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"}},\"required\":[\"file_path\"]}",
+    );
+    host_tool.execute = HostReadRefsProbe.host;
+    host_tool.release_result = HostReadRefsProbe.releaseHost;
+    const host_tools = [_]wire.HostToolV1{host_tool};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.host_tools = &host_tools;
+    runtime_config.host_tool_count = host_tools.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    const allowed_tools = [_]wire.BytesViewV1{sdk.bytesView("Read")};
+    const allow_read = [_]wire.BytesViewV1{sdk.bytesView("Read")};
+    var rules = std.mem.zeroes(wire.PermissionRuleSetV1);
+    rules.struct_size = @sizeOf(wire.PermissionRuleSetV1);
+    rules.allow = &allow_read;
+    rules.allow_count = allow_read.len;
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_DEFAULT;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.allowed_tools = &allowed_tools;
+    host.allowed_tool_count = allowed_tools.len;
+    host.permission_rules = &rules;
+    var config = sessionCreateConfig(&host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = HostReadRefsProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
+    );
+    probe.expected_session = session;
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 3;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(
+            session,
+            1,
+            sdk.bytesView("invoke Host Read"),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_releases);
+    try std.testing.expectEqual(@as(u32, 1), probe.tool_results);
+
+    const decoy_path = try std.fs.path.join(a, &.{ root, "decoy.txt" });
+    defer a.free(decoy_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(std.testing.io, decoy_path, .{}),
+    );
 }
 
 test "L2 invalid Session configuration publishes no handle and diagnostics never leak credentials" {
@@ -3945,14 +4362,14 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
     excessive_runtime_config.builtin_tool_count = wire.MAX_TOOL_COUNT_V1 + 1;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
-        api.runtimeCreate()(&excessive_runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&excessive_runtime_config, null, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
     api.bufferRelease()(&diagnostic);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
@@ -3981,7 +4398,7 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
     var metadata_limited_session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
-        api.sessionCreate()(runtime, &config, &callbacks, &metadata_limited_session, &diagnostic),
+        api.session().create()(runtime, &config, &callbacks, &metadata_limited_session, &diagnostic),
     );
     try std.testing.expect(metadata_limited_session == null);
     api.bufferRelease()(&diagnostic);
@@ -4015,12 +4432,12 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
     var limited_session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
-        api.sessionCreate()(runtime, &config, &callbacks, &limited_session, &diagnostic),
+        api.session().create()(runtime, &config, &callbacks, &limited_session, &diagnostic),
     );
     try std.testing.expect(limited_session == null);
     api.bufferRelease()(&diagnostic);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
 }
 
@@ -4040,9 +4457,9 @@ test "L2 sandbox admission is eager while unrestricted skips the probe" {
     runtime_config.builtin_tools = &builtins;
     runtime_config.builtin_tool_count = builtins.len;
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     const read_only = [_]wire.BytesViewV1{sdk.bytesView("Read")};
@@ -4064,18 +4481,18 @@ test "L2 sandbox admission is eager while unrestricted skips the probe" {
     var unrestricted: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &config, &callbacks, &unrestricted, &diagnostic),
+        api.session().create()(runtime, &config, &callbacks, &unrestricted, &diagnostic),
     );
     try std.testing.expect(unrestricted != null);
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(unrestricted, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(unrestricted, &diagnostic));
 
     host_config.shell_policy_code = wire.SHELL_SANDBOXED;
     var sandboxed: ?*wire.SessionHandle = null;
-    const status = api.sessionCreate()(runtime, &config, &callbacks, &sandboxed, &diagnostic);
+    const status = api.session().create()(runtime, &config, &callbacks, &sandboxed, &diagnostic);
     if (@import("builtin").os.tag == .macos) {
         try std.testing.expectEqual(wire.STATUS_OK, status);
         try std.testing.expect(sandboxed != null);
-        try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(sandboxed, &diagnostic));
+        try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(sandboxed, &diagnostic));
     } else {
         try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, status);
         try std.testing.expect(sandboxed == null);
@@ -4102,9 +4519,9 @@ test "L2 public events reconstruct continuation output and observable run usage"
     var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
     runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
@@ -4126,10 +4543,10 @@ test "L2 public events reconstruct continuation output and observable run usage"
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic),
     );
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     var options = std.mem.zeroes(wire.RunOptionsV1);
@@ -4138,12 +4555,18 @@ test "L2 public events reconstruct continuation output and observable run usage"
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(session, 1, sdk.bytesView("continue fixture"), &options, &result, &diagnostic),
+        api.session().runText(session, 1, sdk.bytesView("continue fixture"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqualStrings("headtail", probe.answer[0..probe.answer_len]);
     try std.testing.expectEqualStrings("private reasoning", probe.thinking[0..probe.thinking_len]);
     try std.testing.expectEqual(@as(usize, 2), probe.stream_done_count);
+    try std.testing.expectEqual(@as(usize, 2), probe.segment_begin_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.continued_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.final_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.commentary_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.partial_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.discarded_count);
     try std.testing.expectEqual(@as(u64, 11), probe.usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 5), probe.usage.output_tokens);
 }
@@ -4170,10 +4593,10 @@ test "L2 session_set_model preserves Conversation and changes the next Run reque
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
@@ -4192,10 +4615,10 @@ test "L2 session_set_model preserves Conversation and changes the next Run reque
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
     );
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
     var options = std.mem.zeroes(wire.RunOptionsV1);
     options.struct_size = @sizeOf(wire.RunOptionsV1);
@@ -4203,7 +4626,7 @@ test "L2 session_set_model preserves Conversation and changes the next Run reque
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             sdk.bytesView("first prompt"),
@@ -4214,11 +4637,11 @@ test "L2 session_set_model preserves Conversation and changes the next Run reque
     );
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionSetModel()(session, sdk.bytesView("new-model"), &diagnostic),
+        api.sessionControl().setModel()(session, sdk.bytesView("new-model"), &diagnostic),
     );
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             2,
             sdk.bytesView("second prompt"),
@@ -4253,7 +4676,7 @@ test "L2 invalid model is a recoverable provider outcome through the public faca
 
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        fixture.api.sessionSetModel()(
+        fixture.api.sessionControl().setModel()(
             fixture.session,
             sdk.bytesView("invalid-model"),
             &fixture.diagnostic,
@@ -4264,7 +4687,7 @@ test "L2 invalid model is a recoverable provider outcome through the public faca
 
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        fixture.api.sessionSetModel()(
+        fixture.api.sessionControl().setModel()(
             fixture.session,
             sdk.bytesView("recovered-model"),
             &fixture.diagnostic,
@@ -4302,7 +4725,7 @@ test "L2 unnamed Provider HTTP 529 crosses AgentCore ABI without killing the Hos
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        fixture.api.sessionRunText(
+        fixture.api.session().runText(
             fixture.session,
             1,
             sdk.bytesView("exercise unnamed provider status"),
@@ -4327,7 +4750,7 @@ test "L2 unnamed Provider HTTP 529 crosses AgentCore ABI without killing the Hos
     const session = fixture.session orelse return error.MissingSession;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        fixture.api.sessionDestroy()(session, &fixture.diagnostic),
+        fixture.api.session().destroy()(session, &fixture.diagnostic),
     );
     fixture.session = null;
     fixture.releaseDiagnostic();
@@ -4361,7 +4784,7 @@ test "L2 public compact commits a summary and reports COMPACT_COMPACTED" {
     var compact_result = std.mem.zeroes(wire.CompactResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        fixture.api.sessionCompact()(
+        fixture.api.sessionControl().compact()(
             fixture.session,
             1,
             &compact_result,
@@ -4394,7 +4817,7 @@ test "L2 public compact abort is concurrent bounded and leaves the facade reusab
         diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
 
         fn run(self: *@This()) void {
-            self.status = self.api.sessionCompact()(
+            self.status = self.api.sessionControl().compact()(
                 self.session,
                 2,
                 &self.result,
@@ -4437,7 +4860,7 @@ test "L2 public compact abort is concurrent bounded and leaves the facade reusab
 
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
-        fixture.api.sessionSetModel()(
+        fixture.api.sessionControl().setModel()(
             fixture.session,
             sdk.bytesView("must-not-race-compact"),
             &fixture.diagnostic,
@@ -4446,7 +4869,7 @@ test "L2 public compact abort is concurrent bounded and leaves the facade reusab
     fixture.releaseDiagnostic();
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        fixture.api.sessionAbortCompact()(
+        fixture.api.sessionControl().abortCompact()(
             fixture.session,
             2,
             &fixture.diagnostic,
@@ -4461,7 +4884,7 @@ test "L2 public compact abort is concurrent bounded and leaves the facade reusab
     try std.testing.expectEqual(wire.COMPACT_ABORTED, worker.result.outcome_code);
     try std.testing.expectEqual(
         wire.STATUS_TOO_LATE,
-        fixture.api.sessionAbortCompact()(
+        fixture.api.sessionControl().abortCompact()(
             fixture.session,
             2,
             &fixture.diagnostic,
@@ -4470,7 +4893,7 @@ test "L2 public compact abort is concurrent bounded and leaves the facade reusab
     fixture.releaseDiagnostic();
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        fixture.api.sessionSetModel()(
+        fixture.api.sessionControl().setModel()(
             fixture.session,
             sdk.bytesView("model-after-abort"),
             &fixture.diagnostic,
@@ -4530,9 +4953,9 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
     runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var query = wire.SkillCatalogQueryV1{
@@ -4547,13 +4970,13 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
-        _ = api.skillCatalogRelease()(handle, &diagnostic);
+        _ = api.skill().releaseCatalog()(handle, &diagnostic);
     };
     var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&descriptor);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.resolveWorkspaceSkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+        api.skill().resolveCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
     );
     const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
     try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "\"invocation_name\":\"review\"") != null);
@@ -4626,22 +5049,22 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic),
     );
-    try std.testing.expectEqual(wire.STATUS_OK, api.skillCatalogRelease()(catalog, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.skill().releaseCatalog()(catalog, &diagnostic));
     catalog = null;
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.resolveWorkspaceSkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+        api.skill().resolveCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
     );
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionBindSkillPolicy()(session, catalog, &skill_policy, &diagnostic),
+        api.skill().bindPolicy()(session, catalog, &skill_policy, &diagnostic),
     );
-    try std.testing.expectEqual(wire.STATUS_OK, api.skillCatalogRelease()(catalog, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.skill().releaseCatalog()(catalog, &diagnostic));
     catalog = null;
     api.bufferRelease()(&descriptor);
 
@@ -4658,11 +5081,11 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     var disabled_selection = skillPolicy(&workctl_only);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionBindSkillPolicy()(session, null, &disabled_selection, &diagnostic),
+        api.skill().bindPolicy()(session, null, &disabled_selection, &diagnostic),
     );
     try std.testing.expectEqual(
         wire.STATUS_SKILL_POLICY_VIOLATION,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             1,
             sdk.bytesView(ids.skill_id),
@@ -4679,7 +5102,7 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     stale_while_denied[0] = if (stale_while_denied[0] == '0') '1' else '0';
     try std.testing.expectEqual(
         wire.STATUS_STALE_CATALOG,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             1,
             sdk.bytesView(ids.skill_id),
@@ -4693,14 +5116,14 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionBindSkillPolicy()(session, null, &skill_policy, &diagnostic),
+        api.skill().bindPolicy()(session, null, &skill_policy, &diagnostic),
     );
     var stale: [64]u8 = undefined;
     @memcpy(&stale, ids.revision);
     stale[0] = if (stale[0] == '0') '1' else '0';
     try std.testing.expectEqual(
         wire.STATUS_STALE_CATALOG,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             1,
             sdk.bytesView(ids.skill_id),
@@ -4714,7 +5137,7 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_SKILL_ARGUMENTS,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             1,
             sdk.bytesView(ids.skill_id),
@@ -4729,7 +5152,7 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     var noncanonical_empty: u8 = 0;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_SKILL_ARGUMENTS,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             1,
             sdk.bytesView(ids.skill_id),
@@ -4744,7 +5167,7 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     const missing_id = [_]u8{'f'} ** 64;
     try std.testing.expectEqual(
         wire.STATUS_SKILL_NOT_FOUND,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             1,
             sdk.bytesView(&missing_id),
@@ -4758,7 +5181,7 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             1,
             sdk.bytesView(ids.skill_id),
@@ -4772,7 +5195,7 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             2,
             sdk.bytesView(workctl_ids.skill_id),
@@ -4860,10 +5283,10 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var query = wire.SkillCatalogQueryV1{
@@ -4881,17 +5304,17 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
     defer api.bufferRelease()(&descriptor);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.resolveWorkspaceSkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+        api.skill().resolveCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
 
     query.reserved0 = 0;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.resolveWorkspaceSkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+        api.skill().resolveCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
     );
     defer if (catalog) |handle| {
-        _ = api.skillCatalogRelease()(handle, &diagnostic);
+        _ = api.skill().releaseCatalog()(handle, &diagnostic);
     };
     const effective_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
     try std.testing.expect(std.mem.indexOf(u8, effective_bytes, "\"invocation_name\":\"personal-only\"") != null);
@@ -4900,7 +5323,7 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
     try std.testing.expect(std.mem.indexOf(u8, effective_bytes, "Personal Shared") == null);
     try std.testing.expect(std.mem.indexOf(u8, effective_bytes, "claude-explicit") == null);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.skillCatalogRelease()(catalog, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.skill().releaseCatalog()(catalog, &diagnostic));
     catalog = null;
     api.bufferRelease()(&descriptor);
     const explicit_root = try std.fs.path.join(a, &.{ project, ".claude", "skills" });
@@ -4916,7 +5339,7 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
     query.additional_source_count = 1;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.resolveWorkspaceSkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+        api.skill().resolveCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
     );
     const explicit_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
     var explicit_decoded = try sdk.decodeSkillCatalog(a, explicit_bytes);
@@ -4934,7 +5357,7 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
     }
     try std.testing.expect(found_explicit);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.skillCatalogRelease()(catalog, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.skill().releaseCatalog()(catalog, &diagnostic));
     catalog = null;
     api.bufferRelease()(&descriptor);
     const conflict_root = try std.fs.path.join(a, &.{ project, ".codex", "skills" });
@@ -4951,7 +5374,7 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
     query.additional_source_count = explicit_sources.len;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.resolveWorkspaceSkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+        api.skill().resolveCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
     );
     const conflict_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
     var conflict_decoded = try sdk.decodeSkillCatalog(a, conflict_bytes);
@@ -4996,10 +5419,10 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var query = wire.SkillCatalogQueryV1{
@@ -5017,7 +5440,7 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
     defer api.bufferRelease()(&original_descriptor);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.resolveWorkspaceSkillCatalog()(
+        api.skill().resolveCatalog()(
             runtime,
             &query,
             &original_catalog,
@@ -5058,14 +5481,14 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic),
     );
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.skillCatalogRelease()(original_catalog, &diagnostic),
+        api.skill().releaseCatalog()(original_catalog, &diagnostic),
     );
     original_catalog = null;
     api.bufferRelease()(&original_descriptor);
@@ -5078,13 +5501,13 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
     );
     var changed_catalog: ?*wire.SkillCatalogHandle = null;
     defer if (changed_catalog) |handle| {
-        _ = api.skillCatalogRelease()(handle, &diagnostic);
+        _ = api.skill().releaseCatalog()(handle, &diagnostic);
     };
     var changed_descriptor = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&changed_descriptor);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.resolveWorkspaceSkillCatalog()(
+        api.skill().resolveCatalog()(
             runtime,
             &query,
             &changed_catalog,
@@ -5110,7 +5533,7 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
     ));
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionBindSkillPolicy()(
+        api.skill().bindPolicy()(
             session,
             changed_catalog,
             &original_policy.policy,
@@ -5139,7 +5562,7 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
     defer api.bufferRelease()(&incomplete_descriptor);
     try std.testing.expectEqual(
         wire.STATUS_SKILL_CATALOG_INCOMPLETE,
-        api.resolveWorkspaceSkillCatalog()(
+        api.skill().resolveCatalog()(
             runtime,
             &query,
             &incomplete_catalog,
@@ -5159,7 +5582,7 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
     defer a.free(empty_arguments);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             1,
             sdk.bytesView(original_ids.skill_id),
@@ -5173,513 +5596,6 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
     const request = server.requestAt(0) orelse return error.NoRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, request.body(), "PINNED_OLD_CONTENT") != null);
     try std.testing.expect(std.mem.indexOf(u8, request.body(), "PINNED_NEW_CONTENT") == null);
-}
-
-test "L2 Revision 10 Completion complete owns config and uses all three provider streams" {
-    const Exercise = struct {
-        fn run(
-            api: sdk.Api,
-            provider_kind: u32,
-            response: []const u8,
-            model_literal: []const u8,
-            expected_text: []const u8,
-        ) !void {
-            const a = std.testing.allocator;
-            var server = try harness.MockServer.start(response, 0);
-            defer server.stop();
-            const url = try server.urlOwned(a);
-            const key = try a.dupe(u8, "temporary-completion-key");
-            const model = try a.dupe(u8, model_literal);
-
-            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
-            defer api.bufferRelease()(&diagnostic);
-            var config = wire.CompletionConfigV1{
-                .struct_size = @sizeOf(wire.CompletionConfigV1),
-                .provider_kind_code = provider_kind,
-                .api_key = sdk.bytesView(key),
-                .base_url = sdk.bytesView(url),
-                .model = sdk.bytesView(model),
-                .reserved = [_]u64{0} ** 4,
-            };
-            var completion: ?*wire.CompletionHandle = null;
-            try std.testing.expectEqual(
-                wire.STATUS_OK,
-                api.completionCreate()(&config, &completion, &diagnostic),
-            );
-            @memset(key, 0xa5);
-            @memset(model, 0xa5);
-            @memset(url, 0xa5);
-            a.free(key);
-            a.free(model);
-            a.free(url);
-            defer if (completion) |handle| {
-                _ = api.completionDestroy()(handle, &diagnostic);
-            };
-
-            var info = std.mem.zeroes(wire.CompletionInfoV1);
-            try std.testing.expectEqual(
-                wire.STATUS_OK,
-                api.completionDescribe()(completion, &info, &diagnostic),
-            );
-            defer api.bufferRelease()(&info.model);
-            try std.testing.expectEqual(provider_kind, info.provider_kind_code);
-            try std.testing.expectEqualStrings(
-                model_literal,
-                try sdk.borrowedBytes(.{ .ptr = info.model.ptr, .len = info.model.len }),
-            );
-
-            var messages = [_]wire.CompletionMessageV1{
-                .{
-                    .struct_size = @sizeOf(wire.CompletionMessageV1),
-                    .role_code = wire.COMPLETION_ROLE_USER,
-                    .text = sdk.bytesView("completion-user-marker"),
-                    .reserved = [_]u64{0} ** 2,
-                },
-                .{
-                    .struct_size = @sizeOf(wire.CompletionMessageV1),
-                    .role_code = wire.COMPLETION_ROLE_ASSISTANT,
-                    .text = sdk.bytesView("completion-assistant-marker"),
-                    .reserved = [_]u64{0} ** 2,
-                },
-            };
-            var request = wire.CompletionRequestV1{
-                .struct_size = @sizeOf(wire.CompletionRequestV1),
-                .reserved0 = 0,
-                .messages = messages[0..].ptr,
-                .message_count = messages.len,
-                .system = sdk.bytesView("completion-system-marker"),
-                .reserved = [_]u64{0} ** 4,
-            };
-            var result = std.mem.zeroes(wire.CompletionResultV1);
-            try std.testing.expectEqual(
-                wire.STATUS_OK,
-                api.completionComplete()(completion, &request, &result, &diagnostic),
-            );
-            defer api.bufferRelease()(&result.text);
-            try std.testing.expectEqual(
-                wire.COMPLETION_STOP_END_TURN,
-                result.stop_reason_code,
-            );
-            try std.testing.expectEqualStrings(
-                expected_text,
-                try sdk.borrowedBytes(.{ .ptr = result.text.ptr, .len = result.text.len }),
-            );
-            const captured = server.lastRequest() orelse return error.NoRequestCaptured;
-            try std.testing.expect(std.mem.indexOf(u8, captured.body(), "completion-user-marker") != null);
-            try std.testing.expect(std.mem.indexOf(u8, captured.body(), "completion-assistant-marker") != null);
-            try std.testing.expect(std.mem.indexOf(u8, captured.body(), "completion-system-marker") != null);
-            try std.testing.expect(std.mem.indexOf(u8, captured.body(), "\"tools\"") == null);
-        }
-    };
-
-    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
-        return error.MissingApi;
-    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
-    try Exercise.run(api, wire.PROVIDER_ANTHROPIC, FINAL_SSE, "completion-anthropic", "done");
-    try Exercise.run(api, wire.PROVIDER_OPENAI, OPENAI_FINAL_SSE, "completion-openai", "openai skill done");
-    try Exercise.run(api, wire.PROVIDER_GEMINI, GEMINI_FINAL_SSE, "completion-gemini", "gemini done");
-}
-
-test "L2 Revision 10 Completion stream owns request buffers and projects typed events" {
-    const a = std.testing.allocator;
-    var server = try harness.MockServer.start(CONTINUATION_HEAD_SSE, 0);
-    defer server.stop();
-    const url = try server.urlOwned(a);
-    defer a.free(url);
-    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
-        return error.MissingApi;
-    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
-    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
-    defer api.bufferRelease()(&diagnostic);
-    var config = wire.CompletionConfigV1{
-        .struct_size = @sizeOf(wire.CompletionConfigV1),
-        .provider_kind_code = wire.PROVIDER_ANTHROPIC,
-        .api_key = sdk.bytesView("test-key"),
-        .base_url = sdk.bytesView(url),
-        .model = sdk.bytesView("stream-model"),
-        .reserved = [_]u64{0} ** 4,
-    };
-    var completion: ?*wire.CompletionHandle = null;
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionCreate()(&config, &completion, &diagnostic),
-    );
-    defer if (completion) |handle| {
-        _ = api.completionDestroy()(handle, &diagnostic);
-    };
-
-    const user = try a.dupe(u8, "stream-user-lifetime-marker");
-    const system = try a.dupe(u8, "stream-system-lifetime-marker");
-    var messages = [_]wire.CompletionMessageV1{.{
-        .struct_size = @sizeOf(wire.CompletionMessageV1),
-        .role_code = wire.COMPLETION_ROLE_USER,
-        .text = sdk.bytesView(user),
-        .reserved = [_]u64{0} ** 2,
-    }};
-    var request = wire.CompletionRequestV1{
-        .struct_size = @sizeOf(wire.CompletionRequestV1),
-        .reserved0 = 0,
-        .messages = messages[0..].ptr,
-        .message_count = messages.len,
-        .system = sdk.bytesView(system),
-        .reserved = [_]u64{0} ** 4,
-    };
-    var stream: ?*wire.CompletionStreamHandle = null;
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionStreamStart()(completion, &request, &stream, &diagnostic),
-    );
-    @memset(user, 0xa5);
-    @memset(system, 0xa5);
-    a.free(user);
-    a.free(system);
-    defer if (stream) |handle| {
-        _ = api.completionStreamDestroy()(handle, &diagnostic);
-    };
-    try std.testing.expectEqual(
-        wire.STATUS_BUSY,
-        api.completionDestroy()(completion, &diagnostic),
-    );
-    api.bufferRelease()(&diagnostic);
-
-    var saw_thinking = false;
-    var saw_text = false;
-    var saw_usage = false;
-    var saw_done = false;
-    while (!saw_done) {
-        var event = std.mem.zeroes(wire.CompletionEventV1);
-        try std.testing.expectEqual(
-            wire.STATUS_OK,
-            api.completionStreamNext()(stream, &event, &diagnostic),
-        );
-        defer api.bufferRelease()(&event.payload);
-        switch (event.kind_code) {
-            wire.COMPLETION_EVENT_THINKING => {
-                saw_thinking = true;
-                try std.testing.expectEqualStrings(
-                    "private reasoning",
-                    try sdk.borrowedBytes(.{ .ptr = event.payload.ptr, .len = event.payload.len }),
-                );
-            },
-            wire.COMPLETION_EVENT_TEXT => {
-                saw_text = true;
-                try std.testing.expectEqualStrings(
-                    "head",
-                    try sdk.borrowedBytes(.{ .ptr = event.payload.ptr, .len = event.payload.len }),
-                );
-            },
-            wire.COMPLETION_EVENT_USAGE => saw_usage = true,
-            wire.COMPLETION_EVENT_DONE => {
-                saw_done = true;
-                try std.testing.expectEqual(wire.COMPLETION_STOP_MAX_TOKENS, event.stop_reason_code);
-            },
-            else => return error.UnexpectedCompletionEvent,
-        }
-    }
-    try std.testing.expect(saw_thinking and saw_text and saw_usage);
-    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
-    try std.testing.expect(std.mem.indexOf(u8, captured.body(), "stream-user-lifetime-marker") != null);
-    try std.testing.expect(std.mem.indexOf(u8, captured.body(), "stream-system-lifetime-marker") != null);
-    var after_done = std.mem.zeroes(wire.CompletionEventV1);
-    try std.testing.expectEqual(
-        wire.STATUS_TOO_LATE,
-        api.completionStreamNext()(stream, &after_done, &diagnostic),
-    );
-    api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionStreamDestroy()(stream, &diagnostic),
-    );
-    stream = null;
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionDestroy()(completion, &diagnostic),
-    );
-    completion = null;
-}
-
-test "L2 Revision 10 Completion stream start releases request buffers for every provider" {
-    const Exercise = struct {
-        fn run(api: sdk.Api, provider_kind: u32, response: []const u8, model: []const u8) !void {
-            const a = std.testing.allocator;
-            var server = try harness.MockServer.start(response, 0);
-            defer server.stop();
-            const url = try server.urlOwned(a);
-            defer a.free(url);
-
-            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
-            defer api.bufferRelease()(&diagnostic);
-            var config = wire.CompletionConfigV1{
-                .struct_size = @sizeOf(wire.CompletionConfigV1),
-                .provider_kind_code = provider_kind,
-                .api_key = sdk.bytesView("test-key"),
-                .base_url = sdk.bytesView(url),
-                .model = sdk.bytesView(model),
-                .reserved = [_]u64{0} ** 4,
-            };
-            var completion: ?*wire.CompletionHandle = null;
-            try std.testing.expectEqual(
-                wire.STATUS_OK,
-                api.completionCreate()(&config, &completion, &diagnostic),
-            );
-            defer if (completion) |handle| {
-                _ = api.completionDestroy()(handle, &diagnostic);
-            };
-
-            const user_marker = "all-provider-stream-user-lifetime-marker";
-            const system_marker = "all-provider-stream-system-lifetime-marker";
-            const user = try a.dupe(u8, user_marker);
-            const system = try a.dupe(u8, system_marker);
-            const messages = try a.alloc(wire.CompletionMessageV1, 1);
-            messages[0] = .{
-                .struct_size = @sizeOf(wire.CompletionMessageV1),
-                .role_code = wire.COMPLETION_ROLE_USER,
-                .text = sdk.bytesView(user),
-                .reserved = [_]u64{0} ** 2,
-            };
-            var request = wire.CompletionRequestV1{
-                .struct_size = @sizeOf(wire.CompletionRequestV1),
-                .reserved0 = 0,
-                .messages = messages.ptr,
-                .message_count = messages.len,
-                .system = sdk.bytesView(system),
-                .reserved = [_]u64{0} ** 4,
-            };
-            var stream: ?*wire.CompletionStreamHandle = null;
-            try std.testing.expectEqual(
-                wire.STATUS_OK,
-                api.completionStreamStart()(completion, &request, &stream, &diagnostic),
-            );
-            @memset(user, 0xa5);
-            @memset(system, 0xa5);
-            @memset(std.mem.sliceAsBytes(messages), 0xa5);
-            @memset(std.mem.asBytes(&request), 0xa5);
-            a.free(user);
-            a.free(system);
-            a.free(messages);
-            defer if (stream) |handle| {
-                _ = api.completionStreamDestroy()(handle, &diagnostic);
-            };
-
-            var saw_text = false;
-            var saw_done = false;
-            while (!saw_done) {
-                var event = std.mem.zeroes(wire.CompletionEventV1);
-                try std.testing.expectEqual(
-                    wire.STATUS_OK,
-                    api.completionStreamNext()(stream, &event, &diagnostic),
-                );
-                defer api.bufferRelease()(&event.payload);
-                switch (event.kind_code) {
-                    wire.COMPLETION_EVENT_TEXT => saw_text = true,
-                    wire.COMPLETION_EVENT_THINKING, wire.COMPLETION_EVENT_USAGE => {},
-                    wire.COMPLETION_EVENT_DONE => {
-                        saw_done = true;
-                        try std.testing.expectEqual(
-                            wire.COMPLETION_STOP_END_TURN,
-                            event.stop_reason_code,
-                        );
-                    },
-                    else => return error.UnexpectedCompletionEvent,
-                }
-            }
-            try std.testing.expect(saw_text);
-            const captured = server.lastRequest() orelse return error.NoRequestCaptured;
-            try std.testing.expect(std.mem.indexOf(u8, captured.body(), user_marker) != null);
-            try std.testing.expect(std.mem.indexOf(u8, captured.body(), system_marker) != null);
-
-            try std.testing.expectEqual(
-                wire.STATUS_OK,
-                api.completionStreamDestroy()(stream, &diagnostic),
-            );
-            stream = null;
-            try std.testing.expectEqual(
-                wire.STATUS_OK,
-                api.completionDestroy()(completion, &diagnostic),
-            );
-            completion = null;
-        }
-    };
-
-    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
-        return error.MissingApi;
-    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
-    try Exercise.run(api, wire.PROVIDER_ANTHROPIC, FINAL_SSE, "lifetime-anthropic");
-    try Exercise.run(api, wire.PROVIDER_OPENAI, OPENAI_FINAL_SSE, "lifetime-openai");
-    try Exercise.run(api, wire.PROVIDER_GEMINI, GEMINI_FINAL_SSE, "lifetime-gemini");
-}
-
-test "L2 Revision 10 Completion abort concurrently interrupts blocking next" {
-    const NextWorker = struct {
-        api: sdk.Api,
-        stream: *wire.CompletionStreamHandle,
-        status: u32 = std.math.maxInt(u32),
-        event: wire.CompletionEventV1 = std.mem.zeroes(wire.CompletionEventV1),
-        diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
-
-        fn run(self: *@This()) void {
-            self.status = self.api.completionStreamNext()(
-                self.stream,
-                &self.event,
-                &self.diagnostic,
-            );
-        }
-    };
-
-    const a = std.testing.allocator;
-    var server = try harness.MockServer.start(FINAL_SSE, 0);
-    defer server.stop();
-    server.gateNextResponse();
-    const url = try server.urlOwned(a);
-    defer a.free(url);
-    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
-        return error.MissingApi;
-    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
-    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
-    defer api.bufferRelease()(&diagnostic);
-    var config = wire.CompletionConfigV1{
-        .struct_size = @sizeOf(wire.CompletionConfigV1),
-        .provider_kind_code = wire.PROVIDER_ANTHROPIC,
-        .api_key = sdk.bytesView("test-key"),
-        .base_url = sdk.bytesView(url),
-        .model = sdk.bytesView("abort-model"),
-        .reserved = [_]u64{0} ** 4,
-    };
-    var completion: ?*wire.CompletionHandle = null;
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionCreate()(&config, &completion, &diagnostic),
-    );
-    defer if (completion) |handle| {
-        _ = api.completionDestroy()(handle, &diagnostic);
-    };
-    var message = wire.CompletionMessageV1{
-        .struct_size = @sizeOf(wire.CompletionMessageV1),
-        .role_code = wire.COMPLETION_ROLE_USER,
-        .text = sdk.bytesView("wait for abort"),
-        .reserved = [_]u64{0} ** 2,
-    };
-    var request = wire.CompletionRequestV1{
-        .struct_size = @sizeOf(wire.CompletionRequestV1),
-        .reserved0 = 0,
-        .messages = @ptrCast(&message),
-        .message_count = 1,
-        .system = sdk.bytesView(""),
-        .reserved = [_]u64{0} ** 4,
-    };
-    var stream: ?*wire.CompletionStreamHandle = null;
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionStreamStart()(completion, &request, &stream, &diagnostic),
-    );
-    defer if (stream) |handle| {
-        _ = api.completionStreamDestroy()(handle, &diagnostic);
-    };
-    try server.waitUntilResponseGated();
-
-    var worker = NextWorker{ .api = api, .stream = stream.? };
-    const next_thread = try std.Thread.spawn(.{}, NextWorker.run, .{&worker});
-    var joined = false;
-    defer if (!joined) {
-        server.releaseGatedResponse();
-        next_thread.join();
-    };
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionStreamAbort()(stream, wire.ABORT_USER_REQUEST, &diagnostic),
-    );
-    next_thread.join();
-    joined = true;
-    server.releaseGatedResponse();
-    defer api.bufferRelease()(&worker.diagnostic);
-    defer api.bufferRelease()(&worker.event.payload);
-    try std.testing.expectEqual(wire.STATUS_OK, worker.status);
-    try std.testing.expectEqual(wire.COMPLETION_EVENT_DONE, worker.event.kind_code);
-    try std.testing.expectEqual(
-        wire.COMPLETION_STOP_ABORTED,
-        worker.event.stop_reason_code,
-    );
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionStreamDestroy()(stream, &diagnostic),
-    );
-    stream = null;
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionDestroy()(completion, &diagnostic),
-    );
-    completion = null;
-}
-
-test "L2 Revision 10 Completion rejects invalid requests and tool responses explicitly" {
-    const a = std.testing.allocator;
-    var server = try harness.MockServer.start(HOST_SSE, 0);
-    defer server.stop();
-    const url = try server.urlOwned(a);
-    defer a.free(url);
-    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
-        return error.MissingApi;
-    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
-    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
-    defer api.bufferRelease()(&diagnostic);
-    var config = wire.CompletionConfigV1{
-        .struct_size = @sizeOf(wire.CompletionConfigV1),
-        .provider_kind_code = wire.PROVIDER_ANTHROPIC,
-        .api_key = sdk.bytesView("test-key"),
-        .base_url = sdk.bytesView(url),
-        .model = sdk.bytesView("validation-model"),
-        .reserved = [_]u64{0} ** 4,
-    };
-    var completion: ?*wire.CompletionHandle = null;
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionCreate()(&config, &completion, &diagnostic),
-    );
-    defer if (completion) |handle| {
-        _ = api.completionDestroy()(handle, &diagnostic);
-    };
-    var message = wire.CompletionMessageV1{
-        .struct_size = @sizeOf(wire.CompletionMessageV1),
-        .role_code = 0,
-        .text = sdk.bytesView("invalid role"),
-        .reserved = [_]u64{0} ** 2,
-    };
-    var request = wire.CompletionRequestV1{
-        .struct_size = @sizeOf(wire.CompletionRequestV1),
-        .reserved0 = 0,
-        .messages = @ptrCast(&message),
-        .message_count = 1,
-        .system = sdk.bytesView(""),
-        .reserved = [_]u64{0} ** 4,
-    };
-    var result = std.mem.zeroes(wire.CompletionResultV1);
-    try std.testing.expectEqual(
-        wire.STATUS_INVALID_ARGUMENT,
-        api.completionComplete()(completion, &request, &result, &diagnostic),
-    );
-    api.bufferRelease()(&diagnostic);
-    request.message_count = 0;
-    try std.testing.expectEqual(
-        wire.STATUS_INVALID_ARGUMENT,
-        api.completionComplete()(completion, &request, &result, &diagnostic),
-    );
-    api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
-
-    message.role_code = wire.COMPLETION_ROLE_USER;
-    message.text = sdk.bytesView("trigger unsupported tool response");
-    request.message_count = 1;
-    try std.testing.expectEqual(
-        wire.STATUS_COMPLETION_UNSUPPORTED_RESPONSE,
-        api.completionComplete()(completion, &request, &result, &diagnostic),
-    );
-    api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.completionDestroy()(completion, &diagnostic),
-    );
-    completion = null;
 }
 
 test "L2 AgentCore Skill forks cannot override the Session model" {
@@ -5721,10 +5637,10 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var query = wire.SkillCatalogQueryV1{
@@ -5739,13 +5655,13 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
-        _ = api.skillCatalogRelease()(handle, &diagnostic);
+        _ = api.skill().releaseCatalog()(handle, &diagnostic);
     };
     var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&descriptor);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.resolveWorkspaceSkillCatalog()(
+        api.skill().resolveCatalog()(
             runtime,
             &query,
             &catalog,
@@ -5785,7 +5701,7 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(
+        api.session().create()(
             runtime,
             &session_config,
             &callbacks,
@@ -5794,7 +5710,7 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
         ),
     );
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     var options = std.mem.zeroes(wire.RunOptionsV1);
@@ -5802,7 +5718,7 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
     options.max_turns = 3;
     var result = std.mem.zeroes(wire.RunResultV1);
 
-    const blocked_status = api.sessionRunSkill(
+    const blocked_status = api.session().runSkill(
         session,
         1,
         sdk.bytesView(blocked.skill_id),
@@ -5829,7 +5745,7 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
 
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             sdk.bytesView("Invoke the blocked Skill."),
@@ -5872,7 +5788,7 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
 
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             2,
             sdk.bytesView("Continue after the rejected Skill."),
@@ -6036,10 +5952,10 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var query = wire.SkillCatalogQueryV1{
@@ -6054,13 +5970,13 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
-        _ = api.skillCatalogRelease()(handle, &diagnostic);
+        _ = api.skill().releaseCatalog()(handle, &diagnostic);
     };
     var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&descriptor);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.resolveWorkspaceSkillCatalog()(
+        api.skill().resolveCatalog()(
             runtime,
             &query,
             &catalog,
@@ -6110,7 +6026,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(
+        api.session().create()(
             runtime,
             &session_config,
             &callbacks,
@@ -6120,7 +6036,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     );
     probe.expected_session = session;
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     var options = std.mem.zeroes(wire.RunOptionsV1);
@@ -6129,7 +6045,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             sdk.bytesView("Use the review Skill."),
@@ -6181,7 +6097,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     options.max_turns = 3;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             2,
             sdk.bytesView("Activate root-policy, then Glob in the same response."),
@@ -6208,7 +6124,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     options.max_turns = 5;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunSkill(
+        api.session().runSkill(
             session,
             3,
             sdk.bytesView(root_identity.skill_id),
@@ -6239,7 +6155,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     probe.expected_run_id = 4;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             4,
             sdk.bytesView("Try the hidden Skill name."),
@@ -6262,7 +6178,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     probe.expected_run_id = 5;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             5,
             sdk.bytesView("Use the forked Skill."),
@@ -6317,7 +6233,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     var openai_session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(
+        api.session().create()(
             runtime,
             &session_config,
             &callbacks,
@@ -6327,13 +6243,13 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     );
     openai_probe.expected_session = openai_session;
     defer if (openai_session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     options.max_turns = 3;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             openai_session,
             1,
             sdk.bytesView("Use review through the OpenAI interface."),
@@ -6385,7 +6301,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     var fatal_session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(
+        api.session().create()(
             runtime,
             &session_config,
             &fatal_callbacks,
@@ -6394,12 +6310,12 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
         ),
     );
     defer if (fatal_session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     try std.testing.expectEqual(
         wire.STATUS_CALLBACK_FAILED,
-        api.sessionRunText(
+        api.session().runText(
             fatal_session,
             1,
             sdk.bytesView("Run the forked Skill."),
@@ -6412,7 +6328,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_STATE,
-        api.sessionRunText(
+        api.session().runText(
             fatal_session,
             2,
             sdk.bytesView("A callback-failed Session stays poisoned."),
@@ -6465,9 +6381,9 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer {
-        if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
     }
 
     const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("HostEcho") };
@@ -6502,27 +6418,27 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .reserved = [_]u64{0} ** 4,
     };
     var session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic));
     probe.expected_session = session;
     defer {
-        if (session) |handle| _ = api.sessionDestroy()(handle, &diagnostic);
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
-    try std.testing.expectEqual(wire.STATUS_BUSY, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_BUSY, api.runtime().destroy()(runtime, &diagnostic));
     api.bufferRelease()(&diagnostic);
 
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
-    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.sessionAbort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().abort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionRunText(session, 0, sdk.bytesView("zero is not a Run identifier"), &options, &result, &diagnostic),
+        api.session().runText(session, 0, sdk.bytesView("zero is not a Run identifier"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     var invalid_utf8: u8 = 0xff;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             .{ .ptr = @ptrCast(&invalid_utf8), .len = wire.MAX_PROMPT_BYTES_V1 + 1 },
@@ -6532,7 +6448,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         ),
     );
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(session, 1, sdk.bytesView("exercise ABI"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("exercise ABI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(@as(usize, 1), probe.ui_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.ui_releases);
@@ -6546,72 +6462,72 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     options.max_turns = wire.MAX_TURNS_V1 + 1;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
-        api.sessionRunText(session, 2, sdk.bytesView("must not start"), &options, &result, &diagnostic),
+        api.session().runText(session, 2, sdk.bytesView("must not start"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     options.max_turns = 5;
     probe.expected_run_id = 2;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(session, 2, sdk.bytesView("run after pre-admission rejection"), &options, &result, &diagnostic),
+        api.session().runText(session, 2, sdk.bytesView("run after pre-admission rejection"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
-    try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.sessionAbort()(session, 2, wire.ABORT_USER_REQUEST, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.session().abort()(session, 2, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_STALE_RUN, api.sessionAbort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_STALE_RUN, api.session().abort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
 
     try std.testing.expectEqual(
         wire.STATUS_STALE_RUN,
-        api.sessionRunText(session, 2, sdk.bytesView("accepted identifiers cannot be reused"), &options, &result, &diagnostic),
+        api.session().runText(session, 2, sdk.bytesView("accepted identifiers cannot be reused"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_STALE_RUN,
-        api.sessionRunText(session, 1, sdk.bytesView("accepted identifiers cannot move backwards"), &options, &result, &diagnostic),
+        api.session().runText(session, 1, sdk.bytesView("accepted identifiers cannot move backwards"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
 
     probe.expected_run_id = 20;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(session, 20, sdk.bytesView("Run identifiers may skip"), &options, &result, &diagnostic),
+        api.session().runText(session, 20, sdk.bytesView("Run identifiers may skip"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     const max_run_id = std.math.maxInt(u64);
     probe.expected_run_id = max_run_id;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(session, max_run_id, sdk.bytesView("consume the final Run identifier"), &options, &result, &diagnostic),
+        api.session().runText(session, max_run_id, sdk.bytesView("consume the final Run identifier"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(
         wire.STATUS_STALE_RUN,
-        api.sessionRunText(session, max_run_id, sdk.bytesView("UINT64_MAX cannot repeat"), &options, &result, &diagnostic),
+        api.session().runText(session, max_run_id, sdk.bytesView("UINT64_MAX cannot repeat"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_STALE_RUN,
-        api.sessionRunText(session, 1, sdk.bytesView("UINT64_MAX cannot wrap to a low identifier"), &options, &result, &diagnostic),
+        api.session().runText(session, 1, sdk.bytesView("UINT64_MAX cannot wrap to a low identifier"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
 
     var second_session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &second_session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, &second_session, &diagnostic));
     defer if (second_session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
     probe.expected_session = second_session;
     probe.expected_run_id = max_run_id;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(second_session, max_run_id, sdk.bytesView("Run identifiers are scoped to a Session"), &options, &result, &diagnostic),
+        api.session().runText(second_session, max_run_id, sdk.bytesView("Run identifiers are scoped to a Session"), &options, &result, &diagnostic),
     );
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(second_session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(second_session, &diagnostic));
     second_session = null;
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
 }
 
@@ -6645,7 +6561,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
 
         fn run(self: *@This()) void {
             var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .reserved = [_]u64{0} ** 4 };
-            self.status = self.api.sessionRunText(self.session, 1, sdk.bytesView("pause in facade epilogue"), &options, &self.result, &self.diagnostic);
+            self.status = self.api.session().runText(self.session, 1, sdk.bytesView("pause in facade epilogue"), &options, &self.result, &self.diagnostic);
         }
     };
 
@@ -6666,9 +6582,9 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
@@ -6685,9 +6601,9 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
     var session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic));
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     var barrier = Barrier{};
@@ -6707,33 +6623,33 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .reserved = [_]u64{0} ** 4 };
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
-        api.sessionRunText(session, 2, sdk.bytesView("must not enter during epilogue"), &options, &competing_result, &diagnostic),
+        api.session().runText(session, 2, sdk.bytesView("must not enter during epilogue"), &options, &competing_result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_BUSY, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_BUSY, api.session().destroy()(session, &diagnostic));
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
-        api.sessionSetModel()(session, sdk.bytesView(""), &diagnostic),
-    );
-    api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(
-        wire.STATUS_BUSY,
-        api.sessionBindSkillPolicy()(session, null, null, &diagnostic),
+        api.sessionControl().setModel()(session, sdk.bytesView(""), &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
-        api.sessionUpdatePermissionRules()(session, null, &diagnostic),
+        api.skill().bindPolicy()(session, null, null, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_BUSY,
+        api.sessionControl().updatePermissionRules()(session, null, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     var compact_result = std.mem.zeroes(wire.CompactResultV1);
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
-        api.sessionCompact()(session, 0, &compact_result, &diagnostic),
+        api.sessionControl().compact()(session, 0, &compact_result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.sessionAbort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.session().abort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
 
     barrier.release.store(true, .release);
@@ -6742,9 +6658,9 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     defer api.bufferRelease()(&worker.diagnostic);
     try std.testing.expectEqual(wire.STATUS_OK, worker.status);
     try std.testing.expectEqual(wire.STOP_END_TURN, worker.result.stop_reason_code);
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
 }
 
@@ -6848,9 +6764,9 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer {
-        if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
     }
 
     const allowed = [_]wire.BytesViewV1{sdk.bytesView("HostEcho")};
@@ -6870,23 +6786,23 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
     var session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic));
     defer {
-        if (session) |handle| _ = api.sessionDestroy()(handle, &diagnostic);
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(session, 1, sdk.bytesView("invoke failing host"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("invoke failing host"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(@as(usize, 1), probe.releases);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(session, 2, sdk.bytesView("run again"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 2, sdk.bytesView("run again"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
 }
 
@@ -6972,14 +6888,14 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreateWithPlugins()(
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(
         &runtime_config,
         &plugin_config,
         &runtime,
         &diagnostic,
     ));
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     const allowed = [_]wire.BytesViewV1{sdk.bytesView("HostStream")};
@@ -6999,7 +6915,7 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
     var session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(
         runtime,
         &session_config,
         &callbacks,
@@ -7007,7 +6923,7 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
         &diagnostic,
     ));
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     var options = wire.RunOptionsV1{
@@ -7016,7 +6932,7 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
         .reserved = [_]u64{0} ** 4,
     };
     var result: wire.RunResultV1 = undefined;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
         session,
         1,
         sdk.bytesView("stream a large result"),
@@ -7035,9 +6951,9 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
     try std.testing.expect(std.mem.indexOf(u8, body, core.tool_result.PROJECTION_SCHEMA) != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "ReadArtifact") != null);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
 }
 
@@ -7109,14 +7025,14 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreateWithPlugins()(
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(
         &runtime_config,
         &plugin_config,
         &runtime,
         &diagnostic,
     ));
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     const allowed = [_]wire.BytesViewV1{sdk.bytesView("HostStream")};
@@ -7136,7 +7052,7 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
     var session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(
         runtime,
         &session_config,
         &callbacks,
@@ -7144,7 +7060,7 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
         &diagnostic,
     ));
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     var options = wire.RunOptionsV1{
@@ -7153,7 +7069,7 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
         .reserved = [_]u64{0} ** 4,
     };
     var result: wire.RunResultV1 = undefined;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
         session,
         1,
         sdk.bytesView("fail the stream"),
@@ -7169,9 +7085,9 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
     const digest = core.tool_result_artifact.sha256Hex("partial-public-abi");
     try std.testing.expect(std.mem.indexOf(u8, request.body(), digest[0..]) == null);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
 }
 
@@ -7219,7 +7135,7 @@ test "Revision 12 Host stream descriptors reject missing callbacks and reserved 
     var runtime: ?*wire.RuntimeHandle = null;
 
     descriptor.execute_stream = null;
-    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.runtimeCreateWithPlugins()(
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.runtime().create()(
         &runtime_config,
         &plugins,
         &runtime,
@@ -7230,7 +7146,7 @@ test "Revision 12 Host stream descriptors reject missing callbacks and reserved 
 
     descriptor.execute_stream = Stub.execute;
     descriptor.release_detail = null;
-    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.runtimeCreateWithPlugins()(
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.runtime().create()(
         &runtime_config,
         &plugins,
         &runtime,
@@ -7241,7 +7157,7 @@ test "Revision 12 Host stream descriptors reject missing callbacks and reserved 
 
     descriptor.release_detail = Stub.release;
     descriptor.reserved[0] = 1;
-    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.runtimeCreateWithPlugins()(
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.runtime().create()(
         &runtime_config,
         &plugins,
         &runtime,
@@ -7269,9 +7185,9 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer {
-        if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
     }
 
     var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
@@ -7290,29 +7206,29 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
     callbacks.ctx = &probe;
     callbacks.on_event = FatalEventProbe.event;
     var session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic));
     defer {
-        if (session) |handle| _ = api.sessionDestroy()(handle, &diagnostic);
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_CALLBACK_FAILED,
-        api.sessionRunText(session, 1, sdk.bytesView("fail event delivery"), &options, &result, &diagnostic),
+        api.session().runText(session, 1, sdk.bytesView("fail event delivery"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.sessionAbort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.session().abort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_STATE,
-        api.sessionRunText(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic),
+        api.session().runText(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
 }
 
@@ -7335,9 +7251,9 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer {
-        if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
     }
 
     var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
@@ -7356,16 +7272,16 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
     callbacks.ctx = &probe;
     callbacks.on_event = AbortEventProbe.event;
     var session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic));
     defer {
-        if (session) |handle| _ = api.sessionDestroy()(handle, &diagnostic);
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(session, 1, sdk.bytesView("abort from callback"), &options, &result, &diagnostic),
+        api.session().runText(session, 1, sdk.bytesView("abort from callback"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STATUS_STALE_RUN, probe.stale_abort_status);
     try std.testing.expectEqual(wire.STATUS_OK, probe.abort_status);
@@ -7374,16 +7290,16 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
     probe.calls = 1;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(session, 2, sdk.bytesView("run after abort"), &options, &result, &diagnostic),
+        api.session().runText(session, 2, sdk.bytesView("run after abort"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
-    try std.testing.expectEqual(wire.STATUS_STALE_RUN, api.sessionAbort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_STALE_RUN, api.session().abort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.sessionAbort()(session, 2, wire.ABORT_USER_REQUEST, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.session().abort()(session, 2, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
 }
 
@@ -7409,9 +7325,9 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer {
-        if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
     }
 
     const allowed = [_]wire.BytesViewV1{sdk.bytesView("AskUserQuestion")};
@@ -7435,19 +7351,19 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
     callbacks.on_ui_request = UiFailureProbe.ui;
     callbacks.release_response = UiFailureProbe.release;
     var session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic));
     defer {
-        if (session) |handle| _ = api.sessionDestroy()(handle, &diagnostic);
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
-    try std.testing.expectEqual(expected_status, api.sessionRunText(session, 1, sdk.bytesView("ask through Host UI"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(expected_status, api.session().runText(session, 1, sdk.bytesView("ask through Host UI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(expected_releases, probe.releases);
     api.bufferRelease()(&diagnostic);
     if (expected_status == wire.STATUS_CALLBACK_FAILED) {
-        try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.sessionRunText(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic));
+        try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.session().runText(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic));
         api.bufferRelease()(&diagnostic);
     } else {
         try std.testing.expectEqual(expected_stop, result.stop_reason_code);
@@ -7457,12 +7373,12 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
             try std.testing.expectEqual(wire.STATUS_OK, probe.first_abort_status);
             try std.testing.expectEqual(wire.STATUS_OK, probe.second_abort_status);
         }
-        try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(session, 2, sdk.bytesView("Session remains reusable"), &options, &result, &diagnostic));
+        try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 2, sdk.bytesView("Session remains reusable"), &options, &result, &diagnostic));
         try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     }
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
     session = null;
-    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
     runtime = null;
 }
 
@@ -7503,9 +7419,40 @@ fn expectMappedEventEquals(event: core.protocol.ui_event.CoreEvent, expected: sd
     }
 }
 
+fn expectOutputSegmentEndMapping(
+    disposition: core.output_semantics.Disposition,
+    expected_disposition: sdk.OutputSegmentDisposition,
+) !void {
+    try expectMappedEventEquals(
+        .{ .output_segment_end = .{
+            .index = 17,
+            .turn = 18,
+            .group = 19,
+            .disposition = disposition,
+            .bytes = 20,
+        } },
+        .{ .output_segment_end = .{
+            .index = 17,
+            .turn = 18,
+            .group = 19,
+            .disposition = expected_disposition,
+            .bytes = 20,
+        } },
+    );
+}
+
 test "L2 every public AgentCoreEventV1 mapping preserves its complete payload" {
     try expectMappedEventEquals(.{ .text_chunk = "text-sentinel" }, .{ .text_chunk = "text-sentinel" });
     try expectMappedEventEquals(.{ .thinking_chunk = "thinking-sentinel" }, .{ .thinking_chunk = "thinking-sentinel" });
+    try expectMappedEventEquals(
+        .{ .output_segment_begin = .{ .index = 7, .turn = 8, .group = 9 } },
+        .{ .output_segment_begin = .{ .index = 7, .turn = 8, .group = 9 } },
+    );
+    try expectOutputSegmentEndMapping(.commentary, .commentary);
+    try expectOutputSegmentEndMapping(.final, .final);
+    try expectOutputSegmentEndMapping(.continued, .continued);
+    try expectOutputSegmentEndMapping(.partial, .partial);
+    try expectOutputSegmentEndMapping(.discarded, .discarded);
     try expectMappedEventEquals(
         .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },
         .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },
@@ -7534,6 +7481,48 @@ test "L2 every public AgentCoreEventV1 mapping preserves its complete payload" {
             .content = "result-content",
             .is_error = true,
             .elapsed_ms = 33,
+        } },
+    );
+    const internal_changes = [_]core.file_change.Record{.{
+        .locator = .{ .workspace_path = "src/new.zig" },
+        .from_locator = .{ .workspace_path = "src/old.zig" },
+        .kind = .moved,
+        .status = .partial,
+        .tool = "ApplyPatch",
+        .tool_use_id = "change-id",
+        .agent_depth = 2,
+        .before_bytes = 11,
+        .after_bytes = 22,
+        .unified_diff = "-old\n+new\n",
+        .diff_complete = false,
+    }};
+    const public_changes = [_]sdk.FileChangeRecord{.{
+        .locator = .{ .workspace_path = "src/new.zig" },
+        .from_locator = .{ .workspace_path = "src/old.zig" },
+        .kind = .moved,
+        .status = .partial,
+        .tool = "ApplyPatch",
+        .tool_use_id = "change-id",
+        .agent_depth = 2,
+        .before_bytes = 11,
+        .after_bytes = 22,
+        .unified_diff = "-old\n+new\n",
+        .diff_complete = false,
+    }};
+    try expectMappedEventEquals(
+        .{ .file_changes = .{
+            .id = "change-id",
+            .name = "ApplyPatch",
+            .changes = &internal_changes,
+            .overflow = true,
+            .lost = true,
+        } },
+        .{ .file_changes = .{
+            .id = "change-id",
+            .name = "ApplyPatch",
+            .changes = &public_changes,
+            .overflow = true,
+            .lost = true,
         } },
     );
     try expectMappedEventEquals(
@@ -7846,7 +7835,7 @@ test "L2 Revision 10 independent Host loads a pinned process tool through AgentC
     var runtime: ?*wire.RuntimeHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.runtimeCreateWithPlugins()(
+        api.runtime().create()(
             &runtime_config,
             &plugin_config,
             &runtime,
@@ -7854,7 +7843,7 @@ test "L2 Revision 10 independent Host loads a pinned process tool through AgentC
         ),
     );
     defer if (runtime) |handle| {
-        _ = api.runtimeDestroy()(handle, &diagnostic);
+        _ = api.runtime().destroy()(handle, &diagnostic);
     };
 
     var permission_probe = ProcessPermissionProbe{};
@@ -7880,7 +7869,7 @@ test "L2 Revision 10 independent Host loads a pinned process tool through AgentC
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionCreate()(
+        api.session().create()(
             runtime,
             &session_config,
             &callbacks,
@@ -7890,7 +7879,7 @@ test "L2 Revision 10 independent Host loads a pinned process tool through AgentC
     );
     permission_probe.expected_session = session;
     defer if (session) |handle| {
-        _ = api.sessionDestroy()(handle, &diagnostic);
+        _ = api.session().destroy()(handle, &diagnostic);
     };
 
     var options = std.mem.zeroes(wire.RunOptionsV1);
@@ -7899,7 +7888,7 @@ test "L2 Revision 10 independent Host loads a pinned process tool through AgentC
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRunText(
+        api.session().runText(
             session,
             1,
             sdk.bytesView("call the configured process plugin"),
@@ -7931,10 +7920,23 @@ test "Revision 10 process plugin descriptors fail closed before staging" {
     var runtime: ?*wire.RuntimeHandle = null;
 
     try std.testing.expectEqual(
-        wire.STATUS_INVALID_ARGUMENT,
-        api.runtimeCreateWithPlugins()(&runtime_config, null, &runtime, &diagnostic),
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
     );
-    try std.testing.expect(runtime == null);
+    try std.testing.expect(runtime != null);
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
+    runtime = null;
+    api.bufferRelease()(&diagnostic);
+
+    var empty_plugins = std.mem.zeroes(wire.RuntimePluginConfigV1);
+    empty_plugins.struct_size = @sizeOf(wire.RuntimePluginConfigV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, &empty_plugins, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime != null);
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().destroy()(runtime, &diagnostic));
+    runtime = null;
     api.bufferRelease()(&diagnostic);
 
     var source = wire.ProcessPluginSourceV1{
@@ -7954,7 +7956,7 @@ test "Revision 10 process plugin descriptors fail closed before staging" {
     };
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.runtimeCreateWithPlugins()(&runtime_config, &plugins, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, &plugins, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
     api.bufferRelease()(&diagnostic);
@@ -7963,7 +7965,7 @@ test "Revision 10 process plugin descriptors fail closed before staging" {
     source.layer_code = 0;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.runtimeCreateWithPlugins()(&runtime_config, &plugins, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, &plugins, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
     api.bufferRelease()(&diagnostic);
@@ -7972,7 +7974,7 @@ test "Revision 10 process plugin descriptors fail closed before staging" {
     source.reserved[0] = 1;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.runtimeCreateWithPlugins()(&runtime_config, &plugins, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, &plugins, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
     api.bufferRelease()(&diagnostic);
@@ -7981,7 +7983,7 @@ test "Revision 10 process plugin descriptors fail closed before staging" {
     plugins.process_plugin_count = wire.MAX_PROCESS_PLUGIN_SOURCES_V1 + 1;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
-        api.runtimeCreateWithPlugins()(&runtime_config, &plugins, &runtime, &diagnostic),
+        api.runtime().create()(&runtime_config, &plugins, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
 }
