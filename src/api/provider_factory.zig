@@ -86,6 +86,7 @@ pub const Factory = struct {
 };
 
 /// 据 provider_kind 造 OwnedProvider(独立 io_runtime + 对应具体 client,堆分配)。
+/// openai_protocol 走默认 chat/completions(需要 Responses 的调用方走带 resolver 的全参入口)。
 pub fn makeProvider(
     a: std.mem.Allocator,
     kind: types.ProviderKind,
@@ -93,18 +94,21 @@ pub fn makeProvider(
     model: []const u8,
     base_url: ?[]const u8,
 ) !OwnedProvider {
-    return makeProviderWithDialectResolver(a, kind, api_key, model, base_url, .builtin());
+    return makeProviderWithDialectResolver(a, kind, api_key, model, base_url, .chat_completions, .builtin());
 }
 
 /// Runtime-scoped provider construction. The resolver is a borrowed immutable
 /// view owned by the Runtime Snapshot and therefore remains stable for the
 /// complete Provider/Session lifetime.
+/// openai_protocol 仅 OpenAI arm 消费(anthropic/gemini 忽略):子 provider 继承父的
+/// wire 协议选择(chat/completions 或 Responses),协议绝不从 base_url/model 推断。
 pub fn makeProviderWithDialectResolver(
     a: std.mem.Allocator,
     kind: types.ProviderKind,
     api_key: []const u8,
     model: []const u8,
     base_url: ?[]const u8,
+    openai_protocol: types.OpenAIProtocol,
     dialect_resolver: dialect_mod.Resolver,
 ) !OwnedProvider {
     @import("../util/log.zig").info("mp", "makeProvider kind={s} base_url={s}", .{ @tagName(kind), base_url orelse "<null>" });
@@ -125,6 +129,7 @@ pub fn makeProviderWithDialectResolver(
         .openai => blk: {
             const c = try a.create(openai_mod.OpenAIClient);
             c.* = openai_mod.OpenAIClient.init(a, io_rt.io(), api_key, model, base_url);
+            c.protocol = openai_protocol;
             c.dialect_resolver = dialect_resolver;
             break :blk .{ .openai = c };
         },

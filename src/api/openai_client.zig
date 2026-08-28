@@ -26,6 +26,11 @@
 //!   - 认证:Authorization: Bearer {key}(凑巧同 Anthropic;无 anthropic-version header)
 //!   - 请求 body:{model, messages:[{role,content|tool_calls|tool_call_id}], tools:[{type:function,...}], stream}
 //!   - SSE:data: {choices:[{delta:{content|tool_calls}, finish_reason}]} / data: [DONE]
+//!
+//! **Responses API(issue #4)**:protocol=.responses 时同一 Client 改讲 /v1/responses——
+//! 请求走 serializeOpenAIResponsesRequest(input items / instructions / 扁平 tools /
+//! reasoning:{effort} / store:false),SSE 走 parseResponsesChunk(typed 事件,无 [DONE])。
+//! 协议是显式配置(--openai-protocol / METACODES_OPENAI_PROTOCOL),绝不从 base_url/model 推断。
 
 const std = @import("std");
 const http = std.http;
@@ -49,17 +54,22 @@ const StopReason = api_stream.StopReason;
 const UsageDelta = api_stream.UsageDelta;
 
 pub const DEFAULT_OPENAI_URL = "https://api.openai.com/v1/chat/completions";
+pub const DEFAULT_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
 pub const OpenAIClient = struct {
     allocator: std.mem.Allocator,
     api_key: []const u8,
-    base_url: []const u8, // 完整 chat/completions URL(可指向 MockServer / 自建中转站)
+    /// 完整端点 URL 覆盖(可指向 MockServer / 自建中转站)。null = 按 protocol 选官方端点
+    /// (effectiveUrl)。存 init 入参原样——protocol 可在 init 后设置(precedent app.zig)。
+    base_url: ?[]const u8,
     model: []const u8,
     http_client: http.Client,
     abort_registry: provider_mod.RequestAbortRegistry = .{},
     max_tokens: u32 = 4096,
     context_window: u32 = 128_000,
     reasoning_effort: ?types.ReasoningEffort = null,
+    /// OpenAI wire 协议(显式配置,组装层从 config.openai_protocol 塞;绝不从 URL 推断)。
+    protocol: types.OpenAIProtocol = .chat_completions,
     /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
     overrides: request_overrides.RequestOverrides = .{},
     dialect_resolver: dialect_mod.Resolver = .{},
@@ -68,7 +78,7 @@ pub const OpenAIClient = struct {
         return .{
             .allocator = allocator,
             .api_key = api_key,
-            .base_url = base_url orelse DEFAULT_OPENAI_URL,
+            .base_url = base_url,
             .model = model,
             .http_client = http.Client{ .allocator = allocator, .io = io },
         };
@@ -76,6 +86,14 @@ pub const OpenAIClient = struct {
     pub fn deinit(self: *OpenAIClient) void {
         self.abort_registry.deinit(self.allocator);
         self.http_client.deinit();
+    }
+
+    /// 本次请求的实际端点:显式 base_url 优先,否则按 protocol 选官方端点。
+    fn effectiveUrl(self: *const OpenAIClient) []const u8 {
+        return self.base_url orelse switch (self.protocol) {
+            .chat_completions => DEFAULT_OPENAI_URL,
+            .responses => DEFAULT_OPENAI_RESPONSES_URL,
+        };
     }
 
     // ── Provider vtable ──────────────────────────────────────────────────────
@@ -160,7 +178,11 @@ pub const OpenAIClient = struct {
         if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
         o.tool_choice = tool_choice;
         const dialect = self.dialect_resolver.resolve(.openai, model);
-        const body = try serializeOpenAIRequestWithOverridesAndDialect(self.allocator, model, messages, system, tools, o, dialect);
+        // wire 协议分派:chat/completions(默认)或 Responses API(typed SSE)。
+        const body = switch (self.protocol) {
+            .chat_completions => try serializeOpenAIRequestWithOverridesAndDialect(self.allocator, model, messages, system, tools, o, dialect),
+            .responses => try serializeOpenAIResponsesRequest(self.allocator, model, messages, system, tools, o, dialect),
+        };
         defer self.allocator.free(body);
         return self.doStream(body, abort, dialect);
     }
@@ -172,9 +194,9 @@ pub const OpenAIClient = struct {
             "openai",
             rid,
             "POST {s} model={s} body_bytes={d} cache_mode={s} reasoning_effort={s}",
-            .{ self.base_url, self.model, body.len, cache.modeFor(.openai).label(), if (self.reasoning_effort) |effort| effort.name() else "default" },
+            .{ self.effectiveUrl(), self.model, body.len, cache.modeFor(.openai).label(), if (self.reasoning_effort) |effort| effort.name() else "default" },
         );
-        const uri = std.Uri.parse(self.base_url) catch return error.InvalidUrl;
+        const uri = std.Uri.parse(self.effectiveUrl()) catch return error.InvalidUrl;
         const auth = std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key}) catch return error.RequestFailed;
         defer secureFree(self.allocator, auth);
 
@@ -228,6 +250,7 @@ pub const OpenAIClient = struct {
             .allocator = self.allocator,
             .model = self.model,
             .dialect = dialect,
+            .protocol = self.protocol,
             .request = req_ptr,
             .response = response,
             .abort = abort,
@@ -251,6 +274,8 @@ const OpenAIStream = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
     dialect: dialect_mod.Dialect,
+    /// wire 协议(chat/completions 或 Responses):parseChunk 据此分派解析路径。
+    protocol: types.OpenAIProtocol = .chat_completions,
     request: *http.Client.Request,
     response: http.Client.Response,
     transfer_buf: [8192]u8 = undefined,
@@ -259,6 +284,9 @@ const OpenAIStream = struct {
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
     done: bool = false,
+    /// Responses 协议:终止事件(completed/incomplete)已发 usage,flush 队列排空后
+    /// 补发一个 .done(Responses 无 [DONE] 哨兵行)。
+    pending_done: bool = false,
     last_stop: StopReason = .unknown,
     // 并行 tool_calls 增量累积(P0.1):OpenAI 流式把每个 tool_call 按 `index` 分槽分块发
     // (id/name 一次,arguments 跨 chunk 拼)。按 index 找槽累积,done 时把每个槽 flush 成一个
@@ -314,6 +342,12 @@ const OpenAIStream = struct {
             self.flush_pos += 1;
             return ev;
         }
+        // Responses 终止事件已发 usage、flush 已排空 → 补发 done 并收流。
+        if (self.pending_done) {
+            self.pending_done = false;
+            self.done = true;
+            return StreamEvent{ .done = {} };
+        }
         if (self.done) return null;
         if (self.reader == null) {
             self.reader = self.response.reader(&self.transfer_buf);
@@ -343,6 +377,8 @@ const OpenAIStream = struct {
 
     /// 解析一个 OpenAI SSE data chunk。返回可 emit 的中立事件,或 null(增量累积中)。
     fn parseChunk(self: *OpenAIStream, data: []const u8) !?StreamEvent {
+        // Responses API 走 typed 事件解析路径(chat/completions 的启发式对它不适用)。
+        if (self.protocol == .responses) return self.parseResponsesChunk(data);
         // usage chunk(include_usage 时末尾发):{"choices":[],"usage":{prompt_tokens,completion_tokens,
         // prompt_tokens_details:{cached_tokens}}}。归一成中立 UsageDelta(prompt→input、completion→output、
         // cached_tokens→cache_read,经 cache.parseOpenAICacheUsage)。让缓存命中能上抛 UI,与 Anthropic 一致。
@@ -410,6 +446,100 @@ const OpenAIStream = struct {
             }
         }
         return null;
+    }
+
+    /// 解析一个 Responses API SSE data chunk(typed 事件:`"type":"response.xxx"`)。
+    /// 返回可 emit 的中立事件,或 null(增量累积/被忽略的事件类型)。
+    /// 未识别的事件类型一律忽略(向前兼容:服务端新增事件不破坏既有流)。
+    fn parseResponsesChunk(self: *OpenAIStream, data: []const u8) !?StreamEvent {
+        const ev_type = util_json.extractStringField(data, "type") orelse return null;
+        // 文本增量:{"type":"response.output_text.delta","delta":"..."}。
+        // delta 是 JSON string 片段 → 解除一层转义(同 chat content 分支);空片段 free 不发。
+        if (std.mem.eql(u8, ev_type, "response.output_text.delta")) {
+            if (try util_json.extractAndUnescapeStringField(data, "delta", self.allocator)) |text| {
+                if (text.len > 0) return StreamEvent{ .text = text };
+                self.allocator.free(text);
+            }
+            return null;
+        }
+        // 新 output item:function_call item 携带完整 call_id + name(arguments 后续增量发)。
+        // 按 output_index 分槽累积(对齐 chat 的 tool_calls index 分槽)。
+        if (std.mem.eql(u8, ev_type, "response.output_item.added")) {
+            const item = findObjectField(data, "item") orelse return null;
+            const item_type = util_json.extractStringField(item, "type") orelse return null;
+            if (!std.mem.eql(u8, item_type, "function_call")) return null;
+            self.tc_active = true;
+            const acc = self.accFor(util_json.extractIntField(data, "output_index")) catch return null;
+            // call_id/name 每 item 只发一次;仅在本槽尚未填时写(防重复拼接,同 chat ~id 守卫)。
+            if (util_json.extractStringField(item, "call_id")) |id| {
+                if (id.len > 0 and acc.id.items.len == 0) acc.id.appendSlice(self.allocator, id) catch {};
+            }
+            if (util_json.extractStringField(item, "name")) |name| {
+                if (name.len > 0 and acc.name.items.len == 0) acc.name.appendSlice(self.allocator, name) catch {};
+            }
+            return null;
+        }
+        // arguments 增量:片段解除一层转义后按槽拼接(同 chat arguments 契约)。
+        if (std.mem.eql(u8, ev_type, "response.function_call_arguments.delta")) {
+            if (try util_json.extractAndUnescapeStringField(data, "delta", self.allocator)) |args| {
+                defer self.allocator.free(args);
+                const acc = self.accFor(util_json.extractIntField(data, "output_index")) catch return null;
+                try acc.args.appendSlice(self.allocator, args);
+            }
+            return null;
+        }
+        // arguments 终值:done 事件携带完整 arguments(authoritative)——整体覆盖已拼片段,
+        // 漏发/重发 delta 都不会造成错拼。
+        if (std.mem.eql(u8, ev_type, "response.function_call_arguments.done")) {
+            if (try util_json.extractAndUnescapeStringField(data, "arguments", self.allocator)) |args| {
+                defer self.allocator.free(args);
+                const acc = self.accFor(util_json.extractIntField(data, "output_index")) catch return null;
+                acc.args.clearRetainingCapacity();
+                try acc.args.appendSlice(self.allocator, args);
+            }
+            return null;
+        }
+        // 正常终止:usage + stop 归一 + flush tool_call 槽 + 排队 done(Responses 无 [DONE] 行)。
+        if (std.mem.eql(u8, ev_type, "response.completed")) {
+            self.last_stop = if (self.tc_active) .tool_use else .end_turn;
+            return self.finishResponsesTerminal(data);
+        }
+        // 截断终止:incomplete_details.reason=max_output_tokens → .max_tokens,其余 .unknown。
+        if (std.mem.eql(u8, ev_type, "response.incomplete")) {
+            self.last_stop = if (util_json.extractStringField(data, "reason")) |reason|
+                (if (std.mem.eql(u8, reason, "max_output_tokens")) StopReason.max_tokens else .unknown)
+            else
+                .unknown;
+            return self.finishResponsesTerminal(data);
+        }
+        // 失败终止(response.failed)/流级 error 事件:上抛给 agent_loop 的 stream_error 处理。
+        if (std.mem.eql(u8, ev_type, "response.failed") or std.mem.eql(u8, ev_type, "error")) {
+            log.errId("openai", self.id, "responses stream failed: {s}", .{
+                util_json.extractStringField(data, "message") orelse "unknown",
+            });
+            return error.RequestFailed;
+        }
+        return null; // 其它 typed 事件(created/in_progress/output_text.done 等):忽略
+    }
+
+    /// Responses 终止事件(completed/incomplete)公共尾:usage 归一 + flush + 排队 done。
+    fn finishResponsesTerminal(self: *OpenAIStream, data: []const u8) ?StreamEvent {
+        // cached_tokens 嵌在 usage.input_tokens_details 下;first-match 模式安全——
+        // `"input_tokens":` 含闭引号+冒号,不会命中 `"input_tokens_details"`。
+        const cached = util_json.extractIntField(data, "cached_tokens");
+        // 语义归一(同 chat usage 分支):Responses 的 input_tokens **包含** cached_tokens,
+        // 中立 UsageDelta 约定 input_tokens 不含 cache(Anthropic 语义)。消费方
+        // (usage 锚点/成本累计)按 in+cache_r+cache_w 求和——不减会把缓存双计。
+        const usage = UsageDelta{
+            .input_tokens = util_json.extractIntField(data, "input_tokens") -| cached,
+            .output_tokens = util_json.extractIntField(data, "output_tokens"),
+            .cache_read_input_tokens = cached,
+            .cache_creation_input_tokens = 0, // Responses 无写区分 → 0
+        };
+        self.buildFlush();
+        self.flushed = true;
+        self.pending_done = true;
+        return StreamEvent{ .usage = usage };
     }
 
     /// 按 index 找累积槽,没有则新建。返回稳定指针(ToolCallAcc 的三个 ArrayList 后备内存在堆,
@@ -522,6 +652,44 @@ fn findToolCallsArray(data: []const u8) ?[]const u8 {
         }
     }
     return data[arr_open + 1 ..]; // 未闭合:返回剩余
+}
+
+/// 定位 `"<key>":` 后的 object,返回 `{` 与配对 `}` 之间的内容(深度感知,跳字符串;
+/// 与 findToolCallsArray 同扫描风格,只是括号换成花括号)。分块未闭合时返回剩余部分。
+/// 找不到 key 或值不是 object 返 null。
+fn findObjectField(data: []const u8, key: []const u8) ?[]const u8 {
+    var pattern_buf: [64]u8 = undefined;
+    if (key.len + 3 > pattern_buf.len) return null;
+    pattern_buf[0] = '"';
+    @memcpy(pattern_buf[1..][0..key.len], key);
+    pattern_buf[1 + key.len] = '"';
+    pattern_buf[2 + key.len] = ':';
+    const pattern = pattern_buf[0 .. key.len + 3];
+    const start = std.mem.indexOf(u8, data, pattern) orelse return null;
+    var i = start + pattern.len;
+    while (i < data.len and data[i] != '{') : (i += 1) {}
+    if (i >= data.len) return null;
+    const obj_open = i;
+    var depth: i32 = 0;
+    var in_str = false;
+    var esc = false;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (in_str) {
+            if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return data[obj_open + 1 .. i];
+            },
+            else => {},
+        }
+    }
+    return data[obj_open + 1 ..]; // 未闭合:返回剩余
 }
 
 /// 迭代 JSON array slice 里的顶层 `{...}` 对象(深度感知,跳字符串)。
@@ -766,6 +934,170 @@ fn serializeOpenAITool(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t:
     try out.appendSlice(allocator, ",\"parameters\":");
     try @import("request.zig").serializeInputSchema(t.input_schema, out, allocator);
     try out.appendSlice(allocator, "}}");
+}
+
+/// 中立 Conversation/tools → OpenAI **Responses API** 请求 body(/v1/responses)。caller free。
+/// 与 chat/completions 的 wire 差异(本函数锁住的全部脏活):
+///   - messages → `input` items:text-bearing user/assistant 是 {role,content};tool_use 是
+///     顶层 {"type":"function_call",call_id,name,arguments};tool_result 是
+///     {"type":"function_call_output",call_id,output}。thinking block 跳过(不回传)。
+///   - system → 顶层 `instructions`(经 dialect.injectSystemMods + activateCapabilities,
+///     同 chat 的 system 组装;非空才发)。
+///   - thinking 控制:顶层 `reasoning:{effort}`(effort 档位上限 high,xhigh→high)——
+///     不走 dialect.serializeThinking(那是 chat body 的字段形态)。
+///   - tools 扁平:{"type":"function",name,description,parameters,strict:false}(无嵌套 function)。
+///   - `store:false`(agent loop 自管上下文,不用服务端存储);无 max_output_tokens、
+///     无 stream_options(Responses 流式默认带 usage)。
+pub fn serializeOpenAIResponsesRequest(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+) ![]u8 {
+    const profile = dialect.profileFor(.openai, model);
+    const visible_capabilities = dialect_mod.visibleCapabilities(tools);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"model\":");
+    try util_json.serializeString(model, &out, allocator);
+    // reasoning.effort:仅 active 档位发;Responses 档位表 minimal|low|medium|high(无 xhigh)。
+    if (overrides.reasoning_effort) |e| if (e.active()) {
+        const effort: []const u8 = switch (e) {
+            .none, .minimal => "minimal", // active() 已排除;保底最低档
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+            .xhigh => "high", // Responses 无 xhigh 档 → 封顶 high
+        };
+        try out.appendSlice(allocator, ",\"reasoning\":{\"effort\":");
+        try util_json.serializeString(effort, &out, allocator);
+        try out.append(allocator, '}');
+    };
+    // 通用采样参数(同 chat)。
+    if (overrides.temperature) |t| {
+        try out.appendSlice(allocator, ",\"temperature\":");
+        try util_json.serializeNumber(t, &out, allocator);
+    }
+    if (overrides.top_p) |p| {
+        try out.appendSlice(allocator, ",\"top_p\":");
+        try util_json.serializeNumber(p, &out, allocator);
+    }
+    try out.appendSlice(allocator, ",\"stream\":true,\"store\":false");
+    // system → instructions。组装链与 chat 一致(dialect 注入 + 能力激活),非空才发。
+    var sys_buf: std.ArrayList(u8) = .empty;
+    defer sys_buf.deinit(allocator);
+    if (system) |sys| try sys_buf.appendSlice(allocator, sys);
+    try dialect.injectSystemMods(profile, overrides.reasoning_effort, &sys_buf, allocator);
+    try dialect.activateCapabilities(
+        profile,
+        visible_capabilities,
+        &sys_buf,
+        allocator,
+    );
+    if (sys_buf.items.len != 0) {
+        try out.appendSlice(allocator, ",\"instructions\":");
+        try util_json.serializeString(sys_buf.items, &out, allocator);
+    }
+    try out.appendSlice(allocator, ",\"input\":[");
+    var first = true;
+    for (messages) |m| {
+        try serializeResponsesInputItems(allocator, &out, m, &first);
+    }
+    try out.append(allocator, ']');
+    // tools:Responses 扁平形态(name/description/parameters 顶层;strict:false 不强制 schema 严格模式)。
+    if (tools) |tl| {
+        if (tl.len > 0) {
+            try out.appendSlice(allocator, ",\"tools\":[");
+            for (tl, 0..) |t, i| {
+                if (i > 0) try out.append(allocator, ',');
+                try out.appendSlice(allocator, "{\"type\":\"function\",\"name\":");
+                try util_json.serializeString(t.name, &out, allocator);
+                try out.appendSlice(allocator, ",\"description\":");
+                try util_json.serializeString(t.description, &out, allocator);
+                try out.appendSlice(allocator, ",\"parameters\":");
+                try @import("request.zig").serializeInputSchema(t.input_schema, &out, allocator);
+                try out.appendSlice(allocator, ",\"strict\":false}");
+            }
+            try out.append(allocator, ']');
+        }
+    }
+    try serializeResponsesToolChoice(overrides.tool_choice, &out, allocator);
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+/// 一条中立 ApiMessage → 0..N 个 Responses `input` items(逗号管理经 first 指针)。
+/// text-bearing 消息 → {role,content}(拼接 .text block,跳 .thinking);每个 tool_use →
+/// {"type":"function_call"};每个 tool_result → {"type":"function_call_output"}。
+fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, first: *bool) !void {
+    var text_buf: std.ArrayList(u8) = .empty;
+    defer text_buf.deinit(allocator);
+    for (m.content) |c| switch (c) {
+        .text => |t| try text_buf.appendSlice(allocator, t),
+        else => {},
+    };
+    if (text_buf.items.len > 0) {
+        if (!first.*) try out.append(allocator, ',');
+        first.* = false;
+        try out.appendSlice(allocator, "{\"role\":\"");
+        try out.appendSlice(allocator, switch (m.role) {
+            .user => "user",
+            .assistant => "assistant",
+        });
+        try out.appendSlice(allocator, "\",\"content\":");
+        try util_json.serializeString(text_buf.items, out, allocator);
+        try out.append(allocator, '}');
+    }
+    for (m.content) |c| switch (c) {
+        .tool_use => |tu| {
+            if (!first.*) try out.append(allocator, ',');
+            first.* = false;
+            try out.appendSlice(allocator, "{\"type\":\"function_call\",\"call_id\":");
+            try util_json.serializeString(tu.id, out, allocator);
+            try out.appendSlice(allocator, ",\"name\":");
+            try util_json.serializeString(tu.name, out, allocator);
+            // arguments 是装在 string 里的 JSON 文档(serializeString 加回一层转义)。
+            try out.appendSlice(allocator, ",\"arguments\":");
+            try util_json.serializeString(tu.input, out, allocator);
+            try out.append(allocator, '}');
+        },
+        .tool_result => |tr| {
+            if (!first.*) try out.append(allocator, ',');
+            first.* = false;
+            try out.appendSlice(allocator, "{\"type\":\"function_call_output\",\"call_id\":");
+            try util_json.serializeString(tr.tool_use_id, out, allocator);
+            try out.appendSlice(allocator, ",\"output\":");
+            try util_json.serializeString(tr.content, out, allocator);
+            try out.append(allocator, '}');
+        },
+        else => {},
+    };
+}
+
+/// Responses API 的 tool_choice(responses-local,不走 dialect.serializeToolChoice——
+/// 那是 chat 的嵌套 function 形态)。中立语义映射:auto→"auto",any/required→"required",
+/// none→"none",tool+name→扁平 {"type":"function","name":..},tool 缺 name→"required"。
+/// 未识别 type 不发(服务端用默认)。
+fn serializeResponsesToolChoice(tc_opt: ?json_mod.ToolChoice, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    const tc = tc_opt orelse return;
+    if (std.mem.eql(u8, tc.type, "auto")) {
+        try out.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+    } else if (std.mem.eql(u8, tc.type, "none")) {
+        try out.appendSlice(allocator, ",\"tool_choice\":\"none\"");
+    } else if (std.mem.eql(u8, tc.type, "any") or std.mem.eql(u8, tc.type, "required")) {
+        try out.appendSlice(allocator, ",\"tool_choice\":\"required\"");
+    } else if (std.mem.eql(u8, tc.type, "tool")) {
+        if (tc.name) |n| {
+            try out.appendSlice(allocator, ",\"tool_choice\":{\"type\":\"function\",\"name\":");
+            try util_json.serializeString(n, out, allocator);
+            try out.append(allocator, '}');
+        } else {
+            try out.appendSlice(allocator, ",\"tool_choice\":\"required\"");
+        }
+    }
 }
 
 test "OpenAI 请求翻译:中立 Conversation → chat/completions body" {
