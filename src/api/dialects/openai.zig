@@ -85,7 +85,9 @@ fn openaiSerializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice, 
 //
 // 中立 ResponseFormatRequest → OpenAI chat/completions wire:
 //   json_object → ",\"response_format\":{\"type\":\"json_object\"}"
-//   json_schema → ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":<schema>}}"
+//   json_schema → ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"response\",\"schema\":<schema>}}"
+//   (name 是 OpenAI 必填字段——缺失服务端 400 "Missing required parameter";中立请求
+//   结构无 name 概念,发固定 "response"。R2-4 修:此前漏发,json_schema 从不可用。)
 //
 // 能力降级:GLM-5 profile.response_format_support==.json_object_only,json_schema 降级为
 // json_object(服务端拒 json_schema,静默降级保请求成功)。
@@ -101,7 +103,7 @@ fn openaiSerializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?Response
     }
     if (effective.kind == .json_schema) {
         if (effective.schema) |s| {
-            try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":");
+            try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"response\",\"schema\":");
             try out.appendSlice(a, s);
             try out.appendSlice(a, "}}");
             return true;

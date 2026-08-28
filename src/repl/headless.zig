@@ -401,6 +401,10 @@ fn buildOptions(
     project_rule_gate: ?@import("../tools/context.zig").ProjectRuleGate,
 ) agent_loop.Options {
     return .{
+        // R2/F3:run 身份用真实 session id(此前缺省 SessionId.single——RunControl/
+        // transcript 用真 id 而 agent_loop 内 KG 任务 claim/lease 归属却是 single,
+        // 并发 headless 进程共享 KG store 时租约互相碰撞)。
+        .session = app.session_id,
         // task#20:--suspendable 时装恒 .pending requester → headless 遇 UI 工具挂起而非 NotATty。
         .ui_requester = if (app.config.suspendable)
             .{ .ctx = @ptrCast(&pending_requester_dummy), .requestFn = &pendingRequestFn }

@@ -169,6 +169,24 @@ compatibility boundaries, and entry points are defined by
   serializing `item` before the top-level `type` previously dropped the
   function call), and parallel/interleaved Responses tool calls are covered by
   a cassette test.
+- Transcript persistence survives `/retry`: the writer's append-only
+  assumption broke on rollback (flushed count is monotonic), so a retry that
+  shrank and regrew the conversation left the regenerated turn unpersisted
+  and resuming the session revived the discarded pre-retry turn. Prefix-
+  destroying mutations (retry rollback, compact's wholesale replacement) now
+  bump a shrink epoch and the writer atomically rewrites the transcript.
+- `/resume` now clears the active skill before switching session identity:
+  previously the next run in the resumed session (e.g. an immediate
+  `/retry`) executed under the previous session's skill tool policy, and the
+  old skill execution state leaked (unregistered under the wrong id).
+- Headless (`-p`) runs now carry the real session id into the agent loop
+  (previously the default `single`), so KG task claims/leases from
+  concurrent headless processes sharing a store no longer collide on one
+  identity.
+- `--response-format json_schema` now serializes the API-required
+  `format.name` (constant `"response"`) on both the Chat Completions and
+  Responses wires; both previously omitted it, so json_schema requests were
+  rejected server-side with "Missing required parameter".
 - OpenAI-compatible streaming now decodes the JSON string escapes of SSE
   fragments: `delta.content` and `reasoning_content` (GLM/Kimi/DeepSeek/Qwen/
   Mistral) previously reached the conversation and thinking stream as raw

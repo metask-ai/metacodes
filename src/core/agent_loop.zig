@@ -1964,10 +1964,22 @@ pub fn run(
                 // after the paired successful result is in Conversation.
                 required_first_accepted = true;
             }
+            // 权限侧真名(review round 2 / R2-3):hook 匹配、分类、规则与 ask 记忆都必须
+            // 看**将被执行的名字**。dispatcher 宇宙 exact-name 不修;遗留分支用与 executeOne
+            // 同一把 P0.6 归一化("bash"→"Bash")——否则 "Bash" 匹配的 block-hook / session
+            // "always deny" 对 case-variant 名一律失配,而 dispatch 仍会修名真执行。
+            // 真未知名保持原名(read 兜底 + UnknownTool 引导)。Slot 仍带 raw 名
+            // (证据契约:requested vs dispatched 归属不糊);PostToolUse 观测 hook 仍按
+            // raw 名匹配(存量,不在本修范围——Pre 侧是安全向,先闭合)。
+            var name_probe_ctx = tools_mod.ToolContext{ .allocator = allocator, .dyn_registry = opts.dyn_registry };
+            const canonical_name = if (opts.tool_dispatcher != null)
+                tu.name // dispatcher universe: exact-name policy, no repair
+            else
+                tools_mod.resolveToolNameExact(&name_probe_ctx, tu.name) orelse tu.name;
             // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
             var eff_input = tu.input;
             if (hookset) |hs| if (hs.hasPre()) {
-                const pre = hooks_mod.runPreToolUseFull(hs, allocator, tu.name, tu.input, opts.abort);
+                const pre = hooks_mod.runPreToolUseFull(hs, allocator, canonical_name, tu.input, opts.abort);
                 if (pre.modified_input) |mi| {
                     mod_inputs.append(allocator, mi) catch allocator.free(mi);
                     // append 成功才用改写值;失败(OOM)已 free,退回原 input。
@@ -1997,22 +2009,10 @@ pub fn run(
             // in default) instead of the legacy name-based read fallback.
             // Dispatch of such a name still fails as UnknownTool; note the
             // deny happens before dispatch, so the UnknownTool "did you
-            // mean X" guidance does not fire on the denied path.
-            //
-            // Legacy (no-dispatcher) branch: classification/rule matching
-            // must see the SAME name executeOne will actually run. P0.6
-            // deterministically repairs weak-model casings ("bash"→"Bash")
-            // at dispatch time — classifying the raw name would let an
-            // unknown-name read fallback allow, in plan mode, a call that
-            // then really executes Bash (classification/dispatch looking at
-            // different names). Resolve with the same normalizer up front;
-            // a truly unknown name keeps the legacy read fallback and still
-            // fails dispatch as UnknownTool.
-            var name_probe_ctx = tools_mod.ToolContext{ .allocator = allocator, .dyn_registry = opts.dyn_registry };
-            const canonical_name = if (opts.tool_dispatcher != null)
-                tu.name // dispatcher universe: exact-name policy, no repair
-            else
-                tools_mod.resolveToolNameExact(&name_probe_ctx, tu.name) orelse tu.name;
+            // mean X" guidance does not fire on the denied path. The legacy
+            // branch classifies canonical_name (resolved above, same
+            // normalizer as executeOne) so classification can never look at
+            // a different name than what dispatch will actually run.
             const classified = if (opts.tool_dispatcher) |dispatcher|
                 dispatcher.category(tu.name) orelse .execute
             else if (opts.dyn_registry) |registry|
@@ -2033,7 +2033,10 @@ pub fn run(
                 .ask => {
                     // ctx constCast:promptUser 写 session 记忆(有副作用)。同 plan_mode 分支
                     // 的 @constCast 先例——agent_loop 持 *const 但权限交互本就改 per-session 状态。
-                    const allowed = permission_mod.promptUser(@constCast(permission_ctx), tu.name, eff_input) catch false;
+                    // R2-3:传 canonical_name——ask 记忆(rememberAllow/Deny)与决策链读取
+                    // (decisionFor)必须同键,否则 "always deny" 存 "bash" 键、后续按 "Bash"
+                    // 查不到,session deny 被 settings allow 越过。
+                    const allowed = permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input) catch false;
                     policy_allowed = allowed;
                     log.infoId("permission", rid, "prompt tool={s} user_allowed={}", .{ tu.name, allowed });
                     if (!allowed) {

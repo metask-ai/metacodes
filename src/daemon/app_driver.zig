@@ -79,8 +79,13 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
             defer host.generating.store(false, .seq_cst);
             if (web_session.execCommand(app, &host.journal, infra, c) != null) pending_run = true;
         }
+        // 停机窗口:排水期间 requestStop 可能已发——AbortSignal 是 first-reason-wins,
+        // 其 user_ctrl_c 会被先落座的 user_interrupt **遮蔽**。此时绝不复位、绝不起 run
+        // (复位会清掉停机 abort,让一整轮 un-aborted run 卡住 destroy 的 join);
+        // 直接回环,由循环条件 stopRequested 退出。
+        if (host.stopRequested()) continue;
         // 命令期被打断的残留 interrupt 复位——否则毒化紧随的 pending run / inbox 消息
-        // (already-aborted 即刻吞掉)。host 停机走 stop_flag/user_ctrl_c,不受此影响。
+        // (already-aborted 即刻吞掉)。
         if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.resetForTesting();
 
         if (!pending_run) {

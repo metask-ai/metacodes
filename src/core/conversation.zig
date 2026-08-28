@@ -40,6 +40,11 @@ pub const Conversation = struct {
     compact_boundary: usize = 0,
     compact_summary: ?[]u8 = null, // owned;压缩摘要,投影时作为边界前的一条 assistant 消息注入
     mutation_version: u64 = 0,
+    /// **前缀破坏代数**(R2/F1):删除或整体替换已存在消息的变更在此 +1(/retry 回卷、
+    /// compact 的 replaceWithOwned)。transcript.Writer 据此发现 append-only 假设失效 →
+    /// 全量重写;否则 flushed_count 单调,回卷再增长到同长度时重生成的回合永不落盘,
+    /// resume 会复活被丢弃的旧回合。纯 append 不 bump。
+    shrink_epoch: u64 = 0,
     /// API usage 锚点:上次请求服务端实际计的 prompt tokens(in+cache_r+cache_w)。
     /// auto-compact 的 token 估算以它为基准,只对锚点之后新 append 的消息做本地估算,
     /// 避免估算器与各家 tokenizer 的偏差随会话长度放大(对齐 cc 用 usage 算 context%)。
@@ -189,6 +194,7 @@ pub const Conversation = struct {
         }
         if (self.compact_boundary > user_idx) self.compact_boundary = user_idx;
         self.mutation_version +%= 1;
+        self.shrink_epoch +%= 1;
     }
 
     /// 深拷贝整个对话到 dst allocator(转后台续跑用)。返回的 Conversation 与源 **0 共享指针**
@@ -310,6 +316,7 @@ pub const Conversation = struct {
         replacement.compact_summary = null;
         replacement.compact_boundary = 0;
         self.mutation_version +%= 1;
+        self.shrink_epoch +%= 1; // 整体替换 = 前缀破坏(transcript 须全量重写)
         self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
         return true;
     }

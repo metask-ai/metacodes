@@ -501,12 +501,12 @@ test "Responses(g3): response_format/prompt_cache_key/parallel_tool_calls 接线
     // chat 的 response_format 字段形态不得出现(Responses 用 text.format)。
     try std.testing.expect(std.mem.indexOf(u8, body, "\"response_format\"") == null);
 
-    // json_schema:schema 内联进 format(字段用法镜像 chat 序列化——只有 schema)。
+    // json_schema:schema + 必填 name 内联进 format(平铺形态;缺 name 服务端 400,R2-4)。
     const body2 = try openai.serializeOpenAIResponsesRequest(a, "gpt-5.2", &msgs, null, null, .{
         .response_format = .{ .kind = .json_schema, .schema = "{\"type\":\"object\"}" },
     }, dialect);
     defer a.free(body2);
-    try std.testing.expect(std.mem.indexOf(u8, body2, "\"text\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body2, "\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"response\",\"schema\":{\"type\":\"object\"}}}") != null);
 
     // schema 缺失的 json_schema 退化 json_object(镜像 chat 降级语义)。
     const body3 = try openai.serializeOpenAIResponsesRequest(a, "gpt-5.2", &msgs, null, null, .{

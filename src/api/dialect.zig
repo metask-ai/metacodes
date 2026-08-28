@@ -629,7 +629,7 @@ test "M4 OpenAI dialect: response_format json_schema + schema 发完整 wire" {
     defer out.deinit(a);
     const got = try d.serializeResponseFormat(p, .{ .kind = .json_schema, .schema = "{\"type\":\"object\"}" }, &out, a);
     try std.testing.expect(got);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":{\"type\":\"object\"}}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"response\",\"schema\":{\"type\":\"object\"}}}") != null);
 }
 
 test "M4 OpenAI dialect: GLM-5 json_schema 降级为 json_object(能力守门)" {

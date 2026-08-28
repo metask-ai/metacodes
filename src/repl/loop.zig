@@ -3462,21 +3462,16 @@ fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []c
     };
     defer allocator.free(result);
 
-    // 显示 stdout/stderr(从 result JSON 抽)
-    const common = @import("../tools/common.zig");
-    if (common.extractJsonArg(result, "stdout")) |so| {
-        const unesc = @import("../util/json.zig").unescapeString(so, allocator) catch null;
-        if (unesc) |u| {
-            defer allocator.free(u);
-            if (u.len > 0) std.debug.print("{s}", .{u});
-        }
+    // 显示 stdout/stderr(parity-correct 提取 + 一次解码,与 web shellCommandResult 同源;
+    // 旧 extractJsonArg 的闭引号扫描对结尾反斜杠的内容会误判边界)。
+    const json_util = @import("../util/json.zig");
+    if (json_util.extractAndUnescapeStringField(result, "stdout", allocator) catch null) |u| {
+        defer allocator.free(u);
+        if (u.len > 0) std.debug.print("{s}", .{u});
     }
-    if (common.extractJsonArg(result, "stderr")) |se| {
-        const unesc = @import("../util/json.zig").unescapeString(se, allocator) catch null;
-        if (unesc) |u| {
-            defer allocator.free(u);
-            if (u.len > 0) std.debug.print("\x1b[33m{s}\x1b[0m", .{u});
-        }
+    if (json_util.extractAndUnescapeStringField(result, "stderr", allocator) catch null) |u| {
+        defer allocator.free(u);
+        if (u.len > 0) std.debug.print("\x1b[33m{s}\x1b[0m", .{u});
     }
 }
 
@@ -3625,6 +3620,10 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     );
 
     // 到这里所有操作已经成功：真正 atomic 切换。
+    // R2/F2:先清 active skill——必须在 session_id 切走**之前**(clearActiveSkill 按当前
+    // id 注销 skill_runtime 的 ExecutionState;晚清会用新 id 注销不到旧态 → 泄漏),且
+    // 不清则 resumed 会话的下一次 run(如紧跟的 /retry)会带着上一会话的 skill 工具面。
+    app.clearActiveSkill();
     app.conversation.deinit();
     app.conversation = staged;
     staged_owned_here = false; // ownership 已转移给 app.conversation

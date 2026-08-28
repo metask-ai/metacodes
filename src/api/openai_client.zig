@@ -1109,11 +1109,12 @@ pub fn serializeOpenAIResponsesRequest(
     // responses 路径静默 no-op——CLI 传了却不上 wire)。responses-local,不走
     // dialect.serializeResponseFormat(那是 chat 的 response_format 字段形态;
     // protocol=responses 是显式 OpenAI 原生配置,无三方兼容端点的能力守门问题)。
-    // 字段用法镜像 chat 序列化:json_object 只发 type;json_schema 内联 schema,
-    // schema 缺失退化 json_object(同 chat 降级语义)。
+    // 字段用法镜像 chat 序列化:json_object 只发 type;json_schema 内联 schema + 必填
+    // name(Responses 的 text.format 是平铺形态,name 在 format 层;缺 name 服务端 400,
+    // R2-4 修),schema 缺失退化 json_object(同 chat 降级语义)。
     if (overrides.response_format) |rf| {
         if (rf.kind == .json_schema and rf.schema != null) {
-            try out.appendSlice(allocator, ",\"text\":{\"format\":{\"type\":\"json_schema\",\"schema\":");
+            try out.appendSlice(allocator, ",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"response\",\"schema\":");
             try out.appendSlice(allocator, rf.schema.?);
             try out.appendSlice(allocator, "}}");
         } else if (rf.kind != .none) {

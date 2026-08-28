@@ -60,6 +60,8 @@ pub const Writer = struct {
     fd: pfs.Fd = FD_UNSET,
     /// 已刷盘的 message 数；下次 flush 从这里开始
     flushed_count: usize = 0,
+    /// 上次 flush 时见到的 conversation.shrink_epoch(前缀破坏代数;不等 → 全量重写)。
+    seen_shrink_epoch: u64 = 0,
     model: []const u8, // borrowed (session 期间不变)
 
     /// "fd 未打开" 哨兵值。POSIX 约定负 fd 无效。
@@ -124,6 +126,14 @@ pub const Writer = struct {
     }
 
     fn flushImpl(self: *Writer, conversation: *const Conversation) !void {
+        // 前缀破坏(/retry 回卷、compact replaceWithOwned)后 append-only 假设失效:
+        // flushed_count 单调 + O_APPEND 意味着"回卷再涨回同长度"的重生成回合永不落盘,
+        // resume 读回的是被丢弃的旧回合(R2/F1)。据 conversation.shrink_epoch 察觉,
+        // 原子全量重写(tmp + renameReplace,崩溃窗口只丢本次重写,不产生半文件)。
+        if (self.seen_shrink_epoch != conversation.shrink_epoch) {
+            try self.rewriteAll(conversation);
+            self.seen_shrink_epoch = conversation.shrink_epoch;
+        }
         if (self.fd == FD_UNSET) {
             var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
             const path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl\x00", .{self.dir});
@@ -141,6 +151,32 @@ pub const Writer = struct {
         }
 
         try self.writeMeta(conversation);
+    }
+
+    /// 全量重写 transcript.jsonl(见 flushImpl 注)。借用 writeMessage:临时把 self.fd
+    /// 指向 tmp 文件写全量,成功后 renameReplace 原子替换,fd 复位 FD_UNSET(下次 flush
+    /// 重新以 O_APPEND 打开新文件,恢复 append-crash 语义)。任何失败都恢复原 fd 语义。
+    fn rewriteAll(self: *Writer, conversation: *const Conversation) !void {
+        if (self.fd != FD_UNSET) {
+            _ = pfs.close(self.fd);
+            self.fd = FD_UNSET;
+        }
+        var tbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const tmp_path = try std.fmt.bufPrint(&tbuf, "{s}/transcript.jsonl.tmp\x00", .{self.dir});
+        const tmp_fd = pfs.open(@ptrCast(tmp_path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (tmp_fd < 0) return error.OpenFailed;
+        self.fd = tmp_fd;
+        errdefer {
+            _ = pfs.close(self.fd);
+            self.fd = FD_UNSET;
+        }
+        for (conversation.messages.items) |*m| try self.writeMessage(m);
+        _ = pfs.close(self.fd);
+        self.fd = FD_UNSET;
+        var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl\x00", .{self.dir});
+        if (pfs.renameReplace(@ptrCast(tmp_path.ptr), @ptrCast(path.ptr)) != 0) return error.RenameFailed;
+        self.flushed_count = conversation.messages.items.len;
     }
 
     fn writeMessage(self: *Writer, m: *const msg_mod.Message) !void {

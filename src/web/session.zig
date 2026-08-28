@@ -239,22 +239,25 @@ fn shellCommandResult(svc: *session_service_mod.SessionService, journal: *EventJ
     };
     defer web_alloc.free(result);
 
-    const common = @import("../tools/common.zig");
     const json_util = @import("../util/json.zig");
     var msg_buf: std.ArrayList(u8) = .empty;
     defer msg_buf.deinit(web_alloc);
     msg_buf.appendSlice(web_alloc, "$ ") catch return;
     msg_buf.appendSlice(web_alloc, command) catch return;
     inline for (.{ "stdout", "stderr" }) |stream| {
-        if (common.extractJsonArg(result, stream)) |raw| {
-            if (json_util.unescapeString(raw, web_alloc) catch null) |text| {
-                defer web_alloc.free(text);
-                if (text.len > 0) {
-                    msg_buf.appendSlice(web_alloc, "\n") catch return;
-                    const cap = @min(text.len, 2048);
-                    msg_buf.appendSlice(web_alloc, text[0..cap]) catch return;
-                    if (text.len > cap) msg_buf.appendSlice(web_alloc, "\n[… truncated]") catch return;
-                }
+        // parity-correct 提取 + 一次解码(util/json 单源;旧 extractJsonArg 的闭引号
+        // 扫描对结尾反斜杠的内容会误判边界)。
+        const maybe_text = json_util.extractAndUnescapeStringField(result, stream, web_alloc) catch null;
+        if (maybe_text) |text| {
+            defer web_alloc.free(text);
+            if (text.len > 0) {
+                msg_buf.appendSlice(web_alloc, "\n") catch return;
+                var cap = @min(text.len, 2048);
+                // 截断必须退到 UTF-8 边界:从多字节字符中间切开会让整条 message 变成
+                // 非法 UTF-8,std.json 只能把它序列化成字节数组(SPA 渲染成数字串)。
+                while (cap > 0 and cap < text.len and (text[cap] & 0xC0) == 0x80) cap -= 1;
+                msg_buf.appendSlice(web_alloc, text[0..cap]) catch return;
+                if (text.len > cap) msg_buf.appendSlice(web_alloc, "\n[… truncated]") catch return;
             }
         }
     }
@@ -350,7 +353,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
             if (execCommand(app, &journal, web_alloc, c) != null) pending_run = true;
         }
         // 命令期被 Stop 打断(如中断长 `!cmd`)的残留 interrupt 在此复位——否则紧随的
-        // pending run / inbox 消息会被 already-aborted 即刻吞掉(S1 同类)。SIGINT 不复位。
+        // pending run / inbox 消息会被 already-aborted 即刻吞掉(S1 同类)。SIGINT 不复位;
+        // 若 SIGINT 恰在残留 interrupt 存续期到达(first-reason-wins 遮蔽),该次按键随
+        // 复位丢失、下一次生效——与既有空闲/run 后复位点的语义一致,可接受。
         if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.resetForTesting();
 
         if (!pending_run) {
