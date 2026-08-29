@@ -149,9 +149,12 @@ fn anthropicProfile(model: []const u8) ModelProfile {
         .thinking_mode = .anthropic_adaptive,
         .effort_levels = .full,
         .returns_reasoning_content = false, // Claude 用 content[] 里的 thinking block,非平级字段
-        // Claude 3+ 全系 vision(base64 image source block)。经 Anthropic 兼容网关的
-        // 第三方文本模型(如 glm-5)不支持 → 按 claude 前缀守门,其余保守 false。
-        .supports_image_input = hasSubstr(model, "claude"),
+        // Vision 自 Claude 3 起(claude-1/2/instant 是纯文本代);经 Anthropic 兼容
+        // 网关的第三方文本模型(如 glm-5)同样不支持。按已验证家族守门,其余保守 false。
+        .supports_image_input = hasSubstr(model, "claude") and
+            !hasSubstr(model, "claude-instant") and
+            !hasSubstr(model, "claude-1") and
+            !hasSubstr(model, "claude-2"),
     };
     // Claude 4.x 保留 thinking(preserved thinking)
     if (hasSubstr(model, "claude-opus-4") or hasSubstr(model, "claude-sonnet-4") or hasSubstr(model, "claude-haiku-4")) {
@@ -243,13 +246,26 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .returns_reasoning_content = true, // ThinkChunk
         };
     }
-    // OpenAI 原生(GPT-4o/o1/o3/GPT-5)
+    // OpenAI 原生(GPT-4o/o1/o3/GPT-5)。注意本分支同时是**所有未匹配模型名的
+    // catch-all**(vLLM/自部署/新厂商)——vision 只对已验证 OpenAI 家族开 true,
+    // 未知模型保持保守 false(fail-closed:本地显式能力错误优于远端 400/静默忽略)。
     return .{
         .thinking_mode = .openai_effort,
         .effort_levels = .full,
         .returns_reasoning_content = false, // OpenAI 不暴露 reasoning content
-        .supports_image_input = true, // GPT-4o+/o 系/GPT-5 全系 vision(chat image_url / responses input_image)
+        .supports_image_input = openaiNativeVision(model),
     };
+}
+
+/// OpenAI 原生已验证 vision 家族:GPT-4o/4.1/GPT-5/ChatGPT 全系;推理系中 o1(非
+/// mini/preview)、o3(非 mini)、o4 支持。o1-mini/o1-preview/o3-mini/GPT-3.5 与一切
+/// 未知名字保守 false。
+fn openaiNativeVision(model: []const u8) bool {
+    if (hasSubstr(model, "gpt-4o") or hasSubstr(model, "gpt-4.1") or
+        hasSubstr(model, "gpt-5") or hasSubstr(model, "chatgpt")) return true;
+    if (hasSubstr(model, "o1-mini") or hasSubstr(model, "o1-preview") or
+        hasSubstr(model, "o3-mini")) return false;
+    return hasSubstr(model, "o1") or hasSubstr(model, "o3") or hasSubstr(model, "o4");
 }
 
 fn geminiProfile(model: []const u8) ModelProfile {
@@ -459,10 +475,20 @@ test "profileFor: other 保守默认" {
 }
 
 test "profileFor: vision 能力矩阵(issue #10)" {
-    // 已验证 vision 家族 true;文本模型/未验证家族保守 false。
+    // 已验证 vision 家族 true;文本模型/未验证家族/未知模型名保守 false(fail-closed)。
     try std.testing.expect(profileFor(.anthropic, "claude-sonnet-4-20250514").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "claude-3-5-haiku-20241022").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "claude-2.1").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "claude-instant-1.2").supports_image_input);
     try std.testing.expect(profileFor(.openai, "gpt-4o").supports_image_input);
     try std.testing.expect(profileFor(.openai, "gpt-5.2").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "o3").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "o3-mini").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "o1-mini").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "gpt-3.5-turbo").supports_image_input);
+    // 未知模型名落 OpenAI catch-all:vision 必须 fail-closed(不发远端赌 400)。
+    try std.testing.expect(!profileFor(.openai, "llama-3.3-70b").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "grok-4").supports_image_input);
     try std.testing.expect(profileFor(.gemini, "gemini-2.5-pro").supports_image_input);
     try std.testing.expect(profileFor(.openai, "qwen3-vl-235b").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "qwen3-235b").supports_image_input);

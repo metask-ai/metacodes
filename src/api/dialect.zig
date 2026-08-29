@@ -363,6 +363,9 @@ pub const Dialect = struct {
         return try self.serializeParallelToolCallsFn(self.ctx, p, enabled, out, a);
     }
     pub fn serializeImagePart(self: Dialect, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
+        // 能力守门集中在 wrapper:vendor 覆盖 serializeImagePartFn 也绕不开
+        // profile.supports_image_input(issue #10 铁律由构造保证,不靠每个实现自觉)。
+        if (!p.supports_image_input) return false;
         return try self.serializeImagePartFn(self.ctx, p, image, out, a);
     }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {

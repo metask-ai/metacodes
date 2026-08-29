@@ -150,22 +150,28 @@ fn openaiSerializeParallelToolCalls(ctx: *anyopaque, p: ModelProfile, enabled: ?
 //   {"type":"image_url","image_url":{"url":"data:<mime>;base64,<data>"}}
 // (vision 全生态标准形态:GPT-4o+/Qwen-VL/GLM-4V 等 OpenAI-compatible vision 端点通用。
 //  Responses API 的 input_image 是 responses-local 形态,不经此方法。)
-// 能力守门:profile.supports_image_input=false 返 false,调用方报显式
-// error.ImageInputUnsupported——绝不静默把 base64 当文本发(issue #10 铁律)。
+// 能力守门在 Dialect.serializeImagePart wrapper(集中一处,vendor 覆盖也绕不开);
+// 本函数只管 wire 形态——绝不静默把 base64 当文本发(issue #10 铁律)。
 // **本函数是 OpenAI-compatible 协议的单一真相源**;将来某厂商原生端点要求不同
 // 图像形态时,该厂商 dialect 换挂自己的实现即可(方言扩展点)。
 fn openaiSerializeImagePart(ctx: *anyopaque, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
     _ = ctx;
-    if (!p.supports_image_input) return false;
-    // data URL 是单个 JSON string:分段走 serializeStringContents(无引号 escape),
-    // 引号手工闭合。不信任上游校验——media_type/data 里的异常字节在此被正确转义,
-    // 不会破坏请求 JSON 结构(合法 MIME 与 base64 字母表本就无需转义,零开销路径)。
-    try out.appendSlice(a, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+    _ = p;
+    try out.appendSlice(a, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"");
+    try writeImageDataUrl(image, out, a);
+    try out.appendSlice(a, "\"}}");
+    return true;
+}
+
+/// data URL 核心(`data:<mime>;base64,<data>`,不带外围引号):chat 的 image_url 与
+/// Responses 的 input_image 共用同一注入安全实现。分段走 serializeStringContents
+/// (无引号 escape)——不信任上游校验,media_type/data 里的异常字节在此被正确转义,
+/// 不破坏请求 JSON 结构(合法 MIME 与 base64 字母表本就无需转义,零开销路径)。
+pub fn writeImageDataUrl(image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
+    try out.appendSlice(a, "data:");
     try util_json.serializeStringContents(image.media_type, out, a);
     try out.appendSlice(a, ";base64,");
     try util_json.serializeStringContents(image.data, out, a);
-    try out.appendSlice(a, "\"}}");
-    return true;
 }
 
 // ── 共享:reasoning_content 流式增量解码(GLM/Kimi/DeepSeek/Qwen/Mistral 同一平级字段)──

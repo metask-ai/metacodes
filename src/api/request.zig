@@ -309,12 +309,13 @@ fn serializeContent(
     try buf.append(allocator, ']');
 }
 
-const ImageResult = struct { media_type: []const u8, data: []const u8 };
+pub const ImageResult = struct { media_type: []const u8, data: []const u8 };
 
 /// 检测 tool_result content 是否为 Read 工具的图像形态。
 /// 仅当以 `{"type":"image"` 开头且含 media_type + data 字段时返回；否则 null（当文本处理）。
 /// 返回的 slice 借用 content 内部字节（未 unescape）——base64/media_type 无需转义，直接透传。
-fn extractImageResult(content: []const u8) ?ImageResult {
+/// pub:估算/身份/预算投影(agent_loop、session_budget)用同一嗅探判定图像形态 tool_result。
+pub fn extractImageResult(content: []const u8) ?ImageResult {
     const trimmed = std.mem.trimStart(u8, content, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, "{\"type\":\"image\"")) return null;
     const mt = util_json.extractStringField(trimmed, "media_type") orelse return null;

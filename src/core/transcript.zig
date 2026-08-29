@@ -246,6 +246,13 @@ pub const Writer = struct {
                 break;
             };
             if (title.len > 0) break;
+            // 纯图 user 消息(--image 允许空 prompt):给 /resume 列表一个可辨识标签,
+            // 而不是空行。后续消息有 text 时仍会被上面的循环覆盖(先到先得,不覆盖)。
+            for (m.blocks) |b| if (b == .image) {
+                title = "[image]";
+                break;
+            };
+            if (title.len > 0) break;
         }
 
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -403,9 +410,15 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
             const name = bv.object.get("name") orelse return error.InvalidTranscript;
             const input = bv.object.get("input") orelse return error.InvalidTranscript;
             if (id != .string or name != .string or input != .string) return error.InvalidTranscript;
+            // 逐字段 errdefer:第 2/3 个 dupe OOM 时,已 dupe 的前串未进 blocks
+            // (constructed 尚未 +1),函数级清理够不到——必须在此释放。
+            const id_owned = try allocator.dupe(u8, id.string);
+            errdefer allocator.free(id_owned);
+            const name_owned = try allocator.dupe(u8, name.string);
+            errdefer allocator.free(name_owned);
             blocks[idx] = .{ .tool_use = .{
-                .id = try allocator.dupe(u8, id.string),
-                .name = try allocator.dupe(u8, name.string),
+                .id = id_owned,
+                .name = name_owned,
                 .input = try allocator.dupe(u8, input.string),
             } };
         } else if (std.mem.eql(u8, tv.string, "tool_result")) {
@@ -413,8 +426,10 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
             const c = bv.object.get("content") orelse return error.InvalidTranscript;
             const is_err = bv.object.get("is_error") orelse std.json.Value{ .bool = false };
             if (tuid != .string or c != .string) return error.InvalidTranscript;
+            const tuid_owned = try allocator.dupe(u8, tuid.string);
+            errdefer allocator.free(tuid_owned);
             blocks[idx] = .{ .tool_result = .{
-                .tool_use_id = try allocator.dupe(u8, tuid.string),
+                .tool_use_id = tuid_owned,
                 .content = try allocator.dupe(u8, c.string),
                 .is_error = if (is_err == .bool) is_err.bool else false,
             } };
