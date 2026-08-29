@@ -286,7 +286,7 @@ fn serializeContent(
                 //   字节与此前手写形态逐字节相同(prompt cache 前缀契约不变)。
                 // 非 vision(如经 Anthropic 网关的 GLM 文本模型,方言返 false)发短
                 // 占位文本——绝不把 MB 级 base64(文本或 block 形态)塞给无法看图的模型。
-                if (dialect_mod.extractImageResult(tr.content)) |img| image: {
+                if (extractImageResult(tr.content)) |img| image: {
                     const mark = buf.items.len;
                     try buf.append(allocator, '[');
                     if (try dialect.serializeImagePart(profile, img, buf, allocator)) {
@@ -316,6 +316,23 @@ fn serializeContent(
         }
     }
     try buf.append(allocator, ']');
+}
+
+/// 与中立 IR 的 ImageBlock 同构(单一类型):extractImageResult 的返回值可直接喂
+/// Dialect.serializeImagePart,无需字段搬运。保留此别名给既有消费方签名。
+pub const ImageResult = types.ImageBlock;
+
+/// 检测 tool_result content 是否为 Read 工具的图像形态。
+/// 仅当以 `{"type":"image"` 开头且含 media_type + data 字段时返回；否则 null（当文本处理）。
+/// 返回的 slice 借用 content 内部字节（未 unescape）——base64/media_type 无需转义，直接透传。
+/// pub:三个协议族的 tool_result 序列化(本文件/openai_client/gemini_client)与
+/// 估算/身份/预算投影(agent_loop、session_budget)用同一嗅探判定图像形态 tool_result。
+pub fn extractImageResult(content: []const u8) ?types.ImageBlock {
+    const trimmed = std.mem.trimStart(u8, content, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "{\"type\":\"image\"")) return null;
+    const mt = util_json.extractStringField(trimmed, "media_type") orelse return null;
+    const data = util_json.extractStringField(trimmed, "data") orelse return null;
+    return .{ .media_type = mt, .data = data };
 }
 
 fn serializeTools(tools: []const ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -789,6 +806,14 @@ test "serializeMessagesRequest with image tool_result emits content block array"
     try std.testing.expect(std.mem.indexOf(u8, body, "\"source\":{\"type\":\"base64\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"data\":\"iVBORw==\"") != null);
+}
+
+test "extractImageResult ignores plain text" {
+    try std.testing.expect(extractImageResult("just text") == null);
+    try std.testing.expect(extractImageResult("{\"stdout\":\"x\"}") == null);
+    const img = extractImageResult("{\"type\":\"image\",\"media_type\":\"image/gif\",\"data\":\"AAAA\"}").?;
+    try std.testing.expectEqualStrings("image/gif", img.media_type);
+    try std.testing.expectEqualStrings("AAAA", img.data);
 }
 
 test "serializeMessagesRequest: 非 vision 模型的图像 tool_result → 占位文本(不发 base64)" {

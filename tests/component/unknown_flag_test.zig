@@ -155,3 +155,34 @@ test "argv0 alone yields a clean default config" {
     const config = cc.parseArgsForTest(&argv, a);
     try std.testing.expect(config.parse_error == null);
 }
+
+test "--image collects repeatable paths with -p (issue #10 flag wiring)" {
+    // arena:appendNulList 累加时丢弃旧串不回收(parse 是进程一次性路径),
+    // 逐项 free 抓不全,用 arena 整体回收。
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const argv = [_][*:0]const u8{ "metacodes", "--image", "a.png", "--image", "b.jpg", "-p", "hi" };
+    const config = cc.parseArgsForTest(&argv, a);
+    try std.testing.expect(config.parse_error == null);
+    // \x00 分隔累加(appendNulList 约定),顺序保持。
+    try std.testing.expectEqualStrings("a.png\x00b.jpg", config.images.?);
+    try std.testing.expectEqualStrings("hi", config.prompt.?);
+}
+
+test "--image without a value is rejected" {
+    const a = std.testing.allocator;
+    const argv = [_][*:0]const u8{ "metacodes", "--image" };
+    const config = cc.parseArgsForTest(&argv, a);
+    defer freeErr(a, config);
+    try parseErr(config, "missing value for --image");
+}
+
+test "--image without -p/--print fails closed (no silent drop into TUI/serve)" {
+    const a = std.testing.allocator;
+    const argv = [_][*:0]const u8{ "metacodes", "--image", "a.png" };
+    const config = cc.parseArgsForTest(&argv, a);
+    defer freeErr(a, config);
+    defer if (config.images) |imgs| a.free(imgs);
+    try parseErr(config, "--image requires -p/--print");
+}
