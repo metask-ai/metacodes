@@ -45,9 +45,9 @@ test "Subagents E2E: 3 builtins injected on init" {
     try std.testing.expect(set.find("Explore") != null);
     try std.testing.expect(set.find("Plan") != null);
     try std.testing.expect(set.find("general-purpose") != null);
-    // Explore: haiku + read-only(tools 含 Read/Grep/Glob/Bash,disallowed 含 Write/Edit)
+    // Explore: low 档位 + read-only(tools 含 Read/Grep/Glob/Bash,disallowed 含 Write/Edit)
     const expl = set.find("Explore").?;
-    try std.testing.expectEqualStrings("haiku", expl.model);
+    try std.testing.expectEqualStrings("low", expl.model);
     try std.testing.expect(expl.tools.len == 4);
     try std.testing.expect(expl.disallowed_tools.len == 2);
 }

@@ -58,6 +58,34 @@ automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
 NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`. Flag
 removals or semantic changes require a changelog entry.
 
+### Model tiers
+
+Subagent/skill model pins and `/model` accept tier names — `low`, `mid`,
+`high` (legacy aliases `haiku`/`sonnet`/`opus` map to the same tiers) — which
+resolve against the current provider's tier table in
+`~/.metacodes/config.json`:
+
+```json
+"model_tiers": {
+  "openai": {
+    "low":  {"model": "gpt-5.6-mini", "effort": "medium"},
+    "high": {"model": "gpt-5.6-sol",  "effort": "xhigh"}
+  }
+}
+```
+
+The table is keyed by provider kind (`anthropic`/`openai`/`gemini`) so one
+user-level file serves any `--provider` session without cross-provider model
+injection. An unconfigured tier inherits the session model and effort — there
+are no built-in per-provider model IDs. A tier's optional `effort` is the
+canonical `none|minimal|low|medium|high|xhigh` scale; each model family's
+dialect translates it to its own wire format and level count (OpenAI
+`reasoning.effort` full scale; GLM `reasoning_effort` pass-through; Kimi
+K2.6/K3 three levels; DeepSeek two levels; MiniMax M3 three states
+`disabled|adaptive|enabled` with M2.x always-on; Anthropic adaptive thinking
+plus `output_config.effort`). Explicit `effort:` in an agent definition wins
+over the tier's effort. The built-in `Explore` agent pins the `low` tier.
+
 ## Zig source embedding
 
 `src/lib.zig` exports the UI-neutral core. In a consumer, these types are reached

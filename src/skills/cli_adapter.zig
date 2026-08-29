@@ -801,9 +801,11 @@ fn executeFork(
         }
     }
 
+    // skill.model 与 Task 同语义:档位名查当前 provider 档位表(未配置 → inherit),
+    // 显式模型名透传。档位 effort 此路径暂不消费(fork 子跑道无 effort override 通道)。
     const model_override = switch (activation.model_selection) {
         .inherit_parent => null,
-        .override => |model| agent_tool.resolveModelAlias(model),
+        .override => |model| agent_tool.resolveModelSelection(ctx.model_tiers, model, null).model,
     };
     var child_permission = permission.scopedDerive(null);
     child_permission.active_skill = null;

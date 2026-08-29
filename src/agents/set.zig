@@ -265,7 +265,10 @@ const GENERAL_PROMPT =
 ;
 
 fn injectBuiltins(set: *AgentSet) !void {
-    try addBuiltin(set, "Explore", EXPLORE_DESC, EXPLORE_PROMPT, &.{ "Read", "Grep", "Glob", "Bash" }, &.{ "Write", "Edit" }, "haiku", .plan, 30, .blue);
+    // Explore pin 档位名 "low"(非具体型号):按当前 provider 档位表解析;未配置
+    // 档位表时 inherit 父模型——探索型任务用低档模型省成本,但绝不注入跨 provider
+    // 的硬编码模型 ID(issue #11)。
+    try addBuiltin(set, "Explore", EXPLORE_DESC, EXPLORE_PROMPT, &.{ "Read", "Grep", "Glob", "Bash" }, &.{ "Write", "Edit" }, "low", .plan, 30, .blue);
     try addBuiltin(set, "Plan", PLAN_DESC, PLAN_PROMPT, &.{ "Read", "Grep", "Glob", "KgRecall", "KgContext" }, &.{ "Write", "Edit", "Bash" }, "inherit", .plan, 30, .purple);
     try addBuiltin(set, "general-purpose", GENERAL_DESC, GENERAL_PROMPT, &.{}, &.{}, "inherit", null, 50, .green);
 }
@@ -374,9 +377,9 @@ test "AgentSet: injectBuiltins gives Explore/Plan/general-purpose" {
     try testing.expect(set.find("Explore") != null);
     try testing.expect(set.find("Plan") != null);
     try testing.expect(set.find("general-purpose") != null);
-    // Explore: 蓝色,Haiku
+    // Explore: 蓝色,low 档位
     try testing.expect(set.find("Explore").?.color == .blue);
-    try testing.expectEqualStrings("haiku", set.find("Explore").?.model);
+    try testing.expectEqualStrings("low", set.find("Explore").?.model);
     // Plan: 紫色
     const plan = set.find("Plan").?;
     try testing.expect(plan.color == .purple);

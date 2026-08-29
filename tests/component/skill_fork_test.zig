@@ -278,7 +278,12 @@ test "L2: shared Runtime fork honors model override" {
     var fixture: Fixture = undefined;
     try fixture.init(allocator, io_runtime.io(), root);
     defer fixture.deinit(allocator);
+    // skill.model=haiku 是兼容别名 → low 档:配置档位表后,fork 子请求应携带档位 model
+    //(未配置时为 inherit,不再映射硬编码 Anthropic ID)。
+    var tiers = cc.model_tiers.ProviderTiers{};
+    tiers.low = .{ .model = @constCast("tier-low-model") };
     var ctx = fixture.context(allocator, root, &client);
+    ctx.model_tiers = &tiers;
     const entry = fixture.registry.find("Skill").?;
     var output_body = try entry.execute(
         &ctx,
@@ -288,7 +293,7 @@ test "L2: shared Runtime fork honors model override" {
     try std.testing.expect(output_body == .@"inline");
     const capture = server.lastRequest() orelse return error.NoRequestCaptured;
     const model = capture.jsonField("model") orelse return error.ModelFieldMissing;
-    try std.testing.expect(std.mem.indexOf(u8, model, "haiku") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model, "tier-low-model") != null);
 }
 
 test "L2: unsupported agent binding fails before child execution" {

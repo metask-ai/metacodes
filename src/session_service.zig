@@ -124,9 +124,15 @@ pub const SessionService = struct {
     // ── 直接 mutation API（exec 内部调；也供非命令触发点直调，如 Shift+Tab/model-picker 键）──
 
     pub fn setModel(self: *SessionService, alloc: std.mem.Allocator, model_id: []const u8) CommandOutcome {
-        // U11:别名解析(sonnet/opus 等)先于守卫——对齐 loop.zig /model use 路径;
-        // 旧 web setModel 漏别名+漏 persistLoginSelection 的漂移在此收敛。
-        const resolved = @import("tools/agent.zig").resolveModelAlias(std.mem.trim(u8, model_id, " \t"));
+        // U11:档位/别名解析先于守卫——对齐 loop.zig /model use 路径。档位名
+        // (low/mid/high;兼容 haiku/sonnet/opus)查当前 provider 档位表;未配置时
+        // 按字面交给 provider 守卫拒绝(明确报错,不静默映射硬编码 ID,不无声 no-op)。
+        const trimmed = std.mem.trim(u8, model_id, " \t");
+        const resolved = @import("tools/agent.zig").resolveModelSelection(
+            self.app.activeModelTiers(),
+            trimmed,
+            null,
+        ).model orelse trimmed;
         // provider 守卫(对齐 loop.zig 旧 /model；顺带修 web /model 之前漏守卫)：收集当前
         // provider 的候选，拒绝跨 provider 的 model。候选 slice owned,元素借 catalog/BUILTINS。
         const candidates = model_command.collectCandidates(alloc, self.app.config.provider_kind, self.app.api_client.catalog.entries.items) catch {
@@ -436,6 +442,7 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .project_dir = app.project_dir_or_empty(),
         .agents = &app.agents,
         .parent_model = app.activeModel(),
+        .model_tiers = app.activeModelTiers(),
         .model_switch_compact = app.pendingModelSwitchCompact(),
         .skills_set = &app.skills,
         .mcp_sessions = &app.mcp_sessions.items,

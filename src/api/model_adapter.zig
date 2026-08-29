@@ -15,6 +15,8 @@
 //! - DeepSeek: thinking:{type} + reasoning_effort 顶层,1 档
 //! - Qwen3: enable_thinking + /think /no_think chat template
 //! - Mistral: reasoning_effort,parallel_tool_calls
+//! - MiniMax M3: thinking:{type: disabled|adaptive|enabled} 三态(effort 串仅兼容不调深度);
+//!   M2.x: thinking 常开不可关,reasoning_split 分离 reasoning_content(2026-08 调研)
 //!
 //! 调研来源:各厂商 chat_template.jinja / OpenAPI spec / 官方文档(2025-08 快照)。
 
@@ -41,6 +43,12 @@ pub const ThinkingMode = enum {
     /// Kimi K3:顶层 reasoning_effort(low/high/max 默认 max),不发 thinking body,
     /// 必须 省略 temperature/top_p/n 等参数。K3 总是开 thinking(不能关)。
     kimi_k3_top_level,
+    /// MiniMax M3:thinking:{type: disabled|adaptive|enabled} 三态;OpenAI-compat 的
+    /// reasoning.effort 档位串仅兼容接受、不调深度,故不发。
+    minimax_m3_thinking,
+    /// MiniMax M2.x:thinking 常开且不可关(disabled 被接受但忽略);只发
+    /// reasoning_split:true 让思考以 reasoning_content 平级字段返回。
+    minimax_m2_split,
 };
 
 /// 工具调用 wire 格式
@@ -63,6 +71,8 @@ pub const EffortLevels = enum {
     kimi_k2_3,
     /// DeepSeek:2 档(high/max)— V4 文档明确 xhigh→max(此前误为 high)
     deepseek_2,
+    /// MiniMax M3:三态(none→disabled,minimal/low→adaptive,medium+→enabled)。
+    minimax_3state,
     /// 不支持 effort
     none_,
 };
@@ -198,6 +208,23 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .returns_reasoning_content = true,
         };
     }
+    // MiniMax M3(三态 thinking;可关)
+    if (hasSubstr(model, "minimax-m3") or hasSubstr(model, "minimax_m3")) {
+        return .{
+            .thinking_mode = .minimax_m3_thinking,
+            .effort_levels = .minimax_3state,
+            .returns_reasoning_content = true,
+        };
+    }
+    // MiniMax M2.x(常开不可关;reasoning_split 平级返回思考)
+    if (hasSubstr(model, "minimax")) {
+        return .{
+            .thinking_mode = .minimax_m2_split,
+            .effort_levels = .none_,
+            .returns_reasoning_content = true,
+            .cannot_disable_thinking = true,
+        };
+    }
     // Mistral
     if (hasSubstr(model, "mistral") or hasSubstr(model, "magistral")) {
         return .{
@@ -257,6 +284,19 @@ pub fn deepseekEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]con
         .none, .minimal => null, // 跳过
         .low, .medium, .high => "high",
         .xhigh => "max",
+    };
+}
+
+/// MiniMax M3 的 thinking 三态映射:none→disabled,minimal/low→adaptive(模型自判),
+/// medium/high/xhigh→enabled(强制)。null(未指定)→ adaptive(官方默认,显式发送保证
+/// 请求字节确定性)。来源:platform.minimax.io responses-create + MiniMax-M3 model card
+/// (2026-08 调研):OpenAI-compat 的 reasoning.effort 串仅兼容接受、不调 M3 深度。
+pub fn minimaxM3ThinkingType(effort: ?@import("../types.zig").ReasoningEffort) []const u8 {
+    const e = effort orelse return "adaptive";
+    return switch (e) {
+        .none => "disabled",
+        .minimal, .low => "adaptive",
+        .medium, .high, .xhigh => "enabled",
     };
 }
 
@@ -371,6 +411,32 @@ test "deepseekEffortMap 2 档(V4 xhigh→max)" {
     try std.testing.expectEqualStrings("high", deepseekEffortMap(.medium).?);
     try std.testing.expectEqualStrings("high", deepseekEffortMap(.high).?);
     try std.testing.expectEqualStrings("max", deepseekEffortMap(.xhigh).?);
+}
+
+test "profileFor: MiniMax M3(三态 thinking,可关)" {
+    const p = profileFor(.openai, "minimax-m3");
+    try std.testing.expect(p.thinking_mode == .minimax_m3_thinking);
+    try std.testing.expect(p.effort_levels == .minimax_3state);
+    try std.testing.expect(p.returns_reasoning_content);
+    try std.testing.expect(!p.cannot_disable_thinking);
+}
+
+test "profileFor: MiniMax M2.1(常开不可关)" {
+    const p = profileFor(.openai, "minimax-m2.1");
+    try std.testing.expect(p.thinking_mode == .minimax_m2_split);
+    try std.testing.expect(p.effort_levels == .none_);
+    try std.testing.expect(p.returns_reasoning_content);
+    try std.testing.expect(p.cannot_disable_thinking);
+}
+
+test "minimaxM3ThinkingType 三态映射" {
+    try std.testing.expectEqualStrings("adaptive", minimaxM3ThinkingType(null));
+    try std.testing.expectEqualStrings("disabled", minimaxM3ThinkingType(.none));
+    try std.testing.expectEqualStrings("adaptive", minimaxM3ThinkingType(.minimal));
+    try std.testing.expectEqualStrings("adaptive", minimaxM3ThinkingType(.low));
+    try std.testing.expectEqualStrings("enabled", minimaxM3ThinkingType(.medium));
+    try std.testing.expectEqualStrings("enabled", minimaxM3ThinkingType(.high));
+    try std.testing.expectEqualStrings("enabled", minimaxM3ThinkingType(.xhigh));
 }
 
 test "profileFor: other 保守默认" {

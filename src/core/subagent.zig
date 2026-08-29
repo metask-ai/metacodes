@@ -58,6 +58,8 @@ pub const SpawnOptions = struct {
     /// per-spawn model 覆盖(用 AgentDef.model 解析后的具体 model 名;"inherit" 父端
     /// 自己已经解析过,这里只接受具体 model 名或 null)。
     model_override: ?[]const u8 = null,
+    /// 档位表透传(嵌套 Task:子 agent 里再 spawn 时仍能解析 low/mid/high)。
+    model_tiers: ?*const @import("../api/model_tiers.zig").ProviderTiers = null,
     /// AgentDef.effort override。Anthropic client 在本 isolated run 期间临时覆盖，结束恢复。
     reasoning_effort_override: ?@import("../types.zig").ReasoningEffort = null,
     /// AgentDef.overrides override(per-subagent 方言字段:temperature/top_p/prompt_cache_key/
@@ -236,6 +238,7 @@ pub fn spawnAgentSink(
             .project_dir = opts.project_dir,
             .session_id = opts.session.asSlice(),
             .model_override = opts.model_override,
+            .model_tiers = opts.model_tiers,
             .tasks = &sub_tasks,
             .kg = child_kg_ptr,
             .kg_projects_dir = opts.kg_projects_dir,
