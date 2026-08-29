@@ -515,6 +515,7 @@ pub const TuiBackend = struct {
         var parser = input.KeyParser{}; // 本线程独占,不持锁
         var editor = input.LineEditor.init(allocator);
         defer editor.deinit();
+        var dead_reads: u32 = 0; // 连续"poll 可读却读不到字节"计数(终端 hangup 检测)
 
         while (!self.input_stop.load(.acquire)) {
             // ESC 待决时用短超时(40ms)→ 孤立 ESC 快速兑现为中断;否则常规 100ms tick。
@@ -532,7 +533,23 @@ pub const TuiBackend = struct {
 
             var b: [1]u8 = undefined;
             const n = platform_term.readInput(fd, &b); // console 宽读统一入口(review-2 F4)
-            if (n <= 0) continue;
+            if (n <= 0) {
+                // poll 报可读却无字节:stdin EOF(pty master 已关,n==0)或死终端读错误
+                // (Linux EIO,n<0)。continue 会让 poll 立即再报可读 → 忙转:终端已死,
+                // 进程整核空转且 agent 继续烧 turn(SIGHUP 被忽略的环境——nohup/CI 驱动
+                // ——离线 tty 套件必现挂死)。偶发 EINTR 同落 n<0,故用连续计数区分:
+                // 活终端不会持续"可读零字节"。达阈值视作 hangup:等价 esc 中断当前推理
+                // (abort + 停全部 agent job)并退出 watcher;主线程收尾后回主输入循环,
+                // 读 stdin 同见 EOF → 走既有 Ctrl+D 退出路径。
+                dead_reads += 1;
+                if (dead_reads >= 8) {
+                    if (self.input_abort) |ab| ab.abort(.user_ctrl_c);
+                    if (app.agent_jobs) |*reg| _ = reg.abortAllRunning();
+                    return;
+                }
+                continue;
+            }
+            dead_reads = 0;
 
             const key = parser.feed(b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
             self.handleKey(snap, key, &editor);

@@ -634,7 +634,9 @@ fn finishRun(backend: *const UiBackend, sess: @import("session_id.zig").SessionI
 ///
 /// 关键不变式由 `output_semantics.Tracker` 保证:同一时刻至多一个段打开,每段恰关闭一次
 /// (重复关闭是 no-op,不会造出配不上对的 `output_segment_end`)。因此调用点可以无条件
-/// 调 `close`,不用先判断"现在到底开着没"。
+/// 调 `close`,不用先判断"现在到底开着没"。反向的配对由 `begin` 兜底:若某个循环出口
+/// 漏了收段,下一轮 `begin` 先把悬开段以 .partial 收口再开新段,消费者永远不会看到
+/// 无配对的 `output_segment_begin`(漏关仍是 bug——正文进不了 Ledger,故留 warn 日志)。
 const OutputChannel = struct {
     backend: *const UiBackend,
     session: @import("session_id.zig").SessionId,
@@ -645,6 +647,13 @@ const OutputChannel = struct {
     pending_bytes: u64 = 0,
 
     fn begin(self: *OutputChannel, turn: u32) void {
+        // 配对兜底(见顶注):漏关的段在这里以 .partial 收口,end 事件照发。
+        // Tracker.begin 直接覆盖 self.open,不经此处收口的话,那个 begin 事件
+        // 永远等不到配对的 end,Ledger 也不记这段。
+        if (self.tracker.isOpen()) {
+            log.warn("agent", "output segment leaked open across turns; closing as partial (missing close at a loop exit)", .{});
+            self.close(.partial, "");
+        }
         const seg = self.tracker.begin(turn);
         self.pending_bytes = 0;
         self.backend.emitEvent(self.session, .{ .output_segment_begin = .{
@@ -1707,10 +1716,18 @@ pub fn run(
                 if (required_first_repairs >= MAX_REQUIRED_FIRST_REPAIRS or
                     !host_injection_meter.tryConsume())
                 {
+                    // fail-closed:定性与 run 顶部 defer 兜底一致(.partial),但必须趁
+                    // assistant_text 还在作用域时显式收段——兜底只有权威字节数,Ledger
+                    // 会丢这段 partial 正文。
+                    output_channel.close(.partial, assistant_text.items);
                     backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
                 }
                 required_first_repairs += 1;
+                // 主机拒绝过早的"最终答案"并注入 required-first 修复 → 本段是过程
+                // 信息(与其它 nudge 路径同款定性),不是答案。不收段的话它会跨轮
+                // 悬开,破坏"段开/关严格配对"的协议不变式。
+                output_channel.close(.commentary, assistant_text.items);
                 const route = required_first_route.?;
                 const repair = try requiredFirstRepairText(allocator, route);
                 defer allocator.free(repair);
