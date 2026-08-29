@@ -2813,7 +2813,13 @@ fn estimateMessageTokens(m: msg.Message) usize {
         switch (b) {
             .text => |t| total += Conversation.estimateTokens(t),
             .tool_use => |tu| total += Conversation.estimateTokens(tu.name) + Conversation.estimateTokens(tu.input),
-            .tool_result => |tr| total += Conversation.estimateTokens(tr.content),
+            // usage-anchor 热路径同口径:Read 图像 tool_result 落在锚点后缀时按
+            // IMAGE_TOKEN_ESTIMATE 计,否则一次大图 Read 就把 anchor+增量推过
+            // auto_threshold,每图强制一次有损 compact。
+            .tool_result => |tr| total += if (json_mod.extractImageResult(tr.content) != null)
+                conversation_mod.IMAGE_TOKEN_ESTIMATE
+            else
+                Conversation.estimateTokens(tr.content),
             .thinking => {},
             .image => total += conversation_mod.IMAGE_TOKEN_ESTIMATE,
         }
@@ -5111,4 +5117,22 @@ test "canonical 请求身份:非 claude vision 模型带图可算,图内容参�
     // 同输入 → 同身份(确定性)。
     const h1_again = try canonicalAgentRequestSha256(a, provider, &m1, null, &.{}, null);
     try std.testing.expectEqualStrings(&h1, &h1_again);
+}
+
+test "usage-anchor 热路径:Read 图像 tool_result 增量按 IMAGE_TOKEN_ESTIMATE 计" {
+    // 锚点后缀里一条 5MB 级图像 tool_result 若按字节/4 计 → anchor+~125 万,
+    // maybeAutoCompact 每图强制一次有损 compact(review 轮修复,此测试锁定)。
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, 400_000);
+    defer a.free(big);
+    @memset(big, 'A');
+    const tr_content = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{big});
+    defer a.free(tr_content);
+    const blocks = [_]msg.Block{
+        .{ .tool_result = .{ .tool_use_id = "t1", .content = tr_content } },
+    };
+    const m = msg.Message{ .role = .user, .blocks = @constCast(&blocks) };
+    const total = estimateMessageTokens(m);
+    try std.testing.expect(total >= conversation_mod.IMAGE_TOKEN_ESTIMATE);
+    try std.testing.expect(total < 50_000);
 }

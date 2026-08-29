@@ -1182,9 +1182,11 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         } else if (std.mem.eql(u8, arg, "-")) {
             // 从 stdin 读全部作为 prompt（headless pipe 模式）。读失败显式落
             // parse_error——静默 null 会掉进 TUI(或触发误导的 --image 组合报错)。
-            config.prompt = readAllStdin(allocator) catch blk: {
+            config.prompt = readAllStdin(allocator) catch {
+                // 与其它 setParseError 站点一致地立即返回:继续解析会让后续错误覆盖
+                // 本条(泄漏 allocPrint 串),第二个 `-` 还会对已失败的 stdin 重读。
                 setParseError(config, allocator, "failed to read stdin prompt for '-'", .{});
-                break :blk null;
+                return;
             };
         } else {
             // 未识别参数一律 fail-closed:记录后停止解析,由 main 报错退出。
@@ -1285,7 +1287,7 @@ fn printHelp() void {
         \\  --max-tokens <n>      Override max output tokens per request
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
-        \\  --image <path>        Headless: attach an image (png/jpg/gif/webp) to the prompt (repeatable, order kept)
+        \\  --image <path>        Headless: attach an image (png/jpg/jpeg/gif/webp) to the prompt (repeatable, order kept)
         \\  --dump-prompt         Print the assembled system prompt and exit
         \\  --dump-plugins        Print the immutable plugin inventory JSON and exit
         \\  serve [port]          Daemon mode (HTTP; default port 7777)

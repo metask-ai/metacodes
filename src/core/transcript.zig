@@ -246,13 +246,18 @@ pub const Writer = struct {
                 break;
             };
             if (title.len > 0) break;
-            // 纯图 user 消息(--image 允许空 prompt):给 /resume 列表一个可辨识标签,
-            // 而不是空行。后续消息有 text 时仍会被上面的循环覆盖(先到先得,不覆盖)。
-            for (m.blocks) |b| if (b == .image) {
-                title = "[image]";
-                break;
-            };
-            if (title.len > 0) break;
+        }
+        // 纯图会话兜底:整个扫描找不到任何 user text(--image 允许空 prompt)才落
+        // "[image]" 标签——首条是图、后续消息有 text 时,text 仍然胜出(不因图占位
+        // 而永远锁死 /resume 列表标题)。
+        if (title.len == 0) {
+            outer: for (messages) |m| {
+                if (m.role != .user) continue;
+                for (m.blocks) |b| if (b == .image) {
+                    title = "[image]";
+                    break :outer;
+                };
+            }
         }
 
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -830,4 +835,59 @@ test "image + thinking 块 transcript roundtrip(issue #10 会话恢复语义)" {
     const asst_blocks = conv2.messages.items[1].blocks;
     try std.testing.expectEqualStrings("推理内容", asst_blocks[0].thinking);
     try std.testing.expectEqualStrings("两张图分别是…", asst_blocks[1].text);
+}
+
+test "title_guess: 纯图首条不锁死标题,后续 user text 胜出;全程无 text 才落 [image]" {
+    const a = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-title-img-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+    var writer = try Writer.init(a, "/dummy", tmp_home, "m", genSessionId());
+    defer writer.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    const blks = try a.alloc(msg_mod.Block, 1);
+    blks[0] = .{ .image = .{ .media_type = try a.dupe(u8, "image/png"), .data = try a.dupe(u8, "UE5H") } };
+    try conv.append(.{ .role = .user, .blocks = blks });
+    writer.flush(&conv);
+
+    {
+        const raw = try readMetaForTest(a, writer.dir);
+        defer a.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"title_guess\":\"[image]\"") != null);
+    }
+
+    // 后续 user text → 标题被 text 取代(不被 [image] 占位锁死)。
+    try conv.appendText(.user, "fix the login bug");
+    writer.flush(&conv);
+    {
+        const raw = try readMetaForTest(a, writer.dir);
+        defer a.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"title_guess\":\"fix the login bug\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "[image]") == null);
+    }
+}
+
+fn readMetaForTest(allocator: std.mem.Allocator, session_dir: []const u8) ![]u8 {
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/meta.json\x00", .{session_dir});
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    var all = std.ArrayList(u8).empty;
+    errdefer all.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = pfs.read(fd, &buf);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try all.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+    return all.toOwnedSlice(allocator);
 }

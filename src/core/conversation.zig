@@ -10,6 +10,7 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const msg = @import("message.zig");
 const result_projection = @import("result_projection.zig");
+const json_mod = @import("../json.zig");
 
 pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";
 pub const TOOL_RESULT_COMMITMENT_PREFIX = "[tool-result-commitment ";
@@ -361,7 +362,13 @@ pub const Conversation = struct {
             for (m.blocks) |b| switch (b) {
                 .text => |t| total += estimateTokens(t),
                 .tool_use => |tu| total += estimateTokens(tu.input) + estimateTokens(tu.name),
-                .tool_result => |tr| total += estimateTokens(tr.content),
+                // Read 工具图像形态 tool_result 与一等 image 同口径:按 IMAGE_TOKEN_ESTIMATE
+                // 计,不按 base64 字节/4(否则 3.75MB 截图 ≈ 125 万 token,fallback 估算
+                // 误触发 auto-compact——与 serializeForEstimation 投影同一不变量)。
+                .tool_result => |tr| total += if (json_mod.extractImageResult(tr.content) != null)
+                    IMAGE_TOKEN_ESTIMATE
+                else
+                    estimateTokens(tr.content),
                 .thinking => |t| total += estimateTokens(t),
                 .image => total += IMAGE_TOKEN_ESTIMATE,
             };
@@ -1319,4 +1326,20 @@ test "totalTokens: image block 按 IMAGE_TOKEN_ESTIMATE 计入" {
     } };
     try c.append(.{ .role = .user, .blocks = blocks });
     try std.testing.expect(c.totalTokens() >= IMAGE_TOKEN_ESTIMATE);
+}
+
+test "totalTokens: Read 图像形态 tool_result 按 IMAGE_TOKEN_ESTIMATE 计(fallback 不爆表)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const big = try a.alloc(u8, 400_000);
+    defer a.free(big);
+    @memset(big, 'A');
+    const tr_content = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{big});
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t1"), .content = tr_content } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    const total = c.totalTokens();
+    try std.testing.expect(total >= IMAGE_TOKEN_ESTIMATE);
+    try std.testing.expect(total < 50_000); // 远小于按字节计的 ~10 万
 }

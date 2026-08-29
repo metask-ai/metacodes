@@ -257,15 +257,26 @@ fn openaiProfile(model: []const u8) ModelProfile {
     };
 }
 
-/// OpenAI 原生已验证 vision 家族:GPT-4o/4.1/GPT-5/ChatGPT 全系;推理系中 o1(非
-/// mini/preview)、o3(非 mini)、o4 支持。o1-mini/o1-preview/o3-mini/GPT-3.5 与一切
-/// 未知名字保守 false。
+/// OpenAI 原生已验证 vision 家族:GPT-4o/4.1/4.5/GPT-5/ChatGPT 全系、gpt-4-turbo/
+/// gpt-4-vision;推理系 o1/o3/o4(o1-mini/o1-preview/o3-mini 除外)。o 系按**前缀+
+/// 边界**匹配——裸子串会把 marco-o1/skywork-o1 这类第三方文本模型误判成 vision
+/// (正是本表要关死的远端 400 模式)。GPT-3.5/裸 gpt-4(0613 代)与一切未知名字保守 false。
 fn openaiNativeVision(model: []const u8) bool {
     if (hasSubstr(model, "gpt-4o") or hasSubstr(model, "gpt-4.1") or
+        hasSubstr(model, "gpt-4.5") or hasSubstr(model, "gpt-4-turbo") or
+        hasSubstr(model, "gpt-4-vision") or
         hasSubstr(model, "gpt-5") or hasSubstr(model, "chatgpt")) return true;
     if (hasSubstr(model, "o1-mini") or hasSubstr(model, "o1-preview") or
         hasSubstr(model, "o3-mini")) return false;
-    return hasSubstr(model, "o1") or hasSubstr(model, "o3") or hasSubstr(model, "o4");
+    return oSeriesPrefix(model, "o1") or oSeriesPrefix(model, "o3") or oSeriesPrefix(model, "o4");
+}
+
+/// o 系推理模型名以 "oN" 开头且后随边界(结尾/'-'/'.'):o1、o3-pro、o4-mini-2025 命中;
+/// marco-o1、skywork-o1、olmo-4 等不命中。
+fn oSeriesPrefix(model: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, model, prefix)) return false;
+    if (model.len == prefix.len) return true;
+    return model[prefix.len] == '-' or model[prefix.len] == '.';
 }
 
 fn geminiProfile(model: []const u8) ModelProfile {
@@ -486,6 +497,12 @@ test "profileFor: vision 能力矩阵(issue #10)" {
     try std.testing.expect(!profileFor(.openai, "o3-mini").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "o1-mini").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "gpt-3.5-turbo").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "gpt-4-turbo-2024-04-09").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "o4-mini").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "o1-2024-12-17").supports_image_input);
+    // o 系是前缀匹配:含 "o1" 子串的第三方文本模型不误判(marco-o1 等)。
+    try std.testing.expect(!profileFor(.openai, "marco-o1").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "skywork-o1-open").supports_image_input);
     // 未知模型名落 OpenAI catch-all:vision 必须 fail-closed(不发远端赌 400)。
     try std.testing.expect(!profileFor(.openai, "llama-3.3-70b").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "grok-4").supports_image_input);
