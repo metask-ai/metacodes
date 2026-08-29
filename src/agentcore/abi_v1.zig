@@ -3970,6 +3970,26 @@ fn provider(code: u32) ?core.types.ProviderKind {
     };
 }
 
+/// Interpret protocol_kind_code in the selected provider's namespace. The
+/// OpenAI-specific return type exists only because this is the adapter to the
+/// current Core factory; AgentCore configuration remains provider-neutral.
+fn coreOpenAiProtocol(
+    kind: core.types.ProviderKind,
+    protocol_code: u32,
+) ?core.types.OpenAIProtocol {
+    return switch (kind) {
+        .openai => switch (protocol_code) {
+            wire.PROTOCOL_DEFAULT => .chat_completions,
+            wire.OPENAI_PROTOCOL_RESPONSES => .responses,
+            else => null,
+        },
+        .anthropic, .gemini => if (protocol_code == wire.PROTOCOL_DEFAULT)
+            .chat_completions
+        else
+            null,
+    };
+}
+
 fn permissionMode(code: u32) ?core.types.PermissionMode {
     return switch (code) {
         wire.PERMISSION_DEFAULT => .default,
@@ -5079,6 +5099,7 @@ fn runtimeDescribeMcp(
 const SessionBuildConfig = struct {
     callbacks: wire.SessionCallbacksV1,
     provider_kind: core.types.ProviderKind,
+    protocol_kind_code: u32 = wire.PROTOCOL_DEFAULT,
     api_key: []const u8,
     model: []const u8,
     base_url: ?[]const u8,
@@ -5106,6 +5127,7 @@ const SessionBuildConfig = struct {
 const RestoreHostConfig = struct {
     callbacks: wire.SessionCallbacksV1,
     provider_kind: core.types.ProviderKind,
+    protocol_kind_code: u32 = wire.PROTOCOL_DEFAULT,
     api_key: []const u8,
     base_url: ?[]const u8,
     permission_mode: core.types.PermissionMode,
@@ -5347,8 +5369,13 @@ fn buildAbiSession(
         self.permission_state.deinit();
     }
 
+    const openai_protocol = coreOpenAiProtocol(
+        config.provider_kind,
+        config.protocol_kind_code,
+    ) orelse return error.InvalidProviderProtocol;
     const core_config = core.agent_session.SessionConfig{
         .provider_kind = config.provider_kind,
+        .openai_protocol = openai_protocol,
         .api_key = config.api_key,
         .model = config.model,
         .base_url = config.base_url,
@@ -5653,6 +5680,7 @@ fn restoreCheckpoint(
     const self = try buildAbiSession(runtime, .{
         .callbacks = config.callbacks,
         .provider_kind = config.provider_kind,
+        .protocol_kind_code = config.protocol_kind_code,
         .api_key = config.api_key,
         .model = decoded.model,
         .base_url = config.base_url,
@@ -5927,13 +5955,16 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const callbacks = callbacks_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session callbacks are required", out_error);
     const out = out_session orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_session is required", out_error);
     if (config.struct_size != @sizeOf(wire.SessionCreateConfigV1) or config.reserved0 != 0 or !allZero(config.reserved) or
-        host.struct_size != @sizeOf(wire.SessionHostConfigV1) or host.reserved0 != 0 or
+        host.struct_size != @sizeOf(wire.SessionHostConfigV1) or
         !allZero(host.reserved) or
         callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or callbacks.reserved0 != 0 or
         !allZero(callbacks.reserved) or callbacks.on_event == null or
         (callbacks.on_ui_request != null and callbacks.release_response == null))
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid Session create, Host, or callback config", out_error);
-    const kind = provider(host.provider_kind_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown provider", out_error);
+    const kind = provider(host.provider_kind_code) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "unknown provider", out_error);
+    _ = coreOpenAiProtocol(kind, host.protocol_kind_code) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "unknown protocol for provider", out_error);
     const mode = permissionMode(host.permission_mode_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
     const shell = shellPolicy(host.shell_policy_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown shell policy", out_error);
     const run_journal = runJournalMode(host.run_journal_mode_code) orelse
@@ -6025,6 +6056,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const self = buildAbiSession(runtime, .{
         .callbacks = callbacks.*,
         .provider_kind = kind,
+        .protocol_kind_code = host.protocol_kind_code,
         .api_key = api_key,
         .model = model,
         .base_url = if (base_url.len == 0) null else base_url,
@@ -6086,7 +6118,7 @@ fn sessionRestore(
     if (config.struct_size != @sizeOf(wire.SessionRestoreConfigV1) or
         config.reserved0 != 0 or !allZero(config.reserved) or
         host.struct_size != @sizeOf(wire.SessionHostConfigV1) or
-        host.reserved0 != 0 or !allZero(host.reserved) or
+        !allZero(host.reserved) or
         callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or
         callbacks.reserved0 != 0 or !allZero(callbacks.reserved) or
         callbacks.on_event == null or
@@ -6100,6 +6132,8 @@ fn sessionRestore(
     defer runtime_call.deinit();
     const kind = provider(host.provider_kind_code) orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "unknown provider", out_error);
+    _ = coreOpenAiProtocol(kind, host.protocol_kind_code) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "unknown protocol for provider", out_error);
     const mode = permissionMode(host.permission_mode_code) orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
     const shell = shellPolicy(host.shell_policy_code) orelse
@@ -6198,6 +6232,7 @@ fn sessionRestore(
         .{
             .callbacks = callbacks.*,
             .provider_kind = kind,
+            .protocol_kind_code = host.protocol_kind_code,
             .api_key = api_key,
             .base_url = if (base_url.len == 0) null else base_url,
             .permission_mode = mode,

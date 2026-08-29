@@ -157,7 +157,14 @@ must validate ABI revision 14, the exact 64-byte root, all five mandatory typed
 tables, reserved zeros, function slots, and the schema-1 bundle manifest.
 Runtime/Session, sync run, abort, event/UI callbacks, checkpoint/restore, Host
 streaming tools, MCP streaming, process plugins, and durable journal profiles
-are covered. `on_event` is the per-Session serialized, non-durable Run
+are covered. `SessionHostConfigV1` combines `provider_kind_code`,
+`protocol_kind_code`, `base_url`, and the create/restore model binding. Protocol
+zero preserves each provider's existing default; OpenAI consumers may select
+`OPENAI_PROTOCOL_RESPONSES` explicitly to send Responses `input` requests and
+parse typed Responses SSE. Anthropic and Gemini currently accept only the
+default protocol code. Invalid provider/protocol pairs fail before network I/O,
+and neither URL nor model names select a protocol. `on_event` is the
+per-Session serialized, non-durable Run
 observation stream. Its typed events include authoritative visible-output
 segment boundaries and `commentary` / `final` / `continued` / `partial` /
 `discarded` classifications, plus structured `file_changes` evidence for

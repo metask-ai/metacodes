@@ -50,6 +50,10 @@ extern "C" {
 #define METASK_AGENTCORE_PROVIDER_ANTHROPIC 1u
 #define METASK_AGENTCORE_PROVIDER_OPENAI 2u
 #define METASK_AGENTCORE_PROVIDER_GEMINI 3u
+/* Zero selects the provider's existing default. Protocol-specific values are
+ * valid only with the provider named in the macro. */
+#define METASK_AGENTCORE_PROTOCOL_DEFAULT 0u
+#define METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES 1u
 #define METASK_AGENTCORE_PERMISSION_DEFAULT 1u
 #define METASK_AGENTCORE_PERMISSION_ACCEPT_EDITS 2u
 #define METASK_AGENTCORE_PERMISSION_AUTO 3u
@@ -543,7 +547,9 @@ typedef struct {
     /* One METASK_AGENTCORE_RUN_JOURNAL_* value. Durable mode writes the
      * unified provider/tool intent-result journal below workspace_home. */
     uint32_t run_journal_mode_code;
-    uint32_t reserved0;
+    /* METASK_AGENTCORE_PROTOCOL_DEFAULT, or a protocol code defined for
+     * provider_kind_code. No URL or model-name inference is performed. */
+    uint32_t protocol_kind_code;
     uint64_t reserved[3];
 } metask_agentcore_session_host_config_v1;
 
@@ -1006,7 +1012,7 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, permissi
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, mcp_selection, 120);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, durable_budget, 128);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, run_journal_mode_code, 136);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved0, 140);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, protocol_kind_code, 140);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved, 144);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, host, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, model, 16);

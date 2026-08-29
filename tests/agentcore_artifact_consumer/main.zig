@@ -6,6 +6,8 @@ const Server = @import("mock_server.zig").Server;
 comptime {
     if (wire.ABI_REVISION != 14 or
         @intFromEnum(wire.Status.skill_catalog_incomplete) != 27 or
+        wire.PROTOCOL_DEFAULT != 0 or
+        wire.OPENAI_PROTOCOL_RESPONSES != 1 or
         wire.MCP_NEGOTIATION_AUTO != 1 or
         wire.MCP_NEGOTIATION_MODERN_ONLY != 2 or
         wire.MCP_NEGOTIATION_LEGACY_ONLY != 3 or
@@ -80,6 +82,12 @@ const FINAL_SSE =
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
+
+const RESPONSES_FINAL_SSE =
+    "event: response.output_text.delta\n" ++
+    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_consumer\",\"output_index\":0,\"delta\":\"source-free responses done\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_consumer\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":2}}}\n\n";
 
 const SpinMutex = struct {
     state: std.atomic.Value(u8) = .init(0),
@@ -464,7 +472,6 @@ pub fn main(init: std.process.Init) !void {
         READ_ARTIFACT_SSE,
         FINAL_SSE,
         FINAL_SSE,
-        FINAL_SSE,
     };
     const server = try Server.start(init.io, &bodies);
     defer server.stop();
@@ -604,7 +611,7 @@ pub fn main(init: std.process.Init) !void {
         .mcp_selection = null,
         .durable_budget = null,
         .run_journal_mode_code = wire.RUN_JOURNAL_DURABLE_WORKSPACE,
-        .reserved0 = 0,
+        .protocol_kind_code = wire.PROTOCOL_DEFAULT,
         .reserved = [_]u64{0} ** 3,
     };
     var config = wire.SessionCreateConfigV1{
@@ -750,6 +757,12 @@ pub fn main(init: std.process.Init) !void {
         &diagnostic,
     ), diagnostic);
     api.bufferRelease()(&descriptor);
+    const responses_server = try Server.start(init.io, &.{RESPONSES_FINAL_SSE});
+    defer responses_server.stop();
+    const responses_url = try responses_server.url(a);
+    session_host.provider_kind_code = wire.PROVIDER_OPENAI;
+    session_host.protocol_kind_code = wire.OPENAI_PROTOCOL_RESPONSES;
+    session_host.base_url = sdk.bytesView(responses_url);
     session_host.skill_catalog = restored_catalog;
     var checkpoint_source = checkpoint.source();
     var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
@@ -792,7 +805,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.session().runText(
         session,
         3,
-        sdk.bytesView("continue after source-free restore"),
+        sdk.bytesView("continue through Responses after source-free restore"),
         &options,
         &result,
         &diagnostic,
@@ -807,7 +820,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 14 Agent Runtime, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 14 Agent Runtime, OpenAI Responses, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

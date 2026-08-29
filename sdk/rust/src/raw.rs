@@ -32,6 +32,8 @@ pub const METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE: u32 = 27;
 pub const METASK_AGENTCORE_PROVIDER_ANTHROPIC: u32 = 1;
 pub const METASK_AGENTCORE_PROVIDER_OPENAI: u32 = 2;
 pub const METASK_AGENTCORE_PROVIDER_GEMINI: u32 = 3;
+pub const METASK_AGENTCORE_PROTOCOL_DEFAULT: u32 = 0;
+pub const METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES: u32 = 1;
 pub const METASK_AGENTCORE_PERMISSION_DEFAULT: u32 = 1;
 pub const METASK_AGENTCORE_PERMISSION_ACCEPT_EDITS: u32 = 2;
 pub const METASK_AGENTCORE_PERMISSION_AUTO: u32 = 3;
@@ -1096,7 +1098,7 @@ pub struct metask_agentcore_session_host_config_v1 {
     pub mcp_selection: *const metask_agentcore_mcp_selection_v1,
     pub durable_budget: *const metask_agentcore_durable_budget_profile_v1,
     pub run_journal_mode_code: u32,
-    pub reserved0: u32,
+    pub protocol_kind_code: u32,
     pub reserved: [u64; 3usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -1152,8 +1154,8 @@ const _: () = {
         run_journal_mode_code
     )
         - 136usize];
-    ["Offset of field: metask_agentcore_session_host_config_v1::reserved0"]
-        [::std::mem::offset_of!(metask_agentcore_session_host_config_v1, reserved0) - 140usize];
+    ["Offset of field: metask_agentcore_session_host_config_v1::protocol_kind_code"]
+        [::std::mem::offset_of!(metask_agentcore_session_host_config_v1, protocol_kind_code) - 140usize];
     ["Offset of field: metask_agentcore_session_host_config_v1::reserved"]
         [::std::mem::offset_of!(metask_agentcore_session_host_config_v1, reserved) - 144usize];
 };
