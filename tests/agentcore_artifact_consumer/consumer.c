@@ -11,6 +11,8 @@
 
 #if METASK_AGENTCORE_ABI_REVISION != 14u || \
     METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE != 27u || \
+    METASK_AGENTCORE_PROTOCOL_DEFAULT != 0u || \
+    METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES != 1u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_AUTO != 1u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY != 2u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY != 3u || \
@@ -438,6 +440,7 @@ int main(void) {
     metask_agentcore_session_host_config_v1 session_host = {0};
     session_host.struct_size = sizeof(session_host);
     session_host.provider_kind_code = METASK_AGENTCORE_PROVIDER_ANTHROPIC;
+    session_host.protocol_kind_code = METASK_AGENTCORE_PROTOCOL_DEFAULT;
     session_host.permission_mode_code = METASK_AGENTCORE_PERMISSION_FULL_ACCESS;
     session_host.shell_policy_code = METASK_AGENTCORE_SHELL_DISABLED;
     session_host.api_key = view("c-consumer-key");

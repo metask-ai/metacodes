@@ -120,6 +120,10 @@ pub const ProviderKind = enum(u32) {
 pub const PROVIDER_ANTHROPIC: u32 = @intFromEnum(ProviderKind.anthropic);
 pub const PROVIDER_OPENAI: u32 = @intFromEnum(ProviderKind.openai);
 pub const PROVIDER_GEMINI: u32 = @intFromEnum(ProviderKind.gemini);
+/// Use the selected provider's existing default wire protocol.
+pub const PROTOCOL_DEFAULT: u32 = 0;
+/// OpenAI `POST /v1/responses`. Other providers reject this code.
+pub const OPENAI_PROTOCOL_RESPONSES: u32 = 1;
 
 pub const PERMISSION_DEFAULT: u32 = 1;
 pub const PERMISSION_ACCEPT_EDITS: u32 = 2;
@@ -716,7 +720,8 @@ pub const SessionHostConfigV1 = extern struct {
     durable_budget: ?*const DurableBudgetProfileV1,
     /// One RUN_JOURNAL_* value; durable mode writes below workspace_home.
     run_journal_mode_code: u32,
-    reserved0: u32,
+    /// PROTOCOL_DEFAULT, or a protocol code defined for provider_kind_code.
+    protocol_kind_code: u32,
     reserved: [3]u64,
 };
 
@@ -1120,7 +1125,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(SessionHostConfigV1, "mcp_selection"));
     try std.testing.expectEqual(@as(usize, 128), @offsetOf(SessionHostConfigV1, "durable_budget"));
     try std.testing.expectEqual(@as(usize, 136), @offsetOf(SessionHostConfigV1, "run_journal_mode_code"));
-    try std.testing.expectEqual(@as(usize, 140), @offsetOf(SessionHostConfigV1, "reserved0"));
+    try std.testing.expectEqual(@as(usize, 140), @offsetOf(SessionHostConfigV1, "protocol_kind_code"));
     try std.testing.expectEqual(@as(usize, 144), @offsetOf(SessionHostConfigV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SessionCreateConfigV1, "host"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionCreateConfigV1, "model"));

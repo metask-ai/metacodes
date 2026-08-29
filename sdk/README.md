@@ -12,6 +12,10 @@ Do not copy individual files into a release. Consume the complete generated bund
 and validate its manifest, hashes, target, ABI version, exact 64-byte root, all
 five mandatory typed tables, function slots, and reserved fields. Revision 14 is
 the Agent Runtime surface; it does not expose an independent Completion client.
+`SessionHostConfigV1.protocol_kind_code` is provider-scoped: zero preserves the
+provider default, while OpenAI may explicitly select
+`OPENAI_PROTOCOL_RESPONSES`. Pair it with `provider_kind_code`, the full endpoint
+override in `base_url`, and the Session model; no URL/model inference occurs.
 Build and exercise a native bundle with:
 
 ```sh

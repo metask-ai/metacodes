@@ -120,6 +120,30 @@ const OPENAI_FINAL_SSE =
     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
     "data: [DONE]\n\n";
 
+const OPENAI_RESPONSES_FINAL_SSE =
+    "event: response.created\n" ++
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_agentcore\"}}\n\n" ++
+    "event: response.output_text.delta\n" ++
+    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_agentcore\",\"output_index\":0,\"delta\":\"responses done\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_agentcore\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":2}}}\n\n";
+
+const OPENAI_RESPONSES_FORK_SKILL_SSE =
+    "event: response.output_item.added\n" ++
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_fork\",\"call_id\":\"call_fork\",\"name\":\"Skill\",\"arguments\":\"\"}}\n\n" ++
+    "event: response.function_call_arguments.done\n" ++
+    "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_fork\",\"output_index\":0,\"arguments\":\"{\\\"name\\\":\\\"forked\\\"}\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fork\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":2}}}\n\n";
+
+const OPENAI_RESPONSES_REVIEW_SKILL_SSE =
+    "event: response.output_item.added\n" ++
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_review\",\"call_id\":\"call_review\",\"name\":\"Skill\",\"arguments\":\"\"}}\n\n" ++
+    "event: response.function_call_arguments.done\n" ++
+    "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_review\",\"output_index\":0,\"arguments\":\"{\\\"name\\\":\\\"review\\\",\\\"values\\\":[\\\"README.md\\\"]}\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_review\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":2}}}\n\n";
+
 const GEMINI_FINAL_SSE =
     "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gemini done\"}]},\"finishReason\":\"STOP\"}]," ++
     "\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":3,\"cachedContentTokenCount\":1}}\n\n";
@@ -793,12 +817,50 @@ const PublicSessionFixture = struct {
         );
     }
 
+    fn initProvider(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        provider_kind_code: u32,
+        protocol_kind_code: u32,
+    ) !PublicSessionFixture {
+        return initProviderConfigured(
+            root,
+            base_url,
+            model,
+            null,
+            wire.RUN_JOURNAL_EPHEMERAL,
+            provider_kind_code,
+            protocol_kind_code,
+        );
+    }
+
     fn initConfigured(
         root: []const u8,
         base_url: []const u8,
         model: []const u8,
         budget: ?*const wire.DurableBudgetProfileV1,
         run_journal_mode_code: u32,
+    ) !PublicSessionFixture {
+        return initProviderConfigured(
+            root,
+            base_url,
+            model,
+            budget,
+            run_journal_mode_code,
+            wire.PROVIDER_ANTHROPIC,
+            wire.PROTOCOL_DEFAULT,
+        );
+    }
+
+    fn initProviderConfigured(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        budget: ?*const wire.DurableBudgetProfileV1,
+        run_journal_mode_code: u32,
+        provider_kind_code: u32,
+        protocol_kind_code: u32,
     ) !PublicSessionFixture {
         const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
             return error.MissingApi;
@@ -816,7 +878,7 @@ const PublicSessionFixture = struct {
 
         var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
         host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
-        host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+        host_config.provider_kind_code = provider_kind_code;
         host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
         host_config.shell_policy_code = wire.SHELL_DISABLED;
         host_config.api_key = sdk.bytesView("test-key");
@@ -825,6 +887,7 @@ const PublicSessionFixture = struct {
         host_config.workspace_home = sdk.bytesView(root);
         host_config.durable_budget = budget;
         host_config.run_journal_mode_code = run_journal_mode_code;
+        host_config.protocol_kind_code = protocol_kind_code;
         var session_config = sessionCreateConfig(&host_config, model);
         var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
         callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
@@ -933,7 +996,7 @@ test "L2 public AgentCore durable Run journal records the physical provider effe
     try std.testing.expectEqual(@as(usize, 1), server.requestCount());
 }
 
-test "Revision 13 public Session rejects unknown Run journal mode and nonzero replacement reserve" {
+test "Revision 14 public Session rejects unknown Run journal and provider protocol codes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -977,12 +1040,70 @@ test "Revision 13 public Session rejects unknown Run journal mode and nonzero re
     api.bufferRelease()(&diagnostic);
 
     host.run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL;
-    host.reserved0 = 1;
+    host.protocol_kind_code = wire.OPENAI_PROTOCOL_RESPONSES;
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
         api.session().create()(runtime, &create, &callbacks, &session, &diagnostic),
     );
     try std.testing.expect(session == null);
+
+    api.bufferRelease()(&diagnostic);
+    host.provider_kind_code = wire.PROVIDER_OPENAI;
+    host.protocol_kind_code = std.math.maxInt(u32);
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.session().create()(runtime, &create, &callbacks, &session, &diagnostic),
+    );
+    try std.testing.expect(session == null);
+}
+
+test "L2 public AgentCore selects OpenAI Responses and preserves it across set_model" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(
+        &.{ OPENAI_RESPONSES_FINAL_SSE, OPENAI_RESPONSES_FINAL_SSE },
+        0,
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var fixture = try PublicSessionFixture.initProvider(
+        root,
+        url,
+        "responses-model",
+        wire.PROVIDER_OPENAI,
+        wire.OPENAI_PROTOCOL_RESPONSES,
+    );
+    defer fixture.deinit();
+
+    var result = try fixture.runText(1, "use the Responses protocol");
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    const first_body = (server.requestAt(0) orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, first_body, "\"input\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_body, "\"store\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_body, "\"messages\":") == null);
+
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionControl().setModel()(
+            fixture.session,
+            sdk.bytesView("replacement-responses-model"),
+            &fixture.diagnostic,
+        ),
+    );
+    result = try fixture.runText(2, "keep using the Responses protocol");
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    const second = server.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expectEqualStrings(
+        "\"replacement-responses-model\"",
+        second.jsonField("model").?,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"input\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"messages\":") == null);
 }
 
 test "L2 durable budget profile crosses the public wire and rejects before Run admission" {
@@ -6279,6 +6400,88 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
         std.mem.indexOf(u8, openai_body, "\"tool_call_id\":\"call_skill\"") != null,
     );
 
+    const responses_fork_bodies = [_][]const u8{
+        OPENAI_RESPONSES_REVIEW_SKILL_SSE,
+        OPENAI_RESPONSES_FINAL_SSE,
+        OPENAI_RESPONSES_FORK_SKILL_SSE,
+        OPENAI_RESPONSES_REVIEW_SKILL_SSE,
+        OPENAI_RESPONSES_FINAL_SSE,
+        OPENAI_RESPONSES_FINAL_SSE,
+    };
+    var responses_fork_server = try harness.MockServer.startCassette(
+        &responses_fork_bodies,
+        0,
+    );
+    defer responses_fork_server.stop();
+    const responses_fork_url = try responses_fork_server.urlOwned(a);
+    defer a.free(responses_fork_url);
+
+    host_config.protocol_kind_code = wire.OPENAI_PROTOCOL_RESPONSES;
+    host_config.base_url = sdk.bytesView(responses_fork_url);
+    var responses_fork_probe = Probe{};
+    callbacks.ctx = &responses_fork_probe;
+    var responses_fork_session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(
+            runtime,
+            &session_config,
+            &callbacks,
+            &responses_fork_session,
+            &diagnostic,
+        ),
+    );
+    responses_fork_probe.expected_session = responses_fork_session;
+    defer if (responses_fork_session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    options.max_turns = 5;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(
+            responses_fork_session,
+            1,
+            sdk.bytesView("Satisfy the required-first review Skill."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    responses_fork_probe.expected_run_id = 2;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(
+            responses_fork_session,
+            2,
+            sdk.bytesView("Use the forked Skill through Responses."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 6), responses_fork_server.requestCount());
+    var found_responses_fork_child = false;
+    for (0..responses_fork_server.requestCount()) |index| {
+        const request = responses_fork_server.requestAt(index) orelse continue;
+        if (std.mem.indexOf(
+            u8,
+            request.body(),
+            "AGENTCORE_FORK_CHILD_SENTINEL",
+        ) == null) continue;
+        found_responses_fork_child = true;
+        try std.testing.expect(std.mem.indexOf(u8, request.body(), "\"input\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, request.body(), "\"messages\":") == null);
+        try std.testing.expectEqualStrings(
+            "\"glm-5.2\"",
+            request.jsonField("model").?,
+        );
+    }
+    try std.testing.expect(found_responses_fork_child);
+    try std.testing.expect(!responses_fork_server.captureOverflowed());
+
     const fatal_bodies = [_][]const u8{
         FORK_SKILL_SSE,
         FINAL_SSE,
@@ -6292,6 +6495,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     defer a.free(fatal_url);
 
     host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.protocol_kind_code = wire.PROTOCOL_DEFAULT;
     host_config.base_url = sdk.bytesView(fatal_url);
     var fatal_probe = NestedSkillFatalProbe{};
     var fatal_callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
@@ -6404,7 +6608,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .mcp_selection = null,
         .durable_budget = null,
         .run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL,
-        .reserved0 = 0,
+        .protocol_kind_code = wire.PROTOCOL_DEFAULT,
         .reserved = [_]u64{0} ** 3,
     };
     var session_config = sessionCreateConfig(&host_config, "test-model");

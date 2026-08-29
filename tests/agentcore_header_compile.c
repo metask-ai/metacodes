@@ -27,6 +27,10 @@ _Static_assert(METASK_AGENTCORE_MAX_SKILL_CATALOG_CONTENT_BYTES_V1 == 67108864UL
                "catalog content limit changed");
 _Static_assert(METASK_AGENTCORE_MAX_SKILL_RUNTIME_RETAINED_SNAPSHOT_BYTES_V1 == 268435456ULL,
                "Runtime retained-snapshot limit changed");
+_Static_assert(METASK_AGENTCORE_PROTOCOL_DEFAULT == 0u,
+               "provider protocol default changed");
+_Static_assert(METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES == 1u,
+               "OpenAI Responses protocol code changed");
 
 const metask_agentcore_api_v1 *agentcore_header_compile_probe(void) {
     return metask_agentcore_api_v1_discover();
@@ -47,6 +51,7 @@ void agentcore_revision_fourteen_type_probe(void) {
 
     runtime.struct_size = (uint32_t)sizeof(runtime);
     host.struct_size = (uint32_t)sizeof(host);
+    host.protocol_kind_code = METASK_AGENTCORE_PROTOCOL_DEFAULT;
     create.struct_size = (uint32_t)sizeof(create);
     create.host = &host;
     restore.struct_size = (uint32_t)sizeof(restore);

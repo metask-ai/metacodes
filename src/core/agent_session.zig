@@ -625,6 +625,9 @@ pub const RunJournalConfig = union(enum) {
 
 pub const SessionConfig = struct {
     provider_kind: types.ProviderKind,
+    /// OpenAI wire protocol. Public adapters validate provider/protocol
+    /// pairing before this typed configuration reaches the Session.
+    openai_protocol: types.OpenAIProtocol = .chat_completions,
     api_key: []const u8,
     model: []const u8,
     base_url: ?[]const u8 = null,
@@ -1062,6 +1065,7 @@ pub const AgentSession = struct {
     api_key: []u8,
     model: []u8,
     base_url: ?[]u8,
+    openai_protocol: types.OpenAIProtocol,
     provider: provider_factory.OwnedProvider,
     conversation: Conversation,
     workspace: workspace_mod.WorkspacePolicy,
@@ -1106,15 +1110,13 @@ pub const AgentSession = struct {
 
     fn makeToolProvider(raw: *anyopaque) anyerror!provider_factory.OwnedProvider {
         const self: *AgentSession = @ptrCast(@alignCast(raw));
-        // SessionConfig 未暴露 openai_protocol(嵌入层协议选择不在 issue #4 范围):
-        // 固定 chat/completions。
         return provider_factory.makeProviderWithDialectResolver(
             std.heap.c_allocator,
             self.provider.kind(),
             self.api_key,
             self.model,
             self.base_url,
-            .chat_completions,
+            self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
         );
     }
@@ -1204,7 +1206,7 @@ pub const AgentSession = struct {
             api_key,
             model,
             base_url,
-            .chat_completions, // SessionConfig 未暴露 openai_protocol(嵌入层默认 chat)
+            config.openai_protocol,
             runtime.plugin_snapshot.dialectResolver(),
         );
         errdefer owned_provider.deinit();
@@ -1240,6 +1242,7 @@ pub const AgentSession = struct {
             .api_key = api_key,
             .model = model,
             .base_url = base_url,
+            .openai_protocol = config.openai_protocol,
             .provider = owned_provider,
             .conversation = conversation,
             .workspace = workspace,
@@ -1449,7 +1452,7 @@ pub const AgentSession = struct {
             self.api_key,
             replacement_model,
             self.base_url,
-            .chat_completions, // SessionConfig 未暴露 openai_protocol(嵌入层默认 chat)
+            self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
         ) catch |err| {
             self.cancelMutation();

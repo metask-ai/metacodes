@@ -666,6 +666,33 @@ shell tool selected under the disabled shell policy fail Session creation with
 `workspace_home` may be empty, in which case it defaults to the canonicalized
 `workspace_root`; a non-empty value must be absolute.
 
+### Provider protocol selection
+
+`SessionHostConfigV1` defines one provider connection as
+`provider_kind_code + protocol_kind_code + base_url`; the model remains in the
+fresh-create input or restored checkpoint. `protocol_kind_code` occupies byte
+offset 140 in the unchanged 168-byte Host config and accepts:
+
+- `METASK_AGENTCORE_PROTOCOL_DEFAULT` (`0`): use the selected provider's
+  existing default. In Revision 14 that means Anthropic Messages, OpenAI Chat
+  Completions, or Gemini GenerateContent;
+- `METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES` (`1`): valid only with
+  `METASK_AGENTCORE_PROVIDER_OPENAI`; serialize `POST /v1/responses` request
+  bodies and parse the typed Responses SSE event stream.
+
+Anthropic and Gemini reject every non-zero protocol code. OpenAI rejects every
+code other than `0` and `1`. Unknown or mismatched codes return
+`METASK_AGENTCORE_STATUS_INVALID_ARGUMENT` during fresh creation or restore,
+before any Provider request is attempted. AgentCore never infers a protocol
+from `base_url` or the model name. For OpenAI, an empty `base_url` lets the
+selected protocol choose its official endpoint; a non-empty `base_url` is the
+complete endpoint override and does not alter the selected protocol.
+
+The selection is Session-stable. It is retained when `set_model` rebuilds the
+Provider and inherited by Skill child Providers. Restore uses the current Host
+protocol selection just as it uses the current Host provider, credential, and
+endpoint; the checkpoint does not persist or override connection authority.
+
 ### Active-Run intent/result journal
 
 `SessionHostConfigV1.run_journal_mode_code` is part of the exact revision-14
