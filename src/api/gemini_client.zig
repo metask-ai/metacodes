@@ -25,7 +25,9 @@
 //!     配对(Gemini 靠 name 配对)。见 parseChunk functionCall 循环 / serializeGeminiContent。
 //!   - **建连重试 / 非流式 / thinking(thought parts)**:未做。(多模态 inline_data 的
 //!     图像**输入**已做——user 消息 image block 经 GeminiDialect.serializeImagePart 发
-//!     inline_data part,issue #10;图像输出/其它媒体仍未做。)
+//!     inline_data part,issue #10;图像 **tool_result**(Read 工具)也已做——Gemini 3 系发
+//!     官方 multimodal functionResponse,旧世代发同级 inline_data part,见
+//!     serializeGeminiContent;图像输出/其它媒体仍未做。)
 //!   - **max_tokens/context_window**:硬编码,未按 model 区分(Gemini 1.5 Pro 2M 等)。
 //!
 //! 取舍登记:keep_alive=false(每请求新连接)——牺牲真后端连接池(省 TLS 握手)换稳定性;
@@ -732,7 +734,19 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
         // parts(旧版只发首个 → 并行回合下一次请求缺 functionResponse 配对)。
         // functionResponse.name 必须是**原 functionCall 的真实名**(Gemini 靠 name 配对,非 id);
         // 从全量消息按 tool_use_id 找回真名,找不到才退回 id 占位。
+        //
+        // 图像 tool_result(Read 工具,dialect.extractImageResult 命中):
+        //   - Gemini 3 系(profile.supports_multimodal_function_response):官方 multimodal
+        //     functionResponse——图像嵌在 functionResponse.parts[].inlineData(camelCase,
+        //     照 v1beta discovery doc / function-calling#multimodal 的 REST 例),原生配对。
+        //   - 旧世代(2.5 等):functionResponse.response.result 发短指向文本,图像本体作
+        //     **同一 user content 的同级 inline_data part** 收尾(生产验证形态;functionResponse
+        //     part 数与上一轮 functionCall 数必须相等,同级 part 不计入)。
+        //   - 方言返 false(非 vision,防御分支):result 发短占位文本。
+        // 三种情况都绝不把 MB 级 base64 原文塞进 response.result 字符串。
         try out.appendSlice(allocator, "{\"role\":\"user\",\"parts\":[");
+        var sibling_parts: std.ArrayList(u8) = .empty; // 旧世代图像的同级 parts(含前导逗号)
+        defer sibling_parts.deinit(allocator);
         var first_fr = true;
         for (m.content) |c| switch (c) {
             .tool_result => |tr| {
@@ -742,11 +756,55 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
                 try out.appendSlice(allocator, "{\"functionResponse\":{\"name\":");
                 try util_json.serializeString(fname, out, allocator);
                 try out.appendSlice(allocator, ",\"response\":{\"result\":");
-                try util_json.serializeString(tr.content, out, allocator);
-                try out.appendSlice(allocator, "}}}");
+                if (dialect_mod.extractImageResult(tr.content)) |img| {
+                    if (profile.supports_image_input and profile.supports_multimodal_function_response) {
+                        var pointer: std.ArrayList(u8) = .empty;
+                        defer pointer.deinit(allocator);
+                        try pointer.appendSlice(allocator, "[image (");
+                        try pointer.appendSlice(allocator, img.media_type);
+                        try pointer.appendSlice(allocator, ") attached]");
+                        try util_json.serializeString(pointer.items, out, allocator);
+                        // response(必填)收口后嵌官方 parts:FunctionResponsePart.inlineData
+                        // (FunctionResponseBlob 与 Blob 字段名一致;camelCase 照官方例)。
+                        try out.appendSlice(allocator, "},\"parts\":[{\"inlineData\":{\"mimeType\":");
+                        try util_json.serializeString(img.media_type, out, allocator);
+                        try out.appendSlice(allocator, ",\"data\":");
+                        try util_json.serializeString(img.data, out, allocator);
+                        try out.appendSlice(allocator, "}}]}}");
+                    } else {
+                        // 旧世代:先 scratch 渲染同级 label+image part;方言返回值是
+                        // 指向文本/占位文本的唯一分支决策点,两者不可能不一致。
+                        const mark = sibling_parts.items.len;
+                        try sibling_parts.appendSlice(allocator, ",{\"text\":");
+                        var label: std.ArrayList(u8) = .empty;
+                        defer label.deinit(allocator);
+                        try label.appendSlice(allocator, "Image result of ");
+                        try label.appendSlice(allocator, fname);
+                        try label.append(allocator, ':');
+                        try util_json.serializeString(label.items, &sibling_parts, allocator);
+                        try sibling_parts.appendSlice(allocator, "},");
+                        const emitted = try dialect.serializeImagePart(profile, img, &sibling_parts, allocator);
+                        var result_text: std.ArrayList(u8) = .empty;
+                        defer result_text.deinit(allocator);
+                        if (emitted) {
+                            try result_text.appendSlice(allocator, "[image (");
+                            try result_text.appendSlice(allocator, img.media_type);
+                            try result_text.appendSlice(allocator, ") attached in this message]");
+                        } else {
+                            sibling_parts.shrinkRetainingCapacity(mark);
+                            try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &result_text, allocator);
+                        }
+                        try util_json.serializeString(result_text.items, out, allocator);
+                        try out.appendSlice(allocator, "}}}");
+                    }
+                } else {
+                    try util_json.serializeString(tr.content, out, allocator);
+                    try out.appendSlice(allocator, "}}}");
+                }
             },
             else => {},
         };
+        try out.appendSlice(allocator, sibling_parts.items);
         try out.appendSlice(allocator, "]}");
         return;
     }
@@ -996,4 +1054,78 @@ test "Gemini: image 在 text 前时顺序保持" {
     const img = std.mem.indexOf(u8, body, "\"inline_data\"").?;
     const txt = std.mem.indexOf(u8, body, "以上是截图").?;
     try std.testing.expect(img < txt);
+}
+
+// ── 图像 tool_result(Read 工具形态)────────────────────────────────────────────
+
+const IMG_TOOL_RESULT_JSON = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}";
+
+fn imageToolResultMsgs() [2]types.ApiMessage {
+    return .{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .tool_use = .{ .id = "t1", .name = "Read", .input = "{\"file_path\":\"a.png\"}" } },
+        } },
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = IMG_TOOL_RESULT_JSON } },
+        } },
+    };
+}
+
+test "Gemini 3: 图像 tool_result → 官方 multimodal functionResponse(嵌套 parts.inlineData)" {
+    const a = std.testing.allocator;
+    const msgs = imageToolResultMsgs();
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-3-flash", null, null);
+    defer a.free(body);
+    // 官方形态(function-calling#multimodal / v1beta discovery doc):图像嵌在
+    // functionResponse.parts,response(必填)只留短指向文本。字节级锁定。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached]\"},\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}]}}") != null);
+    // base64 只出现在 inlineData,绝不作为转义文本重复。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
+
+test "Gemini 2.5: 图像 tool_result → functionResponse 指向文本 + 同级 inline_data part" {
+    const a = std.testing.allocator;
+    const msgs = imageToolResultMsgs();
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    // 旧世代无 multimodal functionResponse:图像作同一 user content 的同级 part 收尾
+    // (生产验证形态),label 文本配对函数名。字节级锁定完整序列。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached in this message]\"}}},{\"text\":\"Image result of Read:\"},{\"inline_data\":{\"mime_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "inlineData") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
+
+test "Gemini 2.5 并行: 文本+图像 tool_result → functionResponse 数保持,图像同级 part 收尾" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .tool_use = .{ .id = "t1", .name = "Bash", .input = "{}" } },
+            .{ .tool_use = .{ .id = "t2", .name = "Read", .input = "{}" } },
+        } },
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok" } },
+            .{ .tool_result = .{ .tool_use_id = "t2", .content = IMG_TOOL_RESULT_JSON } },
+        } },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    // 文本 tool_result 字节不变;两个 functionResponse 相邻(配对数与 functionCall 相等),
+    // 图像同级 part 在**所有** functionResponse 之后。
+    const fr_bash = std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Bash\",\"response\":{\"result\":\"ok\"}}}").?;
+    const fr_read = std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached in this message]\"}}}").?;
+    const sibling = std.mem.indexOf(u8, body, "{\"text\":\"Image result of Read:\"},{\"inline_data\":").?;
+    try std.testing.expect(fr_bash < fr_read);
+    try std.testing.expect(fr_read < sibling);
+}
+
+test "Gemini 防御分支: 方言不支持图像输入 → functionResponse 占位文本,无 base64" {
+    const a = std.testing.allocator;
+    const msgs = imageToolResultMsgs();
+    // defaultDialect 的 serializeImagePart 恒返 false(fail-closed),但 profileFor 仍是
+    // 内建 Gemini profile——覆盖"profile 声称支持、方言拒绝"的插件方言防御路径。
+    const body = try serializeGeminiRequestWithOverridesAndDialect(a, &msgs, null, null, null, "gemini-2.5-pro", .{}, .{ .ctx = undefined });
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"result\":\"[image (image/png) was read successfully but omitted: this model does not support image input]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "inline_data") == null);
 }

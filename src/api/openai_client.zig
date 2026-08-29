@@ -953,6 +953,15 @@ fn serializeOpenAIMessage(
         // OpenAI 要求每个 tool_result 是独立 {role:"tool"} message。并行工具一轮有多个
         // tool_result,**全部展开**成逗号分隔的多条 message(P0.1:旧版只发首个 → 并行回合
         // 下一次请求缺 tool_call_id 配对被 OpenAI 400)。调用方在本消息前已加分隔逗号。
+        //
+        // 图像 tool_result(Read 工具,dialect.extractImageResult 命中):chat/completions
+        // 的 {role:"tool"} 消息 content 只接受文本,不接受 image part——官方推荐做法是
+        // tool 消息回短文本、图像本体放进**紧随其后的 {role:"user"} 消息**(image_url
+        // data URL part,与一等图像输入同一方言 wire)。每张图前置一个 text part 标注
+        // 来源 tool_call_id,并行多图也能配对。非 vision 模型(方言返 false)tool 消息
+        // 发短占位文本。两种情况都绝不把 MB 级 base64 原文当纯文本塞给模型。
+        var image_parts: std.ArrayList(u8) = .empty;
+        defer image_parts.deinit(allocator);
         var first_tr = true;
         for (m.content) |c| switch (c) {
             .tool_result => |tr| {
@@ -961,11 +970,45 @@ fn serializeOpenAIMessage(
                 try out.appendSlice(allocator, "{\"role\":\"tool\",\"tool_call_id\":");
                 try util_json.serializeString(tr.tool_use_id, out, allocator);
                 try out.appendSlice(allocator, ",\"content\":");
-                try util_json.serializeString(tr.content, out, allocator);
+                if (dialect_mod.extractImageResult(tr.content)) |img| {
+                    // scratch 先渲染方言图像 part:方言返回值是 vision/占位的唯一分支决策点,
+                    // 指向文本与图像本体不可能不一致。
+                    const mark = image_parts.items.len;
+                    if (mark > 0) try image_parts.append(allocator, ',');
+                    try image_parts.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
+                    var label: std.ArrayList(u8) = .empty;
+                    defer label.deinit(allocator);
+                    try label.appendSlice(allocator, "Image result of tool call ");
+                    try label.appendSlice(allocator, tr.tool_use_id);
+                    try label.append(allocator, ':');
+                    try util_json.serializeString(label.items, &image_parts, allocator);
+                    try image_parts.appendSlice(allocator, "},");
+                    if (try dialect.serializeImagePart(profile, img, &image_parts, allocator)) {
+                        var pointer: std.ArrayList(u8) = .empty;
+                        defer pointer.deinit(allocator);
+                        try pointer.appendSlice(allocator, "[image (");
+                        try pointer.appendSlice(allocator, img.media_type);
+                        try pointer.appendSlice(allocator, ") attached in the following user message]");
+                        try util_json.serializeString(pointer.items, out, allocator);
+                    } else {
+                        image_parts.shrinkRetainingCapacity(mark);
+                        var placeholder: std.ArrayList(u8) = .empty;
+                        defer placeholder.deinit(allocator);
+                        try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
+                        try util_json.serializeString(placeholder.items, out, allocator);
+                    }
+                } else {
+                    try util_json.serializeString(tr.content, out, allocator);
+                }
                 try out.append(allocator, '}');
             },
             else => {},
         };
+        if (image_parts.items.len > 0) {
+            try out.appendSlice(allocator, ",{\"role\":\"user\",\"content\":[");
+            try out.appendSlice(allocator, image_parts.items);
+            try out.appendSlice(allocator, "]}");
+        }
         return;
     }
     const role_str = switch (m.role) {
@@ -1177,6 +1220,8 @@ pub fn serializeOpenAIResponsesRequest(
 /// 含 image 的消息 → content 变 parts 数组(input_text/input_image 按原始顺序交错);
 /// input_image 是 responses-local wire 形态(同 text.format 先例,不走 dialect——
 /// protocol=responses 是显式 OpenAI 原生配置),能力守门仍查 profile.supports_image_input。
+/// 图像 tool_result(Read 工具形态)→ vision 模型 output 发 input_image parts 数组
+/// (官方 2025-09-26 起支持,call_id 原生配对);非 vision 模型 output 发短占位文本。
 fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, first: *bool, profile: dialect_mod.ModelProfile) !void {
     var has_image = false;
     var text_len: usize = 0;
@@ -1253,7 +1298,26 @@ fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayLis
             try out.appendSlice(allocator, "{\"type\":\"function_call_output\",\"call_id\":");
             try util_json.serializeString(tr.tool_use_id, out, allocator);
             try out.appendSlice(allocator, ",\"output\":");
-            try util_json.serializeString(tr.content, out, allocator);
+            if (dialect_mod.extractImageResult(tr.content)) |img| {
+                if (profile.supports_image_input) {
+                    // 官方形态(2025-09-26 起):output 接受 content parts **数组**(真数组,
+                    // 非 JSON 字符串化数组);input_image 与一等图像输入同 responses-local
+                    // wire,call_id 原生配对,无需追加消息。detail 不发(服务端默认 auto)。
+                    try out.appendSlice(allocator, "[{\"type\":\"input_image\",\"image_url\":\"data:");
+                    try util_json.serializeStringContents(img.media_type, out, allocator);
+                    try out.appendSlice(allocator, ";base64,");
+                    try util_json.serializeStringContents(img.data, out, allocator);
+                    try out.appendSlice(allocator, "\"}]");
+                } else {
+                    // 非 vision:显式占位文本,绝不把 base64 原文当 output 字符串发。
+                    var placeholder: std.ArrayList(u8) = .empty;
+                    defer placeholder.deinit(allocator);
+                    try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
+                    try util_json.serializeString(placeholder.items, out, allocator);
+                }
+            } else {
+                try util_json.serializeString(tr.content, out, allocator);
+            }
             try out.append(allocator, '}');
         },
         else => {},
@@ -1541,6 +1605,60 @@ test "chat: 不支持 vision 的模型带 image → 显式能力错误(不静默
     );
 }
 
+const IMG_TOOL_RESULT_JSON = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}";
+
+test "chat: vision 模型的图像 tool_result → tool 消息短文本 + 紧随 user 消息 image_url" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .tool_use = .{ .id = "call_1", .name = "Read", .input = "{}" } },
+        } },
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "call_1", .content = IMG_TOOL_RESULT_JSON } },
+        } },
+    };
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, null, null, null, null);
+    defer a.free(body);
+    // tool 消息:短指向文本,不含 base64;图像本体在紧随其后的 user 消息(官方约定:
+    // chat 的 tool 消息 content 不接受 image part)。字节级锁定完整序列。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"[image (image/png) attached in the following user message]\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Image result of tool call call_1:\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,UE5HREFUQQ==\"}}]}") != null);
+    // 原始 JSON 绝不作为文本出现(仅 data URL 内出现一次 base64)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
+
+test "chat: 非 vision 模型的图像 tool_result → 占位文本,无 base64 无追加消息" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "call_1", .content = IMG_TOOL_RESULT_JSON } },
+        } },
+    };
+    const body = try serializeOpenAIRequest(a, "deepseek-chat", &msgs, null, null, null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"[image (image/png) was read successfully but omitted: this model does not support image input]\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "image_url") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") == null);
+}
+
+test "chat: 并行 tool_result 文本+图像混合 → 文本字节不变,单条追加 user 消息配对 id" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "call_a", .content = "file contents" } },
+            .{ .tool_result = .{ .tool_use_id = "call_b", .content = IMG_TOOL_RESULT_JSON } },
+        } },
+    };
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, null, null, null, null);
+    defer a.free(body);
+    // 非图像 tool_result 字节与图像特性引入前逐字节相同(prompt cache 契约)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"tool\",\"tool_call_id\":\"call_a\",\"content\":\"file contents\"}") != null);
+    // 图像统一收尾在**单条**追加 user 消息,text part 配对 tool_call_id。
+    const trailer = std.mem.indexOf(u8, body, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Image result of tool call call_b:\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,UE5HREFUQQ==\"}}]}").?;
+    const tool_b = std.mem.indexOf(u8, body, "\"tool_call_id\":\"call_b\"").?;
+    try std.testing.expect(tool_b < trailer);
+}
+
 test "responses: 含 image 的 user 消息 → input_text/input_image parts(按序)" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
@@ -1566,4 +1684,32 @@ test "responses: 不支持 vision 的模型带 image → 显式能力错误" {
         error.ImageInputUnsupported,
         serializeOpenAIResponsesRequest(a, "qwen3-235b", &msgs, null, null, .{}, dialect_mod.dialectFor(.openai, "qwen3-235b")),
     );
+}
+
+test "responses: vision 模型的图像 tool_result → output 为 input_image parts 数组" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "call_1", .content = IMG_TOOL_RESULT_JSON } },
+        } },
+    };
+    const body = try serializeOpenAIResponsesRequest(a, "gpt-5.2", &msgs, null, null, .{}, dialect_mod.dialectFor(.openai, "gpt-5.2"));
+    defer a.free(body);
+    // 官方形态:output 是真 JSON 数组(非字符串化数组),call_id 原生配对。字节级锁定。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,UE5HREFUQQ==\"}]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
+
+test "responses: 非 vision 模型的图像 tool_result → output 占位字符串,无 base64" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "call_1", .content = IMG_TOOL_RESULT_JSON } },
+        } },
+    };
+    const body = try serializeOpenAIResponsesRequest(a, "qwen3-235b", &msgs, null, null, .{}, dialect_mod.dialectFor(.openai, "qwen3-235b"));
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"output\":\"[image (image/png) was read successfully but omitted: this model does not support image input]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "input_image") == null);
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const util_json = @import("../util/json.zig");
+const dialect_mod = @import("dialect.zig");
 
 /// Anthropic Messages API 请求体。
 pub const MessagesRequest = struct {
@@ -115,7 +116,6 @@ pub const InputSchema = struct {
 
 /// 序列化请求为 JSON 字节串。调用方 free。
 pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocator) ![]u8 {
-    const dialect_mod = @import("dialect.zig");
     return serializeMessagesRequestWithDialect(
         req,
         allocator,
@@ -282,13 +282,22 @@ fn serializeContent(
                 try util_json.serializeString(tr.tool_use_id, buf, allocator);
                 try buf.appendSlice(allocator, ",\"content\":");
                 // 图像结果：Read 工具返回 {"type":"image","media_type":..,"data":..}
-                // → 发成 content block 数组 [{"type":"image","source":{"type":"base64",...}}]
-                if (extractImageResult(tr.content)) |img| {
-                    try buf.appendSlice(allocator, "[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
-                    try util_json.serializeString(img.media_type, buf, allocator);
-                    try buf.appendSlice(allocator, ",\"data\":");
-                    try util_json.serializeString(img.data, buf, allocator);
-                    try buf.appendSlice(allocator, "}}]");
+                // → vision 模型发 content block 数组 [<方言原生图像块>]。Claude 的方言
+                //   字节与此前手写形态逐字节相同(prompt cache 前缀契约不变)。
+                // 非 vision(如经 Anthropic 网关的 GLM 文本模型,方言返 false)发短
+                // 占位文本——绝不把 MB 级 base64(文本或 block 形态)塞给无法看图的模型。
+                if (dialect_mod.extractImageResult(tr.content)) |img| image: {
+                    const mark = buf.items.len;
+                    try buf.append(allocator, '[');
+                    if (try dialect.serializeImagePart(profile, img, buf, allocator)) {
+                        try buf.append(allocator, ']');
+                        break :image;
+                    }
+                    buf.shrinkRetainingCapacity(mark);
+                    var placeholder: std.ArrayList(u8) = .empty;
+                    defer placeholder.deinit(allocator);
+                    try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
+                    try util_json.serializeString(placeholder.items, buf, allocator);
                 } else {
                     try util_json.serializeString(tr.content, buf, allocator);
                 }
@@ -307,19 +316,6 @@ fn serializeContent(
         }
     }
     try buf.append(allocator, ']');
-}
-
-const ImageResult = struct { media_type: []const u8, data: []const u8 };
-
-/// 检测 tool_result content 是否为 Read 工具的图像形态。
-/// 仅当以 `{"type":"image"` 开头且含 media_type + data 字段时返回；否则 null（当文本处理）。
-/// 返回的 slice 借用 content 内部字节（未 unescape）——base64/media_type 无需转义，直接透传。
-fn extractImageResult(content: []const u8) ?ImageResult {
-    const trimmed = std.mem.trimStart(u8, content, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "{\"type\":\"image\"")) return null;
-    const mt = util_json.extractStringField(trimmed, "media_type") orelse return null;
-    const data = util_json.extractStringField(trimmed, "data") orelse return null;
-    return .{ .media_type = mt, .data = data };
 }
 
 fn serializeTools(tools: []const ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -786,13 +782,32 @@ test "serializeMessagesRequest with image tool_result emits content block array"
             .is_error = false,
         } }},
     };
-    const req = MessagesRequest{ .model = "m", .messages = &.{msg} };
+    const req = MessagesRequest{ .model = "claude-sonnet-4-20250514", .messages = &.{msg} };
     const body = try serializeMessagesRequest(req, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":[{\"type\":\"image\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"source\":{\"type\":\"base64\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"data\":\"iVBORw==\"") != null);
+}
+
+test "serializeMessagesRequest: 非 vision 模型的图像 tool_result → 占位文本(不发 base64)" {
+    // 经 Anthropic 网关的 GLM 文本模型:tool_result 图像不能发 image block(网关拒收),
+    // 更不能把 base64 当文本发(token 爆炸)。显式短占位,模型知道读到了图但看不了。
+    const msg = types.ApiMessage{
+        .role = .user,
+        .content = &.{.{ .tool_result = .{
+            .tool_use_id = "t1",
+            .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"iVBORw==\"}",
+            .is_error = false,
+        } }},
+    };
+    const req = MessagesRequest{ .model = "glm-5.2", .messages = &.{msg} };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"[image (image/png) was read successfully but omitted: this model does not support image input]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "iVBORw==") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") == null);
 }
 
 test "serializeMessagesRequest: 一等 image block 发 Anthropic base64 source(顺序保持)" {
@@ -826,14 +841,6 @@ test "serializeMessagesRequest: 不支持 vision 的模型带 image → 显式�
         error.ImageInputUnsupported,
         serializeMessagesRequest(req, std.testing.allocator),
     );
-}
-
-test "extractImageResult ignores plain text" {
-    try std.testing.expect(extractImageResult("just text") == null);
-    try std.testing.expect(extractImageResult("{\"stdout\":\"x\"}") == null);
-    const img = extractImageResult("{\"type\":\"image\",\"media_type\":\"image/gif\",\"data\":\"AAAA\"}").?;
-    try std.testing.expectEqualStrings("image/gif", img.media_type);
-    try std.testing.expectEqualStrings("AAAA", img.data);
 }
 
 test "serializeMessagesRequest escapes special chars in text" {

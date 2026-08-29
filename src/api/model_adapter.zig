@@ -126,6 +126,11 @@ pub const ModelProfile = struct {
     /// 请求含 image block 时必须报显式能力错误(error.ImageInputUnsupported),
     /// 绝不静默丢图/OCR/文本占位。保守默认 false;仅对已验证 vision 家族开 true。
     supports_image_input: bool = false,
+    /// 支持 multimodal functionResponse(图像嵌在 functionResponse.parts 里,官方形态)。
+    /// 仅 Gemini 3 系起支持(ai.google.dev function-calling#multimodal + v1beta discovery
+    /// doc,2025-12-17 changelog);旧世代 Gemini 走同级 inline_data part 形态。
+    /// 保守默认 false。
+    supports_multimodal_function_response: bool = false,
 };
 
 /// provider kind(与 capability.zig 对齐,但本模块独立持有以解耦)
@@ -256,14 +261,17 @@ fn geminiProfile(model: []const u8) ModelProfile {
     // Gemini 3.x 系列(3.1 Pro / 3.1 Flash-Lite / 3 Flash)不能关 thinking:
     // 默认就是 low,effort=null/none/minimal 应映射为 low(不是不发)。
     // 来源:ai.google.dev/gemini-api/docs/openai(2026-08 KnowForge 调研)。
-    const cannot_disable = hasSubstr(model, "gemini-3");
+    const is_gemini3_family = hasSubstr(model, "gemini-3");
     return .{
         .thinking_mode = .gemini_level,
         .supports_image_input = true, // Gemini 全系原生多模态(inline_data parts)
+        // multimodal functionResponse(functionResponse.parts[].inlineData)仅 Gemini 3 系起
+        // 官方支持;旧世代(2.5 等)tool_result 图像走同级 inline_data part 形态。
+        .supports_multimodal_function_response = is_gemini3_family,
 
         .effort_levels = .none_, // Gemini 用 thinking_level(minimal/low/medium/high),非 effort
         .returns_reasoning_content = false, // Gemini 用 thought_summary + signature,非平级字段
-        .cannot_disable_thinking = cannot_disable,
+        .cannot_disable_thinking = is_gemini3_family,
     };
 }
 
@@ -472,4 +480,12 @@ test "profileFor: vision 能力矩阵(issue #10)" {
     try std.testing.expect(!profileFor(.openai, "minimax-m3").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "mistral-large").supports_image_input);
     try std.testing.expect(!profileFor(.other, "mystery").supports_image_input);
+}
+
+test "profileFor: multimodal functionResponse 仅 Gemini 3 系 true" {
+    try std.testing.expect(profileFor(.gemini, "gemini-3-flash").supports_multimodal_function_response);
+    try std.testing.expect(profileFor(.gemini, "gemini-3.1-pro").supports_multimodal_function_response);
+    try std.testing.expect(!profileFor(.gemini, "gemini-2.5-pro").supports_multimodal_function_response);
+    try std.testing.expect(!profileFor(.anthropic, "claude-sonnet-4-20250514").supports_multimodal_function_response);
+    try std.testing.expect(!profileFor(.openai, "gpt-5.2").supports_multimodal_function_response);
 }

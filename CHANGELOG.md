@@ -10,6 +10,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- Image tool results (the `Read` tool's
+  `{"type":"image","media_type":...,"data":...}` form) are now serialized
+  natively on every protocol family instead of being passed to the model as a
+  multi-megabyte base64 text string on OpenAI and Gemini. Vision models get
+  the image itself: OpenAI chat/completions sends a short pointer in the tool
+  message and the image in an immediately following user message (tool
+  message content officially accepts text only); the OpenAI Responses
+  protocol sends `function_call_output.output` as an official `input_image`
+  parts array; Gemini 3 uses the official multimodal function response
+  (`functionResponse.parts[].inlineData`), older Gemini models get a sibling
+  `inline_data` part in the same user turn. A model without vision gets a
+  short explicit placeholder — never the raw base64 — including text models
+  behind Anthropic-compatible gateways, which previously received an `image`
+  source block they reject. Non-image tool results and Claude vision
+  serialization stay byte-identical (prompt-cache prefixes unaffected).
+
 ### Added
 
 - Model tiers (issue #11 core-side fix): subagent/skill model pins and

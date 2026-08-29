@@ -108,10 +108,33 @@ replaced with placeholder text. Image blocks round-trip through the JSONL
 transcript and the AgentCore checkpoint (block tag 5), so restored sessions
 resend the original bytes.
 
+Tool results can also carry an image: the `Read` tool returns
+`{"type":"image","media_type":...,"data":...}` for image files, and every
+protocol family now serializes that form natively instead of passing the raw
+base64 JSON through as tool-result text. Anthropic keeps the base64 `image`
+source block inside the `tool_result` content array (byte-identical to
+before). OpenAI chat/completions sends a short pointer as the tool message
+(tool message content officially accepts only text) and attaches the image in
+an immediately following user message (`image_url` data URL, one text label
+per image naming its `tool_call_id`). The OpenAI Responses protocol sends
+`function_call_output.output` as an `input_image` content-part array (official
+since 2025-09), pairing by `call_id`. Gemini 3 series uses the official
+multimodal function response (`functionResponse.parts[].inlineData`,
+`ModelProfile.supports_multimodal_function_response`); older Gemini models
+receive the image as a sibling `inline_data` part in the same user turn after
+all `functionResponse` parts.
+
+Unlike first-class user images (which fail the request up front), a tool
+result arrives after the tool already ran mid-conversation, so a model
+without vision gets a short explicit placeholder text — `[image (<MIME>) was
+read successfully but omitted: this model does not support image input]` —
+never the multi-megabyte base64 payload and never a silently wedged session.
+
 Prompt-cache note: a text-only conversation serializes byte-identically to
 builds without this feature (OpenAI `content` stays a plain string unless the
 message actually contains an image), so existing cache prefixes are
-unaffected.
+unaffected. Non-image tool results are also byte-identical to before on all
+three protocol families.
 
 ## Zig source embedding
 
