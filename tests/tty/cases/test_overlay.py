@@ -205,6 +205,11 @@ def test_ctrl_o_box_top_idempotent(bin_path):
     # 重发对话尾把框推走、贴底漂移)。**alt-screen 根治**:进 ESC[?1049h 切独立缓冲(主屏 grid+
     # 光标整屏保存)、全屏画 transcript;退出 ESC[?1049l 由终端**逐字节恢复主缓冲** → box_top 必然
     # 与按前一致(终端保证),无任何 inline 几何数学。
+    # 2026-08-29 去 flake:旧版用 6 条模型消息造历史,离线死端口下每条触发带**随机抖动**的
+    # 指数退避重连,"Retrying in Ns… (attempt N/10)" 横幅按该时序异步入历史区;对照 run 比
+    # 基准 run 多活 1.2s(两次 Ctrl+O 的 sleep),常恰好多收 1 条横幅 → box_top 差 1 行,
+    # 断言随机挂(实测两屏唯一差异就是横幅数)。历史改用本地 !echo(shell 模式,零网络
+    # 零重试,每条恒 2 行),两 run 内容恒等,box_top 对比只反映 Ctrl+O 幂等性本身。
     def box_only(events):
         a = TTYAssert(run(bin_path, ["sleep:0.8"] + events, term_size=(24, 80),
                           per_key_drain=0.04, startup_drain=0.8), rows=24, cols=80)
@@ -212,7 +217,7 @@ def test_ctrl_o_box_top_idempotent(bin_path):
 
     msgs = []
     for i in range(6):
-        msgs += ["type:msg %d zig" % i, "key:enter", "sleep:1.0"]
+        msgs += ["type:!echo msg %d zig" % i, "key:enter", "sleep:0.5"]
 
     box0 = box_only(msgs)
     box2 = box_only(msgs + ["key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:0.6"])

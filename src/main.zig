@@ -367,6 +367,20 @@ pub fn main(init: std.process.Init) !void {
     // --- record/replay cassette 录制目录(Stage 7)---
     if (config.record_dir) |dir| recorder.setDir(dir);
 
+    // 交互式 TUI 拥有终端:禁止日志写 stderr(fd 2),否则 err/warn 与渲染(render_region.flush 也走
+    // std.debug.print→fd 2)字节级交错,把固定区写花、滚屏 desync。日志仍写文件(METACODES_LOG_FILE)。
+    // **gate 必须查渲染所在的 fd 2**(不是 fd 1):`metacodes >file` 只重定向 stdout、TUI 仍渲染到 fd 2 的
+    // 终端,此时也要抑制日志。verbose(用户显式要日志)/ fd 2 非 tty(无终端可写花)不关。
+    // **必须在 App.init 之前**:init 期的 warn/err(如 KG 降级告警)否则抢在 gate 前直接打进终端,
+    // 留在 TUI 上方成残行,且超宽行在 strict-autowrap 终端还会折行挤歪整屏。
+    // 非 TUI 模式(teammate/serve/web/resume/headless/dump)无渲染流,保留 stderr 日志。
+    const interactive_tui = config.serve_port == null and config.web_port == null and
+        config.resume_response == null and config.prompt == null and
+        config.teammate_name.len == 0 and !config.dump_prompt and !config.dump_plugins;
+    if (interactive_tui and !config.verbose and platform_term.isatty(2)) {
+        log.setStderrEnabled(false);
+    }
+
     // Introspection builds the same App/Plugin snapshot but cannot issue a
     // provider request, so it neither requires credentials nor consumes the
     // one-shot runtime FD authority. Every executable Run path still resolves
@@ -491,14 +505,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(code);
     }
 
-    // 交互式 TUI 拥有终端:禁止日志写 stderr(fd 2),否则 err/warn 与渲染(render_region.flush 也走
-    // std.debug.print→fd 2)字节级交错,把固定区写花、滚屏 desync。日志仍写文件(METACODES_LOG_FILE)。
-    // **gate 必须查渲染所在的 fd 2**(不是 fd 1):`metacodes >file` 只重定向 stdout、TUI 仍渲染到 fd 2 的
-    // 终端,此时也要抑制日志。verbose(用户显式要日志)/ fd 2 非 tty(无终端可写花)不关。
-    if (!config.verbose and platform_term.isatty(2)) {
-        log.setStderrEnabled(false);
-    }
-
+    // (stderr 日志 gate 已提前到 App.init 之前——见 interactive_tui;init 期日志同样不得上屏。)
     try repl.run(app, allocator);
 }
 
