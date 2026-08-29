@@ -624,6 +624,14 @@ by that summary. Restore materializes the summary as leading assistant context,
 so continued Runs and later compaction preserve the same model-visible state.
 The checkpoint `max_messages` limit counts that materialized summary as one
 message in addition to the encoded active-message count.
+
+Conversation blocks are encoded with tag bytes `1=text`, `2=tool_use`,
+`3=tool_result`, `4=thinking`, `5=image`. An image block carries two encoded
+strings, `media_type` then base64 `data`; raw image bytes never enter the
+envelope, so every string still satisfies the UTF-8 validation rule. Tag `5`
+is an additive extension: checkpoints written before it decode unchanged,
+while an older reader that encounters tag `5` fails closed with `Corrupt`
+instead of silently dropping model-visible image content.
 Hosts that require verbatim historical audit must persist the event/transcript
 stream separately. This projection is what allows compact to reduce durable
 usage for a near-hard Session.

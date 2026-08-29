@@ -498,7 +498,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
     if (config.prompt) |p| {
-        const code = @import("repl/headless.zig").run(app, allocator, p, config.json_output) catch |err| blk: {
+        const code = @import("repl/headless.zig").run(app, allocator, p, config.images, config.json_output) catch |err| blk: {
             std.debug.print("error: headless setup failed: {s}\n", .{@errorName(err)});
             break :blk 1;
         };
@@ -1032,6 +1032,14 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.requirement_ledger_observe = true;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
+        } else if (std.mem.eql(u8, arg, "--image")) {
+            // headless 多模态输入(issue #10):可重复,顺序保留。路径在 headless.run
+            // 读取校验(MIME 白名单/大小上限),这里只收集。
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --image", .{});
+                return;
+            };
+            config.images = appendNulList(allocator, config.images, s);
         } else if (std.mem.eql(u8, arg, "--plugin-dir")) {
             const s = args.next() orelse {
                 setParseError(config, allocator, "missing value for --plugin-dir", .{});
@@ -1265,6 +1273,7 @@ fn printHelp() void {
         \\  --max-tokens <n>      Override max output tokens per request
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
+        \\  --image <path>        Headless: attach an image (png/jpg/gif/webp) to the prompt (repeatable, order kept)
         \\  --dump-prompt         Print the assembled system prompt and exit
         \\  --dump-plugins        Print the immutable plugin inventory JSON and exit
         \\  serve [port]          Daemon mode (HTTP; default port 7777)

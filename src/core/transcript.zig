@@ -10,6 +10,8 @@
 //!     - `{"type":"text","text":"..."}`
 //!     - `{"type":"tool_use","id":"","name":"","input":"<json string>"}`
 //!     - `{"type":"tool_result","tool_use_id":"","content":"...","is_error":bool}`
+//!     - `{"type":"thinking","thinking":"..."}`
+//!     - `{"type":"image","media_type":"image/png","data":"<base64>"}`
 //! - **meta.json**：每次写 transcript 后覆盖写入 {model, last_modified_ns, message_count, title_guess}
 //! - **title_guess**：首条 user text 的前 80 字节（去换行）
 //! - **加载**：逐行 parse JSONL 重建 Conversation；meta 用于 /resume 列表
@@ -216,6 +218,14 @@ pub const Writer = struct {
                     try std.json.Stringify.encodeJsonString(t, .{}, &aw.writer);
                     try aw.writer.writeAll("}");
                 },
+                .image => |img| {
+                    // base64 载荷 JSON 安全;resume 后图像语义原样恢复(issue #10)。
+                    try aw.writer.writeAll("{\"type\":\"image\",\"media_type\":");
+                    try std.json.Stringify.encodeJsonString(img.media_type, .{}, &aw.writer);
+                    try aw.writer.writeAll(",\"data\":");
+                    try std.json.Stringify.encodeJsonString(img.data, .{}, &aw.writer);
+                    try aw.writer.writeAll("}");
+                },
             }
         }
         try aw.writer.writeAll("]}\n");
@@ -407,6 +417,22 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
                 .tool_use_id = try allocator.dupe(u8, tuid.string),
                 .content = try allocator.dupe(u8, c.string),
                 .is_error = if (is_err == .bool) is_err.bool else false,
+            } };
+        } else if (std.mem.eql(u8, tv.string, "thinking")) {
+            // 写侧一直会写 thinking 块,读侧此前缺此分支 → 任何带 thinking 的会话
+            // resume 整体 InvalidTranscript(roundtrip bug,随 image 支持一并修复)。
+            const t = bv.object.get("thinking") orelse return error.InvalidTranscript;
+            if (t != .string) return error.InvalidTranscript;
+            blocks[idx] = .{ .thinking = try allocator.dupe(u8, t.string) };
+        } else if (std.mem.eql(u8, tv.string, "image")) {
+            const mt = bv.object.get("media_type") orelse return error.InvalidTranscript;
+            const data = bv.object.get("data") orelse return error.InvalidTranscript;
+            if (mt != .string or data != .string) return error.InvalidTranscript;
+            const mt_owned = try allocator.dupe(u8, mt.string);
+            errdefer allocator.free(mt_owned);
+            blocks[idx] = .{ .image = .{
+                .media_type = mt_owned,
+                .data = try allocator.dupe(u8, data.string),
             } };
         } else {
             return error.InvalidTranscript;
@@ -736,4 +762,57 @@ test "listSessions orders by last_modified desc" {
     // 降序：最新的在前
     try std.testing.expect(list[0].last_modified_ns >= list[1].last_modified_ns);
     try std.testing.expect(list[1].last_modified_ns >= list[2].last_modified_ns);
+}
+
+test "image + thinking 块 transcript roundtrip(issue #10 会话恢复语义)" {
+    // image:媒体类型/base64 原样恢复。thinking:写侧一直会写,读侧此前缺分支 →
+    // 任何带 thinking 的会话 resume 整体失败(随 image 支持一并修复,此测试锁定)。
+    const a = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-test-img-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+
+    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet", genSessionId());
+    defer writer.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+
+    const blks = try a.alloc(msg_mod.Block, 3);
+    blks[0] = .{ .text = try a.dupe(u8, "这是截图") };
+    blks[1] = .{ .image = .{
+        .media_type = try a.dupe(u8, "image/png"),
+        .data = try a.dupe(u8, "UE5HREFUQQ=="),
+    } };
+    blks[2] = .{ .image = .{
+        .media_type = try a.dupe(u8, "image/jpeg"),
+        .data = try a.dupe(u8, "SlBFRw=="),
+    } };
+    try conv.append(.{ .role = .user, .blocks = blks });
+
+    const blks2 = try a.alloc(msg_mod.Block, 2);
+    blks2[0] = .{ .thinking = try a.dupe(u8, "推理内容") };
+    blks2[1] = .{ .text = try a.dupe(u8, "两张图分别是…") };
+    try conv.append(.{ .role = .assistant, .blocks = blks2 });
+
+    writer.flush(&conv);
+
+    var conv2 = Conversation.init(a);
+    defer conv2.deinit();
+    try loadTranscript(&conv2, writer.dir, a);
+    try std.testing.expectEqual(@as(usize, 2), conv2.len());
+    const user_blocks = conv2.messages.items[0].blocks;
+    try std.testing.expectEqual(@as(usize, 3), user_blocks.len);
+    try std.testing.expectEqualStrings("这是截图", user_blocks[0].text);
+    try std.testing.expectEqualStrings("image/png", user_blocks[1].image.media_type);
+    try std.testing.expectEqualStrings("UE5HREFUQQ==", user_blocks[1].image.data);
+    try std.testing.expectEqualStrings("image/jpeg", user_blocks[2].image.media_type);
+    const asst_blocks = conv2.messages.items[1].blocks;
+    try std.testing.expectEqualStrings("推理内容", asst_blocks[0].thinking);
+    try std.testing.expectEqualStrings("两张图分别是…", asst_blocks[1].text);
 }

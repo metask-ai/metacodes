@@ -142,10 +142,11 @@ pub fn serializeMessagesRequestWithDialect(
     defer allocator.free(mt);
     try result.appendSlice(allocator, mt);
 
-    try result.appendSlice(allocator, ",\"messages\":");
-    try serializeMessages(req.messages, &result, allocator);
-
     const profile = dialect.profileFor(.anthropic, req.model);
+
+    try result.appendSlice(allocator, ",\"messages\":");
+    try serializeMessages(req.messages, &result, allocator, dialect, profile);
+
     const visible_capabilities = @import("dialect.zig").visibleCapabilities(req.tools);
     var system_buf: std.ArrayList(u8) = .empty;
     defer system_buf.deinit(allocator);
@@ -217,7 +218,13 @@ pub fn serializeMessagesRequestWithDialect(
     return try result.toOwnedSlice(allocator);
 }
 
-fn serializeMessages(messages: []const types.ApiMessage, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+fn serializeMessages(
+    messages: []const types.ApiMessage,
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    dialect: @import("dialect.zig").Dialect,
+    profile: @import("model_adapter.zig").ModelProfile,
+) !void {
     try buf.append(allocator, '[');
     for (messages, 0..) |msg, i| {
         if (i > 0) try buf.append(allocator, ',');
@@ -228,13 +235,19 @@ fn serializeMessages(messages: []const types.ApiMessage, buf: *std.ArrayList(u8)
             .assistant => "assistant",
         }, buf, allocator);
         try buf.appendSlice(allocator, ",\"content\":");
-        try serializeContent(msg.content, buf, allocator);
+        try serializeContent(msg.content, buf, allocator, dialect, profile);
         try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
 }
 
-fn serializeContent(content: []const types.ApiContent, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+fn serializeContent(
+    content: []const types.ApiContent,
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    dialect: @import("dialect.zig").Dialect,
+    profile: @import("model_adapter.zig").ModelProfile,
+) !void {
     try buf.append(allocator, '[');
     for (content, 0..) |block, i| {
         if (i > 0) try buf.append(allocator, ',');
@@ -283,6 +296,13 @@ fn serializeContent(content: []const types.ApiContent, buf: *std.ArrayList(u8), 
                     try buf.appendSlice(allocator, ",\"is_error\":true");
                 }
                 try buf.append(allocator, '}');
+            },
+            .image => |img| {
+                // 一等图像内容(issue #10):wire 形态委托方言(Claude=base64 source block)。
+                // 方言返 false = 该 (provider, model) 不支持图像输入 → 显式能力错误,
+                // 绝不静默丢图或降级为文本。
+                const emitted = try dialect.serializeImagePart(profile, img, buf, allocator);
+                if (!emitted) return error.ImageInputUnsupported;
             },
         }
     }
@@ -773,6 +793,39 @@ test "serializeMessagesRequest with image tool_result emits content block array"
     try std.testing.expect(std.mem.indexOf(u8, body, "\"source\":{\"type\":\"base64\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"data\":\"iVBORw==\"") != null);
+}
+
+test "serializeMessagesRequest: 一等 image block 发 Anthropic base64 source(顺序保持)" {
+    // issue #10 验收:text 与 image 按原始顺序到达最终请求;MIME/base64 原样。
+    const msg = types.ApiMessage{ .role = .user, .content = &.{
+        .{ .text = "看这两张图" },
+        .{ .image = .{ .media_type = "image/png", .data = "UE5HREFUQQ==" } },
+        .{ .text = "中间的文字" },
+        .{ .image = .{ .media_type = "image/jpeg", .data = "SlBFR0RBVEE=" } },
+    } };
+    const req = MessagesRequest{ .model = "claude-sonnet-4", .messages = &.{msg} };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    const first_img = std.mem.indexOf(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}").?;
+    const mid_text = std.mem.indexOf(u8, body, "中间的文字").?;
+    const second_img = std.mem.indexOf(u8, body, "\"media_type\":\"image/jpeg\",\"data\":\"SlBFR0RBVEE=\"").?;
+    const lead_text = std.mem.indexOf(u8, body, "看这两张图").?;
+    try std.testing.expect(lead_text < first_img);
+    try std.testing.expect(first_img < mid_text);
+    try std.testing.expect(mid_text < second_img);
+}
+
+test "serializeMessagesRequest: 不支持 vision 的模型带 image → 显式能力错误" {
+    // 经 Anthropic 网关的 GLM 文本模型 profile.supports_image_input=false:
+    // 绝不静默丢图/降级为文本,必须显式 error.ImageInputUnsupported。
+    const msg = types.ApiMessage{ .role = .user, .content = &.{
+        .{ .image = .{ .media_type = "image/png", .data = "QUJD" } },
+    } };
+    const req = MessagesRequest{ .model = "glm-5.2", .messages = &.{msg} };
+    try std.testing.expectError(
+        error.ImageInputUnsupported,
+        serializeMessagesRequest(req, std.testing.allocator),
+    );
 }
 
 test "extractImageResult ignores plain text" {

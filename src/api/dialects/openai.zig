@@ -144,6 +144,30 @@ fn openaiSerializeParallelToolCalls(ctx: *anyopaque, p: ModelProfile, enabled: ?
     return true;
 }
 
+// ── 共享:图像 content part 序列化(所有 OpenAI-compatible dialect 同 wire 格式)────
+//
+// 中立 ImageBlock → OpenAI chat/completions content-part:
+//   {"type":"image_url","image_url":{"url":"data:<mime>;base64,<data>"}}
+// (vision 全生态标准形态:GPT-4o+/Qwen-VL/GLM-4V 等 OpenAI-compatible vision 端点通用。
+//  Responses API 的 input_image 是 responses-local 形态,不经此方法。)
+// 能力守门:profile.supports_image_input=false 返 false,调用方报显式
+// error.ImageInputUnsupported——绝不静默把 base64 当文本发(issue #10 铁律)。
+// **本函数是 OpenAI-compatible 协议的单一真相源**;将来某厂商原生端点要求不同
+// 图像形态时,该厂商 dialect 换挂自己的实现即可(方言扩展点)。
+fn openaiSerializeImagePart(ctx: *anyopaque, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    if (!p.supports_image_input) return false;
+    // data URL 是单个 JSON string:分段走 serializeStringContents(无引号 escape),
+    // 引号手工闭合。不信任上游校验——media_type/data 里的异常字节在此被正确转义,
+    // 不会破坏请求 JSON 结构(合法 MIME 与 base64 字母表本就无需转义,零开销路径)。
+    try out.appendSlice(a, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+    try util_json.serializeStringContents(image.media_type, out, a);
+    try out.appendSlice(a, ";base64,");
+    try util_json.serializeStringContents(image.data, out, a);
+    try out.appendSlice(a, "\"}}");
+    return true;
+}
+
 // ── 共享:reasoning_content 流式增量解码(GLM/Kimi/DeepSeek/Qwen/Mistral 同一平级字段)──
 //
 // OpenAI-compatible 端点把 reasoning_content 作为 delta 平级字符串字段流式返回。
@@ -187,6 +211,7 @@ const OpenAINative = struct {
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
         // injectSystemMods / supportsToolChoice / supportsResponseFormat / profile 走 default
     };
 };
@@ -235,6 +260,7 @@ const Glm = struct {
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
     };
 };
 
@@ -260,6 +286,7 @@ const KimiK3 = struct {
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
     };
 };
 
@@ -291,6 +318,7 @@ const Kimi = struct {
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
     };
 };
 
@@ -324,6 +352,7 @@ const DeepSeek = struct {
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
     };
 };
 
@@ -347,6 +376,7 @@ const Qwen = struct {
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
     };
 };
 
@@ -359,6 +389,7 @@ const Mistral = struct {
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
     };
 };
 
@@ -384,6 +415,7 @@ const MiniMaxM3 = struct {
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
     };
 };
 
@@ -406,6 +438,7 @@ const MiniMaxM2 = struct {
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
     };
 };
 
@@ -648,4 +681,39 @@ test "openaiDialectFor: OpenAI 原生 extractThinkingDelta 返 null" {
     const d = openaiDialectFor("gpt-4o");
     const got = try d.extractThinkingDelta("{\"delta\":{\"content\":\"hi\"}}", a);
     try std.testing.expect(got == null);
+}
+
+test "OpenAI dialect: serializeImagePart 发 image_url data URL(vision 模型)" {
+    const d = openaiDialectFor("gpt-4o");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const p = d.profileFor(.openai, "gpt-4o");
+    const ok = try d.serializeImagePart(p, .{ .media_type = "image/png", .data = "QUJD" }, &out, a);
+    try std.testing.expect(ok);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,QUJD\"}}",
+        out.items,
+    );
+}
+
+test "OpenAI dialect: 非 vision 模型 serializeImagePart 返 false(能力守门)" {
+    const d = openaiDialectFor("deepseek-chat");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const p = d.profileFor(.openai, "deepseek-chat");
+    try std.testing.expect(!(try d.serializeImagePart(p, .{ .media_type = "image/png", .data = "QUJD" }, &out, a)));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "OpenAI dialect: 异常 media_type 字节被 JSON 转义(不破坏请求结构)" {
+    const d = openaiDialectFor("gpt-4o");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const p = d.profileFor(.openai, "gpt-4o");
+    _ = try d.serializeImagePart(p, .{ .media_type = "image/\"x", .data = "QUJD" }, &out, a);
+    // 引号被转义为 \":序列化输出仍是合法 JSON 片段。
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "image/\\\"x") != null);
 }

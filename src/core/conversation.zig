@@ -20,6 +20,11 @@ pub const TOOL_RESULT_CONTEXT_MAX_BYTES: usize = 64 * 1024;
 /// 旧值 /16 直接把 token 数当字节数用(200K → 12.5KB),单位错配导致截断过狠。
 pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: usize = 8;
 
+/// 单张输入图像的 token 估算上限。各家 vision 端点把大图缩放到 ~1.1M 像素量级
+/// (Anthropic tokens≈pixels/750 → ~1590;OpenAI high-detail 同量级封顶),不解码
+/// 图像尺寸时取缩放上限做保守高估——auto-compact 阈值宁可早触发,绝不因低估爆窗口。
+pub const IMAGE_TOKEN_ESTIMATE: usize = 1600;
+
 pub fn toolResultContextBytes(max_input_tokens: usize) usize {
     const derived = if (max_input_tokens == 0)
         TOOL_RESULT_CONTEXT_MIN_BYTES
@@ -358,6 +363,7 @@ pub const Conversation = struct {
                 .tool_use => |tu| total += estimateTokens(tu.input) + estimateTokens(tu.name),
                 .tool_result => |tr| total += estimateTokens(tr.content),
                 .thinking => |t| total += estimateTokens(t),
+                .image => total += IMAGE_TOKEN_ESTIMATE,
             };
         }
         return total;
@@ -691,6 +697,8 @@ fn blockEql(a: msg.Block, b: msg.Block) bool {
         .tool_result => |tr| std.mem.eql(u8, tr.tool_use_id, b.tool_result.tool_use_id) and
             std.mem.eql(u8, tr.content, b.tool_result.content) and
             tr.is_error == b.tool_result.is_error,
+        .image => |img| std.mem.eql(u8, img.media_type, b.image.media_type) and
+            std.mem.eql(u8, img.data, b.image.data),
     };
 }
 
@@ -1298,4 +1306,17 @@ test "cloneInto 继承投影状态(boundary+summary)供后台续跑" {
     const active = copy.activeMessages();
     try std.testing.expectEqual(@as(usize, 1), active.len);
     try std.testing.expectEqualStrings("m3", active[0].blocks[0].text);
+}
+
+test "totalTokens: image block 按 IMAGE_TOKEN_ESTIMATE 计入" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .image = .{
+        .media_type = try a.dupe(u8, "image/png"),
+        .data = try a.dupe(u8, "UE5HREFUQQ=="),
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    try std.testing.expect(c.totalTokens() >= IMAGE_TOKEN_ESTIMATE);
 }

@@ -2750,6 +2750,7 @@ fn buildApiMessages(
                     .content = tr.content,
                     .is_error = tr.is_error,
                 } },
+                .image => |img| .{ .image = .{ .media_type = img.media_type, .data = img.data } },
                 .thinking => continue, // 不发回 API
             };
             contents[idx] = c;
@@ -2814,6 +2815,7 @@ fn estimateMessageTokens(m: msg.Message) usize {
             .tool_use => |tu| total += Conversation.estimateTokens(tu.name) + Conversation.estimateTokens(tu.input),
             .tool_result => |tr| total += Conversation.estimateTokens(tr.content),
             .thinking => {},
+            .image => total += conversation_mod.IMAGE_TOKEN_ESTIMATE,
         }
     }
     return total;

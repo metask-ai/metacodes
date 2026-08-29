@@ -422,6 +422,14 @@ fn measureMessage(item: message.Message, limits: Limits) Error!u64 {
                 size = try addEncodedString(size, result.content, limits);
                 size = try checkedAdd(size, 1);
             },
+            .image => |image| {
+                // 载荷是 base64(UTF-8 安全),复用字符串编码通道;原始图像字节绝不入 envelope。
+                if (!std.unicode.utf8ValidateSlice(image.media_type) or
+                    !std.unicode.utf8ValidateSlice(image.data))
+                    return error.Corrupt;
+                size = try addEncodedString(size, image.media_type, limits);
+                size = try addEncodedString(size, image.data, limits);
+            },
         }
     }
     return size;
@@ -694,6 +702,11 @@ fn writeMessage(writer: *Writer, item: message.Message) Error!void {
             try writeInt(writer, u8, 4);
             try writeString(writer, bytes);
         },
+        .image => |image| {
+            try writeInt(writer, u8, 5);
+            try writeString(writer, image.media_type);
+            try writeString(writer, image.data);
+        },
     };
 }
 
@@ -743,6 +756,12 @@ fn readMessage(
                 } };
             },
             4 => .{ .thinking = try readString(reader, allocator, messages_end, limits) },
+            5 => image: {
+                const media_type = try readString(reader, allocator, messages_end, limits);
+                errdefer allocator.free(media_type);
+                const data = try readString(reader, allocator, messages_end, limits);
+                break :image .{ .image = .{ .media_type = media_type, .data = data } };
+            },
             else => return error.Corrupt,
         };
     }
@@ -1131,4 +1150,55 @@ test "Revision 6 checkpoint distinguishes unsupported schema and corruption" {
         .{ .ctx = &corrupt_source, .read_fn = TestSource.read },
         limits,
     ));
+}
+
+test "checkpoint round-trips image blocks (tag 5, issue #10)" {
+    // 图像语义(MIME + base64 载荷 + 块顺序)在 export/restore 后原样保留。
+    const allocator = std.testing.allocator;
+    var conversation = Conversation.init(allocator);
+    defer conversation.deinit();
+    const blocks = try allocator.alloc(message.Block, 3);
+    blocks[0] = .{ .text = try allocator.dupe(u8, "看这张截图") };
+    blocks[1] = .{ .image = .{
+        .media_type = try allocator.dupe(u8, "image/png"),
+        .data = try allocator.dupe(u8, "UE5HREFUQQ=="),
+    } };
+    blocks[2] = .{ .image = .{
+        .media_type = try allocator.dupe(u8, "image/jpeg"),
+        .data = try allocator.dupe(u8, "SlBFRw=="),
+    } };
+    try conversation.append(.{ .role = .user, .blocks = blocks });
+
+    const id = core.session_id.gen();
+    var sink = TestSink{ .allocator = allocator };
+    defer sink.deinit();
+    const limits = Limits{ .hard_bytes = 1024 * 1024 };
+    _ = try exportToSink(.{
+        .session_id = id,
+        .checkpoint_generation = 1,
+        .last_run_id = 1,
+        .last_compact_id = 0,
+        .terminal_kind = .run,
+        .terminal_id = 1,
+        .model = "claude-sonnet-4",
+        .conversation = &conversation,
+        .policy_generation = 1,
+        .catalog_generation = 1,
+        .authority = .{ .skill = "", .permission = "", .mcp = "" },
+    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
+
+    var source = TestSource{ .bytes = sink.bytes.items, .step = 5 };
+    var decoded = try decodeFromSource(
+        allocator,
+        .{ .ctx = &source, .read_fn = TestSource.read },
+        limits,
+    );
+    defer decoded.deinit();
+    const restored = decoded.conversation.messages.items[0].blocks;
+    try std.testing.expectEqual(@as(usize, 3), restored.len);
+    try std.testing.expectEqualStrings("看这张截图", restored[0].text);
+    try std.testing.expectEqualStrings("image/png", restored[1].image.media_type);
+    try std.testing.expectEqualStrings("UE5HREFUQQ==", restored[1].image.data);
+    try std.testing.expectEqualStrings("image/jpeg", restored[2].image.media_type);
+    try std.testing.expectEqualStrings("SlBFRw==", restored[2].image.data);
 }

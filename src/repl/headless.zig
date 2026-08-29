@@ -70,17 +70,82 @@ const HeadlessToolPolicy = struct {
     }
 };
 
+/// 读 `--image` 路径列表(\x00 分隔),构造 text+images 按序混排的多模态 user 消息。
+/// 每图:扩展名 → MIME 白名单(png/jpg/jpeg/gif/webp,复用 Read 工具判定);原始字节
+/// 上限对齐 Read 工具(3.75MB);base64 后交 message.userMessageWithImages(dupe owned)。
+/// 任一图读失败/超限/类型不识别 → 显式错误(绝不静默跳过)。
+fn buildImageUserMessage(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    image_paths_nul: []const u8,
+) !@import("../core/message.zig").Message {
+    const msg_mod = @import("../core/message.zig");
+    const read_tool = @import("../tools/read.zig");
+
+    var inputs: std.ArrayList(msg_mod.ImageInput) = .empty;
+    defer {
+        for (inputs.items) |input| allocator.free(input.data);
+        inputs.deinit(allocator);
+    }
+
+    var it = std.mem.splitScalar(u8, image_paths_nul, 0);
+    while (it.next()) |path| {
+        if (path.len == 0) continue;
+        const media_type = read_tool.imageMediaType(path) orelse {
+            std.debug.print("error: --image {s}: unsupported image type (png/jpg/jpeg/gif/webp)\n", .{path});
+            return error.UnsupportedImageType;
+        };
+        const raw = readFileBounded(allocator, path, read_tool.MAX_IMAGE_BYTES) catch |err| {
+            std.debug.print("error: --image {s}: {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
+        defer allocator.free(raw);
+        const enc = std.base64.standard.Encoder;
+        const b64 = try allocator.alloc(u8, enc.calcSize(raw.len));
+        errdefer allocator.free(b64);
+        _ = enc.encode(b64, raw);
+        try inputs.append(allocator, .{ .media_type = media_type, .data = b64 });
+    }
+    if (inputs.items.len == 0 and text.len == 0) return error.EmptyMessage;
+    return msg_mod.userMessageWithImages(allocator, text, inputs.items);
+}
+
+/// 读整个文件,超过 max_bytes 报 error.ImageTooLarge(读入即弃,不截断——截断图像无意义)。
+fn readFileBounded(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    var pbuf: [4096]u8 = undefined;
+    if (path.len >= pbuf.len) return error.PathTooLong;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = pfs.close(fd);
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var chunk: [16384]u8 = undefined;
+    while (true) {
+        const n = pfs.read(fd, chunk[0..chunk.len]);
+        if (n <= 0) break;
+        try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
+        if (buf.items.len > max_bytes) return error.ImageTooLarge;
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 /// headless 用 WriterBackend null-sink:吞掉 agent_loop 的流式输出（ANSI + tool 注解），
 /// 只要最终文本。工具卡事件 no-op,text_chunk/颜色括号全丢弃。
 /// 跑单次 prompt。返回进程退出码。
+/// `images`:`--image <path>` 的 \x00 分隔路径列表(null=纯文本)。有图时构造一条
+/// text+images 按序混排的多模态 user 消息(issue #10);读文件/MIME/大小校验失败或
+/// 当前 (provider, model) 不支持图像输入时显式报错退出——绝不静默丢图降级为文本。
 pub fn run(
     app: *app_mod.App,
     allocator: std.mem.Allocator,
     prompt: []const u8,
+    images: ?[]const u8,
     json_output: bool,
 ) !u8 {
     const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
-    if (trimmed.len == 0) {
+    if (trimmed.len == 0 and images == null) {
         std.debug.print("error: empty prompt\n", .{});
         return 1;
     }
@@ -94,7 +159,21 @@ pub fn run(
     const previous_no_interactive = enterNonInteractivePermissionBoundary(&app.permission_ctx);
     defer restoreInteractivePermissionBoundary(&app.permission_ctx, previous_no_interactive);
 
-    try app.conversation.appendText(.user, trimmed);
+    if (images) |image_paths| {
+        // 入口预检:不支持 vision 的 (provider, model) 立即显式报错(不落网络请求)。
+        if (!app.provider().supports(.image_input)) {
+            std.debug.print(
+                "error: model does not support image input (provider capability image_input=false)\n",
+                .{},
+            );
+            return 1;
+        }
+        var user_msg = try buildImageUserMessage(allocator, trimmed, image_paths);
+        errdefer user_msg.deinit(allocator);
+        try app.conversation.append(user_msg);
+    } else {
+        try app.conversation.appendText(.user, trimmed);
+    }
 
     // Headless is the benchmark/CI entry point, so evaluation cannot remain a
     // REPL-only decorator.  Metadata and event fds are host-owned; malformed

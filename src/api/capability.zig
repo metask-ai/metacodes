@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const Capability = @import("provider.zig").Capability;
+const model_adapter = @import("model_adapter.zig");
 
 /// LLM 后端种类(决定能力矩阵走哪一行)。anthropic + openai 有真实矩阵(P3 写了真 Provider、
 /// 验证过其 API);其它 provider(gemini/grok)加时再据实填,不预先猜测。
@@ -35,13 +36,14 @@ pub fn supports(kind: ProviderKind, model: []const u8, cap: Capability) bool {
 /// Gemini 能力矩阵(C3 真填:Gemini 用 function calling + responseSchema structured output + 隐式/显式
 /// context caching;无 Anthropic 式 server-tool web_search)。
 /// Gemini 能力矩阵
-fn geminiSupports(_: []const u8, cap: Capability) bool {
+fn geminiSupports(model: []const u8, cap: Capability) bool {
     return switch (cap) {
         .prompt_cache => true, // 隐式 + 显式 context caching(有状态对象)——本 client 实现了句柄表机制
         .web_search, .server_tool => false, // Gemini grounding 与 Anthropic server-tool 语义不同, 保守 false
         .extended_thinking => false, // thinking(thought parts)未接, 保守 false
         .structured_output => true, // responseSchema JSON
         .reasoning_content => false, // Gemini 用 thought_summary+signature,非平级字段
+        .image_input => model_adapter.profileFor(.gemini, model).supports_image_input,
     };
 }
 
@@ -62,6 +64,8 @@ fn openaiSupports(model: []const u8, cap: Capability) bool {
                 hasSubstr(model, "qwen-3") or hasSubstr(model, "mistral") or hasSubstr(model, "magistral");
             break :blk compat;
         },
+        // 单一真相在 ModelProfile(序列化守门同源),此处转发查表。
+        .image_input => model_adapter.profileFor(.openai, model).supports_image_input,
     };
 }
 
@@ -79,6 +83,7 @@ fn anthropicSupports(model: []const u8, cap: Capability) bool {
         .structured_output => claude4,
         // Claude 用 content[] 里的 thinking block,非平级 reasoning_content 字段。
         .reasoning_content => false,
+        .image_input => model_adapter.profileFor(.anthropic, model).supports_image_input,
     };
 }
 
@@ -127,4 +132,12 @@ test "Gemini 能力矩阵(C3 据实)" {
     try std.testing.expect(supports(.gemini, "gemini-2.5-pro", .prompt_cache)); // context caching
     try std.testing.expect(!supports(.gemini, "gemini-2.5-flash", .web_search)); // grounding 语义不同, 保守
     try std.testing.expect(!supports(.gemini, "gemini-2.5-flash", .extended_thinking));
+}
+
+test "image_input 能力矩阵转发 ModelProfile(单一真相)" {
+    try std.testing.expect(supports(.anthropic, "claude-sonnet-4", .image_input));
+    try std.testing.expect(supports(.openai, "gpt-4o", .image_input));
+    try std.testing.expect(supports(.gemini, "gemini-2.5-flash", .image_input));
+    try std.testing.expect(!supports(.openai, "deepseek-chat", .image_input));
+    try std.testing.expect(!supports(.other, "mystery", .image_input));
 }

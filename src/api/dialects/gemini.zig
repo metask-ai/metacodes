@@ -110,11 +110,26 @@ const Gemini = struct {
         return true;
     }
 
+    /// Gemini generateContent 图像 part:{"inline_data":{"mime_type":<mime>,"data":<b64>}}。
+    /// 输出单个 part 对象(与 {"text":..} 同级),数组逗号由 serializeGeminiContent 管理。
+    /// 能力守门:profile.supports_image_input=false 返 false,调用方报显式能力错误。
+    fn serializeImagePart(ctx: *anyopaque, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+        _ = ctx;
+        if (!p.supports_image_input) return false;
+        try out.appendSlice(a, "{\"inline_data\":{\"mime_type\":");
+        try util_json.serializeString(image.media_type, out, a);
+        try out.appendSlice(a, ",\"data\":");
+        try util_json.serializeString(image.data, out, a);
+        try out.appendSlice(a, "}}");
+        return true;
+    }
+
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
         .serializeToolChoiceFn = serializeToolChoice,
         .serializeResponseFormatFn = serializeResponseFormat,
+        .serializeImagePartFn = serializeImagePart,
     };
 };
 
@@ -232,4 +247,18 @@ test "Gemini 片段合并: response_format 先 + thinking 后,逗号正确" {
     // 期望:response_mime_type 在前,thinking_level 在后,中间有逗号
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_mime_type\":\"application/json\",\"thinking_level\":\"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "application/json\"\"thinking_level") == null); // 无缺逗号破损
+}
+
+test "Gemini dialect: serializeImagePart 发 inline_data part" {
+    const d = geminiDialectFor("gemini-2.5-pro");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const p = d.profileFor(.gemini, "gemini-2.5-pro");
+    const ok = try d.serializeImagePart(p, .{ .media_type = "image/jpeg", .data = "SlBFRw==" }, &out, a);
+    try std.testing.expect(ok);
+    try std.testing.expectEqualStrings(
+        "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"SlBFRw==\"}}",
+        out.items,
+    );
 }

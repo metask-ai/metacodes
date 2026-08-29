@@ -122,6 +122,10 @@ pub const ModelProfile = struct {
     /// 不能关 thinking(Kimi K3 总是开;Gemini 3.x 系列不能关)。
     /// 若 effort=null 或 .none/.minimal,dialect 仍要发"最低档"而非不发。
     cannot_disable_thinking: bool = false,
+    /// 支持原生图像输入(vision)。序列化守门的单一真相:false 的 (kind, model) 在
+    /// 请求含 image block 时必须报显式能力错误(error.ImageInputUnsupported),
+    /// 绝不静默丢图/OCR/文本占位。保守默认 false;仅对已验证 vision 家族开 true。
+    supports_image_input: bool = false,
 };
 
 /// provider kind(与 capability.zig 对齐,但本模块独立持有以解耦)
@@ -145,6 +149,9 @@ fn anthropicProfile(model: []const u8) ModelProfile {
         .thinking_mode = .anthropic_adaptive,
         .effort_levels = .full,
         .returns_reasoning_content = false, // Claude 用 content[] 里的 thinking block,非平级字段
+        // Claude 3+ 全系 vision(base64 image source block)。经 Anthropic 兼容网关的
+        // 第三方文本模型(如 glm-5)不支持 → 按 claude 前缀守门,其余保守 false。
+        .supports_image_input = hasSubstr(model, "claude"),
     };
     // Claude 4.x 保留 thinking(preserved thinking)
     if (hasSubstr(model, "claude-opus-4") or hasSubstr(model, "claude-sonnet-4") or hasSubstr(model, "claude-haiku-4")) {
@@ -206,6 +213,8 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .thinking_mode = .qwen_template,
             .effort_levels = .none_, // Qwen3 无 effort 档位,只开关
             .returns_reasoning_content = true,
+            // Qwen3 文本模型无 vision;VL 变体(qwen3-vl-*)走 OpenAI image_url 格式。
+            .supports_image_input = hasSubstr(model, "vl"),
         };
     }
     // MiniMax M3(三态 thinking;可关)
@@ -239,6 +248,7 @@ fn openaiProfile(model: []const u8) ModelProfile {
         .thinking_mode = .openai_effort,
         .effort_levels = .full,
         .returns_reasoning_content = false, // OpenAI 不暴露 reasoning content
+        .supports_image_input = true, // GPT-4o+/o 系/GPT-5 全系 vision(chat image_url / responses input_image)
     };
 }
 
@@ -249,6 +259,8 @@ fn geminiProfile(model: []const u8) ModelProfile {
     const cannot_disable = hasSubstr(model, "gemini-3");
     return .{
         .thinking_mode = .gemini_level,
+        .supports_image_input = true, // Gemini 全系原生多模态(inline_data parts)
+
         .effort_levels = .none_, // Gemini 用 thinking_level(minimal/low/medium/high),非 effort
         .returns_reasoning_content = false, // Gemini 用 thought_summary + signature,非平级字段
         .cannot_disable_thinking = cannot_disable,
@@ -444,4 +456,20 @@ test "profileFor: other 保守默认" {
     try std.testing.expect(p.thinking_mode == .none);
     try std.testing.expect(p.effort_levels == .none_);
     try std.testing.expect(!p.returns_reasoning_content);
+}
+
+test "profileFor: vision 能力矩阵(issue #10)" {
+    // 已验证 vision 家族 true;文本模型/未验证家族保守 false。
+    try std.testing.expect(profileFor(.anthropic, "claude-sonnet-4-20250514").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "gpt-4o").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "gpt-5.2").supports_image_input);
+    try std.testing.expect(profileFor(.gemini, "gemini-2.5-pro").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "qwen3-vl-235b").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "qwen3-235b").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "glm-5.2").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "deepseek-chat").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "kimi-k3").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "minimax-m3").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "mistral-large").supports_image_input);
+    try std.testing.expect(!profileFor(.other, "mystery").supports_image_input);
 }

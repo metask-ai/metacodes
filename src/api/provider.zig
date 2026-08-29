@@ -137,6 +137,9 @@ pub const Capability = enum {
     /// 返回 reasoning_content 平级字段(DeepSeek/Kimi/Qwen/GLM-5;Claude 用 thinking block,OpenAI 不暴露)。
     /// 用于 UI 决定是否折叠显示思考过程 + preserved thinking 回传策略。
     reasoning_content,
+    /// 原生图像输入(vision)。宿主入口预检用;序列化层守门以
+    /// ModelProfile.supports_image_input 为单一真相(capability.zig 转发查表)。
+    image_input,
 };
 
 /// LLM 后端接口。ctx 是后端实例(Client / 未来 OpenAIClient)的 type-erased 指针。

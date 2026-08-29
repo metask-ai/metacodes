@@ -342,7 +342,8 @@ fn rejectDevicePath(path: []const u8) !void {
 }
 
 /// 按扩展名判定图像 media_type；非图像返 null。
-fn imageMediaType(path: []const u8) ?[]const u8 {
+/// pub:headless --image 入口复用同一 MIME 白名单(png/jpg/jpeg/gif/webp)。
+pub fn imageMediaType(path: []const u8) ?[]const u8 {
     const Ext = struct { suffix: []const u8, mt: []const u8 };
     const table = [_]Ext{
         .{ .suffix = ".png", .mt = "image/png" },
@@ -367,7 +368,8 @@ fn endsWithIgnoreCase(s: []const u8, suffix: []const u8) bool {
 }
 
 /// 图像读取上限（base64 前的原始字节）。Anthropic 单图 ~5MB 限制，留余量取 3.75MB。
-const MAX_IMAGE_BYTES: usize = 3_750_000;
+/// pub:headless --image 入口沿用同一上限(单一真相)。
+pub const MAX_IMAGE_BYTES: usize = 3_750_000;
 
 /// 读图像 → base64 → 返回结构化 JSON：{"type":"image","media_type":"...","data":"<b64>"}。
 /// api/request.zig 的 serializeContent 检测到此形态会发成真正的 image content block。
