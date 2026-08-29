@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 14;
+pub const ABI_REVISION: u32 = 15;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 14 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 15 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -39,6 +39,7 @@ pub const Status = enum(u32) {
     mcp_not_refreshed = 24,
     invalid_mcp_selection = 25,
     skill_catalog_incomplete = 27,
+    image_input_unsupported = 28,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -69,6 +70,7 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.mcp_not_refreshed) => .mcp_not_refreshed,
             @intFromEnum(Status.invalid_mcp_selection) => .invalid_mcp_selection,
             @intFromEnum(Status.skill_catalog_incomplete) => .skill_catalog_incomplete,
+            @intFromEnum(Status.image_input_unsupported) => .image_input_unsupported,
             else => error.UnknownStatus,
         };
     }
@@ -101,6 +103,7 @@ pub const STATUS_LOGICAL_SESSION_CONFLICT: u32 = @intFromEnum(Status.logical_ses
 pub const STATUS_MCP_NOT_REFRESHED: u32 = @intFromEnum(Status.mcp_not_refreshed);
 pub const STATUS_INVALID_MCP_SELECTION: u32 = @intFromEnum(Status.invalid_mcp_selection);
 pub const STATUS_SKILL_CATALOG_INCOMPLETE: u32 = @intFromEnum(Status.skill_catalog_incomplete);
+pub const STATUS_IMAGE_INPUT_UNSUPPORTED: u32 = @intFromEnum(Status.image_input_unsupported);
 
 pub const ProviderKind = enum(u32) {
     anthropic = 1,
@@ -192,6 +195,11 @@ pub const MAX_METADATA_STRING_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_RUNTIME_METADATA_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_SESSION_METADATA_BYTES_V1: u64 = 4 * 1024 * 1024;
 pub const MAX_PROMPT_BYTES_V1: u64 = 16 * 1024 * 1024;
+pub const MAX_RUN_INPUT_PARTS_V1: u64 = 64;
+/// Base64 payload cap for one image part. This is exactly the standard base64
+/// encoding of the Read tool's 3.75 MB raw-image limit, so an image that the
+/// built-in Read tool can attach is also submittable through the ABI.
+pub const MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1: u64 = 5_000_000;
 pub const MAX_SKILL_CATALOG_SKILLS_V1: u64 = 1024;
 pub const MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1: u64 = 4 * 1024 * 1024;
 pub const MAX_SKILL_FILE_CONTENT_BYTES_V1: u64 = 16 * 1024 * 1024;
@@ -236,6 +244,10 @@ pub const PLUGIN_LAYER_MANAGED: u32 = 5;
 
 pub const RUN_INPUT_TEXT: u32 = 1;
 pub const RUN_INPUT_SKILL: u32 = 2;
+pub const RUN_INPUT_MULTIMODAL: u32 = 3;
+
+pub const RUN_INPUT_PART_TEXT: u32 = 1;
+pub const RUN_INPUT_PART_IMAGE: u32 = 2;
 
 pub const SKILL_SOURCE_USER: u32 = 1;
 pub const SKILL_SOURCE_WORKSPACE: u32 = 2;
@@ -757,6 +769,21 @@ pub const SkillCatalogQueryV1 = extern struct {
     reserved: [1]u64,
 };
 
+/// One ordered part of a RUN_INPUT_MULTIMODAL user record. Exactly the fields
+/// of the declared kind are populated; every other view is canonical empty:
+/// - RUN_INPUT_PART_TEXT: `text` is non-empty UTF-8.
+/// - RUN_INPUT_PART_IMAGE: `media_type` is one of `image/png`, `image/jpeg`,
+///   `image/gif`, `image/webp`; `data` is non-empty standard base64 with `=`
+///   padding and no whitespace, at most MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1.
+pub const RunInputPartV1 = extern struct {
+    struct_size: u32,
+    kind_code: u32,
+    text: BytesViewV1,
+    media_type: BytesViewV1,
+    data: BytesViewV1,
+    reserved: [2]u64,
+};
+
 pub const RunInputV1 = extern struct {
     struct_size: u32,
     kind_code: u32,
@@ -764,7 +791,12 @@ pub const RunInputV1 = extern struct {
     skill_id: BytesViewV1,
     catalog_revision: BytesViewV1,
     arguments_json: BytesViewV1,
-    reserved: [4]u64,
+    /// RUN_INPUT_MULTIMODAL only: 1..MAX_RUN_INPUT_PARTS_V1 ordered parts,
+    /// borrowed for the synchronous call. Null with zero count for every
+    /// other kind.
+    parts: ?[*]const RunInputPartV1,
+    part_count: u64,
+    reserved: [2]u64,
 };
 
 pub const RunOptionsV1 = extern struct {
@@ -974,7 +1006,7 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 14 accepts
+/// Runs the canonical default best-effort compact policy. Revision 15 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1084,6 +1116,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionCreateConfigV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SkillSourceV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(SkillCatalogQueryV1));
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(RunInputPartV1));
     try std.testing.expectEqual(@as(usize, 104), @sizeOf(RunInputV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(RunOptionsV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(RunResultV1));
@@ -1142,7 +1175,14 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillCatalogQueryV1, "workspace_epoch"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(SkillCatalogQueryV1, "additional_sources"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(SkillCatalogQueryV1, "additional_source_count"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunInputPartV1, "text"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunInputPartV1, "media_type"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(RunInputPartV1, "data"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(RunInputPartV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(RunInputV1, "arguments_json"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(RunInputV1, "parts"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(RunInputV1, "part_count"));
+    try std.testing.expectEqual(@as(usize, 88), @offsetOf(RunInputV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(ApiV1, "abi_revision"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "buffer_release"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(ApiV1, "runtime"));
@@ -1168,7 +1208,8 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectEqual(Status.invalid_mcp_selection, try Status.fromCode(25));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(26));
     try std.testing.expectEqual(Status.skill_catalog_incomplete, try Status.fromCode(27));
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(28));
+    try std.testing.expectEqual(Status.image_input_unsupported, try Status.fromCode(28));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(29));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
     try std.testing.expectEqual(StopReason.checkpoint_resource_limit, try StopReason.fromCode(8));
@@ -1190,9 +1231,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 14 keeps MCP wire codes stable" {
+test "Revision 15 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 14), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 15), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

@@ -125,7 +125,7 @@ pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (!std.mem.eql(u8, manifest.build.optimize, expected.optimize)) return error.OptimizeMismatch;
     if (manifest.build.strip != expected.strip) return error.StripMismatch;
     if (manifest.contract.binary_abi_version != 1 or
-        manifest.contract.binary_abi_revision != 14 or
+        manifest.contract.binary_abi_revision != 15 or
         manifest.contract.binary_abi_table_size != 64)
         return error.AbiMismatch;
     if (!std.mem.eql(u8, manifest.contract.binary_abi_status, "experimental")) return error.AbiStatusMismatch;
@@ -259,7 +259,7 @@ fn validManifest() Manifest {
         .contract = .{
             .binary_abi_status = "experimental",
             .binary_abi_version = 1,
-            .binary_abi_revision = 14,
+            .binary_abi_revision = 15,
             .binary_abi_table_size = 64,
         },
         .runtime_assets = &valid_runtime_assets,

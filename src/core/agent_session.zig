@@ -10,6 +10,7 @@ const types = @import("../types.zig");
 const provider_factory = @import("../api/provider_factory.zig");
 const provider_mod = @import("../api/provider.zig");
 const Conversation = @import("conversation.zig").Conversation;
+const message_mod = @import("message.zig");
 const permission = @import("../permission.zig");
 const permission_settings = @import("../permission/settings.zig");
 const compact_kernel = @import("compact_kernel.zig");
@@ -969,6 +970,67 @@ pub const AdmittedRun = struct {
         );
     }
 
+    /// Continue an admitted Run with one multimodal user record built from
+    /// ordered text/image parts. Part bytes are borrowed and copied during
+    /// append. Appends and provider execution retain the ordinary poison
+    /// semantics; a non-vision model still fails the provider serializer with
+    /// `error.ImageInputUnsupported` before any network I/O.
+    pub fn runUserParts(
+        self: *AdmittedRun,
+        parts: []const message_mod.UserContentPart,
+        max_turns: u32,
+    ) anyerror!agent_loop.RunResult {
+        return self.runUserPartsWithToolSurfaceImpl(parts, max_turns, null, null, null);
+    }
+
+    /// Multimodal companion of `runUserMessagesWithToolSurfaceUsingProvider`:
+    /// the same facade-owned Provider override and tool overlay, with one
+    /// ordered text/image user record instead of text prompts.
+    pub fn runUserPartsWithToolSurfaceUsingProvider(
+        self: *AdmittedRun,
+        parts: []const message_mod.UserContentPart,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+        provider_override: provider_mod.Provider,
+    ) anyerror!agent_loop.RunResult {
+        return self.runUserPartsWithToolSurfaceImpl(
+            parts,
+            max_turns,
+            execution_policy,
+            tool_surface,
+            provider_override,
+        );
+    }
+
+    fn runUserPartsWithToolSurfaceImpl(
+        self: *AdmittedRun,
+        parts: []const message_mod.UserContentPart,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+        provider_override: ?provider_mod.Provider,
+    ) anyerror!agent_loop.RunResult {
+        if (self.completed) return error.InvalidSessionState;
+        if (parts.len == 0) {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        }
+        try self.session.claimAdmittedRun(self.identity_value);
+        self.completed = true;
+        self.session.conversation.appendUserParts(parts) catch |err| {
+            _ = self.session.poisonRun();
+            return err;
+        };
+        return self.session.runLoop(
+            self.identity_value,
+            max_turns,
+            execution_policy,
+            tool_surface,
+            provider_override,
+        );
+    }
+
     /// Run a synchronous child executor under this already-admitted Run. The
     /// parent Conversation receives the supplied root records and, only after
     /// successful quiescence, the executor's non-empty final assistant text.
@@ -1750,6 +1812,21 @@ pub const AgentSession = struct {
     pub fn runText(self: *AgentSession, run_id: u64, prompt: []const u8, max_turns: u32, sink: EventSink) anyerror!agent_loop.RunResult {
         var admitted = try self.admitRun(run_id, sink);
         return admitted.runText(prompt, max_turns);
+    }
+
+    /// Run one multimodal user turn (ordered text/image parts) while
+    /// preserving Conversation across successful Runs. Part bytes are borrowed
+    /// and copied during append; a non-vision model fails the provider
+    /// serializer with `error.ImageInputUnsupported` before any network I/O.
+    pub fn runUserParts(
+        self: *AgentSession,
+        run_id: u64,
+        parts: []const message_mod.UserContentPart,
+        max_turns: u32,
+        sink: EventSink,
+    ) anyerror!agent_loop.RunResult {
+        var admitted = try self.admitRun(run_id, sink);
+        return admitted.runUserParts(parts, max_turns);
     }
 
     pub fn admitRun(

@@ -151,12 +151,47 @@ pub fn main(init: std.process.Init) !void {
     defer session.destroy() catch unreachable;
 
     var sink_context: u8 = 0;
-    const result = session.runText(
+    const prompt = "Reply with one short sentence. You may use the Host Echo tool if useful.";
+    // Optional multimodal turn: METACODES_IMAGE=<path.png|jpg|jpeg|gif|webp>
+    // attaches the image beside the prompt as one ordered text+image user
+    // record. Capability gating stays in core: a non-vision model fails with
+    // ImageInputUnsupported before any network I/O.
+    const result = if (std.c.getenv("METACODES_IMAGE")) |image_env| blk: {
+        const image_path = std.mem.span(image_env);
+        const media_type = mc.tool_read.imageMediaType(image_path) orelse {
+            std.debug.print("[example] METACODES_IMAGE: unsupported image type: {s}\n", .{image_path});
+            return;
+        };
+        // limit semantics are reached-or-exceeded, so +1 admits a file of
+        // exactly MAX_IMAGE_BYTES and still rejects anything larger.
+        const raw = std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            image_path,
+            allocator,
+            .limited(mc.tool_read.MAX_IMAGE_BYTES + 1),
+        ) catch |err| {
+            std.debug.print("[example] METACODES_IMAGE {s}: {s}\n", .{ image_path, @errorName(err) });
+            return;
+        };
+        const encoder = std.base64.standard.Encoder;
+        const encoded = try allocator.alloc(u8, encoder.calcSize(raw.len));
+        _ = encoder.encode(encoded, raw);
+        break :blk session.runUserParts(
+            1,
+            &.{
+                .{ .text = prompt },
+                .{ .image = .{ .media_type = media_type, .data = encoded } },
+            },
+            4,
+            .{ .ctx = &sink_context, .emit = PrintSink.emit },
+        );
+    } else session.runText(
         1,
-        "Reply with one short sentence. You may use the Host Echo tool if useful.",
+        prompt,
         4,
         .{ .ctx = &sink_context, .emit = PrintSink.emit },
-    ) catch |err| {
+    );
+    const run = result catch |err| {
         std.debug.print("\n[example] run error: {s}\n", .{@errorName(err)});
         return;
     };
@@ -164,9 +199,9 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(
         "\n[example] stop={s} turns={d} tool_calls={d} plugin_calls={d} releases={d}\n",
         .{
-            @tagName(result.stop_reason),
-            result.turns,
-            result.tool_calls,
+            @tagName(run.stop_reason),
+            run.turns,
+            run.tool_calls,
             embedding.calls,
             embedding.releases,
         },

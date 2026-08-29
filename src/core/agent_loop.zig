@@ -2829,7 +2829,7 @@ fn estimateApiRequestTokens(
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
 ) !usize {
-    const req_body = try json_mod.serializeMessagesRequest(.{
+    const req_body = try json_mod.serializeCanonicalRequestProjection(.{
         .model = model_override orelse provider.model(),
         .max_tokens = provider.maxTokens(),
         .messages = messages,
@@ -2854,7 +2854,7 @@ fn serializedRequestInputTokenReserve(
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
 ) !u64 {
-    const req_body = try json_mod.serializeMessagesRequest(.{
+    const req_body = try json_mod.serializeCanonicalRequestProjection(.{
         .model = model_override orelse provider.model(),
         .max_tokens = provider.maxTokens(),
         .messages = messages,
@@ -2881,7 +2881,7 @@ fn canonicalAgentRequestSha256(
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
 ) ![64]u8 {
-    const req_body = try json_mod.serializeMessagesRequest(.{
+    const req_body = try json_mod.serializeCanonicalRequestProjection(.{
         .model = model_override orelse provider.model(),
         .max_tokens = provider.maxTokens(),
         .messages = messages,

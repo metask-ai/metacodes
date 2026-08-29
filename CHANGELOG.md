@@ -12,6 +12,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- AgentCore ABI v1 revision 15: `session_run_input` gains
+  `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
+  base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,
+  total bounded by the 16 MiB input cap) that becomes one first-class
+  multimodal user record with the exact-reservation admission invariant, full
+  checkpoint/restore round-trip, and a pre-admission image-capability
+  preflight returning the new status
+  `METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED` (28) before any Provider
+  request. C header, Zig SDK (`runMultimodal`, `textPart`/`imagePart`), Rust
+  bindings, and both source-free consumers move to revision 15 atomically;
+  source embedders get `AgentSession.runUserParts` /
+  `Conversation.appendUserParts` and the example gains `METACODES_IMAGE`.
+  Fixed en route: the provider-neutral canonical request projection (durable
+  budget accounting, journal request identity, token estimates) no longer
+  re-applies per-model image capability — previously any image run on a
+  vision model whose name lacks `claude` (every OpenAI/Gemini model) failed
+  inside accounting with `ImageInputUnsupported` before the real request was
+  sent (`json.serializeCanonicalRequestProjection`).
 - Model tiers (issue #11 core-side fix): subagent/skill model pins and
   `/model` now resolve tier names — `low`/`mid`/`high`, with legacy aliases
   `haiku`/`sonnet`/`opus` mapping to the same tiers — against a per-provider

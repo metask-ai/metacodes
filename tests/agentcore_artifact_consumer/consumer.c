@@ -6,11 +6,17 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 14 must not retain historical callback aliases"
+#error "revision 15 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 14u || \
+#if METASK_AGENTCORE_ABI_REVISION != 15u || \
     METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE != 27u || \
+    METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED != 28u || \
+    METASK_AGENTCORE_RUN_INPUT_MULTIMODAL != 3u || \
+    METASK_AGENTCORE_RUN_INPUT_PART_TEXT != 1u || \
+    METASK_AGENTCORE_RUN_INPUT_PART_IMAGE != 2u || \
+    METASK_AGENTCORE_MAX_RUN_INPUT_PARTS_V1 != 64u || \
+    METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 != 5000000u || \
     METASK_AGENTCORE_PROTOCOL_DEFAULT != 0u || \
     METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES != 1u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_AUTO != 1u || \
@@ -23,7 +29,7 @@
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
     METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 14 codes must match the public contract"
+#error "source-free Revision 15 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -61,11 +67,51 @@ static const char RESPONSE_BODY[] =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n"
     "data: {\"type\":\"message_stop\"}\n\n";
 
+/* Rolling substring scan over a streamed request so the multimodal image
+ * payload is proven inside provider-visible request bytes even when recv
+ * splits it across chunks. */
+struct needle_scan {
+    const char *needle;
+    size_t needle_len;
+    char carry[96];
+    size_t carry_len;
+    int found;
+};
+
+static void scan_feed(struct needle_scan *scan, const char *bytes, size_t len) {
+    char window[8192 + 96];
+    if (scan == NULL || scan->found || scan->needle_len == 0 ||
+        scan->needle_len > sizeof(scan->carry)) {
+        return;
+    }
+    while (len != 0) {
+        size_t chunk = len > 8192 ? 8192 : len;
+        size_t total = scan->carry_len + chunk;
+        size_t keep = scan->needle_len - 1;
+        size_t index;
+        memcpy(window, scan->carry, scan->carry_len);
+        memcpy(window + scan->carry_len, bytes, chunk);
+        for (index = 0; index + scan->needle_len <= total; index++) {
+            if (memcmp(window + index, scan->needle, scan->needle_len) == 0) {
+                scan->found = 1;
+                return;
+            }
+        }
+        if (keep > total) keep = total;
+        memcpy(scan->carry, window + total - keep, keep);
+        scan->carry_len = keep;
+        bytes += chunk;
+        len -= chunk;
+    }
+}
+
 struct test_server {
     socket_handle fd;
     uint16_t port;
     thread_handle thread;
     int result;
+    int rounds;
+    struct needle_scan scan;
 };
 
 static int socket_is_valid(socket_handle fd) {
@@ -111,7 +157,7 @@ static int write_all(socket_handle fd, const void *bytes, size_t len) {
     return 0;
 }
 
-static int read_request(socket_handle fd) {
+static int read_request(socket_handle fd, struct needle_scan *scan) {
     char header[64 * 1024 + 1];
     size_t total = 0;
     char *end = NULL;
@@ -123,6 +169,7 @@ static int read_request(socket_handle fd) {
         end = strstr(header, "\r\n\r\n");
     }
     if (end == NULL) return -1;
+    scan_feed(scan, header, total);
     size_t header_len = (size_t)(end - header) + 4;
     size_t content_len = 0;
     char *length = strstr(header, "Content-Length:");
@@ -133,61 +180,77 @@ static int read_request(socket_handle fd) {
         size_t needed = content_len - body_read;
         int count = socket_read(fd, discard, needed < sizeof(discard) ? needed : sizeof(discard));
         if (count <= 0) return -1;
+        scan_feed(scan, discard, (size_t)count);
         body_read += (size_t)count;
     }
     return 0;
 }
 
 #ifdef _WIN32
-static DWORD WINAPI serve_once(LPVOID raw) {
+static DWORD WINAPI serve_rounds(LPVOID raw) {
 #define THREAD_RETURN return 0
 #else
-static void *serve_once(void *raw) {
+static void *serve_rounds(void *raw) {
 #define THREAD_RETURN return NULL
 #endif
     struct test_server *server = (struct test_server *)raw;
-    socket_handle client = accept(server->fd, NULL, NULL);
+    int round;
+    for (round = 0; round < server->rounds; round++) {
+        socket_handle client = accept(server->fd, NULL, NULL);
 #ifdef _WIN32
-    DWORD timeout = 10000;
-    if (socket_is_valid(client) &&
-        (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
-                    sizeof(timeout)) != 0 ||
-         setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout,
-                    sizeof(timeout)) != 0)) {
+        DWORD timeout = 10000;
+        if (socket_is_valid(client) &&
+            (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
+                        sizeof(timeout)) != 0 ||
+             setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout,
+                        sizeof(timeout)) != 0)) {
 #else
-    struct timeval timeout = {.tv_sec = 10, .tv_usec = 0};
-    if (socket_is_valid(client) &&
-        (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
-         setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0)) {
+        struct timeval timeout = {.tv_sec = 10, .tv_usec = 0};
+        if (socket_is_valid(client) &&
+            (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+             setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0)) {
 #endif
-        close_socket(client);
-        server->result = -1;
-        THREAD_RETURN;
+            close_socket(client);
+            server->result = -1;
+            THREAD_RETURN;
+        }
+        if (!socket_is_valid(client) || read_request(client, &server->scan) != 0) {
+            if (socket_is_valid(client)) close_socket(client);
+            server->result = -1;
+            THREAD_RETURN;
+        }
+        {
+            char header[256];
+            int header_len = snprintf(header, sizeof(header),
+                                      "HTTP/1.1 200 OK\r\n"
+                                      "Content-Type: text/event-stream\r\n"
+                                      "Content-Length: %zu\r\n"
+                                      "Connection: close\r\n\r\n",
+                                      sizeof(RESPONSE_BODY) - 1);
+            int round_ok = header_len > 0 &&
+                           write_all(client, header, (size_t)header_len) == 0 &&
+                           write_all(client, RESPONSE_BODY, sizeof(RESPONSE_BODY) - 1) == 0;
+            close_socket(client);
+            if (!round_ok) {
+                server->result = -1;
+                THREAD_RETURN;
+            }
+        }
     }
-    if (!socket_is_valid(client) || read_request(client) != 0) {
-        if (socket_is_valid(client)) close_socket(client);
-        server->result = -1;
-        THREAD_RETURN;
-    }
-    char header[256];
-    int header_len = snprintf(header, sizeof(header),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: text/event-stream\r\n"
-                              "Content-Length: %zu\r\n"
-                              "Connection: close\r\n\r\n",
-                              sizeof(RESPONSE_BODY) - 1);
-    server->result = header_len > 0 &&
-                             write_all(client, header, (size_t)header_len) == 0 &&
-                             write_all(client, RESPONSE_BODY, sizeof(RESPONSE_BODY) - 1) == 0
-                         ? 0
-                         : -1;
-    close_socket(client);
+    server->result = 0;
     THREAD_RETURN;
 #undef THREAD_RETURN
 }
 
-static int start_server(struct test_server *server) {
+static int start_server(struct test_server *server, int rounds,
+                        const char *needle) {
     memset(server, 0, sizeof(*server));
+    server->rounds = rounds;
+    server->result = -1;
+    if (needle != NULL) {
+        server->scan.needle = needle;
+        server->scan.needle_len = strlen(needle);
+    }
 #ifdef _WIN32
     WSADATA winsock;
     if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return -1;
@@ -233,10 +296,10 @@ static int start_server(struct test_server *server) {
     }
     server->port = ntohs(address.sin_port);
 #ifdef _WIN32
-    server->thread = CreateThread(NULL, 0, serve_once, server, 0, NULL);
+    server->thread = CreateThread(NULL, 0, serve_rounds, server, 0, NULL);
     if (server->thread == NULL) {
 #else
-    if (pthread_create(&server->thread, NULL, serve_once, server) != 0) {
+    if (pthread_create(&server->thread, NULL, serve_rounds, server) != 0) {
 #endif
         close_socket(server->fd);
 #ifdef _WIN32
@@ -426,7 +489,7 @@ int main(void) {
         return release_error(api, &diagnostic, 13);
     }
     struct test_server server;
-    if (start_server(&server) != 0) {
+    if (start_server(&server, 2, "\"data\":\"aWNvbi1ieXRlcw==\"") != 0) {
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 14);
     }
@@ -518,23 +581,105 @@ int main(void) {
     metask_agentcore_run_options_v1 options = {0};
     options.struct_size = sizeof(options);
     options.max_turns = 1;
+
+    /* Multimodal pre-provider probes: the current model has no image
+     * capability and malformed wire is rejected outright. Neither request
+     * reaches the mock provider (both response rounds stay unconsumed) and
+     * the rejected Run id stays reusable. */
+    metask_agentcore_run_input_part_v1 image_parts[2];
+    memset(image_parts, 0, sizeof(image_parts));
+    image_parts[0].struct_size = (uint32_t)sizeof(image_parts[0]);
+    image_parts[0].kind_code = METASK_AGENTCORE_RUN_INPUT_PART_TEXT;
+    image_parts[0].text = view("what is in this icon?");
+    image_parts[1].struct_size = (uint32_t)sizeof(image_parts[1]);
+    image_parts[1].kind_code = METASK_AGENTCORE_RUN_INPUT_PART_IMAGE;
+    image_parts[1].media_type = view("image/png");
+    image_parts[1].data = view("aWNvbi1ieXRlcw==");
+    metask_agentcore_run_input_v1 multimodal = {0};
+    multimodal.struct_size = sizeof(multimodal);
+    multimodal.kind_code = METASK_AGENTCORE_RUN_INPUT_MULTIMODAL;
+    multimodal.parts = image_parts;
+    multimodal.part_count = 2;
+    metask_agentcore_run_result_v1 result = {0};
+    if (api->session->run_input(session, 1, &multimodal, &options, &result,
+                                &diagnostic) !=
+        METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED) {
+        api->buffer_release(&diagnostic);
+        stop_server(&server);
+        api->session->destroy(session, &diagnostic);
+        api->buffer_release(&diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 21);
+    }
+    api->buffer_release(&diagnostic);
+    metask_agentcore_run_input_v1 malformed = multimodal;
+    malformed.parts = (const metask_agentcore_run_input_part_v1 *)0;
+    malformed.part_count = 0;
+    metask_agentcore_run_input_v1 text_with_parts = {0};
+    text_with_parts.struct_size = sizeof(text_with_parts);
+    text_with_parts.kind_code = METASK_AGENTCORE_RUN_INPUT_TEXT;
+    text_with_parts.text = view("text with stray parts");
+    text_with_parts.parts = image_parts;
+    text_with_parts.part_count = 1;
+    if (api->session->run_input(session, 1, &malformed, &options, &result,
+                                &diagnostic) !=
+            METASK_AGENTCORE_STATUS_INVALID_ARGUMENT ||
+        (api->buffer_release(&diagnostic),
+         api->session->run_input(session, 1, &text_with_parts, &options,
+                                 &result, &diagnostic)) !=
+            METASK_AGENTCORE_STATUS_INVALID_ARGUMENT) {
+        api->buffer_release(&diagnostic);
+        stop_server(&server);
+        api->session->destroy(session, &diagnostic);
+        api->buffer_release(&diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 22);
+    }
+    api->buffer_release(&diagnostic);
+
+    /* Vision-capable model for the two real provider rounds. */
+    if (api->session_control->set_model(session, view("claude-c-consumer"),
+                                        &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
+        stop_server(&server);
+        api->session->destroy(session, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 23);
+    }
+
     metask_agentcore_run_input_v1 input = {0};
     input.struct_size = sizeof(input);
     input.kind_code = METASK_AGENTCORE_RUN_INPUT_TEXT;
     input.text = view("exercise C ABI");
-    metask_agentcore_run_result_v1 result = {0};
     active_run_id = 1;
     uint32_t run_status = api->session->run_input(session, 1, &input, &options,
                                                  &result, &diagnostic);
     active_run_id = 0;
-    stop_server(&server);
-    if (run_status != METASK_AGENTCORE_STATUS_OK || result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN ||
-        event_calls == 0 || server.result != 0) {
+    if (run_status != METASK_AGENTCORE_STATUS_OK ||
+        result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN) {
         api->buffer_release(&diagnostic);
+        stop_server(&server);
         api->session->destroy(session, &diagnostic);
         api->buffer_release(&diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 18);
+    }
+
+    /* End-to-end multimodal Run: the ordered text+image parts must reach the
+     * captured provider request bytes (base64 payload verified by the mock
+     * server's rolling scan). */
+    active_run_id = 2;
+    run_status = api->session->run_input(session, 2, &multimodal, &options,
+                                         &result, &diagnostic);
+    active_run_id = 0;
+    stop_server(&server);
+    if (run_status != METASK_AGENTCORE_STATUS_OK ||
+        result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN ||
+        event_calls == 0 || server.result != 0 || !server.scan.found) {
+        api->buffer_release(&diagnostic);
+        api->session->destroy(session, &diagnostic);
+        api->buffer_release(&diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 24);
     }
     if (api->session->destroy(session, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         api->buffer_release(&diagnostic);
@@ -545,6 +690,6 @@ int main(void) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);
-    puts("AgentCore source-free C consumer: ABI table, callback and lifecycle OK");
+    puts("AgentCore source-free C consumer: ABI table, callback, multimodal input and lifecycle OK");
     return 0;
 }

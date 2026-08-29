@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 14 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 15 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 14 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 15 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 14u
+#define METASK_AGENTCORE_ABI_REVISION 15u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -46,6 +46,7 @@ extern "C" {
 #define METASK_AGENTCORE_STATUS_MCP_NOT_REFRESHED 24u
 #define METASK_AGENTCORE_STATUS_INVALID_MCP_SELECTION 25u
 #define METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE 27u
+#define METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED 28u
 
 #define METASK_AGENTCORE_PROVIDER_ANTHROPIC 1u
 #define METASK_AGENTCORE_PROVIDER_OPENAI 2u
@@ -92,6 +93,10 @@ extern "C" {
 #define METASK_AGENTCORE_MAX_RUNTIME_METADATA_BYTES_V1 16777216ULL
 #define METASK_AGENTCORE_MAX_SESSION_METADATA_BYTES_V1 4194304ULL
 #define METASK_AGENTCORE_MAX_PROMPT_BYTES_V1 16777216ULL
+#define METASK_AGENTCORE_MAX_RUN_INPUT_PARTS_V1 64ULL
+/* Base64 payload cap for one image part: exactly the standard base64 encoding
+ * of the built-in Read tool's 3.75 MB raw-image limit. */
+#define METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 5000000ULL
 #define METASK_AGENTCORE_MAX_SKILL_CATALOG_SKILLS_V1 1024ULL
 #define METASK_AGENTCORE_MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1 4194304ULL
 #define METASK_AGENTCORE_MAX_SKILL_FILE_CONTENT_BYTES_V1 16777216ULL
@@ -136,6 +141,9 @@ extern "C" {
 
 #define METASK_AGENTCORE_RUN_INPUT_TEXT 1u
 #define METASK_AGENTCORE_RUN_INPUT_SKILL 2u
+#define METASK_AGENTCORE_RUN_INPUT_MULTIMODAL 3u
+#define METASK_AGENTCORE_RUN_INPUT_PART_TEXT 1u
+#define METASK_AGENTCORE_RUN_INPUT_PART_IMAGE 2u
 #define METASK_AGENTCORE_SKILL_SOURCE_USER 1u
 #define METASK_AGENTCORE_SKILL_SOURCE_WORKSPACE 2u
 #define METASK_AGENTCORE_COMPACT_COMPACTED 1u
@@ -582,6 +590,20 @@ typedef struct {
     uint64_t reserved[1];
 } metask_agentcore_skill_catalog_query_v1;
 
+/* One ordered part of a RUN_INPUT_MULTIMODAL user record. Exactly the fields
+ * of the declared kind are populated; every other view is canonical empty.
+ * PART_TEXT carries non-empty UTF-8 `text`. PART_IMAGE carries `media_type`
+ * (image/png, image/jpeg, image/gif, or image/webp) plus non-empty standard
+ * base64 `data` bounded by METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t kind_code;
+    metask_agentcore_bytes_view_v1 text;
+    metask_agentcore_bytes_view_v1 media_type;
+    metask_agentcore_bytes_view_v1 data;
+    uint64_t reserved[2];
+} metask_agentcore_run_input_part_v1;
+
 typedef struct {
     uint32_t struct_size;
     uint32_t kind_code;
@@ -589,7 +611,11 @@ typedef struct {
     metask_agentcore_bytes_view_v1 skill_id;
     metask_agentcore_bytes_view_v1 catalog_revision;
     metask_agentcore_bytes_view_v1 arguments_json;
-    uint64_t reserved[4];
+    /* RUN_INPUT_MULTIMODAL only: 1..MAX_RUN_INPUT_PARTS_V1 ordered parts,
+     * borrowed for the synchronous call. Null with zero count otherwise. */
+    const metask_agentcore_run_input_part_v1 *parts;
+    uint64_t part_count;
+    uint64_t reserved[2];
 } metask_agentcore_run_input_v1;
 
 typedef struct {
@@ -747,7 +773,7 @@ typedef uint32_t (*metask_agentcore_session_export_checkpoint_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 14. No earlier revision layout
+/* Function-table order is fixed within Revision 15. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -924,8 +950,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 14u,
-                               "AgentCore revision 14");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 15u,
+                               "AgentCore revision 15");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -970,6 +996,7 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_host_config_v1, 168);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_create_config_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_source_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_catalog_query_v1, 80);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_run_input_part_v1, 72);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_run_input_v1, 104);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_run_options_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_run_result_v1, 72);
@@ -1019,6 +1046,14 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, model,
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_sources, 56);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_source_count, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_selector_v1, tool_name, 40);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_part_v1, text, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_part_v1, media_type, 24);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_part_v1, data, 40);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_part_v1, reserved, 56);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, arguments_json, 56);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, parts, 72);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, part_count, 80);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, reserved, 88);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, durable_usage_bytes, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, required_checkpoint_bytes, 32);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_checkpoint_export_result_v1, digest, 32);

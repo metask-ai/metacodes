@@ -123,6 +123,30 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
     );
 }
 
+/// Provider 中立的 canonical 请求投影(预算记账/journal 身份/token 估算用)。
+/// 不是真实 provider 请求:图像能力门属于真实发送路径(与 AgentCore 预检),
+/// 投影必须对任意 Session model 可计算——否则非 claude 命名的 vision 模型
+/// (如 gpt-*/gemini-*)带图时,记账序列化自己先报 ImageInputUnsupported,
+/// 真实请求反而从未发出。故此处强制放行 image 位,始终按 Anthropic base64
+/// image source block 形态计字节;text-only 请求字节与 serializeMessagesRequest
+/// 完全一致。
+pub fn serializeCanonicalRequestProjection(req: MessagesRequest, allocator: std.mem.Allocator) ![]u8 {
+    const dialect_mod = @import("dialect.zig");
+    var dialect = dialect_mod.dialectFor(.anthropic, req.model);
+    dialect.profileFn = canonicalProjectionProfile;
+    return serializeMessagesRequestWithDialect(req, allocator, dialect);
+}
+
+fn canonicalProjectionProfile(
+    _: *anyopaque,
+    kind: @import("dialect.zig").ProviderKind,
+    model: []const u8,
+) @import("dialect.zig").ModelProfile {
+    var profile = @import("model_adapter.zig").profileFor(kind, model);
+    profile.supports_image_input = true;
+    return profile;
+}
+
 /// Runtime-scoped variant. The selected Dialect is pinned by the Session's
 /// immutable plugin Snapshot; plugin metadata/generation never enters the
 /// serialized request, preserving provider prefix-cache identity.
@@ -969,4 +993,42 @@ test "serializeInputSchema: prop_specs 支持 array items 与 enum" {
     try serializeInputSchema(schema, &buf, std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"items\":{\"type\":\"string\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"enum\":[\"a\",\"b\"]") != null);
+}
+
+test "canonical 投影:非 claude 命名的 vision 模型带图可计量,text-only 与普通序列化字节一致" {
+    const a = std.testing.allocator;
+    const image_messages = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .text = "look" },
+            .{ .image = .{ .media_type = "image/png", .data = "UE5H" } },
+        } },
+    };
+    // 普通(真实请求)序列化按 Anthropic 能力守门:gpt-5.2 无 "claude" → 显式能力错误。
+    try std.testing.expectError(
+        error.ImageInputUnsupported,
+        serializeMessagesRequest(
+            .{ .model = "gpt-5.2", .messages = &image_messages },
+            a,
+        ),
+    );
+    // canonical 投影是记账/身份用的 provider 中立形态:必须对任意模型可计算。
+    const projected = try serializeCanonicalRequestProjection(
+        .{ .model = "gpt-5.2", .messages = &image_messages },
+        a,
+    );
+    defer a.free(projected);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        projected,
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"UE5H\"}}",
+    ) != null);
+    // text-only:投影与普通序列化逐字节一致(记账不改变既有字节)。
+    const text_messages = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hello" }} },
+    };
+    const plain = try serializeMessagesRequest(.{ .model = "gpt-5.2", .messages = &text_messages }, a);
+    defer a.free(plain);
+    const canonical = try serializeCanonicalRequestProjection(.{ .model = "gpt-5.2", .messages = &text_messages }, a);
+    defer a.free(canonical);
+    try std.testing.expectEqualStrings(plain, canonical);
 }

@@ -164,6 +164,39 @@ pub fn userMessageWithImages(
     return .{ .role = .user, .blocks = blocks };
 }
 
+/// 一段借入的多模态根输入:text/image 任意有序混排(不限"前置 text + 图列表")。
+/// 字节在构造/追加时复制;调用方保留切片所有权。
+pub const UserContentPart = union(enum) {
+    text: []const u8,
+    image: ImageInput,
+};
+
+/// 构造 text/image 任意有序混排的 user Message(全部字节 dupe 成 owned)。
+/// parts 为空 → error.EmptyMessage(不产出空 content 消息)。
+pub fn userMessageFromParts(
+    allocator: std.mem.Allocator,
+    parts: []const UserContentPart,
+) !Message {
+    if (parts.len == 0) return error.EmptyMessage;
+    const blocks = try allocator.alloc(Block, parts.len);
+    errdefer allocator.free(blocks);
+    var built: usize = 0;
+    errdefer for (blocks[0..built]) |b| b.deinit(allocator);
+    for (parts) |part| {
+        blocks[built] = switch (part) {
+            .text => |t| .{ .text = try allocator.dupe(u8, t) },
+            .image => |img| blk: {
+                const mt = try allocator.dupe(u8, img.media_type);
+                errdefer allocator.free(mt);
+                const data = try allocator.dupe(u8, img.data);
+                break :blk .{ .image = .{ .media_type = mt, .data = data } };
+            },
+        };
+        built += 1;
+    }
+    return .{ .role = .user, .blocks = blocks };
+}
+
 test "textMessage roundtrip" {
     var m = try textMessage(.user, "hello", std.testing.allocator);
     defer m.deinit(std.testing.allocator);
@@ -266,4 +299,22 @@ test "Block.dupe/deinit image 深拷贝无泄漏" {
     defer copy.deinit(a);
     try std.testing.expectEqualStrings("image/png", copy.image.media_type);
     try std.testing.expectEqualStrings("QUJDRA==", copy.image.data);
+}
+
+test "userMessageFromParts: 任意有序混排(text-image-text, owned dupe)" {
+    const a = std.testing.allocator;
+    const parts = [_]UserContentPart{
+        .{ .text = "前文" },
+        .{ .image = .{ .media_type = "image/png", .data = "UE5H" } },
+        .{ .text = "后文" },
+    };
+    const m = try userMessageFromParts(a, &parts);
+    defer m.deinit(a);
+    try std.testing.expect(m.role == .user);
+    try std.testing.expectEqual(@as(usize, 3), m.blocks.len);
+    try std.testing.expectEqualStrings("前文", m.blocks[0].text);
+    try std.testing.expectEqualStrings("image/png", m.blocks[1].image.media_type);
+    try std.testing.expectEqualStrings("UE5H", m.blocks[1].image.data);
+    try std.testing.expectEqualStrings("后文", m.blocks[2].text);
+    try std.testing.expectError(error.EmptyMessage, userMessageFromParts(a, &.{}));
 }

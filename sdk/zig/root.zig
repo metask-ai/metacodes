@@ -84,6 +84,32 @@ pub fn bytesView(bytes: []const u8) types.BytesViewV1 {
     return .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = bytes.len };
 }
 
+/// One RUN_INPUT_PART_TEXT element: non-empty UTF-8 text, other views
+/// canonical empty.
+pub fn textPart(part_text: []const u8) types.RunInputPartV1 {
+    return .{
+        .struct_size = @sizeOf(types.RunInputPartV1),
+        .kind_code = types.RUN_INPUT_PART_TEXT,
+        .text = bytesView(part_text),
+        .media_type = bytesView(""),
+        .data = bytesView(""),
+        .reserved = [_]u64{0} ** 2,
+    };
+}
+
+/// One RUN_INPUT_PART_IMAGE element: an allowlisted image media type plus
+/// standard base64 payload, `text` canonical empty.
+pub fn imagePart(media_type: []const u8, base64_data: []const u8) types.RunInputPartV1 {
+    return .{
+        .struct_size = @sizeOf(types.RunInputPartV1),
+        .kind_code = types.RUN_INPUT_PART_IMAGE,
+        .text = bytesView(""),
+        .media_type = bytesView(media_type),
+        .data = bytesView(base64_data),
+        .reserved = [_]u64{0} ** 2,
+    };
+}
+
 pub fn borrowedBytes(view: types.BytesViewV1) error{InvalidBytesView}![]const u8 {
     const len = std.math.cast(usize, view.len) orelse return error.InvalidBytesView;
     if (len == 0) return "";
@@ -201,7 +227,41 @@ pub const SessionApi = struct {
             .skill_id = bytesView(""),
             .catalog_revision = bytesView(""),
             .arguments_json = bytesView(""),
-            .reserved = [_]u64{0} ** 4,
+            .parts = null,
+            .part_count = 0,
+            .reserved = [_]u64{0} ** 2,
+        };
+        return self.runInput()(
+            session,
+            run_id,
+            &input,
+            options,
+            out_result,
+            out_diagnostic,
+        );
+    }
+    /// Submit one RUN_INPUT_MULTIMODAL Run: an ordered text/image parts array
+    /// borrowed for the synchronous call. Build elements with `textPart` and
+    /// `imagePart`.
+    pub fn runMultimodal(
+        self: SessionApi,
+        session: ?*types.SessionHandle,
+        run_id: u64,
+        parts: []const types.RunInputPartV1,
+        options: ?*const types.RunOptionsV1,
+        out_result: ?*types.RunResultV1,
+        out_diagnostic: ?*types.OwnedBytesV1,
+    ) u32 {
+        const input = types.RunInputV1{
+            .struct_size = @sizeOf(types.RunInputV1),
+            .kind_code = types.RUN_INPUT_MULTIMODAL,
+            .text = bytesView(""),
+            .skill_id = bytesView(""),
+            .catalog_revision = bytesView(""),
+            .arguments_json = bytesView(""),
+            .parts = if (parts.len == 0) null else parts.ptr,
+            .part_count = parts.len,
+            .reserved = [_]u64{0} ** 2,
         };
         return self.runInput()(
             session,
@@ -230,7 +290,9 @@ pub const SessionApi = struct {
             .skill_id = skill_id,
             .catalog_revision = catalog_revision,
             .arguments_json = arguments_json,
-            .reserved = [_]u64{0} ** 4,
+            .parts = null,
+            .part_count = 0,
+            .reserved = [_]u64{0} ** 2,
         };
         return self.runInput()(
             session,
@@ -372,7 +434,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 14 SDK rejects Revision 13 and old Revision 14 roots" {
+test "Revision 15 SDK rejects Revision 13, Revision 14, and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -388,18 +450,27 @@ test "Revision 14 SDK rejects Revision 13 and old Revision 14 roots" {
     try std.testing.expectEqual(@as(usize, 280), @sizeOf(Revision13Api));
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision13));
 
-    const OldRevision14Api = extern struct {
+    // A Revision 14 root shares the 64-byte shape; only the revision check
+    // rejects it, so it must fail exactly there.
+    var revision14: types.ApiV1 align(@alignOf(types.ApiV1)) =
+        std.mem.zeroes(types.ApiV1);
+    revision14.struct_size = @sizeOf(types.ApiV1);
+    revision14.abi_version = types.ABI_VERSION_V1;
+    revision14.abi_revision = 14;
+    try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision14));
+
+    const StaleReferenceApi = extern struct {
         struct_size: u32,
         abi_version: u32,
         abi_revision: u32,
         reserved0: u32,
         tail: [56]u8,
     };
-    var old_revision14: OldRevision14Api align(@alignOf(types.ApiV1)) =
-        std.mem.zeroes(OldRevision14Api);
-    old_revision14.struct_size = @sizeOf(OldRevision14Api);
-    old_revision14.abi_version = types.ABI_VERSION_V1;
-    old_revision14.abi_revision = 14;
-    try std.testing.expectEqual(@as(usize, 72), @sizeOf(OldRevision14Api));
-    try std.testing.expectError(error.UnsupportedAbi, Api.validate(&old_revision14));
+    var stale_reference: StaleReferenceApi align(@alignOf(types.ApiV1)) =
+        std.mem.zeroes(StaleReferenceApi);
+    stale_reference.struct_size = @sizeOf(StaleReferenceApi);
+    stale_reference.abi_version = types.ABI_VERSION_V1;
+    stale_reference.abi_revision = 15;
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(StaleReferenceApi));
+    try std.testing.expectError(error.UnsupportedAbi, Api.validate(&stale_reference));
 }
