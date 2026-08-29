@@ -71,6 +71,14 @@ requests, and destroys sessions before their owning runtime generation.
 sessions. Existing sessions remain pinned to their old generation. Failed staging
 does not consume a generation or mutate the active runtime.
 
+Runtime creation validates tool availability, not only tool names: built-ins
+that execute through an external binary (`Glob`/`Grep` → ripgrep) fail
+creation with `error.ToolDependencyUnavailable` when that executable cannot be
+resolved, instead of entering the catalog and failing on their first
+invocation. A host can probe the dependency up front with
+`mc.util_toolchain.ripgrepPath()` and select a tool set without `Glob`/`Grep`
+when it is absent.
+
 The recommended high-level lifecycle is:
 
 ```zig

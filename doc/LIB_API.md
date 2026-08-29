@@ -188,6 +188,13 @@ MCP stdio、大型 WebFetch/curl、ripgrep 与代码索引输出都在子进程/
 `ApplyPatch`、`NotebookEdit` 明确归类为 `input_derived`：它们不复制一个未知外部输出流，
 不能与 byte-zero 迁移缺口混为一谈。
 
+`ToolEntry.runtime_dependency` 声明工具执行必需的进程外可执行依赖（当前仅
+`ripgrep`，`Glob`/`Grep` 声明之）。catalog 准入按声明探测可用性：解析不到 `rg`
+时 Runtime 创建返回 `error.ToolDependencyUnavailable`，而不是把工具广告给
+Provider 后在首次调用时报 `RipgrepNotFound`。嵌入宿主可用
+`util_toolchain.ripgrepPath()` 预探测（解析顺序：`RG_BIN` → `PATH` → 宿主可执行
+文件同目录 → 常见安装位），据此决定是否在工具集中包含 `Glob`/`Grep`。
+
 Spool 在固定内存中增量计算 SHA-256、保存 1152-byte head 与 384-byte rolling tail，
 并以 no-replace 原语原子发布到 Session 级 CAS；POSIX hard-link 发布会在 receipt
 逃逸前同时持久化源/目标目录，竞争者不能覆盖同名 CAS 对象，失败路径只回滚本次精确

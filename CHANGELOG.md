@@ -141,6 +141,18 @@ compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Glob/Grep runtime dependencies now participate in tool availability
+  validation (issue #8): catalog admission probes that the ripgrep executable
+  actually resolves (`RG_BIN` → `PATH` → next to the host executable → system
+  fallbacks), so Runtime creation fails with a typed
+  `error.ToolDependencyUnavailable` — surfaced through the AgentCore ABI as
+  `STATUS_INVALID_ARGUMENT` with a diagnostic naming the missing executable
+  and the provisioning options — instead of advertising tools to the Provider
+  that fail their first invocation with `RipgrepNotFound`. Hosts without `rg`
+  select a tool set omitting `Glob`/`Grep` (probe available as
+  `util_toolchain.ripgrepPath()`); dependency-free selections are unaffected.
+  Locked by deterministic negative/positive tests at the toolchain, catalog,
+  Runtime, and ABI layers.
 - Plan-mode classification escape on the CLI (no-dispatcher) path: a model
   emitting a case-variant builtin name (e.g. `bash`) was classified by the
   unknown-name read fallback and allowed in plan mode, then deterministically

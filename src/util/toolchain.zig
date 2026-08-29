@@ -40,6 +40,22 @@ var cached_path: [:0]const u8 = "";
 var path_buf: [std.fs.max_path_bytes]u8 = undefined;
 var init_mutex: sync.Mutex = .{};
 
+/// 测试 seam(仅测试构建存在;生产构建为 void,不可误用):catalog 依赖门的
+/// 两个方向都需要确定性覆盖——开发机/CI 几乎总能解析到 rg,负路径在真实环境
+/// 不可构造。串行 test runner 内设置后必须 defer 复位为 null。
+pub var test_ripgrep_override: if (builtin.is_test) ?bool else void =
+    if (builtin.is_test) null else {};
+
+/// 依赖可用性探测(catalog 准入用):rg 是否可解析。复用 ripgrepPath 的
+/// 进程内缓存,不引入新的解析顺序。
+pub fn ripgrepAvailable() bool {
+    if (comptime builtin.is_test) {
+        if (test_ripgrep_override) |forced| return forced;
+    }
+    _ = ripgrepPath() catch return false;
+    return true;
+}
+
 /// 返回一个可执行的 rg 路径。优先 RG_BIN，其次 PATH，其次 fallback。返回值静态生命周期。
 pub fn ripgrepPath() error{RipgrepNotFound}![:0]const u8 {
     if (cache_done.load(.acquire)) {
@@ -128,6 +144,18 @@ test "ripgrepPath resolves whenever a vendored rg exists" {
         return error.SkipZigTest;
     };
     try std.testing.expect(resolved.len > 0);
+}
+
+test "ripgrepAvailable mirrors ripgrepPath and honors the test override" {
+    // 无 override 时必须与 ripgrepPath 同判——探测是解析的布尔投影,不是第二套逻辑。
+    const resolved = if (ripgrepPath()) |_| true else |_| false;
+    try std.testing.expectEqual(resolved, ripgrepAvailable());
+
+    test_ripgrep_override = false;
+    defer test_ripgrep_override = null;
+    try std.testing.expect(!ripgrepAvailable());
+    test_ripgrep_override = true;
+    try std.testing.expect(ripgrepAvailable());
 }
 
 test "next-to-executable probe finds an adjacent rg" {

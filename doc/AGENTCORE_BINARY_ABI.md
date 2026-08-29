@@ -1181,6 +1181,18 @@ including Task, Cron, KG, MCP, worktree, and notification tools. Adding those
 requires a future explicit Host capability contract; they are not silently
 advertised with missing state.
 
+`Glob` and `Grep` execute through an external ripgrep executable (`rg`).
+Selecting either tool makes its resolution part of Runtime creation: the
+resolver probes `RG_BIN`, `PATH`, the directory containing the Host
+executable, and the documented system fallback locations. When no executable
+resolves, `runtime_create` fails with
+`METASK_AGENTCORE_STATUS_INVALID_ARGUMENT` and a `ToolDependencyUnavailable`
+diagnostic naming the missing dependency and the accepted provisioning
+options, instead of advertising tools whose first invocation would fail with
+`RipgrepNotFound`. Hosts that cannot provide `rg` must omit `Glob`/`Grep`
+from `builtin_tools`; bundling `rg` next to the Host executable satisfies the
+probe without additional configuration.
+
 ### Resource limits
 
 V1 applies these limits to inputs or identities that amplify library
