@@ -9,6 +9,30 @@ const FileEntry = struct {
     sha256: []const u8,
 };
 
+/// An executable the bundled tools spawn at run time. Shipping it as a
+/// manifest asset closes the Glob/Grep dependency loop: the Host that
+/// redistributes the bundle also receives the executable and its pin,
+/// instead of relying on ambient rg installations.
+const RuntimeAsset = struct {
+    name: []const u8,
+    version: []const u8,
+    revision: []const u8,
+    path: []const u8,
+    upstream: []const u8,
+    license: []const u8,
+    role: []const u8,
+};
+
+/// Upstream identity of the vendored ripgrep set, read from the repository's
+/// pin authority (vendor/ripgrep/manifest.json) so the bundle manifest cannot
+/// drift from the staged binary's provenance.
+const RipgrepPin = struct {
+    upstream_release: []const u8,
+    upstream_revision: []const u8,
+    source_repository: []const u8,
+    license: []const u8,
+};
+
 const Manifest = struct {
     schema_version: u32 = 1,
     vendor: []const u8 = "metask",
@@ -42,6 +66,7 @@ const Manifest = struct {
         binary_abi_revision: u32 = abi_types.ABI_REVISION,
         binary_abi_table_size: u32 = @sizeOf(abi_types.ApiV1),
     },
+    runtime_assets: []const RuntimeAsset,
     files: []const FileEntry,
 };
 
@@ -91,7 +116,18 @@ pub fn main(init: std.process.Init) !void {
     else
         &no_link_inputs;
     const system_frameworks: []const []const u8 = &no_link_inputs;
-    const readme = try renderReadme(allocator, version, target_id, resolved_target, rust_target, source.commit);
+    const ripgrep_rel: []const u8 = if (std.mem.eql(u8, os, "windows")) "bin/rg.exe" else "bin/rg";
+    const ripgrep_pin = try loadRipgrepPin(allocator, init.io);
+    const readme = try renderReadme(
+        allocator,
+        version,
+        target_id,
+        resolved_target,
+        rust_target,
+        source.commit,
+        ripgrep_rel,
+        ripgrep_pin.upstream_release,
+    );
     const zon = try renderZon(allocator, version);
     const cargo = try renderCargoToml(allocator, version);
     const cargo_lock = try renderCargoLock(allocator, version);
@@ -105,6 +141,8 @@ pub fn main(init: std.process.Init) !void {
     const library_rel = try std.fmt.allocPrint(allocator, "lib/{s}", .{library_file});
     const relative_paths = [_][]const u8{
         library_rel,
+        ripgrep_rel,
+        "bin/ripgrep-LICENSE-MIT",
         "include/metask/agentcore.h",
         "bindings/zig/build.zig",
         "bindings/zig/build.zig.zon",
@@ -153,6 +191,15 @@ pub fn main(init: std.process.Init) !void {
             .system_frameworks = system_frameworks,
         },
         .contract = .{},
+        .runtime_assets = &.{.{
+            .name = "ripgrep",
+            .version = ripgrep_pin.upstream_release,
+            .revision = ripgrep_pin.upstream_revision,
+            .path = ripgrep_rel,
+            .upstream = ripgrep_pin.source_repository,
+            .license = ripgrep_pin.license,
+            .role = "Glob/Grep execution dependency",
+        }},
         .files = &files,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 });
@@ -173,6 +220,26 @@ fn parseBool(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
     return null;
+}
+
+fn loadRipgrepPin(allocator: std.mem.Allocator, io: std.Io) !RipgrepPin {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "vendor/ripgrep/manifest.json",
+        allocator,
+        .limited(64 * 1024),
+    );
+    return parseRipgrepPin(allocator, bytes);
+}
+
+fn parseRipgrepPin(allocator: std.mem.Allocator, bytes: []const u8) !RipgrepPin {
+    const parsed = try std.json.parseFromSliceLeaky(RipgrepPin, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+    });
+    if (parsed.upstream_release.len == 0 or parsed.upstream_revision.len == 0 or
+        parsed.source_repository.len == 0 or parsed.license.len == 0)
+        return error.InvalidRipgrepPin;
+    return parsed;
 }
 
 fn packageVersion(allocator: std.mem.Allocator, sdk_version: []const u8, source: SourceIdentity) ![]const u8 {
@@ -221,6 +288,8 @@ fn renderReadme(
     zig_target: []const u8,
     rust_target: []const u8,
     commit: []const u8,
+    ripgrep_rel: []const u8,
+    ripgrep_version: []const u8,
 ) ![]const u8 {
     return std.fmt.allocPrint(allocator,
         \\# metask-agentcore {s}
@@ -234,6 +303,14 @@ fn renderReadme(
         \\Zig consumers use the package in `bindings/zig` and import `metask_agentcore`.
         \\Rust consumers use the raw `metask-agentcore-sys` crate in `bindings/rust`.
         \\
+        \\`{s}` is the manifest-pinned ripgrep {s} runtime asset (upstream official release
+        \\binary, MIT OR Unlicense; MIT text at `bin/ripgrep-LICENSE-MIT`, declaration in
+        \\`runtime_assets` in `manifest.json`). The built-in `Glob`/`Grep` tools execute
+        \\through it, and Runtime creation refuses to advertise them when no ripgrep
+        \\resolves. Deploy it next to your Host executable — that location is probed
+        \\automatically — or point the `RG_BIN` environment variable at it; installations
+        \\on `PATH` also resolve.
+        \\
         \\The ABI is experimental and requires an exact revision match. Ownership, lifetime, concurrency,
         \\and failure contracts are defined by `doc/AGENTCORE_BINARY_ABI.md` at the source commit above.
         \\Revision 14 exposes one 64-byte root plus mandatory Runtime, Session, Session Control, Skill,
@@ -244,7 +321,7 @@ fn renderReadme(
         \\256 MiB of retained catalog snapshots per Runtime. `invalid_resource` issues carry a typed
         \\reason; a single invalid Skill degrades the catalog without removing valid siblings.
         \\
-    , .{ version, target, zig_target, rust_target, commit });
+    , .{ version, target, zig_target, rust_target, commit, ripgrep_rel, ripgrep_version });
 }
 
 fn renderZon(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
@@ -365,6 +442,23 @@ fn writeAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
 fn isLowerHex(bytes: []const u8) bool {
     for (bytes) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
     return true;
+}
+
+test "ripgrep pin parses the vendor manifest identity and rejects empty fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const pin = try parseRipgrepPin(arena.allocator(),
+        \\{"artifacts":[],"bundle_schema":"metacodes.ripgrep-bundle/v1",
+        \\ "license":"MIT OR Unlicense","source_repository":"https://github.com/BurntSushi/ripgrep",
+        \\ "upstream_release":"14.1.1","upstream_revision":"4649aa9700"}
+    );
+    try std.testing.expectEqualStrings("14.1.1", pin.upstream_release);
+    try std.testing.expectEqualStrings("4649aa9700", pin.upstream_revision);
+    try std.testing.expectError(error.InvalidRipgrepPin, parseRipgrepPin(
+        arena.allocator(),
+        \\{"license":"","source_repository":"x","upstream_release":"y","upstream_revision":"z"}
+        ,
+    ));
 }
 
 test "strict boolean parser" {

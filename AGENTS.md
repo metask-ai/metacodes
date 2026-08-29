@@ -49,7 +49,9 @@ a dollar cap, and the durable budget journal.
 
 - Keep secrets, personal paths, generated evaluation runs, binaries, and local
   TinyKG stores out of Git. The manifest-pinned release assets under
-  `vendor/tinykg/bin/` are the sole binary exception.
+  `vendor/tinykg/bin/` and `vendor/ripgrep/bin/` are the only binary
+  exceptions; both are manually reviewed upstream artifacts pinned by SHA-256
+  and inventoried by their verify scripts.
 - Use `rg`/`rg --files` for discovery and `apply_patch` for source edits.
 - Do not overwrite unrelated worktree changes. Destructive Git commands require
   explicit authorization.

@@ -25,6 +25,11 @@ pub const CatalogError = error{
     DuplicateToolName,
     ToolNotInRuntime,
     InvalidHostTool,
+    /// A selected built-in declares an external executable dependency
+    /// (ToolEntry.runtime_dependency) that cannot be resolved in this
+    /// environment. Refused at admission so a Runtime never advertises a
+    /// tool that cannot execute.
+    ToolDependencyUnavailable,
 };
 
 pub const HostToolResult = struct {
@@ -228,6 +233,12 @@ pub const Catalog = struct {
         for (builtin_names) |name| {
             if (findEntry(entries.items, name) != null) return error.DuplicateToolName;
             const builtin = tools.getTool(name) orelse return error.UnknownBuiltinTool;
+            // 准入 = 可执行性:凡进 catalog 的内置工具都会被广告给 Provider,
+            // 其执行期外部依赖必须在此刻可解析。缺失是创建期类型化配置错误,
+            // 不是广告之后首调时的 RipgrepNotFound。
+            if (builtin.runtime_dependency) |dependency| {
+                if (!runtimeDependencyAvailable(dependency)) return error.ToolDependencyUnavailable;
+            }
             try entries.append(owned, .{
                 .definition = .{
                     .name = builtin.name,
@@ -312,6 +323,12 @@ pub const Catalog = struct {
         return findEntry(self.entries, name);
     }
 };
+
+fn runtimeDependencyAvailable(dependency: tools.RuntimeDependency) bool {
+    return switch (dependency) {
+        .ripgrep => @import("../util/toolchain.zig").ripgrepAvailable(),
+    };
+}
 
 fn findEntry(entries: []const Entry, name: []const u8) ?*const Entry {
     for (entries) |*entry| if (std.mem.eql(u8, entry.definition.name, name)) return entry;
@@ -697,6 +714,34 @@ test "Selection rejects names outside Runtime and dispatches only selected entri
     defer std.testing.allocator.free(names);
     try std.testing.expectEqualStrings("Read", names);
     try std.testing.expect(tools.suggestToolName(&ctx, "Grepp") == null);
+}
+
+test "builtin admission verifies runtime dependencies before advertisement" {
+    const toolchain = @import("../util/toolchain.zig");
+
+    // 依赖不可解析:声明了 runtime_dependency 的内置(Glob/Grep)必须在准入时
+    // 被拒,而不是进 catalog 后首调返回 RipgrepNotFound。
+    toolchain.test_ripgrep_override = false;
+    defer toolchain.test_ripgrep_override = null;
+    try std.testing.expectError(
+        error.ToolDependencyUnavailable,
+        Catalog.initBuiltins(std.testing.allocator, &.{"Grep"}),
+    );
+    try std.testing.expectError(
+        error.ToolDependencyUnavailable,
+        Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Glob" }),
+    );
+
+    // 门只看真实依赖:同一环境下无依赖声明的内置不受影响。
+    var unaffected = try Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Write", "Bash" });
+    unaffected.deinit();
+
+    // 依赖可解析:Glob/Grep 正常准入并可被 Session 选择。
+    toolchain.test_ripgrep_override = true;
+    var catalog = try Catalog.initBuiltins(std.testing.allocator, &.{ "Glob", "Grep" });
+    defer catalog.deinit();
+    try std.testing.expect(catalog.find("Glob") != null);
+    try std.testing.expect(catalog.find("Grep") != null);
 }
 
 test "Selection redescribes builtin tool descriptions via describe_fn (缺陷 A)" {

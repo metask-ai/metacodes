@@ -92,6 +92,15 @@ pub const ResultProduction = enum {
 /// 对应 cc/src/Tool.ts 的 tool.prompt(ctx)。
 pub const DescribeFn = *const fn (allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8;
 
+/// 内置工具执行期依赖的进程外可执行文件。catalog 准入按此探测可用性:
+/// Runtime 不得广告一个在当前环境无法执行的工具——依赖缺失是创建期的
+/// 类型化配置错误(ToolDependencyUnavailable),不是首调时的执行失败。
+pub const RuntimeDependency = enum {
+    /// rg / rg.exe,解析顺序见 util/toolchain.zig(RG_BIN → PATH →
+    /// Host 可执行文件同目录 → 常见安装位)。
+    ripgrep,
+};
+
 pub const ToolEntry = struct {
     name: []const u8,
     /// 静态短描述。describe_fn 为 null 时用它（简单工具）。
@@ -115,6 +124,9 @@ pub const ToolEntry = struct {
     swarm_gated: bool = false,
     /// Only advertised when the active long-horizon treatment includes TinyKG.
     tinykg_gated: bool = false,
+    /// 执行期必需的进程外可执行依赖。非 null 时 catalog 准入先探测可用性,
+    /// 缺失则拒绝创建而不是广告后首调失败。
+    runtime_dependency: ?RuntimeDependency = null,
 };
 
 const SESSION_TASK_STATUS_VALUES: []const []const u8 = &.{ "pending", "in_progress", "completed", "deleted" };
@@ -187,6 +199,7 @@ pub const registry: []const ToolEntry = &.{
         .execute = .{ .result_body = glob_tool.executeBody },
         .replay = .read_only,
         .result_production = .byte_zero_spool,
+        .runtime_dependency = .ripgrep,
     },
     .{
         .name = "Grep",
@@ -203,6 +216,7 @@ pub const registry: []const ToolEntry = &.{
         .execute = .{ .result_body = grep_tool.executeBody },
         .replay = .read_only,
         .result_production = .byte_zero_spool,
+        .runtime_dependency = .ripgrep,
     },
     // CodeMap:代码结构大纲(LSP documentSymbol,Y2 砍 tree-sitter 后)。排在搜索工具之后、Bash
     // 之前——和 Grep/Glob 同属"专用搜索/导航工具",比整文件 Read 省 token,引导模型优先用它定位定义。

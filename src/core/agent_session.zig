@@ -41,7 +41,10 @@ pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_part
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
 /// Process-level tools (Task, Cron, KG, MCP, worktree, notifications, etc.) are
 /// deliberately rejected at Runtime creation instead of being advertised with
-/// null Host state.
+/// null Host state. Membership here is a name-level claim only: built-ins that
+/// additionally need an external executable (Glob/Grep → ripgrep) are verified
+/// at catalog admission and fail Runtime creation with
+/// `error.ToolDependencyUnavailable` when the executable cannot be resolved.
 /// WebSearch is a Session-owned network capability backed by the configured
 /// internal web service/provider. It is an ordinary function tool, not a
 /// provider-specific server-tool descriptor; AgentSession owns its
@@ -77,6 +80,41 @@ test "default AgentRuntime preserves the coding tool surface through first-party
     defer std.testing.allocator.free(inventory);
     try std.testing.expect(std.mem.indexOf(u8, inventory, "metacodes.core.coding") != null);
     try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":10") != null);
+}
+
+test "Runtime creation refuses Glob/Grep when their ripgrep dependency is unresolvable" {
+    const toolchain = @import("../util/toolchain.zig");
+    toolchain.test_ripgrep_override = false;
+    defer toolchain.test_ripgrep_override = null;
+
+    // 默认 coding profile 含 Glob/Grep:依赖缺失必须在创建期报类型化配置错误,
+    // 而不是把工具广告给 Provider 后在首次调用时失败(issue 报告的桌面端形态)。
+    try std.testing.expectError(
+        error.ToolDependencyUnavailable,
+        AgentRuntime.create(std.testing.allocator, .{}),
+    );
+    // 显式选择同样被拒:消费者按名索取了一个无法执行的工具。
+    try std.testing.expectError(
+        error.ToolDependencyUnavailable,
+        AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Grep"} }),
+    );
+    // 不含 Glob/Grep 的显式选择在同一环境下仍可创建:门只跟随真实依赖。
+    const degraded = try AgentRuntime.create(std.testing.allocator, .{
+        .builtin_tools = &.{ "Read", "Write", "Bash" },
+    });
+    defer degraded.destroy() catch unreachable;
+    try std.testing.expect(degraded.catalog.find("Read") != null);
+    try std.testing.expect(degraded.catalog.find("Grep") == null);
+}
+
+test "Runtime creation admits Glob/Grep when ripgrep resolves" {
+    const toolchain = @import("../util/toolchain.zig");
+    toolchain.test_ripgrep_override = true;
+    defer toolchain.test_ripgrep_override = null;
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{});
+    defer runtime.destroy() catch unreachable;
+    try std.testing.expect(runtime.catalog.find("Glob") != null);
+    try std.testing.expect(runtime.catalog.find("Grep") != null);
 }
 
 test "minimal and none core profiles retain the mandatory artifact recovery kernel" {

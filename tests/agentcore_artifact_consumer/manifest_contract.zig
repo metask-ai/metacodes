@@ -5,6 +5,16 @@ pub const FileEntry = struct {
     sha256: []const u8,
 };
 
+pub const RuntimeAsset = struct {
+    name: []const u8,
+    version: []const u8,
+    revision: []const u8,
+    path: []const u8,
+    upstream: []const u8,
+    license: []const u8,
+    role: []const u8,
+};
+
 pub const Manifest = struct {
     schema_version: u32,
     vendor: []const u8,
@@ -38,6 +48,7 @@ pub const Manifest = struct {
         binary_abi_revision: u32,
         binary_abi_table_size: u32,
     },
+    runtime_assets: []const RuntimeAsset,
     files: []const FileEntry,
 };
 
@@ -74,9 +85,11 @@ pub const Error = error{
     UnexpectedFile,
     DuplicateFile,
     MissingFile,
+    InvalidRuntimeAssets,
 };
 
 pub const fixed_artifact_files = [_][]const u8{
+    "bin/ripgrep-LICENSE-MIT",
     "include/metask/agentcore.h",
     "bindings/zig/build.zig",
     "bindings/zig/build.zig.zon",
@@ -142,15 +155,32 @@ fn isLowerHex(bytes: []const u8) bool {
     return true;
 }
 
-pub fn validateManifestFiles(files: []const FileEntry, library_path: []const u8) Error!void {
-    var seen = [_]bool{false} ** (fixed_artifact_files.len + 1);
+pub fn validateManifestFiles(
+    files: []const FileEntry,
+    library_path: []const u8,
+    ripgrep_path: []const u8,
+) Error!void {
+    var seen = [_]bool{false} ** (fixed_artifact_files.len + 2);
     for (files) |file| {
-        const index = artifactFileIndex(file.path, library_path) orelse return error.UnexpectedFile;
+        const index = artifactFileIndex(file.path, library_path, ripgrep_path) orelse return error.UnexpectedFile;
         if (seen[index]) return error.DuplicateFile;
         if (file.sha256.len != 64 or !isLowerHex(file.sha256)) return error.InvalidSha256;
         seen[index] = true;
     }
     for (seen) |present| if (!present) return error.MissingFile;
+}
+
+/// The bundle must declare exactly one ripgrep runtime asset covering the
+/// staged `bin/rg[.exe]` file: the Glob/Grep execution dependency ships with
+/// the bundle instead of being an ambient environment assumption.
+pub fn validateRuntimeAssets(assets: []const RuntimeAsset, ripgrep_path: []const u8) Error!void {
+    if (assets.len != 1) return error.InvalidRuntimeAssets;
+    const asset = assets[0];
+    if (!std.mem.eql(u8, asset.name, "ripgrep") or
+        !std.mem.eql(u8, asset.path, ripgrep_path) or
+        asset.version.len == 0 or asset.revision.len == 0 or
+        asset.upstream.len == 0 or asset.license.len == 0 or asset.role.len == 0)
+        return error.InvalidRuntimeAssets;
 }
 
 pub fn fileSha256(files: []const FileEntry, path: []const u8) ?[]const u8 {
@@ -160,10 +190,11 @@ pub fn fileSha256(files: []const FileEntry, path: []const u8) ?[]const u8 {
     return null;
 }
 
-fn artifactFileIndex(path: []const u8, library_path: []const u8) ?usize {
+fn artifactFileIndex(path: []const u8, library_path: []const u8, ripgrep_path: []const u8) ?usize {
     if (std.mem.eql(u8, path, library_path)) return 0;
+    if (std.mem.eql(u8, path, ripgrep_path)) return 1;
     const index = findFixed(&fixed_artifact_files, path) orelse return null;
-    return index + 1;
+    return index + 2;
 }
 
 fn findFixed(comptime expected: []const []const u8, actual: []const u8) ?usize {
@@ -175,13 +206,25 @@ fn findFixed(comptime expected: []const []const u8, actual: []const u8) ?usize {
 
 const hash = "0000000000000000000000000000000000000000000000000000000000000000";
 const macos_library_path = "lib/libmetask_agentcore.a";
+const posix_ripgrep_path = "bin/rg";
+const windows_ripgrep_path = "bin/rg.exe";
 const valid_files = makeValidFiles();
+const valid_runtime_assets = [_]RuntimeAsset{.{
+    .name = "ripgrep",
+    .version = "14.1.1",
+    .revision = "4649aa9700",
+    .path = posix_ripgrep_path,
+    .upstream = "https://github.com/BurntSushi/ripgrep",
+    .license = "MIT OR Unlicense",
+    .role = "Glob/Grep execution dependency",
+}};
 
-fn makeValidFiles() [fixed_artifact_files.len + 1]FileEntry {
-    var files: [fixed_artifact_files.len + 1]FileEntry = undefined;
+fn makeValidFiles() [fixed_artifact_files.len + 2]FileEntry {
+    var files: [fixed_artifact_files.len + 2]FileEntry = undefined;
     files[0] = .{ .path = macos_library_path, .sha256 = hash };
+    files[1] = .{ .path = posix_ripgrep_path, .sha256 = hash };
     for (fixed_artifact_files, 0..) |path, index|
-        files[index + 1] = .{ .path = path, .sha256 = hash };
+        files[index + 2] = .{ .path = path, .sha256 = hash };
     return files;
 }
 
@@ -219,6 +262,7 @@ fn validManifest() Manifest {
             .binary_abi_revision = 14,
             .binary_abi_table_size = 64,
         },
+        .runtime_assets = &valid_runtime_assets,
         .files = &valid_files,
     };
 }
@@ -379,19 +423,41 @@ test "manifest contract rejects toolchain target optimize and ABI drift" {
 }
 
 test "manifest file set validates dynamic library name hashes and exact entries" {
-    try validateManifestFiles(&valid_files, macos_library_path);
+    try validateManifestFiles(&valid_files, macos_library_path, posix_ripgrep_path);
     var windows_files = valid_files;
     windows_files[0].path = "lib/metask_agentcore.lib";
-    try validateManifestFiles(&windows_files, windows_files[0].path);
+    windows_files[1].path = windows_ripgrep_path;
+    try validateManifestFiles(&windows_files, windows_files[0].path, windows_ripgrep_path);
     try std.testing.expectEqualStrings(hash, fileSha256(&valid_files, macos_library_path).?);
     try std.testing.expect(fileSha256(&valid_files, "lib/missing.lib") == null);
-    try std.testing.expectError(error.MissingFile, validateManifestFiles(valid_files[0 .. valid_files.len - 1], macos_library_path));
+    try std.testing.expectError(error.MissingFile, validateManifestFiles(valid_files[0 .. valid_files.len - 1], macos_library_path, posix_ripgrep_path));
     const extra = valid_files ++ [_]FileEntry{.{ .path = "bindings/zig/src/unlisted.zig", .sha256 = hash }};
-    try std.testing.expectError(error.UnexpectedFile, validateManifestFiles(&extra, macos_library_path));
+    try std.testing.expectError(error.UnexpectedFile, validateManifestFiles(&extra, macos_library_path, posix_ripgrep_path));
     var duplicate = valid_files;
     duplicate[4] = duplicate[0];
-    try std.testing.expectError(error.DuplicateFile, validateManifestFiles(&duplicate, macos_library_path));
+    try std.testing.expectError(error.DuplicateFile, validateManifestFiles(&duplicate, macos_library_path, posix_ripgrep_path));
     var invalid_hash = valid_files;
     invalid_hash[0].sha256 = "ABCDEF";
-    try std.testing.expectError(error.InvalidSha256, validateManifestFiles(&invalid_hash, macos_library_path));
+    try std.testing.expectError(error.InvalidSha256, validateManifestFiles(&invalid_hash, macos_library_path, posix_ripgrep_path));
+    // 缺 rg 条目 = MissingFile:运行期资产是 files allowlist 的强制成员,
+    // 不能退化回"环境里碰巧有 rg"的旧状态。
+    var missing_rg: [valid_files.len - 1]FileEntry = undefined;
+    missing_rg[0] = valid_files[0];
+    for (valid_files[2..], 0..) |entry, index| missing_rg[index + 1] = entry;
+    try std.testing.expectError(error.MissingFile, validateManifestFiles(&missing_rg, macos_library_path, posix_ripgrep_path));
+}
+
+test "runtime assets must pin exactly the staged ripgrep executable" {
+    try validateRuntimeAssets(&valid_runtime_assets, posix_ripgrep_path);
+    try std.testing.expectError(error.InvalidRuntimeAssets, validateRuntimeAssets(&.{}, posix_ripgrep_path));
+    try std.testing.expectError(
+        error.InvalidRuntimeAssets,
+        validateRuntimeAssets(&valid_runtime_assets, windows_ripgrep_path),
+    );
+    var renamed = valid_runtime_assets;
+    renamed[0].name = "other";
+    try std.testing.expectError(error.InvalidRuntimeAssets, validateRuntimeAssets(&renamed, posix_ripgrep_path));
+    var empty_version = valid_runtime_assets;
+    empty_version[0].version = "";
+    try std.testing.expectError(error.InvalidRuntimeAssets, validateRuntimeAssets(&empty_version, posix_ripgrep_path));
 }

@@ -71,6 +71,14 @@ requests, and destroys sessions before their owning runtime generation.
 sessions. Existing sessions remain pinned to their old generation. Failed staging
 does not consume a generation or mutate the active runtime.
 
+Runtime creation validates tool availability, not only tool names: built-ins
+that execute through an external binary (`Glob`/`Grep` → ripgrep) fail
+creation with `error.ToolDependencyUnavailable` when that executable cannot be
+resolved, instead of entering the catalog and failing on their first
+invocation. A host can probe the dependency up front with
+`mc.util_toolchain.ripgrepPath()` and select a tool set without `Glob`/`Grep`
+when it is absent.
+
 The recommended high-level lifecycle is:
 
 ```zig
@@ -111,7 +119,10 @@ The source-free bundle contains:
 - `sdk/zig` typed bindings;
 - `sdk/rust` bindings and build integration;
 - one target-specific static library;
-- a manifest whose file allow-list and SHA-256 values are mandatory.
+- the manifest-pinned ripgrep runtime asset (`bin/rg[.exe]`) that `Glob`/`Grep`
+  execute through — deploy it next to the Host executable or via `RG_BIN`;
+- a manifest whose file allow-list, runtime-asset declaration, and SHA-256
+  values are mandatory.
 
 Consumers call only `metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and
 must validate ABI revision 14, the exact 64-byte root, all five mandatory typed

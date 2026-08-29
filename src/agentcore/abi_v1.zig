@@ -3825,6 +3825,7 @@ fn runtimeErrorStatus(err: anyerror) u32 {
         err == error.TooManyServices)
         wire.STATUS_RESOURCE_LIMIT
     else if (err == error.UnknownBuiltinTool or err == error.UnsupportedBuiltinTool or
+        err == error.ToolDependencyUnavailable or
         err == error.DuplicateToolName or err == error.InvalidHostTool or
         err == error.InvalidPackageRoot or err == error.PackageRootSymlink or
         err == error.PackageManifestMissing or err == error.PackageManifestUntrusted or
@@ -4723,6 +4724,15 @@ fn runtimeCreateImpl(
         .host_stream_tools = native_stream_tools,
         .process_plugins = process_plugins,
     }) catch |err| {
+        // 依赖缺失是宿主可修复的部署问题:诊断必须直接说明缺什么、怎么给。
+        if (err == error.ToolDependencyUnavailable)
+            return fail(
+                wire.STATUS_INVALID_ARGUMENT,
+                "ToolDependencyUnavailable: Glob/Grep require a ripgrep executable; " ++
+                    "provide rg via RG_BIN, PATH, or next to the host executable, " ++
+                    "or omit Glob/Grep from builtin_tools",
+                out_error,
+            );
         return failError(runtimeErrorStatus(err), err, out_error);
     };
     if (self.core_runtime.catalog.entries.len > wire.MAX_TOOL_COUNT_V1) {
@@ -10132,6 +10142,34 @@ test "ABI Runtime rejects process-only built-ins as invalid input" {
     defer bufferRelease(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, runtimeCreate(&config, null, &runtime, &diagnostic));
     try std.testing.expect(runtime == null);
+}
+
+test "ABI Runtime creation surfaces an unresolved Glob/Grep ripgrep dependency" {
+    core.util_toolchain.test_ripgrep_override = false;
+    defer core.util_toolchain.test_ripgrep_override = null;
+
+    const names = [_]wire.BytesViewV1{ view("Read"), view("Grep") };
+    var config = std.mem.zeroes(wire.RuntimeConfigV1);
+    config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    config.builtin_tools = &names;
+    config.builtin_tool_count = names.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer bufferRelease(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, runtimeCreate(&config, null, &runtime, &diagnostic));
+    try std.testing.expect(runtime == null);
+    // 诊断必须可操作:点名缺失的可执行依赖,而非泛化的 core error。
+    const detail = diagnostic.ptr.?[0..@intCast(diagnostic.len)];
+    try std.testing.expect(std.mem.indexOf(u8, detail, "ripgrep") != null);
+    bufferRelease(&diagnostic);
+
+    // 同一环境下不选 Glob/Grep 仍可创建:宿主收到诊断后可显式降级重建。
+    const degraded_names = [_]wire.BytesViewV1{view("Read")};
+    config.builtin_tools = &degraded_names;
+    config.builtin_tool_count = degraded_names.len;
+    try std.testing.expectEqual(wire.STATUS_OK, runtimeCreate(&config, null, &runtime, &diagnostic));
+    try std.testing.expect(runtime != null);
+    try std.testing.expectEqual(wire.STATUS_OK, runtimeDestroy(runtime, &diagnostic));
 }
 
 test "ABI Runtime accepts Session-owned WebSearch and WebFetch built-ins" {

@@ -137,9 +137,19 @@ pub fn build(b: *std.Build) void {
         .strip = expected_strip,
         .zig_version = builtin.zig_version_string,
     }) catch |err| std.debug.panic("invalid AgentCore manifest identity: {s}", .{@errorName(err)});
-    manifest_contract.validateManifestFiles(manifest.value.files, library_rel_path) catch |err|
+    const ripgrep_rel: []const u8 = if (target.result.os.tag == .windows) "bin/rg.exe" else "bin/rg";
+    const ripgrep_path = b.pathJoin(&.{ bundle_root, "bin", if (target.result.os.tag == .windows) "rg.exe" else "rg" });
+    manifest_contract.validateManifestFiles(manifest.value.files, library_rel_path, ripgrep_rel) catch |err|
         std.debug.panic("invalid AgentCore manifest file set: {s}", .{@errorName(err)});
+    manifest_contract.validateRuntimeAssets(manifest.value.runtime_assets, ripgrep_rel) catch |err|
+        std.debug.panic("invalid AgentCore manifest runtime assets: {s}", .{@errorName(err)});
     verifySha256(b, lib_path, manifest_contract.fileSha256(manifest.value.files, library_rel_path).?);
+    verifySha256(b, ripgrep_path, manifest_contract.fileSha256(manifest.value.files, ripgrep_rel).?);
+    verifyTextArtifact(
+        b,
+        b.pathJoin(&.{ bundle_root, "bin", "ripgrep-LICENSE-MIT" }),
+        manifest_contract.fileSha256(manifest.value.files, "bin/ripgrep-LICENSE-MIT").?,
+    );
     verifyTextArtifact(b, header_path, manifest_contract.fileSha256(manifest.value.files, "include/metask/agentcore.h").?);
     verifyTextArtifact(b, zig_build_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/build.zig").?);
     verifyTextArtifact(b, zig_zon_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/build.zig.zon").?);

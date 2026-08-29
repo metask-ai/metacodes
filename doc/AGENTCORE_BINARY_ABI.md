@@ -167,6 +167,8 @@ each other:
 ```text
 <prefix>/agentcore/<resolved-target>/
 ├── lib/<target static-library filename>
+├── bin/rg[.exe]
+├── bin/ripgrep-LICENSE-MIT
 ├── include/metask/agentcore.h
 ├── bindings/zig/
 │   ├── build.zig
@@ -185,13 +187,27 @@ each other:
 
 The manifest records vendor/component identity, package and source identity,
 the package target plus producer Zig and Cargo targets, optimization and strip
-settings, binary ABI status/version/revision, system link requirements, and
-SHA-256 for every shipped file. The source-free consumer validates those fields,
+settings, binary ABI status/version/revision, system link requirements, the
+declared runtime assets, and SHA-256 for every shipped file. The source-free
+consumer validates those fields,
 the complete manifest file whitelist, and every declared payload hash, then
 applies the declared link inputs to every language probe. Bundles require an
 explicit `-Dtarget=<triple>` so an artifact cannot silently inherit the build
 host. Files outside the manifest are local staging residue, not compatibility
 surface: consumers ignore them and the archive command never includes them.
+
+`bin/rg[.exe]` is the ripgrep runtime asset backing the built-in `Glob`/`Grep`
+tools. Bundle assembly stages it from the repository's manifest-pinned vendored
+set (`vendor/ripgrep/manifest.json`, upstream official release binaries,
+SHA-256 verified at staging), records it in the manifest `files` whitelist, and
+declares it under `runtime_assets` (name, upstream version and revision, path,
+license, role); the MIT license text ships beside it as
+`bin/ripgrep-LICENSE-MIT`. A target with no vendored ripgrep artifact fails
+bundle assembly instead of shipping tools that cannot execute;
+`aarch64-windows` deliberately maps to the x86_64 executable, which
+Windows-on-ARM runs through its built-in x64 emulation. Hosts deploy the file
+next to their own executable (that location is probed automatically) or point
+`RG_BIN` at it.
 
 `agentcore:bundle` cross-compiles one bundle per explicit target and link-checks
 source-free Zig, C, and C++17 consumers against the installed artifacts. The
@@ -1180,6 +1196,20 @@ rejects process-level tools whose dependencies are not owned by AgentSession,
 including Task, Cron, KG, MCP, worktree, and notification tools. Adding those
 requires a future explicit Host capability contract; they are not silently
 advertised with missing state.
+
+`Glob` and `Grep` execute through an external ripgrep executable (`rg`).
+Selecting either tool makes its resolution part of Runtime creation: the
+resolver probes `RG_BIN`, `PATH`, the directory containing the Host
+executable, and the documented system fallback locations. When no executable
+resolves, `runtime_create` fails with
+`METASK_AGENTCORE_STATUS_INVALID_ARGUMENT` and a `ToolDependencyUnavailable`
+diagnostic naming the missing dependency and the accepted provisioning
+options, instead of advertising tools whose first invocation would fail with
+`RipgrepNotFound`. The bundle itself ships the matching executable as the
+`bin/rg[.exe]` runtime asset (see the bundle layout section), so a Host
+normally deploys that file next to its own executable — a location the probe
+resolves without additional configuration. Hosts that deliberately drop the
+asset must also omit `Glob`/`Grep` from `builtin_tools`.
 
 ### Resource limits
 

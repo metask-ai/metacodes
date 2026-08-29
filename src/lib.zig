@@ -158,6 +158,7 @@ pub const evaluation_backend = @import("core/evaluation_backend.zig"); // V1:稳
 pub const util_abort = @import("util/abort.zig"); // AbortSignal
 pub const util_log = @import("util/log.zig");
 pub const util_time = @import("util/time.zig");
+pub const util_toolchain = @import("util/toolchain.zig"); // ripgrep 解析/可用性探测(Glob/Grep 依赖)
 
 test {
     // 引用所有 re-export → 强制编译每个库模块。若任何模块间接拉到 repl/tui/app(UI 层),
