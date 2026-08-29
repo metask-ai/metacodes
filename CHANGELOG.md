@@ -29,6 +29,22 @@ compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- The AgentCore bundle now ships ripgrep as a manifest runtime asset
+  (issue #8 follow-up): `vendor/ripgrep/` grows a TinyKG-style manifest-pinned
+  cross-platform set of upstream official 14.1.1 release binaries
+  (macos-aarch64/x86_64, linux-x86_64 musl static, the existing
+  windows-x86_64; `aarch64-windows` explicitly maps to the x86_64 executable
+  via Windows-on-ARM x64 emulation), verified fail-closed by
+  `scripts/verify_ripgrep_binary.py` (SHA-256, format magic, exact `bin/`
+  inventory) in CI. `zig build agentcore:bundle` stages the target's binary as
+  `bin/rg[.exe]` (SHA-verified by `scripts/stage_ripgrep_binary.py`), records
+  it in the manifest `files` allowlist plus a new `runtime_assets` declaration
+  (name/version/revision/path/upstream/license/role), and ships the MIT text
+  as `bin/ripgrep-LICENSE-MIT`; the source-free consumer validates the asset
+  hash and declaration, and a target with no vendored ripgrep fails bundle
+  assembly. The toolchain resolver's stale `./vendor/ripgrep/rg` fallback now
+  points at the real per-target vendored binaries, so dev/CI checkouts resolve
+  rg without a system installation.
 - UI-neutral session command surface (issue #3): all raw input now flows
   through one typed pipeline (`session_intent.parse` →
   `SessionService.dispatch` → `RunPlan`), shared verbatim by the terminal

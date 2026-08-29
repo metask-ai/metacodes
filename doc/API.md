@@ -119,7 +119,10 @@ The source-free bundle contains:
 - `sdk/zig` typed bindings;
 - `sdk/rust` bindings and build integration;
 - one target-specific static library;
-- a manifest whose file allow-list and SHA-256 values are mandatory.
+- the manifest-pinned ripgrep runtime asset (`bin/rg[.exe]`) that `Glob`/`Grep`
+  execute through — deploy it next to the Host executable or via `RG_BIN`;
+- a manifest whose file allow-list, runtime-asset declaration, and SHA-256
+  values are mandatory.
 
 Consumers call only `metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and
 must validate ABI revision 14, the exact 64-byte root, all five mandatory typed

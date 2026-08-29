@@ -110,10 +110,13 @@ jobs:
           fi
       - name: TinyKG binary-contract unit tests
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
+      - name: ripgrep binary-contract unit tests
+        run: python3 -m unittest scripts.tests.test_stage_ripgrep_binary -v
       - name: Verify native bundle and fresh-store contract
         shell: bash
         run: |
           python3 scripts/verify_tinykg_binary.py
+          python3 scripts/verify_ripgrep_binary.py
           zig build tinykg:stage
       - name: Verify Linux arm64 cross-stage contract
         if: runner.os == 'Linux'
@@ -179,4 +182,4 @@ jobs:
           zig test src/platform/dir.zig -lc
       - name: Verify native bundle and fresh-store contract
         shell: cmd
-        run: python scripts/verify_tinykg_binary.py && zig build tinykg:stage
+        run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage

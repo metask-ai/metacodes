@@ -922,6 +922,25 @@ pub fn build(b: *std.Build) void {
         .prefix,
         b.fmt("{s}/bindings/rust/examples/link_probe.rs", .{agentcore_bundle_rel}),
     );
+    // rg 是再分发的 MIT OR Unlicense 上游二进制:许可文本随资产同行。
+    const install_agentcore_ripgrep_license = b.addInstallFileWithDir(
+        b.path("vendor/ripgrep/LICENSE-MIT"),
+        .prefix,
+        b.fmt("{s}/bin/ripgrep-LICENSE-MIT", .{agentcore_bundle_rel}),
+    );
+    // Glob/Grep 的运行期依赖随包分发:按 target 从 vendor/ripgrep manifest 选
+    // 二进制,SHA-256 校验后 staging 为 bundle 内 bin/rg[.exe],再进 manifest
+    // 的 files allowlist 与 runtime_assets 声明。无对应 vendored 二进制的
+    // target 在此 fail-closed,而不是发一个 Glob/Grep 无法执行的 bundle。
+    const agentcore_stage_python = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const stage_agentcore_ripgrep = b.addSystemCommand(&.{
+        agentcore_stage_python,
+        "scripts/stage_ripgrep_binary.py",
+        agentcore_architecture,
+        agentcore_os,
+        b.getInstallPath(.prefix, b.fmt("{s}/bin", .{agentcore_bundle_rel})),
+    });
+    stage_agentcore_ripgrep.setCwd(b.path("."));
     const missing_agentcore_target = if (target_was_explicit)
         null
     else
@@ -950,6 +969,8 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.step.dependOn(&install_agentcore_rust_lib.step);
     manifest_cmd.step.dependOn(&install_agentcore_rust_raw.step);
     manifest_cmd.step.dependOn(&install_agentcore_rust_link_probe.step);
+    manifest_cmd.step.dependOn(&stage_agentcore_ripgrep.step);
+    manifest_cmd.step.dependOn(&install_agentcore_ripgrep_license.step);
     const consumer_link_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     addNestedBuildCacheArgs(b, consumer_link_cmd);
     consumer_link_cmd.addArgs(&.{

@@ -4,7 +4,9 @@
 //! 查找顺序：
 //!   1. 环境变量 RG_BIN（用户手动指定）
 //!   2. $PATH 逐目录探测（POSIX ':' / Windows ';' 分隔;文件名 rg / rg.exe）
-//!   3. 几个常见路径的 fallback（vendored / apt / cargo / vscode / Windows 常见安装位）
+//!   2.5 可执行文件同目录（部署场景:bundle 的 bin/rg 放宿主可执行文件旁）
+//!   3. 几个常见路径的 fallback（per-target vendored 二进制 / apt / cargo /
+//!      vscode / Windows 常见安装位）
 //!
 //! 未命中返回 error.RipgrepNotFound。结果缓存(进程内不变;并发 Grep 线程安全)。
 
@@ -16,19 +18,39 @@ const sync = @import("platform").sync;
 
 const RG_NAME = if (is_windows) "rg.exe" else "rg";
 
-const FALLBACK_PATHS = if (is_windows) [_][:0]const u8{
-    ".\\vendor\\ripgrep\\rg.exe",
-    "vendor\\ripgrep\\rg.exe",
+/// 仓库 vendored 二进制(manifest-pinned,见 vendor/ripgrep/manifest.json)。
+/// 按编译 target 在 comptime 选中对应文件;无 vendored 二进制的 target(如
+/// aarch64-linux)为 null,由 PATH/系统安装位兜底。相对路径 = 从仓库根运行的
+/// 开发/CI 场景;部署场景走 RG_BIN / PATH / 可执行文件同目录。
+const VENDORED_RG: ?[:0]const u8 = switch (builtin.os.tag) {
+    .macos => switch (builtin.cpu.arch) {
+        .aarch64 => "./vendor/ripgrep/bin/rg-macos-aarch64",
+        .x86_64 => "./vendor/ripgrep/bin/rg-macos-x86_64",
+        else => null,
+    },
+    .linux => switch (builtin.cpu.arch) {
+        .x86_64 => "./vendor/ripgrep/bin/rg-linux-x86_64",
+        else => null,
+    },
+    .windows => switch (builtin.cpu.arch) {
+        .x86_64 => "vendor\\ripgrep\\bin\\rg-windows-x86_64.exe",
+        else => null,
+    },
+    else => null,
+};
+
+const VENDORED_FALLBACK = if (VENDORED_RG) |vendored| [_][:0]const u8{vendored} else [_][:0]const u8{};
+
+const FALLBACK_PATHS = VENDORED_FALLBACK ++ (if (is_windows) [_][:0]const u8{
     // scoop / choco / winget 常见位(用户目录展开在 PATH 搜索兜住,这里放系统级)
     "C:\\ProgramData\\chocolatey\\bin\\rg.exe",
 } else [_][:0]const u8{
-    "./vendor/ripgrep/rg",
     "/usr/bin/rg",
     "/usr/local/bin/rg",
     "/opt/homebrew/bin/rg",
     "/root/.cargo/bin/rg",
     "/usr/share/kiro/resources/app/node_modules/@vscode/ripgrep/bin/rg",
-};
+});
 
 // 缓存:rg 路径进程内不变。PATH 搜索命中的路径存这里(静态生命周期)。
 // **task#24 并发修**:cache_done atomic 只护"已缓存"读——首次 init 时多线程(并发后台 subagent
@@ -135,9 +157,10 @@ test "ripgrepPath resolves whenever a vendored rg exists" {
     // NotFound") passed in every environment by construction and let the
     // deployed resolver stay broken for ~200 container trials.  A conditional
     // POSITIVE is the honest form: when the repo's vendored rg is present
-    // (every dev/CI checkout), resolution MUST succeed; only environments
-    // that genuinely lack any rg may skip.
-    const reachable = pfs.exists("./vendor/ripgrep/rg") or searchPath() != null;
+    // (every dev/CI checkout running from the repo root), resolution MUST
+    // succeed; only environments that genuinely lack any rg may skip.
+    const vendored_reachable = if (VENDORED_RG) |vendored| pfs.exists(vendored.ptr) else false;
+    const reachable = vendored_reachable or searchPath() != null;
     const resolved = ripgrepPath() catch |err| {
         try std.testing.expect(err == error.RipgrepNotFound);
         if (reachable) return error.TestUnexpectedResult;
