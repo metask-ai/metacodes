@@ -345,6 +345,8 @@ pub const Options = struct {
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 当前会话用的 model 名(供 subagent inherit 解析)。
     parent_model: []const u8 = "",
+    /// 当前 provider 的模型档位表(透传进 ToolContext 供 Task/skill 档位解析)。
+    model_tiers: ?*const @import("../api/model_tiers.zig").ProviderTiers = null,
     /// per-call model override(subagent 用 AgentDef.model 覆盖父 client.model)。
     /// null = 用 api_client.model;非 null = 本次 turn 循环的所有请求都用此 model。
     model_override: ?[]const u8 = null,
@@ -1260,6 +1262,7 @@ pub fn run(
             .plan_file_path = opts.plan_file_path,
             .agents = opts.agents,
             .parent_model = opts.parent_model,
+            .model_tiers = opts.model_tiers,
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,
             .cron_registry = opts.cron_registry,
@@ -2174,6 +2177,7 @@ pub fn run(
             .last_proposed_plan = if (proposed_plan_buf) |p| p else "",
             .agents = opts.agents,
             .parent_model = opts.parent_model,
+            .model_tiers = opts.model_tiers,
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,
             .cron_registry = opts.cron_registry,

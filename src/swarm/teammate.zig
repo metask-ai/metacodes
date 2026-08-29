@@ -203,6 +203,8 @@ pub const SpawnTeammateParams = struct {
     agent_type: []const u8 = "",
     max_turns_per_run: u32 = 0, // 0=默认 20
     model_override: ?[]const u8 = null,
+    /// 档位表借用指针(App 生命周期只读;teammate 内嵌套 Task 解析 low/mid/high 用)。
+    model_tiers: ?*const @import("../api/model_tiers.zig").ProviderTiers = null,
     reasoning_effort_override: ?types_mod.ReasoningEffort = null,
     perm_override: ?types_mod.PermissionMode = null,
     project_dir: []const u8 = "",
@@ -237,6 +239,7 @@ const TeammateInput = struct {
     project_dir: []u8,
     home: []u8, // teammate SwarmContext 路径根(SendMessage 用)
     model_override: ?[]u8,
+    model_tiers: ?*const @import("../api/model_tiers.zig").ProviderTiers,
     reasoning_effort_override: ?types_mod.ReasoningEffort,
     permission_ctx: permission_mod.PermissionContext,
     perm_override: ?types_mod.PermissionMode,
@@ -665,6 +668,7 @@ pub const TeammateRegistry = struct {
             .project_dir = pdir_owned,
             .home = home_owned,
             .model_override = mover_owned,
+            .model_tiers = p.model_tiers,
             .reasoning_effort_override = p.reasoning_effort_override,
             .permission_ctx = permission_owned,
             .perm_override = p.perm_override,
@@ -1122,6 +1126,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
                 .agent_jobs = null, // SW1 登记:teammate 无嵌套后台 job
                 .project_dir = input.project_dir,
                 .model_override = if (input.model_override) |m| m else null,
+                .model_tiers = input.model_tiers,
                 .tasks = &sub_tasks,
                 .kg = kg_ptr,
                 .kg_projects_dir = input.kg_projects_dir,

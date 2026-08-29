@@ -66,7 +66,7 @@
     {
       "declaration": "AgentDef.model",
       "test_file": "tests/component/subagent_agentdef_fields_test.zig",
-      "test_name": "L2 AgentDef.model=haiku: Task 解析配置并覆盖真实子请求 model",
+      "test_name": "L2 AgentDef.model=haiku: 档位表命中时覆盖真实子请求 model",
       "feedback_step": "test:agentdef-fields",
       "assertion_markers": [
         "model: haiku",

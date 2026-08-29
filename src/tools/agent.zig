@@ -21,6 +21,7 @@ const ToolContext = @import("context.zig").ToolContext;
 const subagent = @import("../core/subagent.zig");
 const util_json = @import("../util/json.zig");
 const filter_mod = @import("../agents/filter.zig");
+const model_tiers_mod = @import("../api/model_tiers.zig");
 
 /// 最深嵌套层数。parent=0,孙=2;>= 这个值就拒绝 spawn。
 /// 嵌套 subagent 是允许的(子 agent 也能调 Task),但深度有限保护栈。
@@ -215,14 +216,18 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (d.permission_mode) |m| perm_override = mapPermissionMode(m);
     }
 
-    // model override:Task 工具参数 > AgentDef.model > null(继承父)
-    // "inherit" / 空 / 缺失 → null;其它视作 model 名(short alias 或全名)。
+    // model override:Task 工具参数 > AgentDef.model > null(继承父)。
+    // "inherit" / 空 / 缺失 → null;档位名(low/mid/high;兼容别名 haiku/sonnet/opus)
+    // 查当前 provider 档位表,未配置的档位回退 inherit——绝不产出跨 provider 的
+    // 硬编码模型 ID(issue #11);其余字符串视作显式模型名透传。档位可附带推理
+    // 深度,优先级 AgentDef.effort > 档位 effort > inherit。
     const model_arg = util_json.extractStringField(args, "model");
-    const model_override: ?[]const u8 = blk: {
-        if (model_arg) |m| if (m.len > 0 and !std.mem.eql(u8, m, "inherit")) break :blk resolveModelAlias(m);
-        if (def_opt) |d| if (d.model.len > 0 and !std.mem.eql(u8, d.model, "inherit")) break :blk resolveModelAlias(d.model);
-        break :blk null;
-    };
+    const model_selection = resolveModelSelection(
+        ctx.model_tiers,
+        model_arg,
+        if (def_opt) |d| d.model else null,
+    );
+    const model_override = model_selection.model;
 
     // subagent system prompt:def + 环境 + CLAUDE.md/git(Explore/Plan 跳过) + skills preload
     const preload_mod = @import("../agents/preload.zig");
@@ -293,7 +298,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .permission_ctx = effective_perm,
             .agent_type = subagent_type_raw,
             .model_override = model_override,
-            .reasoning_effort_override = if (def_opt) |d| d.effort else null,
+            .model_tiers = ctx.model_tiers,
+            .reasoning_effort_override = (if (def_opt) |d| d.effort else null) orelse model_selection.effort,
             .perm_override = perm_override,
             .project_dir = effective_project_dir,
             .cwd = effective_cwd,
@@ -345,7 +351,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .agent_depth = ctx.agent_depth + 1,
             .max_turns = max_turns,
             .model_override = model_override,
-            .reasoning_effort_override = if (def_opt) |d| d.effort else null,
+            .model_tiers = ctx.model_tiers,
+            .reasoning_effort_override = (if (def_opt) |d| d.effort else null) orelse model_selection.effort,
             .overrides_override = if (def_opt) |d| d.overrides else null,
             .perm_override = perm_override,
             .project_dir = effective_project_dir,
@@ -476,7 +483,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .project_rule_gate = ctx.project_rule_gate,
             .permission_mode_override = perm_override,
             .model_override = model_override,
-            .reasoning_effort_override = if (def_opt) |d| d.effort else null,
+            .model_tiers = ctx.model_tiers,
+            .reasoning_effort_override = (if (def_opt) |d| d.effort else null) orelse model_selection.effort,
             .overrides_override = if (def_opt) |d| d.overrides else null,
             .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
             .project_dir = effective_project_dir,
@@ -571,16 +579,22 @@ fn mapPermissionMode(mode: @import("../agents/def.zig").PermissionMode) @import(
     };
 }
 
-/// 短名 → 具体 model ID。"haiku" → "claude-3-5-haiku-20241022",
-/// "sonnet"/"opus" 同理映射到当前主力版本。已是全名(含 "claude-")则原样返回。
-/// 留 borrowed 引用,不分配(借 def.model 或 args 的字符串内存)。
-/// pub:skills/tool.zig 的 context:fork 分支解析 skill.model 字段时复用。
-pub fn resolveModelAlias(name: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, name, "claude-")) return name; // 已是全名
-    if (std.mem.eql(u8, name, "haiku")) return "claude-3-5-haiku-20241022";
-    if (std.mem.eql(u8, name, "sonnet")) return "claude-sonnet-4-20250514";
-    if (std.mem.eql(u8, name, "opus")) return "claude-opus-4-1-20250805";
-    return name; // 未知短名:原样传给 API(由 API 判错)
+/// 结果为 borrowed 引用,不分配(借档位表 / def.model / args 的字符串内存)。
+/// pub:skills/cli_adapter.zig 的 fork 分支与 /model 路径复用同一档位语义。
+pub const ModelSelection = model_tiers_mod.Resolved;
+
+/// Task model 参数 / AgentDef.model → {model 覆盖, 档位 effort}。纯函数直测。
+/// 档位名查表(未配置 → inherit);显式模型名透传;"inherit"/空 → 全 inherit。
+pub fn resolveModelSelection(
+    tiers: ?*const model_tiers_mod.ProviderTiers,
+    model_arg: ?[]const u8,
+    def_model: ?[]const u8,
+) ModelSelection {
+    if (model_arg) |m| if (m.len > 0 and !std.mem.eql(u8, m, "inherit"))
+        return model_tiers_mod.resolveName(tiers, m);
+    if (def_model) |m| if (m.len > 0 and !std.mem.eql(u8, m, "inherit"))
+        return model_tiers_mod.resolveName(tiers, m);
+    return .{ .model = null, .effort = null };
 }
 
 fn parseUintField(data: []const u8, field: []const u8) ?u64 {
@@ -645,6 +659,31 @@ test "active project rules reject detached Agent before provider or worker side 
         error.ProjectRulesRequireSynchronousAgent,
         execute(&ctx, "{\"prompt\":\"hi\",\"name\":\"worker\"}"),
     );
+}
+
+test "resolveModelSelection: 参数 > def;档位查表;未配置档位与 inherit 全回退" {
+    var tiers = model_tiers_mod.ProviderTiers{};
+    tiers.low = .{ .model = @constCast("cheap-model"), .effort = .medium };
+
+    // Task 参数优先于 def;档位命中带回 model+effort。
+    const arg_wins = resolveModelSelection(&tiers, "low", "some-def-model");
+    try testing.expectEqualStrings("cheap-model", arg_wins.model.?);
+    try testing.expectEqual(@import("../types.zig").ReasoningEffort.medium, arg_wins.effort.?);
+
+    // def 的兼容别名 haiku → low 档;显式全名透传且无档位 effort。
+    const def_alias = resolveModelSelection(&tiers, null, "haiku");
+    try testing.expectEqualStrings("cheap-model", def_alias.model.?);
+    const explicit = resolveModelSelection(&tiers, null, "gpt-5.6-sol");
+    try testing.expectEqualStrings("gpt-5.6-sol", explicit.model.?);
+    try testing.expect(explicit.effort == null);
+
+    // 未配置档位(mid)与 "inherit"/null:全 inherit——绝不回退硬编码模型 ID。
+    const unconfigured = resolveModelSelection(&tiers, "mid", null);
+    try testing.expect(unconfigured.model == null and unconfigured.effort == null);
+    const inherit = resolveModelSelection(&tiers, "inherit", "inherit");
+    try testing.expect(inherit.model == null and inherit.effort == null);
+    const no_table = resolveModelSelection(null, "opus", null);
+    try testing.expect(no_table.model == null and no_table.effort == null);
 }
 
 test "parseUintField extracts max_turns" {

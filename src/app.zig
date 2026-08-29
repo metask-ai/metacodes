@@ -244,6 +244,8 @@ pub const App = struct {
     models_picker_key_index: ?usize = null,
     models_picker_model_index: ?usize = null,
     model_switch_owned: ?[]u8 = null,
+    /// 模型档位表(~/.metacodes/config.json 的 model_tiers;null=未配置)。
+    model_tiers_table: ?@import("api/model_tiers.zig").TierTable = null,
     pending_previous_model_for_compact: ?[]u8 = null,
     pending_previous_model_context_window: ?u32 = null,
     pending_current_model_context_window: ?u32 = null,
@@ -553,6 +555,15 @@ pub const App = struct {
         }
         app.theme = theme_mod.select(app.theme_variant, cap);
 
+        // 模型档位表(model_tiers):同一份 ~/.metacodes/config.json。解析失败降级为
+        // 未配置(档位名全 inherit)并告警——配置拼写错误不该炸启动,但绝不静默。
+        if (@import("platform").paths.homeDir()) |home| {
+            app.model_tiers_table = @import("api/model_tiers.zig").loadFromHome(allocator, home) catch |err| tier_err: {
+                @import("util/log.zig").warn("config", "model_tiers 解析失败({s}),按未配置处理", .{@errorName(err)});
+                break :tier_err null;
+            };
+        }
+
         // Session 级权限记忆挂到 permission_ctx(persist 路径复用 match_ctx.home/project_root,
         // 在 settings 加载处统一设,无需独立 persist context)。
         app.permission_ctx.session_rules = &app.session_rules;
@@ -772,6 +783,13 @@ pub const App = struct {
         };
     }
 
+    /// 当前 provider 的模型档位表(low/mid/high)。未配置 → null(档位名全 inherit)。
+    /// 返回指针借用 App 生命周期的表,启动后只读——后台 worker 线程读安全。
+    pub fn activeModelTiers(app: *const App) ?*const @import("api/model_tiers.zig").ProviderTiers {
+        const table = &(app.model_tiers_table orelse return null);
+        return table.forKind(app.config.provider_kind);
+    }
+
     /// 供 subagent ctx.api_client(web_search 是 Anthropic server tool,只 Anthropic 用)。
     /// 非 Anthropic provider → null(subagent 不能用 web_search,其余工具照常)。
     pub fn anthropicClientOrNull(app: *App) ?*client_mod.Client {
@@ -800,6 +818,7 @@ pub const App = struct {
             app.allocator.free(k);
         }
         if (app.model_switch_owned) |m| app.allocator.free(m);
+        if (app.model_tiers_table) |*t| t.deinit();
         if (app.pending_previous_model_for_compact) |m| app.allocator.free(m);
         if (app.openai_client) |*oc| oc.deinit();
         if (app.gemini_client) |*gc| gc.deinit();

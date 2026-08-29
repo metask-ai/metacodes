@@ -215,6 +215,8 @@ pub const SpawnParams = struct {
     agent_depth: u8 = 1,
     max_turns: u32 = 0, // 0 = 用 SpawnOptions 默认
     model_override: ?[]const u8 = null,
+    /// 档位表借用指针(App 生命周期只读表;worker 线程读安全,不 dupe)。
+    model_tiers: ?*const @import("../api/model_tiers.zig").ProviderTiers = null,
     reasoning_effort_override: ?@import("../types.zig").ReasoningEffort = null,
     overrides_override: ?@import("../api/request_overrides.zig").RequestOverrides = null,
     perm_override: ?@import("../types.zig").PermissionMode = null,
@@ -263,6 +265,7 @@ const JobInput = struct {
     project_dir: []u8,
     parent_model: []u8,
     model_override: ?[]u8,
+    model_tiers: ?*const @import("../api/model_tiers.zig").ProviderTiers,
     reasoning_effort_override: ?@import("../types.zig").ReasoningEffort,
     // 值拷贝:
     permission_ctx: permission_mod.PermissionContext,
@@ -587,6 +590,7 @@ pub const AgentJobRegistry = struct {
             .project_dir = pdir_owned,
             .parent_model = pmodel_owned,
             .model_override = mover_owned,
+            .model_tiers = p.model_tiers,
             .reasoning_effort_override = p.reasoning_effort_override,
             .permission_ctx = permission_owned,
             .perm_override = p.perm_override,
@@ -1065,6 +1069,7 @@ fn jobThreadMain(input: *JobInput) void {
         .execution_policy = child_tool_policy.executionPolicy(),
         .permission_mode_override = input.perm_override,
         .model_override = input.model_override,
+        .model_tiers = input.model_tiers,
         .reasoning_effort_override = input.reasoning_effort_override,
         .host_services = input.host_services,
         .project_dir = input.project_dir,

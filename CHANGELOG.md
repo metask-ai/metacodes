@@ -8,6 +8,30 @@ status, compatibility boundaries, and entry points are defined by
 [README](README.md), [ROADMAP](ROADMAP.md), [doc/API.md](doc/API.md), and
 [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md).
 
+## Unreleased
+
+### Added
+
+- Model tiers (issue #11 core-side fix): subagent/skill model pins and
+  `/model` now resolve tier names — `low`/`mid`/`high`, with legacy aliases
+  `haiku`/`sonnet`/`opus` mapping to the same tiers — against a per-provider
+  table in `~/.metacodes/config.json` (`model_tiers`, keyed by provider kind,
+  each tier an optional `{model, effort}`). An unconfigured tier inherits the
+  session model/effort; the hardcoded alias→Anthropic-ID map is gone, so a
+  tier or alias can never inject a cross-provider model ID — the mechanism
+  that made Explore subagents send `claude-3-5-haiku-20241022` to
+  OpenAI-compatible relays and fail with an opaque 503 while the parent
+  session worked. The built-in `Explore` agent now pins tier `low`
+  (previously `haiku`); `/model <tier>` applies the configured tier model and
+  keeps the existing cross-provider guard for unresolved literals. Tier
+  `effort` rides the existing per-family dialect translation, which now also
+  covers MiniMax: M3 gets the native three-state
+  `thinking:{type: disabled|adaptive|enabled}` mapping (compat
+  `reasoning.effort` strings are accepted upstream but do not tune depth, so
+  they are not sent), and M2.x — where thinking is always on — sends only
+  `reasoning_split:true` so reasoning arrives as `reasoning_content`.
+  OpenAI/Anthropic/GLM/Kimi/DeepSeek translations were already built in.
+
 ## 0.1.0 — 2026-08-29
 
 ### Security

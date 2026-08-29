@@ -222,7 +222,7 @@ test "L2 AgentDef.overrides: frontmatter reaches child request and preserves par
     try std.testing.expectEqual(@as(f32, 0.8), client.overrides.top_p.?);
 }
 
-test "L2 AgentDef.model=haiku: Task 解析配置并覆盖真实子请求 model" {
+test "L2 AgentDef.model=haiku: 档位表命中时覆盖真实子请求 model" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.start(END_TURN_SSE, 0);
     defer srv.stop();
@@ -236,12 +236,39 @@ test "L2 AgentDef.model=haiku: Task 解析配置并覆盖真实子请求 model" 
     defer agents.deinit();
     try addAgent(a, &agents, "---\nname: haiku-agent\nmodel: haiku\n---\nUse the configured model.");
     const perm = cc.permission.createContext(.bypass_permissions, a);
-    const ctx = baseContext(a, &client, &agents, &perm, &.{});
 
+    // 档位表命中:haiku(兼容别名)→ low 档 → 配置的具体 model 进入真实子请求。
+    var tiers = cc.model_tiers.ProviderTiers{};
+    tiers.low = .{ .model = @constCast("claude-3-5-haiku-20241022") };
+    var ctx = baseContext(a, &client, &agents, &perm, &.{});
+    ctx.model_tiers = &tiers;
     const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"haiku-agent\",\"prompt\":\"go\"}");
-    defer a.free(out);
+    a.free(out);
     const model = (srv.lastRequest() orelse return error.NoRequestCaptured).jsonField("model") orelse return error.ModelFieldMissing;
     try std.testing.expectEqualStrings("\"claude-3-5-haiku-20241022\"", model);
+}
+
+test "L2 AgentDef.model=haiku 未配置档位表: 不映射硬编码 ID,子请求继承父 model" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try addAgent(a, &agents, "---\nname: haiku-agent\nmodel: haiku\n---\nUse the configured model.");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+
+    // 未配置档位表:别名不再映射硬编码 Anthropic ID(issue #11 差分根源),继承父模型。
+    const ctx = baseContext(a, &client, &agents, &perm, &.{});
+    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"haiku-agent\",\"prompt\":\"go\"}");
+    a.free(out);
+    const model = (srv.lastRequest() orelse return error.NoRequestCaptured).jsonField("model") orelse return error.ModelFieldMissing;
+    try std.testing.expectEqualStrings("\"claude-sonnet-4-20250514\"", model);
 }
 
 test "L2 AgentDef.permission_mode=plan: Task 注入真实子请求 Plan Mode" {

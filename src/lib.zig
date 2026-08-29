@@ -106,6 +106,7 @@ pub const api_dialect = @import("api/dialect.zig"); // 方言 vtable(模型 wire
 pub const api_request = @import("api/request.zig"); // Anthropic 请求序列化
 pub const api_request_overrides = @import("api/request_overrides.zig"); // 方言字段统一配置入口
 pub const model_adapter = @import("api/model_adapter.zig"); // ModelProfile 能力探测
+pub const model_tiers = @import("api/model_tiers.zig"); // provider 内 low/mid/high 模型档位表
 pub const json = @import("json.zig");
 pub const types = @import("types.zig");
 pub const config = @import("app/config.zig");

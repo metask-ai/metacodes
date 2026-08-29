@@ -1989,7 +1989,11 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
                 std.debug.print("usage: /model use <model-id>\n", .{});
                 return;
             }
-            const resolved = @import("../tools/agent.zig").resolveModelAlias(target_raw);
+            const resolved = @import("../tools/agent.zig").resolveModelSelection(
+                app.activeModelTiers(),
+                target_raw,
+                null,
+            ).model orelse target_raw;
             try switchModel(app, allocator, candidates, resolved);
             return;
         },

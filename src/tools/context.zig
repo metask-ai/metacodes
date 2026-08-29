@@ -485,6 +485,10 @@ pub const ToolContext = struct {
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 父 model(供 subagent model 字段 `inherit` 解析)。
     parent_model: []const u8 = "",
+    /// 当前 provider 的模型档位表(low/mid/high → {model, effort};App 启动时按
+    /// provider_kind 从 ~/.metacodes/config.json 选定)。null = 未配置:档位名
+    /// 一律 inherit 父模型,绝不回退硬编码模型 ID。
+    model_tiers: ?*const @import("../api/model_tiers.zig").ProviderTiers = null,
     /// Skill 集合(供 subagent preload_skills 字段读取 skill body)。
     skills: ?*const @import("../skills/skill.zig").SkillSet = null,
     /// MCP session 列表(ListMcpResourcesTool / ReadMcpResourceTool 用)。

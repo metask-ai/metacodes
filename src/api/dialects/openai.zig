@@ -1,4 +1,4 @@
-//! OpenAI-compatible dialect 实现(覆盖 OpenAI 原生 + GLM-5 + Kimi K3 + DeepSeek + Qwen3 + Mistral)。
+//! OpenAI-compatible dialect 实现(覆盖 OpenAI 原生 + GLM-5 + Kimi K3 + DeepSeek + Qwen3 + Mistral + MiniMax M2/M3)。
 //!
 //! 这些模型都走 OpenAI chat/completions wire 协议(Provider=OpenAIClient),但各有
 //! thinking 控制 / system 改写 / reasoning_content 解析的变体。本文件把它们集中,
@@ -362,6 +362,53 @@ const Mistral = struct {
     };
 };
 
+// ── MiniMax M3 ──────────────────────────────────────────────────────────────
+const MiniMaxM3 = struct {
+    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
+        _ = ctx;
+        _ = p;
+        // M3:thinking:{type: disabled|adaptive|enabled} 三态。OpenAI-compat 的
+        // reasoning.effort 档位串仅兼容接受、不调深度——不发,避免假控制。
+        // null → "adaptive"(官方默认,显式发送保证请求字节确定性)。
+        // 来源:platform.minimax.io responses-create + MiniMax-M3 model card(2026-08 调研)。
+        try out.appendSlice(a, ",\"thinking\":{\"type\":");
+        try util_json.serializeString(model_adapter.minimaxM3ThinkingType(effort), out, a);
+        try out.append(a, '}');
+    }
+
+    const dialect = Dialect{
+        .ctx = undefined,
+        .serializeThinkingFn = serializeThinking,
+        .extractThinkingDeltaFn = openaiExtractReasoningContent,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+    };
+};
+
+// ── MiniMax M2.x ────────────────────────────────────────────────────────────
+const MiniMaxM2 = struct {
+    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
+        _ = ctx;
+        _ = p;
+        _ = effort; // M2.x thinking 常开且不可关(disabled 被接受但忽略)——不发无效档位。
+        // reasoning_split:思考以 reasoning_content 平级字段返回(而非内嵌 <think> 文本),
+        // 对齐 openaiExtractReasoningContent 既有解析路径。
+        try out.appendSlice(a, ",\"reasoning_split\":true");
+    }
+
+    const dialect = Dialect{
+        .ctx = undefined,
+        .serializeThinkingFn = serializeThinking,
+        .extractThinkingDeltaFn = openaiExtractReasoningContent,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+    };
+};
+
 // ── dialectFor:按 model 子串返回对应 Dialect ────────────────────────────────
 // 顺序敏感:先匹配更具体的(GLM-4 在 GLM 前);k2/kimi 都匹配 Kimi。
 //
@@ -385,6 +432,13 @@ pub fn openaiDialectFor(model: []const u8) Dialect {
     if (model_adapter.hasSubstr(model, "qwen3") or model_adapter.hasSubstr(model, "qwen-3")) {
         return Qwen.dialect.withCtx(statelessCtx());
     }
+    // MiniMax:M3 必须在 M2.x 通配前匹配(更具体的子串)
+    if (model_adapter.hasSubstr(model, "minimax-m3") or model_adapter.hasSubstr(model, "minimax_m3")) {
+        return MiniMaxM3.dialect.withCtx(statelessCtx());
+    }
+    if (model_adapter.hasSubstr(model, "minimax")) {
+        return MiniMaxM2.dialect.withCtx(statelessCtx());
+    }
     if (model_adapter.hasSubstr(model, "mistral") or model_adapter.hasSubstr(model, "magistral")) {
         return Mistral.dialect.withCtx(statelessCtx());
     }
@@ -407,6 +461,34 @@ test "openaiDialectFor: GLM-5.2 返 Glm dialect(thinking+clear_thinking+reasonin
     try std.testing.expect(std.mem.indexOf(u8, out.items, "clear_thinking") != null);
     // 顶层 reasoning_effort 透传 effort.name()(7 档),GLM-5.2+ 服务端自己做映射
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"high\"") != null);
+}
+
+test "openaiDialectFor: MiniMax M3 三态 thinking(不发 effort 串)" {
+    const d = openaiDialectFor("minimax-m3");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(.{}, .xhigh, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "reasoning_effort") == null);
+    out.clearRetainingCapacity();
+    try d.serializeThinking(.{}, .low, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"type\":\"adaptive\"") != null);
+    out.clearRetainingCapacity();
+    try d.serializeThinking(.{}, .none, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"type\":\"disabled\"") != null);
+}
+
+test "openaiDialectFor: MiniMax M2.1 只发 reasoning_split(常开不可关)" {
+    const d = openaiDialectFor("minimax-m2.1");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(.{}, .xhigh, &out, a);
+    try std.testing.expectEqualStrings(",\"reasoning_split\":true", out.items);
+    out.clearRetainingCapacity();
+    try d.serializeThinking(.{}, .none, &out, a);
+    try std.testing.expectEqualStrings(",\"reasoning_split\":true", out.items);
 }
 
 test "openaiDialectFor: GLM-5.2 effort=xhigh 透传 xhigh(非 7→2 映射)" {
