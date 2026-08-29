@@ -39,6 +39,9 @@ pub const SessionHost = struct {
     allocator: std.mem.Allocator,
     journal: EventJournal,
     inbox: MsgQueue, // 客户端消息;driver 线程消费(绑定层如何 push 待其定义)
+    /// U11:斜杠命令队列(transport 线程只入队,driver 线程独占执行——对齐 web
+    /// StateSource.command 的"HTTP 线程绝不碰 App"契约)。
+    cmdbox: MsgQueue,
 
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// **生成期标志**(driver 维护:一轮 agent_loop.run 期间 true,空闲 false)。transport 的
@@ -67,6 +70,7 @@ pub const SessionHost = struct {
             .allocator = allocator,
             .journal = EventJournal.init(allocator),
             .inbox = MsgQueue.init(allocator),
+            .cmdbox = MsgQueue.init(allocator),
             .driver_ctx = driver_ctx,
             .driver_fn = driver_fn,
             .ctx_deinit_fn = ctx_deinit_fn,
@@ -112,6 +116,7 @@ pub const SessionHost = struct {
         if (self.ctx_deinit_fn) |f| f(self.driver_ctx, self.allocator);
         self.journal.deinit();
         self.inbox.deinit();
+        self.cmdbox.deinit();
         const alloc = self.allocator;
         alloc.destroy(self);
     }

@@ -44,6 +44,22 @@ events=$(curl -s --max-time 3 "http://127.0.0.1:$dport/events")
 echo "$events" | grep -q "DAEMON_OK" || { echo "FAIL: SSE 无 assistant 文本(driver 未跑 agent_loop?)"; echo "$events"; exit 1; }
 echo "$events" | grep -q '"run_done".*end_turn' || { echo "FAIL: 无 run_done end_turn"; echo "$events"; exit 1; }
 
+# ── U11:rich /state + /command(canonical 命令面;此前 daemon 是 "{}" + 501)──
+state=$(curl -s "http://127.0.0.1:$dport/state")
+echo "$state" | grep -q '"session_id"' || { echo "FAIL: /state 非 rich 快照: $state"; exit 1; }
+echo "$state" | grep -q '"permission_mode"' || { echo "FAIL: /state 缺 permission_mode: $state"; exit 1; }
+cack=$(curl -s -X POST "http://127.0.0.1:$dport/command" -H "Origin: http://127.0.0.1:$dport" -d '{"cmd":"/mode plan"}')
+echo "$cack" | grep -q '"ok":true' || { echo "FAIL: /command 未入队: $cack"; exit 1; }
+sleep 1
+events2=$(curl -s --max-time 3 "http://127.0.0.1:$dport/events")
+echo "$events2" | grep -q 'permission mode → plan' || { echo "FAIL: 无 command_result mode→plan"; echo "$events2"; exit 1; }
+curl -s "http://127.0.0.1:$dport/state" | grep -q '"permission_mode":"plan"' || { echo "FAIL: /state 未反映 plan"; exit 1; }
+# `!cmd` shell 车道:执行 + stdout 摘录回显进 command_result(浏览器用户可见)。
+sack=$(curl -s -X POST "http://127.0.0.1:$dport/command" -H "Origin: http://127.0.0.1:$dport" -d '{"cmd":"!echo WIRE_SHELL_OK"}')
+echo "$sack" | grep -q '"ok":true' || { echo "FAIL: shell /command 未入队: $sack"; exit 1; }
+sleep 1
+curl -s --max-time 3 "http://127.0.0.1:$dport/events" | grep -q 'WIRE_SHELL_OK' || { echo "FAIL: shell 输出未回显进 command_result"; exit 1; }
+
 kill -INT $dpid
 for i in $(seq 1 50); do kill -0 $dpid 2>/dev/null || break; sleep 0.1; done
 if kill -0 $dpid 2>/dev/null; then echo "FAIL: SIGINT 后挂死(关停 join 未收敛)"; exit 1; fi
@@ -51,4 +67,4 @@ wait $dpid; rc=$?
 [ "$rc" = 0 ] || { echo "FAIL: daemon 退出码 $rc(非 0)"; exit 1; }
 grep -q "daemon closed" "$out" || { echo "FAIL: 无 'daemon closed'"; exit 1; }
 
-echo "PASS: daemon e2e — message→agent_loop→journal→SSE + SIGINT 优雅关停"
+echo "PASS: daemon e2e — message→agent_loop→journal→SSE + U11(rich /state + /command) + SIGINT 优雅关停"

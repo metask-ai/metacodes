@@ -25,6 +25,7 @@ pub const TOOL_NAME = model_semantics.TOOL_NAME;
 pub const InitError = error{
     OutOfMemory,
     NoModelInvocableSkills,
+    SkillToolNameCollision,
 };
 
 pub const Options = struct {
@@ -136,6 +137,14 @@ pub const Environment = struct {
             base.dispatcher
         else
             options.session.tools.dispatcher();
+        // `resolveTool` claims TOOL_NAME unconditionally, so a base tool of
+        // the same name would be silently shadowed at dispatch while both
+        // definitions still reach the provider as duplicates. Refuse the
+        // overlay instead of advertising an ambiguous directory.
+        for (base_definitions) |definition| {
+            if (std.mem.eql(u8, definition.name, TOOL_NAME))
+                return error.SkillToolNameCollision;
+        }
         const definitions = options.allocator.alloc(
             core.json.ToolDefinition,
             base_definitions.len + 1,
@@ -236,12 +245,8 @@ pub const Environment = struct {
         return .{
             .ctx = self,
             .dispatchFn = dispatch,
-            .prefetchSafeFn = prefetchSafe,
+            .metadataFn = metadata,
             .nameAtFn = nameAt,
-            .hostSyncFn = hostSync,
-            .builtinFn = isBuiltin,
-            .categoryFn = category,
-            .replayDeclarationFn = replayDeclaration,
         };
     }
 
@@ -268,14 +273,34 @@ pub const Environment = struct {
         };
     }
 
-    fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-        // Skill mutates the Run-local current PolicyFrame in provider order.
-        // Allowing a later Read/Glob to prefetch while the response is still
-        // streaming would execute it against the parent frame before an
-        // earlier Skill call narrows authority. Disable speculation for the
-        // whole overlay; executeSlots still preserves ordinary safe batching
-        // on either side of the serial Skill boundary.
-        return false;
+    fn metadata(raw: *const anyopaque, name: []const u8) ?core.tools.ToolMeta {
+        const self: *const Environment = @ptrCast(@alignCast(raw));
+        switch (resolveTool(name)) {
+            // The Skill tool itself only narrows authority through the
+            // Run-local PolicyFrame; every child tool call is still
+            // permission-checked individually. Activation is therefore a
+            // read-classified overlay tool, never replayable, never
+            // prefetched, and by kind neither builtin nor host.
+            .skill => return .{
+                .kind = .external,
+                .category = .read,
+                .replay = .never,
+                .prefetch_safe = false,
+            },
+            .base => {
+                var meta = self.base_dispatcher.metadata(name) orelse return null;
+                // Skill mutates the Run-local current PolicyFrame in provider
+                // order. Allowing a later Read/Glob to prefetch while the
+                // response is still streaming would execute it against the
+                // parent frame before an earlier Skill call narrows authority.
+                // Disable speculation for the whole overlay; executeSlots
+                // still preserves ordinary safe batching on either side of
+                // the serial Skill boundary. Everything else about the base
+                // resolution (identity, category, replay) passes through.
+                meta.prefetch_safe = false;
+                return meta;
+            },
+        }
     }
 
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {
@@ -284,38 +309,6 @@ pub const Environment = struct {
             return self.base_dispatcher.nameAt(index);
         if (index == self.base_definitions.len) return TOOL_NAME;
         return null;
-    }
-
-    fn hostSync(raw: *const anyopaque, name: []const u8) bool {
-        const self: *const Environment = @ptrCast(@alignCast(raw));
-        return switch (resolveTool(name)) {
-            .skill => false,
-            .base => self.base_dispatcher.isHostSync(name),
-        };
-    }
-
-    fn isBuiltin(raw: *const anyopaque, name: []const u8) bool {
-        const self: *const Environment = @ptrCast(@alignCast(raw));
-        return switch (resolveTool(name)) {
-            .skill => false,
-            .base => self.base_dispatcher.isBuiltin(name),
-        };
-    }
-
-    fn category(raw: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
-        const self: *const Environment = @ptrCast(@alignCast(raw));
-        return switch (resolveTool(name)) {
-            .skill => null,
-            .base => self.base_dispatcher.category(name),
-        };
-    }
-
-    fn replayDeclaration(raw: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
-        const self: *const Environment = @ptrCast(@alignCast(raw));
-        return switch (resolveTool(name)) {
-            .skill => .never,
-            .base => self.base_dispatcher.replayDeclaration(name),
-        };
     }
 
     fn allowsTool(raw: *const anyopaque, name: []const u8) bool {
@@ -529,7 +522,6 @@ pub const Environment = struct {
         var budget_tools: ?session_budget.ToolEnvironment = if (self.budget_controller) |controller| .{
             .controller = controller,
             .base = child_environment.surface(),
-            .mcp_view = self.mcp_view,
         } else null;
         const child_surface = if (budget_tools) |*tools|
             tools.surface()
@@ -700,31 +692,21 @@ test "Skill metadata preserves base identity category and replay while disabling
         fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
             return if (index == 0) "Read" else null;
         }
-        fn prefetchSafe(_: *const anyopaque, name: []const u8) bool {
-            return std.mem.eql(u8, name, "Read");
-        }
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return false;
-        }
-        fn isBuiltin(_: *const anyopaque, name: []const u8) bool {
-            return std.mem.eql(u8, name, "Read");
-        }
-        fn category(_: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
-            return if (std.mem.eql(u8, name, "Read")) .read else null;
-        }
-        fn replayDeclaration(_: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
-            return if (std.mem.eql(u8, name, "Read")) .read_only else .never;
+        fn metadata(_: *const anyopaque, name: []const u8) ?core.tools.ToolMeta {
+            if (std.mem.eql(u8, name, "Read")) return .{
+                .kind = .builtin,
+                .category = .read,
+                .replay = .read_only,
+                .prefetch_safe = true,
+            };
+            return null;
         }
         fn dispatcher() core.tools.ToolDispatcher {
             return .{
                 .ctx = &unit,
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = prefetchSafe,
+                .metadataFn = metadata,
                 .nameAtFn = nameAt,
-                .hostSyncFn = hostSync,
-                .builtinFn = isBuiltin,
-                .categoryFn = category,
-                .replayDeclarationFn = replayDeclaration,
             };
         }
         const unit: u8 = 0;
@@ -739,7 +721,8 @@ test "Skill metadata preserves base identity category and replay while disabling
     try std.testing.expect(!dispatcher.prefetchSafe(TOOL_NAME));
     try std.testing.expect(!dispatcher.isHostSync(TOOL_NAME));
     try std.testing.expect(!dispatcher.isBuiltin(TOOL_NAME));
-    try std.testing.expect(dispatcher.category(TOOL_NAME) == null);
+    // 激活只经 PolicyFrame 收窄权限,每个子工具调用仍单独过权限 → Skill 显式 .read。
+    try std.testing.expectEqual(core.tool_context.ToolCategory.read, dispatcher.category(TOOL_NAME).?);
     try std.testing.expectEqual(core.tools.ReplayDeclaration.never, dispatcher.replayDeclaration(TOOL_NAME));
     try std.testing.expect(!dispatcher.prefetchSafe("Read"));
     try std.testing.expect(!dispatcher.isHostSync("Read"));
@@ -874,4 +857,108 @@ test "Skill execution policy matches MCP metadata against canonical tool identit
         alias,
         "{\"city\":\"Paris\"}",
     ));
+}
+
+test "init refuses a base surface that already advertises the Skill tool name" {
+    // One enabled model-invocable skill gets init past the
+    // NoModelInvocableSkills gate so the collision check is what fires.
+    const records = [_]catalog.SkillRecord{.{
+        .skill_id = [_]u8{'1'} ** 64,
+        .invocation_name = "enabled",
+        .definition = .{
+            .name = "Enabled",
+            .description = "visible",
+            .body = "body",
+            .allowed_tools = &.{},
+            .disallowed_tools = &.{},
+            .arguments = &.{},
+            .disable_model_invocation = false,
+            .model_activation = .required_first,
+            .context = .inline_ctx,
+            .agent = "",
+            .model = "",
+            .shell = "bash",
+            .source_path = "",
+        },
+        .directories = &.{},
+        .files = &.{},
+    }};
+    var snapshot = catalog.Snapshot{
+        .owner_allocator = std.testing.allocator,
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .scope_id = [_]u8{'a'} ** 64,
+        .revision = [_]u8{'b'} ** 64,
+        .health = .healthy,
+        .skills = &records,
+        .issues = &.{},
+        .descriptor_json = "",
+        .content_bytes = 0,
+        .resident_bytes = 0,
+    };
+    defer snapshot.arena.deinit();
+
+    const Base = struct {
+        fn dispatch(
+            _: *const anyopaque,
+            _: *const core.tool_context.ToolContext,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!core.tools.ToolDispatchOutcome {
+            return .host_fatal;
+        }
+        fn metadata(_: *const anyopaque, _: []const u8) ?core.tools.ToolMeta {
+            return .{
+                .kind = .host,
+                .category = .execute,
+                .replay = .never,
+                .prefetch_safe = false,
+            };
+        }
+        fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
+            return if (index == 0) TOOL_NAME else null;
+        }
+        fn dispatcher() core.tools.ToolDispatcher {
+            return .{
+                .ctx = &unit,
+                .dispatchFn = dispatch,
+                .metadataFn = metadata,
+                .nameAtFn = nameAt,
+            };
+        }
+        const unit: u8 = 0;
+    };
+    const base_definitions = [_]core.json.ToolDefinition{.{
+        .name = TOOL_NAME,
+        .description = "Host-owned tool squatting on the overlay name",
+        .input_schema = .{},
+    }};
+
+    var abort = core.util_abort.AbortSignal.init();
+    // A same-name base tool would be silently shadowed by `resolveTool` while
+    // both definitions still went to the provider; init must refuse instead.
+    // Stored-only dependencies (session/materializations/frame/sink/owner)
+    // stay undefined: the collision is detected before any of them is used.
+    try std.testing.expectError(
+        error.SkillToolNameCollision,
+        Environment.init(.{
+            .allocator = std.testing.allocator,
+            .session = undefined,
+            .materializations = undefined,
+            .snapshot = &snapshot,
+            .availability = .all,
+            .identity = .{
+                .session_id = core.session_id.SessionId.single,
+                .run_id = 1,
+            },
+            .base_frame = undefined,
+            .abort = &abort,
+            .event_sink = undefined,
+            .max_turns = 1,
+            .base_surface = .{
+                .definitions = &base_definitions,
+                .dispatcher = Base.dispatcher(),
+            },
+            .permission_owner = undefined,
+        }),
+    );
 }

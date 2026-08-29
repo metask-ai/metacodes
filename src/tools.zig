@@ -36,6 +36,8 @@ const find_symbol_tool = @import("tools/find_symbol.zig");
 
 pub const ToolContext = @import("tools/context.zig").ToolContext;
 pub const ToolDispatcher = @import("tools/context.zig").ToolDispatcher;
+pub const ToolExecutorKind = @import("tools/context.zig").ToolExecutorKind;
+pub const ToolMeta = @import("tools/context.zig").ToolMeta;
 pub const ToolDispatchOutcome = @import("tools/context.zig").ToolDispatchOutcome;
 pub const ToolResultBody = @import("tools/context.zig").ToolResultBody;
 pub const ToolExecutionPolicy = @import("tools/context.zig").ToolExecutionPolicy;

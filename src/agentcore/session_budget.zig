@@ -601,7 +601,6 @@ pub const Reservation = struct {
 pub const ToolEnvironment = struct {
     controller: *Controller,
     base: core.agent_session.RunToolSurface,
-    mcp_view: ?*const mcp_session.View = null,
 
     pub fn surface(self: *const ToolEnvironment) core.agent_session.RunToolSurface {
         return .{
@@ -609,12 +608,8 @@ pub const ToolEnvironment = struct {
             .dispatcher = .{
                 .ctx = self,
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = prefetchSafe,
+                .metadataFn = metadata,
                 .nameAtFn = nameAt,
-                .hostSyncFn = hostSync,
-                .builtinFn = isBuiltin,
-                .categoryFn = category,
-                .replayDeclarationFn = replayDeclaration,
             },
         };
     }
@@ -626,8 +621,18 @@ pub const ToolEnvironment = struct {
         arguments_json: []const u8,
     ) anyerror!core.tools.ToolDispatchOutcome {
         const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        const kind: OperationKind = if (self.mcp_view) |view|
-            if (view.findModelTool(name) != null) .mcp else .tool
+        // Classification must share dispatch's resolution authority. The old
+        // unfiltered-View lookup drifted from the freshness-filtered MCP
+        // Environment: a selected-but-expired alias reserved under MCP caps
+        // while dispatch answered UnknownTool. The base metadata resolution
+        // reports MCP aliases (and every other out-of-process executor) as
+        // `.external`, so exactly those reserve under the external/MCP caps;
+        // builtin/host and unresolvable names stay on the Tool caps.
+        const kind: OperationKind = if (self.base.dispatcher.metadata(name)) |meta|
+            switch (meta.kind) {
+                .external => .mcp,
+                .builtin, .host => .tool,
+            }
         else
             .tool;
         const request_bytes = checkedAdd(
@@ -695,34 +700,17 @@ pub const ToolEnvironment = struct {
         return outcome;
     }
 
-    fn prefetchSafe(raw: *const anyopaque, name: []const u8) bool {
+    /// Budgeting is a pure dispatch decorator: name-level execution metadata
+    /// is delegated wholesale, so the base resolution (builtin identity,
+    /// category, replay, scheduling flags) survives this layer unmodified.
+    fn metadata(raw: *const anyopaque, name: []const u8) ?core.tools.ToolMeta {
         const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.prefetchSafe(name);
+        return self.base.dispatcher.metadata(name);
     }
 
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {
         const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
         return self.base.dispatcher.nameAt(index);
-    }
-
-    fn hostSync(raw: *const anyopaque, name: []const u8) bool {
-        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.isHostSync(name);
-    }
-
-    fn isBuiltin(raw: *const anyopaque, name: []const u8) bool {
-        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.isBuiltin(name);
-    }
-
-    fn category(raw: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
-        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.category(name);
-    }
-
-    fn replayDeclaration(raw: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
-        const self: *const ToolEnvironment = @ptrCast(@alignCast(raw));
-        return self.base.dispatcher.replayDeclaration(name);
     }
 };
 
@@ -1459,12 +1447,8 @@ const TestDispatcher = struct {
         return .{
             .ctx = self,
             .dispatchFn = dispatch,
-            .prefetchSafeFn = prefetchSafe,
+            .metadataFn = metadata,
             .nameAtFn = noName,
-            .hostSyncFn = hostSync,
-            .builtinFn = isBuiltin,
-            .categoryFn = category,
-            .replayDeclarationFn = replayDeclaration,
         };
     }
 
@@ -1481,24 +1465,14 @@ const TestDispatcher = struct {
         return .{ .ok = core.tools.ToolResultBody.initInline(bytes) };
     }
 
-    fn prefetchSafe(_: *const anyopaque, name: []const u8) bool {
-        return std.mem.eql(u8, name, "Read");
-    }
-
-    fn hostSync(_: *const anyopaque, _: []const u8) bool {
-        return false;
-    }
-
-    fn isBuiltin(_: *const anyopaque, name: []const u8) bool {
-        return std.mem.eql(u8, name, "Read");
-    }
-
-    fn category(_: *const anyopaque, name: []const u8) ?core.tool_context.ToolCategory {
-        return if (std.mem.eql(u8, name, "Read")) .read else null;
-    }
-
-    fn replayDeclaration(_: *const anyopaque, name: []const u8) core.tools.ReplayDeclaration {
-        return if (std.mem.eql(u8, name, "Read")) .read_only else .never;
+    fn metadata(_: *const anyopaque, name: []const u8) ?core.tools.ToolMeta {
+        if (std.mem.eql(u8, name, "Read")) return .{
+            .kind = .builtin,
+            .category = .read,
+            .replay = .read_only,
+            .prefetch_safe = true,
+        };
+        return null;
     }
 
     fn noName(_: *const anyopaque, _: usize) ?[]const u8 {
@@ -1737,8 +1711,13 @@ test "artifact envelope allocation failure releases the Tool reservation" {
             ) };
         }
 
-        fn no(_: *const anyopaque, _: []const u8) bool {
-            return false;
+        fn metadata(_: *const anyopaque, _: []const u8) ?core.tools.ToolMeta {
+            return .{
+                .kind = .external,
+                .category = .execute,
+                .replay = .never,
+                .prefetch_safe = false,
+            };
         }
 
         fn noName(_: *const anyopaque, _: usize) ?[]const u8 {
@@ -1749,9 +1728,8 @@ test "artifact envelope allocation failure releases the Tool reservation" {
             return .{
                 .ctx = self,
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = no,
+                .metadataFn = metadata,
                 .nameAtFn = noName,
-                .hostSyncFn = no,
             };
         }
     };
@@ -1855,7 +1833,6 @@ test "MCP reservation failure occurs before connector invocation" {
     var budgeted = ToolEnvironment{
         .controller = &controller,
         .base = mcp_environment.surface(),
-        .mcp_view = &view,
     };
     const tool_ctx = core.tool_context.ToolContext{
         .allocator = std.testing.allocator,
@@ -1932,7 +1909,6 @@ test "oversized MCP success is promoted to the shared recoverable artifact plane
     var budgeted = ToolEnvironment{
         .controller = &controller,
         .base = mcp_environment.surface(),
-        .mcp_view = &view,
     };
     const tool_ctx = core.tool_context.ToolContext{
         .allocator = allocator,

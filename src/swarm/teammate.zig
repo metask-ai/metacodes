@@ -293,6 +293,8 @@ pub const TeammateRegistry = struct {
     base_url: ?[]u8,
     model: []u8,
     provider_kind: types_mod.ProviderKind = .anthropic,
+    /// OpenAI wire 协议(仅 provider_kind==.openai 时消费):teammate 继承 lead 的显式选择。
+    openai_protocol: types_mod.OpenAIProtocol = .chat_completions,
     dialect_resolver: dialect_mod.Resolver = .builtin(),
     home: []u8,
 
@@ -310,6 +312,7 @@ pub const TeammateRegistry = struct {
             base_url,
             model,
             provider_kind,
+            .chat_completions,
             home,
             .builtin(),
         );
@@ -321,6 +324,7 @@ pub const TeammateRegistry = struct {
         base_url: ?[]const u8,
         model: []const u8,
         provider_kind: types_mod.ProviderKind,
+        openai_protocol: types_mod.OpenAIProtocol,
         home: []const u8,
         dialect_resolver: dialect_mod.Resolver,
     ) !TeammateRegistry {
@@ -339,6 +343,7 @@ pub const TeammateRegistry = struct {
             .base_url = url_owned,
             .model = model_owned,
             .provider_kind = provider_kind,
+            .openai_protocol = openai_protocol,
             .dialect_resolver = dialect_resolver,
             .home = home_owned,
         };
@@ -591,6 +596,7 @@ pub const TeammateRegistry = struct {
             self.api_key,
             p.model_override orelse self.model,
             self.base_url,
+            self.openai_protocol,
             self.dialect_resolver,
         );
         errdefer if (!committed) owned.deinit();

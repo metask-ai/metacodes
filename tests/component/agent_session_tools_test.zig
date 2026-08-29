@@ -47,25 +47,20 @@ fn rejectSkillDispatch(
     return error.UnexpectedToolDispatch;
 }
 
-fn skillSurfacePrefetchSafe(_: *const anyopaque, _: []const u8) bool {
-    return false;
+fn skillSurfaceMetadata(_: *const anyopaque, _: []const u8) ?cc.tools.ToolMeta {
+    return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
 }
 
 fn skillSurfaceNameAt(_: *const anyopaque, index: usize) ?[]const u8 {
     return if (index == 0) "Skill" else null;
 }
 
-fn skillSurfaceHostSync(_: *const anyopaque, _: []const u8) bool {
-    return false;
-}
-
 fn skillSurfaceDispatcher() cc.tools.ToolDispatcher {
     return .{
         .ctx = @ptrCast(&skill_surface_ctx),
         .dispatchFn = rejectSkillDispatch,
-        .prefetchSafeFn = skillSurfacePrefetchSafe,
+        .metadataFn = skillSurfaceMetadata,
         .nameAtFn = skillSurfaceNameAt,
-        .hostSyncFn = skillSurfaceHostSync,
     };
 }
 

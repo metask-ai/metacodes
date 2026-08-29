@@ -145,6 +145,14 @@ revision 内增加语义：
     `STATUS_INVALID_ARGUMENT`，不新增同义 status token；合法配置下的运行容量不足必须使用
     `STATUS_CHECKPOINT_BUDGET_REQUIRED`，不得重新折回 `InvalidBudget`。
 
+12. **E12 — ToolExecutorKind 分桶与预算 cap 归类(开放,taxonomy 观测)**:budget 层
+    的 Tool-vs-MCP 归类现从 `metadata().kind` 派生(`.external` → MCP-class caps),消除了
+    unfiltered-View 与 dispatch 的漂移;但 Skill overlay tool 也声明 `.external`(实为
+    in-process 渲染),故 host 若把 `mcp_result_cap_bytes` 收得比 tool cap 紧,Skill 结果
+    会一并受限(当前两 cap 默认相等,行为无差)。若真实 Host 出现"MCP 紧、Skill 松"的
+    配置需求,应引入独立 executor kind(如 `.overlay`)而非在 budget 层按名字特判——
+    分桶语义先在 Core 定案再进 ABI。
+
 ## F 组：SDK 生成卫生
 
 - [ ] **Rust bindgen capability 常量位宽**：`bindgen 0.72.1` 当前把 C header 中的

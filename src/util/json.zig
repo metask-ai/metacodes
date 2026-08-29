@@ -238,6 +238,55 @@ pub fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
     return data[start..end];
 }
 
+/// extractAndUnescapeStringField 的 raw 版:同一转义奇偶状态机找真正的闭引号,但**不**
+/// 解码,返回借用 data 的原始转义 slice。跨 chunk 拼接场景必须用它:SSE 片段可以在
+/// `\uXXXX` 代理对中间断开,逐片段解码会把拆开的高/低代理各变成一个 U+FFFD——只有按
+/// 原始字节拼完、终值一次解码才无损(OpenAI 流式 tool-call arguments 的 decode-once 契约)。
+/// 字段缺失/非 string 值/值内裸控制字节(<0x20,合法 JSON 必须转义它们)返回 null。
+pub fn extractRawStringField(data: []const u8, field: []const u8) ?[]const u8 {
+    var pattern_buf: [256]u8 = undefined;
+    if (field.len >= pattern_buf.len - 3) return null;
+    pattern_buf[0] = '"';
+    @memcpy(pattern_buf[1..][0..field.len], field);
+    pattern_buf[1 + field.len] = '"';
+    pattern_buf[2 + field.len] = ':';
+    const pattern = pattern_buf[0 .. field.len + 3];
+
+    const field_index = std.mem.indexOf(u8, data, pattern) orelse return null;
+    var cursor = field_index + pattern.len;
+    while (cursor < data.len and std.ascii.isWhitespace(data[cursor])) : (cursor += 1) {}
+    if (cursor >= data.len or data[cursor] != '"') return null;
+    cursor += 1;
+    const value_start = cursor;
+    var escaped = false;
+    while (cursor < data.len) : (cursor += 1) {
+        const byte = data[cursor];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte == '"') return data[value_start..cursor];
+        if (byte < 0x20) return null;
+    }
+    return null;
+}
+
+/// 提取一个 JSON string 字段并解除其外层 JSON 转义,返回 allocator 拥有的新 buffer。
+/// 与 extractStringField 的区别:值扫描用转义奇偶状态机找真正的闭引号(`\\"` 不早断)、
+/// 拒绝值内裸控制字节(<0x20,合法 JSON 必须转义它们),且返回值已过 unescapeString。
+/// 流式 SSE 的 string 片段(OpenAI content/reasoning_content、Responses delta)
+/// 都装在 JSON string 里——不解除转义,`\n`/`\uXXXX` 会以字面量流进 UI/工具层。
+/// 空串返回空 owned buffer(与缺字段可区分);字段缺失/非 string 值(如 null)返回 null。
+/// caller free。
+pub fn extractAndUnescapeStringField(data: []const u8, field: []const u8, allocator: std.mem.Allocator) !?[]u8 {
+    const raw = extractRawStringField(data, field) orelse return null;
+    return try unescapeString(raw, allocator);
+}
+
 /// 提取顶层字段为**字符串或数字**(返回 raw slice,借 data 内存)。缺失返回 null。
 /// `extractStringField` 只认带引号的字符串值;但模型常把"看起来是数字的 id"发成裸数字
 /// (实测:TaskCreate 返 id="1" 后,模型调 TaskUpdate 发 `"taskId":1` 而非 `"1"` → 旧版
@@ -479,6 +528,76 @@ test "extractStringField tolerates whitespace after colon" {
     try std.testing.expectEqualStrings("v", extractStringField(nl, "k").?);
     // 非字符串值(数字)→ null(本函数只取 string)
     try std.testing.expect(extractStringField("{\"k\": 5}", "k") == null);
+}
+
+test "extractAndUnescapeStringField 解除一层 JSON 转义并处理反斜杠奇偶" {
+    const a = std.testing.allocator;
+    const decoded = (try extractAndUnescapeStringField(
+        "{\"arguments\":\"{\\\"name\\\":\\\"review\\\",\\\"path\\\":\\\"C:\\\\\\\\tmp\\\"}\"}",
+        "arguments",
+        a,
+    )) orelse return error.MissingArguments;
+    defer a.free(decoded);
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"review\",\"path\":\"C:\\\\tmp\"}",
+        decoded,
+    );
+
+    // 值以转义反斜杠结尾:奇偶状态机不把 `\\` 后的引号误当值内转义引号吞掉。
+    const trailing = (try extractAndUnescapeStringField(
+        "{\"arguments\":\"fragment\\\\\"}",
+        "arguments",
+        a,
+    )) orelse return error.MissingArguments;
+    defer a.free(trailing);
+    try std.testing.expectEqualStrings("fragment\\", trailing);
+}
+
+test "extractAndUnescapeStringField 解码 \\n/\\t/\\uXXXX 与空串/null 值" {
+    const a = std.testing.allocator;
+    const decoded = (try extractAndUnescapeStringField(
+        "{\"content\":\"a\\nb\\tc\\u4f60\"}",
+        "content",
+        a,
+    )) orelse return error.MissingContent;
+    defer a.free(decoded);
+    try std.testing.expectEqualStrings("a\nb\tc你", decoded);
+
+    // 空串:返回空 owned buffer(caller 可 free),不是 null——空片段与缺字段可区分。
+    const empty = (try extractAndUnescapeStringField(
+        "{\"content\":\"\"}",
+        "content",
+        a,
+    )) orelse return error.MissingContent;
+    defer a.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+
+    // 非 string 值(null 字面量)→ null(本函数只取 string)。
+    try std.testing.expect((try extractAndUnescapeStringField(
+        "{\"content\":null}",
+        "content",
+        a,
+    )) == null);
+}
+
+test "extractRawStringField 保留转义原样(含拆开的代理对半边)" {
+    // raw 版不解码:`\n` / `\"` / 半个代理对都按原始字节返回,供跨 chunk 拼接后一次解码。
+    try std.testing.expectEqualStrings(
+        "a\\nb\\\"c",
+        extractRawStringField("{\"delta\":\"a\\nb\\\"c\"}", "delta").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\\\"msg\\\":\\\"\\ud83c",
+        extractRawStringField("{\"delta\":\"{\\\"msg\\\":\\\"\\ud83c\"}", "delta").?,
+    );
+    // 值以转义反斜杠结尾:奇偶状态机不把 `\\` 后的闭引号误当值内转义引号吞掉。
+    try std.testing.expectEqualStrings(
+        "fragment\\\\",
+        extractRawStringField("{\"delta\":\"fragment\\\\\"}", "delta").?,
+    );
+    // 非 string 值(null)/缺字段 → null。
+    try std.testing.expect(extractRawStringField("{\"delta\":null}", "delta") == null);
+    try std.testing.expect(extractRawStringField("{\"a\":1}", "delta") == null);
 }
 
 test "extractStringOrNumberField: string 与裸数字都取" {

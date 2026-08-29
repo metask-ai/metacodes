@@ -498,14 +498,24 @@ function respond(payload) { fetch("/respond", { method: "POST", body: JSON.strin
 function hideDialog() { overlay.style.display = "none"; pendingReqId = 0; }
 
 // ── 输入 / 命令 / 历史 / 中断 ─────────────────────────────────────────────────
-// 斜杠命令表(对齐 TUI 子集)。backend=经 POST /command;client=纯前端。
+// 斜杠命令表(palette 展示用)。backend=经 POST /command;client=纯前端。
+// U11:动词注册的单一事实源是服务端 session_intent.BUILTIN_VERBS——表外的 "/x"
+// 不再前端拦截,一律透传 /command 由服务端裁决(unsupported 也由服务端如实回)。
 const COMMANDS = [
   { name: "/help", desc: "Show commands", kind: "client" },
   { name: "/clear", desc: "Clear the screen", kind: "client" },
   { name: "/cost", desc: "Show token usage & cost", kind: "client" },
-  { name: "/mode", desc: "Cycle permission mode (default→acceptEdits→plan→bypass)", kind: "backend" },
+  { name: "/mode", desc: "Cycle or set permission mode (/mode [name])", kind: "backend" },
   { name: "/compact", desc: "Compact old conversation history", kind: "backend" },
-  { name: "/model", desc: "Show or switch the active model (/model <name>)", kind: "backend" },
+  { name: "/model", desc: "Switch the active model (/model use <name>)", kind: "backend" },
+  { name: "/effort", desc: "Set reasoning effort (/effort <level>)", kind: "backend" },
+  { name: "/theme", desc: "Switch theme preset (/theme <variant>)", kind: "backend" },
+  { name: "/vim", desc: "Toggle vim editor mode", kind: "backend" },
+  { name: "/add-dir", desc: "Add a working directory (/add-dir <path>)", kind: "backend" },
+  { name: "/retry", desc: "Resend the last user message", kind: "backend" },
+  { name: "/commit", desc: "Draft a git commit using the model", kind: "backend" },
+  { name: "/review", desc: "Ask the model to review the current diff", kind: "backend" },
+  { name: "/init", desc: "Analyze the codebase and write CLAUDE.md", kind: "backend" },
 ];
 const palette = document.getElementById("palette");
 let palSel = 0, palItems = [];
@@ -528,19 +538,23 @@ function updatePalette() {
   palette.style.display = "block";
 }
 
-function runCommand(text) {
-  const name = text.split(" ")[0];
-  const spec = COMMANDS.find(c => c.name === name);
-  if (!spec) { sysline("unknown command: " + name, true); return; }
-  if (spec.kind === "client") {
-    if (name === "/clear") { scroll.innerHTML = ""; return; }
-    if (name === "/help") { const d = el("md"); d.innerHTML = renderMarkdown("**Commands**\n" + COMMANDS.map(c => "- `" + c.name + "` — " + c.desc).join("\n")); scroll.appendChild(d); return; }
-    if (name === "/cost") { fetch("/state").then(r => r.json()).then(s => sysline("tokens: " + (s.input_tokens || 0) + " in / " + (s.output_tokens || 0) + " out · $" + Number(s.cost_usd || 0).toFixed(4))); return; }
-  }
-  // backend command:入队,真实结果经 journal command_result 事件异步回(见 dispatch)。
+function backendCommand(text) {
+  // 入队,真实结果经 journal command_result 事件异步回(见 dispatch)。
   fetch("/command", { method: "POST", body: JSON.stringify({ cmd: text }) })
     .then(r => { if (!r.ok) sysline("command failed: " + r.status, true); })
     .catch(() => sysline("command failed", true));
+}
+
+function runCommand(text) {
+  const name = text.split(" ")[0];
+  const spec = COMMANDS.find(c => c.name === name);
+  if (spec && spec.kind === "client") {
+    if (name === "/clear") { scroll.innerHTML = ""; return; }
+    if (name === "/help") { const d = el("md"); d.innerHTML = renderMarkdown("**Commands**\n" + COMMANDS.map(c => "- `" + c.name + "` — " + c.desc).join("\n") + "\n- `!<cmd>` — run a shell command (output joins the conversation context)"); scroll.appendChild(d); return; }
+    if (name === "/cost") { fetch("/state").then(r => r.json()).then(s => sysline("tokens: " + (s.input_tokens || 0) + " in / " + (s.output_tokens || 0) + " out · $" + Number(s.cost_usd || 0).toFixed(4))); return; }
+  }
+  // 表内 backend 与表外 "/x" 一律透传:动词裁决归服务端(U11 单一注册表)。
+  backendCommand(text);
 }
 
 function send() {
@@ -548,6 +562,7 @@ function send() {
   palette.style.display = "none"; input.value = ""; autoResize();
   history.push(text); histIdx = history.length;
   if (text.startsWith("/")) { runCommand(text); return; } // 斜杠命令不进对话
+  if (text.startsWith("!")) { backendCommand(text); return; } // U11:shell 车道(不是模型 prompt)
   fetch("/message", { method: "POST", body: JSON.stringify({ text }) }).then(r => { if (!r.ok) sysline("send failed: " + r.status, true); });
 }
 function autoResize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, window.innerHeight * 0.4) + "px"; }

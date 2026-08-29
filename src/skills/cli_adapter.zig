@@ -669,7 +669,6 @@ pub fn handleSlash(
         .usage_acc = &app.usage,
     };
     const ui_backend = backend.backend();
-    const jobs = if (app.jobs) |*registry| registry else null;
     const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
         try project_activation.RunControl.init(
             allocator,
@@ -689,45 +688,20 @@ pub fn handleSlash(
         try control.finishRun(@errorName(err));
         return err;
     };
+    // U11(issue #3):字段装配走 canonical session_service.buildRunOptions。此前本路径
+    // 手抄 Options 漏了 agents/skills_set/mcp_sessions/cron_registry/file_change_journal/
+    // parent_model 等 7 字段——skill 触发的 run 里模型能力被静默削弱;收敛后仅补
+    // run_control 三件套(本路径专属)。
+    var run_opts = @import("../session_service.zig").buildRunOptions(app, null);
+    run_opts.tool_observer = if (run_control) |control| control.observer() else null;
+    run_opts.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
+    run_opts.project_rule_gate = if (run_control) |control| control.formalGate() else null;
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{
-            .session = app.session_id,
-            .verbose = app.config.verbose,
-            .abort = &app.abort,
-            .read_state = &app.read_state,
-            .edit_hl_cache = &app.edit_hl_cache,
-            .lsp = app.lsp_service,
-            .jobs = jobs,
-            .agent_jobs = if (app.agent_jobs) |*registry| registry else null,
-            .plan_prev_mode = &app.plan_prev_mode,
-            .tasks = &app.tasks,
-            .kg = if (app.kg) |*client| client else null,
-            .kg_projects_dir = app.kg_projects_dir,
-            .memdir_abs = app.memdir_abs,
-            .api_client = app.anthropicClientOrNull(),
-            .tool_defs = app.tool_defs,
-            .system_prompt = app.system_prompt,
-            .inject_user_context = app.user_context,
-            .model_switch_compact = app.pendingModelSwitchCompact(),
-            .dyn_registry = &app.dyn_registry,
-            .host_services = app.hostServices(),
-            .tool_observer = if (run_control) |control| control.observer() else null,
-            .execution_boundary = if (run_control) |control| control.executionBoundary() else null,
-            .project_rule_gate = if (run_control) |control| control.formalGate() else null,
-            .project_dir = app.project_dir_or_empty(),
-            .sandbox = app.sandboxPtr(),
-            .cwd_abs = app.cwdAbs(),
-            .additional_dirs = app.additionalDirs(),
-            .home_dir = app.homeDir(),
-            .artifact_root = app.sessionDir() orelse "",
-            .tool_result_metrics = &app.tool_result_metrics,
-            .plan_file_path = app.plan_file_path,
-            .emit_tool_cards = true,
-        },
+        run_opts,
         &ui_backend,
         allocator,
     ) catch |err| {

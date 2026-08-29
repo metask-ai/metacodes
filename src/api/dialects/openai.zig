@@ -85,7 +85,9 @@ fn openaiSerializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice, 
 //
 // 中立 ResponseFormatRequest → OpenAI chat/completions wire:
 //   json_object → ",\"response_format\":{\"type\":\"json_object\"}"
-//   json_schema → ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":<schema>}}"
+//   json_schema → ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"response\",\"schema\":<schema>}}"
+//   (name 是 OpenAI 必填字段——缺失服务端 400 "Missing required parameter";中立请求
+//   结构无 name 概念,发固定 "response"。R2-4 修:此前漏发,json_schema 从不可用。)
 //
 // 能力降级:GLM-5 profile.response_format_support==.json_object_only,json_schema 降级为
 // json_object(服务端拒 json_schema,静默降级保请求成功)。
@@ -101,7 +103,7 @@ fn openaiSerializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?Response
     }
     if (effective.kind == .json_schema) {
         if (effective.schema) |s| {
-            try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":");
+            try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"response\",\"schema\":");
             try out.appendSlice(a, s);
             try out.appendSlice(a, "}}");
             return true;
@@ -140,6 +142,21 @@ fn openaiSerializeParallelToolCalls(ctx: *anyopaque, p: ModelProfile, enabled: ?
     try out.appendSlice(a, ",\"parallel_tool_calls\":");
     try out.appendSlice(a, if (e) "true" else "false");
     return true;
+}
+
+// ── 共享:reasoning_content 流式增量解码(GLM/Kimi/DeepSeek/Qwen/Mistral 同一平级字段)──
+//
+// OpenAI-compatible 端点把 reasoning_content 作为 delta 平级字符串字段流式返回。
+// SSE string 片段带一层 JSON 转义(\n/\uXXXX 等)——必须解除后再交 UI/preserved-thinking
+// 回传,否则思考文本把转义序列当字面量显示(issue #4)。空片段 free-and-null(不发事件)。
+// **本函数是 6 个兼容 dialect 的单一真相源**;OpenAINative 例外(原生不返回此字段,保持 null 实现)。
+fn openaiExtractReasoningContent(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
+    _ = ctx;
+    if (try util_json.extractAndUnescapeStringField(raw, "reasoning_content", a)) |r| {
+        if (r.len > 0) return r;
+        a.free(r);
+    }
+    return null;
 }
 
 // ── OpenAI 原生(GPT-4o / GPT-5 / o1 / o3)──────────────────────────────────
@@ -198,15 +215,6 @@ const Glm = struct {
         }
     }
 
-    fn extractThinkingDelta(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
-        _ = ctx;
-        // GLM-5 OpenAI-compatible 端点返回 reasoning_content 平级字段。
-        if (util_json.extractStringField(raw, "reasoning_content")) |r| {
-            if (r.len > 0) return try a.dupe(u8, r);
-        }
-        return null;
-    }
-
     fn activateCapabilities(ctx: *anyopaque, p: ModelProfile, capabilities: @import("../dialect.zig").VisibleCapabilities, system: *std.ArrayList(u8), allocator: std.mem.Allocator) anyerror!void {
         _ = ctx;
         _ = p;
@@ -222,7 +230,7 @@ const Glm = struct {
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
         .activateCapabilitiesFn = activateCapabilities,
-        .extractThinkingDeltaFn = extractThinkingDelta,
+        .extractThinkingDeltaFn = openaiExtractReasoningContent,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
@@ -244,18 +252,10 @@ const KimiK3 = struct {
         try util_json.serializeString(mapped, out, a);
     }
 
-    fn extractThinkingDelta(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
-        _ = ctx;
-        if (util_json.extractStringField(raw, "reasoning_content")) |r| {
-            if (r.len > 0) return try a.dupe(u8, r);
-        }
-        return null;
-    }
-
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = extractThinkingDelta,
+        .extractThinkingDeltaFn = openaiExtractReasoningContent,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
@@ -283,18 +283,10 @@ const Kimi = struct {
         try out.append(a, '}');
     }
 
-    fn extractThinkingDelta(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
-        _ = ctx;
-        if (util_json.extractStringField(raw, "reasoning_content")) |r| {
-            if (r.len > 0) return try a.dupe(u8, r);
-        }
-        return null;
-    }
-
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = extractThinkingDelta,
+        .extractThinkingDeltaFn = openaiExtractReasoningContent,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
@@ -324,18 +316,10 @@ const DeepSeek = struct {
         }
     }
 
-    fn extractThinkingDelta(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
-        _ = ctx;
-        if (util_json.extractStringField(raw, "reasoning_content")) |r| {
-            if (r.len > 0) return try a.dupe(u8, r);
-        }
-        return null;
-    }
-
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = extractThinkingDelta,
+        .extractThinkingDeltaFn = openaiExtractReasoningContent,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
@@ -355,18 +339,10 @@ const Qwen = struct {
         try out.appendSlice(a, if (enable) "true" else "false");
     }
 
-    fn extractThinkingDelta(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
-        _ = ctx;
-        if (util_json.extractStringField(raw, "reasoning_content")) |r| {
-            if (r.len > 0) return try a.dupe(u8, r);
-        }
-        return null;
-    }
-
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = extractThinkingDelta,
+        .extractThinkingDeltaFn = openaiExtractReasoningContent,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
@@ -376,17 +352,9 @@ const Qwen = struct {
 
 // ── Mistral(ThinkChunk,语义同 reasoning_content)────────────────────────────
 const Mistral = struct {
-    fn extractThinkingDelta(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
-        _ = ctx;
-        if (util_json.extractStringField(raw, "reasoning_content")) |r| {
-            if (r.len > 0) return try a.dupe(u8, r);
-        }
-        return null;
-    }
-
     const dialect = Dialect{
         .ctx = undefined,
-        .extractThinkingDeltaFn = extractThinkingDelta,
+        .extractThinkingDeltaFn = openaiExtractReasoningContent,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
@@ -566,6 +534,31 @@ test "openaiDialectFor: extractThinkingDelta 解析 reasoning_content" {
     try std.testing.expect(got != null);
     defer a.free(got.?);
     try std.testing.expectEqualStrings("thinking...", got.?);
+}
+
+test "openaiDialectFor: extractThinkingDelta 解除 SSE 转义(\\n/\\t/\\uXXXX)" {
+    const a = std.testing.allocator;
+    const d = openaiDialectFor("deepseek-chat");
+    const got = try d.extractThinkingDelta("{\"delta\":{\"reasoning_content\":\"a\\nb\\t\\u4f60\"}}", a);
+    try std.testing.expect(got != null);
+    defer a.free(got.?);
+    // 真实换行/制表/你(不是字面 \n/\t/你)。
+    try std.testing.expectEqualStrings("a\nb\t你", got.?);
+}
+
+test "openaiDialectFor: extractThinkingDelta 空片段返 null(free-and-null)" {
+    const a = std.testing.allocator;
+    const d = openaiDialectFor("glm-5.2");
+    try std.testing.expect((try d.extractThinkingDelta("{\"delta\":{\"reasoning_content\":\"\"}}", a)) == null);
+}
+
+test "openaiDialectFor: extractThinkingDelta 结尾转义反斜杠不早断(奇偶)" {
+    const a = std.testing.allocator;
+    const d = openaiDialectFor("kimi-k3");
+    const got = try d.extractThinkingDelta("{\"delta\":{\"reasoning_content\":\"frag\\\\\"}}", a);
+    try std.testing.expect(got != null);
+    defer a.free(got.?);
+    try std.testing.expectEqualStrings("frag\\", got.?);
 }
 
 test "openaiDialectFor: OpenAI 原生 extractThinkingDelta 返 null" {

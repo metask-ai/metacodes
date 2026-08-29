@@ -2532,5 +2532,51 @@ class TopologyTests(unittest.TestCase):
             self.assertEqual("blocked", json.loads(report.read_text(encoding="utf-8"))["status"])
 
 
+class TelemetryHygieneTests(unittest.TestCase):
+    def test_secret_shaped_environment_is_scrubbed_from_child_copies(self) -> None:
+        env = {
+            "PATH": "/usr/bin",
+            "HOME": "/home/u",
+            "METACODES_TEST_TINYKG_BIN": "/tmp/tinykg",
+            "METACODES_TEST_TINYKG_SHA256": "ab" * 32,
+            "METASK_API_KEY": "secret",
+            "AWS_ACCESS_KEY_ID": "secret",
+            "MY_SERVICE_TOKEN": "secret",
+            "gh_password": "secret",
+            "SSH_PRIVATE_KEY": "secret",
+            "DEPLOY_CREDENTIALS": "secret",
+        }
+        rule_control.scrub_secret_environment(env)
+        self.assertEqual(
+            {
+                "PATH",
+                "HOME",
+                "METACODES_TEST_TINYKG_BIN",
+                "METACODES_TEST_TINYKG_SHA256",
+            },
+            set(env),
+        )
+
+    def test_output_tail_home_redaction(self) -> None:
+        home = str(Path.home())
+        text = f"error at {home}/work/x.zig:1:1 and again {home}/y"
+        redacted = rule_control.redact_home_text(text)
+        self.assertNotIn(home, redacted)
+        self.assertEqual("error at ~/work/x.zig:1:1 and again ~/y", redacted)
+        with mock.patch.object(Path, "home", side_effect=RuntimeError("no home")):
+            self.assertEqual("as-is", rule_control.redact_home_text("as-is"))
+
+    def test_workspace_redaction_never_emits_the_account_absolute_path(self) -> None:
+        home = Path.home()
+        inside = home / "work" / "metacodes"
+        self.assertEqual("~/work/metacodes", rule_control.redacted_workspace(inside))
+        outside = Path("/srv/build/metacodes")
+        self.assertEqual("metacodes", rule_control.redacted_workspace(outside))
+        with mock.patch.object(Path, "home", side_effect=RuntimeError("no home")):
+            self.assertEqual(
+                "metacodes", rule_control.redacted_workspace(outside)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

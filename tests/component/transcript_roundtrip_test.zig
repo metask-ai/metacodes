@@ -94,3 +94,44 @@ test "L2 transcript: openExisting resume 续写不重复已刷盘消息" {
     _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
     _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr);
 }
+
+test "L2 transcript R2/F1回归: /retry 回卷后 flush 全量重写,resume 不复活被丢弃回合" {
+    // 缺陷形态:Writer.flushed_count 单调 + O_APPEND——回卷(4→3)再重生成(→4)后
+    // flush 无事可写,盘上仍是回卷前的旧第 4 条;loadTranscript 复活被丢弃的回合、
+    // 丢掉重生成的回合。修复:conversation.shrink_epoch 变更 → Writer 原子全量重写。
+    const a = std.testing.allocator;
+    const home = "/tmp/cc-transcript-l2";
+    _ = std.c.mkdir(home, 0o755);
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "q1");
+    try conv.appendText(.assistant, "a1");
+    try conv.appendText(.user, "q2");
+    try conv.appendText(.assistant, "a2-stale"); // 将被 /retry 丢弃的旧回合
+
+    var writer = try transcript.Writer.init(a, "/some/cwd", home, "claude-sonnet-4-20250514", transcript.genSessionId());
+    const dir = try a.dupe(u8, writer.dir);
+    defer a.free(dir);
+    writer.flush(&conv); // 盘上 4 条(含 a2-stale)
+
+    // /retry 语义:回卷到最后一条 user(q2,idx=2),重生成新回合 → 长度又回到 4。
+    conv.rollbackForRetry(2);
+    try conv.appendText(.assistant, "a2-regenerated");
+    writer.flush(&conv);
+    writer.deinit();
+
+    var loaded = Conversation.init(a);
+    defer loaded.deinit();
+    try transcript.loadTranscript(&loaded, dir, a);
+    try std.testing.expectEqual(@as(usize, 4), loaded.messages.items.len);
+    try std.testing.expectEqualStrings("a2-regenerated", firstText(loaded.messages.items[3]));
+    // 旧回合绝不能复活。
+    for (loaded.messages.items) |m| {
+        try std.testing.expect(std.mem.indexOf(u8, firstText(m), "a2-stale") == null);
+    }
+
+    var pbuf: [512]u8 = undefined;
+    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
+    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr);
+}

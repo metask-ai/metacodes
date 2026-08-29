@@ -56,7 +56,7 @@
 
 ## §4 验证机制
 
-- **基线脚本**(待建 scripts/perf_baseline.sh):量二进制体积 + 启动时间 + --help RSS,输出对比上次。每阶段/release 跑。
+- **基线脚本**(scripts/perf_baseline.sh):量二进制体积 + 启动时间 + --help RSS,输出对比上次。每阶段/release 跑。
 - **热路径零分配验证**:关键路径(流式/spinner)用 testing.allocator 或 failing_allocator 在单测里确认无意外分配(Zig 可注入 allocator 计分配次数)。
 - **回退红线**:二进制 >1.5MB / 启动 >20ms / 空闲 RSS >3MB → 查因,不放行。
 

@@ -67,17 +67,44 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
     const be = dctx.wb.backend();
 
     while (!host.stopRequested()) {
-        const msg = host.inbox.popFront() orelse {
-            reapAgentDone(app, &be, host.id, infra); // 空闲期也 reap:后台 job 可能在无新消息时完成
-            time.sleepMs(50);
-            continue;
-        };
-        defer infra.free(msg); // msg 来自 host.inbox(infra alloc)
+        // U11:斜杠命令(host.cmdbox,transport 只入队)在 driver 独占点执行——与 web run()
+        // 同一 execCommand(execLine canonical 命令面)。带 run 计划的命令(/commit /review
+        // /init /retry;append 已在 service 内完成)→ 本轮直接跑 agent_loop,不等 inbox。
+        var pending_run = false;
+        while (host.cmdbox.popFront()) |c| {
+            defer infra.free(c);
+            // 命令执行期也亮 generating(对齐 web run):`!cmd` 可长时间阻塞,不亮则
+            // /interrupt 被 409 门挡死——daemon session 没有终端 SIGINT 兜底,必须能中断。
+            host.generating.store(true, .seq_cst);
+            defer host.generating.store(false, .seq_cst);
+            if (web_session.execCommand(app, &host.journal, infra, c) != null) pending_run = true;
+        }
+        // 停机窗口:排水期间 requestStop 可能已发——AbortSignal 是 first-reason-wins,
+        // 其 user_ctrl_c 会被先落座的 user_interrupt **遮蔽**。此时绝不复位、绝不起 run
+        // (复位会清掉停机 abort,让一整轮 un-aborted run 卡住 destroy 的 join);
+        // 直接回环,由循环条件 stopRequested 退出。
+        if (host.stopRequested()) continue;
+        // 命令期被打断的残留 interrupt 复位——否则毒化紧随的 pending run / inbox 消息
+        // (already-aborted 即刻吞掉)。
+        if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.resetForTesting();
 
-        app.conversation.appendText(.user, msg) catch |e| {
-            log.warn("daemon", "appendText failed: {s}", .{@errorName(e)});
-            continue;
-        };
+        if (!pending_run) {
+            const msg = host.inbox.popFront() orelse {
+                reapAgentDone(app, &be, host.id, infra); // 空闲期也 reap:后台 job 可能在无新消息时完成
+                time.sleepMs(50);
+                continue;
+            };
+            defer infra.free(msg); // msg 来自 host.inbox(infra alloc)
+
+            // U11:prompt 提交经 service.submitPrompt(clearActiveSkill + append 与 TUI/web
+            // 同源;此前 daemon 直 appendText 漏 clearActiveSkill)。空文本/失败 → 无 run。
+            var svc = @import("../session_service.zig").SessionService.init(app);
+            const d = svc.submitPrompt(msg);
+            if (d.run == null) {
+                if (!d.outcome.ok) log.warn("daemon", "submitPrompt failed", .{});
+                continue;
+            }
+        }
 
         const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
             project_activation.RunControl.init(

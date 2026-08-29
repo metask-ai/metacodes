@@ -485,3 +485,100 @@ test "OpenAI tool_call 无 id → 合成非空唯一 id(不流空 dispatch_id)" 
     try std.testing.expect(std.mem.startsWith(u8, ids[0], "call_"));
     try std.testing.expect(!std.mem.eql(u8, ids[0], ids[1]));
 }
+
+// issue #4:流式 content 带 JSON 转义(\n/\t/\"/\\/\uXXXX)。旧实现把 raw escaped slice
+// 直接 dupe 进对话 → 字面 `\n` 污染 assistant 文本。修法 = 解除一层外层 JSON 转义。
+const OPENAI_ESCAPED_TEXT_SSE =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"line1\\nline2\\tt \"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"content\":\"quote:\\\" back:\\\\ cn:\\u4f60\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+test "issue#4: OpenAI 流式 content 解除 JSON 转义(真实 \\n/\\t/引号/反斜杠/你 进对话)" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{OPENAI_ESCAPED_TEXT_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
+    defer client.deinit();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "hi");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
+    var render = writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+
+    const result = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 3 }, &be, a) catch |e| {
+        std.debug.print("escaped-content run failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(a);
+    for (conv.messages.items) |m| {
+        if (m.role != .assistant) continue;
+        for (m.blocks) |b| switch (b) {
+            .text => |t| try got.appendSlice(a, t),
+            else => {},
+        };
+    }
+    // 解码后的真实字节:0x0A/0x09/裸引号/单反斜杠/UTF-8 你——不是字面 \n\t\"\\你。
+    try std.testing.expectEqualStrings("line1\nline2\tt quote:\" back:\\ cn:你", got.items);
+    try std.testing.expect(std.mem.indexOf(u8, got.items, "\\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got.items, "\\u4f60") == null);
+}
+
+// issue #4(thinking 面):deepseek reasoning_content 增量同样带一层 SSE 转义。
+const DEEPSEEK_ESCAPED_REASONING_SSE =
+    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\\nline\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+test "issue#4: deepseek reasoning_content 增量解除转义(.thinking 字节含 0x0A)" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{DEEPSEEK_ESCAPED_REASONING_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "deepseek-chat", url);
+    defer client.deinit();
+
+    const p = client.provider();
+    const msgs = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = p.sendStream(&msgs, null, null, null, null, null, "") catch |e| {
+        std.debug.print("deepseek sendStream failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    defer handle.deinit();
+
+    var thinking: std.ArrayList(u8) = .empty;
+    defer thinking.deinit(a);
+    while (try handle.next()) |ev| switch (ev) {
+        .text => |t| a.free(t),
+        .thinking => |t| {
+            try thinking.appendSlice(a, t);
+            a.free(t);
+        },
+        .tool_use_start => |tu| {
+            a.free(tu.id);
+            a.free(tu.name);
+            a.free(tu.input_json);
+        },
+        else => {},
+    };
+    try std.testing.expectEqualStrings("think\nline", thinking.items);
+    try std.testing.expect(std.mem.indexOf(u8, thinking.items, "\\n") == null);
+}

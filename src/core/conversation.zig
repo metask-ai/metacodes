@@ -32,14 +32,23 @@ pub const DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP: usize = 2;
 pub const Conversation = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(msg.Message),
-    /// P1.5 纯投影压缩:**原始消息永不删除**(供 transcript/resume/查看历史全量保留)。压缩=推进
+    /// P1.5 纯投影压缩:boundary 型压缩**不删除原始消息**。压缩=推进
     /// 这个 boundary 游标 + 存一条 compact_summary。发给模型 / token 估算都只看 [boundary..] + summary
     /// (见 activeStart/totalTokens/buildApiMessages)。对齐 cc 的 getMessagesAfterCompactBoundary。
+    /// **持久化语义(R2/F1 后)**:transcript 是**活态镜像**——前缀破坏性变更(/retry 回卷、
+    /// compact 的 replaceWithOwned)触发全量重写,resume == 当时的活对话。微压缩/截断把
+    /// 已 flush 的 tool_result 原地改成 stub 后,一旦发生重写,盘上也定格为 stub(模型
+    /// 视角的真实状态);不再承诺盘上永远保留 stub 化之前的完整原文。
     /// **一致性铁律**:任何"发给模型"的投影和"token 估算"的投影必须用同一 boundary+summary,否则
     /// 压缩后估算不降→死循环,或估算降了实际发全量→爆 context。
     compact_boundary: usize = 0,
     compact_summary: ?[]u8 = null, // owned;压缩摘要,投影时作为边界前的一条 assistant 消息注入
     mutation_version: u64 = 0,
+    /// **前缀破坏代数**(R2/F1):删除或整体替换已存在消息的变更在此 +1(/retry 回卷、
+    /// compact 的 replaceWithOwned)。transcript.Writer 据此发现 append-only 假设失效 →
+    /// 全量重写;否则 flushed_count 单调,回卷再增长到同长度时重生成的回合永不落盘,
+    /// resume 会复活被丢弃的旧回合。纯 append 不 bump。
+    shrink_epoch: u64 = 0,
     /// API usage 锚点:上次请求服务端实际计的 prompt tokens(in+cache_r+cache_w)。
     /// auto-compact 的 token 估算以它为基准,只对锚点之后新 append 的消息做本地估算,
     /// 避免估算器与各家 tokenizer 的偏差随会话长度放大(对齐 cc 用 usage 算 context%)。
@@ -172,6 +181,29 @@ pub const Conversation = struct {
         return self.messages.items.len;
     }
 
+    /// /retry 的回卷:丢弃 messages[user_idx+1..](user_idx = 要重发的最后一条 user 下标)。
+    /// 持快照锁(与并发 transcript 快照/append 互斥)+ bump mutation_version(前缀变了,
+    /// 旧快照必须失效)。**compact_boundary 钳到 ≤ user_idx**:回卷穿过 boundary 时,若不钳,
+    /// activeStart 的逐读 clamp 会让活跃窗口投影为空——重发的 user 消息被藏在 boundary 之下,
+    /// 请求只剩 compact_summary、无 user 消息;其后追加的消息也一直隐形到 len 重新超过
+    /// stale boundary。钳到 user_idx(而非 len)保证重发消息本身在窗口内;它与 summary 的
+    /// 内容重叠是可接受的冗余(模型必须逐字看到要重答的 user 消息)。
+    pub fn rollbackForRetry(self: *Conversation, user_idx: usize) void {
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
+        std.debug.assert(user_idx < self.messages.items.len);
+        const popped = self.messages.items.len > user_idx + 1;
+        while (self.messages.items.len > user_idx + 1) {
+            const m = self.messages.pop().?;
+            m.deinit(self.allocator);
+        }
+        const clamped = self.compact_boundary > user_idx;
+        if (clamped) self.compact_boundary = user_idx;
+        self.mutation_version +%= 1;
+        // 无 pop 且无 clamp(如中止 run 后立即 /retry)= 前缀未破坏,不触发全量重写(R3-3)。
+        if (popped or clamped) self.shrink_epoch +%= 1;
+    }
+
     /// 深拷贝整个对话到 dst allocator(转后台续跑用)。返回的 Conversation 与源 **0 共享指针**
     /// (每 message/block 的字节都 dupe 到 dst),可安全交给后台线程,源在前台被 reset 不影响它。
     /// 持快照锁:防拷贝遍历时被并发 append realloc 抽走 items(同 transcript 快照纪律)。
@@ -291,6 +323,7 @@ pub const Conversation = struct {
         replacement.compact_summary = null;
         replacement.compact_boundary = 0;
         self.mutation_version +%= 1;
+        self.shrink_epoch +%= 1; // 整体替换 = 前缀破坏(transcript 须全量重写)
         self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
         return true;
     }

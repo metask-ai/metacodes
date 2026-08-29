@@ -23,10 +23,8 @@ const WebServer = @import("../web/server.zig").WebServer;
 const SessionRegistry = registry.SessionRegistry;
 const SessionHost = registry.SessionHost;
 
-/// trivial /state:rich attach(seq/roster/config)= U10-C。MVP 返回空对象。
-fn trivialState(_: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
-    return allocator.dupe(u8, "{}");
-}
+// U11:trivialState 已废——复用 web_session.StateSource(rich /state + /command 入队),
+// 单/多 session daemon 与 --web 同一份快照与命令面。
 
 /// 跑 daemon(单 session MVP)直到 SIGINT。返回进程退出码。
 pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
@@ -69,17 +67,25 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     errdefer reg.shutdownAll();
 
     // ── transport(复用 WebServer,绑本 session)──────────────────────────────
-    // **U10-C 待补**:command_fn(slash 命令 over HTTP,web run 有 StateSource.command,MVP 未接)+
-    // rich state_fn(StateSource:seq/roster/config)。MVP 用 trivialState "{}"。见 task#22。
-    var dummy: u8 = 0;
+    // U11(原 U10-C 待补项/task#22):rich /state + /command 都经 web_session.StateSource
+    // ——与 --web 完全同一份(seq/roster/config 快照;命令 HTTP 线程只入 host.cmdbox,
+    // driver 独占执行)。
+    var state_src = web_session.StateSource{
+        .app = app,
+        .wb = &wb,
+        .cmdbox = &host.cmdbox,
+        .journal = &host.journal,
+        .generating = &host.generating,
+    };
     const srv = try WebServer.start(web_alloc, port, .{
         .journal = &host.journal,
         .web_backend = &wb,
         .inbox = &host.inbox, // POST /message → host.inbox(driver 消费)
         .abort = &app.abort,
         .generating = &host.generating, // S1:/interrupt 生成期门(driver 维护),空闲期误打不吞下条消息
-        .state_ctx = @ptrCast(&dummy),
-        .state_fn = &trivialState,
+        .state_ctx = @ptrCast(&state_src),
+        .state_fn = &web_session.StateSource.snapshot,
+        .command_fn = &web_session.StateSource.command,
     });
 
     std.debug.print("metacodes daemon (1 session): http://127.0.0.1:{d}  (Ctrl+C to quit)\n", .{srv.port});

@@ -458,10 +458,12 @@ pub const App = struct {
             .model_context = @import("app/model_context.zig").ModelContext.init(allocator),
         };
 
-        // OpenAI 后端:仅当 provider_kind==.openai 才建(讲 chat/completions 协议)。
-        // base_url 复用 config.base_url(record/replay 指 MockServer);null → OpenAI 官方端点。
+        // OpenAI 后端:仅当 provider_kind==.openai 才建(chat/completions 或 Responses,
+        // 按 config.openai_protocol 显式选择)。base_url 复用 config.base_url(record/replay
+        // 指 MockServer);null → 按 protocol 选 OpenAI 官方端点。
         if (config.provider_kind == .openai) {
             app.openai_client = openai_mod.OpenAIClient.init(allocator, io, api_key, config.model, config.base_url);
+            app.openai_client.?.protocol = config.openai_protocol;
             app.openai_client.?.reasoning_effort = config.reasoning_effort;
             app.openai_client.?.overrides = buildOverridesFromConfig(config);
         }
@@ -674,7 +676,7 @@ pub const App = struct {
         // Background jobs allocate and free from worker threads.  The session
         // arena is not thread-safe; keep the registry and all job-owned state
         // on c_allocator (the provider/agent_loop allocator must match too).
-        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.initWithDialectResolver(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind, app_dialect_resolver) catch |err| blk: {
+        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.initWithDialectResolver(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind, app.config.openai_protocol, app_dialect_resolver) catch |err| blk: {
             @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -688,6 +690,7 @@ pub const App = struct {
             .base_url = config.base_url,
             .model = app.config.model,
             .provider_kind = app.config.provider_kind,
+            .openai_protocol = app.config.openai_protocol,
             .dialect_resolver = app_dialect_resolver,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
         };
@@ -1061,6 +1064,30 @@ pub const App = struct {
         };
     }
 
+    /// 前台开新空会话时轮换会话身份:新 session_id + 指向新目录的 transcript writer,
+    /// 权限路由键同步(R3-1,Ctrl+B 转后台路径用)。**必须换 writer**:旧 writer 的
+    /// flushed_count/seen_shrink_epoch 属于旧历史,fresh conversation(epoch=0)复用它
+    /// 会在下一次 flush 把旧 transcript 整个重写成新会话的寥寥数条(历史被毁;修前则是
+    /// 错位追加)。换 id + 新 writer 后旧 transcript 目录原样封存(仍可 /resume)。
+    /// writer 重建失败非致命(warn,transcript 停写——与启动失败同语义)。
+    pub fn rotateSessionIdentity(app: *App) void {
+        app.session_id = transcript.genSessionId();
+        app.permission_ctx.session = app.session_id;
+        if (app.transcript_writer) |*w| w.deinit();
+        app.transcript_writer = null;
+        app.initTranscriptWriter() catch |err| {
+            @import("util/log.zig").warn("transcript", "rotate writer failed: {s}", .{@errorName(err)});
+        };
+        // R4-3:goal 属于被转走的旧会话——不清则旧 goal 记进新会话目录、用量记错账,
+        // /resume 旧会话时又读到陈旧快照。新会话从无 goal 起步(对齐"新空会话"语义)。
+        app.goal_state.clearInMemory();
+        // 已知残留(R4-2,存量收窄未闭):Ctrl+B 时若有 active skill,其 ExecutionState
+        // 仍挂在旧 id 下(后续 clearActiveSkill 用新 id 注销不到 → 泄漏到 App deinit);
+        // 且后台 job 按值拷走的 permission_ctx.active_skill 借着该投影——此处**不能**
+        // 注销旧 id(会毁掉后台正读的投影 = UAF)。正确修法是 spawn 时深拷/引用计数
+        // 投影,见 follow-up。
+    }
+
     fn initTranscriptWriter(app: *App) !void {
         // HOME
         const home = @import("platform").paths.homeDir() orelse return error.NoHome;
@@ -1315,19 +1342,23 @@ pub const App = struct {
         return app.permission_ctx.modeValue();
     }
 
-    /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
-    /// **只写 permission_ctx.mode(单一源,U2 S2)**;所有读方(footer/statusline/web /state)走 permMode()。
-    pub fn cyclePermMode(app: *App) void {
+    /// 设置权限模式 + 维护 plan_prev_mode 簿记:进 plan 记 from(ExitPlanMode approve 据此
+    /// 恢复真实前态),离开 plan 清。Shift+Tab 轮换与 `/mode` 命名设置(U11)**必须共用此路**
+    /// ——命名路径若直写 setMode 会漏簿记,stale prev 可让 plan approve 恢复到更宽的历史模式
+    /// (如 bypass)。**只写 permission_ctx.mode(单一源,U2 S2)**;读方走 permMode()。
+    pub fn setPermModeTracked(app: *App, to: types.PermissionMode) void {
         const from = app.permMode();
-        const to = nextPermMode(from);
-        // 经 Shift+Tab 进/出 plan 时同步维护 plan_prev_mode,使 ExitPlanMode(approve)能恢复
-        // 到进 plan 前的真实模式(否则回退 default)。进 plan:记 from;离开 plan:清。
         if (to == .plan and from != .plan) {
             app.plan_prev_mode = from;
         } else if (from == .plan and to != .plan) {
             app.plan_prev_mode = null;
         }
         app.permission_ctx.setMode(to);
+    }
+
+    /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
+    pub fn cyclePermMode(app: *App) void {
+        app.setPermModeTracked(nextPermMode(app.permMode()));
     }
 
     /// 设置 TUI 主题(变体 → 派生 theme → 持久化 ~/.metacodes/config.json)。U2 S1:抽出

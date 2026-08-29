@@ -324,6 +324,8 @@ pub fn checkClassified(
         }
     }
 
+    // 名字兜底只服务 legacy 路径(null dispatcher / dyn_registry):dispatcher 在场时
+    // agent_loop 已把未解析名收敛成显式 .execute,不会落到这里的 unknown-read。
     const cat = category_override orelse category.getToolCategory(tool_name);
     const risk: category.RiskLevel = switch (cat) {
         .read => .low,

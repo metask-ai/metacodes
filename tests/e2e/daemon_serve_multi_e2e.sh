@@ -85,6 +85,18 @@ echo "$ackB" | grep -q '"ok":true' || { echo "FAIL: /s/$B/message 未接受: $ac
 evB2=$(curl -s --max-time 3 "http://127.0.0.1:$dport/s/$B/events")
 echo "$evB2" | grep -q "DAEMON_OK" || { echo "FAIL: B 发消息后仍无生成(B driver 死?)"; echo "$evB2"; exit 1; }
 
+# ── U11:per-session rich /state + /command(此前 multi 是 "{}" + 501)+ 命令隔离 ──
+stA=$(curl -s "http://127.0.0.1:$dport/s/$A/state")
+echo "$stA" | grep -q "\"session_id\":\"$A\"" || { echo "FAIL: A /state 非本 session rich 快照: $stA"; exit 1; }
+cackA=$(curl -s -X POST "http://127.0.0.1:$dport/s/$A/command" -H "Origin: http://127.0.0.1:$dport" -d '{"cmd":"/mode plan"}')
+echo "$cackA" | grep -q '"ok":true' || { echo "FAIL: A /command 未入队: $cackA"; exit 1; }
+sleep 1
+curl -s "http://127.0.0.1:$dport/s/$A/state" | grep -q '"permission_mode":"plan"' || { echo "FAIL: A /state 未反映 mode plan"; exit 1; }
+# 命令隔离铁证:A 的 /mode 绝不改 B。
+curl -s "http://127.0.0.1:$dport/s/$B/state" | grep -q '"permission_mode":"plan"' && { echo "FAIL: 命令串台!A 的 /mode 改了 B"; exit 1; }
+evA2=$(curl -s --max-time 3 "http://127.0.0.1:$dport/s/$A/events")
+echo "$evA2" | grep -q 'permission mode → plan' || { echo "FAIL: A 无 command_result mode→plan"; echo "$evA2"; exit 1; }
+
 # U10-B:UDS+NDJSON 绑定(与 web 共享 registry)。此时 A/B 均已跑完 → 空闲。
 [ -S "$usock" ] || { echo "FAIL: UDS socket 未创建: $usock"; cat "$out"; exit 1; }
 uds_out=$(python3 - "$usock" "$A" "$B" <<'PY'
@@ -177,4 +189,4 @@ wait $dpid; rc=$?
 [ "$rc" = 0 ] || { echo "FAIL: daemon 退出码 $rc(非 0)"; exit 1; }
 grep -q "daemon closed" "$out" || { echo "FAIL: 无 'daemon closed'"; exit 1; }
 
-echo "PASS: serve-multi e2e — 路由隔离 + UDS(list/message/attach/interrupt) + U10-E(真中断/多消息连续) + SIGINT 优雅关停"
+echo "PASS: serve-multi e2e — 路由隔离 + UDS(list/message/attach/interrupt) + U10-E(真中断/多消息连续) + U11(/state·/command 按 session 隔离) + SIGINT 优雅关停"

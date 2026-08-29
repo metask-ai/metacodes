@@ -49,17 +49,40 @@ CI targets self-hosted runners (Linux X64, macOS ARM64, Windows X64).
       cases remain opt-in via their `METACODES_TEST_PROJECT_*` env fixtures).
 - [x] Zig caches persist per runner (checkout's workspace clean no longer
       forces cold rebuilds); pull-request jobs carry a fork-isolation guard.
-- [ ] CI green on `main` push (needs this migration merged, runners online).
-- [ ] Keep the default CI wall-clock under ~15 min per platform; heavyweight
-      gates (`rule-control`, AgentCore Windows) stay in their own workflows.
+- [x] CI green on `main` push (merge commit af1ea06: CI and AgentCore Windows
+      both succeeded on the self-hosted fleet).
+- [x] Default CI wall-clock under ~15 min per platform with warm caches.
+      Evidence trail: af1ea06 (three jobs per platform) measured ≈ 13 min
+      wall, dominated by the macOS test job queueing ~5 min behind its
+      sibling jobs on the single macOS runner; after consolidating to one
+      `Gates` job per platform plus persistent Lean products (94c20ee):
+      wall 9:14; after dropping lean-action's per-run elan reinstall
+      (795bdb3), steady-state **execution** is Linux 1:39 / macOS 5:59 /
+      Windows 0:41 with the Lean step at 2 s (cache hit). Wall clock beyond
+      that is runner availability (queueing), not workflow cost. Keep it
+      there — heavyweight gates (`rule-control`, AgentCore Windows) stay in
+      their own workflows.
 - [ ] Release-gate isolation: `rule-control` currently shares the
       `[self-hosted, macOS, ARM64]` label set with pull_request CI jobs;
       before public visibility, give it a dedicated or ephemeral runner so
       PR-authored code cannot precondition the machine that produces release
       decisions.
-- Runner prerequisites: `python3`, `git`, and either preinstalled `rg` or
+- Runner prerequisites: `python3`, `git`, `elan` in `~/.elan` on the
+  Linux/macOS runners (the pinned toolchain then installs once via
+  `control-plane/lean/lean-toolchain`), and either preinstalled `rg` or
   passwordless `sudo apt-get` (Linux) / Homebrew (macOS) for ci.yml's
   presence-guarded ripgrep install; missing prerequisites fail the job loudly.
+- [x] Fleet topology (2026-08-26): the macOS machine runs two runner
+      instances — `YuankundeMac-mini-metacodes` (repository-level, a
+      dedicated lane so this repo's ~6-minute CI never queues behind other
+      org repos' long jobs) and `YuankundeMac-mini` (organization-level,
+      shared). Both share the persistent Zig/Lean caches, which are
+      concurrency-safe by design; validated by a dispatch run landing
+      `Gates (macOS)` on the dedicated instance (first run 9:49 including
+      the one-time full clone; steady state ≈ 6 min). Concurrent jobs share
+      the machine's CPU — acceptable at these durations. The release-gate
+      isolation item above still applies: both instances currently match
+      `rule-control`'s labels.
 - Owner alternative: restoring GitHub-hosted billing would re-enable
   `ubuntu-latest`/`macos-latest` as a fallback matrix.
 

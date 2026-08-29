@@ -1,11 +1,10 @@
 # app/
 
-应用生命周期与入口辅助。
+应用级配置与模型上下文。
 
-| 文件 | 职责 | 来源（迁移后） |
-|---|---|---|
-| `args.zig` | CLI 参数解析 + printHelp | `src/main.zig:38-78` |
-| `config.zig` | Config 结构体 + 合并优先级（env > CLI > file > default） | `src/types.zig:4-9` + 未来扩展 |
-| `constants.zig` | VERSION / ANTHROPIC_API_URL / 默认 model 等常量 | `src/main.zig:8`, `src/client.zig:7-8` |
+- `config.zig` — 持久化配置(`~/.metacodes/config.json`)读写与合并。
+- `model_context.zig` + `model_context_default.toml` — 模型上下文窗口/价格等
+  元数据(内置默认 + 可覆盖)。
 
-占位目录 — M0.5 开始填充。
+CLI 参数解析与 `printHelp` 在 `src/main.zig`(`parseArgsInto`);
+版本常量单源在 `src/version.zig`。

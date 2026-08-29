@@ -1,16 +1,18 @@
 # permission/
 
-权限模块骨架。
+权限决策链:模式、规则、交互授权与 hooks。已完整实现(早期"骨架"阶段
+的描述已过时);对齐 Claude Code 的权限语义。
 
-**本期（M0-M4）范围限定**：仅保留接口与骨架逻辑，完整权限由未来的沙箱方案（seccomp / landlock / namespace）实现。
+- `mode.zig` — 官方权限模式枚举与 CLI 解析。
+- `decision.zig` — `check(...) -> allow | deny | ask` 决策核心。
+- `rule_spec.zig` / `rule_matcher.zig` — 规则语法(`Bash(git status:*)` 等)
+  解析与匹配;`bash_parser.zig` 供 Bash 命令结构化。
+- `prompt.zig` — 交互授权(UiRequest 桥、会话内记忆、
+  `settings.local.json` 持久化)。
+- `settings.zig` / `settings_writer.zig` / `loader.zig` — 设置文件读写。
+- `session_rules.zig` — 会话级授权状态。
+- `hooks.zig` — 权限 hooks。
+- `category.zig` — ToolCategory / RiskLevel。
 
-| 文件 | 职责 | 本期状态 |
-|---|---|---|
-| `mode.zig` | `Mode` 枚举：default / accept_edits / bypass / plan / dont_ask；CLI 解析 | 完整实现 |
-| `decision.zig` | `Decision` union + `check(ctx, tool, input) -> .allow \| .deny(reason) \| .ask(reason)` | 骨架：bypass → allow；plan → write/exec 类 deny；危险命令命中 → deny；其他 → allow |
-| `context.zig` | `PermissionContext`（持 Mode、RuleSet、Prompter、Hooks 引用） | 仅字段 + init |
-| `rule.zig` | Rule DSL：`Bash(git status:*)` / `Read(/tmp/**)` | **空实现，`TODO(sandbox)` 注释** |
-| `prompt.zig` | 用户交互 y/n/A/q | **空实现，`TODO(sandbox)` 注释** |
-| `category.zig` | ToolCategory / RiskLevel | `src/permission.zig:12-76` 迁移 |
-
-占位目录 — M0.6 开始填充骨架。
+`PermissionContext` 等聚合类型在上层 `src/permission.zig`。
+规则语义以本目录类型与 `tests/component` 权限测试为准。

@@ -1068,12 +1068,15 @@ pub const AgentSession = struct {
 
     fn makeToolProvider(raw: *anyopaque) anyerror!provider_factory.OwnedProvider {
         const self: *AgentSession = @ptrCast(@alignCast(raw));
+        // SessionConfig 未暴露 openai_protocol(嵌入层协议选择不在 issue #4 范围):
+        // 固定 chat/completions。
         return provider_factory.makeProviderWithDialectResolver(
             std.heap.c_allocator,
             self.provider.kind(),
             self.api_key,
             self.model,
             self.base_url,
+            .chat_completions,
             self.runtime.plugin_snapshot.dialectResolver(),
         );
     }
@@ -1163,6 +1166,7 @@ pub const AgentSession = struct {
             api_key,
             model,
             base_url,
+            .chat_completions, // SessionConfig 未暴露 openai_protocol(嵌入层默认 chat)
             runtime.plugin_snapshot.dialectResolver(),
         );
         errdefer owned_provider.deinit();
@@ -1407,6 +1411,7 @@ pub const AgentSession = struct {
             self.api_key,
             replacement_model,
             self.base_url,
+            .chat_completions, // SessionConfig 未暴露 openai_protocol(嵌入层默认 chat)
             self.runtime.plugin_snapshot.dialectResolver(),
         ) catch |err| {
             self.cancelMutation();

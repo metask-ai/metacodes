@@ -498,7 +498,7 @@ pub const Selection = struct {
     }
 
     pub fn dispatcher(self: *const Selection) tools.ToolDispatcher {
-        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync, .builtinFn = isBuiltinEntry, .categoryFn = category, .replayDeclarationFn = replayDeclaration };
+        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .metadataFn = resolveMeta, .nameAtFn = nameAt };
     }
 
     fn dispatch(raw: *const anyopaque, tool_ctx: *const tools.ToolContext, name: []const u8, args: []const u8) anyerror!tools.ToolDispatchOutcome {
@@ -651,34 +651,23 @@ pub const Selection = struct {
         }
     };
 
-    fn prefetchSafe(raw: *const anyopaque, name: []const u8) bool {
-        const self: *const Selection = @ptrCast(@alignCast(raw));
-        const entry = self.find(name) orelse return false;
-        return entry.prefetch_safe;
-    }
-
-    fn hostSync(raw: *const anyopaque, name: []const u8) bool {
-        const self: *const Selection = @ptrCast(@alignCast(raw));
-        const entry = self.find(name) orelse return false;
-        return entry.executor == .host_sync or entry.executor == .host_stream;
-    }
-
-    fn isBuiltinEntry(raw: *const anyopaque, name: []const u8) bool {
-        const self: *const Selection = @ptrCast(@alignCast(raw));
-        const entry = self.find(name) orelse return false;
-        return entry.executor == .builtin;
-    }
-
-    fn category(raw: *const anyopaque, name: []const u8) ?permission_category.ToolCategory {
+    /// One metadata resolution per name, derived from the same `Entry` lookup
+    /// `dispatch` uses. Selection misses stay conservative through the
+    /// `ToolDispatcher` derived defaults (false/null/.never), and dispatch of
+    /// such a name fails with UnknownTool above.
+    fn resolveMeta(raw: *const anyopaque, name: []const u8) ?tools.ToolMeta {
         const self: *const Selection = @ptrCast(@alignCast(raw));
         const entry = self.find(name) orelse return null;
-        return entry.category;
-    }
-
-    fn replayDeclaration(raw: *const anyopaque, name: []const u8) execution_effect.ReplayDeclaration {
-        const self: *const Selection = @ptrCast(@alignCast(raw));
-        const entry = self.find(name) orelse return .never;
-        return entry.replay;
+        return .{
+            .kind = switch (entry.executor) {
+                .builtin => .builtin,
+                .host_sync, .host_stream => .host,
+                .isolated => .external,
+            },
+            .category = entry.category,
+            .replay = entry.replay,
+            .prefetch_safe = entry.prefetch_safe,
+        };
     }
 
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {

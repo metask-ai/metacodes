@@ -58,7 +58,7 @@ DSH 的全部动态 plugin capability、全新 provider transport、UI 插件或
 | 完全保留 metacodes 内核精髓 | 插件支持矩阵不包含 AgentLoop、Permission grant、Lean verifier、TinyKG writer、budget/checkpoint；插件工具仍走 native admission | 已完成并失败关闭 |
 | Lean + TinyKG 形式化/本体 | 候选只能提交 inert evidence；Lean/native verdict、TinyKG provenance/CAS 仍是 kernel-owned | 边界已保留；不是插件可替换服务 |
 | 自我迭代 | candidate → TinyKG → frozen paired eval → Lean/native verdict → CAS → 新 immutable generation | 治理路径与发布机制已具备；自动自批明确禁止 |
-| 嵌入各种软件/场景 | Zig source API、C/C++/Zig/Rust AgentCore rev12、CLI、Web SSE/HTTP、typed Event/UI seam | 多宿主基础已完成；Host/process/MCP Tool Result 均进入同一 CAS/spool 数据面；静态 service/`RuntimeHost` 尚未扩入 C ABI |
+| 嵌入各种软件/场景 | Zig source API、C/C++/Zig/Rust AgentCore v1 revision 13、CLI、Web SSE/HTTP、typed Event/UI seam | 多宿主基础已完成；Host/process/MCP Tool Result 均进入同一 CAS/spool 数据面；静态 service/`RuntimeHost` 尚未扩入 C ABI |
 | coding 高 benchmark 表现 | `1.2.0` 以同模型/任务/grader/预算完整执行 18 对、36 rollouts | 两臂可信成功率均为 17/18；candidate 因平均成本增加 US$0.0648145 超过 US$0.02 门禁而拒绝，显著 improvement 未建立；外部 WorkBuddy 未运行 |
 
 ## 4. 已通过的确定性门禁
@@ -90,7 +90,7 @@ DSH 的全部动态 plugin capability、全新 provider transport、UI 插件或
 失败保持/代际 pinning/自动 drain L2、`test:lib`
 隔离、独立 Zig Host、无凭证 CLI
 inventory、空 baseline 与 namespaced candidate 对照、5 次 ReleaseSafe snapshot
-微基准。AgentCore rev12 native gate 还验证了 source-free C/C++/Zig/Rust consumer；
+微基准。AgentCore v1 revision 13 native gate 还验证了 source-free C/C++/Zig/Rust consumer；
 独立 Host L2 从公共 ABI 配置真实 hash-pinned 进程包，并观察到非零
 executable/package/schema 权限绑定、审批 provenance、子进程执行与工具结果回流。
 

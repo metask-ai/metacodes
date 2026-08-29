@@ -133,6 +133,10 @@ pub const Config = struct {
     /// gpt*/o1*/o3* → openai(讲 chat/completions 协议)。**只在 App 组装层据此选 Client,
     /// core/UI 零感知**(多 Provider 重构 P3)。
     provider_kind: ProviderKind = .anthropic,
+    /// OpenAI wire 协议选择(`--openai-protocol` / env METACODES_OPENAI_PROTOCOL)。
+    /// 默认 chat_completions;responses 走 /v1/responses(typed SSE 事件流)。
+    /// 仅 provider_kind==.openai 时被消费;**显式配置,绝不从 base_url/model 推断**。
+    openai_protocol: OpenAIProtocol = .chat_completions,
 };
 
 /// A single tagged treatment prevents invalid combinations such as "TinyKG on
@@ -180,6 +184,30 @@ test "TinyKG arm respects an explicit auto-memory disable" {
 
 /// LLM 后端协议种类(App 组装层据此选具体 Client;core 只见中立 Provider)。
 pub const ProviderKind = enum { anthropic, openai, gemini };
+
+/// OpenAI 后端的 wire 协议(仅 provider_kind==.openai 时生效):
+/// chat_completions = /v1/chat/completions(默认);responses = /v1/responses。
+/// 显式配置选择(flag/env),绝不从 base_url/model 推断。
+pub const OpenAIProtocol = enum {
+    chat_completions,
+    responses,
+
+    /// 解析 CLI/env 值:"responses" → responses;"chat"/"chat_completions" → chat_completions。
+    /// 词表外返 null(调用方 fail-closed,拼错不许静默落默认)。
+    pub fn parse(value: []const u8) ?OpenAIProtocol {
+        if (std.mem.eql(u8, value, "responses")) return .responses;
+        if (std.mem.eql(u8, value, "chat") or std.mem.eql(u8, value, "chat_completions")) return .chat_completions;
+        return null;
+    }
+};
+
+test "OpenAIProtocol.parse:词表内映射,词表外 fail-closed" {
+    try std.testing.expectEqual(OpenAIProtocol.responses, OpenAIProtocol.parse("responses").?);
+    try std.testing.expectEqual(OpenAIProtocol.chat_completions, OpenAIProtocol.parse("chat").?);
+    try std.testing.expectEqual(OpenAIProtocol.chat_completions, OpenAIProtocol.parse("chat_completions").?);
+    try std.testing.expect(OpenAIProtocol.parse("respones") == null);
+    try std.testing.expect(OpenAIProtocol.parse("") == null);
+}
 
 pub const AuthPrecedence = enum { api_key_first, oauth_first };
 

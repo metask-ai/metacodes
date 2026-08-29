@@ -10,8 +10,47 @@ compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Security
+
+- Third-party GitHub Actions are pinned to full commit SHAs, and the Windows
+  Rust bootstrap downloads a version-pinned `rustup-init` verified by SHA-256
+  before execution — the action set and the installer are no longer mutable at
+  fetch time. (The Rust `stable` toolchain itself stays rustup-managed behind
+  the presence guard: it installs once and is not re-resolved per run.)
+- `scripts/verify_tinykg_binary.py` now inventories `vendor/tinykg/bin/`:
+  an executable not declared by the manifest fails the gate (per-binary
+  hashes cannot see extra files).
+- The rule-control telemetry artifact no longer records the runner's absolute
+  workspace path, and feedback child processes run with secret-named
+  environment variables removed (name denylist: `*API_KEY*`, `*ACCESS_KEY*`,
+  `*PRIVATE_KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`), so
+  echoed child environments do not carry those variables into uploaded
+  artifacts.
+
 ### Added
 
+- UI-neutral session command surface (issue #3): all raw input now flows
+  through one typed pipeline (`session_intent.parse` →
+  `SessionService.dispatch` → `RunPlan`), shared verbatim by the terminal
+  REPL, `--web`, and the daemon. Web/daemon gain `/commit` `/review` `/init`
+  `/retry` `/mode` and `!cmd` over `POST /command` (single- and multi-session
+  daemons previously answered 501; they now serve the rich `/state` snapshot
+  too), the REPL gains `/mode [name]`, and run-option assembly collapses into
+  one canonical `session_service.buildRunOptions` — fixing silent capability
+  loss where skill-triggered and injected runs were missing
+  agents/skills/MCP/cron wiring, and web runs were missing
+  LSP/swarm/background-request wiring. Locked by
+  `tests/component/session_api_parity_test.zig`.
+- Explicit OpenAI Responses API support: `--openai-protocol
+  chat_completions|responses` (alias `chat`; env `METACODES_OPENAI_PROTOCOL`)
+  selects the OpenAI wire protocol — never inferred from `--base-url` or the
+  model name, and invalid values fail closed. `responses` speaks
+  `/v1/responses`: typed SSE events (`response.output_text.delta`,
+  `response.output_item.added`, `response.function_call_arguments.*`,
+  `response.completed`/`incomplete`/`failed`), `input` items with
+  `function_call`/`function_call_output` call_id round-trip, top-level
+  `instructions`, flat tools, `reasoning:{effort}` (capped at `high`), and
+  `store:false`. Subagents and teammates inherit the parent's protocol choice.
 - `metacodes --version` prints `metacodes <semver>`; help banner now names the
   project instead of the legacy internal product name. The semver has one
   in-source authority (`src/version.zig`, consumed by the CLI, `lib.VERSION`,
@@ -32,12 +71,55 @@ compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- `tools.ToolDispatcher` now resolves every per-name execution metadata query
+  through one required `metadataFn` returning `?ToolMeta` (executor kind,
+  permission category, replay declaration, prefetch flag); the five per-field
+  callbacks (`prefetchSafeFn`/`hostSyncFn`/`builtinFn`/`categoryFn`/
+  `replayDeclarationFn`) are removed. Dispatch and metadata share one entry
+  lookup, so builtin identity, classification, replay and scheduling flags can
+  no longer drift apart across the AgentCore wrapper layers
+  (budget/Skill/MCP). Consistency consequences: builtin file tools keep their
+  `file_refs`/file-change evidence and Read resolves to a `.read_only` replay
+  through wrapped Run surfaces, and Host/MCP tools carry their declared
+  executable categories through wrappers (ask in default mode, deny in plan,
+  instead of a silent name-based allow). With a Session dispatcher present, a
+  name the directory cannot resolve now conservatively classifies as
+  `.execute` — never the legacy unknown-name read fallback — and dispatching
+  it still fails as UnknownTool. The AgentCore C ABI is unaffected.
+- ToolDispatcher metadata hardening: `validateMetadataCoverage()` walks the
+  advertised directory and reports the first dispatchable name lacking
+  metadata (asserted in Debug at the composed Run surface, so a wrapper that
+  adds a name but forgets the metadata branch fails loudly); the session
+  budget layer now classifies Tool-vs-MCP operations from the same metadata
+  resolution dispatch uses instead of the unfiltered MCP view (a
+  selected-but-expired alias no longer reserves under MCP caps while dispatch
+  answers UnknownTool; `ToolEnvironment.mcp_view` is removed). The MCP-class
+  boundary is now the `.external` executor kind, which also covers the Skill
+  overlay tool — with the default equal caps this changes nothing, and the
+  taxonomy question is tracked as ledger item E12. The Skill overlay also
+  refuses to build over a base surface that already advertises a tool named
+  `Skill` (`error.SkillToolNameCollision`) instead of silently shadowing it
+  while sending duplicate definitions to the provider.
 - CI migrated to self-hosted runners (Linux X64, macOS ARM64, Windows X64)
   with a pinned Lean toolchain build. No GitHub-hosted path remains in the
   workflows; restoring account billing would allow reintroducing hosted
   runners as a fallback matrix (tracked in ROADMAP M1). Pull-request jobs
   carry a fork-isolation guard, and Zig caches live in persistent per-runner
   storage so checkout's workspace clean no longer forces cold rebuilds.
+- The CI workflow runs one consolidated `Gates (<platform>)` job per platform
+  instead of three jobs queueing on each platform's single runner (the macOS
+  test job previously waited ~5 minutes behind its sibling jobs), and Lean
+  `.lake` build products persist per runner alongside the Zig caches so the
+  kernel stops cold-building every run.
+- `leanprover/lean-action` removed from all workflows: on every run it
+  executed an unpinned installer streamed from elan's `master` branch on the
+  persistent runners (the same class of mutable-fetch-and-execute the rustup
+  bootstrap fix closed), cost ~40 s, and the per-run elan reinstall
+  invalidated Lake's traces so the kernel rebuilt despite the restored
+  `.lake`. elan is now a presence-checked runner prerequisite and CI drives
+  `lake build` directly; this also removes two per-run action-tarball
+  downloads from job setup, which the macOS runner's GitHub connectivity made
+  expensive (a single action download was measured at 2m16s).
 - Eight paid-runner L2 cases (seven in
   `scripts/eval/tests/test_memory_budget_runtime.py`, one v7-receipt case in
   `test_memory_agent_runtime.py`) that exercise the production macOS Seatbelt
@@ -56,6 +138,80 @@ compatibility boundaries, and entry points are defined by
   `METACODES_TEST_REQUIRE_LEAN_SDK=1`, which turns that skip into a failure so
   an olean path drift cannot become a permanent silent skip; the guard path
   itself is imported from `project_harness_evolution.SDK_OLEAN_RELATIVE`.
+
+### Fixed
+
+- Plan-mode classification escape on the CLI (no-dispatcher) path: a model
+  emitting a case-variant builtin name (e.g. `bash`) was classified by the
+  unknown-name read fallback and allowed in plan mode, then deterministically
+  repaired to `Bash` at dispatch and really executed. Permission
+  classification and rule matching now normalize with the same resolver the
+  dispatcher uses, so plan mode denies what will actually run; truly unknown
+  names keep the read fallback and the UnknownTool guidance.
+- `/retry` after an auto-compact could roll the conversation back past the
+  compact boundary, leaving the active window projecting empty (the request
+  contained only the compact summary — no user message — and later turns
+  stayed hidden behind the stale boundary). The rollback now clamps the
+  boundary to the retried user message under the snapshot lock.
+- OpenAI streaming hardening (adversarial review of the Responses work): SSE
+  lines longer than the 8KB transfer buffer no longer kill the stream with
+  `StreamTooLong` — `OpenAIStream` now falls back to the same 16MB-capped
+  overflow accumulation the Anthropic path uses, so Responses terminal events
+  carrying the full accumulated payload (`response.output_text.done`,
+  `response.completed`, `response.function_call_arguments.done`) parse instead
+  of forcing a discarded, re-billed turn. Under `protocol=responses`,
+  `--response-format` (as top-level `text.format`), `--prompt-cache-key`, and
+  `--parallel-tool-calls` are serialized instead of silently no-oping.
+  Streamed tool-call `arguments` fragments (chat and Responses) accumulate as
+  raw escaped bytes and decode exactly once at flush, so a `\uXXXX` surrogate
+  pair split across two deltas no longer becomes two U+FFFD. Responses event
+  dispatch no longer trusts the first `"type"` in the raw event (a server
+  serializing `item` before the top-level `type` previously dropped the
+  function call), and parallel/interleaved Responses tool calls are covered by
+  a cassette test.
+- Transcript persistence survives `/retry`: the writer's append-only
+  assumption broke on rollback (flushed count is monotonic), so a retry that
+  shrank and regrew the conversation left the regenerated turn unpersisted
+  and resuming the session revived the discarded pre-retry turn. Prefix-
+  destroying mutations (retry rollback, compact's wholesale replacement) now
+  bump a shrink epoch and the writer atomically rewrites the transcript.
+  Semantics note: the transcript is a live-state mirror — after a rewrite,
+  tool results that microcompact/truncation had already stubbed in memory
+  are stubbed on disk too (resume reproduces what the model actually saw;
+  previously microcompacted outputs came back verbatim on resume, and
+  combined with a retry rollback the restored history could misalign). A
+  no-op retry (nothing rolled back, no boundary clamp) does not trigger a
+  rewrite.
+- Ctrl+B (background the current session) now rotates the foreground to a
+  fresh session id, transcript writer, and cleared goal state. Previously
+  the fresh conversation kept the old session's writer and corrupted the
+  old transcript (misaligned appends; after the rewrite fix, a prior
+  retry/compact in the old session would have made the next flush replace
+  it wholesale). The old session's transcript is now sealed as-is and
+  stays resumable.
+- Task-obligation tracking survives case-variant tool names end to end:
+  both the dispatch-side accounting and the result-side met-confirmation
+  now key on the canonical name / pending id (a lowercase `bash` call that
+  really executed previously left the obligation unmet with a bounded
+  spurious nudge).
+- `/resume` now clears the active skill before switching session identity:
+  previously the next run in the resumed session (e.g. an immediate
+  `/retry`) executed under the previous session's skill tool policy, and the
+  old skill execution state leaked (unregistered under the wrong id).
+- Headless (`-p`) runs now carry the real session id into the agent loop
+  (previously the default `single`), so KG task claims/leases from
+  concurrent headless processes sharing a store no longer collide on one
+  identity.
+- `--response-format json_schema` now serializes the API-required
+  `format.name` (constant `"response"`) on both the Chat Completions and
+  Responses wires; both previously omitted it, so json_schema requests were
+  rejected server-side with "Missing required parameter".
+- OpenAI-compatible streaming now decodes the JSON string escapes of SSE
+  fragments: `delta.content` and `reasoning_content` (GLM/Kimi/DeepSeek/Qwen/
+  Mistral) previously reached the conversation and thinking stream as raw
+  escaped bytes, so `\n`/`\t`/`\uXXXX` rendered as literals. Both paths (and
+  streamed tool-call `arguments`) now share one unescaping extractor in
+  `util/json.zig`.
 
 ## Unreleased — standalone extraction and embedding boundary
 

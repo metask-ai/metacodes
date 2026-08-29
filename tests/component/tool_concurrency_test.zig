@@ -45,22 +45,19 @@ test "L2 #5: 没有 provider factory 时两个 WebSearch 不重叠使用 session
             }
             return .{ .ok = tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, "ok")) };
         }
-        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-            return false;
+        fn metadata(_: *const anyopaque, _: []const u8) ?tools.ToolMeta {
+            // .external(非 host)→ 并发判定继续走名字/输入分类,WebSearch 保持串行语义。
+            return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
         }
         fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
             return if (index == 0) "WebSearch" else null;
-        }
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return false;
         }
         fn dispatcher(self: *@This()) tools.ToolDispatcher {
             return .{
                 .ctx = @ptrCast(self),
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = prefetchSafe,
+                .metadataFn = metadata,
                 .nameAtFn = nameAt,
-                .hostSyncFn = hostSync,
             };
         }
     };
@@ -111,8 +108,9 @@ test "L2 WebSearch 独立 provider 让混合批并发且 Read 不被隔离" {
             _ = self.active.fetchSub(1, .acq_rel);
             return .{ .ok = tools.ToolResultBody.initInline(try tool_ctx.allocator.dupe(u8, "ok")) };
         }
-        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
-            return false;
+        fn metadata(_: *const anyopaque, _: []const u8) ?tools.ToolMeta {
+            // .external(非 host)→ WebSearch/Read 的并发能力仍由名字/输入分类决定。
+            return .{ .kind = .external, .category = .execute, .replay = .never, .prefetch_safe = false };
         }
         fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
             return switch (index) {
@@ -121,16 +119,12 @@ test "L2 WebSearch 独立 provider 让混合批并发且 Read 不被隔离" {
                 else => null,
             };
         }
-        fn hostSync(_: *const anyopaque, _: []const u8) bool {
-            return false;
-        }
         fn dispatcher(self: *@This()) tools.ToolDispatcher {
             return .{
                 .ctx = @ptrCast(self),
                 .dispatchFn = dispatch,
-                .prefetchSafeFn = prefetchSafe,
+                .metadataFn = metadata,
                 .nameAtFn = nameAt,
-                .hostSyncFn = hostSync,
             };
         }
     };
