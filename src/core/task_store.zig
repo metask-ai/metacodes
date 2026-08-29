@@ -400,6 +400,8 @@ pub const TaskStore = struct {
     }
 
     /// 创建任务，返回刚创建的 task 指针（借，调用方不 free）。
+    /// mirror 开启时,后续任何 mutation 的 reload 会整体替换 task 对象——
+    /// 返回的指针(及其字段切片)只保证在下一次 store mutation 开始前有效。
     pub fn create(
         self: *TaskStore,
         subject: []const u8,
@@ -520,11 +522,16 @@ pub const TaskStore = struct {
     pub fn updateStatus(self: *TaskStore, id: []const u8, status: TaskStatus) !void {
         _ = self.mutex.lock(); // task#19
         defer _ = self.mutex.unlock();
+        // mirror 开启时 beginMirrorTxnLocked 的 reload 会整体替换并释放现有 task 对象。
+        // 调用方传的 id 常借自 store 内 task(`store.updateStatus(t.id, ...)`)——不先拷贝,
+        // reload 后它就是悬垂指针,查找失配 → TaskNotFound 被调用方吞掉,更新静默失效。
+        const id_copy = try self.allocator.dupe(u8, id);
+        defer self.allocator.free(id_copy);
         var mirror_txn = try self.beginMirrorTxnLocked();
         defer if (mirror_txn) |*lock| lock.release();
         errdefer if (mirror_txn != null) self.reloadMirrorLocked() catch {};
         for (self.tasks.items, 0..) |t, i| {
-            if (!std.mem.eql(u8, t.id, id)) continue;
+            if (!std.mem.eql(u8, t.id, id_copy)) continue;
             if (status == .deleted) {
                 t.deinit(self.allocator);
                 self.allocator.destroy(t);
@@ -567,10 +574,8 @@ pub const TaskStore = struct {
     ) !void {
         _ = self.mutex.lock(); // task#19
         defer _ = self.mutex.unlock();
-        var mirror_txn = try self.beginMirrorTxnLocked();
-        defer if (mirror_txn) |*lock| lock.release();
-        errdefer if (mirror_txn != null) self.reloadMirrorLocked() catch {};
-        // 先用可变局部变量接管所有权。任一错误路径由 errdefer 释放。
+        // 先用可变局部变量接管所有权(在任何可失败步骤之前,含下方 dupe/txn)。
+        // 任一错误路径由 errdefer 释放。
         var subject = opts.subject;
         errdefer if (subject) |s| self.allocator.free(s);
         var description = opts.description;
@@ -579,8 +584,14 @@ pub const TaskStore = struct {
         errdefer if (active_form) |s| self.allocator.free(s);
         var owner = opts.owner;
         errdefer if (owner) |s| self.allocator.free(s);
+        // id 可能借自 store 内 task,mirror reload 会释放它——先拷贝(见 updateStatus)。
+        const id_copy = try self.allocator.dupe(u8, id);
+        defer self.allocator.free(id_copy);
+        var mirror_txn = try self.beginMirrorTxnLocked();
+        defer if (mirror_txn) |*lock| lock.release();
+        errdefer if (mirror_txn != null) self.reloadMirrorLocked() catch {};
 
-        const t = self.get(id) orelse return error.TaskNotFound;
+        const t = self.get(id_copy) orelse return error.TaskNotFound;
 
         // 全部批量替换：无 allocator 调用，不会中途失败。
         // 每条：把 local 置 null 表示所有权已转移，errdefer 不再 free。
@@ -611,10 +622,13 @@ pub const TaskStore = struct {
     pub fn addBlocks(self: *TaskStore, id: []const u8, blocked_ids: []const []const u8) !void {
         _ = self.mutex.lock(); // task#19(一致性:虽 snapshot 暂不读 blocks)
         defer _ = self.mutex.unlock();
+        // id 可能借自 store 内 task,mirror reload 会释放它——先拷贝(见 updateStatus)。
+        const id_copy = try self.allocator.dupe(u8, id);
+        defer self.allocator.free(id_copy);
         var mirror_txn = try self.beginMirrorTxnLocked();
         defer if (mirror_txn) |*lock| lock.release();
         errdefer if (mirror_txn != null) self.reloadMirrorLocked() catch {};
-        const t = self.get(id) orelse return error.TaskNotFound;
+        const t = self.get(id_copy) orelse return error.TaskNotFound;
         for (blocked_ids) |bid| {
             const s = try self.allocator.dupe(u8, bid);
             errdefer self.allocator.free(s);
@@ -626,10 +640,13 @@ pub const TaskStore = struct {
     pub fn addBlockedBy(self: *TaskStore, id: []const u8, blocker_ids: []const []const u8) !void {
         _ = self.mutex.lock(); // task#19
         defer _ = self.mutex.unlock();
+        // id 可能借自 store 内 task,mirror reload 会释放它——先拷贝(见 updateStatus)。
+        const id_copy = try self.allocator.dupe(u8, id);
+        defer self.allocator.free(id_copy);
         var mirror_txn = try self.beginMirrorTxnLocked();
         defer if (mirror_txn) |*lock| lock.release();
         errdefer if (mirror_txn != null) self.reloadMirrorLocked() catch {};
-        const t = self.get(id) orelse return error.TaskNotFound;
+        const t = self.get(id_copy) orelse return error.TaskNotFound;
         for (blocker_ids) |bid| {
             const s = try self.allocator.dupe(u8, bid);
             errdefer self.allocator.free(s);
@@ -730,6 +747,40 @@ test "TaskStore: completed 记 completed_ms,转出 completed 清零" {
     // 转回 in_progress(返工)→ 时戳清零,TTL 重置。
     try store.updateStatus(t.id, .in_progress);
     try testing.expectEqual(@as(i64, 0), t.completed_ms);
+}
+
+test "TaskStore: mirror 开启时 updateStatus(t.id) 不悬垂(reload 释放旧 task)" {
+    // 回归(TTY T25/T28 ◻ 根因):mirror reload 会整体替换并释放 task 对象。把 create
+    // 返回的 t.id 直接传回 updateStatus 时,id 在调用内部 reload 后指向已释放内存 →
+    // 查找失配 → TaskNotFound 被调用方吞掉,状态静默停在 pending。修复:入口先拷贝 id。
+    const test_fs = @import("../util/fs.zig");
+    var dbuf: [128]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dbuf, "/tmp/cc-zig-taskstore-test-{d}", .{util_time.nowNs()});
+    try test_fs.mkdirParents(dir_path);
+    defer test_fs.testing.rmrfBestEffort(dir_path);
+    var pbuf: [192]u8 = undefined;
+    const mirror = try std.fmt.bufPrint(&pbuf, "{s}/tasks.json", .{dir_path});
+
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try store.setMirror(mirror);
+
+    const t = try store.create("answered q1", "test", "answered q1");
+    try store.updateStatus(t.id, .completed); // t.id 会在本调用的 reload 中被释放
+    const cur = store.get("1") orelse return error.TaskNotFound;
+    try testing.expect(cur.status == .completed);
+    try testing.expect(cur.completed_ms != 0);
+
+    // update/addBlocks/addBlockedBy 同一入口约定:store 内 id 传回不悬垂。
+    const cur2 = store.get("1").?;
+    try store.update(cur2.id, .{ .subject = try testing.allocator.dupe(u8, "S2") });
+    try testing.expectEqualStrings("S2", store.get("1").?.subject);
+    const cur3 = store.get("1").?;
+    try store.addBlocks(cur3.id, &.{"9"});
+    try testing.expect(store.get("1").?.blocks.items.len == 1);
+    const cur4 = store.get("1").?;
+    try store.addBlockedBy(cur4.id, &.{"8"});
+    try testing.expect(store.get("1").?.blocked_by.items.len == 1);
 }
 
 test "TaskStore: unique active KG task fails safe on ambiguity and malformed ids" {
