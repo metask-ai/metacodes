@@ -77,11 +77,16 @@ jobs:
           if errorlevel 1 exit /b 1
           rustc --version
           cargo --version
+      # --test-timeout 5m:zig build runner 的 between-test 看门狗 = max(--test-timeout, 60s)。
+      # 该共享 runner(与其它仓 job 抢 CPU/磁盘 + Defender 实时扫描大体积测试 exe 的按需换页)
+      # 曾五次把 abi unit/contract 二进制冻过 60s 静默窗——所有已执行测试全过,却被
+      # "test runner failed to respond for ~1m" 击杀(runs 33182209880/33186110733/33229667443/
+      # 33229697275 等,重跑均绿)。抬到 5m 只影响真挂死的失败延迟,不吞任何测试失败。
       - name: Native AgentCore delivery gate
         shell: cmd
         run: |
           zig version
-          zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe -j12
+          zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe -j12 --test-timeout 5m
       - name: Native Windows platform gate
         shell: cmd
-        run: zig build windows:gate -Dtarget=x86_64-windows-gnu -j12
+        run: zig build windows:gate -Dtarget=x86_64-windows-gnu -j12 --test-timeout 5m
