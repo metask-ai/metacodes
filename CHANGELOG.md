@@ -1,14 +1,14 @@
 # Changelog
 
-The standalone repository is versioned per `build.zig.zon`; no release has
-been tagged yet. Entries titled **"Historical —"** were imported from the
-pre-extraction `cc-zig` line — their version numbers and dates are
-historical labels, not release promises of this repository. Current status,
-compatibility boundaries, and entry points are defined by
+The standalone repository is versioned per `build.zig.zon`; the first tagged
+release is `0.1.0` (2026-08-29). Entries titled **"Historical —"** were
+imported from the pre-extraction `cc-zig` line — their version numbers and
+dates are historical labels, not release promises of this repository. Current
+status, compatibility boundaries, and entry points are defined by
 [README](README.md), [ROADMAP](ROADMAP.md), [doc/API.md](doc/API.md), and
 [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md).
 
-## Unreleased
+## 0.1.0 — 2026-08-29
 
 ### Security
 
@@ -241,7 +241,7 @@ compatibility boundaries, and entry points are defined by
   streamed tool-call `arguments`) now share one unescaping extractor in
   `util/json.zig`.
 
-## Unreleased — standalone extraction and embedding boundary
+## 0.1.0 — standalone extraction and embedding boundary
 
 ### Changed
 
