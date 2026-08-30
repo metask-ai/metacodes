@@ -83,6 +83,13 @@ pub const Service = struct {
     reaper: ?std.Thread = null,
     stop: bool = false,
 
+    /// **allocator 必须线程安全**:`reaperLoop` 在后台线程上用它 alloc/free(收割 idle client 时
+    /// 的两个临时 ArrayList + free client key),与调用方线程的分配并发。
+    ///
+    /// 生产传的是 App 的 arena,**这满足要求**(核对过 Zig 0.16 std:`ArenaAllocator` 文档写明
+    /// "threadsafe, given that child_allocator is threadsafe",`end_index` 走 `@atomicLoad` +
+    /// `@cmpxchgStrong`;`std.process.Init` 的 arena 后端是 `page_allocator`)。别照着旧笔记
+    /// 把它改成 c_allocator——那条"arena 非线程安全"的说法对 0.16 已经不成立。
     pub fn create(allocator: std.mem.Allocator, cwd: []const u8, abort: ?transport.AbortCheck) !*Service {
         const self = try allocator.create(Service);
         errdefer allocator.destroy(self);
