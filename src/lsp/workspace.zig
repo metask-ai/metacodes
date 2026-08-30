@@ -62,6 +62,10 @@ pub fn resolveWorkspaceForFile(file_path: []const u8, cwd: ?[]const u8, out_buf:
 
 /// path 是否在 workspace root 之内(commonpath 包含判断,不解析 symlink)。
 /// root 须是 path 的祖先(逐段前缀 + 边界在 `/`)。
+///
+/// **POSIX 形状,Windows 未支持**:边界只认 `'/'`,故 `C:\proj` + `C:\proj\src\a.zig` 会被
+/// 判成"不在 workspace 内",把整个 LSP 门关掉。修它要连同本文件的 `trimEnd(.., "/")`、
+/// `"{s}/{s}"` 拼接与 `eql(dir, "/")` 终止条件一起平台化。见 `lsp.zig` 的 Windows 状态表。
 pub fn isInsideWorkspace(path: []const u8, root: []const u8) bool {
     const r = std.mem.trimEnd(u8, root, "/");
     if (r.len == 0) return true; // root="/" 包含一切

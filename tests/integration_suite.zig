@@ -43,6 +43,7 @@ test {
     _ = @import("component/compound_perm_test.zig");
     _ = @import("component/protected_skill_inject_test.zig");
     _ = @import("component/read_state_test.zig");
+    _ = @import("component/symbol_capability_test.zig");
     _ = @import("component/tool_concurrency_test.zig");
     _ = @import("component/tool_observation_test.zig");
     _ = @import("component/project_rule_gate_test.zig");

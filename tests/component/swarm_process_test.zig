@@ -17,13 +17,32 @@ var g_mock_name: [64]u8 = undefined;
 var g_mock_name_len: usize = 0;
 var g_mock_cwd: [256]u8 = undefined;
 var g_mock_cwd_len: usize = 0;
+/// flag 按**字节**存,不存 slice:`extra_flags` 由 spawnTeammateProcess 在栈上组装,
+/// 断言发生在它返回之后。今天元素恰好都是静态字面量所以存 slice 也不会崩,但那是巧合,
+/// 不是契约——将来有人改成堆上拼的 flag,存 slice 的测试就读到已释放内存了。
+var g_mock_flags: [8][64]u8 = undefined;
+var g_mock_flag_lens: [8]usize = undefined;
+var g_mock_flags_len: usize = 0;
+
 fn mockSpawn(a: std.mem.Allocator, p: tp.SpawnProcessParams) anyerror!i64 {
     _ = a;
     g_mock_name_len = @min(p.name.len, g_mock_name.len);
     @memcpy(g_mock_name[0..g_mock_name_len], p.name[0..g_mock_name_len]);
     g_mock_cwd_len = @min(p.cwd.len, g_mock_cwd.len);
     @memcpy(g_mock_cwd[0..g_mock_cwd_len], p.cwd[0..g_mock_cwd_len]);
+    g_mock_flags_len = @min(p.extra_flags.len, g_mock_flags.len);
+    for (p.extra_flags[0..g_mock_flags_len], 0..) |f, i| {
+        g_mock_flag_lens[i] = @min(f.len, g_mock_flags[i].len);
+        @memcpy(g_mock_flags[i][0..g_mock_flag_lens[i]], f[0..g_mock_flag_lens[i]]);
+    }
     return 99999; // 假 pid
+}
+
+fn mockSawFlag(needle: []const u8) bool {
+    for (g_mock_flags[0..g_mock_flags_len], g_mock_flag_lens[0..g_mock_flags_len]) |*f, n| {
+        if (std.mem.eql(u8, f[0..n], needle)) return true;
+    }
+    return false;
 }
 
 test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 追踪,mock fork)" {
@@ -43,7 +62,7 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
     defer sw.deinit();
 
     g_mock_name_len = 0;
-    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", null, &mockSpawn);
+    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", null, &mockSpawn, true);
     try std.testing.expectEqual(@as(i64, 99999), pid);
     // mock 收到 name。
     try std.testing.expectEqualStrings("worker", g_mock_name[0..g_mock_name_len]);
@@ -71,7 +90,7 @@ test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {
     try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
     var sw = swctx.SwarmContext{ .allocator = a, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
     defer sw.deinit();
-    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", null, &mockSpawn));
+    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", null, &mockSpawn, true));
 }
 
 test "L2 SW6 A: --teammate 身份 args 解析进 config" {
@@ -222,4 +241,62 @@ test "L2 SW6 F7: 进程外 teammate 先等死再收尸——已死收掉,存活�
     sw.terminateProcessTeammates(2000); // SIGTERM → 等死 → 收尸
     try std.testing.expectEqual(@as(usize, 0), sw.process_teammates.items.len);
     try std.testing.expectEqual(@as(std.c.pid_t, -1), std.c.waitpid(live_pid, &st, 1));
+}
+
+test "L2: lead 的 --no-lsp 跟着进程外 teammate 过进程边界" {
+    // LSP 默认开之后,不透传就等于"lead 关了、teammate 照样起 language server"——逃生口
+    // 在进程边界上漏掉,而进程外 teammate 恰恰是资源开销最该被尊重的地方。
+    const a = std.testing.allocator;
+    var home_buf: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw6-nolsp-{d}", .{cc.util_time.nowNs()});
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    for ([_]bool{ true, false }) |lead_lsp_on| {
+        // 每轮重建:lead 的 sw.deinit() 会做 orphan 清理删掉整个 team 目录。
+        var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
+        var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj") };
+        defer tf.deinit();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
+
+        var sw = swctx.SwarmContext{ .allocator = a, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+        defer sw.deinit();
+
+        g_mock_flags_len = 0;
+        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", null, &mockSpawn, lead_lsp_on);
+        // 两侧都断言:开着时不得平白多塞 flag,关着时必须带上。
+        try std.testing.expectEqual(!lead_lsp_on, mockSawFlag("--no-lsp"));
+    }
+}
+
+test "L2: buildTeammateArgv 写出的 argv,teammate 自己的解析器真的认 --no-lsp" {
+    // 两段闭环:① flag 进了 argv;② 把**同一条 argv** 喂回 parseArgs,lsp 真的被关掉。
+    // 只验 ① 的话,一个位置放错/被后面的 flag 覆盖的 argv 也能"通过"。
+    const a = std.testing.allocator;
+    const argv = try tp.buildTeammateArgv(a, "/usr/local/bin/metacodes", .{
+        .name = "bob",
+        .team = "proj",
+        .cwd = "/tmp/wt",
+        .extra_flags = &.{"--no-lsp"},
+    });
+    defer tp.freeArgv(a, argv);
+
+    var seen = false;
+    var parse_argv: std.ArrayList([*:0]const u8) = .empty;
+    defer parse_argv.deinit(a);
+    for (argv) |item| {
+        const z = item orelse continue; // 末尾的 execve null 终止符
+        if (std.mem.eql(u8, std.mem.span(z), "--no-lsp")) seen = true;
+        try parse_argv.append(a, z);
+    }
+    try std.testing.expect(seen);
+
+    // parseArgs 会 dupe 值型 flag 的字符串(--agent-name/--team-name/--teammate-cwd 都是),
+    // 用 arena 一把回收,省得逐字段 free 还漏。
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const config = cc.parseArgsForTest(parse_argv.items, arena.allocator());
+    try std.testing.expect(config.parse_error == null); // 整条命令行合法
+    try std.testing.expect(!config.lsp_enabled); // 且真的关掉了
+    try std.testing.expectEqualStrings("bob", config.teammate_name); // 身份没被挤掉
 }

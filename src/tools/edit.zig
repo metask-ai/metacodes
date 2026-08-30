@@ -429,8 +429,8 @@ fn finalizeCommittedWrite(
         final_newlines += 1;
     try out.writer.print(",\"final_newlines\":{d}", .{final_newlines});
     // 改后诊断:Y2 砍 tree-sitter 后,原 tree-sitter 语法检查(syntaxWarning)由 LSP 被动诊断取代
-    // ——更准(真类型/未声明/语法错)。**取舍登记**:未开 `--lsp` 时编辑不再有免费语法警告
-    // (tree-sitter 时代无条件提供);开 `--lsp` 则得 server 级诊断,更强。option A 已知代价。
+    // ——更准(真类型/未声明/语法错)。**取舍登记**:LSP 不在位(`--no-lsp`,或该语言的 server
+    // 没装)时编辑不再有免费语法警告(tree-sitter 时代无条件提供);在位则得 server 级诊断,更强。
     // 写后用**新内容**取 delta 诊断(vs 写前 baseline),非空则附进结果给模型。
     try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, file_path, content);
     try out.writer.writeByte('}');

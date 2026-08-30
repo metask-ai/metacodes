@@ -2,7 +2,14 @@
 //! 不同于 Grep(返回所有出现),只返回定义,带 file:line + 签名。
 //!
 //! 先快后准:rg -l -w <name> 找候选文件 → 逐个经 LSP documentSymbol 抽符号、留 name 匹配的定义。
-//! 需 `--lsp` + 对应 language server(Y2 砍 tree-sitter 后)。输出 JSON 数组,便于模型/上层解析。
+//! 需要装了对应 language server(Y2 砍 tree-sitter 后;LSP 默认开,`--no-lsp` 关)。
+//! 输出 JSON 数组,便于模型/上层解析。
+//!
+//! **空结果必须自证**(issue #17):符号能力缺失时(LSP 被关 / 没注册 server / server 没装 /
+//! server 起不来 / 不在 git 仓)绝不能输出裸 `[]`——那会被模型读成"这个符号不存在"并据此走错路。
+//! 一律在数组后追加一句限定语,点名具体原因。裸 `[]` 只在能力全程在位时出现。
+//! (**已知残留**:`MAX_CANDIDATE_FILES` 截断仍是静默的——那是配额而非能力缺失,且没有不依赖
+//! 真 language server 的确定性测法,故不在本次修复内假装解决。CodeMap 的 glob cap 有明说。)
 const std = @import("std");
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
@@ -11,6 +18,7 @@ const read_state = @import("../core/read_state.zig");
 const toolchain = @import("../util/toolchain.zig");
 const symbols = @import("../symbols/symbol.zig");
 const symbol_provider = @import("symbol_provider.zig");
+const capability = @import("../lsp/capability.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const ToolResultBody = @import("context.zig").ToolResultBody;
 const artifact_store = @import("../core/tool_result_artifact.zig");
@@ -57,10 +65,11 @@ fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer)
     const name = common.extractJsonArg(args, "name") orelse return error.MissingName;
     if (name.len == 0) return error.EmptyName;
 
-    // Y2 砍 tree-sitter 后符号只来自 LSP。无 --lsp → 带提示的空结果,别用裸 `[]` 把"能力缺失"
-    // 伪装成"查无定义"(否则模型误判该符号不存在走错路;对齐 CodeMap 的 "(no LSP server...)" 提示)。
+    // Y2 砍 tree-sitter 后符号只来自 LSP。没有 Service → 带提示的空结果,别用裸 `[]` 把"能力缺失"
+    // 伪装成"查无定义"。早退是为了省掉 rg;措辞与下面所有缺失原因共用同一个渲染器,不会漂移。
     if (ctx.lsp == null) {
-        try w.writeAll("[]\n(FindSymbol needs --lsp and an installed language server to resolve definitions; none is configured. This empty result does NOT mean the symbol is undefined — use Grep to search text, or restart with --lsp.)");
+        try w.writeAll("[]");
+        try writeUnavailableNote(w, .{ .reason = .lsp_disabled }, 0);
         return;
     }
 
@@ -75,7 +84,8 @@ fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer)
     };
     const kind_filter = common.extractJsonArg(args, "kind"); // 可选
 
-    const defs = try findDefinitions(allocator, name, path, kind_filter, ctx);
+    const scan = try scanDefinitions(allocator, name, path, kind_filter, ctx);
+    const defs = scan.defs;
     defer {
         for (defs) |s| freeSymbol(allocator, s);
         allocator.free(defs);
@@ -87,18 +97,47 @@ fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer)
         try writeSymbolJson(w, s);
     }
     try w.writeByte(']');
+    // 有候选文件因能力缺失被跳过 → 结果不可信为完整,更不可信为"查无定义"。
+    if (scan.unavailable) |u| try writeUnavailableNote(w, u, defs.len);
 }
 
-/// 跨文件找符号*定义*,返回匹配的 Symbol 列表(owned:每个 Symbol 的字符串字段都 dupe 到
-/// allocator,调用方负责 freeSymbol + free slice)。供 FindSymbol.execute 与 Grep 搭车复用。
-/// kind_filter 非 null 时按 kind.jsonName() 过滤。
-pub fn findDefinitions(
+/// 给结果加限定语:说清"为什么没有(或可能不全)",堵死"能力缺失被读成查无定义"(issue #17)。
+/// **所有**缺失原因(含 LSP 被关)都走这里,措辞只有这一处。
+fn writeUnavailableNote(w: *std.Io.Writer, u: capability.Unavailable, found: usize) !void {
+    var why_buf: [capability.WHY_BUF]u8 = undefined;
+    const why = u.why(&why_buf);
+    if (found == 0) {
+        try w.print(
+            "\n(FindSymbol resolved no definitions because {s}. This empty result does NOT mean the symbol is undefined — use Grep to search the text, or install/enable the language server and retry.)",
+            .{why},
+        );
+    } else {
+        try w.print(
+            "\n(Some candidate files were skipped because {s}, so this list may be incomplete. A missing definition here does NOT mean it is undefined — use Grep to search the text.)",
+            .{why},
+        );
+    }
+}
+
+/// 一次跨文件定义扫描的结果。
+pub const Scan = struct {
+    /// 匹配的定义(owned:字符串字段 dupe 到 allocator,调用方负责 freeSymbol + free slice)。
+    defs: []symbols.Symbol,
+    /// 有候选文件因**符号能力缺失**被跳过时,记下**最可操作**的那个原因(不是最先遇到的——
+    /// 见 `capability.moreActionable`);否则 null。
+    /// 非 null ⇒ `defs` 不保证完整,空 `defs` **不得**解读为"查无定义"(issue #17)。
+    unavailable: ?capability.Unavailable,
+};
+
+/// 跨文件找符号*定义*,并如实报告扫描过程中的能力缺失。kind_filter 非 null 时按
+/// kind.jsonName() 过滤。
+pub fn scanDefinitions(
     allocator: std.mem.Allocator,
     name: []const u8,
     path: []const u8,
     kind_filter: ?[]const u8,
     ctx: *const ToolContext,
-) ![]symbols.Symbol {
+) !Scan {
     const files = try listCandidateFiles(allocator, name, path, ctx);
     defer {
         for (files) |f| allocator.free(f);
@@ -111,10 +150,23 @@ pub fn findDefinitions(
         defs.deinit(allocator);
     }
 
+    // 候选文件为空(rg 一个都没找到)时保持 null:那是真正的"查无此名",裸 `[]` 才是诚实的。
+    var unavailable: ?capability.Unavailable = null;
+    // 门禁答案只取决于扩展名,而每算一次要扫一遍 PATH(30 段 PATH 实测 36–43µs)。候选文件可达
+    // 数千个、且被挡掉的那些此外什么都不做 → 不记忆化就是上百 ms 的纯 access(2)。
+    var caps = symbol_provider.CapabilityCache.init(ctx);
+
     var processed: usize = 0;
     for (files) |file| {
         if (processed >= MAX_CANDIDATE_FILES) break;
-        if (!symbol_provider.hasSymbolsFor(ctx, file)) continue; // 有 LSP server 才抽符号(--lsp)
+        // 门禁:需要 LSP 在位 + 注册 server + 该 server 二进制真的装了。
+        switch (caps.get(file)) {
+            .available => {},
+            .unavailable => |u| {
+                unavailable = capability.moreActionable(unavailable, u);
+                continue;
+            },
+        }
         processed += 1;
         try ctx.throwIfAborted();
 
@@ -122,18 +174,41 @@ pub fn findDefinitions(
         defer allocator.free(source);
         if (source.len > MAX_SOURCE_BYTES) continue;
 
-        var syms = symbol_provider.extractSymbols(ctx, allocator, file, source) catch continue;
-        defer syms.deinit();
-
-        for (syms.items) |s| {
-            if (!std.mem.eql(u8, s.name, name)) continue;
-            if (kind_filter) |kf| {
-                if (!std.mem.eql(u8, s.kind.jsonName(), kf)) continue;
-            }
-            try defs.append(allocator, try dupeSymbol(allocator, s));
+        // **不 catch**:这里唯一的错误来源是分配失败。把 OOM 吞成"这文件没匹配"会得到一份
+        // 短了却看起来完整的定义列表——正是本 issue 要消灭的那类谎报,只是换了个原因。
+        var outcome = try symbol_provider.extractSymbols(ctx, allocator, file, source);
+        switch (outcome) {
+            // 门禁看不见的运行期失败(spawn 失败 / broken-set / client 满员 / 不在 git 仓)。
+            .unavailable => |u| {
+                unavailable = capability.moreActionable(unavailable, u);
+                continue;
+            },
+            .symbols => |*syms| {
+                defer syms.deinit();
+                for (syms.items) |s| {
+                    if (!std.mem.eql(u8, s.name, name)) continue;
+                    if (kind_filter) |kf| {
+                        if (!std.mem.eql(u8, s.kind.jsonName(), kf)) continue;
+                    }
+                    try defs.append(allocator, try dupeSymbol(allocator, s));
+                }
+            },
         }
     }
-    return try defs.toOwnedSlice(allocator);
+    return .{ .defs = try defs.toOwnedSlice(allocator), .unavailable = unavailable };
+}
+
+/// `scanDefinitions` 的只要结果版。供 Grep 搭车复用——Grep 的主结果本就完整,拿不到定义前缀
+/// 时静默降级是正确的,故它不需要能力状态。
+pub fn findDefinitions(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    path: []const u8,
+    kind_filter: ?[]const u8,
+    ctx: *const ToolContext,
+) ![]symbols.Symbol {
+    const scan = try scanDefinitions(allocator, name, path, kind_filter, ctx);
+    return scan.defs;
 }
 
 /// Symbol 的字符串字段借用 extractSymbols 的临时 buffer(syms.deinit 后失效),
@@ -232,12 +307,98 @@ fn listCandidateFiles(
     return try files.toOwnedSlice(allocator);
 }
 
-test "FindSymbol 无 --lsp → 带提示的空结果(非裸 [],不伪装查无)" {
+test "FindSymbol 无 LSP 服务 → 带提示的空结果(非裸 [],不伪装查无)" {
     const a = std.testing.allocator;
     const ctx = ToolContext.simple(a); // 无 lsp
     const r = try execute(&ctx, "{\"name\":\"Foo\"}");
     defer a.free(r);
-    // 不是裸 "[]";含引导 --lsp 的提示,模型能区分"能力缺失"vs"查无定义"。
-    try std.testing.expect(std.mem.indexOf(u8, r, "--lsp") != null);
+    // 不是裸 "[]";点名关掉它的开关(LSP 默认开,所以引导是"别用 --no-lsp"而非"加 --lsp")。
+    try std.testing.expect(!std.mem.eql(u8, r, "[]"));
+    try std.testing.expect(std.mem.indexOf(u8, r, "--no-lsp") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "does NOT mean") != null);
+}
+
+test "REGRESSION issue #17: 限定语点名缺失的 language server 二进制" {
+    // 修复项 3:沿用既有措辞,并把缺失的 binary 名带上,模型据此知道下一步该装什么。
+    const a = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try writeUnavailableNote(&out.writer, .{
+        .reason = .server_not_installed,
+        .detail = "pyright-langserver",
+    }, 0);
+    const s = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, s, "pyright-langserver") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "not installed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "does NOT mean") != null);
+}
+
+test "REGRESSION issue #17: 有结果但有文件被跳过 → 提示可能不完整(不谎称完整)" {
+    const a = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try writeUnavailableNote(&out.writer, .{ .reason = .server_not_installed, .detail = "gopls" }, 3);
+    const s = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, s, "may be incomplete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "gopls") != null);
+}
+
+test "REGRESSION issue #17: LSP 在位但符号能力缺失 → 仍不是裸 []" {
+    // 老代码的漏洞正在这条路径上:`ctx.lsp != null` 就跳过了唯一的限定分支,
+    // 于是"server 没装 / 起不来 / 不在 git 仓"全都以裸 `[]` 收场。
+    //
+    // 本测试**在任何机器上都跑到 unavailable**,不靠"恰好没装某个 server":
+    //   · 没装 zls  → 门禁判 server_not_installed;
+    //   · 装了 zls  → /tmp 不是 git 仓,fetchSymbols 判 outside_workspace。
+    // 两条都必须给出限定语,断言取二者的公共不变量。
+    const a = std.testing.allocator;
+    const pprocess = @import("platform").process;
+
+    const base = try std.fmt.allocPrint(a, "/tmp/cc_fs_capgap_{d}", .{pprocess.currentPid()});
+    defer a.free(base);
+    {
+        var zbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{base}) catch return;
+        _ = std.c.mkdir(z.ptr, 0o755);
+    }
+    const file = try std.fmt.allocPrint(a, "{s}/probe.zig", .{base});
+    defer a.free(file);
+    {
+        var zbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{file}) catch return;
+        const fd = pfs.open(z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) return;
+        _ = pfs.write(fd, "pub fn CapGapProbeSymbol() void {}\n");
+        pfs.close(fd);
+    }
+    defer {
+        var zbuf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrintZ(&zbuf, "{s}", .{file})) |z| {
+            _ = std.c.unlink(z.ptr);
+        } else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}", .{base})) |z| {
+            _ = std.c.rmdir(z.ptr);
+        } else |_| {}
+    }
+
+    const Service = @import("../lsp/service.zig").Service;
+    var svc = Service.create(a, base, null) catch return;
+    defer svc.shutdown();
+
+    var ctx = ToolContext.simple(a);
+    ctx.lsp = svc; // LSP **在位** —— 老 guard 在这里就放行了
+    ctx.cwd_abs = base;
+
+    var abuf: [512]u8 = undefined;
+    const args = std.fmt.bufPrint(&abuf, "{{\"name\":\"CapGapProbeSymbol\",\"path\":\"{s}\"}}", .{base}) catch unreachable;
+    const r = try execute(&ctx, args);
+    defer a.free(r);
+
+    try std.testing.expect(!std.mem.eql(u8, r, "[]")); // 核心断言:裸 [] 绝迹
+    try std.testing.expect(std.mem.startsWith(u8, r, "[]")); // 定义确实一个没找到
+    try std.testing.expect(std.mem.indexOf(u8, r, "does NOT mean") != null);
+    // 原因必须是具体的两种之一(不是笼统的"没找到")。
+    const named_binary = std.mem.indexOf(u8, r, "not installed") != null;
+    const outside_repo = std.mem.indexOf(u8, r, "outside a git workspace") != null;
+    try std.testing.expect(named_binary or outside_repo);
 }
