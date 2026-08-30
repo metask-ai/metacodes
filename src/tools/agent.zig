@@ -280,7 +280,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 (std.fmt.bufPrint(&wt_buf, "{s}/.metacodes/worktrees/{s}-{s}", .{ ctx.home_dir, sw.team_sanitized, name_s }) catch "")
             else
                 "";
-            const pid = tp.spawnTeammateProcess(sw, name, wt, if (wt.len > 0) "HEAD" else "", ctx.project_dir, ctx.abort, &tp.forkExecTeammate) catch |err| return err;
+            // ctx.lsp 就是 lead 的 LSP 装配结果(--no-lsp → null),据此把逃生口带过进程边界。
+            const pid = tp.spawnTeammateProcess(sw, name, wt, if (wt.len > 0) "HEAD" else "", ctx.project_dir, ctx.abort, &tp.forkExecTeammate, ctx.lsp != null) catch |err| return err;
             return std.fmt.allocPrint(ctx.allocator, "{{\"teammate\":\"{s}\",\"pid\":{d},\"backend\":\"process\",\"status\":\"spawned\"}}", .{ name_s, pid });
         }
 

@@ -2,9 +2,10 @@
 //! 不同于 Grep(返回所有出现),只返回定义,带 file:line + 签名。
 //!
 //! 先快后准:rg -l -w <name> 找候选文件 → 逐个经 LSP documentSymbol 抽符号、留 name 匹配的定义。
-//! 需 `--lsp` + 对应 language server(Y2 砍 tree-sitter 后)。输出 JSON 数组,便于模型/上层解析。
+//! 需要装了对应 language server(Y2 砍 tree-sitter 后;LSP 默认开,`--no-lsp` 关)。
+//! 输出 JSON 数组,便于模型/上层解析。
 //!
-//! **空结果必须自证**(issue #17):符号能力缺失时(没开 --lsp / 没注册 server / server 没装 /
+//! **空结果必须自证**(issue #17):符号能力缺失时(LSP 被关 / 没注册 server / server 没装 /
 //! server 起不来 / 不在 git 仓)绝不能输出裸 `[]`——那会被模型读成"这个符号不存在"并据此走错路。
 //! 一律在数组后追加一句限定语,点名具体原因。裸 `[]` 只在能力全程在位时出现。
 //! (**已知残留**:`MAX_CANDIDATE_FILES` 截断仍是静默的——那是配额而非能力缺失,且没有不依赖
@@ -64,7 +65,7 @@ fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer)
     const name = common.extractJsonArg(args, "name") orelse return error.MissingName;
     if (name.len == 0) return error.EmptyName;
 
-    // Y2 砍 tree-sitter 后符号只来自 LSP。无 --lsp → 带提示的空结果,别用裸 `[]` 把"能力缺失"
+    // Y2 砍 tree-sitter 后符号只来自 LSP。没有 Service → 带提示的空结果,别用裸 `[]` 把"能力缺失"
     // 伪装成"查无定义"。早退是为了省掉 rg;措辞与下面所有缺失原因共用同一个渲染器,不会漂移。
     if (ctx.lsp == null) {
         try w.writeAll("[]");
@@ -101,7 +102,7 @@ fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer)
 }
 
 /// 给结果加限定语:说清"为什么没有(或可能不全)",堵死"能力缺失被读成查无定义"(issue #17)。
-/// **所有**缺失原因(含未开 --lsp)都走这里,措辞只有这一处。
+/// **所有**缺失原因(含 LSP 被关)都走这里,措辞只有这一处。
 fn writeUnavailableNote(w: *std.Io.Writer, u: capability.Unavailable, found: usize) !void {
     var why_buf: [capability.WHY_BUF]u8 = undefined;
     const why = u.why(&why_buf);
@@ -154,7 +155,7 @@ pub fn scanDefinitions(
     var processed: usize = 0;
     for (files) |file| {
         if (processed >= MAX_CANDIDATE_FILES) break;
-        // 门禁:需要 --lsp + 注册 server + 该 server 二进制真的装了。
+        // 门禁:需要 LSP 在位 + 注册 server + 该 server 二进制真的装了。
         switch (symbol_provider.capabilityFor(ctx, file)) {
             .available => {},
             .unavailable => |u| {
@@ -300,14 +301,14 @@ fn listCandidateFiles(
     return try files.toOwnedSlice(allocator);
 }
 
-test "FindSymbol 无 --lsp → 带提示的空结果(非裸 [],不伪装查无)" {
+test "FindSymbol 无 LSP 服务 → 带提示的空结果(非裸 [],不伪装查无)" {
     const a = std.testing.allocator;
     const ctx = ToolContext.simple(a); // 无 lsp
     const r = try execute(&ctx, "{\"name\":\"Foo\"}");
     defer a.free(r);
-    // 不是裸 "[]";含引导 --lsp 的提示,模型能区分"能力缺失"vs"查无定义"。
+    // 不是裸 "[]";点名关掉它的开关(LSP 默认开,所以引导是"别用 --no-lsp"而非"加 --lsp")。
     try std.testing.expect(!std.mem.eql(u8, r, "[]"));
-    try std.testing.expect(std.mem.indexOf(u8, r, "--lsp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "--no-lsp") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "does NOT mean") != null);
 }
 
@@ -379,7 +380,7 @@ test "REGRESSION issue #17: --lsp 开但符号能力缺失 → 仍不是裸 []" 
     defer svc.shutdown();
 
     var ctx = ToolContext.simple(a);
-    ctx.lsp = svc; // **开着 --lsp** —— 老 guard 在这里就放行了
+    ctx.lsp = svc; // LSP **在位** —— 老 guard 在这里就放行了
     ctx.cwd_abs = base;
 
     var abuf: [512]u8 = undefined;

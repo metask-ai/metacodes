@@ -18,7 +18,7 @@ const std = @import("std");
 ///  - LSP 层(`lsp/service.zig`):`no_server_for_language` / `outside_workspace` /
 ///    `server_not_installed` / `server_unavailable`。
 pub const Reason = enum {
-    /// 进程没开 `--lsp`,符号子系统整体未装配。(工具层产)
+    /// 本进程没有 LSP 服务(默认是开的——`--no-lsp` 关掉了,或调用方本就没装配)。(工具层产)
     lsp_disabled,
     /// 该扩展名在 `SERVERS` 里没有注册的 language server。
     no_server_for_language,
@@ -48,7 +48,7 @@ pub const Unavailable = struct {
     /// `buf` 建议 `WHY_BUF` 字节;不够时退回不含 detail 的静态串(绝不截断出半截单词)。
     pub fn why(self: Unavailable, buf: []u8) []const u8 {
         return switch (self.reason) {
-            .lsp_disabled => "no language server is configured (restart with --lsp)",
+            .lsp_disabled => "language server integration is not active (it is on by default; --no-lsp turns it off)",
             .no_server_for_language => "no language server is registered for this file type",
             .server_not_installed => std.fmt.bufPrint(
                 buf,
@@ -96,8 +96,10 @@ test "why: 每个 reason 都有非空说明(新增 reason 漏写措辞会在此�
     }
 }
 
-test "why: lsp_disabled 指出 --lsp(工具层据此引导用户)" {
+test "why: lsp_disabled 说清'默认是开的' + 关它的开关名" {
     var buf: [WHY_BUF]u8 = undefined;
     const s = (Unavailable{ .reason = .lsp_disabled }).why(&buf);
-    try testing.expect(std.mem.indexOf(u8, s, "--lsp") != null);
+    // 默认翻转后措辞必须跟着翻:引导用户去掉 --no-lsp,而不是再加一个已经默认开的 --lsp。
+    try testing.expect(std.mem.indexOf(u8, s, "--no-lsp") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "on by default") != null);
 }

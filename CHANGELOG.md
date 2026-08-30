@@ -50,6 +50,34 @@ status, compatibility boundaries, and entry points are defined by
   `reasoning_split:true` so reasoning arrives as `reasoning_content`.
   OpenAI/Anthropic/GLM/Kimi/DeepSeek translations were already built in.
 
+### Changed
+
+- Language server integration is **on by default**; the new `--no-lsp` turns it
+  off (issue #17 follow-on). `--lsp` still works and now simply reasserts the
+  default, so existing command lines keep running; the last of `--lsp` /
+  `--no-lsp` on the line wins. Since `1515b34` removed tree-sitter, `CodeMap`,
+  `FindSymbol`, `Read(outline: true)` and Edit/Write post-write diagnostics all
+  source symbols from LSP, so an opt-in flag meant the default configuration ran
+  four features in a degraded state — and the flag was a redundant second gate:
+  the real gate is and remains runtime (a registered server for the extension,
+  its binary actually installed, the file inside a git workspace, a `root_marker`
+  hit), followed by lazy spawn keyed by `server_id+root`, a 10-minute idle
+  reaper, a client-count ceiling and the broken-set. On a machine with no
+  language server installed, enabling it starts no process at all. Enabling by
+  project size was rejected: `root_markers` already encode "this is a real
+  project", and large trees are exactly where indexing is most expensive, so
+  size-as-eagerness is backwards. Measured cost of the one newly-involuntary
+  path — post-write diagnostics — on this repository with zls: 112 ms cold,
+  52 ms warm per write (the 14 s/26 s constants in `lsp/service.zig` are
+  ceilings for heavier servers, not typical values); the disk write itself is
+  never blocked and the wait is Ctrl+C-interruptible. `--no-lsp` propagates to
+  out-of-process teammates, which would otherwise start their own servers
+  against the lead's explicit choice. Auto-installing language servers stays
+  rejected — it contradicts the repository's binary policy, spans six
+  unrelated install channels, would execute npm `postinstall` outside the
+  permission and sandbox layers, and a version-mismatched server is worse than
+  an absent one because nothing signals the error.
+
 ### Fixed
 
 - Symbol capability gaps no longer masquerade as "symbol not defined"

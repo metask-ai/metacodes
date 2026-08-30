@@ -1,5 +1,6 @@
 //! Edit/Write/ApplyPatch/NotebookEdit 共享的 LSP 被动诊断 hook(Y2 Step3)。
-//! 写前 snapshot baseline、写后取 delta 诊断附进工具结果。ctx.lsp==null(未 --lsp)→ 全 no-op。
+//! 写前 snapshot baseline、写后取 delta 诊断附进工具结果。ctx.lsp==null(`--no-lsp` 或调用方
+//! 没装配)→ 全 no-op。
 //! best-effort:任何失败绝不阻断写入(graceful degradation)。
 const std = @import("std");
 const ToolContext = @import("context.zig").ToolContext;

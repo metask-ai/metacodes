@@ -256,7 +256,7 @@ pub const Options = struct {
     read_state: ?*ReadState = null,
     /// Edit/Write 旁路高亮缓存(diff 工具卡 tree-sitter 着色用)。null → 不缓存。
     edit_hl_cache: ?*@import("edit_hl_cache.zig").EditHlCache = null,
-    /// LSP 被动诊断服务(Y2;仅 --lsp)。透传进 ToolContext 供 Edit/Write finalizeWrite 用。
+    /// LSP 服务(CLI 默认开,`--no-lsp` 关)。透传进 ToolContext 供 Edit/Write finalizeWrite 用。
     lsp: ?*@import("../lsp/service.zig").Service = null,
     /// 自动 compact 的 token 阈值。null → 按 input context window 扣输出保留区后动态算。
     auto_compact_threshold: ?usize = null,

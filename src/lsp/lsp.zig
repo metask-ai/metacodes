@@ -2,8 +2,8 @@
 //!
 //! v1 passive-only + documentSymbol:push diagnostics(publishDiagnostics)+ didOpen/didChange/didSave
 //! + textDocument/documentSymbol(替 tree-sitter 供 CodeMap/FindSymbol/Read-outline);不做 pull
-//! (textDocument/diagnostic)、不做 hover/definition。opt-in `--lsp` + git
-//! workspace gate + 按需 spawn + broken-set + idle-reap + graceful degradation。
+//! (textDocument/diagnostic)、不做 hover/definition。**默认开**(`--no-lsp` 关)+ git
+//! workspace gate + 二进制可用性门 + 按需 spawn + broken-set + idle-reap + graceful degradation。
 //!
 //! 模块:transport(Content-Length 帧+spawn)/protocol(JSON-RPC envelope)/client(单 server
 //! reader 线程+req/resp 关联+wait diagnostics)/service(spawn cache+broken-set+delta baseline)/

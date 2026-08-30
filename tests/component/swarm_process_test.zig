@@ -17,13 +17,26 @@ var g_mock_name: [64]u8 = undefined;
 var g_mock_name_len: usize = 0;
 var g_mock_cwd: [256]u8 = undefined;
 var g_mock_cwd_len: usize = 0;
+var g_mock_flags: [8][]const u8 = undefined;
+var g_mock_flags_len: usize = 0;
+
 fn mockSpawn(a: std.mem.Allocator, p: tp.SpawnProcessParams) anyerror!i64 {
     _ = a;
     g_mock_name_len = @min(p.name.len, g_mock_name.len);
     @memcpy(g_mock_name[0..g_mock_name_len], p.name[0..g_mock_name_len]);
     g_mock_cwd_len = @min(p.cwd.len, g_mock_cwd.len);
     @memcpy(g_mock_cwd[0..g_mock_cwd_len], p.cwd[0..g_mock_cwd_len]);
+    // extra_flags 借用 spawnTeammateProcess 栈上的静态串数组;此处只在同一调用内读,不逃逸。
+    g_mock_flags_len = @min(p.extra_flags.len, g_mock_flags.len);
+    for (p.extra_flags[0..g_mock_flags_len], 0..) |f, i| g_mock_flags[i] = f;
     return 99999; // 假 pid
+}
+
+fn mockSawFlag(needle: []const u8) bool {
+    for (g_mock_flags[0..g_mock_flags_len]) |f| {
+        if (std.mem.eql(u8, f, needle)) return true;
+    }
+    return false;
 }
 
 test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 追踪,mock fork)" {
@@ -43,7 +56,7 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
     defer sw.deinit();
 
     g_mock_name_len = 0;
-    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", null, &mockSpawn);
+    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", null, &mockSpawn, true);
     try std.testing.expectEqual(@as(i64, 99999), pid);
     // mock 收到 name。
     try std.testing.expectEqualStrings("worker", g_mock_name[0..g_mock_name_len]);
@@ -71,7 +84,7 @@ test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {
     try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
     var sw = swctx.SwarmContext{ .allocator = a, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
     defer sw.deinit();
-    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", null, &mockSpawn));
+    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", null, &mockSpawn, true));
 }
 
 test "L2 SW6 A: --teammate 身份 args 解析进 config" {
@@ -222,4 +235,47 @@ test "L2 SW6 F7: 进程外 teammate 先等死再收尸——已死收掉,存活�
     sw.terminateProcessTeammates(2000); // SIGTERM → 等死 → 收尸
     try std.testing.expectEqual(@as(usize, 0), sw.process_teammates.items.len);
     try std.testing.expectEqual(@as(std.c.pid_t, -1), std.c.waitpid(live_pid, &st, 1));
+}
+
+test "L2: lead 的 --no-lsp 跟着进程外 teammate 过进程边界" {
+    // LSP 默认开之后,不透传就等于"lead 关了、teammate 照样起 language server"——逃生口
+    // 在进程边界上漏掉,而进程外 teammate 恰恰是资源开销最该被尊重的地方。
+    const a = std.testing.allocator;
+    var home_buf: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw6-nolsp-{d}", .{cc.util_time.nowNs()});
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    for ([_]bool{ true, false }) |lead_lsp_on| {
+        // 每轮重建:lead 的 sw.deinit() 会做 orphan 清理删掉整个 team 目录。
+        var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
+        var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj") };
+        defer tf.deinit();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
+
+        var sw = swctx.SwarmContext{ .allocator = a, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+        defer sw.deinit();
+
+        g_mock_flags_len = 0;
+        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", null, &mockSpawn, lead_lsp_on);
+        // 两侧都断言:开着时不得平白多塞 flag,关着时必须带上。
+        try std.testing.expectEqual(!lead_lsp_on, mockSawFlag("--no-lsp"));
+    }
+}
+
+test "L2: buildTeammateArgv 把 --no-lsp 真的写进子进程 argv" {
+    const a = std.testing.allocator;
+    const argv = try tp.buildTeammateArgv(a, "/usr/local/bin/metacodes", .{
+        .name = "bob",
+        .team = "proj",
+        .extra_flags = &.{"--no-lsp"},
+    });
+    defer tp.freeArgv(a, argv);
+    var seen = false;
+    for (argv) |item| {
+        if (item) |z| {
+            if (std.mem.eql(u8, std.mem.span(z), "--no-lsp")) seen = true;
+        }
+    }
+    try std.testing.expect(seen);
 }

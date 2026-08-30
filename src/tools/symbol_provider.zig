@@ -204,7 +204,7 @@ test "REGRESSION issue #17: 六种真语言上,决策谓词与安装谓词逐一
     }
 }
 
-test "hasSymbolsFor: 无 --lsp → false(且原因是 lsp_disabled,不是'这语言没 server')" {
+test "hasSymbolsFor: 没有 LSP 服务 → false(且原因是 lsp_disabled,不是'这语言没 server')" {
     const a = testing.allocator;
     const ctx = ToolContext.simple(a); // 无 lsp
     try testing.expect(!hasSymbolsFor(&ctx, "/p/a.zig"));
@@ -214,7 +214,7 @@ test "hasSymbolsFor: 无 --lsp → false(且原因是 lsp_disabled,不是'这语
     }
 }
 
-test "extractSymbols: 无 --lsp → .unavailable,绝不返回空符号集冒充'没符号'" {
+test "extractSymbols: 没有 LSP 服务 → .unavailable,绝不返回空符号集冒充'没符号'" {
     const a = testing.allocator;
     const ctx = ToolContext.simple(a);
     var outcome = try extractSymbols(&ctx, a, "/p/a.zig", "pub fn f() void {}\n");

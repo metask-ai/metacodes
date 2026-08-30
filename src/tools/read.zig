@@ -93,7 +93,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const st = read_state.statFd(fd) catch null;
 
     // 大文件守卫:整读(未显式传 offset/limit)且 > MAX_FILE_BYTES → 不再死胡同报错;
-    // 若有 LSP server(--lsp),返回符号大纲 + 提示(用 offset/limit 读具体范围);
+    // 若该语言的 LSP server 可用,返回符号大纲 + 提示(用 offset/limit 读具体范围);
     // 否则维持原"too large"错误串(无 server 无法出大纲)。显式 offset/limit 放行。
     if (!has_offset and !has_limit) {
         if (st) |s| {
