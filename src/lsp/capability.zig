@@ -85,6 +85,8 @@ pub fn actionability(r: Reason) u8 {
 }
 
 /// 在已记录的原因与新出现的原因之间取更值得报告的那个(`null` = 还没记过)。
+/// 同级**保留先记下的那个**——否则同一批候选文件里换个遍历顺序就会换掉 `detail`(报的
+/// server 名跟着抖),结论不稳定。
 pub fn moreActionable(current: ?Unavailable, candidate: Unavailable) Unavailable {
     const cur = current orelse return candidate;
     return if (actionability(candidate.reason) > actionability(cur.reason)) candidate else cur;

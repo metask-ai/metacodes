@@ -269,19 +269,34 @@ test "L2: lead 的 --no-lsp 跟着进程外 teammate 过进程边界" {
     }
 }
 
-test "L2: buildTeammateArgv 把 --no-lsp 真的写进子进程 argv" {
+test "L2: buildTeammateArgv 写出的 argv,teammate 自己的解析器真的认 --no-lsp" {
+    // 两段闭环:① flag 进了 argv;② 把**同一条 argv** 喂回 parseArgs,lsp 真的被关掉。
+    // 只验 ① 的话,一个位置放错/被后面的 flag 覆盖的 argv 也能"通过"。
     const a = std.testing.allocator;
     const argv = try tp.buildTeammateArgv(a, "/usr/local/bin/metacodes", .{
         .name = "bob",
         .team = "proj",
+        .cwd = "/tmp/wt",
         .extra_flags = &.{"--no-lsp"},
     });
     defer tp.freeArgv(a, argv);
+
     var seen = false;
+    var parse_argv: std.ArrayList([*:0]const u8) = .empty;
+    defer parse_argv.deinit(a);
     for (argv) |item| {
-        if (item) |z| {
-            if (std.mem.eql(u8, std.mem.span(z), "--no-lsp")) seen = true;
-        }
+        const z = item orelse continue; // 末尾的 execve null 终止符
+        if (std.mem.eql(u8, std.mem.span(z), "--no-lsp")) seen = true;
+        try parse_argv.append(a, z);
     }
     try std.testing.expect(seen);
+
+    // parseArgs 会 dupe 值型 flag 的字符串(--agent-name/--team-name/--teammate-cwd 都是),
+    // 用 arena 一把回收,省得逐字段 free 还漏。
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const config = cc.parseArgsForTest(parse_argv.items, arena.allocator());
+    try std.testing.expect(config.parse_error == null); // 整条命令行合法
+    try std.testing.expect(!config.lsp_enabled); // 且真的关掉了
+    try std.testing.expectEqualStrings("bob", config.teammate_name); // 身份没被挤掉
 }

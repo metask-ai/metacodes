@@ -799,7 +799,7 @@ fn zlsInstalled() bool {
     return @import("../lsp/servers.zig").which("zls", &buf) != null;
 }
 
-test "Read 弱提示:--lsp 开 + >150行 + zls 真装了 → CodeMap reminder;小文件/非源码/无 --lsp/没装 server 不追加" {
+test "Read 弱提示:LSP 在位 + >150行 + zls 真装了 → CodeMap reminder;小文件/非源码/无 LSP/没装 server 不追加" {
     const a = std.testing.allocator;
     // Y2 砍 tree-sitter 后:hint 由 hasSymbolsFor gate(ctx.lsp 开 + 该扩展名有注册 server +
     // 该 server 二进制可解析)。
@@ -859,7 +859,7 @@ test "Read 弱提示:--lsp 开 + >150行 + zls 真装了 → CodeMap reminder;�
         defer a.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") == null);
     }
-    // **无 --lsp**(ctx.lsp==null):即便大源码文件也不 hint(Y2 砍 tree-sitter 后 hint 依赖 LSP)。
+    // **无 LSP 服务**(ctx.lsp==null,如 --no-lsp 或 subagent):即便大源码文件也不 hint。
     {
         const noctx = testCtx();
         const path = "/tmp/cc-zig-read-hint-nolsp.zig";

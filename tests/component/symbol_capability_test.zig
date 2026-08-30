@@ -288,9 +288,12 @@ test "L2 follow-on: LSP 默认开,--no-lsp 关,--lsp 覆盖(最后一个赢)" {
         .{ .argv = &.{ "metacodes", "--no-lsp", "--lsp" }, .want = true, .why = "后写覆盖先写" },
         .{ .argv = &.{ "metacodes", "--lsp", "--no-lsp" }, .want = false, .why = "后写覆盖先写(反向)" },
     };
+    // arena:parseArgs 对值型 flag 会 dupe 字符串。这些用例目前只有布尔 flag,但用 arena
+    // 收口,免得后来加一条带值的用例就静默漏内存。
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
     for (cases) |c| {
-        const config = cc.parseArgsForTest(c.argv, a);
-        defer if (config.parse_error) |e| a.free(e);
+        const config = cc.parseArgsForTest(c.argv, arena.allocator());
         try std.testing.expect(config.parse_error == null); // --no-lsp 必须是已知 flag
         if (config.lsp_enabled != c.want) {
             std.debug.print("lsp_enabled={} want={} ({s})\n", .{ config.lsp_enabled, c.want, c.why });

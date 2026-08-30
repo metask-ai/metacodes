@@ -343,7 +343,7 @@ test "REGRESSION issue #17: 有结果但有文件被跳过 → 提示可能不�
     try std.testing.expect(std.mem.indexOf(u8, s, "gopls") != null);
 }
 
-test "REGRESSION issue #17: --lsp 开但符号能力缺失 → 仍不是裸 []" {
+test "REGRESSION issue #17: LSP 在位但符号能力缺失 → 仍不是裸 []" {
     // 老代码的漏洞正在这条路径上:`ctx.lsp != null` 就跳过了唯一的限定分支,
     // 于是"server 没装 / 起不来 / 不在 git 仓"全都以裸 `[]` 收场。
     //

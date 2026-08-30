@@ -55,35 +55,40 @@ status, compatibility boundaries, and entry points are defined by
 - Language server integration is **on by default**; the new `--no-lsp` turns it
   off (issue #17 follow-on). `--lsp` still works and now simply reasserts the
   default, so existing command lines keep running; the last of `--lsp` /
-  `--no-lsp` on the line wins. Since `1515b34` removed tree-sitter, `CodeMap`,
-  `FindSymbol`, `Read(outline: true)` and Edit/Write post-write diagnostics all
-  source symbols from LSP, so an opt-in flag meant the default configuration ran
-  four features in a degraded state — and the flag was a redundant second gate:
-  the real gate is and remains runtime (a registered server for the extension,
-  its binary actually installed, the file inside a git workspace, a `root_marker`
-  hit), followed by lazy spawn keyed by `server_id+root`, a 10-minute idle
-  reaper, a client-count ceiling and the broken-set. On a machine with no
-  language server installed, enabling it starts no process at all. Enabling by
-  project size was rejected: `root_markers` already encode "this is a real
-  project", and large trees are exactly where indexing is most expensive, so
-  size-as-eagerness is backwards. Measured cost of the one newly-involuntary
-  path — post-write diagnostics — on this repository with zls: 112 ms cold,
-  52 ms warm per write (the 14 s/26 s constants in `lsp/service.zig` are
-  ceilings for heavier servers, not typical values); the disk write itself is
-  never blocked and the wait is Ctrl+C-interruptible. `--no-lsp` propagates to
-  out-of-process teammates, which would otherwise start their own servers
-  against the lead's explicit choice. Two limitations the flip makes visible
-  and that this change does **not** close: subagents still run without LSP —
-  `agent_loop.Options.lsp` is deliberately not threaded into child loops
-  because `lsp/client.zig` requires `sendRequest`/`sendNotification` to come
-  from a single caller thread and subagents run on background threads, so
-  lifting it needs send-side serialization in the Client, not a one-line
-  passthrough; and each out-of-process teammate is a full session, so it gets
-  its own servers for its own worktree (`--no-lsp` is the lever there).
-  Auto-installing language servers stays rejected — it contradicts the repository's binary policy, spans six
-  unrelated install channels, would execute npm `postinstall` outside the
-  permission and sandbox layers, and a version-mismatched server is worse than
-  an absent one because nothing signals the error.
+  `--no-lsp` on the line wins.
+  - *Why flip it.* Since `1515b34` removed tree-sitter, `CodeMap`,
+    `FindSymbol`, `Read(outline: true)` and Edit/Write post-write diagnostics
+    all source symbols from LSP, so an opt-in flag meant the default
+    configuration ran four features in a degraded state. The flag was also a
+    redundant second gate: the real gate is and remains runtime — a registered
+    server for the extension, its binary actually installed, the file inside a
+    git workspace, a `root_marker` hit — followed by lazy spawn keyed by
+    `server_id+root`, a 10-minute idle reaper, a client-count ceiling and the
+    broken-set. On a machine with no language server installed, enabling it
+    starts no process at all.
+  - *What it costs.* The one newly-involuntary path is post-write diagnostics.
+    Measured on this repository with zls: 112 ms cold, 52 ms warm per write.
+    The 14 s/26 s constants in `lsp/service.zig` are ceilings for heavier
+    servers, not typical values; the disk write itself is never blocked and the
+    wait is Ctrl+C-interruptible.
+  - *Escape hatch reaches subprocesses.* `--no-lsp` propagates to
+    out-of-process teammates, which would otherwise start their own servers
+    against the lead's explicit choice.
+  - *Not closed by this change.* Subagents still run without LSP:
+    `agent_loop.Options.lsp` is deliberately not threaded into child loops
+    because `lsp/client.zig` requires `sendRequest`/`sendNotification` from a
+    single caller thread while subagents run on background threads, so lifting
+    it needs send-side serialization in the Client, not a one-line passthrough.
+    For the same reason independent sessions cannot share a `Service`, so each
+    out-of-process teammate and each `--serve-multi` daemon session starts its
+    own servers; `--no-lsp` is the lever meanwhile.
+  - *Rejected.* Enabling by project size — `root_markers` already encode "this
+    is a real project", and large trees are exactly where indexing is most
+    expensive, so size-as-eagerness is backwards. Auto-installing language
+    servers — it contradicts the repository's binary policy, spans six
+    unrelated install channels, would execute npm `postinstall` outside the
+    permission and sandbox layers, and a version-mismatched server is worse
+    than an absent one because nothing signals the error.
 
 ### Fixed
 
