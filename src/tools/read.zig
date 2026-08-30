@@ -52,13 +52,19 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     // outline 模式(opt-in):返回符号大纲(函数/类型/类 + 行号 + 签名)而非文件内容。
-    // 仅对**有 symbols 查询**的语言(json/yaml 等仅高亮语言无大纲 → 回退正常读取,向后兼容)。
+    // 三态处理(issue #17):有大纲 → 返大纲;能力在位但文件没符号 → 安静回退正常读;
+    // **能力缺失 → 也回退,但把原因记下来,读完在结果末尾交代**——静默回退等于让模型
+    // 以为"这文件没结构",和裸 `[]` 是同一类谎报。
+    var outline_gap: ?symbol_provider.Unavailable = null;
     if (isTrue(common.extractJsonArg(args, "outline"))) {
-        // LSP server 能出符号 → 大纲;无符号(flaky server/无 server 语言)→ null → 回退正常读。
-        if (symbol_provider.hasSymbolsFor(ctx, path)) {
-            if (try readOutline(allocator, ctx, path)) |outline| return outline;
+        switch (symbol_provider.capabilityFor(ctx, path)) {
+            .unavailable => |u| outline_gap = u,
+            .available => switch (try readOutline(allocator, ctx, path)) {
+                .text => |outline| return outline,
+                .no_symbols => {},
+                .unavailable => |u| outline_gap = u,
+            },
         }
-        // 不支持/无 symbols/大纲为空 → 落到正常读取路径
     }
 
     const has_offset = common.extractJsonArg(args, "offset") != null;
@@ -93,10 +99,21 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (st) |s| {
             if (s.size > MAX_FILE_BYTES) {
                 if (symbol_provider.hasSymbolsFor(ctx, path)) {
-                    if (try readOutlineFromFd(allocator, ctx, path, fd)) |outline| {
-                        defer allocator.free(outline);
-                        return try std.fmt.allocPrint(allocator, "File too large to show in full ({d} bytes, limit {d}). Outline below; Read a range with offset+limit for bodies.\n\n{s}", .{ s.size, MAX_FILE_BYTES, outline });
+                    switch (try readOutlineFromFd(allocator, ctx, path, fd)) {
+                        .text => |outline| {
+                            defer allocator.free(outline);
+                            return try std.fmt.allocPrint(allocator, "File too large to show in full ({d} bytes, limit {d}). Outline below; Read a range with offset+limit for bodies.\n\n{s}", .{ s.size, MAX_FILE_BYTES, outline });
+                        },
+                        .no_symbols => {},
+                        .unavailable => |u| {
+                            if (outline_gap == null and isTrue(common.extractJsonArg(args, "outline"))) outline_gap = u;
+                        },
                     }
+                }
+                // 这条已经是终局提示,没有"末尾追加"的机会 → 显式请求过 outline 的话就地交代。
+                if (outline_gap) |u| {
+                    var why_buf: [symbol_provider.capability.WHY_BUF]u8 = undefined;
+                    return try std.fmt.allocPrint(allocator, "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content. No outline was available: {s}.\"}}", .{ s.size, MAX_FILE_BYTES, u.why(&why_buf) });
                 }
                 return try std.fmt.allocPrint(allocator, "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content.\"}}", .{ s.size, MAX_FILE_BYTES });
             }
@@ -121,11 +138,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     while (line_idx < offset_1based and line_start < full.len) : (line_idx += 1) {
         const nl = std.mem.indexOfScalarPos(u8, full, line_start, '\n') orelse {
             // 不足 offset 行 → 返回空
-            return try allocator.dupe(u8, "");
+            return try emptyBodyOrOutlineNote(allocator, outline_gap);
         };
         line_start = nl + 1;
     }
-    if (line_start >= full.len) return try allocator.dupe(u8, "");
+    // 空文件/区间越界:内容为空。要过 outline 却没能力时,这里同样得交代——否则
+    // 空串就成了另一种"能力缺失伪装成没内容"。
+    if (line_start >= full.len) return try emptyBodyOrOutlineNote(allocator, outline_gap);
 
     // 取 limit 行
     var end: usize = line_start;
@@ -158,12 +177,22 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         rendered = noted;
     }
 
+    // 显式要过 outline 但能力缺失 → 在正常内容后交代原因(别让"回退正常读"看起来像"这文件没结构")。
+    if (outline_gap) |u| {
+        var why_buf: [symbol_provider.capability.WHY_BUF]u8 = undefined;
+        const noted = try std.fmt.allocPrint(allocator, "{s}\n\n<system-reminder>Outline was requested but is unavailable: {s}. The full file content is shown above instead; this does NOT mean the file has no structure.</system-reminder>", .{ rendered, u.why(&why_buf) });
+        allocator.free(rendered);
+        rendered = noted;
+    }
+
     // 弱提示(搭车):整读(无 offset/limit)一个**有 LSP server 的**大源码文件时,在结果末尾追加
     // system-reminder,引导"定位定义可用 CodeMap/FindSymbol 更快"。频控:同一文件本 session 只提
     // 一次(read_state.hinted)。触发(全满足):无 offset/limit + hasSymbolsFor(有 server)+ >150 行 +
     // 没提过。Y2 砍 tree-sitter 后不再廉价解析验"真有符号"(为 hint 起 LSP server 太浪费)——用
     // "有 server" 作 CodeMap/FindSymbol 可用的代理,过度提示的代价仅一句软提醒。
-    if (!has_offset and !has_limit and symbol_provider.hasSymbolsFor(ctx, path)) {
+    // outline_gap != null 时不提:大纲刚因为能力缺失落空,再劝"用 CodeMap/FindSymbol 更快"
+    // 是把模型往同一堵墙上引。
+    if (!has_offset and !has_limit and outline_gap == null and symbol_provider.hasSymbolsFor(ctx, path)) {
         const total_lines = std.mem.count(u8, full, "\n") + 1;
         const already = if (ctx.read_state) |rs| rs.wasHinted(path) else false;
         if (total_lines > 150 and !already) {
@@ -182,6 +211,13 @@ fn capToLastLine(content: []const u8, max: usize) CapResult {
     const nl = std.mem.lastIndexOfScalar(u8, content[0..max], '\n');
     const cut = if (nl) |i| i + 1 else max;
     return .{ .slice = content[0..cut], .truncated = true };
+}
+
+/// 内容为空时的返回值:没有待说明的 outline 缺失 → 空串(旧行为);有 → 只回一句说明。
+fn emptyBodyOrOutlineNote(allocator: std.mem.Allocator, gap: ?symbol_provider.Unavailable) ![]u8 {
+    const u = gap orelse return try allocator.dupe(u8, "");
+    var why_buf: [symbol_provider.capability.WHY_BUF]u8 = undefined;
+    return try std.fmt.allocPrint(allocator, "<system-reminder>Outline was requested but is unavailable: {s}. The file (or the requested range) is empty.</system-reminder>", .{u.why(&why_buf)});
 }
 
 /// 截断提示带**精确续读行号**(三件套第③件:分页导引)。resume_line = 已展示的最后一行的下一行,
@@ -270,15 +306,15 @@ fn isTrue(s: ?[]const u8) bool {
     return s != null and std.mem.eql(u8, s.?, "true");
 }
 
-/// outline 模式:打开文件、读全量、渲染符号大纲。**无符号 → null**(调用方回退正常读)。
-fn readOutline(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8) !?[]u8 {
+/// outline 模式:打开文件、读全量、渲染符号大纲。三态见 `code_map.Outline`(调用方按态分流)。
+fn readOutline(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8) !code_map.Outline {
     const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer _ = pfs.close(fd);
     return try readOutlineFromFd(allocator, ctx, path, fd);
 }
 
-/// 已有 fd 时渲染大纲(大文件守卫路径复用,避免重开)。无符号 → null。
-fn readOutlineFromFd(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, fd: pfs.Fd) !?[]u8 {
+/// 已有 fd 时渲染大纲(大文件守卫路径复用,避免重开)。三态见 `code_map.Outline`。
+fn readOutlineFromFd(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, fd: pfs.Fd) !code_map.Outline {
     const source = try common.readAllFromFd(fd, allocator);
     defer allocator.free(source);
     return try code_map.renderOutlineForSource(ctx, allocator, path, source);
@@ -750,17 +786,26 @@ test "Read 流式:offset 超文件行数 → 空" {
     try std.testing.expectEqualStrings("", r);
 }
 
-test "Read 弱提示:--lsp 开 + >150行有 server 语言 → CodeMap reminder;小文件/非源码/无 --lsp 不追加" {
+/// hint 的门禁自 issue #17 起包含"那个 server 的二进制真的装了",所以断言必须**跟着机器变**:
+/// 装了 zls → 该提;没装 → 不该提(CodeMap/FindSymbol 那时也用不了,提了是误导)。
+/// 刻意不写成"没装就 SkipZigTest"——被 skip 掉的正是这个 bug 当初藏身的那一侧。
+fn zlsInstalled() bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    return @import("../lsp/servers.zig").which("zls", &buf) != null;
+}
+
+test "Read 弱提示:--lsp 开 + >150行 + zls 真装了 → CodeMap reminder;小文件/非源码/无 --lsp/没装 server 不追加" {
     const a = std.testing.allocator;
-    // Y2 砍 tree-sitter 后:hint 由 hasSymbolsFor gate(需 ctx.lsp 开 + 该扩展名有注册 server;
-    // findServerForFile 是纯扩展名注册表查,不需真装 server)。
+    // Y2 砍 tree-sitter 后:hint 由 hasSymbolsFor gate(ctx.lsp 开 + 该扩展名有注册 server +
+    // 该 server 二进制可解析)。
     const Service = @import("../lsp/service.zig").Service;
     var svc = Service.create(a, "/tmp", null) catch return;
     defer svc.shutdown();
     var ctx = testCtx();
     ctx.lsp = svc;
 
-    // 大源码文件(200 行 .zig,有 zls server 注册)→ 带 reminder
+    // 大源码文件(200 行 .zig)→ 装了 zls 才带 reminder
+    const want_hint = zlsInstalled();
     {
         const path = "/tmp/cc-zig-read-hint-big.zig";
         const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
@@ -775,8 +820,8 @@ test "Read 弱提示:--lsp 开 + >150行有 server 语言 → CodeMap reminder;�
 
         const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-big.zig\"}");
         defer a.free(r);
-        try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") != null);
-        try std.testing.expect(std.mem.indexOf(u8, r, "CodeMap") != null);
+        try std.testing.expectEqual(want_hint, std.mem.indexOf(u8, r, "<system-reminder>") != null);
+        try std.testing.expectEqual(want_hint, std.mem.indexOf(u8, r, "CodeMap") != null);
     }
     // 小源码文件(10 行)→ 不带 reminder
     {
@@ -829,9 +874,9 @@ test "Read 弱提示:--lsp 开 + >150行有 server 语言 → CodeMap reminder;�
     }
 }
 
-test "Read 弱提示:同 session 同文件只提一次(dedup)" {
+test "Read 弱提示:同 session 同文件只提一次(dedup);没装 server 则一次都不提" {
     // Y2 砍 tree-sitter 后 hint 不再廉价验"真有符号"(为 hint 起 LSP server 太浪费),简化为
-    // hasSymbolsFor(有 server)+ >150 行——纯注释源码也会提(轻微 over-hint,登记的取舍)。
+    // hasSymbolsFor(有 server 且装了)+ >150 行——纯注释源码也会提(轻微 over-hint,登记的取舍)。
     const a = std.testing.allocator;
     const Service = @import("../lsp/service.zig").Service;
     var svc = Service.create(a, "/tmp", null) catch return;
@@ -858,11 +903,12 @@ test "Read 弱提示:同 session 同文件只提一次(dedup)" {
 
         const r1 = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-dedup.zig\"}");
         defer a.free(r1);
-        try std.testing.expect(std.mem.indexOf(u8, r1, "<system-reminder>") != null);
+        // 装了 zls:第一次提。没装:两次都不提(能力缺失时提 CodeMap 是误导)。
+        try std.testing.expectEqual(zlsInstalled(), std.mem.indexOf(u8, r1, "<system-reminder>") != null);
 
         const r2 = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-dedup.zig\"}");
         defer a.free(r2);
-        try std.testing.expect(std.mem.indexOf(u8, r2, "<system-reminder>") == null); // 第二次不再提
+        try std.testing.expect(std.mem.indexOf(u8, r2, "<system-reminder>") == null); // 第二次一律不提
     }
 }
 

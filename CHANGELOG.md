@@ -50,6 +50,33 @@ status, compatibility boundaries, and entry points are defined by
   `reasoning_split:true` so reasoning arrives as `reasoning_content`.
   OpenAI/Anthropic/GLM/Kimi/DeepSeek translations were already built in.
 
+### Fixed
+
+- Symbol capability gaps no longer masquerade as "symbol not defined"
+  (issue #17). `FindSymbol` returned a bare `[]` whenever `--lsp` was on but
+  the language server binary was missing, because the *decide* predicate
+  (`symbol_provider.hasSymbolsFor`) consulted only the compile-time
+  `SERVERS` extension table while the *use* predicate
+  (`lsp.Service.getOrSpawn`) additionally resolved the binary, spawned it,
+  and consulted the broken-set — a two-state type (`!Symbols`) squeezing a
+  three-state reality. The shape was inherited from the tree-sitter era, when
+  statically linked grammars made "extension registered" equivalent to
+  "capability available"; commit `1515b34` changed the dependency to an
+  external runtime process without updating the capability contract.
+  The predicate is now single-sourced and runtime-aware
+  (`lsp.servers.binaryAvailable`), and the symbol path carries an explicit
+  third state (`lsp/capability.zig` `Unavailable{reason, detail}`,
+  `symbol_provider.Outcome`, `lsp.Service.fetchSymbols`) with one shared
+  wording table. `FindSymbol` now appends a qualifier naming the missing
+  binary (and flags partial results when only some candidate files were
+  skipped), `CodeMap` prints the specific reason instead of `(no symbols)`,
+  and `Read(outline: true)` explains why it fell back to a full read rather
+  than degrading silently. Regression tests cover the **server-absent** side
+  unconditionally — synthetic `ServerDef`s with absolute-path binaries make
+  that side reachable on any machine, replacing the
+  `if (which("zls") == null) return error.SkipZigTest` pattern that had
+  skipped exactly the half where the defect lived.
+
 ## 0.1.0 — 2026-08-29
 
 ### Security

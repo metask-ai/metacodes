@@ -26,6 +26,7 @@ const client_mod = @import("client.zig");
 const servers = @import("servers.zig");
 const workspace = @import("workspace.zig");
 const reporter = @import("reporter.zig");
+const capability = @import("capability.zig");
 const transport = @import("transport.zig");
 const log = @import("../util/log.zig");
 
@@ -39,6 +40,16 @@ const REAP_INTERVAL_MS: u64 = 30 * 1000;
 /// 每包 package.json 各解析出一个 root),10 分钟 idle 窗口内可堆出十几个重量级 server
 /// (clangd --background-index / rust-analyzer 各吃几百 MB)。超限拒 spawn 走已有返空降级。
 pub const MAX_LSP_CLIENTS: usize = 6;
+
+/// documentSymbol 的三态结果。见 `lsp/capability.zig` 的病理说明:把"能力缺失"和"真的没符号"
+/// 压成同一个空列表,是 issue #17 的直接成因。
+pub const SymbolFetch = union(enum) {
+    /// 能力在位。`items` 可以为空——那才是真正的"这个文件没有符号"。
+    ok: client_mod.LspSymbols,
+    /// 能力缺失。Service 只产 `no_server_for_language` / `outside_workspace` /
+    /// `server_not_installed` / `server_unavailable` 四种。
+    unavailable: capability.Unavailable,
+};
 
 /// baseline:某 path 上次的诊断集(owned),供 delta 去重。
 const Baseline = struct {
@@ -94,18 +105,27 @@ pub const Service = struct {
         _ = self.mutex.unlock();
     }
 
-    /// 该文件是否应启动 LSP:git workspace 内 + 有对应 server + 未 broken。
-    /// 返回 {def, git_root, server_root}(root 写进 caller 的 buf)或 null。
-    fn resolve(self: *Service, path: []const u8, git_buf: []u8, root_buf: []u8) ?struct {
-        def: *const servers.ServerDef,
-        server_root: []const u8,
-    } {
-        const def = servers.findServerForFile(path) orelse return null;
+    /// resolve 的结果。**为什么不是 `?T`**:两种 null 的含义完全不同(该语言压根没 server /
+    /// 文件不在 workspace),压成一个 null 就是 issue #17 那类"三态挤两态"的起点。
+    const Resolution = union(enum) {
+        ok: struct {
+            def: *const servers.ServerDef,
+            server_root: []const u8, // 写进 caller 的 root_buf
+        },
+        /// 该扩展名没有注册 server。
+        no_server,
+        /// 不在 git 仓,或解析不出 server root → 按设计不启动。
+        outside_workspace,
+    };
+
+    /// 该文件是否应启动 LSP:git workspace 内 + 有对应 server。
+    fn resolve(self: *Service, path: []const u8, git_buf: []u8, root_buf: []u8) Resolution {
+        const def = servers.findServerForFile(path) orelse return .no_server;
         const wsr = workspace.resolveWorkspaceForFile(path, self.cwd, git_buf);
-        if (!wsr.gated_in) return null; // 不在 git 仓 → 不启动
-        const git_root = wsr.root;
-        const server_root = servers.resolveServerRoot(def, path, git_root, root_buf) orelse return null;
-        return .{ .def = def, .server_root = server_root };
+        if (!wsr.gated_in) return .outside_workspace; // 不在 git 仓 → 不启动
+        const server_root = servers.resolveServerRoot(def, path, wsr.root, root_buf) orelse
+            return .outside_workspace;
+        return .{ .ok = .{ .def = def, .server_root = server_root } };
     }
 
     fn clientKey(self: *Service, server_id: []const u8, root: []const u8) ![]u8 {
@@ -240,7 +260,10 @@ pub const Service = struct {
     pub fn snapshotBaseline(self: *Service, path: []const u8, text: []const u8) void {
         var git_buf: [std.fs.max_path_bytes]u8 = undefined;
         var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const r = self.resolve(path, &git_buf, &root_buf) orelse return;
+        const r = switch (self.resolve(path, &git_buf, &root_buf)) {
+            .ok => |o| o,
+            .no_server, .outside_workspace => return,
+        };
         const cl = self.getOrSpawn(r.def, r.server_root) orelse return;
         const ver = cl.openFile(path, text) catch return;
         cl.waitForDiagnostics(ver, BASELINE_WAIT_MS);
@@ -257,7 +280,10 @@ pub const Service = struct {
         // (app/edit)负责;此处失败静默返空(graceful degradation)。
         var git_buf: [std.fs.max_path_bytes]u8 = undefined;
         var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const r = self.resolve(path, &git_buf, &root_buf) orelse return alloc.dupe(u8, "");
+        const r = switch (self.resolve(path, &git_buf, &root_buf)) {
+            .ok => |o| o,
+            .no_server, .outside_workspace => return alloc.dupe(u8, ""),
+        };
         const cl = self.getOrSpawn(r.def, r.server_root) orelse return alloc.dupe(u8, "");
         const ver = cl.openFile(path, text) catch return alloc.dupe(u8, "");
         cl.waitForDiagnostics(ver, DIAGNOSTICS_WAIT_MS);
@@ -288,24 +314,33 @@ pub const Service = struct {
         return capped;
     }
 
-    /// 取文件符号(documentSymbol,替 tree-sitter 供 CodeMap/FindSymbol/Read-outline)。
-    /// best-effort:无 server/非 git workspace/请求失败 → 空 LspSymbols。gpa 拥有返回 arena,caller deinit。
-    /// text = 文件当前全文(先 didOpen/didChange 同步给 server 再请求)。
-    pub fn getSymbols(self: *Service, gpa: std.mem.Allocator, path: []const u8, text: []const u8) client_mod.LspSymbols {
-        return self.getSymbolsInner(gpa, path, text) catch emptySymbols(gpa);
-    }
-
-    fn getSymbolsInner(self: *Service, gpa: std.mem.Allocator, path: []const u8, text: []const u8) !client_mod.LspSymbols {
+    /// 取文件符号(documentSymbol,替 tree-sitter 供 CodeMap/FindSymbol/Read-outline)的**三态**结果。
+    ///
+    /// `.ok` = 能力在位,`items` 就是 server 报的真实符号集(**可以为空 = 该文件确实没符号**);
+    /// `.unavailable` = 能力缺失,调用方必须把原因讲出来,不得当成"查无定义"(issue #17)。
+    /// text = 文件当前全文(先 didOpen/didChange 同步给 server 再请求)。gpa 拥有返回 arena。
+    pub fn fetchSymbols(self: *Service, gpa: std.mem.Allocator, path: []const u8, text: []const u8) SymbolFetch {
         var git_buf: [std.fs.max_path_bytes]u8 = undefined;
         var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const r = self.resolve(path, &git_buf, &root_buf) orelse return emptySymbols(gpa);
-        const cl = self.getOrSpawn(r.def, r.server_root) orelse return emptySymbols(gpa);
-        _ = cl.openFile(path, text) catch return emptySymbols(gpa); // 同步文档 → server 有 overlay
-        return cl.documentSymbol(gpa, path);
-    }
-
-    fn emptySymbols(gpa: std.mem.Allocator) client_mod.LspSymbols {
-        return .{ .items = &.{}, .arena = std.heap.ArenaAllocator.init(gpa) };
+        const r = switch (self.resolve(path, &git_buf, &root_buf)) {
+            .ok => |o| o,
+            .no_server => return .{ .unavailable = .{ .reason = .no_server_for_language } },
+            .outside_workspace => return .{ .unavailable = .{ .reason = .outside_workspace } },
+        };
+        const cl = self.getOrSpawn(r.def, r.server_root) orelse {
+            // getOrSpawn 把所有失败都折成 null。用它自己第一步用的那个谓词(which)区分
+            // "根本没装" vs "装了但起不来/满员"——两者给用户的下一步动作完全不同。
+            return .{ .unavailable = if (servers.binaryAvailable(r.def))
+                .{ .reason = .server_unavailable, .detail = r.def.server_id }
+            else
+                .{ .reason = .server_not_installed, .detail = r.def.binary } };
+        };
+        // 同步文档 → server 有 overlay。失败=server 侧异常,不是"没符号"。
+        _ = cl.openFile(path, text) catch
+            return .{ .unavailable = .{ .reason = .server_unavailable, .detail = r.def.server_id } };
+        const syms = cl.documentSymbol(gpa, path) catch
+            return .{ .unavailable = .{ .reason = .server_unavailable, .detail = r.def.server_id } };
+        return .{ .ok = syms };
     }
 
     /// 存 path 的当前诊断为 baseline(diagKey 集合)。持锁内替换旧的。
@@ -547,7 +582,14 @@ test "Service e2e: 真 zls documentSymbol 抽 struct/function 符号(需装 zls)
     var svc = try Service.create(a, base, null);
     defer svc.shutdown();
 
-    var syms = svc.getSymbols(a, file, src);
+    const fetched = svc.fetchSymbols(a, file, src);
+    var syms = switch (fetched) {
+        .ok => |s| s,
+        .unavailable => |u| {
+            std.debug.print("expected symbols, got unavailable: {t} '{s}'\n", .{ u.reason, u.detail });
+            return error.SymbolCapabilityUnavailable;
+        },
+    };
     defer syms.deinit();
 
     // zls 应报 Point 与 add(Function=12)。**真 zls 语义差异**(登记):`pub const X = struct`

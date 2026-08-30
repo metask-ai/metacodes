@@ -7,13 +7,15 @@
 //!
 //! 模块:transport(Content-Length 帧+spawn)/protocol(JSON-RPC envelope)/client(单 server
 //! reader 线程+req/resp 关联+wait diagnostics)/service(spawn cache+broken-set+delta baseline)/
-//! workspace(git 门)/servers(ServerDef 注册表)/reporter(格式化+XSS)/range_shift(行移 delta)。
+//! workspace(git 门)/servers(ServerDef 注册表 + 二进制可用性谓词)/capability(符号能力
+//! 三态词汇表)/reporter(格式化+XSS)/range_shift(行移 delta)。
 
 pub const transport = @import("transport.zig");
 pub const protocol = @import("protocol.zig");
 pub const reporter = @import("reporter.zig");
 pub const workspace = @import("workspace.zig");
 pub const servers = @import("servers.zig");
+pub const capability = @import("capability.zig");
 pub const client = @import("client.zig");
 pub const service = @import("service.zig");
 pub const symbols = @import("symbols.zig");
@@ -24,6 +26,7 @@ test {
     _ = reporter;
     _ = workspace;
     _ = servers;
+    _ = capability;
     _ = client;
     _ = service;
     _ = symbols;

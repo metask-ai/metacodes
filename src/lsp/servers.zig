@@ -102,6 +102,20 @@ pub fn which(binary: []const u8, out_buf: []u8) ?[]const u8 {
     return null;
 }
 
+/// def 的 language server 二进制**此刻是否真的可用**(PATH 可解析,或 binary 含 `/` 时该路径可执行)。
+///
+/// **注册表命中 ≠ 能力可用**(issue #17):`SERVERS` 是编译期静态表,`binary` 是运行期外部进程。
+/// 判定"这个文件能不能出符号"必须同时过这一关,否则 `.py` 在没装 pyright 的机器上会被判成
+/// "有能力",最终以裸空结果收场、被读成"查无定义"。
+///
+/// 成本 = 一次 PATH 扫描(每个目录一次 `access(2)`)。**刻意不做进程级缓存**:逐文件调用的循环
+/// 都是有界的(CodeMap `MAX_FILES` / FindSymbol `MAX_CANDIDATE_FILES`),相对每文件一次 LSP 往返
+/// (~30ms)可忽略;而缓存会把"跑到一半才装上 server"钉死成永久不可用,也会让测试互相污染。
+pub fn binaryAvailable(def: *const ServerDef) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    return which(def.binary, &buf) != null;
+}
+
 fn isExecutable(path: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return false;
@@ -162,4 +176,49 @@ test "resolveServerRoot: marker 命中 / 退回 git_root" {
     const r = resolveServerRoot(def, "/nonexistent_xyz/src/main.zig", "/nonexistent_xyz", &buf);
     try testing.expect(r != null);
     try testing.expectEqualStrings("/nonexistent_xyz", r.?);
+}
+
+test "binaryAvailable: 绝对路径 def 可判定(不依赖机器上装了哪个 language server)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(/bin/sh 作已知可执行样本)
+    // issue #17 的核心谓词:注册表里"有一行"和"二进制真的在"是两回事,这里把两侧都钉死。
+    // 用绝对路径构造 def → 不受 PATH 内容影响,server-absent 一侧在 CI 上无条件跑到。
+    const present = ServerDef{
+        .server_id = "fake-present",
+        .extensions = &.{".fakepresent"},
+        .binary = "/bin/sh",
+        .root_markers = &.{},
+    };
+    const absent = ServerDef{
+        .server_id = "fake-absent",
+        .extensions = &.{".fakeabsent"},
+        .binary = "/nonexistent/no-such-langserver-9417",
+        .root_markers = &.{},
+    };
+    try testing.expect(binaryAvailable(&present));
+    try testing.expect(!binaryAvailable(&absent));
+}
+
+test "binaryAvailable: PATH 里瞎名 → false(注册了但没装的那一侧)" {
+    const absent = ServerDef{
+        .server_id = "fake-absent-path",
+        .extensions = &.{".fakeabsentpath"},
+        .binary = "no-such-langserver-xyz-9417",
+        .root_markers = &.{},
+    };
+    try testing.expect(!binaryAvailable(&absent));
+}
+
+test "REGRESSION issue #17: 注册表谓词与安装谓词是两回事" {
+    // 老代码把"扩展名注册"当成"能力可用"。这里断言两个谓词**在类型层面就是两件事**:
+    // 一个合成的、注册形态完全合法的 def,其二进制不存在时能力必须判为不可用。
+    const def = ServerDef{
+        .server_id = "ghost",
+        .extensions = &.{".ghost"},
+        .binary = "/nonexistent/ghost-langserver",
+        .root_markers = &.{"ghost.toml"},
+    };
+    // 注册侧:形态合法(有扩展名、有 marker)。
+    try testing.expect(def.extensions.len > 0);
+    // 安装侧:不可用 —— 两者不得互相冒充。
+    try testing.expect(!binaryAvailable(&def));
 }
