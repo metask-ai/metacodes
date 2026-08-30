@@ -388,7 +388,25 @@ pub const Kernel = struct {
         self.* = undefined;
     }
 
-    pub fn catalogRevision(self: *const Kernel) CatalogRevision {
+    /// Publish-safe read of the catalog pointer.
+    ///
+    /// `adoptCatalog` can replace it, so an unsynchronized read could observe a
+    /// stale or torn pointer. The catalog *contents* are immutable once built,
+    /// so iteration after the snapshot needs no lock. The previous catalog must
+    /// outlive in-flight readers; its owner controls that.
+    pub fn catalogSnapshot(self: *Kernel) *const OfferCatalog {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.catalog;
+    }
+
+    pub fn catalogRevision(self: *Kernel) CatalogRevision {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.catalog.revision;
+    }
+
+    fn catalogRevisionLocked(self: *const Kernel) CatalogRevision {
         return self.catalog.revision;
     }
 
@@ -429,10 +447,14 @@ pub const Kernel = struct {
     fn meta(self: *Kernel, envelope: ApiEnvelope) ResponseMeta {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.metaLocked(envelope);
+    }
+
+    fn metaLocked(self: *const Kernel, envelope: ApiEnvelope) ResponseMeta {
         return .{
             .request_id = envelope.request_id,
             .config_revision = self.config_revision,
-            .catalog_revision = self.catalogRevision(),
+            .catalog_revision = self.catalogRevisionLocked(),
         };
     }
 
@@ -453,11 +475,12 @@ pub const Kernel = struct {
         out: *std.ArrayList(OfferSummary),
     ) KernelError!ListPage {
         try requireSupportedEnvelope(envelope);
+        const catalog = self.catalogSnapshot();
         const current = self.currentOfferId();
         out.clearRetainingCapacity();
         var total: usize = 0;
         var skipped: usize = 0;
-        for (self.catalog.items()) |*offer| {
+        for (catalog.items()) |*offer| {
             if (!matchesQuery(offer, query)) continue;
             total += 1;
             if (skipped < query.offset) {
@@ -484,11 +507,22 @@ pub const Kernel = struct {
     /// offer's catalog quote stands, and with neither the answer is `unknown` —
     /// never a fabricated zero.
     pub fn quoteEstimate(
-        self: *const Kernel,
+        self: *Kernel,
         offer_id: OfferId,
         usage: offer_mod.Usage,
     ) offer_mod.Quote {
-        const offer = self.catalog.find(offer_id) orelse return .unknown;
+        return self.quoteAgainst(self.catalogSnapshot(), offer_id, usage);
+    }
+
+    /// Never acquires the lock: callers that already hold it price in place,
+    /// and `quoteEstimate` snapshots first.
+    fn quoteAgainst(
+        self: *const Kernel,
+        catalog: *const OfferCatalog,
+        offer_id: OfferId,
+        usage: offer_mod.Usage,
+    ) offer_mod.Quote {
+        const offer = catalog.find(offer_id) orelse return .unknown;
         if (self.registry) |registry| {
             if (registry.findById(offer.provider_id)) |profile| {
                 const hooked = profile.quote(offer.request_model_id, offer.channel_id, usage);
@@ -500,7 +534,7 @@ pub const Kernel = struct {
 
     /// `model.describe`.
     pub fn modelDescribe(self: *Kernel, offer_id: OfferId) ?OfferSummary {
-        const offer = self.catalog.find(offer_id) orelse return null;
+        const offer = self.catalogSnapshot().find(offer_id) orelse return null;
         const current = self.currentOfferId();
         const is_current = if (current) |id| id.eql(offer.offer_id) else false;
         return OfferSummary.from(offer, is_current);
@@ -540,8 +574,8 @@ pub const Kernel = struct {
     /// unsupported service tier or reasoning value must fail rather than be
     /// silently dropped — `rebaseSelection` is the separate, lenient path for
     /// carrying an existing control set to a different offer.
-    pub fn selectionValidate(self: *const Kernel, candidate: RuntimeSelection) ValidationOutcome {
-        return self.validateAgainstOffer(candidate, .strict);
+    pub fn selectionValidate(self: *Kernel, candidate: RuntimeSelection) ValidationOutcome {
+        return validateAgainstOffer(self.catalogSnapshot(), candidate, .strict);
     }
 
     /// `selection.rebase` — the offer-switch path.
@@ -550,18 +584,18 @@ pub const Kernel = struct {
     /// rejected, so a picker can show the user what a switch would keep before
     /// committing it. The result is a complete replacement set, applied
     /// atomically by `selectionCommit`.
-    pub fn rebaseSelection(self: *const Kernel, candidate: RuntimeSelection) ValidationOutcome {
-        return self.validateAgainstOffer(candidate, .lenient);
+    pub fn rebaseSelection(self: *Kernel, candidate: RuntimeSelection) ValidationOutcome {
+        return validateAgainstOffer(self.catalogSnapshot(), candidate, .lenient);
     }
 
     const ControlMode = enum { strict, lenient };
 
     fn validateAgainstOffer(
-        self: *const Kernel,
+        catalog: *const OfferCatalog,
         candidate: RuntimeSelection,
         mode: ControlMode,
     ) ValidationOutcome {
-        const resolution = selection_mod.resolve(self.catalog, candidate) catch |err|
+        const resolution = selection_mod.resolve(catalog, candidate) catch |err|
             return .{ .unavailable = err };
         const offer = resolution.primary();
 
@@ -635,7 +669,11 @@ pub const Kernel = struct {
             return .{ .conflict = conflict };
         }
 
-        const validation = self.selectionValidate(candidate);
+        // The lock is already held for the whole transaction, so validate
+        // against the catalog directly: going through `selectionValidate`
+        // would re-enter `catalogSnapshot` and deadlock on a non-reentrant
+        // mutex.
+        const validation = validateAgainstOffer(self.catalog, candidate, .strict);
         switch (validation) {
             .ok => {},
             .unavailable => |err| {
@@ -663,7 +701,7 @@ pub const Kernel = struct {
         committed.controls = validation.ok.effective_controls;
         committed.resolved_offer_id = validation.ok.offer_id;
         committed.resolved_offer_revision = validation.ok.offer_revision;
-        committed.catalog_revision = self.catalogRevision();
+        committed.catalog_revision = self.catalogRevisionLocked();
 
         switch (scope) {
             .once => self.once_selection = committed,
@@ -683,7 +721,7 @@ pub const Kernel = struct {
             .selection = committed,
             .scope = scope,
             .config_revision = self.config_revision,
-            .catalog_revision = self.catalogRevision(),
+            .catalog_revision = self.catalogRevisionLocked(),
             .requires_persist = scope == .global,
         } };
     }
@@ -741,14 +779,25 @@ pub const Kernel = struct {
     pub fn recordActualRoute(self: *Kernel, observed: selection_mod.ActualRouteEvent) void {
         var event = observed;
         if (event.cost_micros == null) {
+            // Pricing calls a provider-supplied hook. Doing that under the
+            // kernel lock would let a slow or misbehaving vendor callback stall
+            // every other client, so it runs first and the journal write takes
+            // the lock afterwards.
             event.cost_micros = self.quoteEstimate(event.actual_offer_id, event.usage)
                 .estimateMicros(event.usage);
         }
+        self.appendRouteEvents(event);
+    }
+
+    /// Split out so neither half mixes locking with a locking call: this body
+    /// takes the lock and uses only `…Locked` helpers, while its caller runs
+    /// the provider hook with no lock held.
+    fn appendRouteEvents(self: *Kernel, event: selection_mod.ActualRouteEvent) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const context = EventContext{
             .config_revision = self.config_revision,
-            .catalog_revision = self.catalogRevision(),
+            .catalog_revision = self.catalogRevisionLocked(),
         };
         _ = self.journal.append(.route_actual, .{ .route_actual = event }, context);
         // A turn that did not use its first candidate is a failover; the
@@ -780,7 +829,7 @@ pub const Kernel = struct {
         else
             false;
         const catalog_stale = if (envelope.expected_catalog_revision) |expected|
-            expected.value() != self.catalogRevision().value()
+            expected.value() != self.catalogRevisionLocked().value()
         else
             false;
         if (!config_stale and !catalog_stale) return null;
@@ -788,14 +837,15 @@ pub const Kernel = struct {
             .expected_config_revision = envelope.expected_config_revision,
             .actual_config_revision = self.config_revision,
             .expected_catalog_revision = envelope.expected_catalog_revision,
-            .actual_catalog_revision = self.catalogRevision(),
+            .actual_catalog_revision = self.catalogRevisionLocked(),
         };
     }
 
+    /// Called with the kernel lock already held.
     fn eventContext(self: *const Kernel, envelope: ApiEnvelope) EventContext {
         return .{
             .config_revision = self.config_revision,
-            .catalog_revision = self.catalogRevision(),
+            .catalog_revision = self.catalogRevisionLocked(),
             // Over-long ids are dropped from the annotation rather than
             // truncated: a truncated correlation key silently points at the
             // wrong operation.
@@ -1296,6 +1346,14 @@ test "concurrent readers and a writer do not corrupt kernel state" {
                 if (page.offers.len != self.catalog.items().len) {
                     _ = self.failures.fetchAdd(1, .monotonic);
                 }
+                _ = self.kernel.modelDescribe(self.catalog.items()[0].offer_id);
+                _ = self.kernel.catalogRevision();
+                var replay: std.ArrayList(ControlPlaneEvent) = .empty;
+                defer replay.deinit(std.heap.c_allocator);
+                _ = self.kernel.replayEvents(0, std.heap.c_allocator, &replay) catch {
+                    _ = self.failures.fetchAdd(1, .monotonic);
+                    return;
+                };
             }
         }
 
@@ -1308,6 +1366,23 @@ test "concurrent readers and a writer do not corrupt kernel state" {
                     RuntimeSelection.pinned(offer.offer_id, offer.offer_revision, .session),
                     .session,
                 );
+                // Exercise every locked path, not just commit: a lock taken
+                // twice on one of these hangs here instead of surfacing as an
+                // unrelated test timing out ten minutes later.
+                _ = self.kernel.beginTurn();
+                self.kernel.endTurn();
+                _ = self.kernel.selectionResolve();
+                _ = self.kernel.quoteEstimate(offer.offer_id, .{ .input_tokens = 10 });
+                self.kernel.recordActualRoute(.{
+                    .requested = .{ .pinned = offer.offer_id },
+                    .actual_offer_id = offer.offer_id,
+                    .actual_offer_revision = offer.offer_revision,
+                    .provider_id = offer.provider_id,
+                    .channel_id = offer.channel_id,
+                    .protocol = offer.protocol,
+                    .usage = .{ .input_tokens = 10, .output_tokens = 5 },
+                });
+                self.kernel.adoptConfigRevision(@enumFromInt(round + 1));
             }
         }
     };
@@ -1329,6 +1404,7 @@ test "concurrent readers and a writer do not corrupt kernel state" {
     try std.testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
     // The writer's last commit is intact and the journal stayed consistent.
     try std.testing.expect(kernel.currentOfferId() != null);
+    try std.testing.expect(kernel.journal.len > 0);
     var previous: u64 = kernel.journal.oldest_sequence - 1;
     for (kernel.journal.items()) |event| {
         try std.testing.expectEqual(previous + 1, event.stream_sequence);
