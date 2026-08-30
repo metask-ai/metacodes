@@ -1,6 +1,6 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 14,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 15,
                "AgentCore revision changed");
 _Static_assert(sizeof(metask_agentcore_api_v1) == 64,
                "AgentCore root layout changed");
@@ -31,12 +31,24 @@ _Static_assert(METASK_AGENTCORE_PROTOCOL_DEFAULT == 0u,
                "provider protocol default changed");
 _Static_assert(METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES == 1u,
                "OpenAI Responses protocol code changed");
+_Static_assert(sizeof(metask_agentcore_run_input_part_v1) == 72,
+               "multimodal part layout changed");
+_Static_assert(METASK_AGENTCORE_RUN_INPUT_MULTIMODAL == 3u &&
+                   METASK_AGENTCORE_RUN_INPUT_PART_TEXT == 1u &&
+                   METASK_AGENTCORE_RUN_INPUT_PART_IMAGE == 2u,
+               "multimodal run input codes changed");
+_Static_assert(METASK_AGENTCORE_MAX_RUN_INPUT_PARTS_V1 == 64ULL,
+               "multimodal part-count limit changed");
+_Static_assert(METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 == 5000000ULL,
+               "image part payload limit changed");
+_Static_assert(METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED == 28u,
+               "image capability status changed");
 
 const metask_agentcore_api_v1 *agentcore_header_compile_probe(void) {
     return metask_agentcore_api_v1_discover();
 }
 
-void agentcore_revision_fourteen_type_probe(void) {
+void agentcore_revision_fifteen_type_probe(void) {
     metask_agentcore_runtime_config_v1 runtime = {0};
     metask_agentcore_session_host_config_v1 host = {0};
     metask_agentcore_session_create_config_v1 create = {0};
@@ -44,6 +56,8 @@ void agentcore_revision_fourteen_type_probe(void) {
     metask_agentcore_mcp_server_v1 server = {0};
     metask_agentcore_mcp_configuration_v1 mcp_configuration = {0};
     metask_agentcore_mcp_apply_report_v1 mcp_report = {0};
+    metask_agentcore_run_input_part_v1 part = {0};
+    metask_agentcore_run_input_v1 run_input = {0};
     metask_agentcore_checkpoint_export_config_v1 checkpoint = {0};
     metask_agentcore_checkpoint_export_result_v1 checkpoint_result = {0};
     metask_agentcore_owned_bytes_v1 diagnostic =
@@ -60,6 +74,12 @@ void agentcore_revision_fourteen_type_probe(void) {
     server.namespace_ = metask_agentcore_bytes_view_v1_from("probe", 5);
     mcp_configuration.struct_size = (uint32_t)sizeof(mcp_configuration);
     mcp_report.struct_size = (uint32_t)sizeof(mcp_report);
+    part.struct_size = (uint32_t)sizeof(part);
+    part.kind_code = METASK_AGENTCORE_RUN_INPUT_PART_IMAGE;
+    run_input.struct_size = (uint32_t)sizeof(run_input);
+    run_input.kind_code = METASK_AGENTCORE_RUN_INPUT_MULTIMODAL;
+    run_input.parts = &part;
+    run_input.part_count = 1;
     checkpoint.struct_size = (uint32_t)sizeof(checkpoint);
     checkpoint_result.struct_size = (uint32_t)sizeof(checkpoint_result);
 
@@ -69,13 +89,14 @@ void agentcore_revision_fourteen_type_probe(void) {
     (void)server;
     (void)mcp_configuration;
     (void)mcp_report;
+    (void)run_input;
     (void)checkpoint;
     (void)checkpoint_result;
     metask_agentcore_owned_bytes_v1_release((const metask_agentcore_api_v1 *)0,
                                             &diagnostic);
 }
 
-void agentcore_revision_fourteen_call_shape_probe(
+void agentcore_revision_fifteen_call_shape_probe(
     const metask_agentcore_api_v1 *api,
     const metask_agentcore_runtime_config_v1 *runtime_config,
     const metask_agentcore_runtime_plugin_config_v1 *plugins,

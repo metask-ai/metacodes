@@ -996,7 +996,7 @@ test "L2 public AgentCore durable Run journal records the physical provider effe
     try std.testing.expectEqual(@as(usize, 1), server.requestCount());
 }
 
-test "Revision 14 public Session rejects unknown Run journal and provider protocol codes" {
+test "Revision 15 public Session rejects unknown Run journal and provider protocol codes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -3955,7 +3955,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 14), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 15), wire.ABI_REVISION);
     try std.testing.expectEqual(
         @as(u32, 8),
         std.mem.readInt(u32, &abi_revision_bytes, .little),
@@ -8190,4 +8190,377 @@ test "Revision 10 process plugin descriptors fail closed before staging" {
         api.runtime().create()(&runtime_config, &plugins, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
+}
+
+fn submitMultimodal(
+    fixture: *PublicSessionFixture,
+    run_id: u64,
+    parts: []const wire.RunInputPartV1,
+    out_result: *wire.RunResultV1,
+) u32 {
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    out_result.* = std.mem.zeroes(wire.RunResultV1);
+    return fixture.api.session().runMultimodal(
+        fixture.session,
+        run_id,
+        parts,
+        &options,
+        out_result,
+        &fixture.diagnostic,
+    );
+}
+
+test "L2 Revision 15 multimodal Run carries ordered image parts into the provider request and survives checkpoint restore" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    var create = sessionCreateConfig(&host, "claude-vision-fixture");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &create, &callbacks, &session, &diagnostic),
+    );
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    const parts = [_]wire.RunInputPartV1{
+        sdk.textPart("leading-part"),
+        sdk.imagePart("image/png", "UE5HREFUQQ=="),
+        sdk.textPart("trailing-part"),
+    };
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runMultimodal(session, 1, &parts, &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    {
+        const request = server.lastRequest() orelse return error.MissingRequest;
+        const body = request.body();
+        const image_wire =
+            "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}";
+        const leading = std.mem.indexOf(u8, body, "leading-part") orelse return error.MissingTextPart;
+        const image = std.mem.indexOf(u8, body, image_wire) orelse return error.MissingImagePart;
+        const trailing = std.mem.indexOf(u8, body, "trailing-part") orelse return error.MissingTextPart;
+        try std.testing.expect(leading < image and image < trailing);
+    }
+
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&restore_report);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().restore()(
+            runtime,
+            &restore_config,
+            &callbacks,
+            &session,
+            &restore_report,
+            &diagnostic,
+        ),
+    );
+
+    var continued = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(
+            session,
+            2,
+            sdk.bytesView("continue after restore"),
+            &options,
+            &continued,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, continued.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    {
+        // The restored Conversation resends the original image bytes: the
+        // checkpoint block-tag-5 round trip is observable at the provider wire.
+        const request = server.lastRequest() orelse return error.MissingRequest;
+        const body = request.body();
+        try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
+    }
+}
+
+test "L2 Revision 15 image capability preflight rejects before any Provider request and keeps the Run id reusable" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // "test-model" has no vision capability under the Anthropic profile.
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", "UE5HREFUQQ=="),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
+        submitMultimodal(&fixture, 1, &with_image, &result),
+    );
+    fixture.releaseDiagnostic();
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    // Text-only multimodal input needs no image capability, and the rejected
+    // Run was never admitted, so the same Run id remains usable.
+    const text_only = [_]wire.RunInputPartV1{sdk.textPart("plain multimodal text")};
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        submitMultimodal(&fixture, 1, &text_only, &result),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
+test "Revision 15 multimodal wire validation bounds every length before payload access" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var fixture = try PublicSessionFixture.init(root, "http://127.0.0.1:1", "claude-vision-fixture");
+    defer fixture.deinit();
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    // TEXT and SKILL kinds must keep parts null with zero count.
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    const stray_part = [_]wire.RunInputPartV1{sdk.textPart("stray")};
+    var text_with_parts = std.mem.zeroes(wire.RunInputV1);
+    text_with_parts.struct_size = @sizeOf(wire.RunInputV1);
+    text_with_parts.kind_code = wire.RUN_INPUT_TEXT;
+    text_with_parts.text = sdk.bytesView("prompt");
+    text_with_parts.parts = &stray_part;
+    text_with_parts.part_count = stray_part.len;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        fixture.api.session().runInput()(
+            fixture.session,
+            1,
+            &text_with_parts,
+            &options,
+            &result,
+            &fixture.diagnostic,
+        ),
+    );
+    fixture.releaseDiagnostic();
+
+    // Empty parts arrays are malformed wire, not an empty prompt.
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        submitMultimodal(&fixture, 1, &.{}, &result),
+    );
+    fixture.releaseDiagnostic();
+
+    // Part-count and payload caps reject with null payload pointers, proving
+    // the declared lengths are bounded before any pointer is dereferenced.
+    var too_many: [65]wire.RunInputPartV1 = undefined;
+    for (&too_many) |*part| part.* = sdk.textPart("x");
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        submitMultimodal(&fixture, 1, &too_many, &result),
+    );
+    fixture.releaseDiagnostic();
+
+    var oversized_image = sdk.imagePart("image/png", "");
+    oversized_image.data = .{ .ptr = null, .len = wire.MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 + 4 };
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        submitMultimodal(&fixture, 1, &.{oversized_image}, &result),
+    );
+    fixture.releaseDiagnostic();
+
+    var oversized_total: [4]wire.RunInputPartV1 = undefined;
+    for (&oversized_total) |*part| {
+        part.* = sdk.imagePart("image/png", "");
+        part.data = .{ .ptr = null, .len = 4_500_000 };
+    }
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        submitMultimodal(&fixture, 1, &oversized_total, &result),
+    );
+    fixture.releaseDiagnostic();
+
+    // Semantic part validation: allowlisted media type, standard base64,
+    // non-empty text, exact per-kind canonical-empty fields.
+    const cases = [_]wire.RunInputPartV1{
+        sdk.imagePart("image/tiff", "UE5HREFUQQ=="),
+        sdk.imagePart("image/png", "not base64!!"),
+        sdk.imagePart("image/png", "UE5HREFUQQ="),
+        sdk.textPart(""),
+        blk: {
+            var part = sdk.imagePart("image/png", "UE5HREFUQQ==");
+            part.text = sdk.bytesView("text on an image part");
+            break :blk part;
+        },
+        blk: {
+            var part = sdk.textPart("wrong size");
+            part.struct_size = @sizeOf(wire.RunInputPartV1) - 8;
+            break :blk part;
+        },
+        blk: {
+            var part = sdk.textPart("reserved");
+            part.reserved[1] = 7;
+            break :blk part;
+        },
+        blk: {
+            var part = sdk.textPart("unknown kind");
+            part.kind_code = 99;
+            break :blk part;
+        },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            wire.STATUS_INVALID_ARGUMENT,
+            submitMultimodal(&fixture, 1, &.{case}, &result),
+        );
+        fixture.releaseDiagnostic();
+    }
+}
+
+test "L2 Revision 15 multimodal root input reserves its durable delta before admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var fixture = try PublicSessionFixture.init(root, "http://127.0.0.1:1", "claude-vision-fixture");
+    defer fixture.deinit();
+
+    // Two well-formed 4.8 MB base64 images pass every wire cap (per image
+    // < 5,000,000; total < 16 MiB) but exceed the default 8 MiB durable input
+    // cap, so the exact multimodal reservation must reject before admission.
+    const image_bytes = try a.alloc(u8, 4_800_000);
+    defer a.free(image_bytes);
+    @memset(image_bytes, 'A');
+    const parts = [_]wire.RunInputPartV1{
+        sdk.imagePart("image/png", image_bytes),
+        sdk.imagePart("image/jpeg", image_bytes),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
+        submitMultimodal(&fixture, 1, &parts, &result),
+    );
+    try std.testing.expectEqual(
+        wire.RUN_CHECKPOINT_BUDGET_REQUIRED,
+        result.checkpoint_outcome_code,
+    );
+    fixture.releaseDiagnostic();
+}
+
+test "L2 Revision 15 multimodal Run reaches OpenAI Responses under a non-Anthropic model name and durable accounting" {
+    // Regression: the durable-budget canonical request measurement serializes a
+    // provider-neutral Anthropic projection. It must never re-apply per-model
+    // image capability, or a vision model whose name lacks "claude" (every
+    // OpenAI/Gemini model) fails accounting before the real request is sent.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{OPENAI_RESPONSES_FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.initProviderConfigured(
+        root,
+        url,
+        "gpt-5.2",
+        null,
+        wire.RUN_JOURNAL_DURABLE_WORKSPACE,
+        wire.PROVIDER_OPENAI,
+        wire.OPENAI_PROTOCOL_RESPONSES,
+    );
+    defer fixture.deinit();
+    const parts = [_]wire.RunInputPartV1{
+        sdk.textPart("describe the attached icon"),
+        sdk.imagePart("image/png", "aWNvbi1ieXRlcw=="),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        submitMultimodal(&fixture, 1, &parts, &result),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    const request = server.lastRequest() orelse return error.MissingRequest;
+    const body = request.body();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        body,
+        "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,aWNvbi1ieXRlcw==\"}",
+    ) != null);
 }

@@ -233,6 +233,29 @@ pub fn preflight(
     return preflightProjected(profile, current_usage, raw_input, input_delta);
 }
 
+/// Multimodal companion of `preflight`: one user record built from ordered
+/// text/image parts reserves its exact encoded delta, the same admission
+/// invariant text prompts use. Raw input counts every borrowed payload byte
+/// (text, media_type, base64 data).
+pub fn preflightParts(
+    profile: Profile,
+    current_usage: u64,
+    parts: []const core.message.UserContentPart,
+) Error!Preflight {
+    try profile.validate();
+    var raw_input: u64 = 0;
+    for (parts) |part| switch (part) {
+        .text => |bytes| raw_input = try checkedAdd(raw_input, bytes.len),
+        .image => |image| {
+            raw_input = try checkedAdd(raw_input, image.media_type.len);
+            raw_input = try checkedAdd(raw_input, image.data.len);
+        },
+    };
+    const input_delta = checkpoint.encodedUserPartsMessageBytes(parts) catch
+        return error.ResourceLimit;
+    return preflightProjected(profile, current_usage, raw_input, input_delta);
+}
+
 pub fn preflightProjected(
     profile: Profile,
     current_usage: u64,

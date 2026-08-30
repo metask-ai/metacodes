@@ -193,11 +193,38 @@ pub fn measureSnapshot(snapshot: Snapshot, limits: Limits) Error!Usage {
     };
 }
 
-/// Exact encoded delta for one Message containing one text block. This is the
-/// only pre-admission input shape currently accepted by AgentCore Runs.
+/// Exact encoded delta for one Message containing one text block. Text Runs
+/// reserve their pre-admission root record through this; multimodal Runs use
+/// `encodedUserPartsMessageBytes`.
 pub fn encodedTextMessageBytes(bytes: []const u8) Error!u64 {
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.Corrupt;
     return checkedAdd(14, bytes.len);
+}
+
+/// Exact encoded delta for one user Message built from ordered text/image
+/// parts, matching `measureMessage` byte for byte: 1 role byte + 4 count
+/// bytes, then per block one tag byte plus 8-byte-length-prefixed strings
+/// (text, or media_type then base64 data).
+pub fn encodedUserPartsMessageBytes(parts: []const message.UserContentPart) Error!u64 {
+    if (parts.len == 0) return error.Corrupt;
+    var size: u64 = 1 + 4;
+    for (parts) |part| {
+        size = try checkedAdd(size, 1);
+        switch (part) {
+            .text => |bytes| {
+                if (!std.unicode.utf8ValidateSlice(bytes)) return error.Corrupt;
+                size = try checkedAdd(try checkedAdd(size, 8), bytes.len);
+            },
+            .image => |image| {
+                if (!std.unicode.utf8ValidateSlice(image.media_type) or
+                    !std.unicode.utf8ValidateSlice(image.data))
+                    return error.Corrupt;
+                size = try checkedAdd(try checkedAdd(size, 8), image.media_type.len);
+                size = try checkedAdd(try checkedAdd(size, 8), image.data.len);
+            },
+        }
+    }
+    return size;
 }
 
 pub fn decodeFromSource(
@@ -1201,4 +1228,41 @@ test "checkpoint round-trips image blocks (tag 5, issue #10)" {
     try std.testing.expectEqualStrings("UE5HREFUQQ==", restored[1].image.data);
     try std.testing.expectEqualStrings("image/jpeg", restored[2].image.media_type);
     try std.testing.expectEqualStrings("SlBFRw==", restored[2].image.data);
+}
+
+test "encodedUserPartsMessageBytes 与真实编码字节精确一致(多模态预留=提交)" {
+    const allocator = std.testing.allocator;
+    var conversation = Conversation.init(allocator);
+    defer conversation.deinit();
+    const parts = [_]message.UserContentPart{
+        .{ .text = "看这张截图" },
+        .{ .image = .{ .media_type = "image/png", .data = "UE5HREFUQQ==" } },
+        .{ .text = "以及后记" },
+    };
+    try conversation.appendUserParts(&parts);
+    const limits = Limits{ .hard_bytes = 1024 * 1024 };
+    const usage = try measureSnapshot(.{
+        .session_id = core.session_id.gen(),
+        .checkpoint_generation = 1,
+        .last_run_id = 1,
+        .last_compact_id = 0,
+        .terminal_kind = .run,
+        .terminal_id = 1,
+        .model = "claude-sonnet-4",
+        .conversation = &conversation,
+        .policy_generation = 1,
+        .catalog_generation = 1,
+        .authority = .{ .skill = "", .permission = "", .mcp = "" },
+    }, limits);
+    try std.testing.expectEqual(
+        try encodedUserPartsMessageBytes(&parts),
+        usage.message_bytes,
+    );
+    // 单 text part 与既有 text 根记录公式一致(5+1+8+len == 14+len)。
+    const text_only = [_]message.UserContentPart{.{ .text = "hello" }};
+    try std.testing.expectEqual(
+        try encodedTextMessageBytes("hello"),
+        try encodedUserPartsMessageBytes(&text_only),
+    );
+    try std.testing.expectError(error.Corrupt, encodedUserPartsMessageBytes(&.{}));
 }

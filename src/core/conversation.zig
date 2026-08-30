@@ -183,6 +183,13 @@ pub const Conversation = struct {
         try self.append(m);
     }
 
+    /// 便利方法：追加 text/image 任意有序混排的 user 消息。字节被复制。
+    pub fn appendUserParts(self: *Conversation, parts: []const msg.UserContentPart) !void {
+        const m = try msg.userMessageFromParts(self.allocator, parts);
+        errdefer m.deinit(self.allocator);
+        try self.append(m);
+    }
+
     pub fn len(self: *const Conversation) usize {
         return self.messages.items.len;
     }

@@ -313,7 +313,7 @@ fn renderReadme(
         \\
         \\The ABI is experimental and requires an exact revision match. Ownership, lifetime, concurrency,
         \\and failure contracts are defined by `doc/AGENTCORE_BINARY_ABI.md` at the source commit above.
-        \\Revision 14 exposes one 64-byte root plus mandatory Runtime, Session, Session Control, Skill,
+        \\Revision 15 exposes one 64-byte root plus mandatory Runtime, Session, Session Control, Skill,
         \\and MCP tables. It has no capability negotiation and no independent public Completion client.
         \\The public header and bindings expose the complete Skill catalog resource contract: 16 MiB per
         \\file, 32 MiB/1024 files/4096 entries per Skill, 64 MiB/16384 files/1024 slots per catalog,

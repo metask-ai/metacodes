@@ -61,7 +61,7 @@ pub const PermissionCandidate = struct {
     scope: PermissionCandidateScope,
 };
 
-/// Exact Revision 14 Permission callback request. Unlike AskUserQuestion this
+/// Exact Revision 15 Permission callback request. Unlike AskUserQuestion this
 /// is a flat typed object, identified by `type == "permission"`.
 pub const PermissionRequest = struct {
     type: []const u8,

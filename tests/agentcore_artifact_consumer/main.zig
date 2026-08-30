@@ -4,8 +4,14 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 14 or
+    if (wire.ABI_REVISION != 15 or
         @intFromEnum(wire.Status.skill_catalog_incomplete) != 27 or
+        @intFromEnum(wire.Status.image_input_unsupported) != 28 or
+        wire.RUN_INPUT_MULTIMODAL != 3 or
+        wire.RUN_INPUT_PART_TEXT != 1 or
+        wire.RUN_INPUT_PART_IMAGE != 2 or
+        wire.MAX_RUN_INPUT_PARTS_V1 != 64 or
+        wire.MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 != 5_000_000 or
         wire.PROTOCOL_DEFAULT != 0 or
         wire.OPENAI_PROTOCOL_RESPONSES != 1 or
         wire.MCP_NEGOTIATION_AUTO != 1 or
@@ -18,10 +24,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 14 codes must match the public contract");
+        @compileError("source-free Revision 15 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 14 must not expose the removed catalog refresh entry");
+        @compileError("revision 15 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -757,7 +763,7 @@ pub fn main(init: std.process.Init) !void {
         &diagnostic,
     ), diagnostic);
     api.bufferRelease()(&descriptor);
-    const responses_server = try Server.start(init.io, &.{RESPONSES_FINAL_SSE});
+    const responses_server = try Server.start(init.io, &.{ RESPONSES_FINAL_SSE, RESPONSES_FINAL_SSE });
     defer responses_server.stop();
     const responses_url = try responses_server.url(a);
     session_host.provider_kind_code = wire.PROVIDER_OPENAI;
@@ -801,6 +807,15 @@ pub fn main(init: std.process.Init) !void {
     }
     api.bufferRelease()(&restore_report);
 
+    // The checkpoint intentionally carries the earlier fixture model. Once the
+    // restored session is switched to OpenAI Responses, select a verified
+    // vision-capable model before exercising the multimodal ABI path.
+    try expectStatus(
+        .ok,
+        api.sessionControl().setModel()(session, sdk.bytesView("gpt-5.2"), &diagnostic),
+        diagnostic,
+    );
+
     try probe.beginRun(3);
     try expectStatus(.ok, api.session().runText(
         session,
@@ -814,13 +829,32 @@ pub fn main(init: std.process.Init) !void {
     if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn)
         return error.UnexpectedRunResult;
 
+    // Revision 15 multimodal input over the same restored Responses Session:
+    // an ordered text+image parts array is a first-class Run input.
+    const multimodal_parts = [_]wire.RunInputPartV1{
+        sdk.textPart("describe the attached icon"),
+        sdk.imagePart("image/png", "aWNvbi1ieXRlcw=="),
+    };
+    try probe.beginRun(4);
+    try expectStatus(.ok, api.session().runMultimodal(
+        session,
+        4,
+        &multimodal_parts,
+        &options,
+        &result,
+        &diagnostic,
+    ), diagnostic);
+    try probe.endRun(4);
+    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn)
+        return error.UnexpectedRunResult;
+
     try probe.unregisterSession(session.?);
     try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
     session = null;
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 14 Agent Runtime, OpenAI Responses, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 15 Agent Runtime, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

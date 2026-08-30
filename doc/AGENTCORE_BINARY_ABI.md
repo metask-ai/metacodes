@@ -9,20 +9,23 @@ ABI v1 is an experimental in-process embedding contract for synchronous,
 stateful AgentSession execution. It does not expose or define a host product
 model.
 
-**Status: experimental.** Revision 14 is one exact hard-cut Agent Runtime wire
+**Status: experimental.** Revision 15 is one exact hard-cut Agent Runtime wire
 shape. It keeps the existing Permission authority, checkpoint/restore, durable
 budget, MCP Runtime/Session seams, Workspace Skill source/identity/policy
 binding, hash-pinned process-tool packages, Host/MCP byte-zero Tool Result
-streaming, and active-Run intent/result journal. It deliberately removes the
-independent public Completion facade. This is not a general v1 stability
-promise.
+streaming, and active-Run intent/result journal. Over Revision 14 it adds one
+capability: `session_run_input` accepts a third tagged kind,
+`RUN_INPUT_MULTIMODAL`, carrying an ordered text/image parts array with a
+pre-admission image-capability preflight (public status code 28). It
+deliberately removes the independent public Completion facade. This is not a
+general v1 stability promise.
 
 Consumers must pin an exact bundle (the manifest records the source commit)
 and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 14**. Revision 14 is a
+The current experimental bundle is **ABI v1 revision 15**. Revision 15 is a
 hard-cut replacement for every earlier revision. The root is no longer a
 capability-tagged flat table. It is a 64-byte exact layout containing the
 stable 16-byte discovery prefix, `buffer_release`, and five non-null typed
@@ -30,7 +33,7 @@ table pointers. Every table is mandatory at discovery; consumers simply avoid
 calling domains they do not use. There is no `query_interface`, string ID,
 optional-capability negotiation, or compatibility shim:
 
-- `metask_agentcore_api_v1` is 64 bytes and requires `abi_revision == 14`;
+- `metask_agentcore_api_v1` is 64 bytes and requires `abi_revision == 15`;
 - Runtime, Session, Session Control, Skill, and MCP tables are respectively
   24, 40, 64, 32, and 40 bytes;
 - the root plus child tables expose 21 functions: root `buffer_release` and
@@ -38,6 +41,9 @@ optional-capability negotiation, or compatibility shim:
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
   `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
   96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
+  `RunInputPartV1` is 72 bytes, and `RunInputV1` replaces two former reserved
+  words with the `parts` pointer (offset 72) and `part_count` (offset 80) of
+  the multimodal input kind;
 - `ProcessPluginSourceV1` and `RuntimePluginConfigV1` are respectively 48 and
   72 bytes; `HostResultSinkV1` and `HostStreamToolV1` are respectively 56 and
   96 bytes; the single `runtime->create` takes a nullable plugin config, where
@@ -52,12 +58,13 @@ optional-capability negotiation, or compatibility shim:
 - `SkillSourceV1`, `SkillPolicyV1`, and `SkillCatalogQueryV1` are respectively
   64, 56, and 80 bytes;
 - public status code 26 is a permanent tombstone; decoding it yields unknown,
-  while `SKILL_CATALOG_INCOMPLETE` remains 27;
-- `manifest.json` keeps schema version 1 and records revision 14 and root size
+  while `SKILL_CATALOG_INCOMPLETE` remains 27 and `IMAGE_INPUT_UNSUPPORTED`
+  is 28;
+- `manifest.json` keeps schema version 1 and records revision 15 and root size
   64. Child-table validation belongs to ABI discovery and is not duplicated in
   bundle metadata.
 
-Revision 14 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
+Revision 15 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then validate
@@ -66,16 +73,16 @@ per-Run callback validates and copies any retained `RunContext`
 fields during the callback, and Host registries bind/compare `session_id`
 atomically under their per-Session lock.
 
-Revision 14 deliberately exposes explicit process-package sources, their
+Revision 15 deliberately exposes explicit process-package sources, their
 namespaced `host_tool` contributions, and explicit Host stream-tool
 descriptors. It does not expose the generic
 data/static plugin grouping model or `metacodes.plugin-inventory/v1`; those
 remain available through the source-level Zig Runtime plus CLI/Web JSON Host
 interfaces. Projecting generic inventory into this binary table requires a
-later explicit ABI revision. A revision-14 consumer must not infer plugin
+later explicit ABI revision. A revision-15 consumer must not infer plugin
 identity from tool or Skill names, and every reserved field remains zero.
 
-### Revision 14 table topology
+### Revision 15 table topology
 
 The root layout is exact on the required 64-bit pointer ABI:
 
@@ -83,7 +90,7 @@ The root layout is exact on the required 64-bit pointer ABI:
 |---:|---|---|
 | 0 | `struct_size` | exactly 64 |
 | 4 | `abi_version` | exactly 1 |
-| 8 | `abi_revision` | exactly 14 |
+| 8 | `abi_revision` | exactly 15 |
 | 12 | `reserved0` | zero |
 | 16 | `buffer_release` | non-null function |
 | 24 | `runtime` | non-null 24-byte table |
@@ -108,8 +115,9 @@ A validator first checks non-null root alignment and only the stable
 exact 64-byte/version check, and may dereference a child only after that child
 pointer is non-null and aligned. Wrong revision, reserved values, child sizes,
 or any null slot reject the entire discovery. The 280-byte Revision 13 root and
-the unreleased 72-byte R14 reference layout therefore fail at root size without
-an out-of-bounds read.
+the unreleased 72-byte reference layout therefore fail at root size without an
+out-of-bounds read, and a stale 64-byte Revision 14 root fails at the revision
+check.
 
 A future stability freeze first requires closure of the open items tracked in
 `doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (every group A item closed; every
@@ -240,23 +248,24 @@ Current delivery status is intentionally target-specific:
 
 | Target | Bundle/archive | Native source-free consumption |
 |---|---|---|
-| `x86_64-windows-msvc` | revision 14 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-08-26) | C/C++/Zig/Rust source-free native gate passed, including fresh/restore and continued Runs |
-| `aarch64-windows-msvc` | revision 14 ReleaseSafe cross-bundle, schema-1 manifest, public-symbol, and C/C++/Zig source-free link gates passed locally (2026-08-28) | native C/C++/Zig/Rust revision 14 gate pending |
-| `aarch64-windows-gnu` | revision 14 ReleaseSafe cross-bundle, schema-1 manifest, public-symbol, and C/C++/Zig source-free link gates passed locally (2026-08-28) | native C/C++/Zig/Rust revision 14 gate pending |
-| `x86_64-windows-gnu` | revision 13 evidence retained; revision 14 not revalidated | native revision 14 gate pending |
-| `x86_64-linux-gnu` | revision 13 evidence retained; revision 14 not revalidated | native revision 14 gate pending |
-| `x86_64-macos` | revision 13 evidence retained; revision 14 not revalidated | native revision 14 gate pending |
-| `aarch64-macos` | revision 13 evidence retained; revision 14 not revalidated | native revision 14 gate pending |
+| `aarch64-macos` | revision 15 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-08-29) | C/C++/Zig/Rust source-free native gate passed, including multimodal, fresh/restore and continued Runs |
+| `x86_64-windows-msvc` | revision 14 evidence retained; revision 15 not revalidated | native revision 15 gate pending |
+| `aarch64-windows-msvc` | revision 14 evidence retained; revision 15 not revalidated | native revision 15 gate pending |
+| `aarch64-windows-gnu` | revision 14 evidence retained; revision 15 not revalidated | native revision 15 gate pending |
+| `x86_64-windows-gnu` | revision 13 evidence retained; revision 15 not revalidated | native revision 15 gate pending |
+| `x86_64-linux-gnu` | revision 13 evidence retained; revision 15 not revalidated | native revision 15 gate pending |
+| `x86_64-macos` | revision 13 evidence retained; revision 15 not revalidated | native revision 15 gate pending |
 
 Cross-build success is not a support claim. In particular, the empty macOS
 framework list remains provisional until the corresponding native gates pass.
 This validation status is not an ABI restriction.
 
-Revision 14 hard-cuts the current schema-1 manifest contract in place. The
+Revision 15 hard-cuts the current schema-1 manifest contract in place. The
 manifest records the exact ABI version, revision, and root size, while runtime
 discovery validates all five mandatory child tables. There is no manifest
 migration, dual parser, capability negotiation, or duplicated child-table
-inventory; Revision 13 bundles are rejected by their revision and root size.
+inventory; earlier-revision bundles are rejected by their recorded revision,
+and Revision 13 additionally by root size.
 
 ReleaseSafe bundles strip DWARF by default; the explicit
 `-Dagentcore-strip=true` in the release command pins that policy in build
@@ -284,10 +293,10 @@ remain valid until `deinit`; consumers must not copy an owner and deinitialize
 both copies.
 
 `decodeSkillCatalog` returns an owned `ParsedSkillCatalog` for
-`metask.skill-catalog/v1`. Revision 14 hard-cuts the current experimental shape
+`metask.skill-catalog/v1`. Revision 15 hard-cuts the current experimental shape
 of that schema: every earlier unreleased experimental shape bearing the same
 token is void, and consumers must interpret the descriptor only with the exact
-Revision 14 bundle they pin. The decoder validates the
+Revision 15 bundle they pin. The decoder validates the
 schema, the 1024-Skill limit, identity forms, duplicate concrete `skill_id` or
 `skill_policy_key` records, health and issue consistency, and each Skill
 argument schema. AgentCore remains the canonical producer and independently
@@ -368,7 +377,7 @@ ordering and may invoke their callbacks concurrently. The stream has no common
 event sequence number, cursor, replay, or exactly-once contract; only
 `run_state.transition_seq` orders RunState snapshots.
 
-`on_event` is mandatory in Revision 14. `run_state` is emitted for admitted-run
+`on_event` is mandatory in Revision 15. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
 and advances only for emitted RunState snapshots. Usage remains authoritative
@@ -415,7 +424,7 @@ serialized AgentCore observation and does not mutate Core-owned evidence.
 
 `output_segment_begin` and `output_segment_end` are additive ABI-v1 observation
 tags. Older Hosts decode them through the `unknown` observation path; no C ABI
-layout, function table, or Revision 14 change is involved.
+layout, function table, or Revision 15 change is involved.
 
 `file_changes` is likewise an additive ABI-v1 observation tag. Its JSON bytes
 are borrowed only for the synchronous callback; the Zig SDK decoder returns an
@@ -425,7 +434,7 @@ owned typed value. Older Hosts retain the event through the `unknown` path.
 decode it through the `unknown` observation path and ignore or retain it in
 accordance with the forward-compatibility rules above.
 
-`tool_result.file_refs` is an optional Revision 14 observation field. It is
+`tool_result.file_refs` is an optional Revision 15 observation field. It is
 present only for successful selected built-in file-tool executions and contains
 at most 32 entries. Each entry has one locator union (`workspace_path`,
 `absolute_path`, or `uri`), an open-ended bounded `kind` string, a bounded
@@ -452,7 +461,7 @@ their `ctx` and keeps it valid until Session destruction succeeds.
 
 ### Process-plugin Runtime configuration
 
-Revision 14 uses one `runtime->create(runtime_config, plugin_config,
+Revision 15 uses one `runtime->create(runtime_config, plugin_config,
 out_runtime, out_diagnostic)`. The Runtime config is required; the plugin
 config is nullable. Null and an empty, well-formed `RuntimePluginConfigV1`
 create equivalent no-extra-plugin generations. Descriptor arrays and path
@@ -511,7 +520,7 @@ version, pinned executable SHA-256, global tool name and validated reserialized
 input schema.
 The binding—not the display name alone—enters Permission provenance and
 checkpoint authority resolution. Process tools deliberately have no
-`allow_session`/`deny_session` candidate in revision 14, so a Host may answer
+`allow_session`/`deny_session` candidate in revision 15, so a Host may answer
 only the offered one-shot choices unless an independent native rule decides
 first. Changing executable/package/schema authority invalidates a restored
 binding instead of silently reauthorizing the new implementation.
@@ -606,7 +615,7 @@ not define status precedence when multiple other input or admission errors are
 present in the same call.
 
 ABI v1 provides no in-place recovery or mutation of a poisoned Session. The
-Host must destroy that physical handle. Revision 14 checkpoint/restore creates
+Host must destroy that physical handle. Revision 15 checkpoint/restore creates
 a new handle from a previously exported committed checkpoint; it does not
 reconstruct state that was never successfully exported or resume an active
 Run.
@@ -614,7 +623,7 @@ Run.
 When facade poison occurs after Core has returned to an inspectable idle state,
 `session_describe` succeeds and reports lifecycle `poisoned`; it must not report
 `idle`. An active ordinary Session activity makes `session_describe` return
-`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 14 description does not
+`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 15 description does not
 emit lifecycle `busy`.
 
 A checkpoint is resumable model state, not a raw transcript archive. Before
@@ -654,7 +663,7 @@ requests cooperative abort and any other value returns
 ### Manual compact
 
 `session_compact` runs the canonical default compact policy as a best-effort
-Conversation maintenance operation. Revision 14 has no Host-supplied target
+Conversation maintenance operation. Revision 15 has no Host-supplied target
 token budget and does not guarantee that the result fits the context window of
 the current or a future model. `session_set_model` and `session_compact` are
 independent primitives, not a compound model-migration transaction.
@@ -663,7 +672,7 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 `after_context_tokens` are context-size estimates for UI and policy decisions;
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
-reason in Revision 14, and a Host must not infer one by parsing diagnostics.
+reason in Revision 15, and a Host must not infer one by parsing diagnostics.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
@@ -689,7 +698,7 @@ fresh-create input or restored checkpoint. `protocol_kind_code` occupies byte
 offset 140 in the unchanged 168-byte Host config and accepts:
 
 - `METASK_AGENTCORE_PROTOCOL_DEFAULT` (`0`): use the selected provider's
-  existing default. In Revision 14 that means Anthropic Messages, OpenAI Chat
+  existing default. In Revision 15 that means Anthropic Messages, OpenAI Chat
   Completions, or Gemini GenerateContent;
 - `METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES` (`1`): valid only with
   `METASK_AGENTCORE_PROVIDER_OPENAI`; serialize `POST /v1/responses` request
@@ -710,7 +719,7 @@ endpoint; the checkpoint does not persist or override connection authority.
 
 ### Active-Run intent/result journal
 
-`SessionHostConfigV1.run_journal_mode_code` is part of the exact revision-14
+`SessionHostConfigV1.run_journal_mode_code` is part of the exact revision-15
 wire contract and accepts only:
 
 - `METASK_AGENTCORE_RUN_JOURNAL_EPHEMERAL` (`0`): the default, zero-journal-I/O
@@ -732,7 +741,7 @@ downgraded to never.
 The journal is outside Conversation and provider request projection. Enabling
 it therefore does not insert prompt bytes, reorder history, or invalidate a
 warm prompt-cache prefix. An unfinished pair or retained crash marker fails
-closed; revision 14 does **not** expose in-place active-Run resume, automatic
+closed; revision 15 does **not** expose in-place active-Run resume, automatic
 tool replay, or exactly-once external effects. It provides durable evidence
 and deterministic recovery classification for a later explicit recovery API,
 not authority to guess whether an external side effect occurred.
@@ -800,14 +809,14 @@ published once, not that the Host filesystem is transactional.
 AgentCore does not implicitly read `/etc/metacodes/skills`, `.claude/skills`,
 `.codex/skills`, or `.metacodes/skills`. A Host may explicitly register any
 local directory only when its contents already use the canonical Agent Skill
-format. Directory names do not select a parser; Revision 14 has no Claude/Codex
+format. Directory names do not select a parser; Revision 15 has no Claude/Codex
 format adapter or public Provider Registry. The projected provider id is
 `agents.directory`.
 
 Each valid `skills[]` entry exposes separate identities:
 
 - `skill_policy_key`: the logical invocation slot, equal to
-  `invocation_name` in Revision 14;
+  `invocation_name` in Revision 15;
 - `provider_id`, `source_scope`, `source_instance_id`, and `contribution_id`:
   source identity;
 - `content_revision`: body/resources identity;
@@ -857,7 +866,9 @@ and Policy and atomically commits them only while idle. Any failure preserves
 the complete previous binding; it never partially disables exceptions or
 unbinds the old catalog. Rebind does not modify Conversation or `run_id`.
 
-`session_run_input` accepts exactly one tagged input:
+`session_run_input` accepts exactly one tagged input. Every kind populates
+only its own fields; every other view stays canonical empty, and the
+`parts`/`part_count` pair is null/zero except for the multimodal kind:
 
 - `RUN_INPUT_TEXT`: only `text` is non-empty; it is bounded to 16 MiB before
   pointer access or UTF-8 decoding. Slash-looking text has no special meaning.
@@ -865,6 +876,40 @@ unbinds the old catalog. Rebind does not modify Conversation or `run_id`.
   bound catalog. `skill_id`, `catalog_revision`, and `arguments_json` identify
   an explicit Host invocation. Arguments are canonical empty or
   `{"values":["..."]}`, with at most 64 values and 1 MiB encoded JSON.
+- `RUN_INPUT_MULTIMODAL`: `text` and the Skill fields are canonical empty;
+  `parts` points at 1..64 (`MAX_RUN_INPUT_PARTS_V1`) ordered `RunInputPartV1`
+  elements borrowed for the synchronous call. The parts become one user record
+  preserving Host order. Each element carries `struct_size` exactly 72, zero
+  reserved words, and exactly the fields of its kind:
+  - `RUN_INPUT_PART_TEXT`: non-empty UTF-8 `text`; `media_type` and `data`
+    canonical empty.
+  - `RUN_INPUT_PART_IMAGE`: `media_type` equal to one of `image/png`,
+    `image/jpeg`, `image/gif`, or `image/webp` (the same allowlist the
+    built-in Read tool derives from file extensions), plus non-empty `data` in
+    standard base64 with `=` padding and no whitespace; `text` canonical
+    empty. One image payload is bounded to
+    `MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1` (5,000,000 bytes — exactly the base64
+    encoding of the Read tool's 3.75 MB raw-image cap). Raw image bytes never
+    cross the ABI.
+
+  Every declared part length is bounded before the matching payload pointer is
+  dereferenced, and the summed part payload (text, media type, and base64
+  bytes) is bounded by the same 16 MiB input cap as `RUN_INPUT_TEXT`. Count,
+  per-image, and total-payload violations return
+  `METASK_AGENTCORE_STATUS_RESOURCE_LIMIT`; every other malformed part is
+  `METASK_AGENTCORE_STATUS_INVALID_ARGUMENT`.
+
+  After wire validation, and before admission or any Provider request, a
+  multimodal input containing at least one image part is preflighted against
+  the Session's current model capability (the same
+  `ModelProfile.supports_image_input` truth the provider serializers enforce).
+  An unsupported binding returns
+  `METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED` (28) without advancing
+  `run_id`, mutating Conversation, or sending anything to the Provider — the
+  same pre-Provider discipline as the provider-protocol codes above. The Host
+  may retry the same `run_id` after `session_set_model`, or resubmit without
+  images. A parts array with no image part needs no image capability. Images
+  are never silently dropped, OCR'd, or replaced with placeholder text.
 
 Observable validation order is fixed: malformed wire/identity is
 `INVALID_ARGUMENT`; mismatched pinned revision is `STALE_CATALOG`; an unknown
@@ -876,15 +921,19 @@ Materialization begins only after admission, is private to that activation,
 and is removed before terminal return. A Skill can only narrow the Session's
 tool, shell, and permission authority.
 
-Text input and typed Skill input share one root-record admission invariant.
-Text reserves its exact prompt record; Skill reserves its exact canonical
-invocation record before admission. Skill body rendering may read referenced
-files or run declared shell injection, so it remains inside the admitted Run.
-Before Conversation mutation, AgentCore atomically replaces the invocation-only
-estimate with the exact generated root records. Input-cap failure becomes a
-bounded resource-limit outcome and durable-budget shortage becomes a
-budget-exhausted outcome. AgentCore neither reserves the entire input cap as a
-fictional Skill payload nor moves effectful materialization before admission.
+Text, multimodal, and typed Skill input share one root-record admission
+invariant. Text and multimodal reserve their exact encoded root record —
+for multimodal that is the checkpoint-encoded ordered text/image user record —
+and Skill reserves its exact canonical invocation record before admission.
+Skill body rendering may read referenced files or run declared shell
+injection, so it remains inside the admitted Run. Before Conversation
+mutation, AgentCore atomically replaces the invocation-only estimate with the
+exact generated root records. Input-cap failure becomes a bounded
+resource-limit outcome and durable-budget shortage becomes a budget-exhausted
+outcome. AgentCore neither reserves the entire input cap as a fictional Skill
+payload nor moves effectful materialization before admission. An admitted
+multimodal record persists through `session_export_checkpoint` as ordered
+block tags 1/5, so a restored Session resends the original image bytes.
 
 The Session configuration owns the provider model binding. Skill metadata
 cannot replace it: inline Skills ignore `model`, fork Skills with an empty
@@ -939,7 +988,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 14. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 15. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -951,7 +1000,7 @@ product decision.
 
 ### MCP Runtime catalog and Session view
 
-Revision 14 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
+Revision 15 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
 connections. Public negotiation codes preserve Revision 6 meanings:
 `auto=1`, `modern_only=2`, and exact `legacy_only=3`; exact
 `legacy_2025_06_only=4` is appended. Runtime owns negotiation,
@@ -1002,7 +1051,7 @@ returns.
 | Reporting every completed HTTP response's final status and body | Host Connector |
 | Binding one connection context to `purpose_code` and `requested_era_code` | Host Connector |
 
-Revision 14 separates MCP control and result traffic in the type system.
+Revision 15 separates MCP control and result traffic in the type system.
 `McpConnectorV1.request` writes a 40-byte `McpResponseV1` only for bounded
 discovery/initialize/catalog control frames. Stdio responses use
 `http_status == 0`; Streamable HTTP completed responses use their final status
@@ -1092,12 +1141,12 @@ materializes a provider
 with the recorded envelope admission is an invariant violation. View
 destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
-outside Revision 14.
+outside Revision 15.
 
 The value-only MCP checkpoint section has one current `MCPSEL` format and no
 independent revision axis. Its decoder rejects every earlier `R6MCP`/`R7MCP`
 encoding. Era remains provenance rather than a selection fingerprint input.
-The outer AgentCore ABI Revision 14 remains the sole compatibility boundary.
+The outer AgentCore ABI Revision 15 remains the sole compatibility boundary.
 
 ### Model-visible MCP diagnostics
 
@@ -1142,7 +1191,7 @@ prompt-outcome contract replaces that seam.
 
 ### Completion boundary
 
-Revision 14 exposes no Completion handle, DTO, status, or function slot.
+Revision 15 exposes no Completion handle, DTO, status, or function slot.
 Independent title, summary, classification, and other product-level model calls
 belong to the Host or a product plugin. If the Agent itself must invoke such a
 capability, the Host exposes a semantically bounded Tool; a generic Completion
@@ -1275,7 +1324,9 @@ allocations or unbounded work:
 | one Runtime/Session metadata string | 1 MiB |
 | total Runtime metadata | 16 MiB |
 | total Session metadata | 4 MiB |
-| one TextInput prompt | 16 MiB |
+| one TextInput prompt; total multimodal part payload | 16 MiB |
+| parts per multimodal input | 64 |
+| one image part base64 payload | 5,000,000 bytes |
 | Skill invocation slots per catalog | 1024 |
 | one Skill argument array / JSON | 64 values / 1 MiB |
 | one catalog descriptor | 4 MiB |
@@ -1364,7 +1415,7 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. While Revision 14 remains
+`struct_size`; every reserved field must be zero. While Revision 15 remains
 unreleased and experimental, an explicitly approved hard cut may replace its
 wire shape in place only when the library, headers, SDKs, consumers, tests, and
 documentation move atomically; the replaced bundle is void and no compatibility
@@ -1376,11 +1427,11 @@ or control-message extensions require `metask_agentcore_get_api(2)` and v2
 types. Assigning a meaning or non-zero value to a reserved field is always an
 explicit wire-contract decision, never an inferred compatible extension.
 
-Revision 14's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 15's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
-Revision 14 has no root capability mask. The five typed table pointers and
+Revision 15 has no root capability mask. The five typed table pointers and
 their exact layouts are the complete ABI surface and are all mandatory.
 Concrete Runtime and Session configuration still determines which tools and
 callbacks are active; that configuration is not ABI capability negotiation.

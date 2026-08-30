@@ -2070,6 +2070,30 @@ const AbiSession = struct {
         };
     }
 
+    /// Multimodal companion of `preflightRootRecords`: one ordered
+    /// text/image user record reserves its exact encoded root-record delta
+    /// under the same pre-admission invariant.
+    fn preflightRootParts(
+        self: *AbiSession,
+        parts: []const core.message.UserContentPart,
+    ) !session_budget.Preflight {
+        const usage = try self.measureDurableUsage();
+        try self.budget_state.updateUsage(usage.total_bytes);
+        return session_budget.preflightParts(
+            self.budget_state.profile,
+            usage.total_bytes,
+            parts,
+        ) catch |err| switch (err) {
+            error.BudgetRequired => {
+                self.budget_state.recordRequired(
+                    self.budget_state.profile.hard_bytes +| 1,
+                );
+                return error.CheckpointBudgetRequired;
+            },
+            else => return err,
+        };
+    }
+
     fn finishBudgetedRun(
         self: *AbiSession,
         run_id: u64,
@@ -2893,6 +2917,12 @@ const AbiSession = struct {
         return execution;
     }
 
+    /// One pre-admission root input for the shared bound-Skill Run pipeline.
+    const RootRunInput = union(enum) {
+        text: []const u8,
+        parts: []const core.message.UserContentPart,
+    };
+
     fn runTextWithBoundSkills(
         self: *AbiSession,
         materializations: *skill_materialization.Manager,
@@ -2900,7 +2930,42 @@ const AbiSession = struct {
         prompt: []const u8,
         max_turns: u32,
     ) anyerror!SkillExecution {
-        const preflight = try self.preflightRootRecords(&.{prompt});
+        return self.runRootWithBoundSkills(
+            materializations,
+            run_id,
+            .{ .text = prompt },
+            max_turns,
+        );
+    }
+
+    /// Multimodal Text-Run companion: identical pipeline, with one ordered
+    /// text/image user record as the admitted root input.
+    fn runMultimodalWithBoundSkills(
+        self: *AbiSession,
+        materializations: *skill_materialization.Manager,
+        run_id: u64,
+        parts: []const core.message.UserContentPart,
+        max_turns: u32,
+    ) anyerror!SkillExecution {
+        return self.runRootWithBoundSkills(
+            materializations,
+            run_id,
+            .{ .parts = parts },
+            max_turns,
+        );
+    }
+
+    fn runRootWithBoundSkills(
+        self: *AbiSession,
+        materializations: *skill_materialization.Manager,
+        run_id: u64,
+        input: RootRunInput,
+        max_turns: u32,
+    ) anyerror!SkillExecution {
+        const preflight = switch (input) {
+            .text => |prompt| try self.preflightRootRecords(&.{prompt}),
+            .parts => |parts| try self.preflightRootParts(parts),
+        };
         var budget_controller = session_budget.Controller.init(
             allocator,
             self.budget_state.profile,
@@ -3016,13 +3081,23 @@ const AbiSession = struct {
                     .{uncovered},
                 );
         }
-        const result = admitted.runUserMessagesWithToolSurfaceUsingProvider(
-            &.{prompt},
-            max_turns,
-            execution_policy,
-            budget_tools.surface(),
-            budget_provider.provider(),
-        ) catch |run_error| {
+        const run_attempt = switch (input) {
+            .text => |prompt| admitted.runUserMessagesWithToolSurfaceUsingProvider(
+                &.{prompt},
+                max_turns,
+                execution_policy,
+                budget_tools.surface(),
+                budget_provider.provider(),
+            ),
+            .parts => |parts| admitted.runUserPartsWithToolSurfaceUsingProvider(
+                parts,
+                max_turns,
+                execution_policy,
+                budget_tools.surface(),
+                budget_provider.provider(),
+            ),
+        };
+        const result = run_attempt catch |run_error| {
             const callback_failed = if (skill_environment) |*environment|
                 environment.callbackFailed()
             else
@@ -3735,6 +3810,104 @@ fn text(v: wire.BytesViewV1) ![]const u8 {
     return bytes;
 }
 
+comptime {
+    // The wire image cap is exactly the standard base64 encoding of the Read
+    // tool's raw-image limit: one image the built-in Read tool can attach is
+    // also submittable through RUN_INPUT_MULTIMODAL, and nothing larger is.
+    if (wire.MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 !=
+        std.base64.standard.Encoder.calcSize(core.tool_read.MAX_IMAGE_BYTES))
+        @compileError("MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 must match the Read tool image cap");
+}
+
+/// The image media types every wired provider dialect accepts. This is the
+/// same allowlist the built-in Read tool and the headless `--image` entry
+/// derive from file extensions.
+fn isSupportedImageMediaType(media_type: []const u8) bool {
+    const supported = [_][]const u8{
+        "image/png", "image/jpeg", "image/gif", "image/webp",
+    };
+    for (supported) |candidate| {
+        if (std.mem.eql(u8, media_type, candidate)) return true;
+    }
+    return false;
+}
+
+/// Standard base64 with `=` padding and no whitespace: length divisible by
+/// four, alphabet `A-Z a-z 0-9 + /`, at most two `=` and only at the end.
+fn isStandardBase64(data: []const u8) bool {
+    if (data.len == 0 or data.len % 4 != 0) return false;
+    var padding: usize = 0;
+    for (data) |byte| {
+        if (byte == '=') {
+            padding += 1;
+            if (padding > 2) return false;
+            continue;
+        }
+        if (padding != 0) return false;
+        const in_alphabet = (byte >= 'A' and byte <= 'Z') or
+            (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or byte == '+' or byte == '/';
+        if (!in_alphabet) return false;
+    }
+    return true;
+}
+
+/// Wire validation for one RUN_INPUT_MULTIMODAL parts array. Every declared
+/// length is bounded before the matching payload pointer is dereferenced; the
+/// returned slices borrow the Host's part payloads for the synchronous call.
+fn parseMultimodalParts(
+    arena: std.mem.Allocator,
+    parts_ptr: ?[*]const wire.RunInputPartV1,
+    part_count: u64,
+    out_has_image: *bool,
+) ![]core.message.UserContentPart {
+    if (part_count == 0) return error.EmptyMultimodalInput;
+    if (part_count > wire.MAX_RUN_INPUT_PARTS_V1) return error.ResourceLimit;
+    const count: usize = @intCast(part_count);
+    const raw_parts = (parts_ptr orelse return error.InvalidMultimodalInput)[0..count];
+    var total_payload: u64 = 0;
+    for (raw_parts) |part| {
+        if (part.struct_size != @sizeOf(wire.RunInputPartV1) or !allZero(part.reserved))
+            return error.InvalidRunInputPart;
+        total_payload = std.math.add(u64, total_payload, part.text.len) catch
+            return error.ResourceLimit;
+        total_payload = std.math.add(u64, total_payload, part.media_type.len) catch
+            return error.ResourceLimit;
+        total_payload = std.math.add(u64, total_payload, part.data.len) catch
+            return error.ResourceLimit;
+        if (part.kind_code == wire.RUN_INPUT_PART_IMAGE and
+            part.data.len > wire.MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1)
+            return error.ResourceLimit;
+    }
+    if (total_payload > wire.MAX_PROMPT_BYTES_V1) return error.ResourceLimit;
+    const parsed = try arena.alloc(core.message.UserContentPart, count);
+    var has_image = false;
+    for (raw_parts, parsed) |part, *slot| {
+        switch (part.kind_code) {
+            wire.RUN_INPUT_PART_TEXT => {
+                if (!canonicalEmpty(part.media_type) or !canonicalEmpty(part.data))
+                    return error.InvalidRunInputPart;
+                const part_text = try text(part.text);
+                if (part_text.len == 0) return error.EmptyTextPart;
+                slot.* = .{ .text = part_text };
+            },
+            wire.RUN_INPUT_PART_IMAGE => {
+                if (!canonicalEmpty(part.text)) return error.InvalidRunInputPart;
+                const media_type = try text(part.media_type);
+                const data = try borrowed(part.data);
+                if (!isSupportedImageMediaType(media_type))
+                    return error.UnsupportedImageMediaType;
+                if (!isStandardBase64(data)) return error.InvalidImageBase64;
+                has_image = true;
+                slot.* = .{ .image = .{ .media_type = media_type, .data = data } };
+            },
+            else => return error.UnknownRunInputPartKind,
+        }
+    }
+    out_has_image.* = has_image;
+    return parsed;
+}
+
 fn ownedSlice(v: wire.OwnedBytesV1) error{ InvalidArgument, Overflow }![]const u8 {
     return borrowed(.{ .ptr = v.ptr, .len = v.len });
 }
@@ -3957,6 +4130,7 @@ fn runErrorStatus(self: *const AbiSession, err: anyerror) u32 {
         error.InvalidSessionState => wire.STATUS_INVALID_STATE,
         error.CallbackFailed => self.callbackFailureStatus(),
         error.CheckpointBudgetRequired => wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
+        error.ImageInputUnsupported => wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
         else => wire.STATUS_CORE_ERROR,
     };
 }
@@ -6514,6 +6688,8 @@ fn sessionRunInput(
             if (!canonicalEmpty(input.skill_id) or !canonicalEmpty(input.catalog_revision) or
                 !canonicalEmpty(input.arguments_json))
                 return fail(wire.STATUS_INVALID_ARGUMENT, "TextInput Skill fields must be canonical empty", out_error);
+            if (input.parts != null or input.part_count != 0)
+                return fail(wire.STATUS_INVALID_ARGUMENT, "TextInput parts must be null with zero count", out_error);
             if (input.text.len > wire.MAX_PROMPT_BYTES_V1)
                 return fail(wire.STATUS_RESOURCE_LIMIT, "prompt exceeds AgentCore ABI v1 limit", out_error);
             const prompt = text(input.text) catch |err|
@@ -6540,6 +6716,8 @@ fn sessionRunInput(
         wire.RUN_INPUT_SKILL => skill_run: {
             if (!canonicalEmpty(input.text))
                 return fail(wire.STATUS_INVALID_ARGUMENT, "SkillInvocation text must be canonical empty", out_error);
+            if (input.parts != null or input.part_count != 0)
+                return fail(wire.STATUS_INVALID_ARGUMENT, "SkillInvocation parts must be null with zero count", out_error);
             if (input.skill_id.len > 64 or input.catalog_revision.len > 64)
                 return fail(wire.STATUS_INVALID_ARGUMENT, "Skill identity exceeds its canonical length", out_error);
             if (input.arguments_json.len > wire.MAX_SKILL_ARGUMENT_JSON_BYTES_V1)
@@ -6573,6 +6751,47 @@ fn sessionRunInput(
                 }
                 return failError(status, err, out_error);
             };
+        },
+        wire.RUN_INPUT_MULTIMODAL => multimodal_run: {
+            if (!canonicalEmpty(input.text) or !canonicalEmpty(input.skill_id) or
+                !canonicalEmpty(input.catalog_revision) or !canonicalEmpty(input.arguments_json))
+                return fail(wire.STATUS_INVALID_ARGUMENT, "MultimodalInput text and Skill fields must be canonical empty", out_error);
+            var scratch = std.heap.ArenaAllocator.init(allocator);
+            defer scratch.deinit();
+            var has_image = false;
+            const parts = parseMultimodalParts(
+                scratch.allocator(),
+                input.parts,
+                input.part_count,
+                &has_image,
+            ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+            // Capability preflight (single truth: ModelProfile.supports_image_input).
+            // Rejection happens before admission and before any Provider request,
+            // so the Run ID stays reusable and Conversation is untouched.
+            if (has_image and !self.core_session.provider.provider().supports(.image_input))
+                return fail(
+                    wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
+                    "session model does not support image input",
+                    out_error,
+                );
+            const multimodal_execution = self.runMultimodalWithBoundSkills(
+                &runtime.materializations,
+                run_id,
+                parts,
+                options.max_turns,
+            ) catch |err| {
+                const status = runErrorStatus(self, err);
+                if (err == error.CheckpointBudgetRequired)
+                    writeRunBudgetFields(self, out);
+                if (err == error.AdmittedCleanupFailed or
+                    self.core_session.isPoisoned())
+                {
+                    if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
+                    self.facade_poisoned.store(true, .release);
+                }
+                return failError(status, err, out_error);
+            };
+            break :multimodal_run multimodal_execution;
         },
         else => return fail(wire.STATUS_INVALID_ARGUMENT, "unknown RunInputV1 kind", out_error),
     };
@@ -7044,7 +7263,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 14), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 15), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 64), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
