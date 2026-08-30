@@ -112,10 +112,10 @@ const Gemini = struct {
 
     /// Gemini generateContent 图像 part:{"inline_data":{"mime_type":<mime>,"data":<b64>}}。
     /// 输出单个 part 对象(与 {"text":..} 同级),数组逗号由 serializeGeminiContent 管理。
-    /// 能力守门:profile.supports_image_input=false 返 false,调用方报显式能力错误。
+    /// 能力守门在 Dialect.serializeImagePart wrapper(集中一处);本实现只管 wire 形态。
     fn serializeImagePart(ctx: *anyopaque, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
         _ = ctx;
-        if (!p.supports_image_input) return false;
+        _ = p;
         try out.appendSlice(a, "{\"inline_data\":{\"mime_type\":");
         try util_json.serializeString(image.media_type, out, a);
         try out.appendSlice(a, ",\"data\":");

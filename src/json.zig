@@ -16,6 +16,8 @@ pub const PropSpec = api_request.PropSpec;
 pub const serializeMessagesRequest = api_request.serializeMessagesRequest;
 pub const serializeCanonicalRequestProjection = api_request.serializeCanonicalRequestProjection;
 pub const serializeMessagesRequestWithDialect = api_request.serializeMessagesRequestWithDialect;
+pub const extractImageResult = api_request.extractImageResult;
+pub const ImageResult = api_request.ImageResult;
 
 // --- api/stream.zig 重导出 ---
 pub const SseParser = api_stream.SseParser;

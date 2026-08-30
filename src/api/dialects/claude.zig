@@ -58,11 +58,10 @@ const Claude = struct {
 
     /// Anthropic Messages API 图像 content block:
     /// {"type":"image","source":{"type":"base64","media_type":<mime>,"data":<b64>}}。
-    /// 能力守门:profile.supports_image_input=false(如经 Anthropic 网关的 GLM 文本模型)
-    /// 返 false,由调用方报显式能力错误。
+    /// 能力守门在 Dialect.serializeImagePart wrapper(集中一处);本实现只管 wire 形态。
     fn serializeImagePart(ctx: *anyopaque, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
         _ = ctx;
-        if (!p.supports_image_input) return false;
+        _ = p;
         try out.appendSlice(a, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
         try util_json.serializeString(image.media_type, out, a);
         try out.appendSlice(a, ",\"data\":");

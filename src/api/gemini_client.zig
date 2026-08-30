@@ -728,6 +728,9 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
         has_tool_result = true;
     };
     if (has_tool_result) {
+        // 同 OpenAI:tool_result 消息只投影 functionResponse parts,同消息 image 会被
+        // 静默丢——issue #10 铁律下防御性显式报错(正常路径经 merge 守护永不产出)。
+        for (m.content) |c| if (c == .image) return error.ImageWithToolResultUnsupported;
         // P0.1 并行:一轮多个 tool_result → **全部**作为同一 user content 的多个 functionResponse
         // parts(旧版只发首个 → 并行回合下一次请求缺 functionResponse 配对)。
         // functionResponse.name 必须是**原 functionCall 的真实名**(Gemini 靠 name 配对,非 id);
@@ -996,4 +999,18 @@ test "Gemini: image 在 text 前时顺序保持" {
     const img = std.mem.indexOf(u8, body, "\"inline_data\"").?;
     const txt = std.mem.indexOf(u8, body, "以上是截图").?;
     try std.testing.expect(img < txt);
+}
+
+test "Gemini: tool_result 消息混入 image → 显式错误(防 functionResponse 投影静默丢图)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok" } },
+            .{ .image = .{ .media_type = "image/png", .data = "QUJD" } },
+        } },
+    };
+    try std.testing.expectError(
+        error.ImageWithToolResultUnsupported,
+        serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null),
+    );
 }

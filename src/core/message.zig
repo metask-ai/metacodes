@@ -139,6 +139,8 @@ pub const ImageInput = struct {
 
 /// 构造多模态 user Message:可选前置 text + 按序图像列表(全部字节 dupe 成 owned)。
 /// text 为空且 images 为空 → error.EmptyMessage(不产出空 content 消息)。
+/// 定位:lib 嵌入方(borrowed 输入)的便利入口。CLI headless 自建 blocks(载荷所有权
+/// 直接转移,免二次 MB 拷贝),故仓库内无生产调用方——这是刻意保留的公共 API。
 pub fn userMessageWithImages(
     allocator: std.mem.Allocator,
     text: []const u8,

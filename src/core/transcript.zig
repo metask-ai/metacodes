@@ -247,6 +247,18 @@ pub const Writer = struct {
             };
             if (title.len > 0) break;
         }
+        // 纯图会话兜底:整个扫描找不到任何 user text(--image 允许空 prompt)才落
+        // "[image]" 标签——首条是图、后续消息有 text 时,text 仍然胜出(不因图占位
+        // 而永远锁死 /resume 列表标题)。
+        if (title.len == 0) {
+            outer: for (messages) |m| {
+                if (m.role != .user) continue;
+                for (m.blocks) |b| if (b == .image) {
+                    title = "[image]";
+                    break :outer;
+                };
+            }
+        }
 
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
@@ -403,9 +415,15 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
             const name = bv.object.get("name") orelse return error.InvalidTranscript;
             const input = bv.object.get("input") orelse return error.InvalidTranscript;
             if (id != .string or name != .string or input != .string) return error.InvalidTranscript;
+            // 逐字段 errdefer:第 2/3 个 dupe OOM 时,已 dupe 的前串未进 blocks
+            // (constructed 尚未 +1),函数级清理够不到——必须在此释放。
+            const id_owned = try allocator.dupe(u8, id.string);
+            errdefer allocator.free(id_owned);
+            const name_owned = try allocator.dupe(u8, name.string);
+            errdefer allocator.free(name_owned);
             blocks[idx] = .{ .tool_use = .{
-                .id = try allocator.dupe(u8, id.string),
-                .name = try allocator.dupe(u8, name.string),
+                .id = id_owned,
+                .name = name_owned,
                 .input = try allocator.dupe(u8, input.string),
             } };
         } else if (std.mem.eql(u8, tv.string, "tool_result")) {
@@ -413,8 +431,10 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
             const c = bv.object.get("content") orelse return error.InvalidTranscript;
             const is_err = bv.object.get("is_error") orelse std.json.Value{ .bool = false };
             if (tuid != .string or c != .string) return error.InvalidTranscript;
+            const tuid_owned = try allocator.dupe(u8, tuid.string);
+            errdefer allocator.free(tuid_owned);
             blocks[idx] = .{ .tool_result = .{
-                .tool_use_id = try allocator.dupe(u8, tuid.string),
+                .tool_use_id = tuid_owned,
                 .content = try allocator.dupe(u8, c.string),
                 .is_error = if (is_err == .bool) is_err.bool else false,
             } };
@@ -815,4 +835,59 @@ test "image + thinking 块 transcript roundtrip(issue #10 会话恢复语义)" {
     const asst_blocks = conv2.messages.items[1].blocks;
     try std.testing.expectEqualStrings("推理内容", asst_blocks[0].thinking);
     try std.testing.expectEqualStrings("两张图分别是…", asst_blocks[1].text);
+}
+
+test "title_guess: 纯图首条不锁死标题,后续 user text 胜出;全程无 text 才落 [image]" {
+    const a = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-title-img-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+    var writer = try Writer.init(a, "/dummy", tmp_home, "m", genSessionId());
+    defer writer.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    const blks = try a.alloc(msg_mod.Block, 1);
+    blks[0] = .{ .image = .{ .media_type = try a.dupe(u8, "image/png"), .data = try a.dupe(u8, "UE5H") } };
+    try conv.append(.{ .role = .user, .blocks = blks });
+    writer.flush(&conv);
+
+    {
+        const raw = try readMetaForTest(a, writer.dir);
+        defer a.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"title_guess\":\"[image]\"") != null);
+    }
+
+    // 后续 user text → 标题被 text 取代(不被 [image] 占位锁死)。
+    try conv.appendText(.user, "fix the login bug");
+    writer.flush(&conv);
+    {
+        const raw = try readMetaForTest(a, writer.dir);
+        defer a.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"title_guess\":\"fix the login bug\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "[image]") == null);
+    }
+}
+
+fn readMetaForTest(allocator: std.mem.Allocator, session_dir: []const u8) ![]u8 {
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/meta.json\x00", .{session_dir});
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    var all = std.ArrayList(u8).empty;
+    errdefer all.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = pfs.read(fd, &buf);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try all.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+    return all.toOwnedSlice(allocator);
 }

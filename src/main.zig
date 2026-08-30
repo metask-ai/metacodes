@@ -1180,8 +1180,14 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         } else if (std.mem.eql(u8, arg, "--dump-plugins")) {
             config.dump_plugins = true;
         } else if (std.mem.eql(u8, arg, "-")) {
-            // 从 stdin 读全部作为 prompt（headless pipe 模式）
-            config.prompt = readAllStdin(allocator) catch null;
+            // 从 stdin 读全部作为 prompt（headless pipe 模式）。读失败显式落
+            // parse_error——静默 null 会掉进 TUI(或触发误导的 --image 组合报错)。
+            config.prompt = readAllStdin(allocator) catch {
+                // 与其它 setParseError 站点一致地立即返回:继续解析会让后续错误覆盖
+                // 本条(泄漏 allocPrint 串),第二个 `-` 还会对已失败的 stdin 重读。
+                setParseError(config, allocator, "failed to read stdin prompt for '-'", .{});
+                return;
+            };
         } else {
             // 未识别参数一律 fail-closed:记录后停止解析,由 main 报错退出。
             // 绝不静默忽略——flag 面是外部契约(评估 harness 靠它传 treatment)。
@@ -1193,16 +1199,24 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             return;
         }
     }
+    // `--image` 只在 headless prompt 模式(-p/--print/stdin `-`)消费;其它任何模式
+    // (TUI/serve/web/dump)静默忽略违背 issue #10"图绝不静默丢"铁律与 flag 面
+    // fail-closed 契约。统一在 parse 尾部拒绝(parseArgsForTest 可测)。
+    if (config.images != null and config.prompt == null and config.parse_error == null) {
+        setParseError(config, allocator, "--image requires -p/--print (headless prompt mode)", .{});
+    }
 }
 
-/// 读 stdin 全部内容（headless `-` 模式）。EOF 即停。
+/// 读 stdin 全部内容（headless `-` 模式）。EOF 即停;读错误显式报错(不把
+/// EINTR/EIO 截断的部分输入当完整 prompt)。
 fn readAllStdin(allocator: std.mem.Allocator) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var chunk: [4096]u8 = undefined;
     while (true) {
         const n = pfs.read(0, chunk[0..chunk.len]);
-        if (n <= 0) break;
+        if (n < 0) return error.StdinReadFailed;
+        if (n == 0) break;
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
     return buf.toOwnedSlice(allocator);
@@ -1273,7 +1287,7 @@ fn printHelp() void {
         \\  --max-tokens <n>      Override max output tokens per request
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
-        \\  --image <path>        Headless: attach an image (png/jpg/gif/webp) to the prompt (repeatable, order kept)
+        \\  --image <path>        Headless: attach an image (png/jpg/jpeg/gif/webp) to the prompt (repeatable, order kept)
         \\  --dump-prompt         Print the assembled system prompt and exit
         \\  --dump-plugins        Print the immutable plugin inventory JSON and exit
         \\  serve [port]          Daemon mode (HTTP; default port 7777)
