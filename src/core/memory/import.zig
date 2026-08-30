@@ -272,11 +272,23 @@ pub fn expandImports(
 const testing = std.testing;
 
 /// 测试 helper:把 TmpDir 解析成绝对路径(owned)。
-/// TmpDir.sub_path 是相对 `.zig-cache/tmp/` 的随机名;拼成相对路径过 canonical 取绝对。
+/// TmpDir.sub_path 是相对 `.zig-cache/tmp/` 的随机名;拼成相对路径过 realpath 取绝对。
+///
+/// **不复用生产 `canonical`**:后者 realpath 失败时*故意*回退原路径(循环检测宁可
+/// 保守也不报错)。这个回退在测试里是灾难——base_dir 退化成相对路径后,
+/// resolveImportPath 会把它再拼一次(`<rel>/<rel>/d0.md`),readFileAlloc 找不到文件
+/// 走静默 `continue`,断言最终以"内容缺失"的形式失败,完全看不出真因(cwd 不是
+/// build root / 目录被并发进程删掉)。这里失败即报错,把环境问题和逻辑问题分开。
 fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
     const rel = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(rel);
-    return canonical(allocator, rel);
+    if (rel.len + 1 > std.fs.max_path_bytes) return error.TmpDirPathTooLong;
+    var path_z: [std.fs.max_path_bytes]u8 = undefined;
+    @memcpy(path_z[0..rel.len], rel);
+    path_z[rel.len] = 0;
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    const res = pfs.realpath(@ptrCast(&path_z), &out) orelse return error.TmpDirPathUnresolved;
+    return allocator.dupe(u8, std.mem.span(@as([*:0]u8, @ptrCast(res))));
 }
 
 /// 测试 helper:posix 写文件(0.16 Io.Dir.writeFile 需 io 参数,绕开)。
@@ -367,16 +379,19 @@ test "expandImports: cycle detection (a->b->a) no infinite loop" {
     const dir_path = try tmpAbsPath(a, &tmp);
     defer a.free(dir_path);
 
-    try writeFileAt(dir_path, "x.md", "X @y.md");
-    try writeFileAt(dir_path, "y.md", "Y @x.md");
+    // 标记必须够长够特别:out 里含绝对 tmp 路径(见 depth limit 测试的注释),而
+    // 随机目录名单独就能满足 `indexOf(out,"X") != null` 这种单字符存在性断言
+    // ——展开彻底坏掉时测试仍会**假通过**。用 X-CONTENT/Y-CONTENT 堵掉。
+    try writeFileAt(dir_path, "x.md", "X-CONTENT @y.md");
+    try writeFileAt(dir_path, "y.md", "Y-CONTENT @x.md");
 
     const root = try std.fmt.allocPrint(a, "@{s}/x.md", .{dir_path});
     defer a.free(root);
     const out = try expandImports(a, root, dir_path, "");
     defer a.free(out);
-    // X 和 Y 各出现(至少一次),不卡死即通过
-    try testing.expect(std.mem.indexOf(u8, out, "X") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "Y") != null);
+    // 两侧内容各出现(至少一次),不卡死即通过
+    try testing.expect(std.mem.indexOf(u8, out, "X-CONTENT") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Y-CONTENT") != null);
 }
 
 test "expandImports: depth limit stops at MAX" {
@@ -398,14 +413,22 @@ test "expandImports: depth limit stops at MAX" {
         defer a.free(body);
         try writeFileAt(dir_path, name, body);
     }
-    const root = try std.fmt.allocPrint(a, "@{s}/d0.md", .{dir_path});
-    defer a.free(root);
-    const out = try expandImports(a, root, dir_path, "");
+    // root 用**相对** import(靠 base_dir=dir_path 解析),而不是 `@{dir_path}/d0.md`。
+    // 理由(此测试曾经 flaky,~1/273 概率随机失败):expandInto 会 verbatim 保留原
+    // `@path` 行,并把路径再写进 `<!-- BEGIN @import ... -->` 标记 → 绝对 import 会
+    // 让 tmp 目录名进入 out 两次。而 TmpDir.sub_path 是 16 字符 url-safe base64
+    // 随机名(字母表 A-Za-z0-9-_ 含 'L' 和 '5'),自带子串 "L5" 的概率约 15/4096,
+    // 一旦命中,下面 `indexOf(out,"L5") == null` 就会失败——与深度逻辑毫无关系。
+    // 改成相对 import 后,out 里只剩文件内容和短相对标记,断言空间与随机目录名解耦。
+    const out = try expandImports(a, "@d0.md", dir_path, "");
     defer a.free(out);
     // 深度上限 5:root(depth0)展开 d0(depth1)..d4(depth5);处理 d4 内容时
     // depth==5 >= MAX,d4 里的 @d5.md 不再展开 → L0..L4 在,L5 不在。
     try testing.expect(std.mem.indexOf(u8, out, "L4") != null);
     try testing.expect(std.mem.indexOf(u8, out, "L5") == null);
+    // 守门:上面两条短字面量断言,只在 out 不含随机 tmp 路径时才有意义。谁把 root
+    // 改回绝对 import,这里会**确定性**失败,而不是让随机 flake 悄悄回来。
+    try testing.expect(std.mem.indexOf(u8, out, dir_path) == null);
 }
 
 test "isTextExt: whitelist" {
