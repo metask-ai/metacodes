@@ -120,7 +120,8 @@ pub fn which(binary: []const u8, out_buf: []u8) ?[]const u8 {
 /// × 36µs ≈ 116ms,而答案至多只有 7 种。
 ///
 /// 因此:**不做进程级缓存**(那会把"跑到一半才装上 server"钉死成永久不可用,还会让测试互相
-/// 污染),改由调用方在循环里持一个 `symbol_provider.CapabilityCache`——生命周期只有那一次扫描。
+/// 污染),改由逐文件循环的调用方(FindSymbol 的候选扫描、CodeMap 的 glob 批量)各持一个
+/// `symbol_provider.CapabilityCache`——生命周期只有那一次扫描。
 pub fn binaryAvailable(def: *const ServerDef) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     return which(def.binary, &buf) != null;

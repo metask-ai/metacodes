@@ -103,6 +103,10 @@ fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer)
     const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
     defer allocator.free(path);
 
+    // 门禁答案只取决于扩展名,而每算一次要扫一遍 PATH(30 段 PATH 实测 36–43µs)。逐文件问同
+    // 一个问题就记忆化——glob 批量下省的是 MAX_FILES 次重复 access(2)。
+    var caps = symbol_provider.CapabilityCache.init(ctx);
+
     // path 含 glob 元字符 → 走 rg --files 解析文件列表;否则单文件。
     if (isGlob(path)) {
         const files = try listFiles(allocator, path, ctx);
@@ -124,11 +128,11 @@ fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer)
                 break;
             }
             try ctx.throwIfAborted();
-            try mapOneFile(ctx, allocator, w, f);
+            try mapOneFile(ctx, allocator, w, f, &caps);
             shown += 1;
         }
     } else {
-        try mapOneFile(ctx, allocator, w, path);
+        try mapOneFile(ctx, allocator, w, path, &caps);
     }
 }
 
@@ -139,9 +143,10 @@ fn mapOneFile(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     file: []const u8,
+    caps: *symbol_provider.CapabilityCache,
 ) !void {
     // 门禁:能力缺失就地说明原因(措辞来自 capability.why,与 FindSymbol/Read 同一份)。
-    switch (symbol_provider.capabilityFor(ctx, file)) {
+    switch (caps.get(file)) {
         .available => {},
         .unavailable => |u| return printNoOutline(w, file, u),
     }
