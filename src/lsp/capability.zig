@@ -39,27 +39,6 @@ pub const Reason = enum {
 /// `why()` 输出的建议缓冲大小(最长一条 = 前缀 + 一个 server 二进制名)。
 pub const WHY_BUF: usize = 256;
 
-/// 一次扫描里出现多种缺失原因时,该报哪一个。**按"用户能拿它做什么"排序**,不是按发生顺序。
-///
-/// 为什么不能用"先到先得":FindSymbol 的候选文件来自 `rg -l -w`,顺序是目录遍历序。一个顺带
-/// 提到该名字的 `README.md` 排在 `.py` 前面,就会让结论变成"这种文件类型没有注册 language
-/// server"——把真正要说的"pyright 没装"盖掉。恰恰是本 issue 要修的那种"说了等于没说"。
-pub fn actionability(r: Reason) u8 {
-    return switch (r) {
-        .server_not_installed => 4, // 最可操作:装上就有
-        .server_unavailable => 3, // 装了但起不来:去查 server
-        .outside_workspace => 2, // 换个位置打开就有
-        .lsp_disabled => 1, // 去掉 --no-lsp 就有(全局性,不会与别的原因混)
-        .no_server_for_language, .path_unresolved => 0, // 对这个文件本来就无解,没什么可做
-    };
-}
-
-/// 在已记录的原因与新出现的原因之间取更值得报告的那个(`null` = 还没记过)。
-pub fn moreActionable(current: ?Unavailable, candidate: Unavailable) Unavailable {
-    const cur = current orelse return candidate;
-    return if (actionability(candidate.reason) > actionability(cur.reason)) candidate else cur;
-}
-
 /// 能力缺失(原因 + 一个静态细节串)。`detail` 指向 `SERVERS` 里的常量(binary / server_id),
 /// 无所有权、可自由按值复制、生命周期与程序等长。
 pub const Unavailable = struct {
@@ -89,6 +68,27 @@ pub const Unavailable = struct {
         };
     }
 };
+
+/// 一次扫描里出现多种缺失原因时,该报哪一个。**按"用户能拿它做什么"排序**,不是按发生顺序。
+///
+/// 为什么不能用"先到先得":FindSymbol 的候选文件来自 `rg -l -w`,顺序是目录遍历序。一个顺带
+/// 提到该名字的 `README.md` 排在 `.py` 前面,就会让结论变成"这种文件类型没有注册 language
+/// server"——把真正要说的"pyright 没装"盖掉。恰恰是本 issue 要修的那种"说了等于没说"。
+pub fn actionability(r: Reason) u8 {
+    return switch (r) {
+        .server_not_installed => 4, // 最可操作:装上就有
+        .server_unavailable => 3, // 装了但起不来:去查 server
+        .outside_workspace => 2, // 换个位置打开就有
+        .lsp_disabled => 1, // 去掉 --no-lsp 就有(全局性,不会与别的原因混)
+        .no_server_for_language, .path_unresolved => 0, // 对这个文件本来就无解,没什么可做
+    };
+}
+
+/// 在已记录的原因与新出现的原因之间取更值得报告的那个(`null` = 还没记过)。
+pub fn moreActionable(current: ?Unavailable, candidate: Unavailable) Unavailable {
+    const cur = current orelse return candidate;
+    return if (actionability(candidate.reason) > actionability(cur.reason)) candidate else cur;
+}
 
 // ============================================================================
 // Tests

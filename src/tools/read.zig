@@ -183,7 +183,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 显式要过 outline 但能力缺失 → 在正常内容后交代原因(别让"回退正常读"看起来像"这文件没结构")。
     if (outline_gap) |u| {
         var why_buf: [symbol_provider.capability.WHY_BUF]u8 = undefined;
-        const noted = try std.fmt.allocPrint(allocator, "{s}\n\n<system-reminder>Outline was requested but is unavailable: {s}. The full file content is shown above instead; this does NOT mean the file has no structure.</system-reminder>", .{ rendered, u.why(&why_buf) });
+        const noted = try std.fmt.allocPrint(allocator, "{s}\n\n<system-reminder>Outline was requested but is unavailable: {s}. The file contents are shown above instead; this does NOT mean the file has no structure.</system-reminder>", .{ rendered, u.why(&why_buf) });
         allocator.free(rendered);
         rendered = noted;
     }

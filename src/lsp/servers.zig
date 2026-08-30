@@ -74,6 +74,12 @@ pub fn findServerForFile(path: []const u8) ?*const ServerDef {
 }
 
 /// 在 PATH 里找可执行 binary,写绝对路径进 out_buf 返回;找不到 → null。
+///
+/// **POSIX 专属(既有缺陷,登记)**:按 `:` 切 PATH、用 `/` 拼接、`access(X_OK)` 判定——三条在
+/// Windows 上都不成立(`C:\bin;C:\other` 会被切成 `C` / `\bin;C` / `\other`)。后果不是本次
+/// 引入的:`Service.getOrSpawn` 解析 binary 走的就是这个函数,所以 LSP 在 Windows 上**本来就
+/// 起不来**。区别只在于现在 `binaryAvailable` 让它诚实报"not found in PATH",而不是照旧给一个
+/// 沉默的空结果。真要在 Windows 支持 LSP,得先按 `;` 切 + `PATHEXT` 后缀 + 反斜杠拼接。
 pub fn which(binary: []const u8, out_buf: []u8) ?[]const u8 {
     // binary 含 '/' 视为路径直接查。
     if (std.mem.indexOfScalar(u8, binary, '/') != null) {
