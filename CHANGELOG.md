@@ -92,6 +92,55 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- The language server binary lookup is platform-correct, so the LSP subsystem
+  is no longer unconditionally dead on Windows. `lsp/servers.zig`'s `which`
+  hardcoded three POSIX assumptions — split `PATH` on `:`, join with `/`,
+  test executability with `access(X_OK)` — and every one of them fails on
+  Windows: `C:\bin;C:\other` split on `:` yields `C`, `\bin;C`, `\other`
+  (none of them a directory), and executability there is decided by the
+  `PATHEXT` extension list while every registered `ServerDef.binary` is an
+  extensionless name (`zls`, `gopls`, `clangd`). Both consumers flow through
+  that one function, so they failed together: `Service.getOrSpawn` could never
+  start a server, and the issue #17 capability gate `servers.binaryAvailable`
+  reported "the '<binary>' language server is not installed (not found in
+  PATH)" for every language even when it was installed. This predates issue
+  #17; that work only made the failure legible. The lookup now lives in the
+  portable layer as `platform.exe_lookup` (separator, joiner, `PATHEXT`
+  probing with the cmd.exe default list, quoted `PATH` segments,
+  drive-relative names, and no extension appended to a name that already
+  carries one), and `which` is a one-line delegation. `realProbe` also stops
+  accepting a *directory* as an executable, which plain `access(X_OK)` did on
+  POSIX. Empty `PATH` segments are still skipped rather than searching the
+  working directory, which POSIX would allow but is a PATH-injection surface.
+- `zig build test:platform` ran **zero** tests, and `windows:gate` depends on
+  it — so the "Native Windows platform gate" step was passing vacuously for
+  its entire unit-test half. `src/platform/platform.zig` aggregated the
+  submodules as `pub const x = @import(...)` with no `test` block referencing
+  them, and Zig only collects tests from files it analyzes. Adding the block
+  turns up 52 tests (43 pass / 9 environment-skipped) that had never run. The
+  LSP suite (`test:lsp`) now also runs on that gate, and the workflow's path
+  filter covers `src/lsp/**`, since server lookup is native-platform logic.
+  Independently of that gate, `ci.yml`'s per-module `zig test
+  src/platform/<module>.zig` loops — the unfiltered ones that run on every PR,
+  on POSIX and on the Windows runner — now include the new module, so the
+  Windows-semantics assertions run on both.
+
+- The new lookup's parsing is a pure function over an explicit `Style` plus a
+  supplied `PATH`/`PATHEXT` string, so Windows semantics are asserted on
+  **every** host — including the regression case that splitting `C:\bin;C:\other`
+  on `:` shreds it — instead of behind a `SkipZigTest` on non-Windows machines.
+  `lsp/servers.zig`'s own `which` test likewise stopped skipping on Windows and
+  now asserts against `cmd`/`cmd.exe` there and `sh` on POSIX.
+  Windows support for the subsystem as a whole is **not** claimed: process
+  spawn, pipes, polling and termination already have real Windows
+  implementations, but `workspace.isInsideWorkspace` only accepts `/` as a
+  path boundary (so every file is judged outside the workspace),
+  `client.pathToUri` emits `file://C:\proj\a.zig` where LSP requires
+  `file:///c%3A/proj/a.zig`, and `CreateProcess` cannot launch the `.cmd`
+  shims npm installs for `typescript-language-server`. Those three are
+  enumerated in the status table at the top of `src/lsp/lsp.zig`, which is the
+  single place that states Windows readiness.
+
 - Symbol capability gaps no longer masquerade as "symbol not defined"
   (issue #17). `FindSymbol` returned a bare `[]` whenever `--lsp` was on but
   the language server binary was missing, because the *decide* predicate

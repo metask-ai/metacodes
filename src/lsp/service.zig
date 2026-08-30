@@ -524,6 +524,10 @@ fn writeFileZ(path: []const u8, content: []const u8) void {
 test "Service e2e: 真 zls 报类型错误的 delta 诊断(需装 zls)" {
     const a = testing.allocator;
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
+    // POSIX 专属测试脚手架:固定 `/tmp/...` 路径 + POSIX `mkdir(path, mode)`;且 Windows 上
+    // `workspace.isInsideWorkspace` 的 `/` 边界判定本就会把文件判成 workspace 外(见
+    // `lsp.zig` 的 Windows 状态表),这条 e2e 在那之前就不可能通过。
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     if (servers.which("zls", &zbuf) == null) return error.SkipZigTest; // 未装 zls → skip
 
     // 建 /tmp/cc_lsp_zls_<pid>/{.git, main.zig}。fake .git 让 workspace gate 过。
@@ -562,6 +566,10 @@ test "Service e2e: 真 zls 报类型错误的 delta 诊断(需装 zls)" {
 test "Service e2e: 真 zls documentSymbol 抽 struct/function 符号(需装 zls)" {
     const a = testing.allocator;
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
+    // POSIX 专属测试脚手架:固定 `/tmp/...` 路径 + POSIX `mkdir(path, mode)`;且 Windows 上
+    // `workspace.isInsideWorkspace` 的 `/` 边界判定本就会把文件判成 workspace 外(见
+    // `lsp.zig` 的 Windows 状态表),这条 e2e 在那之前就不可能通过。
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     if (servers.which("zls", &zbuf) == null) return error.SkipZigTest; // 未装 → skip
 
     const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_sym_{d}", .{pprocess.currentPid()}) catch return;

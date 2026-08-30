@@ -495,12 +495,18 @@ fn codeToStr(v: ?std.json.Value) []const u8 {
 }
 
 /// file:// URI → 本地路径(简化:剥 "file://" 前缀;不处理 % 编码,LSP server 一般不编码常规路径)。
+///
+/// **POSIX 形状,Windows 未支持**(与 `pathToUri` 成对,登记在 `lsp.zig` 的 Windows 状态表)。
 fn uriToPath(uri: []const u8) []const u8 {
     if (std.mem.startsWith(u8, uri, "file://")) return uri["file://".len..];
     return uri;
 }
 
 /// 本地绝对路径 → file:// URI(owned)。简化不做 % 编码。
+///
+/// **POSIX 形状,Windows 未支持**:`C:\proj\a.zig` 会出成 `file://C:\proj\a.zig`,而 LSP
+/// 规范要的是 `file:///c%3A/proj/a.zig`(盘符前多一个斜杠 + `:` 百分号编码 + 反斜杠转正斜杠)。
+/// 改这里必须同时改 `uriToPath` 并补往返测试。见 `lsp.zig` 的 Windows 状态表。
 fn pathToUri(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "file://{s}", .{path});
 }
@@ -544,6 +550,9 @@ const X_OK: c_int = 1;
 
 test "Client: initialize + didOpen → publishDiagnostics 端到端(mock LSP server)" {
     const a = testing.allocator;
+    // POSIX 专属测试脚手架:mock server 是靠 shebang 直接当 argv[0] 执行的 .py 脚本,
+    // Windows 既没有 shebang 也不能用 `_access(X_OK)` 判可执行(mode 只认 0/2/4/6)。
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     // mock 脚本不可执行(如异机)→ skip,不 45s 挂死。
     if (std.c.access(MOCK_LSP, X_OK) != 0) return;
 
@@ -569,6 +578,7 @@ test "Client: initialize + didOpen → publishDiagnostics 端到端(mock LSP ser
 
 test "Client: didChange 版本递增 + 诊断刷新(mock)" {
     const a = testing.allocator;
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属:shebang .py 脚手架
     if (std.c.access(MOCK_LSP, X_OK) != 0) return;
     const argv = [_]?[*:0]const u8{ MOCK_LSP, null };
     var cl = Client.create(a, argv[0..], false, null) catch return;
@@ -589,6 +599,7 @@ test "Client: didChange 版本递增 + 诊断刷新(mock)" {
 
 test "Client: shutdown 对 ignore-SIGTERM server 升级 SIGKILL 不挂死(Linus ③ 回归)" {
     const a = testing.allocator;
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属:shebang .py 脚手架
     if (std.c.access(MOCK_LSP_STUBBORN, X_OK) != 0) return;
     const argv = [_]?[*:0]const u8{ MOCK_LSP_STUBBORN, null };
     var cl = Client.create(a, argv[0..], false, null) catch return;
