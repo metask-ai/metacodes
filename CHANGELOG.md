@@ -42,6 +42,17 @@ status, compatibility boundaries, and entry points are defined by
   rename, with idempotent retries and deterministic revision conflicts. See
   [doc/PROVIDER_OFFER_ARCHITECTURE.md](doc/PROVIDER_OFFER_ARCHITECTURE.md),
   including its explicit list of deferred slices.
+  Endpoint policy refuses two whole classes of URL rather than pattern-matching
+  them: a percent-encoded host or path (a substring rule over encoded bytes is
+  not a rule while the server still decodes it) and any URL carrying userinfo
+  (that string becomes `ModelOffer.endpoint_ref` and flows into `model.list`,
+  events, and setup output, none of which redact it). The control plane guards
+  its mutable state and hands `model.list` results into a caller-owned buffer,
+  so two clients cannot invalidate each other's page; `events.replay` copies
+  under the lock. `config_store` is the single authority for `config_revision`
+  — the kernel mirrors it through `adoptConfigRevision` rather than keeping a
+  second counter — and idempotency keys are a bounded ring, so a retry is still
+  recognized after other commits have landed.
 
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
@@ -86,8 +97,10 @@ status, compatibility boundaries, and entry points are defined by
 - `~/.metacodes/config.json` writes no longer delete other writers' keys. The
   config writer serialized only its own five fields, so any theme change
   silently dropped `mcp_servers`, `permission_rules`, and `model_tiers`. It now
-  merges through an order-preserving JSON merge and refuses to overwrite a
-  document it cannot parse.
+  merges through an order-preserving JSON merge, refuses to overwrite a document
+  it cannot parse, and treats a failed read as an error rather than as an empty
+  document — descriptor exhaustion or a transient I/O error would otherwise
+  truncate the whole file.
 
 ## 0.1.0 — 2026-08-29
 

@@ -184,7 +184,14 @@ structured conflict, never last-writer-wins.
 
 Event payloads are ids and enums only. There is deliberately no free-form string
 field a prompt, token, or provider body could travel in. An evicted cursor is
-reported as a gap rather than replayed incompletely.
+reported as a gap rather than replayed incompletely, and `events.replay` copies
+under the lock so a client never walks a ring that eviction is memmoving.
+
+Producers exist today for `runtime.selection_changed`, `runtime.switch_failed`,
+`route.actual`, `failover`, and `catalog.updated`. `pricing.updated`,
+`auth.changed`, `credential.expiring`, and `provider.degraded` are declared with
+their payload shapes but have no producer until the catalog refresh, credential
+store, and health plane land — see the deferred list.
 
 ## Persistence
 
@@ -194,11 +201,20 @@ document is a provider *map*: several providers, accounts, regions, and relays
 coexist, and disabling one preserves its configuration and credential reference.
 
 Every commit takes the cross-process lock, re-reads the document, replays
-idempotently when the operation id matches, rejects a stale expected revision,
-applies the mutation, bumps the revision, and merges only the keys the control
-plane owns — then writes a same-directory temporary file, fsyncs it, renames it
-over the target, and fsyncs the parent directory. Crash-injection tests cover
-both the pre-fsync and pre-rename points.
+idempotently when the operation id is among the retained recent keys (a bounded
+ring, so a retry is still recognized after other commits have landed), rejects a
+stale expected revision, applies the mutation, bumps the revision, and merges
+only the keys the control plane owns — then writes a same-directory temporary
+file, fsyncs it, renames it over the target, and fsyncs the parent directory.
+Crash-injection tests cover both the pre-fsync and pre-rename points, and a
+failed read is an error rather than an empty document: treating an I/O failure
+as "no configuration" would truncate every other writer's data.
+
+`config_store` is the sole authority for `config_revision`. The kernel mirrors
+it through `adoptConfigRevision` and never invents one, so the number a client
+receives from `model.list` is the number `selection.commit` compares against.
+A `global` commit therefore reports `requires_persist`; the embedder writes it
+and feeds the resulting revision back.
 
 The order-preserving merge (`src/util/json_merge.zig`) also fixed a pre-existing
 data-loss bug: `src/app/config.zig`'s writer serialized only its own five fields
@@ -248,8 +264,9 @@ Sessions that name no provider keep the historical path unchanged.
 | `src/util/json_merge.zig` | order-preserving JSON object merge |
 
 `zig build test:provider` compiles the subsystem from a root that reaches only
-`std`, `types.zig`, and `util/model.zig`. If a provider module ever grows a
-dependency on the transport, the TUI, or `platform`, that step stops compiling.
+`std`, `types.zig`, `util/model.zig`, and the portable `platform` layer
+(sync/fs). If a provider module ever grows a dependency on the transport, the
+TUI, or a UI protocol, that step stops compiling.
 
 ## Not implemented yet
 
@@ -262,10 +279,15 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
 - **Provider catalog refresh and health hooks (P1).** Offers come from compiled
   profile data. There is no `GET /models` ingestion, no per-offer health or
   capacity observation, and no OpenRouter model/endpoint adapter. The data model
-  carries these fields; nothing populates them, so they read `unknown`.
-- **Quote hooks (P1).** `ProviderProfile.quote_hook` and `ModelEntry.quote` are
-  wired through the catalog into `model.list`, but no built-in profile ships a
-  price table. Quotes are `unknown` until a catalog or user config supplies one.
+  carries these fields and `adoptCatalog` can swap in a refreshed catalog, but
+  nothing produces one yet, so health and capacity read `unknown`. The
+  `pricing.updated`, `auth.changed`, `credential.expiring`, and
+  `provider.degraded` event types wait on the same work.
+- **Built-in price tables (P1).** `ProviderProfile.quote_hook` and
+  `ModelEntry.quote` are wired end to end — the hook is reached through
+  `quote.estimate` and the static quote through `model.list` — but no built-in
+  profile ships a price table, so built-in quotes read `unknown` until a
+  provider catalog or user config supplies one.
 - **User-defined providers (P1).** A profile can be registered at runtime
   through the same extension point, but there is no `CustomProviderDefinition`
   config schema, no `DeclarativeProtocolSpec`, and no dry-run/connection test.
@@ -280,5 +302,10 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
 - **`api_key_query` placement.** Rejected by both transports rather than
   silently dropped; it needs URL rewriting in the request path.
 - **Session-scoped `runtime-selection.json`.** `config_store.Store` accepts an
-  arbitrary path and is the intended writer, but no session host writes one yet.
+  arbitrary path and is the intended writer, but no session host writes one yet,
+  and no startup path calls `Store.initHome` — the durable global selection is
+  readable and writable through the store, just not yet loaded at boot.
+- **Credential pool rotation (P2).** `CredentialRef` carries priority, cooldown,
+  and last-error, and resolution honours cooldown and invalid status, but only
+  one credential per provider is offered to it.
 - **TinyKG audit plane.** No decision/verification nodes are appended.

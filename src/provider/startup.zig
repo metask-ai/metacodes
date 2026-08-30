@@ -51,6 +51,10 @@ pub const StartupRoute = struct {
     request_model_id: []u8,
     /// Owned. Display identity only.
     display_name: []u8,
+    /// Owned. Region and plan of the selected channel, shown in setup output
+    /// before any request is sent. Null when the channel declares none.
+    region: ?[]u8,
+    plan: ?[]u8,
     auth_scheme: credential.AuthScheme,
     limits: offer_mod.EffectiveLimits,
     capabilities: offer_mod.CapabilityMatrix,
@@ -62,6 +66,8 @@ pub const StartupRoute = struct {
         self.allocator.free(self.endpoint_url);
         self.allocator.free(self.request_model_id);
         self.allocator.free(self.display_name);
+        if (self.region) |value| self.allocator.free(value);
+        if (self.plan) |value| self.allocator.free(value);
         self.* = undefined;
     }
 };
@@ -70,6 +76,9 @@ pub const Failure = union(enum) {
     unknown_provider: []const u8,
     unknown_channel: []const u8,
     unknown_offer: []const u8,
+    /// `--offer` and `--channel` name different routes. Silently honouring one
+    /// would ignore an explicit user instruction.
+    offer_channel_conflict: struct { offer_channel: Slug, requested_channel: Slug },
     /// The model matches several routes; the samples say which.
     ambiguous_model: selection_mod.Ambiguity,
     endpoint_rejected: profile_mod.EndpointError,
@@ -95,6 +104,11 @@ pub const Failure = union(enum) {
                 allocator,
                 "offer '{s}' is not in the current catalog",
                 .{name},
+            ),
+            .offer_channel_conflict => |conflict| std.fmt.allocPrint(
+                allocator,
+                "--offer names a route on channel '{s}' but --channel says '{s}'; drop one",
+                .{ conflict.offer_channel.slice(), conflict.requested_channel.slice() },
             ),
             .ambiguous_model => |ambiguity| blk: {
                 var out: std.ArrayList(u8) = .empty;
@@ -186,6 +200,12 @@ pub fn resolve(
             return .{ .failure = .{ .unknown_offer = text } };
         const found = catalog.find(parsed) orelse
             return .{ .failure = .{ .unknown_offer = text } };
+        if (channel_filter) |wanted| {
+            if (!found.channel_id.eql(wanted)) return .{ .failure = .{ .offer_channel_conflict = .{
+                .offer_channel = found.channel_id,
+                .requested_channel = wanted,
+            } } };
+        }
         return ownOrFail(allocator, profile, found, false);
     }
 
@@ -285,6 +305,10 @@ fn own(
     const model = try allocator.dupe(u8, offer.request_model_id);
     errdefer allocator.free(model);
     const display = try allocator.dupe(u8, offer.display_name);
+    errdefer allocator.free(display);
+    const region = if (offer.region) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (region) |value| allocator.free(value);
+    const plan = if (offer.plan) |value| try allocator.dupe(u8, value) else null;
 
     return .{
         .allocator = allocator,
@@ -297,6 +321,8 @@ fn own(
         .endpoint_url = endpoint,
         .request_model_id = model,
         .display_name = display,
+        .region = region,
+        .plan = plan,
         .auth_scheme = profile.auth,
         .limits = offer.limits,
         .capabilities = offer.capabilities,
@@ -495,4 +521,26 @@ test "a protocol with no built-in transport fails instead of falling back" {
     const text = try outcome.failure.message(a);
     defer a.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "no built-in transport") != null);
+}
+
+test "a resolved route carries the region and plan setup output must show" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    const outcome = try resolve(a, &registry, .{
+        .provider = "zai-coding-plan",
+        .channel = "global-openai",
+    });
+    var route = outcome.route;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("global", route.region.?);
+    try std.testing.expectEqualStrings("coding", route.plan.?);
+    try std.testing.expectEqualStrings("openai_chat", route.protocol_id);
+
+    // Providers without a region declare none rather than inventing one.
+    const metask = try resolve(a, &registry, .{ .provider = "metask" });
+    var plain = metask.route;
+    defer plain.deinit();
+    try std.testing.expect(plain.region == null);
+    try std.testing.expect(plain.plan == null);
 }

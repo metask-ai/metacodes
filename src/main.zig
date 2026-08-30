@@ -303,7 +303,44 @@ fn applyProviderRoute(
             config.auth_scheme = route.auth_scheme;
             const rendered = route.offer_id.render();
             config.selected_offer_id = allocator.dupe(u8, &rendered) catch null;
+            config.resolved_provider_id = allocator.dupe(u8, route.provider_id.slice()) catch null;
+            // Setup/doctor visibility: the selected region, protocol, and
+            // endpoint are shown before any request is sent. The endpoint is a
+            // channel base URL and carries no credential; the credential itself
+            // is never printed or logged.
+            @import("util/log.zig").info(
+                "provider",
+                "route provider={s} channel={s} protocol={s} region={s} model={s} endpoint={s} offer={s}",
+                .{
+                    route.provider_id.slice(),
+                    route.channel_id.slice(),
+                    route.protocol_id,
+                    route.region orelse "-",
+                    route.request_model_id,
+                    route.endpoint_url,
+                    &rendered,
+                },
+            );
+            if (config.verbose) {
+                std.debug.print(
+                    "provider route: {s}/{s} [{s}] region={s} model={s}\n  endpoint {s}\n  offer    {s}\n",
+                    .{
+                        route.provider_id.slice(),
+                        route.channel_id.slice(),
+                        route.protocol_id,
+                        route.region orelse "-",
+                        route.request_model_id,
+                        route.endpoint_url,
+                        &rendered,
+                    },
+                );
+            }
+            // Only `endpoint_url` and `request_model_id` transfer into Config;
+            // everything else this route owns is consumed by the summary above
+            // and freed here.
             allocator.free(route.display_name);
+            if (route.region) |value| allocator.free(value);
+            if (route.plan) |value| allocator.free(value);
         },
     }
 }
@@ -467,9 +504,19 @@ pub fn main(init: std.process.Init) !void {
     const metask_scope = selectedProfileIsMetask(config);
     var provider_secret: ?[]u8 = null;
     if (!introspection_only and !metask_scope) {
-        provider_secret = try resolveProviderScopedSecret(allocator, config, config.provider_profile.?);
+        provider_secret = try resolveProviderScopedSecret(
+            allocator,
+            config,
+            config.provider_profile.?,
+        );
     }
-    defer if (provider_secret) |secret| allocator.free(secret);
+    // Same handling as `ResolvedCredential.deinit`: zero the bytes before
+    // returning them to the allocator so key material does not linger in freed
+    // heap or a core dump.
+    defer if (provider_secret) |secret| {
+        std.crypto.secureZero(u8, secret);
+        allocator.free(secret);
+    };
 
     var resolved_credential: ?auth.ResolvedCredential = null;
     if (!introspection_only and provider_secret == null) {
@@ -1008,13 +1055,15 @@ fn applyStoredLoginSelection(allocator: std.mem.Allocator, config: *types.Config
 /// and the one-shot runtime descriptor — byte for byte. Every other profile is
 /// resolved in its own scope, so a Metask token can never authenticate it.
 pub fn selectedProfileIsMetask(config: types.Config) bool {
-    const name = config.provider_profile orelse return true;
-    var registry = @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(
-        std.heap.page_allocator,
-    ) catch return true;
-    defer registry.deinit();
-    const profile = registry.find(name) orelse return true;
-    return profile.id.eqlText("metask");
+    // Naming no provider keeps the historical path.
+    if (config.provider_profile == null) return true;
+    // A named provider always has a resolved id by this point: route
+    // resolution runs first and exits on failure. Deliberately not a second
+    // registry lookup — a lookup that failed here would silently re-enter the
+    // Metask credential path for a non-Metask provider, which is precisely the
+    // cross-provider leak this scoping exists to prevent.
+    const resolved = config.resolved_provider_id orelse return false;
+    return std.mem.eql(u8, resolved, "metask");
 }
 
 /// Provider-scoped credential resolution (issue #16).
@@ -1027,13 +1076,12 @@ pub fn resolveProviderScopedSecret(
     allocator: std.mem.Allocator,
     config: types.Config,
     profile_name: []const u8,
-) !?[]u8 {
+) ![]u8 {
     const credential_mod = provider_credential;
     const provider_ids_mod = provider_ids;
-    var registry = @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator) catch
-        return null;
+    var registry = try @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator);
     defer registry.deinit();
-    const profile = registry.find(profile_name) orelse return null;
+    const profile = registry.find(profile_name) orelse return error.UnknownProviderProfile;
 
     var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
     const resolved = credential_mod.resolve(.{
@@ -1046,7 +1094,7 @@ pub fn resolveProviderScopedSecret(
         printProviderCredentialHelp(profile.*, err);
         return err;
     };
-    return try allocator.dupe(u8, resolved.secret);
+    return allocator.dupe(u8, resolved.secret);
 }
 
 fn printProviderCredentialHelp(

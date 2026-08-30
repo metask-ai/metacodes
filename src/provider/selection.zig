@@ -223,6 +223,10 @@ pub fn resolve(catalog: *const OfferCatalog, selection: RuntimeSelection) Resolv
 
 fn resolvePinned(catalog: *const OfferCatalog, pin: SelectionTarget.Pinned) ResolveError!Resolution {
     const found = catalog.find(pin.offer_id) orelse return error.PinnedOfferUnavailable;
+    // A pin that the provider has since marked unavailable is reported as
+    // unavailable — the same answer as a pin that vanished. Using it anyway
+    // would send a request the channel is known to refuse.
+    if (found.availability == .unavailable) return error.PinnedOfferUnavailable;
     var out = Resolution{ .revision_changed = found.offer_revision != pin.offer_revision };
     out.candidates[0] = found;
     out.len = 1;

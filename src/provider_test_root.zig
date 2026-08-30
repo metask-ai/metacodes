@@ -1,9 +1,10 @@
 //! Isolation root for the `src/provider/` subsystem.
 //!
 //! Rooting a test compilation at `src/` lets the provider modules reach
-//! `types.zig` and `util/model.zig` while proving the subsystem pulls in
-//! nothing heavier: if a provider module ever grows a dependency on the TUI,
-//! transport, or `platform`, this root stops compiling.
+//! `types.zig`, `util/model.zig`, and the portable `platform` layer while
+//! proving the subsystem pulls in nothing heavier: if a provider module ever
+//! grows a dependency on the TUI, the transport, or a UI protocol, this root
+//! stops compiling.
 
 const std = @import("std");
 
@@ -18,6 +19,7 @@ pub const config_doc = @import("provider/config_doc.zig");
 pub const control_plane = @import("provider/control_plane.zig");
 pub const runtime_binding = @import("provider/runtime_binding.zig");
 pub const startup = @import("provider/startup.zig");
+pub const config_store = @import("provider/config_store.zig");
 
 test {
     // This std build has no refAllDeclsRecursive; the explicit re-exports above

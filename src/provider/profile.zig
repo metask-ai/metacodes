@@ -101,6 +101,14 @@ pub const EndpointError = error{
     InsecureEndpoint,
     ForbiddenEndpointPath,
     MissingRequiredEndpointPath,
+    /// The host or path carries percent escapes. An endpoint base is a literal
+    /// path; escapes only serve to hide a forbidden fragment from a substring
+    /// check while the server still resolves it.
+    EncodedEndpointComponent,
+    /// The URL embeds userinfo. Credentials travel as a `CredentialRef`, never
+    /// inside an endpoint: an endpoint string reaches offer metadata, the
+    /// control-plane API, logs, and events, none of which redact it.
+    CredentialInEndpoint,
     HostNotAllowed,
     MalformedEndpoint,
     EndpointBufferTooSmall,
@@ -126,8 +134,14 @@ pub const EndpointPolicy = struct {
         const uri = std.Uri.parse(url) catch return error.MalformedEndpoint;
         const host_component = uri.host orelse return error.MalformedEndpoint;
         var host_buffer: [256]u8 = undefined;
-        const host = componentText(host_component, &host_buffer) orelse return error.MalformedEndpoint;
+        const host = try literalComponent(host_component, &host_buffer);
         if (host.len == 0) return error.MalformedEndpoint;
+
+        // A `user:password@host` endpoint would put a secret into
+        // `ModelOffer.endpoint_ref`, and from there into `model.list`, event
+        // payloads, and setup output. Refuse it at the boundary instead of
+        // trying to redact it at every consumer.
+        if (uri.user != null or uri.password != null) return error.CredentialInEndpoint;
 
         const is_tls = std.mem.eql(u8, uri.scheme, "https");
         if (!is_tls) {
@@ -145,7 +159,7 @@ pub const EndpointPolicy = struct {
         }
 
         var path_buffer: [1024]u8 = undefined;
-        const path = componentText(uri.path, &path_buffer) orelse return error.MalformedEndpoint;
+        const path = try literalComponent(uri.path, &path_buffer);
         for (self.forbidden_path_fragments) |fragment| {
             if (std.mem.indexOf(u8, path, fragment) != null) return error.ForbiddenEndpointPath;
         }
@@ -166,22 +180,30 @@ pub const EndpointPolicy = struct {
     }
 };
 
-fn componentText(component: std.Uri.Component, buffer: []u8) ?[]const u8 {
-    return switch (component) {
+/// A URI component that must be literal.
+///
+/// Substring policy on a percent-encoded component is not a check at all:
+/// `https://open.bigmodel.cn/api%2Fpaas%2Fv4` does not contain the literal
+/// `/api/paas/v4`, yet a server that decodes the path routes it there. Rather
+/// than guess which side decodes, reject any escape in an endpoint base — a
+/// provider endpoint has no legitimate need for one — and run the policy on
+/// bytes that are identical on the wire and in the check.
+fn literalComponent(component: std.Uri.Component, buffer: []u8) EndpointError![]const u8 {
+    const text = component.toRaw(buffer) catch return error.MalformedEndpoint;
+    const encoded = switch (component) {
         .raw => |raw| raw,
-        .percent_encoded => |encoded| blk: {
-            if (encoded.len > buffer.len) break :blk null;
-            @memcpy(buffer[0..encoded.len], encoded);
-            break :blk buffer[0..encoded.len];
-        },
+        .percent_encoded => |value| value,
     };
+    if (!std.mem.eql(u8, text, encoded)) return error.EncodedEndpointComponent;
+    if (std.mem.indexOfScalar(u8, text, '%') != null) return error.EncodedEndpointComponent;
+    return text;
 }
 
 fn isLoopback(host: []const u8) bool {
-    return std.mem.eql(u8, host, "127.0.0.1") or
-        std.mem.eql(u8, host, "localhost") or
-        std.mem.eql(u8, host, "::1") or
-        std.mem.eql(u8, host, "[::1]");
+    return std.ascii.eqlIgnoreCase(host, "127.0.0.1") or
+        std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.ascii.eqlIgnoreCase(host, "::1") or
+        std.ascii.eqlIgnoreCase(host, "[::1]");
 }
 
 // ── channels and inventory ───────────────────────────────────────────────────
@@ -437,9 +459,17 @@ pub fn validateProfile(profile: ProviderProfile) ProfileError!void {
                 if (current.protocol.eql(other.protocol)) return error.DuplicateProtocolRoute;
             }
         }
-        // The declared base must satisfy the profile's own policy; a profile
-        // cannot ship a base URL its overrides would be rejected for.
-        profile.endpoint_policy.validate(descriptor.base_url) catch return error.InvalidChannelBaseUrl;
+        // The declared base must satisfy the profile policy *and* every route
+        // policy on this channel. Validating only the profile level would let a
+        // profile ship a base its own overrides would be rejected for — the
+        // declaration and the enforcement would disagree.
+        for (descriptor.routes) |route| {
+            EndpointPolicy.validateBoth(
+                profile.endpoint_policy,
+                route.policy,
+                descriptor.base_url,
+            ) catch return error.InvalidChannelBaseUrl;
+        }
         if (profile.inventoryFor(descriptor).len == 0) return error.NoModelInventory;
     }
 
@@ -663,4 +693,106 @@ test "aliases resolve to the profile id without becoming a second identity" {
     try std.testing.expect(profile.matchesName("test"));
     try std.testing.expect(profile.matchesName("glm-coding-plan"));
     try std.testing.expect(!profile.matchesName("glm"));
+}
+
+test "a percent-encoded path cannot smuggle a forbidden fragment past the policy" {
+    const forbidden = [_][]const u8{"/api/paas/v4"};
+    const routes = [_]ProtocolRoute{.{ .protocol = .openai_chat }};
+    const channels = [_]ChannelDescriptor{.{
+        .id = Slug.lit("cn-openai"),
+        .display_name = "China",
+        .base_url = "https://open.bigmodel.cn/api/coding/paas/v4",
+        .routes = &routes,
+    }};
+    const profile = testProfile(&channels, .{ .forbidden_path_fragments = &forbidden });
+    var buffer: [256]u8 = undefined;
+
+    // Encoded separators do not contain the literal fragment, but a server that
+    // decodes the path routes it to exactly the forbidden surface.
+    for ([_][]const u8{
+        "https://open.bigmodel.cn/api%2Fpaas%2Fv4",
+        "https://open.bigmodel.cn/api%2fpaas%2fv4",
+        "https://open.bigmodel.cn/%61pi/paas/v4",
+    }) |smuggled| {
+        try std.testing.expectError(error.EncodedEndpointComponent, channels[0].endpointFor(
+            profile.endpoint_policy,
+            .openai_chat,
+            smuggled,
+            &buffer,
+        ));
+    }
+
+    // An encoded host is refused for the same reason.
+    try std.testing.expectError(error.EncodedEndpointComponent, channels[0].endpointFor(
+        profile.endpoint_policy,
+        .openai_chat,
+        "https://open%2Ebigmodel%2Ecn/api/coding/paas/v4",
+        &buffer,
+    ));
+}
+
+test "loopback detection is case insensitive" {
+    const routes = [_]ProtocolRoute{.{ .protocol = .openai_chat }};
+    const channels = [_]ChannelDescriptor{.{
+        .id = Slug.lit("default"),
+        .display_name = "Default",
+        .base_url = "https://example.test/v1",
+        .routes = &routes,
+    }};
+    const profile = testProfile(&channels, .{});
+    var buffer: [256]u8 = undefined;
+    const url = try channels[0].endpointFor(
+        profile.endpoint_policy,
+        .openai_chat,
+        "http://LocalHost:8123/v1",
+        &buffer,
+    );
+    try std.testing.expectEqualStrings("http://LocalHost:8123/v1/chat/completions", url);
+}
+
+test "profile validation proves each channel base satisfies its own route policy" {
+    // A channel whose declared base does not satisfy its route's required
+    // fragment is a profile bug: overrides would be rejected for a URL shape
+    // the profile itself ships.
+    const required = [_][]const u8{"/coding/"};
+    const routes = [_]ProtocolRoute{.{
+        .protocol = .openai_chat,
+        .policy = .{ .required_path_fragments = &required },
+    }};
+    const channels = [_]ChannelDescriptor{.{
+        .id = Slug.lit("bad"),
+        .display_name = "Bad",
+        .base_url = "https://vendor.test/api/paas/v4",
+        .routes = &routes,
+    }};
+    try std.testing.expectError(
+        error.InvalidChannelBaseUrl,
+        validateProfile(testProfile(&channels, .{})),
+    );
+}
+
+test "an endpoint may not carry credentials in its userinfo" {
+    const routes = [_]ProtocolRoute{.{ .protocol = .openai_chat }};
+    const channels = [_]ChannelDescriptor{.{
+        .id = Slug.lit("relay"),
+        .display_name = "Relay",
+        .base_url = "https://relay.internal/v1",
+        .routes = &routes,
+    }};
+    const profile = testProfile(&channels, .{});
+    var buffer: [256]u8 = undefined;
+    for ([_][]const u8{
+        "https://sk-secret-key@relay.internal/v1",
+        "https://user:sk-secret@relay.internal/v1",
+        "http://tok@127.0.0.1:8123/v1",
+    }) |with_credential| {
+        try std.testing.expectError(error.CredentialInEndpoint, channels[0].endpointFor(
+            profile.endpoint_policy,
+            .openai_chat,
+            with_credential,
+            &buffer,
+        ));
+    }
+    // The declared bases of every built-in profile are checked the same way by
+    // `validateProfile`, so a profile cannot ship one either.
 }

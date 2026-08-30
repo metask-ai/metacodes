@@ -85,7 +85,7 @@ pub fn saveToFile(config: FileConfig, allocator: std.mem.Allocator, path: []cons
     // provider control plane). Serializing only this struct's fields would
     // delete every other owner's data, so replace exactly these keys and keep
     // the rest of the document — and its key order — intact.
-    const existing = readWhole(allocator, path_z) catch try allocator.dupe(u8, "");
+    const existing = try readWhole(allocator, path_z);
     defer allocator.free(existing);
 
     var scratch = std.heap.ArenaAllocator.init(allocator);
@@ -134,14 +134,23 @@ pub fn saveToFile(config: FileConfig, allocator: std.mem.Allocator, path: []cons
 
 fn readWhole(allocator: std.mem.Allocator, path_z: [:0]const u8) ![]u8 {
     const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return allocator.dupe(u8, "");
+    if (fd < 0) {
+        // Only an absent file is an empty document. Descriptor exhaustion, an
+        // I/O error, or a transient permission failure must not be read as
+        // "nothing here" — the caller merges onto this result and writes it
+        // back, so a wrong empty read truncates every other writer's data.
+        const errno: std.c.E = @enumFromInt(std.c._errno().*);
+        if (errno != .NOENT) return error.ConfigUnreadable;
+        return allocator.dupe(u8, "");
+    }
     defer _ = pfs.close(fd);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var buf: [16384]u8 = undefined;
     while (true) {
         const n = pfs.read(fd, &buf);
-        if (n <= 0) break;
+        if (n == 0) break;
+        if (n < 0) return error.ConfigUnreadable;
         try out.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
     }
     return out.toOwnedSlice(allocator);
@@ -306,4 +315,17 @@ test "a malformed existing document is never silently overwritten" {
     const untouched = try readWhole(a, path_z);
     defer a.free(untouched);
     try std.testing.expectEqualStrings("{ this is not json", untouched);
+}
+
+test "an unreadable existing document is never treated as empty" {
+    const a = std.testing.allocator;
+    // A directory in place of the config file makes `open` fail with something
+    // other than ENOENT, which must not be read as "no configuration yet".
+    const dir_path = "/tmp/metacodes-config-unreadable-test";
+    const dir_z: [:0]const u8 = dir_path;
+    _ = std.c.mkdir(dir_z.ptr, 0o700);
+    defer _ = std.c.rmdir(dir_z.ptr);
+
+    try std.testing.expectError(error.ConfigUnreadable, readWhole(a, dir_z));
+    try std.testing.expectError(error.ConfigUnreadable, saveToFile(.{ .model = "x" }, a, dir_path));
 }

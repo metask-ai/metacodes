@@ -44,6 +44,12 @@ pub const OperationId = controls_mod.Bounded(64);
 
 pub const MAX_PROTOCOL_DEFAULTS: usize = 4;
 
+/// Retained idempotency keys. A single "last key" only recognizes a retry that
+/// immediately follows its original, which is not what a retrying client does:
+/// it retries after other traffic has landed. A small ring makes the guarantee
+/// match the wording.
+pub const MAX_RECENT_OPERATIONS: usize = 8;
+
 pub const ProtocolList = struct {
     entries: [MAX_PROTOCOL_DEFAULTS]ProtocolText = undefined,
     len: u8 = 0,
@@ -107,9 +113,10 @@ pub const Document = struct {
     providers: std.ArrayList(ProviderEntry) = .empty,
     aliases: std.ArrayList(AliasEntry) = .empty,
     global_selection: ?RuntimeSelection = null,
-    /// Idempotency key of the commit that produced this revision. A retry
-    /// carrying the same key is a no-op instead of a second revision bump.
-    last_operation_id: ?OperationId = null,
+    /// Idempotency keys of the most recent commits, oldest first. A retry
+    /// carrying any retained key is a no-op instead of a second revision bump.
+    recent_operations: [MAX_RECENT_OPERATIONS]OperationId = undefined,
+    recent_operation_len: u8 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Document {
         return .{ .allocator = allocator };
@@ -119,6 +126,31 @@ pub const Document = struct {
         self.providers.deinit(self.allocator);
         self.aliases.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn recentOperations(self: *const Document) []const OperationId {
+        return self.recent_operations[0..self.recent_operation_len];
+    }
+
+    /// True when this key was used by one of the retained recent commits.
+    pub fn hasOperation(self: *const Document, operation_id: []const u8) bool {
+        for (self.recentOperations()) |entry| {
+            if (entry.eqlText(operation_id)) return true;
+        }
+        return false;
+    }
+
+    pub fn recordOperation(self: *Document, operation_id: []const u8) DocumentError!void {
+        const key = try OperationId.parse(operation_id);
+        if (self.recent_operation_len == MAX_RECENT_OPERATIONS) {
+            var index: usize = 0;
+            while (index + 1 < MAX_RECENT_OPERATIONS) : (index += 1) {
+                self.recent_operations[index] = self.recent_operations[index + 1];
+            }
+            self.recent_operation_len -= 1;
+        }
+        self.recent_operations[self.recent_operation_len] = key;
+        self.recent_operation_len += 1;
     }
 
     pub fn provider(self: *const Document, id: Slug) ?ProviderEntry {
@@ -177,11 +209,16 @@ pub const Document = struct {
             try renderSelection(arena, value)
         else
             null;
-        var operation: ?[]u8 = null;
-        if (self.last_operation_id) |operation_id| {
+        var operations: ?[]u8 = null;
+        if (self.recent_operation_len > 0) {
             var buffer: std.ArrayList(u8) = .empty;
-            try writeJsonString(arena, &buffer, operation_id.slice());
-            operation = buffer.items;
+            try buffer.append(arena, '[');
+            for (self.recentOperations(), 0..) |operation_id, index| {
+                if (index > 0) try buffer.append(arena, ',');
+                try writeJsonString(arena, &buffer, operation_id.slice());
+            }
+            try buffer.append(arena, ']');
+            operations = buffer.items;
         }
 
         return json_merge.mergeObjectFields(self.allocator, original, &.{
@@ -190,7 +227,7 @@ pub const Document = struct {
             .{ .key = "providers", .json = providers },
             .{ .key = "aliases", .json = aliases },
             .{ .key = "global_selection", .json = selection },
-            .{ .key = "last_operation_id", .json = operation },
+            .{ .key = "recent_operation_ids", .json = operations },
         }) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.InvalidDocument,
@@ -507,8 +544,15 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) DocumentError!Docum
         if (value != .null) document.global_selection = try parseSelection(value);
     }
 
-    if (stringOf(root.object.get("last_operation_id"))) |operation_text| {
-        document.last_operation_id = try OperationId.parse(operation_text);
+    if (root.object.get("recent_operation_ids")) |list| {
+        if (list != .array) return error.InvalidDocument;
+        for (list.array.items) |item| {
+            const operation_text = stringOf(item) orelse return error.InvalidDocument;
+            try document.recordOperation(operation_text);
+        }
+    } else if (stringOf(root.object.get("last_operation_id"))) |operation_text| {
+        // Documents written before the ring existed carry a single key.
+        try document.recordOperation(operation_text);
     }
 
     return document;
@@ -1023,4 +1067,48 @@ test "an exported document carries references but no secret material" {
     for ([_][]const u8{ "api_key", "access_token", "refresh_token", "Bearer", "sk-" }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, text, needle) == null);
     }
+}
+
+test "idempotency keys survive intervening commits" {
+    const a = std.testing.allocator;
+    var document = Document.init(a);
+    defer document.deinit();
+
+    try document.recordOperation("op-1");
+    try document.recordOperation("op-2");
+    try std.testing.expect(document.hasOperation("op-1"));
+    try std.testing.expect(!document.hasOperation("op-3"));
+
+    const text = try document.merge("{}");
+    defer a.free(text);
+    var reloaded = try parse(a, text);
+    defer reloaded.deinit();
+    // A retry of the *earlier* key is still recognized after later traffic —
+    // the single-key form could only ever recognize the immediately previous
+    // commit.
+    try std.testing.expect(reloaded.hasOperation("op-1"));
+    try std.testing.expect(reloaded.hasOperation("op-2"));
+
+    // The ring evicts oldest-first and stays bounded.
+    var index: usize = 0;
+    while (index < MAX_RECENT_OPERATIONS) : (index += 1) {
+        var name: [16]u8 = undefined;
+        try reloaded.recordOperation(try std.fmt.bufPrint(&name, "fill-{d}", .{index}));
+    }
+    try std.testing.expectEqual(@as(u8, MAX_RECENT_OPERATIONS), reloaded.recent_operation_len);
+    try std.testing.expect(!reloaded.hasOperation("op-1"));
+    try std.testing.expect(reloaded.hasOperation("fill-0"));
+}
+
+test "a legacy single-key document upgrades to the ring" {
+    const a = std.testing.allocator;
+    var document = try parse(a,
+        \\{"schema_version":1,"config_revision":4,"last_operation_id":"op-legacy"}
+    );
+    defer document.deinit();
+    try std.testing.expect(document.hasOperation("op-legacy"));
+
+    const text = try document.merge("{}");
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "recent_operation_ids") != null);
 }

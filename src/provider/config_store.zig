@@ -44,11 +44,15 @@ pub const StoreError = error{
     PathTooLong,
     LockBusy,
     OpenFailed,
+    ReadFailed,
     WriteFailed,
     SyncFailed,
     RenameFailed,
     CrashInjected,
     MutationFailed,
+    /// An empty idempotency key would be recorded and then match every other
+    /// empty key, silently turning unrelated commits into replays.
+    InvalidOperationId,
 } || config_doc.DocumentError;
 
 pub const Mutation = struct {
@@ -129,10 +133,9 @@ pub const Store = struct {
         defer document.deinit();
 
         if (request.operation_id) |operation_id| {
-            if (document.last_operation_id) |previous| {
-                if (previous.eqlText(operation_id)) {
-                    return .{ .config_revision = document.config_revision, .idempotent_replay = true };
-                }
+            if (operation_id.len == 0) return error.InvalidOperationId;
+            if (document.hasOperation(operation_id)) {
+                return .{ .config_revision = document.config_revision, .idempotent_replay = true };
             }
         }
 
@@ -143,10 +146,9 @@ pub const Store = struct {
         request.mutation.apply(&document) catch return error.MutationFailed;
 
         document.config_revision = document.config_revision.next();
-        document.last_operation_id = if (request.operation_id) |operation_id|
-            try config_doc.OperationId.parse(operation_id)
-        else
-            null;
+        // A commit without a key records nothing; it must not evict the keys
+        // that make earlier retries recognizable.
+        if (request.operation_id) |operation_id| try document.recordOperation(operation_id);
 
         const bytes = try document.merge(original);
         defer self.allocator.free(bytes);
@@ -159,7 +161,14 @@ pub const Store = struct {
         const path_z = self.allocator.dupeZ(u8, self.path) catch return error.OutOfMemory;
         defer self.allocator.free(path_z);
         const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
-        if (fd < 0) return self.allocator.dupe(u8, "") catch error.OutOfMemory;
+        if (fd < 0) {
+            // Only a genuinely absent file is an empty document. Treating a
+            // permission or I/O error the same way would make the next commit
+            // overwrite a document it could not read.
+            const errno: std.c.E = @enumFromInt(std.c._errno().*);
+            if (errno != .NOENT) return error.OpenFailed;
+            return self.allocator.dupe(u8, "") catch error.OutOfMemory;
+        }
         defer pfs.close(fd);
 
         var out: std.ArrayList(u8) = .empty;
@@ -167,7 +176,7 @@ pub const Store = struct {
         var buffer: [16 * 1024]u8 = undefined;
         while (true) {
             const read = pfs.read(fd, &buffer);
-            if (read < 0) return error.OpenFailed;
+            if (read < 0) return error.ReadFailed;
             if (read == 0) break;
             out.appendSlice(self.allocator, buffer[0..@intCast(read)]) catch return error.OutOfMemory;
         }
@@ -193,6 +202,11 @@ pub const Store = struct {
         defer self.allocator.free(temp_path);
         const final_path = self.allocator.dupeZ(u8, self.path) catch return error.OutOfMemory;
         defer self.allocator.free(final_path);
+
+        // Any failure after this point leaves a partial temporary behind; drop
+        // it so the next commit cannot inherit half a document, and so a crash
+        // test observes the same directory state a real crash would leave.
+        errdefer pfs.unlinkPath(temp_path) catch {};
 
         {
             const fd = pfs.open(
@@ -249,4 +263,54 @@ pub fn setGlobalSelection(
         .operation_id = operation_id,
         .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
     });
+}
+
+test "an empty idempotency key is rejected rather than matching every other one" {
+    const a = std.testing.allocator;
+    const path = "/tmp/metacodes-provider-empty-op-test.json";
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    }
+    defer for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        var cleanup: [std.fs.max_path_bytes]u8 = undefined;
+        const target = std.fmt.bufPrintZ(&cleanup, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    };
+
+    var store = try Store.initPath(a, path);
+    defer store.deinit();
+
+    const Noop = struct {
+        fn run(_: *anyopaque, _: *Document) anyerror!void {}
+    };
+    var anchor: u8 = 0;
+    try std.testing.expectError(error.InvalidOperationId, store.commit(.{
+        .operation_id = "",
+        .mutation = .{ .ctx = @ptrCast(&anchor), .applyFn = Noop.run },
+    }));
+
+    // A commit with no key at all remains legal.
+    const anonymous = try store.commit(.{
+        .mutation = .{ .ctx = @ptrCast(&anchor), .applyFn = Noop.run },
+    });
+    try std.testing.expect(!anonymous.idempotent_replay);
+}
+
+test "the home store resolves either the override or the home path" {
+    const a = std.testing.allocator;
+    // `initHome` is the production entry point. Assert the branch this
+    // environment actually takes rather than mutating the process environment,
+    // which would leak into every other test in the shard.
+    var store = Store.initHome(a) catch |err| {
+        try std.testing.expectEqual(StoreError.NoHome, err);
+        return;
+    };
+    defer store.deinit();
+    if (std.c.getenv(CONFIG_PATH_ENV)) |raw| {
+        try std.testing.expectEqualStrings(std.mem.span(raw), store.path);
+    } else {
+        try std.testing.expect(std.mem.endsWith(u8, store.path, "/.metacodes/config.json"));
+    }
 }

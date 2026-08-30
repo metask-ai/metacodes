@@ -288,6 +288,9 @@ pub const StoredEntry = struct {
     status: CredentialStatus = .active,
     account_or_plan: ?[]const u8 = null,
     expires_at: ?i64 = null,
+    /// Set by the pool after a rate-limit or failure; resolution skips the
+    /// entry until this time passes.
+    cooldown_until: ?i64 = null,
 };
 
 pub const ResolveInput = struct {
@@ -401,16 +404,28 @@ fn resolveEnv(input: ResolveInput) ResolveError!?EnvHit {
 }
 
 fn storedApiKey(input: ResolveInput) ResolveError!?StoredEntry {
-    const entry = input.stored_api_key orelse return null;
-    if (!isAccepted(input.accepted_kinds, entry.kind)) return null;
-    if (entry.status == .invalid) return null;
-    return entry;
+    return usableStored(input, input.stored_api_key);
 }
 
 fn storedOAuth(input: ResolveInput) ResolveError!?StoredEntry {
-    const entry = input.stored_oauth orelse return null;
+    return usableStored(input, input.stored_oauth);
+}
+
+/// Persisted material is eligible only when the profile accepts its kind and
+/// the pool state says it may be used now. `CredentialRef.isUsableAt` is the
+/// single definition of that, so the cooldown a failed request records is
+/// actually honoured by the next resolution.
+fn usableStored(input: ResolveInput, candidate: ?StoredEntry) ResolveError!?StoredEntry {
+    const entry = candidate orelse return null;
     if (!isAccepted(input.accepted_kinds, entry.kind)) return null;
-    if (entry.status == .invalid) return null;
+    const reference = CredentialRef{
+        .id = Slug.lit("probe"),
+        .provider_id = input.provider_id,
+        .kind = entry.kind,
+        .status = entry.status,
+        .cooldown_until = entry.cooldown_until,
+    };
+    if (!reference.isUsableAt(input.now_seconds)) return null;
     return entry;
 }
 
@@ -436,6 +451,7 @@ fn build(
             .source = source,
             .account_or_plan = if (entry) |value| value.account_or_plan else null,
             .expires_at = expires_at,
+            .cooldown_until = if (entry) |value| value.cooldown_until else null,
         },
         .secret = secret,
         .alias_used = alias_used,
@@ -672,4 +688,32 @@ test "auth bytes can be wiped after use" {
     try std.testing.expect(auth.value.len > 0);
     wipe(&buffer);
     for (buffer) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "a credential in cooldown is skipped until it expires" {
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    const kinds = [_]CredentialKind{.api_key};
+    const base = ResolveInput{
+        .provider_id = Slug.lit("metask"),
+        .accepted_kinds = &kinds,
+        .stored_api_key = .{ .kind = .api_key, .secret = "resting", .cooldown_until = 500 },
+        .now_seconds = 400,
+    };
+    try std.testing.expectError(error.MissingCredentials, resolve(base, &buffer));
+
+    var later = base;
+    later.now_seconds = 501;
+    const resolved = try resolve(later, &buffer);
+    try std.testing.expectEqualStrings("resting", resolved.secret);
+    try std.testing.expectEqual(@as(?i64, 500), resolved.ref.cooldown_until);
+}
+
+test "an invalid stored credential is never selected" {
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    const kinds = [_]CredentialKind{.api_key};
+    try std.testing.expectError(error.MissingCredentials, resolve(.{
+        .provider_id = Slug.lit("metask"),
+        .accepted_kinds = &kinds,
+        .stored_api_key = .{ .kind = .api_key, .secret = "revoked", .status = .invalid },
+    }, &buffer));
 }

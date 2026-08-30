@@ -1371,16 +1371,18 @@ pub fn build(b: *std.Build) void {
 
     // test:provider —— issue #16 provider offer kernel, in isolation.
     // The subsystem must stay reachable from a root that pulls in nothing
-    // heavier than std + types.zig + util/model.zig: if a provider module ever
-    // grows a dependency on the transport, the TUI, or platform, this step
-    // stops compiling. Its tests also run inside the aggregate `test` gate;
-    // this step exists for the dependency proof, not for extra coverage.
+    // beyond std, types.zig, util/model.zig, and the portable `platform` layer
+    // (sync/fs): if a provider module ever grows a dependency on the transport,
+    // the TUI, or a UI protocol, this step stops compiling. Its tests also run
+    // inside the aggregate `test` gate; this step exists for the dependency
+    // proof, not for extra coverage.
     const provider_test_mod = b.createModule(.{
         .root_source_file = b.path("src/provider_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    addPlatform(b, provider_test_mod); // control_plane guards its state with platform/sync
     const provider_test = b.addTest(.{ .name = "provider-test", .root_module = provider_test_mod });
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
     provider_test_step.dependOn(&addTestRunArtifact(b, provider_test, windows_test_prelude).step);

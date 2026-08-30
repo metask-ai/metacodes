@@ -146,6 +146,11 @@ pub const Config = struct {
     provider_offer: ?[]const u8 = null,
     /// Offer id of the resolved startup route, rendered for display/logs.
     selected_offer_id: ?[]const u8 = null,
+    /// Canonical `ProviderId` of the resolved startup route. Recorded once at
+    /// resolution so later startup steps never re-derive provider identity from
+    /// the user-supplied alias — a second lookup that failed would fall back to
+    /// the Metask credential path and leak a credential across providers.
+    resolved_provider_id: ?[]const u8 = null,
     /// Provider-declared authentication for the resolved route. Null keeps the
     /// historical `authorization: Bearer <key>` transport behaviour.
     auth_scheme: ?@import("provider/credential.zig").AuthScheme = null,

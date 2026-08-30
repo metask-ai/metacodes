@@ -462,7 +462,11 @@ pub const Quote = union(enum) {
     }
 
     /// Cost of one usage sample, in micro-units of the quote currency.
-    /// Any unknown component makes the whole cost unknown.
+    ///
+    /// Any unknown component makes the whole cost unknown — and so does an
+    /// arithmetic overflow. Saturating here would report a wrong number that
+    /// reads exactly like a real one, which is the failure mode the whole
+    /// "missing price is unknown, never zero" rule exists to prevent.
     pub fn estimateMicros(self: Quote, usage: Usage) ?u64 {
         const price = self.priced() orelse return null;
         const input_rate = price.input_price_micros orelse return null;
@@ -473,10 +477,25 @@ pub const Quote = union(enum) {
             .per_token => 1,
             .per_request, .provider_defined => return null,
         };
-        const gross = (usage.input_tokens *| input_rate) / divisor +
-            (usage.output_tokens *| output_rate) / divisor;
+        // `input_tokens` is the total; `cached_input_tokens` is the subset the
+        // provider served from cache. Billing cached tokens at the full rate
+        // would over-report, so an unknown cached rate makes the estimate
+        // unknown rather than expensive.
+        const cached = @min(usage.cached_input_tokens, usage.input_tokens);
+        const fresh = usage.input_tokens - cached;
+        const cached_rate = if (cached == 0)
+            @as(u64, 0)
+        else
+            price.cached_input_price_micros orelse return null;
+
+        const fresh_cost = std.math.mul(u64, fresh, input_rate) catch return null;
+        const cached_cost = std.math.mul(u64, cached, cached_rate) catch return null;
+        const output_cost = std.math.mul(u64, usage.output_tokens, output_rate) catch return null;
+        const input_total = std.math.add(u64, fresh_cost, cached_cost) catch return null;
+        const gross = std.math.add(u64, input_total / divisor, output_cost / divisor) catch return null;
         const basis = price.discount_basis_points orelse return gross;
-        return (gross *| basis) / 10_000;
+        const discounted = std.math.mul(u64, gross, basis) catch return null;
+        return discounted / 10_000;
     }
 };
 
@@ -680,6 +699,46 @@ test "quote: missing price is unknown, never zero" {
         .input_price_micros = 3_000_000,
     } };
     try std.testing.expectEqual(@as(?u64, null), half_known.estimateMicros(.{ .input_tokens = 1000 }));
+}
+
+test "cached input tokens are billed at the declared cached rate" {
+    var quote = Quote{ .known = .{
+        .currency = Currency.lit("USD"),
+        .billing_unit = .per_million_tokens,
+        .input_price_micros = 3_000_000,
+        .output_price_micros = 15_000_000,
+    } };
+    // A cached portion with no declared cached rate cannot be priced; saying
+    // "unknown" beats billing it at the full input rate.
+    try std.testing.expectEqual(@as(?u64, null), quote.estimateMicros(.{
+        .input_tokens = 1_000_000,
+        .cached_input_tokens = 400_000,
+    }));
+
+    quote.known.cached_input_price_micros = 300_000;
+    // 600k fresh @3.0 + 400k cached @0.3 = 1_800_000 + 120_000
+    try std.testing.expectEqual(@as(?u64, 1_920_000), quote.estimateMicros(.{
+        .input_tokens = 1_000_000,
+        .cached_input_tokens = 400_000,
+    }));
+    // A cached count larger than the total is clamped, never negative.
+    try std.testing.expectEqual(@as(?u64, 300_000), quote.estimateMicros(.{
+        .input_tokens = 1_000_000,
+        .cached_input_tokens = 5_000_000,
+    }));
+}
+
+test "an overflowing cost estimate is unknown, not a saturated number" {
+    const quote = Quote{ .known = .{
+        .currency = Currency.lit("USD"),
+        .billing_unit = .per_token,
+        .input_price_micros = std.math.maxInt(u64) / 2,
+        .output_price_micros = 1,
+    } };
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        quote.estimateMicros(.{ .input_tokens = 1_000_000 }),
+    );
 }
 
 test "quote applies billing unit and discount basis points" {

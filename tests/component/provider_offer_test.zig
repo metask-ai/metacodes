@@ -243,7 +243,9 @@ test "L2: a relay shows the canonical model while sending its own request id" {
     defer kernel.deinit();
 
     // What every UI sees.
-    const page = try kernel.modelList(.{}, .{});
+    var view: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer view.deinit(a);
+    const page = try kernel.modelList(.{}, .{}, a, &view);
     try std.testing.expectEqual(@as(usize, 1), page.offers.len);
     try std.testing.expectEqualStrings("GLM-5.3", page.offers[0].display_name);
     try std.testing.expectEqualStrings("zai/glm-5.3", page.offers[0].canonical_model_id.?);
@@ -344,7 +346,9 @@ test "L2: a credential cannot cross provider boundaries and never reaches a UI s
     // The client-facing view carries the reference id, never the material.
     var kernel = cc.provider_control_plane.Kernel.init(a, &catalog);
     defer kernel.deinit();
-    const page = try kernel.modelList(.{}, .{});
+    var view: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer view.deinit(a);
+    const page = try kernel.modelList(.{}, .{}, a, &view);
     for (page.offers) |summary| {
         try std.testing.expect(std.mem.indexOf(u8, summary.endpoint_ref, "zai-secret") == null);
         try std.testing.expect(std.mem.indexOf(u8, summary.request_model_id, "zai-secret") == null);
@@ -402,7 +406,14 @@ test "L2: two clients read the same catalog and selection from one kernel" {
     try std.testing.expect(commit == .committed);
 
     // "Web UI" reads the same kernel: same current offer, same event stream.
-    const web_view = try kernel.modelList(.{ .request_id = 8 }, .{ .provider_id = Slug.lit("zai-coding-plan") });
+    var web_buffer: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer web_buffer.deinit(a);
+    const web_view = try kernel.modelList(
+        .{ .request_id = 8 },
+        .{ .provider_id = Slug.lit("zai-coding-plan") },
+        a,
+        &web_buffer,
+    );
     var marked: usize = 0;
     for (web_view.offers) |summary| {
         if (summary.is_current) marked += 1;
@@ -412,7 +423,9 @@ test "L2: two clients read the same catalog and selection from one kernel" {
     try std.testing.expect(described.is_current);
     try std.testing.expectEqualStrings("global", described.region.?);
 
-    const replay = kernel.journal.since(0);
+    var events: std.ArrayList(cc.provider_control_plane.ControlPlaneEvent) = .empty;
+    defer events.deinit(a);
+    const replay = try kernel.replayEvents(0, a, &events);
     try std.testing.expect(!replay.gap);
     try std.testing.expectEqual(
         cc.provider_control_plane.EventType.runtime_selection_changed,
@@ -613,16 +626,28 @@ test "L2: only a non-Metask profile leaves the historical credential path" {
     // the one-shot descriptor) and scopes every other profile to its own
     // declared material. Getting this predicate wrong is what let a Metask
     // token authenticate a Z.AI route.
+    // Naming no provider keeps the historical path.
     try std.testing.expect(cc.selectedProfileIsMetask(.{}));
-    try std.testing.expect(cc.selectedProfileIsMetask(.{ .provider_profile = "metask" }));
-    try std.testing.expect(cc.selectedProfileIsMetask(.{ .provider_profile = "anthropic" }));
-    // An unknown name falls back to the historical path rather than failing in
-    // a second place; `applyProviderRoute` already rejected it by then.
-    try std.testing.expect(cc.selectedProfileIsMetask(.{ .provider_profile = "not-a-vendor" }));
 
+    // The decision reads the id route resolution already recorded, not a second
+    // lookup of the user's alias. An alias resolves to its canonical id first.
+    try std.testing.expect(cc.selectedProfileIsMetask(.{
+        .provider_profile = "anthropic",
+        .resolved_provider_id = "metask",
+    }));
+    try std.testing.expect(!cc.selectedProfileIsMetask(.{
+        .provider_profile = "glm-coding-plan",
+        .resolved_provider_id = "zai-coding-plan",
+    }));
+    try std.testing.expect(!cc.selectedProfileIsMetask(.{
+        .provider_profile = "openai",
+        .resolved_provider_id = "openai",
+    }));
+
+    // Fail closed: a named provider with no recorded id must not re-enter the
+    // Metask credential path. That fallback is exactly how a Metask token
+    // reached a Z.AI route before this scoping existed.
     try std.testing.expect(!cc.selectedProfileIsMetask(.{ .provider_profile = "zai-coding-plan" }));
-    try std.testing.expect(!cc.selectedProfileIsMetask(.{ .provider_profile = "glm-coding-plan" }));
-    try std.testing.expect(!cc.selectedProfileIsMetask(.{ .provider_profile = "openai" }));
 }
 
 test "L2: provider-scoped startup resolution accepts --api-key and fails closed otherwise" {
@@ -632,8 +657,16 @@ test "L2: provider-scoped startup resolution accepts --api-key and fails closed 
         .{ .provider_profile = "zai-coding-plan", .api_key = "cli-plan-key" },
         "zai-coding-plan",
     );
-    defer if (with_key) |secret| a.free(secret);
-    try std.testing.expectEqualStrings("cli-plan-key", with_key.?);
+    defer a.free(with_key);
+    try std.testing.expectEqualStrings("cli-plan-key", with_key);
+
+    // An unknown profile name is an error, not a silent `null` that would let
+    // the caller fall back to the Metask path.
+    try std.testing.expectError(error.UnknownProviderProfile, cc.resolveProviderScopedSecret(
+        a,
+        .{ .provider_profile = "not-a-vendor" },
+        "not-a-vendor",
+    ));
 
     // The Metask credential store is not consulted for another provider. Both
     // branches below prove that: with `OPENAI_API_KEY` present the result is
@@ -646,8 +679,8 @@ test "L2: provider-scoped startup resolution accepts --api-key and fails closed 
             .{ .provider_profile = "openai" },
             "openai",
         );
-        defer if (from_env) |secret| a.free(secret);
-        try std.testing.expectEqualStrings(std.mem.span(raw), from_env.?);
+        defer a.free(from_env);
+        try std.testing.expectEqualStrings(std.mem.span(raw), from_env);
     } else {
         try std.testing.expectError(error.MissingCredentials, cc.resolveProviderScopedSecret(
             a,
@@ -655,4 +688,91 @@ test "L2: provider-scoped startup resolution accepts --api-key and fails closed 
             "openai",
         ));
     }
+}
+
+test "L2: an idempotent retry is recognized after intervening commits" {
+    const a = std.testing.allocator;
+    const path = try tempConfigPath(a, "idempotent");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    var store = try cc.provider_config_store.Store.initPath(a, path);
+    defer store.deinit();
+
+    var add_metask = AddProvider{ .id = Slug.lit("metask") };
+    var add_zai = AddProvider{ .id = Slug.lit("zai-coding-plan") };
+    var add_openai = AddProvider{ .id = Slug.lit("openai") };
+
+    const first = try store.commit(.{
+        .operation_id = "op-a",
+        .mutation = .{ .ctx = @ptrCast(&add_metask), .applyFn = AddProvider.run },
+    });
+    _ = try store.commit(.{
+        .operation_id = "op-b",
+        .mutation = .{ .ctx = @ptrCast(&add_zai), .applyFn = AddProvider.run },
+    });
+    // A commit with no key must not evict the retained keys.
+    _ = try store.commit(.{
+        .mutation = .{ .ctx = @ptrCast(&add_openai), .applyFn = AddProvider.run },
+    });
+
+    // Retrying the *first* operation after later traffic is still a no-op.
+    const replay = try store.commit(.{
+        .operation_id = "op-a",
+        .mutation = .{ .ctx = @ptrCast(&add_metask), .applyFn = AddProvider.run },
+    });
+    try std.testing.expect(replay.idempotent_replay);
+    try std.testing.expect(replay.config_revision.value() > first.config_revision.value());
+
+    var loaded = try store.load();
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 3), loaded.providers.items.len);
+    try std.testing.expect(loaded.hasOperation("op-a"));
+    try std.testing.expect(loaded.hasOperation("op-b"));
+}
+
+test "L2: an endpoint carrying a credential is refused before it reaches any surface" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    // A `user@host` base URL would put the secret into ModelOffer.endpoint_ref,
+    // and from there into model.list, events, and setup output.
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{
+        .provider = "zai-coding-plan",
+        .channel = "cn-openai",
+        .base_url = "https://sk-live-secret@relay.internal/api/coding/paas/v4",
+    });
+    try std.testing.expect(outcome == .failure);
+    try std.testing.expectEqual(
+        cc.provider_profile.EndpointError.CredentialInEndpoint,
+        outcome.failure.endpoint_rejected,
+    );
+    const text = try outcome.failure.message(a);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sk-live-secret") == null);
+}
+
+test "L2: --offer and --channel may not contradict each other" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+
+    var anthropic_offer: ?cc.provider_ids.OfferId = null;
+    for (catalog.items()) |candidate| {
+        if (candidate.channel_id.eqlText("cn-anthropic")) anthropic_offer = candidate.offer_id;
+    }
+    const rendered = anthropic_offer.?.render();
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{
+        .provider = "zai",
+        .channel = "cn-openai",
+        .offer_id = &rendered,
+    });
+    try std.testing.expect(outcome == .failure);
+    const text = try outcome.failure.message(a);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cn-anthropic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cn-openai") != null);
 }
