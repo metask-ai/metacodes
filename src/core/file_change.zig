@@ -340,11 +340,20 @@ fn locatorFor(
 /// the parent's Journal pointer, so every entry point takes the mutex.
 ///
 /// **Allocator contract**: the mutex serializes this journal's own calls, but
-/// it cannot make the *allocator* thread-safe. A journal that will be shared
-/// with background execution must be constructed with a thread-safe allocator
-/// (`std.heap.c_allocator`) — the App GPA is not one, and handing it to a
-/// teammate thread corrupts the heap. A journal used only from the Run's own
-/// thread (a single headless Run, a test) may use any allocator.
+/// it cannot make the *allocator* thread-safe, so a journal shared with
+/// background execution must be constructed with one that is.
+///
+/// The App allocator would in fact qualify — it is `std.process.Init`'s arena
+/// (`main.zig`), and Zig 0.16's `ArenaAllocator` is threadsafe given a
+/// threadsafe child, which `page_allocator` is; every vtable entry drives
+/// `end_index` through `@atomicRmw`/`@cmpxchgStrong`. (An earlier version of
+/// this comment claimed "the App GPA is not thread-safe"; it is neither a GPA
+/// nor unsafe. Verify against the installed std before acting on either
+/// claim.) The reason production still passes `std.heap.c_allocator` is
+/// **reclamation, not safety**: an arena cannot free anything but its most
+/// recent allocation, so the entry and diff-byte caps below — which exist
+/// because a REPL journal accumulates across turns — would cap what is
+/// *retained* while never returning a byte.
 pub const Journal = struct {
     allocator: std.mem.Allocator,
     mutex: sync.Mutex = .{},
