@@ -144,6 +144,34 @@ test "L2 issue #17: FindSymbol 无 LSP 服务 → 同一套限定语(措辞不�
     try std.testing.expect(std.mem.indexOf(u8, r, "--no-lsp") != null);
 }
 
+test "L2 issue #17: 候选文件混语言时,报最可操作的原因(别被 README 盖掉)" {
+    // 一个顺带提到该名字的 .md 若"先到先得",结论就会变成"这种文件类型没注册 server",
+    // 真正要说的那句(某个 server 没装 / 起不来)被盖掉,等于没修。
+    // **合并规则本身由 capability.zig 的 moreActionable 单测确定性地钉死**;rg 的并行遍历
+    // 不保证输出顺序,所以这里不假装能控制顺序——它验的是那条规则真的接进了 FindSymbol
+    // 这条路:混语言候选下,结论必须落在可操作的那一侧,与 rg 先吐哪个无关。
+    const a = std.testing.allocator;
+    var sb = try Sandbox.init(a, "cc-capgap-mix", "aaa_readme.md", "mentions MixProbeSymbol in prose\n");
+    defer sb.deinit();
+    const src = try std.fmt.allocPrint(a, "{s}/zzz_probe.py", .{sb.dir});
+    defer a.free(src);
+    writeAt(src, "def MixProbeSymbol():\n    pass\n");
+    defer rmAt(src);
+
+    const ctx = sb.ctx();
+    var abuf: [640]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"name\":\"MixProbeSymbol\",\"path\":\"{s}\"}}", .{sb.dir});
+    const r = try dispatchOk(&ctx, "FindSymbol", args);
+    defer a.free(r);
+
+    try std.testing.expect(std.mem.startsWith(u8, r, "[]"));
+    try std.testing.expect(std.mem.indexOf(u8, r, "does NOT mean") != null);
+    // 核心断言:.md 那条"没注册 server"不得成为最终结论。
+    // 没装 pyright → "not installed";装了 → /tmp 非 git 仓 → "outside a git workspace"。两者都比它可操作。
+    try std.testing.expect(std.mem.indexOf(u8, r, "no language server is registered") == null);
+    try expectNamesAConcreteReason(r);
+}
+
 // ============================================================================
 // CodeMap / Read(outline) —— 共用 symbol_provider,同一个病根
 // ============================================================================

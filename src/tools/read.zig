@@ -55,8 +55,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 三态处理(issue #17):有大纲 → 返大纲;能力在位但文件没符号 → 安静回退正常读;
     // **能力缺失 → 也回退,但把原因记下来,读完在结果末尾交代**——静默回退等于让模型
     // 以为"这文件没结构",和裸 `[]` 是同一类谎报。
+    const want_outline = isTrue(common.extractJsonArg(args, "outline"));
     var outline_gap: ?symbol_provider.Unavailable = null;
-    if (isTrue(common.extractJsonArg(args, "outline"))) {
+    if (want_outline) {
         switch (symbol_provider.capabilityFor(ctx, path)) {
             .unavailable => |u| outline_gap = u,
             .available => switch (try readOutline(allocator, ctx, path)) {
@@ -105,8 +106,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                             return try std.fmt.allocPrint(allocator, "File too large to show in full ({d} bytes, limit {d}). Outline below; Read a range with offset+limit for bodies.\n\n{s}", .{ s.size, MAX_FILE_BYTES, outline });
                         },
                         .no_symbols => {},
+                        // 走到这里说明门禁刚判过 .available(hasSymbolsFor 与上面同一个谓词),
+                        // 所以只有 server 在两次调用之间死掉才会命中——兜底,不是主路径。
                         .unavailable => |u| {
-                            if (outline_gap == null and isTrue(common.extractJsonArg(args, "outline"))) outline_gap = u;
+                            if (want_outline and outline_gap == null) outline_gap = u;
                         },
                     }
                 }
@@ -192,10 +195,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // "有 server" 作 CodeMap/FindSymbol 可用的代理,过度提示的代价仅一句软提醒。
     // outline_gap != null 时不提:大纲刚因为能力缺失落空,再劝"用 CodeMap/FindSymbol 更快"
     // 是把模型往同一堵墙上引。
-    if (!has_offset and !has_limit and outline_gap == null and symbol_provider.hasSymbolsFor(ctx, path)) {
-        const total_lines = std.mem.count(u8, full, "\n") + 1;
+    // **判定顺序按成本排**:hasSymbolsFor 要扫一遍 PATH(30 段实测 36µs),而 Read 是高频工具;
+    // 去重命中和小文件本来就不该提示,先用它们把绝大多数 Read 挡在 PATH 扫描之前。
+    if (!has_offset and !has_limit and outline_gap == null) {
         const already = if (ctx.read_state) |rs| rs.wasHinted(path) else false;
-        if (total_lines > 150 and !already) {
+        const total_lines = std.mem.count(u8, full, "\n") + 1;
+        if (!already and total_lines > 150 and symbol_provider.hasSymbolsFor(ctx, path)) {
             if (ctx.read_state) |rs| rs.markHinted(path);
             defer allocator.free(rendered);
             return try std.fmt.allocPrint(allocator, "{s}\n\n<system-reminder>This is a {d}-line source file. If you only need to find where something is defined, CodeMap (a structural outline) or FindSymbol (jump to a named definition) would be faster and cheaper than reading the whole file.</system-reminder>", .{ rendered, total_lines });

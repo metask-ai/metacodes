@@ -7,6 +7,10 @@
 //! **三态是硬要求**(issue #17):能力缺失 ≠ 查无符号。曾经两者都是空列表,模型把
 //! "没装 pyright" 读成"这个符号不存在"并据此走错路。状态词汇表见 `lsp/capability.zig`。
 //!
+//! **判定只有一份实现**:`capabilityForDef` 是唯一真理源,`capabilityFor` / `hasSymbolsFor` /
+//! `CapabilityCache.get` / `extractSymbols` 全部委托给它。新增入口必须继续委托——本 issue 的
+//! 病根就是有人在另一处**重新推导**了同一个问题,两份答案随即分叉。
+//!
 //! **语义**:kind 分类是 LSP server 的语义(如 zls 把 `pub const X = struct` 报成 Constant 而非
 //! Struct)。option A 接受(用户 2026-07-12 定案)。
 //!
@@ -64,6 +68,43 @@ pub fn capabilityForDef(def: ?*const servers.ServerDef) Capability {
         return .{ .unavailable = .{ .reason = .server_not_installed, .detail = d.binary } };
     return .{ .available = d };
 }
+
+/// 逐文件循环用的能力记忆化器。**调用方持有,无全局状态**——生命周期只有那一次扫描,所以既
+/// 不会把"跑到一半才装上 server"钉死成永久不可用,也不会跨测试污染。
+///
+/// 为什么需要:能力只取决于文件扩展名,`findServerForFile` 至多产出 `SERVERS.len + 1` 种答案;
+/// 而每算一次都要 `binaryAvailable` 扫一遍 PATH(实测 30 段 PATH 下 36–43µs)。FindSymbol 会对
+/// **每个候选文件**问一次,候选上限量级 3200 → 116ms+ 纯 `access(2)`,且被门禁挡掉的文件此外
+/// 什么都不做,那部分是纯浪费。
+///
+/// 容量按"最多几种答案"配死(每个注册 server 一格 + "无注册 server" 一格),所以正常来源
+/// (`findServerForFile`)永远填不满;真填满了就直接不缓存,退化成逐次计算,不会答错。
+pub const CapabilityCache = struct {
+    lsp_present: bool,
+    entries: [servers.SERVERS.len + 1]Entry = undefined,
+    len: usize = 0,
+
+    const Entry = struct { def: ?*const servers.ServerDef, cap: Capability };
+
+    pub fn init(ctx: *const ToolContext) CapabilityCache {
+        return .{ .lsp_present = ctx.lsp != null };
+    }
+
+    /// 语义与 `capabilityFor(ctx, file)` 完全一致,只是同一扩展名不重复扫 PATH。
+    pub fn get(self: *CapabilityCache, file: []const u8) Capability {
+        if (!self.lsp_present) return .{ .unavailable = .{ .reason = .lsp_disabled } };
+        const def = servers.findServerForFile(file);
+        for (self.entries[0..self.len]) |e| {
+            if (e.def == def) return e.cap; // 可选指针相等:null==null 也命中
+        }
+        const fresh = capabilityForDef(def);
+        if (self.len < self.entries.len) {
+            self.entries[self.len] = .{ .def = def, .cap = fresh };
+            self.len += 1;
+        }
+        return fresh;
+    }
+};
 
 /// 布尔门(只关心"能不能"、不需要解释原因的调用点用,如 Read 的弱提示)。
 /// 语义严格等于 `capabilityFor(...) == .available`,不另立谓词。
@@ -225,4 +266,44 @@ test "extractSymbols: 没有 LSP 服务 → .unavailable,绝不返回空符号�
         },
         .unavailable => |u| try testing.expectEqual(capability.Reason.lsp_disabled, u.reason),
     }
+}
+
+test "CapabilityCache: 与 capabilityFor 逐文件同答,且同扩展名只算一次" {
+    const a = testing.allocator;
+    const ctx = ToolContext.simple(a); // 无 lsp → 恒 lsp_disabled
+    var cache = CapabilityCache.init(&ctx);
+    for ([_][]const u8{ "/p/a.zig", "/p/b.py", "/p/c.md", "/p/a.zig" }) |f| {
+        switch (cache.get(f)) {
+            .unavailable => |u| try testing.expectEqual(capability.Reason.lsp_disabled, u.reason),
+            .available => return error.TestUnexpectedResult,
+        }
+    }
+    // 没开 LSP 时压根不该去碰注册表/PATH,故不占槽位。
+    try testing.expectEqual(@as(usize, 0), cache.len);
+}
+
+test "CapabilityCache: 槽位按不同扩展名增长,重复扩展名不再增长" {
+    const a = testing.allocator;
+    var ctx = ToolContext.simple(a);
+    // 只需要 ctx.lsp 非 null 走真判定;这里不发请求,给个 dangling 指针会 UB,
+    // 故用真 Service(创建很轻:只起一个 idle reaper 线程)。
+    const Service = @import("../lsp/service.zig").Service;
+    const svc = try Service.create(a, "/nonexistent_xyz_cwd", null);
+    defer svc.shutdown();
+    ctx.lsp = svc;
+
+    var cache = CapabilityCache.init(&ctx);
+    const first = cache.get("/p/a.zig");
+    try testing.expectEqual(@as(usize, 1), cache.len);
+    _ = cache.get("/p/b.zig"); // 同扩展名 → 命中,不增长
+    try testing.expectEqual(@as(usize, 1), cache.len);
+    _ = cache.get("/p/c.md"); // 无注册 server → 另一格(null 键)
+    try testing.expectEqual(@as(usize, 2), cache.len);
+    _ = cache.get("/p/d.md");
+    try testing.expectEqual(@as(usize, 2), cache.len);
+
+    // 缓存值必须与直算一致(两侧都断言,不管本机装没装 zls)。
+    const direct = capabilityFor(&ctx, "/p/a.zig");
+    try testing.expectEqual(std.meta.activeTag(direct), std.meta.activeTag(first));
+    try testing.expectEqual(std.meta.activeTag(direct), std.meta.activeTag(cache.get("/p/e.zig")));
 }

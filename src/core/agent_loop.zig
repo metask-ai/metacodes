@@ -256,7 +256,14 @@ pub const Options = struct {
     read_state: ?*ReadState = null,
     /// Edit/Write 旁路高亮缓存(diff 工具卡 tree-sitter 着色用)。null → 不缓存。
     edit_hl_cache: ?*@import("edit_hl_cache.zig").EditHlCache = null,
-    /// LSP 服务(CLI 默认开,`--no-lsp` 关)。透传进 ToolContext 供 Edit/Write finalizeWrite 用。
+    /// LSP 服务(CLI 默认开,`--no-lsp` 关)。透传进 ToolContext 供 Edit/Write finalizeWrite +
+    /// CodeMap/FindSymbol/Read-outline 用。
+    ///
+    /// **不透传进 subagent(登记的已知局限)**:`core/subagent.zig` 刻意不把它放进子 loop 的
+    /// Options,所以 subagent 里这四项能力一律报 `lsp_disabled`。原因不是疏忽——`lsp/client.zig`
+    /// 的线程模型白纸黑字要求 `sendRequest`/`sendNotification` 由**单一 caller 线程**串行调用,
+    /// 而 subagent 跑在后台线程上;直接透传会让两个线程交错写同一个 server 的 stdin。要放开得先
+    /// 给 Client 加发送侧串行化,那是 LSP 子系统的改动,不是加一行 `.lsp = opts.lsp`。
     lsp: ?*@import("../lsp/service.zig").Service = null,
     /// 自动 compact 的 token 阈值。null → 按 input context window 扣输出保留区后动态算。
     auto_compact_threshold: ?usize = null,

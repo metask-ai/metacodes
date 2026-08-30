@@ -72,8 +72,15 @@ status, compatibility boundaries, and entry points are defined by
   ceilings for heavier servers, not typical values); the disk write itself is
   never blocked and the wait is Ctrl+C-interruptible. `--no-lsp` propagates to
   out-of-process teammates, which would otherwise start their own servers
-  against the lead's explicit choice. Auto-installing language servers stays
-  rejected — it contradicts the repository's binary policy, spans six
+  against the lead's explicit choice. Two limitations the flip makes visible
+  and that this change does **not** close: subagents still run without LSP —
+  `agent_loop.Options.lsp` is deliberately not threaded into child loops
+  because `lsp/client.zig` requires `sendRequest`/`sendNotification` to come
+  from a single caller thread and subagents run on background threads, so
+  lifting it needs send-side serialization in the Client, not a one-line
+  passthrough; and each out-of-process teammate is a full session, so it gets
+  its own servers for its own worktree (`--no-lsp` is the lever there).
+  Auto-installing language servers stays rejected — it contradicts the repository's binary policy, spans six
   unrelated install channels, would execute npm `postinstall` outside the
   permission and sandbox layers, and a version-mismatched server is worse than
   an absent one because nothing signals the error.
@@ -99,7 +106,16 @@ status, compatibility boundaries, and entry points are defined by
   binary (and flags partial results when only some candidate files were
   skipped), `CodeMap` prints the specific reason instead of `(no symbols)`,
   and `Read(outline: true)` explains why it fell back to a full read rather
-  than degrading silently. Regression tests cover the **server-absent** side
+  than degrading silently. When a scan spans several languages the reported
+  reason is the most *actionable* one rather than the first encountered — rg
+  walks in parallel, so a README that merely mentions the name could otherwise
+  make the answer "no language server is registered for this file type" and
+  bury the "pyright is not installed" that the caller can act on. The
+  per-file capability answer is memoized for the duration of one scan
+  (`symbol_provider.CapabilityCache`, caller-owned, no global state): the
+  predicate costs a PATH scan — measured at 36–43 µs with a 30-entry PATH —
+  and FindSymbol asks it once per candidate file, up to ~3200, for at most
+  seven distinct answers. Regression tests cover the **server-absent** side
   unconditionally — synthetic `ServerDef`s with absolute-path binaries make
   that side reachable on any machine, replacing the
   `if (which("zls") == null) return error.SkipZigTest` pattern that had

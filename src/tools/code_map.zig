@@ -49,8 +49,10 @@ pub fn renderOutlineForSource(
     defer out.deinit();
     const w = &out.writer;
 
-    var outcome = symbol_provider.extractSymbols(ctx, allocator, file, source) catch
-        return .no_symbols; // 转换/分配失败:退回正常读取,不谎称能力缺失
+    // **不 catch**:唯一的错误来源是分配失败,而 `.no_symbols` 的含义是"能力在位、这文件真的
+    // 没符号"。把 OOM 折进去,调用方就会安静地按"没结构"处理——同一类谎报。下面的 renderTree /
+    // toOwnedSlice 本来也是直接上抛的,原先只 catch 这一处纯属不一致。
+    var outcome = try symbol_provider.extractSymbols(ctx, allocator, file, source);
     switch (outcome) {
         .unavailable => |u| return .{ .unavailable = u },
         .symbols => |*syms| {

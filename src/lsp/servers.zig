@@ -108,9 +108,13 @@ pub fn which(binary: []const u8, out_buf: []u8) ?[]const u8 {
 /// 判定"这个文件能不能出符号"必须同时过这一关,否则 `.py` 在没装 pyright 的机器上会被判成
 /// "有能力",最终以裸空结果收场、被读成"查无定义"。
 ///
-/// 成本 = 一次 PATH 扫描(每个目录一次 `access(2)`)。**刻意不做进程级缓存**:逐文件调用的循环
-/// 都是有界的(CodeMap `MAX_FILES` / FindSymbol `MAX_CANDIDATE_FILES`),相对每文件一次 LSP 往返
-/// (~30ms)可忽略;而缓存会把"跑到一半才装上 server"钉死成永久不可用,也会让测试互相污染。
+/// 成本 = 一次 PATH 扫描(每段目录一次 `access(2)`)。**实测不便宜**:PATH 30 段时单次 36µs
+/// (命中)/ 43µs(未命中,要扫完整个 PATH 才放弃)。对"随后就要做一次 LSP 往返"的文件可以忽略,
+/// 但对**被门禁挡掉、此外什么都不做**的文件就是纯浪费——FindSymbol 的候选上限量级 3200 个文件
+/// × 36µs ≈ 116ms,而答案至多只有 7 种。
+///
+/// 因此:**不做进程级缓存**(那会把"跑到一半才装上 server"钉死成永久不可用,还会让测试互相
+/// 污染),改由调用方在循环里持一个 `symbol_provider.CapabilityCache`——生命周期只有那一次扫描。
 pub fn binaryAvailable(def: *const ServerDef) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     return which(def.binary, &buf) != null;

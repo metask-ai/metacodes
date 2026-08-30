@@ -17,7 +17,11 @@ var g_mock_name: [64]u8 = undefined;
 var g_mock_name_len: usize = 0;
 var g_mock_cwd: [256]u8 = undefined;
 var g_mock_cwd_len: usize = 0;
-var g_mock_flags: [8][]const u8 = undefined;
+/// flag 按**字节**存,不存 slice:`extra_flags` 由 spawnTeammateProcess 在栈上组装,
+/// 断言发生在它返回之后。今天元素恰好都是静态字面量所以存 slice 也不会崩,但那是巧合,
+/// 不是契约——将来有人改成堆上拼的 flag,存 slice 的测试就读到已释放内存了。
+var g_mock_flags: [8][64]u8 = undefined;
+var g_mock_flag_lens: [8]usize = undefined;
 var g_mock_flags_len: usize = 0;
 
 fn mockSpawn(a: std.mem.Allocator, p: tp.SpawnProcessParams) anyerror!i64 {
@@ -26,15 +30,17 @@ fn mockSpawn(a: std.mem.Allocator, p: tp.SpawnProcessParams) anyerror!i64 {
     @memcpy(g_mock_name[0..g_mock_name_len], p.name[0..g_mock_name_len]);
     g_mock_cwd_len = @min(p.cwd.len, g_mock_cwd.len);
     @memcpy(g_mock_cwd[0..g_mock_cwd_len], p.cwd[0..g_mock_cwd_len]);
-    // extra_flags 借用 spawnTeammateProcess 栈上的静态串数组;此处只在同一调用内读,不逃逸。
     g_mock_flags_len = @min(p.extra_flags.len, g_mock_flags.len);
-    for (p.extra_flags[0..g_mock_flags_len], 0..) |f, i| g_mock_flags[i] = f;
+    for (p.extra_flags[0..g_mock_flags_len], 0..) |f, i| {
+        g_mock_flag_lens[i] = @min(f.len, g_mock_flags[i].len);
+        @memcpy(g_mock_flags[i][0..g_mock_flag_lens[i]], f[0..g_mock_flag_lens[i]]);
+    }
     return 99999; // 假 pid
 }
 
 fn mockSawFlag(needle: []const u8) bool {
-    for (g_mock_flags[0..g_mock_flags_len]) |f| {
-        if (std.mem.eql(u8, f, needle)) return true;
+    for (g_mock_flags[0..g_mock_flags_len], g_mock_flag_lens[0..g_mock_flags_len]) |*f, n| {
+        if (std.mem.eql(u8, f[0..n], needle)) return true;
     }
     return false;
 }

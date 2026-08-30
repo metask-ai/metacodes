@@ -18,7 +18,10 @@ const std = @import("std");
 ///  - LSP 层(`lsp/service.zig`):`no_server_for_language` / `outside_workspace` /
 ///    `server_not_installed` / `server_unavailable`。
 pub const Reason = enum {
-    /// 本进程没有 LSP 服务(默认是开的——`--no-lsp` 关掉了,或调用方本就没装配)。(工具层产)
+    /// 当前上下文没有 LSP 服务。两种来源:用户 `--no-lsp` 关掉了;或者这个执行上下文本就
+    /// 没装配 Service——**subagent 就是后者**(`agent_loop.Options.lsp` 不透传进子 loop,原因见
+    /// 那里:`lsp/client.zig` 要求 sendRequest 由单一 caller 线程串行调,而 subagent 跑在后台
+    /// 线程上)。措辞因此不能咬死是 `--no-lsp` 干的。(工具层产)
     lsp_disabled,
     /// 该扩展名在 `SERVERS` 里没有注册的 language server。
     no_server_for_language,
@@ -36,6 +39,27 @@ pub const Reason = enum {
 /// `why()` 输出的建议缓冲大小(最长一条 = 前缀 + 一个 server 二进制名)。
 pub const WHY_BUF: usize = 256;
 
+/// 一次扫描里出现多种缺失原因时,该报哪一个。**按"用户能拿它做什么"排序**,不是按发生顺序。
+///
+/// 为什么不能用"先到先得":FindSymbol 的候选文件来自 `rg -l -w`,顺序是目录遍历序。一个顺带
+/// 提到该名字的 `README.md` 排在 `.py` 前面,就会让结论变成"这种文件类型没有注册 language
+/// server"——把真正要说的"pyright 没装"盖掉。恰恰是本 issue 要修的那种"说了等于没说"。
+pub fn actionability(r: Reason) u8 {
+    return switch (r) {
+        .server_not_installed => 4, // 最可操作:装上就有
+        .server_unavailable => 3, // 装了但起不来:去查 server
+        .outside_workspace => 2, // 换个位置打开就有
+        .lsp_disabled => 1, // 去掉 --no-lsp 就有(全局性,不会与别的原因混)
+        .no_server_for_language, .path_unresolved => 0, // 对这个文件本来就无解,没什么可做
+    };
+}
+
+/// 在已记录的原因与新出现的原因之间取更值得报告的那个(`null` = 还没记过)。
+pub fn moreActionable(current: ?Unavailable, candidate: Unavailable) Unavailable {
+    const cur = current orelse return candidate;
+    return if (actionability(candidate.reason) > actionability(cur.reason)) candidate else cur;
+}
+
 /// 能力缺失(原因 + 一个静态细节串)。`detail` 指向 `SERVERS` 里的常量(binary / server_id),
 /// 无所有权、可自由按值复制、生命周期与程序等长。
 pub const Unavailable = struct {
@@ -48,7 +72,7 @@ pub const Unavailable = struct {
     /// `buf` 建议 `WHY_BUF` 字节;不够时退回不含 detail 的静态串(绝不截断出半截单词)。
     pub fn why(self: Unavailable, buf: []u8) []const u8 {
         return switch (self.reason) {
-            .lsp_disabled => "language server integration is not active (it is on by default; --no-lsp turns it off)",
+            .lsp_disabled => "language server integration is not available in this context (it is on by default in the main session; --no-lsp turns it off)",
             .no_server_for_language => "no language server is registered for this file type",
             .server_not_installed => std.fmt.bufPrint(
                 buf,
@@ -102,4 +126,27 @@ test "why: lsp_disabled 说清'默认是开的' + 关它的开关名" {
     // 默认翻转后措辞必须跟着翻:引导用户去掉 --no-lsp,而不是再加一个已经默认开的 --lsp。
     try testing.expect(std.mem.indexOf(u8, s, "--no-lsp") != null);
     try testing.expect(std.mem.indexOf(u8, s, "on by default") != null);
+}
+
+test "actionability: 能装的排在没得治的前面(混合候选文件时的取舍)" {
+    try testing.expect(actionability(.server_not_installed) > actionability(.no_server_for_language));
+    try testing.expect(actionability(.server_not_installed) > actionability(.outside_workspace));
+    try testing.expect(actionability(.server_unavailable) > actionability(.no_server_for_language));
+    try testing.expect(actionability(.outside_workspace) > actionability(.no_server_for_language));
+    // lsp_disabled 是全局的,不会和别的原因混;但也不该被"这类型没 server"盖掉。
+    try testing.expect(actionability(.lsp_disabled) > actionability(.no_server_for_language));
+}
+
+test "moreActionable: 先到的没得治的原因会被后到的可操作原因顶掉" {
+    const md = Unavailable{ .reason = .no_server_for_language };
+    const py = Unavailable{ .reason = .server_not_installed, .detail = "pyright-langserver" };
+    // README.md 先被 rg 列出来,.py 在后 —— 结论必须是"pyright 没装"。
+    try testing.expectEqual(Reason.server_not_installed, moreActionable(md, py).reason);
+    // 反向也一样:更可操作的先到就守住,不被后面的噪声覆盖。
+    try testing.expectEqual(Reason.server_not_installed, moreActionable(py, md).reason);
+    // 首次记录直接采用。
+    try testing.expectEqual(Reason.no_server_for_language, moreActionable(null, md).reason);
+    // 同级不抖动(保持先到的,detail 稳定)。
+    const py2 = Unavailable{ .reason = .server_not_installed, .detail = "gopls" };
+    try testing.expectEqualStrings("pyright-langserver", moreActionable(py, py2).detail);
 }

@@ -150,7 +150,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "file_path", .type = "string", .description = "The absolute path to the file to read" },
             .{ .name = "offset", .type = "integer", .description = "The line number to start reading from (1-based)" },
             .{ .name = "limit", .type = "integer", .description = "The number of lines to read" },
-            .{ .name = "outline", .type = "boolean", .description = "Return a symbol outline (functions/types with line numbers) instead of file contents. Requires an installed language server for the file's language; falls back to normal reading (with a note saying why) otherwise." },
+            .{ .name = "outline", .type = "boolean", .description = "Return a symbol outline (functions/types with line numbers) instead of file contents. Requires an installed language server for the file's language; falls back to normal reading otherwise, naming the reason when the language server is unavailable." },
         }, .required = &.{"file_path"} },
         .execute = .{ .legacy_inline = read_tool.execute },
         .replay = .read_only,

@@ -123,7 +123,8 @@ fn writeUnavailableNote(w: *std.Io.Writer, u: capability.Unavailable, found: usi
 pub const Scan = struct {
     /// 匹配的定义(owned:字符串字段 dupe 到 allocator,调用方负责 freeSymbol + free slice)。
     defs: []symbols.Symbol,
-    /// 有候选文件因**符号能力缺失**被跳过时,记下首个原因;否则 null。
+    /// 有候选文件因**符号能力缺失**被跳过时,记下**最可操作**的那个原因(不是最先遇到的——
+    /// 见 `capability.moreActionable`);否则 null。
     /// 非 null ⇒ `defs` 不保证完整,空 `defs` **不得**解读为"查无定义"(issue #17)。
     unavailable: ?capability.Unavailable,
 };
@@ -151,15 +152,18 @@ pub fn scanDefinitions(
 
     // 候选文件为空(rg 一个都没找到)时保持 null:那是真正的"查无此名",裸 `[]` 才是诚实的。
     var unavailable: ?capability.Unavailable = null;
+    // 门禁答案只取决于扩展名,而每算一次要扫一遍 PATH(30 段 PATH 实测 36–43µs)。候选文件可达
+    // 数千个、且被挡掉的那些此外什么都不做 → 不记忆化就是上百 ms 的纯 access(2)。
+    var caps = symbol_provider.CapabilityCache.init(ctx);
 
     var processed: usize = 0;
     for (files) |file| {
         if (processed >= MAX_CANDIDATE_FILES) break;
         // 门禁:需要 LSP 在位 + 注册 server + 该 server 二进制真的装了。
-        switch (symbol_provider.capabilityFor(ctx, file)) {
+        switch (caps.get(file)) {
             .available => {},
             .unavailable => |u| {
-                if (unavailable == null) unavailable = u;
+                unavailable = capability.moreActionable(unavailable, u);
                 continue;
             },
         }
@@ -170,11 +174,13 @@ pub fn scanDefinitions(
         defer allocator.free(source);
         if (source.len > MAX_SOURCE_BYTES) continue;
 
-        var outcome = symbol_provider.extractSymbols(ctx, allocator, file, source) catch continue;
+        // **不 catch**:这里唯一的错误来源是分配失败。把 OOM 吞成"这文件没匹配"会得到一份
+        // 短了却看起来完整的定义列表——正是本 issue 要消灭的那类谎报,只是换了个原因。
+        var outcome = try symbol_provider.extractSymbols(ctx, allocator, file, source);
         switch (outcome) {
             // 门禁看不见的运行期失败(spawn 失败 / broken-set / client 满员 / 不在 git 仓)。
             .unavailable => |u| {
-                if (unavailable == null) unavailable = u;
+                unavailable = capability.moreActionable(unavailable, u);
                 continue;
             },
             .symbols => |*syms| {
