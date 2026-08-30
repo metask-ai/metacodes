@@ -1,6 +1,8 @@
 //! 跨进程文件锁(对齐 cc proper-lockfile 语义,精简实现)。
 //!
-//! 用途:swarm 共享 JSON 文件(team config.json / inboxes/<name>.json)的互斥写。
+//! 用途:通用的共享文件读-改-写互斥(与 swarm 无关,故落在 util/)。消费者:
+//! swarm/team(config.json)、swarm/mailbox(inboxes/<name>.json)、
+//! core/task_store(镜像事务)、kg/client(迁移锁)。
 //! 机制:`<path>.lock` 哨兵文件,O_CREAT|O_EXCL 原子创建=持锁;文件内容是
 //! `{pid} {wall_ms}`,供陈旧检测(持锁者崩溃后 stale_ms 过期可抢)。
 //!
@@ -19,8 +21,8 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
-const util_time = @import("../util/time.zig");
-const log = @import("../util/log.zig");
+const util_time = @import("time.zig");
+const log = @import("log.zig");
 
 const is_windows = @import("builtin").os.tag == .windows;
 
@@ -206,7 +208,7 @@ fn pid() i64 {
 // ============================================================================
 
 const testing = std.testing;
-const test_fs = @import("../util/fs.zig");
+const test_fs = @import("fs.zig");
 
 fn testDir(buf: []u8) ![]const u8 {
     const d = try std.fmt.bufPrint(buf, "/tmp/cc-zig-filelock-test-{d}", .{util_time.nowNs()});
