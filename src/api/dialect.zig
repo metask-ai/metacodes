@@ -305,6 +305,25 @@ pub const Dialect = struct {
         allocator: std.mem.Allocator,
     ) anyerror!bool = defaultSerializeParallelToolCalls,
 
+    /// 请求侧:把一个中立 image block 翻译成本方言的 content-part wire JSON 片段,
+    /// 追加到 `out`。返回 true=已输出;false=该 (dialect, model) 不支持图像输入——
+    /// 调用方(provider 序列化器)必须报显式 error.ImageInputUnsupported,绝不静默
+    /// 丢弃或降级为文本(issue #10 铁律)。实现内部先查 profile.supports_image_input。
+    /// **`out` 契约**:输出单个 content 块/part 对象,不带外围逗号——数组结构与逗号
+    /// 由调用方管理(与 message 序列化其余 block 一致)。
+    /// - Claude dialect:{"type":"image","source":{"type":"base64","media_type":..,"data":..}}
+    /// - OpenAI dialect:{"type":"image_url","image_url":{"url":"data:<mime>;base64,<data>"}}
+    ///   (chat/completions 形态;Responses API 的 input_image 是 responses-local,不经此方法)
+    /// - Gemini dialect:{"inline_data":{"mime_type":..,"data":..}}
+    /// default = 返回 false(fail-closed:未注册方言/other 协议族不知 wire 格式)。
+    serializeImagePartFn: *const fn (
+        ctx: *anyopaque,
+        profile: ModelProfile,
+        image: types.ImageBlock,
+        out: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+    ) anyerror!bool = defaultSerializeImagePart,
+
     /// 暴露纯数据 profile 供 UI/agent_loop 快速问能力。单一真相源收口(step 8 后)。
     /// default = 返回 profileFor 的结果。
     profileFn: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
@@ -342,6 +361,12 @@ pub const Dialect = struct {
     }
     pub fn serializeParallelToolCalls(self: Dialect, p: ModelProfile, enabled: ?bool, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
         return try self.serializeParallelToolCallsFn(self.ctx, p, enabled, out, a);
+    }
+    pub fn serializeImagePart(self: Dialect, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
+        // 能力守门集中在 wrapper:vendor 覆盖 serializeImagePartFn 也绕不开
+        // profile.supports_image_input(issue #10 铁律由构造保证,不靠每个实现自觉)。
+        if (!p.supports_image_input) return false;
+        return try self.serializeImagePartFn(self.ctx, p, image, out, a);
     }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
         return self.profileFn(self.ctx, kind, model);
@@ -487,6 +512,16 @@ fn defaultSerializeParallelToolCalls(ctx: *anyopaque, p: ModelProfile, enabled: 
     _ = enabled;
     _ = out;
     _ = a;
+    return false;
+}
+
+fn defaultSerializeImagePart(ctx: *anyopaque, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    _ = p;
+    _ = image;
+    _ = out;
+    _ = a;
+    // fail-closed:default/other 协议族不知图像 wire 格式 → false,调用方报显式能力错误。
     return false;
 }
 

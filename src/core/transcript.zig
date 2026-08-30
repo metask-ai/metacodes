@@ -10,6 +10,8 @@
 //!     - `{"type":"text","text":"..."}`
 //!     - `{"type":"tool_use","id":"","name":"","input":"<json string>"}`
 //!     - `{"type":"tool_result","tool_use_id":"","content":"...","is_error":bool}`
+//!     - `{"type":"thinking","thinking":"..."}`
+//!     - `{"type":"image","media_type":"image/png","data":"<base64>"}`
 //! - **meta.json**：每次写 transcript 后覆盖写入 {model, last_modified_ns, message_count, title_guess}
 //! - **title_guess**：首条 user text 的前 80 字节（去换行）
 //! - **加载**：逐行 parse JSONL 重建 Conversation；meta 用于 /resume 列表
@@ -216,6 +218,14 @@ pub const Writer = struct {
                     try std.json.Stringify.encodeJsonString(t, .{}, &aw.writer);
                     try aw.writer.writeAll("}");
                 },
+                .image => |img| {
+                    // base64 载荷 JSON 安全;resume 后图像语义原样恢复(issue #10)。
+                    try aw.writer.writeAll("{\"type\":\"image\",\"media_type\":");
+                    try std.json.Stringify.encodeJsonString(img.media_type, .{}, &aw.writer);
+                    try aw.writer.writeAll(",\"data\":");
+                    try std.json.Stringify.encodeJsonString(img.data, .{}, &aw.writer);
+                    try aw.writer.writeAll("}");
+                },
             }
         }
         try aw.writer.writeAll("]}\n");
@@ -236,6 +246,18 @@ pub const Writer = struct {
                 break;
             };
             if (title.len > 0) break;
+        }
+        // 纯图会话兜底:整个扫描找不到任何 user text(--image 允许空 prompt)才落
+        // "[image]" 标签——首条是图、后续消息有 text 时,text 仍然胜出(不因图占位
+        // 而永远锁死 /resume 列表标题)。
+        if (title.len == 0) {
+            outer: for (messages) |m| {
+                if (m.role != .user) continue;
+                for (m.blocks) |b| if (b == .image) {
+                    title = "[image]";
+                    break :outer;
+                };
+            }
         }
 
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -393,9 +415,15 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
             const name = bv.object.get("name") orelse return error.InvalidTranscript;
             const input = bv.object.get("input") orelse return error.InvalidTranscript;
             if (id != .string or name != .string or input != .string) return error.InvalidTranscript;
+            // 逐字段 errdefer:第 2/3 个 dupe OOM 时,已 dupe 的前串未进 blocks
+            // (constructed 尚未 +1),函数级清理够不到——必须在此释放。
+            const id_owned = try allocator.dupe(u8, id.string);
+            errdefer allocator.free(id_owned);
+            const name_owned = try allocator.dupe(u8, name.string);
+            errdefer allocator.free(name_owned);
             blocks[idx] = .{ .tool_use = .{
-                .id = try allocator.dupe(u8, id.string),
-                .name = try allocator.dupe(u8, name.string),
+                .id = id_owned,
+                .name = name_owned,
                 .input = try allocator.dupe(u8, input.string),
             } };
         } else if (std.mem.eql(u8, tv.string, "tool_result")) {
@@ -403,10 +431,28 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
             const c = bv.object.get("content") orelse return error.InvalidTranscript;
             const is_err = bv.object.get("is_error") orelse std.json.Value{ .bool = false };
             if (tuid != .string or c != .string) return error.InvalidTranscript;
+            const tuid_owned = try allocator.dupe(u8, tuid.string);
+            errdefer allocator.free(tuid_owned);
             blocks[idx] = .{ .tool_result = .{
-                .tool_use_id = try allocator.dupe(u8, tuid.string),
+                .tool_use_id = tuid_owned,
                 .content = try allocator.dupe(u8, c.string),
                 .is_error = if (is_err == .bool) is_err.bool else false,
+            } };
+        } else if (std.mem.eql(u8, tv.string, "thinking")) {
+            // 写侧一直会写 thinking 块,读侧此前缺此分支 → 任何带 thinking 的会话
+            // resume 整体 InvalidTranscript(roundtrip bug,随 image 支持一并修复)。
+            const t = bv.object.get("thinking") orelse return error.InvalidTranscript;
+            if (t != .string) return error.InvalidTranscript;
+            blocks[idx] = .{ .thinking = try allocator.dupe(u8, t.string) };
+        } else if (std.mem.eql(u8, tv.string, "image")) {
+            const mt = bv.object.get("media_type") orelse return error.InvalidTranscript;
+            const data = bv.object.get("data") orelse return error.InvalidTranscript;
+            if (mt != .string or data != .string) return error.InvalidTranscript;
+            const mt_owned = try allocator.dupe(u8, mt.string);
+            errdefer allocator.free(mt_owned);
+            blocks[idx] = .{ .image = .{
+                .media_type = mt_owned,
+                .data = try allocator.dupe(u8, data.string),
             } };
         } else {
             return error.InvalidTranscript;
@@ -736,4 +782,112 @@ test "listSessions orders by last_modified desc" {
     // 降序：最新的在前
     try std.testing.expect(list[0].last_modified_ns >= list[1].last_modified_ns);
     try std.testing.expect(list[1].last_modified_ns >= list[2].last_modified_ns);
+}
+
+test "image + thinking 块 transcript roundtrip(issue #10 会话恢复语义)" {
+    // image:媒体类型/base64 原样恢复。thinking:写侧一直会写,读侧此前缺分支 →
+    // 任何带 thinking 的会话 resume 整体失败(随 image 支持一并修复,此测试锁定)。
+    const a = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-test-img-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+
+    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet", genSessionId());
+    defer writer.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+
+    const blks = try a.alloc(msg_mod.Block, 3);
+    blks[0] = .{ .text = try a.dupe(u8, "这是截图") };
+    blks[1] = .{ .image = .{
+        .media_type = try a.dupe(u8, "image/png"),
+        .data = try a.dupe(u8, "UE5HREFUQQ=="),
+    } };
+    blks[2] = .{ .image = .{
+        .media_type = try a.dupe(u8, "image/jpeg"),
+        .data = try a.dupe(u8, "SlBFRw=="),
+    } };
+    try conv.append(.{ .role = .user, .blocks = blks });
+
+    const blks2 = try a.alloc(msg_mod.Block, 2);
+    blks2[0] = .{ .thinking = try a.dupe(u8, "推理内容") };
+    blks2[1] = .{ .text = try a.dupe(u8, "两张图分别是…") };
+    try conv.append(.{ .role = .assistant, .blocks = blks2 });
+
+    writer.flush(&conv);
+
+    var conv2 = Conversation.init(a);
+    defer conv2.deinit();
+    try loadTranscript(&conv2, writer.dir, a);
+    try std.testing.expectEqual(@as(usize, 2), conv2.len());
+    const user_blocks = conv2.messages.items[0].blocks;
+    try std.testing.expectEqual(@as(usize, 3), user_blocks.len);
+    try std.testing.expectEqualStrings("这是截图", user_blocks[0].text);
+    try std.testing.expectEqualStrings("image/png", user_blocks[1].image.media_type);
+    try std.testing.expectEqualStrings("UE5HREFUQQ==", user_blocks[1].image.data);
+    try std.testing.expectEqualStrings("image/jpeg", user_blocks[2].image.media_type);
+    const asst_blocks = conv2.messages.items[1].blocks;
+    try std.testing.expectEqualStrings("推理内容", asst_blocks[0].thinking);
+    try std.testing.expectEqualStrings("两张图分别是…", asst_blocks[1].text);
+}
+
+test "title_guess: 纯图首条不锁死标题,后续 user text 胜出;全程无 text 才落 [image]" {
+    const a = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-title-img-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+    var writer = try Writer.init(a, "/dummy", tmp_home, "m", genSessionId());
+    defer writer.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    const blks = try a.alloc(msg_mod.Block, 1);
+    blks[0] = .{ .image = .{ .media_type = try a.dupe(u8, "image/png"), .data = try a.dupe(u8, "UE5H") } };
+    try conv.append(.{ .role = .user, .blocks = blks });
+    writer.flush(&conv);
+
+    {
+        const raw = try readMetaForTest(a, writer.dir);
+        defer a.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"title_guess\":\"[image]\"") != null);
+    }
+
+    // 后续 user text → 标题被 text 取代(不被 [image] 占位锁死)。
+    try conv.appendText(.user, "fix the login bug");
+    writer.flush(&conv);
+    {
+        const raw = try readMetaForTest(a, writer.dir);
+        defer a.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"title_guess\":\"fix the login bug\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "[image]") == null);
+    }
+}
+
+fn readMetaForTest(allocator: std.mem.Allocator, session_dir: []const u8) ![]u8 {
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/meta.json\x00", .{session_dir});
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    var all = std.ArrayList(u8).empty;
+    errdefer all.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = pfs.read(fd, &buf);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try all.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+    return all.toOwnedSlice(allocator);
 }

@@ -53,6 +53,10 @@ pub const Config = struct {
     /// Headless 模式：非 null 时跑单次 prompt 后退出，不进 REPL。
     /// 来源：`-p "..."` / `--print "..."`，或 `-`（从 stdin 读全部）。
     prompt: ?[]const u8 = null,
+    /// headless 多模态输入(issue #10):`--image <path>`(可重复)。与 prompt 一起
+    /// 构成一条按序 text+images 的 user 消息。多个路径用 `\x00` 分隔拼一串
+    /// (同 add_dirs 的 appendNulList 约定)。null = 无图像。
+    images: ?[]const u8 = null,
     /// `--json`：headless 下用 NDJSON 事件流输出，便于 CI/脚本消费。
     json_output: bool = false,
     /// `--stream-json`:headless 运行期实时 NDJSON 事件流(text/tool/usage/turn),
@@ -303,6 +307,17 @@ pub const ApiContent = union(enum) {
     thinking: []const u8,
     tool_use: ToolUseBlock,
     tool_result: ToolResultBlock,
+    /// 用户消息中的一等图像内容(issue #10)。base64 载荷 + MIME,与 text 可按序混排。
+    /// wire 翻译按 provider 方言(dialect.serializeImagePart);不支持图像输入的
+    /// (provider, model) 序列化时必须返回显式能力错误,绝不静默丢弃或降级为文本。
+    image: ImageBlock,
+};
+
+/// 图像内容块(中立 IR)。data 是 base64 编码字节;media_type 是与内容一致的 MIME
+/// (至少支持 image/png 与 image/jpeg)。字节所有权跟随所在 ApiMessage 的借用契约。
+pub const ImageBlock = struct {
+    media_type: []const u8,
+    data: []const u8,
 };
 
 /// 工具调用块

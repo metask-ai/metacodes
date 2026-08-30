@@ -491,11 +491,16 @@ fn hasToolResult(m: types.ApiMessage) bool {
     for (m.content) |c| if (c == .tool_result) return true;
     return false;
 }
+fn hasImage(m: types.ApiMessage) bool {
+    for (m.content) |c| if (c == .image) return true;
+    return false;
+}
 
 /// 合并相邻同角色消息:新 content = 两者拼接。就地改写(旧数组 free,新数组 owned)。
 /// **provider 安全**:OpenAI/Gemini 的序列化把含 tool_result 的消息当 wire 层 `role:"tool"`/
-/// functionResponse,且遇 tool_result 消息**早返回丢弃同消息内 text**。故绝不合并出"text +
-/// tool_result 混合"消息——若合并后会同时含 text 和 tool_result 则跳过。text+text(inject+首 user)
+/// functionResponse,且遇 tool_result 消息**早返回丢弃同消息内 text/image**。故绝不合并出
+/// "text/image + tool_result 混合"消息——若合并后会同时含用户可见内容(text 或 image)与
+/// tool_result 则跳过。text+text(inject+首 user)、text+image(上下文注入+多模态 user)
 /// 和 tool_result+tool_result(补桩+真结果)都安全,照合。
 fn mergeConsecutiveRoles(allocator: std.mem.Allocator, list: *std.ArrayList(types.ApiMessage)) !void {
     var i: usize = 0;
@@ -506,8 +511,8 @@ fn mergeConsecutiveRoles(allocator: std.mem.Allocator, list: *std.ArrayList(type
             i += 1;
             continue;
         }
-        // 合并后是否会 text 与 tool_result 混合?会则跳过(防序列化丢 text)。
-        const combined_has_text = hasText(a) or hasText(b);
+        // 合并后是否会 text/image 与 tool_result 混合?会则跳过(防序列化丢用户内容)。
+        const combined_has_text = hasText(a) or hasText(b) or hasImage(a) or hasImage(b);
         const combined_has_tr = hasToolResult(a) or hasToolResult(b);
         if (combined_has_text and combined_has_tr) {
             i += 1;
@@ -792,4 +797,50 @@ test "normalizeApiMessages: 幂等(跑两遍结果不变)" {
     try normalizeApiMessages(a, &list);
     try testing.expectEqual(after_first, list.items.len);
     try testing.expectEqual(first_blocks, list.items[0].content.len);
+}
+
+test "merge: text+image 的多模态 user 与 inject 上下文合并保图(顺序保持)" {
+    const a = testing.allocator;
+    var list = std.ArrayList(types.ApiMessage).empty;
+    defer {
+        for (list.items) |m| a.free(m.content);
+        list.deinit(a);
+    }
+    const c0 = try a.alloc(types.ApiContent, 1);
+    c0[0] = .{ .text = "context" };
+    try list.append(a, .{ .role = .user, .content = c0 });
+    const c1 = try a.alloc(types.ApiContent, 2);
+    c1[0] = .{ .text = "看图" };
+    c1[1] = .{ .image = .{ .media_type = "image/png", .data = "UE5H" } };
+    try list.append(a, .{ .role = .user, .content = c1 });
+
+    try normalizeApiMessages(a, &list);
+    try testing.expectEqual(@as(usize, 1), list.items.len);
+    try testing.expectEqual(@as(usize, 3), list.items[0].content.len);
+    try testing.expect(list.items[0].content[2] == .image);
+    try testing.expectEqualStrings("UE5H", list.items[0].content[2].image.data);
+}
+
+test "merge: image 消息不与 tool_result 消息合并(防序列化丢图)" {
+    const a = testing.allocator;
+    var list = std.ArrayList(types.ApiMessage).empty;
+    defer {
+        for (list.items) |m| a.free(m.content);
+        list.deinit(a);
+    }
+    // assistant tool_use → user tool_result → user image:后两条同角色但不得合并。
+    const c0 = try a.alloc(types.ApiContent, 1);
+    c0[0] = .{ .tool_use = .{ .id = "t1", .name = "Read", .input = "{}" } };
+    try list.append(a, .{ .role = .assistant, .content = c0 });
+    const c1 = try a.alloc(types.ApiContent, 1);
+    c1[0] = .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok" } };
+    try list.append(a, .{ .role = .user, .content = c1 });
+    const c2 = try a.alloc(types.ApiContent, 1);
+    c2[0] = .{ .image = .{ .media_type = "image/png", .data = "UE5H" } };
+    try list.append(a, .{ .role = .user, .content = c2 });
+
+    try normalizeApiMessages(a, &list);
+    try testing.expectEqual(@as(usize, 3), list.items.len);
+    try testing.expect(list.items[1].content[0] == .tool_result);
+    try testing.expect(list.items[2].content[0] == .image);
 }

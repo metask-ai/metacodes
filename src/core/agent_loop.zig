@@ -2750,6 +2750,7 @@ fn buildApiMessages(
                     .content = tr.content,
                     .is_error = tr.is_error,
                 } },
+                .image => |img| .{ .image = .{ .media_type = img.media_type, .data = img.data } },
                 .thinking => continue, // 不发回 API
             };
             contents[idx] = c;
@@ -2812,11 +2813,105 @@ fn estimateMessageTokens(m: msg.Message) usize {
         switch (b) {
             .text => |t| total += Conversation.estimateTokens(t),
             .tool_use => |tu| total += Conversation.estimateTokens(tu.name) + Conversation.estimateTokens(tu.input),
-            .tool_result => |tr| total += Conversation.estimateTokens(tr.content),
+            // usage-anchor 热路径同口径:Read 图像 tool_result 落在锚点后缀时按
+            // IMAGE_TOKEN_ESTIMATE 计,否则一次大图 Read 就把 anchor+增量推过
+            // auto_threshold,每图强制一次有损 compact。
+            .tool_result => |tr| total += if (json_mod.extractImageResult(tr.content) != null)
+                conversation_mod.IMAGE_TOKEN_ESTIMATE
+            else
+                Conversation.estimateTokens(tr.content),
             .thinking => {},
+            .image => total += conversation_mod.IMAGE_TOKEN_ESTIMATE,
         }
     }
     return total;
+}
+
+/// 估算/预留/身份专用投影:把图像载荷换成短占位 text(真实请求绝不经此路径)。
+/// 覆盖两种图像通道:一等 `.image` block 与 Read 工具图像形态的 tool_result
+/// (`{"type":"image",...}` JSON,经 request.zig extractImageResult 判定)。
+/// 动机:①字节估算(≈bytes/4)会把 MB 级 base64 计成~百万 token(3.75MB 图 ≈ 125 万),
+/// 误触发 auto-compact 与预算门;②这些路径统一走 Anthropic 序列化器,非 claude 模型带图
+/// 会因 vision 守门报错(request_gate 场景 catch 成 maxInt → 必被预算拒)。投影后
+/// body 无 base64、序列化必成功;图的真实贡献按 IMAGE_TOKEN_ESTIMATE 单独加回。
+/// 返回 null = 无图(调用方直接用原 slice,零分配零拷贝)。
+/// pub:agentcore session_budget 的请求字节测量复用同一投影(加回真实载荷长度)。
+pub const EstimationProjection = struct {
+    messages: []types.ApiMessage,
+    image_count: usize,
+
+    pub fn deinit(self: EstimationProjection, allocator: std.mem.Allocator) void {
+        for (self.messages) |m| allocator.free(m.content);
+        allocator.free(self.messages);
+    }
+};
+
+fn contentIsImage(c: types.ApiContent) bool {
+    return switch (c) {
+        .image => true,
+        .tool_result => |tr| json_mod.extractImageResult(tr.content) != null,
+        else => false,
+    };
+}
+
+pub fn projectImagesForEstimation(allocator: std.mem.Allocator, messages: []const types.ApiMessage) !?EstimationProjection {
+    var image_count: usize = 0;
+    for (messages) |m| for (m.content) |c| {
+        if (contentIsImage(c)) image_count += 1;
+    };
+    if (image_count == 0) return null;
+    const out = try allocator.alloc(types.ApiMessage, messages.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |m| allocator.free(m.content);
+        allocator.free(out);
+    }
+    for (messages, 0..) |m, i| {
+        const content = try allocator.alloc(types.ApiContent, m.content.len);
+        for (m.content, 0..) |c, ci| content[ci] = switch (c) {
+            .image => .{ .text = "[image]" }, // static 占位,借用语义与其余 block 一致
+            .tool_result => |tr| if (json_mod.extractImageResult(tr.content) != null)
+                .{ .tool_result = .{
+                    .tool_use_id = tr.tool_use_id,
+                    .content = "[image tool result]",
+                    .is_error = tr.is_error,
+                } }
+            else
+                c,
+            else => c,
+        };
+        out[i] = .{ .role = m.role, .content = content };
+        built = i + 1;
+    }
+    return .{ .messages = out, .image_count = image_count };
+}
+
+/// 投影 + Anthropic-canonical 序列化(估算/预留/身份共用的唯一入口——"序列化用于
+/// 度量必先投影"的不变量在此由构造保证,新消费者无法绕过)。调用方 free body。
+const EstimationBody = struct { body: []u8, image_tokens: u64 };
+
+fn serializeForEstimation(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    messages: []const types.ApiMessage,
+    system_prompt: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) !EstimationBody {
+    const projection = try projectImagesForEstimation(allocator, messages);
+    defer if (projection) |p| p.deinit(allocator);
+    const effective: []const types.ApiMessage = if (projection) |p| p.messages else messages;
+    const image_tokens: u64 = @intCast((if (projection) |p| p.image_count else 0) * conversation_mod.IMAGE_TOKEN_ESTIMATE);
+    const body = try json_mod.serializeMessagesRequest(.{
+        .model = model_override orelse provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = effective,
+        .system = system_prompt,
+        .stream = true,
+        .tools = tool_defs,
+        .reasoning_effort = provider.reasoningEffort(),
+    }, allocator);
+    return .{ .body = body, .image_tokens = image_tokens };
 }
 
 fn estimateApiRequestTokens(
@@ -2827,17 +2922,9 @@ fn estimateApiRequestTokens(
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
 ) !usize {
-    const req_body = try json_mod.serializeMessagesRequest(.{
-        .model = model_override orelse provider.model(),
-        .max_tokens = provider.maxTokens(),
-        .messages = messages,
-        .system = system_prompt,
-        .stream = true,
-        .tools = tool_defs,
-        .reasoning_effort = provider.reasoningEffort(),
-    }, allocator);
-    defer allocator.free(req_body);
-    return Conversation.estimateTokens(req_body);
+    const est = try serializeForEstimation(allocator, provider, messages, system_prompt, tool_defs, model_override);
+    defer allocator.free(est.body);
+    return Conversation.estimateTokens(est.body) +| @as(usize, @intCast(est.image_tokens));
 }
 
 /// Conservative request-local input reserve used by the paid evaluation gate.
@@ -2852,25 +2939,26 @@ fn serializedRequestInputTokenReserve(
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
 ) !u64 {
-    const req_body = try json_mod.serializeMessagesRequest(.{
-        .model = model_override orelse provider.model(),
-        .max_tokens = provider.maxTokens(),
-        .messages = messages,
-        .system = system_prompt,
-        .stream = true,
-        .tools = tool_defs,
-        .reasoning_effort = provider.reasoningEffort(),
-    }, allocator);
-    defer allocator.free(req_body);
-    const estimated = @as(u64, @intCast(Conversation.estimateTokens(req_body)));
+    // 图像经估算投影(serializeForEstimation):按 IMAGE_TOKEN_ESTIMATE 计入 estimated
+    // (随 doubled 一起获得 2x 预留),不按 base64 字节计——否则一张图就把预留推到
+    // ~百万 token,request_gate 必拒。byte_reserve 的 floor 相应基于投影后 body:
+    // provider 按 token 计费(base64 字节不进 tokenizer 语义),图的预留由
+    // IMAGE_TOKEN_ESTIMATE*2(≈2x 缩放上限)承担,不再由 wire 字节 floor 承担。
+    const est = try serializeForEstimation(allocator, provider, messages, system_prompt, tool_defs, model_override);
+    defer allocator.free(est.body);
+    const estimated = @as(u64, @intCast(Conversation.estimateTokens(est.body))) +| est.image_tokens;
     const doubled_estimate = estimated *| 2;
-    const byte_reserve = (@as(u64, @intCast(req_body.len)) +| 1) / 2;
+    const byte_reserve = (@as(u64, @intCast(est.body.len)) +| 1) / 2;
     return @max(doubled_estimate, byte_reserve) +| 4096;
 }
 
 /// Provider-neutral identity of the exact AgentLoop request IR. Concrete
 /// transports may serialize different wire dialects, but retries and restored
 /// runs compare this canonical projection before any provider I/O.
+/// 图像处理:canonical 序列化用估算投影(占位替换,避开 vision 守门——否则非 claude
+/// vision 模型带图的 execution-boundary 会话在此报错,run 直接 .api_error),图像
+/// 内容的身份经原始载荷字节按序追加进 hash(sha256Hex 每段带长度前缀,无拼接歧义):
+/// 两图交换/换内容/换 MIME → hash 变;身份完备且恒可计算。
 fn canonicalAgentRequestSha256(
     allocator: std.mem.Allocator,
     provider: provider_mod.Provider,
@@ -2879,17 +2967,22 @@ fn canonicalAgentRequestSha256(
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
 ) ![64]u8 {
-    const req_body = try json_mod.serializeMessagesRequest(.{
-        .model = model_override orelse provider.model(),
-        .max_tokens = provider.maxTokens(),
-        .messages = messages,
-        .system = system_prompt,
-        .stream = true,
-        .tools = tool_defs,
-        .reasoning_effort = provider.reasoningEffort(),
-    }, allocator);
-    defer allocator.free(req_body);
-    return execution_effect.sha256Hex(&.{req_body});
+    const est = try serializeForEstimation(allocator, provider, messages, system_prompt, tool_defs, model_override);
+    defer allocator.free(est.body);
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(allocator);
+    try parts.append(allocator, est.body);
+    for (messages) |m| for (m.content) |c| switch (c) {
+        .image => |img| {
+            try parts.append(allocator, img.media_type);
+            try parts.append(allocator, img.data);
+        },
+        .tool_result => |tr| if (json_mod.extractImageResult(tr.content) != null) {
+            try parts.append(allocator, tr.content);
+        },
+        else => {},
+    };
+    return execution_effect.sha256Hex(parts.items);
 }
 
 fn estimateNextRequestTokensOrFallback(
@@ -4920,4 +5013,126 @@ test "parseForcedAutoCompactThreshold: 合法强制值 + 坏值回退 null" {
     try std.testing.expectEqual(@as(?usize, null), parseForcedAutoCompactThreshold("0"));
     try std.testing.expectEqual(@as(?usize, null), parseForcedAutoCompactThreshold("garbage"));
     // 无 env 时 getenv 返回 null → 走正常 formula+floor(wiring 由真模型 e2e 验证)。
+}
+
+test "估算投影:image 按 IMAGE_TOKEN_ESTIMATE 计,不按 base64 字节(防爆表/误 compact)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    // 800KB 伪 base64:按旧字节估算 ≈ 20 万 token;按投影应只计 IMAGE_TOKEN_ESTIMATE。
+    const big = try a.alloc(u8, 800_000);
+    @memset(big, 'A');
+    const blocks = try a.alloc(msg.Block, 2);
+    blocks[0] = .{ .text = try a.dupe(u8, "看图") };
+    blocks[1] = .{ .image = .{ .media_type = try a.dupe(u8, "image/png"), .data = big } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+
+    // model 用非 claude 名:投影后估算序列化不再触发 vision 守门(此前会 error 落 fallback)。
+    var state = TestProviderState{ .model = "gpt-4o", .max_tokens = 777, .reasoning_effort = null };
+    const provider = testProvider(&state);
+    const estimated = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    try std.testing.expect(estimated >= conversation_mod.IMAGE_TOKEN_ESTIMATE);
+    try std.testing.expect(estimated < 50_000); // 远小于按字节计的 ~20 万
+
+    // request_gate 的 input 预留同理:不因图爆表,也不因非 vision 模型报错(此前
+    // catch maxInt → 预算门必拒)。
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+    const reserve = try serializedRequestInputTokenReserve(a, provider, api.items, null, &.{}, null);
+    try std.testing.expect(reserve < 100_000);
+    try std.testing.expect(reserve >= 2 * @as(u64, conversation_mod.IMAGE_TOKEN_ESTIMATE));
+}
+
+test "projectImagesForEstimation: 无图返 null(零拷贝),有图替换占位并计数" {
+    const a = std.testing.allocator;
+    const text_only = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+    };
+    try std.testing.expect((try projectImagesForEstimation(a, &text_only)) == null);
+
+    const mixed = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .text = "a" },
+            .{ .image = .{ .media_type = "image/png", .data = "XXXX" } },
+            .{ .image = .{ .media_type = "image/jpeg", .data = "YYYY" } },
+        } },
+    };
+    const proj = (try projectImagesForEstimation(a, &mixed)).?;
+    defer proj.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), proj.image_count);
+    try std.testing.expectEqualStrings("a", proj.messages[0].content[0].text);
+    try std.testing.expectEqualStrings("[image]", proj.messages[0].content[1].text);
+    try std.testing.expectEqualStrings("[image]", proj.messages[0].content[2].text);
+}
+
+test "估算投影覆盖 tool_result 图像形态(Read 截图不爆表)" {
+    const a = std.testing.allocator;
+    // Read 工具图像形态 tool_result:800KB 伪 base64。
+    const big = try a.alloc(u8, 800_000);
+    defer a.free(big);
+    @memset(big, 'A');
+    const tr_content = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{big});
+    defer a.free(tr_content);
+
+    const contents = [_]types.ApiContent{
+        .{ .tool_result = .{ .tool_use_id = "t1", .content = tr_content } },
+    };
+    const messages = [_]types.ApiMessage{.{ .role = .user, .content = &contents }};
+    const proj = (try projectImagesForEstimation(a, &messages)).?;
+    defer proj.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), proj.image_count);
+    try std.testing.expectEqualStrings("[image tool result]", proj.messages[0].content[0].tool_result.content);
+    try std.testing.expectEqualStrings("t1", proj.messages[0].content[0].tool_result.tool_use_id);
+
+    // 端到端:估算不按 base64 字节计。
+    var state = TestProviderState{ .model = "gpt-4o", .max_tokens = 777, .reasoning_effort = null };
+    const provider = testProvider(&state);
+    const estimated = try estimateApiRequestTokens(a, provider, &messages, null, &.{}, null);
+    try std.testing.expect(estimated < 50_000);
+}
+
+test "canonical 请求身份:非 claude vision 模型带图可算,图内容参与身份" {
+    // 此前经 Anthropic 序列化器直算 → gpt-4o 带图报 ImageInputUnsupported,
+    // execution-boundary 会话 run 直接 .api_error(review 轮修复,此测试锁定)。
+    const a = std.testing.allocator;
+    var state = TestProviderState{ .model = "gpt-4o", .max_tokens = 777, .reasoning_effort = null };
+    const provider = testProvider(&state);
+
+    const c1 = [_]types.ApiContent{
+        .{ .text = "look" },
+        .{ .image = .{ .media_type = "image/png", .data = "AAAA" } },
+    };
+    const m1 = [_]types.ApiMessage{.{ .role = .user, .content = &c1 }};
+    const h1 = try canonicalAgentRequestSha256(a, provider, &m1, null, &.{}, null);
+
+    // 图内容变 → 身份变(占位投影不丢失图像身份)。
+    const c2 = [_]types.ApiContent{
+        .{ .text = "look" },
+        .{ .image = .{ .media_type = "image/png", .data = "BBBB" } },
+    };
+    const m2 = [_]types.ApiMessage{.{ .role = .user, .content = &c2 }};
+    const h2 = try canonicalAgentRequestSha256(a, provider, &m2, null, &.{}, null);
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+
+    // 同输入 → 同身份(确定性)。
+    const h1_again = try canonicalAgentRequestSha256(a, provider, &m1, null, &.{}, null);
+    try std.testing.expectEqualStrings(&h1, &h1_again);
+}
+
+test "usage-anchor 热路径:Read 图像 tool_result 增量按 IMAGE_TOKEN_ESTIMATE 计" {
+    // 锚点后缀里一条 5MB 级图像 tool_result 若按字节/4 计 → anchor+~125 万,
+    // maybeAutoCompact 每图强制一次有损 compact(review 轮修复,此测试锁定)。
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, 400_000);
+    defer a.free(big);
+    @memset(big, 'A');
+    const tr_content = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{big});
+    defer a.free(tr_content);
+    const blocks = [_]msg.Block{
+        .{ .tool_result = .{ .tool_use_id = "t1", .content = tr_content } },
+    };
+    const m = msg.Message{ .role = .user, .blocks = @constCast(&blocks) };
+    const total = estimateMessageTokens(m);
+    try std.testing.expect(total >= conversation_mod.IMAGE_TOKEN_ESTIMATE);
+    try std.testing.expect(total < 50_000);
 }

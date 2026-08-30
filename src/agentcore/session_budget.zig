@@ -1144,17 +1144,32 @@ fn canonicalRequestBytes(
     tools: ?[]const core.json.ToolDefinition,
     tool_choice: ?core.json.ToolChoice,
 ) anyerror!u64 {
+    // 图像经估算投影序列化(占位替换):canonical 测量统一走 Anthropic 序列化器,
+    // 非 claude vision 模型带图会因守门报错 → 预算 admission 拒绝一个 provider 本会
+    // 接受的请求。真实载荷字节(base64 data + MIME + 每图 ~64B wire 信封)在投影后
+    // 加回,保持"每请求 wire 字节"的测量语义与无图请求的既有口径一致。
+    const projection = try core.agent_loop.projectImagesForEstimation(allocator, messages);
+    defer if (projection) |p| p.deinit(allocator);
+    const effective: []const core.types.ApiMessage = if (projection) |p| p.messages else messages;
     const encoded = try core.json.serializeMessagesRequest(.{
         .model = model,
         .max_tokens = max_tokens,
-        .messages = messages,
+        .messages = effective,
         .system = system,
         .stream = true,
         .tools = tools,
         .tool_choice = tool_choice,
     }, allocator);
     defer allocator.free(encoded);
-    return @intCast(encoded.len);
+    var payload_bytes: u64 = 0;
+    for (messages) |m| for (m.content) |c| switch (c) {
+        .image => |img| payload_bytes +|= @as(u64, img.data.len) +| img.media_type.len +| 64,
+        .tool_result => |tr| if (core.json.extractImageResult(tr.content) != null) {
+            payload_bytes +|= @as(u64, tr.content.len);
+        },
+        else => {},
+    };
+    return @as(u64, @intCast(encoded.len)) +| payload_bytes;
 }
 
 fn translateContextError(err: anyerror) anyerror {
@@ -1952,4 +1967,23 @@ test "exact admission boundary and soft recommendation are deterministic" {
     try std.testing.expect(!state.describe().compaction_recommended);
     try state.updateUsage(profile.soft_bytes);
     try std.testing.expect(state.describe().compaction_recommended);
+}
+
+test "canonicalRequestBytes: 非 claude vision 模型带图可测量,载荷字节计入" {
+    // 此前经 Anthropic 序列化器直算 → gpt-4o 带图报 ImageInputUnsupported,
+    // 预算 admission 拒绝 provider 本会接受的请求(review 轮修复,此测试锁定)。
+    const allocator = std.testing.allocator;
+    const contents = [_]core.types.ApiContent{
+        .{ .text = "look" },
+        .{ .image = .{ .media_type = "image/png", .data = "QUJDREVGRw==" } },
+    };
+    const messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &contents }};
+    const with_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &messages, null, null, null);
+
+    const text_only = [_]core.types.ApiContent{.{ .text = "look" }};
+    const text_messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &text_only }};
+    const without_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &text_messages, null, null, null);
+
+    // 真实载荷字节(base64+MIME+信封)计入测量:带图严格大于纯文本 + 载荷长度。
+    try std.testing.expect(with_image > without_image + 12);
 }

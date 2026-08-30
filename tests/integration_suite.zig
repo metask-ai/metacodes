@@ -53,6 +53,7 @@ test {
     _ = @import("component/tool_result_storage_test.zig");
     _ = @import("component/cache_break_test.zig");
     _ = @import("component/microcompact_test.zig");
+    _ = @import("component/multimodal_input_test.zig");
     _ = @import("component/kg_integration_test.zig");
     _ = @import("component/kg_task_projection_test.zig");
     _ = @import("component/formal_kernel_test.zig");

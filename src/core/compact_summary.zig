@@ -68,6 +68,12 @@ pub fn summarizeWithModel(
                 transcript_buf.appendSlice(allocator, "]") catch return null;
             },
             .thinking => {},
+            .image => |img| {
+                // 总结输入的占位标记(被压缩前缀整体替换为摘要,非 model-visible 会话内容)。
+                transcript_buf.appendSlice(allocator, "[image ") catch return null;
+                transcript_buf.appendSlice(allocator, img.media_type) catch return null;
+                transcript_buf.appendSlice(allocator, "]") catch return null;
+            },
         };
         transcript_buf.append(allocator, '\n') catch return null;
     }
@@ -131,6 +137,12 @@ pub fn summarizeAbortable(
                 transcript_buf.appendSlice(allocator, "]") catch return null;
             },
             .thinking => {},
+            .image => |img| {
+                // 总结输入的占位标记(被压缩前缀整体替换为摘要,非 model-visible 会话内容)。
+                transcript_buf.appendSlice(allocator, "[image ") catch return null;
+                transcript_buf.appendSlice(allocator, img.media_type) catch return null;
+                transcript_buf.appendSlice(allocator, "]") catch return null;
+            },
         };
         transcript_buf.append(allocator, '\n') catch return null;
     }

@@ -86,6 +86,33 @@ K2.6/K3 three levels; DeepSeek two levels; MiniMax M3 three states
 plus `output_config.effort`). Explicit `effort:` in an agent definition wins
 over the tier's effort. The built-in `Explore` agent pins the `low` tier.
 
+### Multimodal image input
+
+User messages can carry first-class image content alongside text. Core
+represents a conversation block as `Block.image {media_type, data}` (base64
+payload, MIME at least `image/png` and `image/jpeg`), ordered freely between
+text blocks; the projection to the provider request preserves that order.
+Headless runs attach images with `--image <path>` (repeatable, order kept,
+png/jpg/jpeg/gif/webp by extension, 3.75 MB raw per image); the prompt text
+plus the images become one multimodal user message.
+
+Each provider dialect translates the neutral image block to its native wire
+form (`Dialect.serializeImagePart`): Anthropic emits a base64 `image` source
+block, OpenAI-compatible endpoints emit an `image_url` data URL content part
+(the Responses protocol emits `input_image`), and Gemini emits an
+`inline_data` part. Capability is per-model data
+(`ModelProfile.supports_image_input`, queryable as `Capability.image_input`):
+a model without vision fails the request with `error.ImageInputUnsupported`
+before any network I/O — images are never silently dropped, OCR'd, or
+replaced with placeholder text. Image blocks round-trip through the JSONL
+transcript and the AgentCore checkpoint (block tag 5), so restored sessions
+resend the original bytes.
+
+Prompt-cache note: a text-only conversation serializes byte-identically to
+builds without this feature (OpenAI `content` stays a plain string unless the
+message actually contains an image), so existing cache prefixes are
+unaffected.
+
 ## Zig source embedding
 
 `src/lib.zig` exports the UI-neutral core. In a consumer, these types are reached

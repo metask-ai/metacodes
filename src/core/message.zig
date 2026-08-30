@@ -25,6 +25,9 @@ pub const Block = union(enum) {
     /// Extended thinking 内容(对齐 Claude 3.7+)。content_block_start type="thinking"
     /// + thinking_delta 累积。展示走 tui/widget/thinking.zig。
     thinking: []const u8,
+    /// 用户输入的一等图像内容(issue #10)。base64 载荷 + MIME,与 text 按序混排,
+    /// 参与当前请求、后续轮次与 session 恢复。绝不以 OCR/描述/占位文本替代。
+    image: Image,
 
     pub fn deinit(self: Block, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -39,6 +42,10 @@ pub const Block = union(enum) {
                 allocator.free(tr.content);
             },
             .thinking => |t| allocator.free(t),
+            .image => |img| {
+                allocator.free(img.media_type);
+                allocator.free(img.data);
+            },
         }
     }
 
@@ -62,6 +69,12 @@ pub const Block = union(enum) {
                 const content = try dst.dupe(u8, tr.content);
                 break :blk Block{ .tool_result = .{ .tool_use_id = tid, .content = content, .is_error = tr.is_error } };
             },
+            .image => |img| blk: {
+                const mt = try dst.dupe(u8, img.media_type);
+                errdefer dst.free(mt);
+                const data = try dst.dupe(u8, img.data);
+                break :blk Block{ .image = .{ .media_type = mt, .data = data } };
+            },
         };
     }
 };
@@ -76,6 +89,12 @@ pub const ToolResult = struct {
     tool_use_id: []const u8,
     content: []const u8,
     is_error: bool = false,
+};
+
+/// 图像块(base64 载荷)。media_type 必须与实际内容一致(至少 image/png、image/jpeg)。
+pub const Image = struct {
+    media_type: []const u8,
+    data: []const u8,
 };
 
 /// 一条对话消息（role + blocks）。所有 block 内部字节为 allocator 拥有。
@@ -109,6 +128,42 @@ pub fn textMessage(role: Role, text: []const u8, allocator: std.mem.Allocator) !
     const blocks = try allocator.alloc(Block, 1);
     blocks[0] = .{ .text = text_owned };
     return .{ .role = role, .blocks = blocks };
+}
+
+/// 输入图像描述(路径无关的纯内容对):宿主先读文件/剪贴板并 base64,再交本构造函数。
+pub const ImageInput = struct {
+    media_type: []const u8,
+    /// base64 编码字节。
+    data: []const u8,
+};
+
+/// 构造多模态 user Message:可选前置 text + 按序图像列表(全部字节 dupe 成 owned)。
+/// text 为空且 images 为空 → error.EmptyMessage(不产出空 content 消息)。
+/// 定位:lib 嵌入方(borrowed 输入)的便利入口。CLI headless 自建 blocks(载荷所有权
+/// 直接转移,免二次 MB 拷贝),故仓库内无生产调用方——这是刻意保留的公共 API。
+pub fn userMessageWithImages(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    images: []const ImageInput,
+) !Message {
+    const block_count = images.len + @intFromBool(text.len > 0);
+    if (block_count == 0) return error.EmptyMessage;
+    const blocks = try allocator.alloc(Block, block_count);
+    errdefer allocator.free(blocks);
+    var built: usize = 0;
+    errdefer for (blocks[0..built]) |b| b.deinit(allocator);
+    if (text.len > 0) {
+        blocks[0] = .{ .text = try allocator.dupe(u8, text) };
+        built = 1;
+    }
+    for (images) |img| {
+        const mt = try allocator.dupe(u8, img.media_type);
+        errdefer allocator.free(mt);
+        const data = try allocator.dupe(u8, img.data);
+        blocks[built] = .{ .image = .{ .media_type = mt, .data = data } };
+        built += 1;
+    }
+    return .{ .role = .user, .blocks = blocks };
 }
 
 test "textMessage roundtrip" {
@@ -175,4 +230,42 @@ test "Message.dupe 深拷贝独立 + 无泄漏(含 4 种 block)" {
     try std.testing.expectEqualStrings("Bash", copy.blocks[2].tool_use.name);
     try std.testing.expectEqualStrings("ok", copy.blocks[3].tool_result.content);
     try std.testing.expect(copy.blocks[3].tool_result.is_error);
+}
+
+test "userMessageWithImages: text+images 按序构造(owned dupe)" {
+    const a = std.testing.allocator;
+    const inputs = [_]ImageInput{
+        .{ .media_type = "image/png", .data = "UE5H" },
+        .{ .media_type = "image/jpeg", .data = "SlBH" },
+    };
+    const m = try userMessageWithImages(a, "看图", &inputs);
+    defer m.deinit(a);
+    try std.testing.expect(m.role == .user);
+    try std.testing.expectEqual(@as(usize, 3), m.blocks.len);
+    try std.testing.expectEqualStrings("看图", m.blocks[0].text);
+    try std.testing.expectEqualStrings("image/png", m.blocks[1].image.media_type);
+    try std.testing.expectEqualStrings("SlBH", m.blocks[2].image.data);
+}
+
+test "userMessageWithImages: 空 text 只图;全空报 EmptyMessage" {
+    const a = std.testing.allocator;
+    const inputs = [_]ImageInput{.{ .media_type = "image/png", .data = "UE5H" }};
+    const m = try userMessageWithImages(a, "", &inputs);
+    defer m.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), m.blocks.len);
+    try std.testing.expect(@as(std.meta.Tag(Block), m.blocks[0]) == .image);
+    try std.testing.expectError(error.EmptyMessage, userMessageWithImages(a, "", &.{}));
+}
+
+test "Block.dupe/deinit image 深拷贝无泄漏" {
+    const a = std.testing.allocator;
+    const src = Block{ .image = .{
+        .media_type = try a.dupe(u8, "image/png"),
+        .data = try a.dupe(u8, "QUJDRA=="),
+    } };
+    const copy = try src.dupe(a);
+    src.deinit(a);
+    defer copy.deinit(a);
+    try std.testing.expectEqualStrings("image/png", copy.image.media_type);
+    try std.testing.expectEqualStrings("QUJDRA==", copy.image.data);
 }

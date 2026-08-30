@@ -70,17 +70,76 @@ const HeadlessToolPolicy = struct {
     }
 };
 
+/// 读 `--image` 路径列表(\x00 分隔),构造 text+images 按序混排的多模态 user 消息。
+/// 每图:扩展名 → MIME 白名单(png/jpg/jpeg/gif/webp,复用 Read 工具判定);读取走
+/// tools/common.readAllFromFdCapped(单一入口:读错误显式 ReadError,超 3.75MB 上限
+/// FileTooLarge——绝不把截断/部分字节当完整图);base64 缓冲直接转移进 image block
+/// (无二次 MB 级拷贝)。空路径段/类型不识别/读失败 → 显式错误(绝不静默跳过)。
+fn buildImageUserMessage(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    image_paths_nul: []const u8,
+) !@import("../core/message.zig").Message {
+    const msg_mod = @import("../core/message.zig");
+    const read_tool = @import("../tools/read.zig");
+    const common = @import("../tools/common.zig");
+
+    var blocks: std.ArrayList(msg_mod.Block) = .empty;
+    errdefer {
+        for (blocks.items) |b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+    if (text.len > 0) try blocks.append(allocator, .{ .text = try allocator.dupe(u8, text) });
+
+    var it = std.mem.splitScalar(u8, image_paths_nul, 0);
+    while (it.next()) |path| {
+        if (path.len == 0) {
+            // 空参数(如未设的 shell 变量 `--image "$SHOT"`)静默丢图违背 issue #10 铁律。
+            std.debug.print("error: --image: empty path argument\n", .{});
+            return error.EmptyImagePath;
+        }
+        const media_type = read_tool.imageMediaType(path) orelse {
+            std.debug.print("error: --image {s}: unsupported image type (png/jpg/jpeg/gif/webp)\n", .{path});
+            return error.UnsupportedImageType;
+        };
+        const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
+            std.debug.print("error: --image {s}: FileNotFound\n", .{path});
+            return error.FileNotFound;
+        };
+        defer _ = pfs.close(fd);
+        const raw = common.readAllFromFdCapped(fd, allocator, read_tool.MAX_IMAGE_BYTES) catch |err| {
+            std.debug.print("error: --image {s}: {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
+        defer allocator.free(raw);
+        const enc = std.base64.standard.Encoder;
+        const b64 = try allocator.alloc(u8, enc.calcSize(raw.len));
+        errdefer allocator.free(b64);
+        _ = enc.encode(b64, raw);
+        const mt_owned = try allocator.dupe(u8, media_type);
+        errdefer allocator.free(mt_owned);
+        // b64 所有权直接转移进 block(消除此前经 userMessageWithImages 的二次 MB 拷贝)。
+        try blocks.append(allocator, .{ .image = .{ .media_type = mt_owned, .data = b64 } });
+    }
+    if (blocks.items.len == 0) return error.EmptyMessage;
+    return .{ .role = .user, .blocks = try blocks.toOwnedSlice(allocator) };
+}
+
 /// headless 用 WriterBackend null-sink:吞掉 agent_loop 的流式输出（ANSI + tool 注解），
 /// 只要最终文本。工具卡事件 no-op,text_chunk/颜色括号全丢弃。
 /// 跑单次 prompt。返回进程退出码。
+/// `images`:`--image <path>` 的 \x00 分隔路径列表(null=纯文本)。有图时构造一条
+/// text+images 按序混排的多模态 user 消息(issue #10);读文件/MIME/大小校验失败或
+/// 当前 (provider, model) 不支持图像输入时显式报错退出——绝不静默丢图降级为文本。
 pub fn run(
     app: *app_mod.App,
     allocator: std.mem.Allocator,
     prompt: []const u8,
+    images: ?[]const u8,
     json_output: bool,
 ) !u8 {
     const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
-    if (trimmed.len == 0) {
+    if (trimmed.len == 0 and images == null) {
         std.debug.print("error: empty prompt\n", .{});
         return 1;
     }
@@ -94,7 +153,24 @@ pub fn run(
     const previous_no_interactive = enterNonInteractivePermissionBoundary(&app.permission_ctx);
     defer restoreInteractivePermissionBoundary(&app.permission_ctx, previous_no_interactive);
 
-    try app.conversation.appendText(.user, trimmed);
+    if (images) |image_paths| {
+        // 入口预检:不支持 vision 的 (provider, model) 立即显式报错(不落网络请求)。
+        if (!app.provider().supports(.image_input)) {
+            std.debug.print(
+                "error: model does not support image input (provider capability image_input=false)\n",
+                .{},
+            );
+            return 1;
+        }
+        // 消息字节必须由 conversation 的 allocator 拥有(deinit 用 self.allocator 释放;
+        // 当前两者相同,按构造正确性显式绑定,防将来任一侧换 allocator 变 UB)。
+        const conv_allocator = app.conversation.allocator;
+        const user_msg = try buildImageUserMessage(conv_allocator, trimmed, image_paths);
+        errdefer user_msg.deinit(conv_allocator);
+        try app.conversation.append(user_msg);
+    } else {
+        try app.conversation.appendText(.user, trimmed);
+    }
 
     // Headless is the benchmark/CI entry point, so evaluation cannot remain a
     // REPL-only decorator.  Metadata and event fds are host-owned; malformed
@@ -811,4 +887,46 @@ test "lastAssistantText empty when no assistant" {
     const t = try lastAssistantText(&conv, a);
     defer a.free(t);
     try std.testing.expectEqualStrings("", t);
+}
+
+test "buildImageUserMessage: 文件 → text+image 按序构造(MIME/base64 正确)" {
+    const a = std.testing.allocator;
+    var tmp_buf: [512]u8 = undefined;
+    const dir = @import("../tools/test_tmp.zig").dir(&tmp_buf);
+    const path = try std.fmt.allocPrint(a, "{s}/cc-headless-img-test.png", .{dir});
+    defer a.free(path);
+    {
+        const fd = pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600) catch return error.SkipZigTest;
+        defer _ = pfs.close(fd);
+        _ = pfs.write(fd, "PNGDATA");
+    }
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(path);
+
+    var paths_nul: std.ArrayList(u8) = .empty;
+    defer paths_nul.deinit(a);
+    try paths_nul.appendSlice(a, path);
+
+    const m = try buildImageUserMessage(a, "看图", paths_nul.items);
+    defer m.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), m.blocks.len);
+    try std.testing.expectEqualStrings("看图", m.blocks[0].text);
+    try std.testing.expectEqualStrings("image/png", m.blocks[1].image.media_type);
+    // "PNGDATA" 的标准 base64。
+    try std.testing.expectEqualStrings("UE5HREFUQQ==", m.blocks[1].image.data);
+}
+
+test "buildImageUserMessage: 不识别扩展名/空路径段 → 显式错误(不静默跳过)" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedImageType,
+        buildImageUserMessage(a, "t", "note.txt"),
+    );
+    try std.testing.expectError(
+        error.EmptyImagePath,
+        buildImageUserMessage(a, "t", ""),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        buildImageUserMessage(a, "t", "/definitely/not/there.png"),
+    );
 }

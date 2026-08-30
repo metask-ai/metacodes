@@ -56,11 +56,26 @@ const Claude = struct {
         return false;
     }
 
+    /// Anthropic Messages API 图像 content block:
+    /// {"type":"image","source":{"type":"base64","media_type":<mime>,"data":<b64>}}。
+    /// 能力守门在 Dialect.serializeImagePart wrapper(集中一处);本实现只管 wire 形态。
+    fn serializeImagePart(ctx: *anyopaque, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+        _ = ctx;
+        _ = p;
+        try out.appendSlice(a, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
+        try util_json.serializeString(image.media_type, out, a);
+        try out.appendSlice(a, ",\"data\":");
+        try util_json.serializeString(image.data, out, a);
+        try out.appendSlice(a, "}}");
+        return true;
+    }
+
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = serializeToolChoice,
+        .serializeImagePartFn = serializeImagePart,
     };
 };
 
@@ -92,6 +107,7 @@ const GlmAnthropic = struct {
         .routeToolChoiceFn = routeToolChoice,
         .extractThinkingDeltaFn = Claude.extractThinkingDelta,
         .serializeToolChoiceFn = Claude.serializeToolChoice,
+        .serializeImagePartFn = Claude.serializeImagePart,
     };
 };
 
@@ -157,4 +173,31 @@ test "Anthropic-compatible GLM adds strict Skill activation only when visible" {
     try std.testing.expectEqualStrings("tool", first.type);
     try std.testing.expectEqualStrings("Skill", first.name.?);
     try std.testing.expect(glm.routeToolChoice(.{}, required, true, null) == null);
+}
+
+test "Claude dialect: serializeImagePart 发 base64 source block" {
+    const d = claudeDialectFor("claude-sonnet-4");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const p = d.profileFor(.anthropic, "claude-sonnet-4");
+    const ok = try d.serializeImagePart(p, .{ .media_type = "image/png", .data = "QUJD" }, &out, a);
+    try std.testing.expect(ok);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}}",
+        out.items,
+    );
+}
+
+test "Claude dialect: profile 不支持 vision 时 serializeImagePart 返 false 不输出" {
+    // 经 Anthropic 网关的 GLM 文本模型:能力守门,调用方据 false 报显式错误。
+    const d = claudeDialectFor("glm-5.2");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const p = d.profileFor(.anthropic, "glm-5.2");
+    try std.testing.expect(!p.supports_image_input);
+    const ok = try d.serializeImagePart(p, .{ .media_type = "image/png", .data = "QUJD" }, &out, a);
+    try std.testing.expect(!ok);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }

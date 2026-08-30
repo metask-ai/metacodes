@@ -624,6 +624,21 @@ by that summary. Restore materializes the summary as leading assistant context,
 so continued Runs and later compaction preserve the same model-visible state.
 The checkpoint `max_messages` limit counts that materialized summary as one
 message in addition to the encoded active-message count.
+
+Conversation blocks are encoded with tag bytes `1=text`, `2=tool_use`,
+`3=tool_result`, `4=thinking`, `5=image`. An image block carries two encoded
+strings, `media_type` then base64 `data`; raw image bytes never enter the
+envelope, so every string still satisfies the UTF-8 validation rule. Tag `5`
+is an additive extension: checkpoints written before it decode unchanged,
+while an older reader that encounters tag `5` fails closed with `Corrupt`
+instead of silently dropping model-visible image content.
+
+Reachability note: the Revision 14 run-input surface (`RUN_INPUT_TEXT` /
+`RUN_INPUT_SKILL`) cannot inject image blocks, so a tag `5` envelope is
+currently produced only by hosts that populate the Conversation through the
+Zig surface. The C-ABI consumer round-trip for image-bearing checkpoints
+lands together with the planned `RUN_INPUT_MULTIMODAL` input (a Revision 15
+change), which is the first way a pure C host can create one.
 Hosts that require verbatim historical audit must persist the event/transcript
 stream separately. This projection is what allows compact to reduce durable
 usage for a near-hard Session.

@@ -107,6 +107,11 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
                     try lines.append(allocator, head);
                     try appendWrappedFolded(allocator, &lines, t, "    ", th.dim, th.reset, 3);
                 },
+                .image => |img| {
+                    // 终端不内联渲图:显示元信息行(类型 + base64 字节数)。
+                    const head = try std.fmt.allocPrint(allocator, "  {s}❯ [image {s}, {d} bytes base64]{s}", .{ th.dim, img.media_type, img.data.len, th.reset });
+                    try lines.append(allocator, head);
+                },
             }
         }
         try lines.append(allocator, try allocator.dupe(u8, "")); // 空行分隔

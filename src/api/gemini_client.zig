@@ -23,7 +23,9 @@
 //!   - **并行 functionCall(P0.1 已实现)**:一个 chunk 的 parts 多个 functionCall 全部 emit
 //!     (首个返回、其余排队 drain);functionResponse.name 按 tool_use_id 从全量消息找回真实工具名
 //!     配对(Gemini 靠 name 配对)。见 parseChunk functionCall 循环 / serializeGeminiContent。
-//!   - **建连重试 / 非流式 / thinking(thought parts)/ 多模态 inline_data**:未做。
+//!   - **建连重试 / 非流式 / thinking(thought parts)**:未做。(多模态 inline_data 的
+//!     图像**输入**已做——user 消息 image block 经 GeminiDialect.serializeImagePart 发
+//!     inline_data part,issue #10;图像输出/其它媒体仍未做。)
 //!   - **max_tokens/context_window**:硬编码,未按 model 区分(Gemini 1.5 Pro 2M 等)。
 //!
 //! 取舍登记:keep_alive=false(每请求新连接)——牺牲真后端连接池(省 TLS 握手)换稳定性;
@@ -650,7 +652,7 @@ pub fn serializeGeminiRequestWithOverridesAndDialect(
     for (messages) |m| {
         if (!first_msg) try out.append(allocator, ',');
         first_msg = false;
-        try serializeGeminiContent(allocator, &out, m, messages);
+        try serializeGeminiContent(allocator, &out, m, messages, dialect, profile);
     }
     try out.append(allocator, ']');
     // tools:[{function_declarations:[...]}]
@@ -719,13 +721,16 @@ fn findToolUseName(messages: []const types.ApiMessage, id: []const u8) ?[]const 
     return null;
 }
 
-fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, all_messages: []const types.ApiMessage) !void {
+fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, all_messages: []const types.ApiMessage, dialect: dialect_mod.Dialect, profile: dialect_mod.ModelProfile) !void {
     // tool_result → user 角色的 functionResponse part(Gemini 特有)。
     var has_tool_result = false;
     for (m.content) |c| if (c == .tool_result) {
         has_tool_result = true;
     };
     if (has_tool_result) {
+        // 同 OpenAI:tool_result 消息只投影 functionResponse parts,同消息 image 会被
+        // 静默丢——issue #10 铁律下防御性显式报错(正常路径经 merge 守护永不产出)。
+        for (m.content) |c| if (c == .image) return error.ImageWithToolResultUnsupported;
         // P0.1 并行:一轮多个 tool_result → **全部**作为同一 user content 的多个 functionResponse
         // parts(旧版只发首个 → 并行回合下一次请求缺 functionResponse 配对)。
         // functionResponse.name 必须是**原 functionCall 的真实名**(Gemini 靠 name 配对,非 id);
@@ -774,6 +779,14 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
             // tu.input 是 JSON 字符串(args 对象);直接内联(已是合法 JSON 对象)。
             try out.appendSlice(allocator, if (tu.input.len > 0) tu.input else "{}");
             try out.appendSlice(allocator, "}}");
+        },
+        .image => |img| {
+            // 一等图像内容(issue #10):inline_data part,wire 形态委托方言。
+            // 方言返 false = 该 model 不支持图像输入 → 显式能力错误,绝不静默丢图。
+            if (!first_part) try out.append(allocator, ',');
+            first_part = false;
+            const emitted = try dialect.serializeImagePart(profile, img, out, allocator);
+            if (!emitted) return error.ImageInputUnsupported;
         },
         else => {},
     };
@@ -955,4 +968,49 @@ test "braceObject/extractArgsObject 转义状态机:值尾随转义反斜杠不�
     // args 对象完整提取,尾随反斜杠保留。
     const args = extractArgsObject(bo.obj).?;
     try std.testing.expectEqualStrings("{\"p\":\"a\\\\\"}", args);
+}
+
+// ── issue #10:一等图像输入 ────────────────────────────────────────────────────
+
+test "Gemini: 含 image 的 user 消息 → inline_data part(text/image 按序)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .text = "看图" },
+            .{ .image = .{ .media_type = "image/png", .data = "UE5HREFUQQ==" } },
+        } },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    const seq = std.mem.indexOf(u8, body, "{\"text\":\"看图\"},{\"inline_data\":{\"mime_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}");
+    try std.testing.expect(seq != null);
+}
+
+test "Gemini: image 在 text 前时顺序保持" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .image = .{ .media_type = "image/jpeg", .data = "SlBFRw==" } },
+            .{ .text = "以上是截图" },
+        } },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    const img = std.mem.indexOf(u8, body, "\"inline_data\"").?;
+    const txt = std.mem.indexOf(u8, body, "以上是截图").?;
+    try std.testing.expect(img < txt);
+}
+
+test "Gemini: tool_result 消息混入 image → 显式错误(防 functionResponse 投影静默丢图)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok" } },
+            .{ .image = .{ .media_type = "image/png", .data = "QUJD" } },
+        } },
+    };
+    try std.testing.expectError(
+        error.ImageWithToolResultUnsupported,
+        serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null),
+    );
 }
