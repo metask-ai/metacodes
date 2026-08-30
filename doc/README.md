@@ -20,6 +20,8 @@ Start here rather than reading design ledgers chronologically.
 - [UI/backend boundary](UI_DECOUPLE_BACKEND_FRAMEWORK.md)
 - [TUI state architecture](TUI_STATE_ARCHITECTURE.md)
 - [Swarm design](SWARM_DESIGN.md)
+- [Provider offers and control plane](PROVIDER_OFFER_ARCHITECTURE.md) — provider
+  profiles, channels, model offers, typed credentials, routing, and persistence.
 - [Session service design (U2)](U2_SESSIONSERVICE_DESIGN.md)
 - [Daemon tier design (U9/U10)](U9_U10_DAEMON_TIER_DESIGN.md)
 

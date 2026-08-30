@@ -16,6 +16,7 @@ const gemini_mod = @import("gemini_client.zig");
 const provider_mod = @import("provider.zig");
 const types = @import("../types.zig");
 const dialect_mod = @import("dialect.zig");
+const auth_header_mod = @import("auth_header.zig");
 
 /// 三选一具体 client。tagged union(ProviderKind)→ "kind 说 X 但字段 null" 的非法态
 /// 编译期不可表示(遵 CLAUDE.md "Make Illegal States Unrepresentable")。
@@ -97,6 +98,13 @@ pub fn makeProvider(
     return makeProviderWithDialectResolver(a, kind, api_key, model, base_url, .chat_completions, .builtin());
 }
 
+/// Optional per-route knobs. Defaulted so existing call sites keep their exact
+/// behaviour; a call site that owns a resolved offer passes its auth scheme so
+/// child agents authenticate the same way the parent does.
+pub const Options = struct {
+    auth_scheme: ?auth_header_mod.AuthScheme = null,
+};
+
 /// Runtime-scoped provider construction. The resolver is a borrowed immutable
 /// view owned by the Runtime Snapshot and therefore remains stable for the
 /// complete Provider/Session lifetime.
@@ -111,6 +119,19 @@ pub fn makeProviderWithDialectResolver(
     openai_protocol: types.OpenAIProtocol,
     dialect_resolver: dialect_mod.Resolver,
 ) !OwnedProvider {
+    return makeProviderWithOptions(a, kind, api_key, model, base_url, openai_protocol, dialect_resolver, .{});
+}
+
+pub fn makeProviderWithOptions(
+    a: std.mem.Allocator,
+    kind: types.ProviderKind,
+    api_key: []const u8,
+    model: []const u8,
+    base_url: ?[]const u8,
+    openai_protocol: types.OpenAIProtocol,
+    dialect_resolver: dialect_mod.Resolver,
+    options: Options,
+) !OwnedProvider {
     @import("../util/log.zig").info("mp", "makeProvider kind={s} base_url={s}", .{ @tagName(kind), base_url orelse "<null>" });
     const io_rt = try a.create(std.Io.Threaded);
     errdefer a.destroy(io_rt);
@@ -124,6 +145,7 @@ pub fn makeProviderWithDialectResolver(
             const c = try a.create(client_mod.Client);
             c.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), api_key, model, base_url);
             c.dialect_resolver = dialect_resolver;
+            c.auth_scheme = options.auth_scheme;
             break :blk .{ .anthropic = c };
         },
         .openai => blk: {
@@ -131,6 +153,7 @@ pub fn makeProviderWithDialectResolver(
             c.* = openai_mod.OpenAIClient.init(a, io_rt.io(), api_key, model, base_url);
             c.protocol = openai_protocol;
             c.dialect_resolver = dialect_resolver;
+            c.auth_scheme = options.auth_scheme;
             break :blk .{ .openai = c };
         },
         .gemini => blk: {

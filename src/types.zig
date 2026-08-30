@@ -137,10 +137,25 @@ pub const Config = struct {
     /// gpt*/o1*/o3* → openai(讲 chat/completions 协议)。**只在 App 组装层据此选 Client,
     /// core/UI 零感知**(多 Provider 重构 P3)。
     provider_kind: ProviderKind = .anthropic,
+    /// Provider profile id or alias (`--provider`). Non-null switches startup
+    /// from model-name inference to registry-based route resolution (issue #16).
+    provider_profile: ?[]const u8 = null,
+    /// Channel within the selected profile (`--channel`).
+    provider_channel: ?[]const u8 = null,
+    /// Exact offer id (`--offer`), which pins one reproducible route.
+    provider_offer: ?[]const u8 = null,
+    /// Offer id of the resolved startup route, rendered for display/logs.
+    selected_offer_id: ?[]const u8 = null,
+    /// Provider-declared authentication for the resolved route. Null keeps the
+    /// historical `authorization: Bearer <key>` transport behaviour.
+    auth_scheme: ?@import("provider/credential.zig").AuthScheme = null,
     /// OpenAI wire 协议选择(`--openai-protocol` / env METACODES_OPENAI_PROTOCOL)。
     /// 默认 chat_completions;responses 走 /v1/responses(typed SSE 事件流)。
     /// 仅 provider_kind==.openai 时被消费;**显式配置,绝不从 base_url/model 推断**。
     openai_protocol: OpenAIProtocol = .chat_completions,
+    /// True when the wire protocol came from `--openai-protocol` or its
+    /// environment variable. An explicit choice outranks a route default.
+    openai_protocol_explicit: bool = false,
 };
 
 /// A single tagged treatment prevents invalid combinations such as "TinyKG on

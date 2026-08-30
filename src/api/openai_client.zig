@@ -47,6 +47,7 @@ const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
+const auth_header_mod = @import("auth_header.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 const StreamEvent = api_stream.StreamEvent;
@@ -73,6 +74,9 @@ pub const OpenAIClient = struct {
     protocol: types.OpenAIProtocol = .chat_completions,
     /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
     overrides: request_overrides.RequestOverrides = .{},
+    /// Provider-declared authentication for the selected offer (issue #16).
+    /// Null keeps the historical `authorization: Bearer <key>` bytes exactly.
+    auth_scheme: ?auth_header_mod.AuthScheme = null,
     dialect_resolver: dialect_mod.Resolver = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) OpenAIClient {
@@ -198,8 +202,11 @@ pub const OpenAIClient = struct {
             .{ self.effectiveUrl(), self.model, body.len, cache.modeFor(.openai).label(), if (self.reasoning_effort) |effort| effort.name() else "default" },
         );
         const uri = std.Uri.parse(self.effectiveUrl()) catch return error.InvalidUrl;
-        const auth = std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key}) catch return error.RequestFailed;
-        defer secureFree(self.allocator, auth);
+        const auth = auth_header_mod.build(self.allocator, self.auth_scheme, self.api_key) catch |err| {
+            log.errId("openai", rid, "auth header materialization failed: {s}", .{@errorName(err)});
+            return error.RequestFailed;
+        };
+        defer secureFree(self.allocator, auth.value);
 
         const req_ptr = try self.allocator.create(http.Client.Request);
         errdefer self.allocator.destroy(req_ptr); // 唯一 destroy:所有错误路径靠它(不手动 destroy,否则 double-free)
@@ -210,7 +217,7 @@ pub const OpenAIClient = struct {
             .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
-                .{ .name = "authorization", .value = auth },
+                .{ .name = auth.name, .value = auth.value },
             },
         }) catch |err| {
             log.errId("openai", rid, "request init failed: {s}", .{@errorName(err)});

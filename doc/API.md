@@ -9,6 +9,7 @@ artifact store, and TinyKG admission are not replaceable extensions.
 | Interface | Entry point | Status | Compatibility rule |
 |---|---|---|---|
 | CLI | `zig-out/bin/metacodes` | pre-1.0 | flags may evolve with changelog notice |
+| Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
 | AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 15 | exact root/child layouts and bundle manifest |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
@@ -17,6 +18,25 @@ artifact store, and TinyKG admission are not replaceable extensions.
 
 There is no general HTTP service API promise yet. The Web and daemon hosts are
 product surfaces built over the same core protocols.
+
+## Provider selection surface
+
+Route selection is provider-owned data, not a model-name convention. See
+[Provider offers and control plane](PROVIDER_OFFER_ARCHITECTURE.md) for the
+normative model; the entry points are:
+
+| Surface | Contract |
+|---|---|
+| `--provider <id\|alias>` / `METACODES_PROVIDER` | resolve the route through the provider registry instead of inferring a transport from the model name |
+| `--channel <id>` | narrow to one endpoint/region/plan/account binding |
+| `--offer <offer-id>` | pin one exact reproducible route |
+| `--base-url <url>` | validated against the selected profile and route policy before any request URL is built |
+| `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers`, `aliases`, `global_selection`, `last_operation_id`; written atomically, other keys preserved |
+| `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, replayable event journal |
+
+A newer `config.json` `schema_version` is rejected rather than merged. Sessions
+that name no provider keep the historical Metask credential and model-inference
+path unchanged.
 
 ## Session command surface (UI-neutral)
 

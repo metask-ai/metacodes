@@ -17,6 +17,22 @@ pub const VERSION = @import("version.zig").semver;
 pub const api_stream = @import("api/stream.zig");
 pub const api_provider = @import("api/provider.zig");
 pub const api_provider_factory = @import("api/provider_factory.zig");
+pub const api_auth_header = @import("api/auth_header.zig");
+pub const fs_util = @import("util/fs.zig");
+// issue #16 provider offer kernel — re-exported for L2 component tests and for
+// embedders that drive model selection through the control plane.
+pub const provider_ids = @import("provider/ids.zig");
+pub const provider_offer = @import("provider/offer.zig");
+pub const provider_controls = @import("provider/controls.zig");
+pub const provider_credential = @import("provider/credential.zig");
+pub const provider_profile = @import("provider/profile.zig");
+pub const provider_registry = @import("provider/registry.zig");
+pub const provider_selection = @import("provider/selection.zig");
+pub const provider_config_doc = @import("provider/config_doc.zig");
+pub const provider_config_store = @import("provider/config_store.zig");
+pub const provider_control_plane = @import("provider/control_plane.zig");
+pub const provider_runtime_binding = @import("provider/runtime_binding.zig");
+pub const provider_startup = @import("provider/startup.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig");
@@ -238,6 +254,60 @@ fn argsIter(init: std.process.Init) std.process.Args.Iterator {
 
 /// 据 model 名前缀推断 provider 协议(纯函数,无 env)。gpt*/o1*/o3* → openai,gemini* → gemini,
 /// 其余 anthropic。env METACODES_PROVIDER 在 main 里显式覆盖此推断。
+/// Resolve `--provider/--channel/--offer` into a concrete route and apply it.
+///
+/// The registry owns endpoint construction, protocol choice, wire model id, and
+/// the auth scheme, so nothing downstream has to re-derive them. A provider,
+/// channel, offer, or `--base-url` the profile rejects exits before any request
+/// is built rather than silently degrading to another endpoint.
+fn applyProviderRoute(
+    config: *types.Config,
+    allocator: std.mem.Allocator,
+    profile_name: []const u8,
+) void {
+    const startup = @import("provider/startup.zig");
+    var registry = @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator) catch {
+        std.debug.print("error: provider registry initialization failed\n", .{});
+        std.process.exit(2);
+    };
+    defer registry.deinit();
+
+    const outcome = startup.resolve(allocator, &registry, .{
+        .provider = profile_name,
+        .channel = config.provider_channel,
+        .offer_id = config.provider_offer,
+        .model = if (config.model_explicit) config.model else null,
+        .base_url = config.base_url,
+    }) catch {
+        std.debug.print("error: out of memory while resolving the provider route\n", .{});
+        std.process.exit(2);
+    };
+
+    switch (outcome) {
+        .failure => |failure| {
+            const text = failure.message(allocator) catch "provider route resolution failed";
+            std.debug.print("error: {s}\n", .{text});
+            std.process.exit(2);
+        },
+        .route => |resolved| {
+            var route = resolved;
+            config.provider_kind = route.transport;
+            if (!config.openai_protocol_explicit) config.openai_protocol = route.openai_protocol;
+            // Ownership of the two strings transfers into Config; the display
+            // name is not consumed here.
+            config.base_url = route.endpoint_url;
+            config.model = route.request_model_id;
+            // The route *is* the model decision, so a stored Metask selection
+            // must not overwrite it later in startup.
+            config.model_explicit = true;
+            config.auth_scheme = route.auth_scheme;
+            const rendered = route.offer_id.render();
+            config.selected_offer_id = allocator.dupe(u8, &rendered) catch null;
+            allocator.free(route.display_name);
+        },
+    }
+}
+
 pub fn inferProviderKind(model: []const u8) types.ProviderKind {
     if (std.mem.startsWith(u8, model, "gpt") or
         std.mem.startsWith(u8, model, "o1") or
@@ -335,12 +405,15 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    // --- provider 选择:env METACODES_PROVIDER 显式优先,否则据 model 前缀推断 ---
-    // (gpt*/o1*/o3* → openai,gemini* → gemini)。只在此组装层据此选 Client;core/UI 零感知。
-    if (std.c.getenv("METACODES_PROVIDER")) |c| {
-        const v = std.mem.span(c);
-        if (std.mem.eql(u8, v, "openai")) config.provider_kind = .openai;
-        if (std.mem.eql(u8, v, "gemini")) config.provider_kind = .gemini;
+    // --- provider 选择 ---
+    // issue #16:命名一个 provider profile 时走 registry 解析出**真实路由**
+    // (endpoint + 协议 + wire model id + auth scheme),不再靠 model 名前缀猜。
+    // 没命名 provider 的会话保持历史推断路径,行为零变化。
+    if (config.provider_profile == null) {
+        if (std.c.getenv("METACODES_PROVIDER")) |c| config.provider_profile = std.mem.span(c);
+    }
+    if (config.provider_profile) |profile_name| {
+        applyProviderRoute(&config, allocator, profile_name);
     } else {
         config.provider_kind = inferProviderKind(config.model);
     }
@@ -350,6 +423,7 @@ pub fn main(init: std.process.Init) !void {
     // **绝不从 base_url/model 推断**——协议选择是显式配置。
     if (std.c.getenv("METACODES_OPENAI_PROTOCOL")) |c| {
         const value = std.mem.span(c);
+        config.openai_protocol_explicit = true;
         config.openai_protocol = types.OpenAIProtocol.parse(value) orelse {
             std.debug.print("error: invalid METACODES_OPENAI_PROTOCOL '{s}'\n", .{value});
             std.process.exit(2);
@@ -387,8 +461,18 @@ pub fn main(init: std.process.Init) !void {
     // one-shot runtime FD authority. Every executable Run path still resolves
     // credentials before App/job/tool subprocesses exist.
     const introspection_only = config.dump_prompt or config.dump_plugins;
+    // issue #16: a non-Metask provider profile resolves its credential in its
+    // own scope. Metask (and every session that names no provider) keeps the
+    // historical path unchanged.
+    const metask_scope = selectedProfileIsMetask(config);
+    var provider_secret: ?[]u8 = null;
+    if (!introspection_only and !metask_scope) {
+        provider_secret = try resolveProviderScopedSecret(allocator, config, config.provider_profile.?);
+    }
+    defer if (provider_secret) |secret| allocator.free(secret);
+
     var resolved_credential: ?auth.ResolvedCredential = null;
-    if (!introspection_only) {
+    if (!introspection_only and provider_secret == null) {
         resolved_credential = auth.resolveRuntimeCredential(allocator, config.api_key, config.auth_precedence) catch |err| {
             @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
             std.debug.print(
@@ -405,12 +489,22 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     defer if (resolved_credential) |*credential| credential.deinit(allocator);
-    const api_key = if (resolved_credential) |credential| credential.bearer_token else "";
+    const api_key = if (provider_secret) |secret|
+        @as([]const u8, secret)
+    else if (resolved_credential) |credential|
+        @as([]const u8, credential.bearer_token)
+    else
+        "";
 
-    applyStoredLoginSelection(allocator, &config) catch |err| {
-        log.debug("auth", "stored model selection unavailable: {s}", .{@errorName(err)});
-    };
-    if (resolved_credential) |credential| if (!isUsableConfiguredSession(config, credential.source)) {
+    // The stored Metask login carries a Metask model and reasoning effort;
+    // applying it to another provider's route would silently replace the
+    // selected model.
+    if (metask_scope) {
+        applyStoredLoginSelection(allocator, &config) catch |err| {
+            log.debug("auth", "stored model selection unavailable: {s}", .{@errorName(err)});
+        };
+    }
+    if (metask_scope) if (resolved_credential) |credential| if (!isUsableConfiguredSession(config, credential.source)) {
         std.debug.print(
             \\Metask login is incomplete.
             \\Run `metacodes login` in a terminal and select an API key, model, and reasoning effort.
@@ -908,6 +1002,82 @@ fn applyStoredLoginSelection(allocator: std.mem.Allocator, config: *types.Config
     }
 }
 
+/// True when the selected provider profile is Metask (or none was named).
+///
+/// Metask keeps the historical credential path — stored OAuth, stored API key,
+/// and the one-shot runtime descriptor — byte for byte. Every other profile is
+/// resolved in its own scope, so a Metask token can never authenticate it.
+pub fn selectedProfileIsMetask(config: types.Config) bool {
+    const name = config.provider_profile orelse return true;
+    var registry = @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(
+        std.heap.page_allocator,
+    ) catch return true;
+    defer registry.deinit();
+    const profile = registry.find(name) orelse return true;
+    return profile.id.eqlText("metask");
+}
+
+/// Provider-scoped credential resolution (issue #16).
+///
+/// Only material the profile declares is eligible: its environment aliases and
+/// an explicit `--api-key`. The Metask credential store is deliberately not
+/// consulted, which is the whole point — an unrelated vendor key must never be
+/// selected merely because it exists.
+pub fn resolveProviderScopedSecret(
+    allocator: std.mem.Allocator,
+    config: types.Config,
+    profile_name: []const u8,
+) !?[]u8 {
+    const credential_mod = provider_credential;
+    const provider_ids_mod = provider_ids;
+    var registry = @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator) catch
+        return null;
+    defer registry.deinit();
+    const profile = registry.find(profile_name) orelse return null;
+
+    var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
+    const resolved = credential_mod.resolve(.{
+        .provider_id = profile.id,
+        .accepted_kinds = profile.accepted_credential_kinds,
+        .env_aliases = profile.env_aliases,
+        .cli_api_key = config.api_key,
+        .env = credential_mod.EnvLookup.process(),
+    }, &reference_buffer) catch |err| {
+        printProviderCredentialHelp(profile.*, err);
+        return err;
+    };
+    return try allocator.dupe(u8, resolved.secret);
+}
+
+fn printProviderCredentialHelp(
+    profile: @import("provider/profile.zig").ProviderProfile,
+    err: anyerror,
+) void {
+    switch (err) {
+        error.AmbiguousCredentialAliases => {
+            std.debug.print(
+                "Conflicting credentials for provider '{s}'.\n" ++
+                    "Several accepted environment variables hold different values; unset all but one.\n" ++
+                    "No token value was printed.\n",
+                .{profile.id.slice()},
+            );
+        },
+        else => {
+            std.debug.print(
+                "Authentication required for provider '{s}'.\n",
+                .{profile.id.slice()},
+            );
+            for (profile.accepted_credential_kinds) |kind| {
+                if (profile.canonicalEnvAlias(kind)) |canonical| {
+                    std.debug.print("  export {s}=...\n", .{canonical});
+                }
+            }
+            std.debug.print("  metacodes --api-key <key> --provider {s} ...\n", .{profile.id.slice()});
+            std.debug.print("No token value was printed.\n", .{});
+        },
+    }
+}
+
 fn isUsableConfiguredSession(config: types.Config, source: auth.CredentialSource) bool {
     return switch (source) {
         .cli_api_key, .fd_api_key, .env_api_key => true,
@@ -1056,12 +1226,31 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |s| config.answers_file = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--base-url")) {
             if (args.next()) |s| config.base_url = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--provider")) {
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --provider", .{});
+                return;
+            };
+            config.provider_profile = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--channel")) {
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --channel", .{});
+                return;
+            };
+            config.provider_channel = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--offer")) {
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --offer", .{});
+                return;
+            };
+            config.provider_offer = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--openai-protocol")) {
             // 值域 fail-closed:拼错的协议名静默落默认 = 请求打到错误端点还不知情。
             const v = args.next() orelse {
                 setParseError(config, allocator, "missing value for --openai-protocol", .{});
                 return;
             };
+            config.openai_protocol_explicit = true;
             config.openai_protocol = types.OpenAIProtocol.parse(v) orelse {
                 setParseError(config, allocator, "invalid value '{s}' for --openai-protocol (chat|chat_completions|responses)", .{v});
                 return;
@@ -1298,6 +1487,9 @@ fn printHelp() void {
         \\  --process-plugin-dir <path>  Enable a pinned executable plugin package (repeatable)
         \\  --answers-file <path> Preset answers for permission .ask / AskUserQuestion (non-tty)
         \\  --base-url <url>      Override API endpoint (must end with /v1/messages)
+        \\  --provider <id>       Provider profile id or alias (metask | openai | gemini | zai-coding-plan)
+        \\  --channel <id>        Channel within the provider (e.g. cn-anthropic, global-openai)
+        \\  --offer <offer-id>    Pin one exact model route (offer-...); see --provider output
         \\  --openai-protocol <p> OpenAI wire protocol: chat_completions (default; alias "chat") | responses (env METACODES_OPENAI_PROTOCOL)
         \\  --auth-precedence <p> api-key-first | oauth-first
         \\  --record <dir>        Record requests + SSE responses to dir (cassette)

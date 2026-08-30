@@ -15,6 +15,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const util_json = @import("../util/json.zig");
+const json_merge = @import("../util/json_merge.zig");
 
 pub const FileConfig = struct {
     model: ?[]const u8 = null,
@@ -79,50 +80,71 @@ pub fn saveToFile(config: FileConfig, allocator: std.mem.Allocator, path: []cons
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
+    // Read-modify-write. `config.json` has several independent owners
+    // (theme, mcp_servers, permission_rules, model_tiers, and the issue #16
+    // provider control plane). Serializing only this struct's fields would
+    // delete every other owner's data, so replace exactly these keys and keep
+    // the rest of the document — and its key order — intact.
+    const existing = readWhole(allocator, path_z) catch try allocator.dupe(u8, "");
+    defer allocator.free(existing);
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+
+    var fields: std.ArrayList(json_merge.Field) = .empty;
+    if (config.model) |v| {
+        var buf: std.ArrayList(u8) = .empty;
+        try util_json.serializeString(v, &buf, arena);
+        try fields.append(arena, .{ .key = "model", .json = buf.items });
+    }
+    if (config.permission_mode) |v| {
+        var buf: std.ArrayList(u8) = .empty;
+        try util_json.serializeString(v, &buf, arena);
+        try fields.append(arena, .{ .key = "permission_mode", .json = buf.items });
+    }
+    if (config.max_turns) |v| {
+        try fields.append(arena, .{
+            .key = "max_turns",
+            .json = try std.fmt.allocPrint(arena, "{d}", .{v}),
+        });
+    }
+    if (config.verbose) |v| {
+        try fields.append(arena, .{ .key = "verbose", .json = if (v) "true" else "false" });
+    }
+    if (config.no_theme) |v| {
+        try fields.append(arena, .{ .key = "no_theme", .json = if (v) "true" else "false" });
+    }
+
+    const merged = json_merge.mergeObjectFields(allocator, existing, fields.items) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // A document we cannot parse must not be overwritten: that would turn
+        // a hand-edit typo into silent data loss.
+        else => return error.MalformedExistingConfig,
+    };
+    defer allocator.free(merged);
+
     const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return error.WriteError;
     defer _ = pfs.close(fd);
-
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    try out.append(allocator, '{');
-    var first = true;
-    if (config.model) |v| {
-        if (!first) try out.append(allocator, ',');
-        first = false;
-        try out.appendSlice(allocator, "\"model\":");
-        try util_json.serializeString(v, &out, allocator);
-    }
-    if (config.permission_mode) |v| {
-        if (!first) try out.append(allocator, ',');
-        first = false;
-        try out.appendSlice(allocator, "\"permission_mode\":");
-        try util_json.serializeString(v, &out, allocator);
-    }
-    if (config.max_turns) |v| {
-        if (!first) try out.append(allocator, ',');
-        first = false;
-        const s = try std.fmt.allocPrint(allocator, "\"max_turns\":{d}", .{v});
-        defer allocator.free(s);
-        try out.appendSlice(allocator, s);
-    }
-    if (config.verbose) |v| {
-        if (!first) try out.append(allocator, ',');
-        first = false;
-        try out.appendSlice(allocator, "\"verbose\":");
-        try out.appendSlice(allocator, if (v) "true" else "false");
-    }
-    if (config.no_theme) |v| {
-        if (!first) try out.append(allocator, ',');
-        first = false;
-        try out.appendSlice(allocator, "\"no_theme\":");
-        try out.appendSlice(allocator, if (v) "true" else "false");
-    }
-    try out.append(allocator, '}');
-
-    _ = pfs.write(fd, out.items);
+    const written = pfs.write(fd, merged);
+    if (written < 0 or @as(usize, @intCast(written)) != merged.len) return error.WriteError;
     _ = pfs.fsync(fd);
+}
+
+fn readWhole(allocator: std.mem.Allocator, path_z: [:0]const u8) ![]u8 {
+    const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return allocator.dupe(u8, "");
+    defer _ = pfs.close(fd);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var buf: [16384]u8 = undefined;
+    while (true) {
+        const n = pfs.read(fd, &buf);
+        if (n <= 0) break;
+        try out.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseJson(allocator: std.mem.Allocator, data: []const u8) !FileConfig {
@@ -233,4 +255,55 @@ test "FileConfig: parseJson handles formatted JSON" {
     try testing.expectEqualStrings("formatted", cfg.model.?);
     try testing.expect(cfg.max_turns.? == 7);
     try testing.expect(cfg.verbose.? == false);
+}
+
+test "saving preserves keys owned by other writers" {
+    const a = std.testing.allocator;
+    const path = "/tmp/metacodes-config-preserve-test.json";
+    const path_z: [:0]const u8 = path;
+    defer _ = pfs.unlinkPath(path_z) catch {};
+
+    {
+        const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        const existing =
+            \\{"model":"old","mcp_servers":[{"name":"kg"}],"permission_rules":[{"tool":"Bash"}],
+            \\ "schema_version":1,"providers":{"metask":{"enabled":true}}}
+        ;
+        _ = pfs.write(fd, existing);
+    }
+
+    try saveToFile(.{ .model = "glm-4.6", .verbose = true }, a, path);
+
+    const written = try readWhole(a, path_z);
+    defer a.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "glm-4.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"old\"") == null);
+    // Every other owner's data survived the write.
+    for ([_][]const u8{ "mcp_servers", "permission_rules", "schema_version", "providers", "metask" }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, written, needle) != null);
+    }
+
+    const reloaded = try loadFromFile(a, path);
+    defer reloaded.deinit(a);
+    try std.testing.expectEqualStrings("glm-4.6", reloaded.model.?);
+    try std.testing.expectEqual(@as(?bool, true), reloaded.verbose);
+}
+
+test "a malformed existing document is never silently overwritten" {
+    const a = std.testing.allocator;
+    const path = "/tmp/metacodes-config-malformed-test.json";
+    const path_z: [:0]const u8 = path;
+    defer _ = pfs.unlinkPath(path_z) catch {};
+    {
+        const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        _ = pfs.write(fd, "{ this is not json");
+    }
+    try std.testing.expectError(error.MalformedExistingConfig, saveToFile(.{ .model = "x" }, a, path));
+    const untouched = try readWhole(a, path_z);
+    defer a.free(untouched);
+    try std.testing.expectEqualStrings("{ this is not json", untouched);
 }
