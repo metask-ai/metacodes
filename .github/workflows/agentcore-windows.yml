@@ -8,6 +8,8 @@ on:
       - "scripts/windows_test_prelude.zig"
       - "src/agentcore/**"
       - "src/core/**"
+      - "src/lsp/**"
+      - "src/lsp_test_root.zig"
       - "src/platform/**"
       - "sdk/**"
       - "tests/component/agentcore_abi_test.zig"

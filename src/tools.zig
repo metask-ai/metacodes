@@ -150,7 +150,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "file_path", .type = "string", .description = "The absolute path to the file to read" },
             .{ .name = "offset", .type = "integer", .description = "The line number to start reading from (1-based)" },
             .{ .name = "limit", .type = "integer", .description = "The number of lines to read" },
-            .{ .name = "outline", .type = "boolean", .description = "Return a symbol outline (functions/types with line numbers) instead of file contents. Requires --lsp and an installed language server for the file's language; falls back to normal reading otherwise." },
+            .{ .name = "outline", .type = "boolean", .description = "Return a symbol outline (functions/types with line numbers) instead of file contents. Requires an installed language server for the file's language; falls back to normal reading otherwise, naming the reason when the language server is unavailable." },
         }, .required = &.{"file_path"} },
         .execute = .{ .legacy_inline = read_tool.execute },
         .replay = .read_only,
@@ -226,8 +226,9 @@ pub const registry: []const ToolEntry = &.{
             "constants with line numbers and signatures. Operates on SOURCE CODE only (not " ++
             "plain-text, config, JSON, or docs). Pass a file path for one file, or a glob (e.g. " ++
             "src/**/*) to map many files. Far cheaper than reading whole files when you only " ++
-            "need to find where things are defined. Requires --lsp and an installed language " ++
-            "server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd).",
+            "need to find where things are defined. Requires an installed language server " ++
+            "(zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); when one " ++
+            "is unavailable the output says so instead of appearing empty.",
         .describe_fn = descriptions.describeCodeMap,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "path", .type = "string", .description = "A file path OR a glob pattern (e.g. src/**/*)" },
@@ -244,8 +245,9 @@ pub const registry: []const ToolEntry = &.{
         .description = "Find where a symbol is DEFINED across the codebase (SOURCE CODE only). " ++
             "Unlike Grep (which returns all occurrences), this returns only definitions, with " ++
             "file:line and signature. Use this to jump to a function/type/class definition by " ++
-            "name when you don't know which file it lives in. Requires --lsp and an installed " ++
-            "language server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd).",
+            "name when you don't know which file it lives in. Requires an installed language " ++
+            "server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); an " ++
+            "empty result is qualified when one is unavailable, so `[]` alone means not defined.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "name", .type = "string", .description = "The symbol name to find the definition of" },
             .{ .name = "kind", .type = "string", .description = "Optional kind filter", .enum_values = &.{ "function", "method", "struct", "enum", "union", "type", "constant", "variable", "class", "interface" } },

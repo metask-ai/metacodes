@@ -416,6 +416,24 @@ pub fn exists(path: [*:0]const u8) bool {
 extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
+/// 路径存在**且不是目录**(跟随 symlink)。PATH 查找用:POSIX 上可搜索目录的
+/// `access(X_OK)` 也返 0,裸判会把一个叫 `zls` 的目录当成 server 二进制交给 spawn。
+/// 跟随 symlink 是必须的——PATH 里的可执行文件常是软链(homebrew/npm/rustup 全这么装)。
+pub fn isExistingNonDir(path: [*:0]const u8) bool {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, std.mem.span(path)) catch return false;
+        if (wlen >= wbuf.len) return false;
+        wbuf[wlen] = 0;
+        const attr = GetFileAttributesW(@ptrCast(&wbuf));
+        if (attr == 0xFFFF_FFFF) return false; // INVALID_FILE_ATTRIBUTES
+        return (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+    const m = statMode(path, true) orelse return false;
+    return (m & S_IFMT) != S_IFDIR;
+}
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
 /// 删除一个已解析的普通文件路径。控制面 lease 用它显式释放独占标记；失败必须由
 /// 调用方处理，不能把“仍被占用”静默解释成成功。
 pub fn unlinkPath(path: [*:0]const u8) error{UnlinkFailed}!void {
@@ -438,6 +456,7 @@ extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.winapi) c
 const S_IFMT: u32 = 0o170000;
 const S_IFSOCK: u32 = 0o140000;
 const S_IFLNK: u32 = 0o120000;
+const S_IFDIR: u32 = 0o040000;
 
 /// Bounded lstat-style classification for pre-dispatch policy sensors. It
 /// distinguishes a proven absence from lookup failure so a caller may allow

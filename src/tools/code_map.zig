@@ -26,25 +26,42 @@ const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 /// 读到此上限就 killpg 止血。路径均长 ~80B × MAX_FILES=200 ≈ 16KB,256KB 给足余量。
 const LIST_BYTE_CAP: usize = 256 * 1024;
 
-/// 渲染单文件大纲为缩进文本树(供 Read 工具的 outline 模式复用)。调用方拥有返回串。
-/// **无符号/解析失败 → 返回 null**(Linus S1:让 Read 回退正常
-/// 读取,而非把 "(no symbols)" 当内容返回——纯 LSP 语言遇 flaky server 不会退化成空大纲)。
+/// `renderOutlineForSource` 的三态结果。**不是 `?[]u8`**:调用方(Read 的 outline 模式)对
+/// "能力在位但文件没符号"和"能力缺失"要做不同的事——前者静默回退正常读取即可,后者必须交代
+/// 原因,否则又变成 issue #17 那种"静默降级冒充正常结果"。
+pub const Outline = union(enum) {
+    /// 渲染好的缩进文本树(调用方拥有)。
+    text: []u8,
+    /// 能力在位,但该文件确实没有符号 → 调用方可安静回退正常读取(Linus S1 的原意)。
+    no_symbols,
+    /// 能力缺失 → 调用方必须说明原因。
+    unavailable: symbol_provider.Unavailable,
+};
+
+/// 渲染单文件大纲为缩进文本树(供 Read 工具的 outline 模式复用)。
 pub fn renderOutlineForSource(
     ctx: *const ToolContext,
     allocator: std.mem.Allocator,
     file: []const u8,
     source: []const u8,
-) !?[]u8 {
+) !Outline {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
 
-    var syms = symbol_provider.extractSymbols(ctx, allocator, file, source) catch return null;
-    defer syms.deinit();
-
-    if (syms.items.len == 0) return null;
-    try renderTree(w, syms.items);
-    return try out.toOwnedSlice();
+    // **不 catch**:唯一的错误来源是分配失败,而 `.no_symbols` 的含义是"能力在位、这文件真的
+    // 没符号"。把 OOM 折进去,调用方就会安静地按"没结构"处理——同一类谎报。下面的 renderTree /
+    // toOwnedSlice 本来也是直接上抛的,原先只 catch 这一处纯属不一致。
+    var outcome = try symbol_provider.extractSymbols(ctx, allocator, file, source);
+    switch (outcome) {
+        .unavailable => |u| return .{ .unavailable = u },
+        .symbols => |*syms| {
+            defer syms.deinit();
+            if (syms.items.len == 0) return .no_symbols;
+            try renderTree(w, syms.items);
+            return .{ .text = try out.toOwnedSlice() };
+        },
+    }
 }
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -86,6 +103,10 @@ fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer)
     const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
     defer allocator.free(path);
 
+    // 门禁答案只取决于扩展名,而每算一次要扫一遍 PATH(30 段 PATH 实测 36–43µs)。逐文件问同
+    // 一个问题就记忆化——glob 批量下省的是 MAX_FILES 次重复 access(2)。
+    var caps = symbol_provider.CapabilityCache.init(ctx);
+
     // path 含 glob 元字符 → 走 rg --files 解析文件列表;否则单文件。
     if (isGlob(path)) {
         const files = try listFiles(allocator, path, ctx);
@@ -107,11 +128,11 @@ fn executeToWriter(ctx: *const ToolContext, args: []const u8, w: *std.Io.Writer)
                 break;
             }
             try ctx.throwIfAborted();
-            try mapOneFile(ctx, allocator, w, f);
+            try mapOneFile(ctx, allocator, w, f, &caps);
             shown += 1;
         }
     } else {
-        try mapOneFile(ctx, allocator, w, path);
+        try mapOneFile(ctx, allocator, w, path, &caps);
     }
 }
 
@@ -122,10 +143,12 @@ fn mapOneFile(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     file: []const u8,
+    caps: *symbol_provider.CapabilityCache,
 ) !void {
-    if (!symbol_provider.hasSymbolsFor(ctx, file)) {
-        try w.print("{s}\n  (no LSP server for this file; run with --lsp and install the language server)\n", .{file});
-        return;
+    // 门禁:能力缺失就地说明原因(措辞来自 capability.why,与 FindSymbol/Read 同一份)。
+    switch (caps.get(file)) {
+        .available => {},
+        .unavailable => |u| return printNoOutline(w, file, u),
     }
 
     const source = readFile(allocator, file) catch |e| {
@@ -138,18 +161,31 @@ fn mapOneFile(
     };
     defer allocator.free(source);
 
-    var syms = symbol_provider.extractSymbols(ctx, allocator, file, source) catch |e| {
+    var outcome = symbol_provider.extractSymbols(ctx, allocator, file, source) catch |e| {
         try w.print("{s}\n  (parse failed: {s})\n", .{ file, @errorName(e) });
         return;
     };
-    defer syms.deinit();
-
-    try w.print("{s}\n", .{file});
-    if (syms.items.len == 0) {
-        try w.writeAll("  (no symbols)\n");
-        return;
+    switch (outcome) {
+        // 门禁看不见的运行期失败(server 起不来 / broken-set / client 满员 / 不在 git 仓)
+        // 在这里兜住:同样报原因,绝不冒充 "(no symbols)"。
+        .unavailable => |u| return printNoOutline(w, file, u),
+        .symbols => |*syms| {
+            defer syms.deinit();
+            try w.print("{s}\n", .{file});
+            if (syms.items.len == 0) {
+                try w.writeAll("  (no symbols)\n");
+                return;
+            }
+            try renderTree(w, syms.items);
+        },
     }
-    try renderTree(w, syms.items);
+}
+
+/// 能力缺失行:`<file>` + 一句具体原因。**与 "(no symbols)" 严格区分**——后者只属于
+/// "能力在位、这个文件真的没符号"。两个 unavailable 分支共用此函数,措辞不会各写一遍。
+fn printNoOutline(w: *std.Io.Writer, file: []const u8, u: symbol_provider.Unavailable) !void {
+    var why_buf: [symbol_provider.capability.WHY_BUF]u8 = undefined;
+    try w.print("{s}\n  (no outline: {s})\n", .{ file, u.why(&why_buf) });
 }
 
 /// 按 parent 关系渲染缩进树。v1:两级(顶层 + 直接 child),足够覆盖
