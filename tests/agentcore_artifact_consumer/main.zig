@@ -807,6 +807,15 @@ pub fn main(init: std.process.Init) !void {
     }
     api.bufferRelease()(&restore_report);
 
+    // The checkpoint intentionally carries the earlier fixture model. Once the
+    // restored session is switched to OpenAI Responses, select a verified
+    // vision-capable model before exercising the multimodal ABI path.
+    try expectStatus(
+        .ok,
+        api.sessionControl().setModel()(session, sdk.bytesView("gpt-5.2"), &diagnostic),
+        diagnostic,
+    );
+
     try probe.beginRun(3);
     try expectStatus(.ok, api.session().runText(
         session,
