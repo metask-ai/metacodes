@@ -35,6 +35,8 @@ pub const provider_runtime_binding = @import("provider/runtime_binding.zig");
 pub const provider_startup = @import("provider/startup.zig");
 pub const provider_host = @import("provider/host.zig");
 pub const provider_custom = @import("provider/custom_provider.zig");
+pub const provider_oauth = @import("provider/oauth.zig");
+pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig");
@@ -604,6 +606,7 @@ pub fn main(init: std.process.Init) !void {
                 \\Authentication required.
                 \\Use one of:
                 \\  metacodes login --oauth-token-json <token-response.json>
+                \\  metacodes login --provider <id> --oauth-token-json <token-response.json>
                 \\  metacodes login --api-key <key>
                 \\  export METASK_API_KEY=...
                 \\
@@ -796,6 +799,10 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
 
     var mode: enum { browser, help, status, api_key, oauth_json } = .browser;
     var value: ?[]const u8 = null;
+    // `--provider <id>` stores the token against that provider's own OAuth
+    // session instead of the Metask credential store, which is what keeps a
+    // token for one vendor from ever satisfying another.
+    var provider_name: ?[]const u8 = null;
     var open_browser = true;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "status") or std.mem.eql(u8, arg, "--status")) {
@@ -812,6 +819,11 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
                 std.debug.print("usage: metacodes login --oauth-token-json <file>\n", .{});
                 return 2;
             };
+        } else if (std.mem.eql(u8, arg, "--provider")) {
+            provider_name = args.next() orelse {
+                std.debug.print("usage: metacodes login --provider <id> --oauth-token-json <file>\n", .{});
+                return 2;
+            };
         } else if (std.mem.eql(u8, arg, "--no-browser")) {
             mode = .browser;
             open_browser = false;
@@ -824,6 +836,18 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
             std.debug.print("error: unknown login/logout argument '{s}'\n", .{arg});
             return 2;
         }
+    }
+
+    if (provider_name) |name| {
+        if (mode != .oauth_json) {
+            std.debug.print(
+                "login --provider currently accepts only --oauth-token-json; " ++
+                    "the interactive flow is Metask-only\n",
+                .{},
+            );
+            return 2;
+        }
+        return storeProviderOAuthToken(allocator, name, value.?);
     }
 
     switch (mode) {
@@ -931,6 +955,7 @@ fn printLoginHelp() void {
         \\  metacodes login --no-browser
         \\  metacodes login status
         \\  metacodes login --oauth-token-json <token-response.json>
+        \\  metacodes login --provider <id> --oauth-token-json <token-response.json>
         \\  metacodes login --api-key <key>
         \\  metacodes logout
         \\
@@ -1150,6 +1175,71 @@ pub fn selectedProfileIsMetask(config: types.Config) bool {
 /// an explicit `--api-key`. The Metask credential store is deliberately not
 /// consulted, which is the whole point — an unrelated vendor key must never be
 /// selected merely because it exists.
+/// `metacodes login --provider <id> --oauth-token-json <file>`.
+///
+/// Imports a standard RFC 6749 token response into that provider's own OAuth
+/// session. The refresh lifecycle then runs itself: the session refreshes
+/// before expiry, performs one exchange no matter how many turns notice at
+/// once, and persists a rotated refresh token atomically.
+fn storeProviderOAuthToken(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    path: []const u8,
+) u8 {
+    var registry = provider_registry.ProviderRegistry.initWithBuiltins(allocator) catch return 2;
+    defer registry.deinit();
+    var custom = loadCustomProviders(allocator, &registry);
+    defer if (custom) |*definitions| definitions.deinit();
+
+    const built = registry.find(provider_name) orelse {
+        std.debug.print("error: unknown provider '{s}'\n", .{provider_name});
+        return 2;
+    };
+    if (built.oauth_token_url == null) {
+        std.debug.print(
+            "error: provider '{s}' declares no OAuth token endpoint\n",
+            .{built.id.slice()},
+        );
+        return 2;
+    }
+
+    const text = readFileArg(allocator, path) catch |err| {
+        std.debug.print("error: could not read {s}: {s}\n", .{ path, @errorName(err) });
+        return 2;
+    };
+    defer {
+        std.crypto.secureZero(u8, text);
+        allocator.free(text);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const outcome = provider_oauth.parseTokenResponse(arena.allocator(), text) catch |err| {
+        std.debug.print("error: {s} is not a token response ({s})\n", .{ path, @errorName(err) });
+        return 2;
+    };
+    if (outcome.refresh_token == null) {
+        std.debug.print("error: the token response carries no refresh_token; it could never be refreshed\n", .{});
+        return 2;
+    }
+
+    var session = provider_oauth.Session.initHome(allocator, built.id, built.id) catch |err| {
+        std.debug.print("error: could not open the OAuth store ({s})\n", .{@errorName(err)});
+        return 2;
+    };
+    defer session.deinit();
+
+    session.importOutcome(outcome, @import("util/time.zig").nowUnix()) catch |err| {
+        std.debug.print("error: could not store the token ({s})\n", .{@errorName(err)});
+        return 2;
+    };
+    std.debug.print(
+        "Stored an OAuth login for provider '{s}'. No secret was printed.\n",
+        .{built.id.slice()},
+    );
+    return 0;
+}
+
 /// Register the user's configured providers into `registry`.
 ///
 /// Returns the arena that owns their strings; the caller must keep it alive
@@ -1814,6 +1904,8 @@ test {
     _ = &@import("repl/picker_host.zig");
     _ = &@import("provider/host.zig");
     _ = &@import("provider/custom_provider.zig");
+    _ = &@import("provider/oauth.zig");
+    _ = &@import("api/oauth_exchange.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/multiline.zig");

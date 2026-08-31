@@ -418,6 +418,10 @@ pub const ProviderProfile = struct {
     endpoint_policy: EndpointPolicy = .{},
     classify_error: ClassifyFn = defaultClassifyError,
     quote_hook: ?QuoteFn = null,
+    /// RFC 6749 token endpoint for this provider's OAuth kinds. Null means the
+    /// profile declares no OAuth lifecycle here — Metask's lives in
+    /// `core/auth.zig` and keeps its historical path.
+    oauth_token_url: ?[]const u8 = null,
 
     pub fn matchesName(self: ProviderProfile, name: []const u8) bool {
         if (self.id.eqlText(name)) return true;

@@ -19,6 +19,10 @@ const Slug = ids.Slug;
 
 pub const BASE_URL = "https://api.openai.com/v1";
 
+/// RFC 6749 token endpoint. Refresh and rotated-refresh persistence run through
+/// `provider/oauth.zig`; only the URL is profile data.
+pub const OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
+
 fn entry(
     comptime request_model_id: []const u8,
     comptime display_name: []const u8,
@@ -76,6 +80,7 @@ pub const PROFILE = profile.ProviderProfile{
     .env_aliases = &ENV_ALIASES,
     .auth = .bearer,
     .default_channel = Slug.lit("default"),
+    .oauth_token_url = OAUTH_TOKEN_URL,
 };
 
 test "openai profile routes both wire families from one channel" {
@@ -102,4 +107,15 @@ test "codex oauth is a distinct accepted kind, not an openai key alias" {
     for (PROFILE.env_aliases) |alias| {
         try std.testing.expect(alias.kind != .openai_codex_oauth);
     }
+}
+
+test "the profile declares a token endpoint for the OAuth kinds it accepts" {
+    // A profile that accepts an OAuth kind and declares no token endpoint
+    // cannot refresh, which surfaces as a mysterious expiry hours later.
+    var accepts_oauth = false;
+    for (PROFILE.accepted_credential_kinds) |kind| {
+        if (@import("../oauth.zig").servesKind(kind)) accepts_oauth = true;
+    }
+    try std.testing.expect(accepts_oauth);
+    try std.testing.expect(PROFILE.oauth_token_url != null);
 }

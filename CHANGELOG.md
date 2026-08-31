@@ -140,6 +140,24 @@ status, compatibility boundaries, and entry points are defined by
   `config.json` and read from disk, so no transport dependency enters the
   provider subsystem.
 
+- Provider-scoped OAuth lifecycle (issue #16, P1). `provider/oauth.zig` runs
+  refresh, single flight, and rotated-refresh persistence for any profile that
+  declares an OAuth credential kind and a token endpoint — OpenAI and Codex
+  first; Metask keeps its historical `core/auth.zig` path byte for byte. N turns
+  discovering an expired token at once perform exactly one refresh, because with
+  a rotating refresh token the losers of that race would present a token the
+  server already invalidated. The rotated token is persisted atomically (temp
+  file + fsync + rename, 0600) *before* it becomes the live one: a provider that
+  rotated has already killed the old token, so "used but not saved" locks the
+  user out while "saved but not yet live" is recovered by the next load. Refresh
+  triggers a margin before expiry, since a token that expires mid-flight fails
+  the request it was attached to, and `invalid_grant` is terminal rather than a
+  transport error a retry loop would chew on. The module performs no I/O — the
+  exchange is a function pointer, with `api/oauth_exchange.zig` as the
+  production `refresh_token` grant — so every lifecycle test drives a fake and
+  none needs a network. `metacodes login --provider <id> --oauth-token-json
+  <file>` imports the first token into that provider's own store.
+
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
   base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,

@@ -107,6 +107,8 @@ const provider_config_store = @import("provider/config_store.zig");
 const provider_selection_mod = @import("provider/selection.zig");
 const provider_ids_mod = @import("provider/ids.zig");
 const model_picker_mod = @import("repl/model_picker.zig");
+const provider_oauth_mod = @import("provider/oauth.zig");
+const oauth_exchange_mod = @import("api/oauth_exchange.zig");
 const provider_mod = @import("api/provider.zig");
 const request_overrides = @import("api/request_overrides.zig");
 const dialect_mod = @import("api/dialect.zig");
@@ -960,6 +962,52 @@ pub const App = struct {
         return host;
     }
 
+    /// The profile a selection resolves to, if it is still in the catalog.
+    fn resolvedProfileFor(
+        host: *provider_host_mod.Host,
+        selection: provider_selection_mod.RuntimeSelection,
+    ) ?*const @import("provider/profile.zig").ProviderProfile {
+        const resolution = provider_selection_mod.resolve(host.kernel.catalogSnapshot(), selection) catch
+            return null;
+        return host.registry.findById(resolution.primary().provider_id);
+    }
+
+    /// A live access token for a provider whose profile declares an OAuth
+    /// lifecycle, refreshing through the shared single-flight session.
+    ///
+    /// Returns null for every profile that declares none — Metask keeps its
+    /// historical `core/auth.zig` path byte for byte, and a provider with no
+    /// token endpoint has no lifecycle to run.
+    pub fn oauthAccessToken(
+        app: *App,
+        built: *const @import("provider/profile.zig").ProviderProfile,
+        now_seconds: i64,
+    ) !?[]u8 {
+        const token_url = built.oauth_token_url orelse return null;
+        var serves = false;
+        for (built.accepted_credential_kinds) |kind| {
+            if (provider_oauth_mod.servesKind(kind)) serves = true;
+        }
+        if (!serves) return null;
+
+        var session = try provider_oauth_mod.Session.initHome(
+            app.allocator,
+            built.id,
+            built.id,
+        );
+        defer session.deinit();
+        // No stored login is not an error: the provider simply falls through to
+        // its API-key aliases.
+        if (!(session.load() catch false)) return null;
+
+        var exchange = oauth_exchange_mod.HttpExchange{
+            .allocator = app.allocator,
+            .io = app.api_client.http_client.io,
+            .endpoint = .{ .token_url = token_url, .client_id = built.id.slice() },
+        };
+        return try session.accessToken(now_seconds, exchange.exchange());
+    }
+
     /// Refresh the picker's snapshot from the kernel. Called when the picker
     /// opens and whenever the catalog moves underneath it.
     pub fn refreshModelPicker(app: *App) !void {
@@ -1034,14 +1082,33 @@ pub const App = struct {
         selection: provider_selection_mod.RuntimeSelection,
     ) !void {
         var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
+        const now = @import("util/time.zig").nowUnix();
+
+        // An OAuth provider's live access token is obtained (and refreshed, and
+        // persisted) before resolution, so the resolver sees ordinary stored
+        // material and the OAuth lifecycle stays in one place.
+        var oauth_token: ?[]u8 = null;
+        defer if (oauth_token) |value| {
+            std.crypto.secureZero(u8, value);
+            app.allocator.free(value);
+        };
+        if (resolvedProfileFor(host, selection)) |built| {
+            oauth_token = app.oauthAccessToken(built, now) catch null;
+        }
+
         const binding = try provider_binding_mod.bind(
             &host.registry,
             host.kernel.catalogSnapshot(),
             selection,
             .{
                 .cli_api_key = app.config.api_key,
+                .stored_oauth = if (oauth_token) |value| .{
+                    .kind = .openai_oauth,
+                    .secret = value,
+                } else null,
+                .precedence = if (oauth_token != null) .oauth_first else .api_key_first,
                 .env = @import("provider/credential.zig").EnvLookup.process(),
-                .now_seconds = @import("util/time.zig").nowUnix(),
+                .now_seconds = now,
             },
             &reference_buffer,
         );

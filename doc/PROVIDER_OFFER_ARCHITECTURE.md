@@ -155,6 +155,40 @@ the historical bytes), `api_key_header`, `custom_header`, `api_key_query`
 (rejected by the current transports rather than silently dropped), and
 `signed_adapter` (reviewed adapters, P2).
 
+## OAuth
+
+Metask's OAuth stays in `core/auth.zig`, byte for byte. `provider/oauth.zig` is
+the same lifecycle for any profile that declares an OAuth credential kind and a
+token endpoint — OpenAI and Codex first — kept inside the provider subsystem so
+it is reachable from provider-scoped resolution and so a token for one vendor
+can never satisfy another.
+
+Three properties carry the design:
+
+- **Single flight.** N turns discovering an expired access token at once perform
+  *one* refresh. Without it, a rotated refresh token makes the losers of the
+  race present a token the server has already invalidated, and the session dies
+  with an authentication error that looks random. Waiters block on a condition
+  and take the winner's result.
+- **Rotated-refresh persistence is atomic, and happens first.** A provider that
+  returns a new refresh token has already invalidated the old one, so the write
+  (temp file + fsync + rename, 0600) completes *before* the new tokens become
+  the live ones. The worst case is then a token saved but not yet in memory,
+  which the next load recovers; the alternative — used but not saved — locks the
+  user out permanently.
+- **The refresh margin is generous.** A token that expires mid-flight fails the
+  request it was attached to, so refresh triggers `REFRESH_MARGIN_SECONDS`
+  before the server's expiry rather than at it.
+
+`invalid_grant` is terminal: the user must log in again, and reporting it as a
+transport failure would point a retry loop at an endpoint that can only keep
+saying no.
+
+The module performs no I/O. The token exchange is a caller-supplied function, so
+every lifecycle test drives a fake exchange and none needs a network;
+`src/api/oauth_exchange.zig` is the production half, one small auditable
+`refresh_token` grant over HTTP.
+
 ## Controls
 
 `ControlSpec` is provider-declared and versioned; the kernel owns no control
@@ -430,6 +464,8 @@ to the historical path, which still serves proxies and server-catalog models.
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
+| `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
+| `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
 | `src/repl/model_picker.zig` | picker state machine (pure) |
 | `src/repl/model_picker_view.zig` | picker rendering |
 | `src/repl/picker_host.zig` | commit + rebind against the session |
@@ -445,10 +481,11 @@ TUI, or a UI protocol, that step stops compiling.
 
 Listed rather than left silent. Each is a later delivery slice from the issue.
 
-- **OAuth lifecycle for OpenAI/Codex (P1).** The profile declares the accepted
-  kinds and the transport auth shape; the device/PKCE flow, single-flight
-  refresh, and rotated-refresh-token persistence are not implemented. Only
-  Metask OAuth works today, on its historical path.
+- **Interactive OAuth login for non-Metask providers (P1).** The lifecycle —
+  refresh, single flight, rotated-refresh persistence — is implemented and
+  reachable; obtaining the *first* token still means
+  `metacodes login --provider <id> --oauth-token-json <file>`. The browser /
+  device / PKCE flow is Metask-only.
 - **Live catalog fetching (P1).** Catalogs are ingested from documents on disk
   (`provider_catalogs` in `config.json`), not fetched. The parsing, offer
   construction, and events are identical either way, so wiring an HTTP fetcher

@@ -1199,3 +1199,166 @@ test "L2: a configured provider's declared metadata reaches every client the sam
     );
     try std.testing.expect(admission == .rejected);
 }
+
+// ── provider-scoped OAuth lifecycle ──────────────────────────────────────────
+
+fn oauthTempPath(a: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "/tmp/metacodes-oauth-l2-{s}.json", .{name});
+}
+
+test "L2: an expired provider token refreshes over real HTTP and persists the rotation" {
+    const a = std.testing.allocator;
+    // A 200 with a JSON body: the token endpoint's actual shape.
+    var server = try harness.MockServer.startWithStatus(
+        \\{"access_token":"at-2","refresh_token":"rt-2","token_type":"Bearer","expires_in":3600}
+    , 0, "HTTP/1.1 200 OK");
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    const path = try oauthTempPath(a, "refresh");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    var session = try cc.provider_oauth.Session.init(
+        a,
+        Slug.lit("openai"),
+        Slug.lit("openai"),
+        path,
+    );
+    defer session.deinit();
+    try session.importOutcome(.{
+        .access_token = "at-1",
+        .refresh_token = "rt-1",
+        .expires_in_seconds = 10,
+    }, 1_000);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var exchange = cc.api_oauth_exchange.HttpExchange{
+        .allocator = a,
+        .io = io_runtime.io(),
+        .endpoint = .{ .token_url = origin, .client_id = "metacodes-test" },
+    };
+
+    // Well past expiry: the lifecycle must refresh rather than present a dead
+    // token and let the request fail.
+    const token = session.accessToken(9_000, exchange.exchange()) catch return error.SkipZigTest;
+    defer a.free(token);
+    try std.testing.expectEqualStrings("at-2", token);
+
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, captured.raw, "grant_type=refresh_token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.raw, "refresh_token=rt-1") != null);
+
+    // The provider rotated, so `rt-1` is already dead. The file must hold the
+    // replacement before the process could possibly crash.
+    const stored = try readWholeFile(a, path);
+    defer a.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "rt-2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"rt-1\"") == null);
+}
+
+test "L2: a rejected refresh is terminal and leaves the stored login untouched" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startWithStatus(
+        \\{"error":"invalid_grant","error_description":"expired"}
+    , 0, "HTTP/1.1 400 Bad Request");
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    const path = try oauthTempPath(a, "rejected");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    var session = try cc.provider_oauth.Session.init(a, Slug.lit("openai"), Slug.lit("openai"), path);
+    defer session.deinit();
+    try session.importOutcome(.{
+        .access_token = "at-1",
+        .refresh_token = "rt-1",
+        .expires_in_seconds = 10,
+    }, 1_000);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var exchange = cc.api_oauth_exchange.HttpExchange{
+        .allocator = a,
+        .io = io_runtime.io(),
+        .endpoint = .{ .token_url = origin, .client_id = "metacodes-test" },
+    };
+
+    // `invalid_grant` means the user must log in again. Reporting it as a
+    // transport failure would send a retry loop at an endpoint that can only
+    // keep saying no.
+    try std.testing.expectError(
+        error.RefreshRejected,
+        session.accessToken(9_000, exchange.exchange()),
+    );
+
+    // Nothing was overwritten: the user's stored login is still the one they
+    // have, and a re-login replaces it deliberately rather than by accident.
+    const stored = try readWholeFile(a, path);
+    defer a.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "rt-1") != null);
+}
+
+test "L2: an OAuth access token authenticates the provider's own route" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{
+        .only_provider = Slug.lit("openai"),
+        .endpoint_overrides = &.{.{ .provider_id = Slug.lit("openai"), .base_url = origin }},
+    });
+    defer catalog.deinit();
+
+    var reference_buffer: [cc.provider_ids.MAX_SLUG_LEN]u8 = undefined;
+    const binding = try cc.provider_runtime_binding.bindOffer(
+        &registry,
+        &catalog.items()[0],
+        .{
+            // The OAuth access token arrives as stored material of an OAuth
+            // kind; an API key for another vendor still cannot satisfy it.
+            .stored_oauth = .{ .kind = .openai_oauth, .secret = "oauth-access-token" },
+            .precedence = .oauth_first,
+        },
+        &reference_buffer,
+        false,
+    );
+    try std.testing.expectEqualStrings("oauth-access-token", binding.secret);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.api_openai.OpenAIClient.init(
+        a,
+        io_runtime.io(),
+        binding.secret,
+        binding.request_model_id,
+        binding.endpoint_url,
+    );
+    client.protocol = binding.openai_protocol;
+    client.auth_scheme = binding.auth_scheme;
+    defer client.deinit();
+
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = client.provider().sendStream(&messages, null, null, null, null, null, "") catch
+        return error.SkipZigTest;
+    while (handle.next() catch null) |event| switch (event) {
+        .text => |text| a.free(text),
+        else => {},
+    };
+    handle.deinit();
+
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expectEqualStrings("Bearer oauth-access-token", headerValue(captured, "authorization").?);
+}
