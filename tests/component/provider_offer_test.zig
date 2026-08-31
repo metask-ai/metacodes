@@ -1074,3 +1074,128 @@ test "L2: the TUI picker and a second client see one catalog and one selection" 
     try seedPicker(&picker, &host.kernel, a);
     try std.testing.expect(picker.current_offer.?.eql(target.offer_id));
 }
+
+// ── user-defined providers ───────────────────────────────────────────────────
+
+test "L2: a configured relay reaches its own path, header, and wire model id" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    const definition = try std.fmt.allocPrint(a,
+        \\{{"custom_providers": {{"house-relay": {{
+        \\  "display_name": "House relay",
+        \\  "aliases": ["relay"],
+        \\  "auth": {{"kind": "custom_header", "header": "X-Relay-Token", "value_prefix": "Token "}},
+        \\  "env_aliases": [{{"name": "RELAY_TOKEN", "kind": "api_key", "canonical": true}}],
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/v1",
+        \\    "protocol": {{"wire": "openai_chat", "path_suffix": "/completions", "id": "relay_openai"}},
+        \\    "region": "eu"}}],
+        \\  "models": [{{"request_model_id": "relay-glm-pro", "display_name": "GLM-4.6 (relay)",
+        \\    "canonical_model_id": "zai/glm-4.6",
+        \\    "limits": {{"context_window": 200000, "max_output_tokens": 128000}},
+        \\    "capabilities": {{"tools": "supported"}},
+        \\    "price": {{"currency": "EUR", "input": 2.5, "output": 9}}}}]}}}}}}
+    , .{origin});
+    defer a.free(definition);
+
+    var definitions = try cc.provider_custom.parse(a, definition);
+    defer definitions.deinit();
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    for (definitions.profiles()) |built| try registry.register(built);
+
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{ .provider = "relay" });
+    try std.testing.expect(outcome == .route);
+    var route = outcome.route;
+    defer route.deinit();
+
+    // A relay only moved the path, so the OpenAI transport serves it — no
+    // adapter, no code, and no fallback to a wire the server does not speak.
+    try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, route.transport);
+    try std.testing.expectEqualStrings("relay-glm-pro", route.request_model_id);
+    try std.testing.expectEqual(@as(?u32, 200_000), route.limits.context_window);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.api_openai.OpenAIClient.init(
+        a,
+        io_runtime.io(),
+        "relay-secret",
+        route.request_model_id,
+        route.endpoint_url,
+    );
+    client.protocol = route.openai_protocol;
+    client.auth_scheme = route.auth_scheme;
+    defer client.deinit();
+
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = client.provider().sendStream(&messages, null, null, null, null, null, "") catch
+        return error.SkipZigTest;
+    while (handle.next() catch null) |event| switch (event) {
+        .text => |text| a.free(text),
+        else => {},
+    };
+    handle.deinit();
+
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    // The declared path suffix, the declared header with its prefix, and the
+    // relay's own model id — the canonical mapping is display identity and
+    // must not leak onto the wire.
+    try std.testing.expect(std.mem.indexOf(u8, requestLine(captured), "/v1/completions") != null);
+    try std.testing.expectEqualStrings("Token relay-secret", headerValue(captured, "X-Relay-Token").?);
+    try std.testing.expect(headerValue(captured, "authorization") == null);
+    const model_field = captured.jsonField("model") orelse return error.ModelFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "relay-glm-pro") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-4.6") == null);
+}
+
+test "L2: a configured provider's declared metadata reaches every client the same way" {
+    const a = std.testing.allocator;
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+
+    try host.adoptCustomProviders(
+        \\{"custom_providers": {"house-relay": {
+        \\  "channels": [{"id":"primary","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"relay-glm-pro","canonical_model_id":"zai/glm-4.6",
+        \\    "limits": {"context_window": 200000},
+        \\    "price": {"currency":"EUR","input":2.5,"output":9,"discount_basis_points":9000},
+        \\    "controls": [{"id":"reasoning_effort","label":"Reasoning","kind":"enumeration","values":["low","high"]}]}]}}}
+    );
+
+    var page: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try host.kernel.modelList(.{}, .{ .provider_id = Slug.lit("house-relay") }, a, &page);
+    try std.testing.expectEqual(@as(usize, 1), listed.offers.len);
+    const summary = listed.offers[0];
+
+    // Everything the definition declared is on the summary every UI reads.
+    try std.testing.expectEqual(@as(?u32, 200_000), summary.limits.context_window);
+    try std.testing.expectEqualStrings("EUR", summary.quote.priced().?.currency.slice());
+    try std.testing.expectEqual(@as(?u16, 9_000), summary.quote.priced().?.discount_basis_points);
+    try std.testing.expectEqual(@as(usize, 1), summary.controls.len);
+    try std.testing.expectEqualStrings("reasoning_effort", summary.controls[0].id);
+
+    // And the picker renders it without knowing it was user-defined.
+    var picker = picker_mod.Picker.init(a);
+    defer picker.deinit();
+    try seedPicker(&picker, &host.kernel, a);
+    _ = picker.onKey(.{ .char = 'h' });
+    var scratch: [picker_mod.Picker.MAX_ROWS]picker_mod.Row = undefined;
+    const rows = picker.rows(&scratch);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(picker.offers.items[rows[0].provider.offer_index].provider_id.eqlText("house-relay"));
+
+    // Token admission uses the declared limit, so a prompt that cannot fit is
+    // rejected before any request exists.
+    const admission = summary.limits.admit(
+        .{ .input_tokens = 500_000, .requested_output_tokens = 1_000 },
+        .{},
+    );
+    try std.testing.expect(admission == .rejected);
+}

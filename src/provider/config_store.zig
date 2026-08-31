@@ -173,6 +173,13 @@ pub const Store = struct {
         return .{ .config_revision = document.config_revision };
     }
 
+    /// Raw document text. Callers that need a key this module does not model
+    /// (the `custom_providers` section, for one) parse it themselves rather
+    /// than forcing every such key through `Document`.
+    pub fn readText(self: *const Store) StoreError![]u8 {
+        return self.readAll();
+    }
+
     fn readAll(self: *const Store) StoreError![]u8 {
         const path_z = self.allocator.dupeZ(u8, self.path) catch return error.OutOfMemory;
         defer self.allocator.free(path_z);

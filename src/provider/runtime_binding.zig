@@ -110,8 +110,15 @@ pub fn bindOffer(
     revision_changed: bool,
 ) BindError!RuntimeBinding {
     const profile = registry.findById(offer.provider_id) orelse return error.UnknownProvider;
-    const protocol = profile_mod.Protocol.parse(offer.protocol) orelse
-        return error.UnsupportedProtocolTransport;
+    // The wire the catalog recorded, not a re-parse of the protocol *id*: a
+    // declarative custom protocol has its own id and a real wire.
+    const wire = offer.wire orelse return error.UnsupportedProtocolTransport;
+    const protocol: profile_mod.Protocol = switch (wire) {
+        .anthropic_messages => .anthropic_messages,
+        .openai_chat => .openai_chat,
+        .openai_responses => .openai_responses,
+        .gemini_generate_content => .gemini_generate_content,
+    };
     const transport = try registry_mod.transportKindFor(protocol);
     const openai_protocol = switch (transport) {
         .openai => try registry_mod.openAiProtocolFor(protocol),

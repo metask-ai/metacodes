@@ -14,6 +14,7 @@ const ids = @import("ids.zig");
 const registry_mod = @import("registry.zig");
 const control_plane = @import("control_plane.zig");
 const config_store = @import("config_store.zig");
+const custom_provider = @import("custom_provider.zig");
 
 pub const ProviderRegistry = registry_mod.ProviderRegistry;
 pub const OfferCatalog = registry_mod.OfferCatalog;
@@ -29,6 +30,9 @@ pub const Host = struct {
     /// until the next refresh because `adoptCatalog` documents that a previous
     /// catalog must outlive in-flight readers.
     retired: ?OfferCatalog = null,
+    /// Owns every string the configured profiles point at. It must outlive the
+    /// registry, which borrows them.
+    custom: ?custom_provider.Definitions = null,
     kernel: Kernel,
 
     pub fn create(allocator: std.mem.Allocator) HostError!*Host {
@@ -60,8 +64,31 @@ pub const Host = struct {
         self.kernel.deinit();
         if (self.retired) |*old| old.deinit();
         self.catalog.deinit();
+        // The registry borrows the configured profiles' strings, so it goes
+        // first.
         self.registry.deinit();
+        if (self.custom) |*definitions| definitions.deinit();
         allocator.destroy(self);
+    }
+
+    /// Register the providers the user configured.
+    ///
+    /// Best effort by design: a malformed `custom_providers` section must not
+    /// stop a session that also has working built-in providers. It is reported
+    /// rather than swallowed — the caller decides how loudly.
+    pub fn adoptCustomProviders(self: *Host, text: []const u8) custom_provider.DefinitionError!void {
+        var definitions = try custom_provider.parse(self.allocator, text);
+        errdefer definitions.deinit();
+        for (definitions.profiles()) |built| {
+            self.registry.register(built) catch return error.DuplicateProviderId;
+        }
+        if (self.custom) |*previous| previous.deinit();
+        self.custom = definitions;
+        try self.refreshCatalog();
+    }
+
+    fn refreshCatalog(self: *Host) custom_provider.DefinitionError!void {
+        self.refresh() catch return error.OutOfMemory;
     }
 
     /// Rebuild the catalog and hand it to the kernel. The previous catalog is
@@ -92,6 +119,11 @@ pub const Host = struct {
     /// the store is the sole authority, so a failed read leaves the kernel at
     /// its initial revision and a later commit conflicts loudly.
     pub fn adoptDurableState(self: *Host, store: *const config_store.Store) void {
+        if (store.readText()) |text| {
+            defer self.allocator.free(text);
+            self.adoptCustomProviders(text) catch {};
+        } else |_| {}
+
         var document = store.load() catch return;
         defer document.deinit();
         self.kernel.adoptConfigRevision(document.config_revision);
@@ -132,4 +164,67 @@ test "two refreshes keep the retired catalog alive for one generation" {
     try std.testing.expect(host.retired != null);
     try host.refresh();
     try std.testing.expect(host.retired != null);
+}
+
+test "a configured provider joins the catalog beside the built-in ones" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const builtin_count = host.kernel.catalogSnapshot().items().len;
+
+    try host.adoptCustomProviders(
+        \\{"custom_providers": {"house-relay": {
+        \\  "display_name": "House relay",
+        \\  "channels": [{"id":"primary","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"relay-pro","canonical_model_id":"zai/glm-4.6"}]}}}
+    );
+
+    const items = host.kernel.catalogSnapshot().items();
+    try std.testing.expectEqual(builtin_count + 1, items.len);
+
+    var found = false;
+    for (items) |candidate| {
+        if (!candidate.provider_id.eqlText("house-relay")) continue;
+        found = true;
+        // The relay's canonical mapping is display identity; the wire carries
+        // its own id, which is the property a relay exists to have.
+        try std.testing.expectEqualStrings("relay-pro", candidate.request_model_id);
+        try std.testing.expectEqualStrings("zai/glm-4.6", candidate.canonical_model_id.?);
+        try std.testing.expectEqualStrings("https://relay.example.com/v1/chat/completions", candidate.endpoint_ref);
+    }
+    try std.testing.expect(found);
+
+    // And it is selectable through the same kernel API as any built-in offer.
+    var page: std.ArrayList(control_plane.OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try host.kernel.modelList(.{}, .{ .provider_id = ids.Slug.lit("house-relay") }, a, &page);
+    try std.testing.expectEqual(@as(usize, 1), listed.offers.len);
+}
+
+test "a malformed custom section leaves the built-in providers working" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    try std.testing.expectError(
+        error.NoModels,
+        host.adoptCustomProviders(
+            \\{"custom_providers": {"broken": {
+            \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}]}}}
+        ),
+    );
+    // A bad definition must not take the session's working providers with it.
+    try std.testing.expectEqual(before, host.kernel.catalogSnapshot().items().len);
+}
+
+test "durable state adoption survives a config file that does not exist" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    var store = try config_store.Store.initPath(a, "/tmp/metacodes-provider-host-absent.json");
+    defer store.deinit();
+    // Absent is not an error: a fresh installation has no control-plane state.
+    host.adoptDurableState(&store);
+    try std.testing.expect(host.kernel.catalogSnapshot().items().len > 0);
 }

@@ -256,6 +256,69 @@ legitimately accept private model names — with metadata left unknown.
 
 Sessions that name no provider keep the historical path unchanged.
 
+## User-defined providers
+
+`custom_providers` in `~/.metacodes/config.json` defines provider instances that
+go through the same `ProviderRegistry.register` call and the same validation as
+a built-in profile, so nothing downstream can tell the difference. What differs
+is ownership: a built-in profile is comptime data, while a configured one is
+parsed into an arena that must outlive the registry borrowing its strings.
+
+```json
+"custom_providers": {
+  "house-relay": {
+    "display_name": "House relay",
+    "aliases": ["relay"],
+    "auth": {"kind": "custom_header", "header": "X-Relay-Token", "value_prefix": "Token "},
+    "env_aliases": [{"name": "RELAY_TOKEN", "kind": "api_key", "canonical": true}],
+    "endpoint_policy": {"required_path_fragments": ["/relay"]},
+    "channels": [{
+      "id": "primary", "base_url": "https://relay.example.com/relay/v1", "region": "eu",
+      "protocol": {"wire": "openai_chat", "path_suffix": "/completions", "id": "relay_openai"}
+    }],
+    "models": [{
+      "request_model_id": "relay-glm-pro", "canonical_model_id": "zai/glm-4.6",
+      "limits": {"context_window": 200000, "max_output_tokens": 128000},
+      "capabilities": {"tools": "supported", "vision": "unsupported"},
+      "price": {"currency": "EUR", "input": 2.5, "output": 9, "discount_basis_points": 9000},
+      "controls": [{"id": "reasoning_effort", "kind": "enumeration", "values": ["low", "high"]}]
+    }]
+  }
+}
+```
+
+**The schema is declarative and cannot execute anything.** There is no field for
+code, a callback, a shell command, or a request template, and unknown keys are
+ignored rather than interpreted. A hostile config can misroute the user's own
+traffic — which the endpoint policy still constrains — but it cannot read
+prompts or reach a credential it was not given. `quote_hook` and
+`classify_error` stay at their defaults for configured providers; those are code
+and belong to a reviewed profile.
+
+A protocol is a **wire**, optionally with a different request path. That is what
+relays, gateways, and self-hosted servers actually differ by, and it keeps them
+inside the schema: the wire selects the transport, the path suffix rides along
+in the offer. A genuinely novel wire is rejected (`UnknownWire`) rather than
+guessed — that case needs a reviewed adapter (P2).
+
+`ModelOffer` carries the wire beside the protocol id for this reason. Re-parsing
+the id would report "no transport" for a declarative protocol that has one.
+
+Declared limits, capabilities, prices, and controls carry
+`Provenance.source = user_config` and a price is marked `estimated`: a number
+the user typed is a declaration, not a vendor observation, and must not read as
+one. Everything else about it is ordinary — the picker, `model.list`,
+`quote.estimate`, and token admission treat it exactly like a built-in offer.
+
+`metacodes --check-providers` is the dry run: it validates the configuration and
+prints every route it produces — provider, channel, protocol, endpoint, wire
+model id, context, price — and exits non-zero on a bad definition. No credential
+is resolved and no request URL is built, which is exactly when a bad definition
+should be explained. Validation itself happens at parse time: an endpoint the
+provider's own policy forbids, a plaintext non-loopback host, a URL carrying
+userinfo, a missing channel or model, an unknown auth scheme, or a price in an
+unknown currency all fail before registration.
+
 ## TUI
 
 `Ctrl+O` and `/model` open the same picker; transcript viewing moved to
@@ -318,6 +381,7 @@ to the historical path, which still serves proxies and server-catalog models.
 | `src/provider/runtime_binding.zig` | selection → transport parameters |
 | `src/provider/startup.zig` | CLI/bootstrap route resolution |
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
+| `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
 | `src/repl/model_picker.zig` | picker state machine (pure) |
 | `src/repl/model_picker_view.zig` | picker rendering |
 | `src/repl/picker_host.zig` | commit + rebind against the session |
@@ -348,9 +412,6 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
   real quote (see *Pricing*), so `model.list` and `quote.estimate` return known
   prices for it. `openai` and `gemini` stay `unknown` until a provider catalog
   or user config supplies rates; `zai-coding-plan` stays `unknown` by design.
-- **User-defined providers (P1).** A profile can be registered at runtime
-  through the same extension point, but there is no `CustomProviderDefinition`
-  config schema, no `DeclarativeProtocolSpec`, and no dry-run/connection test.
 - **The picker's credential stage (P1).** `/models` still owns account-key
   selection through its own menu, because the picker has no credential stage
   yet — that waits on credential-pool rotation below. `/model` and `Ctrl+O`

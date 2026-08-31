@@ -327,6 +327,15 @@ pub fn resolveSelection(
     return ownOrFail(allocator, profile, chosen, false);
 }
 
+fn wireProtocol(wire: profile_mod.Protocol.Wire) profile_mod.Protocol {
+    return switch (wire) {
+        .anthropic_messages => .anthropic_messages,
+        .openai_chat => .openai_chat,
+        .openai_responses => .openai_responses,
+        .gemini_generate_content => .gemini_generate_content,
+    };
+}
+
 fn ownOrFail(
     allocator: std.mem.Allocator,
     profile: *const profile_mod.ProviderProfile,
@@ -366,8 +375,12 @@ fn own(
 ) OwnError!StartupRoute {
     // No silent fallback: a protocol without a built-in transport must surface
     // as an error, not quietly become the Anthropic wire.
-    const protocol = profile_mod.Protocol.parse(offer.protocol) orelse
-        return error.UnsupportedProtocolTransport;
+    //
+    // The wire comes from the offer, not from re-parsing its protocol *id*: a
+    // declarative custom protocol has its own id and a real wire, and parsing
+    // the id would report "no transport" for a route that has one.
+    const wire = offer.wire orelse return error.UnsupportedProtocolTransport;
+    const protocol = wireProtocol(wire);
     const transport = try registry_mod.transportKindFor(protocol);
     const openai_protocol = switch (transport) {
         .openai => try registry_mod.openAiProtocolFor(protocol),

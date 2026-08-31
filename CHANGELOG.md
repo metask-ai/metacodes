@@ -105,6 +105,22 @@ status, compatibility boundaries, and entry points are defined by
   New gate `zig build test:picker` compiles the picker from a root reaching the
   provider kernel and the terminal theme and nothing else.
 
+- User-defined providers (issue #16, P1). A `custom_providers` section in
+  `~/.metacodes/config.json` defines provider instances that go through the same
+  registration and validation as a built-in profile, so the picker, `--provider`,
+  `model.list`, `quote.estimate`, and token admission treat them identically.
+  The schema is declarative and cannot execute anything: there is no field for
+  code, a callback, a shell command, or a request template, and unknown keys are
+  ignored rather than interpreted. A protocol is a *wire* plus an optional
+  request path — what relays and gateways actually differ by — so a relay needs
+  no adapter, while a genuinely novel wire is rejected rather than guessed.
+  Declared limits, capabilities, prices, and controls carry
+  `user_config` provenance and a configured price is marked estimated, because a
+  number the user typed is a declaration and not a vendor observation. New
+  `--check-providers` dry run validates the configuration and prints every route
+  it produces — provider, channel, protocol, endpoint, wire model id, context,
+  price — with no credential resolved and no request URL built.
+
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
   base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,

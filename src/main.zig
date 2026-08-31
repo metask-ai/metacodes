@@ -34,6 +34,7 @@ pub const provider_control_plane = @import("provider/control_plane.zig");
 pub const provider_runtime_binding = @import("provider/runtime_binding.zig");
 pub const provider_startup = @import("provider/startup.zig");
 pub const provider_host = @import("provider/host.zig");
+pub const provider_custom = @import("provider/custom_provider.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig");
@@ -279,6 +280,8 @@ fn applyProviderRoute(
         std.process.exit(2);
     };
     defer registry.deinit();
+    var custom = loadCustomProviders(allocator, &registry);
+    defer if (custom) |*definitions| definitions.deinit();
 
     const outcome = startup.resolve(allocator, &registry, .{
         .provider = profile_name,
@@ -503,6 +506,14 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("error: invalid METACODES_LONG_HORIZON_ARM '{s}'\n", .{value});
             std.process.exit(2);
         };
+    }
+
+    // `--check-providers` is a dry run: it validates the configuration and
+    // prints the routes it produces before any credential is resolved or any
+    // request URL is built, which is exactly when a bad definition should be
+    // explained.
+    if (config.check_providers) {
+        std.process.exit(checkProviders(allocator));
     }
 
     // --- provider 选择 ---
@@ -1139,6 +1150,120 @@ pub fn selectedProfileIsMetask(config: types.Config) bool {
 /// an explicit `--api-key`. The Metask credential store is deliberately not
 /// consulted, which is the whole point — an unrelated vendor key must never be
 /// selected merely because it exists.
+/// Register the user's configured providers into `registry`.
+///
+/// Returns the arena that owns their strings; the caller must keep it alive
+/// while the registry is in use. A malformed section is reported and skipped
+/// rather than fatal — a session with working built-in providers must still
+/// start, and the `--check-providers` dry run exists to explain the failure.
+fn loadCustomProviders(
+    allocator: std.mem.Allocator,
+    registry: *provider_registry.ProviderRegistry,
+) ?provider_custom.Definitions {
+    var store = provider_config_store.Store.initHome(allocator) catch return null;
+    defer store.deinit();
+    const text = store.readText() catch return null;
+    defer allocator.free(text);
+
+    var definitions = provider_custom.parse(allocator, text) catch |err| {
+        if (err != error.OutOfMemory) {
+            std.debug.print(
+                "warning: custom_providers in ~/.metacodes/config.json is invalid ({s}); " ++
+                    "run `metacodes --check-providers` for details\n",
+                .{@errorName(err)},
+            );
+        }
+        return null;
+    };
+    for (definitions.profiles()) |built| {
+        registry.register(built) catch |err| {
+            std.debug.print(
+                "warning: custom provider '{s}' was not registered ({s})\n",
+                .{ built.id.slice(), @errorName(err) },
+            );
+        };
+    }
+    return definitions;
+}
+
+/// `--check-providers`: validate the configuration and print every route it
+/// produces, without any network I/O. This is the dry run — it answers "would
+/// this definition work?" before a request is ever built.
+pub fn checkProviders(allocator: std.mem.Allocator) u8 {
+    var registry = provider_registry.ProviderRegistry.initWithBuiltins(allocator) catch {
+        std.debug.print("error: provider registry initialization failed\n", .{});
+        return 2;
+    };
+    defer registry.deinit();
+
+    var status: u8 = 0;
+    var store = provider_config_store.Store.initHome(allocator) catch null;
+    defer if (store) |*value| value.deinit();
+    var definitions: ?provider_custom.Definitions = null;
+    defer if (definitions) |*value| value.deinit();
+
+    if (store) |*value| {
+        if (value.readText()) |text| {
+            defer allocator.free(text);
+            if (provider_custom.parse(allocator, text)) |parsed| {
+                definitions = parsed;
+                for (parsed.profiles()) |built| {
+                    registry.register(built) catch |err| {
+                        std.debug.print("custom provider '{s}': NOT REGISTERED ({s})\n", .{ built.id.slice(), @errorName(err) });
+                        status = 2;
+                    };
+                }
+            } else |err| {
+                std.debug.print("custom_providers: INVALID ({s})\n", .{@errorName(err)});
+                status = 2;
+            }
+        } else |err| {
+            std.debug.print("config: unreadable ({s})\n", .{@errorName(err)});
+            status = 2;
+        }
+    }
+
+    var catalog = registry.buildCatalog(allocator, .{}) catch |err| {
+        std.debug.print("catalog: FAILED ({s})\n", .{@errorName(err)});
+        return 2;
+    };
+    defer catalog.deinit();
+
+    for (catalog.items()) |item| {
+        const rendered = item.offer_id.render();
+        std.debug.print("{s}/{s} [{s}] model={s}\n  endpoint {s}\n  offer    {s}\n", .{
+            item.provider_id.slice(),
+            item.channel_id.slice(),
+            item.protocol,
+            item.request_model_id,
+            item.endpoint_ref,
+            &rendered,
+        });
+        if (item.limits.context_window) |window| {
+            std.debug.print("  context  {d}\n", .{window});
+        } else {
+            std.debug.print("  context  unknown (admission fails closed)\n", .{});
+        }
+        if (item.quote.priced()) |price| {
+            std.debug.print("  price    {s} {s}{s}\n", .{
+                price.currency.slice(),
+                switch (price.billing_unit) {
+                    .per_million_tokens => "per 1M tokens",
+                    .per_thousand_tokens => "per 1K tokens",
+                    .per_token => "per token",
+                    .per_request => "per request",
+                    .provider_defined => "provider-defined unit",
+                },
+                if (price.estimated) " (estimated)" else "",
+            });
+        } else {
+            std.debug.print("  price    unknown\n", .{});
+        }
+    }
+    std.debug.print("{d} route(s); no request was made.\n", .{catalog.items().len});
+    return status;
+}
+
 pub fn resolveProviderScopedSecret(
     allocator: std.mem.Allocator,
     config: types.Config,
@@ -1148,6 +1273,8 @@ pub fn resolveProviderScopedSecret(
     const provider_ids_mod = provider_ids;
     var registry = try @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator);
     defer registry.deinit();
+    var custom = loadCustomProviders(allocator, &registry);
+    defer if (custom) |*definitions| definitions.deinit();
     const profile = registry.find(profile_name) orelse return error.UnknownProviderProfile;
 
     var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
@@ -1341,6 +1468,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |s| config.answers_file = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--base-url")) {
             if (args.next()) |s| config.base_url = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--check-providers")) {
+            config.check_providers = true;
         } else if (std.mem.eql(u8, arg, "--provider")) {
             const v = args.next() orelse {
                 setParseError(config, allocator, "missing value for --provider", .{});
@@ -1608,6 +1737,7 @@ fn printHelp() void {
         \\  --provider <id>       Provider profile id or alias (metask | openai | gemini | zai-coding-plan)
         \\  --channel <id>        Channel within the provider (e.g. cn-anthropic, global-openai)
         \\  --offer <offer-id>    Pin one exact model route (offer-...); see --provider output
+        \\  --check-providers     Validate provider configuration and list every route, then exit (no network)
         \\  --openai-protocol <p> OpenAI wire protocol: chat_completions (default; alias "chat") | responses (env METACODES_OPENAI_PROTOCOL)
         \\  --auth-precedence <p> api-key-first | oauth-first
         \\  --record <dir>        Record requests + SSE responses to dir (cassette)
@@ -1683,6 +1813,7 @@ test {
     _ = &@import("repl/model_picker_view.zig");
     _ = &@import("repl/picker_host.zig");
     _ = &@import("provider/host.zig");
+    _ = &@import("provider/custom_provider.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/multiline.zig");

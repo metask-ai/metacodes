@@ -54,18 +54,22 @@ pub const TransportError = error{UnsupportedProtocolTransport};
 /// `inferProviderKind`'s model-name guessing. A custom protocol has no built-in
 /// transport and must fail loudly rather than fall back to Anthropic.
 pub fn transportKindFor(protocol: Protocol) TransportError!types.ProviderKind {
-    return switch (protocol) {
+    // Keyed by the *wire*, so a declarative custom protocol that only changes
+    // the request path still reaches a real transport, while a genuinely novel
+    // wire (no declared wire) fails closed until an adapter is registered.
+    const wire = protocol.wire() orelse return error.UnsupportedProtocolTransport;
+    return switch (wire) {
         .anthropic_messages => .anthropic,
         .openai_chat, .openai_responses => .openai,
         .gemini_generate_content => .gemini,
-        .custom => error.UnsupportedProtocolTransport,
     };
 }
 
 /// The OpenAI wire variant a protocol selects. Never inferred from base URL or
 /// model name — the route says which one it is.
 pub fn openAiProtocolFor(protocol: Protocol) TransportError!types.OpenAIProtocol {
-    return switch (protocol) {
+    const wire = protocol.wire() orelse return error.UnsupportedProtocolTransport;
+    return switch (wire) {
         .openai_chat => .chat_completions,
         .openai_responses => .responses,
         else => error.UnsupportedProtocolTransport,
@@ -240,6 +244,7 @@ pub const OfferCatalog = struct {
                             .request_model_id = entry.request_model_id,
                             .upstream_model_id = entry.upstream_model_id,
                             .protocol = route.protocol.id(),
+                            .wire = route.protocol.wire(),
                             .endpoint_ref = endpoint,
                             .credential_ref = bound_credential,
                             .display_name = entry.display_name,

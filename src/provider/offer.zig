@@ -568,6 +568,12 @@ pub const ModelOffer = struct {
     upstream_model_id: ?[]const u8 = null,
 
     protocol: []const u8,
+    /// The wire this protocol speaks, carried alongside its id so the transport
+    /// can be chosen without parsing the id back into a built-in enum. A
+    /// declarative custom protocol has its own id and a real wire; re-parsing
+    /// the id would lose that and report "no transport" for a route that has
+    /// one. Null is a genuinely novel wire, which fails closed.
+    wire: ?@import("profile.zig").Protocol.Wire = null,
     /// Fully constructed request endpoint for this protocol on this channel.
     endpoint_ref: []const u8,
     credential_ref: ?Slug = null,
