@@ -442,6 +442,14 @@ the user typed is a declaration, not a vendor observation, and must not read as
 one. Everything else about it is ordinary — the picker, `model.list`,
 `quote.estimate`, and token admission treat it exactly like a built-in offer.
 
+The lifecycle is reachable through the control plane, not only by editing the
+file: `/providers` lists routes, `/providers enable|disable <id>` toggles an
+instance, and `/providers remove <id>` deletes its configuration. Disabling
+preserves the instance's configuration and credential references — that is the
+whole difference from removing it — and excludes it from the *catalog*, so
+"disabled" is true in the picker, `model.list`, and `--provider` at once rather
+than being re-checked at three call sites.
+
 `metacodes --check-providers` is the dry run: it validates the configuration and
 prints every route it produces — provider, channel, protocol, endpoint, wire
 model id, context, price — and exits non-zero on a bad definition. No credential

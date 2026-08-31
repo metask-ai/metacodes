@@ -1696,6 +1696,38 @@ pub const App = struct {
         }
     }
 
+    /// Enable, disable, or remove a provider instance through the control
+    /// plane, and re-apply the result to the live catalog.
+    ///
+    /// Disabling preserves the instance's configuration and credential
+    /// references; removing does not. Both take effect in every UI at once,
+    /// because they change the catalog every UI reads.
+    pub fn setProviderEnabled(app: *App, id: provider_ids_mod.Slug, enabled: bool) !void {
+        var store = try provider_config_store.Store.initHome(app.allocator);
+        defer store.deinit();
+        const result = try provider_config_store.setProviderEnabled(&store, id, enabled, null);
+        try app.reapplyProviderConfiguration(&store, result.config_revision);
+    }
+
+    pub fn removeProviderConfiguration(app: *App, id: provider_ids_mod.Slug) !void {
+        var store = try provider_config_store.Store.initHome(app.allocator);
+        defer store.deinit();
+        const result = try provider_config_store.removeProvider(&store, id, null);
+        try app.reapplyProviderConfiguration(&store, result.config_revision);
+    }
+
+    fn reapplyProviderConfiguration(
+        app: *App,
+        store: *const provider_config_store.Store,
+        revision: provider_ids_mod.ConfigRevision,
+    ) !void {
+        const host = try app.providerHost();
+        host.kernel.adoptConfigRevision(revision);
+        var document = try store.load();
+        defer document.deinit();
+        try host.applyProviderConfiguration(&document);
+    }
+
     /// Resolve a local alias and switch this session onto it.
     ///
     /// A pinned alias means the same route it always did; a floating one

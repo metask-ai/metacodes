@@ -236,6 +236,24 @@ status, compatibility boundaries, and entry points are defined by
   already decided and leaving it auto would let it re-resolve mid-turn against a
   catalog the user never saw.
 
+- Provider lifecycle through the control plane, and a five-vendor capability
+  fixture (issue #16). `/providers enable|disable|remove <id>` manages a
+  provider instance without editing `config.json` by hand; disabling preserves
+  its configuration and credential references — the difference from removing it
+  — and excludes it from the *catalog*, so "disabled" is true in the picker,
+  `model.list`, and `--provider` at once instead of being re-checked at three
+  call sites. A new capability-matrix fixture declares DeepSeek V4, GLM-5.3,
+  Kimi K3, GPT-5.6, and MiniMax M3 with timestamped, provider-declared
+  capabilities and four different control vocabularies, and asserts what no
+  name-inference rule could get right: reasoning supported / unsupported /
+  unknown across three models, GLM's peer `reasoning_content` as a separate
+  capability, a latency tier on one model and a service tier on another, and
+  channel-specific limits narrowing a model's own. New L2 coverage proves a
+  control change alters the bytes actually sent (and that leaving it unset
+  smuggles no default onto the wire), and that a provider's opaque control
+  metadata round-trips through `model.list` into the picker without any core,
+  TUI, or Web change.
+
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
   base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,

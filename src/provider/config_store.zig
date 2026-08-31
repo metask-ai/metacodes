@@ -266,6 +266,58 @@ pub const Store = struct {
     }
 };
 
+/// Enable or disable one provider instance.
+///
+/// Disabling preserves the instance's configuration and credential references,
+/// which is the whole difference between "off for now" and "removed".
+pub fn setProviderEnabled(
+    store: *const Store,
+    id: ids.Slug,
+    enabled: bool,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        id: ids.Slug,
+        enabled: bool,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (document.providers.items) |*entry| {
+                if (!entry.id.eql(self.id)) continue;
+                entry.enabled = self.enabled;
+                return;
+            }
+            // Recording the state for a provider with no entry yet is what
+            // makes "disable a built-in provider" expressible at all.
+            try document.upsertProvider(.{ .id = self.id, .enabled = self.enabled });
+        }
+    };
+    var apply = Apply{ .id = id, .enabled = enabled };
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
+/// Remove one provider instance's configuration entirely.
+pub fn removeProvider(
+    store: *const Store,
+    id: ids.Slug,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        id: ids.Slug,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = document.removeProvider(self.id);
+        }
+    };
+    var apply = Apply{ .id = id };
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
 /// Insert or replace one alias record.
 pub fn setAlias(
     store: *const Store,

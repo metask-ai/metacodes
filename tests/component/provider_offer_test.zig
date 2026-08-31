@@ -1434,3 +1434,122 @@ test "L2: a session-scoped commit never reaches config.json, and a global one do
     const resolution = try cc.provider_selection.resolve(&catalog, restored);
     try std.testing.expect(resolution.primary().offer_id.eql(session_target.offer_id));
 }
+
+// ── controls reach the wire ──────────────────────────────────────────────────
+
+test "L2: a control the offer declares changes the bytes actually sent" {
+    const a = std.testing.allocator;
+
+    // One server per request: `MockServer.start` accepts exactly one
+    // connection, so reusing it for the second capture would block forever.
+    const Capture = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            effort: ?cc.types_mod.ReasoningEffort,
+        ) ![]u8 {
+            var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+            defer server.stop();
+            const origin = try server.urlOwned(allocator);
+            defer allocator.free(origin);
+
+            var registry = try ProviderRegistry.initWithBuiltins(allocator);
+            defer registry.deinit();
+            var catalog = try registry.buildCatalog(allocator, .{
+                .only_provider = Slug.lit("openai"),
+                .endpoint_overrides = &.{.{ .provider_id = Slug.lit("openai"), .base_url = origin }},
+            });
+            defer catalog.deinit();
+
+            var reference_buffer: [cc.provider_ids.MAX_SLUG_LEN]u8 = undefined;
+            const bound = try cc.provider_runtime_binding.bindOffer(
+                &registry,
+                &catalog.items()[0],
+                .{ .cli_api_key = "sk-control" },
+                &reference_buffer,
+                false,
+            );
+
+            var io_runtime = std.Io.Threaded.init(allocator, .{});
+            defer io_runtime.deinit();
+            var client = cc.api_openai.OpenAIClient.init(
+                allocator,
+                io_runtime.io(),
+                bound.secret,
+                bound.request_model_id,
+                bound.endpoint_url,
+            );
+            client.protocol = bound.openai_protocol;
+            client.auth_scheme = bound.auth_scheme;
+            client.reasoning_effort = effort;
+            defer client.deinit();
+
+            const messages = [_]cc.types_mod.ApiMessage{
+                .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+            };
+            var handle = client.provider().sendStream(&messages, null, null, null, null, null, "") catch
+                return error.SkipZigTest;
+            while (handle.next() catch null) |event| switch (event) {
+                .text => |text| allocator.free(text),
+                else => {},
+            };
+            handle.deinit();
+            const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+            return allocator.dupe(u8, captured.raw);
+        }
+    };
+
+    const without = try Capture.run(a, null);
+    defer a.free(without);
+    const with_high = try Capture.run(a, .high);
+    defer a.free(with_high);
+
+    // The control is not decoration: setting it changes the request body, and
+    // leaving it unset does not smuggle a default onto the wire.
+    try std.testing.expect(std.mem.indexOf(u8, without, "reasoning_effort") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_high, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(!std.mem.eql(u8, without, with_high));
+}
+
+test "L2: a provider metadata extension round-trips through the generic client view" {
+    const a = std.testing.allocator;
+    // A control carrying an opaque provider payload: the kernel must move it
+    // through `model.list` untouched, so a client can render vendor-specific
+    // metadata without any core, TUI, or Web change.
+    var definitions = try cc.provider_custom.parse(a,
+        \\{"custom_providers": {"vendor-x": {
+        \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"m","controls":[
+        \\    {"id":"thinking","label":"Thinking","kind":"enumeration","values":["on","off"],
+        \\     "cost_latency_warning":"slower and pricier"}]}]}}}
+    );
+    defer definitions.deinit();
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    for (definitions.profiles()) |built| try registry.register(built);
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("vendor-x") });
+    defer catalog.deinit();
+
+    var kernel = cc.provider_control_plane.Kernel.init(a, &catalog);
+    defer kernel.deinit();
+    var page: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try kernel.modelList(.{}, .{}, a, &page);
+    try std.testing.expectEqual(@as(usize, 1), listed.offers.len);
+
+    const spec = listed.offers[0].controls[0];
+    try std.testing.expectEqualStrings("thinking", spec.id);
+    try std.testing.expectEqualStrings("Thinking", spec.label);
+    try std.testing.expectEqual(@as(usize, 2), spec.allowed_values.len);
+    // Provider-owned metadata the kernel neither interprets nor drops.
+    try std.testing.expectEqualStrings("slower and pricier", spec.cost_latency_warning.?);
+
+    // And the picker renders it without knowing which vendor it came from.
+    var picker = picker_mod.Picker.init(a);
+    defer picker.deinit();
+    try seedPicker(&picker, &kernel, a);
+    _ = picker.onKey(.enter);
+    _ = picker.onKey(.enter);
+    try std.testing.expectEqual(picker_mod.Stage.options, picker.stage);
+    try std.testing.expectEqual(@as(usize, 1), picker.rowCount());
+}

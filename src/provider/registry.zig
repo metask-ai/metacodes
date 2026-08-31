@@ -182,6 +182,10 @@ pub const CatalogOptions = struct {
     endpoint_overrides: []const EndpointOverride = &.{},
     /// Restrict the catalog to one provider. Null builds every profile.
     only_provider: ?Slug = null,
+    /// Providers the configuration disabled. They keep their configuration and
+    /// credential references — that is what makes disabling different from
+    /// removing — but produce no offers, so nothing can route to them.
+    excluded_providers: []const Slug = &.{},
 };
 
 pub const CatalogError = profile_mod.EndpointError ||
@@ -211,6 +215,11 @@ pub const OfferCatalog = struct {
             if (options.only_provider) |wanted| {
                 if (!profile.id.eql(wanted)) continue;
             }
+            var excluded = false;
+            for (options.excluded_providers) |id| {
+                if (profile.id.eql(id)) excluded = true;
+            }
+            if (excluded) continue;
             for (profile.channels) |channel| {
                 const override = findOverride(options.endpoint_overrides, profile.id, channel.id);
                 // Every binding that applies to this channel produces its *own*

@@ -216,6 +216,17 @@ pub const Document = struct {
         try self.providers.append(self.allocator, entry);
     }
 
+    /// Remove one provider instance and everything configured about it.
+    /// Returns true when something was removed.
+    pub fn removeProvider(self: *Document, id: Slug) bool {
+        for (self.providers.items, 0..) |entry, index| {
+            if (!entry.id.eql(id)) continue;
+            _ = self.providers.orderedRemove(index);
+            return true;
+        }
+        return false;
+    }
+
     pub fn alias(self: *const Document, name: []const u8) ?AliasEntry {
         for (self.aliases.items) |entry| if (entry.name.eqlText(name)) return entry;
         return null;

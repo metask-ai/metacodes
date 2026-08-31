@@ -237,7 +237,8 @@ pub const Host = struct {
     /// without being so early the warning becomes background noise.
     pub const CREDENTIAL_EXPIRY_WARNING_SECONDS: i64 = 24 * 60 * 60;
 
-    /// Bind the configured credential pool into the catalog.
+    /// Apply the configuration document to the catalog: credential pools and
+    /// disabled providers.
     ///
     /// A credential participates in the offer id, so two accounts on the same
     /// route are two offers rather than one route that quietly changes identity
@@ -245,7 +246,11 @@ pub const Host = struct {
     /// "switch to my work account" a selectable route instead of an invisible
     /// side effect — and it is why the picker needs no separate credential
     /// stage: the accounts *are* offers.
-    pub fn adoptCredentialPool(self: *Host, document: *const config_doc.Document) HostError!void {
+    ///
+    /// A disabled provider is excluded here rather than at resolution, so
+    /// "disabled" is visible in every UI at once: the picker, `model.list`, and
+    /// `--provider` all read the catalog.
+    pub fn applyProviderConfiguration(self: *Host, document: *const config_doc.Document) HostError!void {
         var bindings: std.ArrayList(registry_mod.CredentialBinding) = .empty;
         defer bindings.deinit(self.allocator);
         for (document.providers.items) |entry| {
@@ -257,11 +262,25 @@ pub const Host = struct {
                 }) catch return error.OutOfMemory;
             }
         }
-        if (bindings.items.len == 0) return;
+        // A disabled provider stays configured but is not routable. Doing this
+        // in the catalog rather than at resolution keeps "disabled" visible
+        // everywhere at once: the picker, `model.list`, and `--provider` all
+        // read the catalog.
+        var disabled: std.ArrayList(Slug) = .empty;
+        defer disabled.deinit(self.allocator);
+        for (document.providers.items) |entry| {
+            if (entry.enabled) continue;
+            disabled.append(self.allocator, entry.id) catch return error.OutOfMemory;
+        }
+
+        // No early return when both lists are empty: the configuration can also
+        // transition *back* to "nothing configured", and skipping the rebuild
+        // then would leave the previous exclusions in force.
 
         var rebuilt = self.registry.buildCatalog(self.allocator, .{
             .revision = self.catalog.revision.next(),
             .credential_bindings = bindings.items,
+            .excluded_providers = disabled.items,
         }) catch return error.OutOfMemory;
         errdefer rebuilt.deinit();
         if (self.retired) |*old| old.deinit();
@@ -288,7 +307,7 @@ pub const Host = struct {
         var document = store.load() catch return;
         defer document.deinit();
         self.kernel.adoptConfigRevision(document.config_revision);
-        self.adoptCredentialPool(&document) catch {};
+        self.applyProviderConfiguration(&document) catch {};
         if (document.global_selection) |selection| {
             self.kernel.seedGlobalSelection(selection);
         }
@@ -531,7 +550,7 @@ test "two accounts on one provider are two selectable routes" {
     });
     try document.upsertProvider(entry);
 
-    try host.adoptCredentialPool(&document);
+    try host.applyProviderConfiguration(&document);
     const items = host.kernel.catalogSnapshot().items();
 
     var work: usize = 0;
@@ -564,6 +583,47 @@ test "a provider with no configured pool keeps exactly its previous offers" {
     try document.upsertProvider(.{ .id = Slug.lit("openai") });
     // No credentials declared: an existing single-account setup must not gain
     // or lose a single route.
-    try host.adoptCredentialPool(&document);
+    try host.applyProviderConfiguration(&document);
     try std.testing.expectEqual(before, host.kernel.catalogSnapshot().items().len);
+}
+
+test "a disabled provider keeps its configuration and produces no routes" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    var before: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("openai")) before += 1;
+    }
+    try std.testing.expect(before > 0);
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    try document.upsertProvider(.{
+        .id = Slug.lit("openai"),
+        .enabled = false,
+        .credential_ref = Slug.lit("cred-openai"),
+    });
+    try host.applyProviderConfiguration(&document);
+
+    var after: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("openai")) after += 1;
+    }
+    // Nothing can route to it, in every UI at once, because they all read the
+    // catalog.
+    try std.testing.expectEqual(@as(usize, 0), after);
+    // And the configuration survives — that is the difference between
+    // disabling and removing.
+    try std.testing.expect(document.provider(Slug.lit("openai")).?.credential_ref != null);
+
+    // Re-enabling restores exactly the routes it had.
+    try document.upsertProvider(.{ .id = Slug.lit("openai"), .enabled = true });
+    try host.applyProviderConfiguration(&document);
+    var restored: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("openai")) restored += 1;
+    }
+    try std.testing.expectEqual(before, restored);
 }
