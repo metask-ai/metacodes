@@ -380,6 +380,31 @@ pub const Dialect = struct {
     }
 };
 
+/// 检测 tool_result content 是否为 Read 工具的图像形态
+/// (`{"type":"image","media_type":..,"data":..}`,见 tools/read.zig readImage)。
+/// 仅当以 `{"type":"image"` 开头且含 media_type + data 字段时返回;否则 null(当文本处理)。
+/// 返回的 slice 借用 content 内部字节(未 unescape)——base64/media_type 无需转义,直接透传。
+/// 三个协议族的 tool_result 序列化共用本检测(单一真相):命中后经
+/// serializeImagePart 发方言原生图像块;不支持图像输入的模型发短占位文本,
+/// **绝不**把含 MB 级 base64 的原始 JSON 当纯文本发给模型。
+pub fn extractImageResult(content: []const u8) ?types.ImageBlock {
+    const trimmed = std.mem.trimStart(u8, content, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "{\"type\":\"image\"")) return null;
+    const mt = util_json.extractStringField(trimmed, "media_type") orelse return null;
+    const data = util_json.extractStringField(trimmed, "data") orelse return null;
+    return .{ .media_type = mt, .data = data };
+}
+
+/// tool_result 图像在不支持图像输入的模型上的显式占位文本(绝不发 base64 原文)。
+/// 告知模型:图像已成功读取,但当前模型无图像输入能力。字节形态被 L2 测试锁定。
+/// **纯文本契约**:输出未做 JSON 转义;调用方嵌入请求 JSON 时必须经 serializeString
+/// (media_type 不受信任,异常字节由该层转义,不会破坏请求结构)。
+pub fn appendImageOmittedPlaceholder(media_type: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try out.appendSlice(allocator, "[image (");
+    try out.appendSlice(allocator, media_type);
+    try out.appendSlice(allocator, ") was read successfully but omitted: this model does not support image input]");
+}
+
 /// Immutable, Runtime-scoped dialect lookup. A Provider client borrows this
 /// value for its whole lifetime, so a RuntimeHost replacement cannot change
 /// the behavior of already-admitted Sessions. The built-in resolver preserves
@@ -898,4 +923,23 @@ test "M6 Gemini dialect: parallel_tool_calls 不发(Gemini 默认并行)" {
     const got = try d.serializeParallelToolCalls(p, true, &out, a);
     try std.testing.expect(!got);
     try std.testing.expect(out.items.len == 0);
+}
+
+test "extractImageResult: 命中 Read 图像形态,忽略普通文本/JSON" {
+    try std.testing.expect(extractImageResult("just text") == null);
+    try std.testing.expect(extractImageResult("{\"stdout\":\"x\"}") == null);
+    const img = extractImageResult("{\"type\":\"image\",\"media_type\":\"image/gif\",\"data\":\"AAAA\"}").?;
+    try std.testing.expectEqualStrings("image/gif", img.media_type);
+    try std.testing.expectEqualStrings("AAAA", img.data);
+}
+
+test "appendImageOmittedPlaceholder: 纯文本占位含 MIME,不含 base64" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendImageOmittedPlaceholder("image/png", &out, a);
+    try std.testing.expectEqualStrings(
+        "[image (image/png) was read successfully but omitted: this model does not support image input]",
+        out.items,
+    );
 }
