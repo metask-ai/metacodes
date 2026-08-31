@@ -467,6 +467,7 @@ pub const App = struct {
         if (config.provider_kind == .openai) {
             app.openai_client = openai_mod.OpenAIClient.init(allocator, io, api_key, config.model, config.base_url);
             app.openai_client.?.protocol = config.openai_protocol;
+            app.openai_client.?.auth_scheme = config.auth_scheme;
             app.openai_client.?.reasoning_effort = config.reasoning_effort;
             app.openai_client.?.overrides = buildOverridesFromConfig(config);
         }
@@ -499,6 +500,9 @@ pub const App = struct {
         else
             dialect_mod.Resolver.builtin();
         app.api_client.dialect_resolver = app_dialect_resolver;
+        // issue #16: the resolved offer's provider-declared auth scheme. Null
+        // (no `--provider`) keeps the historical bearer header byte for byte.
+        app.api_client.auth_scheme = config.auth_scheme;
         if (app.openai_client) |*client| client.dialect_resolver = app_dialect_resolver;
         if (app.gemini_client) |*client| client.dialect_resolver = app_dialect_resolver;
         const plugin_skill_sources = if (app.plugin_snapshot) |snapshot| snapshot.skill_sources else &.{};
@@ -692,6 +696,8 @@ pub const App = struct {
             @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
+        // Child agents authenticate the way the parent's resolved route does.
+        if (app.agent_jobs) |*jobs| jobs.auth_scheme = config.auth_scheme;
 
         // Swarm 会话状态(lead 视角)。teammates registry 惰性(TeamCreate 才建);此处只装
         // 构造参数 + home。api_key/base_url/model 借 App 生命周期稳定内存(App 存活期不变)。

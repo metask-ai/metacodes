@@ -1369,6 +1369,24 @@ pub fn build(b: *std.Build) void {
     const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
     lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test, windows_test_prelude).step);
 
+    // test:provider —— issue #16 provider offer kernel, in isolation.
+    // The subsystem must stay reachable from a root that pulls in nothing
+    // beyond std, types.zig, util/model.zig, and the portable `platform` layer
+    // (sync/fs): if a provider module ever grows a dependency on the transport,
+    // the TUI, or a UI protocol, this step stops compiling. Its tests also run
+    // inside the aggregate `test` gate; this step exists for the dependency
+    // proof, not for extra coverage.
+    const provider_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/provider_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, provider_test_mod); // control_plane guards its state with platform/sync
+    const provider_test = b.addTest(.{ .name = "provider-test", .root_module = provider_test_mod });
+    const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
+    provider_test_step.dependOn(&addTestRunArtifact(b, provider_test, windows_test_prelude).step);
+
     // test:platform —— 可移植抽象层(sync/process/fs/signal/rng/paths)。platform 成独立命名模块后
     // 其测试不再聚合进 cc-test，故独立入口。process fork 真子进程测试需 METACODES_PROC_TEST=1 启用。
     const platform_test_mod = b.createModule(.{

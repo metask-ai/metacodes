@@ -351,6 +351,10 @@ pub const AgentJobRegistry = struct {
     provider_kind: types_mod.ProviderKind = .anthropic,
     /// OpenAI wire 协议(仅 provider_kind==.openai 时消费):子 job 继承父的显式选择。
     openai_protocol: types_mod.OpenAIProtocol = .chat_completions,
+    /// Provider-declared authentication for the parent's resolved route
+    /// (issue #16). Null keeps the historical bearer header, so a child agent
+    /// authenticates exactly the way the parent does.
+    auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
     /// Borrowed from the App/Runtime immutable plugin Snapshot. App drains all
     /// jobs before destroying that Snapshot.
     dialect_resolver: dialect_mod.Resolver = .builtin(),
@@ -513,7 +517,7 @@ pub const AgentJobRegistry = struct {
         //    不一致 → Invalid free(GPA 实测)。后台单/多 job 用 registry.allocator 全程一致,已验证能跑。
         //    ⚠️ 线程安全存疑(见 HANDOFF):后台 job 线程用 registry.allocator 做 HTTP,若 App gpa 非线程安全
         //    且与 io_runtime worker 并发理论上有 TaskBatch 同款风险,但后台测试历来通过、未实测崩溃,留查。
-        var owned = try pf.makeProviderWithDialectResolver(
+        var owned = try pf.makeProviderWithOptions(
             self.allocator,
             self.provider_kind,
             self.api_key,
@@ -521,6 +525,7 @@ pub const AgentJobRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
+            .{ .auth_scheme = self.auth_scheme },
         );
         errdefer if (!committed) owned.deinit();
 
@@ -874,7 +879,7 @@ pub const AgentJobRegistry = struct {
         // TaskBatch 并发 worker),且主线程造它时可能与 App 的 io_runtime worker 线程并发。App 的
         // gpa(self.allocator)非线程安全并发访问会损坏(假 OOM/unreachable → SIGABRT,真机实测)。
         // 故用 c_allocator(malloc,线程安全)隔离。OwnedProvider 自带此 allocator,deinit 也用它,一致。
-        return pf.makeProviderWithDialectResolver(
+        return pf.makeProviderWithOptions(
             std.heap.c_allocator,
             self.provider_kind,
             self.api_key,
@@ -882,6 +887,7 @@ pub const AgentJobRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
+            .{ .auth_scheme = self.auth_scheme },
         );
     }
 

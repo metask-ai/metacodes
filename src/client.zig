@@ -15,6 +15,7 @@ const sync = @import("platform").sync;
 const rng = @import("platform").rng;
 const connection_gate = @import("api/connection_gate.zig");
 const dialect_mod = @import("api/dialect.zig");
+const auth_header_mod = @import("api/auth_header.zig");
 
 /// P0:AnthropicProvider 复用中立 Provider 接口(非 generic)。Client.provider() 产出它
 /// (thunk 转调 + StreamResponse.handle() 中立化)。P1 起 agent_loop 等收 Provider 类型。
@@ -262,6 +263,10 @@ pub const Client = struct {
     /// 用户 CLI `--max-tokens N` 覆盖；null = 自动（catalog → fallback table → default）。
     max_tokens_override: ?u32 = null,
     reasoning_effort: ?types.ReasoningEffort = null,
+    /// Provider-declared authentication for the selected offer (issue #16).
+    /// Null keeps the historical `authorization: Bearer <key>` bytes exactly,
+    /// so existing sessions and recorded cassettes are unaffected.
+    auth_scheme: ?auth_header_mod.AuthScheme = null,
     /// Immutable Runtime-scoped model dialect lookup. Ordinary App/CLI clients
     /// use the built-in resolver; AgentRuntime injects its Snapshot resolver.
     dialect_resolver: dialect_mod.Resolver = .{},
@@ -428,8 +433,8 @@ pub const Client = struct {
 
         const uri = std.Uri.parse(url) catch return error.InvalidUrl;
 
-        const auth_header = std.fmt.allocPrint(client.allocator, "Bearer {s}", .{client.api_key}) catch return error.RequestFailed;
-        defer secureFree(client.allocator, auth_header);
+        const auth = auth_header_mod.build(client.allocator, client.auth_scheme, client.api_key) catch return error.RequestFailed;
+        defer secureFree(client.allocator, auth.value);
 
         var connection_lease = connection_gate.acquire(null) catch return error.RequestFailed;
         defer connection_lease.release();
@@ -437,7 +442,7 @@ pub const Client = struct {
             .keep_alive = false, // 同 POST:不复用陈旧连接
             .extra_headers = &.{
                 .{ .name = "anthropic-version", .value = "2023-06-01" },
-                .{ .name = "authorization", .value = auth_header },
+                .{ .name = auth.name, .value = auth.value },
             },
         }) catch return error.RequestFailed;
         defer req.deinit();
@@ -660,11 +665,11 @@ pub const Client = struct {
 
         // OAuth access tokens can be longer than a small stack buffer. Allocate
         // the header value and scrub it after request setup.
-        const auth_header = std.fmt.allocPrint(client.allocator, "Bearer {s}", .{client.api_key}) catch {
-            log.errId("client", rid, "alloc auth header failed", .{});
+        const auth = auth_header_mod.build(client.allocator, client.auth_scheme, client.api_key) catch |err| {
+            log.errId("client", rid, "auth header materialization failed: {s}", .{@errorName(err)});
             return error.RequestFailed;
         };
-        defer secureFree(client.allocator, auth_header);
+        defer secureFree(client.allocator, auth.value);
 
         // Request 必须 heap-allocate：Response 内含 *Request，生命周期要覆盖 stream
         // 读取过程。若放栈上，doRequest 返回后 *Request 悬挂 → stream.next() 踩到
@@ -697,7 +702,7 @@ pub const Client = struct {
             .extra_headers = &.{
                 .{ .name = "anthropic-version", .value = "2023-06-01" },
                 .{ .name = "content-type", .value = "application/json" },
-                .{ .name = "authorization", .value = auth_header },
+                .{ .name = auth.name, .value = auth.value },
             },
         }) catch |err| {
             log.errId("client", rid, "request setup failed: {s}", .{@errorName(err)});

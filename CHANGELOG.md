@@ -12,6 +12,48 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Provider profiles, model offers, and a UI-independent runtime control plane
+  (issue #16, delivery slice P0 plus the Z.AI GLM Coding Plan provider).
+  `ProviderProfile → ChannelDescriptor → ModelOffer → RuntimeSelection`
+  replaces "a model name identifies the route": relays, regions, plans,
+  accounts, and BYOK bindings now produce distinct offers for the same visible
+  model, and `OfferId` is a domain-separated digest over the normalized stable
+  binding so a metadata refresh moves `offer_revision` without moving a pinned
+  selection. Adding a vendor is one `src/provider/profiles/<vendor>.zig` file
+  plus one line in `BUILTIN_PROFILES`; the transport is selected by the offer's
+  protocol, which retires `main.zig`'s model-name prefix guessing for every
+  session that names a provider. New CLI flags `--provider`, `--channel`, and
+  `--offer`; a model matching several routes reports the candidate offer ids
+  instead of guessing, and a `--base-url` override is validated against the
+  profile and route policy before any request URL is constructed. Ships
+  `metask`, `openai`, `gemini`, and `zai-coding-plan` profiles — the last with
+  all four documented China/global × OpenAI/Anthropic-wire routes, its own
+  credential kind, `ZAI_API_KEY`/`GLM_API_KEY`/`Z_AI_API_KEY` aliases, and a
+  forbidden-path rule that makes silent fallback to the general
+  `/api/paas/v4` surface unrepresentable. Credentials become typed, secret-free
+  `CredentialRef`s resolved in provider scope, so a Metask key can no longer
+  authenticate an OpenAI or Z.AI route; the transports materialize a
+  provider-declared `AuthScheme` (bearer, `x-api-key`, custom header) instead of
+  a hard-coded bearer header. Metadata is conservative throughout: distinct
+  context/input/output limits with fail-closed admission, tri-state
+  capabilities, `unknown` (never zero) prices, and per-field provenance.
+  `~/.metacodes/config.json` gains a schema-versioned, monotonically revisioned
+  provider map written under a cross-process lock via temp-file + fsync +
+  rename, with idempotent retries and deterministic revision conflicts. See
+  [doc/PROVIDER_OFFER_ARCHITECTURE.md](doc/PROVIDER_OFFER_ARCHITECTURE.md),
+  including its explicit list of deferred slices.
+  Endpoint policy refuses two whole classes of URL rather than pattern-matching
+  them: a percent-encoded host or path (a substring rule over encoded bytes is
+  not a rule while the server still decodes it) and any URL carrying userinfo
+  (that string becomes `ModelOffer.endpoint_ref` and flows into `model.list`,
+  events, and setup output, none of which redact it). The control plane guards
+  its mutable state and hands `model.list` results into a caller-owned buffer,
+  so two clients cannot invalidate each other's page; `events.replay` copies
+  under the lock. `config_store` is the single authority for `config_revision`
+  — the kernel mirrors it through `adoptConfigRevision` rather than keeping a
+  second counter — and idempotency keys are a bounded ring, so a retry is still
+  recognized after other commits have landed.
+
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
   base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,
@@ -91,6 +133,14 @@ status, compatibility boundaries, and entry points are defined by
     than an absent one because nothing signals the error.
 
 ### Fixed
+
+- `~/.metacodes/config.json` writes no longer delete other writers' keys. The
+  config writer serialized only its own five fields, so any theme change
+  silently dropped `mcp_servers`, `permission_rules`, and `model_tiers`. It now
+  merges through an order-preserving JSON merge, refuses to overwrite a document
+  it cannot parse, and treats a failed read as an error rather than as an empty
+  document — descriptor exhaustion or a transient I/O error would otherwise
+  truncate the whole file.
 
 - The language server binary lookup is platform-correct, so the LSP subsystem
   is no longer unconditionally dead on Windows. `lsp/servers.zig`'s `which`
