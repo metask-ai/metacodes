@@ -38,6 +38,7 @@ pub const provider_custom = @import("provider/custom_provider.zig");
 pub const provider_oauth = @import("provider/oauth.zig");
 pub const kg_provider_audit = @import("kg/provider_audit.zig");
 pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
+pub const api_catalog_fetch = @import("api/catalog_fetch.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig");
@@ -1908,6 +1909,7 @@ test {
     _ = &@import("provider/oauth.zig");
     _ = &@import("kg/provider_audit.zig");
     _ = &@import("api/oauth_exchange.zig");
+    _ = &@import("api/catalog_fetch.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/multiline.zig");

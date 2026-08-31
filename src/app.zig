@@ -999,6 +999,11 @@ pub const App = struct {
                     .secret = secret,
                     .priority = credential.priority,
                     .account_or_plan = if (credential.account_or_plan) |label| label.slice() else null,
+                    // Learned state from previous runs: a cooldown recorded
+                    // here is why the next process skips the credential instead
+                    // of rediscovering the same rate limit by hitting it.
+                    .cooldown_until = credential.cooldown_until,
+                    .status = if (credential.invalid) .invalid else .active,
                 };
                 len += 1;
             }
@@ -1648,6 +1653,114 @@ pub const App = struct {
     pub fn kgReady(app: *const App) bool {
         if (app.kg) |*k| return k.ready;
         return false;
+    }
+
+    /// Default cooldown for a rate-limited credential. Long enough that the
+    /// next turn does not walk straight back into the limit, short enough that
+    /// a brief burst does not retire an account for the session.
+    pub const CREDENTIAL_COOLDOWN_SECONDS: i64 = 5 * 60;
+
+    /// Record a failed request against the credential that made it.
+    ///
+    /// The class is the provider's own classification, not a guess: profiles
+    /// already own `classify_error`, and the difference between "slow down" and
+    /// "this key is dead" is exactly the difference between a cooldown and an
+    /// invalidation. Durable, because a limit rediscovered every run is a limit
+    /// never learned.
+    pub fn noteCredentialFailure(
+        app: *App,
+        provider_id: provider_ids_mod.Slug,
+        credential_id: provider_ids_mod.Slug,
+        class: provider_credential_mod.FailureClass,
+    ) void {
+        if (class == .transient) return;
+        var store = provider_config_store.Store.initHome(app.allocator) catch return;
+        defer store.deinit();
+        const result = provider_config_store.noteCredentialFailure(
+            &store,
+            provider_id,
+            credential_id,
+            class,
+            @import("util/time.zig").nowUnix(),
+            CREDENTIAL_COOLDOWN_SECONDS,
+            null,
+        ) catch return;
+        if (app.provider_host) |host| {
+            host.kernel.adoptConfigRevision(result.config_revision);
+            host.kernel.noteAuthChanged(
+                provider_id,
+                credential_id,
+                if (class == .invalid) .invalid else .active,
+            );
+        }
+    }
+
+    /// Refresh provider catalogs named by `provider_catalogs` over the network.
+    ///
+    /// The config may give either files or URLs; the host already handles
+    /// files, so this fills in the URLs. A refresh that fails leaves the
+    /// previous catalog in place — a stale catalog is a far better answer than
+    /// an empty one, and every pin stays resolvable because offer ids are
+    /// derived from the stable binding.
+    ///
+    /// Returns the number of providers refreshed.
+    pub fn refreshProviderCatalogs(app: *App) !usize {
+        var store = provider_config_store.Store.initHome(app.allocator) catch return 0;
+        defer store.deinit();
+        const text = store.readText() catch return 0;
+        defer app.allocator.free(text);
+
+        var arena = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const root = std.json.parseFromSliceLeaky(std.json.Value, scratch, text, .{}) catch return 0;
+        if (root != .object) return 0;
+        const section = root.object.get("provider_catalogs") orelse return 0;
+        if (section != .object) return 0;
+
+        const host = try app.providerHost();
+        const io = app.api_client.http_client.io;
+        var refreshed: usize = 0;
+
+        var it = section.object.iterator();
+        while (it.next()) |pair| {
+            const entry = pair.value_ptr.*;
+            if (entry != .object) continue;
+            const models_url = stringField(entry.object.get("models_url")) orelse continue;
+            const provider_id = provider_ids_mod.Slug.parse(pair.key_ptr.*) catch continue;
+            const bearer = if (stringField(entry.object.get("credential_env"))) |name|
+                provider_credential_mod.EnvLookup.process().get(name)
+            else
+                null;
+
+            const models = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
+                .url = models_url,
+                .bearer = bearer,
+            }) catch continue;
+            defer app.allocator.free(models.body);
+
+            var documents: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (documents.items) |document| app.allocator.free(@constCast(document));
+                documents.deinit(app.allocator);
+            }
+            if (entry.object.get("endpoint_urls")) |list| {
+                if (list == .array) {
+                    for (list.array.items) |item| {
+                        const url = stringField(item) orelse continue;
+                        const document = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
+                            .url = url,
+                            .bearer = bearer,
+                        }) catch continue;
+                        try documents.append(app.allocator, document.body);
+                    }
+                }
+            }
+
+            host.ingestOpenRouter(provider_id, models.body, documents.items) catch continue;
+            refreshed += 1;
+        }
+        return refreshed;
     }
 
     /// Project the provider control plane's new events into the TinyKG audit
@@ -2859,4 +2972,12 @@ test "model switch compact is queued only when switching to smaller context wind
     try std.testing.expect(!shouldQueueModelSwitchCompact("same", "same", 200_000, 80_000));
     try std.testing.expect(!shouldQueueModelSwitchCompact("small", "large", 80_000, 200_000));
     try std.testing.expect(!shouldQueueModelSwitchCompact("a", "b", 200_000, 200_000));
+}
+
+fn stringField(value: ?std.json.Value) ?[]const u8 {
+    const found = value orelse return null;
+    return switch (found) {
+        .string => |text| text,
+        else => null,
+    };
 }

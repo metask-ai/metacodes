@@ -288,6 +288,59 @@ pub fn setGlobalSelection(
     });
 }
 
+/// Record a credential failure durably.
+///
+/// The learned state has to outlive the process, or every run rediscovers the
+/// same rate limit by hitting it. Written through the same lock, revision, and
+/// atomic-rename path as every other mutation, so a concurrent picker commit
+/// cannot lose it.
+pub fn noteCredentialFailure(
+    store: *const Store,
+    provider_id: ids.Slug,
+    credential_id: ids.Slug,
+    class: @import("credential.zig").FailureClass,
+    now_seconds: i64,
+    cooldown_seconds: i64,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        provider_id: ids.Slug,
+        credential_id: ids.Slug,
+        class: @import("credential.zig").FailureClass,
+        now_seconds: i64,
+        cooldown_seconds: i64,
+
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (document.providers.items) |*entry| {
+                if (!entry.id.eql(self.provider_id)) continue;
+                for (entry.credentials.entries[0..entry.credentials.len]) |*credential| {
+                    if (!credential.id.eql(self.credential_id)) continue;
+                    switch (self.class) {
+                        .rate_limited => credential.cooldown_until = self.now_seconds + self.cooldown_seconds,
+                        .invalid => credential.invalid = true,
+                        // A transient network failure is nobody's credential's
+                        // fault; marking one would retire a working account.
+                        .transient => {},
+                    }
+                    return;
+                }
+            }
+        }
+    };
+    var apply = Apply{
+        .provider_id = provider_id,
+        .credential_id = credential_id,
+        .class = class,
+        .now_seconds = now_seconds,
+        .cooldown_seconds = cooldown_seconds,
+    };
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
 /// Convenience wrapper for the common "replace the session selection" mutation.
 pub fn setSessionSelection(
     store: *const Store,
@@ -414,4 +467,88 @@ test "two sessions keep separate selections and neither touches the other" {
     var cleared = try stores[0].load();
     defer cleared.deinit();
     try std.testing.expect(cleared.session_selection == null);
+}
+
+test "a learned credential failure is durable and leaves the other members alone" {
+    const a = std.testing.allocator;
+    const path = "/tmp/metacodes-provider-credential-failure.json";
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    }
+    defer for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        var cleanup: [std.fs.max_path_bytes]u8 = undefined;
+        const target = std.fmt.bufPrintZ(&cleanup, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    };
+
+    var store = try Store.initPath(a, path);
+    defer store.deinit();
+
+    const Seed = struct {
+        fn run(_: *anyopaque, document: *Document) anyerror!void {
+            var entry = config_doc.ProviderEntry{ .id = ids.Slug.lit("openai") };
+            try entry.credentials.append(.{
+                .id = ids.Slug.lit("work"),
+                .env = try config_doc.AliasName.parse("OPENAI_API_KEY_WORK"),
+                .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+            });
+            try entry.credentials.append(.{
+                .id = ids.Slug.lit("personal"),
+                .env = try config_doc.AliasName.parse("OPENAI_API_KEY_PERSONAL"),
+                .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+            });
+            try document.upsertProvider(entry);
+        }
+    };
+    var anchor: u8 = 0;
+    _ = try store.commit(.{ .mutation = .{ .ctx = @ptrCast(&anchor), .applyFn = Seed.run } });
+
+    _ = try noteCredentialFailure(
+        &store,
+        ids.Slug.lit("openai"),
+        ids.Slug.lit("work"),
+        .rate_limited,
+        1_000,
+        300,
+        "limit-1",
+    );
+    _ = try noteCredentialFailure(
+        &store,
+        ids.Slug.lit("openai"),
+        ids.Slug.lit("personal"),
+        .invalid,
+        1_000,
+        300,
+        "dead-1",
+    );
+
+    var reloaded = try store.load();
+    defer reloaded.deinit();
+    const entry = reloaded.provider(ids.Slug.lit("openai")).?;
+    const members = entry.credentials.items();
+    try std.testing.expectEqual(@as(?i64, 1_300), members[0].cooldown_until);
+    try std.testing.expect(!members[0].invalid);
+    // A dead key is invalidated rather than put on a timer: retrying it only
+    // burns the account's error budget.
+    try std.testing.expect(members[1].invalid);
+    try std.testing.expectEqual(@as(?i64, null), members[1].cooldown_until);
+
+    // A transient failure records nothing — it would retire a working account.
+    _ = try noteCredentialFailure(
+        &store,
+        ids.Slug.lit("openai"),
+        ids.Slug.lit("work"),
+        .transient,
+        9_000,
+        300,
+        "blip-1",
+    );
+    var after = try store.load();
+    defer after.deinit();
+    try std.testing.expectEqual(
+        @as(?i64, 1_300),
+        after.provider(ids.Slug.lit("openai")).?.credentials.items()[0].cooldown_until,
+    );
 }

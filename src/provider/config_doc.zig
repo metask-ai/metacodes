@@ -79,6 +79,12 @@ pub const CredentialEntry = struct {
     /// Lower is tried first.
     priority: u8 = 0,
     account_or_plan: ?AliasName = null,
+    /// Learned state. A rate limit records a cooldown here so the *next*
+    /// process skips the credential instead of rediscovering the limit; an
+    /// authentication failure records `invalid`, because retrying a key the
+    /// provider rejected only burns the account's error budget.
+    cooldown_until: ?i64 = null,
+    invalid: bool = false,
 };
 
 pub const CredentialList = struct {
@@ -322,6 +328,14 @@ pub const Document = struct {
                         try out.appendSlice(arena, ",\"account\":");
                         try writeJsonString(arena, &out, label.slice());
                     }
+                    if (credential.cooldown_until) |until| {
+                        try out.appendSlice(arena, try std.fmt.allocPrint(
+                            arena,
+                            ",\"cooldown_until\":{d}",
+                            .{until},
+                        ));
+                    }
+                    if (credential.invalid) try out.appendSlice(arena, ",\"invalid\":true");
                     try out.append(arena, '}');
                 }
                 try out.append(arena, ']');
@@ -683,6 +697,14 @@ fn parseProvider(key: []const u8, value: std.json.Value) DocumentError!ProviderE
                     try AliasName.parse(label)
                 else
                     null,
+                .cooldown_until = if (item.object.get("cooldown_until")) |cooldown|
+                    intOf(cooldown) orelse return error.InvalidDocument
+                else
+                    null,
+                .invalid = if (item.object.get("invalid")) |flag| blk: {
+                    if (flag != .bool) return error.InvalidDocument;
+                    break :blk flag.bool;
+                } else false,
             });
         }
     }

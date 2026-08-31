@@ -434,6 +434,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         // issue #16:transcript 查看器从 Ctrl+O 移到 Ctrl+X Ctrl+O,`/transcript`
         // 是等价的可发现入口——绑定变了,可达性不能变。
+        // issue #16:`/providers` 列出当前所有路由;`/providers refresh` 重新拉取
+        // 配置里声明的 provider catalog(失败保留旧 catalog——陈旧目录远好过空目录)。
+        if (std.mem.eql(u8, trimmed, "/providers") or std.mem.startsWith(u8, trimmed, "/providers ")) {
+            const rest = std.mem.trim(u8, trimmed[10..], " \t");
+            try handleProviders(app, allocator, rest);
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/transcript")) {
             app.pending_overlay = .transcript;
             continue;
@@ -2079,6 +2086,67 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             return;
         },
     }
+}
+
+fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    if (std.mem.eql(u8, rest, "refresh")) {
+        const refreshed = app.refreshProviderCatalogs() catch |err| {
+            std.debug.print("\x1b[31mcatalog refresh failed: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        if (refreshed == 0) {
+            std.debug.print(
+                "No provider catalogs are configured. Add `provider_catalogs` to " ++
+                    "~/.metacodes/config.json with a models_url (or models_file).\n",
+                .{},
+            );
+            return;
+        }
+        std.debug.print("Refreshed {d} provider catalog(s).\n", .{refreshed});
+        return;
+    }
+    if (rest.len != 0) {
+        std.debug.print("usage: /providers [refresh]\n", .{});
+        return;
+    }
+
+    const host = app.providerHost() catch |err| {
+        std.debug.print("\x1b[31mprovider control plane unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    var page: std.ArrayList(@import("../provider/control_plane.zig").OfferSummary) = .empty;
+    defer page.deinit(allocator);
+    const listed = host.kernel.modelList(.{}, .{}, allocator, &page) catch |err| {
+        std.debug.print("\x1b[31mmodel.list failed: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+
+    var current: ?[]const u8 = null;
+    for (listed.offers) |summary| {
+        const marker = if (summary.is_current) blk: {
+            current = summary.request_model_id;
+            break :blk "*";
+        } else " ";
+        std.debug.print("{s} {s}/{s} [{s}] {s}", .{
+            marker,
+            summary.provider_id.slice(),
+            summary.channel_id.slice(),
+            summary.protocol,
+            summary.request_model_id,
+        });
+        if (summary.credential_ref) |ref| std.debug.print(" account={s}", .{ref.slice()});
+        if (summary.limits.context_window) |window| {
+            std.debug.print(" ctx={d}", .{window});
+        } else {
+            std.debug.print(" ctx=?", .{});
+        }
+        if (summary.quote.priced() == null) std.debug.print(" price=?", .{});
+        std.debug.print("\n", .{});
+    }
+    std.debug.print(
+        "{d} route(s), catalog revision {d}. Ctrl+O or /model to choose one.\n",
+        .{ listed.total, listed.meta.catalog_revision.value() },
+    );
 }
 
 fn printModelHelp() void {

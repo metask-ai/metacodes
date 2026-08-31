@@ -173,6 +173,15 @@ The pool is consulted *after* explicit, runtime-descriptor, environment-alias,
 and single stored credentials, so an existing single-credential setup resolves
 exactly as it did before the pool existed.
 
+Failure state is **learned and durable**. `config_store.noteCredentialFailure`
+records a cooldown or an invalidation through the same lock, revision, and
+atomic-rename path as every other mutation, so the next process skips the
+credential instead of rediscovering the same rate limit by hitting it. The class
+is the provider's own classification — profiles already own `classify_error` —
+because the difference between "slow down" and "this key is dead" is exactly the
+difference between a cooldown and an invalidation. A transient network failure
+records nothing; marking one would retire a working account.
+
 ## Selection persistence
 
 Scope decides *where* a committed selection is written, and the two files never
@@ -457,6 +466,17 @@ rewrites `requested`. What the user asked for is not something the router gets
 to change after the fact. The upstream provider arrives as a channel slug, not a
 string, because an event payload carries ids and enums only.
 
+Catalogs are named by `provider_catalogs` in `config.json` and may be read from
+disk (`models_file`, `endpoint_files`) or fetched (`models_url`,
+`endpoint_urls`, with an optional `credential_env` for an authenticated
+endpoint). `/providers refresh` performs the fetch. The parsing, offer
+construction, and events are identical either way — the host cannot fetch,
+because a transport dependency there would break the isolation gate, so
+`api/catalog_fetch.zig` does the GET and hands the bytes in. A refresh that
+fails leaves the previous catalog in place: a stale catalog is a far better
+answer than an empty one, and every pin stays resolvable because offer ids are
+derived from the stable binding.
+
 Ingesting a catalog moves the catalog revision and emits `catalog.updated`,
 `pricing.updated`, and — when an endpoint reports degraded or unavailable —
 `provider.degraded`. `auth.changed` and `credential.expiring` have producers on
@@ -530,6 +550,7 @@ to the historical path, which still serves proxies and server-catalog models.
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
 | `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
+| `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
 | `src/repl/model_picker.zig` | picker state machine (pure) |
 | `src/repl/model_picker_view.zig` | picker rendering |
 | `src/repl/picker_host.zig` | commit + rebind against the session |
@@ -550,12 +571,9 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
   reachable; obtaining the *first* token still means
   `metacodes login --provider <id> --oauth-token-json <file>`. The browser /
   device / PKCE flow is Metask-only.
-- **Live catalog fetching (P1).** Catalogs are ingested from documents on disk
-  (`provider_catalogs` in `config.json`), not fetched. The parsing, offer
-  construction, and events are identical either way, so wiring an HTTP fetcher
-  changes only where the bytes come from — but a `curl > file` step is required
-  today. Per-offer *capacity* (throughput) also stays `unknown`: OpenRouter's
-  endpoint rows do not carry it.
+- **Per-offer capacity.** Throughput stays `unknown`: OpenRouter's endpoint rows
+  do not carry it, so `hard_min_throughput_tps` can only ever reject. Latency is
+  in the same position until a health plane observes it.
 - **Catalog- and config-sourced prices (P1).** The `metask` profile ships a
   real quote (see *Pricing*), so `model.list` and `quote.estimate` return known
   prices for it. `openai` and `gemini` stay `unknown` until a provider catalog
@@ -565,8 +583,4 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
   scheme. `AgentSession.Config` accepts it, but `agentcore/abi_v1.zig` does not
   expose it, so a C embedder still gets the default bearer — adding it is an ABI
   revision, not a wiring fix.
-- **Automatic failover between pool members (P2).** Selection, priority,
-  cooldown, and invalidation exist, and `noteFailure` computes the updated
-  state; nothing writes that state back after a failed request yet, so a
-  cooldown has to be configured rather than learned.
 - **TinyKG audit plane.** No decision/verification nodes are appended.
