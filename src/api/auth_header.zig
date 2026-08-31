@@ -15,9 +15,6 @@ const credential = @import("../provider/credential.zig");
 pub const AuthScheme = credential.AuthScheme;
 
 pub const Error = error{
-    /// Query-parameter auth needs URL rewriting, which these transports do not
-    /// perform. Failing here is better than silently sending no credential.
-    QueryAuthUnsupportedByTransport,
     SignedAdapterRequired,
     EmptyCredentialMaterial,
     OutOfMemory,
@@ -51,7 +48,6 @@ pub fn build(
             .name = custom.name,
             .value = try std.fmt.allocPrint(allocator, "{s}{s}", .{ custom.value_prefix, secret }),
         },
-        .api_key_query => error.QueryAuthUnsupportedByTransport,
         .signed_adapter => error.SignedAdapterRequired,
     };
 }
@@ -83,7 +79,6 @@ test "provider schemes change the actual header name and value" {
 
 test "unsupported placements fail instead of sending nothing" {
     const a = std.testing.allocator;
-    try std.testing.expectError(error.QueryAuthUnsupportedByTransport, build(a, .{ .api_key_query = "key" }, "sk"));
     try std.testing.expectError(error.SignedAdapterRequired, build(a, .{ .signed_adapter = "sigv4" }, "sk"));
     try std.testing.expectError(error.EmptyCredentialMaterial, build(a, null, ""));
 }

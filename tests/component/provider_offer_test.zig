@@ -1362,3 +1362,75 @@ test "L2: an OAuth access token authenticates the provider's own route" {
     const captured = server.lastRequest() orelse return error.NoRequestCaptured;
     try std.testing.expectEqualStrings("Bearer oauth-access-token", headerValue(captured, "authorization").?);
 }
+
+// ── scope decides where a selection is written ───────────────────────────────
+
+test "L2: a session-scoped commit never reaches config.json, and a global one does" {
+    const a = std.testing.allocator;
+    const config_path = try tempConfigPath(a, "scope-split");
+    defer a.free(config_path);
+    removeTempDir(config_path);
+    defer removeTempDir(config_path);
+
+    const session_dir = std.fs.path.dirname(config_path).?;
+    var config_store = try cc.provider_config_store.Store.initPath(a, config_path);
+    defer config_store.deinit();
+    var session_store = try cc.provider_config_store.Store.initSessionFile(a, session_dir);
+    defer session_store.deinit();
+    defer removeTempDir(session_store.path);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{});
+    defer catalog.deinit();
+    var kernel = cc.provider_control_plane.Kernel.init(a, &catalog);
+    defer kernel.deinit();
+
+    const session_target = catalog.items()[0];
+    const global_target = catalog.items()[1];
+
+    const session_commit = kernel.selectionCommit(
+        .{},
+        cc.provider_selection.RuntimeSelection.pinned(session_target.offer_id, session_target.offer_revision, .session),
+        .session,
+    );
+    // Session scope is not durable *globally*: the kernel does not ask for a
+    // config write, and the host writes the session's own file instead.
+    try std.testing.expect(!session_commit.committed.requires_persist);
+    _ = try cc.provider_config_store.setSessionSelection(
+        &session_store,
+        session_commit.committed.selection,
+        null,
+        "session-op",
+    );
+
+    const global_commit = kernel.selectionCommit(
+        .{},
+        cc.provider_selection.RuntimeSelection.pinned(global_target.offer_id, global_target.offer_revision, .global),
+        .global,
+    );
+    try std.testing.expect(global_commit.committed.requires_persist);
+    _ = try cc.provider_config_store.setGlobalSelection(
+        &config_store,
+        global_commit.committed.selection,
+        null,
+        "global-op",
+    );
+
+    // Each file holds exactly one of the two, so a session choice cannot
+    // become everyone's and a global one cannot be mistaken for this session's.
+    var config_doc = try config_store.load();
+    defer config_doc.deinit();
+    try std.testing.expect(config_doc.session_selection == null);
+    try std.testing.expect(config_doc.global_selection.?.target.pinned_offer.offer_id.eql(global_target.offer_id));
+
+    var session_doc = try session_store.load();
+    defer session_doc.deinit();
+    try std.testing.expect(session_doc.global_selection == null);
+    try std.testing.expect(session_doc.session_selection.?.target.pinned_offer.offer_id.eql(session_target.offer_id));
+
+    // Restoring is session-first: the narrower scope wins on resume.
+    const restored = session_doc.session_selection.?;
+    const resolution = try cc.provider_selection.resolve(&catalog, restored);
+    try std.testing.expect(resolution.primary().offer_id.eql(session_target.offer_id));
+}

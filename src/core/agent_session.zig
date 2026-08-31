@@ -629,6 +629,10 @@ pub const SessionConfig = struct {
     /// OpenAI wire protocol. Public adapters validate provider/protocol
     /// pairing before this typed configuration reaches the Session.
     openai_protocol: types.OpenAIProtocol = .chat_completions,
+    /// issue #16: provider-declared authentication for the resolved route.
+    /// Null keeps the historical `authorization: Bearer` bytes, so an embedder
+    /// that names no provider is byte-identical.
+    auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
     api_key: []const u8,
     model: []const u8,
     base_url: ?[]const u8 = null,
@@ -1128,6 +1132,10 @@ pub const AgentSession = struct {
     model: []u8,
     base_url: ?[]u8,
     openai_protocol: types.OpenAIProtocol,
+    /// Carried so a tool-scoped provider authenticates the way the session's
+    /// own route does; a subagent sending bearer at an `x-api-key` endpoint has
+    /// the right key and the wrong header.
+    auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
     provider: provider_factory.OwnedProvider,
     conversation: Conversation,
     workspace: workspace_mod.WorkspacePolicy,
@@ -1172,7 +1180,7 @@ pub const AgentSession = struct {
 
     fn makeToolProvider(raw: *anyopaque) anyerror!provider_factory.OwnedProvider {
         const self: *AgentSession = @ptrCast(@alignCast(raw));
-        return provider_factory.makeProviderWithDialectResolver(
+        return provider_factory.makeProviderWithOptions(
             std.heap.c_allocator,
             self.provider.kind(),
             self.api_key,
@@ -1180,6 +1188,7 @@ pub const AgentSession = struct {
             self.base_url,
             self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = self.auth_scheme },
         );
     }
 
@@ -1262,7 +1271,7 @@ pub const AgentSession = struct {
             Conversation.init(allocator);
         errdefer conversation.deinit();
 
-        const owned_provider = try provider_factory.makeProviderWithDialectResolver(
+        const owned_provider = try provider_factory.makeProviderWithOptions(
             allocator,
             config.provider_kind,
             api_key,
@@ -1270,6 +1279,7 @@ pub const AgentSession = struct {
             base_url,
             config.openai_protocol,
             runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = config.auth_scheme },
         );
         errdefer owned_provider.deinit();
 
@@ -1305,6 +1315,7 @@ pub const AgentSession = struct {
             .model = model,
             .base_url = base_url,
             .openai_protocol = config.openai_protocol,
+            .auth_scheme = config.auth_scheme,
             .provider = owned_provider,
             .conversation = conversation,
             .workspace = workspace,

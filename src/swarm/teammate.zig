@@ -298,6 +298,9 @@ pub const TeammateRegistry = struct {
     provider_kind: types_mod.ProviderKind = .anthropic,
     /// OpenAI wire 协议(仅 provider_kind==.openai 时消费):teammate 继承 lead 的显式选择。
     openai_protocol: types_mod.OpenAIProtocol = .chat_completions,
+    /// issue #16:lead 已解析路由的 provider-declared auth scheme。null = 历史
+    /// bearer 字节。由 `SwarmContext` 在 spawn 时注入。
+    auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
     dialect_resolver: dialect_mod.Resolver = .builtin(),
     home: []u8,
 
@@ -593,7 +596,7 @@ pub const TeammateRegistry = struct {
         try mailbox.ensureInbox(lead_inbox_path);
 
         // 4) 专属 provider(c_allocator:线程安全 + 与 agent_loop 事件所有权一致)。
-        var owned = try pf.makeProviderWithDialectResolver(
+        var owned = try pf.makeProviderWithOptions(
             std.heap.c_allocator,
             self.provider_kind,
             self.api_key,
@@ -601,6 +604,9 @@ pub const TeammateRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
+            // issue #16:继承 lead 的 auth scheme。少了它,teammate 会把正确的
+            // 密钥发到错误的头上——对 `x-api-key` 类 provider 就是 401。
+            .{ .auth_scheme = self.auth_scheme },
         );
         errdefer if (!committed) owned.deinit();
 

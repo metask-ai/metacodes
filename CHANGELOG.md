@@ -158,6 +158,24 @@ status, compatibility boundaries, and entry points are defined by
   none needs a network. `metacodes login --provider <id> --oauth-token-json
   <file>` imports the first token into that provider's own store.
 
+- Selection scope, auth-scheme inheritance, and the query-auth decision
+  (issue #16). A `session`-scoped commit is now written to the session's own
+  `runtime-selection.json` and restored by `/resume`; because session scope is
+  narrower than global, a resumed session continues on the route it was using
+  rather than whatever became global meanwhile, and a stored route that no
+  longer resolves is reported instead of silently replaced. The resolved route's
+  auth scheme now reaches swarm teammates and `AgentSession` as well as `App`
+  and background subagent jobs — a worker sending bearer at an `x-api-key`
+  endpoint has the right key and the wrong header — and a route switch moves the
+  swarm context with it so a teammate spawned afterwards cannot dial the
+  previous provider. `AgentJobRegistry.setRoute` moves key, endpoint, transport,
+  and scheme together for the same reason.
+  `AuthScheme.api_key_query` is **removed** rather than implemented. A secret in
+  a query string lands in server access logs, proxy logs, and referrer headers,
+  and it would flow into the endpoint strings this subsystem already refuses to
+  let carry credentials — the endpoint policy rejects userinfo URLs for exactly
+  that reason.
+
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
   base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,

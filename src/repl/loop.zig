@@ -3731,6 +3731,19 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
         }
     }
 
+    // issue #16:恢复本 session 自己的路由选择。它比 global 窄,所以赢——resume
+    // 回来的会话应该继续用它当时那条路由,而不是这期间变成 global 的那条。
+    // 选择存在但已解析不出来时明说,绝不静默换成别家 provider。
+    if (app.restoreSessionSelection()) |restored| {
+        if (restored) std.debug.print("Restored this session's model route: {s}\n", .{app.activeModel()});
+    } else |err| {
+        std.debug.print(
+            "\x1b[33mwarning: this session's stored model route is unavailable ({s}); " ++
+                "the current route is unchanged\x1b[0m\n",
+            .{@errorName(err)},
+        );
+    }
+
     std.debug.print("Resumed session ({d} messages). Continue by sending a message.\n", .{app.conversation.len()});
 }
 

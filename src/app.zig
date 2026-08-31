@@ -738,6 +738,7 @@ pub const App = struct {
             .model = app.config.model,
             .provider_kind = app.config.provider_kind,
             .openai_protocol = app.config.openai_protocol,
+            .auth_scheme = app.config.auth_scheme,
             .dialect_resolver = app_dialect_resolver,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
         };
@@ -1045,11 +1046,57 @@ pub const App = struct {
             .committed => |accepted| {
                 try app.bindCommittedSelection(host, accepted.selection);
                 if (accepted.requires_persist) try app.persistGlobalSelection(host, accepted.selection);
+                // A session-scoped choice is durable *for this session*: it has
+                // to survive a resume, and it must not reach any other session,
+                // which is why it goes to the session's own file.
+                if (accepted.scope == .session) app.persistSessionSelection(accepted.selection) catch {};
             },
             // The kernel already refused; the old runtime is still the live one.
             .rejected, .conflict => {},
         }
         return outcome;
+    }
+
+    /// `<session_dir>/runtime-selection.json`. Null when this session has no
+    /// transcript directory, which is the case for one-shot and headless runs
+    /// where there is nothing to resume into.
+    fn sessionSelectionStore(app: *App) ?provider_config_store.Store {
+        const writer = app.transcript_writer orelse return null;
+        return provider_config_store.Store.initSessionFile(app.allocator, writer.dir) catch null;
+    }
+
+    fn persistSessionSelection(
+        app: *App,
+        selection: provider_selection_mod.RuntimeSelection,
+    ) !void {
+        var store = app.sessionSelectionStore() orelse return;
+        defer store.deinit();
+        _ = try provider_config_store.setSessionSelection(&store, selection, null, null);
+    }
+
+    /// Restore this session's own selection, if it committed one before.
+    ///
+    /// Ordering against the global selection is deliberate: session scope is
+    /// narrower, so it wins. A resumed session continues on the route it was
+    /// using, not on whatever became global in the meantime.
+    pub fn restoreSessionSelection(app: *App) !bool {
+        var store = app.sessionSelectionStore() orelse return false;
+        defer store.deinit();
+        var document = store.load() catch return false;
+        defer document.deinit();
+        const selection = document.session_selection orelse return false;
+
+        const host = try app.providerHost();
+        const outcome = host.kernel.selectionCommit(.{}, selection, .session);
+        switch (outcome) {
+            .committed => |accepted| {
+                try app.bindCommittedSelection(host, accepted.selection);
+                return true;
+            },
+            // A stored session route that no longer resolves is reported by the
+            // caller, not silently replaced with a different vendor.
+            .rejected, .conflict => return error.SessionSelectionUnavailable,
+        }
     }
 
     fn persistGlobalSelection(
@@ -1214,6 +1261,14 @@ pub const App = struct {
             client.api_key = secret;
             client.base_url = endpoint;
         }
+        // Swarm teammates are constructed from this context when they spawn, so
+        // it has to move with the route: a teammate started after a switch must
+        // not dial the previous provider with this provider's credential.
+        app.swarm.api_key = secret;
+        app.swarm.base_url = endpoint;
+        app.swarm.provider_kind = binding.transport;
+        app.swarm.openai_protocol = binding.openai_protocol;
+        app.swarm.auth_scheme = binding.auth_scheme;
 
         // Every borrower now points at the new strings.
         if (retired_url) |old| app.allocator.free(old);

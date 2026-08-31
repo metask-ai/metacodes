@@ -219,9 +219,9 @@ fn parseAuth(arena: std.mem.Allocator, value: ?std.json.Value) DefinitionError!p
             .value_prefix = try dupe(arena, prefix),
         } };
     }
-    // `api_key_query` and `signed_adapter` are deliberately not configurable:
-    // the transports reject the first, and the second is a reviewed adapter
-    // reference, not a config value.
+    // `signed_adapter` is deliberately not configurable: it is a reviewed
+    // adapter reference, not a config value. There is no query-parameter scheme
+    // at all — see `AuthScheme` for why a secret never goes in a URL.
     return error.UnknownAuthScheme;
 }
 

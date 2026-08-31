@@ -178,10 +178,17 @@ pub const EnvLookup = struct {
 /// `signed_adapter` exists so the type covers the reviewed-adapter case from
 /// the start; materializing one is deliberately an error in P0 rather than an
 /// undeclared hole in the union.
+///
+/// **There is deliberately no query-parameter placement.** A secret in a query
+/// string lands in server access logs, proxy logs, and referrer headers, and it
+/// would flow into the endpoint strings this subsystem already refuses to let
+/// carry credentials — `EndpointPolicy` rejects a URL with userinfo for exactly
+/// that reason. Supporting the placement would mean building URLs no consumer
+/// of `endpoint_ref` redacts. A provider that only accepts a query key is
+/// better served by a relay that turns a header into one.
 pub const AuthScheme = union(enum) {
     bearer,
     api_key_header: []const u8,
-    api_key_query: []const u8,
     custom_header: CustomHeader,
     signed_adapter: []const u8,
 
@@ -210,7 +217,9 @@ pub const Materialized = struct {
     name: []const u8,
     value: []const u8,
 
-    pub const Placement = enum { header, query };
+    /// Only headers. See `AuthScheme` for why a query placement is refused
+    /// rather than implemented.
+    pub const Placement = enum { header };
 
     pub fn format(self: Materialized, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("{s}:{s}=<redacted len={d}>", .{
@@ -236,11 +245,6 @@ pub fn materialize(
         .api_key_header => |header| .{
             .placement = .header,
             .name = header,
-            .value = try writePrefixed(buffer, "", secret),
-        },
-        .api_key_query => |query| .{
-            .placement = .query,
-            .name = query,
             .value = try writePrefixed(buffer, "", secret),
         },
         .custom_header => |custom| .{
@@ -652,8 +656,10 @@ test "auth materialization covers bearer, api-key header, and custom header" {
     );
     try std.testing.expectEqualStrings("x-goog-api-key", custom.name);
 
-    const query = try materialize(.{ .api_key_query = "key" }, "sk-secret", &buffer);
-    try std.testing.expectEqual(Materialized.Placement.query, query.placement);
+    // Every scheme places a header. A query placement would put the secret in a
+    // URL, which server logs, proxies, and `endpoint_ref` consumers all keep.
+    try std.testing.expectEqual(Materialized.Placement.header, header.placement);
+    try std.testing.expectEqual(Materialized.Placement.header, custom.placement);
 }
 
 test "signed adapters and empty material fail closed" {

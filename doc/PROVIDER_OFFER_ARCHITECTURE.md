@@ -132,6 +132,23 @@ Error classification is provider-owned: `429` with quota wording is
 (retryable); invalid key, wrong endpoint, and permission failures never retry as
 transport errors.
 
+## Selection persistence
+
+Scope decides *where* a committed selection is written, and the two files never
+share a key:
+
+| Scope | Written to | Restored by |
+|---|---|---|
+| `global` | `~/.metacodes/config.json` → `global_selection` | `applyPersistedGlobalSelection` at startup, before model-name inference |
+| `session` | `<session_dir>/runtime-selection.json` → `session_selection` | `App.restoreSessionSelection` on `/resume` |
+| `once` | nowhere | expires with the turn |
+
+Session scope is narrower, so on resume it wins: a resumed session continues on
+the route it was using, not on whatever became global in the meantime. A stored
+selection that no longer resolves is reported — as a startup error for global,
+as a warning that leaves the current route alone for session — and never
+silently replaced with a different vendor.
+
 ## Credentials
 
 ```text
@@ -151,9 +168,15 @@ its own scope, and the stored Metask model/effort selection is not applied to
 it.
 
 `AuthScheme` is materialized by the transport: `bearer` (default, identical to
-the historical bytes), `api_key_header`, `custom_header`, `api_key_query`
-(rejected by the current transports rather than silently dropped), and
-`signed_adapter` (reviewed adapters, P2).
+the historical bytes), `api_key_header`, `custom_header`, and `signed_adapter`
+(reviewed adapters, P2).
+
+There is deliberately **no query-parameter placement**. A secret in a query
+string lands in server access logs, proxy logs, and referrer headers, and it
+would flow into the endpoint strings this subsystem already refuses to let carry
+credentials — `EndpointPolicy` rejects a URL with userinfo for exactly that
+reason. A provider that only accepts a query key is better served by a relay
+that turns a header into one.
 
 ## OAuth
 
@@ -500,20 +523,11 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
   selection through its own menu, because the picker has no credential stage
   yet — that waits on credential-pool rotation below. `/model` and `Ctrl+O`
   select *routes*; `/models` selects *credentials*. See *TUI* below.
-- **Auth scheme inheritance beyond `AgentJobRegistry`.** `App`'s own clients and
-  background subagent jobs carry the resolved route's auth scheme. Swarm
-  teammates and `AgentCore` sessions still construct providers with the default
-  bearer scheme; they are unaffected today because every built-in profile except
-  Gemini uses bearer, and the Gemini transport fixes its own header.
-- **`api_key_query` placement.** Rejected by both transports rather than
-  silently dropped; it needs URL rewriting in the request path.
-- **Session-scoped `runtime-selection.json`.** The document, the store
-  (`Store.initSessionFile`), and the isolation between the session file and
-  `config.json` exist and are tested, but no session host writes one yet — the
-  TUI picker migration is what will. The *global* selection is loaded at boot:
-  `applyPersistedGlobalSelection` reads `Store.initHome` before model-name
-  inference runs, and a stored pin the catalog no longer offers is a startup
-  error rather than a silent fallback to another vendor.
+- **Auth scheme over the AgentCore C ABI.** `App`, background subagent jobs,
+  swarm teammates, and `AgentSession` all carry the resolved route's auth
+  scheme. `AgentSession.Config` accepts it, but `agentcore/abi_v1.zig` does not
+  expose it, so a C embedder still gets the default bearer — adding it is an ABI
+  revision, not a wiring fix.
 - **Credential pool rotation (P2).** `CredentialRef` carries priority, cooldown,
   and last-error, and resolution honours cooldown and invalid status, but only
   one credential per provider is offered to it.
