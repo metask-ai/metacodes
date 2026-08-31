@@ -23,6 +23,14 @@
 //! are declared. `glm-4.5-air` intentionally ships with unknown limits so the
 //! fail-closed admission path is exercised by a real built-in profile rather
 //! than only by a fixture.
+//!
+//! Every quote here stays `unknown`, and that is the correct value rather than
+//! a gap. The Coding Plan is a **subscription**: the user pays a plan fee, and
+//! the per-token list price of the general API is not what they are billed.
+//! Publishing a per-token number for these channels would be a fabricated
+//! price wearing the same type as a real one — precisely what "unknown, never
+//! zero" exists to prevent. A plan-aware quote needs the account's plan and
+//! remaining quota, which only a catalog/quota refresh can supply.
 
 const std = @import("std");
 const ids = @import("../ids.zig");
@@ -324,4 +332,16 @@ test "unknown model limits stay unknown and fail admission closed" {
     const decision = entry.limits.admit(.{ .input_tokens = 10, .requested_output_tokens = 10 }, .{});
     try std.testing.expect(!decision.isAdmitted());
     try std.testing.expectEqual(offer.RejectionReason.unknown_limit_fail_closed, decision.rejected.reason);
+}
+
+test "coding-plan quotes stay unknown because the plan is not billed per token" {
+    for (MODELS) |entry| {
+        try std.testing.expect(!entry.quote.isKnown());
+        // Unknown must also mean "no estimate", not "an estimate of zero".
+        try std.testing.expectEqual(
+            @as(?u64, null),
+            entry.quote.estimateMicros(.{ .input_tokens = 1_000_000, .output_tokens = 1_000_000 }),
+        );
+    }
+    try std.testing.expect(PROFILE.quote_hook == null);
 }

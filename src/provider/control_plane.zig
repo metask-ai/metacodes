@@ -1676,3 +1676,46 @@ test "a recorded route carries the cost its provider quote implies" {
     const explicit = kernel.journal.items()[kernel.journal.len - 1];
     try std.testing.expectEqual(@as(?u64, 42), explicit.payload.route_actual.cost_micros);
 }
+
+test "a built-in price reaches model.list and quote.estimate, and unknown stays unknown" {
+    const a = std.testing.allocator;
+    var registry = try registry_mod.ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{});
+    defer catalog.deinit();
+
+    var kernel = Kernel.init(a, &catalog);
+    defer kernel.deinit();
+    kernel.registry = &registry;
+
+    var page: std.ArrayList(OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try kernel.modelList(.{}, .{}, a, &page);
+
+    var priced: usize = 0;
+    var unpriced: usize = 0;
+    for (listed.offers) |summary| {
+        if (summary.quote.isKnown()) {
+            priced += 1;
+            // A price a client can render must carry its currency and unit;
+            // a bare number is not comparable across providers.
+            const value = summary.quote.priced().?;
+            try std.testing.expectEqual(offer_mod.BillingUnit.per_million_tokens, value.billing_unit);
+            try std.testing.expect(value.input_price_micros != null);
+        } else {
+            unpriced += 1;
+        }
+    }
+    // Both halves must exist: a provider that prices, and one that says it
+    // cannot. A run where everything is unknown would pass a weaker assertion.
+    try std.testing.expect(priced > 0);
+    try std.testing.expect(unpriced > 0);
+
+    for (listed.offers) |summary| {
+        const estimate = kernel.quoteEstimate(summary.offer_id, .{
+            .input_tokens = 1_000_000,
+            .output_tokens = 1_000_000,
+        });
+        try std.testing.expectEqual(summary.quote.isKnown(), estimate.isKnown());
+    }
+}

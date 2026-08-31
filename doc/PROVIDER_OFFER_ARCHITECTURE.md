@@ -85,7 +85,19 @@ permissive direction:
   may confirm one; `unknown` is only promoted by a provider declaration, and
   only `supported` permits emitting the wire feature.
 - **Pricing.** `Quote` is a tagged union. A missing price is `unknown`, and any
-  unknown component makes the whole cost unknown. There is no zero.
+  unknown component makes the whole cost unknown. There is no zero. Cached
+  reads and cache writes are separately priced, because folding either into the
+  fresh-input rate misreports the cost in one direction or the other.
+
+  The `metask` profile's quote is derived from `util/pricing.zig` — the same
+  table `UsageTotals.costUsd` already reports with — and a test asserts the two
+  agree, so the picker cannot show a number `/cost` contradicts. It carries
+  `estimated = true`: these are published rates, not a provider bill.
+
+  `zai-coding-plan` stays `unknown` on purpose. The Coding Plan is a
+  subscription, so a per-token list price is not what the user is billed;
+  publishing one would be a fabricated price wearing the same type as a real
+  one. A plan-aware quote needs the account's plan and remaining quota.
 - **Provenance.** Every metadata group carries freshness (`known`/`inherited`/
   `stale`/`unknown`) and source (`builtin_profile`/`provider_catalog`/
   `user_config`/`observed`).
@@ -283,11 +295,10 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
   nothing produces one yet, so health and capacity read `unknown`. The
   `pricing.updated`, `auth.changed`, `credential.expiring`, and
   `provider.degraded` event types wait on the same work.
-- **Built-in price tables (P1).** `ProviderProfile.quote_hook` and
-  `ModelEntry.quote` are wired end to end — the hook is reached through
-  `quote.estimate` and the static quote through `model.list` — but no built-in
-  profile ships a price table, so built-in quotes read `unknown` until a
-  provider catalog or user config supplies one.
+- **Catalog- and config-sourced prices (P1).** The `metask` profile ships a
+  real quote (see *Pricing*), so `model.list` and `quote.estimate` return known
+  prices for it. `openai` and `gemini` stay `unknown` until a provider catalog
+  or user config supplies rates; `zai-coding-plan` stays `unknown` by design.
 - **User-defined providers (P1).** A profile can be registered at runtime
   through the same extension point, but there is no `CustomProviderDefinition`
   config schema, no `DeclarativeProtocolSpec`, and no dry-run/connection test.
