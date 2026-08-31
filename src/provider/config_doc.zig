@@ -65,6 +65,37 @@ pub const ProtocolList = struct {
     }
 };
 
+pub const MAX_POOL_CREDENTIALS: usize = 8;
+
+/// A pool member, by reference. **No secret** — the value lives in the named
+/// environment variable, so a config document that several tools read (and that
+/// is not mode 0600) never holds credential material. That is also why the
+/// export/import round-trip can be lossless.
+pub const CredentialEntry = struct {
+    id: Slug,
+    /// Environment variable holding the secret.
+    env: AliasName,
+    kind: controls_mod.Bounded(32),
+    /// Lower is tried first.
+    priority: u8 = 0,
+    account_or_plan: ?AliasName = null,
+};
+
+pub const CredentialList = struct {
+    entries: [MAX_POOL_CREDENTIALS]CredentialEntry = undefined,
+    len: u8 = 0,
+
+    pub fn items(self: *const CredentialList) []const CredentialEntry {
+        return self.entries[0..self.len];
+    }
+
+    pub fn append(self: *CredentialList, entry: CredentialEntry) error{TooManyCredentials}!void {
+        if (self.len == MAX_POOL_CREDENTIALS) return error.TooManyCredentials;
+        self.entries[self.len] = entry;
+        self.len += 1;
+    }
+};
+
 /// One configured provider instance. Independent credentials, channels, and
 /// endpoint policy; disabling preserves everything.
 pub const ProviderEntry = struct {
@@ -77,6 +108,9 @@ pub const ProviderEntry = struct {
     channels: ChannelList = .{},
     protocol_defaults: ProtocolList = .{},
     base_url: ?UrlText = null,
+    /// Credential pool for this provider. Several accounts, each a distinct
+    /// route identity, because the credential participates in the offer id.
+    credentials: CredentialList = .{},
 };
 
 pub const AliasPolicy = enum { pinned, floating };
@@ -103,6 +137,7 @@ pub const DocumentError = error{
     TooManyChannels,
     TooManyProtocols,
     TooManyControls,
+    TooManyCredentials,
     OutOfMemory,
 };
 
@@ -267,6 +302,29 @@ pub const Document = struct {
             if (entry.channels.len > 0) {
                 try out.appendSlice(arena, ",\"channels\":");
                 try writeSlugArray(arena, &out, entry.channels.items());
+            }
+            if (entry.credentials.len > 0) {
+                try out.appendSlice(arena, ",\"credentials\":[");
+                for (entry.credentials.items(), 0..) |credential, position| {
+                    if (position > 0) try out.append(arena, ',');
+                    try out.appendSlice(arena, "{\"id\":");
+                    try writeJsonString(arena, &out, credential.id.slice());
+                    try out.appendSlice(arena, ",\"env\":");
+                    try writeJsonString(arena, &out, credential.env.slice());
+                    try out.appendSlice(arena, ",\"kind\":");
+                    try writeJsonString(arena, &out, credential.kind.slice());
+                    try out.appendSlice(arena, try std.fmt.allocPrint(
+                        arena,
+                        ",\"priority\":{d}",
+                        .{credential.priority},
+                    ));
+                    if (credential.account_or_plan) |label| {
+                        try out.appendSlice(arena, ",\"account\":");
+                        try writeJsonString(arena, &out, label.slice());
+                    }
+                    try out.append(arena, '}');
+                }
+                try out.append(arena, ']');
             }
             if (entry.protocol_defaults.len > 0) {
                 try out.appendSlice(arena, ",\"protocol_defaults\":[");
@@ -600,6 +658,32 @@ fn parseProvider(key: []const u8, value: std.json.Value) DocumentError!ProviderE
         for (list.array.items) |item| {
             const text = stringOf(item) orelse return error.InvalidDocument;
             try entry.protocol_defaults.append(text);
+        }
+    }
+    if (value.object.get("credentials")) |list| {
+        if (list != .array) return error.InvalidDocument;
+        for (list.array.items) |item| {
+            if (item != .object) return error.InvalidDocument;
+            const env_name = stringOf(item.object.get("env")) orelse return error.InvalidDocument;
+            // A literal secret here would put credential material into a
+            // document several tools read and that is not mode 0600.
+            if (item.object.get("secret") != null) return error.InvalidDocument;
+            try entry.credentials.append(.{
+                .id = Slug.parse(stringOf(item.object.get("id")) orelse return error.InvalidDocument) catch
+                    return error.InvalidSlug,
+                .env = try AliasName.parse(env_name),
+                .kind = try controls_mod.Bounded(32).parse(stringOf(item.object.get("kind")) orelse "api_key"),
+                .priority = blk: {
+                    const number = item.object.get("priority") orelse break :blk 0;
+                    const value_int = intOf(number) orelse return error.InvalidDocument;
+                    if (value_int < 0 or value_int > 255) return error.InvalidDocument;
+                    break :blk @intCast(value_int);
+                },
+                .account_or_plan = if (stringOf(item.object.get("account"))) |label|
+                    try AliasName.parse(label)
+                else
+                    null,
+            });
         }
     }
     return entry;

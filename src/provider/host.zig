@@ -16,6 +16,7 @@ const control_plane = @import("control_plane.zig");
 const selection_mod = @import("selection.zig");
 const config_store = @import("config_store.zig");
 const custom_provider = @import("custom_provider.zig");
+const config_doc = @import("config_doc.zig");
 const openrouter = @import("openrouter.zig");
 const offer_mod = @import("offer.zig");
 const profile_mod = @import("profile.zig");
@@ -232,6 +233,43 @@ pub const Host = struct {
         }
     }
 
+    /// Expiry warning window. A day is enough notice to rotate a credential
+    /// without being so early the warning becomes background noise.
+    pub const CREDENTIAL_EXPIRY_WARNING_SECONDS: i64 = 24 * 60 * 60;
+
+    /// Bind the configured credential pool into the catalog.
+    ///
+    /// A credential participates in the offer id, so two accounts on the same
+    /// route are two offers rather than one route that quietly changes identity
+    /// depending on which key resolution happened to pick. That is what makes
+    /// "switch to my work account" a selectable route instead of an invisible
+    /// side effect — and it is why the picker needs no separate credential
+    /// stage: the accounts *are* offers.
+    pub fn adoptCredentialPool(self: *Host, document: *const config_doc.Document) HostError!void {
+        var bindings: std.ArrayList(registry_mod.CredentialBinding) = .empty;
+        defer bindings.deinit(self.allocator);
+        for (document.providers.items) |entry| {
+            if (!entry.enabled) continue;
+            for (entry.credentials.items()) |credential| {
+                bindings.append(self.allocator, .{
+                    .provider_id = entry.id,
+                    .credential_ref = credential.id,
+                }) catch return error.OutOfMemory;
+            }
+        }
+        if (bindings.items.len == 0) return;
+
+        var rebuilt = self.registry.buildCatalog(self.allocator, .{
+            .revision = self.catalog.revision.next(),
+            .credential_bindings = bindings.items,
+        }) catch return error.OutOfMemory;
+        errdefer rebuilt.deinit();
+        if (self.retired) |*old| old.deinit();
+        self.retired = self.catalog;
+        self.catalog = rebuilt;
+        self.kernel.adoptCatalog(&self.catalog);
+    }
+
     /// Load the durable document and seed the kernel with what it holds: the
     /// config revision `selection.commit` compares against, and the global
     /// selection a previous run committed.
@@ -250,6 +288,7 @@ pub const Host = struct {
         var document = store.load() catch return;
         defer document.deinit();
         self.kernel.adoptConfigRevision(document.config_revision);
+        self.adoptCredentialPool(&document) catch {};
         if (document.global_selection) |selection| {
             self.kernel.seedGlobalSelection(selection);
         }
@@ -467,4 +506,64 @@ fn readFile(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
         filled += n;
     }
     return buffer[0..filled];
+}
+
+test "two accounts on one provider are two selectable routes" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    var entry = config_doc.ProviderEntry{ .id = Slug.lit("openai") };
+    try entry.credentials.append(.{
+        .id = Slug.lit("work"),
+        .env = try config_doc.AliasName.parse("OPENAI_API_KEY_WORK"),
+        .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+        .priority = 0,
+    });
+    try entry.credentials.append(.{
+        .id = Slug.lit("personal"),
+        .env = try config_doc.AliasName.parse("OPENAI_API_KEY_PERSONAL"),
+        .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+        .priority = 1,
+    });
+    try document.upsertProvider(entry);
+
+    try host.adoptCredentialPool(&document);
+    const items = host.kernel.catalogSnapshot().items();
+
+    var work: usize = 0;
+    var personal: usize = 0;
+    var seen_ids: std.ArrayList(ids.OfferId) = .empty;
+    defer seen_ids.deinit(a);
+    for (items) |item| {
+        if (!item.provider_id.eqlText("openai")) continue;
+        const ref = item.credential_ref orelse continue;
+        if (ref.eqlText("work")) work += 1;
+        if (ref.eqlText("personal")) personal += 1;
+        for (seen_ids.items) |existing| try std.testing.expect(!existing.eql(item.offer_id));
+        try seen_ids.append(a, item.offer_id);
+    }
+    // Each account is its own route identity, so "switch to my work account" is
+    // a selectable offer rather than an invisible side effect of resolution.
+    try std.testing.expect(work > 0);
+    try std.testing.expectEqual(work, personal);
+    try std.testing.expect(host.kernel.catalogSnapshot().items().len > before);
+}
+
+test "a provider with no configured pool keeps exactly its previous offers" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    try document.upsertProvider(.{ .id = Slug.lit("openai") });
+    // No credentials declared: an existing single-account setup must not gain
+    // or lose a single route.
+    try host.adoptCredentialPool(&document);
+    try std.testing.expectEqual(before, host.kernel.catalogSnapshot().items().len);
 }

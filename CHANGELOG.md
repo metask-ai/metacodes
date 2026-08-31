@@ -176,6 +176,27 @@ status, compatibility boundaries, and entry points are defined by
   let carry credentials — the endpoint policy rejects userinfo URLs for exactly
   that reason.
 
+- Credential pools: several accounts per provider, each its own route
+  (issue #16, P2). A `credentials` list on a configured provider declares
+  accounts **by reference** — id, environment-variable name, kind, priority —
+  so no secret enters `config.json`, which several tools read and which is not
+  mode 0600; a literal `secret` key is rejected at parse time. A bound
+  credential participates in the offer id, so each account becomes its own offer
+  and appears as its own row in the picker with an `account=` column. That also
+  removes the need for a separate credential stage: the accounts already are
+  offers. Because the offer names the credential, binding uses that member
+  rather than the pool's highest-priority one — resolving to a different account
+  would make the offer id identify a route the request does not take. Selection
+  among unbound members is deterministic (priority, then id) so configuration
+  order cannot make a failover irreproducible, and members that are invalid,
+  cooling down, expired, or empty are skipped. `noteFailure` maps a
+  provider-classified failure to the right state: a rate limit earns a cooldown,
+  an authentication failure marks the credential invalid, and a transient
+  network error changes nothing. The pool is consulted after every existing
+  source, so a single-credential setup resolves exactly as before.
+  `credential.expiring` and `auth.changed` now have producers on the OAuth path,
+  which is the only thing that knows a credential's expiry.
+
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
   base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,

@@ -131,6 +131,9 @@ fn drawRow(
             w.print(" model={s}", .{offer.request_model_id}) catch {};
             if (offer.region) |region| w.print(" region={s}", .{region}) catch {};
             if (offer.plan) |plan| w.print(" plan={s}", .{plan}) catch {};
+            // The credential is part of the route identity, so two accounts on
+            // one endpoint are two rows and the row has to say which is which.
+            if (offer.credential_ref) |ref| w.print(" account={s}", .{ref.slice()}) catch {};
             writeLimits(w, offer.limits);
             writeQuote(w, offer.quote);
             writeHealth(w, offer.health, offer.availability);

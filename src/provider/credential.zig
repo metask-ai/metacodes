@@ -287,6 +287,11 @@ pub const AuthPrecedence = enum { api_key_first, oauth_first };
 /// Persisted credential material handed in by the credential store. The store
 /// owns the bytes; resolution only borrows them.
 pub const StoredEntry = struct {
+    /// The credential's own id, when it has one. A pool member does: its id is
+    /// part of the offer identity, so deriving a fresh
+    /// `(provider, kind, source)` id here would report a different credential
+    /// than the offer names.
+    id: ?Slug = null,
     kind: CredentialKind,
     secret: []const u8,
     status: CredentialStatus = .active,
@@ -312,6 +317,11 @@ pub const ResolveInput = struct {
     /// Persisted API key and OAuth material from the credential store.
     stored_api_key: ?StoredEntry = null,
     stored_oauth: ?StoredEntry = null,
+    /// Additional credentials for this provider, in no particular order. The
+    /// pool is consulted after the single stored entries above and ordered by
+    /// `poolOrder`, so an existing single-credential setup resolves exactly as
+    /// it did before this field existed.
+    pool: []const PoolEntry = &.{},
     precedence: AuthPrecedence = .api_key_first,
     env: EnvLookup = EnvLookup.empty(),
     now_seconds: i64 = 0,
@@ -379,7 +389,120 @@ pub fn resolve(input: ResolveInput, ref_id_buffer: []u8) ResolveError!Resolved {
         return try build(input, entry.kind, .stored, entry.secret, null, entry, ref_id_buffer);
     if (try storedOAuth(input)) |entry|
         return try build(input, entry.kind, .stored, entry.secret, null, entry, ref_id_buffer);
+    if (try selectFromPool(input)) |chosen|
+        return try buildPooled(input, chosen, ref_id_buffer);
     return error.MissingCredentials;
+}
+
+// ── credential pool ──────────────────────────────────────────────────────────
+
+/// One member of a provider's credential pool.
+///
+/// The id is the caller's, not derived: pool members are distinguished by
+/// account rather than by (provider, kind, source), and a derived id would
+/// collapse two accounts of the same kind into one reference — which is exactly
+/// what makes a cooldown apply to the wrong credential.
+pub const PoolEntry = struct {
+    id: Slug,
+    kind: CredentialKind,
+    secret: []const u8,
+    status: CredentialStatus = .active,
+    account_or_plan: ?[]const u8 = null,
+    expires_at: ?i64 = null,
+    /// Lower sorts first. Ties break on id, so selection is deterministic
+    /// rather than dependent on configuration order.
+    priority: u8 = 0,
+    cooldown_until: ?i64 = null,
+    last_error: ?[]const u8 = null,
+
+    pub fn reference(self: PoolEntry, provider_id: Slug) CredentialRef {
+        return .{
+            .id = self.id,
+            .provider_id = provider_id,
+            .kind = self.kind,
+            .status = self.status,
+            .source = .stored,
+            .account_or_plan = self.account_or_plan,
+            .expires_at = self.expires_at,
+            .priority = self.priority,
+            .cooldown_until = self.cooldown_until,
+            .last_error = self.last_error,
+        };
+    }
+};
+
+/// Deterministic ordering: priority, then id. Two credentials that a caller
+/// listed in a different order must still be tried in the same order, or a
+/// failover becomes irreproducible.
+pub fn poolOrder(a: PoolEntry, b: PoolEntry) bool {
+    if (a.priority != b.priority) return a.priority < b.priority;
+    return std.mem.order(u8, a.id.slice(), b.id.slice()) == .lt;
+}
+
+/// The pool member to use now: accepted kind, usable state, best order.
+///
+/// Expiry, cooldown, and invalid status are all `CredentialRef.isUsableAt`, so
+/// the rule a failed request records is the same rule the next resolution
+/// reads.
+pub fn selectFromPool(input: ResolveInput) ResolveError!?PoolEntry {
+    var best: ?PoolEntry = null;
+    for (input.pool) |candidate| {
+        if (!isAccepted(input.accepted_kinds, candidate.kind)) continue;
+        if (!candidate.reference(input.provider_id).isUsableAt(input.now_seconds)) continue;
+        if (candidate.expires_at) |expiry| {
+            if (expiry <= input.now_seconds) continue;
+        }
+        if (candidate.secret.len == 0) continue;
+        if (best) |current| {
+            if (poolOrder(candidate, current)) best = candidate;
+        } else {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+fn buildPooled(
+    input: ResolveInput,
+    entry: PoolEntry,
+    ref_id_buffer: []u8,
+) ResolveError!Resolved {
+    _ = ref_id_buffer;
+    try requireAccepted(input.accepted_kinds, entry.kind);
+    return .{ .ref = entry.reference(input.provider_id), .secret = entry.secret };
+}
+
+/// Record a failure against a pool member and return the updated entry.
+///
+/// A rate limit earns a cooldown; an authentication failure marks the
+/// credential invalid, because retrying a key the provider rejected only burns
+/// the account's error budget. The distinction is the provider's — this
+/// function takes the class, it does not guess it.
+pub fn noteFailure(
+    entry: PoolEntry,
+    class: FailureClass,
+    now_seconds: i64,
+    cooldown_seconds: i64,
+) PoolEntry {
+    var out = entry;
+    switch (class) {
+        .rate_limited => out.cooldown_until = now_seconds + cooldown_seconds,
+        .invalid => out.status = .invalid,
+        .transient => {},
+    }
+    return out;
+}
+
+pub const FailureClass = enum { rate_limited, invalid, transient };
+
+/// Parse a credential kind from its configured name. Unknown names return null
+/// rather than a default: silently treating an unrecognized kind as `api_key`
+/// would let a config typo authenticate with the wrong material.
+pub fn parseCredentialKind(text: []const u8) ?CredentialKind {
+    inline for (@typeInfo(CredentialKind).@"enum".fields) |field| {
+        if (std.mem.eql(u8, text, field.name)) return @field(CredentialKind, field.name);
+    }
+    return null;
 }
 
 const EnvHit = struct {
@@ -444,7 +567,8 @@ fn build(
 ) ResolveError!Resolved {
     try requireAccepted(input.accepted_kinds, kind);
     if (secret.len == 0) return error.MissingCredentials;
-    const id = try derivedRefId(input.provider_id, kind, source, ref_id_buffer);
+    const id = if (entry) |value| (value.id orelse
+        try derivedRefId(input.provider_id, kind, source, ref_id_buffer)) else try derivedRefId(input.provider_id, kind, source, ref_id_buffer);
     const expires_at = if (entry) |value| value.expires_at else null;
     return .{
         .ref = .{
@@ -722,4 +846,128 @@ test "an invalid stored credential is never selected" {
         .accepted_kinds = &kinds,
         .stored_api_key = .{ .kind = .api_key, .secret = "revoked", .status = .invalid },
     }, &buffer));
+}
+
+test "the pool picks by priority, then deterministically by id" {
+    const provider = Slug.lit("openai");
+    const kinds = [_]CredentialKind{.api_key};
+    const pool = [_]PoolEntry{
+        .{ .id = Slug.lit("cred-b"), .kind = .api_key, .secret = "sk-b", .priority = 1 },
+        .{ .id = Slug.lit("cred-a"), .kind = .api_key, .secret = "sk-a", .priority = 1 },
+        .{ .id = Slug.lit("cred-first"), .kind = .api_key, .secret = "sk-first", .priority = 0 },
+    };
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    const resolved = try resolve(.{
+        .provider_id = provider,
+        .accepted_kinds = &kinds,
+        .pool = &pool,
+    }, &buffer);
+    try std.testing.expectEqualStrings("sk-first", resolved.secret);
+
+    // Same priority: the tie breaks on id, so configuration order cannot make
+    // a failover irreproducible.
+    const tied = [_]PoolEntry{ pool[0], pool[1] };
+    const chosen = (try selectFromPool(.{
+        .provider_id = provider,
+        .accepted_kinds = &kinds,
+        .pool = &tied,
+    })).?;
+    try std.testing.expect(chosen.id.eqlText("cred-a"));
+}
+
+test "a cooling, invalid, or expired member is skipped, and the next one is used" {
+    const provider = Slug.lit("openai");
+    const kinds = [_]CredentialKind{.api_key};
+    const pool = [_]PoolEntry{
+        .{ .id = Slug.lit("cred-cooling"), .kind = .api_key, .secret = "sk-cool", .priority = 0, .cooldown_until = 5_000 },
+        .{ .id = Slug.lit("cred-invalid"), .kind = .api_key, .secret = "sk-bad", .priority = 1, .status = .invalid },
+        .{ .id = Slug.lit("cred-expired"), .kind = .api_key, .secret = "sk-old", .priority = 2, .expires_at = 900 },
+        .{ .id = Slug.lit("cred-good"), .kind = .api_key, .secret = "sk-good", .priority = 3 },
+    };
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    const resolved = try resolve(.{
+        .provider_id = provider,
+        .accepted_kinds = &kinds,
+        .pool = &pool,
+        .now_seconds = 1_000,
+    }, &buffer);
+    try std.testing.expectEqualStrings("sk-good", resolved.secret);
+    // The reference identifies *which* credential, so a later failure is
+    // recorded against the one that actually failed.
+    try std.testing.expect(resolved.ref.id.eqlText("cred-good"));
+
+    // Past the cooldown the highest-priority member returns on its own.
+    const later = try resolve(.{
+        .provider_id = provider,
+        .accepted_kinds = &kinds,
+        .pool = &pool,
+        .now_seconds = 6_000,
+    }, &buffer);
+    try std.testing.expectEqualStrings("sk-cool", later.secret);
+}
+
+test "a failure class decides cooldown versus invalidation" {
+    const entry = PoolEntry{ .id = Slug.lit("cred-a"), .kind = .api_key, .secret = "sk" };
+
+    const limited = noteFailure(entry, .rate_limited, 1_000, 60);
+    try std.testing.expectEqual(@as(?i64, 1_060), limited.cooldown_until);
+    try std.testing.expectEqual(CredentialStatus.active, limited.status);
+    try std.testing.expect(!limited.reference(Slug.lit("openai")).isUsableAt(1_030));
+    try std.testing.expect(limited.reference(Slug.lit("openai")).isUsableAt(1_100));
+
+    // Retrying a key the provider rejected only burns the account's error
+    // budget, so an auth failure is terminal for that credential.
+    const rejected = noteFailure(entry, .invalid, 1_000, 60);
+    try std.testing.expectEqual(CredentialStatus.invalid, rejected.status);
+    try std.testing.expect(!rejected.reference(Slug.lit("openai")).isUsableAt(9_999_999));
+
+    // A transient network failure is nobody's fault: the credential stays.
+    const transient = noteFailure(entry, .transient, 1_000, 60);
+    try std.testing.expectEqual(@as(?i64, null), transient.cooldown_until);
+    try std.testing.expectEqual(CredentialStatus.active, transient.status);
+}
+
+test "a pool cannot widen provider scope or supply an unaccepted kind" {
+    const kinds = [_]CredentialKind{.metask_oauth};
+    const pool = [_]PoolEntry{
+        .{ .id = Slug.lit("cred-openai"), .kind = .api_key, .secret = "sk-openai" },
+    };
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    // The pool is provider-scoped input; a kind the profile does not accept is
+    // still refused, exactly as for every other source.
+    try std.testing.expectError(error.MissingCredentials, resolve(.{
+        .provider_id = Slug.lit("metask"),
+        .accepted_kinds = &kinds,
+        .pool = &pool,
+    }, &buffer));
+}
+
+test "the pool never preempts an explicit or environment credential" {
+    const provider = Slug.lit("openai");
+    const kinds = [_]CredentialKind{.api_key};
+    const aliases = [_]EnvAlias{.{ .name = "OPENAI_API_KEY", .kind = .api_key, .canonical = true }};
+    const pool = [_]PoolEntry{
+        .{ .id = Slug.lit("cred-pool"), .kind = .api_key, .secret = "sk-pool" },
+    };
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+
+    var env = TestEnv{ .pairs = &.{.{ "OPENAI_API_KEY", "sk-env" }} };
+    const env_resolved = try resolve(.{
+        .provider_id = provider,
+        .accepted_kinds = &kinds,
+        .env_aliases = &aliases,
+        .env = env.lookup(),
+        .pool = &pool,
+    }, &buffer);
+    // An existing single-credential setup must resolve exactly as it did before
+    // the pool existed.
+    try std.testing.expectEqualStrings("sk-env", env_resolved.secret);
+
+    const cli_resolved = try resolve(.{
+        .provider_id = provider,
+        .accepted_kinds = &kinds,
+        .cli_api_key = "sk-cli",
+        .pool = &pool,
+    }, &buffer);
+    try std.testing.expectEqualStrings("sk-cli", cli_resolved.secret);
 }

@@ -106,6 +106,8 @@ const provider_control_plane = @import("provider/control_plane.zig");
 const provider_config_store = @import("provider/config_store.zig");
 const provider_selection_mod = @import("provider/selection.zig");
 const provider_ids_mod = @import("provider/ids.zig");
+const provider_credential_mod = @import("provider/credential.zig");
+const provider_config_doc = @import("provider/config_doc.zig");
 const model_picker_mod = @import("repl/model_picker.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const oauth_exchange_mod = @import("api/oauth_exchange.zig");
@@ -963,6 +965,42 @@ pub const App = struct {
         return host;
     }
 
+    /// Materialize the configured credential pool for the current session.
+    ///
+    /// The document holds only references — an id, an environment variable
+    /// name, a kind, a priority — so reading it never touches a secret. The
+    /// secrets are read here, from the process environment, and borrowed for
+    /// the duration of request setup.
+    fn credentialPool(
+        app: *App,
+        buffer: []provider_credential_mod.PoolEntry,
+    ) []const provider_credential_mod.PoolEntry {
+        var store = provider_config_store.Store.initHome(app.allocator) catch return &.{};
+        defer store.deinit();
+        var document = store.load() catch return &.{};
+        defer document.deinit();
+
+        const env = provider_credential_mod.EnvLookup.process();
+        var len: usize = 0;
+        for (document.providers.items) |entry| {
+            if (!entry.enabled) continue;
+            for (entry.credentials.items()) |credential| {
+                if (len == buffer.len) break;
+                const secret = env.get(credential.env.slice()) orelse continue;
+                const kind = provider_credential_mod.parseCredentialKind(credential.kind.slice()) orelse continue;
+                buffer[len] = .{
+                    .id = credential.id,
+                    .kind = kind,
+                    .secret = secret,
+                    .priority = credential.priority,
+                    .account_or_plan = if (credential.account_or_plan) |label| label.slice() else null,
+                };
+                len += 1;
+            }
+        }
+        return buffer[0..len];
+    }
+
     /// The profile a selection resolves to, if it is still in the catalog.
     fn resolvedProfileFor(
         host: *provider_host_mod.Host,
@@ -1006,7 +1044,23 @@ pub const App = struct {
             .io = app.api_client.http_client.io,
             .endpoint = .{ .token_url = token_url, .client_id = built.id.slice() },
         };
-        return try session.accessToken(now_seconds, exchange.exchange());
+        const before = session.generation;
+        const token = try session.accessToken(now_seconds, exchange.exchange());
+
+        // The session is the only thing that knows this credential's expiry, so
+        // it is the only thing that can warn before a turn fails. A refresh
+        // that happened is also a status change a UI may want to show.
+        if (app.provider_host) |host| {
+            if (session.tokens) |current| {
+                if (current.expires_at - now_seconds <= provider_host_mod.Host.CREDENTIAL_EXPIRY_WARNING_SECONDS) {
+                    host.kernel.noteCredentialExpiring(built.id, built.id, current.expires_at);
+                }
+            }
+            if (session.generation != before) {
+                host.kernel.noteAuthChanged(built.id, built.id, .active);
+            }
+        }
+        return token;
     }
 
     /// Refresh the picker's snapshot from the kernel. Called when the picker
@@ -1143,11 +1197,18 @@ pub const App = struct {
             oauth_token = app.oauthAccessToken(built, now) catch null;
         }
 
+        // The configured credential pool. Secrets come from the named
+        // environment variables, never from the config document: that document
+        // is read by several tools and is not mode 0600.
+        var pool_buffer: [provider_config_doc.MAX_POOL_CREDENTIALS]provider_credential_mod.PoolEntry = undefined;
+        const pool = app.credentialPool(&pool_buffer);
+
         const binding = try provider_binding_mod.bind(
             &host.registry,
             host.kernel.catalogSnapshot(),
             selection,
             .{
+                .pool = pool,
                 .cli_api_key = app.config.api_key,
                 .stored_oauth = if (oauth_token) |value| .{
                     .kind = .openai_oauth,

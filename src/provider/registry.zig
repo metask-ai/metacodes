@@ -171,6 +171,11 @@ pub const EndpointOverride = struct {
     base_url: []const u8,
 };
 
+/// Upper bound on credentials bound to one channel. Matches the configured
+/// pool bound; a longer list is truncated rather than growing an allocation on
+/// the catalog-build hot path.
+pub const MAX_CHANNEL_BINDINGS: usize = 8;
+
 pub const CatalogOptions = struct {
     revision: CatalogRevision = .initial,
     credential_bindings: []const CredentialBinding = &.{},
@@ -208,7 +213,19 @@ pub const OfferCatalog = struct {
             }
             for (profile.channels) |channel| {
                 const override = findOverride(options.endpoint_overrides, profile.id, channel.id);
-                const bound_credential = findBinding(options.credential_bindings, profile.id, channel.id);
+                // Every binding that applies to this channel produces its *own*
+                // offer: two accounts on one route are two route identities,
+                // not one route that silently changes identity depending on
+                // which credential resolution happened to pick. `null` is the
+                // unbound case, so a provider with no configured pool builds
+                // exactly the offers it always did.
+                var binding_buffer: [MAX_CHANNEL_BINDINGS]?Slug = undefined;
+                const bound_credentials = collectBindings(
+                    options.credential_bindings,
+                    profile.id,
+                    channel.id,
+                    &binding_buffer,
+                );
                 for (channel.routes) |route| {
                     var url_buffer: [1024]u8 = undefined;
                     const url = try channel.endpointFor(
@@ -218,46 +235,48 @@ pub const OfferCatalog = struct {
                         &url_buffer,
                     );
                     const endpoint = try arena.dupe(u8, url);
-                    for (profile.inventoryFor(channel)) |entry| {
-                        if (!entry.servesProtocol(route.protocol)) continue;
-                        const limits = try entry.limits.intersect(channel.limits);
-                        const capabilities = offer_mod.CapabilityMatrix.narrow(
-                            entry.capabilities,
-                            channel.capabilities,
-                        );
-                        const quote = if (channel.quote.isKnown()) channel.quote else entry.quote;
-                        const controls = if (channel.controls.len > 0) channel.controls else entry.controls;
-                        const offer_id = OfferId.derive(.{
-                            .provider_id = profile.id,
-                            .channel_id = channel.id,
-                            .protocol = route.protocol.id(),
-                            .endpoint_url = endpoint,
-                            .request_model_id = entry.request_model_id,
-                            .credential_ref = if (bound_credential) |ref| ref.slice() else "",
-                        });
-                        try catalog.offers.append(arena, .{
-                            .offer_id = offer_id,
-                            .provider_id = profile.id,
-                            .channel_id = channel.id,
-                            .canonical_model_id = entry.canonical_model_id,
-                            .model_variant = entry.model_variant,
-                            .request_model_id = entry.request_model_id,
-                            .upstream_model_id = entry.upstream_model_id,
-                            .protocol = route.protocol.id(),
-                            .wire = route.protocol.wire(),
-                            .endpoint_ref = endpoint,
-                            .credential_ref = bound_credential,
-                            .display_name = entry.display_name,
-                            .region = channel.region,
-                            .plan = channel.plan,
-                            .account = channel.account,
-                            .limits = limits,
-                            .capabilities = capabilities,
-                            .quote = quote,
-                            .availability = entry.availability,
-                            .controls = controls,
-                            .catalog_revision = options.revision,
-                        });
+                    for (bound_credentials) |bound_credential| {
+                        for (profile.inventoryFor(channel)) |entry| {
+                            if (!entry.servesProtocol(route.protocol)) continue;
+                            const limits = try entry.limits.intersect(channel.limits);
+                            const capabilities = offer_mod.CapabilityMatrix.narrow(
+                                entry.capabilities,
+                                channel.capabilities,
+                            );
+                            const quote = if (channel.quote.isKnown()) channel.quote else entry.quote;
+                            const controls = if (channel.controls.len > 0) channel.controls else entry.controls;
+                            const offer_id = OfferId.derive(.{
+                                .provider_id = profile.id,
+                                .channel_id = channel.id,
+                                .protocol = route.protocol.id(),
+                                .endpoint_url = endpoint,
+                                .request_model_id = entry.request_model_id,
+                                .credential_ref = if (bound_credential) |ref| ref.slice() else "",
+                            });
+                            try catalog.offers.append(arena, .{
+                                .offer_id = offer_id,
+                                .provider_id = profile.id,
+                                .channel_id = channel.id,
+                                .canonical_model_id = entry.canonical_model_id,
+                                .model_variant = entry.model_variant,
+                                .request_model_id = entry.request_model_id,
+                                .upstream_model_id = entry.upstream_model_id,
+                                .protocol = route.protocol.id(),
+                                .wire = route.protocol.wire(),
+                                .endpoint_ref = endpoint,
+                                .credential_ref = bound_credential,
+                                .display_name = entry.display_name,
+                                .region = channel.region,
+                                .plan = channel.plan,
+                                .account = channel.account,
+                                .limits = limits,
+                                .capabilities = capabilities,
+                                .quote = quote,
+                                .availability = entry.availability,
+                                .controls = controls,
+                                .catalog_revision = options.revision,
+                            });
+                        }
                     }
                 }
             }
@@ -328,21 +347,40 @@ fn findOverride(
     return fallback;
 }
 
-fn findBinding(
+/// Credentials bound to one channel, or a single `null` when none is.
+///
+/// A channel-specific binding is more specific than a provider-wide one, so
+/// when any channel-specific binding exists the provider-wide ones do not also
+/// apply — otherwise "this key, only for this region" would silently also offer
+/// every other key there.
+fn collectBindings(
     bindings: []const CredentialBinding,
     provider_id: Slug,
     channel_id: Slug,
-) ?Slug {
-    var fallback: ?Slug = null;
+    buffer: []?Slug,
+) []const ?Slug {
+    var len: usize = 0;
     for (bindings) |binding| {
         if (!binding.provider_id.eql(provider_id)) continue;
-        if (binding.channel_id) |wanted| {
-            if (wanted.eql(channel_id)) return binding.credential_ref;
-            continue;
-        }
-        fallback = binding.credential_ref;
+        const wanted = binding.channel_id orelse continue;
+        if (!wanted.eql(channel_id)) continue;
+        if (len == buffer.len) break;
+        buffer[len] = binding.credential_ref;
+        len += 1;
     }
-    return fallback;
+    if (len > 0) return buffer[0..len];
+
+    for (bindings) |binding| {
+        if (!binding.provider_id.eql(provider_id)) continue;
+        if (binding.channel_id != null) continue;
+        if (len == buffer.len) break;
+        buffer[len] = binding.credential_ref;
+        len += 1;
+    }
+    if (len > 0) return buffer[0..len];
+
+    buffer[0] = null;
+    return buffer[0..1];
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

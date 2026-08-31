@@ -132,6 +132,47 @@ Error classification is provider-owned: `429` with quota wording is
 (retryable); invalid key, wrong endpoint, and permission failures never retry as
 transport errors.
 
+## Credential pools
+
+A provider can have several credentials — separate accounts, separate plans —
+declared by reference in `config.json`:
+
+```json
+"providers": {
+  "openai": {"credentials": [
+    {"id": "work", "env": "OPENAI_API_KEY_WORK", "kind": "api_key", "priority": 0},
+    {"id": "personal", "env": "OPENAI_API_KEY_PERSONAL", "kind": "api_key", "priority": 1}
+  ]}
+}
+```
+
+**No secret is in the document.** The value lives in the named environment
+variable; the document holds an id, a variable name, a kind, and a priority. A
+literal `secret` key is rejected at parse time — `config.json` is read by
+several tools and is not mode 0600.
+
+A bound credential participates in the offer id, so *each account is its own
+offer*. Two accounts on one route are two rows in the picker, each showing its
+`account=`, and "switch to my work account" is a selectable route rather than an
+invisible side effect of resolution. This is also why the picker needs no
+separate credential stage: the accounts already are offers.
+
+Because the offer names the credential, binding uses **that** member — not the
+pool's highest-priority one. Resolving to a different account would make the
+offer id identify a route the request does not take.
+
+Selection among unbound members is deterministic: priority first, then id, so
+configuration order cannot make a failover irreproducible. A member is skipped
+when it is invalid, cooling down, expired, or empty. `noteFailure` maps a
+provider-classified failure to the right state — a rate limit earns a cooldown,
+an authentication failure marks the credential invalid, since retrying a key the
+provider rejected only burns the account's error budget — and a transient
+network failure changes nothing.
+
+The pool is consulted *after* explicit, runtime-descriptor, environment-alias,
+and single stored credentials, so an existing single-credential setup resolves
+exactly as it did before the pool existed.
+
 ## Selection persistence
 
 Scope decides *where* a committed selection is written, and the two files never
@@ -519,16 +560,13 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
   real quote (see *Pricing*), so `model.list` and `quote.estimate` return known
   prices for it. `openai` and `gemini` stay `unknown` until a provider catalog
   or user config supplies rates; `zai-coding-plan` stays `unknown` by design.
-- **The picker's credential stage (P1).** `/models` still owns account-key
-  selection through its own menu, because the picker has no credential stage
-  yet — that waits on credential-pool rotation below. `/model` and `Ctrl+O`
-  select *routes*; `/models` selects *credentials*. See *TUI* below.
 - **Auth scheme over the AgentCore C ABI.** `App`, background subagent jobs,
   swarm teammates, and `AgentSession` all carry the resolved route's auth
   scheme. `AgentSession.Config` accepts it, but `agentcore/abi_v1.zig` does not
   expose it, so a C embedder still gets the default bearer — adding it is an ABI
   revision, not a wiring fix.
-- **Credential pool rotation (P2).** `CredentialRef` carries priority, cooldown,
-  and last-error, and resolution honours cooldown and invalid status, but only
-  one credential per provider is offered to it.
+- **Automatic failover between pool members (P2).** Selection, priority,
+  cooldown, and invalidation exist, and `noteFailure` computes the updated
+  state; nothing writes that state back after a failed request yet, so a
+  cooldown has to be configured rather than learned.
 - **TinyKG audit plane.** No decision/verification nodes are appended.
