@@ -63,7 +63,7 @@
     "treatment_executable": "scripts/eval/fixtures/plugin_candidate.py",
     "treatment_executable_sha256": "1a80f4f240e80df798521cb4cacd9a59d12d494cbee06468412b4fe751f28a61",
     "single_factor": "one namespaced Skill data package",
-    "implementation_fingerprint": "ee941c2132e7baea7b793fcfcb9fa0401f32a39ef22ce519ed9a0751c21c784d",
+    "implementation_fingerprint": "b0c3a077c9ecb3dab4b44c094ac75ca32bfd2f8cbc2d92e37279b53c66aae705",
     "runtime_binary_sha256": "fd330c2e4c4120a129fb8148091011f014d29d2c496f4a24ffdd8232c5cce054",
     "evaluation_contract_version": 4,
     "model": {"provider": "anthropic", "id": "glm-5.2"},

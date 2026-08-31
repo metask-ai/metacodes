@@ -1200,12 +1200,33 @@ pub const App = struct {
         // persisted) before resolution, so the resolver sees ordinary stored
         // material and the OAuth lifecycle stays in one place.
         var oauth_token: ?[]u8 = null;
+        var oauth_kind: provider_credential_mod.CredentialKind = .openai_oauth;
         defer if (oauth_token) |value| {
             std.crypto.secureZero(u8, value);
             app.allocator.free(value);
         };
         if (resolvedProfileFor(host, selection)) |built| {
-            oauth_token = app.oauthAccessToken(built, now) catch null;
+            // The kind comes from the profile, not from a constant: a profile
+            // that accepts only `openai_codex_oauth` would reject a token
+            // labelled `openai_oauth`, and the failure would look like a
+            // missing credential rather than a mislabelled one.
+            for (built.accepted_credential_kinds) |kind| {
+                if (provider_oauth_mod.servesKind(kind)) {
+                    oauth_kind = kind;
+                    break;
+                }
+            }
+            oauth_token = app.oauthAccessToken(built, now) catch |err| blk: {
+                // A dead login is worth saying out loud: resolution will fall
+                // through to an environment key, and "it silently used a
+                // different credential" is the confusing outcome.
+                @import("util/log.zig").warn(
+                    "provider",
+                    "OAuth token for '{s}' unavailable ({s}); falling back to other credentials",
+                    .{ built.id.slice(), @errorName(err) },
+                );
+                break :blk null;
+            };
         }
 
         // The configured credential pool. Secrets come from the named
@@ -1222,7 +1243,7 @@ pub const App = struct {
                 .pool = pool,
                 .cli_api_key = app.config.api_key,
                 .stored_oauth = if (oauth_token) |value| .{
-                    .kind = .openai_oauth,
+                    .kind = oauth_kind,
                     .secret = value,
                 } else null,
                 .precedence = if (oauth_token != null) .oauth_first else .api_key_first,
