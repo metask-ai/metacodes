@@ -170,6 +170,19 @@ pub const Picker = struct {
         self.config_revision = page.meta.config_revision;
         self.current_offer = current_offer;
         self.status = if (self.offers.items.len == 0) .empty else .ready;
+
+        // A refresh can remove the offer a half-finished draft was built on:
+        // the options stage would then render nothing and Enter would silently
+        // do nothing, because there is no offer left to commit. Step back to
+        // where a choice is still possible and say why.
+        if (self.offer_id != null and self.currentOfferIndex() == null) {
+            self.offer_id = null;
+            self.controls = .{};
+            if (self.stage == .options or self.stage == .offer) self.stage = .model;
+            self.cursor = 0;
+            self.window_top = 0;
+            self.setNotice("that route is no longer offered; pick another", .{});
+        }
         self.clampCursor();
     }
 
@@ -938,4 +951,59 @@ test "fuzzy matching is case-insensitive and an empty needle hides nothing" {
     try testing.expect(matches("GLM", "glm-4.5-air"));
     try testing.expect(!matches("gpt", "GLM-4.6"));
     try testing.expect(!matches("64", "GLM-4.6"));
+}
+
+test "a refresh that removes the chosen offer steps back instead of dead-ending" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const specs = [_]controls_mod.ControlSpec{.{
+        .id = "reasoning_effort",
+        .label = "Reasoning",
+        .kind = .enumeration,
+        .allowed_values = &.{"low"},
+    }};
+    var offers = [_]OfferSummary{
+        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
+        fixtureOffer("metask", "default", "Claude Sonnet 4.6", "anthropic/claude-sonnet-4-6", "claude-sonnet-4-6", "anthropic_messages"),
+    };
+    offers[0].controls = &specs;
+    try loadFixture(&picker, &offers, null);
+
+    _ = picker.onKey(.enter); // provider
+    _ = picker.onKey(.enter); // model → options (one offer, declares a control)
+    try testing.expectEqual(Stage.options, picker.stage);
+    try testing.expect(picker.offer_id != null);
+
+    // The catalog refreshes and that offer is gone.
+    try loadFixture(&picker, offers[1..], null);
+
+    // Without the step-back the options stage renders nothing and Enter is a
+    // no-op — the user presses it and the picker simply does not respond.
+    try testing.expectEqual(Stage.model, picker.stage);
+    try testing.expect(picker.offer_id == null);
+    try testing.expectEqual(@as(u8, 0), picker.controls.len);
+    try testing.expect(std.mem.indexOf(u8, picker.notice(), "no longer offered") != null);
+    // And the stage it landed on is usable.
+    try testing.expect(picker.rowCount() > 0);
+}
+
+test "a refresh that keeps the chosen offer leaves the draft alone" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("zai", "cn-anthropic", "GLM-4.6", "zai/glm-4.6", "glm-4.6", "anthropic_messages"),
+        fixtureOffer("zai", "cn-openai", "GLM-4.6", "zai/glm-4.6", "glm-4.6", "openai_chat"),
+    };
+    try loadFixture(&picker, &offers, null);
+    _ = picker.onKey(.enter); // provider
+    _ = picker.onKey(.enter); // model → offer stage
+    _ = picker.onKey(.down);
+    _ = picker.onKey(.enter); // pick the second channel
+    const chosen = picker.offer_id.?;
+
+    // Same offers, new revision: a refresh must not throw away a draft that is
+    // still valid.
+    try loadFixture(&picker, &offers, null);
+    try testing.expect(picker.offer_id.?.eql(chosen));
+    try testing.expectEqual(@as(usize, 0), picker.notice_len);
 }

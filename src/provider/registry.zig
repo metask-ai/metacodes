@@ -171,9 +171,10 @@ pub const EndpointOverride = struct {
     base_url: []const u8,
 };
 
-/// Upper bound on credentials bound to one channel. Matches the configured
-/// pool bound; a longer list is truncated rather than growing an allocation on
-/// the catalog-build hot path.
+/// Upper bound on credentials bound to one channel. Matches the configured pool
+/// bound, which rejects a longer list at parse time; exceeding it here is an
+/// error rather than a truncation, because silently dropping a credential the
+/// caller bound means an account the user configured simply never appears.
 pub const MAX_CHANNEL_BINDINGS: usize = 8;
 
 pub const CatalogOptions = struct {
@@ -190,7 +191,7 @@ pub const CatalogOptions = struct {
 
 pub const CatalogError = profile_mod.EndpointError ||
     offer_mod.LimitsError ||
-    error{OutOfMemory};
+    error{ OutOfMemory, TooManyCredentialBindings };
 
 /// Materialized offers plus the arena owning their constructed strings.
 pub const OfferCatalog = struct {
@@ -229,7 +230,7 @@ pub const OfferCatalog = struct {
                 // unbound case, so a provider with no configured pool builds
                 // exactly the offers it always did.
                 var binding_buffer: [MAX_CHANNEL_BINDINGS]?Slug = undefined;
-                const bound_credentials = collectBindings(
+                const bound_credentials = try collectBindings(
                     options.credential_bindings,
                     profile.id,
                     channel.id,
@@ -367,13 +368,13 @@ fn collectBindings(
     provider_id: Slug,
     channel_id: Slug,
     buffer: []?Slug,
-) []const ?Slug {
+) error{TooManyCredentialBindings}![]const ?Slug {
     var len: usize = 0;
     for (bindings) |binding| {
         if (!binding.provider_id.eql(provider_id)) continue;
         const wanted = binding.channel_id orelse continue;
         if (!wanted.eql(channel_id)) continue;
-        if (len == buffer.len) break;
+        if (len == buffer.len) return error.TooManyCredentialBindings;
         buffer[len] = binding.credential_ref;
         len += 1;
     }
@@ -382,7 +383,7 @@ fn collectBindings(
     for (bindings) |binding| {
         if (!binding.provider_id.eql(provider_id)) continue;
         if (binding.channel_id != null) continue;
-        if (len == buffer.len) break;
+        if (len == buffer.len) return error.TooManyCredentialBindings;
         buffer[len] = binding.credential_ref;
         len += 1;
     }

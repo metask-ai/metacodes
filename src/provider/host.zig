@@ -41,6 +41,14 @@ pub const Host = struct {
     custom: ?custom_provider.Definitions = null,
     /// Owns the strings of a provider catalog ingested at runtime.
     catalog_arena: ?std.heap.ArenaAllocator = null,
+    /// The configuration currently applied to the catalog, owned here.
+    ///
+    /// Catalog options are *host state*, not a per-call argument: a rebuild
+    /// that forgot them would quietly resurrect a disabled provider and
+    /// collapse a multi-account pool back to one offer, which is exactly what
+    /// `/providers refresh` used to do.
+    config_bindings: std.ArrayList(registry_mod.CredentialBinding) = .empty,
+    config_exclusions: std.ArrayList(Slug) = .empty,
     kernel: Kernel,
 
     pub fn create(allocator: std.mem.Allocator) HostError!*Host {
@@ -77,6 +85,8 @@ pub const Host = struct {
         self.registry.deinit();
         if (self.custom) |*definitions| definitions.deinit();
         if (self.catalog_arena) |*arena| arena.deinit();
+        self.config_bindings.deinit(allocator);
+        self.config_exclusions.deinit(allocator);
         allocator.destroy(self);
     }
 
@@ -169,10 +179,24 @@ pub const Host = struct {
     /// retired rather than freed, so a reader that snapshotted the old pointer
     /// finishes against valid memory.
     pub fn refresh(self: *Host) HostError!void {
+        return self.rebuild();
+    }
+
+    /// The single catalog swap. Every rebuild goes through it: two copies of
+    /// "retire, replace, adopt" would eventually disagree about which one
+    /// bumps the revision or which one keeps the previous generation alive.
+    fn rebuild(self: *Host) HostError!void {
         // The revision has to move, or a client cannot tell that its snapshot
-        // went stale — which is the whole reason a refresh is observable.
-        const next = self.catalog.revision.next();
-        var rebuilt = self.registry.buildCatalog(self.allocator, .{ .revision = next }) catch |err| switch (err) {
+        // went stale — which is the whole reason a refresh is observable. The
+        // applied configuration always rides along: it is host state, and a
+        // rebuild that dropped it would resurrect a disabled provider.
+        const effective = registry_mod.CatalogOptions{
+            .revision = self.catalog.revision.next(),
+            .credential_bindings = self.config_bindings.items,
+            .excluded_providers = self.config_exclusions.items,
+        };
+
+        var rebuilt = self.registry.buildCatalog(self.allocator, effective) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.OutOfMemory,
         };
@@ -252,7 +276,7 @@ pub const Host = struct {
     /// `--provider` all read the catalog.
     pub fn applyProviderConfiguration(self: *Host, document: *const config_doc.Document) HostError!void {
         var bindings: std.ArrayList(registry_mod.CredentialBinding) = .empty;
-        defer bindings.deinit(self.allocator);
+        errdefer bindings.deinit(self.allocator);
         for (document.providers.items) |entry| {
             if (!entry.enabled) continue;
             for (entry.credentials.items()) |credential| {
@@ -267,26 +291,26 @@ pub const Host = struct {
         // everywhere at once: the picker, `model.list`, and `--provider` all
         // read the catalog.
         var disabled: std.ArrayList(Slug) = .empty;
-        defer disabled.deinit(self.allocator);
+        errdefer disabled.deinit(self.allocator);
         for (document.providers.items) |entry| {
             if (entry.enabled) continue;
             disabled.append(self.allocator, entry.id) catch return error.OutOfMemory;
         }
 
+        // Installed before the rebuild, and only after both lists are complete:
+        // a partially applied configuration would be worse than the previous
+        // one, and every element is a value type, so nothing borrows the
+        // document.
+        self.config_bindings.deinit(self.allocator);
+        self.config_bindings = bindings;
+        self.config_exclusions.deinit(self.allocator);
+        self.config_exclusions = disabled;
+
         // No early return when both lists are empty: the configuration can also
         // transition *back* to "nothing configured", and skipping the rebuild
         // then would leave the previous exclusions in force.
 
-        var rebuilt = self.registry.buildCatalog(self.allocator, .{
-            .revision = self.catalog.revision.next(),
-            .credential_bindings = bindings.items,
-            .excluded_providers = disabled.items,
-        }) catch return error.OutOfMemory;
-        errdefer rebuilt.deinit();
-        if (self.retired) |*old| old.deinit();
-        self.retired = self.catalog;
-        self.catalog = rebuilt;
-        self.kernel.adoptCatalog(&self.catalog);
+        try self.rebuild();
     }
 
     /// Load the durable document and seed the kernel with what it holds: the
@@ -626,4 +650,58 @@ test "a disabled provider keeps its configuration and produces no routes" {
         if (item.provider_id.eqlText("openai")) restored += 1;
     }
     try std.testing.expectEqual(before, restored);
+}
+
+test "a catalog ingest keeps the applied configuration" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    try document.upsertProvider(.{ .id = Slug.lit("gemini"), .enabled = false });
+    var entry = config_doc.ProviderEntry{ .id = Slug.lit("openai") };
+    try entry.credentials.append(.{
+        .id = Slug.lit("work"),
+        .env = try config_doc.AliasName.parse("OPENAI_KEY_WORK"),
+        .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+    });
+    try entry.credentials.append(.{
+        .id = Slug.lit("personal"),
+        .env = try config_doc.AliasName.parse("OPENAI_KEY_PERSONAL"),
+        .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+    });
+    try document.upsertProvider(entry);
+    try host.applyProviderConfiguration(&document);
+
+    const Counts = struct {
+        fn of(catalog: *const OfferCatalog, provider: []const u8) usize {
+            var n: usize = 0;
+            for (catalog.items()) |item| {
+                if (item.provider_id.eqlText(provider)) n += 1;
+            }
+            return n;
+        }
+    };
+    const openai_before = Counts.of(host.kernel.catalogSnapshot(), "openai");
+    try std.testing.expect(openai_before > 0);
+    try std.testing.expectEqual(@as(usize, 0), Counts.of(host.kernel.catalogSnapshot(), "gemini"));
+
+    // A later ingest — or a plain refresh — must not resurrect the disabled
+    // provider or collapse the two accounts back into one offer. Catalog
+    // options are host state, not a per-call argument.
+    try host.ingestOpenRouter(
+        Slug.lit("openrouter"),
+        \\{"data": [{"id": "x/y", "context_length": 1000}]}
+    ,
+        &.{
+            \\{"data": {"id": "x/y", "endpoints": [{"provider_name": "Alpha"}]}}
+        },
+    );
+    try std.testing.expectEqual(openai_before, Counts.of(host.kernel.catalogSnapshot(), "openai"));
+    try std.testing.expectEqual(@as(usize, 0), Counts.of(host.kernel.catalogSnapshot(), "gemini"));
+
+    try host.refresh();
+    try std.testing.expectEqual(openai_before, Counts.of(host.kernel.catalogSnapshot(), "openai"));
+    try std.testing.expectEqual(@as(usize, 0), Counts.of(host.kernel.catalogSnapshot(), "gemini"));
 }

@@ -1906,13 +1906,18 @@ pub const App = struct {
 
         const host = try app.providerHost();
         const resolution = try provider_alias_mod.resolve(host.kernel.catalogSnapshot(), entry);
-        const selection = provider_alias_mod.selectionFor(resolution, .session);
 
-        const outcome = host.kernel.selectionCommit(.{}, selection, .session);
-        switch (outcome) {
-            .committed => |accepted| try app.bindCommittedSelection(host, accepted.selection),
-            .rejected, .conflict => return error.AliasUnavailable,
-        }
+        // The same commit path the picker uses, so an alias switch is durable
+        // for the session exactly like any other session-scoped choice — a
+        // second path that only committed in memory would silently lose the
+        // route on the next `/resume`.
+        const outcome = try app.commitModelSelection(.{
+            .offer_id = resolution.offer_id,
+            .offer_revision = resolution.offer_revision,
+            .controls = .{},
+            .scope = .session,
+        });
+        if (outcome != .committed) return error.AliasUnavailable;
         // A floating alias that never records where it went cannot explain a
         // route after the fact.
         if (resolution.moved) {
