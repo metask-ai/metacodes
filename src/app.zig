@@ -1737,6 +1737,65 @@ pub const App = struct {
         }
     }
 
+    /// Refresh this session's OAuth access token if it is near expiry, and
+    /// repoint every borrower at the new one.
+    ///
+    /// Called at a turn boundary, not at commit time. A commit copies the token
+    /// that was valid then; a session that runs past its expiry would otherwise
+    /// keep presenting it and start failing with 401s that look like a broken
+    /// key. The single-flight session upstream means concurrent turns still
+    /// perform one exchange.
+    ///
+    /// Returns true when the token was replaced. Providers with no OAuth
+    /// lifecycle — Metask, and every API-key profile — are a no-op.
+    pub fn refreshRouteCredential(app: *App) !bool {
+        const host = app.provider_host orelse return false;
+        const selection = host.kernel.effectiveSelection() orelse return false;
+        const built = resolvedProfileFor(host, selection) orelse return false;
+        const token = (try app.oauthAccessToken(built, @import("util/time.zig").nowUnix())) orelse
+            return false;
+        errdefer {
+            std.crypto.secureZero(u8, token);
+            app.allocator.free(token);
+        }
+
+        if (app.route_secret_owned) |current| {
+            if (std.mem.eql(u8, current, token)) {
+                std.crypto.secureZero(u8, token);
+                app.allocator.free(token);
+                return false;
+            }
+        }
+
+        // Background jobs get the new token through the same all-or-nothing
+        // call the route switch uses; a failure here leaves everything on the
+        // previous token rather than splitting the session across two.
+        if (app.agent_jobs) |*jobs| {
+            try jobs.setRoute(
+                token,
+                app.config.base_url,
+                app.config.provider_kind,
+                app.config.openai_protocol,
+                app.config.auth_scheme,
+            );
+        }
+
+        // Repoint every borrower before releasing the old bytes: a background
+        // request thread can read `api_key` at any moment.
+        const retired = app.route_secret_owned;
+        app.route_secret_owned = token;
+        app.api_key = token;
+        app.api_client.api_key = token;
+        if (app.openai_client) |*client| client.api_key = token;
+        if (app.gemini_client) |*client| client.api_key = token;
+        app.swarm.api_key = token;
+        if (retired) |old| {
+            std.crypto.secureZero(u8, old);
+            app.allocator.free(old);
+        }
+        return true;
+    }
+
     /// Enable, disable, or remove a provider instance through the control
     /// plane, and re-apply the result to the live catalog.
     ///

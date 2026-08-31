@@ -768,6 +768,18 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         run_opts.project_rule_gate = if (run_control) |control| control.formalGate() else null;
         run_opts.ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null;
         run_opts.spawn_tick_fn = spawn_tick;
+        // issue #16:turn 边界刷新 OAuth access token。commit 时拷的是当时有效的
+        // 那个;会话跑过期后继续用它就会开始 401——看起来像密钥坏了。单飞在
+        // provider/oauth.zig 里,并发 turn 仍只换一次。
+        _ = app.refreshRouteCredential() catch |err| blk: {
+            std.debug.print(
+                "\x1b[33mwarning: could not refresh the provider credential ({s}); " ++
+                    "continuing with the current one\x1b[0m\n",
+                .{@errorName(err)},
+            );
+            break :blk false;
+        };
+
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),

@@ -282,6 +282,13 @@ Three properties carry the design:
 transport failure would point a retry loop at an endpoint that can only keep
 saying no.
 
+The refresh runs at the **turn boundary**, not only at commit. A commit copies
+the token that was valid then; a session that runs past its expiry would keep
+presenting it and start failing with 401s that look like a broken key. Single
+flight means concurrent turns still perform one exchange, and every borrower —
+clients, subagent registry, swarm context — is repointed before the old bytes
+are released, because a background request thread reads them.
+
 The module performs no I/O. The token exchange is a caller-supplied function, so
 every lifecycle test drives a fake exchange and none needs a network;
 `src/api/oauth_exchange.zig` is the production half, one small auditable
