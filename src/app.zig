@@ -110,6 +110,7 @@ const provider_credential_mod = @import("provider/credential.zig");
 const provider_config_doc = @import("provider/config_doc.zig");
 const model_picker_mod = @import("repl/model_picker.zig");
 const kg_provider_audit = @import("kg/provider_audit.zig");
+const provider_alias_mod = @import("provider/alias.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const oauth_exchange_mod = @import("api/oauth_exchange.zig");
 const provider_mod = @import("api/provider.zig");
@@ -1693,6 +1694,42 @@ pub const App = struct {
                 if (class == .invalid) .invalid else .active,
             );
         }
+    }
+
+    /// Resolve a local alias and switch this session onto it.
+    ///
+    /// A pinned alias means the same route it always did; a floating one
+    /// re-resolves and records where it landed, so a route stays attributable
+    /// after the fact. Either way the resulting selection is *pinned* — the
+    /// alias already decided, and leaving it auto would let it re-resolve
+    /// mid-turn against a catalog the user never saw.
+    pub fn useAlias(app: *App, name: []const u8) !bool {
+        var store = provider_config_store.Store.initHome(app.allocator) catch return false;
+        defer store.deinit();
+        var document = store.load() catch return false;
+        defer document.deinit();
+        const entry = document.alias(name) orelse return false;
+
+        const host = try app.providerHost();
+        const resolution = try provider_alias_mod.resolve(host.kernel.catalogSnapshot(), entry);
+        const selection = provider_alias_mod.selectionFor(resolution, .session);
+
+        const outcome = host.kernel.selectionCommit(.{}, selection, .session);
+        switch (outcome) {
+            .committed => |accepted| try app.bindCommittedSelection(host, accepted.selection),
+            .rejected, .conflict => return error.AliasUnavailable,
+        }
+        // A floating alias that never records where it went cannot explain a
+        // route after the fact.
+        if (resolution.moved) {
+            _ = provider_config_store.setAlias(
+                &store,
+                provider_alias_mod.updated(entry, resolution),
+                null,
+                null,
+            ) catch {};
+        }
+        return true;
     }
 
     /// Refresh provider catalogs named by `provider_catalogs` over the network.

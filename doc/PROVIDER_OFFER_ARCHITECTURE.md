@@ -182,6 +182,31 @@ because the difference between "slow down" and "this key is dead" is exactly the
 difference between a cooldown and an invalidation. A transient network failure
 records nothing; marking one would retire a working account.
 
+## Aliases
+
+A local alias is a name for a route — `fast`, `cheap`, `review` — and an
+**explicit record**, never a string heuristic. Two policies, and the difference
+between them is the whole point:
+
+| Policy | Stores | Across a catalog refresh |
+|---|---|---|
+| `pinned` | offer id + revision | means the same route; reports an error when that offer is gone |
+| `floating` | selector + last resolved offer + catalog revision | re-resolves, and records what it landed on |
+
+A pinned alias that cannot resolve says so rather than resolving to a
+neighbour — a pin that quietly moves is not a pin. A floating selector matching
+several routes is an error listing the candidates, not a guess: choosing one
+would silently pick a protocol, region, price, and credential the user never
+named.
+
+Either policy produces a *pinned* `RuntimeSelection`. The alias already decided
+which route; leaving it auto would let a floating alias re-resolve inside the
+kernel, mid-turn, against a catalog the user never saw.
+
+`/alias` lists, `/alias pin <name>` names the route the session is on,
+`/alias float <name> <model>` declares a re-resolving one, `/alias use <name>`
+switches to it, and `/alias remove <name>` deletes it.
+
 ## Selection persistence
 
 Scope decides *where* a committed selection is written, and the two files never
@@ -540,6 +565,7 @@ to the historical path, which still serves proxies and server-catalog models.
 | `src/provider/profiles/*.zig` | one file per built-in provider |
 | `src/provider/registry.zig` | the extension point + offer catalog |
 | `src/provider/selection.zig` | `RuntimeSelection`, `RoutePolicy`, resolution, legacy migration |
+| `src/provider/alias.zig` | pinned/floating alias resolution |
 | `src/provider/config_doc.zig` | versioned document model and serialization |
 | `src/provider/config_store.zig` | atomic, revisioned, idempotent writer |
 | `src/provider/control_plane.zig` | UI-independent kernel API and event journal |

@@ -26,6 +26,7 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/models", .desc = "Select the account API key for this session" },
     .{ .name = "/transcript", .desc = "Browse the conversation (Ctrl+X Ctrl+O)" },
     .{ .name = "/providers", .desc = "List provider routes; `refresh` re-reads catalogs" },
+    .{ .name = "/alias", .desc = "Name a route: pin, float, use, remove" },
     .{ .name = "/resume", .desc = "Resume a previous session" },
     .{ .name = "/retry", .desc = "Retry the last request" },
     .{ .name = "/compact", .desc = "Compact the conversation context" },

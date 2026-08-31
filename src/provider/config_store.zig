@@ -266,6 +266,47 @@ pub const Store = struct {
     }
 };
 
+/// Insert or replace one alias record.
+pub fn setAlias(
+    store: *const Store,
+    entry: config_doc.AliasEntry,
+    expected: ?ConfigRevision,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        value: config_doc.AliasEntry,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try document.upsertAlias(self.value);
+        }
+    };
+    var apply = Apply{ .value = entry };
+    return store.commit(.{
+        .expected_config_revision = expected,
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
+pub fn removeAlias(
+    store: *const Store,
+    name: []const u8,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        name: []const u8,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = document.removeAlias(self.name);
+        }
+    };
+    var apply = Apply{ .name = name };
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
 /// Convenience wrapper for the common "replace the global selection" mutation.
 pub fn setGlobalSelection(
     store: *const Store,

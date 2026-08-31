@@ -34,6 +34,7 @@ pub const provider_control_plane = @import("provider/control_plane.zig");
 pub const provider_runtime_binding = @import("provider/runtime_binding.zig");
 pub const provider_startup = @import("provider/startup.zig");
 pub const provider_host = @import("provider/host.zig");
+pub const provider_alias = @import("provider/alias.zig");
 pub const provider_custom = @import("provider/custom_provider.zig");
 pub const provider_oauth = @import("provider/oauth.zig");
 pub const kg_provider_audit = @import("kg/provider_audit.zig");
@@ -1905,6 +1906,7 @@ test {
     _ = &@import("repl/model_picker_view.zig");
     _ = &@import("repl/picker_host.zig");
     _ = &@import("provider/host.zig");
+    _ = &@import("provider/alias.zig");
     _ = &@import("provider/custom_provider.zig");
     _ = &@import("provider/oauth.zig");
     _ = &@import("kg/provider_audit.zig");

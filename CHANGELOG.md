@@ -224,6 +224,18 @@ status, compatibility boundaries, and entry points are defined by
   instead of rediscovering the limit by hitting it. The class is the provider's
   own classification, and a transient network failure records nothing.
 
+- Local route aliases (issue #16, P2 follow-up). `AliasEntry` was a declared
+  record with no producer or consumer; `/alias` now creates, lists, resolves,
+  and removes them. A **pinned** alias stores the offer and revision and means
+  the same route across catalog refreshes — reporting an error when that route
+  is gone rather than resolving to a neighbour, because a pin that quietly moves
+  is not a pin. A **floating** alias stores the selector and re-resolves, and
+  records what it landed on so a route stays attributable after the fact; a
+  selector matching several routes is an error listing the candidates, not a
+  guess. Either policy produces a *pinned* runtime selection, since the alias
+  already decided and leaving it auto would let it re-resolve mid-turn against a
+  catalog the user never saw.
+
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
   base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,

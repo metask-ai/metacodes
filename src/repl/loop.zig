@@ -441,6 +441,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             try handleProviders(app, allocator, rest);
             continue;
         }
+        // issue #16:`/alias` 是本地路由别名。pinned 跨 catalog 刷新恒指同一条路由;
+        // floating 在新 catalog 上重解析,并记下落到了哪里。
+        if (std.mem.eql(u8, trimmed, "/alias") or std.mem.startsWith(u8, trimmed, "/alias ")) {
+            const rest = std.mem.trim(u8, trimmed[6..], " \t");
+            try handleAlias(app, allocator, rest);
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/transcript")) {
             app.pending_overlay = .transcript;
             continue;
@@ -2086,6 +2093,167 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             return;
         },
     }
+}
+
+fn printAliasHelp() void {
+    std.debug.print(
+        \\usage:
+        \\  /alias                      list local aliases
+        \\  /alias pin <name>           pin <name> to the route this session is on
+        \\  /alias float <name> <model> re-resolve <name> on every catalog refresh
+        \\  /alias remove <name>
+        \\  /alias use <name>
+        \\
+        \\A pinned alias keeps meaning the same route across catalog refreshes and
+        \\reports an error when that route is gone, rather than resolving to a
+        \\neighbour. A floating alias re-resolves, and records what it landed on. A
+        \\floating selector that matches several routes is an error, not a guess.
+        \\
+    , .{});
+}
+
+fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    const config_store = @import("../provider/config_store.zig");
+    const config_doc = @import("../provider/config_doc.zig");
+    const alias_mod = @import("../provider/alias.zig");
+
+    if (std.mem.eql(u8, rest, "help") or std.mem.eql(u8, rest, "--help")) {
+        printAliasHelp();
+        return;
+    }
+
+    var store = config_store.Store.initHome(allocator) catch |err| {
+        std.debug.print("\x1b[31malias store unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    defer store.deinit();
+
+    if (rest.len == 0) {
+        var document = store.load() catch |err| {
+            std.debug.print("\x1b[31mcould not read the alias store: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        defer document.deinit();
+        if (document.aliases.items.len == 0) {
+            std.debug.print("No aliases. `/alias pin <name>` names the route you are on.\n", .{});
+            return;
+        }
+        const host = app.providerHost() catch null;
+        for (document.aliases.items) |entry| {
+            std.debug.print("  {s} [{s}]", .{ entry.name.slice(), @tagName(entry.policy) });
+            if (entry.selector) |selector| std.debug.print(" -> {s}", .{selector.slice()});
+            if (host) |value| {
+                if (alias_mod.resolve(value.kernel.catalogSnapshot(), entry)) |resolution| {
+                    const summary = value.kernel.modelDescribe(resolution.offer_id);
+                    if (summary) |offer| {
+                        std.debug.print("  = {s}/{s} {s}", .{
+                            offer.provider_id.slice(),
+                            offer.channel_id.slice(),
+                            offer.request_model_id,
+                        });
+                    }
+                } else |err| {
+                    std.debug.print("  \x1b[33m({s})\x1b[0m", .{@errorName(err)});
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+        return;
+    }
+
+    var parts = std.mem.tokenizeScalar(u8, rest, ' ');
+    const verb = parts.next() orelse {
+        printAliasHelp();
+        return;
+    };
+
+    if (std.mem.eql(u8, verb, "pin")) {
+        const name = parts.next() orelse {
+            std.debug.print("usage: /alias pin <name>\n", .{});
+            return;
+        };
+        const host = app.providerHost() catch |err| {
+            std.debug.print("\x1b[31mprovider control plane unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        const current = host.kernel.currentOfferId() orelse {
+            std.debug.print(
+                "This session has no selected offer yet. Choose one with Ctrl+O, then pin it.\n",
+                .{},
+            );
+            return;
+        };
+        const summary = host.kernel.modelDescribe(current) orelse return;
+        _ = config_store.setAlias(&store, .{
+            .name = config_doc.AliasName.parse(name) catch {
+                std.debug.print("\x1b[31malias name too long\x1b[0m\n", .{});
+                return;
+            },
+            .policy = .pinned,
+            .offer_id = current,
+            .offer_revision = summary.offer_revision,
+        }, null, null) catch |err| {
+            std.debug.print("\x1b[31mcould not save the alias: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print("Pinned '{s}' to {s}/{s} {s}\n", .{
+            name,
+            summary.provider_id.slice(),
+            summary.channel_id.slice(),
+            summary.request_model_id,
+        });
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "float")) {
+        const name = parts.next() orelse {
+            std.debug.print("usage: /alias float <name> <model>\n", .{});
+            return;
+        };
+        const selector = parts.next() orelse {
+            std.debug.print("usage: /alias float <name> <model>\n", .{});
+            return;
+        };
+        _ = config_store.setAlias(&store, .{
+            .name = config_doc.AliasName.parse(name) catch return,
+            .policy = .floating,
+            .selector = @import("../provider/selection.zig").Selector.parse(selector) catch return,
+        }, null, null) catch |err| {
+            std.debug.print("\x1b[31mcould not save the alias: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print("'{s}' now floats to '{s}'.\n", .{ name, selector });
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "remove")) {
+        const name = parts.next() orelse {
+            std.debug.print("usage: /alias remove <name>\n", .{});
+            return;
+        };
+        _ = config_store.removeAlias(&store, name, null) catch return;
+        std.debug.print("Removed '{s}'.\n", .{name});
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "use")) {
+        const name = parts.next() orelse {
+            std.debug.print("usage: /alias use <name>\n", .{});
+            return;
+        };
+        const used = app.useAlias(name) catch |err| {
+            std.debug.print("\x1b[31m'{s}' did not resolve: {s}\x1b[0m\n", .{ name, @errorName(err) });
+            return;
+        };
+        if (!used) {
+            std.debug.print("No alias named '{s}'.\n", .{name});
+            return;
+        }
+        std.debug.print("switched to \x1b[36m{s}\x1b[0m via '{s}'\n", .{ app.activeModel(), name });
+        return;
+    }
+
+    printAliasHelp();
 }
 
 fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
