@@ -583,4 +583,3 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
   scheme. `AgentSession.Config` accepts it, but `agentcore/abi_v1.zig` does not
   expose it, so a C embedder still gets the default bearer — adding it is an ABI
   revision, not a wiring fix.
-- **TinyKG audit plane.** No decision/verification nodes are appended.

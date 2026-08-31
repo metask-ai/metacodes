@@ -210,18 +210,19 @@ status, compatibility boundaries, and entry points are defined by
   optional: nothing on the request path calls it, and a TinyKG outage is counted
   rather than propagated into routing.
 
-- TinyKG decision audit plane (issue #16). Control-plane events are projected
-  into an append-only record under `metacodes/provider-decisions` at the turn
-  boundary — accepted and rejected selections with the catalog and config
-  revisions that make them reproducible, actual routes with fallback attempts
-  and cost/latency aggregates, failovers, catalog and pricing refreshes, and
-  credential status changes. `provider.degraded` health samples are deliberately
-  excluded: the requirement names high-frequency observations as something that
-  must not accumulate in the graph. The projection is safe by construction —
-  event payloads are ids and enums with no free-form field — and a test asserts
-  no recorded line contains a quote, a URL, `Bearer`, or `sk-`. The plane is
-  optional: nothing on the request path calls it, and a TinyKG outage is counted
-  rather than propagated into routing.
+- Catalog fetching and learned credential failover (issue #16). Provider
+  catalogs may now be fetched (`models_url`, `endpoint_urls`, optional
+  `credential_env`) as well as read from disk, with `/providers refresh` driving
+  it; a refresh that fails leaves the previous catalog in place, because a stale
+  catalog is a better answer than an empty one and every pin stays resolvable.
+  The fetch lives in `api/catalog_fetch.zig` rather than in the provider
+  subsystem, which must not depend on a transport. `/providers` also lists every
+  route with its account, context, and price. Credential failure state is now
+  learned and durable: a rate limit records a cooldown and an authentication
+  failure records an invalidation, through the same lock, revision, and atomic
+  write as every other mutation, so the next process skips the credential
+  instead of rediscovering the limit by hitting it. The class is the provider's
+  own classification, and a transient network failure records nothing.
 
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
