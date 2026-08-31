@@ -1094,7 +1094,7 @@ test "L2: a configured relay reaches its own path, header, and wire model id" {
         \\    "protocol": {{"wire": "openai_chat", "path_suffix": "/completions", "id": "relay_openai"}},
         \\    "region": "eu"}}],
         \\  "models": [{{"request_model_id": "relay-glm-pro", "display_name": "GLM-4.6 (relay)",
-        \\    "canonical_model_id": "zai/glm-4.6",
+        \\    "canonical_model_id": "zai/glm-5.3",
         \\    "limits": {{"context_window": 200000, "max_output_tokens": 128000}},
         \\    "capabilities": {{"tools": "supported"}},
         \\    "price": {{"currency": "EUR", "input": 2.5, "output": 9}}}}]}}}}}}
@@ -1151,7 +1151,7 @@ test "L2: a configured relay reaches its own path, header, and wire model id" {
     try std.testing.expect(headerValue(captured, "authorization") == null);
     const model_field = captured.jsonField("model") orelse return error.ModelFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, model_field, "relay-glm-pro") != null);
-    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-4.6") == null);
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-5.3") == null);
 }
 
 test "L2: a configured provider's declared metadata reaches every client the same way" {
@@ -1162,7 +1162,7 @@ test "L2: a configured provider's declared metadata reaches every client the sam
     try host.adoptCustomProviders(
         \\{"custom_providers": {"house-relay": {
         \\  "channels": [{"id":"primary","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
-        \\  "models": [{"request_model_id":"relay-glm-pro","canonical_model_id":"zai/glm-4.6",
+        \\  "models": [{"request_model_id":"relay-glm-pro","canonical_model_id":"zai/glm-5.3",
         \\    "limits": {"context_window": 200000},
         \\    "price": {"currency":"EUR","input":2.5,"output":9,"discount_basis_points":9000},
         \\    "controls": [{"id":"reasoning_effort","label":"Reasoning","kind":"enumeration","values":["low","high"]}]}]}}}
@@ -1626,4 +1626,96 @@ test "L2: a route change is broadcast as an ordered, replayable event carrying i
     }
     // The credential *reference* travels; the secret never does.
     try std.testing.expect(std.mem.indexOf(u8, line, "sk-") == null);
+}
+
+test "L2: a configured provider carries several model families and their variants" {
+    const a = std.testing.allocator;
+    var definitions = try cc.provider_custom.parse(a,
+        \\{"custom_providers": {"house": {
+        \\  "channels": [
+        \\    {"id":"chat","base_url":"https://house.example.com/v1","protocol":"openai_chat"},
+        \\    {"id":"messages","base_url":"https://house.example.com/anthropic",
+        \\     "protocol":{"wire":"anthropic_messages","path_suffix":"/v1/messages","id":"house_anthropic"}}],
+        \\  "models": [
+        \\    {"request_model_id":"house-large","canonical_model_id":"house/large","model_variant":"fp8",
+        \\     "limits":{"context_window":200000,"token_counting":"local_estimate"}},
+        \\    {"request_model_id":"house-large-bf16","canonical_model_id":"house/large","model_variant":"bf16",
+        \\     "limits":{"context_window":200000}},
+        \\    {"request_model_id":"house-small","canonical_model_id":"house/small",
+        \\     "limits":{"context_window":32000}}]}}}
+    );
+    defer definitions.deinit();
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    for (definitions.profiles()) |built| try registry.register(built);
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("house") });
+    defer catalog.deinit();
+
+    // Two families × three model rows × two channels: every combination is its
+    // own route, and two variants of one family stay separate offers.
+    try std.testing.expectEqual(@as(usize, 6), catalog.items().len);
+
+    var large_variants: usize = 0;
+    var small: usize = 0;
+    var local_estimate: usize = 0;
+    for (catalog.items()) |item| {
+        if (std.mem.eql(u8, item.canonical_model_id.?, "house/large")) {
+            if (item.channel_id.eqlText("chat")) large_variants += 1;
+        }
+        if (std.mem.eql(u8, item.canonical_model_id.?, "house/small")) small += 1;
+        if (item.limits.token_counting.mode == .local_estimate) local_estimate += 1;
+    }
+    // Many request ids to one canonical model — the many-to-one mapping a relay
+    // or a quantization split produces, preserved without any name heuristic.
+    try std.testing.expectEqual(@as(usize, 2), large_variants);
+    try std.testing.expectEqual(@as(usize, 2), small);
+    // Token-counting mode is declared per model and reaches the offer, which is
+    // what admission reads.
+    try std.testing.expectEqual(@as(usize, 2), local_estimate);
+
+    // And the two protocols really are different wires on different endpoints.
+    var saw_openai = false;
+    var saw_anthropic = false;
+    for (catalog.items()) |item| {
+        if (std.mem.eql(u8, item.protocol, "openai_chat")) saw_openai = true;
+        if (std.mem.eql(u8, item.protocol, "house_anthropic")) {
+            saw_anthropic = true;
+            try std.testing.expect(std.mem.endsWith(u8, item.endpoint_ref, "/anthropic/v1/messages"));
+        }
+    }
+    try std.testing.expect(saw_openai and saw_anthropic);
+}
+
+test "L2: an opaque upstream identity is preserved rather than derived" {
+    const a = std.testing.allocator;
+    var definitions = try cc.provider_custom.parse(a,
+        \\{"custom_providers": {"opaque": {
+        \\  "channels": [{"id":"c","base_url":"https://opaque.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [
+        \\    {"request_model_id":"model-a","upstream_model_id":"7f3c9e"},
+        \\    {"request_model_id":"model-b"}]}}}
+    );
+    defer definitions.deinit();
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    for (definitions.profiles()) |built| try registry.register(built);
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("opaque") });
+    defer catalog.deinit();
+
+    for (catalog.items()) |item| {
+        if (std.mem.eql(u8, item.request_model_id, "model-a")) {
+            // An opaque backend name is carried verbatim; nothing tries to make
+            // it look like a model name.
+            try std.testing.expectEqualStrings("7f3c9e", item.upstream_model_id.?);
+        } else {
+            // And an absent one stays absent rather than being derived from the
+            // request id.
+            try std.testing.expect(item.upstream_model_id == null);
+        }
+        // No canonical id was declared, so grouping falls back to the request
+        // id rather than inventing one.
+        try std.testing.expect(item.canonical_model_id == null);
+    }
 }
