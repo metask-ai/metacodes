@@ -276,6 +276,15 @@ pub const App = struct {
     /// after the input reader returns, so the request is parked here and the
     /// next read consumes it.
     pending_overlay: PendingOverlay = .none,
+    /// One OAuth session per provider, kept for the process.
+    ///
+    /// Single flight is a property of a `Session` object, so a fresh one per
+    /// call would let two concurrent callers both refresh — and with a rotating
+    /// refresh token the loser presents one the server already invalidated.
+    /// Holding it here makes the guarantee real across callers rather than
+    /// within one call.
+    oauth_session: ?provider_oauth_mod.Session = null,
+    oauth_session_provider: ?provider_ids_mod.Slug = null,
     /// Last control-plane event projected into the TinyKG audit plane. Events
     /// are recorded once; a restart starts from the journal's current head
     /// rather than replaying a ring that may already have evicted.
@@ -862,6 +871,7 @@ pub const App = struct {
         }
         app.api_key_catalog.deinit();
         app.model_picker.deinit();
+        if (app.oauth_session) |*session| session.deinit();
         if (app.provider_host) |host| host.destroy();
         if (app.route_base_url_owned) |value| app.allocator.free(value);
         if (app.route_secret_owned) |value| {
@@ -1040,15 +1050,28 @@ pub const App = struct {
         }
         if (!serves) return null;
 
-        var session = try provider_oauth_mod.Session.initHome(
-            app.allocator,
-            built.id,
-            built.id,
-        );
-        defer session.deinit();
-        // No stored login is not an error: the provider simply falls through to
-        // its API-key aliases.
-        if (!(session.load() catch false)) return null;
+        // One session per provider, kept for the process: single flight is a
+        // property of the object, so a fresh one per call would let two callers
+        // both refresh and make the loser present a rotated-away token.
+        const same_provider = if (app.oauth_session_provider) |id| id.eql(built.id) else false;
+        if (!same_provider) {
+            if (app.oauth_session) |*old_session| old_session.deinit();
+            app.oauth_session = try provider_oauth_mod.Session.initHome(
+                app.allocator,
+                built.id,
+                built.id,
+            );
+            app.oauth_session_provider = built.id;
+            // No stored login is not an error: the provider simply falls
+            // through to its API-key aliases.
+            if (!(app.oauth_session.?.load() catch false)) {
+                app.oauth_session.?.deinit();
+                app.oauth_session = null;
+                app.oauth_session_provider = null;
+                return null;
+            }
+        }
+        const session = &app.oauth_session.?;
 
         var exchange = oauth_exchange_mod.HttpExchange{
             .allocator = app.allocator,
