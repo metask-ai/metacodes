@@ -275,8 +275,13 @@ pub const Host = struct {
     /// "disabled" is visible in every UI at once: the picker, `model.list`, and
     /// `--provider` all read the catalog.
     pub fn applyProviderConfiguration(self: *Host, document: *const config_doc.Document) HostError!void {
+        // Owned by these locals until `moved` flips. After that the host owns
+        // them, and letting these errdefers still fire would free memory the
+        // restore path below has already released — a double free, not a wrong
+        // answer.
+        var moved = false;
         var bindings: std.ArrayList(registry_mod.CredentialBinding) = .empty;
-        errdefer bindings.deinit(self.allocator);
+        errdefer if (!moved) bindings.deinit(self.allocator);
         for (document.providers.items) |entry| {
             if (!entry.enabled) continue;
             for (entry.credentials.items()) |credential| {
@@ -291,26 +296,37 @@ pub const Host = struct {
         // everywhere at once: the picker, `model.list`, and `--provider` all
         // read the catalog.
         var disabled: std.ArrayList(Slug) = .empty;
-        errdefer disabled.deinit(self.allocator);
+        errdefer if (!moved) disabled.deinit(self.allocator);
         for (document.providers.items) |entry| {
             if (entry.enabled) continue;
             disabled.append(self.allocator, entry.id) catch return error.OutOfMemory;
         }
 
-        // Installed before the rebuild, and only after both lists are complete:
-        // a partially applied configuration would be worse than the previous
-        // one, and every element is a value type, so nothing borrows the
-        // document.
-        self.config_bindings.deinit(self.allocator);
-        self.config_bindings = bindings;
-        self.config_exclusions.deinit(self.allocator);
-        self.config_exclusions = disabled;
-
+        // The new configuration is *swapped in*, and the old lists are kept
+        // until the rebuild succeeds: a failed rebuild would otherwise leave
+        // the host claiming a configuration its catalog does not reflect.
+        //
         // No early return when both lists are empty: the configuration can also
         // transition *back* to "nothing configured", and skipping the rebuild
         // then would leave the previous exclusions in force.
+        const previous_bindings = self.config_bindings;
+        const previous_exclusions = self.config_exclusions;
+        moved = true;
+        self.config_bindings = bindings;
+        self.config_exclusions = disabled;
+        errdefer {
+            self.config_bindings.deinit(self.allocator);
+            self.config_exclusions.deinit(self.allocator);
+            self.config_bindings = previous_bindings;
+            self.config_exclusions = previous_exclusions;
+        }
 
         try self.rebuild();
+
+        var retired_bindings = previous_bindings;
+        var retired_exclusions = previous_exclusions;
+        retired_bindings.deinit(self.allocator);
+        retired_exclusions.deinit(self.allocator);
     }
 
     /// Load the durable document and seed the kernel with what it holds: the
@@ -704,4 +720,39 @@ test "a catalog ingest keeps the applied configuration" {
     try host.refresh();
     try std.testing.expectEqual(openai_before, Counts.of(host.kernel.catalogSnapshot(), "openai"));
     try std.testing.expectEqual(@as(usize, 0), Counts.of(host.kernel.catalogSnapshot(), "gemini"));
+}
+
+test "a failed rebuild restores the previous configuration exactly" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    var first = config_doc.Document.init(a);
+    defer first.deinit();
+    try first.upsertProvider(.{ .id = Slug.lit("gemini"), .enabled = false });
+    try host.applyProviderConfiguration(&first);
+    try std.testing.expectEqual(@as(usize, 1), host.config_exclusions.items.len);
+
+    var second = config_doc.Document.init(a);
+    defer second.deinit();
+    try second.upsertProvider(.{ .id = Slug.lit("openai"), .enabled = false });
+
+    // Fail after both new lists exist and the swap has happened, so the restore
+    // path runs while the host owns them. Getting that handoff wrong is a
+    // double free, not a wrong answer — the testing allocator is the detector.
+    // (Verified non-vacuous: asserting the success branch is unreachable makes
+    // this test fail.)
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 3 });
+    host.allocator = failing.allocator();
+    const result = host.applyProviderConfiguration(&second);
+    host.allocator = a;
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    // The previous configuration is intact, not a freed shell of it, and the
+    // catalog still reflects it.
+    try std.testing.expectEqual(@as(usize, 1), host.config_exclusions.items.len);
+    try std.testing.expect(host.config_exclusions.items[0].eqlText("gemini"));
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        try std.testing.expect(!item.provider_id.eqlText("gemini"));
+    }
 }
