@@ -24,7 +24,7 @@
 
 const std = @import("std");
 const team_mod = @import("team.zig");
-const file_lock = @import("file_lock.zig");
+const file_lock = @import("../util/file_lock.zig");
 const util_fs = @import("../util/fs.zig");
 const util_json = @import("../util/json.zig");
 const util_time = @import("../util/time.zig");

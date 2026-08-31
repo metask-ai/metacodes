@@ -18,7 +18,7 @@ const std = @import("std");
 const util_time = @import("../util/time.zig");
 const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
-const file_lock = @import("../swarm/file_lock.zig");
+const file_lock = @import("../util/file_lock.zig");
 
 const max_mirror_bytes = 4 * 1024 * 1024;
 
