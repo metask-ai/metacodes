@@ -100,6 +100,13 @@ const client_mod = @import("client.zig");
 const api_keys_mod = @import("api/api_keys.zig");
 const openai_mod = @import("api/openai_client.zig");
 const gemini_mod = @import("api/gemini_client.zig");
+const provider_host_mod = @import("provider/host.zig");
+const provider_binding_mod = @import("provider/runtime_binding.zig");
+const provider_control_plane = @import("provider/control_plane.zig");
+const provider_config_store = @import("provider/config_store.zig");
+const provider_selection_mod = @import("provider/selection.zig");
+const provider_ids_mod = @import("provider/ids.zig");
+const model_picker_mod = @import("repl/model_picker.zig");
 const provider_mod = @import("api/provider.zig");
 const request_overrides = @import("api/request_overrides.zig");
 const dialect_mod = @import("api/dialect.zig");
@@ -234,6 +241,8 @@ fn installCliProcessError(
 /// session 内的 binding 指针指向同一个 client；client 必须比 session 活得久。
 pub const McpSessionEntry = @import("core/mcp_session.zig").McpSessionEntry;
 
+pub const PendingOverlay = enum { none, model_picker, transcript };
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     config: types.Config,
@@ -244,6 +253,23 @@ pub const App = struct {
     models_picker_key_index: ?usize = null,
     models_picker_model_index: ?usize = null,
     model_switch_owned: ?[]u8 = null,
+    // ── issue #16: the provider control plane this session talks to ─────────
+    /// Registry + catalog + kernel, created on first use. Null until something
+    /// asks for a provider view, so a session that never opens the picker pays
+    /// nothing for it.
+    provider_host: ?*provider_host_mod.Host = null,
+    /// Cross-UI picker state. Present whether or not it is on screen, so a
+    /// reopened picker does not have to refetch the catalog.
+    model_picker: model_picker_mod.Picker = undefined,
+    /// Strings a committed offer put into borrowing client fields. Owned here
+    /// because `Client.base_url` and `api_key` are borrowed slices that must
+    /// outlive every in-flight request.
+    route_base_url_owned: ?[]u8 = null,
+    route_secret_owned: ?[]u8 = null,
+    /// A slash command asked for a full-region overlay. Commands are handled
+    /// after the input reader returns, so the request is parked here and the
+    /// next read consumes it.
+    pending_overlay: PendingOverlay = .none,
     /// 模型档位表(~/.metacodes/config.json 的 model_tiers;null=未配置)。
     model_tiers_table: ?@import("api/model_tiers.zig").TierTable = null,
     pending_previous_model_for_compact: ?[]u8 = null,
@@ -432,6 +458,7 @@ pub const App = struct {
             .config = config,
             .api_key = api_key,
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
+            .model_picker = model_picker_mod.Picker.init(allocator),
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
             .session_id = if (config.session_id) |s|
@@ -823,6 +850,13 @@ pub const App = struct {
             app.allocator.free(tok);
         }
         app.api_key_catalog.deinit();
+        app.model_picker.deinit();
+        if (app.provider_host) |host| host.destroy();
+        if (app.route_base_url_owned) |value| app.allocator.free(value);
+        if (app.route_secret_owned) |value| {
+            std.crypto.secureZero(u8, value);
+            app.allocator.free(value);
+        }
         if (app.selected_api_key_owned) |k| {
             @memset(k, 0);
             app.allocator.free(k);
@@ -899,6 +933,226 @@ pub const App = struct {
             app.api_key_catalog.addCurrentKeyFallback(app.api_key) catch |err| {
                 @import("util/log.zig").debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
             };
+        }
+    }
+
+    // ── issue #16: the cross-UI provider control plane ──────────────────────
+
+    /// The session's provider kernel, created on first use.
+    ///
+    /// Every UI reads offers and commits selections through this one object.
+    /// A client that built its own registry would be a second place identity is
+    /// decided, and the two would disagree the moment either refreshed.
+    pub fn providerHost(app: *App) !*provider_host_mod.Host {
+        if (app.provider_host) |host| return host;
+        const host = try provider_host_mod.Host.create(app.allocator);
+        errdefer host.destroy();
+        // Seed the durable revision and any previously committed global
+        // selection, so `selection.commit` compares against the number the
+        // store actually holds rather than an invented one.
+        var store = provider_config_store.Store.initHome(app.allocator) catch {
+            app.provider_host = host;
+            return host;
+        };
+        defer store.deinit();
+        host.adoptDurableState(&store);
+        app.provider_host = host;
+        return host;
+    }
+
+    /// Refresh the picker's snapshot from the kernel. Called when the picker
+    /// opens and whenever the catalog moves underneath it.
+    pub fn refreshModelPicker(app: *App) !void {
+        const host = try app.providerHost();
+        var page: std.ArrayList(provider_control_plane.OfferSummary) = .empty;
+        defer page.deinit(app.allocator);
+        const listed = host.kernel.modelList(.{}, .{}, app.allocator, &page) catch {
+            app.model_picker.markFailed();
+            return;
+        };
+        try app.model_picker.adopt(listed, host.kernel.currentOfferId());
+    }
+
+    /// Apply a picker commit: validate through the kernel, bind the winning
+    /// offer to real transport parameters, and only then move the session onto
+    /// it. A rejection at any step leaves the previous runtime untouched, which
+    /// is why nothing is mutated until the binding exists.
+    pub fn commitModelSelection(
+        app: *App,
+        commit: model_picker_mod.Commit,
+    ) !provider_control_plane.CommitOutcome {
+        const host = try app.providerHost();
+        var candidate = provider_selection_mod.RuntimeSelection.pinned(
+            commit.offer_id,
+            commit.offer_revision,
+            commit.scope,
+        );
+        candidate.controls = commit.controls;
+
+        const outcome = host.kernel.selectionCommit(.{
+            .expected_config_revision = null,
+            .expected_catalog_revision = null,
+        }, candidate, commit.scope);
+        switch (outcome) {
+            .committed => |accepted| {
+                try app.bindCommittedSelection(host, accepted.selection);
+                if (accepted.requires_persist) try app.persistGlobalSelection(host, accepted.selection);
+            },
+            // The kernel already refused; the old runtime is still the live one.
+            .rejected, .conflict => {},
+        }
+        return outcome;
+    }
+
+    fn persistGlobalSelection(
+        app: *App,
+        host: *provider_host_mod.Host,
+        selection: provider_selection_mod.RuntimeSelection,
+    ) !void {
+        var store = try provider_config_store.Store.initHome(app.allocator);
+        defer store.deinit();
+        const result = try provider_config_store.setGlobalSelection(
+            &store,
+            selection,
+            null,
+            null,
+        );
+        // The store is the sole authority for this number; feeding it back is
+        // what keeps `expected_config_revision` meaningful on the next commit.
+        host.kernel.adoptConfigRevision(result.config_revision);
+    }
+
+    /// Move the live session onto a committed selection.
+    ///
+    /// Ordering is the correctness argument. Everything that can fail happens
+    /// before anything is mutated, the model mirrors move through the existing
+    /// `switchModel` seam, and only infallible transport assignment follows —
+    /// so there is no state in which the model is new and the endpoint is old.
+    fn bindCommittedSelection(
+        app: *App,
+        host: *provider_host_mod.Host,
+        selection: provider_selection_mod.RuntimeSelection,
+    ) !void {
+        var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
+        const binding = try provider_binding_mod.bind(
+            &host.registry,
+            host.kernel.catalogSnapshot(),
+            selection,
+            .{
+                .cli_api_key = app.config.api_key,
+                .env = @import("provider/credential.zig").EnvLookup.process(),
+                .now_seconds = @import("util/time.zig").nowUnix(),
+            },
+            &reference_buffer,
+        );
+
+        const endpoint = try app.allocator.dupe(u8, binding.endpoint_url);
+        errdefer app.allocator.free(endpoint);
+        const secret = try app.allocator.dupe(u8, binding.secret);
+        errdefer {
+            std.crypto.secureZero(u8, secret);
+            app.allocator.free(secret);
+        }
+
+        // Background subagents build their own provider from the registry's
+        // copy of the route. `setRoute` moves key, endpoint, transport, and
+        // auth scheme together — a registry holding this provider's key while
+        // still pointing at the previous provider's endpoint would send the
+        // credential to the wrong vendor. It allocates before it swaps, so a
+        // failure here leaves the previous route intact.
+        const previous_key = app.api_key;
+        const previous_url = app.config.base_url;
+        const previous_kind = app.config.provider_kind;
+        const previous_protocol = app.config.openai_protocol;
+        const previous_scheme = app.config.auth_scheme;
+        var jobs_rerouted = false;
+        // Function-scoped so it also covers a failure in `switchModel` below;
+        // a block-scoped errdefer would have already gone out of scope by then,
+        // leaving the registry on the new route while the session is on the old.
+        errdefer if (jobs_rerouted) {
+            if (app.agent_jobs) |*jobs| jobs.setRoute(
+                previous_key,
+                previous_url,
+                previous_kind,
+                previous_protocol,
+                previous_scheme,
+            ) catch {};
+        };
+        if (app.agent_jobs) |*jobs| {
+            try jobs.setRoute(secret, endpoint, binding.transport, binding.openai_protocol, binding.auth_scheme);
+            jobs_rerouted = true;
+        }
+
+        // The target transport must exist before the model seam runs, or the
+        // new client would never receive the model.
+        const io = app.api_client.http_client.io;
+        switch (binding.transport) {
+            .anthropic => {},
+            .openai => if (app.openai_client == null) {
+                app.openai_client = openai_mod.OpenAIClient.init(
+                    app.allocator,
+                    io,
+                    secret,
+                    binding.request_model_id,
+                    endpoint,
+                );
+                app.openai_client.?.dialect_resolver = app.api_client.dialect_resolver;
+                app.openai_client.?.overrides = buildOverridesFromConfig(app.config);
+            },
+            .gemini => if (app.gemini_client == null) {
+                app.gemini_client = gemini_mod.GeminiClient.init(
+                    app.allocator,
+                    io,
+                    secret,
+                    binding.request_model_id,
+                    endpoint,
+                );
+                app.gemini_client.?.dialect_resolver = app.api_client.dialect_resolver;
+                app.gemini_client.?.overrides = buildOverridesFromConfig(app.config);
+            },
+        }
+
+        try app.switchModel(binding.request_model_id);
+
+        // From here on nothing can fail, so the switch is all-or-nothing.
+        //
+        // Order matters the same way it does in `switchModel`: the old endpoint
+        // and secret are what the live clients currently point at, and a
+        // background request thread can read those fields at any moment. Every
+        // borrower is repointed first; only then is the old memory released, so
+        // there is no window in which a reader can observe a freed slice.
+        const retired_url = app.route_base_url_owned;
+        const retired_secret = app.route_secret_owned;
+        app.route_base_url_owned = endpoint;
+        app.route_secret_owned = secret;
+
+        app.config.provider_kind = binding.transport;
+        app.config.openai_protocol = binding.openai_protocol;
+        app.config.auth_scheme = binding.auth_scheme;
+        // `config` is the snapshot subagent and swarm workers are constructed
+        // from, so it has to move with the route or a spawned worker would dial
+        // the previous provider's endpoint.
+        app.config.base_url = endpoint;
+        app.api_key = secret;
+        app.api_client.api_key = secret;
+        app.api_client.base_url = endpoint;
+        app.api_client.auth_scheme = binding.auth_scheme;
+        if (app.openai_client) |*client| {
+            client.api_key = secret;
+            client.base_url = endpoint;
+            client.protocol = binding.openai_protocol;
+            client.auth_scheme = binding.auth_scheme;
+        }
+        if (app.gemini_client) |*client| {
+            client.api_key = secret;
+            client.base_url = endpoint;
+        }
+
+        // Every borrower now points at the new strings.
+        if (retired_url) |old| app.allocator.free(old);
+        if (retired_secret) |old| {
+            std.crypto.secureZero(u8, old);
+            app.allocator.free(old);
         }
     }
 

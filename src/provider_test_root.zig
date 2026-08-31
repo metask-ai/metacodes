@@ -20,6 +20,7 @@ pub const control_plane = @import("provider/control_plane.zig");
 pub const runtime_binding = @import("provider/runtime_binding.zig");
 pub const startup = @import("provider/startup.zig");
 pub const config_store = @import("provider/config_store.zig");
+pub const host = @import("provider/host.zig");
 
 test {
     // This std build has no refAllDeclsRecursive; the explicit re-exports above

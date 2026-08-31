@@ -917,3 +917,160 @@ test "L2: a session selection is written beside the session, not into config.jso
     try std.testing.expect(session_doc.global_selection == null);
     try std.testing.expect(session_doc.session_selection.?.target.pinned_offer.offer_id.eql(session_target.offer_id));
 }
+
+// ── the picker as a control-plane client ─────────────────────────────────────
+
+const picker_mod = @import("cc").repl_model_picker;
+
+fn seedPicker(
+    picker: *picker_mod.Picker,
+    kernel: *cc.provider_control_plane.Kernel,
+    a: std.mem.Allocator,
+) !void {
+    var page: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try kernel.modelList(.{}, .{}, a, &page);
+    try picker.adopt(listed, kernel.currentOfferId());
+}
+
+test "L2: a picker-driven selection reaches the endpoint, path, and wire model it named" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+    const base = try std.fmt.allocPrint(a, "{s}/api/coding/paas/v4", .{origin});
+    defer a.free(base);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{
+        .only_provider = Slug.lit("zai-coding-plan"),
+        .endpoint_overrides = &.{.{
+            .provider_id = Slug.lit("zai-coding-plan"),
+            .channel_id = Slug.lit("cn-openai"),
+            .base_url = base,
+        }},
+    });
+    defer catalog.deinit();
+
+    var kernel = cc.provider_control_plane.Kernel.init(a, &catalog);
+    defer kernel.deinit();
+    kernel.registry = &registry;
+
+    var picker = picker_mod.Picker.init(a);
+    defer picker.deinit();
+    try seedPicker(&picker, &kernel, a);
+
+    // Drive the picker exactly as a keyboard would: provider → model → offer.
+    _ = picker.onKey(.enter);
+    for ("glm46") |byte| _ = picker.onKey(.{ .char = byte });
+    _ = picker.onKey(.enter);
+    try std.testing.expectEqual(picker_mod.Stage.offer, picker.stage);
+
+    // Walk to the OpenAI-wire China channel and commit it.
+    var scratch: [picker_mod.Picker.MAX_ROWS]picker_mod.Row = undefined;
+    var guard: usize = 0;
+    while (guard < scratch.len) : (guard += 1) {
+        const rows = picker.rows(&scratch);
+        const candidate = picker.offers.items[rows[picker.cursor].offer.offer_index];
+        if (candidate.channel_id.eqlText("cn-openai")) break;
+        _ = picker.onKey(.down);
+    }
+    const outcome = picker.onKey(.enter);
+    try std.testing.expect(outcome == .commit);
+
+    const commit = outcome.commit;
+    var candidate_selection = cc.provider_selection.RuntimeSelection.pinned(
+        commit.offer_id,
+        commit.offer_revision,
+        commit.scope,
+    );
+    candidate_selection.controls = commit.controls;
+    const committed = kernel.selectionCommit(.{}, candidate_selection, commit.scope);
+    try std.testing.expect(committed == .committed);
+    // Session is the default scope, so nothing durable was written by a plain
+    // Enter on the picker.
+    try std.testing.expectEqual(cc.provider_selection.Scope.session, committed.committed.scope);
+    try std.testing.expect(!committed.committed.requires_persist);
+
+    // The kernel's effective selection is what the transport must bind.
+    var reference_buffer: [cc.provider_ids.MAX_SLUG_LEN]u8 = undefined;
+    const binding = try cc.provider_runtime_binding.bind(
+        &registry,
+        kernel.catalogSnapshot(),
+        kernel.effectiveSelection().?,
+        .{ .cli_api_key = "picked-secret" },
+        &reference_buffer,
+    );
+    try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, binding.transport);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.api_openai.OpenAIClient.init(
+        a,
+        io_runtime.io(),
+        binding.secret,
+        binding.request_model_id,
+        binding.endpoint_url,
+    );
+    client.protocol = binding.openai_protocol;
+    client.auth_scheme = binding.auth_scheme;
+    defer client.deinit();
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = client.provider().sendStream(&messages, null, null, null, null, null, "") catch
+        return error.SkipZigTest;
+    while (handle.next() catch null) |event| switch (event) {
+        .text => |text| a.free(text),
+        else => {},
+    };
+    handle.deinit();
+
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    // What the user picked is what went on the wire.
+    try std.testing.expect(std.mem.indexOf(u8, requestLine(captured), "/api/coding/paas/v4") != null);
+    try std.testing.expectEqualStrings("Bearer picked-secret", headerValue(captured, "authorization").?);
+    const model_field = captured.jsonField("model") orelse return error.ModelFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-4.6") != null);
+}
+
+test "L2: the TUI picker and a second client see one catalog and one selection" {
+    const a = std.testing.allocator;
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+
+    var picker = picker_mod.Picker.init(a);
+    defer picker.deinit();
+    try seedPicker(&picker, &host.kernel, a);
+
+    // A "web client" reads the same kernel through the same API.
+    var web_page: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer web_page.deinit(a);
+    const web_view = try host.kernel.modelList(.{}, .{}, a, &web_page);
+    try std.testing.expectEqual(web_view.offers.len, picker.offers.items.len);
+
+    // The TUI commits; the second client observes it without being told.
+    const target = host.kernel.catalogSnapshot().items()[0];
+    const committed = host.kernel.selectionCommit(
+        .{},
+        cc.provider_selection.RuntimeSelection.pinned(target.offer_id, target.offer_revision, .session),
+        .session,
+    );
+    try std.testing.expect(committed == .committed);
+
+    var after: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer after.deinit(a);
+    const refreshed = try host.kernel.modelList(.{}, .{}, a, &after);
+    var marked: usize = 0;
+    for (refreshed.offers) |summary| {
+        if (summary.is_current) marked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), marked);
+
+    // And the picker's own snapshot goes stale until it re-reads — it does not
+    // silently claim to be current.
+    try seedPicker(&picker, &host.kernel, a);
+    try std.testing.expect(picker.current_offer.?.eql(target.offer_id));
+}

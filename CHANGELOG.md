@@ -72,6 +72,39 @@ status, compatibility boundaries, and entry points are defined by
   second counter — and idempotency keys are a bounded ring, so a retry is still
   recognized after other commits have landed.
 
+- Cross-UI model picker, durable selection at startup, and built-in pricing
+  (issue #16, further P1 slices). `Ctrl+O` and `/model` open one picker —
+  provider → canonical model → channel/offer → options → commit — that reads
+  offers from the control plane and mutates only through it. Offers are grouped
+  by canonical id, never by visible name, so two channels serving "GLM-4.6"
+  over different protocols, regions, or prices stay separate rows showing their
+  endpoint, wire model id, limits, price, and health. The picker is modal for
+  the keyboard and not for the session: typing filters, the draft in the input
+  box is untouched, a reply keeps streaming, and a mid-stream commit takes
+  effect on the next turn. Session is the default scope and `Tab` cycles to
+  `global`/`once`, so a durable write is always an explicit act the footer
+  spells out before Enter. Transcript viewing moves to `Ctrl+X Ctrl+O` — same
+  letter, on the existing `Ctrl+X` prefix — with `/transcript` as the
+  documented equivalent; TTY regressions cover both paths, including their
+  Kitty CSI-u forms. `/model use <id>` now resolves against the offer catalog
+  first, so a model served by another provider or protocol switches in place; a
+  name carried by several routes reports their offer ids instead of guessing,
+  and an offer id is accepted verbatim. `/models` keeps account-key selection,
+  which is a credential choice rather than a route.
+  A selection committed with `global` scope is now read back at startup:
+  `applyPersistedGlobalSelection` applies it before model-name inference, and a
+  stored pin the catalog no longer offers is a startup error naming the offer
+  and the way out — never a silent fallback to another vendor. Session scope
+  gets its own document and its own file (`<session>/runtime-selection.json`)
+  rather than sharing the global key, so one session's choice cannot become
+  everyone's. The `metask` profile ships a real quote derived from
+  `util/pricing.zig` — the same table `/cost` reports with, asserted equal
+  field by field — while `zai-coding-plan` deliberately stays `unknown` because
+  a Coding Plan subscription is not billed per token. `Quote` gains a cache-write
+  rate so an estimate over a cached turn is not silently low.
+  New gate `zig build test:picker` compiles the picker from a root reaching the
+  provider kernel and the terminal theme and nothing else.
+
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
   base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,

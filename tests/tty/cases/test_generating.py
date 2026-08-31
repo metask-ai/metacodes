@@ -398,7 +398,7 @@ def test_T32_gen_ctrl_o_transcript(bin_path):
     if SKIP:
         return
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
-                         "sleep:1.5", "key:ctrl_o", "sleep:0.8"],
+                         "sleep:1.5", "key:ctrl_x", "key:ctrl_o", "sleep:0.8"],
               per_key_drain=0.05)
     assert b"\x1b[?1049h" in raw, "生成期 Ctrl+O 全屏 transcript 应进 alt-screen"
     assert b"Showing detailed transcript" in raw, "生成期 Ctrl+O 应渲染 cc 风格 transcript footer"
@@ -409,7 +409,7 @@ def test_T33_gen_ctrl_o_toggle_close(bin_path):
     if SKIP:
         return
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
-                         "sleep:1.5", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:1"],
+                         "sleep:1.5", "key:ctrl_x", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:1"],
               per_key_drain=0.05)
     a = TTYAssert(raw)
     assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"

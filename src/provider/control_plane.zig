@@ -726,6 +726,23 @@ pub const Kernel = struct {
         } };
     }
 
+    /// Install a selection that a *previous* process committed, read back from
+    /// the durable document at startup.
+    ///
+    /// Deliberately not a commit: it writes no event, bumps no revision, and
+    /// skips validation, because nothing changed — this is the kernel catching
+    /// up to state that already exists. Validating here would also be wrong,
+    /// since a pin whose offer has since vanished must surface at the point the
+    /// route is resolved, with the actionable message, rather than being
+    /// silently dropped during boot.
+    pub fn seedGlobalSelection(self: *Kernel, selection: RuntimeSelection) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var seeded = selection;
+        seeded.scope = .global;
+        self.global_selection = seeded;
+    }
+
     /// Freeze the selection for one turn. A commit during the turn changes the
     /// scope state but not this snapshot, so it takes effect next turn.
     pub fn beginTurn(self: *Kernel) ?RuntimeSelection {

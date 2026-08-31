@@ -116,12 +116,17 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
     }
 }
 
-test "dispatch: Ctrl+O 上抛 open_transcript(alt-screen,不改 UiState 渲染态)" {
-    // transcript 现走 alt-screen viewer(transcript_viewer.zig),Ctrl+O 只上抛 LoopAction,
-    // 不改 UiState、不嵌入式渲染。渲染帧仍是普通输入帧。
+test "dispatch: Ctrl+O / Ctrl+X Ctrl+O 都只上抛 LoopAction,不改 UiState 渲染态" {
+    // transcript 走 alt-screen viewer(transcript_viewer.zig),picker 画在固定区里;
+    // 两者都只上抛 LoopAction,dispatch 不改 UiState、不嵌入式渲染。渲染帧仍是输入帧。
     var s = UiState{ .rows = 10 };
     const eff = ui.dispatch(&s, .{ .key = .{ .key = .ctrl_o } });
-    try testing.expectEqual(event.LoopAction.open_transcript, eff.action);
+    try testing.expectEqual(event.LoopAction.open_model_picker, eff.action);
+    _ = ui.dispatch(&s, .{ .key = .{ .key = .ctrl_x } });
+    try testing.expectEqual(
+        event.LoopAction.open_transcript,
+        ui.dispatch(&s, .{ .key = .{ .key = .ctrl_o } }).action,
+    );
     // 渲染仍是输入帧(含 ❯),不含 transcript 标题。
     var cw = capture.CaptureWriter.init(testing.allocator);
     defer cw.deinit();

@@ -1,7 +1,8 @@
 # Provider profiles, model offers, and the runtime control plane
 
-Status: delivery slice **P0 shipped**, plus the Z.AI GLM Coding Plan provider
-from P1. Issue: `metask-ai/metacodes#16`.
+Status: **P0 shipped**; from P1 the Z.AI GLM Coding Plan provider, the durable
+selection at startup, built-in pricing, and the cross-UI TUI picker. Issue:
+`metask-ai/metacodes#16`.
 
 This document is the normative description of the provider identity model, the
 credential contract, and the control-plane API. It also records, explicitly,
@@ -255,6 +256,50 @@ legitimately accept private model names — with metadata left unknown.
 
 Sessions that name no provider keep the historical path unchanged.
 
+## TUI
+
+`Ctrl+O` and `/model` open the same picker; transcript viewing moved to
+`Ctrl+X Ctrl+O` (same letter, on the existing `Ctrl+X` prefix) with
+`/transcript` as the documented equivalent. Both paths are covered by TTY
+regressions, including the Kitty CSI-u forms, so the rebinding cannot leave
+either action unreachable.
+
+```text
+Provider → Canonical model → Channel/Offer (optional) → Options (optional) → Commit
+```
+
+The channel step is skipped when a canonical model has exactly one offer, and
+the options step when the offer declares no controls. Offers are grouped by
+*canonical id*, never by visible name: two channels serving "GLM-4.6" over
+different protocols, regions, or prices are different routes, and collapsing
+them by display name would hide the choice the offer model exists to give.
+
+The picker is modal for the keyboard and not for the session. Plain characters
+are its filter, so the draft in the input box is untouched and a reply keeps
+streaming; a commit during a reply changes the next turn, not the one in flight.
+`Ctrl+C`/`Ctrl+D` deliberately pass through, so there is always an exit that does
+not depend on the picker's own state machine. `q` closes only on an empty
+filter, which keeps it typeable inside a model name.
+
+Enter commits at the scope the footer names. Session is the default, and `Tab`
+cycles session → global → once, so any durable write is an explicit act the user
+can see before pressing Enter. A successful commit closes the overlay and prints
+one line into the transcript — a picker that vanishes without saying which of
+several same-named routes it chose leaves the user unable to tell.
+
+`src/repl/model_picker.zig` holds the state machine, `model_picker_view.zig` the
+drawing, and `picker_host.zig` performs the commit against the session.
+`zig build test:picker` compiles all three from a root that reaches the provider
+kernel and the terminal theme and nothing else — the mirror of `test:provider`,
+proving the picker stays a *client* of the control plane rather than a second
+place identity is decided.
+
+`/model use <id>` still works. It resolves against the offer catalog first, so a
+model served by another provider or protocol switches in place; a name carried
+by several routes is reported with their offer ids instead of guessed, and an
+offer id is accepted verbatim. Names the catalog does not declare fall through
+to the historical path, which still serves proxies and server-catalog models.
+
 ## Module map
 
 | File | Responsibility |
@@ -272,6 +317,10 @@ Sessions that name no provider keep the historical path unchanged.
 | `src/provider/control_plane.zig` | UI-independent kernel API and event journal |
 | `src/provider/runtime_binding.zig` | selection → transport parameters |
 | `src/provider/startup.zig` | CLI/bootstrap route resolution |
+| `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
+| `src/repl/model_picker.zig` | picker state machine (pure) |
+| `src/repl/model_picker_view.zig` | picker rendering |
+| `src/repl/picker_host.zig` | commit + rebind against the session |
 | `src/api/auth_header.zig` | transport-side auth materialization |
 | `src/util/json_merge.zig` | order-preserving JSON object merge |
 
@@ -302,9 +351,10 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
 - **User-defined providers (P1).** A profile can be registered at runtime
   through the same extension point, but there is no `CustomProviderDefinition`
   config schema, no `DeclarativeProtocolSpec`, and no dry-run/connection test.
-- **TUI picker migration (P1).** `/model`, `/models`, and the `Ctrl+O`
-  rebinding are unchanged. The control-plane API they should call exists and is
-  tested; the TUI does not call it yet.
+- **The picker's credential stage (P1).** `/models` still owns account-key
+  selection through its own menu, because the picker has no credential stage
+  yet — that waits on credential-pool rotation below. `/model` and `Ctrl+O`
+  select *routes*; `/models` selects *credentials*. See *TUI* below.
 - **Auth scheme inheritance beyond `AgentJobRegistry`.** `App`'s own clients and
   background subagent jobs carry the resolved route's auth scheme. Swarm
   teammates and `AgentCore` sessions still construct providers with the default

@@ -24,6 +24,7 @@ const multiline_mod = @import("multiline.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("../core/transcript.zig");
 const transcript_viewer = @import("transcript_viewer.zig");
+const picker_host = @import("picker_host.zig");
 const progress = @import("progress.zig");
 const render_region_mod = @import("tui/render_region.zig");
 const agent_job_registry_mod = @import("../core/agent_job_registry.zig");
@@ -414,14 +415,27 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             , .{ app.activeModel(), u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cost });
             continue;
         }
+        // issue #16:`/models` 选的是**凭证**(账号 API key),不是路由。路由选择归
+        // `/model` / Ctrl+O 的跨 UI picker;两者是不同的问题,合并会让"换账号"和
+        // "换模型"互相顶掉。picker 的 credential 阶段尚未落地(见架构文档未实现清单)。
         if (std.mem.eql(u8, trimmed, "/models")) {
-            std.debug.print("/models is an interactive picker: choose an API key first, then choose a model. Use /model for text filters.\n", .{});
+            std.debug.print("/models is an interactive account-key picker: type it and use the menu. Use /model (or Ctrl+O) to choose a provider, model, and channel.\n", .{});
             continue;
         }
-        // /model [name] —— 无参列当前 + 可选模型；有参切换
+        // /model [name] —— 无参开 picker;有参走文本选择器(向后兼容)
         if (std.mem.eql(u8, trimmed, "/model") or std.mem.startsWith(u8, trimmed, "/model ")) {
             const rest = std.mem.trim(u8, trimmed[6..], " \t");
+            if (rest.len == 0) {
+                app.pending_overlay = .model_picker;
+                continue;
+            }
             try handleModel(app, allocator, rest);
+            continue;
+        }
+        // issue #16:transcript 查看器从 Ctrl+O 移到 Ctrl+X Ctrl+O,`/transcript`
+        // 是等价的可发现入口——绑定变了,可达性不能变。
+        if (std.mem.eql(u8, trimmed, "/transcript")) {
+            app.pending_overlay = .transcript;
             continue;
         }
         // /effort [level] —— 无参显示当前 reasoning_effort;有参切换(none|minimal|low|medium|high|xhigh)
@@ -1123,6 +1137,23 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
         region.clear();
         std.debug.print("\x1b[?25h", .{}); // 确保光标可见
     }
+    // issue #16:`/model`、`/models`、`/transcript` 在命令层被处理,那时输入读取
+    // 已经返回、固定区不存在。请求停在 app.pending_overlay,由下一次读取兑现。
+    switch (app.pending_overlay) {
+        .none => {},
+        .model_picker => {
+            app.pending_overlay = .none;
+            picker_host.open(app, &region.ui);
+        },
+        .transcript => {
+            app.pending_overlay = .none;
+            const sz0 = tui_term_root.getSize(fd);
+            const rows0: usize = if (sz0) |sz| sz.rows else 24;
+            region.clear();
+            transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows0, region.theme) catch {};
+        },
+    }
+
     // 初始画一个空输入框。
     region.setInput(editor.view(), editor.cursor);
     region.render(app);
@@ -1450,6 +1481,21 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     const rows: usize = if (sz) |s| s.rows else 24;
                     region.clear();
                     transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows, region.theme) catch {};
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .open_model_picker => {
+                    picker_host.open(app, &region.ui);
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .picker_key => {
+                    if (picker_host.onKey(app, &region.ui, eff.picker_key) == .committed) {
+                        // The overlay is gone; the confirmation has to survive
+                        // it or the user cannot tell which route was chosen.
+                        region.clear();
+                        std.debug.print("{s}\n", .{picker_host.lastNotice(app)});
+                    }
                     redraw(&region, &editor, app);
                     continue;
                 },
@@ -1994,6 +2040,37 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
                 target_raw,
                 null,
             ).model orelse target_raw;
+            // issue #16: the offer catalog answers first. It knows routes the
+            // legacy path cannot express — another vendor, another protocol,
+            // another region — and it refuses to guess between them.
+            switch (picker_host.useSelector(app, resolved)) {
+                .switched => {
+                    std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
+                    if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{effort.name()});
+                    std.debug.print(" (max_output={d})\n", .{app.provider().maxTokens()});
+                    return;
+                },
+                .ambiguous => |candidates_found| {
+                    std.debug.print(
+                        "\x1b[33m'{s}' matches {d} routes; name one with /model use <offer-id> or pick it in /model:\x1b[0m\n",
+                        .{ resolved, candidates_found.total },
+                    );
+                    for (candidates_found.ids[0..candidates_found.len]) |offer_id| {
+                        std.debug.print("  {s}\n", .{offer_id});
+                    }
+                    if (candidates_found.total > candidates_found.len) {
+                        std.debug.print("  … and {d} more\n", .{candidates_found.total - candidates_found.len});
+                    }
+                    return;
+                },
+                .failed => |why| {
+                    std.debug.print("\x1b[31mswitch refused: {s}\x1b[0m\n", .{why});
+                    return;
+                },
+                // Not a declared offer: proxies and server-catalog models are
+                // legitimate, so the historical path still applies.
+                .not_in_catalog => {},
+            }
             try switchModel(app, allocator, candidates, resolved);
             return;
         },
@@ -2003,14 +2080,17 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
 fn printModelHelp() void {
     std.debug.print(
         \\usage:
-        \\  /model
+        \\  /model                      open the picker (same as Ctrl+O)
         \\  /model group <anthropic|opus|sonnet|haiku|openai|gemini>
         \\  /model capability <web_search|thinking|prompt_cache|structured_output|server_tool>
-        \\  /model use <model-id>
+        \\  /model use <model-id|offer-id>
         \\  /model <model-id>
         \\
-        \\Model switching is limited to the provider selected at startup. Start with
-        \\--model gpt-... or --model gemini-... to use another provider family.
+        \\`/model use` resolves against the provider offer catalog first, so a model
+        \\served by another provider or protocol switches in place. A name carried by
+        \\several routes is reported with their offer ids instead of guessed. Names the
+        \\catalog does not declare stay on the historical path, which cannot leave the
+        \\provider family selected at startup.
         \\
     , .{});
 }

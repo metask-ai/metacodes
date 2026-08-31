@@ -143,7 +143,7 @@ def test_T35_write_diff_in_transcript(bin_path):
     raw = replay_run(
         cdir,
         ["sleep:0.8", "type:write the file", "key:enter", "sleep:2.0",
-         "key:ctrl_o", "sleep:1.0", "type:q"],
+         "key:ctrl_x", "key:ctrl_o", "sleep:1.0", "type:q"],
         term_size=(40, 100), bin_path=bin_path, before_each=_reset35, success=_ok35,
     )
     if raw is None:
@@ -418,7 +418,7 @@ def test_T42_transcript_close_reanchors_box_to_bottom(bin_path):
     raw = _run_cassette(
         [("a", _sse_text(reply))],
         ["sleep:0.8", "type:hi", "key:enter", "sleep:2.0",
-         "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+         "key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
         term_size=(16, 80),
     )
     if raw is None:

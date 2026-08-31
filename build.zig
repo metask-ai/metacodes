@@ -1387,6 +1387,22 @@ pub fn build(b: *std.Build) void {
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
     provider_test_step.dependOn(&addTestRunArtifact(b, provider_test, windows_test_prelude).step);
 
+    // test:picker —— issue #16 cross-UI model picker, in isolation.
+    // The picker must be a *client* of the control plane: it may reach the
+    // provider kernel and the terminal theme, and nothing else. A dependency on
+    // `App`, the transport, or a provider client stops this step compiling,
+    // which is the same boundary `test:provider` enforces from the other side.
+    const picker_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/picker_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, picker_test_mod);
+    const picker_test = b.addTest(.{ .name = "picker-test", .root_module = picker_test_mod });
+    const picker_test_step = b.step("test:picker", "Test the cross-UI model picker in isolation (issue #16)");
+    picker_test_step.dependOn(&addTestRunArtifact(b, picker_test, windows_test_prelude).step);
+
     // test:platform —— 可移植抽象层(sync/process/fs/signal/rng/paths)。platform 成独立命名模块后
     // 其测试不再聚合进 cc-test，故独立入口。process fork 真子进程测试需 METACODES_PROC_TEST=1 启用。
     const platform_test_mod = b.createModule(.{
