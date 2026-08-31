@@ -2021,7 +2021,6 @@ pub const App = struct {
         const replay = host.kernel.replayEvents(app.provider_audit_cursor, app.allocator, &events) catch
             return .{};
         if (replay.events.len == 0) return .{};
-        app.provider_audit_cursor = replay.events[replay.events.len - 1].stream_sequence;
 
         const Bridge = struct {
             client: *@import("kg/client.zig").KgClient,
@@ -2034,10 +2033,18 @@ pub const App = struct {
             }
         };
         var bridge = Bridge{ .client = client };
-        return kg_provider_audit.recordAll(
+        const summary = kg_provider_audit.recordAll(
             .{ .ctx = @ptrCast(&bridge), .appendFn = Bridge.append },
             replay.events,
         );
+        // Advance only when nothing failed. A transient TinyKG outage otherwise
+        // drops a whole window of decisions silently, which is the one thing an
+        // audit record must not do; the journal's own eviction bounds how long
+        // an unreachable sink can keep the retry set alive.
+        if (summary.failed == 0) {
+            app.provider_audit_cursor = replay.events[replay.events.len - 1].stream_sequence;
+        }
+        return summary;
     }
 
     /// Versioned immutable plugin inventory for CLI/Web/embedding Hosts.

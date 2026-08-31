@@ -311,3 +311,38 @@ test "an unavailable audit plane is counted, never propagated" {
     try testing.expectEqual(@as(usize, 0), summary.recorded);
     try testing.expectEqual(@as(usize, 1), summary.failed);
 }
+
+test "a failed batch reports it, so a caller can decline to advance its cursor" {
+    const a = testing.allocator;
+    var collector = CollectingSink{ .allocator = a, .fail = true };
+    defer collector.deinit();
+
+    const events = [_]Event{
+        selectionEvent(ids.OfferId{ .digest = @splat(0x01) }),
+        selectionEvent(ids.OfferId{ .digest = @splat(0x02) }),
+        // Not recordable: it must count as skipped, not failed, or a caller
+        // keying on `failed` would retry a window forever because one event in
+        // it is never recordable.
+        .{
+            .event_id = 3,
+            .stream_sequence = 3,
+            .event_type = .provider_degraded,
+            .payload = .{ .provider_degraded = .{
+                .provider_id = ids.Slug.lit("openrouter"),
+                .status = .degraded,
+            } },
+        },
+    };
+
+    const failed = recordAll(collector.sink(), &events);
+    try testing.expectEqual(@as(usize, 2), failed.failed);
+    try testing.expectEqual(@as(usize, 1), failed.skipped);
+    try testing.expectEqual(@as(usize, 0), failed.recorded);
+
+    // Once the sink recovers, the same window records cleanly and the caller
+    // may advance.
+    collector.fail = false;
+    const recovered = recordAll(collector.sink(), &events);
+    try testing.expectEqual(@as(usize, 0), recovered.failed);
+    try testing.expectEqual(@as(usize, 2), recovered.recorded);
+}

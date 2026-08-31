@@ -454,10 +454,13 @@ fn writeAtomicPrivate(allocator: std.mem.Allocator, path: []const u8, bytes: []c
 }
 
 fn ensureParent(allocator: std.mem.Allocator, path: []const u8) !void {
+    _ = allocator;
     const dir = std.fs.path.dirname(path) orelse return;
-    const dir_z = try allocator.dupeZ(u8, dir);
-    defer allocator.free(dir_z);
-    _ = std.c.mkdir(dir_z.ptr, 0o700);
+    // Every level, not just the last: on a fresh installation neither
+    // `~/.metacodes` nor `~/.metacodes/oauth` exists, and a single `mkdir` of
+    // the leaf fails with ENOENT — so the very first `login --provider` could
+    // not store its token.
+    try @import("../util/fs.zig").mkdirParents(dir);
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -828,4 +831,43 @@ test "the lifecycle serves the OAuth kinds and leaves Metask on its own path" {
     // Metask's OAuth stays in core/auth.zig, byte for byte.
     try testing.expect(!servesKind(.metask_oauth));
     try testing.expect(!servesKind(.api_key));
+}
+
+test "the token store creates every missing parent directory" {
+    const a = std.testing.allocator;
+    const root = "/tmp/metacodes-oauth-parents";
+    const path = root ++ "/nested/deeper/openai.json";
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cleanup = struct {
+        fn run(buf: []u8) void {
+            for ([_][]const u8{
+                root ++ "/nested/deeper/openai.json",
+                root ++ "/nested/deeper/openai.json.tmp",
+            }) |target| {
+                const z = std.fmt.bufPrintZ(buf, "{s}", .{target}) catch continue;
+                pfs.unlinkPath(z) catch {};
+            }
+            for ([_][]const u8{ root ++ "/nested/deeper", root ++ "/nested", root }) |dir| {
+                const z = std.fmt.bufPrintZ(buf, "{s}", .{dir}) catch continue;
+                _ = std.c.rmdir(z.ptr);
+            }
+        }
+    }.run;
+    cleanup(&buffer);
+    defer cleanup(&buffer);
+
+    var session = try Session.init(a, Slug.lit("openai"), Slug.lit("openai"), path);
+    defer session.deinit();
+    // A single `mkdir` of the leaf would fail with ENOENT here, which is the
+    // state a fresh installation is in.
+    try session.importOutcome(.{
+        .access_token = "at",
+        .refresh_token = "rt",
+        .expires_in_seconds = 3600,
+    }, 1_000);
+
+    var reloaded = try Session.init(a, Slug.lit("openai"), Slug.lit("openai"), path);
+    defer reloaded.deinit();
+    try testing.expect(try reloaded.load());
+    try testing.expectEqualStrings("rt", reloaded.tokens.?.refresh_token);
 }

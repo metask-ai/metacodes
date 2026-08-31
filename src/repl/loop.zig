@@ -2196,11 +2196,12 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             return;
         };
         const summary = host.kernel.modelDescribe(current) orelse return;
+        const pinned_name = config_doc.AliasName.parse(name) catch {
+            std.debug.print("\x1b[31malias name too long\x1b[0m\n", .{});
+            return;
+        };
         _ = config_store.setAlias(&store, .{
-            .name = config_doc.AliasName.parse(name) catch {
-                std.debug.print("\x1b[31malias name too long\x1b[0m\n", .{});
-                return;
-            },
+            .name = pinned_name,
             .policy = .pinned,
             .offer_id = current,
             .offer_revision = summary.offer_revision,
@@ -2226,10 +2227,18 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             std.debug.print("usage: /alias float <name> <model>\n", .{});
             return;
         };
+        const alias_name = config_doc.AliasName.parse(name) catch {
+            std.debug.print("\x1b[31malias name too long\x1b[0m\n", .{});
+            return;
+        };
+        const parsed_selector = @import("../provider/selection.zig").Selector.parse(selector) catch {
+            std.debug.print("\x1b[31mselector too long\x1b[0m\n", .{});
+            return;
+        };
         _ = config_store.setAlias(&store, .{
-            .name = config_doc.AliasName.parse(name) catch return,
+            .name = alias_name,
             .policy = .floating,
-            .selector = @import("../provider/selection.zig").Selector.parse(selector) catch return,
+            .selector = parsed_selector,
         }, null, null) catch |err| {
             std.debug.print("\x1b[31mcould not save the alias: {s}\x1b[0m\n", .{@errorName(err)});
             return;
@@ -2243,7 +2252,12 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             std.debug.print("usage: /alias remove <name>\n", .{});
             return;
         };
-        _ = config_store.removeAlias(&store, name, null) catch return;
+        _ = config_store.removeAlias(&store, name, null) catch |err| {
+            // A silent return here reads as success: the user believes the
+            // alias is gone and it is still there.
+            std.debug.print("\x1b[31mcould not remove '{s}': {s}\x1b[0m\n", .{ name, @errorName(err) });
+            return;
+        };
         std.debug.print("Removed '{s}'.\n", .{name});
         return;
     }
