@@ -785,6 +785,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
         app.persistTranscript();
 
+        // issue #16:把本轮新增的控制面**决策**投影进 TinyKG 审计面。turn 边界,
+        // 不在请求路径上;审计面不可用只记账,不影响路由。
+        _ = app.auditProviderDecisions();
+
         // L3:挂起 → 落 suspend.json + 提示恢复方式。释放 suspend_info(owned)。
         if (result.suspend_info) |si| {
             defer si.deinit();

@@ -109,6 +109,7 @@ const provider_ids_mod = @import("provider/ids.zig");
 const provider_credential_mod = @import("provider/credential.zig");
 const provider_config_doc = @import("provider/config_doc.zig");
 const model_picker_mod = @import("repl/model_picker.zig");
+const kg_provider_audit = @import("kg/provider_audit.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const oauth_exchange_mod = @import("api/oauth_exchange.zig");
 const provider_mod = @import("api/provider.zig");
@@ -274,6 +275,10 @@ pub const App = struct {
     /// after the input reader returns, so the request is parked here and the
     /// next read consumes it.
     pending_overlay: PendingOverlay = .none,
+    /// Last control-plane event projected into the TinyKG audit plane. Events
+    /// are recorded once; a restart starts from the journal's current head
+    /// rather than replaying a ring that may already have evicted.
+    provider_audit_cursor: u64 = 0,
     /// 模型档位表(~/.metacodes/config.json 的 model_tiers;null=未配置)。
     model_tiers_table: ?@import("api/model_tiers.zig").TierTable = null,
     pending_previous_model_for_compact: ?[]u8 = null,
@@ -1643,6 +1648,47 @@ pub const App = struct {
     pub fn kgReady(app: *const App) bool {
         if (app.kg) |*k| return k.ready;
         return false;
+    }
+
+    /// Project the provider control plane's new events into the TinyKG audit
+    /// plane (issue #16).
+    ///
+    /// Called at a turn boundary, never on the request path. The audit plane is
+    /// optional in the strongest sense: no route resolution, credential
+    /// resolution, or request setup calls this, and a TinyKG outage is counted
+    /// rather than propagated.
+    ///
+    /// Only *decisions* are recorded — which offer was accepted, which route a
+    /// turn actually took, which selection failed and why — because the event
+    /// payloads are ids and enums by construction, with no field a prompt,
+    /// token, or provider body could travel in.
+    pub fn auditProviderDecisions(app: *App) kg_provider_audit.Summary {
+        const host = app.provider_host orelse return .{};
+        const client = if (app.kg) |*value| value else return .{};
+        if (!client.ready) return .{};
+
+        var events: std.ArrayList(provider_control_plane.ControlPlaneEvent) = .empty;
+        defer events.deinit(app.allocator);
+        const replay = host.kernel.replayEvents(app.provider_audit_cursor, app.allocator, &events) catch
+            return .{};
+        if (replay.events.len == 0) return .{};
+        app.provider_audit_cursor = replay.events[replay.events.len - 1].stream_sequence;
+
+        const Bridge = struct {
+            client: *@import("kg/client.zig").KgClient,
+            fn append(ctx: *anyopaque, line: []const u8, schema_type: []const u8) anyerror!u64 {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                // `.decision` is what these are, and session-scoped rather than
+                // global: this machine's routing choices are not shared project
+                // knowledge.
+                return self.client.remember(.decision, line, schema_type, false);
+            }
+        };
+        var bridge = Bridge{ .client = client };
+        return kg_provider_audit.recordAll(
+            .{ .ctx = @ptrCast(&bridge), .appendFn = Bridge.append },
+            replay.events,
+        );
     }
 
     /// Versioned immutable plugin inventory for CLI/Web/embedding Hosts.
