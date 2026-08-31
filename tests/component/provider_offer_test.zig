@@ -1719,3 +1719,92 @@ test "L2: an opaque upstream identity is preserved rather than derived" {
         try std.testing.expect(item.canonical_model_id == null);
     }
 }
+
+test "L2: a configured pool entry's account label outlives the read that produced it" {
+    const a = std.testing.allocator;
+    const path = try tempConfigPath(a, "pool-lifetime");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    var store = try cc.provider_config_store.Store.initPath(a, path);
+    defer store.deinit();
+
+    const Seed = struct {
+        fn run(_: *anyopaque, document: *cc.provider_config_doc.Document) anyerror!void {
+            var entry = cc.provider_config_doc.ProviderEntry{ .id = Slug.lit("openai") };
+            try entry.credentials.append(.{
+                .id = Slug.lit("work"),
+                .env = try cc.provider_config_doc.AliasName.parse("METACODES_POOL_LIFETIME_KEY"),
+                .kind = try cc.provider_controls.Bounded(32).parse("api_key"),
+                .account_or_plan = try cc.provider_config_doc.AliasName.parse("acme-workspace"),
+            });
+            try document.upsertProvider(entry);
+        }
+    };
+    var anchor: u8 = 0;
+    _ = try store.commit(.{ .mutation = .{ .ctx = @ptrCast(&anchor), .applyFn = Seed.run } });
+
+    setEnvZ("METACODES_POOL_LIFETIME_KEY", "sk-pool-lifetime");
+    defer unsetEnvZ("METACODES_POOL_LIFETIME_KEY");
+
+    // Read the document, build the pool, and keep only the pool — the shape a
+    // caller that freed the document too early would produce.
+    var document = try store.load();
+    defer document.deinit();
+    var buffer: [cc.provider_config_doc.MAX_POOL_CREDENTIALS]cc.provider_credential.PoolEntry = undefined;
+    const pool = cc.app_module.App.credentialPoolFrom(&document, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), pool.len);
+
+    // Everything the entry borrows must still read correctly while the document
+    // is alive — including the account label, which lives inside it.
+    try std.testing.expectEqualStrings("sk-pool-lifetime", pool[0].secret);
+    try std.testing.expectEqualStrings("acme-workspace", pool[0].account_or_plan.?);
+    try std.testing.expect(pool[0].id.eqlText("work"));
+
+    // The label is not a copy: it points into the *stored* entry, which is
+    // exactly why the document has to outlive the pool. Reading it out of a
+    // by-value `provider()` lookup would compare against a temporary — the
+    // same mistake that made the pool builder hand back dangling slices.
+    const stored = &document.providers.items[0].credentials.entries[0];
+    try std.testing.expect(pool[0].account_or_plan.?.ptr == stored.account_or_plan.?.slice().ptr);
+}
+
+test "L2: a session that named its provider on the command line has a current offer" {
+    const a = std.testing.allocator;
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+
+    // Before seeding, the kernel believes there is no selection — which is what
+    // makes the picker mark nothing current, `/alias pin` refuse, and the
+    // turn-boundary token refresh never run.
+    try std.testing.expect(host.kernel.currentOfferId() == null);
+
+    const target = host.kernel.catalogSnapshot().items()[3];
+    host.kernel.seedSessionSelection(cc.provider_selection.RuntimeSelection.pinned(
+        target.offer_id,
+        target.offer_revision,
+        .session,
+    ));
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(target.offer_id));
+    try std.testing.expect(host.kernel.effectiveSelection() != null);
+
+    // Seeding is not a commit: no event, no revision bump, and it never
+    // overwrites a selection the user actually made.
+    const other = host.kernel.catalogSnapshot().items()[0];
+    host.kernel.seedSessionSelection(cc.provider_selection.RuntimeSelection.pinned(
+        other.offer_id,
+        other.offer_revision,
+        .session,
+    ));
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(target.offer_id));
+
+    // A real commit still wins over the seed.
+    const committed = host.kernel.selectionCommit(
+        .{},
+        cc.provider_selection.RuntimeSelection.pinned(other.offer_id, other.offer_revision, .session),
+        .session,
+    );
+    try std.testing.expect(committed == .committed);
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(other.offer_id));
+}

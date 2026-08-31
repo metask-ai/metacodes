@@ -214,10 +214,17 @@ pub const Session = struct {
                 // Someone else is already exchanging. Wait for them rather than
                 // starting a second exchange: with a rotating refresh token the
                 // second one would present a token the server just killed.
-                const waited_generation = self.generation;
                 self.settled.wait(&self.mutex);
-                if (self.generation != waited_generation) continue;
+                // The in-flight refresh has settled, and its outcome is ours.
+                // Retrying here would perform a second exchange against the
+                // same refresh token — and for the failure that matters most,
+                // `invalid_grant`, that token is already dead, so every waiter
+                // would burn one more request to be told the same thing.
+                // A *later* call still retries: only this cohort shares the
+                // result.
                 if (self.last_error) |err| return err;
+                // Success, or a spurious wake: the loop re-checks. A fresh
+                // token returns above; a still-running refresh waits again.
                 continue;
             }
             break;
@@ -779,9 +786,13 @@ test "a rejected refresh reaches every waiter and is not retried as a transport 
         }
     }
     // Every caller learns the login is dead; none of them silently proceeds
-    // with an expired token, and none retries a refresh that cannot succeed.
+    // with an expired token.
     try testing.expectEqual(@as(usize, 4), rejected);
-    try testing.expect(fake.calls <= 4);
+    // And exactly one exchange happened. `invalid_grant` means the refresh
+    // token is already dead, so a waiter that retried would burn another
+    // request to be told the same thing — single flight has to cover the
+    // failure path, not just the happy one.
+    try testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "the token endpoint's wire shape parses, and invalid_grant is terminal" {

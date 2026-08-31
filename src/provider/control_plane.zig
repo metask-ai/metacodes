@@ -815,6 +815,25 @@ pub const Kernel = struct {
         self.global_selection = seeded;
     }
 
+    /// Install the route this session started on, as resolved by `--provider`,
+    /// `--offer`, or a stored selection at boot.
+    ///
+    /// Not a commit, for the same reasons as `seedGlobalSelection`: nothing
+    /// changed, so no event and no revision. It matters because without it the
+    /// kernel believes the session has no selection at all — `currentOfferId`
+    /// is null, the picker marks nothing as current, `/alias pin` reports
+    /// "no selected offer", and a token refresh keyed on the effective
+    /// selection never runs for a session that named its provider on the
+    /// command line.
+    pub fn seedSessionSelection(self: *Kernel, selection: RuntimeSelection) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.session_selection != null) return;
+        var seeded = selection;
+        seeded.scope = .session;
+        self.session_selection = seeded;
+    }
+
     /// Freeze the selection for one turn. A commit during the turn changes the
     /// scope state but not this snapshot, so it takes effect next turn.
     pub fn beginTurn(self: *Kernel) ?RuntimeSelection {

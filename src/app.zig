@@ -977,8 +977,28 @@ pub const App = struct {
         };
         defer store.deinit();
         host.adoptDurableState(&store);
+        app.seedStartupSelection(host);
         app.provider_host = host;
         return host;
+    }
+
+    /// Tell the kernel which route this session actually started on.
+    ///
+    /// `--provider`/`--offer` and the stored global selection are resolved in
+    /// `main.zig` before an `App` exists, so without this the kernel believes
+    /// the session has no selection: the picker marks nothing current,
+    /// `/alias pin` reports "no selected offer", `/providers` shows no `*`, and
+    /// — the one that actually breaks a session — the turn-boundary OAuth
+    /// refresh, which keys on the effective selection, never runs.
+    fn seedStartupSelection(app: *App, host: *provider_host_mod.Host) void {
+        const rendered = app.config.selected_offer_id orelse return;
+        const offer_id = provider_ids_mod.OfferId.parse(rendered) catch return;
+        const found = host.kernel.catalogSnapshot().find(offer_id) orelse return;
+        host.kernel.seedSessionSelection(provider_selection_mod.RuntimeSelection.pinned(
+            found.offer_id,
+            found.offer_revision,
+            .session,
+        ));
     }
 
     /// Materialize the configured credential pool for the current session.
@@ -987,20 +1007,35 @@ pub const App = struct {
     /// name, a kind, a priority — so reading it never touches a secret. The
     /// secrets are read here, from the process environment, and borrowed for
     /// the duration of request setup.
-    fn credentialPool(
-        app: *App,
+    /// Load the configuration document, or null when there is none to read.
+    /// The caller owns it — see `credentialPoolFrom` for why that matters.
+    pub fn loadConfigDocument(app: *App) ?provider_config_doc.Document {
+        var store = provider_config_store.Store.initHome(app.allocator) catch return null;
+        defer store.deinit();
+        return store.load() catch null;
+    }
+
+    /// Materialize the configured credential pool.
+    ///
+    /// Takes the document by pointer and **does not own it**: the returned
+    /// entries borrow the account label out of it, so a version of this that
+    /// loaded and freed the document internally would hand back dangling
+    /// slices. The caller keeps the document alive for as long as it uses the
+    /// pool.
+    ///
+    /// Secrets come from the named environment variables, never from the
+    /// document: that document is read by several tools and is not mode 0600.
+    pub fn credentialPoolFrom(
+        document: *const provider_config_doc.Document,
         buffer: []provider_credential_mod.PoolEntry,
     ) []const provider_credential_mod.PoolEntry {
-        var store = provider_config_store.Store.initHome(app.allocator) catch return &.{};
-        defer store.deinit();
-        var document = store.load() catch return &.{};
-        defer document.deinit();
-
         const env = provider_credential_mod.EnvLookup.process();
         var len: usize = 0;
-        for (document.providers.items) |entry| {
+        // Iterated by pointer, so `slice()` reads the stored entry rather than
+        // a loop-local copy that dies at the end of the iteration.
+        for (document.providers.items) |*entry| {
             if (!entry.enabled) continue;
-            for (entry.credentials.items()) |credential| {
+            for (entry.credentials.items()) |*credential| {
                 if (len == buffer.len) break;
                 const secret = env.get(credential.env.slice()) orelse continue;
                 const kind = provider_credential_mod.parseCredentialKind(credential.kind.slice()) orelse continue;
@@ -1009,7 +1044,7 @@ pub const App = struct {
                     .kind = kind,
                     .secret = secret,
                     .priority = credential.priority,
-                    .account_or_plan = if (credential.account_or_plan) |label| label.slice() else null,
+                    .account_or_plan = if (credential.account_or_plan) |*label| label.slice() else null,
                     // Learned state from previous runs: a cooldown recorded
                     // here is why the next process skips the credential instead
                     // of rediscovering the same rate limit by hitting it.
@@ -1252,11 +1287,15 @@ pub const App = struct {
             };
         }
 
-        // The configured credential pool. Secrets come from the named
-        // environment variables, never from the config document: that document
-        // is read by several tools and is not mode 0600.
+        // The document outlives the pool it produces: the entries borrow the
+        // account label out of it.
+        var pool_document = app.loadConfigDocument();
+        defer if (pool_document) |*value| value.deinit();
         var pool_buffer: [provider_config_doc.MAX_POOL_CREDENTIALS]provider_credential_mod.PoolEntry = undefined;
-        const pool = app.credentialPool(&pool_buffer);
+        const pool = if (pool_document) |*value|
+            credentialPoolFrom(value, &pool_buffer)
+        else
+            &.{};
 
         const binding = try provider_binding_mod.bind(
             &host.registry,
