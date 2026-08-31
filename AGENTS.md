@@ -45,6 +45,14 @@ The native bundled TinyKG is wired into tests by default. Supply
 Do not run paid or provider-backed benchmarks without explicit user authorization,
 a dollar cap, and the durable budget journal.
 
+Judge a build by its exit code and `Build Summary`, never by the presence of
+`failed command:`. The Zig 0.16 build runner routes every step that wrote to
+stderr through the failure printer, so a passing step is tagged ` w` and
+followed by `failed command: <cmd> --listen=-` while the build still exits 0
+(`master` renames that tag to ` stderr` but keeps the wording). Suites whose
+subject logs diagnostics on expected error paths trip this on every run;
+`agentcore-abi-contract` does so through its HTTP 529 and connection-drop tests.
+
 ## Repository hygiene
 
 - Keep secrets, personal paths, generated evaluation runs, binaries, and local
