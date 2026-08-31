@@ -30,6 +30,11 @@ pub const ConfigRevision = ids.ConfigRevision;
 
 pub const CONFIG_PATH_ENV = "METACODES_CONFIG_FILE";
 
+/// Filename of the session-scoped selection document. It sits beside the
+/// session's own transcript instead of inside `config.json` so two concurrent
+/// sessions cannot overwrite each other's choice.
+pub const SESSION_SELECTION_FILE = "runtime-selection.json";
+
 /// Fault-injection point, used only by crash-safety tests.
 pub const CrashPoint = enum {
     /// After the temporary file is written but before it is fsynced.
@@ -98,6 +103,17 @@ pub const Store = struct {
         const home = @import("platform").paths.homeDir() orelse return error.NoHome;
         const path = std.fmt.allocPrint(allocator, "{s}/.metacodes/config.json", .{home}) catch
             return error.OutOfMemory;
+        return .{ .allocator = allocator, .path = path };
+    }
+
+    /// `<session_dir>/runtime-selection.json`. The caller owns the session
+    /// directory layout; this module only names the file inside it.
+    pub fn initSessionFile(allocator: std.mem.Allocator, session_dir: []const u8) StoreError!Store {
+        const path = std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}",
+            .{ session_dir, SESSION_SELECTION_FILE },
+        ) catch return error.OutOfMemory;
         return .{ .allocator = allocator, .path = path };
     }
 
@@ -265,6 +281,28 @@ pub fn setGlobalSelection(
     });
 }
 
+/// Convenience wrapper for the common "replace the session selection" mutation.
+pub fn setSessionSelection(
+    store: *const Store,
+    selection: ?config_doc.RuntimeSelection,
+    expected: ?ConfigRevision,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        value: ?config_doc.RuntimeSelection,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            document.session_selection = self.value;
+        }
+    };
+    var apply = Apply{ .value = selection };
+    return store.commit(.{
+        .expected_config_revision = expected,
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
 test "an empty idempotency key is rejected rather than matching every other one" {
     const a = std.testing.allocator;
     const path = "/tmp/metacodes-provider-empty-op-test.json";
@@ -313,4 +351,60 @@ test "the home store resolves either the override or the home path" {
     } else {
         try std.testing.expect(std.mem.endsWith(u8, store.path, "/.metacodes/config.json"));
     }
+}
+
+test "two sessions keep separate selections and neither touches the other" {
+    const a = std.testing.allocator;
+    const dirs = [_][]const u8{
+        "/tmp/metacodes-provider-session-a",
+        "/tmp/metacodes-provider-session-b",
+    };
+    var paths: [dirs.len][]u8 = undefined;
+    var made: usize = 0;
+    defer {
+        var index: usize = 0;
+        while (index < made) : (index += 1) {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+                const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ paths[index], suffix }) catch continue;
+                pfs.unlinkPath(target) catch {};
+            }
+            const dir_z = std.fmt.bufPrintZ(&buffer, "{s}", .{dirs[index]}) catch continue;
+            _ = std.c.rmdir(dir_z.ptr);
+            a.free(paths[index]);
+        }
+    }
+
+    var stores: [dirs.len]Store = undefined;
+    for (dirs, 0..) |dir, index| {
+        stores[index] = try Store.initSessionFile(a, dir);
+        paths[index] = try a.dupe(u8, stores[index].path);
+        made += 1;
+    }
+    defer for (&stores) |*store| store.deinit();
+
+    try std.testing.expect(std.mem.endsWith(u8, stores[0].path, "/runtime-selection.json"));
+    try std.testing.expect(!std.mem.eql(u8, stores[0].path, stores[1].path));
+
+    const first = config_doc.RuntimeSelection.pinned(.{ .digest = @splat(0x11) }, 1, .session);
+    const second = config_doc.RuntimeSelection.pinned(.{ .digest = @splat(0x22) }, 1, .session);
+    _ = try setSessionSelection(&stores[0], first, null, "op-a");
+    _ = try setSessionSelection(&stores[1], second, null, "op-b");
+
+    var loaded_a = try stores[0].load();
+    defer loaded_a.deinit();
+    var loaded_b = try stores[1].load();
+    defer loaded_b.deinit();
+
+    // Session scope is only real if one session's commit is invisible to the
+    // other. A shared key would make the second write win for both.
+    try std.testing.expect(loaded_a.session_selection.?.target.pinned_offer.offer_id.eql(first.target.pinned_offer.offer_id));
+    try std.testing.expect(loaded_b.session_selection.?.target.pinned_offer.offer_id.eql(second.target.pinned_offer.offer_id));
+    try std.testing.expect(loaded_a.global_selection == null);
+
+    // Clearing is an explicit null, not a missing key that reads as "unchanged".
+    _ = try setSessionSelection(&stores[0], null, loaded_a.config_revision, "op-a-clear");
+    var cleared = try stores[0].load();
+    defer cleared.deinit();
+    try std.testing.expect(cleared.session_selection == null);
 }

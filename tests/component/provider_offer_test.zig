@@ -776,3 +776,144 @@ test "L2: --offer and --channel may not contradict each other" {
     try std.testing.expect(std.mem.indexOf(u8, text, "cn-anthropic") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cn-openai") != null);
 }
+
+// ── restart: a durable selection is what the next process actually routes to ──
+
+fn setEnvZ(name: [*:0]const u8, value: [*:0]const u8) void {
+    @import("platform").paths.setEnv(name, value);
+}
+
+fn unsetEnvZ(name: [*:0]const u8) void {
+    @import("platform").paths.unsetEnv(name);
+}
+
+test "L2: a globally committed selection routes the next process, model inference does not" {
+    const a = std.testing.allocator;
+    const path = try tempConfigPath(a, "restart");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    setEnvZ(cc.provider_config_store.CONFIG_PATH_ENV, path_z);
+    defer unsetEnvZ(cc.provider_config_store.CONFIG_PATH_ENV);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+    // The OpenAI-wire GLM route: proof the transport comes from the offer's
+    // protocol and not from the model name, which starts with "glm".
+    var target: *const cc.provider_offer.ModelOffer = undefined;
+    for (catalog.items()) |*candidate| {
+        if (candidate.channel_id.eqlText("cn-openai") and
+            std.mem.eql(u8, candidate.request_model_id, "glm-4.6")) target = candidate;
+    }
+
+    {
+        var store = try cc.provider_config_store.Store.initHome(a);
+        defer store.deinit();
+        _ = try cc.provider_config_store.setGlobalSelection(
+            &store,
+            cc.provider_selection.RuntimeSelection.pinned(target.offer_id, target.offer_revision, .global),
+            null,
+            "restart-commit",
+        );
+    }
+
+    // A fresh process: nothing on the command line names a provider.
+    var config = cc.types_mod.Config{};
+    try std.testing.expect(cc.applyPersistedGlobalSelection(&config, a));
+    defer {
+        if (config.selected_offer_id) |value| a.free(value);
+        if (config.resolved_provider_id) |value| a.free(value);
+        if (config.base_url) |value| a.free(value);
+        a.free(config.model);
+    }
+
+    try std.testing.expectEqualStrings("glm-4.6", config.model);
+    try std.testing.expectEqualStrings(target.endpoint_ref, config.base_url.?);
+    try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, config.provider_kind);
+    // Credential scope has to follow the restored route, or the session would
+    // re-enter the Metask credential path for a Z.AI endpoint.
+    try std.testing.expectEqualStrings("zai-coding-plan", config.provider_profile.?);
+    try std.testing.expect(!cc.selectedProfileIsMetask(config));
+    // Model-name inference would have said `anthropic` for "glm-4.6".
+    try std.testing.expect(cc.inferProviderKind(config.model) != config.provider_kind);
+}
+
+test "L2: a stored pin the catalog no longer offers is never silently remapped" {
+    const a = std.testing.allocator;
+    const path = try tempConfigPath(a, "stale-pin");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    var store = try cc.provider_config_store.Store.initPath(a, path);
+    defer store.deinit();
+    const missing = cc.provider_ids.OfferId{ .digest = @splat(0x5A) };
+    _ = try cc.provider_config_store.setGlobalSelection(
+        &store,
+        cc.provider_selection.RuntimeSelection.pinned(missing, 1, .global),
+        null,
+        "stale-commit",
+    );
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var reloaded = try store.load();
+    defer reloaded.deinit();
+
+    // Resolution reports the pin as unresolved instead of picking a neighbour;
+    // `applyPersistedGlobalSelection` turns exactly this into a startup error.
+    const outcome = try cc.provider_startup.resolveSelection(a, &registry, reloaded.global_selection.?);
+    try std.testing.expect(outcome == .failure);
+    try std.testing.expect(outcome.failure == .unresolved_selection);
+}
+
+test "L2: a session selection is written beside the session, not into config.json" {
+    const a = std.testing.allocator;
+    const config_path = try tempConfigPath(a, "session-scope");
+    defer a.free(config_path);
+    removeTempDir(config_path);
+    defer removeTempDir(config_path);
+
+    const session_dir = std.fs.path.dirname(config_path).?;
+    var config_store = try cc.provider_config_store.Store.initPath(a, config_path);
+    defer config_store.deinit();
+    var session_store = try cc.provider_config_store.Store.initSessionFile(a, session_dir);
+    defer session_store.deinit();
+    defer removeTempDir(session_store.path);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+    const global_target = catalog.items()[0];
+    const session_target = catalog.items()[1];
+
+    _ = try cc.provider_config_store.setGlobalSelection(
+        &config_store,
+        cc.provider_selection.RuntimeSelection.pinned(global_target.offer_id, global_target.offer_revision, .global),
+        null,
+        "global-commit",
+    );
+    _ = try cc.provider_config_store.setSessionSelection(
+        &session_store,
+        cc.provider_selection.RuntimeSelection.pinned(session_target.offer_id, session_target.offer_revision, .session),
+        null,
+        "session-commit",
+    );
+
+    // A session-scoped choice must not become everyone's choice.
+    var global_doc = try config_store.load();
+    defer global_doc.deinit();
+    try std.testing.expect(global_doc.session_selection == null);
+    try std.testing.expect(global_doc.global_selection.?.target.pinned_offer.offer_id.eql(global_target.offer_id));
+
+    var session_doc = try session_store.load();
+    defer session_doc.deinit();
+    try std.testing.expect(session_doc.global_selection == null);
+    try std.testing.expect(session_doc.session_selection.?.target.pinned_offer.offer_id.eql(session_target.offer_id));
+}

@@ -85,6 +85,8 @@ pub const Failure = union(enum) {
     /// The offer's protocol has no built-in transport (a custom protocol needs
     /// a registered adapter). Reported instead of quietly falling back.
     unsupported_protocol: []const u8,
+    /// A stored selection no longer resolves against the current catalog.
+    unresolved_selection: selection_mod.SelectionTarget,
     no_route,
 
     /// One line the CLI can print verbatim. Caller frees.
@@ -136,6 +138,22 @@ pub const Failure = union(enum) {
                 "the --base-url override is not valid for this provider route: {s}",
                 .{@errorName(err)},
             ),
+            .unresolved_selection => |target| switch (target) {
+                .pinned_offer => |pin| std.fmt.allocPrint(
+                    allocator,
+                    "the stored selection pins offer {s}, which the current catalog does not " ++
+                        "offer; pass --provider/--model to choose another route, or clear " ++
+                        "\"global_selection\" in ~/.metacodes/config.json",
+                    .{&pin.offer_id.render()},
+                ),
+                .auto_route => |route| std.fmt.allocPrint(
+                    allocator,
+                    "the stored selection '{s}' matches no route the current catalog allows; " ++
+                        "pass --provider/--model to choose another route, or clear " ++
+                        "\"global_selection\" in ~/.metacodes/config.json",
+                    .{route.selector.slice()},
+                ),
+            },
             .no_route => allocator.dupe(u8, "the selected provider exposes no usable route"),
         };
     }
@@ -161,7 +179,18 @@ pub fn resolve(
     registry: *const ProviderRegistry,
     request: StartupRequest,
 ) ResolveError!Outcome {
-    const provider_name = request.provider orelse return .{ .failure = .no_route };
+    const provider_name = request.provider orelse {
+        // An offer id already names its route. Demanding `--provider` beside it
+        // would make a persisted pin — which stores only the offer — unusable
+        // on its own, so the owner is looked up and the normal path re-entered
+        // with every other flag (including `--base-url`) still validated.
+        const text = request.offer_id orelse return .{ .failure = .no_route };
+        var owner = (try ownerOfOffer(allocator, registry, text)) orelse
+            return .{ .failure = .{ .unknown_offer = text } };
+        var narrowed = request;
+        narrowed.provider = owner.slice();
+        return resolve(allocator, registry, narrowed);
+    };
     const profile = registry.find(provider_name) orelse
         return .{ .failure = .{ .unknown_provider = provider_name } };
 
@@ -251,6 +280,51 @@ pub fn resolve(
     const base = try defaultOffer(&catalog, profile, channel_filter) orelse
         return .{ .failure = .no_route };
     return ownOrFail(allocator, profile, base, false);
+}
+
+/// Which profile declares `text`. Built without endpoint overrides on purpose:
+/// an override is scoped to a provider, and this lookup is what discovers which
+/// provider that is.
+fn ownerOfOffer(
+    allocator: std.mem.Allocator,
+    registry: *const ProviderRegistry,
+    text: []const u8,
+) ResolveError!?Slug {
+    const parsed = OfferId.parse(text) catch return null;
+    var catalog = registry.buildCatalog(allocator, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer catalog.deinit();
+    const found = catalog.find(parsed) orelse return null;
+    return found.provider_id;
+}
+
+/// Resolve a persisted or client-supplied `RuntimeSelection` into a startup
+/// route. Unlike `resolve`, this consults every provider: a stored selection
+/// carries its own route identity and no separate provider flag.
+///
+/// A pin that no longer resolves is reported, never remapped onto a similar
+/// offer — a selection is a user instruction, and quietly substituting another
+/// vendor for it is the failure mode the offer model exists to prevent.
+pub fn resolveSelection(
+    allocator: std.mem.Allocator,
+    registry: *const ProviderRegistry,
+    selection: selection_mod.RuntimeSelection,
+) ResolveError!Outcome {
+    var catalog = registry.buildCatalog(allocator, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.IncomparableTokenUnits => return .{ .failure = .no_route },
+        else => return .{ .failure = .{ .endpoint_rejected = @errorCast(err) } },
+    };
+    defer catalog.deinit();
+
+    const resolution = selection_mod.resolve(&catalog, selection) catch
+        return .{ .failure = .{ .unresolved_selection = selection.target } };
+    const chosen = resolution.primary();
+    const profile = registry.findById(chosen.provider_id) orelse
+        return .{ .failure = .no_route };
+    return ownOrFail(allocator, profile, chosen, false);
 }
 
 fn ownOrFail(
@@ -543,4 +617,100 @@ test "a resolved route carries the region and plan setup output must show" {
     defer plain.deinit();
     try std.testing.expect(plain.region == null);
     try std.testing.expect(plain.plan == null);
+}
+
+test "an offer id alone resolves without naming its provider" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+    const wanted = catalog.items()[2];
+    const rendered = wanted.offer_id.render();
+
+    // A persisted pin stores the offer and nothing else; requiring a provider
+    // flag beside it would make restoring that pin impossible.
+    const outcome = try resolve(a, &registry, .{ .offer_id = &rendered });
+    var route = outcome.route;
+    defer route.deinit();
+    try std.testing.expect(route.offer_id.eql(wanted.offer_id));
+    try std.testing.expect(route.provider_id.eqlText("zai-coding-plan"));
+}
+
+test "an offer id alone still validates a base-url override against its owner" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+    const rendered = catalog.items()[0].offer_id.render();
+
+    // Discovering the owner must not lose the policy that owner declares.
+    const outcome = try resolve(a, &registry, .{
+        .offer_id = &rendered,
+        .base_url = "https://open.bigmodel.cn/api/paas/v4",
+    });
+    try std.testing.expect(outcome == .failure);
+    try std.testing.expect(outcome.failure == .endpoint_rejected);
+}
+
+test "an unknown offer id with no provider names the offer, not the provider" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    const outcome = try resolve(a, &registry, .{
+        .offer_id = "offer-00000000000000000000000000000000",
+    });
+    try std.testing.expect(outcome.failure == .unknown_offer);
+}
+
+test "a stored pinned selection resolves across every provider" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+    const wanted = catalog.items()[1];
+
+    const selection = selection_mod.RuntimeSelection.pinned(
+        wanted.offer_id,
+        wanted.offer_revision,
+        .global,
+    );
+    const outcome = try resolveSelection(a, &registry, selection);
+    var route = outcome.route;
+    defer route.deinit();
+    try std.testing.expect(route.offer_id.eql(wanted.offer_id));
+    try std.testing.expectEqualStrings(wanted.request_model_id, route.request_model_id);
+}
+
+test "a stored pin the catalog no longer offers fails instead of remapping" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+
+    const missing = ids.OfferId{ .digest = @splat(0xAB) };
+    const selection = selection_mod.RuntimeSelection.pinned(missing, 1, .global);
+    const outcome = try resolveSelection(a, &registry, selection);
+    try std.testing.expect(outcome == .failure);
+    try std.testing.expect(outcome.failure == .unresolved_selection);
+
+    // The message must name the pin and the way out, not just "failed".
+    const text = try outcome.failure.message(a);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, &missing.render()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "global_selection") != null);
+}
+
+test "a stored auto selection resolves through the route policy" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+
+    const selection = try selection_mod.RuntimeSelection.auto("glm-4.6", .{}, .global);
+    const outcome = try resolveSelection(a, &registry, selection);
+    var route = outcome.route;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("glm-4.6", route.request_model_id);
+    try std.testing.expect(route.provider_id.eqlText("zai-coding-plan"));
 }

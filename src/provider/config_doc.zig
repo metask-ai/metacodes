@@ -113,6 +113,11 @@ pub const Document = struct {
     providers: std.ArrayList(ProviderEntry) = .empty,
     aliases: std.ArrayList(AliasEntry) = .empty,
     global_selection: ?RuntimeSelection = null,
+    /// Selection scoped to one session, written to a session-local document
+    /// rather than to `config.json`. Two sessions that shared one key would
+    /// overwrite each other's choice, which is exactly what session scope
+    /// promises not to do.
+    session_selection: ?RuntimeSelection = null,
     /// Idempotency keys of the most recent commits, oldest first. A retry
     /// carrying any retained key is a no-op instead of a second revision bump.
     recent_operations: [MAX_RECENT_OPERATIONS]OperationId = undefined,
@@ -209,6 +214,10 @@ pub const Document = struct {
             try renderSelection(arena, value)
         else
             null;
+        const session = if (self.session_selection) |value|
+            try renderSelection(arena, value)
+        else
+            null;
         var operations: ?[]u8 = null;
         if (self.recent_operation_len > 0) {
             var buffer: std.ArrayList(u8) = .empty;
@@ -227,6 +236,7 @@ pub const Document = struct {
             .{ .key = "providers", .json = providers },
             .{ .key = "aliases", .json = aliases },
             .{ .key = "global_selection", .json = selection },
+            .{ .key = "session_selection", .json = session },
             .{ .key = "recent_operation_ids", .json = operations },
         }) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -542,6 +552,10 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) DocumentError!Docum
 
     if (root.object.get("global_selection")) |value| {
         if (value != .null) document.global_selection = try parseSelection(value);
+    }
+
+    if (root.object.get("session_selection")) |value| {
+        if (value != .null) document.session_selection = try parseSelection(value);
     }
 
     if (root.object.get("recent_operation_ids")) |list| {
@@ -1111,4 +1125,48 @@ test "a legacy single-key document upgrades to the ring" {
     const text = try document.merge("{}");
     defer a.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "recent_operation_ids") != null);
+}
+
+test "session and global selections are separate keys, not one shared slot" {
+    const a = std.testing.allocator;
+    var document = Document.init(a);
+    defer document.deinit();
+
+    const global_offer = OfferId.derive(.{
+        .provider_id = Slug.lit("metask"),
+        .channel_id = Slug.lit("default"),
+        .protocol = "anthropic_messages",
+        .endpoint_url = "https://napi.metask-ai.com/v1/messages",
+        .request_model_id = "claude-sonnet-4-6",
+    });
+    const session_offer = OfferId.derive(.{
+        .provider_id = Slug.lit("zai-coding-plan"),
+        .channel_id = Slug.lit("cn-anthropic"),
+        .protocol = "anthropic_messages",
+        .endpoint_url = "https://open.bigmodel.cn/api/anthropic/v1/messages",
+        .request_model_id = "glm-4.6",
+    });
+    document.global_selection = RuntimeSelection.pinned(global_offer, 1, .global);
+    document.session_selection = RuntimeSelection.pinned(session_offer, 2, .session);
+
+    const text = try document.merge("{}");
+    defer a.free(text);
+    var reloaded = try parse(a, text);
+    defer reloaded.deinit();
+
+    // A session choice that overwrote the global one would silently change
+    // every other session on the machine.
+    try std.testing.expect(reloaded.global_selection.?.target.pinned_offer.offer_id.eql(global_offer));
+    try std.testing.expect(reloaded.session_selection.?.target.pinned_offer.offer_id.eql(session_offer));
+    try std.testing.expectEqual(selection_mod.Scope.session, reloaded.session_selection.?.scope);
+}
+
+test "a document with only a session selection leaves the global slot empty" {
+    const a = std.testing.allocator;
+    var document = try parse(a,
+        \\{"schema_version":1,"session_selection":{"target":{"kind":"auto_route","selector":"glm-4.6"},"scope":"session"}}
+    );
+    defer document.deinit();
+    try std.testing.expect(document.global_selection == null);
+    try std.testing.expectEqualStrings("glm-4.6", document.session_selection.?.target.auto_route.selector.slice());
 }

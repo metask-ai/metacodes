@@ -301,10 +301,13 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
   Gemini uses bearer, and the Gemini transport fixes its own header.
 - **`api_key_query` placement.** Rejected by both transports rather than
   silently dropped; it needs URL rewriting in the request path.
-- **Session-scoped `runtime-selection.json`.** `config_store.Store` accepts an
-  arbitrary path and is the intended writer, but no session host writes one yet,
-  and no startup path calls `Store.initHome` — the durable global selection is
-  readable and writable through the store, just not yet loaded at boot.
+- **Session-scoped `runtime-selection.json`.** The document, the store
+  (`Store.initSessionFile`), and the isolation between the session file and
+  `config.json` exist and are tested, but no session host writes one yet — the
+  TUI picker migration is what will. The *global* selection is loaded at boot:
+  `applyPersistedGlobalSelection` reads `Store.initHome` before model-name
+  inference runs, and a stored pin the catalog no longer offers is a startup
+  error rather than a silent fallback to another vendor.
 - **Credential pool rotation (P2).** `CredentialRef` carries priority, cooldown,
   and last-error, and resolution honours cooldown and invalid status, but only
   one credential per provider is offered to it.

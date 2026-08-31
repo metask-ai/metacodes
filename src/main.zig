@@ -267,7 +267,7 @@ fn argsIter(init: std.process.Init) std.process.Args.Iterator {
 fn applyProviderRoute(
     config: *types.Config,
     allocator: std.mem.Allocator,
-    profile_name: []const u8,
+    profile_name: ?[]const u8,
 ) void {
     const startup = @import("provider/startup.zig");
     var registry = @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator) catch {
@@ -287,6 +287,54 @@ fn applyProviderRoute(
         std.process.exit(2);
     };
 
+    applyStartupOutcome(config, allocator, outcome);
+}
+
+/// Restore the durable global selection committed by a previous `global` scope
+/// commit. Nothing is applied when no selection was ever committed, so the
+/// historical path stays byte-identical for every installation that has not
+/// used the picker.
+///
+/// A stored pin that no longer resolves is fatal on purpose. The alternative —
+/// falling back to model-name inference — would silently run a different vendor
+/// than the one the user chose, which is the exact substitution the offer model
+/// exists to prevent.
+pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.Allocator) bool {
+    var store = provider_config_store.Store.initHome(allocator) catch return false;
+    defer store.deinit();
+
+    var document = store.load() catch |err| {
+        // Unreadable is not "absent": say so rather than quietly ignoring a
+        // selection that may well be in there.
+        std.debug.print(
+            "warning: ~/.metacodes/config.json could not be read ({s}); " ++
+                "any stored provider selection is being ignored\n",
+            .{@errorName(err)},
+        );
+        return false;
+    };
+    defer document.deinit();
+    const selection = document.global_selection orelse return false;
+
+    var registry = provider_registry.ProviderRegistry.initWithBuiltins(allocator) catch {
+        std.debug.print("error: provider registry initialization failed\n", .{});
+        std.process.exit(2);
+    };
+    defer registry.deinit();
+
+    const outcome = provider_startup.resolveSelection(allocator, &registry, selection) catch {
+        std.debug.print("error: out of memory while resolving the stored provider selection\n", .{});
+        std.process.exit(2);
+    };
+    applyStartupOutcome(config, allocator, outcome);
+    return true;
+}
+
+fn applyStartupOutcome(
+    config: *types.Config,
+    allocator: std.mem.Allocator,
+    outcome: provider_startup.Outcome,
+) void {
     switch (outcome) {
         .failure => |failure| {
             const text = failure.message(allocator) catch "provider route resolution failed";
@@ -308,6 +356,13 @@ fn applyProviderRoute(
             const rendered = route.offer_id.render();
             config.selected_offer_id = allocator.dupe(u8, &rendered) catch null;
             config.resolved_provider_id = allocator.dupe(u8, route.provider_id.slice()) catch null;
+            // A stored selection names no provider on the command line, so the
+            // credential scope has to come from the route itself. Without this
+            // the session would fall back to the Metask credential path for a
+            // route that is not Metask.
+            if (config.provider_profile == null) {
+                config.provider_profile = config.resolved_provider_id;
+            }
             // Setup/doctor visibility: the selected region, protocol, and
             // endpoint are shown before any request is sent. The endpoint is a
             // channel base URL and carries no credential; the credential itself
@@ -455,7 +510,11 @@ pub fn main(init: std.process.Init) !void {
     }
     if (config.provider_profile) |profile_name| {
         applyProviderRoute(&config, allocator, profile_name);
-    } else {
+    } else if (config.provider_offer != null) {
+        // An offer id names its own provider; requiring `--provider` beside it
+        // would make a copied offer id unusable on its own.
+        applyProviderRoute(&config, allocator, null);
+    } else if (!applyPersistedGlobalSelection(&config, allocator)) {
         config.provider_kind = inferProviderKind(config.model);
     }
 
