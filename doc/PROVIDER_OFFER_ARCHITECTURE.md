@@ -1,8 +1,11 @@
 # Provider profiles, model offers, and the runtime control plane
 
-Status: **P0 shipped**; from P1 the Z.AI GLM Coding Plan provider, the durable
-selection at startup, built-in pricing, and the cross-UI TUI picker. Issue:
-`metask-ai/metacodes#16`.
+Status: **all delivery slices shipped** — P0 identity and kernel boundary, the
+P1 providers (Z.AI GLM Coding Plan, OpenAI/Codex OAuth lifecycle), offer and
+routing metadata with the OpenRouter adapters, controls and the cross-UI picker,
+user-defined providers, and the P2 follow-ups (aliases, credential pools,
+learned failover, the TinyKG audit plane). The P2 signed-adapter slice and the
+four items below are open by their own terms. Issue: `metask-ai/metacodes#16`.
 
 This document is the normative description of the provider identity model, the
 credential contract, and the control-plane API. It also records, explicitly,
@@ -613,7 +616,14 @@ TUI, or a UI protocol, that step stops compiling.
 
 ## Not implemented yet
 
-Listed rather than left silent. Each is a later delivery slice from the issue.
+Listed rather than left silent. Each is a decision with a reason, not an
+omission — and none of them is an acceptance criterion of the issue.
+
+- **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
+  signed adapter reference, which needs review and signing infrastructure. The
+  declarative schema covers relays, gateways, and self-hosted servers, which
+  differ by path rather than by wire; anything else is rejected (`UnknownWire`)
+  rather than guessed.
 
 - **Interactive OAuth login for non-Metask providers (P1).** The lifecycle —
   refresh, single flight, rotated-refresh persistence — is implemented and
