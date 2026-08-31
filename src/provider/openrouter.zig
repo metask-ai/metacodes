@@ -173,8 +173,12 @@ pub fn parseEndpoints(allocator: std.mem.Allocator, text: []const u8) AdapterErr
         var channel_id = channelSlug(provider_name) catch return error.InvalidSlug;
         // Two endpoints from one upstream provider differ by quantization or
         // region; the slug has to stay unique or they would collapse into one
-        // offer.
-        if (containsChannel(out.endpoints.items, channel_id)) {
+        // offer. The suffix search continues until the slug is actually free —
+        // a first attempt can itself collide when another provider is literally
+        // named "DeepInfra 1", and a duplicate channel id would be rejected far
+        // downstream as a malformed profile.
+        while (containsChannel(out.endpoints.items, channel_id)) : (seen += 1) {
+            if (seen > MAX_ENDPOINTS * 2) return error.InvalidSlug;
             channel_id = disambiguate(provider_name, seen) catch return error.InvalidSlug;
         }
         seen += 1;
@@ -349,8 +353,8 @@ pub fn compilePolicy(text: []const u8, allocator: std.mem.Allocator) AdapterErro
                 .currency = offer.Currency.lit("USD"),
                 .billing_unit = .per_million_tokens,
                 .max_micros = std.math.maxInt(u64),
-                .max_input_micros = if (prompt) |value| @intFromFloat(@round(value * 1_000_000.0)) else null,
-                .max_output_micros = if (completion) |value| @intFromFloat(@round(value * 1_000_000.0)) else null,
+                .max_input_micros = if (prompt) |value| try scaledMicros(value, 1_000_000.0) else null,
+                .max_output_micros = if (completion) |value| try scaledMicros(value, 1_000_000.0) else null,
             };
         }
     }
@@ -399,7 +403,7 @@ pub fn parseRouterMetadata(text: []const u8, allocator: std.mem.Allocator) Adapt
                 .cached_input_tokens = optionalU64(usage.object.get("cached_tokens")) orelse 0,
             };
             if (optionalF64(usage.object.get("cost"))) |cost| {
-                out.cost_micros = @intFromFloat(@round(cost * 1_000_000.0));
+                out.cost_micros = scaledMicros(cost, 1_000_000.0) catch null;
             }
         }
     }
@@ -475,10 +479,22 @@ fn priceField(value: ?std.json.Value) AdapterError!?u64 {
         .null => return null,
         else => return error.MalformedPrice,
     };
-    if (per_token < 0) return error.MalformedPrice;
-    const micros = per_token * 1_000_000.0 * 1_000_000.0;
-    if (micros > @as(f64, @floatFromInt(std.math.maxInt(u64)))) return error.MalformedPrice;
-    return @intFromFloat(@round(micros));
+    return try scaledMicros(per_token, 1_000_000.0 * 1_000_000.0);
+}
+
+/// `value * scale` as an integer, or an error.
+///
+/// The finiteness check is the load-bearing part: `"prompt": "nan"` or a price
+/// large enough to overflow makes `@intFromFloat` illegal behaviour, and a
+/// catalog document is exactly the kind of input that can carry either. A
+/// comparison against a NaN is false, so the range check alone would not catch
+/// it.
+fn scaledMicros(value: f64, scale: f64) AdapterError!u64 {
+    if (!std.math.isFinite(value) or value < 0) return error.MalformedPrice;
+    const scaled = value * scale;
+    if (!std.math.isFinite(scaled)) return error.MalformedPrice;
+    if (scaled > @as(f64, @floatFromInt(std.math.maxInt(u64)))) return error.MalformedPrice;
+    return @intFromFloat(@round(scaled));
 }
 
 fn parseArchitecture(architecture: ?std.json.Value, parameters: ?std.json.Value) offer.CapabilityMatrix {
@@ -616,36 +632,45 @@ fn triOf(value: ?std.json.Value) offer.Tri {
     return if (flag) .supported else .unsupported;
 }
 
-fn optionalU32(value: ?std.json.Value) ?u32 {
-    const found = value orelse return null;
-    const number: i64 = switch (found) {
+/// A JSON number as an integer, or null. The float branch checks finiteness and
+/// range *before* converting: `@intFromFloat` on a NaN or an out-of-range value
+/// is illegal behaviour, and a fetched document can carry either.
+fn integerOf(value: std.json.Value) ?i64 {
+    return switch (value) {
         .integer => |v| v,
-        .float => |v| @intFromFloat(v),
-        else => return null,
+        .float => |v| blk: {
+            if (!std.math.isFinite(v)) break :blk null;
+            if (v < @as(f64, @floatFromInt(std.math.minInt(i64)))) break :blk null;
+            if (v > @as(f64, @floatFromInt(std.math.maxInt(i64)))) break :blk null;
+            break :blk @intFromFloat(v);
+        },
+        else => null,
     };
+}
+
+fn optionalU32(value: ?std.json.Value) ?u32 {
+    const number = integerOf(value orelse return null) orelse return null;
     if (number <= 0 or number > std.math.maxInt(u32)) return null;
     return @intCast(number);
 }
 
 fn optionalU64(value: ?std.json.Value) ?u64 {
-    const found = value orelse return null;
-    const number: i64 = switch (found) {
-        .integer => |v| v,
-        .float => |v| @intFromFloat(v),
-        else => return null,
-    };
+    const number = integerOf(value orelse return null) orelse return null;
     if (number < 0) return null;
     return @intCast(number);
 }
 
 fn optionalF64(value: ?std.json.Value) ?f64 {
     const found = value orelse return null;
-    return switch (found) {
+    const number: f64 = switch (found) {
         .integer => |v| @floatFromInt(v),
         .float => |v| v,
-        .string => |text| std.fmt.parseFloat(f64, text) catch null,
-        else => null,
+        .string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        else => return null,
     };
+    // A non-finite value poisons every arithmetic it reaches and makes any
+    // later integer conversion illegal, so it never leaves this function.
+    return if (std.math.isFinite(number)) number else null;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -950,4 +975,59 @@ test "two endpoints from one upstream provider stay distinct offers" {
     try testing.expectEqual(@as(usize, 2), endpoints.endpoints.items.len);
     // A collapsed slug would silently drop one of the two routes.
     try testing.expect(!endpoints.endpoints.items[0].channel_id.eql(endpoints.endpoints.items[1].channel_id));
+}
+
+test "hostile numbers are rejected rather than converted" {
+    const a = testing.allocator;
+    // `@intFromFloat` on a NaN or an out-of-range value is illegal behaviour,
+    // and a fetched catalog is exactly the kind of document that can carry one.
+    try testing.expectError(error.MalformedPrice, parseModels(a,
+        \\{"data": [{"id": "x/y", "pricing": {"prompt": "nan"}}]}
+    ));
+    try testing.expectError(error.MalformedPrice, parseModels(a,
+        \\{"data": [{"id": "x/y", "pricing": {"prompt": "inf"}}]}
+    ));
+    try testing.expectError(error.MalformedPrice, parseModels(a,
+        \\{"data": [{"id": "x/y", "pricing": {"prompt": "1e300"}}]}
+    ));
+    try testing.expectError(error.MalformedPrice, parseModels(a,
+        \\{"data": [{"id": "x/y", "pricing": {"prompt": "-0.5"}}]}
+    ));
+
+    // A non-finite context length is dropped rather than converted, leaving the
+    // limit unknown — which admission already fails closed on.
+    var models = try parseModels(a,
+        \\{"data": [{"id": "x/y", "context_length": 1e400}]}
+    );
+    defer models.deinit();
+    try testing.expectEqual(@as(?u32, null), models.find("x/y").?.context_length);
+
+    // And a policy ceiling that cannot be represented is an error, not a
+    // silently enormous one that admits everything.
+    try testing.expectError(error.MalformedPrice, compilePolicy(
+        "{\"provider\": {\"max_price\": {\"prompt\": 1e308}}}",
+        a,
+    ));
+}
+
+test "three endpoints from one provider get three distinct channels" {
+    const a = testing.allocator;
+    var endpoints = try parseEndpoints(a,
+        \\{"data": {"id": "x/y", "endpoints": [
+        \\  {"provider_name": "DeepInfra"},
+        \\  {"provider_name": "DeepInfra 1"},
+        \\  {"provider_name": "DeepInfra"}
+        \\]}}
+    );
+    defer endpoints.deinit();
+    try testing.expectEqual(@as(usize, 3), endpoints.endpoints.items.len);
+
+    // A duplicate channel id survives all the way to profile validation and
+    // fails the whole ingest, so the suffix search has to actually find a free
+    // slug rather than try once.
+    for (endpoints.endpoints.items, 0..) |left, i| {
+        for (endpoints.endpoints.items[i + 1 ..]) |right| {
+            try testing.expect(!left.channel_id.eql(right.channel_id));
+        }
+    }
 }

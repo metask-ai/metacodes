@@ -87,11 +87,11 @@ pub fn fetch(
     );
     const body = reader.allocRemaining(allocator, std.Io.Limit.limited(MAX_DOCUMENT_BYTES)) catch
         return error.TooLarge;
+    // The errdefer owns the body on every error path below. Freeing it
+    // explicitly *and* letting the errdefer run would free it twice, which for
+    // an ordinary 401 or 429 from a catalog endpoint means heap corruption.
     errdefer allocator.free(body);
 
-    if (status.code < 200 or status.code >= 300) {
-        allocator.free(body);
-        return error.HttpError;
-    }
+    if (status.code < 200 or status.code >= 300) return error.HttpError;
     return .{ .status = status.code, .body = body };
 }

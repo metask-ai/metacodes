@@ -550,6 +550,7 @@ fn intOf(value: std.json.Value) ?i64 {
 
 fn optionalU32(value: ?std.json.Value) DefinitionError!?u32 {
     const found = value orelse return null;
+    // `intOf` accepts only a JSON integer, so no float conversion happens here.
     const number = intOf(found) orelse return error.InvalidDocument;
     if (number <= 0 or number > std.math.maxInt(u32)) return error.InvalidDocument;
     return @intCast(number);
@@ -559,13 +560,17 @@ fn optionalU32(value: ?std.json.Value) DefinitionError!?u32 {
 /// config says `3.0` rather than `3000000`.
 fn optionalMicros(value: ?std.json.Value) DefinitionError!?u64 {
     const found = value orelse return null;
-    const scaled: f64 = switch (found) {
+    const declared: f64 = switch (found) {
         .integer => |number| @floatFromInt(number),
         .float => |number| number,
         else => return error.InvalidPrice,
     };
-    if (scaled < 0 or scaled > 1_000_000) return error.InvalidPrice;
-    return @intFromFloat(@round(scaled * 1_000_000.0));
+    // Finiteness first: a comparison against a NaN is false, so the range check
+    // alone would let `"input": nan` through to `@intFromFloat`, which is
+    // illegal behaviour rather than a wrong number.
+    if (!std.math.isFinite(declared)) return error.InvalidPrice;
+    if (declared < 0 or declared > 1_000_000) return error.InvalidPrice;
+    return @intFromFloat(@round(declared * 1_000_000.0));
 }
 
 fn optionalDiscount(value: ?std.json.Value) DefinitionError!?u16 {
@@ -780,4 +785,23 @@ test "configured providers are bounded, and duplicates are rejected" {
     }
     try buffer.appendSlice(a, "}}");
     try testing.expectError(error.TooManyProviders, parse(a, buffer.items));
+}
+
+test "a non-finite or out-of-range price is rejected, not converted" {
+    const a = testing.allocator;
+    // `@intFromFloat` on a NaN or an out-of-range value is illegal behaviour,
+    // and a comparison against NaN is false — so the range check alone would
+    // not stop it. Each of these must be an error, not a number.
+    for ([_][]const u8{
+        \\{"custom_providers": {"x": {
+        \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"m","price":{"currency":"USD","input":1e308}}]}}}
+        ,
+        \\{"custom_providers": {"x": {
+        \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"m","price":{"currency":"USD","input":-1}}]}}}
+        ,
+    }) |text| {
+        try testing.expectError(error.InvalidPrice, parse(a, text));
+    }
 }

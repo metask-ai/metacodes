@@ -1808,3 +1808,43 @@ test "L2: a session that named its provider on the command line has a current of
     try std.testing.expect(committed == .committed);
     try std.testing.expect(host.kernel.currentOfferId().?.eql(other.offer_id));
 }
+
+test "L2: a catalog endpoint answering non-2xx releases its body exactly once" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startWithStatus(
+        \\{"error":"unauthorized"}
+    , 0, "HTTP/1.1 401 Unauthorized");
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+
+    // The failure path freed the body *and* let an errdefer free it again, so
+    // an ordinary 401 from a catalog endpoint corrupted the heap.
+    // `std.testing.allocator` fails on a double free or a leak, so this test is
+    // the check.
+    try std.testing.expectError(error.HttpError, cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{
+        .url = origin,
+        .bearer = "sk-catalog",
+    }));
+}
+
+test "L2: an unreachable catalog endpoint leaves the previous catalog in place" {
+    const a = std.testing.allocator;
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    // Port 1 on loopback refuses immediately.
+    try std.testing.expect(cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{
+        .url = "http://127.0.0.1:1/models",
+    }) == error.RequestFailed);
+
+    // A stale catalog is a far better answer than an empty one, and every pin
+    // stays resolvable.
+    try std.testing.expectEqual(before, host.kernel.catalogSnapshot().items().len);
+}
