@@ -1333,6 +1333,26 @@ pub const App = struct {
             client.api_key = secret;
             client.base_url = endpoint;
         }
+        // Every out-of-process UI learns the *route*, not just the model name: a
+        // visible model name can come from several providers, channels,
+        // protocols, and accounts, so broadcasting only the name would announce
+        // a change a Web or CLI client cannot tell apart from another.
+        {
+            const rendered = binding.offer_id.render();
+            app.emitConfig(.{ .route = .{
+                .provider_id = binding.provider_id.slice(),
+                .channel_id = binding.channel_id.slice(),
+                .protocol = binding.protocol.id(),
+                .request_model_id = binding.request_model_id,
+                .offer_id = &rendered,
+                .credential_ref = if (binding.credential_ref.id.len > 0)
+                    binding.credential_ref.id.slice()
+                else
+                    null,
+                .scope = @tagName(selection.scope),
+            } });
+        }
+
         // Swarm teammates are constructed from this context when they spawn, so
         // it has to move with the route: a teammate started after a switch must
         // not dial the previous provider with this provider's credential.

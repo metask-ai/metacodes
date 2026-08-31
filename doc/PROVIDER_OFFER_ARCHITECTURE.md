@@ -548,6 +548,14 @@ can see before pressing Enter. A successful commit closes the overlay and prints
 one line into the transcript — a picker that vanishes without saying which of
 several same-named routes it chose leaves the user unable to tell.
 
+A committed route is broadcast on the existing UI event stream as a
+`config_changed` → `route` event carrying provider, channel, protocol, wire
+model id, offer id, credential *reference*, and scope. The model name alone
+would not do: a visible name can come from several providers, channels,
+protocols, and accounts, so a name-only broadcast announces a change an
+out-of-process client cannot tell apart from another. The credential reference
+travels; the secret never does.
+
 `src/repl/model_picker.zig` holds the state machine, `model_picker_view.zig` the
 drawing, and `picker_host.zig` performs the commit against the session.
 `zig build test:picker` compiles all three from a root that reaches the provider

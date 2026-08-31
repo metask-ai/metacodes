@@ -253,6 +253,13 @@ status, compatibility boundaries, and entry points are defined by
   smuggles no default onto the wire), and that a provider's opaque control
   metadata round-trips through `model.list` into the picker without any core,
   TUI, or Web change.
+  A committed route is also broadcast on the existing UI event stream as a
+  `config_changed` → `route` event carrying provider, channel, protocol, wire
+  model id, offer id, credential reference, and scope — the model name alone
+  would announce a change an out-of-process client cannot tell apart from
+  another, since one visible name can come from several providers, channels,
+  protocols, and accounts. The credential reference travels; the secret does
+  not.
 
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and

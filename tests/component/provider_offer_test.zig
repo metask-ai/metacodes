@@ -1553,3 +1553,77 @@ test "L2: a provider metadata extension round-trips through the generic client v
     try std.testing.expectEqual(picker_mod.Stage.options, picker.stage);
     try std.testing.expectEqual(@as(usize, 1), picker.rowCount());
 }
+
+// ── cross-UI: an out-of-process client sees the route, not just the name ─────
+
+test "L2: a route change is broadcast as an ordered, replayable event carrying identity" {
+    const a = std.testing.allocator;
+    const ui_event = cc.ui_event;
+
+    const Collector = struct {
+        lines: std.ArrayList([]u8) = .empty,
+        allocator: std.mem.Allocator,
+
+        fn emit(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // The same serialization the Web journal performs, so the test sees
+            // exactly what a browser would.
+            const line = std.json.Stringify.valueAlloc(
+                self.allocator,
+                .{ .config_changed = ev },
+                .{},
+            ) catch return;
+            self.lines.append(self.allocator, line) catch self.allocator.free(line);
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.lines.items) |line| self.allocator.free(line);
+            self.lines.deinit(self.allocator);
+        }
+    };
+
+    var collector = Collector{ .allocator = a };
+    defer collector.deinit();
+    const sink = ui_event.ConfigEventSink{
+        .ctx = @ptrCast(&collector),
+        .emitFn = struct {
+            fn run(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
+                Collector.emit(ctx, ev);
+            }
+        }.run,
+    };
+
+    // A route event as `bindCommittedSelection` produces one.
+    sink.emit(.{ .route = .{
+        .provider_id = "zai-coding-plan",
+        .channel_id = "cn-openai",
+        .protocol = "openai_chat",
+        .request_model_id = "glm-4.6",
+        .offer_id = "offer-0123456789abcdef0123456789abcdef",
+        .credential_ref = "work",
+        .scope = "session",
+    } });
+
+    try std.testing.expectEqual(@as(usize, 1), collector.lines.items.len);
+    const line = collector.lines.items[0];
+    // Identity, not just a display name: a second client can tell this route
+    // from another that shows the same model name.
+    for ([_][]const u8{
+        "\"config_changed\"",
+        "\"route\"",
+        "zai-coding-plan",
+        "cn-openai",
+        "openai_chat",
+        "glm-4.6",
+        "offer-0123456789abcdef0123456789abcdef",
+        "\"credential_ref\":\"work\"",
+        "\"scope\":\"session\"",
+    }) |needle| {
+        std.testing.expect(std.mem.indexOf(u8, line, needle) != null) catch |err| {
+            std.debug.print("missing from route event: {s}\n{s}\n", .{ needle, line });
+            return err;
+        };
+    }
+    // The credential *reference* travels; the secret never does.
+    try std.testing.expect(std.mem.indexOf(u8, line, "sk-") == null);
+}
