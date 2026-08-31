@@ -1185,7 +1185,9 @@ test "L2: a configured provider's declared metadata reaches every client the sam
     var picker = picker_mod.Picker.init(a);
     defer picker.deinit();
     try seedPicker(&picker, &host.kernel, a);
-    _ = picker.onKey(.{ .char = 'h' });
+    // A filter specific enough to name one provider: the stage matches what a
+    // provider serves as well as its id, so a single letter is not unique.
+    for ("house-relay") |byte| _ = picker.onKey(.{ .char = byte });
     var scratch: [picker_mod.Picker.MAX_ROWS]picker_mod.Row = undefined;
     const rows = picker.rows(&scratch);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
