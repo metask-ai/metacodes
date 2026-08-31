@@ -239,7 +239,13 @@ pub const Picker = struct {
         var len: usize = 0;
         for (self.offers.items, 0..) |offer, index| {
             const label = offer.provider_id.slice();
-            if (!matches(self.filter(), label)) continue;
+            // The filter also matches what the provider *serves*. The first
+            // stage is the one where the user knows least: someone looking for
+            // GLM should not have to already know it lives behind
+            // `zai-coding-plan`.
+            if (!matches(self.filter(), label) and
+                !matches(self.filter(), offer.display_name) and
+                !matches(self.filter(), canonicalKey(offer))) continue;
             if (findGroup(out[0..len], label, self)) |existing| {
                 bumpGroup(&out[existing], index, self.isCurrent(offer));
                 continue;
@@ -1006,4 +1012,33 @@ test "a refresh that keeps the chosen offer leaves the draft alone" {
     try loadFixture(&picker, &offers, null);
     try testing.expect(picker.offer_id.?.eql(chosen));
     try testing.expectEqual(@as(usize, 0), picker.notice_len);
+}
+
+test "the provider stage is searchable by what a provider serves" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
+        fixtureOffer("zai-coding-plan", "cn-anthropic", "GLM-4.6", "zai/glm-4.6", "glm-4.6", "anthropic_messages"),
+        fixtureOffer("zai-coding-plan", "cn-openai", "GLM-4.6", "zai/glm-4.6", "glm-4.6", "openai_chat"),
+    };
+    try loadFixture(&picker, &offers, null);
+
+    var scratch: [Picker.MAX_ROWS]Row = undefined;
+    try testing.expectEqual(@as(usize, 2), picker.rows(&scratch).len);
+
+    // "glm" names no provider, but it is what the user is looking for — and
+    // the provider stage is the one where they know least.
+    for ("glm") |byte| _ = picker.onKey(.{ .char = byte });
+    const filtered = picker.rows(&scratch);
+    try testing.expectEqual(@as(usize, 1), filtered.len);
+    try testing.expect(picker.offers.items[filtered[0].provider.offer_index].provider_id.eqlText("zai-coding-plan"));
+    // The count reflects the offers that matched, so the row does not promise
+    // routes the filter has hidden.
+    try testing.expectEqual(@as(usize, 2), filtered[0].provider.offer_count);
+
+    // Filtering by provider id still works.
+    picker.restart();
+    for ("metask") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expectEqual(@as(usize, 1), picker.rows(&scratch).len);
 }

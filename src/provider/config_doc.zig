@@ -1287,3 +1287,59 @@ test "a document with only a session selection leaves the global slot empty" {
     try std.testing.expect(document.global_selection == null);
     try std.testing.expectEqualStrings("glm-4.6", document.session_selection.?.target.auto_route.selector.slice());
 }
+
+test "a credential pool round-trips, secrets excluded" {
+    const a = std.testing.allocator;
+    var document = Document.init(a);
+    defer document.deinit();
+
+    var entry = ProviderEntry{ .id = Slug.lit("openai"), .credential_ref = Slug.lit("cred-1") };
+    try entry.credentials.append(.{
+        .id = Slug.lit("work"),
+        .env = try AliasName.parse("OPENAI_API_KEY_WORK"),
+        .kind = try controls_mod.Bounded(32).parse("api_key"),
+        .priority = 0,
+        .account_or_plan = try AliasName.parse("acme-workspace"),
+    });
+    try entry.credentials.append(.{
+        .id = Slug.lit("personal"),
+        .env = try AliasName.parse("OPENAI_API_KEY_PERSONAL"),
+        .kind = try controls_mod.Bounded(32).parse("api_key"),
+        .priority = 3,
+        .cooldown_until = 1_700_000_000,
+        .invalid = true,
+    });
+    try document.upsertProvider(entry);
+
+    const text = try document.merge("{\"theme\":\"dark\"}");
+    defer a.free(text);
+
+    // A rename on one side of the serializer would silently drop a field, and
+    // the pool would quietly lose an account or its learned state.
+    var reloaded = try parse(a, text);
+    defer reloaded.deinit();
+    const members = reloaded.provider(Slug.lit("openai")).?.credentials.items();
+    try std.testing.expectEqual(@as(usize, 2), members.len);
+    try std.testing.expect(members[0].id.eqlText("work"));
+    try std.testing.expectEqualStrings("OPENAI_API_KEY_WORK", members[0].env.slice());
+    try std.testing.expectEqualStrings("api_key", members[0].kind.slice());
+    try std.testing.expectEqualStrings("acme-workspace", members[0].account_or_plan.?.slice());
+    try std.testing.expectEqual(@as(u8, 3), members[1].priority);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000), members[1].cooldown_until);
+    try std.testing.expect(members[1].invalid);
+
+    // Another writer's key survives, and no secret was ever written.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sk-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "secret") == null);
+}
+
+test "a credential entry carrying a literal secret is refused" {
+    const a = std.testing.allocator;
+    // The document is read by several tools and is not mode 0600, so a secret
+    // in it is a leak by construction rather than by accident.
+    try std.testing.expectError(error.InvalidDocument, parse(a,
+        \\{"schema_version":1,"providers":{"openai":{"enabled":true,"credentials":[
+        \\  {"id":"work","env":"OPENAI_API_KEY_WORK","secret":"sk-leaked"}]}}}
+    ));
+}

@@ -1988,7 +1988,12 @@ pub const App = struct {
                             .url = url,
                             .bearer = bearer,
                         }) catch continue;
-                        try documents.append(app.allocator, document.body);
+                        // The list owns the body from here; on a failed append
+                        // nothing else would ever free it.
+                        documents.append(app.allocator, document.body) catch |err| {
+                            app.allocator.free(document.body);
+                            return err;
+                        };
                     }
                 }
             }
