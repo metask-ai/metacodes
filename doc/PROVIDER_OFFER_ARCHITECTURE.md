@@ -319,6 +319,53 @@ provider's own policy forbids, a plaintext non-loopback host, a URL carrying
 userinfo, a missing channel or model, an unknown auth scheme, or a price in an
 unknown currency all fail before registration.
 
+## Provider catalogs
+
+`src/provider/openrouter.zig` adapts the OpenRouter shape, which is the one
+worth adapting: it is a router, so it already separates the two things a
+metadata source must keep separate.
+
+- **Models** (`GET /models`) describe a canonical model — name, context length,
+  declared pricing, supported parameters.
+- **Endpoints** (`GET /models/{id}/endpoints`) describe the *routes* behind that
+  model, one per upstream provider, each with its own context length, price,
+  quantization, and status.
+
+They are parsed separately and stay separate. A model with three endpoints
+becomes three offers; merging them would reproduce exactly the "a model name
+identifies the route" mistake this whole model corrects. Two endpoints from one
+upstream provider (different quantizations, say) get distinct channel slugs, so
+neither disappears.
+
+Endpoint values win over model values, and only where the endpoint has one: an
+endpoint that omits pricing inherits the model's declared price with
+`inherited` provenance rather than becoming free, and one that omits a context
+length inherits rather than becoming unlimited. An endpoint that never reported
+a status has `unknown` health, which is not the same as having reported "fine".
+A price string that is not a number is an error, not a zero.
+
+Provider preferences compile into `RoutePolicy`. `only`/`ignore` and the numeric
+ceilings become *hard* constraints; `order` and `sort` become preferences that
+never reject — reading a preference as a constraint would silently drop routes
+the user did not exclude. `allow_fallbacks` defaults the kernel's way (off),
+because a selection that silently tries a second route is not the one the user
+inspected. `PriceConstraint` carries per-direction ceilings, since a router's
+price limit is per direction and folding both into one number is wrong in
+whichever direction it rounds.
+
+Router metadata folds into the `ActualRouteEvent` the kernel already derived —
+usage, cost, latency, fallback attempts, status — and deliberately never
+rewrites `requested`. What the user asked for is not something the router gets
+to change after the fact. The upstream provider arrives as a channel slug, not a
+string, because an event payload carries ids and enums only.
+
+Ingesting a catalog moves the catalog revision and emits `catalog.updated`,
+`pricing.updated`, and — when an endpoint reports degraded or unavailable —
+`provider.degraded`. `auth.changed` and `credential.expiring` have producers on
+the kernel (`noteAuthChanged`, `noteCredentialExpiring`) for the credential
+resolver to call. A pin survives an ingest: `OfferId` is derived from the stable
+binding, so a rebuild reproduces it.
+
 ## TUI
 
 `Ctrl+O` and `/model` open the same picker; transcript viewing moved to
@@ -382,6 +429,7 @@ to the historical path, which still serves proxies and server-catalog models.
 | `src/provider/startup.zig` | CLI/bootstrap route resolution |
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
+| `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
 | `src/repl/model_picker.zig` | picker state machine (pure) |
 | `src/repl/model_picker_view.zig` | picker rendering |
 | `src/repl/picker_host.zig` | commit + rebind against the session |
@@ -401,13 +449,12 @@ Listed rather than left silent. Each is a later delivery slice from the issue.
   kinds and the transport auth shape; the device/PKCE flow, single-flight
   refresh, and rotated-refresh-token persistence are not implemented. Only
   Metask OAuth works today, on its historical path.
-- **Provider catalog refresh and health hooks (P1).** Offers come from compiled
-  profile data. There is no `GET /models` ingestion, no per-offer health or
-  capacity observation, and no OpenRouter model/endpoint adapter. The data model
-  carries these fields and `adoptCatalog` can swap in a refreshed catalog, but
-  nothing produces one yet, so health and capacity read `unknown`. The
-  `pricing.updated`, `auth.changed`, `credential.expiring`, and
-  `provider.degraded` event types wait on the same work.
+- **Live catalog fetching (P1).** Catalogs are ingested from documents on disk
+  (`provider_catalogs` in `config.json`), not fetched. The parsing, offer
+  construction, and events are identical either way, so wiring an HTTP fetcher
+  changes only where the bytes come from — but a `curl > file` step is required
+  today. Per-offer *capacity* (throughput) also stays `unknown`: OpenRouter's
+  endpoint rows do not carry it.
 - **Catalog- and config-sourced prices (P1).** The `metask` profile ships a
   real quote (see *Pricing*), so `model.list` and `quote.estimate` return known
   prices for it. `openai` and `gemini` stay `unknown` until a provider catalog

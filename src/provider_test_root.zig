@@ -22,6 +22,7 @@ pub const startup = @import("provider/startup.zig");
 pub const config_store = @import("provider/config_store.zig");
 pub const host = @import("provider/host.zig");
 pub const custom_provider = @import("provider/custom_provider.zig");
+pub const openrouter = @import("provider/openrouter.zig");
 
 test {
     // This std build has no refAllDeclsRecursive; the explicit re-exports above

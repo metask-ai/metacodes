@@ -121,6 +121,25 @@ status, compatibility boundaries, and entry points are defined by
   it produces — provider, channel, protocol, endpoint, wire model id, context,
   price — with no credential resolved and no request URL built.
 
+- Provider catalog adapters and the events they enable (issue #16, P1).
+  `src/provider/openrouter.zig` parses model and endpoint documents
+  *separately* — a model with three endpoints becomes three offers, because a
+  model name is not a route — and merges them so an endpoint's own values win
+  while an absent one inherits with `inherited` provenance instead of becoming
+  free or unlimited. An endpoint that never reported a status has `unknown`
+  health, not healthy; a price string that is not a number is an error, not a
+  zero. Provider preferences compile into `RoutePolicy` with `only`/`ignore` and
+  the numeric ceilings as hard constraints and `order`/`sort` as preferences
+  that never reject, and `PriceConstraint` gained per-direction ceilings because
+  a router's price limit is per direction. Router metadata folds usage, cost,
+  latency, and fallback attempts into the `ActualRouteEvent` the kernel derived
+  without rewriting what was requested. Ingesting a catalog moves the catalog
+  revision and emits `catalog.updated`, `pricing.updated`, and
+  `provider.degraded`; `auth.changed` and `credential.expiring` gained kernel
+  producers. Catalogs are named by a `provider_catalogs` section in
+  `config.json` and read from disk, so no transport dependency enters the
+  provider subsystem.
+
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and
   base64 image parts (per image capped at the Read tool's 3.75 MB raw limit,

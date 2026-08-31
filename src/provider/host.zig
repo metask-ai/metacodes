@@ -13,12 +13,17 @@ const std = @import("std");
 const ids = @import("ids.zig");
 const registry_mod = @import("registry.zig");
 const control_plane = @import("control_plane.zig");
+const selection_mod = @import("selection.zig");
 const config_store = @import("config_store.zig");
 const custom_provider = @import("custom_provider.zig");
+const openrouter = @import("openrouter.zig");
+const offer_mod = @import("offer.zig");
+const profile_mod = @import("profile.zig");
 
 pub const ProviderRegistry = registry_mod.ProviderRegistry;
 pub const OfferCatalog = registry_mod.OfferCatalog;
 pub const Kernel = control_plane.Kernel;
+pub const Slug = ids.Slug;
 
 pub const HostError = error{OutOfMemory} || registry_mod.RegisterError;
 
@@ -33,6 +38,8 @@ pub const Host = struct {
     /// Owns every string the configured profiles point at. It must outlive the
     /// registry, which borrows them.
     custom: ?custom_provider.Definitions = null,
+    /// Owns the strings of a provider catalog ingested at runtime.
+    catalog_arena: ?std.heap.ArenaAllocator = null,
     kernel: Kernel,
 
     pub fn create(allocator: std.mem.Allocator) HostError!*Host {
@@ -68,6 +75,7 @@ pub const Host = struct {
         // first.
         self.registry.deinit();
         if (self.custom) |*definitions| definitions.deinit();
+        if (self.catalog_arena) |*arena| arena.deinit();
         allocator.destroy(self);
     }
 
@@ -91,6 +99,71 @@ pub const Host = struct {
         self.refresh() catch return error.OutOfMemory;
     }
 
+    pub const IngestError = openrouter.AdapterError || registry_mod.RegisterError;
+
+    /// Ingest a provider catalog: one `GET /models` document plus one
+    /// `GET /models/{id}/endpoints` document per model the caller cares about.
+    ///
+    /// The two are parsed separately and stay separate — a model with three
+    /// endpoints becomes three offers, because a model name is not a route.
+    /// Registering replaces any previous ingest for `provider_id`, and the
+    /// catalog revision moves, so a client can tell its snapshot went stale.
+    ///
+    /// The kernel does not fetch. The caller supplies the bytes, which is what
+    /// keeps this subsystem free of a transport dependency.
+    pub fn ingestOpenRouter(
+        self: *Host,
+        provider_id: Slug,
+        models_json: []const u8,
+        endpoint_documents: []const []const u8,
+    ) IngestError!void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const scratch = arena.allocator();
+
+        var models = try openrouter.parseModels(self.allocator, models_json);
+        defer models.deinit();
+
+        var channels: std.ArrayList(profile_mod.ChannelDescriptor) = .empty;
+        var worst = offer_mod.HealthStatus.healthy;
+        for (endpoint_documents) |document| {
+            var endpoints = try openrouter.parseEndpoints(self.allocator, document);
+            defer endpoints.deinit();
+            const model = models.find(endpoints.canonical_model_id) orelse continue;
+            for (endpoints.endpoints.items) |endpoint| {
+                if (endpoint.health.status == .degraded) worst = .degraded;
+                if (endpoint.health.status == .unavailable) worst = .unavailable;
+            }
+            const built = try openrouter.buildChannels(scratch, model.*, endpoints.endpoints.items);
+            channels.appendSlice(scratch, built) catch return error.OutOfMemory;
+        }
+        if (channels.items.len == 0) return error.InvalidDocument;
+
+        const kinds = try scratch.alloc(profile_mod.CredentialKind, 1);
+        kinds[0] = .api_key;
+        const aliases = try scratch.alloc(profile_mod.EnvAlias, 1);
+        aliases[0] = .{ .name = "OPENROUTER_API_KEY", .kind = .api_key, .canonical = true };
+
+        try self.registry.register(.{
+            .id = provider_id,
+            .implementation_id = Slug.lit("openrouter"),
+            .display_name = "OpenRouter",
+            .channels = channels.items,
+            .accepted_credential_kinds = kinds,
+            .env_aliases = aliases,
+            .default_channel = channels.items[0].id,
+        });
+
+        if (self.catalog_arena) |*previous| previous.deinit();
+        self.catalog_arena = arena;
+        self.refresh() catch return error.OutOfMemory;
+        // Prices and health arrived with the catalog, so the events that
+        // describe them are emitted here — the kernel does not fetch and cannot
+        // notice on its own.
+        self.kernel.notePricingUpdated(provider_id);
+        self.kernel.noteProviderHealth(provider_id, worst);
+    }
+
     /// Rebuild the catalog and hand it to the kernel. The previous catalog is
     /// retired rather than freed, so a reader that snapshotted the old pointer
     /// finishes against valid memory.
@@ -110,6 +183,55 @@ pub const Host = struct {
         self.kernel.adoptCatalog(&self.catalog);
     }
 
+    /// Ingest provider catalogs named by the configuration.
+    ///
+    /// The documents are read from disk rather than fetched, on purpose: this
+    /// subsystem must not depend on a transport, and a catalog saved by
+    /// `curl > file` refreshes exactly the same way a live fetch would. The
+    /// parsing, the offer construction, and the events are identical either
+    /// way, so wiring a fetcher later changes only where the bytes come from.
+    ///
+    /// Shape:
+    /// ```json
+    /// "provider_catalogs": {
+    ///   "openrouter": {"models_file": "…/models.json",
+    ///                  "endpoint_files": ["…/deepseek.json"]}
+    /// }
+    /// ```
+    pub fn ingestConfiguredCatalogs(self: *Host, text: []const u8) IngestError!void {
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        const root = std.json.parseFromSliceLeaky(std.json.Value, arena, trimmed, .{}) catch
+            return error.InvalidDocument;
+        if (root != .object) return error.InvalidDocument;
+        const section = root.object.get("provider_catalogs") orelse return;
+        if (section != .object) return error.InvalidDocument;
+
+        var it = section.object.iterator();
+        while (it.next()) |pair| {
+            const provider_id = Slug.parse(pair.key_ptr.*) catch return error.InvalidSlug;
+            const entry = pair.value_ptr.*;
+            if (entry != .object) return error.InvalidDocument;
+            const models_path = stringField(entry.object.get("models_file")) orelse return error.InvalidDocument;
+            const models_json = readFile(arena, models_path) catch return error.InvalidDocument;
+
+            var documents: std.ArrayList([]const u8) = .empty;
+            if (entry.object.get("endpoint_files")) |list| {
+                if (list != .array) return error.InvalidDocument;
+                for (list.array.items) |item| {
+                    const path = stringField(item) orelse return error.InvalidDocument;
+                    const document = readFile(arena, path) catch return error.InvalidDocument;
+                    documents.append(arena, document) catch return error.OutOfMemory;
+                }
+            }
+            try self.ingestOpenRouter(provider_id, models_json, documents.items);
+        }
+    }
+
     /// Load the durable document and seed the kernel with what it holds: the
     /// config revision `selection.commit` compares against, and the global
     /// selection a previous run committed.
@@ -122,6 +244,7 @@ pub const Host = struct {
         if (store.readText()) |text| {
             defer self.allocator.free(text);
             self.adoptCustomProviders(text) catch {};
+            self.ingestConfiguredCatalogs(text) catch {};
         } else |_| {}
 
         var document = store.load() catch return;
@@ -227,4 +350,121 @@ test "durable state adoption survives a config file that does not exist" {
     // Absent is not an error: a fresh installation has no control-plane state.
     host.adoptDurableState(&store);
     try std.testing.expect(host.kernel.catalogSnapshot().items().len > 0);
+}
+
+test "an ingested catalog becomes offers, and its prices and health become events" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+    // `since` returns events *after* the cursor, so the last already-emitted
+    // sequence is the right starting point.
+    const cursor = host.kernel.journal.next_sequence - 1;
+
+    try host.ingestOpenRouter(
+        Slug.lit("openrouter"),
+        \\{"data": [{"id": "deepseek/deepseek-v4", "name": "DeepSeek V4", "context_length": 163840,
+        \\  "supported_parameters": ["tools"],
+        \\  "pricing": {"prompt": "0.0000004", "completion": "0.0000016"}}]}
+    ,
+        &.{
+            \\{"data": {"id": "deepseek/deepseek-v4", "endpoints": [
+            \\  {"provider_name": "DeepInfra", "context_length": 131072, "status": 0,
+            \\   "pricing": {"prompt": "0.0000005", "completion": "0.0000018"}},
+            \\  {"provider_name": "Together AI", "status": -1}
+            \\]}}
+        },
+    );
+
+    // One model, two endpoints, two offers.
+    const items = host.kernel.catalogSnapshot().items();
+    try std.testing.expectEqual(before + 2, items.len);
+    var priced: usize = 0;
+    var inherited: usize = 0;
+    for (items) |item| {
+        if (!item.provider_id.eqlText("openrouter")) continue;
+        try std.testing.expectEqualStrings("deepseek/deepseek-v4", item.canonical_model_id.?);
+        if (item.quote.priced()) |price| {
+            priced += 1;
+            if (price.provenance.freshness == .inherited) inherited += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), priced);
+    // Together AI declared no price of its own, so it inherits the model's —
+    // and says so rather than claiming the endpoint confirmed it.
+    try std.testing.expectEqual(@as(usize, 1), inherited);
+
+    var buffer: std.ArrayList(control_plane.ControlPlaneEvent) = .empty;
+    defer buffer.deinit(a);
+    const replay = try host.kernel.replayEvents(cursor, a, &buffer);
+    var saw_catalog = false;
+    var saw_pricing = false;
+    var saw_degraded = false;
+    for (replay.events) |event| switch (event.event_type) {
+        .catalog_updated => saw_catalog = true,
+        .pricing_updated => saw_pricing = true,
+        .provider_degraded => saw_degraded = true,
+        else => {},
+    };
+    // These three event types had no producer before a catalog could be
+    // ingested; a declared type nothing emits is decoration.
+    try std.testing.expect(saw_catalog);
+    try std.testing.expect(saw_pricing);
+    try std.testing.expect(saw_degraded);
+}
+
+test "a pinned offer survives an unrelated catalog ingest" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    const pinned = host.kernel.catalogSnapshot().items()[0];
+    const committed = host.kernel.selectionCommit(
+        .{},
+        selection_mod.RuntimeSelection.pinned(pinned.offer_id, pinned.offer_revision, .session),
+        .session,
+    );
+    try std.testing.expect(committed == .committed);
+
+    try host.ingestOpenRouter(
+        Slug.lit("openrouter"),
+        \\{"data": [{"id": "x/y", "context_length": 1000}]}
+    ,
+        &.{
+            \\{"data": {"id": "x/y", "endpoints": [{"provider_name": "Alpha"}]}}
+        },
+    );
+
+    // The pin is derived from a stable binding, so a refresh reproduces the id
+    // and the selection still resolves — that is what makes a pin durable.
+    const resolved = host.kernel.selectionResolve().?;
+    try std.testing.expect(resolved == .ok);
+    try std.testing.expect(resolved.ok.offer_id.eql(pinned.offer_id));
+}
+
+fn stringField(value: ?std.json.Value) ?[]const u8 {
+    const found = value orelse return null;
+    return switch (found) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn readFile(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const pfs = @import("platform").fs;
+    const path_z = try arena.dupeZ(u8, path);
+    const fd = try pfs.openZ(path_z, .{ .ACCMODE = .RDONLY }, 0);
+    defer pfs.close(fd);
+    const info = try pfs.fileInfo(fd);
+    // Bounded: a catalog is user-pointed input, and an unbounded read of a path
+    // from a config file is a memory-exhaustion vector.
+    if (info.size > 8 * 1024 * 1024) return error.CatalogTooLarge;
+    const buffer = try arena.alloc(u8, @intCast(info.size));
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const n = try pfs.readZ(fd, buffer[filled..]);
+        if (n == 0) break;
+        filled += n;
+    }
+    return buffer[0..filled];
 }

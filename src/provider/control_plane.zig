@@ -426,6 +426,78 @@ pub const Kernel = struct {
         });
     }
 
+    /// Announce that a provider's prices moved.
+    ///
+    /// Emitted by whoever ingests a provider catalog: the kernel does not fetch,
+    /// so it cannot notice on its own, and a `pricing.updated` type no client
+    /// ever receives is decoration.
+    pub fn notePricingUpdated(self: *Kernel, provider_id: Slug) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.journal.append(.pricing_updated, .{ .pricing_updated = .{
+            .provider_id = provider_id,
+        } }, .{
+            .config_revision = self.config_revision,
+            .catalog_revision = self.catalog.revision,
+        });
+    }
+
+    /// Announce an observed health change for a provider.
+    ///
+    /// `healthy` is not announced: an event stream that reports "still fine" on
+    /// every refresh drowns the one report a client needs to act on.
+    pub fn noteProviderHealth(self: *Kernel, provider_id: Slug, status: offer_mod.HealthStatus) void {
+        if (status == .healthy or status == .unknown) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.journal.append(.provider_degraded, .{ .provider_degraded = .{
+            .provider_id = provider_id,
+            .status = status,
+        } }, .{
+            .config_revision = self.config_revision,
+            .catalog_revision = self.catalog.revision,
+        });
+    }
+
+    /// Announce a credential status change, and separately that one is nearing
+    /// expiry. Both are emitted by the credential resolver, which is the only
+    /// thing that knows.
+    pub fn noteAuthChanged(
+        self: *Kernel,
+        provider_id: Slug,
+        credential_ref: Slug,
+        status: credential.CredentialStatus,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.journal.append(.auth_changed, .{ .auth_changed = .{
+            .provider_id = provider_id,
+            .credential_ref = credential_ref,
+            .status = status,
+        } }, .{
+            .config_revision = self.config_revision,
+            .catalog_revision = self.catalog.revision,
+        });
+    }
+
+    pub fn noteCredentialExpiring(
+        self: *Kernel,
+        provider_id: Slug,
+        credential_ref: Slug,
+        expires_at: i64,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.journal.append(.credential_expiring, .{ .credential_expiring = .{
+            .provider_id = provider_id,
+            .credential_ref = credential_ref,
+            .expires_at = expires_at,
+        } }, .{
+            .config_revision = self.config_revision,
+            .catalog_revision = self.catalog.revision,
+        });
+    }
+
     /// Adopt the durable configuration revision.
     ///
     /// `config_store` is the sole authority for this number; the kernel mirrors
