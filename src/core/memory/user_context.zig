@@ -123,16 +123,20 @@ pub fn build(allocator: std.mem.Allocator, opts: BuildOptions) !?[]u8 {
 
 const testing = std.testing;
 
+/// 测试 helper:把 TmpDir 解析成绝对路径(owned)。
+/// realpath 失败**不回退相对路径**:`.zig-cache/tmp/` 是所有并发测试进程共享的目录,
+/// 解析失败意味着环境不对(cwd 不是 build root / 目录被并发删掉)。悄悄返回相对路径
+/// 只会让下游断言以莫名其妙的方式失败,掩盖真因。报错,让环境问题自己显形。
 fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
     const rel = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(rel);
+    if (rel.len + 1 > std.fs.max_path_bytes) return error.TmpDirPathTooLong;
     var path_z: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(path_z[0..rel.len], rel);
     path_z[rel.len] = 0;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const res = pfs.realpath(@ptrCast(&path_z), &buf);
-    if (res == null) return allocator.dupe(u8, rel);
-    return allocator.dupe(u8, std.mem.span(@as([*:0]u8, @ptrCast(res.?))));
+    const res = pfs.realpath(@ptrCast(&path_z), &buf) orelse return error.TmpDirPathUnresolved;
+    return allocator.dupe(u8, std.mem.span(@as([*:0]u8, @ptrCast(res))));
 }
 
 fn writeFileAt(dir_abs: []const u8, name: []const u8, data: []const u8) !void {

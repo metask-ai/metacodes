@@ -27,7 +27,7 @@ const common = @import("../tools/common.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 const execution_knowledge = @import("execution_knowledge.zig");
-const file_lock = @import("../swarm/file_lock.zig");
+const file_lock = @import("../util/file_lock.zig");
 const transport_mod = @import("transport.zig");
 
 pub const EXPECTED_STORAGE_FORMAT_VERSION = "3";

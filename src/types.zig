@@ -30,8 +30,22 @@ pub const Config = struct {
     permission_mode: PermissionMode = .prompt,
     no_theme: bool = false,
     verbose: bool = false,
-    /// LSP 被动诊断(Y2):`--lsp` 开启。opt-in——默认关,保持零依赖 + 零启动开销。
-    lsp_enabled: bool = false,
+    /// LSP 集成(被动诊断 + 符号来源)。**默认开**;`--no-lsp` 关闭(`--lsp` 保留为显式开启,
+    /// 可覆盖前面的 `--no-lsp`)。
+    ///
+    /// 为什么从 opt-in 翻成默认开(issue #17 follow-on):`1515b34` 砍掉 tree-sitter 后,
+    /// CodeMap / FindSymbol / Read-outline / Edit 写后诊断**四项能力全部只剩 LSP 一个来源**,
+    /// 默认关 = 默认降级。而真正的启用门在运行期且早就齐了——注册 server + 二进制已装
+    /// (`servers.binaryAvailable`)+ 在 git workspace 内 + 命中 root marker,再加惰性 spawn /
+    /// idle 回收 / client 上限 / broken-set。没装 language server 或不在项目里的机器,开着也不
+    /// 会起任何进程。这个 flag 因此是一道多余的第二重门,唯一实际效果就是把默认钉在关。
+    ///
+    /// **代价(登记,不是默认关的理由)**:装了 server 的项目里,每次 Edit/Write 写盘**后**会
+    /// 串行等 delta 诊断。那两个超时(warm ≤14s / 冷 spawn ≤26s)是**上限不是典型值**——本仓
+    /// 实测 zls:冷 112ms、warm 52ms。重量级 server(rust-analyzer/clangd 建索引)会显著更贵,
+    /// 上限兜底。盘写本身不被阻塞,等待可被 Ctrl+C 打断。见 `lsp/service.zig` 顶部 Linus #4。
+    /// 嫌慢就 `--no-lsp`。
+    lsp_enabled: bool = true,
     /// Swarm(teams/teammates):`--agent-teams` 开启。opt-in——默认关,不污染单 agent 会话
     /// 的工具菜单(对齐 cc agentSwarmsEnabled 门)。
     agent_teams: bool = false,

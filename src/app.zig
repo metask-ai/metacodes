@@ -309,7 +309,8 @@ pub const App = struct {
     /// Edit/Write 旁路高亮缓存(tool_id → 新旧全文)。供 diff 工具卡 hl-zig 着色;
     /// 不进对话历史。session 退出 deinit。
     edit_hl_cache: @import("core/edit_hl_cache.zig").EditHlCache,
-    /// LSP 被动诊断服务(Y2;仅 --lsp 开启时非 null)。Edit/Write finalizeWrite 用。session 退出 shutdown。
+    /// LSP 服务(默认开;`--no-lsp` 或创建失败时为 null)。Edit/Write finalizeWrite 取诊断,
+    /// CodeMap/FindSymbol/Read-outline 取符号。session 退出 shutdown。
     lsp_service: ?*@import("lsp/service.zig").Service = null,
     /// Session transcript writer；失败初始化则保持 null（日志落盘 fallback）
     transcript_writer: ?transcript.Writer = null,
@@ -712,7 +713,10 @@ pub const App = struct {
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
         };
 
-        // LSP 被动诊断服务(Y2;仅 --lsp)。best-effort:创建失败仅 log,不阻断启动。
+        // LSP 服务(默认开,`--no-lsp` 关)。**建 Service ≠ 起 language server**:这里只装一个
+        // 惰性管理器 + idle reaper 线程;真正 spawn 要等某个文件同时满足"有注册 server + 二进制
+        // 已装 + 在 git workspace + 命中 root marker"。没装 server 的机器上默认开是零成本。
+        // best-effort:创建失败仅 log,不阻断启动。
         // abort 适配:app.abort(AbortSignal)→ LSP 中立 AbortCheck,让 LSP 等待可 Ctrl+C 中断(M2)。
         if (config.lsp_enabled) {
             const lsp_abort = @import("lsp/transport.zig").AbortCheck{
@@ -727,7 +731,7 @@ pub const App = struct {
                 @import("util/log.zig").warn("lsp", "service init failed: {s} (LSP disabled)", .{@errorName(err)});
                 break :blk null;
             };
-            if (app.lsp_service != null) @import("util/log.zig").info("lsp", "LSP passive diagnostics enabled (--lsp)", .{});
+            if (app.lsp_service != null) @import("util/log.zig").info("lsp", "language server integration enabled (disable with --no-lsp)", .{});
         }
 
         // 构造 system prompt。显式 display identity 只作用于模型自述/knowledge

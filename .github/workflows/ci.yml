@@ -127,7 +127,7 @@ jobs:
           METACODES_PROC_TEST: "1"
         run: |
           set -euo pipefail
-          for module in sync fs rng paths signal process net dir; do
+          for module in sync fs rng paths signal process net dir exe_lookup; do
             zig test "src/platform/${module}.zig" -lc
           done
       - name: Full offline test suite
@@ -179,7 +179,8 @@ jobs:
           zig test src/platform/signal.zig -lc &&
           zig test src/platform/process.zig -lc &&
           zig test src/platform/net.zig -lc &&
-          zig test src/platform/dir.zig -lc
+          zig test src/platform/dir.zig -lc &&
+          zig test src/platform/exe_lookup.zig -lc
       - name: Verify native bundle and fresh-store contract
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage

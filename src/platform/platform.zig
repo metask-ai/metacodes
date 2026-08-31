@@ -13,3 +13,21 @@ pub const paths = @import("paths.zig");
 pub const terminal = @import("terminal.zig");
 pub const net = @import("net.zig");
 pub const dir = @import("dir.zig");
+pub const exe_lookup = @import("exe_lookup.zig");
+
+// 测试发现:Zig 只收集**被引用到**的文件里的 test 块。此前本文件只有一串 `pub const x =
+// @import(...)`,没有引用它们的 test 块 —— `zig build test:platform` 因此长期跑 0 个测试,
+// 而 `windows:gate` 正是挂在这个 step 上,于是整个 Windows 平台闸门是空跑绿的。
+// 加语句块把每个子模块钉进测试图(与 `src/lsp/lsp.zig` 同款)。**新增子模块必须同时补一行**。
+test {
+    _ = sync;
+    _ = process;
+    _ = fs;
+    _ = signal;
+    _ = rng;
+    _ = paths;
+    _ = terminal;
+    _ = net;
+    _ = dir;
+    _ = exe_lookup;
+}

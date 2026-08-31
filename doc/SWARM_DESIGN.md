@@ -19,11 +19,11 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 
 ## 1. 数据模型(SW0)
 
-`src/swarm/{file_lock,team,mailbox}.zig`
+`src/swarm/{team,mailbox}.zig` + `src/util/file_lock.zig`(通用工具,已有 swarm 之外的消费者)
 
 - **磁盘**:`{home}/.metacodes/teams/<team>/config.json`(TeamFile)+ `inboxes/<name>.json`(邮箱)。
 - **身份**:`name@team`(确定性,lead 可推算任何 teammate id,重启不变)。`team-lead` 保留名。
-- **file_lock**:`<path>.lock` O_EXCL 哨兵 + **原子 rename 两阶段抢占**(防双持有)+ mtime 兜底陈旧检测。
+- **file_lock**(`src/util/file_lock.zig`):`<path>.lock` O_EXCL 哨兵 + **原子 rename 两阶段抢占**(防双持有)+ mtime 兜底陈旧检测。
 - **mailbox**:锁内读-改-写;消息 `{from,text,timestamp,read,color?,summary?}`;`classify` 真顶层 JSON parse 认协议类型(非 substring,防误判);`markReadAt` 选择性标读(协议消息留给消费者);软顶 500(裁最旧已读)+ 硬顶 5000(丢最旧未读 + log.warn)。
 - **updateTeam**:一切 team 变更的唯一锁内 RMW 入口(防丢更新)。
 

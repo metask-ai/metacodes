@@ -427,6 +427,9 @@ pub fn spawnTeammateProcess(
     repo: []const u8, // git repo 根(git -C;lead 的 project_dir)。空退回进程 cwd
     abort: anytype,
     spawn_fn: SpawnFn,
+    /// lead 的 LSP 是否在位。false → 给子进程带上 `--no-lsp`。LSP 默认开之后不带就等于
+    /// "lead 关了、teammate 照样起 rust-analyzer",逃生口在进程边界上漏掉。
+    lsp_enabled: bool,
 ) !i64 {
     const a = sw.allocator;
     var name_buf: [64]u8 = undefined;
@@ -478,10 +481,12 @@ pub fn spawnTeammateProcess(
     }
 
     // ③ fork+exec(或 mock)。
+    const lsp_off = [_][]const u8{"--no-lsp"};
     const pid = try spawn_fn(a, .{
         .name = name_s,
         .team = sw.team_sanitized,
         .cwd = effective_wt,
+        .extra_flags = if (lsp_enabled) &.{} else &lsp_off,
     });
 
     // ④ 记录供关闭清理。

@@ -30,7 +30,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const util_fs = @import("../util/fs.zig");
 const util_json = @import("../util/json.zig");
-const file_lock = @import("file_lock.zig");
+const file_lock = @import("../util/file_lock.zig");
 
 pub const TEAM_LEAD_NAME = "team-lead";
 

@@ -21,7 +21,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const fs_util = @import("../util/fs.zig");
-const file_lock = @import("../swarm/file_lock.zig");
+const file_lock = @import("../util/file_lock.zig");
 const config_doc = @import("config_doc.zig");
 const ids = @import("ids.zig");
 

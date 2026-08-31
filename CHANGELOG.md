@@ -92,6 +92,46 @@ status, compatibility boundaries, and entry points are defined by
   `reasoning_split:true` so reasoning arrives as `reasoning_content`.
   OpenAI/Anthropic/GLM/Kimi/DeepSeek translations were already built in.
 
+### Changed
+
+- Language server integration is **on by default**; the new `--no-lsp` turns it
+  off (issue #17 follow-on). `--lsp` still works and now simply reasserts the
+  default, so existing command lines keep running; the last of `--lsp` /
+  `--no-lsp` on the line wins.
+  - *Why flip it.* Since `1515b34` removed tree-sitter, `CodeMap`,
+    `FindSymbol`, `Read(outline: true)` and Edit/Write post-write diagnostics
+    all source symbols from LSP, so an opt-in flag meant the default
+    configuration ran four features in a degraded state. The flag was also a
+    redundant second gate: the real gate is and remains runtime — a registered
+    server for the extension, its binary actually installed, the file inside a
+    git workspace, a `root_marker` hit — followed by lazy spawn keyed by
+    `server_id+root`, a 10-minute idle reaper, a client-count ceiling and the
+    broken-set. On a machine with no language server installed, enabling it
+    starts no process at all.
+  - *What it costs.* The one newly-involuntary path is post-write diagnostics.
+    Measured on this repository with zls: 112 ms cold, 52 ms warm per write.
+    The 14 s/26 s constants in `lsp/service.zig` are ceilings for heavier
+    servers, not typical values; the disk write itself is never blocked and the
+    wait is Ctrl+C-interruptible.
+  - *Escape hatch reaches subprocesses.* `--no-lsp` propagates to
+    out-of-process teammates, which would otherwise start their own servers
+    against the lead's explicit choice.
+  - *Not closed by this change.* Subagents still run without LSP:
+    `agent_loop.Options.lsp` is deliberately not threaded into child loops
+    because `lsp/client.zig` requires `sendRequest`/`sendNotification` from a
+    single caller thread while subagents run on background threads, so lifting
+    it needs send-side serialization in the Client, not a one-line passthrough.
+    For the same reason independent sessions cannot share a `Service`, so each
+    out-of-process teammate and each `--serve-multi` daemon session starts its
+    own servers; `--no-lsp` is the lever meanwhile.
+  - *Rejected.* Enabling by project size — `root_markers` already encode "this
+    is a real project", and large trees are exactly where indexing is most
+    expensive, so size-as-eagerness is backwards. Auto-installing language
+    servers — it contradicts the repository's binary policy, spans six
+    unrelated install channels, would execute npm `postinstall` outside the
+    permission and sandbox layers, and a version-mismatched server is worse
+    than an absent one because nothing signals the error.
+
 ### Fixed
 
 - `~/.metacodes/config.json` writes no longer delete other writers' keys. The
@@ -101,6 +141,89 @@ status, compatibility boundaries, and entry points are defined by
   it cannot parse, and treats a failed read as an error rather than as an empty
   document — descriptor exhaustion or a transient I/O error would otherwise
   truncate the whole file.
+
+- The language server binary lookup is platform-correct, so the LSP subsystem
+  is no longer unconditionally dead on Windows. `lsp/servers.zig`'s `which`
+  hardcoded three POSIX assumptions — split `PATH` on `:`, join with `/`,
+  test executability with `access(X_OK)` — and every one of them fails on
+  Windows: `C:\bin;C:\other` split on `:` yields `C`, `\bin;C`, `\other`
+  (none of them a directory), and executability there is decided by the
+  `PATHEXT` extension list while every registered `ServerDef.binary` is an
+  extensionless name (`zls`, `gopls`, `clangd`). Both consumers flow through
+  that one function, so they failed together: `Service.getOrSpawn` could never
+  start a server, and the issue #17 capability gate `servers.binaryAvailable`
+  reported "the '<binary>' language server is not installed (not found in
+  PATH)" for every language even when it was installed. This predates issue
+  #17; that work only made the failure legible. The lookup now lives in the
+  portable layer as `platform.exe_lookup` (separator, joiner, `PATHEXT`
+  probing with the cmd.exe default list, quoted `PATH` segments,
+  drive-relative names, and no extension appended to a name that already
+  carries one), and `which` is a one-line delegation. `realProbe` also stops
+  accepting a *directory* as an executable, which plain `access(X_OK)` did on
+  POSIX. Empty `PATH` segments are still skipped rather than searching the
+  working directory, which POSIX would allow but is a PATH-injection surface.
+- `zig build test:platform` ran **zero** tests, and `windows:gate` depends on
+  it — so the "Native Windows platform gate" step was passing vacuously for
+  its entire unit-test half. `src/platform/platform.zig` aggregated the
+  submodules as `pub const x = @import(...)` with no `test` block referencing
+  them, and Zig only collects tests from files it analyzes. Adding the block
+  turns up 52 tests (43 pass / 9 environment-skipped) that had never run. The
+  LSP suite (`test:lsp`) now also runs on that gate, and the workflow's path
+  filter covers `src/lsp/**`, since server lookup is native-platform logic.
+  Independently of that gate, `ci.yml`'s per-module `zig test
+  src/platform/<module>.zig` loops — the unfiltered ones that run on every PR,
+  on POSIX and on the Windows runner — now include the new module, so the
+  Windows-semantics assertions run on both.
+
+- The new lookup's parsing is a pure function over an explicit `Style` plus a
+  supplied `PATH`/`PATHEXT` string, so Windows semantics are asserted on
+  **every** host — including the regression case that splitting `C:\bin;C:\other`
+  on `:` shreds it — instead of behind a `SkipZigTest` on non-Windows machines.
+  `lsp/servers.zig`'s own `which` test likewise stopped skipping on Windows and
+  now asserts against `cmd`/`cmd.exe` there and `sh` on POSIX.
+  Windows support for the subsystem as a whole is **not** claimed: process
+  spawn, pipes, polling and termination already have real Windows
+  implementations, but `workspace.isInsideWorkspace` only accepts `/` as a
+  path boundary (so every file is judged outside the workspace),
+  `client.pathToUri` emits `file://C:\proj\a.zig` where LSP requires
+  `file:///c%3A/proj/a.zig`, and `CreateProcess` cannot launch the `.cmd`
+  shims npm installs for `typescript-language-server`. Those three are
+  enumerated in the status table at the top of `src/lsp/lsp.zig`, which is the
+  single place that states Windows readiness.
+
+- Symbol capability gaps no longer masquerade as "symbol not defined"
+  (issue #17). `FindSymbol` returned a bare `[]` whenever `--lsp` was on but
+  the language server binary was missing, because the *decide* predicate
+  (`symbol_provider.hasSymbolsFor`) consulted only the compile-time
+  `SERVERS` extension table while the *use* predicate
+  (`lsp.Service.getOrSpawn`) additionally resolved the binary, spawned it,
+  and consulted the broken-set — a two-state type (`!Symbols`) squeezing a
+  three-state reality. The shape was inherited from the tree-sitter era, when
+  statically linked grammars made "extension registered" equivalent to
+  "capability available"; commit `1515b34` changed the dependency to an
+  external runtime process without updating the capability contract.
+  The predicate is now single-sourced and runtime-aware
+  (`lsp.servers.binaryAvailable`), and the symbol path carries an explicit
+  third state (`lsp/capability.zig` `Unavailable{reason, detail}`,
+  `symbol_provider.Outcome`, `lsp.Service.fetchSymbols`) with one shared
+  wording table. `FindSymbol` now appends a qualifier naming the missing
+  binary (and flags partial results when only some candidate files were
+  skipped), `CodeMap` prints the specific reason instead of `(no symbols)`,
+  and `Read(outline: true)` explains why it fell back to a full read rather
+  than degrading silently. When a scan spans several languages the reported
+  reason is the most *actionable* one rather than the first encountered — rg
+  walks in parallel, so a README that merely mentions the name could otherwise
+  make the answer "no language server is registered for this file type" and
+  bury the "pyright is not installed" that the caller can act on. The
+  per-file capability answer is memoized for the duration of one scan
+  (`symbol_provider.CapabilityCache`, caller-owned, no global state): the
+  predicate costs a PATH scan — measured at 36–43 µs with a 30-entry PATH —
+  and FindSymbol asks it once per candidate file, up to ~3200, for at most
+  seven distinct answers. Regression tests cover the **server-absent** side
+  unconditionally — synthetic `ServerDef`s with absolute-path binaries make
+  that side reachable on any machine, replacing the
+  `if (which("zls") == null) return error.SkipZigTest` pattern that had
+  skipped exactly the half where the defect lived.
 
 ## 0.1.0 — 2026-08-29
 

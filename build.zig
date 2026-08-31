@@ -1974,6 +1974,13 @@ pub fn build(b: *std.Build) void {
         // `zig build test -Dtarget=x86_64-windows-gnu` gate; do not couple its
         // unrelated subsystem timing/concurrency failures to this platform gate.
         windows_gate_step.dependOn(platform_test_step);
+        // The LSP subsystem's server lookup is native-platform logic (PATH
+        // separator, path joiner, PATHEXT probing), so its suite belongs on the
+        // native Windows gate rather than only on POSIX hosts. It is a leaf
+        // subsystem with no timing/concurrency coupling to the rest of the
+        // repository suite, so it does not reintroduce the flakiness the
+        // comment above is guarding against.
+        windows_gate_step.dependOn(lsp_test_step);
         windows_gate_step.dependOn(&windows_help_cmd.step);
 
         const windows_tty_cmd = b.addSystemCommand(&.{

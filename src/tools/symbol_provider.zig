@@ -1,7 +1,15 @@
 //! 统一符号来源。CodeMap/FindSymbol/Read-outline 三工具经此取符号。
 //!
-//! Y2 砍 tree-sitter 后**仅 LSP**:ctx.lsp 开且该文件有 LSP server → documentSymbol。未开 `--lsp`
-//! 或无对应 server → 无符号(三工具优雅降级:CodeMap 报 unsupported、Read-outline 回退正常读)。
+//! Y2 砍 tree-sitter 后**仅 LSP**:ctx.lsp 开、该文件有注册 server、且那个 server 的二进制此刻
+//! 真的可解析 → documentSymbol。任一条不满足 → `.unavailable(原因)`,三工具据此优雅降级
+//! **并说明原因**(CodeMap 打印原因行、FindSymbol 给限定空结果、Read-outline 回退正常读 + 附注)。
+//!
+//! **三态是硬要求**(issue #17):能力缺失 ≠ 查无符号。曾经两者都是空列表,模型把
+//! "没装 pyright" 读成"这个符号不存在"并据此走错路。状态词汇表见 `lsp/capability.zig`。
+//!
+//! **判定只有一份实现**:`capabilityForDef` 是唯一真理源,`capabilityFor` / `hasSymbolsFor` /
+//! `CapabilityCache.get` / `extractSymbols` 全部委托给它。新增入口必须继续委托——本 issue 的
+//! 病根就是有人在另一处**重新推导**了同一个问题,两份答案随即分叉。
 //!
 //! **语义**:kind 分类是 LSP server 的语义(如 zls 把 `pub const X = struct` 报成 Constant 而非
 //! Struct)。option A 接受(用户 2026-07-12 定案)。
@@ -22,27 +30,115 @@ const symbol = @import("../symbols/symbol.zig");
 const lsp_diag = @import("lsp_diag.zig");
 const servers = @import("../lsp/servers.zig");
 
-/// 该文件是否可能产符号:`--lsp` 开且有对应 LSP server。工具用作 outline/大纲入口的 gate。
-pub fn hasSymbolsFor(ctx: *const ToolContext, file: []const u8) bool {
-    return ctx.lsp != null and servers.findServerForFile(file) != null;
+pub const capability = @import("../lsp/capability.zig");
+pub const Unavailable = capability.Unavailable;
+
+/// "这个文件能不能出符号"的判定结果。**三态里的两态**:能力在位(带那个 server 的 def)
+/// vs 能力缺失(带原因)。第三态"在位但没有符号"属于 `Outcome`,不在门禁这一层。
+pub const Capability = union(enum) {
+    available: *const servers.ServerDef,
+    unavailable: Unavailable,
+};
+
+/// 取符号的结果。**不是** `!Symbols`:那个类型只有"ok(可能为空)"和"错误"两态,
+/// 于是"能力缺失"必然被挤成空列表 —— issue #17 的类型层病根。
+pub const Outcome = union(enum) {
+    /// 能力在位:`items` 就是 server 报的真实符号集,**为空即代表该文件确实没符号**。
+    symbols: symbol.Symbols,
+    /// 能力缺失:调用方必须把原因讲出来,绝不能渲染成裸 `[]` / 空大纲。
+    unavailable: Unavailable,
+};
+
+/// 该文件是否可能产符号的**唯一**判定入口(CodeMap / FindSymbol / Read-outline 共用)。
+///
+/// issue #17:这里曾只查静态注册表(`ctx.lsp != null and findServerForFile(file) != null`),
+/// 而真正干活的 `service.getOrSpawn` 还要过 `which` → spawn → broken-set。两个谓词对同一个
+/// 能力给出不同答案,差额(注册了但没装)就以裸空结果的形式泄漏给模型。判定必须包含运行期。
+pub fn capabilityFor(ctx: *const ToolContext, file: []const u8) Capability {
+    if (ctx.lsp == null) return .{ .unavailable = .{ .reason = .lsp_disabled } };
+    return capabilityForDef(servers.findServerForFile(file));
 }
 
-/// 取文件符号(LSP documentSymbol)。返回中立 Symbols(caller deinit)。无来源 → 空 Symbols(非错误)。
-/// source = 文件全文;file = 结果标签(也用于语言/URI 推断)。
-pub fn extractSymbols(ctx: *const ToolContext, gpa: std.mem.Allocator, file: []const u8, source: []const u8) !symbol.Symbols {
-    if (ctx.lsp) |svc| {
-        var abuf: [std.fs.max_path_bytes]u8 = undefined;
-        if (lsp_diag.absPath(file, &abuf)) |ap| {
-            var lsp_syms = svc.getSymbols(gpa, ap, source);
-            defer lsp_syms.deinit();
-            if (lsp_syms.items.len > 0) return convertLsp(gpa, file, lsp_syms.items);
-        }
+/// `capabilityFor` 的纯函数内核(不碰 ctx):注册表命中 **且** 二进制此刻可解析,才算能力在位。
+/// 独立成 pub 是为了测试能传合成 `ServerDef`——server-absent 那一侧因此可以无条件在 CI 跑到,
+/// 不必"机器上恰好没装某个 language server"(那正是这个 bug 当初躲过测试的方式)。
+pub fn capabilityForDef(def: ?*const servers.ServerDef) Capability {
+    const d = def orelse return .{ .unavailable = .{ .reason = .no_server_for_language } };
+    if (!servers.binaryAvailable(d))
+        return .{ .unavailable = .{ .reason = .server_not_installed, .detail = d.binary } };
+    return .{ .available = d };
+}
+
+/// 逐文件循环用的能力记忆化器。**调用方持有,无全局状态**——生命周期只有那一次扫描,所以既
+/// 不会把"跑到一半才装上 server"钉死成永久不可用,也不会跨测试污染。
+///
+/// 为什么需要:能力只取决于文件扩展名,`findServerForFile` 至多产出 `SERVERS.len + 1` 种答案;
+/// 而每算一次都要 `binaryAvailable` 扫一遍 PATH(实测 30 段 PATH 下 36–43µs)。FindSymbol 会对
+/// **每个候选文件**问一次,候选上限量级 3200 → 116ms+ 纯 `access(2)`,且被门禁挡掉的文件此外
+/// 什么都不做,那部分是纯浪费。
+///
+/// 容量按"最多几种答案"配死(每个注册 server 一格 + "无注册 server" 一格),所以正常来源
+/// (`findServerForFile`)永远填不满;真填满了就直接不缓存,退化成逐次计算,不会答错。
+pub const CapabilityCache = struct {
+    lsp_present: bool,
+    entries: [servers.SERVERS.len + 1]Entry = undefined,
+    len: usize = 0,
+
+    const Entry = struct { def: ?*const servers.ServerDef, cap: Capability };
+
+    pub fn init(ctx: *const ToolContext) CapabilityCache {
+        return .{ .lsp_present = ctx.lsp != null };
     }
-    return emptyNeutral(gpa);
+
+    /// 语义与 `capabilityFor(ctx, file)` 完全一致,只是同一扩展名不重复扫 PATH。
+    pub fn get(self: *CapabilityCache, file: []const u8) Capability {
+        if (!self.lsp_present) return .{ .unavailable = .{ .reason = .lsp_disabled } };
+        const def = servers.findServerForFile(file);
+        for (self.entries[0..self.len]) |e| {
+            if (e.def == def) return e.cap; // 可选指针相等:null==null 也命中
+        }
+        const fresh = capabilityForDef(def);
+        if (self.len < self.entries.len) {
+            self.entries[self.len] = .{ .def = def, .cap = fresh };
+            self.len += 1;
+        }
+        return fresh;
+    }
+};
+
+/// 布尔门(只关心"能不能"、不需要解释原因的调用点用,如 Read 的弱提示)。
+/// 语义严格等于 `capabilityFor(...) == .available`,不另立谓词。
+pub fn hasSymbolsFor(ctx: *const ToolContext, file: []const u8) bool {
+    return switch (capabilityFor(ctx, file)) {
+        .available => true,
+        .unavailable => false,
+    };
 }
 
-fn emptyNeutral(gpa: std.mem.Allocator) symbol.Symbols {
-    return .{ .items = &.{}, .arena = std.heap.ArenaAllocator.init(gpa) };
+/// 取文件符号(LSP documentSymbol)。`.symbols` 的 arena 归 caller(deinit)。
+/// source = 文件全文;file = 结果标签(也用于语言/URI 推断)。
+///
+/// 能力缺失一律走 `.unavailable`,**不再**伪装成空符号集。注意原因取自真正干活的那条路径
+/// (`service.fetchSymbols`),所以 `capabilityFor` 看不见的失败(broken-set、client 满员、
+/// 不在 git workspace)也不会静默。
+pub fn extractSymbols(ctx: *const ToolContext, gpa: std.mem.Allocator, file: []const u8, source: []const u8) !Outcome {
+    const svc = ctx.lsp orelse return .{ .unavailable = .{ .reason = .lsp_disabled } };
+    switch (capabilityForDef(servers.findServerForFile(file))) {
+        .unavailable => |u| return .{ .unavailable = u },
+        .available => {},
+    }
+    var abuf: [std.fs.max_path_bytes]u8 = undefined;
+    const ap = lsp_diag.absPath(file, &abuf) orelse
+        return .{ .unavailable = .{ .reason = .path_unresolved } };
+
+    var fetched = svc.fetchSymbols(gpa, ap, source);
+    switch (fetched) {
+        .unavailable => |u| return .{ .unavailable = u },
+        .ok => |*lsp_syms| {
+            defer lsp_syms.deinit();
+            return .{ .symbols = try convertLsp(gpa, file, lsp_syms.items) };
+        },
+    }
 }
 
 /// LspSymbol[](kind=LSP SymbolKind int)→ 中立 Symbols(kind=Kind,signature=detail)。
@@ -84,4 +180,130 @@ test "convertLsp: LSP kind→中立 Kind + detail→signature" {
     try std.testing.expectEqual(symbol.Kind.field, syms.items[1].kind);
     try std.testing.expectEqualStrings("Point", syms.items[1].parent.?);
     try std.testing.expectEqualStrings("mod.zig", syms.items[1].file);
+}
+
+// ============================================================================
+// issue #17 回归:决策谓词(能不能出符号)必须与使用谓词(server 真在不在)一致
+// ============================================================================
+
+const testing = std.testing;
+
+/// 合成 def:binary 用绝对路径,可用/不可用两侧都不依赖机器上装了什么。
+fn fakeDef(binary: []const u8) servers.ServerDef {
+    return .{
+        .server_id = "fake",
+        .extensions = &.{".fake"},
+        .binary = binary,
+        .root_markers = &.{},
+    };
+}
+
+test "capabilityForDef: 无注册 server → no_server_for_language" {
+    switch (capabilityForDef(null)) {
+        .unavailable => |u| try testing.expectEqual(capability.Reason.no_server_for_language, u.reason),
+        .available => return error.TestUnexpectedResult,
+    }
+}
+
+test "REGRESSION issue #17: 注册了但没装 → server_not_installed(点名 binary),不是 available" {
+    // 这就是 bug 的原始形态:def 存在(注册表命中)但二进制不在。老 hasSymbolsFor 在这里返 true,
+    // 于是"能力缺失"一路被压成空结果。合成 def 让 server-absent 这侧在任何机器/CI 上都跑得到。
+    const def = fakeDef("/nonexistent/no-such-langserver-9417");
+    switch (capabilityForDef(&def)) {
+        .available => return error.TestUnexpectedResult,
+        .unavailable => |u| {
+            try testing.expectEqual(capability.Reason.server_not_installed, u.reason);
+            try testing.expectEqualStrings("/nonexistent/no-such-langserver-9417", u.detail);
+            var buf: [capability.WHY_BUF]u8 = undefined;
+            // 措辞点名缺失的二进制(issue 的修复项 3)。
+            try testing.expect(std.mem.indexOf(u8, u.why(&buf), "no-such-langserver-9417") != null);
+        },
+    }
+}
+
+test "capabilityForDef: 注册且装了 → available" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(/bin/sh 作已知可执行样本)
+    const def = fakeDef("/bin/sh");
+    switch (capabilityForDef(&def)) {
+        .available => |d| try testing.expectEqualStrings("fake", d.server_id),
+        .unavailable => return error.TestUnexpectedResult,
+    }
+}
+
+test "REGRESSION issue #17: 六种真语言上,决策谓词与安装谓词逐一相等" {
+    // issue 里的 REPRO_CAPGAP 探针:registered 恒 true,installed 随机器而定,两者曾经会打架。
+    // 这里把它翻成断言——无论本机装了哪几个 server,两个谓词都不许再出现差额。
+    const cases = [_][]const u8{ "/p/a.py", "/p/a.ts", "/p/a.go", "/p/a.zig", "/p/a.rs", "/p/a.c" };
+    for (cases) |f| {
+        const def = servers.findServerForFile(f) orelse return error.TestUnexpectedResult;
+        const installed = servers.binaryAvailable(def);
+        const decided = switch (capabilityForDef(def)) {
+            .available => true,
+            .unavailable => false,
+        };
+        try testing.expectEqual(installed, decided);
+    }
+}
+
+test "hasSymbolsFor: 没有 LSP 服务 → false(且原因是 lsp_disabled,不是'这语言没 server')" {
+    const a = testing.allocator;
+    const ctx = ToolContext.simple(a); // 无 lsp
+    try testing.expect(!hasSymbolsFor(&ctx, "/p/a.zig"));
+    switch (capabilityFor(&ctx, "/p/a.zig")) {
+        .unavailable => |u| try testing.expectEqual(capability.Reason.lsp_disabled, u.reason),
+        .available => return error.TestUnexpectedResult,
+    }
+}
+
+test "extractSymbols: 没有 LSP 服务 → .unavailable,绝不返回空符号集冒充'没符号'" {
+    const a = testing.allocator;
+    const ctx = ToolContext.simple(a);
+    var outcome = try extractSymbols(&ctx, a, "/p/a.zig", "pub fn f() void {}\n");
+    switch (outcome) {
+        .symbols => |*syms| {
+            syms.deinit();
+            return error.TestUnexpectedResult; // 老行为:空 Symbols —— 正是本 issue 要杜绝的
+        },
+        .unavailable => |u| try testing.expectEqual(capability.Reason.lsp_disabled, u.reason),
+    }
+}
+
+test "CapabilityCache: 与 capabilityFor 逐文件同答,且同扩展名只算一次" {
+    const a = testing.allocator;
+    const ctx = ToolContext.simple(a); // 无 lsp → 恒 lsp_disabled
+    var cache = CapabilityCache.init(&ctx);
+    for ([_][]const u8{ "/p/a.zig", "/p/b.py", "/p/c.md", "/p/a.zig" }) |f| {
+        switch (cache.get(f)) {
+            .unavailable => |u| try testing.expectEqual(capability.Reason.lsp_disabled, u.reason),
+            .available => return error.TestUnexpectedResult,
+        }
+    }
+    // 没开 LSP 时压根不该去碰注册表/PATH,故不占槽位。
+    try testing.expectEqual(@as(usize, 0), cache.len);
+}
+
+test "CapabilityCache: 槽位按不同扩展名增长,重复扩展名不再增长" {
+    const a = testing.allocator;
+    var ctx = ToolContext.simple(a);
+    // 只需要 ctx.lsp 非 null 走真判定;这里不发请求,给个 dangling 指针会 UB,
+    // 故用真 Service(创建很轻:只起一个 idle reaper 线程)。
+    const Service = @import("../lsp/service.zig").Service;
+    const svc = try Service.create(a, "/nonexistent_xyz_cwd", null);
+    defer svc.shutdown();
+    ctx.lsp = svc;
+
+    var cache = CapabilityCache.init(&ctx);
+    const first = cache.get("/p/a.zig");
+    try testing.expectEqual(@as(usize, 1), cache.len);
+    _ = cache.get("/p/b.zig"); // 同扩展名 → 命中,不增长
+    try testing.expectEqual(@as(usize, 1), cache.len);
+    _ = cache.get("/p/c.md"); // 无注册 server → 另一格(null 键)
+    try testing.expectEqual(@as(usize, 2), cache.len);
+    _ = cache.get("/p/d.md");
+    try testing.expectEqual(@as(usize, 2), cache.len);
+
+    // 缓存值必须与直算一致(两侧都断言,不管本机装没装 zls)。
+    const direct = capabilityFor(&ctx, "/p/a.zig");
+    try testing.expectEqual(std.meta.activeTag(direct), std.meta.activeTag(first));
+    try testing.expectEqual(std.meta.activeTag(direct), std.meta.activeTag(cache.get("/p/e.zig")));
 }

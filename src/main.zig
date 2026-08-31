@@ -51,6 +51,7 @@ pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
 pub const util_fs = @import("util/fs.zig");
+pub const util_file_lock = @import("util/file_lock.zig");
 pub const conversation = @import("core/conversation.zig");
 pub const message = @import("core/message.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
@@ -77,7 +78,6 @@ pub const kg_transport = @import("kg/transport.zig");
 pub const swarm_team = @import("swarm/team.zig");
 pub const swarm_mailbox = @import("swarm/mailbox.zig");
 pub const swarm_teammate = @import("swarm/teammate.zig");
-pub const swarm_file_lock = @import("swarm/file_lock.zig");
 pub const swarm_context = @import("swarm/context.zig");
 pub const swarm_tools = @import("swarm/tools.zig");
 pub const swarm_teammate_process = @import("swarm/teammate_process.zig");
@@ -126,6 +126,10 @@ pub const bash = @import("tools/bash.zig");
 pub const grep = @import("tools/grep.zig");
 pub const glob = @import("tools/glob.zig");
 pub const read_tool = @import("tools/read.zig");
+pub const find_symbol_tool = @import("tools/find_symbol.zig");
+pub const code_map_tool = @import("tools/code_map.zig");
+pub const symbol_provider = @import("tools/symbol_provider.zig");
+pub const lsp = @import("lsp/lsp.zig");
 pub const write_tool = @import("tools/write.zig");
 pub const edit_tool = @import("tools/edit.zig");
 pub const mcp_client = @import("mcp/client.zig");
@@ -1323,7 +1327,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             config.verbose = true;
         } else if (std.mem.eql(u8, arg, "--lsp")) {
-            config.lsp_enabled = true; // Y2:开 LSP 被动诊断(Edit/Write 后附类型诊断)
+            config.lsp_enabled = true; // 默认已开;保留显式开启(可覆盖前面的 --no-lsp)
+        } else if (std.mem.eql(u8, arg, "--no-lsp")) {
+            // 默认开之后的逃生口(对齐 --no-theme/--no-browser 的否定式)。后写覆盖先写。
+            config.lsp_enabled = false;
         } else if (std.mem.eql(u8, arg, "--agent-teams")) {
             config.agent_teams = true; // SW2:开 teams/teammates(TeamCreate/SendMessage 等)
         } else if (std.mem.eql(u8, arg, "--teammate")) {
@@ -1543,7 +1550,10 @@ fn printHelp() void {
         \\  --record <dir>        Record requests + SSE responses to dir (cassette)
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output
-        \\  --lsp                 Enable LSP passive diagnostics on Edit/Write (needs zls/pyright/etc on PATH)
+        \\  --lsp                 Enable language server integration (default; overrides an earlier --no-lsp)
+        \\  --no-lsp              Disable language server integration (Edit/Write diagnostics, CodeMap,
+        \\                        FindSymbol, Read outline). Servers are only started for a language
+        \\                        whose server is installed, inside a git project with a build marker.
         \\  --agent-teams         Enable teams/teammates (TeamCreate/SendMessage; delegate to parallel teammate agents)
         \\  --teammate-mode <m>   Teammate spawn backend: "process" (out-of-process, worktree-isolated) or "thread" (default, in-process)
         \\  -h, --help            This help
@@ -1582,7 +1592,6 @@ test {
     _ = &@import("core/host_check.zig");
     _ = &@import("core/proposed_plan.zig");
     _ = &@import("core/plan_file.zig");
-    _ = &@import("swarm/file_lock.zig");
     _ = &@import("swarm/team.zig");
     _ = &@import("swarm/mailbox.zig");
     _ = &@import("swarm/teammate.zig");
@@ -1598,6 +1607,7 @@ test {
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("util/abort.zig");
+    _ = &@import("util/file_lock.zig");
     _ = &@import("util/toolchain.zig");
     _ = &@import("util/log.zig");
     _ = &@import("util/model.zig");
