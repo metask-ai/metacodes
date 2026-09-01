@@ -1345,7 +1345,10 @@ def observe_build_test_throughput(repo: Path) -> Observation:
     dedicated = set(re.findall(r'"([^"]+_test\.zig)"', exclusions_block.group(1))) if exclusions_block else set()
     # 解析不出来就是失败,不是"没有排除项"——后者会让每个专用测试都被误报为漏导入,
     # 把一个解析 bug 伪装成一堆内容 bug。错误在下面 errors 可用处统一登记。
-    exclusions_unparsed = not dedicated
+    #
+    # 判据是"块不存在"而非"集合为空":`[_][]const u8{}` 是合法状态(所有测试都进聚合),
+    # 用空集当失败会在那天谎报解析失败。
+    exclusions_unparsed = exclusions_block is None
     # 排除清单是逃生门:加一个名字,聚合导入要求和覆盖要求同时消失。build.zig 只验证
     # 被排除的文件**存在**,不验证它还被任何 step 编译——所以一个被排除又没有专用
     # root_source_file 的测试会彻底无人运行,且两侧都不报警。这里补上那道守卫。
