@@ -53,6 +53,7 @@ requests.
 python3 -m scripts.eval.workbuddy.run_w05 /path/to/fresh-workbuddy-bench \
   --metacodes /path/to/linux-amd64/metacodes \
   --tinykg /path/to/linux-amd64/tinykg \
+  --ripgrep /path/to/linux-amd64/rg \
   --formal-kernel /path/to/linux-amd64/metacodes-formal-kernel \
   --project-kernel /path/to/linux-amd64/metacodes-project-kernel \
   --project-rules /path/to/promoted/project-rules \
