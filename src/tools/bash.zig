@@ -34,7 +34,7 @@ pub const MAX_OUTPUT_BYTES: usize = 30_000;
 /// both channels spilled and a macOS temp path; rounded up so a preview sized
 /// against the remaining allowance cannot push the rendered envelope past the
 /// per-result budget it was derived from.
-pub const ENVELOPE_OVERHEAD_BYTES: usize = 2048;
+pub const ENVELOPE_OVERHEAD_BYTES: result_budget.Encoded = .of(2048);
 
 /// Encoded preview bytes the two channels share, given the turn's budget.
 ///
@@ -44,7 +44,7 @@ pub const ENVELOPE_OVERHEAD_BYTES: usize = 2048;
 /// the result, and because microcompact refuses to touch a recoverable
 /// envelope, that constant was the only decision ever made about a Bash
 /// result's size for its whole life in the Conversation.
-fn channelAllowances(budget: result_budget.Budget, stdout_demand: u64, stderr_demand: u64) result_budget.Pair {
+fn channelAllowances(budget: result_budget.Budget, stdout_demand: result_budget.Encoded, stderr_demand: result_budget.Encoded) result_budget.Pair {
     return result_budget.splitPair(
         budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES),
         stdout_demand,
@@ -64,7 +64,7 @@ fn channelAllowances(budget: result_budget.Budget, stdout_demand: u64, stderr_de
 /// 4142 and spilled to an artifact, destroying 858 bytes of intact output and
 /// buying a recovery round trip. Both channels are in memory here, so the real
 /// number is one linear scan away.
-fn encodedDemand(bytes: []const u8) u64 {
+fn encodedDemand(bytes: []const u8) result_budget.Encoded {
     return encodedCost(bytes, !isInlineUtf8(bytes));
 }
 
@@ -74,11 +74,16 @@ fn encodedDemand(bytes: []const u8) u64 {
 /// only a channel small enough to fit needs a precise one - and that channel
 /// is by definition cheap to read. Anything larger is bounded rather than
 /// measured, which keeps this off the path of a multi-gigabyte spool.
-fn fileEncodedDemand(allocator: std.mem.Allocator, path: []const u8, allowance: usize) u64 {
-    const raw = artifact.observeFileBytes(allocator, path) catch return 0;
-    if (raw == 0) return 0;
-    if (raw > allowance) return raw *| 2;
-    const whole = readWholeFile(path, allocator, @intCast(raw)) catch return raw *| 2;
+fn fileEncodedDemand(allocator: std.mem.Allocator, path: []const u8, allowance: result_budget.Encoded) result_budget.Encoded {
+    const zero = result_budget.Encoded.of(0);
+    const raw = artifact.observeFileBytes(allocator, path) catch return zero;
+    if (raw == 0) return zero;
+    // A channel too large to fit needs no precise demand - `splitPair` treats
+    // every demand at or above the allowance identically - so it is bounded by
+    // JSON escaping's worst case rather than measured.
+    const bound = result_budget.Encoded.of(std.math.cast(usize, raw *| 2) orelse std.math.maxInt(usize));
+    if (raw > allowance.raw()) return bound;
+    const whole = readWholeFile(path, allocator, @intCast(raw)) catch return bound;
     defer allocator.free(whole);
     return encodedDemand(whole);
 }
@@ -169,7 +174,7 @@ fn appendMemoryChannel(
     bytes: []const u8,
     artifact_root: []const u8,
     capture_complete: bool,
-    allowance: usize,
+    allowance: result_budget.Encoded,
     metrics: ?*ResultMetrics,
 ) !void {
     const digest = sha256Hex(bytes);
@@ -195,7 +200,7 @@ fn appendFileChannel(
     label: []const u8,
     path: []const u8,
     artifact_root: []const u8,
-    allowance: usize,
+    allowance: result_budget.Encoded,
     metrics: ?*ResultMetrics,
 ) !void {
     const inspected = artifact.inspectFile(allocator, path) catch |inspect_error| {
@@ -314,44 +319,41 @@ const cutTailEncoded = result_budget.tailCut;
 fn splitPreviewBudget(
     head_source: []const u8,
     tail_source: []const u8,
-    max_encoded: usize,
+    max_encoded: result_budget.Encoded,
     base64: bool,
-) struct { head_len: usize, tail_len: usize } {
-    const head_len = cutHeadEncoded(head_source, max_encoded * 3 / 4, base64);
-    const spent = encodedCost(head_source[0..head_len], base64);
-    const tail_len = cutTailEncoded(tail_source, max_encoded -| spent, base64);
-    return .{ .head_len = head_len, .tail_len = tail_len };
+) struct { head: result_budget.Source, tail: result_budget.Source } {
+    const head_cut = cutHeadEncoded(head_source, max_encoded.scaled(3, 4), base64);
+    const spent = encodedCost(head_cut.head(head_source), base64);
+    const tail_cut = cutTailEncoded(tail_source, max_encoded.minus(spent), base64);
+    return .{ .head = head_cut, .tail = tail_cut };
 }
 
 /// Head/tail lengths for one channel under one encoding. `marker` records
 /// whether the two halves are separated by the omission marker, so the cost of
 /// the marker is only charged when it is actually emitted.
-const PreviewPlan = struct { head_len: usize, tail_len: usize, marker: bool };
+const PreviewPlan = struct { head: result_budget.Source, tail: result_budget.Source, marker: bool };
 
-fn planPreview(bytes: []const u8, max_encoded: usize, base64: bool) PreviewPlan {
-    if (encodedCost(bytes, base64) <= max_encoded)
-        return .{ .head_len = bytes.len, .tail_len = 0, .marker = false };
+fn planPreview(bytes: []const u8, max_encoded: result_budget.Encoded, base64: bool) PreviewPlan {
+    const none = result_budget.Source.of(0);
+    if (encodedCost(bytes, base64).lte(max_encoded))
+        return .{ .head = result_budget.Source.of(bytes.len), .tail = none, .marker = false };
     const marker_cost = encodedCost(PREVIEW_OMISSION_MARKER, base64);
-    if (max_encoded <= marker_cost)
-        return .{ .head_len = cutHeadEncoded(bytes, max_encoded, base64), .tail_len = 0, .marker = false };
-    const budget = max_encoded - marker_cost;
-    const head_len = cutHeadEncoded(bytes, budget * 3 / 4, base64);
-    const tail_len = cutTailEncoded(
-        bytes[head_len..],
-        budget -| encodedCost(bytes[0..head_len], base64),
-        base64,
-    );
-    return .{ .head_len = head_len, .tail_len = tail_len, .marker = true };
+    if (max_encoded.lte(marker_cost))
+        return .{ .head = cutHeadEncoded(bytes, max_encoded, base64), .tail = none, .marker = false };
+    const budget = max_encoded.minus(marker_cost);
+    const head_cut = cutHeadEncoded(bytes, budget.scaled(3, 4), base64);
+    const head = head_cut.head(bytes);
+    const tail_cut = cutTailEncoded(head_cut.rest(bytes), budget.minus(encodedCost(head, base64)), base64);
+    return .{ .head = head_cut, .tail = tail_cut, .marker = true };
 }
 
 /// Whether the bytes this plan actually shows are inline-safe. The omission
 /// marker is plain ASCII, so it cannot change the answer.
 fn planIsInlineUtf8(bytes: []const u8, plan: PreviewPlan) bool {
-    return isInlineUtf8(bytes[0..plan.head_len]) and
-        isInlineUtf8(bytes[bytes.len - plan.tail_len ..]);
+    return isInlineUtf8(plan.head.head(bytes)) and isInlineUtf8(plan.tail.tail(bytes));
 }
 
-fn headTailPreview(allocator: std.mem.Allocator, bytes: []const u8, max_encoded: usize) !ChannelPreview {
+fn headTailPreview(allocator: std.mem.Allocator, bytes: []const u8, max_encoded: result_budget.Encoded) !ChannelPreview {
     // Plan under JSON escaping first. That is both the common case and the
     // expensive one (2:1 against base64's 4:3), so a plan that turns out to be
     // inline-safe is already paid for. Only when the shown region is *not*
@@ -366,34 +368,37 @@ fn headTailPreview(allocator: std.mem.Allocator, bytes: []const u8, max_encoded:
     }
     const content = if (plan.marker)
         try std.mem.concat(allocator, u8, &.{
-            bytes[0..plan.head_len],
+            plan.head.head(bytes),
             PREVIEW_OMISSION_MARKER,
-            bytes[bytes.len - plan.tail_len ..],
+            plan.tail.tail(bytes),
         })
     else
-        try allocator.dupe(u8, bytes[0..plan.head_len]);
+        try allocator.dupe(u8, plan.head.head(bytes));
     return .{
         .content = content,
-        .shown_source_bytes = plan.head_len + plan.tail_len,
+        .shown_source_bytes = plan.head.plus(plan.tail).raw(),
         .base64 = base64,
         .allocator = allocator,
     };
 }
 
-fn headTailFilePreview(allocator: std.mem.Allocator, path: []const u8, total_bytes: u64, max_encoded: usize) !ChannelPreview {
-    if (max_encoded == 0) {
+fn headTailFilePreview(allocator: std.mem.Allocator, path: []const u8, total_bytes: u64, max_encoded: result_budget.Encoded) !ChannelPreview {
+    if (max_encoded.raw() == 0) {
         return .{ .content = try allocator.dupe(u8, ""), .shown_source_bytes = 0, .allocator = allocator };
     }
-    // Encoded size is never below source size, so `max_encoded` source bytes
-    // bounds what could possibly fit - and bounds the read for a spool that
-    // may be gigabytes.
-    if (total_bytes <= max_encoded) {
-        const whole = try readWholeFile(path, allocator, max_encoded);
+    // The crossing, written down: an encoded byte never costs less than the
+    // source byte it came from, so the encoded allowance is a safe upper bound
+    // on how many source bytes could possibly fit - and it bounds the read for
+    // a spool that may be gigabytes. This was one variable serving as both
+    // units before the units became types.
+    const read_bound = result_budget.Source.of(max_encoded.raw());
+    if (total_bytes <= read_bound.raw()) {
+        const whole = try readWholeFile(path, allocator, read_bound.raw());
         defer allocator.free(whole);
         return try headTailPreview(allocator, whole, max_encoded);
     }
-    const head_read: usize = max_encoded * 3 / 4;
-    const tail_read: usize = max_encoded - head_read;
+    const head_read: usize = read_bound.raw() * 3 / 4;
+    const tail_read: usize = read_bound.raw() - head_read;
     var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= path_buffer.len) return error.PathTooLong;
     @memcpy(path_buffer[0..path.len], path);
@@ -420,17 +425,15 @@ fn headTailFilePreview(allocator: std.mem.Allocator, path: []const u8, total_byt
     var cut = splitPreviewBudget(
         head_raw,
         tail_raw,
-        max_encoded -| encodedCost(PREVIEW_OMISSION_MARKER, false),
+        max_encoded.minus(encodedCost(PREVIEW_OMISSION_MARKER, false)),
         false,
     );
-    if (!isInlineUtf8(head_raw[0..cut.head_len]) or
-        !isInlineUtf8(tail_raw[tail_raw.len - cut.tail_len ..]))
-    {
+    if (!isInlineUtf8(cut.head.head(head_raw)) or !isInlineUtf8(cut.tail.tail(tail_raw))) {
         base64 = true;
         cut = splitPreviewBudget(
             head_raw,
             tail_raw,
-            max_encoded -| encodedCost(PREVIEW_OMISSION_MARKER, true),
+            max_encoded.minus(encodedCost(PREVIEW_OMISSION_MARKER, true)),
             true,
         );
     }
@@ -438,17 +441,17 @@ fn headTailFilePreview(allocator: std.mem.Allocator, path: []const u8, total_byt
     // something was omitted; emitting it anyway is the one way this path can
     // exceed the budget it was given. `planPreview` makes the same call for
     // the in-memory path.
-    const content = if (encodedCost(PREVIEW_OMISSION_MARKER, base64) < max_encoded)
+    const content = if (encodedCost(PREVIEW_OMISSION_MARKER, base64).lte(max_encoded))
         try std.mem.concat(allocator, u8, &.{
-            head_raw[0..cut.head_len],
+            cut.head.head(head_raw),
             PREVIEW_OMISSION_MARKER,
-            tail_raw[tail_raw.len - cut.tail_len ..],
+            cut.tail.tail(tail_raw),
         })
     else
-        try allocator.dupe(u8, head_raw[0..cut.head_len]);
+        try allocator.dupe(u8, cut.head.head(head_raw));
     return .{
         .content = content,
-        .shown_source_bytes = cut.head_len + cut.tail_len,
+        .shown_source_bytes = cut.head.plus(cut.tail).raw(),
         .base64 = base64,
         .allocator = allocator,
     };
@@ -1136,17 +1139,17 @@ test "channelAllowances keeps the two channels inside one per-result budget" {
     const budget = result_budget.Budget.fromModel(200_000);
     const payload = budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES);
     // Both channels huge: the allowance is shared, never doubled.
-    const even = channelAllowances(budget, 1 << 20, 1 << 20);
-    try std.testing.expectEqual(payload, even.first + even.second);
+    const even = channelAllowances(budget, .of(1 << 20), .of(1 << 20));
+    try std.testing.expectEqual(payload, even.first.plus(even.second));
     // Empty stderr: stdout gets everything.
-    const lopsided = channelAllowances(budget, 1 << 20, 0);
+    const lopsided = channelAllowances(budget, .of(1 << 20), .of(0));
     try std.testing.expectEqual(payload, lopsided.first);
-    try std.testing.expectEqual(@as(usize, 0), lopsided.second);
+    try std.testing.expectEqual(result_budget.Encoded.of(0), lopsided.second);
     // Demands that both fit are both granted in full - the allowance is a
     // ceiling, so granting exactly what was asked for cuts nothing.
-    const small = channelAllowances(budget, 1000, 20);
-    try std.testing.expectEqual(@as(usize, 1000), small.first);
-    try std.testing.expectEqual(@as(usize, 20), small.second);
+    const small = channelAllowances(budget, .of(1000), .of(20));
+    try std.testing.expectEqual(result_budget.Encoded.of(1000), small.first);
+    try std.testing.expectEqual(result_budget.Encoded.of(20), small.second);
 }
 
 test "a channel's demand is what it will cost, not a worst-case bound" {
@@ -1158,17 +1161,17 @@ test "a channel's demand is what it will cost, not a worst-case bound" {
     const quotes = try a.alloc(u8, 1000);
     defer a.free(quotes);
     @memset(quotes, '"');
-    try std.testing.expectEqual(@as(u64, 2000), encodedDemand(quotes));
+    try std.testing.expectEqual(result_budget.Encoded.of(2000), encodedDemand(quotes));
 
     const plain = try a.alloc(u8, 1000);
     defer a.free(plain);
     @memset(plain, 'x');
-    try std.testing.expectEqual(@as(u64, 1000), encodedDemand(plain));
+    try std.testing.expectEqual(result_budget.Encoded.of(1000), encodedDemand(plain));
 
     const binary = try a.alloc(u8, 999);
     defer a.free(binary);
     @memset(binary, 0x01);
-    try std.testing.expectEqual(@as(u64, 1332), encodedDemand(binary)); // 999 -> 4/3
+    try std.testing.expectEqual(result_budget.Encoded.of(1332), encodedDemand(binary)); // 999 -> 4/3
 }
 
 test "an ordinary stdout/stderr pair that fits is not cut by the split" {

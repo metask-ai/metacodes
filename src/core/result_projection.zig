@@ -23,7 +23,7 @@ pub const BASH_SCHEMA = "metacodes.bash-result.v2";
 /// at ~500 bytes with the longest production media type; rounded up so a
 /// preview sized against `payloadAllowance` cannot push the rendered envelope
 /// past the per-result budget it was derived from.
-pub const ENVELOPE_OVERHEAD_BYTES: usize = 640;
+pub const ENVELOPE_OVERHEAD_BYTES: result_budget.Encoded = .of(640);
 
 /// Budget bytes per token, the same approximation `turnBudgetBytes` uses to
 /// turn a token window into a byte budget.
@@ -75,7 +75,7 @@ pub const Config = struct {
 
     fn previewCap(self: Config) usize {
         return self.preview_bytes orelse
-            self.budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES);
+            self.budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES).raw();
     }
 };
 
@@ -149,13 +149,14 @@ const Allowance = struct {
 
     /// Preview a spilled result keeps. An explicitly configured preview size
     /// is a fixed request, so only turn pressure may shrink it.
-    fn previewBytes(self: Allowance) usize {
-        if (!self.underPressure()) return self.preview_cap;
-        return @min(self.preview_cap, self.ceiling -| ENVELOPE_OVERHEAD_BYTES);
+    fn previewBytes(self: Allowance) result_budget.Encoded {
+        const cap = result_budget.Encoded.of(self.preview_cap);
+        if (!self.underPressure()) return cap;
+        return cap.min(result_budget.Encoded.of(self.ceiling).minus(ENVELOPE_OVERHEAD_BYTES));
     }
 
     fn spillCost(self: Allowance) usize {
-        return ENVELOPE_OVERHEAD_BYTES +| self.previewBytes();
+        return ENVELOPE_OVERHEAD_BYTES.plus(self.previewBytes()).raw();
     }
 
     /// Model-visible cost of a result of `len` bytes.
@@ -165,6 +166,8 @@ const Allowance = struct {
     /// loses content *and* grows the request - the exact negative-sum trade
     /// the Bash channel preview used to make between 1537 and ~1760 bytes.
     /// The `@min(len, ...)` makes that outcome unrepresentable.
+    /// `len` is a committed result's own length, which is what it costs the
+    /// turn once rendered - the same unit as the ceiling.
     fn cost(self: Allowance, len: usize) usize {
         if (len <= self.ceiling) return len;
         return @min(len, self.spillCost());
@@ -484,6 +487,10 @@ fn regrowCommittedEnvelope(
     // constant got most wrong: a result a few kilobytes long, spilled at
     // capture time, then kept as a 1.5KB preview under a budget with room for
     // all of it.
+    // `original_bytes` is a Source count and `ceiling` an Encoded budget; the
+    // crossing is sound because an encoded byte never costs less than the
+    // source byte it came from, and re-inlining makes the content its own
+    // envelope so the two are directly comparable there.
     if (capture_complete and original_bytes <= allowance.ceiling) {
         if (readWholeArtifact(allocator, config.session_root, identity.artifact_id, original_bytes)) |whole| {
             allocator.free(@constCast(current));
@@ -493,10 +500,13 @@ fn regrowCommittedEnvelope(
     }
 
     const target = allowance.previewBytes();
-    // Sound as a cheap pre-filter in either unit: an encoded byte never costs
-    // less than the source byte it came from, so a preview fitting `target`
-    // encoded bytes can never show more than `target` source bytes.
-    if (shown >= target) return false;
+    // The crossing has to be written down. An encoded byte never costs less
+    // than the source byte it came from, so `target` encoded bytes can show at
+    // most `target` source bytes - which is what makes this a sound cheap
+    // pre-filter, and is precisely the reasoning that used to be implicit here
+    // while `target` was silently reused as a source length below.
+    const target_as_source_bound = result_budget.Source.of(target.raw());
+    if (result_budget.Source.of(shown).lte(target_as_source_bound) == false) return false;
 
     // Read a *superset* of what can fit, for the same reason, then cut it to
     // the encoded budget in `renderEnvelopeWithPreview`. Handing the raw chunks
@@ -505,8 +515,8 @@ fn regrowCommittedEnvelope(
     // committed envelope is exempt from the spill pass, so nothing downstream
     // would trim it back. One chunk per side keeps this to two reads, which
     // each re-verify the artifact's digest.
-    const head_read: usize = @min(target * 3 / 4, artifact.MAX_READ_BYTES);
-    const tail_read: usize = @min(target -| head_read, artifact.MAX_READ_BYTES);
+    const head_read: usize = @min(target_as_source_bound.raw() * 3 / 4, artifact.MAX_READ_BYTES);
+    const tail_read: usize = @min(target_as_source_bound.raw() -| head_read, artifact.MAX_READ_BYTES);
     if (head_read == 0) return false;
     var head = artifact.readChunk(allocator, config.session_root, identity.artifact_id, 0, head_read) catch return false;
     defer head.deinit();
@@ -583,14 +593,13 @@ fn renderEnvelopeWithPreview(
     identity: EnvelopeIdentity,
     head_source: []const u8,
     tail_source: []const u8,
-    budget: usize,
+    budget: result_budget.Encoded,
     utf8: bool,
 ) !RenderedEnvelope {
     const base64 = !utf8;
-    const head_len = result_budget.headCut(head_source, budget * 3 / 4, base64);
-    const head = head_source[0..head_len];
-    const tail_len = result_budget.tailCut(tail_source, budget -| result_budget.encodedCost(head, base64), base64);
-    const tail = tail_source[tail_source.len - tail_len ..];
+    const head = result_budget.headCut(head_source, budget.scaled(3, 4), base64).head(head_source);
+    const tail_budget = budget.minus(result_budget.encodedCost(head, base64));
+    const tail = result_budget.tailCut(tail_source, tail_budget, base64).tail(tail_source);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -726,8 +735,8 @@ pub fn shrinkStructuredResult(
 /// is the same quiet lie as an envelope that claims to be intact.
 const TrimLedger = struct {
     original_bytes: ?u64 = null,
-    head_shown: ?usize = null,
-    tail_shown: ?usize = null,
+    head_shown: ?result_budget.Source = null,
+    tail_shown: ?result_budget.Source = null,
     trimmed_channel: ?[]const u8 = null,
     /// Whether `preview_head`/`preview_tail` hold base64 rather than the bytes
     /// themselves. `preview_encoding` precedes both, so a single pass knows in
@@ -743,7 +752,7 @@ const TrimLedger = struct {
         const original = self.original_bytes orelse return null;
         const head = self.head_shown orelse return null;
         const tail = self.tail_shown orelse return null;
-        return original -| head -| tail;
+        return original -| head.raw() -| tail.raw();
     }
 };
 
@@ -795,11 +804,13 @@ fn renderTrimmedObject(
             // counter is the *decoded* length - the unit `original_bytes` and
             // `omitted_bytes` are in.
             const base64_field = is_preview and ledger.preview_base64;
-            const kept = if (value.string.len > water)
+            const kept: result_budget.Source = if (value.string.len > water)
                 try writeTrimmedString(writer, value.string, water, base64_field)
             else blk: {
                 try std.json.Stringify.encodeJsonString(value.string, .{}, writer);
-                break :blk if (base64_field) base64DecodedLen(value.string) else value.string.len;
+                // The unit crossing, made explicit: a base64 field's character
+                // count is Encoded; only its decoded length is Source.
+                break :blk if (base64_field) base64DecodedLen(value.string) else result_budget.Source.of(value.string.len);
             };
             if (std.mem.eql(u8, key, "preview_head")) ledger.head_shown = kept;
             if (std.mem.eql(u8, key, "preview_tail")) ledger.tail_shown = kept;
@@ -811,11 +822,11 @@ fn renderTrimmedObject(
 
         // Counters whose subject this pass has already written.
         if (ledger.head_shown != null and std.mem.eql(u8, key, "preview_head_bytes")) {
-            try writer.print("{d}", .{ledger.head_shown.?});
+            try writer.print("{d}", .{ledger.head_shown.?.raw()});
             continue;
         }
         if (ledger.tail_shown != null and std.mem.eql(u8, key, "preview_tail_bytes")) {
-            try writer.print("{d}", .{ledger.tail_shown.?});
+            try writer.print("{d}", .{ledger.tail_shown.?.raw()});
             continue;
         }
         if (std.mem.eql(u8, key, "omitted_bytes")) {
@@ -879,8 +890,12 @@ const PREVIEW_ELISION = "\n...[trimmed to fit context]...\n";
 
 /// Decoded length of a base64 string, which is the unit its sibling counters
 /// are written in.
-fn base64DecodedLen(text: []const u8) usize {
-    return std.base64.standard.Decoder.calcSizeForSlice(text) catch text.len / 4 * 3;
+/// A base64 string is `Encoded`; what it decodes to is `Source`. Writing the
+/// character count into a counter documented as original bytes overstated it
+/// by a third, and the head+tail+omitted invariant still held because all three
+/// were wrong in the same unit.
+fn base64DecodedLen(text: []const u8) result_budget.Source {
+    return result_budget.Source.of(std.base64.standard.Decoder.calcSizeForSlice(text) catch text.len / 4 * 3);
 }
 
 /// Write `source` cut to roughly `water` bytes and return how many bytes of the
@@ -890,7 +905,7 @@ fn base64DecodedLen(text: []const u8) usize {
 /// base64 runs produces a field that is no longer base64, so nothing can decode
 /// it - losing the tail is the cheaper half of that trade. The returned count
 /// is decoded bytes, so it stays comparable with `original_bytes`.
-fn writeTrimmedString(writer: *std.Io.Writer, source: []const u8, water: usize, base64: bool) !usize {
+fn writeTrimmedString(writer: *std.Io.Writer, source: []const u8, water: usize, base64: bool) !result_budget.Source {
     if (base64) {
         const chars = @min(water, source.len) / 4 * 4;
         try std.json.Stringify.encodeJsonString(source[0..chars], .{}, writer);
@@ -899,7 +914,7 @@ fn writeTrimmedString(writer: *std.Io.Writer, source: []const u8, water: usize, 
     if (water <= PREVIEW_ELISION.len) {
         const head = alignedCut(source, @min(water, source.len));
         try std.json.Stringify.encodeJsonString(source[0..head], .{}, writer);
-        return head;
+        return result_budget.Source.of(head);
     }
     const budget = water - PREVIEW_ELISION.len;
     const head_len = alignedCut(source, budget * 3 / 4);
@@ -910,7 +925,7 @@ fn writeTrimmedString(writer: *std.Io.Writer, source: []const u8, water: usize, 
     try writeJsonStringBody(writer, PREVIEW_ELISION);
     try writeJsonStringBody(writer, source[tail_start..]);
     try writer.writeByte('"');
-    return head_len + (source.len - tail_start);
+    return result_budget.Source.of(head_len + (source.len - tail_start));
 }
 
 /// `encodeJsonString` writes its own quotes; a three-part string has to share
@@ -968,7 +983,7 @@ pub fn shrinkRecoverableEnvelope(
         identity,
         preview.head,
         preview.tail,
-        max_bytes -| ENVELOPE_OVERHEAD_BYTES,
+        result_budget.Encoded.of(max_bytes).minus(ENVELOPE_OVERHEAD_BYTES),
         preview.utf8,
     ) catch return null;
     // The overhead constant is a measured round-up, not a proof. A media type
@@ -1019,7 +1034,7 @@ fn spillOne(
     structured: bool,
     config: Config,
     stats: *Stats,
-    preview_bytes: usize,
+    preview_bytes: result_budget.Encoded,
     turn_budget: bool,
 ) !void {
     const original = item.content.*;
@@ -1045,7 +1060,7 @@ fn renderArtifactEnvelope(
     receipt: artifact.Receipt,
     media_type: []const u8,
     content: []const u8,
-    preview_bytes: usize,
+    preview_bytes: result_budget.Encoded,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -1081,7 +1096,7 @@ fn renderFallbackEnvelope(
     allocator: std.mem.Allocator,
     media_type: []const u8,
     content: []const u8,
-    preview_bytes: usize,
+    preview_bytes: result_budget.Encoded,
     storage_error: []const u8,
 ) ![]u8 {
     const digest = artifact.sha256Hex(content);
@@ -1097,7 +1112,7 @@ fn renderFallbackEnvelope(
     return out.toOwnedSlice();
 }
 
-fn appendPreview(writer: *std.Io.Writer, content: []const u8, preview_bytes: usize) !void {
+fn appendPreview(writer: *std.Io.Writer, content: []const u8, preview_bytes: result_budget.Encoded) !void {
     const valid_utf8 = isInlineUtf8(content);
     // `preview_bytes` is an encoded budget. Cutting on source length would let
     // a quote- or newline-dense result render at up to twice the size it was
@@ -1105,11 +1120,11 @@ fn appendPreview(writer: *std.Io.Writer, content: []const u8, preview_bytes: usi
     // base64 branch has no escapes but expands 4:3, which the same accounting
     // covers by converting the budget back into source bytes.
     const base64 = !valid_utf8;
-    const head_end = result_budget.headCut(content, preview_bytes * 3 / 4, base64);
-    const tail_budget = preview_bytes -| result_budget.encodedCost(content[0..head_end], base64);
-    const tail_len = result_budget.tailCut(content[head_end..], tail_budget, base64);
-    const tail_start = content.len - tail_len;
-    try appendPreviewParts(writer, content[0..head_end], content[tail_start..], tail_start - head_end, valid_utf8);
+    const head_cut = result_budget.headCut(content, preview_bytes.scaled(3, 4), base64);
+    const head = head_cut.head(content);
+    const remaining = head_cut.rest(content);
+    const tail = result_budget.tailCut(remaining, preview_bytes.minus(result_budget.encodedCost(head, base64)), base64).tail(remaining);
+    try appendPreviewParts(writer, head, tail, content.len - head.len - tail.len, valid_utf8);
 }
 
 fn appendPreviewParts(
@@ -1296,7 +1311,7 @@ test "a result the envelope cannot shrink is left inline" {
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
     const root = root_buffer[0..root_len];
-    var content: []const u8 = try allocator.alloc(u8, ENVELOPE_OVERHEAD_BYTES - 1);
+    var content: []const u8 = try allocator.alloc(u8, ENVELOPE_OVERHEAD_BYTES.raw() - 1);
     @memset(@constCast(content), 'S');
     defer allocator.free(@constCast(content));
     const before = content;
@@ -1788,7 +1803,7 @@ test "shrink refuses rather than emit an envelope over the limit" {
 
     // Every limit from "impossible" up to the envelope's own size: never a
     // result over the limit, never one that grew.
-    for ([_]usize{ 0, 1, 64, 320, ENVELOPE_OVERHEAD_BYTES, ENVELOPE_OVERHEAD_BYTES + 1, 1024, 4096 }) |limit| {
+    for ([_]usize{ 0, 1, 64, 320, ENVELOPE_OVERHEAD_BYTES.raw(), ENVELOPE_OVERHEAD_BYTES.raw() + 1, 1024, 4096 }) |limit| {
         if (shrinkRecoverableEnvelope(allocator, content, limit)) |out| {
             defer allocator.free(out);
             try std.testing.expect(out.len <= limit);
@@ -1822,7 +1837,7 @@ test "shrinking converges and preserves an incomplete capture's flag" {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try writeArtifactEnvelopeHead(&out.writer, receipt.id(), "text/plain; charset=utf-8", payload.len, receipt.sha256[0..], false);
-    try appendPreview(&out.writer, payload, 40 * 1024);
+    try appendPreview(&out.writer, payload, .of(40 * 1024));
     try out.writer.writeAll(ARTIFACT_ENVELOPE_TAIL);
     const incomplete = try out.toOwnedSlice();
     defer allocator.free(incomplete);
@@ -1895,7 +1910,7 @@ test "trimming a fallback envelope corrects the counters it invalidates" {
     const body = try allocator.alloc(u8, 30 * 1024);
     defer allocator.free(body);
     @memset(body, 'f');
-    const content: []const u8 = try renderFallbackEnvelope(allocator, "text/plain; charset=utf-8", body, 24 * 1024, "artifact_store_unavailable");
+    const content: []const u8 = try renderFallbackEnvelope(allocator, "text/plain; charset=utf-8", body, .of(24 * 1024), "artifact_store_unavailable");
     defer allocator.free(@constCast(content));
     try std.testing.expect(isProjectionEnvelope(content));
     try std.testing.expect(!isRecoverableEnvelope(content));
@@ -1938,7 +1953,7 @@ test "a trimmed envelope's elision count still adds up" {
     const body = try allocator.alloc(u8, 30 * 1024);
     defer allocator.free(body);
     @memset(body, 'f');
-    const content: []const u8 = try renderFallbackEnvelope(allocator, "text/plain; charset=utf-8", body, 24 * 1024, "artifact_store_unavailable");
+    const content: []const u8 = try renderFallbackEnvelope(allocator, "text/plain; charset=utf-8", body, .of(24 * 1024), "artifact_store_unavailable");
     defer allocator.free(@constCast(content));
 
     for ([_]usize{ 2, 3, 5, 8 }) |divisor| {
@@ -2018,7 +2033,7 @@ test "a trimmed base64 preview is still decodable, and its counter is decoded by
     const binary = try allocator.alloc(u8, 30 * 1024);
     defer allocator.free(binary);
     @memset(binary, 0x01); // not inline-safe -> base64 preview
-    const content: []const u8 = try renderFallbackEnvelope(allocator, "application/octet-stream", binary, 24 * 1024, "artifact_store_unavailable");
+    const content: []const u8 = try renderFallbackEnvelope(allocator, "application/octet-stream", binary, .of(24 * 1024), "artifact_store_unavailable");
     defer allocator.free(@constCast(content));
 
     var original = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});

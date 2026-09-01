@@ -274,6 +274,18 @@ envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 S
 仅是失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新
 投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
 
+**单位是类型,只在跨越处强制**:`result_budget.Source`(内容缓冲区里的字节)与
+`result_budget.Encoded`(渲染进信封后占的字节)是两个 non-exhaustive enum,零表示开销。
+切割原语因此签名为"吃 `Encoded` 预算、吐 `Source` 长度"——那次换算正是反复被跳过的一步。
+一个 base64 字符串本身是 `Encoded`,它解码出来的才是 `Source`,所以不需要第三个单位。
+
+**范围是量出来的,不是凭感觉划的**:只有发生**换算**的地方强制单位(cut/cost 原语、
+`payloadAllowance`、preview 计数)。`Budget` 的字段刻意保持 `usize`——它们几乎只与结果自身
+长度比较,同单位、无从混淆;试着把它们也类型化后 `.raw()` 从 42 涨到 73,十七处新增全在从无
+危险的边界上、一个缺陷也抓不到,遂回退。**类型在没有防止混淆的地方就是纯税。**
+另注:`Source.head(buf)/.tail(buf)` 只是省掉 `.raw()` 的人体工程学,**不保证**长度与缓冲区
+配对(`head(错缓冲区)` 照样编译),那需要 phantom 参数,缓冲区错配仍归测试管。
+
 **编码后字节是唯一记账单位**:凡是"这条结果值多少字节"的判断,量的都是**渲染进信封之后**
 的字节——preview 经 JSON 转义最多翻倍、经 base64 涨 4:3。三处都踩过同一个坑(Bash 通道按
 整条通道选编码却按 preview 渲染、`regrowCommittedEnvelope` 按源字节下刀、`ReadArtifact`

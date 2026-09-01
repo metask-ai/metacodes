@@ -11,7 +11,7 @@ const result_budget = @import("../core/result_budget.zig");
 /// name of the payload. Measured at ~230 bytes; rounded up so a chunk sized
 /// against the remaining allowance cannot push the rendered envelope past the
 /// per-result budget it was derived from.
-const ENVELOPE_OVERHEAD_BYTES: usize = 256;
+const ENVELOPE_OVERHEAD_BYTES: result_budget.Encoded = .of(256);
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const artifact_id = common.extractJsonArg(args, "artifact_id") orelse return error.MissingArtifactId;
@@ -24,10 +24,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // `MAX_READ_BYTES` stays the hard protocol maximum an explicit request may
     // name; the budget then clamps what one call actually returns, and
     // `next_offset` carries the rest exactly as it does for any short read.
-    const ceiling = @max(1, @min(artifact.MAX_READ_BYTES, ctx.result_budget.per_result_bytes));
-    const requested_limit = (try parseOptionalU64(args, "limit")) orelse ceiling;
+    // Two units, and this used to be one variable doing both jobs. `read_limit`
+    // bounds how many *source* bytes to pull off disk - an encoded byte never
+    // costs less than its source byte, so the encoded budget is a safe upper
+    // bound for it. `render_budget` is what the rendered envelope may cost.
+    const budget_cap = @max(1, @min(artifact.MAX_READ_BYTES, ctx.result_budget.per_result_bytes));
+    const read_limit = result_budget.Source.of(budget_cap);
+    const render_budget = result_budget.Encoded.of(budget_cap).minus(ENVELOPE_OVERHEAD_BYTES);
+    const requested_limit = (try parseOptionalU64(args, "limit")) orelse read_limit.raw();
     if (requested_limit == 0 or requested_limit > artifact.MAX_READ_BYTES) return error.InvalidReadLimit;
-    const limit = @min(requested_limit, ceiling);
+    const limit = @min(requested_limit, read_limit.raw());
     var chunk = try artifact.readChunk(ctx.allocator, ctx.artifact_root, artifact_id, offset, @intCast(limit));
     defer chunk.deinit();
 
@@ -40,10 +46,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // encoded ceiling happens here, and `next_offset` carries the difference
     // exactly as it does for any short read.
     const utf8 = std.unicode.utf8ValidateSlice(chunk.bytes);
-    const kept = result_budget.headCut(chunk.bytes, ceiling -| ENVELOPE_OVERHEAD_BYTES, !utf8);
-    const data = chunk.bytes[0..kept];
-    const next_offset: ?u64 = if (chunk.offset + kept < chunk.total_bytes)
-        chunk.offset + kept
+    const kept = result_budget.headCut(chunk.bytes, render_budget, !utf8);
+    const data = kept.head(chunk.bytes);
+    const next_offset: ?u64 = if (chunk.offset + data.len < chunk.total_bytes)
+        chunk.offset + data.len
     else
         null;
     if (ctx.tool_result_metrics) |metrics| metrics.recordRecovery(data.len);
@@ -128,7 +134,7 @@ test "ReadArtifact clamps a recovery read to the per-result budget" {
     defer parsed.deinit();
     // The budget buys the whole envelope, not just its payload, so the chunk
     // is the budget minus the envelope's own scaffolding.
-    const floor_payload: i64 = 8 * 1024 - ENVELOPE_OVERHEAD_BYTES;
+    const floor_payload: i64 = 8 * 1024 - ENVELOPE_OVERHEAD_BYTES.raw();
     try std.testing.expectEqual(floor_payload, parsed.value.object.get("returned_bytes").?.integer);
     // Nothing is lost: the remainder is reachable through next_offset.
     try std.testing.expectEqual(floor_payload, parsed.value.object.get("next_offset").?.integer);
@@ -146,7 +152,7 @@ test "ReadArtifact clamps a recovery read to the per-result budget" {
     var wide_parsed = try std.json.parseFromSlice(std.json.Value, allocator, wide, .{});
     defer wide_parsed.deinit();
     try std.testing.expectEqual(
-        @as(i64, 32 * 1024 - ENVELOPE_OVERHEAD_BYTES),
+        @as(i64, 32 * 1024 - ENVELOPE_OVERHEAD_BYTES.raw()),
         wide_parsed.value.object.get("returned_bytes").?.integer,
     );
 
