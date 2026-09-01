@@ -2321,6 +2321,7 @@ fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         };
         if (std.mem.eql(u8, verb, "enable") or std.mem.eql(u8, verb, "disable")) {
             const enabled = std.mem.eql(u8, verb, "enable");
+            const in_use = !enabled and app.isRoutedThrough(id);
             app.setProviderEnabled(id, enabled) catch |err| {
                 std.debug.print("\x1b[31mcould not update '{s}': {s}\x1b[0m\n", .{ target, @errorName(err) });
                 return;
@@ -2328,14 +2329,28 @@ fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
             // Disabling keeps the instance's configuration and credential
             // references; that is the difference from removing it.
             std.debug.print("{s} '{s}'.\n", .{ if (enabled) "Enabled" else "Disabled", target });
+            if (in_use) {
+                // A session is not torn off the route it is running on — that
+                // would be the worse surprise — but reporting only "Disabled"
+                // would describe something other than what happened.
+                std.debug.print(
+                    "This session is still routed through it. Pick another route with " ++
+                        "Ctrl+O; new sessions will not offer it.\n",
+                    .{},
+                );
+            }
             return;
         }
         if (std.mem.eql(u8, verb, "remove")) {
+            const in_use = app.isRoutedThrough(id);
             app.removeProviderConfiguration(id) catch |err| {
                 std.debug.print("\x1b[31mcould not remove '{s}': {s}\x1b[0m\n", .{ target, @errorName(err) });
                 return;
             };
             std.debug.print("Removed the configuration for '{s}'.\n", .{target});
+            if (in_use) {
+                std.debug.print("This session is still routed through it until you pick another route.\n", .{});
+            }
             return;
         }
         std.debug.print("usage: /providers [refresh | enable <id> | disable <id> | remove <id>]\n", .{});

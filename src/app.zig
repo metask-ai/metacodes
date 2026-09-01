@@ -1859,6 +1859,27 @@ pub const App = struct {
         try app.reapplyProviderConfiguration(&store, result.config_revision);
     }
 
+    /// True when the session's committed route belongs to `id`.
+    ///
+    /// Disabling or removing a provider does not tear a session off the route
+    /// it is running on — that would be a worse surprise — but saying only
+    /// "Disabled" while the session keeps using it is a message that describes
+    /// something other than what happened.
+    pub fn isRoutedThrough(app: *App, id: provider_ids_mod.Slug) bool {
+        // Creates the host if this is the first thing to need it, which also
+        // seeds the route a `--provider` session started on — without that the
+        // kernel has no current offer and this always answered "no".
+        const host = app.providerHost() catch return false;
+        const current = host.kernel.currentOfferId() orelse return false;
+        // Read from the *retired* catalog too: the rebuild has already dropped
+        // a disabled provider's offers, so the live catalog no longer knows.
+        if (host.kernel.catalogSnapshot().find(current)) |offer| return offer.provider_id.eql(id);
+        if (host.retired) |*previous| {
+            if (previous.find(current)) |offer| return offer.provider_id.eql(id);
+        }
+        return false;
+    }
+
     pub fn removeProviderConfiguration(app: *App, id: provider_ids_mod.Slug) !void {
         var store = try provider_config_store.Store.initHome(app.allocator);
         defer store.deinit();
