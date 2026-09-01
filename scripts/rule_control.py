@@ -1330,7 +1330,20 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         for path in directory.rglob("*_test.zig")
         if path.is_file() and not path.is_symlink()
     )
-    dedicated = {"component/agentcore_abi_test.zig"}
+    # build.zig 的 `aggregate_test_exclusions` 是这条纪律的唯一真相源(它会在
+    # build-graph 构造期 panic:"dedicated test ... must not also appear in
+    # tests/integration_suite.zig")。此处从它解析而非手抄——原先这里是一份写死的
+    # 副本,build.zig 加了 tool_dispatcher_metadata_test.zig 而副本没跟上,于是这条
+    # 规则长期要求一个 build.zig 明令禁止的导入:两边对同一件事的规定相反,谁也修不好。
+    exclusions_block = re.search(
+        r"const aggregate_test_exclusions = \[_\]\[\]const u8\{(.*?)\n\};",
+        sources["build"],
+        re.S,
+    )
+    dedicated = set(re.findall(r'"([^"]+_test\.zig)"', exclusions_block.group(1))) if exclusions_block else set()
+    # 解析不出来就是失败,不是"没有排除项"——后者会让每个专用测试都被误报为漏导入,
+    # 把一个解析 bug 伪装成一堆内容 bug。错误在下面 errors 可用处统一登记。
+    exclusions_unparsed = not dedicated
     aggregate_expected = sorted(set(discovered) - dedicated)
     # Mirror build.zig's exact executable inventory form. A mention in prose,
     # a string literal, or a trailing-comment decoy must not count as wiring.
@@ -1572,6 +1585,10 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         absent = [name for name, present in checks.items() if not present]
         if absent:
             errors.append(f"{obligation}: missing {', '.join(absent)}")
+    if exclusions_unparsed:
+        errors.append(
+            "aggregate_source_inventory: cannot parse aggregate_test_exclusions from build.zig"
+        )
     if imported_set != set(aggregate_expected):
         omitted = sorted(set(aggregate_expected) - imported_set)
         surplus = sorted(imported_set - set(aggregate_expected))

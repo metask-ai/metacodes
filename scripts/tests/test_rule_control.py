@@ -765,7 +765,11 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             '  _ = "tests/component"; _ = "tests/integration"; _ = "_test.zig";\n'
             "}\n"
             "validateAggregateTestInventory(b);\n"
-            'const abi = "agentcore_abi_test.zig";\n'
+            # 专用测试的排除清单现在由 build.zig 单一真相源提供(sensor 从这里解析,
+            # 不再手抄一份 Python 副本),所以夹具也必须按真实形状声明它。
+            "const aggregate_test_exclusions = [_][]const u8{\n"
+            '    "component/agentcore_abi_test.zig",\n'
+            "};\n"
             'const agentcore_test_step = b.step("agentcore:test", "fixture");\n'
             'const dev_step = b.step("dev", "fixture");\n'
             "dev_step.dependOn(&install_debug.step);\n"
