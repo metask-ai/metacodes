@@ -340,7 +340,9 @@ O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。
 JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次同步调用建立临时 registry，
 不会退回 pipe 全量捕获。已完成的 Bash 信封同时给出 `<channel>_path`(JobRegistry 落盘位置,
 在 OS 临时目录而非 artifact CAS 内,且不随 registry 销毁而失效):它让 `Read`/`Grep` 能直接
-搜索,并且是捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时**唯一**剩下的句柄。MCP stdio、
+搜索,并且是捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时**唯一**剩下的句柄——正因为是唯一,
+`hasRecoverableArtifact` 除 artifact 字段外也认这条路径(仅当该通道 `_truncated`;每条已完成
+信封都带 path,不加这个门会让所有 Bash 结果都清不掉),否则句柄只活到下一次上下文压力。MCP stdio、
 AgentCore MCP connector、process plugin 与公开 Host stream ABI 都复用同一
 CAS/receipt/`ReadArtifact` 恢复面。
 

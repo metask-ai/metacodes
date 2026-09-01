@@ -450,3 +450,36 @@ test "L2 microcompact: 无法重写的可恢复信封宁可留着也不切坏" {
     try std.testing.expectEqualStrings(bash, kept);
     try std.testing.expect(cc.result_projection.hasRecoverableArtifact(kept));
 }
+
+test "L2 microcompact: 大到发布不了的 Bash 捕获,靠 spool 路径免于被清空" {
+    // 已完成的 Bash 信封给出 `<channel>_path`,理由正是"捕获超过 MAX_ARTIFACT_BYTES
+    // 无法发布时唯一剩下的句柄"。可 clear 判定原本只看 artifact 字段,于是这条
+    // 结果在下一次上下文压力就被清成 stub——句柄只活了一轮,那份磁盘上完好的
+    // 输出对模型等于没有。
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+
+    const unpublishable =
+        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"head...tail\"," ++
+        "\"stdout_captured_bytes\":200000000,\"stdout_capture_complete\":false," ++
+        "\"stdout_truncated\":true,\"stdout_artifact_id\":null,\"stdout_recoverable\":false," ++
+        "\"stdout_path\":\"/tmp/metacodes-job-abc/stdout\"," ++
+        "\"stdout_storage_error\":\"artifact_too_large\",\"exit_code\":0}";
+    try appendToolResult(&conv, a, "tu_spool", unpublishable);
+
+    // 一条模型已经完整看到的结果作对照:它没有要恢复的东西,该清就清。
+    const whole =
+        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"all of it right here\"," ++
+        "\"stdout_truncated\":false,\"stdout_artifact_id\":null,\"stdout_recoverable\":true," ++
+        "\"stdout_path\":\"/tmp/metacodes-job-def/stdout\"," ++
+        "\"stderr_truncated\":false,\"stderr_path\":\"/tmp/metacodes-job-def/stderr\",\"exit_code\":0}";
+    try appendToolResult(&conv, a, "tu_whole", whole);
+
+    const reduced = conv.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expectEqualStrings(unpublishable, conv.messages.items[0].blocks[0].tool_result.content);
+    try std.testing.expect(cc.conversation.isCommittedToolResultProjection(
+        conv.messages.items[1].blocks[0].tool_result.content,
+    ));
+}

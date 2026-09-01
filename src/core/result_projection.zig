@@ -401,8 +401,9 @@ pub fn isRecoverableEnvelope(content: []const u8) bool {
 }
 
 /// Whether clearing this completed result would destroy its only bounded
-/// recovery capability. Bash owns its channel artifacts directly, while all
-/// other tools use the generic projection envelope.
+/// recovery capability. Bash owns its channel handles directly - a published
+/// artifact, or the process spool when the capture was too large to publish -
+/// while all other tools use the generic projection envelope.
 pub fn hasRecoverableArtifact(content: []const u8) bool {
     if (isRecoverableEnvelope(content)) return true;
 
@@ -411,15 +412,39 @@ pub fn hasRecoverableArtifact(content: []const u8) bool {
     if (parsed.value != .object) return false;
     const version = parsed.value.object.get("schema_version") orelse return false;
     if (version != .string or !std.mem.eql(u8, version.string, BASH_SCHEMA)) return false;
-    return bashChannelRecoverable(parsed.value.object, "stdout_artifact_id", "stdout_recoverable") or
-        bashChannelRecoverable(parsed.value.object, "stderr_artifact_id", "stderr_recoverable");
+    return bashChannelRecoverable(parsed.value.object, "stdout") or
+        bashChannelRecoverable(parsed.value.object, "stderr");
 }
 
-fn bashChannelRecoverable(object: std.json.ObjectMap, id_key: []const u8, recoverable_key: []const u8) bool {
-    const recoverable = object.get(recoverable_key) orelse return false;
-    if (recoverable != .bool or !recoverable.bool) return false;
-    const id = object.get(id_key) orelse return false;
-    return id == .string and validArtifactId(id.string);
+/// Whether one Bash channel still has a way back to the bytes it elided.
+///
+/// Two shapes, and the second is the one that matters most: a capture too
+/// large to publish has no artifact id and no digest to make a
+/// content-addressed promise about, so `<channel>_recoverable` is false - but
+/// the process spool on disk still holds every byte, and it is then the *only*
+/// handle there is. Reading just the artifact keys would let microcompact
+/// clear exactly the result whose bytes are least replaceable.
+///
+/// The published-artifact shape is unchanged; the spool shape is an added
+/// disjunct, gated on the channel having actually elided something.
+/// `<channel>_path` is present on every completed result, so without that gate
+/// a channel the model can already see in full would become unclearable -
+/// which is the whole point of the pass this guards.
+fn bashChannelRecoverable(object: std.json.ObjectMap, label: []const u8) bool {
+    var key_buffer: [32]u8 = undefined;
+    const recoverable = object.get(channelKey(&key_buffer, label, "_recoverable"));
+    if (recoverable != null and recoverable.? == .bool and recoverable.?.bool) {
+        const id = object.get(channelKey(&key_buffer, label, "_artifact_id"));
+        if (id != null and id.? == .string and validArtifactId(id.?.string)) return true;
+    }
+    const truncated = object.get(channelKey(&key_buffer, label, "_truncated")) orelse return false;
+    if (truncated != .bool or !truncated.bool) return false;
+    const path = object.get(channelKey(&key_buffer, label, "_path")) orelse return false;
+    return path == .string and path.string.len > 0;
+}
+
+fn channelKey(buffer: []u8, label: []const u8, suffix: []const u8) []const u8 {
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ label, suffix }) catch suffix;
 }
 
 fn validArtifactId(id: []const u8) bool {
@@ -922,6 +947,45 @@ test "recoverable artifact detection includes Bash channel envelopes" {
     const bash = "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_artifact_id\":\"" ++ id ++ "\",\"stdout_recoverable\":true}";
     try std.testing.expect(hasRecoverableArtifact(bash));
     try std.testing.expect(!hasRecoverableArtifact("{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_artifact_id\":null,\"stdout_recoverable\":false}"));
+}
+
+test "a capture too large to publish is protected by its spool path" {
+    // The completed Bash envelope hands back `<channel>_path` precisely
+    // because a capture past MAX_ARTIFACT_BYTES has no artifact id to promise
+    // against - the file on disk is all that is left. Keying the guard on the
+    // artifact fields alone let microcompact clear that result to a stub on
+    // the very next context-pressure pass, so the handle survived exactly one
+    // turn.
+    const unpublishable =
+        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"head...tail\"," ++
+        "\"stdout_captured_bytes\":200000000,\"stdout_capture_complete\":false," ++
+        "\"stdout_truncated\":true,\"stdout_artifact_id\":null,\"stdout_recoverable\":false," ++
+        "\"stdout_path\":\"/tmp/metacodes-job-abc/stdout\"," ++
+        "\"stdout_storage_error\":\"artifact_too_large\",\"exit_code\":0}";
+    try std.testing.expect(hasRecoverableArtifact(unpublishable));
+
+    // stderr instead of stdout is the same claim.
+    const stderr_only =
+        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_truncated\":false," ++
+        "\"stderr_truncated\":true,\"stderr_artifact_id\":null,\"stderr_recoverable\":false," ++
+        "\"stderr_path\":\"/tmp/metacodes-job-abc/stderr\",\"exit_code\":1}";
+    try std.testing.expect(hasRecoverableArtifact(stderr_only));
+
+    // A result the model can already see in full stays clearable: every
+    // completed envelope carries a path, so gating on it alone would make
+    // every Bash result permanent.
+    const whole =
+        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"all of it\"," ++
+        "\"stdout_truncated\":false,\"stdout_artifact_id\":null,\"stdout_recoverable\":true," ++
+        "\"stdout_path\":\"/tmp/metacodes-job-abc/stdout\"," ++
+        "\"stderr_truncated\":false,\"stderr_path\":\"/tmp/metacodes-job-abc/stderr\",\"exit_code\":0}";
+    try std.testing.expect(!hasRecoverableArtifact(whole));
+
+    // And an envelope with no handle at all makes no claim.
+    const nothing =
+        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_truncated\":true," ++
+        "\"stdout_artifact_id\":null,\"stdout_recoverable\":false,\"exit_code\":0}";
+    try std.testing.expect(!hasRecoverableArtifact(nothing));
 }
 
 test "missing store yields an explicit valid fallback envelope" {
