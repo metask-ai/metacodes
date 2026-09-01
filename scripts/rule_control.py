@@ -1330,7 +1330,31 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         for path in directory.rglob("*_test.zig")
         if path.is_file() and not path.is_symlink()
     )
-    dedicated = {"component/agentcore_abi_test.zig"}
+    # build.zig 的 `aggregate_test_exclusions` 是这条纪律的唯一真相源(它会在
+    # build-graph 构造期 panic:"dedicated test ... must not also appear in
+    # tests/integration_suite.zig")。此处从它解析而非手抄——原先这里是一份写死的
+    # 副本,build.zig 加了 tool_dispatcher_metadata_test.zig 而副本没跟上,于是这条
+    # 规则长期要求一个 build.zig 明令禁止的导入:两边对同一件事的规定相反,谁也修不好。
+    # `\}\s*;` 而非 `\n\};`:去掉尾逗号后 zig fmt 会把列表折成一行,只认多行写法会让
+    # 一次纯格式改动把规则变红(虽然是失败关闭且提示明确,但属于无谓摩擦)。
+    exclusions_block = re.search(
+        r"const aggregate_test_exclusions = \[_\]\[\]const u8\{(.*?)\}\s*;",
+        sources["build"],
+        re.S,
+    )
+    dedicated = set(re.findall(r'"([^"]+_test\.zig)"', exclusions_block.group(1))) if exclusions_block else set()
+    # 解析不出来就是失败,不是"没有排除项"——后者会让每个专用测试都被误报为漏导入,
+    # 把一个解析 bug 伪装成一堆内容 bug。错误在下面 errors 可用处统一登记。
+    #
+    # 判据是"块不存在"而非"集合为空":`[_][]const u8{}` 是合法状态(所有测试都进聚合),
+    # 用空集当失败会在那天谎报解析失败。
+    exclusions_unparsed = exclusions_block is None
+    # 排除清单是逃生门:加一个名字,聚合导入要求和覆盖要求同时消失。build.zig 只验证
+    # 被排除的文件**存在**,不验证它还被任何 step 编译——所以一个被排除又没有专用
+    # root_source_file 的测试会彻底无人运行,且两侧都不报警。这里补上那道守卫。
+    dedicated_unrun = sorted(
+        name for name in dedicated if f'b.path("tests/{name}")' not in sources["build"]
+    )
     aggregate_expected = sorted(set(discovered) - dedicated)
     # Mirror build.zig's exact executable inventory form. A mention in prose,
     # a string literal, or a trailing-comment decoy must not count as wiring.
@@ -1572,6 +1596,15 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         absent = [name for name, present in checks.items() if not present]
         if absent:
             errors.append(f"{obligation}: missing {', '.join(absent)}")
+    if exclusions_unparsed:
+        errors.append(
+            "aggregate_source_inventory: cannot parse aggregate_test_exclusions from build.zig"
+        )
+    if dedicated_unrun:
+        errors.append(
+            "aggregate_source_inventory: dedicated tests excluded from the aggregate but "
+            f"compiled by no build step: {', '.join(dedicated_unrun)}"
+        )
     if imported_set != set(aggregate_expected):
         omitted = sorted(set(aggregate_expected) - imported_set)
         surplus = sorted(imported_set - set(aggregate_expected))
@@ -3757,6 +3790,10 @@ def observe_daemon_transport(repo: Path) -> Observation:
     client_init = zig_function_slice(sources["client"], "init") or ""
     ensure_ready = zig_function_slice(sources["client"], "ensureReady") or ""
     remote_run = zig_function_slice(sources["client"], "runCheckedRetry") or ""
+    # issue #30: cloneForThread 此前不在这条规则的视野里,而"共享 store 不回落 CLI"
+    # 的破口恰恰在它——它是唯一不做分发、而是重建 client 的地方,重建时会解析出
+    # 另外三处窄守卫赖以失败关闭的那个 bin_path。
+    clone_for_thread = zig_function_slice(sources["client"], "cloneForThread") or ""
     policy = zig_function_slice(sources["transport"], "postWithPolicy") or ""
     daemon_config = zig_function_slice(sources["client"], "initDaemonTransport") or ""
     parse = zig_function_slice(sources["transport"], "parseResponse") or ""
@@ -3781,7 +3818,10 @@ def observe_daemon_transport(repo: Path) -> Observation:
             ".exclusive_cli",
         )),
         "no_shared_raw_store_fallback": all((
-            'dupe(u8, "daemon-owned")' in client_init,
+            # Store 的两种含义分在类型里,而不是同一个 []const u8 上:非 CLI 传输拿到
+            # `.unowned`(不是路径),文件系统只能经 fsPath() 且必须处理 null。
+            ".unowned" in client_init,
+            "fsPath()" in ensure_ready,
             "invalid remote command shape" in remote_run,
             ".unconfigured" in ensure_ready,
             "未打开本地 Store" in ensure_ready,
@@ -3789,6 +3829,15 @@ def observe_daemon_transport(repo: Path) -> Observation:
             "self.transport == .daemon" in remote_run,
             "self.transport.daemon.run(args[0], args[2..]" in remote_run,
             '@import("../storage' not in sources["transport"],
+            # 克隆路径必须按"是否拥有 Store"分流,而不是只判 `== .daemon`:
+            # 不拥有 Store 的父客户端,克隆体保持 .unconfigured。
+            "self.store.fsPath() orelse" in clone_for_thread,
+            ".transport = .unconfigured" in clone_for_thread,
+            # 静态标记只说明代码长什么样。这条规则的名字是一个**行为**主张,所以它
+            # 还必须有可执行证据:探针构造未配置 client、克隆、ensureReady,断言不 ready
+            # 且 cwd 里一个文件都没落下。
+            "unconfigured_clone_owns_no_store=pass" in sources["runtime"],
+            "unconfigured-clone-no-store" in sources["probe"],
         )),
         "request_identity_and_no_write_retry": all(marker in policy + parse + sources["runtime"] for marker in (
             "max_attempts: u8 = if (mutates) 1 else 2",

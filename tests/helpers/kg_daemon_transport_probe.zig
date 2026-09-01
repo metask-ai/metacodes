@@ -20,6 +20,16 @@ pub fn main(init: std.process.Init) !void {
         client.ensureReady();
         if (std.mem.eql(u8, action, "client-config")) {
             try std.testing.expect(client.ready);
+            // cloneForThread 的第三个分支(daemon)。前两个分支各有覆盖,这个没有,
+            // 而它正是 issue #30 里被改动过的地方(移除了哨兵的 dupe)。克隆体必须
+            // 仍是 daemon 且仍不拥有 Store——否则工作线程会去开一个本地库。
+            // cloneForSession 不发请求(只分配 + 共享 write fence),所以这里不会
+            // 扰动本套件对 actor/session 计数的断言;也刻意不对克隆体调 ensureReady。
+            var cloned = try client.cloneForThread(init.gpa, "/unused-because-config-is-explicit");
+            defer cloned.deinit();
+            try std.testing.expect(cloned.transport == .daemon);
+            try std.testing.expect(cloned.store.fsPath() == null);
+            try std.testing.expectEqualStrings("daemon-owned", cloned.store.argvSlot());
             const stdout_file = std.Io.File.stdout();
             var config_buffer: [512]u8 = undefined;
             var config_writer = stdout_file.writer(init.io, &config_buffer);
@@ -33,6 +43,37 @@ pub fn main(init: std.process.Init) !void {
             try config_writer.interface.writeAll("unsafe_local_daemon_config=degraded\n");
             try config_writer.interface.flush();
         }
+        return;
+    }
+
+    // issue #30:不拥有 Store 的 client,克隆到工作线程后也不许凭空拥有一个。
+    // 这条断言的执行形态很关键——原先规则只 grep 三个函数的字符串标记,而 bug 住在
+    // 第四个函数(cloneForThread)里,于是"禁止共享 store 回落 CLI"这条规则一直是绿的。
+    if (std.mem.eql(u8, action, "unconfigured-clone-no-store")) {
+        var parent = try cc.kg_client.KgClient.init(init.gpa, .{
+            .home = "/unused-because-unconfigured",
+            .domain = "unconfigured-clone-probe",
+            .io = init.io,
+        });
+        defer parent.deinit();
+        try std.testing.expect(parent.transport == .unconfigured);
+        try std.testing.expect(parent.store.fsPath() == null);
+
+        var child = try parent.cloneForThread(init.gpa, "/unused-because-unconfigured");
+        defer child.deinit();
+        // 既不许被提升成 CLI-exclusive,也不许解析出 bin,更不许拥有 Store。
+        try std.testing.expect(child.transport == .unconfigured);
+        try std.testing.expect(child.bin_path == null);
+        try std.testing.expect(child.store.fsPath() == null);
+        // ensureReady 必须 degraded 而不是去建库。调用方据此走降级路径。
+        child.ensureReady();
+        try std.testing.expect(!child.ready);
+
+        const stdout_file = std.Io.File.stdout();
+        var clone_buffer: [256]u8 = undefined;
+        var clone_writer = stdout_file.writer(init.io, &clone_buffer);
+        try clone_writer.interface.writeAll("unconfigured_clone_owns_no_store=pass\n");
+        try clone_writer.interface.flush();
         return;
     }
 
