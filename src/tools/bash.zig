@@ -585,7 +585,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
                 const j = try registry.spawnBackground(command, cwd_opt);
-                return try std.fmt.allocPrint(allocator, "{{\"job_id\":\"{s}\",\"status\":\"started\",\"stdout_path\":\"{s}\",\"stderr_path\":\"{s}\"}}", .{ j.id[0..], j.stdout_path, j.stderr_path });
+                // Same rule as the auto-backgrounded snapshot: the spool is a
+                // staging path and never model-visible. BashOutput polls by
+                // job_id and reads incrementally.
+                return try std.fmt.allocPrint(allocator, "{{\"job_id\":\"{s}\",\"status\":\"started\"}}", .{j.id[0..]});
             }
         }
     }
@@ -1250,4 +1253,26 @@ test "an unpublishable Bash channel says why, not just that it failed" {
     );
     // A channel that was never spilled makes no claim either way.
     try std.testing.expect(parsed.value.object.get("stderr_storage_error") == null);
+}
+
+test "显式 run_in_background 也不交出 staging 路径" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // auto-background 那条改掉之后,显式 run_in_background=true 这条还在返回
+    // stdout_path/stderr_path —— 同一条契约,漏了一半。
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const ctx = ToolContext{ .allocator = a, .jobs = &registry };
+    const result = try execute(&ctx, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\"}");
+    defer a.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result, .{});
+    defer parsed.deinit();
+    const job_id = parsed.value.object.get("job_id").?.string;
+    defer registry.kill(job_id) catch {};
+    try std.testing.expectEqualStrings("started", parsed.value.object.get("status").?.string);
+    // 句柄够用(BashOutput 按 job_id 读),但路径一个字节都不出现。
+    try std.testing.expect(parsed.value.object.get("stdout_path") == null);
+    try std.testing.expect(parsed.value.object.get("stderr_path") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "/metacodes-jobs/") == null);
 }

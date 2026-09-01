@@ -241,13 +241,22 @@ be that path — is rejected for artifact searches, and the child's stderr is
 scrubbed of it before it can reach a tool error.
 
 No staging path is model-visible from Bash at all - not on a completed
-channel, and not in the auto-backgrounded snapshot, which handed one back for
-`Read` until it was replaced by the `job_id` that `BashOutput` already takes.
-The prompt-cache contract below lists staging paths and random ids among the
-things that never are, and a JobRegistry spool path is both. A capture too
+channel, not in the auto-backgrounded snapshot, and not on the explicit
+`run_in_background` response. All three handed one back for `Read` until they
+were replaced by the `job_id` that `BashOutput` already takes. A capture too
 large to publish is therefore genuinely unrecoverable, and
 `<channel>_storage_error` says which of the reasons it was rather than implying
 a handle exists.
+
+Known gap, recorded rather than implied away: `job_id` is itself generated from
+random bytes, so it is a random id by the contract's own definition and a
+backgrounded command still does not serialize identically across runs. It
+cannot simply become a counter, because the same value names the spool file
+under a directory shared between processes, where a counter would collide.
+Closing it means separating the file identity from the model-visible handle -
+tracked with the JobRegistry ownership work, not here. Removing the paths
+narrows the exposure to one short opaque token per backgrounded command and
+stops leaking the host temp directory; it does not finish the job.
 
 Every budget derived from the context window resolves the model the request
 will actually name, not the Provider's own. A subagent shares its parent's

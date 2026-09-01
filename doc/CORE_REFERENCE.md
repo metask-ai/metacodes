@@ -317,9 +317,15 @@ storage_error、各种 id 与 flag)从来不是超限的原因,却是结果可�
 (体量不在字符串里,如超大数值数组)一律留着超限,通用文本截断只用于本来就不是结构化的内容**:
 多花一次请求可以恢复,切成不可解析的散文不能。
 
-**staging 路径在 Bash 一侧全面不可见**:已完成信封与 auto-backgrounded 快照都不再交出
-`stdout_path`/`stderr_path`,后者改用稳定的 `job_id`(BashOutput 本来就按它读,还支持
-`*_since_byte` 增量),能力不减而 provider 可见字节不再随机变化。
+**staging 路径在 Bash 一侧全面不可见**:已完成信封、auto-backgrounded 快照、显式
+`run_in_background` 三条路径都不再交出 `stdout_path`/`stderr_path`,统一改用 `job_id`
+(BashOutput 本来就按它读,还支持 `*_since_byte` 增量),能力不减。
+
+**已登记的缺口(别当成已解决)**:`job_id` 自身由随机字节生成,按 contract 的定义它就是
+random id,所以后台命令跨 run 仍不逐字节一致。它不能简单换成序号——同一个值同时用作
+`/tmp/metacodes-jobs/<uid>/<id>.out` 的文件名,而该目录跨进程共享,序号会撞。真正修法是把
+**文件标识**与**模型可见句柄**分开,属于 JobRegistry 所有权议题(与 spool 清理同源)。删掉
+路径把暴露面收窄到每条后台命令一个短不透明 token,并且不再泄露宿主临时目录,但没有做完。
 
 **预算按真正会被请求的模型解析**:subagent 与父**共享 Provider**,只靠 `model_override`
 区分。`Provider.maxInputTokensFor(model_override)` / `maxTokensFor` 因此成为所有窗口派生量

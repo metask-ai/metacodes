@@ -671,14 +671,15 @@ fn decodePreviewPart(allocator: std.mem.Allocator, value: ?std.json.Value, utf8:
 /// `preview_head_bytes`), so a single pass in key order is enough - and a
 /// counter that still claimed the original length would be exactly the kind of
 /// quiet lie this whole change is about.
-/// Whether this result is a JSON object - the shape every structured tool
-/// result has. The generic text truncation is only ever safe for content that
-/// was not structured to begin with: applied to an object it emits something
-/// no consumer can parse, and the schema is not recoverable from the wreck.
+/// Whether this result is JSON at all - an object, but also a top-level array
+/// or scalar, which tools do return. The generic text truncation is only ever
+/// safe for content that was not structured to begin with: applied to any of
+/// these it emits something no consumer can parse, and the schema is not
+/// recoverable from the wreck.
 pub fn isStructuredObject(content: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, content, .{}) catch return false;
     defer parsed.deinit();
-    return parsed.value == .object;
+    return true;
 }
 
 pub fn shrinkStructuredResult(
@@ -688,7 +689,6 @@ pub fn shrinkStructuredResult(
 ) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
     defer parsed.deinit();
-    if (parsed.value != .object) return null;
 
     // Emitted size is monotone in the water line, so the largest one that fits
     // is a binary search. `low` is always known-feasible once set.
@@ -698,7 +698,7 @@ pub fn shrinkStructuredResult(
     var high: usize = max_bytes;
     while (low <= high) {
         const mid = low + (high - low) / 2;
-        const rendered = renderTrimmedObject(allocator, parsed.value.object, mid) catch break;
+        const rendered = renderTrimmedRoot(allocator, parsed.value, mid) catch break;
         if (rendered.len <= max_bytes) {
             if (best) |bytes| allocator.free(bytes);
             best = rendered;
@@ -729,6 +729,12 @@ const TrimLedger = struct {
     head_shown: ?usize = null,
     tail_shown: ?usize = null,
     trimmed_channel: ?[]const u8 = null,
+    /// Whether `preview_head`/`preview_tail` hold base64 rather than the bytes
+    /// themselves. `preview_encoding` precedes both, so a single pass knows in
+    /// time. Two consequences, and the counters are the lesser one: a base64
+    /// field cut into head + marker + tail is not base64 any more and no
+    /// consumer can decode it.
+    preview_base64: bool = false,
 
     /// `omitted_bytes` is only recomputable once both preview counters are
     /// known, and it must satisfy head + tail + omitted == original or the
@@ -740,6 +746,16 @@ const TrimLedger = struct {
         return original -| head -| tail;
     }
 };
+
+/// Only a top-level object carries the counter conventions worth correcting;
+/// an array or scalar is trimmed by the same recursion without them.
+fn renderTrimmedRoot(allocator: std.mem.Allocator, value: std.json.Value, water: usize) ![]u8 {
+    if (value == .object) return renderTrimmedObject(allocator, value.object, water);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeTrimmedValue(&out.writer, value, water);
+    return out.toOwnedSlice();
+}
 
 /// Re-emit one JSON object, cutting every string longer than `water` - at any
 /// depth - to a head/tail around `PREVIEW_ELISION`. Key order is preserved
@@ -768,13 +784,22 @@ fn renderTrimmedObject(
         const value = entry.value_ptr.*;
         if (value == .integer and value.integer >= 0 and std.mem.eql(u8, key, "original_bytes"))
             ledger.original_bytes = @intCast(value.integer);
+        if (value == .string and std.mem.eql(u8, key, "preview_encoding"))
+            ledger.preview_base64 = std.mem.eql(u8, value.string, "base64");
 
         if (value == .string) {
+            const is_preview = std.mem.eql(u8, key, "preview_head") or
+                std.mem.eql(u8, key, "preview_tail");
+            // A base64 preview must stay decodable, so it is cut to a prefix on
+            // a four-character boundary with no marker spliced in, and its
+            // counter is the *decoded* length - the unit `original_bytes` and
+            // `omitted_bytes` are in.
+            const base64_field = is_preview and ledger.preview_base64;
             const kept = if (value.string.len > water)
-                try writeTrimmedString(writer, value.string, water)
+                try writeTrimmedString(writer, value.string, water, base64_field)
             else blk: {
                 try std.json.Stringify.encodeJsonString(value.string, .{}, writer);
-                break :blk value.string.len;
+                break :blk if (base64_field) base64DecodedLen(value.string) else value.string.len;
             };
             if (std.mem.eql(u8, key, "preview_head")) ledger.head_shown = kept;
             if (std.mem.eql(u8, key, "preview_tail")) ledger.tail_shown = kept;
@@ -820,7 +845,7 @@ fn writeTrimmedValue(writer: *std.Io.Writer, value: std.json.Value, water: usize
     switch (value) {
         .string => |text| {
             if (text.len > water) {
-                _ = try writeTrimmedString(writer, text, water);
+                _ = try writeTrimmedString(writer, text, water, false);
             } else {
                 try std.json.Stringify.encodeJsonString(text, .{}, writer);
             }
@@ -852,11 +877,25 @@ fn writeTrimmedValue(writer: *std.Io.Writer, value: std.json.Value, water: usize
 
 const PREVIEW_ELISION = "\n...[trimmed to fit context]...\n";
 
-/// Write `source` cut to roughly `water` source bytes as a head/tail pair, and
-/// return how many source bytes survived. Cuts land on a UTF-8 boundary, and
-/// on a multiple of four for an all-ASCII string so a base64 payload stays
-/// decodable.
-fn writeTrimmedString(writer: *std.Io.Writer, source: []const u8, water: usize) !usize {
+/// Decoded length of a base64 string, which is the unit its sibling counters
+/// are written in.
+fn base64DecodedLen(text: []const u8) usize {
+    return std.base64.standard.Decoder.calcSizeForSlice(text) catch text.len / 4 * 3;
+}
+
+/// Write `source` cut to roughly `water` bytes and return how many bytes of the
+/// *original* it still shows.
+///
+/// `base64` mode keeps a prefix only: splicing an elision marker between two
+/// base64 runs produces a field that is no longer base64, so nothing can decode
+/// it - losing the tail is the cheaper half of that trade. The returned count
+/// is decoded bytes, so it stays comparable with `original_bytes`.
+fn writeTrimmedString(writer: *std.Io.Writer, source: []const u8, water: usize, base64: bool) !usize {
+    if (base64) {
+        const chars = @min(water, source.len) / 4 * 4;
+        try std.json.Stringify.encodeJsonString(source[0..chars], .{}, writer);
+        return base64DecodedLen(source[0..chars]);
+    }
     if (water <= PREVIEW_ELISION.len) {
         const head = alignedCut(source, @min(water, source.len));
         try std.json.Stringify.encodeJsonString(source[0..head], .{}, writer);
@@ -1968,4 +2007,84 @@ test "a structured result with nothing to trim is left whole, never mangled" {
     // Plain text is still fair game for the text path - it has no schema to
     // destroy.
     try std.testing.expect(!isStructuredObject("just a long plain string of output"));
+}
+
+test "a trimmed base64 preview is still decodable, and its counter is decoded bytes" {
+    // Two bugs in one field. Splicing the elision marker between two base64
+    // runs produced a `preview_head` that is not base64 at all, so nothing
+    // could decode it; and the counter beside it was the *character* count,
+    // inflating the bytes-shown figure by a third against `original_bytes`.
+    const allocator = std.testing.allocator;
+    const binary = try allocator.alloc(u8, 30 * 1024);
+    defer allocator.free(binary);
+    @memset(binary, 0x01); // not inline-safe -> base64 preview
+    const content: []const u8 = try renderFallbackEnvelope(allocator, "application/octet-stream", binary, 24 * 1024, "artifact_store_unavailable");
+    defer allocator.free(@constCast(content));
+
+    var original = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer original.deinit();
+    try std.testing.expectEqualStrings("base64", original.value.object.get("preview_encoding").?.string);
+
+    const shrunk = shrinkStructuredResult(allocator, content, content.len / 3) orelse
+        return error.ShrinkRefused;
+    defer allocator.free(shrunk);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const head = object.get("preview_head").?.string;
+    try std.testing.expect(head.len > 0);
+
+    // Decodes, and to exactly what the counter claims.
+    const decoder = std.base64.standard.Decoder;
+    const size = try decoder.calcSizeForSlice(head);
+    const decoded = try allocator.alloc(u8, size);
+    defer allocator.free(decoded);
+    try decoder.decode(decoded, head);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(decoded.len)),
+        object.get("preview_head_bytes").?.integer,
+    );
+    for (decoded) |byte| try std.testing.expectEqual(@as(u8, 0x01), byte);
+
+    // And the elision count is in the same unit, so the invariant is real
+    // rather than two unit errors cancelling.
+    const shown = object.get("preview_head_bytes").?.integer + object.get("preview_tail_bytes").?.integer;
+    try std.testing.expectEqual(
+        object.get("original_bytes").?.integer,
+        shown + object.get("omitted_bytes").?.integer,
+    );
+}
+
+test "a top-level array is structured too, and is trimmed rather than mangled" {
+    // `isStructuredObject` only recognised objects, so a tool returning a
+    // top-level array or scalar fell straight through to the text truncation
+    // the object case was protected from.
+    const allocator = std.testing.allocator;
+    const filler = try allocator.alloc(u8, 40 * 1024);
+    defer allocator.free(filler);
+    @memset(filler, 'a');
+    filler[0] = 'H';
+    filler[filler.len - 1] = 'T';
+    const array = try std.fmt.allocPrint(allocator, "[{{\"text\":\"{s}\"}},1,2,3]", .{filler});
+    defer allocator.free(array);
+    try std.testing.expect(isStructuredObject(array));
+
+    const shrunk = shrinkStructuredResult(allocator, array, array.len / 3) orelse
+        return error.ShrinkRefused;
+    defer allocator.free(shrunk);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    const items = parsed.value.array.items;
+    // Shape and the scalar elements survive; only the long string was cut.
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expectEqual(@as(i64, 3), items[3].integer);
+    const text = items[0].object.get("text").?.string;
+    try std.testing.expect(text.len < filler.len);
+    try std.testing.expect(std.mem.startsWith(u8, text, "H"));
+
+    // A bare scalar is structured as well - never text-truncated.
+    try std.testing.expect(isStructuredObject("12345"));
+    try std.testing.expect(isStructuredObject("\"a string result\""));
+    try std.testing.expect(!isStructuredObject("not json at all, just prose"));
 }
