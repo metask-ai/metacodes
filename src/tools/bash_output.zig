@@ -48,10 +48,17 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // Default from the turn's budget, not a private constant. 64 KiB of
     // *source* bytes was chosen against "do not blow up the context", but the
     // per-result budget counts *rendered* bytes and tops out at 64 KiB too -
-    // so the default read, in the cheapest possible case of plain ASCII across
-    // one channel, produced a 65_717-byte result that the projection layer
-    // then spilled to an artifact. Polling a background job handed back an
-    // envelope instead of the output, every time.
+    // two different 64Ks - so a default read of a large enough job produced a
+    // 65_717-byte result that the projection layer then spilled to an
+    // artifact, handing the model an envelope instead of the output it had
+    // just asked for.
+    //
+    // How often, measured rather than assumed: across 314 real BashOutput
+    // results the median is 164 bytes and exactly one exceeded a 200K-window
+    // budget. Most polls of a background job return very little. So this is a
+    // tail case, not the common path - worth fixing because the failure is
+    // silent and the fix is the same one `ReadArtifact` already got, not
+    // because it was happening constantly.
     const allowance = ctx.result_budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES);
     const max_bytes = parseUsizeArg(args, "max_bytes") orelse
         @max(1, @min(MAX_MAX_BYTES, allowance.raw()));
@@ -243,12 +250,16 @@ test "BashOutput max_bytes truncates" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_truncated\":true") != null);
 }
 
-test "BashOutput 的默认读取落在单条预算内,而不是必然被溢出" {
+test "BashOutput 的默认读取落在单条预算内" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     // 默认值曾是 64KiB **源**字节,而 per-result 预算数的是**渲染后**字节、上限
-    // 同样是 64KiB —— 于是最省字节的纯 ASCII 单通道默认读也会产出 65_717 字节的
-    // 结果,被投影层溢出成 artifact。模型轮询后台任务,每次拿回的是信封而不是
-    // 输出,还得再花一次 ReadArtifact。
+    // 同样是 64KiB —— 两个不同的 64K。输出足够大时(下面构造的 100KB 纯 ASCII,
+    // 已是最省字节的情形)默认读会产出 65_717 字节的结果,被投影层溢出成
+    // artifact,模型拿回信封而不是它刚要的输出。
+    //
+    // 尾部情形而非常态:审计 314 次真实 BashOutput 结果,中位 164 字节,只有 1 次
+    // 超过 200K 窗口的预算。值得修是因为它静默失败、且修法与 ReadArtifact 同源,
+    // 不是因为它频繁发生。
     const a = std.testing.allocator;
     var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer registry.deinit();
