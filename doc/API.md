@@ -164,6 +164,92 @@ message actually contains an image), so existing cache prefixes are
 unaffected. Non-image tool results are also byte-identical to before on all
 three protocol families.
 
+An image tool result is exempt from the byte-length spilling that
+`core/result_projection.zig` applies to oversized results. The per-result cap
+is `clamp(window/8, 8 KB, 64 KB)` while the `Read` tool accepts images up to
+3.75 MB, so without the carve-out essentially every real screenshot would be
+replaced by an artifact envelope before any dialect could serialize it.
+Detection reuses `dialect.extractImageResult` (the same single truth the wire
+serializers use). Images stay bounded by `Read`'s `MAX_IMAGE_BYTES`, and the
+per-turn budget charges one image at `IMAGE_TOKEN_ESTIMATE` rather than its
+base64 length, so a screenshot no longer evicts unrelated tool results.
+Non-image results project byte-identically to before.
+
+### PDF document input
+
+A user message can also carry a PDF as first-class content. Core represents it
+as `Block.document {media_type, data, title, pages}`: `data` is the base64
+payload, `media_type` is `application/pdf` (the only admitted type today),
+`title` is a stable host-supplied identity such as a file name — never a local
+path, which would both leak the environment and break the provider cache
+prefix — and `pages` is the counted page total, or null when the page tree
+lives in a compressed object stream and is not determinable without a full
+parser. It is never a guess.
+
+Documents are modelled separately from images because the capability is
+separate. `ModelProfile.supports_pdf_input` (queryable as
+`Capability.pdf_input`) is its own truth: `supports_image_input` being true
+never implies it. The first slice supports exactly one native path — Anthropic
+Claude 3.5 and later, which emit a base64 `document` source block. Every other
+provider/model fails the request with `error.DocumentInputUnsupported` before
+any network I/O. A document is never silently replaced by extracted text, OCR,
+a summary, or page images; any future conversion path has to be explicit about
+its representation and information loss.
+
+Admission runs before encoding and before any provider dispatch
+(`core/pdf.zig`): a payload that is not really a PDF fails with
+`InvalidPdfDocument`, a password-protected one with `EncryptedPdfUnsupported`,
+one over 12 MB raw with `PdfTooLarge`, and one over 100 countable pages with
+`PdfTooManyPages`. Token accounting charges a document by its page count
+(`pdf.estimateTokens`), not by its base64 length, so one attachment cannot
+push a turn past the auto-compaction threshold on byte size alone.
+
+Document blocks round-trip through the JSONL transcript and the AgentCore
+checkpoint (block tag 7), so a restored session resends the original bytes,
+title, and page count with no dependence on the host file still existing or
+being unchanged.
+
+Embedders reach the capability the same three ways as images: source-level
+hosts build `message.UserContentPart{ .document = ... }` slices;
+AgentCore binary consumers submit `RUN_INPUT_PART_DOCUMENT` inside a
+`RUN_INPUT_MULTIMODAL` parts array (ABI revision 16, capability preflight
+status 29); the headless CLI takes `--pdf <path>` (repeatable, order kept).
+The headless block order is prompt text, then each `--image` in command-line
+order, then each `--pdf` in command-line order.
+
+The `Read` tool does **not** read PDFs. It has no extraction or page-rendering
+path and no `pages` parameter, and its description now says so; native PDF
+*input* does not imply local PDF *reading*.
+
+### Provider reasoning continuity (OpenAI Responses)
+
+The Responses protocol is used with `store:false`: the server keeps no copy of
+the response, so reasoning context survives only if the client sends the
+server's own `reasoning` items back on the next request. Core models one as
+`Block.reasoning_item {model, json}` — `json` is the item exactly as the
+server emitted it (`id`, `summary`, `encrypted_content`), replayed byte for
+byte, and `model` is the model that produced it.
+
+This is not `Block.thinking`. A thinking block is readable assistant
+reasoning that the UI displays and the Anthropic dialect replays as a
+`thinking` block; a reasoning item is opaque provider state that is never
+displayed, never enters a compaction summary, and never becomes assistant
+text. Every dialect other than OpenAI Responses skips it.
+
+Capture is event-independent: the same item may arrive in
+`response.output_item.done`, in the terminal `response.completed`'s
+`response.output` array, or in both. Both paths extract it and a per-stream
+key (the item `id`) keeps it replayed exactly once. On the next request the
+items are emitted first among that message's `input` items, matching the
+server's own `output` order (reasoning → message/function_call).
+
+Replay is model-scoped: encrypted reasoning state belongs to the model that
+produced it, so after a mid-session model switch the stale items are dropped
+rather than sent to a model that would reject them. Reasoning items round-trip
+through the JSONL transcript and the AgentCore checkpoint (block tag 6), so a
+resumed session keeps the continuity. A conversation with no reasoning items
+serializes byte-identically to before.
+
 ## Zig source embedding
 
 `src/lib.zig` exports the UI-neutral core. In a consumer, these types are reached

@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const pdf_mod = @import("../core/pdf.zig");
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const output_semantics = @import("../core/output_semantics.zig");
@@ -70,15 +71,20 @@ const HeadlessToolPolicy = struct {
     }
 };
 
-/// 读 `--image` 路径列表(\x00 分隔),构造 text+images 按序混排的多模态 user 消息。
+/// 读 `--image` / `--pdf` 路径列表(\x00 分隔),构造一条 text + images + documents
+/// 的多模态 user 消息。**块顺序**:prompt 文本 → 各 `--image`(命令行顺序)→ 各
+/// `--pdf`(命令行顺序);同类附件之间的顺序严格保留。
 /// 每图:扩展名 → MIME 白名单(png/jpg/jpeg/gif/webp,复用 Read 工具判定);读取走
 /// tools/common.readAllFromFdCapped(单一入口:读错误显式 ReadError,超 3.75MB 上限
 /// FileTooLarge——绝不把截断/部分字节当完整图);base64 缓冲直接转移进 image block
 /// (无二次 MB 级拷贝)。空路径段/类型不识别/读失败 → 显式错误(绝不静默跳过)。
-fn buildImageUserMessage(
+/// 每份 PDF:先按 core/pdf.zig 做准入(真 PDF / 未加密 / 未超字节与页数上限),
+/// 再 base64 转移进 document block;`title` 只取**文件名**,绝不放目录路径。
+fn buildAttachmentUserMessage(
     allocator: std.mem.Allocator,
     text: []const u8,
-    image_paths_nul: []const u8,
+    image_paths_nul: ?[]const u8,
+    pdf_paths_nul: ?[]const u8,
 ) !@import("../core/message.zig").Message {
     const msg_mod = @import("../core/message.zig");
     const read_tool = @import("../tools/read.zig");
@@ -91,35 +97,81 @@ fn buildImageUserMessage(
     }
     if (text.len > 0) try blocks.append(allocator, .{ .text = try allocator.dupe(u8, text) });
 
-    var it = std.mem.splitScalar(u8, image_paths_nul, 0);
-    while (it.next()) |path| {
-        if (path.len == 0) {
-            // 空参数(如未设的 shell 变量 `--image "$SHOT"`)静默丢图违背 issue #10 铁律。
-            std.debug.print("error: --image: empty path argument\n", .{});
-            return error.EmptyImagePath;
+    // null = flag 未出现;"" = 用户真传了 `--image ""`,进循环后按空路径报错。
+    if (image_paths_nul) |image_paths| {
+        var it = std.mem.splitScalar(u8, image_paths, 0);
+        while (it.next()) |path| {
+            if (path.len == 0) {
+                // 空参数(如未设的 shell 变量 `--image "$SHOT"`)静默丢图违背 issue #10 铁律。
+                std.debug.print("error: --image: empty path argument\n", .{});
+                return error.EmptyImagePath;
+            }
+            const media_type = read_tool.imageMediaType(path) orelse {
+                std.debug.print("error: --image {s}: unsupported image type (png/jpg/jpeg/gif/webp)\n", .{path});
+                return error.UnsupportedImageType;
+            };
+            const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
+                std.debug.print("error: --image {s}: FileNotFound\n", .{path});
+                return error.FileNotFound;
+            };
+            defer _ = pfs.close(fd);
+            const raw = common.readAllFromFdCapped(fd, allocator, read_tool.MAX_IMAGE_BYTES) catch |err| {
+                std.debug.print("error: --image {s}: {s}\n", .{ path, @errorName(err) });
+                return err;
+            };
+            defer allocator.free(raw);
+            const enc = std.base64.standard.Encoder;
+            const b64 = try allocator.alloc(u8, enc.calcSize(raw.len));
+            errdefer allocator.free(b64);
+            _ = enc.encode(b64, raw);
+            const mt_owned = try allocator.dupe(u8, media_type);
+            errdefer allocator.free(mt_owned);
+            // b64 所有权直接转移进 block(消除此前经 userMessageWithImages 的二次 MB 拷贝)。
+            try blocks.append(allocator, .{ .image = .{ .media_type = mt_owned, .data = b64 } });
         }
-        const media_type = read_tool.imageMediaType(path) orelse {
-            std.debug.print("error: --image {s}: unsupported image type (png/jpg/jpeg/gif/webp)\n", .{path});
-            return error.UnsupportedImageType;
-        };
-        const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
-            std.debug.print("error: --image {s}: FileNotFound\n", .{path});
-            return error.FileNotFound;
-        };
-        defer _ = pfs.close(fd);
-        const raw = common.readAllFromFdCapped(fd, allocator, read_tool.MAX_IMAGE_BYTES) catch |err| {
-            std.debug.print("error: --image {s}: {s}\n", .{ path, @errorName(err) });
-            return err;
-        };
-        defer allocator.free(raw);
-        const enc = std.base64.standard.Encoder;
-        const b64 = try allocator.alloc(u8, enc.calcSize(raw.len));
-        errdefer allocator.free(b64);
-        _ = enc.encode(b64, raw);
-        const mt_owned = try allocator.dupe(u8, media_type);
-        errdefer allocator.free(mt_owned);
-        // b64 所有权直接转移进 block(消除此前经 userMessageWithImages 的二次 MB 拷贝)。
-        try blocks.append(allocator, .{ .image = .{ .media_type = mt_owned, .data = b64 } });
+    }
+
+    if (pdf_paths_nul) |pdf_paths| {
+        var pdf_it = std.mem.splitScalar(u8, pdf_paths, 0);
+        while (pdf_it.next()) |path| {
+            if (path.len == 0) {
+                // 同 --image:空参数(未设的 shell 变量)静默丢文档是不可接受的。
+                std.debug.print("error: --pdf: empty path argument\n", .{});
+                return error.EmptyDocumentPath;
+            }
+            const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
+                std.debug.print("error: --pdf {s}: FileNotFound\n", .{path});
+                return error.FileNotFound;
+            };
+            defer _ = pfs.close(fd);
+            const raw = common.readAllFromFdCapped(fd, allocator, pdf_mod.MAX_PDF_BYTES) catch |err| {
+                std.debug.print("error: --pdf {s}: {s}\n", .{ path, @errorName(err) });
+                return err;
+            };
+            defer allocator.free(raw);
+            // 准入在编码与任何 provider 派发之前:不是 PDF / 加密 / 超字节或页数上限
+            // 一律显式失败,绝不改成抽文本、OCR 或页面图来"凑合发出去"。
+            const pages = pdf_mod.inspect(raw) catch |err| {
+                std.debug.print("error: --pdf {s}: {s}\n", .{ path, pdf_mod.errorCode(err) });
+                return err;
+            };
+            const enc = std.base64.standard.Encoder;
+            const b64 = try allocator.alloc(u8, enc.calcSize(raw.len));
+            errdefer allocator.free(b64);
+            _ = enc.encode(b64, raw);
+            const mt_owned = try allocator.dupe(u8, pdf_mod.MEDIA_TYPE);
+            errdefer allocator.free(mt_owned);
+            // 只取文件名做文档身份:绝对路径是本机细节,进 provider 可见字节既泄漏
+            // 环境又破坏缓存前缀契约。
+            const title_owned = try allocator.dupe(u8, std.fs.path.basename(path));
+            errdefer allocator.free(title_owned);
+            try blocks.append(allocator, .{ .document = .{
+                .media_type = mt_owned,
+                .data = b64,
+                .title = title_owned,
+                .pages = pages,
+            } });
+        }
     }
     if (blocks.items.len == 0) return error.EmptyMessage;
     return .{ .role = .user, .blocks = try blocks.toOwnedSlice(allocator) };
@@ -128,18 +180,22 @@ fn buildImageUserMessage(
 /// headless 用 WriterBackend null-sink:吞掉 agent_loop 的流式输出（ANSI + tool 注解），
 /// 只要最终文本。工具卡事件 no-op,text_chunk/颜色括号全丢弃。
 /// 跑单次 prompt。返回进程退出码。
-/// `images`:`--image <path>` 的 \x00 分隔路径列表(null=纯文本)。有图时构造一条
-/// text+images 按序混排的多模态 user 消息(issue #10);读文件/MIME/大小校验失败或
-/// 当前 (provider, model) 不支持图像输入时显式报错退出——绝不静默丢图降级为文本。
+/// `images`:`--image <path>` 的 \x00 分隔路径列表(null=无图)。
+/// `documents`:`--pdf <path>` 的 \x00 分隔路径列表(null=无文档)。
+/// 二者任一非空时构造一条 text+images+documents 的多模态 user 消息
+/// (issue #10 / #25);读文件、MIME、大小、PDF 准入校验失败,或当前
+/// (provider, model) 不支持对应的原生输入能力时,**在任何网络请求之前**显式
+/// 报错退出——绝不静默丢弃附件,也绝不降级成文本/OCR/页面图。
 pub fn run(
     app: *app_mod.App,
     allocator: std.mem.Allocator,
     prompt: []const u8,
     images: ?[]const u8,
+    documents: ?[]const u8,
     json_output: bool,
 ) !u8 {
     const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
-    if (trimmed.len == 0 and images == null) {
+    if (trimmed.len == 0 and images == null and documents == null) {
         std.debug.print("error: empty prompt\n", .{});
         return 1;
     }
@@ -153,11 +209,19 @@ pub fn run(
     const previous_no_interactive = enterNonInteractivePermissionBoundary(&app.permission_ctx);
     defer restoreInteractivePermissionBoundary(&app.permission_ctx, previous_no_interactive);
 
-    if (images) |image_paths| {
-        // 入口预检:不支持 vision 的 (provider, model) 立即显式报错(不落网络请求)。
-        if (!app.provider().supports(.image_input)) {
+    if (images != null or documents != null) {
+        // 入口预检:能力按类**分别**判定——image_input 为真不蕴含 pdf_input。
+        // 不支持就立即显式报错(不落网络请求、不改 conversation)。
+        if (images != null and !app.provider().supports(.image_input)) {
             std.debug.print(
                 "error: model does not support image input (provider capability image_input=false)\n",
+                .{},
+            );
+            return 1;
+        }
+        if (documents != null and !app.provider().supports(.pdf_input)) {
+            std.debug.print(
+                "error: model does not support PDF document input (provider capability pdf_input=false)\n",
                 .{},
             );
             return 1;
@@ -165,7 +229,7 @@ pub fn run(
         // 消息字节必须由 conversation 的 allocator 拥有(deinit 用 self.allocator 释放;
         // 当前两者相同,按构造正确性显式绑定,防将来任一侧换 allocator 变 UB)。
         const conv_allocator = app.conversation.allocator;
-        const user_msg = try buildImageUserMessage(conv_allocator, trimmed, image_paths);
+        const user_msg = try buildAttachmentUserMessage(conv_allocator, trimmed, images, documents);
         errdefer user_msg.deinit(conv_allocator);
         try app.conversation.append(user_msg);
     } else {
@@ -889,7 +953,7 @@ test "lastAssistantText empty when no assistant" {
     try std.testing.expectEqualStrings("", t);
 }
 
-test "buildImageUserMessage: 文件 → text+image 按序构造(MIME/base64 正确)" {
+test "buildAttachmentUserMessage: 文件 → text+image 按序构造(MIME/base64 正确)" {
     const a = std.testing.allocator;
     var tmp_buf: [512]u8 = undefined;
     const dir = @import("../tools/test_tmp.zig").dir(&tmp_buf);
@@ -906,7 +970,7 @@ test "buildImageUserMessage: 文件 → text+image 按序构造(MIME/base64 正�
     defer paths_nul.deinit(a);
     try paths_nul.appendSlice(a, path);
 
-    const m = try buildImageUserMessage(a, "看图", paths_nul.items);
+    const m = try buildAttachmentUserMessage(a, "看图", paths_nul.items, null);
     defer m.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), m.blocks.len);
     try std.testing.expectEqualStrings("看图", m.blocks[0].text);
@@ -915,18 +979,104 @@ test "buildImageUserMessage: 文件 → text+image 按序构造(MIME/base64 正�
     try std.testing.expectEqualStrings("UE5HREFUQQ==", m.blocks[1].image.data);
 }
 
-test "buildImageUserMessage: 不识别扩展名/空路径段 → 显式错误(不静默跳过)" {
+test "buildAttachmentUserMessage: 不识别扩展名/空路径段 → 显式错误(不静默跳过)" {
     const a = std.testing.allocator;
     try std.testing.expectError(
         error.UnsupportedImageType,
-        buildImageUserMessage(a, "t", "note.txt"),
+        buildAttachmentUserMessage(a, "t", "note.txt", null),
     );
     try std.testing.expectError(
         error.EmptyImagePath,
-        buildImageUserMessage(a, "t", ""),
+        buildAttachmentUserMessage(a, "t", "", null),
     );
     try std.testing.expectError(
         error.FileNotFound,
-        buildImageUserMessage(a, "t", "/definitely/not/there.png"),
+        buildAttachmentUserMessage(a, "t", "/definitely/not/there.png", null),
+    );
+}
+
+/// 落一个文件并返回路径(调用方 free 路径 + rmrf)。
+fn writeTempFile(a: std.mem.Allocator, name: []const u8, bytes: []const u8) ![]u8 {
+    var buf: [512]u8 = undefined;
+    const dir = @import("../tools/test_tmp.zig").dir(&buf);
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, name });
+    errdefer a.free(path);
+    const fd = pfs.openZ(
+        path,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+        0o600,
+    ) catch return error.SkipZigTest;
+    defer _ = pfs.close(fd);
+    _ = pfs.write(fd, bytes);
+    return path;
+}
+
+const TEST_PDF =
+    "%PDF-1.7\n" ++
+    "1 0 obj\n<< /Type /Pages /Count 2 >>\nendobj\n" ++
+    "2 0 obj\n<< /Type /Page >>\nendobj\n" ++
+    "3 0 obj\n<< /Type /Page >>\nendobj\n" ++
+    "trailer\n<< /Root 1 0 R >>\n%%EOF\n";
+
+test "buildAttachmentUserMessage: --pdf → document block(MIME/标题/页数/base64 正确,顺序在图之后)" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    const img_path = try writeTempFile(scratch, "cc-headless-pdf-test.png", "PNGDATA");
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(img_path);
+    const pdf_path = try writeTempFile(scratch, "cc-headless-pdf-test.pdf", TEST_PDF);
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(pdf_path);
+
+    const m = try buildAttachmentUserMessage(a, "读这份报告", img_path, pdf_path);
+    defer m.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), m.blocks.len);
+    try std.testing.expectEqualStrings("读这份报告", m.blocks[0].text);
+    try std.testing.expectEqualStrings("image/png", m.blocks[1].image.media_type);
+    try std.testing.expectEqualStrings("application/pdf", m.blocks[2].document.media_type);
+    // 标题只有文件名:绝对路径绝不进 provider 可见字节。
+    try std.testing.expectEqualStrings("cc-headless-pdf-test.pdf", m.blocks[2].document.title);
+    try std.testing.expect(std.mem.indexOf(u8, m.blocks[2].document.title, "/") == null);
+    try std.testing.expectEqual(@as(?u32, 2), m.blocks[2].document.pages);
+    const decoder = std.base64.standard.Decoder;
+    const size = try decoder.calcSizeForSlice(m.blocks[2].document.data);
+    const raw = try a.alloc(u8, size);
+    defer a.free(raw);
+    try decoder.decode(raw, m.blocks[2].document.data);
+    try std.testing.expectEqualStrings(TEST_PDF, raw);
+}
+
+test "buildAttachmentUserMessage: 非 PDF / 加密 PDF / 空路径 → 显式错误(绝不改成抽文本)" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    const not_pdf = try writeTempFile(scratch, "cc-headless-not.pdf", "this is plainly not a pdf");
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(not_pdf);
+    try std.testing.expectError(
+        error.InvalidPdfDocument,
+        buildAttachmentUserMessage(a, "t", null, not_pdf),
+    );
+
+    const encrypted = try writeTempFile(
+        scratch,
+        "cc-headless-encrypted.pdf",
+        "%PDF-1.7\ntrailer\n<< /Encrypt 9 0 R /Root 1 0 R >>\n%%EOF\n",
+    );
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(encrypted);
+    try std.testing.expectError(
+        error.EncryptedPdfUnsupported,
+        buildAttachmentUserMessage(a, "t", null, encrypted),
+    );
+
+    try std.testing.expectError(
+        error.EmptyDocumentPath,
+        buildAttachmentUserMessage(a, "t", null, ""),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        buildAttachmentUserMessage(a, "t", null, "/definitely/not/there.pdf"),
     );
 }

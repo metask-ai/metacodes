@@ -107,6 +107,10 @@ pub const Tri = enum {
 pub const Capability = enum {
     tools,
     vision,
+    /// Native document (PDF) input. Deliberately **not** folded into `vision`:
+    /// a model that can see an image is not thereby able to read a PDF, and
+    /// conflating them is exactly what issue #25 forbids.
+    documents,
     reasoning,
     /// Provider returns a peer `reasoning_content` field rather than a
     /// thinking block.
@@ -153,6 +157,7 @@ fn mapRuntimeName(comptime name: []const u8) ?Capability {
     if (eql(u8, name, "server_tool")) return .server_tool;
     if (eql(u8, name, "reasoning_content")) return .reasoning_content;
     if (eql(u8, name, "image_input")) return .vision;
+    if (eql(u8, name, "pdf_input")) return .documents;
     return null;
 }
 
@@ -805,17 +810,14 @@ test "group key prefers canonical identity over the wire model name" {
 }
 
 test "runtime capability bridge covers the full runtime enum" {
-    const RuntimeCapability = enum {
-        web_search,
-        extended_thinking,
-        prompt_cache,
-        structured_output,
-        server_tool,
-        reasoning_content,
-        image_input,
-    };
+    // **必须绑真枚举**:此前这里是一份手抄副本,于是"加运行时能力却漏映射会编译
+    // 报错"的承诺其实只覆盖副本——issue #25 加 `pdf_input` 时它一声没吭。绑
+    // api/provider.zig 本尊后,这条断言才真正是那个 comptime 守卫。
+    const RuntimeCapability = @import("../api/provider.zig").Capability;
     assertRuntimeCoverage(RuntimeCapability);
     try std.testing.expectEqual(Capability.vision, fromRuntimeCapability(RuntimeCapability.image_input));
+    // vision 与 documents 是两个能力,绝不映射到同一个。
+    try std.testing.expectEqual(Capability.documents, fromRuntimeCapability(RuntimeCapability.pdf_input));
     try std.testing.expectEqual(Capability.reasoning, fromRuntimeCapability(RuntimeCapability.extended_thinking));
     try std.testing.expectEqual(Capability.caching, fromRuntimeCapability(RuntimeCapability.prompt_cache));
 }
