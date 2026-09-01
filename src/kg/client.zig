@@ -185,15 +185,20 @@ pub const DAEMON_OWNED_SLOT = "daemon-owned";
 pub const StoreRef = union(enum) {
     /// 本 client 拥有的 Store 绝对路径(owned)。可建、可改名、可派生兄弟路径。
     owned: []u8,
-    /// Store 归 daemon。**这里不是路径**,任何文件系统调用都不许拿到它。
-    daemon_owned,
+    /// **本 client 不拥有 Store**——daemon 传输下是 daemon 拥有,未配置时则根本没有
+    /// Store。两种情况在这里等价且必须等价:都不许把它当路径用。
+    ///
+    /// 名字刻意不叫 `.daemon_owned`:未配置的 client 也是这个状态,而那时**没有 daemon**,
+    /// 那个名字对一半用法是假陈述。argv 槽位仍填协议约定的 `DAEMON_OWNED_SLOT`——那是
+    /// 线上形状,与所有权语义是两回事。
+    unowned,
 
     /// CLI 为 store 路径预留的 argv 槽位。两种状态都合法——daemon 传输会在发送前
     /// 剥掉 argv[1]。
     pub fn argvSlot(self: StoreRef) []const u8 {
         return switch (self) {
             .owned => |p| p,
-            .daemon_owned => DAEMON_OWNED_SLOT,
+            .unowned => DAEMON_OWNED_SLOT,
         };
     }
 
@@ -203,7 +208,7 @@ pub const StoreRef = union(enum) {
     pub fn fsPath(self: StoreRef) ?[]const u8 {
         return switch (self) {
             .owned => |p| p,
-            .daemon_owned => null,
+            .unowned => null,
         };
     }
 };
@@ -224,7 +229,7 @@ pub const KgClient = struct {
     transport: Transport,
     /// tinykg 二进制绝对路径(owned)。null = 未解析到 → degraded。
     bin_path: ?[]u8 = null,
-    /// Store 的位置。`.owned` 携带绝对路径(owned 内存),`.daemon_owned` 不是路径。
+    /// Store 的位置。`.owned` 携带绝对路径(owned 内存),`.unowned` 不是路径。
     /// 取 argv 槽位用 `store.argvSlot()`,取磁盘路径用 `store.fsPath()`(返回 optional)。
     store: StoreRef,
     /// 当前项目 domain id(owned)。跨项目记忆用 "global"。
@@ -292,7 +297,7 @@ pub const KgClient = struct {
         if (self.bin_path) |p| self.allocator.free(p);
         switch (self.store) {
             .owned => |p| self.allocator.free(p),
-            .daemon_owned => {}, // 占位符是编译期常量,没有 owned 内存
+            .unowned => {}, // 占位符是编译期常量,没有 owned 内存
         }
         self.allocator.free(self.domain);
         if (self.degraded_reason) |r| self.allocator.free(r);
@@ -339,15 +344,15 @@ pub const KgClient = struct {
         else
             false;
         const use_cli = injected_cli or env_cli;
-        // 只有拥有 Store 时才有路径可言。非 CLI 传输拿到的是 `.daemon_owned` 这个
+        // 只有拥有 Store 时才有路径可言。非 CLI 传输拿到的是 `.unowned` 这个
         // **不是路径**的状态,而不是一个恰好长得像路径的字符串。
         const store: StoreRef = if (use_cli)
             .{ .owned = try resolveStorePath(allocator, opts) }
         else
-            .daemon_owned;
+            .unowned;
         errdefer switch (store) {
             .owned => |p| allocator.free(p),
-            .daemon_owned => {},
+            .unowned => {},
         };
         const domain = try allocator.dupe(u8, opts.domain);
         errdefer allocator.free(domain);
@@ -387,7 +392,7 @@ pub const KgClient = struct {
                 .allocator = allocator,
                 .transport = .{ .daemon = daemon },
                 .bin_path = null,
-                .store = .daemon_owned,
+                .store = .unowned,
                 .domain = domain,
                 .scoped_types = std.StringHashMap(void).init(allocator),
                 .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
@@ -408,7 +413,7 @@ pub const KgClient = struct {
                 .allocator = allocator,
                 .transport = .unconfigured,
                 .bin_path = null,
-                .store = .daemon_owned,
+                .store = .unowned,
                 .domain = domain,
                 .scoped_types = std.StringHashMap(void).init(allocator),
                 .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
@@ -746,7 +751,7 @@ pub const KgClient = struct {
             self.setDegraded("tinykg 二进制未找到。只接受 METACODES_KG_BIN、config kg_bin 或构建时从 checked-in bundle staged 的 <prefix>/vendor/tinykg/tinykg。源码仓库不构建 TinyKG；见 doc/TINYKG_INTEGRATION.md", .{});
             return;
         };
-        // 与 bin 同一套写法:在边界解包一次,往下传参。`.daemon_owned` 到这里就是矛盾
+        // 与 bin 同一套写法:在边界解包一次,往下传参。`.unowned` 到这里就是矛盾
         // ——daemon 拥有 Store 的 client 不该走到 CLI 的建库路径上(issue #30 正是从
         // cloneForThread 把这种 client 提升成 .exclusive_cli 溜进来的)。失败关闭。
         const store = self.store.fsPath() orelse {

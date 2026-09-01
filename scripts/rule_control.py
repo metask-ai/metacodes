@@ -3816,8 +3816,8 @@ def observe_daemon_transport(repo: Path) -> Observation:
         )),
         "no_shared_raw_store_fallback": all((
             # Store 的两种含义分在类型里,而不是同一个 []const u8 上:非 CLI 传输拿到
-            # `.daemon_owned`(不是路径),文件系统只能经 fsPath() 且必须处理 null。
-            ".daemon_owned" in client_init,
+            # `.unowned`(不是路径),文件系统只能经 fsPath() 且必须处理 null。
+            ".unowned" in client_init,
             "fsPath()" in ensure_ready,
             "invalid remote command shape" in remote_run,
             ".unconfigured" in ensure_ready,
