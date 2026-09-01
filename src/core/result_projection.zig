@@ -234,13 +234,16 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         .preview_cap = config.previewCap(),
         .ceiling = config.budget.per_result_bytes,
     };
-    // Price the re-inline *before* doing it. Regrowing against the uncapped
+    // Price the rewrite *before* doing it. Regrowing against the uncapped
     // allowance and only then finding the turn cannot afford the result means
     // reading the artifact back, inlining it, and spilling it to the same
     // artifact again inside one pass - while reporting both "returned to the
-    // model in full" and "spilled" for the same item. Only re-inlinable
-    // envelopes are repriced here, so the ceiling this yields is never lower
-    // than the one the real pass below would have produced.
+    // model in full" and "spilled" for the same item.
+    //
+    // This ceiling is deliberately allowed to come out *below* the one the
+    // real pass computes: there, a committed envelope is exempt and costs
+    // whatever it already is, so nothing downstream can restrain how far this
+    // pass grows it. Restraining it here is the whole point.
     const regrow_allowance = uncapped.at(regrowCeiling(items, plan, lengths, config, uncapped));
     for (items) |item| {
         if (item.is_error) continue;
@@ -1483,4 +1486,127 @@ test "regrowing a whole turn's envelopes stays inside the turn budget" {
     // capture preview, they were just all held to a shared water line.
     try std.testing.expectEqual(@as(usize, count), stats.envelope_regrown_count);
     try std.testing.expect(total > count * (artifact.PREVIEW_HEAD_BYTES + artifact.PREVIEW_TAIL_BYTES));
+}
+
+test "a shrunk preview is still a prefix and a suffix of the original" {
+    // The correctness core of the shrink path: it re-cuts the preview the
+    // envelope already carries, so the head stays a prefix of the original and
+    // the tail stays a suffix - which is the only reason
+    // `original - head - tail` is still the right `omitted_bytes`. Cut from
+    // anywhere else and the envelope would report a number that is not true.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const payload = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @intCast('a' + (index % 26));
+
+    var content: []const u8 = try captureTimeEnvelope(allocator, root, payload);
+    defer allocator.free(@constCast(content));
+    var items = [_]Item{.{ .tool_name = "McpProbe", .content = &content, .is_error = false }};
+    _ = try project(allocator, &items, .{
+        .session_root = root,
+        .budget = result_budget.Budget.fromModel(200_000),
+    });
+
+    const shrunk = shrinkRecoverableEnvelope(allocator, content, content.len / 3) orelse
+        return error.ShrinkRefused;
+    defer allocator.free(shrunk);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+    defer parsed.deinit();
+    const head = parsed.value.object.get("preview_head").?.string;
+    const tail = parsed.value.object.get("preview_tail").?.string;
+    try std.testing.expect(head.len > 0 and tail.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, payload, head));
+    try std.testing.expect(std.mem.endsWith(u8, payload, tail));
+    // And the omission count is exactly what those two cuts left out.
+    try std.testing.expectEqual(
+        @as(i64, @intCast(payload.len - head.len - tail.len)),
+        parsed.value.object.get("omitted_bytes").?.integer,
+    );
+}
+
+test "shrink refuses rather than emit an envelope over the limit" {
+    // `ENVELOPE_OVERHEAD_BYTES` is a measured round-up, not a proof, so the
+    // result is checked against the caller's limit before it is handed back.
+    // Below the scaffolding size there is no envelope to be had, and the
+    // caller must be told that rather than handed something oversized - it
+    // would then leave the result whole, which is the safe direction.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const payload = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(payload);
+    @memset(payload, 'Z');
+    var content: []const u8 = try captureTimeEnvelope(allocator, root, payload);
+    defer allocator.free(@constCast(content));
+    var items = [_]Item{.{ .tool_name = "McpProbe", .content = &content, .is_error = false }};
+    _ = try project(allocator, &items, .{
+        .session_root = root,
+        .budget = result_budget.Budget.fromModel(200_000),
+    });
+
+    // Every limit from "impossible" up to the envelope's own size: never a
+    // result over the limit, never one that grew.
+    for ([_]usize{ 0, 1, 64, 320, ENVELOPE_OVERHEAD_BYTES, ENVELOPE_OVERHEAD_BYTES + 1, 1024, 4096 }) |limit| {
+        if (shrinkRecoverableEnvelope(allocator, content, limit)) |out| {
+            defer allocator.free(out);
+            try std.testing.expect(out.len <= limit);
+            try std.testing.expect(out.len < content.len);
+            try std.testing.expect(isRecoverableEnvelope(out));
+            try std.testing.expect(hasRecoverableArtifact(out));
+        }
+    }
+}
+
+test "shrinking converges and preserves an incomplete capture's flag" {
+    // Two properties the pressure valves depend on. Converges: the valve runs
+    // on every pass, and a result that keeps shrinking would keep invalidating
+    // the prompt-cache tail for nothing. Preserves `capture_complete`: it is
+    // the model's only signal that the artifact is not the whole story, and a
+    // rewrite that quietly flipped it to true would be a lie about the bytes.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const payload = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(payload);
+    @memset(payload, 'C');
+    const receipt = try artifact.persist(allocator, root, payload);
+
+    // An envelope whose capture was cut short, rendered the way the capture
+    // path renders one.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeArtifactEnvelopeHead(&out.writer, receipt.id(), "text/plain; charset=utf-8", payload.len, receipt.sha256[0..], false);
+    try appendPreview(&out.writer, payload, 40 * 1024);
+    try out.writer.writeAll(ARTIFACT_ENVELOPE_TAIL);
+    const incomplete = try out.toOwnedSlice();
+    defer allocator.free(incomplete);
+    try std.testing.expect(isRecoverableEnvelope(incomplete));
+
+    const limit = incomplete.len / 2;
+    const first = shrinkRecoverableEnvelope(allocator, incomplete, limit) orelse return error.ShrinkRefused;
+    defer allocator.free(first);
+    try std.testing.expect(first.len <= limit);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, first, .{});
+    defer parsed.deinit();
+    // The incomplete-capture signal survives the rewrite.
+    try std.testing.expect(!parsed.value.object.get("capture_complete").?.bool);
+    try std.testing.expect(parsed.value.object.get("recoverable").?.bool);
+
+    // Converged: at the same limit there is nothing left to do.
+    try std.testing.expect(shrinkRecoverableEnvelope(allocator, first, limit) == null);
 }
