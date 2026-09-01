@@ -57,7 +57,7 @@ status, compatibility boundaries, and entry points are defined by
   the TTY e2e suite, the git worktree, as untracked `daemon-owned/` and
   `daemon-owned.tinykg-daemon.lock` that no `.gitignore` rule covered.
   The field is now `store: StoreRef`, a union of `.owned` (an absolute path)
-  and `.daemon_owned`; `argvSlot()` serves the argv slot the wire protocol
+  and `.unowned`; `argvSlot()` serves the argv slot the wire protocol
   reserves, and `fsPath()` returns an optional that every filesystem call must
   unwrap. A relative store path from config or `METACODES_KG_STORE` is
   completed against `home` rather than taken as given, so no configuration can
