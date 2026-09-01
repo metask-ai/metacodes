@@ -49,12 +49,19 @@ test "dispatch: help 开着打其它字符 → 关 help 且该键透传编辑器
     try testing.expectEqual(event.LoopAction.pass_to_editor, eff.action);
 }
 
-test "dispatch: Ctrl+O 上抛 open_transcript(alt-screen viewer,非嵌入式 overlay)" {
-    // Ctrl+O 不再 toggle 内嵌 overlay 视图态,而是上抛 LoopAction.open_transcript,
-    // 由调用方(loop.zig / tui_backend.zig)进 alt-screen 调 transcript_viewer。
+test "dispatch: Ctrl+O 开 model picker,Ctrl+X Ctrl+O 仍开 transcript(issue #16 改绑)" {
+    // issue #16:Ctrl+O 让给跨 UI model picker(对齐 Hermes),transcript 查看器改绑
+    // `Ctrl+X Ctrl+O`——复用已有的 Ctrl+X 前缀、同一个字母。两条路都必须可达:
+    // 改绑不能让任何一个动作变成 no-op。两者都仍只上抛 LoopAction,dispatch 不碰 IO。
     var s = UiState{};
-    const eff = ui.dispatch(&s, keyTag(.ctrl_o));
-    try testing.expectEqual(event.LoopAction.open_transcript, eff.action);
+    try testing.expectEqual(event.LoopAction.open_model_picker, ui.dispatch(&s, keyTag(.ctrl_o)).action);
+
+    _ = ui.dispatch(&s, keyTag(.ctrl_x));
+    try testing.expectEqual(event.LoopAction.open_transcript, ui.dispatch(&s, keyTag(.ctrl_o)).action);
+
+    // Ctrl+X 前缀原本的绑定不受影响。
+    _ = ui.dispatch(&s, keyTag(.ctrl_x));
+    try testing.expectEqual(event.LoopAction.kill_background, ui.dispatch(&s, keyTag(.ctrl_k)).action);
 }
 
 test "dispatch: Ctrl+T 切 task 面板显隐(toggle panel.task_list_visible,dispatch 内消费)" {

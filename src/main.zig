@@ -33,6 +33,13 @@ pub const provider_config_store = @import("provider/config_store.zig");
 pub const provider_control_plane = @import("provider/control_plane.zig");
 pub const provider_runtime_binding = @import("provider/runtime_binding.zig");
 pub const provider_startup = @import("provider/startup.zig");
+pub const provider_host = @import("provider/host.zig");
+pub const provider_alias = @import("provider/alias.zig");
+pub const provider_custom = @import("provider/custom_provider.zig");
+pub const provider_oauth = @import("provider/oauth.zig");
+pub const kg_provider_audit = @import("kg/provider_audit.zig");
+pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
+pub const api_catalog_fetch = @import("api/catalog_fetch.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig");
@@ -121,6 +128,7 @@ pub const transcript = @import("core/transcript.zig");
 pub const repl_headless = @import("repl/headless.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
+pub const app_route_strings = @import("app/route_strings.zig");
 pub const tool_context = @import("tools/context.zig");
 pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
 pub const tool_error = @import("core/tool_error.zig");
@@ -218,6 +226,9 @@ pub const tool_card = @import("repl/tui/widget/tool_card.zig");
 pub const tui_test_capture = @import("repl/tui/test_capture.zig");
 pub const repl_input = @import("repl/input.zig");
 pub const repl_complete = @import("repl/complete.zig");
+pub const repl_model_picker = @import("repl/model_picker.zig");
+pub const repl_model_picker_view = @import("repl/model_picker_view.zig");
+pub const repl_picker_host = @import("repl/picker_host.zig");
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 
@@ -269,16 +280,17 @@ fn argsIter(init: std.process.Init) std.process.Args.Iterator {
 fn applyProviderRoute(
     config: *types.Config,
     allocator: std.mem.Allocator,
-    profile_name: []const u8,
+    profile_name: ?[]const u8,
 ) void {
     const startup = @import("provider/startup.zig");
-    var registry = @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator) catch {
+    const host = buildProviderHost(allocator) orelse {
         std.debug.print("error: provider registry initialization failed\n", .{});
         std.process.exit(2);
     };
-    defer registry.deinit();
+    defer host.destroy();
+    const registry = &host.registry;
 
-    const outcome = startup.resolve(allocator, &registry, .{
+    const outcome = startup.resolve(allocator, registry, .{
         .provider = profile_name,
         .channel = config.provider_channel,
         .offer_id = config.provider_offer,
@@ -289,6 +301,54 @@ fn applyProviderRoute(
         std.process.exit(2);
     };
 
+    applyStartupOutcome(config, allocator, outcome);
+}
+
+/// Restore the durable global selection committed by a previous `global` scope
+/// commit. Nothing is applied when no selection was ever committed, so the
+/// historical path stays byte-identical for every installation that has not
+/// used the picker.
+///
+/// A stored pin that no longer resolves is fatal on purpose. The alternative —
+/// falling back to model-name inference — would silently run a different vendor
+/// than the one the user chose, which is the exact substitution the offer model
+/// exists to prevent.
+pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.Allocator) bool {
+    var store = provider_config_store.Store.initHome(allocator) catch return false;
+    defer store.deinit();
+
+    var document = store.load() catch |err| {
+        // Unreadable is not "absent": say so rather than quietly ignoring a
+        // selection that may well be in there.
+        std.debug.print(
+            "warning: ~/.metacodes/config.json could not be read ({s}); " ++
+                "any stored provider selection is being ignored\n",
+            .{@errorName(err)},
+        );
+        return false;
+    };
+    defer document.deinit();
+    const selection = document.global_selection orelse return false;
+
+    const host = buildProviderHost(allocator) orelse {
+        std.debug.print("error: provider registry initialization failed\n", .{});
+        std.process.exit(2);
+    };
+    defer host.destroy();
+
+    const outcome = provider_startup.resolveSelection(allocator, &host.registry, selection) catch {
+        std.debug.print("error: out of memory while resolving the stored provider selection\n", .{});
+        std.process.exit(2);
+    };
+    applyStartupOutcome(config, allocator, outcome);
+    return true;
+}
+
+fn applyStartupOutcome(
+    config: *types.Config,
+    allocator: std.mem.Allocator,
+    outcome: provider_startup.Outcome,
+) void {
     switch (outcome) {
         .failure => |failure| {
             const text = failure.message(allocator) catch "provider route resolution failed";
@@ -310,6 +370,13 @@ fn applyProviderRoute(
             const rendered = route.offer_id.render();
             config.selected_offer_id = allocator.dupe(u8, &rendered) catch null;
             config.resolved_provider_id = allocator.dupe(u8, route.provider_id.slice()) catch null;
+            // A stored selection names no provider on the command line, so the
+            // credential scope has to come from the route itself. Without this
+            // the session would fall back to the Metask credential path for a
+            // route that is not Metask.
+            if (config.provider_profile == null) {
+                config.provider_profile = config.resolved_provider_id;
+            }
             // Setup/doctor visibility: the selected region, protocol, and
             // endpoint are shown before any request is sent. The endpoint is a
             // channel base URL and carries no credential; the credential itself
@@ -448,6 +515,14 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
+    // `--check-providers` is a dry run: it validates the configuration and
+    // prints the routes it produces before any credential is resolved or any
+    // request URL is built, which is exactly when a bad definition should be
+    // explained.
+    if (config.check_providers) {
+        std.process.exit(checkProviders(allocator));
+    }
+
     // --- provider 选择 ---
     // issue #16:命名一个 provider profile 时走 registry 解析出**真实路由**
     // (endpoint + 协议 + wire model id + auth scheme),不再靠 model 名前缀猜。
@@ -457,7 +532,11 @@ pub fn main(init: std.process.Init) !void {
     }
     if (config.provider_profile) |profile_name| {
         applyProviderRoute(&config, allocator, profile_name);
-    } else {
+    } else if (config.provider_offer != null) {
+        // An offer id names its own provider; requiring `--provider` beside it
+        // would make a copied offer id unusable on its own.
+        applyProviderRoute(&config, allocator, null);
+    } else if (!applyPersistedGlobalSelection(&config, allocator)) {
         config.provider_kind = inferProviderKind(config.model);
     }
 
@@ -532,6 +611,7 @@ pub fn main(init: std.process.Init) !void {
                 \\Authentication required.
                 \\Use one of:
                 \\  metacodes login --oauth-token-json <token-response.json>
+                \\  metacodes login --provider <id> --oauth-token-json <token-response.json>
                 \\  metacodes login --api-key <key>
                 \\  export METASK_API_KEY=...
                 \\
@@ -724,6 +804,10 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
 
     var mode: enum { browser, help, status, api_key, oauth_json } = .browser;
     var value: ?[]const u8 = null;
+    // `--provider <id>` stores the token against that provider's own OAuth
+    // session instead of the Metask credential store, which is what keeps a
+    // token for one vendor from ever satisfying another.
+    var provider_name: ?[]const u8 = null;
     var open_browser = true;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "status") or std.mem.eql(u8, arg, "--status")) {
@@ -740,6 +824,11 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
                 std.debug.print("usage: metacodes login --oauth-token-json <file>\n", .{});
                 return 2;
             };
+        } else if (std.mem.eql(u8, arg, "--provider")) {
+            provider_name = args.next() orelse {
+                std.debug.print("usage: metacodes login --provider <id> --oauth-token-json <file>\n", .{});
+                return 2;
+            };
         } else if (std.mem.eql(u8, arg, "--no-browser")) {
             mode = .browser;
             open_browser = false;
@@ -752,6 +841,18 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
             std.debug.print("error: unknown login/logout argument '{s}'\n", .{arg});
             return 2;
         }
+    }
+
+    if (provider_name) |name| {
+        if (mode != .oauth_json) {
+            std.debug.print(
+                "login --provider currently accepts only --oauth-token-json; " ++
+                    "the interactive flow is Metask-only\n",
+                .{},
+            );
+            return 2;
+        }
+        return storeProviderOAuthToken(allocator, name, value.?);
     }
 
     switch (mode) {
@@ -859,6 +960,7 @@ fn printLoginHelp() void {
         \\  metacodes login --no-browser
         \\  metacodes login status
         \\  metacodes login --oauth-token-json <token-response.json>
+        \\  metacodes login --provider <id> --oauth-token-json <token-response.json>
         \\  metacodes login --api-key <key>
         \\  metacodes logout
         \\
@@ -1078,6 +1180,188 @@ pub fn selectedProfileIsMetask(config: types.Config) bool {
 /// an explicit `--api-key`. The Metask credential store is deliberately not
 /// consulted, which is the whole point — an unrelated vendor key must never be
 /// selected merely because it exists.
+/// `metacodes login --provider <id> --oauth-token-json <file>`.
+///
+/// Imports a standard RFC 6749 token response into that provider's own OAuth
+/// session. The refresh lifecycle then runs itself: the session refreshes
+/// before expiry, performs one exchange no matter how many turns notice at
+/// once, and persists a rotated refresh token atomically.
+fn storeProviderOAuthToken(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    path: []const u8,
+) u8 {
+    // The same runtime a session builds, so a provider defined in the config —
+    // or one that came from a catalog — can be logged into by name.
+    const host = buildProviderHost(allocator) orelse return 2;
+    defer host.destroy();
+
+    const built = host.registry.find(provider_name) orelse {
+        std.debug.print("error: unknown provider '{s}'\n", .{provider_name});
+        return 2;
+    };
+    if (built.oauth_token_url == null) {
+        std.debug.print(
+            "error: provider '{s}' declares no OAuth token endpoint\n",
+            .{built.id.slice()},
+        );
+        return 2;
+    }
+
+    const text = readFileArg(allocator, path) catch |err| {
+        std.debug.print("error: could not read {s}: {s}\n", .{ path, @errorName(err) });
+        return 2;
+    };
+    defer {
+        std.crypto.secureZero(u8, text);
+        allocator.free(text);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const outcome = provider_oauth.parseTokenResponse(arena.allocator(), text) catch |err| {
+        std.debug.print("error: {s} is not a token response ({s})\n", .{ path, @errorName(err) });
+        return 2;
+    };
+    if (outcome.refresh_token == null) {
+        std.debug.print("error: the token response carries no refresh_token; it could never be refreshed\n", .{});
+        return 2;
+    }
+
+    var session = provider_oauth.Session.initHome(allocator, built.id) catch |err| {
+        std.debug.print("error: could not open the OAuth store ({s})\n", .{@errorName(err)});
+        return 2;
+    };
+    defer session.deinit();
+
+    session.importOutcome(outcome, @import("util/time.zig").nowUnix()) catch |err| {
+        std.debug.print("error: could not store the token ({s})\n", .{@errorName(err)});
+        return 2;
+    };
+    std.debug.print(
+        "Stored an OAuth login for provider '{s}'. No secret was printed.\n",
+        .{built.id.slice()},
+    );
+    return 0;
+}
+
+/// Set once the configuration warning has been shown.
+var startup_warning_reported: bool = false;
+
+/// Build the provider runtime the way a session does: built-in profiles, the
+/// user's `custom_providers`, any configured catalogs, the credential pool, and
+/// the disabled set.
+///
+/// One construction path for startup route resolution, credential scoping, and
+/// `--check-providers`, because three of them assembling *different subsets*
+/// is how `--provider openrouter` came to fail for a provider the dry run
+/// happily listed. The caller destroys it.
+fn buildProviderHost(allocator: std.mem.Allocator) ?*provider_host.Host {
+    const host = provider_host.Host.create(allocator) catch return null;
+    var store = provider_config_store.Store.initHome(allocator) catch return host;
+    defer store.deinit();
+    host.adoptDurableState(&store);
+    if (host.startup_warning) |why| {
+        // Once per process. Startup builds this runtime more than once — route
+        // resolution and credential scoping each need one — and repeating the
+        // same warning reads as more than one problem.
+        if (!startup_warning_reported) {
+            startup_warning_reported = true;
+            // Without this, a `custom_providers` section that failed to parse
+            // surfaces as `unknown provider 'my-relay'` with nothing connecting
+            // the two — which is the report this warning exists to prevent.
+            std.debug.print(
+                "warning: part of ~/.metacodes/config.json did not apply ({s}); " ++
+                    "run `metacodes --check-providers` for details\n",
+                .{why},
+            );
+        }
+    }
+    return host;
+}
+
+/// `--check-providers`: validate the configuration and print every route it
+/// produces, without any network I/O. This is the dry run — it answers "would
+/// this definition work?" before a request is ever built.
+pub fn checkProviders(allocator: std.mem.Allocator) u8 {
+    // Built the same way a session builds it, so the dry run cannot describe a
+    // different set of routes than the one a session will actually get.
+    const host = provider_host.Host.create(allocator) catch {
+        std.debug.print("error: provider registry initialization failed\n", .{});
+        return 2;
+    };
+    defer host.destroy();
+
+    var status: u8 = 0;
+    var store = provider_config_store.Store.initHome(allocator) catch null;
+    defer if (store) |*value| value.deinit();
+
+    if (store) |*value| {
+        if (value.readText()) |text| {
+            defer allocator.free(text);
+            // Reported individually rather than swallowed: the whole point of a
+            // dry run is to say which definition is wrong.
+            host.adoptCustomProviders(text) catch |err| {
+                std.debug.print("custom_providers: INVALID ({s})\n", .{@errorName(err)});
+                status = 2;
+            };
+            host.ingestConfiguredCatalogs(text) catch |err| {
+                std.debug.print("provider_catalogs: NOT INGESTED ({s})\n", .{@errorName(err)});
+                status = 2;
+            };
+            if (value.load()) |loaded| {
+                var document = loaded;
+                defer document.deinit();
+                host.applyProviderConfiguration(&document) catch |err| {
+                    std.debug.print("providers: NOT APPLIED ({s})\n", .{@errorName(err)});
+                    status = 2;
+                };
+            } else |err| {
+                std.debug.print("config: unparseable ({s})\n", .{@errorName(err)});
+                status = 2;
+            }
+        } else |err| {
+            std.debug.print("config: unreadable ({s})\n", .{@errorName(err)});
+            status = 2;
+        }
+    }
+
+    const catalog = host.kernel.catalogSnapshot();
+    for (catalog.items()) |item| {
+        const rendered = item.offer_id.render();
+        std.debug.print("{s}/{s} [{s}] model={s}\n  endpoint {s}\n  offer    {s}\n", .{
+            item.provider_id.slice(),
+            item.channel_id.slice(),
+            item.protocol,
+            item.request_model_id,
+            item.endpoint_ref,
+            &rendered,
+        });
+        if (item.limits.context_window) |window| {
+            std.debug.print("  context  {d}\n", .{window});
+        } else {
+            std.debug.print("  context  unknown (admission fails closed)\n", .{});
+        }
+        if (item.quote.priced()) |price| {
+            std.debug.print("  price    {s} {s}{s}\n", .{
+                price.currency.slice(),
+                switch (price.billing_unit) {
+                    .per_million_tokens => "per 1M tokens",
+                    .per_thousand_tokens => "per 1K tokens",
+                    .per_token => "per token",
+                    .per_request => "per request",
+                    .provider_defined => "provider-defined unit",
+                },
+                if (price.estimated) " (estimated)" else "",
+            });
+        } else {
+            std.debug.print("  price    unknown\n", .{});
+        }
+    }
+    std.debug.print("{d} route(s); no request was made.\n", .{catalog.items().len});
+    return status;
+}
+
 pub fn resolveProviderScopedSecret(
     allocator: std.mem.Allocator,
     config: types.Config,
@@ -1085,9 +1369,9 @@ pub fn resolveProviderScopedSecret(
 ) ![]u8 {
     const credential_mod = provider_credential;
     const provider_ids_mod = provider_ids;
-    var registry = try @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator);
-    defer registry.deinit();
-    const profile = registry.find(profile_name) orelse return error.UnknownProviderProfile;
+    const host = buildProviderHost(allocator) orelse return error.UnknownProviderProfile;
+    defer host.destroy();
+    const profile = host.registry.find(profile_name) orelse return error.UnknownProviderProfile;
 
     var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
     const resolved = credential_mod.resolve(.{
@@ -1288,6 +1572,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |s| config.answers_file = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--base-url")) {
             if (args.next()) |s| config.base_url = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--check-providers")) {
+            config.check_providers = true;
         } else if (std.mem.eql(u8, arg, "--provider")) {
             const v = args.next() orelse {
                 setParseError(config, allocator, "missing value for --provider", .{});
@@ -1559,6 +1845,7 @@ fn printHelp() void {
         \\  --provider <id>       Provider profile id or alias (metask | openai | gemini | zai-coding-plan)
         \\  --channel <id>        Channel within the provider (e.g. cn-anthropic, global-openai)
         \\  --offer <offer-id>    Pin one exact model route (offer-...); see --provider output
+        \\  --check-providers     Validate provider configuration and list every route, then exit (no network)
         \\  --openai-protocol <p> OpenAI wire protocol: chat_completions (default; alias "chat") | responses (env METACODES_OPENAI_PROTOCOL)
         \\  --auth-precedence <p> api-key-first | oauth-first
         \\  --record <dir>        Record requests + SSE responses to dir (cassette)
@@ -1618,6 +1905,7 @@ test {
     _ = &@import("core/memory/memdir.zig");
     _ = &@import("core/memory/memory_section.zig");
     _ = &@import("app.zig");
+    _ = &@import("app/route_strings.zig");
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("util/abort.zig");
@@ -1630,6 +1918,16 @@ test {
     _ = &@import("tools/context.zig");
     _ = &@import("repl/input.zig");
     _ = &@import("repl/model_command.zig");
+    _ = &@import("repl/model_picker.zig");
+    _ = &@import("repl/model_picker_view.zig");
+    _ = &@import("repl/picker_host.zig");
+    _ = &@import("provider/host.zig");
+    _ = &@import("provider/alias.zig");
+    _ = &@import("provider/custom_provider.zig");
+    _ = &@import("provider/oauth.zig");
+    _ = &@import("kg/provider_audit.zig");
+    _ = &@import("api/oauth_exchange.zig");
+    _ = &@import("api/catalog_fetch.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/multiline.zig");

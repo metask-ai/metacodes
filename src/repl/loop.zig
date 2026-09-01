@@ -24,6 +24,7 @@ const multiline_mod = @import("multiline.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("../core/transcript.zig");
 const transcript_viewer = @import("transcript_viewer.zig");
+const picker_host = @import("picker_host.zig");
 const progress = @import("progress.zig");
 const render_region_mod = @import("tui/render_region.zig");
 const agent_job_registry_mod = @import("../core/agent_job_registry.zig");
@@ -414,14 +415,41 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             , .{ app.activeModel(), u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cost });
             continue;
         }
+        // issue #16:`/models` 选的是**凭证**(账号 API key),不是路由。路由选择归
+        // `/model` / Ctrl+O 的跨 UI picker;两者是不同的问题,合并会让"换账号"和
+        // "换模型"互相顶掉。picker 的 credential 阶段尚未落地(见架构文档未实现清单)。
         if (std.mem.eql(u8, trimmed, "/models")) {
-            std.debug.print("/models is an interactive picker: choose an API key first, then choose a model. Use /model for text filters.\n", .{});
+            std.debug.print("/models is an interactive account-key picker: type it and use the menu. Use /model (or Ctrl+O) to choose a provider, model, and channel.\n", .{});
             continue;
         }
-        // /model [name] —— 无参列当前 + 可选模型；有参切换
+        // /model [name] —— 无参开 picker;有参走文本选择器(向后兼容)
         if (std.mem.eql(u8, trimmed, "/model") or std.mem.startsWith(u8, trimmed, "/model ")) {
             const rest = std.mem.trim(u8, trimmed[6..], " \t");
+            if (rest.len == 0) {
+                app.pending_overlay = .model_picker;
+                continue;
+            }
             try handleModel(app, allocator, rest);
+            continue;
+        }
+        // issue #16:transcript 查看器从 Ctrl+O 移到 Ctrl+X Ctrl+O,`/transcript`
+        // 是等价的可发现入口——绑定变了,可达性不能变。
+        // issue #16:`/providers` 列出当前所有路由;`/providers refresh` 重新拉取
+        // 配置里声明的 provider catalog(失败保留旧 catalog——陈旧目录远好过空目录)。
+        if (std.mem.eql(u8, trimmed, "/providers") or std.mem.startsWith(u8, trimmed, "/providers ")) {
+            const rest = std.mem.trim(u8, trimmed[10..], " \t");
+            try handleProviders(app, allocator, rest);
+            continue;
+        }
+        // issue #16:`/alias` 是本地路由别名。pinned 跨 catalog 刷新恒指同一条路由;
+        // floating 在新 catalog 上重解析,并记下落到了哪里。
+        if (std.mem.eql(u8, trimmed, "/alias") or std.mem.startsWith(u8, trimmed, "/alias ")) {
+            const rest = std.mem.trim(u8, trimmed[6..], " \t");
+            try handleAlias(app, allocator, rest);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/transcript")) {
+            app.pending_overlay = .transcript;
             continue;
         }
         // /effort [level] —— 无参显示当前 reasoning_effort;有参切换(none|minimal|low|medium|high|xhigh)
@@ -740,6 +768,18 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         run_opts.project_rule_gate = if (run_control) |control| control.formalGate() else null;
         run_opts.ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null;
         run_opts.spawn_tick_fn = spawn_tick;
+        // issue #16:turn 边界刷新 OAuth access token。commit 时拷的是当时有效的
+        // 那个;会话跑过期后继续用它就会开始 401——看起来像密钥坏了。单飞在
+        // provider/oauth.zig 里,并发 turn 仍只换一次。
+        _ = app.refreshRouteCredential() catch |err| blk: {
+            std.debug.print(
+                "\x1b[33mwarning: could not refresh the provider credential ({s}); " ++
+                    "continuing with the current one\x1b[0m\n",
+                .{@errorName(err)},
+            );
+            break :blk false;
+        };
+
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),
@@ -770,6 +810,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
         // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
         app.persistTranscript();
+
+        // issue #16:把本轮新增的控制面**决策**投影进 TinyKG 审计面。turn 边界,
+        // 不在请求路径上;审计面不可用只记账,不影响路由。
+        _ = app.auditProviderDecisions();
 
         // L3:挂起 → 落 suspend.json + 提示恢复方式。释放 suspend_info(owned)。
         if (result.suspend_info) |si| {
@@ -1123,6 +1167,23 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
         region.clear();
         std.debug.print("\x1b[?25h", .{}); // 确保光标可见
     }
+    // issue #16:`/model`、`/models`、`/transcript` 在命令层被处理,那时输入读取
+    // 已经返回、固定区不存在。请求停在 app.pending_overlay,由下一次读取兑现。
+    switch (app.pending_overlay) {
+        .none => {},
+        .model_picker => {
+            app.pending_overlay = .none;
+            picker_host.open(app, &region.ui);
+        },
+        .transcript => {
+            app.pending_overlay = .none;
+            const sz0 = tui_term_root.getSize(fd);
+            const rows0: usize = if (sz0) |sz| sz.rows else 24;
+            region.clear();
+            transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows0, region.theme) catch {};
+        },
+    }
+
     // 初始画一个空输入框。
     region.setInput(editor.view(), editor.cursor);
     region.render(app);
@@ -1450,6 +1511,21 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     const rows: usize = if (sz) |s| s.rows else 24;
                     region.clear();
                     transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows, region.theme) catch {};
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .open_model_picker => {
+                    picker_host.open(app, &region.ui);
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .picker_key => {
+                    if (picker_host.onKey(app, &region.ui, eff.picker_key) == .committed) {
+                        // The overlay is gone; the confirmation has to survive
+                        // it or the user cannot tell which route was chosen.
+                        region.clear();
+                        std.debug.print("{s}\n", .{picker_host.lastNotice(app)});
+                    }
                     redraw(&region, &editor, app);
                     continue;
                 },
@@ -1994,23 +2070,377 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
                 target_raw,
                 null,
             ).model orelse target_raw;
+            // issue #16: the offer catalog answers first. It knows routes the
+            // legacy path cannot express — another vendor, another protocol,
+            // another region — and it refuses to guess between them.
+            switch (picker_host.useSelector(app, resolved)) {
+                .switched => {
+                    std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
+                    if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{effort.name()});
+                    std.debug.print(" (max_output={d})\n", .{app.provider().maxTokens()});
+                    return;
+                },
+                .ambiguous => |candidates_found| {
+                    std.debug.print(
+                        "\x1b[33m'{s}' matches {d} routes; name one with /model use <offer-id> or pick it in /model:\x1b[0m\n",
+                        .{ resolved, candidates_found.total },
+                    );
+                    for (candidates_found.ids[0..candidates_found.len]) |offer_id| {
+                        std.debug.print("  {s}\n", .{offer_id});
+                    }
+                    if (candidates_found.total > candidates_found.len) {
+                        std.debug.print("  … and {d} more\n", .{candidates_found.total - candidates_found.len});
+                    }
+                    return;
+                },
+                .failed => |why| {
+                    std.debug.print("\x1b[31mswitch refused: {s}\x1b[0m\n", .{why});
+                    return;
+                },
+                // Not a declared offer: proxies and server-catalog models are
+                // legitimate, so the historical path still applies.
+                .not_in_catalog => {},
+            }
             try switchModel(app, allocator, candidates, resolved);
             return;
         },
     }
 }
 
+fn printAliasHelp() void {
+    std.debug.print(
+        \\usage:
+        \\  /alias                      list local aliases
+        \\  /alias pin <name>           pin <name> to the route this session is on
+        \\  /alias float <name> <model> re-resolve <name> on every catalog refresh
+        \\  /alias remove <name>
+        \\  /alias use <name>
+        \\
+        \\A pinned alias keeps meaning the same route across catalog refreshes and
+        \\reports an error when that route is gone, rather than resolving to a
+        \\neighbour. A floating alias re-resolves, and records what it landed on. A
+        \\floating selector that matches several routes is an error, not a guess.
+        \\
+    , .{});
+}
+
+fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    const config_store = @import("../provider/config_store.zig");
+    const config_doc = @import("../provider/config_doc.zig");
+    const alias_mod = @import("../provider/alias.zig");
+
+    if (std.mem.eql(u8, rest, "help") or std.mem.eql(u8, rest, "--help")) {
+        printAliasHelp();
+        return;
+    }
+
+    var store = config_store.Store.initHome(allocator) catch |err| {
+        std.debug.print("\x1b[31malias store unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    defer store.deinit();
+
+    if (rest.len == 0) {
+        var document = store.load() catch |err| {
+            std.debug.print("\x1b[31mcould not read the alias store: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        defer document.deinit();
+        if (document.aliases.items.len == 0) {
+            std.debug.print("No aliases. `/alias pin <name>` names the route you are on.\n", .{});
+            return;
+        }
+        const host = app.providerHost() catch null;
+        for (document.aliases.items) |entry| {
+            std.debug.print("  {s} [{s}]", .{ entry.name.slice(), @tagName(entry.policy) });
+            if (entry.selector) |selector| std.debug.print(" -> {s}", .{selector.slice()});
+            if (host) |value| {
+                if (alias_mod.resolve(value.kernel.catalogSnapshot(), entry)) |resolution| {
+                    const summary = value.kernel.modelDescribe(resolution.offer_id);
+                    if (summary) |offer| {
+                        std.debug.print("  = {s}/{s} {s}", .{
+                            offer.provider_id.slice(),
+                            offer.channel_id.slice(),
+                            offer.request_model_id,
+                        });
+                    }
+                } else |err| {
+                    std.debug.print("  \x1b[33m({s})\x1b[0m", .{@errorName(err)});
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+        return;
+    }
+
+    var parts = std.mem.tokenizeScalar(u8, rest, ' ');
+    const verb = parts.next() orelse {
+        printAliasHelp();
+        return;
+    };
+
+    if (std.mem.eql(u8, verb, "pin")) {
+        const name = parts.next() orelse {
+            std.debug.print("usage: /alias pin <name>\n", .{});
+            return;
+        };
+        const host = app.providerHost() catch |err| {
+            std.debug.print("\x1b[31mprovider control plane unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        const current = host.kernel.currentOfferId() orelse {
+            std.debug.print(
+                "This session has no selected offer yet. Choose one with Ctrl+O, then pin it.\n",
+                .{},
+            );
+            return;
+        };
+        const summary = host.kernel.modelDescribe(current) orelse return;
+        const pinned_name = config_doc.AliasName.parse(name) catch {
+            std.debug.print("\x1b[31malias name too long\x1b[0m\n", .{});
+            return;
+        };
+        _ = config_store.setAlias(&store, .{
+            .name = pinned_name,
+            .policy = .pinned,
+            .offer_id = current,
+            .offer_revision = summary.offer_revision,
+        }, null, null) catch |err| {
+            std.debug.print("\x1b[31mcould not save the alias: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print("Pinned '{s}' to {s}/{s} {s}\n", .{
+            name,
+            summary.provider_id.slice(),
+            summary.channel_id.slice(),
+            summary.request_model_id,
+        });
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "float")) {
+        const name = parts.next() orelse {
+            std.debug.print("usage: /alias float <name> <model>\n", .{});
+            return;
+        };
+        const selector = parts.next() orelse {
+            std.debug.print("usage: /alias float <name> <model>\n", .{});
+            return;
+        };
+        const alias_name = config_doc.AliasName.parse(name) catch {
+            std.debug.print("\x1b[31malias name too long\x1b[0m\n", .{});
+            return;
+        };
+        const parsed_selector = @import("../provider/selection.zig").Selector.parse(selector) catch {
+            std.debug.print("\x1b[31mselector too long\x1b[0m\n", .{});
+            return;
+        };
+        _ = config_store.setAlias(&store, .{
+            .name = alias_name,
+            .policy = .floating,
+            .selector = parsed_selector,
+        }, null, null) catch |err| {
+            std.debug.print("\x1b[31mcould not save the alias: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print("'{s}' now floats to '{s}'.\n", .{ name, selector });
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "remove")) {
+        const name = parts.next() orelse {
+            std.debug.print("usage: /alias remove <name>\n", .{});
+            return;
+        };
+        _ = config_store.removeAlias(&store, name, null) catch |err| {
+            // A silent return here reads as success: the user believes the
+            // alias is gone and it is still there.
+            std.debug.print("\x1b[31mcould not remove '{s}': {s}\x1b[0m\n", .{ name, @errorName(err) });
+            return;
+        };
+        std.debug.print("Removed '{s}'.\n", .{name});
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "use")) {
+        const name = parts.next() orelse {
+            std.debug.print("usage: /alias use <name>\n", .{});
+            return;
+        };
+        const used = app.useAlias(name) catch |err| {
+            std.debug.print("\x1b[31m'{s}' did not resolve: {s}\x1b[0m\n", .{ name, @errorName(err) });
+            // Naming the colliding routes is the difference between "it did not
+            // work" and something the user can act on.
+            if (err == error.AmbiguousSelector) reportAliasAmbiguity(app, &store, name);
+            return;
+        };
+        if (!used) {
+            std.debug.print("No alias named '{s}'.\n", .{name});
+            return;
+        }
+        std.debug.print("switched to \x1b[36m{s}\x1b[0m via '{s}'\n", .{ app.activeModel(), name });
+        return;
+    }
+
+    printAliasHelp();
+}
+
+/// Print the routes a floating alias's selector matches.
+///
+/// A second traversal, on the error path only: a floating alias that matches
+/// several routes cannot pick one, and telling the user *which* ones lets them
+/// pin instead.
+fn reportAliasAmbiguity(app: *app_mod.App, store: *const @import("../provider/config_store.zig").Store, name: []const u8) void {
+    const alias_mod = @import("../provider/alias.zig");
+    var document = store.load() catch return;
+    defer document.deinit();
+    const entry = document.alias(name) orelse return;
+    const host = app.providerHost() catch return;
+    const candidates = alias_mod.candidatesFor(host.kernel.catalogSnapshot(), entry);
+    if (candidates.match_count < 2) return;
+
+    std.debug.print("'{s}' matches {d} routes; pin one instead:\n", .{ name, candidates.match_count });
+    for (candidates.samplesSlice()) |sample| {
+        std.debug.print("  {s}/{s} [{s}] {s}\n", .{
+            sample.provider_id.slice(),
+            sample.channel_id.slice(),
+            sample.protocol,
+            &sample.offer_id.render(),
+        });
+    }
+    if (candidates.match_count > candidates.samplesSlice().len) {
+        std.debug.print("  … and {d} more\n", .{candidates.match_count - candidates.samplesSlice().len});
+    }
+}
+
+fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    if (std.mem.eql(u8, rest, "refresh")) {
+        const refreshed = app.refreshProviderCatalogs() catch |err| {
+            std.debug.print("\x1b[31mcatalog refresh failed: {s}\x1b[0m\n", .{@errorName(err)});
+            return;
+        };
+        if (app.last_catalog_refresh_error) |why| {
+            // A per-catalog failure does not abort the others, so it has to be
+            // reported here or it disappears entirely.
+            std.debug.print(
+                "\x1b[33mone or more catalogs did not refresh ({s}); the previous " ++
+                    "catalog is still in use\x1b[0m\n",
+                .{why},
+            );
+        }
+        if (refreshed == 0) {
+            std.debug.print(
+                "No provider catalogs are configured. Add `provider_catalogs` to " ++
+                    "~/.metacodes/config.json with a models_url (or models_file).\n",
+                .{},
+            );
+            return;
+        }
+        std.debug.print("Refreshed {d} provider catalog(s).\n", .{refreshed});
+        return;
+    }
+    if (rest.len != 0) {
+        var parts = std.mem.tokenizeScalar(u8, rest, ' ');
+        const verb = parts.next().?;
+        const target = parts.next() orelse {
+            std.debug.print("usage: /providers [refresh | enable <id> | disable <id> | remove <id>]\n", .{});
+            return;
+        };
+        const id = @import("../provider/ids.zig").Slug.parse(target) catch {
+            std.debug.print("\x1b[31minvalid provider id '{s}'\x1b[0m\n", .{target});
+            return;
+        };
+        if (std.mem.eql(u8, verb, "enable") or std.mem.eql(u8, verb, "disable")) {
+            const enabled = std.mem.eql(u8, verb, "enable");
+            const in_use = !enabled and app.isRoutedThrough(id);
+            app.setProviderEnabled(id, enabled) catch |err| {
+                std.debug.print("\x1b[31mcould not update '{s}': {s}\x1b[0m\n", .{ target, @errorName(err) });
+                return;
+            };
+            // Disabling keeps the instance's configuration and credential
+            // references; that is the difference from removing it.
+            std.debug.print("{s} '{s}'.\n", .{ if (enabled) "Enabled" else "Disabled", target });
+            if (in_use) {
+                // A session is not torn off the route it is running on — that
+                // would be the worse surprise — but reporting only "Disabled"
+                // would describe something other than what happened.
+                std.debug.print(
+                    "This session is still routed through it. Pick another route with " ++
+                        "Ctrl+O; new sessions will not offer it.\n",
+                    .{},
+                );
+            }
+            return;
+        }
+        if (std.mem.eql(u8, verb, "remove")) {
+            const in_use = app.isRoutedThrough(id);
+            app.removeProviderConfiguration(id) catch |err| {
+                std.debug.print("\x1b[31mcould not remove '{s}': {s}\x1b[0m\n", .{ target, @errorName(err) });
+                return;
+            };
+            std.debug.print("Removed the configuration for '{s}'.\n", .{target});
+            if (in_use) {
+                std.debug.print("This session is still routed through it until you pick another route.\n", .{});
+            }
+            return;
+        }
+        std.debug.print("usage: /providers [refresh | enable <id> | disable <id> | remove <id>]\n", .{});
+        return;
+    }
+
+    const host = app.providerHost() catch |err| {
+        std.debug.print("\x1b[31mprovider control plane unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    var page: std.ArrayList(@import("../provider/control_plane.zig").OfferSummary) = .empty;
+    defer page.deinit(allocator);
+    const listed = host.kernel.modelList(.{}, .{}, allocator, &page) catch |err| {
+        std.debug.print("\x1b[31mmodel.list failed: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+
+    var current: ?[]const u8 = null;
+    for (listed.offers) |summary| {
+        const marker = if (summary.is_current) blk: {
+            current = summary.request_model_id;
+            break :blk "*";
+        } else " ";
+        std.debug.print("{s} {s}/{s} [{s}] {s}", .{
+            marker,
+            summary.provider_id.slice(),
+            summary.channel_id.slice(),
+            summary.protocol,
+            summary.request_model_id,
+        });
+        if (summary.credential_ref) |ref| std.debug.print(" account={s}", .{ref.slice()});
+        if (summary.limits.context_window) |window| {
+            std.debug.print(" ctx={d}", .{window});
+        } else {
+            std.debug.print(" ctx=?", .{});
+        }
+        if (summary.quote.priced() == null) std.debug.print(" price=?", .{});
+        std.debug.print("\n", .{});
+    }
+    std.debug.print(
+        "{d} route(s), catalog revision {d}. Ctrl+O or /model to choose one.\n",
+        .{ listed.total, listed.meta.catalog_revision.value() },
+    );
+}
+
 fn printModelHelp() void {
     std.debug.print(
         \\usage:
-        \\  /model
+        \\  /model                      open the picker (same as Ctrl+O)
         \\  /model group <anthropic|opus|sonnet|haiku|openai|gemini>
         \\  /model capability <web_search|thinking|prompt_cache|structured_output|server_tool>
-        \\  /model use <model-id>
+        \\  /model use <model-id|offer-id>
         \\  /model <model-id>
         \\
-        \\Model switching is limited to the provider selected at startup. Start with
-        \\--model gpt-... or --model gemini-... to use another provider family.
+        \\`/model use` resolves against the provider offer catalog first, so a model
+        \\served by another provider or protocol switches in place. A name carried by
+        \\several routes is reported with their offer ids instead of guessed. Names the
+        \\catalog does not declare stay on the historical path, which cannot leave the
+        \\provider family selected at startup.
         \\
     , .{});
 }
@@ -3649,6 +4079,19 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
             app.session_id = sid;
             app.permission_ctx.session = sid; // 权限对话框路由到本会话视图(M5/M6)
         }
+    }
+
+    // issue #16:恢复本 session 自己的路由选择。它比 global 窄,所以赢——resume
+    // 回来的会话应该继续用它当时那条路由,而不是这期间变成 global 的那条。
+    // 选择存在但已解析不出来时明说,绝不静默换成别家 provider。
+    if (app.restoreSessionSelection()) |restored| {
+        if (restored) std.debug.print("Restored this session's model route: {s}\n", .{app.activeModel()});
+    } else |err| {
+        std.debug.print(
+            "\x1b[33mwarning: this session's stored model route is unavailable ({s}); " ++
+                "the current route is unchanged\x1b[0m\n",
+            .{@errorName(err)},
+        );
     }
 
     std.debug.print("Resumed session ({d} messages). Continue by sending a message.\n", .{app.conversation.len()});

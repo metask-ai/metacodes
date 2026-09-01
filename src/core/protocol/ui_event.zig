@@ -45,6 +45,24 @@ pub const ConfigChange = union(enum) {
     mode: types.PermissionMode, // 值语义
     dirs: []const u8, // 新增/变更的目录(borrow;sink 跨线程留存须 dup)
     reasoning: ?types.ReasoningEffort, // 值语义
+    /// issue #16:路由变更。model 名不足以标识路由——同一个可见 model 名可能来自
+    /// 不同 provider / channel / 协议 / 账号,只广播 model 名会让进程外 UI 显示一条
+    /// 它无法区分的"变更"。全部是 borrow(同 config_changed 契约)。
+    route: Route,
+};
+
+pub const Route = struct {
+    provider_id: []const u8,
+    channel_id: []const u8,
+    protocol: []const u8,
+    /// 线上真正发送的 model id。
+    request_model_id: []const u8,
+    /// `offer-<32 hex>`;进程外 UI 用它精确指认这条路由。
+    offer_id: []const u8,
+    /// 绑定的凭证引用(账号),无绑定为 null。**永不含密钥**。
+    credential_ref: ?[]const u8 = null,
+    /// 作用域:once / session / global。
+    scope: []const u8,
 };
 
 /// **session 生命周期事件**(U5)。进 journal seq 流(附着重放可见 session 边界)。同 config_changed

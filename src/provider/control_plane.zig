@@ -426,6 +426,78 @@ pub const Kernel = struct {
         });
     }
 
+    /// Announce that a provider's prices moved.
+    ///
+    /// Emitted by whoever ingests a provider catalog: the kernel does not fetch,
+    /// so it cannot notice on its own, and a `pricing.updated` type no client
+    /// ever receives is decoration.
+    pub fn notePricingUpdated(self: *Kernel, provider_id: Slug) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.journal.append(.pricing_updated, .{ .pricing_updated = .{
+            .provider_id = provider_id,
+        } }, .{
+            .config_revision = self.config_revision,
+            .catalog_revision = self.catalog.revision,
+        });
+    }
+
+    /// Announce an observed health change for a provider.
+    ///
+    /// `healthy` is not announced: an event stream that reports "still fine" on
+    /// every refresh drowns the one report a client needs to act on.
+    pub fn noteProviderHealth(self: *Kernel, provider_id: Slug, status: offer_mod.HealthStatus) void {
+        if (status == .healthy or status == .unknown) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.journal.append(.provider_degraded, .{ .provider_degraded = .{
+            .provider_id = provider_id,
+            .status = status,
+        } }, .{
+            .config_revision = self.config_revision,
+            .catalog_revision = self.catalog.revision,
+        });
+    }
+
+    /// Announce a credential status change, and separately that one is nearing
+    /// expiry. Both are emitted by the credential resolver, which is the only
+    /// thing that knows.
+    pub fn noteAuthChanged(
+        self: *Kernel,
+        provider_id: Slug,
+        credential_ref: Slug,
+        status: credential.CredentialStatus,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.journal.append(.auth_changed, .{ .auth_changed = .{
+            .provider_id = provider_id,
+            .credential_ref = credential_ref,
+            .status = status,
+        } }, .{
+            .config_revision = self.config_revision,
+            .catalog_revision = self.catalog.revision,
+        });
+    }
+
+    pub fn noteCredentialExpiring(
+        self: *Kernel,
+        provider_id: Slug,
+        credential_ref: Slug,
+        expires_at: i64,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.journal.append(.credential_expiring, .{ .credential_expiring = .{
+            .provider_id = provider_id,
+            .credential_ref = credential_ref,
+            .expires_at = expires_at,
+        } }, .{
+            .config_revision = self.config_revision,
+            .catalog_revision = self.catalog.revision,
+        });
+    }
+
     /// Adopt the durable configuration revision.
     ///
     /// `config_store` is the sole authority for this number; the kernel mirrors
@@ -724,6 +796,42 @@ pub const Kernel = struct {
             .catalog_revision = self.catalogRevisionLocked(),
             .requires_persist = scope == .global,
         } };
+    }
+
+    /// Install a selection that a *previous* process committed, read back from
+    /// the durable document at startup.
+    ///
+    /// Deliberately not a commit: it writes no event, bumps no revision, and
+    /// skips validation, because nothing changed — this is the kernel catching
+    /// up to state that already exists. Validating here would also be wrong,
+    /// since a pin whose offer has since vanished must surface at the point the
+    /// route is resolved, with the actionable message, rather than being
+    /// silently dropped during boot.
+    pub fn seedGlobalSelection(self: *Kernel, selection: RuntimeSelection) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var seeded = selection;
+        seeded.scope = .global;
+        self.global_selection = seeded;
+    }
+
+    /// Install the route this session started on, as resolved by `--provider`,
+    /// `--offer`, or a stored selection at boot.
+    ///
+    /// Not a commit, for the same reasons as `seedGlobalSelection`: nothing
+    /// changed, so no event and no revision. It matters because without it the
+    /// kernel believes the session has no selection at all — `currentOfferId`
+    /// is null, the picker marks nothing as current, `/alias pin` reports
+    /// "no selected offer", and a token refresh keyed on the effective
+    /// selection never runs for a session that named its provider on the
+    /// command line.
+    pub fn seedSessionSelection(self: *Kernel, selection: RuntimeSelection) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.session_selection != null) return;
+        var seeded = selection;
+        seeded.scope = .session;
+        self.session_selection = seeded;
     }
 
     /// Freeze the selection for one turn. A commit during the turn changes the
@@ -1675,4 +1783,47 @@ test "a recorded route carries the cost its provider quote implies" {
     });
     const explicit = kernel.journal.items()[kernel.journal.len - 1];
     try std.testing.expectEqual(@as(?u64, 42), explicit.payload.route_actual.cost_micros);
+}
+
+test "a built-in price reaches model.list and quote.estimate, and unknown stays unknown" {
+    const a = std.testing.allocator;
+    var registry = try registry_mod.ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{});
+    defer catalog.deinit();
+
+    var kernel = Kernel.init(a, &catalog);
+    defer kernel.deinit();
+    kernel.registry = &registry;
+
+    var page: std.ArrayList(OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try kernel.modelList(.{}, .{}, a, &page);
+
+    var priced: usize = 0;
+    var unpriced: usize = 0;
+    for (listed.offers) |summary| {
+        if (summary.quote.isKnown()) {
+            priced += 1;
+            // A price a client can render must carry its currency and unit;
+            // a bare number is not comparable across providers.
+            const value = summary.quote.priced().?;
+            try std.testing.expectEqual(offer_mod.BillingUnit.per_million_tokens, value.billing_unit);
+            try std.testing.expect(value.input_price_micros != null);
+        } else {
+            unpriced += 1;
+        }
+    }
+    // Both halves must exist: a provider that prices, and one that says it
+    // cannot. A run where everything is unknown would pass a weaker assertion.
+    try std.testing.expect(priced > 0);
+    try std.testing.expect(unpriced > 0);
+
+    for (listed.offers) |summary| {
+        const estimate = kernel.quoteEstimate(summary.offer_id, .{
+            .input_tokens = 1_000_000,
+            .output_tokens = 1_000_000,
+        });
+        try std.testing.expectEqual(summary.quote.isKnown(), estimate.isKnown());
+    }
 }

@@ -1,4 +1,4 @@
-"""TTY coverage for `/model` and `/models` model-selection menus."""
+"""TTY coverage for `/model` (route picker, issue #16) and `/models` (account keys)."""
 
 import http.server
 import threading
@@ -145,12 +145,15 @@ def _menu_between_box_and_footer(raw):
     )
 
 
-def test_tty_model_command_first_shows_account_api_keys(bin_path):
+def test_tty_model_command_opens_the_route_picker(bin_path):
+    # issue #16:`/model` 选的是**路由**(provider → model → channel/offer),提交后
+    # 开跨 UI picker。账号 API key 是另一个问题,留在 `/models`——把两者合并会让
+    # "换账号"和"换模型"互相顶掉。
     server, base_url = _start_two_step_mock()
     try:
         raw = run(
             bin_path,
-            ["sleep:1.0", "type:/model", "sleep:0.4"],
+            ["sleep:1.0", "type:/model", "key:enter", "sleep:0.6"],
             base_url=base_url,
             env={"METACODES_NO_PROBE": None},
             startup_drain=1.2,
@@ -160,17 +163,17 @@ def test_tty_model_command_first_shows_account_api_keys(bin_path):
         server.shutdown()
 
     a, menu = _menu_between_box_and_footer(raw)
-    if "API keys for this account" not in menu:
-        a._fail(f"`/model` 第一屏应显示当前账号 API key 列表:\n{menu}")
-    if "Prod key" not in menu or "Dev key" not in menu:
-        a._fail(f"`/model` 第一屏应显示 API key label:\n{menu}")
-    if "Prod-Claude" not in menu or "Dev-GPT" not in menu:
-        a._fail(f"`/model` 第一屏应显示 API key 分组名:\n{menu}")
-    if DEV_MODEL in menu:
-        a._fail(f"`/model` 第一屏不应直接显示 /v1/models 模型:\n{menu}")
+    if "Provider" not in menu:
+        a._fail(f"`/model` 提交后应打开 picker 的 provider 阶段:\n{menu}")
+    if "enter apply to this session" not in menu:
+        a._fail(f"picker footer 应说明默认作用域:\n{menu}")
+    if "API keys for this account" in menu:
+        a._fail(f"`/model` 不应再进账号 key 菜单(那是 /models):\n{menu}")
 
 
-def test_tty_model_menu_selects_key_model_effort_and_switches(bin_path):
+def test_tty_model_picker_commits_a_route_and_switches(bin_path):
+    # provider(Enter)→ model(Enter)。metask 的每个 canonical model 只有一条路由,
+    # 所以 channel 阶段被跳过、直接提交——正是"只有一个 offer 时跳过 channel 步"。
     server, base_url = _start_two_step_mock()
     try:
         raw = run(
@@ -178,13 +181,12 @@ def test_tty_model_menu_selects_key_model_effort_and_switches(bin_path):
             [
                 "sleep:1.0",
                 "type:/model",
-                "key:down",
+                "key:enter",
+                "sleep:0.6",
                 "key:enter",
                 "sleep:0.4",
                 "key:enter",
-                "sleep:0.4",
-                "key:enter",
-                "sleep:0.4",
+                "sleep:0.8",
             ],
             base_url=base_url,
             env={"METACODES_NO_PROBE": None},
@@ -195,20 +197,24 @@ def test_tty_model_menu_selects_key_model_effort_and_switches(bin_path):
         server.shutdown()
 
     a = TTYAssert(raw)
-    a.assert_prose_contains(f"/model use {DEV_MODEL}")
-    a.assert_prose_contains("switched to ")
-    a.assert_prose_contains(DEV_MODEL)
-    a.assert_prose_contains("reasoning=none")
+    text = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    if "switched to" not in text:
+        a._fail(f"picker 提交后应回报切换结果:\n{text}")
+    # 默认作用域是 session,提交不写任何持久状态。
+    if "for session" not in text:
+        a._fail(f"提交回报应写明作用域:\n{text}")
 
 
-def test_tty_model_after_model_selection_shows_reasoning_default_none(bin_path):
+def test_tty_models_after_model_selection_shows_reasoning_default_none(bin_path):
+    # 思考深度菜单属于 `/models` 的账号 → 模型 → effort 流程(凭证侧),issue #16
+    # 没有动它。
     server, base_url = _start_two_step_mock()
     try:
         raw = run(
             bin_path,
             [
                 "sleep:1.0",
-                "type:/model",
+                "type:/models",
                 "key:down",
                 "key:enter",
                 "sleep:0.4",

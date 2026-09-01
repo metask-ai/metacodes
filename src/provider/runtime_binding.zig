@@ -47,6 +47,10 @@ pub const CredentialSources = struct {
     precedence: credential.AuthPrecedence = .api_key_first,
     env: credential.EnvLookup = credential.EnvLookup.empty(),
     now_seconds: i64 = 0,
+    /// The provider's credential pool. When the offer names a `credential_ref`,
+    /// *that* member is used — the reference is part of the route identity, so
+    /// resolving to a different account would make the offer id a lie.
+    pool: []const credential.PoolEntry = &.{},
 };
 
 /// Everything the client factory needs, and nothing it does not.
@@ -110,18 +114,46 @@ pub fn bindOffer(
     revision_changed: bool,
 ) BindError!RuntimeBinding {
     const profile = registry.findById(offer.provider_id) orelse return error.UnknownProvider;
-    const protocol = profile_mod.Protocol.parse(offer.protocol) orelse
-        return error.UnsupportedProtocolTransport;
+    // The wire the catalog recorded, not a re-parse of the protocol *id*: a
+    // declarative custom protocol has its own id and a real wire.
+    const wire = offer.wire orelse return error.UnsupportedProtocolTransport;
+    const protocol: profile_mod.Protocol = switch (wire) {
+        .anthropic_messages => .anthropic_messages,
+        .openai_chat => .openai_chat,
+        .openai_responses => .openai_responses,
+        .gemini_generate_content => .gemini_generate_content,
+    };
     const transport = try registry_mod.transportKindFor(protocol);
     const openai_protocol = switch (transport) {
         .openai => try registry_mod.openAiProtocolFor(protocol),
         else => types.OpenAIProtocol.chat_completions,
     };
 
+    // An offer that names a credential must use that one. Anything else would
+    // make the offer id — which the credential participates in — identify a
+    // route the request does not take.
+    const pinned_credential: ?credential.StoredEntry = blk: {
+        const wanted = offer.credential_ref orelse break :blk null;
+        for (sources.pool) |member| {
+            if (!member.id.eql(wanted)) continue;
+            break :blk .{
+                .id = member.id,
+                .kind = member.kind,
+                .secret = member.secret,
+                .status = member.status,
+                .account_or_plan = member.account_or_plan,
+                .expires_at = member.expires_at,
+                .cooldown_until = member.cooldown_until,
+            };
+        }
+        break :blk null;
+    };
+
     const resolved_credential = try credential.resolve(.{
         .provider_id = profile.id,
         .accepted_kinds = profile.accepted_credential_kinds,
         .env_aliases = profile.env_aliases,
+        .explicit = pinned_credential,
         .runtime_fd_secret = sources.runtime_fd_secret,
         .cli_api_key = sources.cli_api_key,
         .stored_api_key = sources.stored_api_key,
@@ -129,6 +161,7 @@ pub fn bindOffer(
         .precedence = sources.precedence,
         .env = sources.env,
         .now_seconds = sources.now_seconds,
+        .pool = sources.pool,
     }, ref_id_buffer);
 
     return .{
@@ -374,4 +407,54 @@ test "the gemini profile's declared auth scheme matches what its transport sends
     );
     try std.testing.expectEqualStrings("x-goog-api-key", materialized.name);
     try std.testing.expectEqualStrings("gk-secret", materialized.value);
+}
+
+test "an offer that names a credential binds that one, not the pool's favourite" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    const bindings = [_]registry_mod.CredentialBinding{
+        .{ .provider_id = Slug.lit("openai"), .credential_ref = Slug.lit("work") },
+        .{ .provider_id = Slug.lit("openai"), .credential_ref = Slug.lit("personal") },
+    };
+    var catalog = try registry.buildCatalog(a, .{
+        .only_provider = Slug.lit("openai"),
+        .credential_bindings = &bindings,
+    });
+    defer catalog.deinit();
+
+    const pool = [_]credential.PoolEntry{
+        .{ .id = Slug.lit("work"), .kind = .api_key, .secret = "sk-work", .priority = 0 },
+        .{ .id = Slug.lit("personal"), .kind = .api_key, .secret = "sk-personal", .priority = 1 },
+    };
+
+    var found_personal = false;
+    var reference_buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    for (catalog.items()) |*item| {
+        const ref = item.credential_ref orelse continue;
+        if (!ref.eqlText("personal")) continue;
+        found_personal = true;
+        const binding = try bindOffer(&registry, item, .{ .pool = &pool }, &reference_buffer, false);
+        // `work` has the better priority, so a pool-order pick would take it —
+        // and the offer id, which the credential participates in, would then
+        // identify a route the request does not take.
+        try std.testing.expectEqualStrings("sk-personal", binding.secret);
+        try std.testing.expect(binding.credential_ref.id.eqlText("personal"));
+    }
+    try std.testing.expect(found_personal);
+}
+
+test "an offer with no credential binding still uses ordinary resolution" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("openai") });
+    defer catalog.deinit();
+
+    const pool = [_]credential.PoolEntry{
+        .{ .id = Slug.lit("work"), .kind = .api_key, .secret = "sk-work", .priority = 0 },
+    };
+    var reference_buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    const binding = try bindOffer(&registry, &catalog.items()[0], .{ .pool = &pool }, &reference_buffer, false);
+    try std.testing.expectEqualStrings("sk-work", binding.secret);
 }

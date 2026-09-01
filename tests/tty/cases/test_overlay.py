@@ -23,7 +23,7 @@ def test_help_inline_instant(bin_path):
     raw = run(bin_path, ["sleep:0.8", "type:?", "sleep:0.3"], per_key_drain=0.1)
     a = TTYAssert(raw)
     text = _screen_text(a)
-    assert "Open transcript" in text, text     # 快捷键已展开
+    assert "Open transcript" in text, text     # 快捷键已展开(issue #16 后标注 Ctrl+X Ctrl+O)
     assert "Shift+Tab" in text, text
     # 非模态:输入框边框 + ❯ 行仍在(help 替换的是 footer 行,不是输入框)。
     assert a.box_top_row() is not None, "输入框上边框缺失(help 应非模态):\n" + text
@@ -112,10 +112,13 @@ def test_esc_then_char_not_swallowed(bin_path):
     assert "k" in content_text, "ESC 后的字符 'k' 被吞了(drain 接线缺失?):\n输入行=[" + content_text + "]\n" + text
 
 
-def test_ctrl_o_enters_inline_transcript(bin_path):
-    # Ctrl+O → 全屏 transcript viewer(alt-screen)。多 agent 长跑时 inline 重画会显两份/footer
+def test_ctrl_x_ctrl_o_enters_inline_transcript(bin_path):
+    # issue #16:Ctrl+O 让给 model picker,transcript 改绑 Ctrl+X Ctrl+O(同字母、
+    # 复用已有的 Ctrl+X 前缀)。可达性必须不变——这是"改绑后没有任何动作变成 no-op"
+    # 的 TTY 侧证据。
+    # Ctrl+X Ctrl+O → 全屏 transcript viewer(alt-screen)。多 agent 长跑时 inline 重画会显两份/footer
     # 堆叠/几何漂移,根治法=进 alt-screen 独立缓冲全屏画,退出由终端自动恢复主缓冲(banner+对话+框)。
-    raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
+    raw = run(bin_path, ["sleep:0.8", "key:ctrl_x", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
     assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen(ESC[?1049h)"
     assert b"Showing detailed transcript" in raw, "应渲染 cc 风格 transcript footer"
 
@@ -123,19 +126,33 @@ def test_ctrl_o_enters_inline_transcript(bin_path):
 def test_ctrl_o_via_kitty_csi_u(bin_path):
     # 实测 bug:Kitty 键盘协议白名单终端把 Ctrl+O 编成 CSI-u(ESC[111;5u,111='o'/5=Ctrl)
     # 而非裸 0x0f。旧 CSI-u 解析表无 'o' → 返 .unknown → Ctrl+O 静默失效("完全无反应")。
-    # 用 raw 注入 CSI-u 序列(模拟这类终端的真实字节),断言 viewer 照常打开。
+    # issue #16 改绑后这个键开的是 model picker,但要守的回归没变:CSI-u 形式的 'o'
+    # 不能解析成 .unknown。用 raw 注入 CSI-u 序列(模拟这类终端的真实字节)。
     raw = run(bin_path, ["sleep:0.8", "raw:\\x1b[111;5u", "sleep:0.4"], per_key_drain=0.1)
-    assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"
-    assert b"Showing detailed transcript" in raw, "CSI-u 形式的 Ctrl+O 也应打开 transcript viewer(回归 bug)"
+    a = TTYAssert(raw)
+    text = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    assert "Provider" in text, "CSI-u 形式的 Ctrl+O 也应打开 model picker(回归 bug):\n" + text
+
+
+def test_ctrl_x_ctrl_o_via_kitty_csi_u(bin_path):
+    # 改绑后的 transcript 入口在白名单终端下同样要工作:Ctrl+X 是裸 0x18,
+    # 后随的 Ctrl+O 走 CSI-u。前缀 + CSI-u 组合此前无人覆盖。
+    raw = run(bin_path, ["sleep:0.8", "key:ctrl_x", "raw:\\x1b[111;5u", "sleep:0.4"], per_key_drain=0.1)
+    assert b"\x1b[?1049h" in raw, "Ctrl+X + CSI-u Ctrl+O 应进 alt-screen transcript"
+    assert b"Showing detailed transcript" in raw, "应渲染 transcript footer"
 
 
 def test_ctrl_o_csi_u_toggles_closed(bin_path):
-    # 实测 bug:agent 运行期 Ctrl+O 进 transcript 后再按 Ctrl+O 无法 toggle 关闭。根因:
+    # 实测 bug:agent 运行期进 transcript 后再按 Ctrl+O 无法 toggle 关闭。根因:
     # transcript_viewer 自己的裸字节 read 循环只认 0x0f,不认 Kitty CSI-u ESC[111;5u →
     # 白名单终端第二次 Ctrl+O(CSI-u 形式)被忽略,viewer 不退出。修:viewer 解析 CSI-u codepoint。
-    # 第一次 0x0f 开,第二次 CSI-u 关 → 最终屏无 transcript footer(成功 toggle)。
-    raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.4", "raw:\\x1b[111;5u", "sleep:0.4"], per_key_drain=0.15)
-    assert b"Showing detailed transcript" in raw, "第一次 Ctrl+O 应打开 transcript"
+    # viewer 内部的 toggle 语义与 issue #16 的改绑无关(那只改 dispatch 的入口键)。
+    raw = run(
+        bin_path,
+        ["sleep:0.8", "key:ctrl_x", "key:ctrl_o", "sleep:0.4", "raw:\\x1b[111;5u", "sleep:0.4"],
+        per_key_drain=0.15,
+    )
+    assert b"Showing detailed transcript" in raw, "第一次 Ctrl+X Ctrl+O 应打开 transcript"
     a = TTYAssert(raw)
     final = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
     assert "Showing detailed transcript" not in final, \
@@ -153,21 +170,21 @@ def test_ctrl_o_markdown_render_equivalent(bin_path):
     # 退出后主区不变源码、无残留。/md-test 注入 1 user + 1 assistant(含 **粗体**/`代码`/列表)。
     base = ["sleep:0.8", "type:/md-test", "key:enter", "sleep:0.4"]
     # viewer 内:markdown 渲染(无源码 `**`)+ cc 风格前缀(❯/⏺,无 ▶ user/◀ assistant)。
-    inside = _screen_full(run(bin_path, base + ["key:ctrl_o", "sleep:0.5"], term_size=(20, 90)), rows=20)
+    inside = _screen_full(run(bin_path, base + ["key:ctrl_x", "key:ctrl_o", "sleep:0.5"], term_size=(20, 90)), rows=20)
     assert "⏺ 我是 MetaCode" in inside, f"viewer 未用 ⏺ 前缀渲染 assistant:\n{inside}"
     assert "❯ 你是谁" in inside, f"viewer 未用 ❯ 前缀渲染 user:\n{inside}"
     assert "**MetaCode**" not in inside, f"viewer 显示 markdown 源码 `**`(bug#1):\n{inside}"
     assert "▶ user" not in inside and "◀ assistant" not in inside, f"viewer 残留 ▶/◀ 角色头(bug#2):\n{inside}"
     assert "• 阅读代码" in inside, f"viewer 未渲染列表(- → •):\n{inside}"
     # 退出后:主区无源码 `**`、无 ▶/◀ 残留(进出渲染等效)。
-    after = _screen_full(run(bin_path, base + ["key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"], term_size=(20, 90)), rows=20)
+    after = _screen_full(run(bin_path, base + ["key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"], term_size=(20, 90)), rows=20)
     assert "**MetaCode**" not in after, f"退出后主区变 markdown 源码(bug#1):\n{after}"
     assert "▶ user" not in after and "◀ assistant" not in after, f"退出后 ▶/◀ 残留(bug#2):\n{after}"
 
 
 def test_ctrl_o_toggle_close(bin_path):
     # Ctrl+O 开 inline → 再 Ctrl+O 关(viewer 认 0x0f 退出)→ 恢复输入框。
-    raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.4", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
+    raw = run(bin_path, ["sleep:0.8", "key:ctrl_x", "key:ctrl_o", "sleep:0.4", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
     a = TTYAssert(raw)
     a.assert_box_present()
     assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"
@@ -180,7 +197,7 @@ def test_ctrl_o_double_press_clean(bin_path):
     # 连按两次 Ctrl+O(开+关)→ 净回输入框,无 transcript 残留。
     raw = run(bin_path,
               ["sleep:0.8",
-               "key:ctrl_o", "key:ctrl_o", "sleep:0.5"],  # 连按两次:开+关
+               "key:ctrl_x", "key:ctrl_o", "key:ctrl_o", "sleep:0.5"],  # 连按两次:开+关
               per_key_drain=0.08)
     a = TTYAssert(raw)
     a.assert_box_present()           # 回到输入框
@@ -220,7 +237,7 @@ def test_ctrl_o_box_top_idempotent(bin_path):
         msgs += ["type:!echo msg %d zig" % i, "key:enter", "sleep:0.5"]
 
     box0 = box_only(msgs)
-    box2 = box_only(msgs + ["key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:0.6"])
+    box2 = box_only(msgs + ["key:ctrl_x", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:0.6"])
 
     # 核心幂等:alt-screen 退出自动恢复主缓冲 → 框回原位(无跳屏顶、无滚走历史、无贴底漂移)。
     assert box0 is not None and box2 is not None, \
@@ -236,8 +253,8 @@ def test_ctrl_o_idempotent_with_agent_panel(bin_path):
     setup = ["type:/agent-test-multi", "key:enter", "sleep:0.4"]
     # 连按 4 次(2 个开关周期)后应稳定。
     raw = run(bin_path, ["sleep:0.8"] + setup +
-              ["key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5",
-               "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+              ["key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5",
+               "key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
               term_size=(24, 100), per_key_drain=0.04, startup_drain=0.8)
     a = TTYAssert(raw, rows=24, cols=100)
     full = "\n".join(a.final.line_text(r) for r in range(24))
@@ -265,7 +282,7 @@ def test_ctrl_o_agent_panel_box_top_idempotent(bin_path):
 
     def box_top_after_toggle(rows):
         raw = run(bin_path, ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4",
-                             "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+                             "key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
                   term_size=(rows, 90), per_key_drain=0.05, startup_drain=0.8)
         return TTYAssert(raw, rows=rows, cols=90).box_top_row(), raw
 
@@ -286,7 +303,7 @@ def test_ctrl_o_tall_history_alt_screen(bin_path):
     msgs = []
     for i in range(5):
         msgs += ["type:line %d" % i, "key:enter", "sleep:0.9"]
-    raw = run(bin_path, ["sleep:0.8"] + msgs + ["key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+    raw = run(bin_path, ["sleep:0.8"] + msgs + ["key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
               term_size=(12, 80), per_key_drain=0.05, startup_drain=0.8)
     a = TTYAssert(raw, rows=12, cols=80)
     text = _screen_text(a)
@@ -353,7 +370,7 @@ def test_ctrl_o_multiagent_no_scroll_garbage(bin_path):
         raw = run(
             bin_path,
             ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4",
-             "type:go", "key:enter", "sleep:2.5", "key:ctrl_o", "sleep:1.2"],
+             "type:go", "key:enter", "sleep:2.5", "key:ctrl_x", "key:ctrl_o", "sleep:1.2"],
             base_url=srv.url, startup_drain=0.8, per_key_drain=0.15, term_size=(24, 80),
         )
     a = TTYAssert(raw, rows=24, cols=80)
@@ -382,7 +399,9 @@ def test_ctrl_o_autorepeat_debounced_no_altscreen_churn(bin_path):
     #   对,去抖后每 burst 恰 1 对),且末态干净幂等。用真 Warp 字节(批量 CSI-u),非裸 0x0f。
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
-    BURST = "raw:" + ("\\x1b[111;5u" * 20)  # 按住 Ctrl+O 的 auto-repeat(批量 CSI-u,单次注入=同一 read 缓冲)
+    # issue #16 起 transcript 绑定是 Ctrl+X Ctrl+O,所以 auto-repeat 的等价手势是
+    # 成对的 0x18 + CSI-u 连发。仍是单次注入 → 同一 read 缓冲,机制与改绑前一致。
+    BURST = "raw:" + ("\\x18\\x1b[111;5u" * 20)  # 按住 Ctrl+X Ctrl+O 的 auto-repeat(单次注入=同一 read 缓冲)
     H, L = b"\x1b[?1049h", b"\x1b[?1049l"
 
     def trial(events, rows=24, cols=80):
@@ -444,7 +463,7 @@ def test_gen_ctrl_o_exit_region_redraw_self_cleans(bin_path):
         # 生成期开+关 transcript(Warp CSI-u 形式,间隔 >120ms 避免被去抖折叠 → 真 toggle)。
         raw = run(bin_path,
                   ["sleep:0.8", "type:go", "key:enter", "sleep:1.5",
-                   "raw:\\x1b[111;5u", "sleep:0.6", "raw:\\x1b[111;5u", "sleep:4.0"],
+                   "raw:\\x18\\x1b[111;5u", "sleep:0.6", "raw:\\x1b[111;5u", "sleep:4.0"],
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.06, term_size=(24, 80))
 
     a = TTYAssert(raw, rows=24, cols=80)
@@ -481,7 +500,7 @@ def test_ctrl_o_during_websearch_card_no_card_pileup(bin_path):
     import re
 
     H, L = b"\x1b[?1049h", b"\x1b[?1049l"
-    BURST = "raw:" + ("\\x1b[111;5u" * 20)  # 按住 Ctrl+O 的 auto-repeat(批量 CSI-u)
+    BURST = "raw:" + ("\\x18\\x1b[111;5u" * 20)  # 按住 Ctrl+X Ctrl+O 的 auto-repeat(批量,单次注入)
 
     # 3 turns:① 主 turn 慢吐文本后发 WebSearch tool_use;② WebSearch 隔离子请求(慢,卡常驻 ~7s);
     #          ③ 拿到结果后的续写(end_turn 收尾)。

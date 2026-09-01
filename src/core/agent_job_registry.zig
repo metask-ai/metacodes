@@ -428,6 +428,43 @@ pub const AgentJobRegistry = struct {
         self.allocator.free(old);
     }
 
+    /// Move every future job onto a new provider route (issue #16).
+    ///
+    /// One call, because these fields are one decision: a registry holding this
+    /// provider's key while still pointing at the previous provider's endpoint
+    /// would send the credential to the wrong vendor. Both allocations happen
+    /// before the swap, so a failure leaves the previous route completely
+    /// intact. Jobs already running keep the provider they were constructed
+    /// with; this affects the ones spawned next.
+    pub fn setRoute(
+        self: *AgentJobRegistry,
+        api_key: []const u8,
+        base_url: ?[]const u8,
+        provider_kind: types_mod.ProviderKind,
+        openai_protocol: types_mod.OpenAIProtocol,
+        auth_scheme: ?@import("../provider/credential.zig").AuthScheme,
+    ) !void {
+        const key_owned = try self.allocator.dupe(u8, api_key);
+        errdefer {
+            @memset(key_owned, 0);
+            self.allocator.free(key_owned);
+        }
+        const url_owned: ?[]u8 = if (base_url) |url| try self.allocator.dupe(u8, url) else null;
+
+        self.listLock();
+        defer self.listUnlock();
+        const old_key = self.api_key;
+        const old_url = self.base_url;
+        self.api_key = key_owned;
+        self.base_url = url_owned;
+        self.provider_kind = provider_kind;
+        self.openai_protocol = openai_protocol;
+        self.auth_scheme = auth_scheme;
+        @memset(old_key, 0);
+        self.allocator.free(old_key);
+        if (old_url) |url| self.allocator.free(url);
+    }
+
     fn listLock(self: *AgentJobRegistry) void {
         _ = self.list_mutex.lock();
     }
@@ -1327,4 +1364,50 @@ test "task#18: drainNewlyDone 排终态 job 一次(done_emitted 防重复)+ 跳 
     const second = try reg.drainNewlyDone(a);
     defer AgentJobRegistry.freeDoneInfos(a, second);
     try std.testing.expectEqual(@as(usize, 0), second.len);
+}
+
+test "issue #16: setRoute moves key, endpoint, and transport together" {
+    const a = std.testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "old-key", "https://old.invalid", "old-model", .anthropic);
+    defer reg.deinit();
+
+    try reg.setRoute(
+        "new-key",
+        "https://new.invalid/api/coding/paas/v4",
+        .openai,
+        .chat_completions,
+        .{ .api_key_header = "x-api-key" },
+    );
+    try std.testing.expectEqualStrings("new-key", reg.api_key);
+    try std.testing.expectEqualStrings("https://new.invalid/api/coding/paas/v4", reg.base_url.?);
+    try std.testing.expectEqual(types_mod.ProviderKind.openai, reg.provider_kind);
+    try std.testing.expect(reg.auth_scheme != null);
+    // The model is a separate decision with its own seam; setRoute must not
+    // silently reset it.
+    try std.testing.expectEqualStrings("old-model", reg.model);
+}
+
+test "issue #16: a failed setRoute leaves the previous route completely intact" {
+    const a = std.testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "old-key", "https://old.invalid", "old-model", .anthropic);
+    defer reg.deinit();
+
+    // Fail on the *second* allocation, so the key has already been duped: the
+    // swap must still not have happened. A registry holding the new key while
+    // pointing at the old endpoint would send the credential to the wrong
+    // vendor, which is the whole reason these move together.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    reg.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, reg.setRoute(
+        "new-key",
+        "https://new.invalid",
+        .openai,
+        .chat_completions,
+        null,
+    ));
+    reg.allocator = a;
+
+    try std.testing.expectEqualStrings("old-key", reg.api_key);
+    try std.testing.expectEqualStrings("https://old.invalid", reg.base_url.?);
+    try std.testing.expectEqual(types_mod.ProviderKind.anthropic, reg.provider_kind);
 }
