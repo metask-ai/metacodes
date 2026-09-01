@@ -218,13 +218,19 @@ Their generic head/tail truncation is a text edit, so an artifact envelope is
 first offered to `result_projection.shrinkRecoverableEnvelope`, which
 re-renders it in place with a smaller preview and every identity field intact.
 Anything else structured — a Bash envelope, a non-recoverable fallback, any
-tool's large JSON — keeps its shape by trimming only its long string values,
-with the counters that describe a trimmed string corrected as they are written.
-The short fields are what make a result actionable and are never what made it
-oversized. Only a structured result that cannot be shrunk at all is left
-oversized rather than mangled: `clearToolResultAt` already refuses to erase a
-result's only recovery capability, and a truncation pass that quietly did so
-instead would be worse than doing nothing.
+tool's large JSON — keeps its shape by trimming only its string values, at any
+depth, with every counter that describes a trimmed string corrected as it is
+written (`<channel>_truncated`, `preview_head_bytes`, `preview_tail_bytes`, and
+`omitted_bytes`, which has to keep satisfying head + tail + omitted ==
+original). The short fields are what make a result actionable and are never
+what made it oversized.
+
+A structured result that cannot be shrunk — one whose bulk is not in its
+strings — is left oversized rather than mangled, and the generic text
+truncation is reserved for content that was never structured. Being one request
+too large is recoverable; an unparseable result is not. `clearToolResultAt`
+already refuses to erase a result's only recovery capability for the same
+reason.
 
 Recovery has two primitives rather than one. `ReadArtifact` returns byte
 ranges, which costs one round trip per `MAX_READ_BYTES` and cannot answer a
@@ -234,11 +240,14 @@ filename output is suppressed, `files_with_matches` — whose entire output woul
 be that path — is rejected for artifact searches, and the child's stderr is
 scrubbed of it before it can reach a tool error.
 
-No staging path is model-visible, on any Bash channel. The prompt-cache
-contract below lists staging paths and random ids among the things that never
-are, and a JobRegistry spool path is both; a capture too large to publish is
-therefore genuinely unrecoverable, and `<channel>_storage_error` says which of
-the reasons it was rather than implying a handle exists.
+No staging path is model-visible from Bash at all - not on a completed
+channel, and not in the auto-backgrounded snapshot, which handed one back for
+`Read` until it was replaced by the `job_id` that `BashOutput` already takes.
+The prompt-cache contract below lists staging paths and random ids among the
+things that never are, and a JobRegistry spool path is both. A capture too
+large to publish is therefore genuinely unrecoverable, and
+`<channel>_storage_error` says which of the reasons it was rather than implying
+a handle exists.
 
 Every budget derived from the context window resolves the model the request
 will actually name, not the Provider's own. A subagent shares its parent's

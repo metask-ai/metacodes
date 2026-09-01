@@ -312,7 +312,14 @@ sha256 / read 指令一起没,而且下一轮 clear 因为再也看不到 recove
 fallback 信封、任意工具的大 JSON)走通用的**只裁长字符串**:短字段(exit_code、
 storage_error、各种 id 与 flag)从来不是超限的原因,却是结果可用的全部依据,必须原样留下;
 描述被裁字符串的计数器(`<ch>_truncated`、`preview_*_bytes`)在写出时一并改对,否则就是
-另一种"悄悄撒谎"。只有连裁都裁不动的才宁可留着超限——留着多花一次请求,切坏是输出真没了。
+另一种"悄悄撒谎"(`omitted_bytes` 必须继续满足 head+tail+omitted==original)。裁剪递归到
+任意深度——`{"rows":[{"text":<40KB>}]}` 顶层没有长字符串,只裁顶层等于没裁。**连裁都裁不动的
+(体量不在字符串里,如超大数值数组)一律留着超限,通用文本截断只用于本来就不是结构化的内容**:
+多花一次请求可以恢复,切成不可解析的散文不能。
+
+**staging 路径在 Bash 一侧全面不可见**:已完成信封与 auto-backgrounded 快照都不再交出
+`stdout_path`/`stderr_path`,后者改用稳定的 `job_id`(BashOutput 本来就按它读,还支持
+`*_since_byte` 增量),能力不减而 provider 可见字节不再随机变化。
 
 **预算按真正会被请求的模型解析**:subagent 与父**共享 Provider**,只靠 `model_override`
 区分。`Provider.maxInputTokensFor(model_override)` / `maxTokensFor` 因此成为所有窗口派生量

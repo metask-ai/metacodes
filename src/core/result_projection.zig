@@ -671,6 +671,16 @@ fn decodePreviewPart(allocator: std.mem.Allocator, value: ?std.json.Value, utf8:
 /// `preview_head_bytes`), so a single pass in key order is enough - and a
 /// counter that still claimed the original length would be exactly the kind of
 /// quiet lie this whole change is about.
+/// Whether this result is a JSON object - the shape every structured tool
+/// result has. The generic text truncation is only ever safe for content that
+/// was not structured to begin with: applied to an object it emits something
+/// no consumer can parse, and the schema is not recoverable from the wreck.
+pub fn isStructuredObject(content: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
+
 pub fn shrinkStructuredResult(
     allocator: std.mem.Allocator,
     content: []const u8,
@@ -707,10 +717,34 @@ pub fn shrinkStructuredResult(
     return out;
 }
 
-/// Re-emit one JSON object, cutting every string longer than `water` to a
-/// head/tail around `PREVIEW_ELISION`. Key order is preserved because
-/// `std.json.ObjectMap` is an array hash map, which is what lets the counter
-/// correction below be a single pass.
+/// Bookkeeping a trim invalidates, corrected as the object is written.
+///
+/// Both envelope families put a string before the counters that describe it
+/// (`preview_head` before `preview_head_bytes`, `stdout` before
+/// `stdout_truncated`) and `original_bytes` before all of them, so one pass in
+/// key order can fix every one. A counter left describing the pre-trim string
+/// is the same quiet lie as an envelope that claims to be intact.
+const TrimLedger = struct {
+    original_bytes: ?u64 = null,
+    head_shown: ?usize = null,
+    tail_shown: ?usize = null,
+    trimmed_channel: ?[]const u8 = null,
+
+    /// `omitted_bytes` is only recomputable once both preview counters are
+    /// known, and it must satisfy head + tail + omitted == original or the
+    /// envelope reports an elision size that is not the truth.
+    fn omitted(self: TrimLedger) ?u64 {
+        const original = self.original_bytes orelse return null;
+        const head = self.head_shown orelse return null;
+        const tail = self.tail_shown orelse return null;
+        return original -| head -| tail;
+    }
+};
+
+/// Re-emit one JSON object, cutting every string longer than `water` - at any
+/// depth - to a head/tail around `PREVIEW_ELISION`. Key order is preserved
+/// because `std.json.ObjectMap` is an array hash map, which is what lets the
+/// counter correction be a single pass.
 fn renderTrimmedObject(
     allocator: std.mem.Allocator,
     object: std.json.ObjectMap,
@@ -721,10 +755,7 @@ fn renderTrimmedObject(
     const writer = &out.writer;
     try writer.writeByte('{');
 
-    // What the pass has trimmed so far, so a counter naming it can be fixed.
-    var trimmed_head: ?usize = null;
-    var trimmed_tail: ?usize = null;
-    var trimmed_channel: ?[]const u8 = null;
+    var ledger = TrimLedger{};
     var first = true;
     var it = object.iterator();
     while (it.next()) |entry| {
@@ -735,33 +766,88 @@ fn renderTrimmedObject(
         try writer.writeByte(':');
 
         const value = entry.value_ptr.*;
-        if (value == .string and value.string.len > water) {
-            const kept = try writeTrimmedString(writer, value.string, water);
-            if (std.mem.eql(u8, key, "preview_head")) trimmed_head = kept;
-            if (std.mem.eql(u8, key, "preview_tail")) trimmed_tail = kept;
-            if (std.mem.eql(u8, key, "stdout") or std.mem.eql(u8, key, "stderr")) trimmed_channel = key;
+        if (value == .integer and value.integer >= 0 and std.mem.eql(u8, key, "original_bytes"))
+            ledger.original_bytes = @intCast(value.integer);
+
+        if (value == .string) {
+            const kept = if (value.string.len > water)
+                try writeTrimmedString(writer, value.string, water)
+            else blk: {
+                try std.json.Stringify.encodeJsonString(value.string, .{}, writer);
+                break :blk value.string.len;
+            };
+            if (std.mem.eql(u8, key, "preview_head")) ledger.head_shown = kept;
+            if (std.mem.eql(u8, key, "preview_tail")) ledger.tail_shown = kept;
+            if (value.string.len > water and
+                (std.mem.eql(u8, key, "stdout") or std.mem.eql(u8, key, "stderr")))
+                ledger.trimmed_channel = key;
             continue;
         }
-        // A counter whose subject this pass just cut must describe the cut.
-        if (trimmed_head != null and std.mem.eql(u8, key, "preview_head_bytes")) {
-            try writer.print("{d}", .{trimmed_head.?});
+
+        // Counters whose subject this pass has already written.
+        if (ledger.head_shown != null and std.mem.eql(u8, key, "preview_head_bytes")) {
+            try writer.print("{d}", .{ledger.head_shown.?});
             continue;
         }
-        if (trimmed_tail != null and std.mem.eql(u8, key, "preview_tail_bytes")) {
-            try writer.print("{d}", .{trimmed_tail.?});
+        if (ledger.tail_shown != null and std.mem.eql(u8, key, "preview_tail_bytes")) {
+            try writer.print("{d}", .{ledger.tail_shown.?});
             continue;
         }
-        if (trimmed_channel) |label| {
+        if (std.mem.eql(u8, key, "omitted_bytes")) {
+            if (ledger.omitted()) |value_out| {
+                try writer.print("{d}", .{value_out});
+                continue;
+            }
+        }
+        if (ledger.trimmed_channel) |label| {
             var key_buffer: [32]u8 = undefined;
             if (std.mem.eql(u8, key, channelKey(&key_buffer, label, "_truncated"))) {
                 try writer.writeAll("true");
                 continue;
             }
         }
-        try std.json.Stringify.value(value, .{}, writer);
+        try writeTrimmedValue(writer, value, water);
     }
     try writer.writeByte('}');
     return out.toOwnedSlice();
+}
+
+/// Trim strings wherever they are, not only at the top level. A result shaped
+/// `{"rows":[{"text": <40KB> }]}` has no long top-level string at all, and
+/// leaving it untrimmed sent it to the text truncation that destroys the JSON.
+/// Non-string leaves are emitted verbatim: their type is part of the schema.
+fn writeTrimmedValue(writer: *std.Io.Writer, value: std.json.Value, water: usize) !void {
+    switch (value) {
+        .string => |text| {
+            if (text.len > water) {
+                _ = try writeTrimmedString(writer, text, water);
+            } else {
+                try std.json.Stringify.encodeJsonString(text, .{}, writer);
+            }
+        },
+        .array => |items| {
+            try writer.writeByte('[');
+            for (items.items, 0..) |item, index| {
+                if (index != 0) try writer.writeByte(',');
+                try writeTrimmedValue(writer, item, water);
+            }
+            try writer.writeByte(']');
+        },
+        .object => |nested| {
+            try writer.writeByte('{');
+            var first = true;
+            var it = nested.iterator();
+            while (it.next()) |entry| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+                try std.json.Stringify.encodeJsonString(entry.key_ptr.*, .{}, writer);
+                try writer.writeByte(':');
+                try writeTrimmedValue(writer, entry.value_ptr.*, water);
+            }
+            try writer.writeByte('}');
+        },
+        else => try std.json.Stringify.value(value, .{}, writer),
+    }
 }
 
 const PREVIEW_ELISION = "\n...[trimmed to fit context]...\n";
@@ -1801,4 +1887,85 @@ test "trimming a fallback envelope corrects the counters it invalidates" {
         @as(i64, @intCast(head.len - PREVIEW_ELISION.len)),
         obj.get("preview_head_bytes").?.integer,
     );
+}
+
+test "a trimmed envelope's elision count still adds up" {
+    // Correcting two of the three counters is not correcting them. An envelope
+    // that reports `omitted_bytes` from before the trim understates the gap -
+    // it told the model 6144 bytes were missing out of 30720 when the real
+    // figure was 22896 - and the model decides whether to recover from exactly
+    // that number.
+    const allocator = std.testing.allocator;
+    const body = try allocator.alloc(u8, 30 * 1024);
+    defer allocator.free(body);
+    @memset(body, 'f');
+    const content: []const u8 = try renderFallbackEnvelope(allocator, "text/plain; charset=utf-8", body, 24 * 1024, "artifact_store_unavailable");
+    defer allocator.free(@constCast(content));
+
+    for ([_]usize{ 2, 3, 5, 8 }) |divisor| {
+        const shrunk = shrinkStructuredResult(allocator, content, content.len / divisor) orelse continue;
+        defer allocator.free(shrunk);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        const original = object.get("original_bytes").?.integer;
+        const head = object.get("preview_head_bytes").?.integer;
+        const tail = object.get("preview_tail_bytes").?.integer;
+        const omitted = object.get("omitted_bytes").?.integer;
+        try std.testing.expectEqual(original, head + tail + omitted);
+    }
+}
+
+test "a long string nested inside the result is trimmed too" {
+    // Only top-level strings were trimmed, so `{"rows":[{"text": <40KB>}]}`
+    // had nothing to give and fell through to the text truncation that
+    // destroys the JSON - the shape most tool results actually have.
+    const allocator = std.testing.allocator;
+    const filler = try allocator.alloc(u8, 40 * 1024);
+    defer allocator.free(filler);
+    @memset(filler, 'n');
+    filler[0] = 'H';
+    filler[filler.len - 1] = 'T';
+    const nested = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema_version\":\"probe.v1\",\"exit_code\":3,\"rows\":[{{\"text\":\"{s}\"}}]}}",
+        .{filler},
+    );
+    defer allocator.free(nested);
+
+    const shrunk = shrinkStructuredResult(allocator, nested, nested.len / 3) orelse
+        return error.ShrinkRefused;
+    defer allocator.free(shrunk);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+    defer parsed.deinit();
+    // Structure and the short fields intact, the deep string cut head/tail.
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("exit_code").?.integer);
+    const text = parsed.value.object.get("rows").?.array.items[0].object.get("text").?.string;
+    try std.testing.expect(text.len < filler.len);
+    try std.testing.expect(std.mem.startsWith(u8, text, "H"));
+    try std.testing.expect(std.mem.endsWith(u8, text, "T"));
+}
+
+test "a structured result with nothing to trim is left whole, never mangled" {
+    // A large numeric array has no string to give back. Trimming cannot help,
+    // and the text path would emit something no consumer can parse - so the
+    // valve keeps it oversized instead. One extra request beats a destroyed
+    // schema, which is the same call `hasRecoverableArtifact` already makes.
+    const allocator = std.testing.allocator;
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try buf.writer.writeAll("{\"schema_version\":\"probe.v1\",\"exit_code\":0,\"rows\":[");
+    var index: usize = 0;
+    while (index < 6000) : (index += 1) {
+        if (index != 0) try buf.writer.writeByte(',');
+        try buf.writer.print("{d}", .{index});
+    }
+    try buf.writer.writeAll("]}");
+    const content = buf.written();
+
+    try std.testing.expect(isStructuredObject(content));
+    try std.testing.expect(shrinkStructuredResult(allocator, content, content.len / 3) == null);
+    // Plain text is still fair game for the text path - it has no schema to
+    // destroy.
+    try std.testing.expect(!isStructuredObject("just a long plain string of output"));
 }

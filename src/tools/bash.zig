@@ -737,17 +737,18 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
+    // No staging path here either. `job_id` is the stable handle - it is what
+    // BashOutput takes, it does not move between runs of the same command, and
+    // it names no host temp directory. Handing back the spool path instead
+    // made the same command serialize differently on every run, which is the
+    // prompt-cache contract's "random ids" and "staging paths" clauses at once.
     try aw.writer.writeAll("{\"auto_backgrounded\":true,\"job_id\":");
     try std.json.Stringify.encodeJsonString(j.id[0..], .{}, &aw.writer);
-    try aw.writer.writeAll(",\"stdout_path\":");
-    try std.json.Stringify.encodeJsonString(j.stdout_path, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"stderr_path\":");
-    try std.json.Stringify.encodeJsonString(j.stderr_path, .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stdout\":");
     try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stderr\":");
     try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. Use BashOutput to poll, or Read on stdout_path/stderr_path to read captured output directly.\"}");
+    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. Poll it with BashOutput using this job_id; stdout_since_byte/stderr_since_byte read incrementally so a long job does not re-send what you already have.\"}");
     return try aw.toOwnedSlice();
 }
 
@@ -859,9 +860,12 @@ test "BashTool auto-backgrounds after 15s" {
     }
 }
 
-test "formatAutoBackgrounded 返回 stdout_path/stderr_path 供 Read 直接读" {
-    // 对齐 cc: auto-backgrounded 响应必须含 stdout_path/stderr_path,
-    // 否则模型被迫 BashOutput 轮询,长任务时陷入"轮询无果"死循环。
+test "formatAutoBackgrounded 交出稳定的 job_id,而不是 staging 路径" {
+    // 曾经交出 stdout_path/stderr_path 让模型直接 Read。但 doc/API.md 的
+    // prompt-cache contract 把 staging path 与随机 id 都列为 never
+    // model-visible,而 JobRegistry spool 路径两者皆是:同一条命令每次运行都会
+    // 因随机 job 目录改变 provider 可见字节,并泄露宿主临时目录。job_id 是稳定
+    // 句柄,BashOutput 用它增量读,能力不减。
     const a = std.testing.allocator;
     var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer registry.deinit();
@@ -871,11 +875,14 @@ test "formatAutoBackgrounded 返回 stdout_path/stderr_path 供 Read 直接读" 
     defer a.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"auto_backgrounded\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"job_id\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_path\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"stderr_path\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "partial_stdout") != null);
-    // note 应引导模型用 Read 读 path
-    try std.testing.expect(std.mem.indexOf(u8, result, "Read on stdout_path") != null);
+    // staging 路径一个都不许出现——字段名与真实路径都不行。
+    try std.testing.expect(std.mem.indexOf(u8, result, "stdout_path") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "stderr_path") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, j.stdout_path) == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, j.stderr_path) == null);
+    // note 改为引导 BashOutput + job_id 增量读。
+    try std.testing.expect(std.mem.indexOf(u8, result, "BashOutput") != null);
 }
 
 test "completed job output becomes a bounded recoverable channel artifact" {

@@ -778,10 +778,14 @@ fn boundToolResultContent(allocator: std.mem.Allocator, content: []const u8, max
     // and flag down with the one long string that made the result oversized.
     if (result_projection.shrinkStructuredResult(allocator, content, max_bytes)) |shrunk|
         return shrunk;
-    // Structured but unshrinkable, and carrying the only handle back to its
-    // bytes: leaving it oversized costs a request, mangling it costs the
-    // output.
+    // Structured but unshrinkable - a result whose bulk is not in its strings,
+    // say a large numeric array. Trimming found nothing to give back, and the
+    // text path would emit unparseable output, so it is left oversized: that
+    // costs one request, where destroying the schema costs the result. Same
+    // reasoning as the recoverable-artifact case, and the reason the text path
+    // below is reserved for content that was never structured.
     if (result_projection.hasRecoverableArtifact(content)) return null;
+    if (result_projection.isStructuredObject(content)) return null;
     return truncateToolResultContent(allocator, content, max_bytes) catch null;
 }
 
