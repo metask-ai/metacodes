@@ -884,16 +884,6 @@ fn receiptFor(snapshot: FileSnapshot) Receipt {
     return .{ .artifact_id = artifact_id, .sha256 = snapshot.sha256, .bytes = snapshot.bytes };
 }
 
-/// Resolve a published artifact to its on-disk blob so a search tool can run
-/// over it in place.
-///
-/// `ReadArtifact` can only hand back byte ranges, which makes recovering a
-/// large result O(size / MAX_READ_BYTES) round trips and cannot answer a
-/// question about the content at all. The blob is an ordinary file, so a
-/// search tool can answer in one call - but the path must never reach the
-/// model: it names the kernel-private store, and exposing it would let any
-/// file tool read blobs outside the bounded recovery contract. Callers pass
-/// this straight to a child process and keep it out of the result.
 /// Stable, model-visible reason a publish failed. Lives here rather than in
 /// the projection layer because both envelope families need the same names:
 /// a Bash channel that could not publish used to report `recoverable:false`
@@ -925,10 +915,18 @@ pub fn storageErrorCode(err: anyerror) []const u8 {
 /// round trip that produced the result — so the check stays exact and the
 /// cache stays telemetry.
 const QuotaCache = struct {
+    /// Which store the figure belongs to. A process publishes into more than
+    /// one session root - subagents and swarm teammates each have their own -
+    /// so a reading without an identity is a number that silently belongs to
+    /// somebody else.
     key: u64 = 0,
     used: u64 = 0,
     valid: bool = false,
 };
+
+fn usageKey(directory: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, directory);
+}
 
 /// Guarded by `persist_mutex`, which every quota check already holds.
 var quota_cache: QuotaCache = .{};
@@ -941,23 +939,29 @@ pub const SessionUsage = struct {
     observed: bool,
 };
 
-/// Last observed usage for the session this process has been publishing into.
-/// Cheap: never scans; reports the total measured by the most recent publish.
-/// Intended for telemetry, never for admission decisions.
-pub fn sessionUsage() SessionUsage {
+/// Last observed usage for `session_root`. Cheap: never scans; reports the
+/// total measured by the most recent publish **into that store**, and reports
+/// `observed = false` for any other one rather than handing back a subagent's
+/// figure as this session's. Telemetry only, never an admission decision.
+pub fn sessionUsage(session_root: []const u8) SessionUsage {
+    const unobserved: SessionUsage = .{ .used_bytes = 0, .limit_bytes = MAX_SESSION_BYTES, .observed = false };
+    if (session_root.len == 0) return unobserved;
+    var buffer: [std.fs.max_path_bytes + ARTIFACT_SUBDIR.len + 1]u8 = undefined;
+    const directory = artifactDirectoryBuf(&buffer, session_root) catch return unobserved;
     persist_mutex.lock();
     defer persist_mutex.unlock();
+    if (!quota_cache.valid or quota_cache.key != usageKey(directory)) return unobserved;
     return .{
         .used_bytes = quota_cache.used,
         .limit_bytes = MAX_SESSION_BYTES,
-        .observed = quota_cache.valid,
+        .observed = true,
     };
 }
 
 /// Admission check for `incoming` bytes into `directory`, and the one place
 /// session usage is observed. Caller holds `persist_mutex`.
 fn reserveQuota(allocator: std.mem.Allocator, directory: []const u8, incoming: u64) !void {
-    const key = std.hash.Wyhash.hash(0, directory);
+    const key = usageKey(directory);
     const used = try directoryBytes(allocator, directory);
     if (incoming > MAX_SESSION_BYTES -| used) {
         quota_cache = .{ .key = key, .used = used, .valid = true };
@@ -966,6 +970,16 @@ fn reserveQuota(allocator: std.mem.Allocator, directory: []const u8, incoming: u
     quota_cache = .{ .key = key, .used = used +| incoming, .valid = true };
 }
 
+/// Resolve a published artifact to its on-disk blob so a search tool can run
+/// over it in place.
+///
+/// `ReadArtifact` can only hand back byte ranges, which makes recovering a
+/// large result O(size / MAX_READ_BYTES) round trips and cannot answer a
+/// question about the content at all. The blob is an ordinary file, so a
+/// search tool can answer in one call - but the path must never reach the
+/// model: it names the kernel-private store, and exposing it would let any
+/// file tool read blobs outside the bounded recovery contract. Callers pass
+/// this straight to a child process and keep it out of the result.
 pub fn resolveSearchPath(
     allocator: std.mem.Allocator,
     session_root: []const u8,
@@ -1065,8 +1079,16 @@ pub fn sha256Hex(bytes: []const u8) [ID_HEX_BYTES]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+const ARTIFACT_SUBDIR = "/tool-results/sha256";
+
 fn artifactDirectory(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/tool-results/sha256", .{root});
+    return std.fmt.allocPrint(allocator, "{s}" ++ ARTIFACT_SUBDIR, .{root});
+}
+
+/// The same path without an allocation, for callers on a cheap path. Both go
+/// through `ARTIFACT_SUBDIR` so a layout change cannot move only one of them.
+fn artifactDirectoryBuf(buffer: []u8, root: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}" ++ ARTIFACT_SUBDIR, .{root});
 }
 
 fn spoolDirectory(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
@@ -1623,13 +1645,10 @@ test "session usage is observable without a second scan" {
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
     const root = root_buffer[0..root_len];
 
-    // The gauge is process-global and records whichever session the last
-    // publish measured, so this only asserts what *this* publish observed:
-    // a fresh session root scanned to exactly one blob.
     var payload: [4096]u8 = undefined;
     @memset(&payload, 'Q');
     const first = try persist(allocator, root, &payload);
-    const after_first = sessionUsage();
+    const after_first = sessionUsage(root);
     try std.testing.expect(after_first.observed);
     try std.testing.expectEqual(MAX_SESSION_BYTES, after_first.limit_bytes);
     try std.testing.expectEqual(first.bytes, after_first.used_bytes);
@@ -1637,13 +1656,46 @@ test "session usage is observable without a second scan" {
     // A second, different artifact accumulates.
     payload[0] = 'R';
     const second = try persist(allocator, root, &payload);
-    const after_second = sessionUsage();
+    const after_second = sessionUsage(root);
     try std.testing.expectEqual(after_first.used_bytes + second.bytes, after_second.used_bytes);
 
     // Re-publishing identical content is deduplicated by the CAS and must not
     // double-count.
     _ = try persist(allocator, root, &payload);
-    try std.testing.expectEqual(after_second.used_bytes, sessionUsage().used_bytes);
+    try std.testing.expectEqual(after_second.used_bytes, sessionUsage(root).used_bytes);
+}
+
+test "session usage belongs to the store it was measured in" {
+    // One process publishes into several session roots - every subagent and
+    // swarm teammate has its own. A single global figure reported as "this
+    // session's" is whichever store happened to publish last, so the gauge is
+    // keyed and a root it has not measured reads as unknown, not as zero and
+    // not as somebody else's total.
+    const allocator = std.testing.allocator;
+    var mine = std.testing.tmpDir(.{});
+    defer mine.cleanup();
+    var theirs = std.testing.tmpDir(.{});
+    defer theirs.cleanup();
+    var mine_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var theirs_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const mine_root = mine_buffer[0..try mine.dir.realPath(std.testing.io, &mine_buffer)];
+    const theirs_root = theirs_buffer[0..try theirs.dir.realPath(std.testing.io, &theirs_buffer)];
+
+    var payload: [2048]u8 = undefined;
+    @memset(&payload, 'M');
+    _ = try persist(allocator, mine_root, &payload);
+    try std.testing.expect(sessionUsage(mine_root).observed);
+    try std.testing.expect(!sessionUsage(theirs_root).observed);
+
+    @memset(&payload, 'T');
+    const theirs_receipt = try persist(allocator, theirs_root, &payload);
+    try std.testing.expect(!sessionUsage(mine_root).observed);
+    const after = sessionUsage(theirs_root);
+    try std.testing.expect(after.observed);
+    try std.testing.expectEqual(theirs_receipt.bytes, after.used_bytes);
+
+    // No root at all is unknown too, never a confident zero.
+    try std.testing.expect(!sessionUsage("").observed);
 }
 
 test "a store grown by another writer is still observed by the quota check" {

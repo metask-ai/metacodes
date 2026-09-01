@@ -65,8 +65,12 @@ pub const Config = struct {
     /// Encoded preview bytes a spilled result may keep. `null` derives it from
     /// the budget, which is the only defensible default: spilling means the
     /// content exceeded the allowance, not that the allowance disappeared.
-    /// A caller that overrides this is asking for a preview *smaller* than the
-    /// budget permits; the value is a ceiling, never a floor.
+    ///
+    /// An explicit value replaces the derivation outright rather than capping
+    /// it - tests use it to pin an exact preview against a deliberately tiny
+    /// `per_result_bytes`, which a cap would collapse to zero. It is therefore
+    /// the caller's job to keep an override inside the budget; only turn
+    /// pressure shrinks it afterwards.
     preview_bytes: ?usize = null,
 
     fn previewCap(self: Config) usize {
@@ -172,19 +176,19 @@ const Allowance = struct {
 /// water line: results below it are untouched and only those above it are
 /// trimmed, instead of the largest result being evicted outright.
 fn resolveTurnCeiling(
-    items: []const Item,
+    lengths: []const usize,
     plan: []const ItemPlan,
     fixed_cost: usize,
     per_turn_bytes: usize,
     allowance: Allowance,
 ) usize {
-    if (turnCost(items, plan, fixed_cost, allowance) <= per_turn_bytes)
+    if (turnCost(lengths, plan, fixed_cost, allowance) <= per_turn_bytes)
         return allowance.per_result_bytes;
     var low: usize = 0;
     var high: usize = allowance.per_result_bytes;
     while (low < high) {
         const mid = low + (high - low + 1) / 2;
-        if (turnCost(items, plan, fixed_cost, allowance.at(mid)) <= per_turn_bytes)
+        if (turnCost(lengths, plan, fixed_cost, allowance.at(mid)) <= per_turn_bytes)
             low = mid
         else
             high = mid - 1;
@@ -193,15 +197,15 @@ fn resolveTurnCeiling(
 }
 
 fn turnCost(
-    items: []const Item,
+    lengths: []const usize,
     plan: []const ItemPlan,
     fixed_cost: usize,
     allowance: Allowance,
 ) usize {
     var total = fixed_cost;
-    for (items, plan) |item, entry| {
+    for (lengths, plan) |len, entry| {
         if (entry.exempt) continue;
-        total +|= allowance.cost(item.content.*.len);
+        total +|= allowance.cost(len);
     }
     return total;
 }
@@ -219,6 +223,8 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
     var stats = Stats{};
     const plan = try allocator.alloc(ItemPlan, items.len);
     defer allocator.free(plan);
+    const lengths = try allocator.alloc(usize, items.len);
+    defer allocator.free(lengths);
 
     // Correct capture-time previews before anything is planned: an envelope
     // may be re-inlined outright here, which changes both what it costs and
@@ -228,11 +234,19 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         .preview_cap = config.previewCap(),
         .ceiling = config.budget.per_result_bytes,
     };
+    // Price the re-inline *before* doing it. Regrowing against the uncapped
+    // allowance and only then finding the turn cannot afford the result means
+    // reading the artifact back, inlining it, and spilling it to the same
+    // artifact again inside one pass - while reporting both "returned to the
+    // model in full" and "spilled" for the same item. Only re-inlinable
+    // envelopes are repriced here, so the ceiling this yields is never lower
+    // than the one the real pass below would have produced.
+    const regrow_allowance = uncapped.at(regrowCeiling(items, plan, lengths, config, uncapped));
     for (items) |item| {
         if (item.is_error) continue;
         if (std.mem.eql(u8, item.tool_name, "ReadArtifact")) continue;
         if (!isRecoverableEnvelope(item.content.*)) continue;
-        if (try regrowCommittedEnvelope(allocator, item, config, uncapped)) {
+        if (try regrowCommittedEnvelope(allocator, item, config, regrow_allowance)) {
             stats.envelope_regrown_count += 1;
             if (!isProjectionEnvelope(item.content.*)) stats.envelope_reinlined_count += 1;
         }
@@ -271,8 +285,9 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
     // previous shape decided per-result first and then re-spilled the largest
     // item in a loop, which could render the same result twice and could not
     // shrink anything it had already turned into an envelope.
+    for (items, 0..) |item, index| lengths[index] = item.content.*.len;
     const allowance = uncapped.at(
-        resolveTurnCeiling(items, plan, fixed_cost, config.budget.per_turn_bytes, uncapped),
+        resolveTurnCeiling(lengths, plan, fixed_cost, config.budget.per_turn_bytes, uncapped),
     );
 
     for (items, plan) |item, entry| {
@@ -292,9 +307,60 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
 
     stats.projected_bytes = literalTotal(items);
     stats.budget_exhausted = accountedTotal(items) > config.budget.per_turn_bytes;
-    const usage = artifact.sessionUsage();
+    const usage = artifact.sessionUsage(config.session_root);
     if (usage.observed) stats.session_artifact_bytes = usage.used_bytes;
     return stats;
+}
+
+/// The ceiling the regrow pass may spend, given what rewriting every committed
+/// envelope this turn would cost.
+///
+/// The regrow pass is the one place that can make a result *bigger*, and its
+/// output is exempt from the spill pass below - so if it is not bounded here,
+/// it is not bounded at all. Two ways that bites without this:
+///
+///   - one envelope re-inlined against the uncapped allowance, then spilled
+///     straight back out by the turn ceiling - the artifact read back, written
+///     again, and both "returned to the model in full" and "spilled" reported
+///     for the same item;
+///   - ten parallel tool calls whose envelopes each grow to `per_result_bytes`,
+///     which is ten times the per-result budget and well past the turn's.
+///
+/// Uses `plan` and `lengths` as scratch; both are overwritten by the real
+/// planning pass afterwards. Everything keeps the exemption and the length it
+/// has today except a committed envelope, which is made non-exempt and priced
+/// at its original's size: below the ceiling that is what re-inlining costs,
+/// and above it `Allowance.cost` charges preview-plus-scaffolding, which is
+/// exactly what regrowing costs. Nothing else is repriced, so this can only
+/// restrain the rewrite - it never spills something the real pass would have
+/// left alone.
+fn regrowCeiling(
+    items: []const Item,
+    plan: []ItemPlan,
+    lengths: []usize,
+    config: Config,
+    uncapped: Allowance,
+) usize {
+    if (config.session_root.len == 0) return uncapped.per_result_bytes;
+    var fixed_cost: usize = 0;
+    var any_regrowable = false;
+    for (items, 0..) |item, index| {
+        const content = item.content.*;
+        const read_artifact = std.mem.eql(u8, item.tool_name, "ReadArtifact");
+        // The same gate the regrow loop itself applies.
+        const regrowable = !item.is_error and !read_artifact and isRecoverableEnvelope(content);
+        const exempt = !regrowable and
+            (isImageResult(content) or item.is_error or isProjectionEnvelope(content) or read_artifact);
+        lengths[index] = if (regrowable)
+            (recoverableEnvelopeOriginalBytes(content) orelse content.len)
+        else
+            content.len;
+        plan[index] = .{ .exempt = exempt, .structured = false };
+        if (regrowable) any_regrowable = true;
+        if (exempt) fixed_cost +|= accountedBytes(content);
+    }
+    if (!any_regrowable) return uncapped.per_result_bytes;
+    return resolveTurnCeiling(lengths, plan, fixed_cost, config.budget.per_turn_bytes, uncapped);
 }
 
 /// Bytes a Bash result actually captured, summed across both channels.
@@ -390,24 +456,9 @@ fn regrowCommittedEnvelope(
     if (parsed.value != .object) return false;
     const object = parsed.value.object;
 
-    const id_value = object.get("artifact_id") orelse return false;
-    if (id_value != .string or !validArtifactId(id_value.string)) return false;
-    const original_value = object.get("original_bytes") orelse return false;
-    if (original_value != .integer or original_value.integer < 0) return false;
-    const original_bytes: u64 = @intCast(original_value.integer);
-    const media_type = switch (object.get("media_type") orelse return false) {
-        .string => |value| value,
-        else => return false,
-    };
-    const digest = switch (object.get("sha256") orelse return false) {
-        .string => |value| value,
-        else => return false,
-    };
-    if (digest.len != artifact.ID_HEX_BYTES) return false;
-    const capture_complete = switch (object.get("capture_complete") orelse return false) {
-        .bool => |value| value,
-        else => return false,
-    };
+    const identity = parseEnvelopeIdentity(object) orelse return false;
+    const original_bytes = identity.original_bytes;
+    const capture_complete = identity.capture_complete;
     const shown = previewShownBytes(object);
 
     // Re-inline whenever the whole original now fits. This is the case the
@@ -415,7 +466,7 @@ fn regrowCommittedEnvelope(
     // capture time, then kept as a 1.5KB preview under a budget with room for
     // all of it.
     if (capture_complete and original_bytes <= allowance.ceiling) {
-        if (readWholeArtifact(allocator, config.session_root, id_value.string, original_bytes)) |whole| {
+        if (readWholeArtifact(allocator, config.session_root, identity.artifact_id, original_bytes)) |whole| {
             allocator.free(@constCast(current));
             item.content.* = whole;
             return true;
@@ -423,41 +474,212 @@ fn regrowCommittedEnvelope(
     }
 
     const target = allowance.previewBytes();
+    // Sound as a cheap pre-filter in either unit: an encoded byte never costs
+    // less than the source byte it came from, so a preview fitting `target`
+    // encoded bytes can never show more than `target` source bytes.
     if (shown >= target) return false;
 
-    // One chunk per side keeps this to two reads of the artifact, which each
-    // re-verify its digest; the preview is bounded by the budget anyway.
-    const head_len: usize = @min(target * 3 / 4, artifact.MAX_READ_BYTES);
-    const tail_len: usize = @min(target -| head_len, artifact.MAX_READ_BYTES);
-    if (head_len == 0) return false;
-    var head = artifact.readChunk(allocator, config.session_root, id_value.string, 0, head_len) catch return false;
+    // Read a *superset* of what can fit, for the same reason, then cut it to
+    // the encoded budget in `renderEnvelopeWithPreview`. Handing the raw chunks
+    // over as-is would size the preview by source length and let a quote-dense
+    // or binary artifact render at up to twice the per-result budget - and a
+    // committed envelope is exempt from the spill pass, so nothing downstream
+    // would trim it back. One chunk per side keeps this to two reads, which
+    // each re-verify the artifact's digest.
+    const head_read: usize = @min(target * 3 / 4, artifact.MAX_READ_BYTES);
+    const tail_read: usize = @min(target -| head_read, artifact.MAX_READ_BYTES);
+    if (head_read == 0) return false;
+    var head = artifact.readChunk(allocator, config.session_root, identity.artifact_id, 0, head_read) catch return false;
     defer head.deinit();
-    const tail_offset = original_bytes -| tail_len;
-    var tail = if (tail_len > 0 and tail_offset >= head.bytes.len)
-        artifact.readChunk(allocator, config.session_root, id_value.string, tail_offset, tail_len) catch return false
+    const tail_offset = original_bytes -| tail_read;
+    var tail = if (tail_read > 0 and tail_offset >= head.bytes.len)
+        artifact.readChunk(allocator, config.session_root, identity.artifact_id, tail_offset, tail_read) catch return false
     else
         null;
     defer if (tail) |*chunk| chunk.deinit();
     const tail_bytes: []const u8 = if (tail) |chunk| chunk.bytes else "";
-    if (head.bytes.len + tail_bytes.len <= shown) return false;
+
+    const utf8 = isInlineUtf8(head.bytes) and isInlineUtf8(tail_bytes);
+    const rendered = try renderEnvelopeWithPreview(allocator, identity, head.bytes, tail_bytes, target, utf8);
+    // Rewriting to show no more than the capture already showed is churn: it
+    // burns the prompt-cache tail of this result for nothing.
+    if (rendered.shown_source_bytes <= shown) {
+        allocator.free(rendered.bytes);
+        return false;
+    }
+    allocator.free(@constCast(current));
+    item.content.* = rendered.bytes;
+    return true;
+}
+
+/// Everything a committed artifact envelope's recovery contract depends on,
+/// and nothing that depends on a budget. Re-rendering an envelope means
+/// re-rendering its preview around exactly these fields.
+const EnvelopeIdentity = struct {
+    artifact_id: []const u8,
+    media_type: []const u8,
+    original_bytes: u64,
+    sha256: []const u8,
+    capture_complete: bool,
+};
+
+fn parseEnvelopeIdentity(object: std.json.ObjectMap) ?EnvelopeIdentity {
+    const id_value = object.get("artifact_id") orelse return null;
+    if (id_value != .string or !validArtifactId(id_value.string)) return null;
+    const original_value = object.get("original_bytes") orelse return null;
+    if (original_value != .integer or original_value.integer < 0) return null;
+    const media_type = switch (object.get("media_type") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    const digest = switch (object.get("sha256") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    if (digest.len != artifact.ID_HEX_BYTES) return null;
+    const capture_complete = switch (object.get("capture_complete") orelse return null) {
+        .bool => |value| value,
+        else => return null,
+    };
+    return .{
+        .artifact_id = id_value.string,
+        .media_type = media_type,
+        .original_bytes = @intCast(original_value.integer),
+        .sha256 = digest,
+        .capture_complete = capture_complete,
+    };
+}
+
+/// One rendered envelope plus how many source bytes of the original its
+/// preview shows, so a caller can tell a grow from a shrink without parsing
+/// what it just wrote.
+const RenderedEnvelope = struct { bytes: []u8, shown_source_bytes: u64 };
+
+/// Render one artifact envelope, cutting its preview out of `head_source` and
+/// `tail_source` against `budget` **encoded** bytes. The single place an
+/// envelope is (re-)rendered from an identity plus two source buffers, so the
+/// grow path and the shrink path cannot cut differently.
+fn renderEnvelopeWithPreview(
+    allocator: std.mem.Allocator,
+    identity: EnvelopeIdentity,
+    head_source: []const u8,
+    tail_source: []const u8,
+    budget: usize,
+    utf8: bool,
+) !RenderedEnvelope {
+    const base64 = !utf8;
+    const head_len = result_budget.headCut(head_source, budget * 3 / 4, base64);
+    const head = head_source[0..head_len];
+    const tail_len = result_budget.tailCut(tail_source, budget -| result_budget.encodedCost(head, base64), base64);
+    const tail = tail_source[tail_source.len - tail_len ..];
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const writer = &out.writer;
-    try writeArtifactEnvelopeHead(writer, id_value.string, media_type, original_bytes, digest, capture_complete);
-    const utf8 = isInlineUtf8(head.bytes) and isInlineUtf8(tail_bytes);
-    try appendPreviewParts(
+    try writeArtifactEnvelopeHead(
         writer,
-        head.bytes,
-        tail_bytes,
-        original_bytes -| head.bytes.len -| tail_bytes.len,
-        utf8,
+        identity.artifact_id,
+        identity.media_type,
+        identity.original_bytes,
+        identity.sha256,
+        identity.capture_complete,
     );
+    try appendPreviewParts(writer, head, tail, identity.original_bytes -| head.len -| tail.len, utf8);
     try writer.writeAll(ARTIFACT_ENVELOPE_TAIL);
-    const replacement = try out.toOwnedSlice();
-    allocator.free(@constCast(current));
-    item.content.* = replacement;
-    return true;
+    return .{ .bytes = try out.toOwnedSlice(), .shown_source_bytes = head.len + tail.len };
+}
+
+/// The preview an envelope already carries, as raw source bytes.
+///
+/// `preview_head`/`preview_tail` are stored in the envelope's own encoding: a
+/// UTF-8 preview is the bytes themselves, a base64 preview has to be decoded
+/// before it can be re-cut. Caller frees both slices with `allocator`.
+const DecodedPreview = struct {
+    head: []u8,
+    tail: []u8,
+    utf8: bool,
+
+    fn deinit(self: DecodedPreview, allocator: std.mem.Allocator) void {
+        allocator.free(self.head);
+        allocator.free(self.tail);
+    }
+};
+
+fn decodeEnvelopePreview(allocator: std.mem.Allocator, object: std.json.ObjectMap) ?DecodedPreview {
+    const encoding = switch (object.get("preview_encoding") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    const utf8 = std.mem.eql(u8, encoding, "utf-8");
+    if (!utf8 and !std.mem.eql(u8, encoding, "base64")) return null;
+    const head = decodePreviewPart(allocator, object.get("preview_head"), utf8) orelse return null;
+    const tail = decodePreviewPart(allocator, object.get("preview_tail"), utf8) orelse {
+        allocator.free(head);
+        return null;
+    };
+    return .{ .head = head, .tail = tail, .utf8 = utf8 };
+}
+
+fn decodePreviewPart(allocator: std.mem.Allocator, value: ?std.json.Value, utf8: bool) ?[]u8 {
+    const text = switch (value orelse return null) {
+        .string => |string| string,
+        else => return null,
+    };
+    if (utf8) return allocator.dupe(u8, text) catch null;
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(text) catch return null;
+    const out = allocator.alloc(u8, size) catch return null;
+    decoder.decode(out, text) catch {
+        allocator.free(out);
+        return null;
+    };
+    return out;
+}
+
+/// Re-render a committed artifact envelope so the whole envelope fits
+/// `max_bytes`, keeping every identity field and shrinking only the preview.
+///
+/// The Conversation-level pressure valves bound results that entered under a
+/// different budget, and their generic head/tail truncation is a *text* edit:
+/// applied to an envelope it produces unparseable JSON, which destroys the
+/// artifact id, the digest and the read instruction - the only way the omitted
+/// bytes can ever be recovered. `clearToolResultAt` already refuses to erase
+/// that capability; this is how the truncation pass keeps the same promise
+/// while still doing its job. No store access: the preview is re-cut from the
+/// one the envelope already carries.
+///
+/// Returns null when the content is not an envelope this can rewrite, or when
+/// even a minimal envelope would not fit - the caller must then leave the
+/// result alone rather than mangle it.
+pub fn shrinkRecoverableEnvelope(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    max_bytes: usize,
+) ?[]u8 {
+    if (!isRecoverableEnvelope(content) or content.len <= max_bytes) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const identity = parseEnvelopeIdentity(parsed.value.object) orelse return null;
+    const preview = decodeEnvelopePreview(allocator, parsed.value.object) orelse return null;
+    defer preview.deinit(allocator);
+
+    const rendered = renderEnvelopeWithPreview(
+        allocator,
+        identity,
+        preview.head,
+        preview.tail,
+        max_bytes -| ENVELOPE_OVERHEAD_BYTES,
+        preview.utf8,
+    ) catch return null;
+    // The overhead constant is a measured round-up, not a proof. A media type
+    // long enough to break it means this cannot shrink the result at all, and
+    // saying so is better than returning something over the limit.
+    if (rendered.bytes.len > max_bytes or rendered.bytes.len >= content.len) {
+        allocator.free(rendered.bytes);
+        return null;
+    }
+    return rendered.bytes;
 }
 
 fn previewShownBytes(object: std.json.ObjectMap) u64 {
@@ -583,17 +805,10 @@ fn appendPreview(writer: *std.Io.Writer, content: []const u8, preview_bytes: usi
     // sized against, so the head/tail cuts are chosen by encoded cost. The
     // base64 branch has no escapes but expands 4:3, which the same accounting
     // covers by converting the budget back into source bytes.
-    const head_budget = preview_bytes * 3 / 4;
-    const head_end = if (valid_utf8)
-        result_budget.encodedPrefixLen(content, head_budget)
-    else
-        @min(content.len, head_budget * 3 / 4);
-    const remaining = content[head_end..];
-    const tail_budget = preview_bytes -| (if (valid_utf8) result_budget.encodedLen(content[0..head_end]) else head_end * 4 / 3);
-    const tail_len = if (valid_utf8)
-        result_budget.encodedSuffixLen(remaining, tail_budget)
-    else
-        @min(remaining.len, tail_budget * 3 / 4);
+    const base64 = !valid_utf8;
+    const head_end = result_budget.headCut(content, preview_bytes * 3 / 4, base64);
+    const tail_budget = preview_bytes -| result_budget.encodedCost(content[0..head_end], base64);
+    const tail_len = result_budget.tailCut(content[head_end..], tail_budget, base64);
     const tail_start = content.len - tail_len;
     try appendPreviewParts(writer, content[0..head_end], content[tail_start..], tail_start - head_end, valid_utf8);
 }
@@ -1006,3 +1221,203 @@ test "raw_bytes bills a Bash envelope by what its channels captured" {
     // Not the ~120-byte envelope: what the command actually produced.
     try std.testing.expectEqual(@as(usize, 40_021), stats.raw_bytes);
 }
+
+test "a re-rendered committed envelope stays inside the budget in every encoding" {
+    // The regrow path reads the artifact back and re-renders the preview. It
+    // has to spend the same **encoded** budget the spill path does: an
+    // escape-dense or binary artifact cut by source length renders at up to
+    // twice the per-result budget, and a committed envelope is exempt from the
+    // spill pass, so nothing downstream would trim it back.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const budget = result_budget.Budget.fromModel(200_000);
+
+    // quote: every byte escapes to two. 0x01: not inline-safe, so the preview
+    // is base64 and expands 4:3. 'L': the one-to-one control case.
+    for ([_]u8{ '"', '\n', 0x01, 'L' }) |fill| {
+        const payload = try allocator.alloc(u8, 256 * 1024);
+        defer allocator.free(payload);
+        @memset(payload, fill);
+        var content: []const u8 = try captureTimeEnvelope(allocator, root, payload);
+        defer allocator.free(@constCast(content));
+        var items = [_]Item{.{ .tool_name = "McpProbe", .content = &content, .is_error = false }};
+        const stats = try project(allocator, &items, .{ .session_root = root, .budget = budget });
+        try std.testing.expectEqual(@as(usize, 1), stats.envelope_regrown_count);
+        try std.testing.expect(isRecoverableEnvelope(content));
+        try std.testing.expect(content.len <= budget.per_result_bytes);
+        // Still a real preview, not a degenerate one traded for the bound.
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+        defer parsed.deinit();
+        const shown = parsed.value.object.get("preview_head_bytes").?.integer +
+            parsed.value.object.get("preview_tail_bytes").?.integer;
+        try std.testing.expect(shown > artifact.PREVIEW_HEAD_BYTES + artifact.PREVIEW_TAIL_BYTES);
+    }
+}
+
+test "a re-inline the turn cannot afford is never performed" {
+    // Two committed envelopes, each small enough to inline against the
+    // per-result budget but not both against the turn budget. Deciding the
+    // re-inline against the uncapped allowance read both artifacts back,
+    // inlined them, and spilled both to the same artifacts again in the same
+    // pass - reporting `envelope_reinlined_count=2` (documented as "returned
+    // to the model in full") beside `artifact_spill_count=2` for the same two
+    // results.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const payload_a = try allocator.alloc(u8, 20 * 1024);
+    defer allocator.free(payload_a);
+    @memset(payload_a, 'A');
+    const payload_b = try allocator.alloc(u8, 20 * 1024);
+    defer allocator.free(payload_b);
+    @memset(payload_b, 'B');
+
+    var first: []const u8 = try captureTimeEnvelope(allocator, root, payload_a);
+    defer allocator.free(@constCast(first));
+    var second: []const u8 = try captureTimeEnvelope(allocator, root, payload_b);
+    defer allocator.free(@constCast(second));
+    var items = [_]Item{
+        .{ .tool_name = "A", .content = &first, .is_error = false },
+        .{ .tool_name = "B", .content = &second, .is_error = false },
+    };
+    const stats = try project(allocator, &items, .{
+        .session_root = root,
+        .budget = .{ .per_result_bytes = 25_000, .per_turn_bytes = 16 * 1024 },
+    });
+    try std.testing.expectEqual(@as(usize, 0), stats.envelope_reinlined_count);
+    // `artifact_spill_count` also counts envelopes that arrived as envelopes,
+    // so the signal for "this pass spilled something" is `turn_budget_spills`.
+    try std.testing.expectEqual(@as(usize, 0), stats.turn_budget_spills);
+    // Both stay recoverable envelopes, and the pair fits the turn budget.
+    try std.testing.expect(isRecoverableEnvelope(first));
+    try std.testing.expect(isRecoverableEnvelope(second));
+    try std.testing.expect(first.len + second.len <= 16 * 1024);
+
+    // A turn with room for it still gets the full re-inline.
+    var third: []const u8 = try captureTimeEnvelope(allocator, root, payload_a);
+    defer allocator.free(@constCast(third));
+    var roomy = [_]Item{.{ .tool_name = "A", .content = &third, .is_error = false }};
+    const roomy_stats = try project(allocator, &roomy, .{
+        .session_root = root,
+        .budget = .{ .per_result_bytes = 25_000, .per_turn_bytes = 200 * 1024 },
+    });
+    try std.testing.expectEqual(@as(usize, 1), roomy_stats.envelope_reinlined_count);
+    try std.testing.expectEqualStrings(payload_a, third);
+}
+
+test "shrinkRecoverableEnvelope keeps every identity field and rewrites the counters" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    // Both preview encodings: a base64 preview has to be decoded before it can
+    // be re-cut, and re-encoded after.
+    for ([_]u8{ 'S', 0x01 }) |fill| {
+        const payload = try allocator.alloc(u8, 64 * 1024);
+        defer allocator.free(payload);
+        @memset(payload, fill);
+        var content: []const u8 = try captureTimeEnvelope(allocator, root, payload);
+        defer allocator.free(@constCast(content));
+        var items = [_]Item{.{ .tool_name = "McpProbe", .content = &content, .is_error = false }};
+        _ = try project(allocator, &items, .{
+            .session_root = root,
+            .budget = result_budget.Budget.fromModel(200_000),
+        });
+        try std.testing.expect(isRecoverableEnvelope(content));
+
+        var before = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+        defer before.deinit();
+        const target = content.len / 3;
+        const shrunk = shrinkRecoverableEnvelope(allocator, content, target) orelse
+            return error.ShrinkRefused;
+        defer allocator.free(shrunk);
+        try std.testing.expect(shrunk.len <= target);
+        try std.testing.expect(isRecoverableEnvelope(shrunk));
+        try std.testing.expect(hasRecoverableArtifact(shrunk));
+
+        var after = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+        defer after.deinit();
+        for ([_][]const u8{ "artifact_id", "media_type", "sha256", "preview_encoding" }) |key| {
+            try std.testing.expectEqualStrings(
+                before.value.object.get(key).?.string,
+                after.value.object.get(key).?.string,
+            );
+        }
+        try std.testing.expectEqual(
+            before.value.object.get("original_bytes").?.integer,
+            after.value.object.get("original_bytes").?.integer,
+        );
+        try std.testing.expect(after.value.object.get("recoverable").?.bool);
+        try std.testing.expect(after.value.object.get("read").? == .object);
+        // The counters describe the new preview, not the one it replaced.
+        const before_shown = before.value.object.get("preview_head_bytes").?.integer +
+            before.value.object.get("preview_tail_bytes").?.integer;
+        const after_shown = after.value.object.get("preview_head_bytes").?.integer +
+            after.value.object.get("preview_tail_bytes").?.integer;
+        try std.testing.expect(after_shown < before_shown);
+        try std.testing.expectEqual(
+            after.value.object.get("original_bytes").?.integer,
+            after_shown + after.value.object.get("omitted_bytes").?.integer,
+        );
+
+        // Refuses rather than mangles what it cannot rewrite.
+        try std.testing.expect(shrinkRecoverableEnvelope(allocator, content, content.len) == null);
+        try std.testing.expect(shrinkRecoverableEnvelope(allocator, "not an envelope", 8) == null);
+    }
+}
+
+test "regrowing a whole turn's envelopes stays inside the turn budget" {
+    // The regrow pass is the only step that makes a result bigger, and what it
+    // produces is exempt from the spill pass - so ten parallel tool calls, each
+    // returning a committed envelope, would each grow to the full per-result
+    // budget and put the turn ten times over it with nothing left to trim.
+    // Partial captures (`capture_complete=false`, a capture past
+    // MAX_ARTIFACT_BYTES) cannot be re-inlined but grow just the same, so the
+    // pre-pass has to price every rewritable envelope and not only the
+    // re-inlinable ones.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const count = 10;
+    var contents: [count][]const u8 = undefined;
+    var items: [count]Item = undefined;
+    for (0..count) |index| {
+        const payload = try allocator.alloc(u8, 256 * 1024);
+        defer allocator.free(payload);
+        @memset(payload, @as(u8, 'a') + @as(u8, @intCast(index)));
+        contents[index] = try captureTimeEnvelope(allocator, root, payload);
+        items[index] = .{ .tool_name = "Mcp", .content = &contents[index], .is_error = false };
+    }
+    defer for (contents) |content| allocator.free(@constCast(content));
+
+    const budget = result_budget.Budget.fromModel(200_000);
+    const stats = try project(allocator, &items, .{ .session_root = root, .budget = budget });
+    var total: usize = 0;
+    for (contents) |content| {
+        try std.testing.expect(isRecoverableEnvelope(content));
+        try std.testing.expect(content.len <= budget.per_result_bytes);
+        total += content.len;
+    }
+    try std.testing.expect(total <= budget.per_turn_bytes);
+    try std.testing.expect(!stats.budget_exhausted);
+    // Still worth doing: every one of them grew well past the 1536-byte
+    // capture preview, they were just all held to a shared water line.
+    try std.testing.expectEqual(@as(usize, count), stats.envelope_regrown_count);
+    try std.testing.expect(total > count * (artifact.PREVIEW_HEAD_BYTES + artifact.PREVIEW_TAIL_BYTES));
+}
+

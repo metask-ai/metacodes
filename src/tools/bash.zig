@@ -44,28 +44,58 @@ pub const ENVELOPE_OVERHEAD_BYTES: usize = 2048;
 /// the result, and because microcompact refuses to touch a recoverable
 /// envelope, that constant was the only decision ever made about a Bash
 /// result's size for its whole life in the Conversation.
-fn channelAllowances(budget: result_budget.Budget, stdout_bytes: u64, stderr_bytes: u64) result_budget.Pair {
+fn channelAllowances(budget: result_budget.Budget, stdout_demand: u64, stderr_demand: u64) result_budget.Pair {
     return result_budget.splitPair(
         budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES),
-        encodedDemand(stdout_bytes),
-        encodedDemand(stderr_bytes),
+        stdout_demand,
+        stderr_demand,
     );
 }
 
-/// Upper bound on the encoded size of `raw` source bytes. JSON escaping at
-/// most doubles a byte, and a channel that is not inline-safe is base64'd
-/// instead, which expands only 4:3. Splitting on this bound rather than on the
-/// raw size keeps a quote-dense channel from being cut against a ceiling its
-/// own escaping would exceed; when the escaping does not materialise the only
-/// cost is unused ceiling, which is free.
-fn encodedDemand(raw: u64) u64 {
-    return raw *| 2;
+/// What one channel actually costs the allowance, in the encoding it will be
+/// rendered in.
+///
+/// A bound was tried here first (`raw * 2`, JSON escaping's worst case) on the
+/// theory that unused ceiling is free. It is not: `splitPair` hands a channel
+/// its full stated demand and gives only the remainder to the other, so
+/// overstating a small channel takes bytes away from a large one. With the
+/// 8KiB floor budget, 5000 bytes of stdout beside 1000 bytes of stderr - 6000
+/// encoded against a 6144 allowance, comfortably whole - had stdout cut to
+/// 4142 and spilled to an artifact, destroying 858 bytes of intact output and
+/// buying a recovery round trip. Both channels are in memory here, so the real
+/// number is one linear scan away.
+fn encodedDemand(bytes: []const u8) u64 {
+    return encodedCost(bytes, !isInlineUtf8(bytes));
+}
+
+/// The same demand for a channel that lives in a spool file.
+///
+/// `splitPair` treats every demand at or above the allowance identically, so
+/// only a channel small enough to fit needs a precise one - and that channel
+/// is by definition cheap to read. Anything larger is bounded rather than
+/// measured, which keeps this off the path of a multi-gigabyte spool.
+fn fileEncodedDemand(allocator: std.mem.Allocator, path: []const u8, allowance: usize) u64 {
+    const raw = artifact.observeFileBytes(allocator, path) catch return 0;
+    if (raw == 0) return 0;
+    if (raw > allowance) return raw *| 2;
+    const whole = readWholeFile(path, allocator, @intCast(raw)) catch return raw *| 2;
+    defer allocator.free(whole);
+    return encodedDemand(whole);
 }
 const PREVIEW_OMISSION_MARKER = "\n...[middle omitted]...\n";
 
 const ChannelPreview = struct {
     content: []u8,
     shown_source_bytes: u64,
+    /// The encoding this preview's budget was spent in, carried to
+    /// `appendChannel` rather than re-derived there.
+    ///
+    /// The two used to be decided independently: the budget from the whole
+    /// channel, the rendering from the preview. A channel whose only
+    /// non-inline byte fell in the omitted middle was therefore budgeted at
+    /// base64's 4:3 and then rendered with JSON escaping's 2:1, putting the
+    /// envelope ~40% past the per-result budget it was sized against.
+    base64: bool = false,
     allocator: std.mem.Allocator,
 
     fn deinit(self: *ChannelPreview) void {
@@ -121,7 +151,7 @@ fn formatCompletedOutput(
     budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
 ) ![]u8 {
-    const allowance = channelAllowances(budget, stdout.len, stderr.len);
+    const allowance = channelAllowances(budget, encodedDemand(stdout), encodedDemand(stderr));
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"schema_version\":\"metacodes.bash-result.v2\",");
@@ -156,7 +186,7 @@ fn appendMemoryChannel(
             break :blk null;
         };
     } else null;
-    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, bytes.len, digest, stored, capture_complete, null, storage_error, metrics);
+    try appendChannel(writer, allocator, label, preview.content, preview.base64, preview.shown_source_bytes, bytes.len, digest, stored, capture_complete, null, storage_error, metrics);
 }
 
 fn appendFileChannel(
@@ -179,7 +209,7 @@ fn appendFileChannel(
         else
             .{ .content = try allocator.dupe(u8, ""), .shown_source_bytes = 0, .allocator = allocator };
         defer preview.deinit();
-        try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, observed_bytes, null, null, false, path, artifact.storageErrorCode(error.ArtifactTooLarge), metrics);
+        try appendChannel(writer, allocator, label, preview.content, preview.base64, preview.shown_source_bytes, observed_bytes, null, null, false, path, artifact.storageErrorCode(error.ArtifactTooLarge), metrics);
         return;
     };
     var preview = try headTailFilePreview(allocator, path, inspected.bytes, allowance);
@@ -191,7 +221,7 @@ fn appendFileChannel(
             break :blk null;
         };
     } else null;
-    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, inspected.bytes, inspected.sha256, stored, true, path, storage_error, metrics);
+    try appendChannel(writer, allocator, label, preview.content, preview.base64, preview.shown_source_bytes, inspected.bytes, inspected.sha256, stored, true, path, storage_error, metrics);
 }
 
 fn appendChannel(
@@ -199,6 +229,9 @@ fn appendChannel(
     allocator: std.mem.Allocator,
     label: []const u8,
     preview: []const u8,
+    /// The encoding the preview's budget was spent in. Re-deriving it here
+    /// from `preview` is what let the two disagree; see `ChannelPreview`.
+    preview_base64: bool,
     shown_source_bytes: u64,
     captured_bytes: u64,
     digest: ?[64]u8,
@@ -217,7 +250,7 @@ fn appendChannel(
         }
     }
     try writer.print("\"{s}\":", .{label});
-    if (isInlineUtf8(preview)) {
+    if (!preview_base64) {
         try std.json.Stringify.encodeJsonString(preview, .{}, writer);
         try writer.print(",\"{s}_encoding\":\"utf-8\"", .{label});
     } else {
@@ -273,23 +306,11 @@ fn appendChannel(
     }
 }
 
-/// Encoded cost of `source` in the encoding `appendChannel` will pick for it.
-fn encodedCost(source: []const u8, base64: bool) usize {
-    if (base64) return std.base64.standard.Encoder.calcSize(source.len);
-    return result_budget.encodedLen(source);
-}
-
-/// Longest prefix of `source` costing at most `max_encoded` once encoded.
-fn cutHeadEncoded(source: []const u8, max_encoded: usize, base64: bool) usize {
-    if (base64) return @min(source.len, max_encoded / 4 * 3);
-    return result_budget.encodedPrefixLen(source, max_encoded);
-}
-
-/// Longest suffix of `source` costing at most `max_encoded` once encoded.
-fn cutTailEncoded(source: []const u8, max_encoded: usize, base64: bool) usize {
-    if (base64) return @min(source.len, max_encoded / 4 * 3);
-    return result_budget.encodedSuffixLen(source, max_encoded);
-}
+/// The cut and cost primitives live in `result_budget` so this file and
+/// `result_projection` cut previews the same way.
+const encodedCost = result_budget.encodedCost;
+const cutHeadEncoded = result_budget.headCut;
+const cutTailEncoded = result_budget.tailCut;
 
 /// Head/tail split of one encoded allowance, three quarters to the head.
 /// The budget is spent in **encoded** bytes: cutting on source length instead
@@ -309,40 +330,59 @@ fn splitPreviewBudget(
     return .{ .head_len = head_len, .tail_len = tail_len };
 }
 
-fn headTailPreview(allocator: std.mem.Allocator, bytes: []const u8, max_encoded: usize) !ChannelPreview {
-    // A channel that is inline-safe stays inline-safe under any UTF-8 aligned
-    // cut, so deciding the encoding from the whole channel can only ever
-    // over-budget a preview that turns out to be clean - never under-budget a
-    // preview that turns out not to be.
-    const base64 = !isInlineUtf8(bytes);
-    if (encodedCost(bytes, base64) <= max_encoded) {
-        return .{
-            .content = try allocator.dupe(u8, bytes),
-            .shown_source_bytes = bytes.len,
-            .allocator = allocator,
-        };
-    }
+/// Head/tail lengths for one channel under one encoding. `marker` records
+/// whether the two halves are separated by the omission marker, so the cost of
+/// the marker is only charged when it is actually emitted.
+const PreviewPlan = struct { head_len: usize, tail_len: usize, marker: bool };
+
+fn planPreview(bytes: []const u8, max_encoded: usize, base64: bool) PreviewPlan {
+    if (encodedCost(bytes, base64) <= max_encoded)
+        return .{ .head_len = bytes.len, .tail_len = 0, .marker = false };
     const marker_cost = encodedCost(PREVIEW_OMISSION_MARKER, base64);
-    if (max_encoded <= marker_cost) {
-        const head_len = cutHeadEncoded(bytes, max_encoded, base64);
-        return .{
-            .content = try allocator.dupe(u8, bytes[0..head_len]),
-            .shown_source_bytes = head_len,
-            .allocator = allocator,
-        };
-    }
+    if (max_encoded <= marker_cost)
+        return .{ .head_len = cutHeadEncoded(bytes, max_encoded, base64), .tail_len = 0, .marker = false };
     const budget = max_encoded - marker_cost;
     const head_len = cutHeadEncoded(bytes, budget * 3 / 4, base64);
-    const rest = bytes[head_len..];
-    const tail_len = cutTailEncoded(rest, budget -| encodedCost(bytes[0..head_len], base64), base64);
-    const result = try std.mem.concat(allocator, u8, &.{
-        bytes[0..head_len],
-        PREVIEW_OMISSION_MARKER,
-        bytes[bytes.len - tail_len ..],
-    });
+    const tail_len = cutTailEncoded(
+        bytes[head_len..],
+        budget -| encodedCost(bytes[0..head_len], base64),
+        base64,
+    );
+    return .{ .head_len = head_len, .tail_len = tail_len, .marker = true };
+}
+
+/// Whether the bytes this plan actually shows are inline-safe. The omission
+/// marker is plain ASCII, so it cannot change the answer.
+fn planIsInlineUtf8(bytes: []const u8, plan: PreviewPlan) bool {
+    return isInlineUtf8(bytes[0..plan.head_len]) and
+        isInlineUtf8(bytes[bytes.len - plan.tail_len ..]);
+}
+
+fn headTailPreview(allocator: std.mem.Allocator, bytes: []const u8, max_encoded: usize) !ChannelPreview {
+    // Plan under JSON escaping first. That is both the common case and the
+    // expensive one (2:1 against base64's 4:3), so a plan that turns out to be
+    // inline-safe is already paid for. Only when the shown region is *not*
+    // inline-safe is the plan redone under base64 - and the decision is then
+    // carried in the returned preview, so the renderer cannot pick the other
+    // one from a cut the budget never saw.
+    var base64 = false;
+    var plan = planPreview(bytes, max_encoded, false);
+    if (!planIsInlineUtf8(bytes, plan)) {
+        base64 = true;
+        plan = planPreview(bytes, max_encoded, true);
+    }
+    const content = if (plan.marker)
+        try std.mem.concat(allocator, u8, &.{
+            bytes[0..plan.head_len],
+            PREVIEW_OMISSION_MARKER,
+            bytes[bytes.len - plan.tail_len ..],
+        })
+    else
+        try allocator.dupe(u8, bytes[0..plan.head_len]);
     return .{
-        .content = result,
-        .shown_source_bytes = head_len + tail_len,
+        .content = content,
+        .shown_source_bytes = plan.head_len + plan.tail_len,
+        .base64 = base64,
         .allocator = allocator,
     };
 }
@@ -380,21 +420,45 @@ fn headTailFilePreview(allocator: std.mem.Allocator, path: []const u8, total_byt
 
     // Decide the encoding from the *aligned* cuts, not from the raw chunks: a
     // read boundary that lands mid-codepoint would otherwise base64 an
-    // ordinary text file.
-    const provisional = splitPreviewBudget(head_raw, tail_raw, max_encoded, false);
-    const base64 = !isInlineUtf8(head_raw[0..provisional.head_len]) or
-        !isInlineUtf8(tail_raw[tail_raw.len - provisional.tail_len ..]);
-    const marker_cost = encodedCost(PREVIEW_OMISSION_MARKER, base64);
-    const cut = if (base64)
-        splitPreviewBudget(head_raw, tail_raw, max_encoded -| marker_cost, true)
+    // ordinary text file. Plan under JSON escaping first for the same reason
+    // as the in-memory path, and cut against the same budget both times so the
+    // decision and the cut it produced always belong together.
+    var base64 = false;
+    var cut = splitPreviewBudget(
+        head_raw,
+        tail_raw,
+        max_encoded -| encodedCost(PREVIEW_OMISSION_MARKER, false),
+        false,
+    );
+    if (!isInlineUtf8(head_raw[0..cut.head_len]) or
+        !isInlineUtf8(tail_raw[tail_raw.len - cut.tail_len ..]))
+    {
+        base64 = true;
+        cut = splitPreviewBudget(
+            head_raw,
+            tail_raw,
+            max_encoded -| encodedCost(PREVIEW_OMISSION_MARKER, true),
+            true,
+        );
+    }
+    // An allowance smaller than the marker itself cannot afford to say that
+    // something was omitted; emitting it anyway is the one way this path can
+    // exceed the budget it was given. `planPreview` makes the same call for
+    // the in-memory path.
+    const content = if (encodedCost(PREVIEW_OMISSION_MARKER, base64) < max_encoded)
+        try std.mem.concat(allocator, u8, &.{
+            head_raw[0..cut.head_len],
+            PREVIEW_OMISSION_MARKER,
+            tail_raw[tail_raw.len - cut.tail_len ..],
+        })
     else
-        splitPreviewBudget(head_raw, tail_raw, max_encoded -| marker_cost, false);
-    const content = try std.mem.concat(allocator, u8, &.{
-        head_raw[0..cut.head_len],
-        PREVIEW_OMISSION_MARKER,
-        tail_raw[tail_raw.len - cut.tail_len ..],
-    });
-    return .{ .content = content, .shown_source_bytes = cut.head_len + cut.tail_len, .allocator = allocator };
+        try allocator.dupe(u8, head_raw[0..cut.head_len]);
+    return .{
+        .content = content,
+        .shown_source_bytes = cut.head_len + cut.tail_len,
+        .base64 = base64,
+        .allocator = allocator,
+    };
 }
 
 fn readExactFd(fd: pfs.Fd, bytes: []u8) !void {
@@ -440,13 +504,15 @@ fn formatCompletedFiles(
     budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
 ) ![]u8 {
-    // Two extra stats so the split sees real demand: giving each channel a
-    // fixed half would forfeit half the allowance to the empty stderr that
-    // most commands produce.
+    // The split needs real demand: giving each channel a fixed half would
+    // forfeit half the allowance to the empty stderr that most commands
+    // produce, and overstating a small channel takes the difference straight
+    // out of the large one.
+    const payload = budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES);
     const allowance = channelAllowances(
         budget,
-        artifact.observeFileBytes(allocator, stdout_path) catch 0,
-        artifact.observeFileBytes(allocator, stderr_path) catch 0,
+        fileEncodedDemand(allocator, stdout_path, payload),
+        fileEncodedDemand(allocator, stderr_path, payload),
     );
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -693,7 +759,9 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
 }
 
 /// 读文件到内存,**上限 max_bytes**(轴A OOM 防线):job 输出文件可能很大(命令疯产 GB 落盘),
-/// 但同步返回只需前 MAX_OUTPUT_BYTES(30KB)展示 → 读够 cap 就停,防整读 OOM。max_bytes=0 不限。
+/// 而调用方要的只是一个有界前缀 → 读够 cap 就停,防整读 OOM。max_bytes=0 不限。
+/// cap 由调用方按各自预算给(preview 给 `max_encoded`、demand 测量给文件真实大小、
+/// 部分快照给 `common.MAX_SPAWN_CAPTURE_BYTES`),这里不再钉死某一个常量。
 fn readWholeFile(path: []const u8, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= pbuf.len) return error.PathTooLong;
@@ -1077,11 +1145,95 @@ test "channelAllowances keeps the two channels inside one per-result budget" {
     const lopsided = channelAllowances(budget, 1 << 20, 0);
     try std.testing.expectEqual(payload, lopsided.first);
     try std.testing.expectEqual(@as(usize, 0), lopsided.second);
-    // Small channels keep headroom for their own escaping rather than being
-    // capped at their raw size.
+    // Demands that both fit are both granted in full - the allowance is a
+    // ceiling, so granting exactly what was asked for cuts nothing.
     const small = channelAllowances(budget, 1000, 20);
-    try std.testing.expectEqual(@as(usize, 2000), small.first);
-    try std.testing.expectEqual(@as(usize, 40), small.second);
+    try std.testing.expectEqual(@as(usize, 1000), small.first);
+    try std.testing.expectEqual(@as(usize, 20), small.second);
+}
+
+test "a channel's demand is what it will cost, not a worst-case bound" {
+    // Escape-dense content really does cost two bytes per source byte, and a
+    // channel that is not inline-safe is base64'd at 4:3. Both have to be the
+    // number the split sees: a bound stated for one channel is subtracted from
+    // the other's share, not from thin air.
+    const a = std.testing.allocator;
+    const quotes = try a.alloc(u8, 1000);
+    defer a.free(quotes);
+    @memset(quotes, '"');
+    try std.testing.expectEqual(@as(u64, 2000), encodedDemand(quotes));
+
+    const plain = try a.alloc(u8, 1000);
+    defer a.free(plain);
+    @memset(plain, 'x');
+    try std.testing.expectEqual(@as(u64, 1000), encodedDemand(plain));
+
+    const binary = try a.alloc(u8, 999);
+    defer a.free(binary);
+    @memset(binary, 0x01);
+    try std.testing.expectEqual(@as(u64, 1332), encodedDemand(binary)); // 999 -> 4/3
+}
+
+test "an ordinary stdout/stderr pair that fits is not cut by the split" {
+    // issue #29 in miniature. 5000 bytes of stdout beside 1000 of stderr is
+    // 6000 encoded against the floor budget's 6144-byte payload allowance:
+    // whole, with room to spare. Stating stdout's demand as its worst case
+    // used to hand stderr 2000 of those bytes, cut stdout to 4142, spill it to
+    // an artifact and mark it truncated - 858 bytes of intact output destroyed
+    // and a recovery round trip bought, to save nothing.
+    const a = std.testing.allocator;
+    const out = try a.alloc(u8, 5000);
+    defer a.free(out);
+    @memset(out, 'x');
+    const err = try a.alloc(u8, 1000);
+    defer a.free(err);
+    @memset(err, 'e');
+    const envelope = try formatCompletedOutput(a, out, err, 0, "", true, .floor, null);
+    defer a.free(envelope);
+    try std.testing.expect(envelope.len <= result_budget.PER_RESULT_MIN_BYTES);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("stdout_truncated").?.bool);
+    try std.testing.expect(!parsed.value.object.get("stderr_truncated").?.bool);
+    try std.testing.expectEqual(@as(usize, 5000), parsed.value.object.get("stdout").?.string.len);
+    try std.testing.expectEqual(@as(usize, 1000), parsed.value.object.get("stderr").?.string.len);
+}
+
+test "the budgeted encoding is the rendered encoding" {
+    // A channel whose only non-inline byte falls in the omitted middle: the
+    // preview that survives is clean text. Budgeting it from the whole channel
+    // (base64, 4:3) and then rendering the preview as JSON-escaped text (2:1)
+    // put the envelope ~40% past the per-result budget - 35_087 bytes against
+    // 25_000 - and the projection layer then spilled the whole structured
+    // result, exit code and artifact ids included.
+    const a = std.testing.allocator;
+    const noisy = try a.alloc(u8, 64 * 1024);
+    defer a.free(noisy);
+    @memset(noisy, '"');
+    noisy[noisy.len / 2] = 0x01;
+    const budget = result_budget.Budget.fromModel(200_000);
+    const envelope = try formatCompletedOutput(a, noisy, "", 0, "", true, budget, null);
+    defer a.free(envelope);
+    try std.testing.expect(envelope.len <= budget.per_result_bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});
+    defer parsed.deinit();
+    // The preview that survived is clean text, so it is rendered as text - the
+    // budget and the rendering agree because only one decision was made.
+    try std.testing.expectEqualStrings("utf-8", parsed.value.object.get("stdout_encoding").?.string);
+    try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
+    try std.testing.expect(parsed.value.object.get("stdout").?.string.len > 4096);
+
+    // And a channel that is binary all the way through is still base64, still
+    // inside the budget.
+    const binary = try a.alloc(u8, 64 * 1024);
+    defer a.free(binary);
+    @memset(binary, 0x01);
+    const binary_envelope = try formatCompletedOutput(a, binary, "", 0, "", true, budget, null);
+    defer a.free(binary_envelope);
+    try std.testing.expect(binary_envelope.len <= budget.per_result_bytes);
+    var binary_parsed = try std.json.parseFromSlice(std.json.Value, a, binary_envelope, .{});
+    defer binary_parsed.deinit();
+    try std.testing.expectEqualStrings("base64", binary_parsed.value.object.get("stdout_encoding").?.string);
 }
 
 test "an unpublishable Bash channel says why, not just that it failed" {

@@ -137,6 +137,30 @@ pub fn encodedSuffixLen(bytes: []const u8, max_encoded: usize) usize {
     return bytes.len - ceilUtf8Boundary(bytes, start);
 }
 
+/// Encoded cost of `source` in the encoding the envelope will render it with.
+/// JSON escaping is per byte; base64 expands 4:3 and never escapes.
+///
+/// One definition, because every layer that cuts a preview has to agree with
+/// the layer that renders it: two independent copies of "how much will this
+/// cost" is how a preview ends up sized against one encoding and emitted in
+/// another.
+pub fn encodedCost(source: []const u8, base64: bool) usize {
+    if (base64) return std.base64.standard.Encoder.calcSize(source.len);
+    return encodedLen(source);
+}
+
+/// Longest prefix of `source` costing at most `max_encoded` once encoded.
+pub fn headCut(source: []const u8, max_encoded: usize, base64: bool) usize {
+    if (base64) return @min(source.len, max_encoded / 4 * 3);
+    return encodedPrefixLen(source, max_encoded);
+}
+
+/// Longest suffix of `source` costing at most `max_encoded` once encoded.
+pub fn tailCut(source: []const u8, max_encoded: usize, base64: bool) usize {
+    if (base64) return @min(source.len, max_encoded / 4 * 3);
+    return encodedSuffixLen(source, max_encoded);
+}
+
 pub fn floorUtf8Boundary(bytes: []const u8, desired: usize) usize {
     var end = @min(desired, bytes.len);
     if (end == bytes.len) return end;
@@ -236,5 +260,26 @@ test "encoded cuts never split a codepoint" {
         try std.testing.expect(std.unicode.utf8ValidateSlice(text[text.len - tail ..]));
         try std.testing.expect(encodedLen(text[0..head]) <= limit);
         try std.testing.expect(encodedLen(text[text.len - tail ..]) <= limit);
+    }
+}
+
+test "headCut and tailCut never exceed the encoded budget they were given" {
+    const cases = [_][]const u8{
+        "plain ascii content that maps one to one",
+        "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"",
+        "line\nline\nline\nline\nline\n",
+        "\x00\x01\x02binary\xff\xfe payload",
+        "\u{4F60}\u{597D}\u{4E16}\u{754C}",
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |base64| {
+            var limit: usize = 0;
+            while (limit <= 64) : (limit += 1) {
+                const head = headCut(case, limit, base64);
+                const tail = tailCut(case, limit, base64);
+                try std.testing.expect(encodedCost(case[0..head], base64) <= limit);
+                try std.testing.expect(encodedCost(case[case.len - tail ..], base64) <= limit);
+            }
+        }
     }
 }

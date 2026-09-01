@@ -5146,18 +5146,19 @@ test "微压缩两趟都接线:clear 与 truncate 必须同时在生产路径上
     // 恒为 0。projection 只在结果**提交那一刻**限界且从不重投影历史,所以
     // /resume 载入的历史、或切到更小窗口的模型,其超限结果没有任何一层管得到。
     // 两个压力阀点都必须按 provider 窗口派生的同一预算跑截断趟。
+    // 只数标识符,不数空白:钉死缩进会让这条守卫在任何一次重新格式化后失效,
+    // 而它要守的是"两个压力阀都调了这一趟",跟版式无关。
     const src = @embedFile("agent_loop.zig");
-    const wiring = "reduced.merge(conversation.truncateLargeToolResults(\n            conversation_mod.toolResultContextBytes(provider.maxInputTokens()),\n        ));";
     var count: usize = 0;
     var cursor: usize = 0;
-    while (std.mem.indexOfPos(u8, src, cursor, wiring)) |at| {
-        count += 1;
-        cursor = at + wiring.len;
+    while (std.mem.indexOfPos(u8, src, cursor, "reduced.merge(conversation.truncateLargeToolResults(")) |at| {
+        cursor = at + 1;
+        // 同一条语句里必须紧跟着按 provider 窗口派生的预算,不能各自造常量。
+        const tail = src[at..@min(src.len, at + 240)];
+        if (std.mem.indexOf(u8, tail, "toolResultContextBytes(provider.maxInputTokens())") != null) count += 1;
     }
     // 一处在 micro 阈值带,一处在 blocking-limit 恢复。
     try std.testing.expectEqual(@as(usize, 2), count);
-    // 且预算必须与 projection 的 per_result_bytes 同源,不能各自造常量。
-    try std.testing.expect(std.mem.indexOf(u8, src, "conversation_mod.toolResultContextBytes(provider.maxInputTokens())") != null);
 }
 
 test "parseForcedAutoCompactThreshold: 合法强制值 + 坏值回退 null" {

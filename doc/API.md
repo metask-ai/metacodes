@@ -206,6 +206,22 @@ results therefore no longer project byte-identically to builds before this
 change; committed results are still never re-projected for a later request, so
 prompt-cache prefixes are unaffected.
 
+"Encoded" is the unit everywhere, including on the two paths that are exempt
+from the spill pass and therefore have no second chance: a committed envelope
+re-rendered against the budget, and `ReadArtifact`. Both cut their payload by
+what it will cost once escaped, and the encoding chosen while budgeting is
+carried to whatever renders it rather than being decided a second time.
+
+The Conversation-level pressure valves bound results that entered under a
+different budget - a `/resume`d transcript, or a switch to a smaller window.
+Their generic head/tail truncation is a text edit, so an artifact envelope is
+first offered to `result_projection.shrinkRecoverableEnvelope`, which
+re-renders it in place with a smaller preview and every identity field intact.
+Anything that layer cannot rewrite is left oversized rather than mangled:
+`clearToolResultAt` already refuses to erase a result's only recovery
+capability, and a truncation pass that quietly did so instead would be worse
+than doing nothing.
+
 Recovery has two primitives rather than one. `ReadArtifact` returns byte
 ranges, which costs one round trip per `MAX_READ_BYTES` and cannot answer a
 question about the content; `Grep` therefore accepts `artifact_id` in place of

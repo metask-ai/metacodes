@@ -181,7 +181,16 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
             @intCast(@min(spawned.stderr.bytes, 300)),
         );
         defer allocator.free(detail);
-        common.setErrorDetail(ctx.error_detail, allocator, "ripgrep failed (exit {d}): {s}", .{ spawned.exit_code, detail });
+        // `error_detail` is rendered straight into the model-visible tool
+        // error, so a child's diagnostics are a second way the store path
+        // could reach the model. `--no-messages` suppresses ripgrep's file I/O
+        // errors today, but that is a property of ripgrep's flags rather than
+        // an invariant this file controls; the check costs one scan.
+        if (artifact_id != null and std.mem.indexOf(u8, detail, path) != null) {
+            common.setErrorDetail(ctx.error_detail, allocator, "ripgrep failed on the artifact (exit {d})", .{spawned.exit_code});
+        } else {
+            common.setErrorDetail(ctx.error_detail, allocator, "ripgrep failed (exit {d}): {s}", .{ spawned.exit_code, detail });
+        }
         return error.GrepExecFailed;
     }
 

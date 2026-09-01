@@ -644,7 +644,7 @@ pub const Conversation = struct {
                 if (tr.content.len <= max_bytes) continue;
                 if (isCommittedToolResultProjection(tr.content)) continue;
                 const before = tr.content.len;
-                const new_content = truncateToolResultContent(self.allocator, tr.content, max_bytes) catch continue;
+                const new_content = boundToolResultContent(self.allocator, tr.content, max_bytes) orelse continue;
                 self.allocator.free(@constCast(tr.content));
                 m.blocks[bi] = .{ .tool_result = .{
                     .tool_use_id = tr.tool_use_id,
@@ -751,6 +751,30 @@ fn blockEql(a: msg.Block, b: msg.Block) bool {
 
 fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
     return a.ptr == b.ptr and a.vtable == b.vtable;
+}
+
+/// Bring one oversized tool result under `max_bytes` without ever destroying
+/// the only way its omitted bytes can be recovered.
+///
+/// `truncateToolResultContent` is a *text* edit. Applied to an artifact
+/// envelope it produces unparseable JSON, which takes the artifact id, the
+/// digest and the read instruction down with it - and the next microcompact
+/// pass, no longer able to see a recoverable artifact, then clears the wreck
+/// to a stub. `clearToolResultAt` explicitly refuses to erase that capability;
+/// this pass has to keep the same promise, so an envelope is re-rendered by
+/// the layer that owns its shape and anything that layer cannot rewrite is
+/// left alone.
+///
+/// Returns null when the result must be left as it is.
+fn boundToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ?[]u8 {
+    if (result_projection.shrinkRecoverableEnvelope(allocator, content, max_bytes)) |shrunk|
+        return shrunk;
+    // Known residual: a `metacodes.bash-result.v2` envelope has no shrink
+    // path, so an oversized one (only reachable when the session moved to a
+    // smaller context window than the one it was captured under) stays whole.
+    // Leaving it oversized costs a request; mangling it costs the output.
+    if (result_projection.hasRecoverableArtifact(content)) return null;
+    return truncateToolResultContent(allocator, content, max_bytes) catch null;
 }
 
 fn truncateToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ![]u8 {

@@ -274,6 +274,14 @@ envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 S
 仅是失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新
 投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
 
+**编码后字节是唯一记账单位**:凡是"这条结果值多少字节"的判断,量的都是**渲染进信封之后**
+的字节——preview 经 JSON 转义最多翻倍、经 base64 涨 4:3。三处都踩过同一个坑(Bash 通道按
+整条通道选编码却按 preview 渲染、`regrowCommittedEnvelope` 按源字节下刀、`ReadArtifact`
+按源字节 clamp),共同后果都是"信封比它被派生自的预算大 1.4~2 倍",而这三种结果又都对
+projection 的溢出趟豁免,下游没有任何一层会把它们收回来。cut/cost 原语因此只有一份
+(`result_budget.encodedCost`/`headCut`/`tailCut`),做预算的那次决定(含 utf-8 还是 base64)
+必须**带着**传给渲染方,不允许渲染方自己再判一次。
+
 **字节预算的单一真相**:`core.result_budget.Budget` 由 provider 的 context window 派生
 (`per_result_bytes` 8..64KB、`per_turn_bytes` 16..200KB),`agent_loop` 每轮算一次,同时交给
 `ToolContext.result_budget` 和 `result_projection.project`。自己限界的工具(Bash 的
@@ -285,8 +293,23 @@ stdout/stderr 双通道)从这里取额度并按 max-min 公平切分——空 s
 `artifact.Preview` 是编译期定长数组(1536 字节,在字节流过时就填好,那时既不知道结果多大也
 没有 provider),`project` 因此在提交前按当前预算重渲染该信封——原文放得下就整条回内联
 (`envelope_reinlined_count`),放不下就把 head/tail 扩到额度(`envelope_regrown_count`)。
+这一趟是**唯一会把结果变大**的一步,而它的产物又对溢出趟豁免,所以额度必须先按整轮定价
+(`regrowCeiling`):否则要么一条信封按 per-result 内联完再被 turn 水位线原样溢出去(读一遍
+artifact、写一遍、同时报"整条回给模型"和"已溢出"),要么并行 10 个工具调用各自涨到
+per_result_bytes,合计十倍于单条预算、且下游没有任何一层收得回来。
 `ReadArtifact` 对投影豁免(否则恢复自身会递归溢出),改由 `min(MAX_READ_BYTES,
-per_result_bytes)` 限界,余量走 `next_offset`。
+per_result_bytes)` 限界——同样按**编码后**字节,并扣掉自身信封开销:chunk 是 JSON 转义
+(或 base64)进 `data` 的,按源字节限界会让引号密集内容渲染成预算的两倍,即"给超预算结果
+的恢复,比结果本身更超预算"。余量走 `next_offset`,一个字节都不丢。
+
+**压力阀不得毁掉唯一的恢复能力**:`microcompact` 的 clear 趟明确跳过带 recoverable
+artifact 的结果(那是被省略字节的唯一取回途径),`truncateLargeToolResults` 必须守同一条
+承诺——它的通用头尾截断是**文本**操作,套到信封上会切出不可解析的 JSON,artifact_id /
+sha256 / read 指令一起没,而且下一轮 clear 因为再也看不到 recoverable artifact,会把残骸
+清成 stub。因此该趟先走 `result_projection.shrinkRecoverableEnvelope`:由拥有信封形状的
+那一层原地重渲染 preview(不碰 store,head/tail 从信封自带的 preview 里重切),身份字段
+一个不动、记账数字跟着重算;这一层重写不了的(如 `metacodes.bash-result.v2`,只有会话
+换到更小窗口时才可能超限)宁可留着超限也不切坏——留着多花一次请求,切坏是输出真没了。
 
 **恢复面的两个原语**:`ReadArtifact` 只能取字节区间,恢复一个 N 字节结果要
 O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。`Grep` 因此接受
@@ -299,8 +322,10 @@ O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。
 **配额与可见性**:`MAX_SESSION_BYTES` 检查每次发布都做一次全目录扫描,**刻意保持精确**
 ——session root 由子 agent 与跨进程 swarm teammate 共享,缓存总量只能是下界,信它就会
 在别的写者活跃时越过配额;那次扫描的代价(最坏几千次 syscall)相对一次模型往返是噪声。
-扫描顺带写入 `sessionUsage()`(纯遥测,不参与准入),经 `Stats.session_artifact_bytes`
-进 projection 日志行,让"逼近配额"在变成永久不可恢复之前可见。发布失败的原因由
+扫描顺带写入 `sessionUsage(session_root)`(纯遥测,不参与准入;按 store 键控,一个进程会
+往多个 session root 发布——每个子 agent、每个 swarm teammate 一个——所以没测量过的 root
+读出来是"未知"而不是别人的总量),经 `Stats.session_artifact_bytes` 进 projection 日志行,
+让"逼近配额"在变成永久不可恢复之前可见。发布失败的原因由
 `artifact.storageErrorCode` 统一命名,generic 信封与 Bash 通道
 (`<channel>_storage_error`)共用同一套码,不再出现"只说 recoverable:false 不说为什么"。
 **没有淘汰策略**:artifact id 已经写进 conversation/transcript 并对模型承诺过
@@ -315,8 +340,9 @@ O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。
 JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次同步调用建立临时 registry，
 不会退回 pipe 全量捕获。已完成的 Bash 信封同时给出 `<channel>_path`(JobRegistry 落盘位置,
 在 OS 临时目录而非 artifact CAS 内,且不随 registry 销毁而失效):它让 `Read`/`Grep` 能直接
-搜索,并且是捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时**唯一**剩下的句柄。MCP stdio、AgentCore MCP connector、process plugin 与公开 Host
-stream ABI 都复用同一 CAS/receipt/`ReadArtifact` 恢复面。
+搜索,并且是捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时**唯一**剩下的句柄。MCP stdio、
+AgentCore MCP connector、process plugin 与公开 Host stream ABI 都复用同一
+CAS/receipt/`ReadArtifact` 恢复面。
 
 真实 rollout 的非敏感证据用 `scripts/eval/tool_result_projection_eval.py <cassette>
 --headless-result <result.ndjson> --time-file <time.txt>` 导出；报告只含尺寸、hash、usage、
