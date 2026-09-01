@@ -626,10 +626,19 @@ to the historical path, which still serves proxies and server-catalog models.
 | `src/api/auth_header.zig` | transport-side auth materialization |
 | `src/util/json_merge.zig` | order-preserving JSON object merge |
 
-`zig build test:provider` compiles the subsystem from a root that reaches only
-`std`, `types.zig`, `util/model.zig`, and the portable `platform` layer
-(sync/fs). If a provider module ever grows a dependency on the transport, the
-TUI, or a UI protocol, that step stops compiling.
+`zig build test:provider` compiles the subsystem from a narrow root, proving it
+builds standalone. It does **not** enforce the import boundary — that root sits
+at `src/`, so every file below it is importable, and adding `src/client.zig`
+compiles cleanly.
+
+`zig build subsystem:boundary` enforces the rule where the rule lives, in the
+source: every `@import` in `src/provider/**` must resolve inside the subsystem,
+to one of six named leaf files, or to `std`/`builtin`/`platform`; the picker's
+two files may reach the provider kernel and the terminal theme and nothing else.
+Imports are resolved against the importing file, so `../ids.zig` from a profile
+and `ids.zig` from the kernel are checked as the one path they name — and the
+gate is verified to reject `../client.zig` from the kernel, `../../client.zig`
+from a profile, and `../app.zig` from the picker.
 
 ## Not implemented yet
 

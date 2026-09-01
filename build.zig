@@ -1370,12 +1370,12 @@ pub fn build(b: *std.Build) void {
     lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test, windows_test_prelude).step);
 
     // test:provider —— issue #16 provider offer kernel, in isolation.
-    // The subsystem must stay reachable from a root that pulls in nothing
-    // beyond std, types.zig, util/model.zig, and the portable `platform` layer
-    // (sync/fs): if a provider module ever grows a dependency on the transport,
-    // the TUI, or a UI protocol, this step stops compiling. Its tests also run
-    // inside the aggregate `test` gate; this step exists for the dependency
-    // proof, not for extra coverage.
+    // Compiles the subsystem from a narrow root, which proves it *builds*
+    // standalone. It does not enforce the import boundary — the module root is
+    // `src/`, so any file under it is importable — that is
+    // `subsystem:boundary`'s job. Its tests also run inside the aggregate
+    // `test` gate; this step exists for the standalone-build proof, not for
+    // extra coverage.
     const provider_test_mod = b.createModule(.{
         .root_source_file = b.path("src/provider_test_root.zig"),
         .target = target,
@@ -1387,11 +1387,37 @@ pub fn build(b: *std.Build) void {
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
     provider_test_step.dependOn(&addTestRunArtifact(b, provider_test, windows_test_prelude).step);
 
+    // subsystem:boundary —— the provider kernel and the picker may import only
+    // what their doc comments say. The compile-from-a-narrow-root gates below
+    // cannot enforce it: their module root is `src/`, so any file under it is
+    // importable. This checks the rule where the rule lives, in the source.
+    const subsystem_boundary_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/subsystem_boundary_gate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const subsystem_boundary_exe = b.addExecutable(.{
+        .name = "subsystem-boundary-gate",
+        .root_module = subsystem_boundary_mod,
+    });
+    const subsystem_boundary_run = b.addRunArtifact(subsystem_boundary_exe);
+    subsystem_boundary_run.setCwd(b.path("."));
+    subsystem_boundary_run.addArg(".");
+    const subsystem_boundary_unit = b.addTest(.{
+        .name = "subsystem-boundary-gate-unit",
+        .root_module = subsystem_boundary_mod,
+    });
+    const subsystem_boundary_step = b.step(
+        "subsystem:boundary",
+        "Enforce the provider and picker import boundaries (issue #16)",
+    );
+    subsystem_boundary_step.dependOn(&subsystem_boundary_run.step);
+    subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit, windows_test_prelude).step);
+
     // test:picker —— issue #16 cross-UI model picker, in isolation.
-    // The picker must be a *client* of the control plane: it may reach the
-    // provider kernel and the terminal theme, and nothing else. A dependency on
-    // `App`, the transport, or a provider client stops this step compiling,
-    // which is the same boundary `test:provider` enforces from the other side.
+    // Same shape as `test:provider`: it proves the picker builds standalone.
+    // The rule that it may reach only the provider kernel and the terminal
+    // theme is enforced by `subsystem:boundary`.
     const picker_test_mod = b.createModule(.{
         .root_source_file = b.path("src/picker_test_root.zig"),
         .target = target,
@@ -1465,6 +1491,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(http_status_gate_step);
+    test_step.dependOn(subsystem_boundary_step);
     const tinykg_contract_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",

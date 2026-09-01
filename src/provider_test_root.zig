@@ -1,10 +1,14 @@
 //! Isolation root for the `src/provider/` subsystem.
 //!
-//! Rooting a test compilation at `src/` lets the provider modules reach
-//! `types.zig`, `util/model.zig`, and the portable `platform` layer while
-//! proving the subsystem pulls in nothing heavier: if a provider module ever
-//! grows a dependency on the TUI, the transport, or a UI protocol, this root
-//! stops compiling.
+//! Rooting a test compilation at `src/` proves the subsystem *builds*
+//! standalone — it needs no named module beyond `platform`.
+//!
+//! It does **not** enforce the import boundary, and used to claim it did:
+//! because the module root is `src/`, adding `src/client.zig` here compiles
+//! cleanly. The rule that the provider kernel may reach only `types.zig`, three
+//! leaf utilities, and `platform` is checked at the source level by
+//! `zig build subsystem:boundary`, which is verified to catch exactly that
+//! reach.
 
 const std = @import("std");
 

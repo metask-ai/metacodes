@@ -1,10 +1,10 @@
 //! Isolation root for the cross-UI model picker (issue #16, delivery slice P1).
 //!
-//! The picker is a client of the control plane, and this root proves it: it
-//! reaches the provider kernel and the terminal theme, and nothing else. If the
-//! picker ever grows a dependency on `App`, the transport, or a provider
-//! client, this step stops compiling — which is the same guarantee
-//! `test:provider` gives from the other side of the boundary.
+//! Proves the picker *builds* standalone. The rule that it may reach only the
+//! provider kernel and the terminal theme — and never `App`, the transport, or
+//! a provider client — is enforced by `zig build subsystem:boundary`, because a
+//! root under `src/` cannot enforce it: every file below `src/` is importable
+//! from here.
 
 const std = @import("std");
 
