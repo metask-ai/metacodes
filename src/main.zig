@@ -281,15 +281,14 @@ fn applyProviderRoute(
     profile_name: ?[]const u8,
 ) void {
     const startup = @import("provider/startup.zig");
-    var registry = @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator) catch {
+    const host = buildProviderHost(allocator) orelse {
         std.debug.print("error: provider registry initialization failed\n", .{});
         std.process.exit(2);
     };
-    defer registry.deinit();
-    var custom = loadCustomProviders(allocator, &registry);
-    defer if (custom) |*definitions| definitions.deinit();
+    defer host.destroy();
+    const registry = &host.registry;
 
-    const outcome = startup.resolve(allocator, &registry, .{
+    const outcome = startup.resolve(allocator, registry, .{
         .provider = profile_name,
         .channel = config.provider_channel,
         .offer_id = config.provider_offer,
@@ -329,13 +328,13 @@ pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.A
     defer document.deinit();
     const selection = document.global_selection orelse return false;
 
-    var registry = provider_registry.ProviderRegistry.initWithBuiltins(allocator) catch {
+    const host = buildProviderHost(allocator) orelse {
         std.debug.print("error: provider registry initialization failed\n", .{});
         std.process.exit(2);
     };
-    defer registry.deinit();
+    defer host.destroy();
 
-    const outcome = provider_startup.resolveSelection(allocator, &registry, selection) catch {
+    const outcome = provider_startup.resolveSelection(allocator, &host.registry, selection) catch {
         std.debug.print("error: out of memory while resolving the stored provider selection\n", .{});
         std.process.exit(2);
     };
@@ -1190,12 +1189,12 @@ fn storeProviderOAuthToken(
     provider_name: []const u8,
     path: []const u8,
 ) u8 {
-    var registry = provider_registry.ProviderRegistry.initWithBuiltins(allocator) catch return 2;
-    defer registry.deinit();
-    var custom = loadCustomProviders(allocator, &registry);
-    defer if (custom) |*definitions| definitions.deinit();
+    // The same runtime a session builds, so a provider defined in the config —
+    // or one that came from a catalog — can be logged into by name.
+    const host = buildProviderHost(allocator) orelse return 2;
+    defer host.destroy();
 
-    const built = registry.find(provider_name) orelse {
+    const built = host.registry.find(provider_name) orelse {
         std.debug.print("error: unknown provider '{s}'\n", .{provider_name});
         return 2;
     };
@@ -1244,71 +1243,60 @@ fn storeProviderOAuthToken(
     return 0;
 }
 
-/// Register the user's configured providers into `registry`.
+/// Build the provider runtime the way a session does: built-in profiles, the
+/// user's `custom_providers`, any configured catalogs, the credential pool, and
+/// the disabled set.
 ///
-/// Returns the arena that owns their strings; the caller must keep it alive
-/// while the registry is in use. A malformed section is reported and skipped
-/// rather than fatal — a session with working built-in providers must still
-/// start, and the `--check-providers` dry run exists to explain the failure.
-fn loadCustomProviders(
-    allocator: std.mem.Allocator,
-    registry: *provider_registry.ProviderRegistry,
-) ?provider_custom.Definitions {
-    var store = provider_config_store.Store.initHome(allocator) catch return null;
+/// One construction path for startup route resolution, credential scoping, and
+/// `--check-providers`, because three of them assembling *different subsets*
+/// is how `--provider openrouter` came to fail for a provider the dry run
+/// happily listed. The caller destroys it.
+fn buildProviderHost(allocator: std.mem.Allocator) ?*provider_host.Host {
+    const host = provider_host.Host.create(allocator) catch return null;
+    var store = provider_config_store.Store.initHome(allocator) catch return host;
     defer store.deinit();
-    const text = store.readText() catch return null;
-    defer allocator.free(text);
-
-    var definitions = provider_custom.parse(allocator, text) catch |err| {
-        if (err != error.OutOfMemory) {
-            std.debug.print(
-                "warning: custom_providers in ~/.metacodes/config.json is invalid ({s}); " ++
-                    "run `metacodes --check-providers` for details\n",
-                .{@errorName(err)},
-            );
-        }
-        return null;
-    };
-    for (definitions.profiles()) |built| {
-        registry.register(built) catch |err| {
-            std.debug.print(
-                "warning: custom provider '{s}' was not registered ({s})\n",
-                .{ built.id.slice(), @errorName(err) },
-            );
-        };
-    }
-    return definitions;
+    host.adoptDurableState(&store);
+    return host;
 }
 
 /// `--check-providers`: validate the configuration and print every route it
 /// produces, without any network I/O. This is the dry run — it answers "would
 /// this definition work?" before a request is ever built.
 pub fn checkProviders(allocator: std.mem.Allocator) u8 {
-    var registry = provider_registry.ProviderRegistry.initWithBuiltins(allocator) catch {
+    // Built the same way a session builds it, so the dry run cannot describe a
+    // different set of routes than the one a session will actually get.
+    const host = provider_host.Host.create(allocator) catch {
         std.debug.print("error: provider registry initialization failed\n", .{});
         return 2;
     };
-    defer registry.deinit();
+    defer host.destroy();
 
     var status: u8 = 0;
     var store = provider_config_store.Store.initHome(allocator) catch null;
     defer if (store) |*value| value.deinit();
-    var definitions: ?provider_custom.Definitions = null;
-    defer if (definitions) |*value| value.deinit();
 
     if (store) |*value| {
         if (value.readText()) |text| {
             defer allocator.free(text);
-            if (provider_custom.parse(allocator, text)) |parsed| {
-                definitions = parsed;
-                for (parsed.profiles()) |built| {
-                    registry.register(built) catch |err| {
-                        std.debug.print("custom provider '{s}': NOT REGISTERED ({s})\n", .{ built.id.slice(), @errorName(err) });
-                        status = 2;
-                    };
-                }
-            } else |err| {
+            // Reported individually rather than swallowed: the whole point of a
+            // dry run is to say which definition is wrong.
+            host.adoptCustomProviders(text) catch |err| {
                 std.debug.print("custom_providers: INVALID ({s})\n", .{@errorName(err)});
+                status = 2;
+            };
+            host.ingestConfiguredCatalogs(text) catch |err| {
+                std.debug.print("provider_catalogs: NOT INGESTED ({s})\n", .{@errorName(err)});
+                status = 2;
+            };
+            if (value.load()) |loaded| {
+                var document = loaded;
+                defer document.deinit();
+                host.applyProviderConfiguration(&document) catch |err| {
+                    std.debug.print("providers: NOT APPLIED ({s})\n", .{@errorName(err)});
+                    status = 2;
+                };
+            } else |err| {
+                std.debug.print("config: unparseable ({s})\n", .{@errorName(err)});
                 status = 2;
             }
         } else |err| {
@@ -1317,12 +1305,7 @@ pub fn checkProviders(allocator: std.mem.Allocator) u8 {
         }
     }
 
-    var catalog = registry.buildCatalog(allocator, .{}) catch |err| {
-        std.debug.print("catalog: FAILED ({s})\n", .{@errorName(err)});
-        return 2;
-    };
-    defer catalog.deinit();
-
+    const catalog = host.kernel.catalogSnapshot();
     for (catalog.items()) |item| {
         const rendered = item.offer_id.render();
         std.debug.print("{s}/{s} [{s}] model={s}\n  endpoint {s}\n  offer    {s}\n", .{
@@ -1365,11 +1348,9 @@ pub fn resolveProviderScopedSecret(
 ) ![]u8 {
     const credential_mod = provider_credential;
     const provider_ids_mod = provider_ids;
-    var registry = try @import("provider/registry.zig").ProviderRegistry.initWithBuiltins(allocator);
-    defer registry.deinit();
-    var custom = loadCustomProviders(allocator, &registry);
-    defer if (custom) |*definitions| definitions.deinit();
-    const profile = registry.find(profile_name) orelse return error.UnknownProviderProfile;
+    const host = buildProviderHost(allocator) orelse return error.UnknownProviderProfile;
+    defer host.destroy();
+    const profile = host.registry.find(profile_name) orelse return error.UnknownProviderProfile;
 
     var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
     const resolved = credential_mod.resolve(.{

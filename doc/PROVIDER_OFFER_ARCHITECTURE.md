@@ -460,8 +460,11 @@ whole difference from removing it — and excludes it from the *catalog*, so
 "disabled" is true in the picker, `model.list`, and `--provider` at once rather
 than being re-checked at three call sites.
 
-`metacodes --check-providers` is the dry run: it validates the configuration and
-prints every route it produces — provider, channel, protocol, endpoint, wire
+`metacodes --check-providers` is the dry run. It builds the provider runtime the
+same way a session does — built-ins, `custom_providers`, configured catalogs,
+the credential pool, the disabled set — so it cannot describe a different set of
+routes than the one a session gets. It validates the configuration and prints
+every route it produces — provider, channel, protocol, endpoint, wire
 model id, context, price — and exits non-zero on a bad definition. No credential
 is resolved and no request URL is built, which is exactly when a bad definition
 should be explained. Validation itself happens at parse time: an endpoint the
