@@ -41,7 +41,12 @@ PER_RESULT_MIN_BYTES = 8 * 1024
 PER_RESULT_MAX_BYTES = 64 * 1024
 PER_RESULT_WINDOW_DIVISOR = 8
 
-PROJECTION_ENVELOPE_PREFIX = '{"schema_version":"metacodes.tool-result-projection'
+# Matched as a substring, not an exact prefix. Testing for the literal
+# `{"schema_version":"metacodes...` binds the audit to one writer's spacing:
+# any other emitter, or a transcript passed through a formatter, would leave
+# this silently counting zero. That is the failure mode this whole script
+# exists to catch, and it has now been written here twice.
+PROJECTION_SCHEMA = "metacodes.tool-result-projection"
 BASH_SCHEMA = "metacodes.bash-result.v2"
 RECOVERY_TOOLS = {"ReadArtifact", "Grep", "Read"}
 
@@ -85,7 +90,9 @@ class Audit:
         self.sessions += 1
         tool_of_use: dict[str, str] = {}
         command_of_use: dict[str, str] = {}
-        awaiting_recovery = False
+        # Artifact id of the last recoverable spill, waiting to see whether
+        # anything reaches for it.
+        awaiting_artifact: str | None = None
         # Command text of the last Bash call whose result came back truncated.
         # Held only to compare against the next Bash command; never reported.
         truncated_command: str | None = None
@@ -108,9 +115,10 @@ class Audit:
                         command = self._command_of(block)
                         if command:
                             command_of_use[block["id"]] = command
-                    if awaiting_recovery and name in RECOVERY_TOOLS:
-                        self.spills_recovered += 1
-                    awaiting_recovery = False
+                    if awaiting_artifact is not None and name in RECOVERY_TOOLS:
+                        if self._references_artifact(block, awaiting_artifact):
+                            self.spills_recovered += 1
+                            awaiting_artifact = None
                     if name == "Bash" and truncated_command is not None:
                         command = self._command_of(block)
                         if command and _is_rerun(truncated_command, command):
@@ -122,11 +130,47 @@ class Audit:
                         continue
                     use_id = block.get("tool_use_id")
                     self._add_result(content, tool_of_use.get(use_id))
-                    if content.startswith(PROJECTION_ENVELOPE_PREFIX):
-                        awaiting_recovery = True
+                    recoverable = self._recoverable_artifact_id(content)
+                    if recoverable is not None:
+                        awaiting_artifact = recoverable
                     if self._is_truncated_bash(content):
                         self.truncated_bash_results += 1
                         truncated_command = command_of_use.get(use_id)
+
+    @staticmethod
+    def _recoverable_artifact_id(content: str) -> str | None:
+        """The artifact id of a *recoverable* spill, or None.
+
+        Prefix-matching the schema cannot tell `projection:"artifact"` from
+        `projection:"fallback"`, and a fallback is by definition unrecoverable -
+        counting it as a spill and then arming the recovery detector meant any
+        unrelated `Read` that happened to come next was scored as a recovery.
+        """
+        if PROJECTION_SCHEMA not in content[:160]:
+            return None
+        try:
+            envelope = json.loads(content)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(envelope, dict) or envelope.get("projection") != "artifact":
+            return None
+        artifact_id = envelope.get("artifact_id")
+        return artifact_id if isinstance(artifact_id, str) and artifact_id else None
+
+    @staticmethod
+    def _references_artifact(block: dict, artifact_id: str) -> bool:
+        """Whether this call actually reaches for that artifact.
+
+        Adjacency was the old test, which scored any nearby read. With the
+        staging path gone, only an explicit `artifact_id` can recover a spill.
+        """
+        raw = block.get("input")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (ValueError, TypeError):
+                return False
+        return isinstance(raw, dict) and raw.get("artifact_id") == artifact_id
 
     @staticmethod
     def _command_of(block: dict) -> str | None:
@@ -189,7 +233,11 @@ class Audit:
         return found
 
     def _add_result(self, content: str, tool: str | None) -> None:
-        size = len(content)
+        # UTF-8 bytes, not characters. `len()` on a str counts code points, so
+        # 3000 Chinese characters reported as 3000B against an 8 KiB floor when
+        # the transcript actually holds 9000B - a systematic under-count of
+        # exactly the results most likely to be over budget.
+        size = len(content.encode("utf-8", errors="surrogatepass"))
         self.sizes.append(size)
         if size > self.budget:
             self.over_budget += 1
@@ -197,7 +245,7 @@ class Audit:
             self.unattributed += 1
         else:
             self.by_tool[tool].append(size)
-        if content.startswith(PROJECTION_ENVELOPE_PREFIX):
+        if self._recoverable_artifact_id(content) is not None:
             self.spilled += 1
         if self._is_truncated_bash(content):
             self.bash_truncated += 1

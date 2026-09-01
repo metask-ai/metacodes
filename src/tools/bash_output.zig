@@ -6,16 +6,20 @@
 //!   - `stderr`：true/false，默认 true
 //!   - `stdout_since_byte`：从 stdout 文件的第 N 字节开始读（增量）。默认 0（全读）。
 //!   - `stderr_since_byte`：同上对 stderr。
-//!   - `max_bytes`：单次读出上限（防单 turn tool_result 塞爆 context）。默认 65536。
+//!   - `max_bytes`：单次读出上限。默认由 `ctx.result_budget` 派生(不再是写死的 65536),
+//!     上限 262144;读到的内容还会按同一预算裁剪,余量走 `*_next_offset`。
 //!
 //! output:
 //!   {
 //!     "job_id":"...","status":"running|exited|killed","exit_code":N?,
-//!     "stdout":"...","stdout_total_bytes":N,"stdout_truncated":bool,
+//!     "stdout":"...","stdout_encoding":"utf-8"|"base64",
+//!     "stdout_total_bytes":N,"stdout_next_offset":N,"stdout_truncated":bool,
 //!     "stderr":"...","stderr_total_bytes":N,"stderr_truncated":bool
 //!   }
 //!
-//! 模型应该在下一次轮询时传 stdout_since_byte = 上次 stdout_total_bytes 做增量。
+//! 模型应该在下一次轮询时传 stdout_since_byte = 上次 **stdout_next_offset** 做增量。
+//! `*_total_bytes` 是文件当前大小,**不是游标**——拿它当游标会跳过"本次展示到文件末尾"
+//! 之间的全部内容(读取按预算限界后,这段通常不为空)。
 //! truncated=true 表示本次没读完，需要提高 since_byte（或 max_bytes）。
 
 const std = @import("std");
@@ -92,26 +96,34 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // same way a completed Bash result's channels do. A channel cut here is
     // still "not finished", which is what `truncated` already means, so the
     // caller's `since_byte` loop needs no new concept.
+    // A channel that is not valid UTF-8 cannot go into a JSON string: Zig's
+    // writer escapes control bytes but passes 0x80..0xff through unchanged, so
+    // `printf '\xff'` produced a result that is not UTF-8 at all. The completed
+    // Bash envelope has always picked per channel and said which; this one
+    // wrote everything as text. Budget, cut and render all read the same flag,
+    // for the reason the completed path learned the hard way.
+    const stdout_base64 = !std.unicode.utf8ValidateSlice(stdout_chunk.data);
+    const stderr_base64 = !std.unicode.utf8ValidateSlice(stderr_chunk.data);
     const shares = result_budget.splitPair(
         allowance,
-        result_budget.encodedCost(stdout_chunk.data, false),
-        result_budget.encodedCost(stderr_chunk.data, false),
+        result_budget.encodedCost(stdout_chunk.data, stdout_base64),
+        result_budget.encodedCost(stderr_chunk.data, stderr_base64),
     );
-    const stdout_shown = result_budget.headCut(stdout_chunk.data, shares.first, false);
-    const stderr_shown = result_budget.headCut(stderr_chunk.data, shares.second, false);
+    const stdout_shown = result_budget.headCut(stdout_chunk.data, shares.first, stdout_base64);
+    const stderr_shown = result_budget.headCut(stderr_chunk.data, shares.second, stderr_base64);
     if (want_stdout) {
-        try aw.writer.writeAll(",\"stdout\":");
-        try std.json.Stringify.encodeJsonString(stdout_shown.head(stdout_chunk.data), .{}, &aw.writer);
-        try aw.writer.print(",\"stdout_total_bytes\":{d},\"stdout_truncated\":{s}", .{
+        try writeChannel(&aw.writer, allocator, "stdout", stdout_shown.head(stdout_chunk.data), stdout_base64);
+        try aw.writer.print(",\"stdout_total_bytes\":{d},\"stdout_next_offset\":{d},\"stdout_truncated\":{s}", .{
             stdout_chunk.total_bytes,
+            stdout_since + stdout_shown.raw(),
             if (stdout_chunk.truncated or stdout_shown.raw() < stdout_chunk.data.len) "true" else "false",
         });
     }
     if (want_stderr) {
-        try aw.writer.writeAll(",\"stderr\":");
-        try std.json.Stringify.encodeJsonString(stderr_shown.head(stderr_chunk.data), .{}, &aw.writer);
-        try aw.writer.print(",\"stderr_total_bytes\":{d},\"stderr_truncated\":{s}", .{
+        try writeChannel(&aw.writer, allocator, "stderr", stderr_shown.head(stderr_chunk.data), stderr_base64);
+        try aw.writer.print(",\"stderr_total_bytes\":{d},\"stderr_next_offset\":{d},\"stderr_truncated\":{s}", .{
             stderr_chunk.total_bytes,
+            stderr_since + stderr_shown.raw(),
             if (stderr_chunk.truncated or stderr_shown.raw() < stderr_chunk.data.len) "true" else "false",
         });
     }
@@ -172,6 +184,33 @@ fn readFileRange(path: []const u8, since: usize, max: usize, allocator: std.mem.
         .total_bytes = total_u,
         .truncated = truncated,
     };
+}
+
+/// Write one channel plus the encoding it is in. `*_next_offset` is the cursor
+/// to resume from: `total_bytes` is the file's current size, and a caller that
+/// used it as the next `since_byte` - which the schema told it to - skipped
+/// everything between what was shown and the end of the file. With the read
+/// bounded by a budget rather than by 64 KiB, that gap became the common case:
+/// a 100 KB log showed 24 KB and lost 75 KB with `truncated: true` and no
+/// usable position to continue from.
+fn writeChannel(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    data: []const u8,
+    base64: bool,
+) !void {
+    try writer.print(",\"{s}\":", .{label});
+    if (base64) {
+        const encoder = std.base64.standard.Encoder;
+        const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
+        defer allocator.free(encoded);
+        _ = encoder.encode(encoded, data);
+        try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+    } else {
+        try std.json.Stringify.encodeJsonString(data, .{}, writer);
+    }
+    try writer.print(",\"{s}_encoding\":\"{s}\"", .{ label, if (base64) "base64" else "utf-8" });
 }
 
 fn parseUsizeArg(args: []const u8, field: []const u8) ?usize {
@@ -290,4 +329,96 @@ test "BashOutput 的默认读取落在单条预算内" {
         try std.testing.expect(parsed.value.object.get("stdout").?.string.len > 4096);
         try std.testing.expectEqual(@as(i64, 100_000), parsed.value.object.get("stdout_total_bytes").?.integer);
     }
+}
+
+test "增量游标能真正续读,不跳过被预算裁掉的部分" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // `*_total_bytes` 是文件当前大小;schema 曾让模型拿它当下次 since_byte。
+    // 读取按预算限界后,"展示到文件末尾"之间就有一大段——实测 100KB 文件首轮展示
+    // 24488 字节,按 total 续读会永久跳过 75512 字节,而 truncated=true 却没给出
+    // 任何可用位置。`*_next_offset` 就是那个位置。
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const j = try registry.spawnBackground("awk 'BEGIN { for(i=0;i<100000;i++) printf \"x\" }'", null);
+    while (registry.get(j.idSlice())) |e| {
+        if (e.status != .running) break;
+        time.sleepMs(20);
+        registry.reapExited();
+    }
+    registry.reapExited();
+    const ctx = ToolContext{
+        .allocator = a,
+        .jobs = &registry,
+        .result_budget = result_budget.Budget.fromModel(200_000),
+    };
+
+    const first_args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
+    defer a.free(first_args);
+    const first = try execute(&ctx, first_args);
+    defer a.free(first);
+    var first_parsed = try std.json.parseFromSlice(std.json.Value, a, first, .{});
+    defer first_parsed.deinit();
+    const shown_first = first_parsed.value.object.get("stdout").?.string.len;
+    const next = first_parsed.value.object.get("stdout_next_offset").?.integer;
+    try std.testing.expect(first_parsed.value.object.get("stdout_truncated").?.bool);
+    // 游标 == 已展示的字节数,而不是文件总长。
+    try std.testing.expectEqual(@as(i64, @intCast(shown_first)), next);
+    try std.testing.expectEqual(@as(i64, 100_000), first_parsed.value.object.get("stdout_total_bytes").?.integer);
+
+    // 第二轮从游标续读:必须真的拿到后面的内容,而不是空。
+    const second_args = try std.fmt.allocPrint(
+        a,
+        "{{\"job_id\":\"{s}\",\"stdout_since_byte\":{d}}}",
+        .{ j.idSlice(), next },
+    );
+    defer a.free(second_args);
+    const second = try execute(&ctx, second_args);
+    defer a.free(second);
+    var second_parsed = try std.json.parseFromSlice(std.json.Value, a, second, .{});
+    defer second_parsed.deinit();
+    const shown_second = second_parsed.value.object.get("stdout").?.string.len;
+    try std.testing.expect(shown_second > 0);
+    // 两轮相加严格前进;若拿 total 当游标,第二轮会是 0。
+    try std.testing.expect(shown_first + shown_second > shown_first);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(shown_first + shown_second)),
+        second_parsed.value.object.get("stdout_next_offset").?.integer,
+    );
+}
+
+test "二进制通道走 base64,结果仍是合法 UTF-8 JSON" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // Zig 的 JSON writer 只转义控制符,0x80..0xff 原样写出——含非 UTF-8 字节的
+    // 通道因此产出的根本不是合法 UTF-8。完成态信封一直按通道选编码并携带
+    // `*_encoding`,这里没有。
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const j = try registry.spawnBackground("printf 'A\\xffB\\xfe'", null);
+    while (registry.get(j.idSlice())) |e| {
+        if (e.status != .running) break;
+        time.sleepMs(20);
+        registry.reapExited();
+    }
+    registry.reapExited();
+    const ctx = ToolContext{ .allocator = a, .jobs = &registry };
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
+    defer a.free(args);
+    const out = try execute(&ctx, args);
+    defer a.free(out);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("base64", parsed.value.object.get("stdout_encoding").?.string);
+    // 而且解出来就是原始字节。
+    const encoded = parsed.value.object.get("stdout").?.string;
+    const decoder = std.base64.standard.Decoder;
+    const decoded = try a.alloc(u8, try decoder.calcSizeForSlice(encoded));
+    defer a.free(decoded);
+    try decoder.decode(decoded, encoded);
+    try std.testing.expectEqualSlices(u8, "A\xffB\xfe", decoded);
+    // 纯文本通道不受影响。
+    try std.testing.expectEqualStrings("utf-8", parsed.value.object.get("stderr_encoding").?.string);
 }

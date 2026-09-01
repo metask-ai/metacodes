@@ -12,7 +12,19 @@ from pathlib import Path
 
 from scripts.audit_trajectories import Audit, _is_rerun, per_result_bytes, scan
 
-PROJECTION = '{"schema_version":"metacodes.tool-result-projection.v1","projection":"artifact"'
+ARTIFACT_ID = "sha256:" + "a" * 64
+
+
+def envelope(projection: str, artifact_id: str | None = ARTIFACT_ID) -> str:
+    """A projection envelope as the Zig writer emits one: schema first."""
+    body = {
+        "schema_version": "metacodes.tool-result-projection.v1",
+        "projection": projection,
+        "artifact_id": artifact_id,
+        "original_bytes": 999,
+        "recoverable": projection == "artifact",
+    }
+    return json.dumps(body)
 
 
 def use(uid: str, name: str, **inp) -> dict:
@@ -82,8 +94,8 @@ class SpillRecoveryTest(unittest.TestCase):
         audit.add_session(
             "\n".join(
                 [
-                    line(use("a", "Grep", pattern="x"), result("a", PROJECTION + "}")),
-                    line(use("b", "ReadArtifact", artifact_id="sha256:" + "a" * 64)),
+                    line(use("a", "Grep", pattern="x"), result("a", envelope("artifact"))),
+                    line(use("b", "ReadArtifact", artifact_id=ARTIFACT_ID)),
                 ]
             )
         )
@@ -98,7 +110,7 @@ class SpillRecoveryTest(unittest.TestCase):
         audit.add_session(
             "\n".join(
                 [
-                    line(use("a", "Grep", pattern="x"), result("a", PROJECTION + "}")),
+                    line(use("a", "Grep", pattern="x"), result("a", envelope("artifact"))),
                     line(use("b", "Edit", file_path="/f")),
                 ]
             )
@@ -106,6 +118,54 @@ class SpillRecoveryTest(unittest.TestCase):
         summary = audit.report(top=10)
         self.assertEqual(summary["spilled_to_artifact"], 1)
         self.assertEqual(summary["spills_recovered"], 0)
+
+
+    def test_a_fallback_envelope_is_not_a_recoverable_spill(self):
+        # `projection:"fallback"` shares the schema prefix but has no artifact
+        # behind it. Counting it as a spill and then arming the detector meant
+        # any unrelated read that came next was scored as a recovery.
+        audit = Audit(budget=1000)
+        audit.add_session(
+            "\n".join(
+                [
+                    line(
+                        use("a", "Grep", pattern="x"),
+                        result("a", envelope("fallback", artifact_id=None)),
+                    ),
+                    line(use("b", "Read", file_path="/unrelated")),
+                ]
+            )
+        )
+        summary = audit.report(top=10)
+        self.assertEqual(summary["spilled_to_artifact"], 0)
+        self.assertEqual(summary["spills_recovered"], 0)
+
+    def test_a_read_that_does_not_name_the_artifact_is_not_a_recovery(self):
+        # Adjacency was the old test. With the staging path gone, only an
+        # explicit artifact_id can recover a spill.
+        audit = Audit(budget=1000)
+        audit.add_session(
+            "\n".join(
+                [
+                    line(use("a", "Grep", pattern="x"), result("a", envelope("artifact"))),
+                    line(use("b", "ReadArtifact", artifact_id="sha256:" + "b" * 64)),
+                ]
+            )
+        )
+        summary = audit.report(top=10)
+        self.assertEqual(summary["spilled_to_artifact"], 1)
+        self.assertEqual(summary["spills_recovered"], 0)
+
+
+class ByteCountingTest(unittest.TestCase):
+    def test_sizes_are_utf8_bytes_not_code_points(self):
+        # 3000 Chinese characters are 9000 UTF-8 bytes. Counting code points
+        # under-reports exactly the results most likely to be over budget.
+        audit = Audit(budget=8 * 1024)
+        audit.add_session(line(use("a", "Read", file_path="/f"), result("a", "汉" * 3000)))
+        summary = audit.report(top=10)
+        self.assertEqual(summary["max"], 9000)
+        self.assertEqual(summary["over_budget"], 1)
 
 
 class RerunDetectionTest(unittest.TestCase):
