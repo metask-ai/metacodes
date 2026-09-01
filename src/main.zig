@@ -1256,6 +1256,16 @@ fn buildProviderHost(allocator: std.mem.Allocator) ?*provider_host.Host {
     var store = provider_config_store.Store.initHome(allocator) catch return host;
     defer store.deinit();
     host.adoptDurableState(&store);
+    if (host.startup_warning) |why| {
+        // Without this, a `custom_providers` section that failed to parse
+        // surfaces as `unknown provider 'my-relay'` with nothing connecting the
+        // two — which is the report this warning exists to prevent.
+        std.debug.print(
+            "warning: part of ~/.metacodes/config.json did not apply ({s}); " ++
+                "run `metacodes --check-providers` for details\n",
+            .{why},
+        );
+    }
     return host;
 }
 

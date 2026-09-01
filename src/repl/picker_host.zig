@@ -79,10 +79,20 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Re
     };
     switch (outcome) {
         .committed => |accepted| {
-            app.model_picker.setNotice("switched to {s} for {s}", .{
-                app.activeModel(),
-                view_mod.scopeWord(accepted.scope),
-            });
+            if (app.last_persist_error) |why| {
+                // The route is live; what failed is making it survive a
+                // `/resume`. Saying "switched" alone would be true and
+                // misleading.
+                app.model_picker.setNotice("switched to {s}, but it was not saved ({s})", .{
+                    app.activeModel(),
+                    why,
+                });
+            } else {
+                app.model_picker.setNotice("switched to {s} for {s}", .{
+                    app.activeModel(),
+                    view_mod.scopeWord(accepted.scope),
+                });
+            }
             ui.picker_open = false;
             return .committed;
         },

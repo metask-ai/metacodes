@@ -41,6 +41,13 @@ pub const Host = struct {
     custom: ?custom_provider.Definitions = null,
     /// Owns the strings of a provider catalog ingested at runtime.
     catalog_arena: ?std.heap.ArenaAllocator = null,
+    /// Why a stage of `adoptDurableState` did not apply, if one did not.
+    ///
+    /// This subsystem must not print — it has no UI and no business owning one
+    /// — but swallowing the reason entirely means a broken `custom_providers`
+    /// section shows up much later as "unknown provider", with nothing to
+    /// connect the two. The caller reports it.
+    startup_warning: ?[]const u8 = null,
     /// The configuration currently applied to the catalog, owned here.
     ///
     /// Catalog options are *host state*, not a per-call argument: a rebuild
@@ -363,6 +370,13 @@ pub const Host = struct {
         retired_exclusions.deinit(self.allocator);
     }
 
+    /// Record the first reason a startup stage did not apply. The first is the
+    /// most useful: later stages often fail *because* of it.
+    fn noteStartupWarning(self: *Host, err: anyerror) void {
+        if (self.startup_warning != null) return;
+        self.startup_warning = @errorName(err);
+    }
+
     /// Load the durable document and seed the kernel with what it holds: the
     /// config revision `selection.commit` compares against, and the global
     /// selection a previous run committed.
@@ -374,14 +388,14 @@ pub const Host = struct {
     pub fn adoptDurableState(self: *Host, store: *const config_store.Store) void {
         if (store.readText()) |text| {
             defer self.allocator.free(text);
-            self.adoptCustomProviders(text) catch {};
-            self.ingestConfiguredCatalogs(text) catch {};
-        } else |_| {}
+            self.adoptCustomProviders(text) catch |err| self.noteStartupWarning(err);
+            self.ingestConfiguredCatalogs(text) catch |err| self.noteStartupWarning(err);
+        } else |err| self.noteStartupWarning(err);
 
-        var document = store.load() catch return;
+        var document = store.load() catch |err| return self.noteStartupWarning(err);
         defer document.deinit();
         self.kernel.adoptConfigRevision(document.config_revision);
-        self.applyProviderConfiguration(&document) catch {};
+        self.applyProviderConfiguration(&document) catch |err| self.noteStartupWarning(err);
         if (document.global_selection) |selection| {
             self.kernel.seedGlobalSelection(selection);
         }
@@ -884,4 +898,27 @@ test "a configured provider may not take over a built-in vendor's id" {
         "https://api.openai.com/v1",
         host.registry.find("openai").?.channels[0].base_url,
     );
+}
+
+test "a startup stage that does not apply records why" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try std.testing.expect(host.startup_warning == null);
+
+    // A broken section otherwise disappears, and surfaces much later as
+    // "unknown provider 'my-relay'" with nothing connecting the two.
+    host.adoptCustomProviders(
+        \\{"custom_providers": {"broken": {
+        \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}]}}}
+    ) catch |err| host.noteStartupWarning(err);
+    try std.testing.expectEqualStrings("NoModels", host.startup_warning.?);
+
+    // The first reason is kept: later stages often fail *because* of it, so the
+    // last one is the least useful to report.
+    host.noteStartupWarning(error.SomethingLater);
+    try std.testing.expectEqualStrings("NoModels", host.startup_warning.?);
+
+    // And the built-in providers still work.
+    try std.testing.expect(host.kernel.catalogSnapshot().items().len > 0);
 }

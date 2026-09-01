@@ -296,6 +296,9 @@ pub const App = struct {
     /// than propagated — and reported, because a silently skipped refresh looks
     /// exactly like a successful one.
     last_catalog_refresh_error: ?[]const u8 = null,
+    /// Why the last committed selection was not written durably, if it was not.
+    /// The route is live regardless; what is lost is surviving a `/resume`.
+    last_persist_error: ?[]const u8 = null,
     /// 模型档位表(~/.metacodes/config.json 的 model_tiers;null=未配置)。
     model_tiers_table: ?@import("api/model_tiers.zig").TierTable = null,
     pending_previous_model_for_compact: ?[]u8 = null,
@@ -981,6 +984,16 @@ pub const App = struct {
         };
         defer store.deinit();
         host.adoptDurableState(&store);
+        if (host.startup_warning) |why| {
+            // Reported once, when the host is built. A broken section otherwise
+            // surfaces much later as "unknown provider" with nothing to connect
+            // it to the configuration that caused it.
+            @import("util/log.zig").warn(
+                "provider",
+                "part of ~/.metacodes/config.json did not apply ({s}); run `metacodes --check-providers`",
+                .{why},
+            );
+        }
         app.seedStartupSelection(host);
         app.provider_host = host;
         return host;
@@ -1154,6 +1167,7 @@ pub const App = struct {
         commit: model_picker_mod.Commit,
     ) !provider_control_plane.CommitOutcome {
         const host = try app.providerHost();
+        app.last_persist_error = null;
         var candidate = provider_selection_mod.RuntimeSelection.pinned(
             commit.offer_id,
             commit.offer_revision,
@@ -1172,7 +1186,12 @@ pub const App = struct {
                 // A session-scoped choice is durable *for this session*: it has
                 // to survive a resume, and it must not reach any other session,
                 // which is why it goes to the session's own file.
-                if (accepted.scope == .session) app.persistSessionSelection(accepted.selection) catch {};
+                if (accepted.scope == .session) app.persistSessionSelection(accepted.selection) catch |err| {
+                    // The route is live either way; what is lost is surviving a
+                    // `/resume`, and a user told nothing would find that out
+                    // only after resuming.
+                    app.last_persist_error = @errorName(err);
+                };
             },
             // The kernel already refused; the old runtime is still the live one.
             .rejected, .conflict => {},
@@ -1778,7 +1797,16 @@ pub const App = struct {
             @import("util/time.zig").nowUnix(),
             CREDENTIAL_COOLDOWN_SECONDS,
             null,
-        ) catch return;
+        ) catch |err| {
+            // Not fatal — the request already failed — but a limit that cannot
+            // be recorded is a limit rediscovered by hitting it every run.
+            @import("util/log.zig").warn(
+                "provider",
+                "could not record the credential failure for '{s}' ({s})",
+                .{ credential_id.slice(), @errorName(err) },
+            );
+            return;
+        };
         if (app.provider_host) |host| {
             host.kernel.adoptConfigRevision(result.config_revision);
             host.kernel.noteAuthChanged(
