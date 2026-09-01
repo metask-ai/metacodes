@@ -1847,3 +1847,40 @@ test "L2: an unreachable catalog endpoint leaves the previous catalog in place" 
     // stays resolvable.
     try std.testing.expectEqual(before, host.kernel.catalogSnapshot().items().len);
 }
+
+test "L2: a `--provider` startup route is a resolvable selection before any command runs" {
+    const a = std.testing.allocator;
+    // The turn-boundary credential refresh keys on the *effective selection*.
+    // A session that named its provider on the command line and never opened
+    // the picker has to reach one, or its OAuth token is never refreshed and it
+    // runs past expiry into 401s.
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{ .provider = "openai" });
+    var route = outcome.route;
+    defer route.deinit();
+
+    // This is what `applyStartupOutcome` puts into `Config.selected_offer_id`.
+    const rendered = route.offer_id.render();
+
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+    // And this is what `seedStartupSelection` does with it.
+    const offer_id = try cc.provider_ids.OfferId.parse(&rendered);
+    const found = host.kernel.catalogSnapshot().find(offer_id) orelse
+        return error.StartupOfferMissingFromCatalog;
+    host.kernel.seedSessionSelection(cc.provider_selection.RuntimeSelection.pinned(
+        found.offer_id,
+        found.offer_revision,
+        .session,
+    ));
+
+    // The refresh path's precondition now holds, and it resolves to the profile
+    // that owns the OAuth lifecycle.
+    const selection = host.kernel.effectiveSelection() orelse
+        return error.NoEffectiveSelection;
+    const resolution = try cc.provider_selection.resolve(host.kernel.catalogSnapshot(), selection);
+    const profile = host.registry.findById(resolution.primary().provider_id).?;
+    try std.testing.expect(profile.id.eqlText("openai"));
+    try std.testing.expect(profile.oauth_token_url != null);
+}

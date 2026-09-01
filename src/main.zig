@@ -1243,6 +1243,9 @@ fn storeProviderOAuthToken(
     return 0;
 }
 
+/// Set once the configuration warning has been shown.
+var startup_warning_reported: bool = false;
+
 /// Build the provider runtime the way a session does: built-in profiles, the
 /// user's `custom_providers`, any configured catalogs, the credential pool, and
 /// the disabled set.
@@ -1257,14 +1260,20 @@ fn buildProviderHost(allocator: std.mem.Allocator) ?*provider_host.Host {
     defer store.deinit();
     host.adoptDurableState(&store);
     if (host.startup_warning) |why| {
-        // Without this, a `custom_providers` section that failed to parse
-        // surfaces as `unknown provider 'my-relay'` with nothing connecting the
-        // two — which is the report this warning exists to prevent.
-        std.debug.print(
-            "warning: part of ~/.metacodes/config.json did not apply ({s}); " ++
-                "run `metacodes --check-providers` for details\n",
-            .{why},
-        );
+        // Once per process. Startup builds this runtime more than once — route
+        // resolution and credential scoping each need one — and repeating the
+        // same warning reads as more than one problem.
+        if (!startup_warning_reported) {
+            startup_warning_reported = true;
+            // Without this, a `custom_providers` section that failed to parse
+            // surfaces as `unknown provider 'my-relay'` with nothing connecting
+            // the two — which is the report this warning exists to prevent.
+            std.debug.print(
+                "warning: part of ~/.metacodes/config.json did not apply ({s}); " ++
+                    "run `metacodes --check-providers` for details\n",
+                .{why},
+            );
+        }
     }
     return host;
 }

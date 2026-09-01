@@ -1829,7 +1829,14 @@ pub const App = struct {
     /// Returns true when the token was replaced. Providers with no OAuth
     /// lifecycle — Metask, and every API-key profile — are a no-op.
     pub fn refreshRouteCredential(app: *App) !bool {
-        const host = app.provider_host orelse return false;
+        // A session that named its provider on the command line and never
+        // opened the picker has no host yet — and reading `provider_host`
+        // directly meant its token was never refreshed at all, which is the
+        // failure this whole path exists to prevent. Build it when the session
+        // is actually on a resolved route; a plain Metask session has no offer
+        // id and skips the work entirely.
+        if (app.provider_host == null and app.config.selected_offer_id == null) return false;
+        const host = try app.providerHost();
         const selection = host.kernel.effectiveSelection() orelse return false;
         const built = resolvedProfileFor(host, selection) orelse return false;
         const token = (try app.oauthAccessToken(built, @import("util/time.zig").nowUnix())) orelse
