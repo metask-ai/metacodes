@@ -126,6 +126,7 @@ pub const transcript = @import("core/transcript.zig");
 pub const repl_headless = @import("repl/headless.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
+pub const app_route_strings = @import("app/route_strings.zig");
 pub const tool_context = @import("tools/context.zig");
 pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
 pub const tool_error = @import("core/tool_error.zig");
@@ -1890,6 +1891,7 @@ test {
     _ = &@import("core/memory/memdir.zig");
     _ = &@import("core/memory/memory_section.zig");
     _ = &@import("app.zig");
+    _ = &@import("app/route_strings.zig");
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("util/abort.zig");

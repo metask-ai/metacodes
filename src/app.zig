@@ -109,6 +109,7 @@ const provider_ids_mod = @import("provider/ids.zig");
 const provider_credential_mod = @import("provider/credential.zig");
 const provider_config_doc = @import("provider/config_doc.zig");
 const model_picker_mod = @import("repl/model_picker.zig");
+const route_strings_mod = @import("app/route_strings.zig");
 const kg_provider_audit = @import("kg/provider_audit.zig");
 const provider_alias_mod = @import("provider/alias.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
@@ -270,8 +271,9 @@ pub const App = struct {
     /// Strings a committed offer put into borrowing client fields. Owned here
     /// because `Client.base_url` and `api_key` are borrowed slices that must
     /// outlive every in-flight request.
-    route_base_url_owned: ?[]u8 = null,
-    route_secret_owned: ?[]u8 = null,
+    /// Strings a committed route lends to the live clients. Keeps one previous
+    /// generation readable; see `app/route_strings.zig` for why.
+    route_strings: route_strings_mod.RouteStrings = undefined,
     /// A slash command asked for a full-region overlay. Commands are handled
     /// after the input reader returns, so the request is parked here and the
     /// next read consumes it.
@@ -478,6 +480,7 @@ pub const App = struct {
             .api_key = api_key,
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
             .model_picker = model_picker_mod.Picker.init(allocator),
+            .route_strings = route_strings_mod.RouteStrings.init(allocator),
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
             .session_id = if (config.session_id) |s|
@@ -873,11 +876,7 @@ pub const App = struct {
         app.model_picker.deinit();
         if (app.oauth_session) |*session| session.deinit();
         if (app.provider_host) |host| host.destroy();
-        if (app.route_base_url_owned) |value| app.allocator.free(value);
-        if (app.route_secret_owned) |value| {
-            std.crypto.secureZero(u8, value);
-            app.allocator.free(value);
-        }
+        app.route_strings.deinit();
         if (app.selected_api_key_owned) |k| {
             @memset(k, 0);
             app.allocator.free(k);
@@ -1385,15 +1384,12 @@ pub const App = struct {
 
         // From here on nothing can fail, so the switch is all-or-nothing.
         //
-        // Order matters the same way it does in `switchModel`: the old endpoint
-        // and secret are what the live clients currently point at, and a
-        // background request thread can read those fields at any moment. Every
-        // borrower is repointed first; only then is the old memory released, so
-        // there is no window in which a reader can observe a freed slice.
-        const retired_url = app.route_base_url_owned;
-        const retired_secret = app.route_secret_owned;
-        app.route_base_url_owned = endpoint;
-        app.route_secret_owned = secret;
+        // The previous endpoint and secret are *retired*, not freed: a
+        // background request thread can read `Client.base_url` and `api_key` at
+        // any moment, those fields carry no mutex, and a torn `{new_ptr,
+        // old_len}` read of a freed buffer is out of bounds. One retained
+        // generation makes the worst case a wrong-but-in-bounds string.
+        app.route_strings.install(endpoint, secret);
 
         app.config.provider_kind = binding.transport;
         app.config.openai_protocol = binding.openai_protocol;
@@ -1444,13 +1440,6 @@ pub const App = struct {
         app.swarm.provider_kind = binding.transport;
         app.swarm.openai_protocol = binding.openai_protocol;
         app.swarm.auth_scheme = binding.auth_scheme;
-
-        // Every borrower now points at the new strings.
-        if (retired_url) |old| app.allocator.free(old);
-        if (retired_secret) |old| {
-            std.crypto.secureZero(u8, old);
-            app.allocator.free(old);
-        }
     }
 
     pub fn selectApiKeyForModels(app: *App, idx: usize) !void {
@@ -1821,7 +1810,7 @@ pub const App = struct {
             app.allocator.free(token);
         }
 
-        if (app.route_secret_owned) |current| {
+        if (app.route_strings.secret) |current| {
             if (std.mem.eql(u8, current, token)) {
                 std.crypto.secureZero(u8, token);
                 app.allocator.free(token);
@@ -1844,17 +1833,15 @@ pub const App = struct {
 
         // Repoint every borrower before releasing the old bytes: a background
         // request thread can read `api_key` at any moment.
-        const retired = app.route_secret_owned;
-        app.route_secret_owned = token;
+        // Same retention rule as a full route switch: the previous secret stays
+        // readable for one more generation because an in-flight background
+        // request may still be reading it.
+        app.route_strings.installSecret(token);
         app.api_key = token;
         app.api_client.api_key = token;
         if (app.openai_client) |*client| client.api_key = token;
         if (app.gemini_client) |*client| client.api_key = token;
         app.swarm.api_key = token;
-        if (retired) |old| {
-            std.crypto.secureZero(u8, old);
-            app.allocator.free(old);
-        }
         return true;
     }
 
