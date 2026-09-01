@@ -2693,7 +2693,8 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
 
     if (arg.len == 0) {
         // 状态:store 路径 + domain + frontier(有 kg_root 时)。
-        std.debug.print("KG store: {s}\ndomain:   {s}\n", .{ kg.store_path, kg.domain });
+        // daemon 拥有 Store 时这里显示占位符而非路径——本进程确实没有本地 store 路径可报。
+        std.debug.print("KG store: {s}\ndomain:   {s}\n", .{ kg.store.argvSlot(), kg.domain });
         // 记忆同步检视面(PM P1:autosync 静默失败要可见)。
         if (kg.autosync_ok + kg.autosync_fail > 0) {
             if (kg.autosync_last_err) |e| {

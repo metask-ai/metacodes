@@ -3757,6 +3757,10 @@ def observe_daemon_transport(repo: Path) -> Observation:
     client_init = zig_function_slice(sources["client"], "init") or ""
     ensure_ready = zig_function_slice(sources["client"], "ensureReady") or ""
     remote_run = zig_function_slice(sources["client"], "runCheckedRetry") or ""
+    # issue #30: cloneForThread 此前不在这条规则的视野里,而"共享 store 不回落 CLI"
+    # 的破口恰恰在它——它是唯一不做分发、而是重建 client 的地方,重建时会解析出
+    # 另外三处窄守卫赖以失败关闭的那个 bin_path。
+    clone_for_thread = zig_function_slice(sources["client"], "cloneForThread") or ""
     policy = zig_function_slice(sources["transport"], "postWithPolicy") or ""
     daemon_config = zig_function_slice(sources["client"], "initDaemonTransport") or ""
     parse = zig_function_slice(sources["transport"], "parseResponse") or ""
@@ -3781,7 +3785,10 @@ def observe_daemon_transport(repo: Path) -> Observation:
             ".exclusive_cli",
         )),
         "no_shared_raw_store_fallback": all((
-            'dupe(u8, "daemon-owned")' in client_init,
+            # Store 的两种含义分在类型里,而不是同一个 []const u8 上:非 CLI 传输拿到
+            # `.daemon_owned`(不是路径),文件系统只能经 fsPath() 且必须处理 null。
+            ".daemon_owned" in client_init,
+            "fsPath()" in ensure_ready,
             "invalid remote command shape" in remote_run,
             ".unconfigured" in ensure_ready,
             "未打开本地 Store" in ensure_ready,
@@ -3789,6 +3796,15 @@ def observe_daemon_transport(repo: Path) -> Observation:
             "self.transport == .daemon" in remote_run,
             "self.transport.daemon.run(args[0], args[2..]" in remote_run,
             '@import("../storage' not in sources["transport"],
+            # 克隆路径必须按"是否拥有 Store"分流,而不是只判 `== .daemon`:
+            # 不拥有 Store 的父客户端,克隆体保持 .unconfigured。
+            "self.store.fsPath() orelse" in clone_for_thread,
+            ".transport = .unconfigured" in clone_for_thread,
+            # 静态标记只说明代码长什么样。这条规则的名字是一个**行为**主张,所以它
+            # 还必须有可执行证据:探针构造未配置 client、克隆、ensureReady,断言不 ready
+            # 且 cwd 里一个文件都没落下。
+            "unconfigured_clone_owns_no_store=pass" in sources["runtime"],
+            "unconfigured-clone-no-store" in sources["probe"],
         )),
         "request_identity_and_no_write_retry": all(marker in policy + parse + sources["runtime"] for marker in (
             "max_attempts: u8 = if (mutates) 1 else 2",
