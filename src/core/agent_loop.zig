@@ -21,6 +21,7 @@ const message_repair_mod = @import("message_repair.zig");
 const hooks_mod = @import("../permission/hooks.zig");
 const msg = @import("message.zig");
 const conversation_mod = @import("conversation.zig");
+const pdf_mod = @import("pdf.zig");
 const Conversation = conversation_mod.Conversation;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const ReadState = @import("read_state.zig").ReadState;
@@ -1208,6 +1209,15 @@ pub fn run(
         var thinking_text = std.ArrayList(u8).empty;
         defer thinking_text.deinit(allocator);
 
+        // provider 私有的推理续传项(issue #23,当前唯一生产者是 OpenAI Responses):
+        // 按到达顺序收集 owned item JSON,turn 末转成 reasoning_item block 存进
+        // assistant message,下轮同模型请求逐字节回传。丢弃残缺回合时随之释放。
+        var reasoning_items = std.ArrayList([]u8).empty;
+        defer {
+            for (reasoning_items.items) |item| allocator.free(item);
+            reasoning_items.deinit(allocator);
+        }
+
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);
 
@@ -1508,6 +1518,12 @@ pub fn run(
                         // 主对话不消费 query_update 进度(仅 web_search.zig 子请求驱动 TUI);释放。
                         allocator.free(q);
                     },
+                    .reasoning_item => |item_json| {
+                        // 不可读、不展示、不进 assistant_text——只按序留存供下轮回传。
+                        // append 失败则就地释放(所有权尚未转移)。
+                        log.debugId("agent", rid, "reasoning item bytes={d}", .{item_json.len});
+                        reasoning_items.append(allocator, item_json) catch allocator.free(item_json);
+                    },
                     .usage => |u| {
                         // L1:usage 走 CoreEvent 总线(顶层 TuiBackend 累加进 app.usage;
                         // JobEntry 后端累加进 .tokens 供进度树)——取代旧 opts.usage_sink 私有回调。
@@ -1601,6 +1617,8 @@ pub fn run(
                 }
                 tool_uses.clearRetainingCapacity();
 
+                for (reasoning_items.items) |item| allocator.free(item);
+                reasoning_items.clearRetainingCapacity();
                 if (assistant_text.items.len > 0) {
                     const text_owned = try allocator.dupe(u8, assistant_text.items);
                     errdefer allocator.free(text_owned);
@@ -1639,6 +1657,8 @@ pub fn run(
                 assistant_blocks.clearRetainingCapacity();
                 assistant_text.clearRetainingCapacity();
                 thinking_text.clearRetainingCapacity();
+                for (reasoning_items.items) |item| allocator.free(item);
+                reasoning_items.clearRetainingCapacity();
                 if (can_recover_context_error) {
                     if (!recoverContextWindowExceeded(
                         conversation,
@@ -1678,9 +1698,35 @@ pub fn run(
         }
         const rid = rid_for_turn;
 
-        // 4. 把 thinking + assistant text + tool_uses 组装成 Message 追加到 conversation。
-        // 顺序:thinking block 先于 text(对齐 Anthropic content[] 规范;OpenAI-compatible
-        // 的 reasoning_content 平级字段由 request.zig 序列化时处理,block 顺序无害)。
+        // 4. 把 reasoning items + thinking + assistant text + tool_uses 组装成 Message
+        // 追加到 conversation。顺序:thinking block 先于 text(对齐 Anthropic content[] 规范;
+        // OpenAI-compatible 的 reasoning_content 平级字段由 request.zig 序列化时处理,
+        // block 顺序无害)。
+        // reasoning_item 排在最前:OpenAI Responses 的 `output` 就是 reasoning 在前,
+        // 回传 `input` 亦然(reasoning → message/function_call)。
+        // **不产出只有 reasoning 的 assistant 消息**:那种消息 buildApiMessages 会整条
+        // 跳过(Anthropic 的 content 数组会空),于是它永远不上 wire,却仍被
+        // estimateMessageTokens 按 REASONING_ITEM_TOKEN_ESTIMATE 计入——"发给模型的
+        // 投影"与"token 估算"就此分叉,估算单调虚高、误触发 auto-compact。何况一个
+        // 什么都没产出的回合,它的推理状态也没有可续的下文。这条不变式让
+        // buildApiMessages 的 n_substantive 守卫在本进程内不可能被触发。
+        const turn_has_content = assistant_text.items.len > 0 or tool_uses.items.len > 0;
+        if (!turn_has_content) {
+            for (reasoning_items.items) |item| allocator.free(item);
+            reasoning_items.clearRetainingCapacity();
+        }
+        // 逐项**先摘表再转移**:append/dupe 在 OOM 下失败时,已转移项不再留在
+        // reasoning_items 里,顶部 defer 与 assistant_blocks 的 errdefer 不会双释放。
+        while (reasoning_items.items.len > 0) {
+            const item_json = reasoning_items.orderedRemove(0);
+            errdefer allocator.free(item_json);
+            const model_owned = try allocator.dupe(u8, opts.model_override orelse provider.model());
+            errdefer allocator.free(model_owned);
+            try assistant_blocks.append(allocator, .{ .reasoning_item = .{
+                .model = model_owned,
+                .json = item_json,
+            } });
+        }
         if (thinking_text.items.len > 0) {
             const th_owned = try allocator.dupe(u8, thinking_text.items);
             errdefer allocator.free(th_owned);
@@ -2488,13 +2534,14 @@ pub fn run(
         });
         if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
         if (projection_stats.changed() or projection_stats.budget_exhausted) {
-            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} budget_exhausted={}", .{
+            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_exempt={d} budget_exhausted={}", .{
                 projection_stats.raw_bytes,
                 projection_stats.projected_bytes,
                 projection_stats.artifact_bytes,
                 projection_stats.artifact_spill_count,
                 projection_stats.unrecoverable_fallback_count,
                 projection_stats.turn_budget_spills,
+                projection_stats.image_exempt_count,
                 projection_stats.budget_exhausted,
             });
         }
@@ -2738,14 +2785,25 @@ fn buildApiMessages(
     for (conversation.activeMessages()) |m| {
         // thinking block 不回 API(模型自己产);先算实际要回的 block 数
         var n_actual: usize = 0;
-        for (m.blocks) |b| {
-            if (@as(std.meta.Tag(msg.Block), b) != .thinking) n_actual += 1;
-        }
+        // reasoning_item 是 provider 私有的续传状态,不是"内容":只有 OpenAI
+        // Responses 序列化器会用它,别的方言整块跳过。它单独存在时**不足以**
+        // 撑起一条消息(Anthropic 的 content 数组会空),故不计入实质 block。
+        // 本进程写出的会话不会有这种消息(见上方 turn_has_content 不变式);
+        // 这里是针对外部/未来版本 transcript 的防线,而不是热路径。
+        var n_substantive: usize = 0;
+        for (m.blocks) |b| switch (b) {
+            .thinking => {},
+            .reasoning_item => n_actual += 1,
+            else => {
+                n_actual += 1;
+                n_substantive += 1;
+            },
+        };
         // max_tokens 可能恰好截断在 thinking 末尾：Conversation 会保留该
         // thinking block 供本地审计，但 provider-visible 投影不能生成
         // `content: []` 的空 assistant 消息。跳过后，紧随的 continuation user
         // 会由 normalizeApiMessages 与前一条 user 合并，维持合法角色/content。
-        if (n_actual == 0) continue;
+        if (n_substantive == 0) continue;
         const contents = try allocator.alloc(types.ApiContent, n_actual);
         var idx: usize = 0;
         for (m.blocks) |b| {
@@ -2758,6 +2816,13 @@ fn buildApiMessages(
                     .is_error = tr.is_error,
                 } },
                 .image => |img| .{ .image = .{ .media_type = img.media_type, .data = img.data } },
+                .document => |doc| .{ .document = .{
+                    .media_type = doc.media_type,
+                    .data = doc.data,
+                    .title = doc.title,
+                    .pages = doc.pages,
+                } },
+                .reasoning_item => |item| .{ .reasoning_item = .{ .model = item.model, .json = item.json } },
                 .thinking => continue, // 不发回 API
             };
             contents[idx] = c;
@@ -2829,23 +2894,35 @@ fn estimateMessageTokens(m: msg.Message) usize {
                 Conversation.estimateTokens(tr.content),
             .thinking => {},
             .image => total += conversation_mod.IMAGE_TOKEN_ESTIMATE,
+            // 文档同图像取向:按 provider 的**页计费**估,不按 base64 字节
+            // (12MB PDF ≈ 400 万 token,会把每次带文档的回合直接推过阈值)。
+            .document => |doc| total += pdf_mod.estimateTokens(doc.data.len, doc.pages),
+            // 加密推理状态:回传时 provider 按它编码的**推理 token** 计费,不是
+            // 按密文字节。密文没有可本地推断的 token 数,取保守常量高估——
+            // auto-compact 宁可早触发,绝不因低估爆窗口(与图像同一取向)。
+            .reasoning_item => total += conversation_mod.REASONING_ITEM_TOKEN_ESTIMATE,
         }
     }
     return total;
 }
 
-/// 估算/预留/身份专用投影:把图像载荷换成短占位 text(真实请求绝不经此路径)。
-/// 覆盖两种图像通道:一等 `.image` block 与 Read 工具图像形态的 tool_result
-/// (`{"type":"image",...}` JSON,经 request.zig extractImageResult 判定)。
-/// 动机:①字节估算(≈bytes/4)会把 MB 级 base64 计成~百万 token(3.75MB 图 ≈ 125 万),
-/// 误触发 auto-compact 与预算门;②这些路径统一走 Anthropic 序列化器,非 claude 模型带图
-/// 会因 vision 守门报错(request_gate 场景 catch 成 maxInt → 必被预算拒)。投影后
-/// body 无 base64、序列化必成功;图的真实贡献按 IMAGE_TOKEN_ESTIMATE 单独加回。
+/// 估算/预留/身份专用投影:把 base64 载荷换成短占位 text(真实请求绝不经此路径)。
+/// 覆盖三条载荷通道:一等 `.image` block、一等 `.document` block(issue #25),
+/// 以及 Read 工具图像形态的 tool_result(`{"type":"image",...}` JSON,经
+/// request.zig extractImageResult 判定)。
+/// 动机:①字节估算(≈bytes/4)会把 MB 级 base64 计成~百万 token(3.75MB 图 ≈ 125 万,
+/// 12MB PDF ≈ 400 万),误触发 auto-compact 与预算门;②这些路径统一走 Anthropic
+/// 序列化器,非 claude 模型带图/带文档会因能力守门报错(request_gate 场景 catch 成
+/// maxInt → 必被预算拒)。投影后 body 无 base64、序列化必成功;图按
+/// IMAGE_TOKEN_ESTIMATE、文档按页估算,单独加回。
 /// 返回 null = 无图(调用方直接用原 slice,零分配零拷贝)。
 /// pub:agentcore session_budget 的请求字节测量复用同一投影(加回真实载荷长度)。
 pub const EstimationProjection = struct {
     messages: []types.ApiMessage,
     image_count: usize,
+    /// 文档块 token 估算合计(逐块按页算,见 core/pdf.zig)——文档大小差异极大,
+    /// 不能像图像那样用"数量 × 常量"。
+    document_tokens: usize,
 
     pub fn deinit(self: EstimationProjection, allocator: std.mem.Allocator) void {
         for (self.messages) |m| allocator.free(m.content);
@@ -2853,20 +2930,27 @@ pub const EstimationProjection = struct {
     }
 };
 
-fn contentIsImage(c: types.ApiContent) bool {
+/// 需要在估算前换成占位的载荷块:base64 直接进字节估算会把一张图/一份 PDF
+/// 计成上百万 token,且会撞上非 Claude 模型的能力守门。
+fn contentNeedsProjection(c: types.ApiContent) bool {
     return switch (c) {
-        .image => true,
+        .image, .document => true,
         .tool_result => |tr| json_mod.extractImageResult(tr.content) != null,
         else => false,
     };
 }
 
-pub fn projectImagesForEstimation(allocator: std.mem.Allocator, messages: []const types.ApiMessage) !?EstimationProjection {
+pub fn projectPayloadsForEstimation(allocator: std.mem.Allocator, messages: []const types.ApiMessage) !?EstimationProjection {
     var image_count: usize = 0;
+    var document_tokens: usize = 0;
     for (messages) |m| for (m.content) |c| {
-        if (contentIsImage(c)) image_count += 1;
+        if (!contentNeedsProjection(c)) continue;
+        switch (c) {
+            .document => |doc| document_tokens +|= pdf_mod.estimateTokens(doc.data.len, doc.pages),
+            else => image_count += 1,
+        }
     };
-    if (image_count == 0) return null;
+    if (image_count == 0 and document_tokens == 0) return null;
     const out = try allocator.alloc(types.ApiMessage, messages.len);
     var built: usize = 0;
     errdefer {
@@ -2877,6 +2961,7 @@ pub fn projectImagesForEstimation(allocator: std.mem.Allocator, messages: []cons
         const content = try allocator.alloc(types.ApiContent, m.content.len);
         for (m.content, 0..) |c, ci| content[ci] = switch (c) {
             .image => .{ .text = "[image]" }, // static 占位,借用语义与其余 block 一致
+            .document => .{ .text = "[document]" },
             .tool_result => |tr| if (json_mod.extractImageResult(tr.content) != null)
                 .{ .tool_result = .{
                     .tool_use_id = tr.tool_use_id,
@@ -2890,7 +2975,7 @@ pub fn projectImagesForEstimation(allocator: std.mem.Allocator, messages: []cons
         out[i] = .{ .role = m.role, .content = content };
         built = i + 1;
     }
-    return .{ .messages = out, .image_count = image_count };
+    return .{ .messages = out, .image_count = image_count, .document_tokens = document_tokens };
 }
 
 /// 投影 + Anthropic-canonical 序列化(估算/预留/身份共用的唯一入口——"序列化用于
@@ -2905,10 +2990,14 @@ fn serializeForEstimation(
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
 ) !EstimationBody {
-    const projection = try projectImagesForEstimation(allocator, messages);
+    const projection = try projectPayloadsForEstimation(allocator, messages);
     defer if (projection) |p| p.deinit(allocator);
     const effective: []const types.ApiMessage = if (projection) |p| p.messages else messages;
-    const image_tokens: u64 = @intCast((if (projection) |p| p.image_count else 0) * conversation_mod.IMAGE_TOKEN_ESTIMATE);
+    // 图像按张计常量,文档按页计(逐块估算已在投影里累加)。
+    const image_tokens: u64 = @intCast(
+        (if (projection) |p| p.image_count else 0) * conversation_mod.IMAGE_TOKEN_ESTIMATE +
+            (if (projection) |p| p.document_tokens else 0),
+    );
     const body = try json_mod.serializeMessagesRequest(.{
         .model = model_override orelse provider.model(),
         .max_tokens = provider.maxTokens(),
@@ -2983,6 +3072,17 @@ fn canonicalAgentRequestSha256(
         .image => |img| {
             try parts.append(allocator, img.media_type);
             try parts.append(allocator, img.data);
+        },
+        .document => |doc| {
+            try parts.append(allocator, doc.media_type);
+            try parts.append(allocator, doc.title);
+            try parts.append(allocator, doc.data);
+        },
+        // 推理续传项不进 Anthropic canonical 序列化(那是 Responses 私有形态),
+        // 但两个只在它上有差别的请求确实是不同的请求 IR —— 一并进身份哈希。
+        .reasoning_item => |item| {
+            try parts.append(allocator, item.model);
+            try parts.append(allocator, item.json);
         },
         .tool_result => |tr| if (json_mod.extractImageResult(tr.content) != null) {
             try parts.append(allocator, tr.content);
@@ -5050,12 +5150,12 @@ test "估算投影:image 按 IMAGE_TOKEN_ESTIMATE 计,不按 base64 字节(防�
     try std.testing.expect(reserve >= 2 * @as(u64, conversation_mod.IMAGE_TOKEN_ESTIMATE));
 }
 
-test "projectImagesForEstimation: 无图返 null(零拷贝),有图替换占位并计数" {
+test "projectPayloadsForEstimation: 无载荷返 null(零拷贝),有图/有文档替换占位并计数" {
     const a = std.testing.allocator;
     const text_only = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
     };
-    try std.testing.expect((try projectImagesForEstimation(a, &text_only)) == null);
+    try std.testing.expect((try projectPayloadsForEstimation(a, &text_only)) == null);
 
     const mixed = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{
@@ -5064,12 +5164,44 @@ test "projectImagesForEstimation: 无图返 null(零拷贝),有图替换占位�
             .{ .image = .{ .media_type = "image/jpeg", .data = "YYYY" } },
         } },
     };
-    const proj = (try projectImagesForEstimation(a, &mixed)).?;
+    const proj = (try projectPayloadsForEstimation(a, &mixed)).?;
     defer proj.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), proj.image_count);
     try std.testing.expectEqualStrings("a", proj.messages[0].content[0].text);
     try std.testing.expectEqualStrings("[image]", proj.messages[0].content[1].text);
     try std.testing.expectEqualStrings("[image]", proj.messages[0].content[2].text);
+    try std.testing.expectEqual(@as(usize, 0), proj.document_tokens);
+}
+
+test "projectPayloadsForEstimation: 文档按页计,不按 base64 字节(12MB PDF 不爆表)" {
+    const a = std.testing.allocator;
+    // 4 MB 伪 base64:按字节估算 ≈ 100 万 token,按页估算是 3 页 × 3000。
+    const payload = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'A');
+    const contents = [_]types.ApiContent{
+        .{ .text = "summarize" },
+        .{ .document = .{
+            .media_type = "application/pdf",
+            .data = payload,
+            .title = "report.pdf",
+            .pages = 3,
+        } },
+    };
+    const messages = [_]types.ApiMessage{.{ .role = .user, .content = &contents }};
+    const proj = (try projectPayloadsForEstimation(a, &messages)).?;
+    defer proj.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), proj.image_count);
+    try std.testing.expectEqual(@as(usize, 3 * pdf_mod.PAGE_TOKEN_ESTIMATE), proj.document_tokens);
+    try std.testing.expectEqualStrings("[document]", proj.messages[0].content[1].text);
+
+    // 端到端:非 claude 命名的模型也能算出来(canonical 投影不重放能力守门),
+    // 且结果远低于"按 base64 字节"的百万级。
+    var state = TestProviderState{ .model = "gpt-4o", .max_tokens = 777, .reasoning_effort = null };
+    const provider = testProvider(&state);
+    const estimated = try estimateApiRequestTokens(a, provider, &messages, null, &.{}, null);
+    try std.testing.expect(estimated > 3 * pdf_mod.PAGE_TOKEN_ESTIMATE);
+    try std.testing.expect(estimated < 50_000);
 }
 
 test "估算投影覆盖 tool_result 图像形态(Read 截图不爆表)" {
@@ -5085,7 +5217,7 @@ test "估算投影覆盖 tool_result 图像形态(Read 截图不爆表)" {
         .{ .tool_result = .{ .tool_use_id = "t1", .content = tr_content } },
     };
     const messages = [_]types.ApiMessage{.{ .role = .user, .content = &contents }};
-    const proj = (try projectImagesForEstimation(a, &messages)).?;
+    const proj = (try projectPayloadsForEstimation(a, &messages)).?;
     defer proj.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), proj.image_count);
     try std.testing.expectEqualStrings("[image tool result]", proj.messages[0].content[0].tool_result.content);

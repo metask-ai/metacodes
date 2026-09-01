@@ -309,6 +309,11 @@ const OpenAIStream = struct {
     flush_q: std.ArrayList(StreamEvent) = .empty, // done 时排队的 tool_use_start
     flush_pos: usize = 0,
     flushed: bool = false,
+    /// Responses:已回传过的 reasoning item 去重键(owned)。同一 item 会同时出现在
+    /// `response.output_item.done` 与终止事件的 `response.output` 里——两处都独立提取
+    /// (服务端漏发任一个都不能丢推理状态),靠键去重保证只回传一次。
+    /// 键 = item 的 `id`;无 id 时退化为 item 全文。
+    reasoning_keys: std.ArrayList([]u8) = .empty,
 
     fn handle(self: *OpenAIStream) StreamHandle {
         return .{ .ctx = @ptrCast(self), .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
@@ -339,9 +344,12 @@ const OpenAIStream = struct {
                 self.allocator.free(tu.name);
                 self.allocator.free(tu.input_json);
             },
+            .reasoning_item => |bytes| self.allocator.free(bytes),
             else => {},
         };
         self.flush_q.deinit(self.allocator);
+        for (self.reasoning_keys.items) |key| self.allocator.free(key);
+        self.reasoning_keys.deinit(self.allocator);
         self.line_overflow.deinit(self.allocator);
         if (self.abort_registry) |registry| registry.unregister(self.request);
         self.request.deinit();
@@ -543,6 +551,15 @@ const OpenAIStream = struct {
             }
             return null;
         }
+        // 完整 output item。`store:false` 下服务端不保存响应,推理上下文只能由客户端
+        // 逐字节回传(OpenAI "preserve reasoning without stored responses"),故这里把
+        // reasoning item 原样捕获。function_call 的完整 arguments 走 *_arguments.done,
+        // 本分支不重复处理。
+        if (std.mem.eql(u8, ev_type, "response.output_item.done")) {
+            const item = findObjectFieldRaw(data, "item") orelse return null;
+            if (!itemTypeIs(item, "reasoning")) return null;
+            return self.takeReasoningItem(item);
+        }
         // arguments 增量:片段按**原始转义字节**按槽拼接,flush 时一次解码(同 chat
         // arguments 的 decode-once 契约,见 buildFlush;review F3 拆代理对场景)。
         if (std.mem.eql(u8, ev_type, "response.function_call_arguments.delta")) {
@@ -599,10 +616,57 @@ const OpenAIStream = struct {
             .cache_read_input_tokens = cached,
             .cache_creation_input_tokens = 0, // Responses 无写区分 → 0
         };
+        // 先排 reasoning item、后排 tool_use_start:next() 按入队顺序 drain,消费者
+        // 因此在拿到工具调用之前就收齐了本轮的推理状态。
+        self.queueTerminalReasoningItems(data);
         self.buildFlush();
         self.flushed = true;
         self.pending_done = true;
         return StreamEvent{ .usage = usage };
+    }
+
+    /// 终止事件的 `response.output` 全量数组:补上任何没经 `output_item.done` 到达的
+    /// reasoning item。已回传过的按键跳过,故"两个事件都带同一 item"只产出一次,
+    /// 且不依赖某个特定事件一定出现。
+    fn queueTerminalReasoningItems(self: *OpenAIStream, data: []const u8) void {
+        const response_obj = findObjectField(data, "response") orelse return;
+        const output = findArrayField(response_obj, "output") orelse return;
+        var it = ElemIter{ .s = output };
+        while (it.next()) |elem| {
+            if (!itemTypeIs(elem, "reasoning")) continue;
+            const ev = self.takeReasoningItem(elem) orelse continue;
+            self.flush_q.append(self.allocator, ev) catch self.allocator.free(ev.reasoning_item);
+        }
+    }
+
+    /// 把一条完整的 reasoning item(含花括号)转成 owned 事件;已回传过则返 null。
+    /// 分配失败退化为"本项不回传"(推理续传是尽力而为的优化,绝不因它中断流),
+    /// 但**留痕**——静默降级回修复前的行为是不可接受的。
+    fn takeReasoningItem(self: *OpenAIStream, item: []const u8) ?StreamEvent {
+        // 去重键取 item 的 `id`。这里用首次匹配是安全的:reasoning item 的嵌套结构
+        // 只有 `summary[]`,其元素带 `type`/`text` 而没有 `id`;真出现别的形态时
+        // 首次匹配也只会退化成"键更长",不会把两条不同的 item 判成同一条。
+        // 无 id 时退化为整条 item 全文做键。
+        const key = util_json.extractStringField(item, "id") orelse item;
+        for (self.reasoning_keys.items) |seen| {
+            if (std.mem.eql(u8, seen, key)) return null;
+        }
+        const owned_item = self.allocator.dupe(u8, item) catch return self.noteReasoningDropped();
+        const owned_key = self.allocator.dupe(u8, key) catch {
+            self.allocator.free(owned_item);
+            return self.noteReasoningDropped();
+        };
+        self.reasoning_keys.append(self.allocator, owned_key) catch {
+            self.allocator.free(owned_item);
+            self.allocator.free(owned_key);
+            return self.noteReasoningDropped();
+        };
+        return StreamEvent{ .reasoning_item = owned_item };
+    }
+
+    fn noteReasoningDropped(self: *OpenAIStream) ?StreamEvent {
+        log.warnId("openai", self.id, "reasoning item dropped (allocation failed); continuity for this turn is lost", .{});
+        return null;
     }
 
     /// 按 index 找累积槽,没有则新建。返回稳定指针(ToolCallAcc 的三个 ArrayList 后备内存在堆,
@@ -691,10 +755,37 @@ const ToolCallAcc = struct {
     }
 };
 
-/// 定位 `"tool_calls":` 后的 array,返回 `[` 与配对 `]` 之间的内容(深度感知,跳字符串)。
-/// 分块未闭合(部分 chunk)时返回剩余部分。找不到返 null。
+/// 一个 output item 的 `type` 是否等于 `want`。**按值过滤逐个 `"type"`**,而不是
+/// `extractStringField` 的首次匹配:reasoning item 的 `summary[]` 元素自己也带
+/// `type`("summary_text"),服务端一旦把 summary 排在前面,首次匹配就会静默把整条
+/// 推理续传状态丢掉——本文件已经因为同一条假设翻过一次车(见 extractResponsesEventType
+/// 的 review F4 注释)。JSON 字符串值里的引号必转义,故嵌套字符串内容撞不上这里的
+/// `"type"` 键模式;要匹配的值集合(reasoning/function_call)也与 summary_text 不重叠。
+fn itemTypeIs(item: []const u8, want: []const u8) bool {
+    var rest: []const u8 = item;
+    while (util_json.extractStringField(rest, "type")) |value| {
+        if (std.mem.eql(u8, value, want)) return true;
+        const value_end = (@intFromPtr(value.ptr) - @intFromPtr(rest.ptr)) + value.len;
+        rest = rest[value_end..];
+    }
+    return false;
+}
+
+/// 定位 `"tool_calls":` 后的 array(见 findArrayField)。
 fn findToolCallsArray(data: []const u8) ?[]const u8 {
-    const key = "\"tool_calls\":";
+    return findArrayField(data, "tool_calls");
+}
+
+/// 定位 `"<key>":` 后的 array,返回 `[` 与配对 `]` 之间的内容(深度感知,跳字符串)。
+/// 分块未闭合(部分 chunk)时返回剩余部分。找不到返 null。
+fn findArrayField(data: []const u8, key_name: []const u8) ?[]const u8 {
+    var pattern_buf: [64]u8 = undefined;
+    if (key_name.len + 3 > pattern_buf.len) return null;
+    pattern_buf[0] = '"';
+    @memcpy(pattern_buf[1..][0..key_name.len], key_name);
+    pattern_buf[1 + key_name.len] = '"';
+    pattern_buf[2 + key_name.len] = ':';
+    const key = pattern_buf[0 .. key_name.len + 3];
     const start = std.mem.indexOf(u8, data, key) orelse return null;
     var i = start + key.len;
     while (i < data.len and data[i] != '[') : (i += 1) {}
@@ -740,9 +831,24 @@ fn extractResponsesEventType(data: []const u8) ?[]const u8 {
 }
 
 /// 定位 `"<key>":` 后的 object,返回 `{` 与配对 `}` 之间的内容(深度感知,跳字符串;
-/// 与 findToolCallsArray 同扫描风格,只是括号换成花括号)。分块未闭合时返回剩余部分。
+/// 与 findArrayField 同扫描风格,只是括号换成花括号)。分块未闭合时返回剩余部分。
 /// 找不到 key 或值不是 object 返 null。
 fn findObjectField(data: []const u8, key: []const u8) ?[]const u8 {
+    const span = findObjectFieldSpan(data, key) orelse return null;
+    return data[span.inner_start..span.inner_end];
+}
+
+/// 同 findObjectField,但返回**含两端花括号**的整块 object。reasoning item 必须
+/// 逐字节原样回传给服务端,不能只拿内容再自行拼括号。
+fn findObjectFieldRaw(data: []const u8, key: []const u8) ?[]const u8 {
+    const span = findObjectFieldSpan(data, key) orelse return null;
+    if (!span.closed) return null; // 未闭合的分块 object 不是可回传的完整 item
+    return data[span.inner_start - 1 .. span.inner_end + 1];
+}
+
+const ObjectSpan = struct { inner_start: usize, inner_end: usize, closed: bool };
+
+fn findObjectFieldSpan(data: []const u8, key: []const u8) ?ObjectSpan {
     var pattern_buf: [64]u8 = undefined;
     if (key.len + 3 > pattern_buf.len) return null;
     pattern_buf[0] = '"';
@@ -769,12 +875,13 @@ fn findObjectField(data: []const u8, key: []const u8) ?[]const u8 {
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
-                if (depth == 0) return data[obj_open + 1 .. i];
+                if (depth == 0) return .{ .inner_start = obj_open + 1, .inner_end = i, .closed = true };
             },
             else => {},
         }
     }
-    return data[obj_open + 1 ..]; // 未闭合:返回剩余
+    // 未闭合:返回剩余(与 findArrayField 同款分块容忍)。
+    return .{ .inner_start = obj_open + 1, .inner_end = data.len, .closed = false };
 }
 
 /// 迭代 JSON array slice 里的顶层 `{...}` 对象(深度感知,跳字符串)。
@@ -961,6 +1068,9 @@ fn serializeOpenAIMessage(
         // 不上 wire。text 静默丢是既有已知行为(message_repair 合并守护防产出);image
         // 受 issue #10"绝不静默丢"铁律保护,防御性显式报错(正常路径永不产出此混合)。
         for (m.content) |c| if (c == .image) return error.ImageWithToolResultUnsupported;
+        // 文档同理(issue #25):tool_result 消息的 wire 投影里没有它的位置,
+        // 静默丢弃违反"绝不悄悄丢一等内容"的铁律。
+        for (m.content) |c| if (c == .document) return error.DocumentWithToolResultUnsupported;
         // OpenAI 要求每个 tool_result 是独立 {role:"tool"} message。并行工具一轮有多个
         // tool_result,**全部展开**成逗号分隔的多条 message(P0.1:旧版只发首个 → 并行回合
         // 下一次请求缺 tool_call_id 配对被 OpenAI 400)。调用方在本消息前已加分隔逗号。
@@ -1034,6 +1144,9 @@ fn serializeOpenAIMessage(
     for (m.content) |c| switch (c) {
         .tool_use => has_tool_use = true,
         .image => has_image = true,
+        // 一等文档(issue #25):本协议族本期没有原生文档输入路径。发请求前显式
+        // 报能力错误——绝不静默丢弃、也绝不把 base64 当文本塞进 content。
+        .document => return error.DocumentInputUnsupported,
         else => {},
     };
     try out.appendSlice(allocator, ",\"content\":");
@@ -1175,7 +1288,7 @@ pub fn serializeOpenAIResponsesRequest(
     try out.appendSlice(allocator, ",\"input\":[");
     var first = true;
     for (messages) |m| {
-        try serializeResponsesInputItems(allocator, &out, m, &first, profile);
+        try serializeResponsesInputItems(allocator, &out, m, &first, profile, model);
     }
     try out.append(allocator, ']');
     // tools:Responses 扁平形态(name/description/parameters 顶层;strict:false 不强制 schema 严格模式)。
@@ -1233,7 +1346,30 @@ pub fn serializeOpenAIResponsesRequest(
 /// protocol=responses 是显式 OpenAI 原生配置),能力守门仍查 profile.supports_image_input。
 /// 图像 tool_result(Read 工具形态)→ vision 模型 output 发 input_image parts 数组
 /// (官方 2025-09-26 起支持,call_id 原生配对);非 vision 模型 output 发短占位文本。
-fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, first: *bool, profile: dialect_mod.ModelProfile) !void {
+/// reasoning item(issue #23)→ 顶层 item **逐字节原样**回传,排在本条消息的其余
+/// item 之前(服务端 `output` 就是 reasoning 在前)。
+fn serializeResponsesInputItems(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    m: types.ApiMessage,
+    first: *bool,
+    profile: dialect_mod.ModelProfile,
+    model: []const u8,
+) !void {
+    // `store:false` 时服务端不保存推理状态,只能由客户端把带 encrypted_content 的
+    // reasoning item 原样发回(OpenAI "preserve reasoning without stored responses")。
+    // **不重新序列化**:重排字段或再转义一次都可能让服务端拒绝解密。
+    // 模型门控:加密推理状态是模型作用域的,会话中途换模型后旧 item 不再有效,
+    // 与其让整个请求被服务端拒掉,不如安静地不回传那几项(等价于修复前的行为)。
+    for (m.content) |c| switch (c) {
+        .reasoning_item => |item| {
+            if (!std.mem.eql(u8, item.model, model)) continue;
+            if (!first.*) try out.append(allocator, ',');
+            first.* = false;
+            try out.appendSlice(allocator, item.json);
+        },
+        else => {},
+    };
     var has_image = false;
     var has_tool_result = false;
     var text_len: usize = 0;
@@ -1241,6 +1377,8 @@ fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayLis
         .image => has_image = true,
         .tool_result => has_tool_result = true,
         .text => |t| text_len += t.len,
+        // 同 chat 路径:Responses 本期不做原生文档输入,显式能力错误而非静默丢弃。
+        .document => return error.DocumentInputUnsupported,
         else => {},
     };
     if (has_image) {
@@ -1743,4 +1881,99 @@ test "responses: 非 vision 模型的图像 tool_result → output 占位字符�
     try std.testing.expect(std.mem.indexOf(u8, body, "\"output\":\"[image (image/png) was read successfully but omitted: this model does not support image input]\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "input_image") == null);
+}
+
+const REASONING_ITEM_JSON =
+    "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"opaque-ciphertext\"}";
+
+test "responses: reasoning item 逐字节回传,排在同消息的 function_call 之前" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "what time is it" }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .reasoning_item = .{ .model = "gpt-5.2", .json = REASONING_ITEM_JSON } },
+            .{ .tool_use = .{ .id = "call_1", .name = "get_time", .input = "{}" } },
+        } },
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "call_1", .content = "{\"t\":42}" } },
+        } },
+    };
+    const body = try serializeOpenAIResponsesRequest(a, "gpt-5.2", &msgs, null, null, .{}, dialect_mod.dialectFor(.openai, "gpt-5.2"));
+    defer a.free(body);
+    // 原样(未再转义)出现:重新序列化或多包一层字符串都会让服务端拒绝解密。
+    const reasoning = std.mem.indexOf(u8, body, REASONING_ITEM_JSON) orelse return error.TestUnexpectedResult;
+    const call = std.mem.indexOf(u8, body, "\"type\":\"function_call\"").?;
+    const output = std.mem.indexOf(u8, body, "\"type\":\"function_call_output\"").?;
+    const user = std.mem.indexOf(u8, body, "what time is it").?;
+    try std.testing.expect(user < reasoning);
+    try std.testing.expect(reasoning < call);
+    try std.testing.expect(call < output);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"store\":false") != null);
+    // 不得被当成字符串塞进某个字段(那是"转义过的原始 JSON"形态)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"type\\\":\\\"reasoning\\\"") == null);
+}
+
+test "responses: 换模型后旧 reasoning item 不回传(加密状态是模型作用域的)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .reasoning_item = .{ .model = "gpt-5.2", .json = REASONING_ITEM_JSON } },
+            .{ .text = "let me check" },
+        } },
+    };
+    const body = try serializeOpenAIResponsesRequest(a, "o4-mini", &msgs, null, null, .{}, dialect_mod.dialectFor(.openai, "o4-mini"));
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "rs_1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "opaque-ciphertext") == null);
+    // 同消息的其余内容照常发(丢的只是那一项 provider 私有状态)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "let me check") != null);
+}
+
+test "responses: 无 reasoning item 时请求字节与既有实现完全一致" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .tool_use = .{ .id = "call_1", .name = "get_time", .input = "{}" } },
+        } },
+    };
+    const body = try serializeOpenAIResponsesRequest(a, "gpt-5.2", &msgs, null, null, .{}, dialect_mod.dialectFor(.openai, "gpt-5.2"));
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":[{\"role\":\"user\",\"content\":\"hi\"},{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_time\",\"arguments\":\"{}\"}]") != null);
+}
+
+test "Anthropic 序列化跳过 reasoning item(无多余逗号,其余 block 字节不变)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .reasoning_item = .{ .model = "gpt-5.2", .json = REASONING_ITEM_JSON } },
+            .{ .text = "hello" },
+            .{ .reasoning_item = .{ .model = "gpt-5.2", .json = REASONING_ITEM_JSON } },
+            .{ .tool_use = .{ .id = "call_1", .name = "get_time", .input = "{}" } },
+        } },
+    };
+    const body = try json_mod.serializeMessagesRequest(.{
+        .model = "claude-sonnet-4",
+        .max_tokens = 64,
+        .messages = &msgs,
+        .stream = true,
+    }, a);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "rs_1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "[{\"type\":\"text\",\"text\":\"hello\"},{\"type\":\"tool_use\",\"id\":\"call_1\"") != null);
+}
+
+test "itemTypeIs: 按值过滤,不依赖服务端把顶层 type 排在嵌套对象之前" {
+    const ordered = "{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"x\"}]}";
+    const reordered = "{\"summary\":[{\"type\":\"summary_text\",\"text\":\"x\"}],\"id\":\"rs_1\",\"type\":\"reasoning\"}";
+    const call = "{\"id\":\"fc_1\",\"call_id\":\"c1\",\"type\":\"function_call\",\"name\":\"f\",\"arguments\":\"{}\"}";
+    try std.testing.expect(itemTypeIs(ordered, "reasoning"));
+    // 首次匹配会在这里读到 "summary_text" 并静默丢掉整条推理状态。
+    try std.testing.expect(itemTypeIs(reordered, "reasoning"));
+    try std.testing.expect(!itemTypeIs(call, "reasoning"));
+    try std.testing.expect(itemTypeIs(call, "function_call"));
+    // 转义后的字符串内容撞不上键模式(工具参数里出现同样的文本也不会误判)。
+    const escaped = "{\"id\":\"fc_2\",\"type\":\"function_call\",\"arguments\":\"{\\\"type\\\":\\\"reasoning\\\"}\"}";
+    try std.testing.expect(!itemTypeIs(escaped, "reasoning"));
 }

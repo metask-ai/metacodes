@@ -10,6 +10,7 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const msg = @import("message.zig");
 const result_projection = @import("result_projection.zig");
+const pdf_mod = @import("pdf.zig");
 const json_mod = @import("../json.zig");
 
 pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";
@@ -25,6 +26,11 @@ pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: usize = 8;
 /// (Anthropic tokens≈pixels/750 → ~1590;OpenAI high-detail 同量级封顶),不解码
 /// 图像尺寸时取缩放上限做保守高估——auto-compact 阈值宁可早触发,绝不因低估爆窗口。
 pub const IMAGE_TOKEN_ESTIMATE: usize = 1600;
+
+/// 单条 provider 私有推理续传项(OpenAI Responses `encrypted_content`)的 token
+/// 估算上限。密文长度与它编码的推理 token 数没有本地可算的关系,按 provider 侧
+/// 常见的一轮推理规模取保守高估——auto-compact 宁可早触发,绝不因低估爆窗口。
+pub const REASONING_ITEM_TOKEN_ESTIMATE: usize = 2048;
 
 pub fn toolResultContextBytes(max_input_tokens: usize) usize {
     const derived = if (max_input_tokens == 0)
@@ -378,6 +384,12 @@ pub const Conversation = struct {
                     estimateTokens(tr.content),
                 .thinking => |t| total += estimateTokens(t),
                 .image => total += IMAGE_TOKEN_ESTIMATE,
+                // 文档按 provider 的页计费估,不按 base64 字节(同 IMAGE_TOKEN_ESTIMATE
+                // 的取向;见 core/pdf.zig estimateTokens)。
+                .document => |doc| total += pdf_mod.estimateTokens(doc.data.len, doc.pages),
+                // 加密推理续传项:按 token 计费而非密文字节(同 IMAGE_TOKEN_ESTIMATE
+                // 的取向),保守高估,与 agent_loop.estimateMessageTokens 同口径。
+                .reasoning_item => total += REASONING_ITEM_TOKEN_ESTIMATE,
             };
         }
         return total;
@@ -713,6 +725,12 @@ fn blockEql(a: msg.Block, b: msg.Block) bool {
             tr.is_error == b.tool_result.is_error,
         .image => |img| std.mem.eql(u8, img.media_type, b.image.media_type) and
             std.mem.eql(u8, img.data, b.image.data),
+        // pages 刻意不比:它是准入时从 data 数出来的派生值,data 相同则必然相同。
+        .document => |doc| std.mem.eql(u8, doc.media_type, b.document.media_type) and
+            std.mem.eql(u8, doc.data, b.document.data) and
+            std.mem.eql(u8, doc.title, b.document.title),
+        .reasoning_item => |item| std.mem.eql(u8, item.model, b.reasoning_item.model) and
+            std.mem.eql(u8, item.json, b.reasoning_item.json),
     };
 }
 

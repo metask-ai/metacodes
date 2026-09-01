@@ -10,7 +10,66 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- PDF documents are first-class user input (issue #25). A user message can
+  carry ordered text, image, and PDF parts; Core models a document as
+  `Block.document {media_type, data, title, pages}` and hands the bytes to the
+  provider's native document format, never to OCR, extracted text, page
+  images, or a summary. Document capability is its own truth
+  (`ModelProfile.supports_pdf_input` / `Capability.pdf_input`) and is checked
+  independently of vision — the first slice supports Anthropic Claude 3.5+
+  natively and fails every other provider/model with
+  `error.DocumentInputUnsupported` before any network I/O. Admission runs
+  before encoding and before dispatch (`core/pdf.zig`): not-a-PDF, encrypted,
+  over 12 MB raw, or over 100 countable pages each fail with their own typed
+  outcome, and an undeterminable page count is reported as unknown rather than
+  guessed. Token accounting charges a document by pages, not base64 length.
+  Documents round-trip through the JSONL transcript and the AgentCore
+  checkpoint (block tag 7), so a restored session resends the original bytes
+  with no dependence on the host file. Reachable from source-level hosts
+  (`message.UserContentPart.document`), from binary consumers
+  (`RUN_INPUT_PART_DOCUMENT`, ABI revision 16, preflight status 29), and from
+  the headless CLI (`--pdf <path>`, repeatable, order kept). The provider-offer
+  vocabulary gains a matching `documents` capability, again separate from
+  `vision`; its comptime coverage guard now binds the real runtime capability
+  enum instead of a hand-copied duplicate, so the next capability added without
+  a mapping is a compile error rather than a silent gap.
+- AgentCore ABI v1 **revision 16** (hard cut over 15): adds
+  `RUN_INPUT_PART_DOCUMENT`, `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1`,
+  status `DOCUMENT_INPUT_UNSUPPORTED` (29), and checkpoint block tag 7.
+  `RunInputPartV1` keeps its 72-byte layout — a document part reuses
+  `media_type`, `data`, and `text` (its title). SDK package version
+  `0.2.0-dev` → `0.3.0-dev`; Rust `raw.rs` regenerated with bindgen 0.72.1.
+
 ### Fixed
+
+- The OpenAI Responses protocol now replays reasoning items across tool
+  continuations (issue #23). Requests use `store:false`, so the server keeps no
+  copy of the response and reasoning context survives only if the client sends
+  the server's own `reasoning` items — `id`, `summary`, `encrypted_content` —
+  back verbatim; previously they were parsed away and the next request carried
+  only the function call and its result. Items are captured from
+  `response.output_item.done` **and** from the terminal response's `output`
+  array, deduplicated by id so an item present in both is replayed exactly
+  once, and emitted first among their message's `input` items, matching the
+  server's own output order. Replay is model-scoped: after a mid-session model
+  switch the stale encrypted state is dropped rather than sent to a model that
+  would reject it. Reasoning items persist through the JSONL transcript and the
+  AgentCore checkpoint (block tag 6). A conversation without reasoning items
+  serializes byte-identically to before.
+- Image tool results are no longer spilled into artifact envelopes before the
+  dialect layer can serialize them (issue #26). `result_projection` rewrote any
+  tool result above a `clamp(window/8, 8 KB, 64 KB)` threshold, while the
+  `Read` tool accepts images up to 3.75 MB — so essentially every real
+  screenshot became an envelope and the native image serialization added in
+  #24 never ran on it, on every provider. Image-shaped results (detected with
+  the existing `dialect.extractImageResult`, not a second sniffer) are now
+  exempt from byte-length spilling in both projection passes, and the per-turn
+  budget charges an image at `IMAGE_TOKEN_ESTIMATE` instead of its base64
+  length, so one screenshot no longer evicts unrelated tool results. Images
+  stay bounded by `MAX_IMAGE_BYTES`, and non-image results project
+  byte-identically to before.
 
 - Image tool results (the `Read` tool's
   `{"type":"image","media_type":...,"data":...}` form) are now serialized

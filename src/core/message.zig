@@ -1,6 +1,7 @@
 //! Structured conversation message types.
 //!
-//! Content 是 tagged union，区分三种类型：text / tool_use / tool_result。
+//! Content 是 tagged union：text / tool_use / tool_result / thinking / image /
+//! document / reasoning_item。
 //! 这是为了对齐 Anthropic Messages API 契约，也是消除 "所有内容扁平为 text" hack
 //! 和假想的 `__TOOL_RESULT__:` 字符串前缀的唯一正确路径。
 //!
@@ -28,6 +29,13 @@ pub const Block = union(enum) {
     /// 用户输入的一等图像内容(issue #10)。base64 载荷 + MIME,与 text 按序混排,
     /// 参与当前请求、后续轮次与 session 恢复。绝不以 OCR/描述/占位文本替代。
     image: Image,
+    /// 用户输入的一等文档内容(issue #25,当前仅 PDF)。与 text/image 按序混排,
+    /// 参与当前请求、后续轮次与 session 恢复。绝不以 OCR/抽文本/页面图/摘要替代。
+    document: Document,
+    /// Provider 私有的推理续传状态(issue #23):OpenAI Responses 在 `store:false`
+    /// 下发回的 `reasoning` item(含 `encrypted_content`)。**不可读、不展示**,
+    /// 只为下一次请求原样回传;与 `.thinking`(可展示的思考文本)是两个概念。
+    reasoning_item: ReasoningItem,
 
     pub fn deinit(self: Block, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -45,6 +53,15 @@ pub const Block = union(enum) {
             .image => |img| {
                 allocator.free(img.media_type);
                 allocator.free(img.data);
+            },
+            .document => |doc| {
+                allocator.free(doc.media_type);
+                allocator.free(doc.data);
+                allocator.free(doc.title);
+            },
+            .reasoning_item => |item| {
+                allocator.free(item.model);
+                allocator.free(item.json);
             },
         }
     }
@@ -75,6 +92,20 @@ pub const Block = union(enum) {
                 const data = try dst.dupe(u8, img.data);
                 break :blk Block{ .image = .{ .media_type = mt, .data = data } };
             },
+            .document => |doc| blk: {
+                const mt = try dst.dupe(u8, doc.media_type);
+                errdefer dst.free(mt);
+                const data = try dst.dupe(u8, doc.data);
+                errdefer dst.free(data);
+                const title = try dst.dupe(u8, doc.title);
+                break :blk Block{ .document = .{ .media_type = mt, .data = data, .title = title, .pages = doc.pages } };
+            },
+            .reasoning_item => |item| blk: {
+                const model = try dst.dupe(u8, item.model);
+                errdefer dst.free(model);
+                const json = try dst.dupe(u8, item.json);
+                break :blk Block{ .reasoning_item = .{ .model = model, .json = json } };
+            },
         };
     }
 };
@@ -95,6 +126,25 @@ pub const ToolResult = struct {
 pub const Image = struct {
     media_type: []const u8,
     data: []const u8,
+};
+
+/// 文档块(base64 载荷,见 `types.DocumentBlock`)。`title` 是宿主给的稳定身份,
+/// 可为空串;绝不放绝对路径或运行期变动值。
+pub const Document = struct {
+    media_type: []const u8,
+    data: []const u8,
+    title: []const u8 = "",
+    /// 准入时数出来的页数;null = 不可判定(见 core/pdf.zig)。持久化时
+    /// null 与 0 互映(0 页不是合法 PDF,映射无歧义)。
+    pages: ?u32 = null,
+};
+
+/// 一条 provider 私有的推理续传项(见 `types.ReasoningItemBlock`)。
+/// `json` 逐字节就是服务端发回的 item 对象;`model` 是产出它的模型名,
+/// 序列化层据此拒绝把 A 模型的加密推理状态发给 B 模型。
+pub const ReasoningItem = struct {
+    model: []const u8,
+    json: []const u8,
 };
 
 /// 一条对话消息（role + blocks）。所有 block 内部字节为 allocator 拥有。
@@ -137,6 +187,17 @@ pub const ImageInput = struct {
     data: []const u8,
 };
 
+/// 输入文档描述(路径无关的纯内容三元组,issue #25):宿主先读文件并 base64,
+/// 再交构造函数。`title` 是可选的稳定身份(如文件名),绝不是绝对路径。
+pub const DocumentInput = struct {
+    media_type: []const u8,
+    /// base64 编码字节。
+    data: []const u8,
+    title: []const u8 = "",
+    /// 准入时数出来的页数;null = 不可判定。
+    pages: ?u32 = null,
+};
+
 /// 构造多模态 user Message:可选前置 text + 按序图像列表(全部字节 dupe 成 owned)。
 /// text 为空且 images 为空 → error.EmptyMessage(不产出空 content 消息)。
 /// 定位:lib 嵌入方(borrowed 输入)的便利入口。CLI headless 自建 blocks(载荷所有权
@@ -166,14 +227,15 @@ pub fn userMessageWithImages(
     return .{ .role = .user, .blocks = blocks };
 }
 
-/// 一段借入的多模态根输入:text/image 任意有序混排(不限"前置 text + 图列表")。
+/// 一段借入的多模态根输入:text/image/document 任意有序混排(不限"前置 text + 图列表")。
 /// 字节在构造/追加时复制;调用方保留切片所有权。
 pub const UserContentPart = union(enum) {
     text: []const u8,
     image: ImageInput,
+    document: DocumentInput,
 };
 
-/// 构造 text/image 任意有序混排的 user Message(全部字节 dupe 成 owned)。
+/// 构造 text/image/document 任意有序混排的 user Message(全部字节 dupe 成 owned)。
 /// parts 为空 → error.EmptyMessage(不产出空 content 消息)。
 pub fn userMessageFromParts(
     allocator: std.mem.Allocator,
@@ -192,6 +254,14 @@ pub fn userMessageFromParts(
                 errdefer allocator.free(mt);
                 const data = try allocator.dupe(u8, img.data);
                 break :blk .{ .image = .{ .media_type = mt, .data = data } };
+            },
+            .document => |doc| blk: {
+                const mt = try allocator.dupe(u8, doc.media_type);
+                errdefer allocator.free(mt);
+                const data = try allocator.dupe(u8, doc.data);
+                errdefer allocator.free(data);
+                const title = try allocator.dupe(u8, doc.title);
+                break :blk .{ .document = .{ .media_type = mt, .data = data, .title = title, .pages = doc.pages } };
             },
         };
         built += 1;

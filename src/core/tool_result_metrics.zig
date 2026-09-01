@@ -21,6 +21,9 @@ pub const Snapshot = struct {
     structured_result_count: u64,
     structured_projection_failures: u64,
     turn_budget_spills: u64,
+    /// Image results kept inline that byte-length rules would otherwise have
+    /// spilled (over the per-result cap); see result_projection.Stats.
+    image_exempt_count: u64,
     budget_exhausted_count: u64,
 };
 
@@ -36,6 +39,7 @@ pub const Metrics = struct {
     structured_result_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     structured_projection_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     turn_budget_spills: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    image_exempt_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     budget_exhausted_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn recordProjection(self: *Metrics, stats: projection.Stats) void {
@@ -47,6 +51,7 @@ pub const Metrics = struct {
         add(&self.structured_result_count, stats.structured_result_count);
         add(&self.structured_projection_failures, stats.structured_projection_failures);
         add(&self.turn_budget_spills, stats.turn_budget_spills);
+        add(&self.image_exempt_count, stats.image_exempt_count);
         if (stats.budget_exhausted) add(&self.budget_exhausted_count, 1);
     }
 
@@ -81,6 +86,7 @@ pub const Metrics = struct {
             .structured_result_count = self.structured_result_count.load(.monotonic),
             .structured_projection_failures = self.structured_projection_failures.load(.monotonic),
             .turn_budget_spills = self.turn_budget_spills.load(.monotonic),
+            .image_exempt_count = self.image_exempt_count.load(.monotonic),
             .budget_exhausted_count = self.budget_exhausted_count.load(.monotonic),
         };
     }

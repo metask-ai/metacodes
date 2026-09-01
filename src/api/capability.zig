@@ -44,6 +44,7 @@ fn geminiSupports(model: []const u8, cap: Capability) bool {
         .structured_output => true, // responseSchema JSON
         .reasoning_content => false, // Gemini 用 thought_summary+signature,非平级字段
         .image_input => model_adapter.profileFor(.gemini, model).supports_image_input,
+        .pdf_input => model_adapter.profileFor(.gemini, model).supports_pdf_input,
     };
 }
 
@@ -66,6 +67,7 @@ fn openaiSupports(model: []const u8, cap: Capability) bool {
         },
         // 单一真相在 ModelProfile(序列化守门同源),此处转发查表。
         .image_input => model_adapter.profileFor(.openai, model).supports_image_input,
+        .pdf_input => model_adapter.profileFor(.openai, model).supports_pdf_input,
     };
 }
 
@@ -84,6 +86,7 @@ fn anthropicSupports(model: []const u8, cap: Capability) bool {
         // Claude 用 content[] 里的 thinking block,非平级 reasoning_content 字段。
         .reasoning_content => false,
         .image_input => model_adapter.profileFor(.anthropic, model).supports_image_input,
+        .pdf_input => model_adapter.profileFor(.anthropic, model).supports_pdf_input,
     };
 }
 
@@ -140,4 +143,11 @@ test "image_input 能力矩阵转发 ModelProfile(单一真相)" {
     try std.testing.expect(supports(.gemini, "gemini-2.5-flash", .image_input));
     try std.testing.expect(!supports(.openai, "deepseek-chat", .image_input));
     try std.testing.expect(!supports(.other, "mystery", .image_input));
+    // pdf_input 是独立能力:vision 为真绝不蕴含它。
+    try std.testing.expect(supports(.anthropic, "claude-sonnet-4", .pdf_input));
+    try std.testing.expect(!supports(.anthropic, "claude-3-opus-20240229", .pdf_input));
+    try std.testing.expect(supports(.openai, "gpt-4o", .image_input));
+    try std.testing.expect(!supports(.openai, "gpt-4o", .pdf_input));
+    try std.testing.expect(!supports(.gemini, "gemini-2.5-flash", .pdf_input));
+    try std.testing.expect(!supports(.other, "mystery", .pdf_input));
 }

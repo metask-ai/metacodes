@@ -764,6 +764,10 @@ pub const StreamEvent = union(enum) {
     tool_use_start: ToolUseResult,
     web_search_result: WebSearchResultEvent,
     web_search_query: []u8,
+    /// Provider 私有的推理续传项(issue #23):OpenAI Responses 的 `reasoning`
+    /// output item,原样 JSON。**不是可展示文本**——消费者只负责按序存进
+    /// assistant 消息,供下一次同模型请求逐字节回传。owned,消费者释放。
+    reasoning_item: []u8,
     usage: UsageDelta,
     done: void,
 };

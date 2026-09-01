@@ -118,6 +118,7 @@ pub const message_repair = @import("core/message_repair.zig");
 pub const tool_result_artifact = @import("core/tool_result_artifact.zig");
 pub const tool_result = @import("core/tool_result.zig");
 pub const result_projection = @import("core/result_projection.zig");
+pub const pdf = @import("core/pdf.zig");
 pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
 pub const read_artifact = @import("tools/read_artifact.zig");
 pub const cache_break = @import("core/cache_break.zig");
@@ -723,7 +724,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
     if (config.prompt) |p| {
-        const code = @import("repl/headless.zig").run(app, allocator, p, config.images, config.json_output) catch |err| blk: {
+        const code = @import("repl/headless.zig").run(app, allocator, p, config.images, config.documents, config.json_output) catch |err| blk: {
             std.debug.print("error: headless setup failed: {s}\n", .{@errorName(err)});
             break :blk 1;
         };
@@ -1546,6 +1547,14 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 return;
             };
             config.images = appendNulList(allocator, config.images, s);
+        } else if (std.mem.eql(u8, arg, "--pdf")) {
+            // headless 文档输入(issue #25):可重复,顺序保留。路径在 headless.run
+            // 读取并做 PDF 准入(真 PDF / 未加密 / 字节与页数上限),这里只收集。
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --pdf", .{});
+                return;
+            };
+            config.documents = appendNulList(allocator, config.documents, s);
         } else if (std.mem.eql(u8, arg, "--plugin-dir")) {
             const s = args.next() orelse {
                 setParseError(config, allocator, "missing value for --plugin-dir", .{});
@@ -1732,6 +1741,9 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
     // `--image` 只在 headless prompt 模式(-p/--print/stdin `-`)消费;其它任何模式
     // (TUI/serve/web/dump)静默忽略违背 issue #10"图绝不静默丢"铁律与 flag 面
     // fail-closed 契约。统一在 parse 尾部拒绝(parseArgsForTest 可测)。
+    if (config.documents != null and config.prompt == null and config.parse_error == null) {
+        setParseError(config, allocator, "--pdf requires -p/--print (headless prompt mode)", .{});
+    }
     if (config.images != null and config.prompt == null and config.parse_error == null) {
         setParseError(config, allocator, "--image requires -p/--print (headless prompt mode)", .{});
     }
@@ -1818,6 +1830,7 @@ fn printHelp() void {
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
         \\  --image <path>        Headless: attach an image (png/jpg/jpeg/gif/webp) to the prompt (repeatable, order kept)
+        \\  --pdf <path>          Headless: attach a PDF document to the prompt (repeatable, order kept; needs a model with pdf_input)
         \\  --dump-prompt         Print the assembled system prompt and exit
         \\  --dump-plugins        Print the immutable plugin inventory JSON and exit
         \\  serve [port]          Daemon mode (HTTP; default port 7777)
