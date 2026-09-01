@@ -46,7 +46,6 @@ pub const Resolution = struct {
     /// The caller persists the update; a floating alias that never records
     /// where it went cannot explain a route after the fact.
     moved: bool,
-    ambiguity: selection_mod.Ambiguity = .{ .match_count = 0 },
 };
 
 pub fn resolve(catalog: *const OfferCatalog, entry: AliasEntry) AliasError!Resolution {
@@ -99,8 +98,31 @@ fn resolveFloating(catalog: *const OfferCatalog, entry: AliasEntry) AliasError!R
         .offer_revision = chosen.offer_revision,
         .catalog_revision = catalog.revision,
         .moved = moved,
-        .ambiguity = ambiguity,
     };
+}
+
+/// The routes a floating selector matches, for reporting an ambiguity.
+///
+/// A separate traversal on purpose: it runs only on the error path, and
+/// threading candidates through the success type would leave a field populated
+/// with nothing useful on every ordinary resolution.
+pub fn candidatesFor(catalog: *const OfferCatalog, entry: AliasEntry) selection_mod.Ambiguity {
+    var out = selection_mod.Ambiguity{ .match_count = 0 };
+    const selector = entry.selector orelse return out;
+    for (catalog.items()) |*candidate| {
+        if (!registry_mod.matchesSelector(candidate.*, selector.slice())) continue;
+        if (candidate.availability == .unavailable) continue;
+        out.match_count +|= 1;
+        if (out.sample_len == selection_mod.MAX_AMBIGUITY_SAMPLES) continue;
+        out.samples[out.sample_len] = .{
+            .offer_id = candidate.offer_id,
+            .provider_id = candidate.provider_id,
+            .channel_id = candidate.channel_id,
+            .protocol = candidate.protocol,
+        };
+        out.sample_len += 1;
+    }
+    return out;
 }
 
 /// The record to persist after resolving. A floating alias records where it
@@ -216,6 +238,15 @@ test "a floating selector matching several routes is an error with candidates" {
         .selector = try selection_mod.Selector.parse("glm-4.6"),
     };
     try testing.expectError(error.AmbiguousSelector, resolve(&catalog, entry));
+
+    // The candidates are recoverable, so the command can say *which* routes
+    // rather than only that there were several.
+    const candidates = candidatesFor(&catalog, entry);
+    try testing.expectEqual(@as(u16, 4), candidates.match_count);
+    try testing.expect(candidates.samplesSlice().len > 1);
+    for (candidates.samplesSlice()) |sample| {
+        try testing.expect(sample.provider_id.eqlText("zai-coding-plan"));
+    }
 }
 
 test "a malformed record is rejected rather than half-resolved" {

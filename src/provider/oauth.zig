@@ -102,7 +102,6 @@ pub const Exchange = struct {
 pub const Session = struct {
     allocator: std.mem.Allocator,
     provider_id: Slug,
-    credential_ref: Slug,
     /// Where rotated tokens are persisted. Owned.
     path: []u8,
 
@@ -121,13 +120,11 @@ pub const Session = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         provider_id: Slug,
-        credential_ref: Slug,
         path: []const u8,
     ) OAuthError!Session {
         return .{
             .allocator = allocator,
             .provider_id = provider_id,
-            .credential_ref = credential_ref,
             .path = allocator.dupe(u8, path) catch return error.OutOfMemory,
         };
     }
@@ -136,7 +133,6 @@ pub const Session = struct {
     pub fn initHome(
         allocator: std.mem.Allocator,
         provider_id: Slug,
-        credential_ref: Slug,
     ) OAuthError!Session {
         const dir = if (std.c.getenv("METACODES_OAUTH_DIR")) |raw|
             std.mem.span(raw)
@@ -151,7 +147,7 @@ pub const Session = struct {
         const path = std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ dir, provider_id.slice() }) catch
             return error.OutOfMemory;
         defer allocator.free(path);
-        return init(allocator, provider_id, credential_ref, path);
+        return init(allocator, provider_id, path);
     }
 
     pub fn deinit(self: *Session) void {
@@ -584,7 +580,7 @@ fn tempSession(a: std.mem.Allocator, name: []const u8) !Session {
         const target = std.fmt.bufPrintZ(&cleanup, "{s}{s}", .{ path, suffix }) catch continue;
         pfs.unlinkPath(target) catch {};
     }
-    return Session.init(a, Slug.lit("openai"), Slug.lit("cred-openai"), path);
+    return Session.init(a, Slug.lit("openai"), path);
 }
 
 fn removePath(path: []const u8) void {
@@ -699,7 +695,7 @@ test "rotated tokens are persisted atomically and survive a reload" {
 
     // A crash right here is the dangerous moment: the provider has already
     // invalidated `refresh-0`, so the file must already hold `refresh-1`.
-    var reloaded = try Session.init(a, Slug.lit("openai"), Slug.lit("cred-openai"), path);
+    var reloaded = try Session.init(a, Slug.lit("openai"), path);
     defer reloaded.deinit();
     try testing.expect(try reloaded.load());
     try testing.expectEqualStrings("refresh-1", reloaded.tokens.?.refresh_token);
@@ -856,7 +852,7 @@ test "the token store creates every missing parent directory" {
     cleanup(&buffer);
     defer cleanup(&buffer);
 
-    var session = try Session.init(a, Slug.lit("openai"), Slug.lit("openai"), path);
+    var session = try Session.init(a, Slug.lit("openai"), path);
     defer session.deinit();
     // A single `mkdir` of the leaf would fail with ENOENT here, which is the
     // state a fresh installation is in.
@@ -866,7 +862,7 @@ test "the token store creates every missing parent directory" {
         .expires_in_seconds = 3600,
     }, 1_000);
 
-    var reloaded = try Session.init(a, Slug.lit("openai"), Slug.lit("openai"), path);
+    var reloaded = try Session.init(a, Slug.lit("openai"), path);
     defer reloaded.deinit();
     try testing.expect(try reloaded.load());
     try testing.expectEqualStrings("rt", reloaded.tokens.?.refresh_token);

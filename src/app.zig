@@ -291,6 +291,11 @@ pub const App = struct {
     /// are recorded once; a restart starts from the journal's current head
     /// rather than replaying a ring that may already have evicted.
     provider_audit_cursor: u64 = 0,
+    /// Why the most recent catalog refresh skipped a provider, if it did. A
+    /// per-catalog failure must not abort the others, so it is recorded rather
+    /// than propagated — and reported, because a silently skipped refresh looks
+    /// exactly like a successful one.
+    last_catalog_refresh_error: ?[]const u8 = null,
     /// 模型档位表(~/.metacodes/config.json 的 model_tiers;null=未配置)。
     model_tiers_table: ?@import("api/model_tiers.zig").TierTable = null,
     pending_previous_model_for_compact: ?[]u8 = null,
@@ -1090,11 +1095,7 @@ pub const App = struct {
         const same_provider = if (app.oauth_session_provider) |id| id.eql(built.id) else false;
         if (!same_provider) {
             if (app.oauth_session) |*old_session| old_session.deinit();
-            app.oauth_session = try provider_oauth_mod.Session.initHome(
-                app.allocator,
-                built.id,
-                built.id,
-            );
+            app.oauth_session = try provider_oauth_mod.Session.initHome(app.allocator, built.id);
             app.oauth_session_provider = built.id;
             // No stored login is not an error: the provider simply falls
             // through to its API-key aliases.
@@ -1944,6 +1945,7 @@ pub const App = struct {
         const host = try app.providerHost();
         const io = app.api_client.http_client.io;
         var refreshed: usize = 0;
+        app.last_catalog_refresh_error = null;
 
         var it = section.object.iterator();
         while (it.next()) |pair| {
@@ -1959,7 +1961,10 @@ pub const App = struct {
             const models = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
                 .url = models_url,
                 .bearer = bearer,
-            }) catch continue;
+            }) catch |err| {
+                app.last_catalog_refresh_error = @errorName(err);
+                continue;
+            };
             defer app.allocator.free(models.body);
 
             var documents: std.ArrayList([]const u8) = .empty;
@@ -1974,7 +1979,10 @@ pub const App = struct {
                         const document = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
                             .url = url,
                             .bearer = bearer,
-                        }) catch continue;
+                        }) catch |err| {
+                            app.last_catalog_refresh_error = @errorName(err);
+                            continue;
+                        };
                         // The list owns the body from here; on a failed append
                         // nothing else would ever free it.
                         documents.append(app.allocator, document.body) catch |err| {
@@ -1985,7 +1993,10 @@ pub const App = struct {
                 }
             }
 
-            host.ingestOpenRouter(provider_id, models.body, documents.items) catch continue;
+            host.ingestOpenRouter(provider_id, models.body, documents.items) catch |err| {
+                app.last_catalog_refresh_error = @errorName(err);
+                continue;
+            };
             refreshed += 1;
         }
         return refreshed;

@@ -384,7 +384,6 @@ pub const RouterObservation = struct {
     cost_micros: ?u64 = null,
     latency_ms: ?u32 = null,
     fallback_attempts: ?u8 = null,
-    status: ?selection_mod.RouteStatus = null,
 };
 
 pub fn parseRouterMetadata(text: []const u8, allocator: std.mem.Allocator) AdapterError!RouterObservation {
@@ -429,11 +428,10 @@ pub fn applyObservation(
     out.cost_micros = observation.cost_micros;
     out.latency_ms = observation.latency_ms;
     if (observation.fallback_attempts) |attempts| out.fallback_attempts = attempts;
-    if (observation.status) |status| {
-        out.status = status;
-    } else if (out.fallback_attempts > 0) {
-        out.status = .fell_back;
-    }
+    // Status is derived, not reported: the router says which providers it tried,
+    // and "it fell back" is exactly "it tried more than one". A field carrying a
+    // status nothing produces would be decoration.
+    if (out.fallback_attempts > 0) out.status = .fell_back;
     return out;
 }
 

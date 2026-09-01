@@ -17,8 +17,12 @@ pub const FetchError = error{
     OutOfMemory,
     InvalidUrl,
     RequestFailed,
-    /// A non-2xx answer. The status is reported so a caller can distinguish an
-    /// expired key from an outage instead of retrying both the same way.
+    /// The credential was refused. Distinct from the rest because it is the one
+    /// a retry cannot fix and the user has to act on.
+    Unauthorized,
+    /// Throttled. A retry is the right response, later.
+    RateLimited,
+    /// Any other non-2xx answer.
     HttpError,
     /// Larger than a catalog has any business being. An unbounded read from a
     /// URL in a config file is a memory-exhaustion vector.
@@ -36,8 +40,9 @@ pub const Request = struct {
     bearer: ?[]const u8 = null,
 };
 
+/// The document. The status is not returned: a 2xx is the only success, and
+/// every failure is already distinguished by the error itself.
 pub const Response = struct {
-    status: u16,
     /// Owned by the caller.
     body: []u8,
 };
@@ -92,6 +97,10 @@ pub fn fetch(
     // an ordinary 401 or 429 from a catalog endpoint means heap corruption.
     errdefer allocator.free(body);
 
-    if (status.code < 200 or status.code >= 300) return error.HttpError;
-    return .{ .status = status.code, .body = body };
+    if (status.code < 200 or status.code >= 300) return switch (status.code) {
+        401, 403 => error.Unauthorized,
+        429 => error.RateLimited,
+        else => error.HttpError,
+    };
+    return .{ .body = body };
 }

@@ -2288,6 +2288,15 @@ fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
             std.debug.print("\x1b[31mcatalog refresh failed: {s}\x1b[0m\n", .{@errorName(err)});
             return;
         };
+        if (app.last_catalog_refresh_error) |why| {
+            // A per-catalog failure does not abort the others, so it has to be
+            // reported here or it disappears entirely.
+            std.debug.print(
+                "\x1b[33mone or more catalogs did not refresh ({s}); the previous " ++
+                    "catalog is still in use\x1b[0m\n",
+                .{why},
+            );
+        }
         if (refreshed == 0) {
             std.debug.print(
                 "No provider catalogs are configured. Add `provider_catalogs` to " ++

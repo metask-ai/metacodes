@@ -1223,12 +1223,7 @@ test "L2: an expired provider token refreshes over real HTTP and persists the ro
     removeTempDir(path);
     defer removeTempDir(path);
 
-    var session = try cc.provider_oauth.Session.init(
-        a,
-        Slug.lit("openai"),
-        Slug.lit("openai"),
-        path,
-    );
+    var session = try cc.provider_oauth.Session.init(a, Slug.lit("openai"), path);
     defer session.deinit();
     try session.importOutcome(.{
         .access_token = "at-1",
@@ -1276,7 +1271,7 @@ test "L2: a rejected refresh is terminal and leaves the stored login untouched" 
     removeTempDir(path);
     defer removeTempDir(path);
 
-    var session = try cc.provider_oauth.Session.init(a, Slug.lit("openai"), Slug.lit("openai"), path);
+    var session = try cc.provider_oauth.Session.init(a, Slug.lit("openai"), path);
     defer session.deinit();
     try session.importOutcome(.{
         .access_token = "at-1",
@@ -1827,7 +1822,9 @@ test "L2: a catalog endpoint answering non-2xx releases its body exactly once" {
     // an ordinary 401 from a catalog endpoint corrupted the heap.
     // `std.testing.allocator` fails on a double free or a leak, so this test is
     // the check.
-    try std.testing.expectError(error.HttpError, cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{
+    // A refused credential is distinguished from an outage: one the user must
+    // act on, the other a retry can fix.
+    try std.testing.expectError(error.Unauthorized, cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{
         .url = origin,
         .bearer = "sk-catalog",
     }));

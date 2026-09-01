@@ -1227,7 +1227,7 @@ fn storeProviderOAuthToken(
         return 2;
     }
 
-    var session = provider_oauth.Session.initHome(allocator, built.id, built.id) catch |err| {
+    var session = provider_oauth.Session.initHome(allocator, built.id) catch |err| {
         std.debug.print("error: could not open the OAuth store ({s})\n", .{@errorName(err)});
         return 2;
     };
