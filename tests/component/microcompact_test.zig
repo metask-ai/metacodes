@@ -308,3 +308,57 @@ test "L2 usage 锚点接线: message_start usage → conversation.usageAnchor(in
     // usage 到达时 assistant 消息尚未 append → 锚点只覆盖请求时的 1 条消息。
     try std.testing.expectEqual(@as(usize, 1), anchor.msg_count);
 }
+
+test "L2 microcompact: 生产组合(先清后截)——clear 保留的最近大结果由 truncate 兜底" {
+    // 回归守卫:`truncateLargeToolResults` 曾经零生产调用者,而
+    // `agent_loop` 的 microcompact 日志行一直打印 `truncated={d}`——那个字段
+    // 结构性恒为 0。本测试复刻生产里两趟的组合顺序与预算,证明 clear 故意
+    // 保留的最近结果确实会被 truncate 兜住。
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+
+    const limit = cc.conversation.toolResultContextBytes(200_000);
+
+    // 两条老结果(会被清成 stub)。
+    try appendToolResult(&conv, a, "old0", "old tool output 0 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    try appendToolResult(&conv, a, "old1", "old tool output 1 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+    // 最近两条:clear 按 keep_recent=2 全部保留。其中一条远超单条预算——
+    // 这正是 projection 管不到的形态(/resume 的历史、或切到更小窗口的模型)。
+    try appendToolResult(&conv, a, "recent_small", "recent small tool output");
+    const huge = try a.alloc(u8, limit * 2);
+    defer a.free(huge);
+    @memset(huge, 'A');
+    huge[huge.len - 1] = 'Z';
+    try appendToolResult(&conv, a, "recent_huge", huge);
+
+    // 与 agent_loop.runAutoCompactIfNeeded 完全同序、同预算。
+    var reduced = conv.microcompactToolResultsByRecentResults(
+        cc.conversation.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
+    );
+    reduced.merge(conv.truncateLargeToolResults(limit));
+
+    try std.testing.expectEqual(@as(usize, 2), reduced.cleared);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    try std.testing.expect(reduced.bytes_before > reduced.bytes_after);
+
+    // 老的两条被清成 stub。
+    try std.testing.expect(cc.conversation.isCommittedToolResultProjection(conv.messages.items[0].blocks[0].tool_result.content));
+    try std.testing.expect(cc.conversation.isCommittedToolResultProjection(conv.messages.items[1].blocks[0].tool_result.content));
+    // 最近的小结果原样保留:truncate 不该动它。
+    try std.testing.expectEqualStrings("recent small tool output", conv.messages.items[2].blocks[0].tool_result.content);
+    // 最近的大结果被 clear 保留、被 truncate 兜住:有界、留 sha256 承诺、保尾部。
+    const bounded = conv.messages.items[3].blocks[0].tool_result.content;
+    try std.testing.expect(bounded.len <= limit);
+    try std.testing.expect(std.mem.indexOf(u8, bounded, "original_bytes=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounded, "sha256=") != null);
+    try std.testing.expect(std.mem.endsWith(u8, bounded, "Z"));
+
+    // 幂等:再跑一遍两趟都不该有新动作。
+    var again = conv.microcompactToolResultsByRecentResults(
+        cc.conversation.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
+    );
+    again.merge(conv.truncateLargeToolResults(limit));
+    try std.testing.expect(!again.changed());
+}

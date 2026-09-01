@@ -115,7 +115,7 @@ fn appendMemoryChannel(
         null;
     var preview = try headTailPreview(allocator, bytes, CHANNEL_PREVIEW_BYTES);
     defer preview.deinit();
-    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, bytes.len, digest, stored, capture_complete, metrics);
+    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, bytes.len, digest, stored, capture_complete, null, metrics);
 }
 
 fn appendFileChannel(
@@ -137,7 +137,7 @@ fn appendFileChannel(
         else
             .{ .content = try allocator.dupe(u8, ""), .shown_source_bytes = 0, .allocator = allocator };
         defer preview.deinit();
-        try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, observed_bytes, null, null, false, metrics);
+        try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, observed_bytes, null, null, false, path, metrics);
         return;
     };
     const stored: ?artifact.Receipt = if (inspected.bytes > CHANNEL_PREVIEW_BYTES)
@@ -146,7 +146,7 @@ fn appendFileChannel(
         null;
     var preview = try headTailFilePreview(allocator, path, inspected.bytes, CHANNEL_PREVIEW_BYTES);
     defer preview.deinit();
-    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, inspected.bytes, inspected.sha256, stored, true, metrics);
+    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, inspected.bytes, inspected.sha256, stored, true, path, metrics);
 }
 
 fn appendChannel(
@@ -159,6 +159,7 @@ fn appendChannel(
     digest: ?[64]u8,
     stored: ?artifact.Receipt,
     capture_complete: bool,
+    spool_path: ?[]const u8,
     metrics: ?*ResultMetrics,
 ) !void {
     if (metrics) |m| m.recordCapturedStream(captured_bytes);
@@ -204,6 +205,17 @@ fn appendChannel(
     } else {
         try writer.writeAll("null");
         try writer.print(",\"{s}_recoverable\":{s}", .{ label, if (captured_bytes <= shown_source_bytes and capture_complete) "true" else "false" });
+    }
+    // The process spool lives in the OS temp directory, never in the
+    // kernel-private artifact CAS, and outlives the JobRegistry entry. It is
+    // the only recovery capability left when the capture was too large to
+    // publish, and it lets Grep/Read answer questions the 32KiB ReadArtifact
+    // window cannot. The auto-backgrounded response already exposes it; the
+    // completed response withholding it made the completed path strictly
+    // weaker than the incomplete one.
+    if (spool_path) |path| {
+        try writer.print(",\"{s}_path\":", .{label});
+        try std.json.Stringify.encodeJsonString(path, .{}, writer);
     }
 }
 
@@ -694,6 +706,12 @@ test "completed job output becomes a bounded recoverable channel artifact" {
     try std.testing.expect(std.mem.endsWith(u8, parsed.value.object.get("stdout").?.string, "BASH_TAIL"));
     try std.testing.expectEqual(@as(u64, 1), metrics.snapshot().artifact_spill_count);
     try std.testing.expectEqual(@as(u64, 40_009), metrics.snapshot().captured_stream_bytes);
+    // The process spool path is handed back alongside the artifact id. The
+    // `indexOf(result, root) == null` assertion above still holds because the
+    // JobRegistry spool lives in the OS temp directory, not in the
+    // kernel-private artifact CAS.
+    try std.testing.expectEqualStrings(job.stdout_path, parsed.value.object.get("stdout_path").?.string);
+    try std.testing.expectEqualStrings(job.stderr_path, parsed.value.object.get("stderr_path").?.string);
     var tail = try artifact.readChunk(allocator, root, artifact_id, 39_990, 32);
     defer tail.deinit();
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "BASH_TAIL") != null);
@@ -728,6 +746,17 @@ test "BashTool embedding without JobRegistry still spools from byte zero" {
     var tail = try artifact.readChunk(allocator, root, artifact_id, 39_990, 32);
     defer tail.deinit();
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "EMBED_TAIL") != null);
+
+    // The spool path must be a handle the model can actually act on: Read and
+    // Grep answer questions the 32KiB ReadArtifact window cannot. Prove it
+    // resolves to the complete bytes even though the transient JobRegistry
+    // that produced it has already been torn down.
+    const spool_path = parsed.value.object.get("stdout_path").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, spool_path, root) == null);
+    const spooled = try readWholeFile(spool_path, allocator, 0);
+    defer allocator.free(spooled);
+    try std.testing.expectEqual(@as(usize, 40_010), spooled.len);
+    try std.testing.expect(std.mem.endsWith(u8, spooled, "EMBED_TAIL"));
 }
 
 test "over-limit completed spool reports true size without a false commitment" {
@@ -760,6 +789,13 @@ test "over-limit completed spool reports true size without a false commitment" {
     try std.testing.expect(!parsed.value.object.get("stdout_capture_complete").?.bool);
     try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
     try std.testing.expect(!parsed.value.object.get("stdout_recoverable").?.bool);
+    // A capture too large to publish has no artifact_id and no committed
+    // digest, so `recoverable` stays false: there is nothing to make a
+    // content-addressed promise about. The spool path is the weaker but real
+    // capability that used to be withheld here, turning an intact on-disk
+    // file into a total loss for the model.
+    try std.testing.expectEqualStrings(stdout_path, parsed.value.object.get("stdout_path").?.string);
+    try std.testing.expectEqualStrings(stderr_path, parsed.value.object.get("stderr_path").?.string);
 }
 
 test "truncateHead: 小输出原样,大输出截断 + 标记" {
@@ -796,4 +832,7 @@ test "BashTool 大输出 becomes bounded even when artifact storage is unavailab
     try std.testing.expect(std.mem.indexOf(u8, r, "\"stdout_recoverable\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "\"stdout_capture_complete\":true") != null);
     try std.testing.expect(r.len < 8 * 1024);
+    // No JobRegistry and no artifact root means no on-disk spool exists, so the
+    // path field is absent rather than pointing at nothing.
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"stdout_path\"") == null);
 }

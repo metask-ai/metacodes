@@ -499,6 +499,17 @@ pub const Conversation = struct {
         pub fn changed(self: ToolResultReduction) bool {
             return self.cleared > 0 or self.truncated > 0;
         }
+
+        /// Accumulate a second pass over the same Conversation. The two passes
+        /// are disjoint by construction: clearing skips results that are
+        /// already stubs, and truncation skips both stubs and results it has
+        /// already truncated, so no result is double-counted.
+        pub fn merge(self: *ToolResultReduction, other: ToolResultReduction) void {
+            self.cleared +|= other.cleared;
+            self.truncated +|= other.truncated;
+            self.bytes_before +|= other.bytes_before;
+            self.bytes_after +|= other.bytes_after;
+        }
     };
 
     pub fn compactWithSummaryReport(
@@ -617,6 +628,14 @@ pub const Conversation = struct {
     /// model, but as a head/tail preview instead of an unbounded blob. This is
     /// intentionally independent of full compact: a single recent tool result
     /// can be enough to exceed the context window.
+    ///
+    /// `result_projection` bounds results only at the moment they are
+    /// committed, and never re-projects history. This pass is therefore the
+    /// only bound that applies to results which entered the Conversation under
+    /// a different budget: a transcript loaded by /resume, or a session that
+    /// switched to a smaller-window model. It runs beside the microcompact
+    /// clear pass in `maybeAutoCompact`; both are no-ops when every result
+    /// already fits.
     pub fn truncateLargeToolResults(self: *Conversation, max_bytes: usize) ToolResultReduction {
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();

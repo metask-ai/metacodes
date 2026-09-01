@@ -3279,7 +3279,18 @@ fn runAutoCompactIfNeeded(
     const micro_threshold = forced_threshold orelse
         @max(@min(pressure.warning_threshold, auto_threshold), MIN_AUTO_COMPACT_THRESHOLD);
     if (request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
-        const reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
+        var reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
+        // Clearing deliberately preserves the most recent results, and skips
+        // anything whose artifact envelope is its only recovery capability.
+        // Neither exemption bounds a single oversized result that entered the
+        // Conversation under a different budget (a /resume'd transcript, or a
+        // switch to a smaller window), because projection never re-runs on
+        // history. Bound those here against the same per-result budget
+        // projection uses, so the `truncated=` field of the line below stops
+        // being structurally zero.
+        reduced.merge(conversation.truncateLargeToolResults(
+            conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
+        ));
         if (reduced.changed()) {
             outcome = .compacted;
             log.info("agent", "microcompact: cleared={d} truncated={d} old tool_results bytes={d}->{d} keep_recent_results={d} threshold={d} cause={s}", .{ reduced.cleared, reduced.truncated, reduced.bytes_before, reduced.bytes_after, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP, micro_threshold, trigger_cause });
@@ -3456,7 +3467,14 @@ fn runAutoCompactIfNeeded(
     if (outcome == .skipped_no_savings) return outcome;
 
     if (pressure.isAtBlockingLimit()) {
-        const reduced = conversation.microcompactToolResultsByRecentResults(0);
+        var reduced = conversation.microcompactToolResultsByRecentResults(0);
+        // Same rationale as the stale-result valve above, and it matters more
+        // here: at the blocking limit the request is otherwise rejected, so a
+        // single unbounded surviving result is the difference between
+        // recovering and returning api_error.
+        reduced.merge(conversation.truncateLargeToolResults(
+            conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
+        ));
         if (reduced.changed()) {
             outcome = .compacted;
             const before_block_tokens = request_tokens_before;
@@ -5110,6 +5128,26 @@ test "auto-compact 阈值用 input context window 而非 output max_tokens(防�
     // 全额输出预留(服务端校验 in+max_tokens ≤ window):200K-32K-13K = 155K。
     try std.testing.expectEqual(@as(usize, 155_000), context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 0).auto_compact_threshold);
     try std.testing.expect(MIN_AUTO_COMPACT_THRESHOLD >= 32_000);
+}
+
+test "微压缩两趟都接线:clear 与 truncate 必须同时在生产路径上" {
+    // 回归守卫:`truncateLargeToolResults` 曾经零生产调用者——全仓每一个调用点
+    // 都在 test 块内,而下面这条日志行一直打印 `truncated={d}`,该字段结构性
+    // 恒为 0。projection 只在结果**提交那一刻**限界且从不重投影历史,所以
+    // /resume 载入的历史、或切到更小窗口的模型,其超限结果没有任何一层管得到。
+    // 两个压力阀点都必须按 provider 窗口派生的同一预算跑截断趟。
+    const src = @embedFile("agent_loop.zig");
+    const wiring = "reduced.merge(conversation.truncateLargeToolResults(\n            conversation_mod.toolResultContextBytes(provider.maxInputTokens()),\n        ));";
+    var count: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, src, cursor, wiring)) |at| {
+        count += 1;
+        cursor = at + wiring.len;
+    }
+    // 一处在 micro 阈值带,一处在 blocking-limit 恢复。
+    try std.testing.expectEqual(@as(usize, 2), count);
+    // 且预算必须与 projection 的 per_result_bytes 同源,不能各自造常量。
+    try std.testing.expect(std.mem.indexOf(u8, src, "conversation_mod.toolResultContextBytes(provider.maxInputTokens())") != null);
 }
 
 test "parseForcedAutoCompactThreshold: 合法强制值 + 坏值回退 null" {
