@@ -298,3 +298,22 @@ test "RequestAbortRegistry closes pre-registration abort race" {
     defer registry.unregister(&interrupted);
     try std.testing.expect(interrupted);
 }
+
+test "runtime capability bridge covers the full runtime enum" {
+    // **必须绑真枚举**:此前 offer.zig 里是一份手抄副本,于是"加运行时能力却漏
+    // 映射会编译报错"的承诺其实只覆盖副本——issue #25 加 `pdf_input` 时它一声
+    // 没吭。绑 `Capability` 本尊后,这条断言才真正是那个 comptime 守卫。
+    //
+    // 断言住在 api 侧而不是 offer.zig 里,是因为 `subsystem:boundary` 不许
+    // provider 子系统 import 传输层——那正是 `test:provider` 隔离性的全部内容。
+    // offer.zig 的两个 helper 对运行时枚举是泛型的,生产代码因此不跨界;只有这
+    // 条断言需要具体类型,于是它下沉到允许同时看见两层的这一侧。方向是
+    // api → provider,守卫的强度一分未减。
+    const offer = @import("../provider/offer.zig");
+    offer.assertRuntimeCoverage(Capability);
+    try std.testing.expectEqual(offer.Capability.vision, offer.fromRuntimeCapability(Capability.image_input));
+    // vision 与 documents 是两个能力,绝不映射到同一个。
+    try std.testing.expectEqual(offer.Capability.documents, offer.fromRuntimeCapability(Capability.pdf_input));
+    try std.testing.expectEqual(offer.Capability.reasoning, offer.fromRuntimeCapability(Capability.extended_thinking));
+    try std.testing.expectEqual(offer.Capability.caching, offer.fromRuntimeCapability(Capability.prompt_cache));
+}

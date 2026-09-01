@@ -830,16 +830,3 @@ test "group key prefers canonical identity over the wire model name" {
     try std.testing.expectEqualStrings("zai/glm-5.3", offer.groupKey());
     try std.testing.expectEqualStrings("relay-glm-pro", offer.request_model_id);
 }
-
-test "runtime capability bridge covers the full runtime enum" {
-    // **必须绑真枚举**:此前这里是一份手抄副本,于是"加运行时能力却漏映射会编译
-    // 报错"的承诺其实只覆盖副本——issue #25 加 `pdf_input` 时它一声没吭。绑
-    // api/provider.zig 本尊后,这条断言才真正是那个 comptime 守卫。
-    const RuntimeCapability = @import("../api/provider.zig").Capability;
-    assertRuntimeCoverage(RuntimeCapability);
-    try std.testing.expectEqual(Capability.vision, fromRuntimeCapability(RuntimeCapability.image_input));
-    // vision 与 documents 是两个能力,绝不映射到同一个。
-    try std.testing.expectEqual(Capability.documents, fromRuntimeCapability(RuntimeCapability.pdf_input));
-    try std.testing.expectEqual(Capability.reasoning, fromRuntimeCapability(RuntimeCapability.extended_thinking));
-    try std.testing.expectEqual(Capability.caching, fromRuntimeCapability(RuntimeCapability.prompt_cache));
-}
