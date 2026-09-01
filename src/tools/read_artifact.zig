@@ -158,7 +158,6 @@ test "ReadArtifact clamps a recovery read to the per-result budget" {
     try std.testing.expectError(error.InvalidReadLimit, execute(&wide_ctx, oversize));
 }
 
-
 test "a recovery read is bounded in the bytes the model is charged for" {
     // The recovery tool is exempt from the projection pass, so its own bound
     // is the only one. Cutting on source length let a quote-dense chunk render

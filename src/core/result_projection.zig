@@ -1484,4 +1484,3 @@ test "regrowing a whole turn's envelopes stays inside the turn budget" {
     try std.testing.expectEqual(@as(usize, count), stats.envelope_regrown_count);
     try std.testing.expect(total > count * (artifact.PREVIEW_HEAD_BYTES + artifact.PREVIEW_TAIL_BYTES));
 }
-
