@@ -733,6 +733,8 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
         // 同 OpenAI:tool_result 消息只投影 functionResponse parts,同消息 image 会被
         // 静默丢——issue #10 铁律下防御性显式报错(正常路径经 merge 守护永不产出)。
         for (m.content) |c| if (c == .image) return error.ImageWithToolResultUnsupported;
+        // 文档同理(issue #25):tool_result 消息的 wire 投影没有它的位置。
+        for (m.content) |c| if (c == .document) return error.DocumentWithToolResultUnsupported;
         // P0.1 并行:一轮多个 tool_result → **全部**作为同一 user content 的多个 functionResponse
         // parts(旧版只发首个 → 并行回合下一次请求缺 functionResponse 配对)。
         // functionResponse.name 必须是**原 functionCall 的真实名**(Gemini 靠 name 配对,非 id);
@@ -846,6 +848,9 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
             const emitted = try dialect.serializeImagePart(profile, img, out, allocator);
             if (!emitted) return error.ImageInputUnsupported;
         },
+        // 一等文档(issue #25):本协议族本期没有原生文档输入路径 → 显式能力错误,
+        // 绝不静默丢弃、OCR、抽文本或降级成页面图。
+        .document => return error.DocumentInputUnsupported,
         else => {},
     };
     // 空 parts 兜底(Gemini 要求 parts 非空)。

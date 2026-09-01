@@ -234,9 +234,9 @@ pub fn preflight(
 }
 
 /// Multimodal companion of `preflight`: one user record built from ordered
-/// text/image parts reserves its exact encoded delta, the same admission
-/// invariant text prompts use. Raw input counts every borrowed payload byte
-/// (text, media_type, base64 data).
+/// text/image/document parts reserves its exact encoded delta, the same
+/// admission invariant text prompts use. Raw input counts every borrowed
+/// payload byte (text, media_type, base64 data, document title).
 pub fn preflightParts(
     profile: Profile,
     current_usage: u64,
@@ -249,6 +249,11 @@ pub fn preflightParts(
         .image => |image| {
             raw_input = try checkedAdd(raw_input, image.media_type.len);
             raw_input = try checkedAdd(raw_input, image.data.len);
+        },
+        .document => |document| {
+            raw_input = try checkedAdd(raw_input, document.media_type.len);
+            raw_input = try checkedAdd(raw_input, document.data.len);
+            raw_input = try checkedAdd(raw_input, document.title.len);
         },
     };
     const input_delta = checkpoint.encodedUserPartsMessageBytes(parts) catch
@@ -1112,6 +1117,14 @@ fn measureStreamEvent(event: core.api_stream.StreamEvent) Error!MeasuredPayload 
             .payload = @intCast(query.len),
             .durable = 0,
         },
+        // Provider-private continuation state: it crosses the wire in both
+        // directions and is persisted verbatim in the assistant record, so it
+        // is charged like any other stored payload (envelope covers the
+        // transcript block's type/model framing).
+        .reasoning_item => |bytes| .{
+            .payload = @intCast(bytes.len),
+            .durable = try checkedAdd(bytes.len, 32),
+        },
         .usage, .done => .{ .payload = 0, .durable = 0 },
     };
 }
@@ -1154,6 +1167,7 @@ fn deinitStreamEvent(
             allocator.free(result.content_json);
         },
         .web_search_query => |query| allocator.free(query),
+        .reasoning_item => |bytes| allocator.free(bytes),
         .usage, .done => {},
     }
 }
@@ -1167,11 +1181,11 @@ fn canonicalRequestBytes(
     tools: ?[]const core.json.ToolDefinition,
     tool_choice: ?core.json.ToolChoice,
 ) anyerror!u64 {
-    // 图像经估算投影序列化(占位替换):canonical 测量统一走 Anthropic 序列化器,
+    // 图像/文档经估算投影序列化(占位替换):canonical 测量统一走 Anthropic 序列化器,
     // 非 claude vision 模型带图会因守门报错 → 预算 admission 拒绝一个 provider 本会
-    // 接受的请求。真实载荷字节(base64 data + MIME + 每图 ~64B wire 信封)在投影后
-    // 加回,保持"每请求 wire 字节"的测量语义与无图请求的既有口径一致。
-    const projection = try core.agent_loop.projectImagesForEstimation(allocator, messages);
+    // 接受的请求。真实载荷字节(base64 data + MIME + 标题 + 每块 wire 信封)在投影后
+    // 加回,保持"每请求 wire 字节"的测量语义与无附件请求的既有口径一致。
+    const projection = try core.agent_loop.projectPayloadsForEstimation(allocator, messages);
     defer if (projection) |p| p.deinit(allocator);
     const effective: []const core.types.ApiMessage = if (projection) |p| p.messages else messages;
     const encoded = try core.json.serializeMessagesRequest(.{
@@ -1187,6 +1201,7 @@ fn canonicalRequestBytes(
     var payload_bytes: u64 = 0;
     for (messages) |m| for (m.content) |c| switch (c) {
         .image => |img| payload_bytes +|= @as(u64, img.data.len) +| img.media_type.len +| 64,
+        .document => |doc| payload_bytes +|= @as(u64, doc.data.len) +| doc.media_type.len +| doc.title.len +| 96,
         .tool_result => |tr| if (core.json.extractImageResult(tr.content) != null) {
             payload_bytes +|= @as(u64, tr.content.len);
         },

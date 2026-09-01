@@ -745,6 +745,10 @@ pub fn author(
         // evidence.  The final typed response remains the only admitted
         // author payload.
         .thinking => |bytes| allocator.free(bytes),
+        // Same reasoning: a provider-private continuation item is control
+        // state, not the author payload, and this one-shot request has no
+        // next turn to replay it into.
+        .reasoning_item => |bytes| allocator.free(bytes),
         .usage => |delta| try addUsage(&usage, delta),
         .done => saw_done = true,
         .tool_use_start => |tool| {

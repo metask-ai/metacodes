@@ -9,11 +9,40 @@
 const std = @import("std");
 const artifact = @import("tool_result_artifact.zig");
 const tool_result = @import("tool_result.zig");
+const conversation_mod = @import("conversation.zig");
+const json_mod = @import("../json.zig");
 
 pub const SCHEMA = tool_result.PROJECTION_SCHEMA;
 pub const ENVELOPE_PREFIX = tool_result.ENVELOPE_PREFIX;
 pub const BASH_SCHEMA = "metacodes.bash-result.v2";
 pub const DEFAULT_PREVIEW_BYTES: usize = 1536;
+
+/// Budget bytes per token, the same approximation `turnBudgetBytes` uses to
+/// turn a token window into a byte budget.
+const BUDGET_BYTES_PER_TOKEN: usize = 4;
+
+/// What one image tool result costs this layer's byte budget. A vision block is
+/// billed by the provider at a fixed token price (`IMAGE_TOKEN_ESTIMATE`),
+/// never by its base64 length, so measuring it in bytes would let a single
+/// 3.75 MB screenshot evict every unrelated result in the same turn.
+const IMAGE_ACCOUNTED_BYTES: usize =
+    conversation_mod.IMAGE_TOKEN_ESTIMATE * BUDGET_BYTES_PER_TOKEN;
+
+/// Image-shaped tool result (`{"type":"image",...}` from the Read tool).
+/// Detection delegates to `dialect.extractImageResult` — the single truth the
+/// wire serializers use — so this layer can never drift into a second sniffer.
+/// Module-private on purpose: consumers that need the predicate should ask
+/// that single truth directly rather than route through the projection layer.
+fn isImageResult(content: []const u8) bool {
+    return json_mod.extractImageResult(content) != null;
+}
+
+/// Budget weight of one committed result. Images cost their native token
+/// estimate; every other result costs exactly its bytes, so non-image
+/// projection stays byte-identical to the pre-image-carve-out behavior.
+fn accountedBytes(content: []const u8) usize {
+    return if (isImageResult(content)) IMAGE_ACCOUNTED_BYTES else content.len;
+}
 
 pub const Item = struct {
     tool_name: []const u8,
@@ -29,7 +58,12 @@ pub const Config = struct {
 };
 
 pub const Stats = struct {
+    /// Literal bytes handed to this pass (artifact envelopes count their
+    /// recorded original size).
     raw_bytes: usize = 0,
+    /// Literal bytes after projection — same unit as `raw_bytes`, so the pair
+    /// reads as a real before/after. The turn-budget decision is **not** made
+    /// on this number: see `budget_exhausted`.
     projected_bytes: usize = 0,
     artifact_bytes: usize = 0,
     artifact_spill_count: usize = 0,
@@ -37,6 +71,14 @@ pub const Stats = struct {
     structured_result_count: usize = 0,
     structured_projection_failures: usize = 0,
     turn_budget_spills: usize = 0,
+    /// Image results kept inline that byte-length rules would otherwise have
+    /// spilled (over `per_result_bytes`). Logged rather than left silent, so
+    /// the carve-out is visible in the same line that reports the spills.
+    image_exempt_count: usize = 0,
+    /// Whether the committed results still exceed `per_turn_bytes` in **budget
+    /// weight** (`accountedBytes`: an image costs its token estimate, every
+    /// other result costs its bytes). Deliberately not derived from
+    /// `projected_bytes`, which is a byte metric.
     budget_exhausted: bool = false,
 
     pub fn changed(self: Stats) bool {
@@ -76,11 +118,20 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         // content. Replacing them would hide the exact recovery contract from
         // the model; the aggregate budget may report exhaustion instead.
         if (item.is_error) continue;
+        // Image-shaped results are not bulk text: downstream every dialect
+        // turns them into a native vision block (or the explicit non-vision
+        // placeholder). Spilling one by byte length would replace the picture
+        // with an artifact envelope the model cannot see, and `ReadArtifact`
+        // would only hand the base64 back as text.
+        if (isImageResult(item.content.*)) {
+            if (item.content.*.len > config.per_result_bytes) stats.image_exempt_count += 1;
+            continue;
+        }
         if (item.content.*.len <= config.per_result_bytes) continue;
         try spillOne(allocator, item, structured[index], config, &stats, false);
     }
 
-    var total = totalBytes(items);
+    var total = accountedTotal(items);
     while (total > config.per_turn_bytes) {
         var biggest: ?usize = null;
         var biggest_len: usize = 0;
@@ -88,6 +139,10 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
             if (std.mem.eql(u8, item.tool_name, "ReadArtifact")) continue;
             if (item.is_error) continue;
             if (isProjectionEnvelope(item.content.*)) continue;
+            // Same carve-out as the per-result pass. Without it the budget
+            // loop would pick the image first every time, because base64 makes
+            // it the largest item even when it is the cheapest in tokens.
+            if (isImageResult(item.content.*)) continue;
             // Strict > preserves the original ordinal as the deterministic
             // tie-breaker for equal-size parallel results.
             if (item.content.*.len > biggest_len) {
@@ -96,14 +151,14 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
             }
         }
         const index = biggest orelse break;
-        const before = items[index].content.*.len;
+        const before = accountedBytes(items[index].content.*);
         try spillOne(allocator, items[index], structured[index], config, &stats, true);
-        const after = items[index].content.*.len;
+        const after = accountedBytes(items[index].content.*);
         total = total - before + after;
         if (after >= before) break;
     }
-    stats.projected_bytes = totalBytes(items);
-    stats.budget_exhausted = stats.projected_bytes > config.per_turn_bytes;
+    stats.projected_bytes = literalTotal(items);
+    stats.budget_exhausted = accountedTotal(items) > config.per_turn_bytes;
     return stats;
 }
 
@@ -301,7 +356,13 @@ fn isStructuredJson(content: []const u8) bool {
     }
 }
 
-fn totalBytes(items: []const Item) usize {
+fn accountedTotal(items: []const Item) usize {
+    var total: usize = 0;
+    for (items) |item| total +|= accountedBytes(item.content.*);
+    return total;
+}
+
+fn literalTotal(items: []const Item) usize {
     var total: usize = 0;
     for (items) |item| total +|= item.content.*.len;
     return total;
@@ -398,4 +459,78 @@ test "aggregate spill uses original ordinal as equal-size tie break" {
     try std.testing.expectEqual(@as(usize, 1), stats.turn_budget_spills);
     try std.testing.expect(isRecoverableEnvelope(first));
     try std.testing.expectEqualStrings("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", second);
+}
+
+/// Image tool result whose base64 payload is well past every production
+/// `per_result_bytes` cap (8..64 KB). Caller frees.
+fn testImageResult(allocator: std.mem.Allocator, data_bytes: usize) ![]const u8 {
+    const data = try allocator.alloc(u8, data_bytes);
+    defer allocator.free(data);
+    @memset(data, 'A');
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}",
+        .{data},
+    );
+}
+
+test "image results survive the per-result pass regardless of byte length" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    var image: []const u8 = try testImageResult(allocator, 96 * 1024);
+    defer allocator.free(@constCast(image));
+    const original = try allocator.dupe(u8, image);
+    defer allocator.free(original);
+    var items = [_]Item{.{ .tool_name = "Read", .content = &image, .is_error = false }};
+    const stats = try project(allocator, &items, .{
+        .session_root = root,
+        .per_result_bytes = 64 * 1024,
+        .per_turn_bytes = 200 * 1024,
+    });
+    try std.testing.expectEqualStrings(original, image);
+    try std.testing.expectEqual(@as(usize, 0), stats.artifact_spill_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.image_exempt_count);
+    // Byte metrics stay literal and unchanged (nothing was rewritten) while the
+    // budget decision uses the vision token estimate, not the base64 size —
+    // 96 KB of payload against a 200 KB turn budget is not exhaustion.
+    try std.testing.expectEqual(image.len, stats.projected_bytes);
+    try std.testing.expectEqual(stats.raw_bytes, stats.projected_bytes);
+    try std.testing.expect(!stats.budget_exhausted);
+}
+
+test "turn budget spills text before it ever considers an image" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    // The image is by far the largest item, so a byte-length victim search
+    // would pick it first; only the carve-out makes the text the victim.
+    var image: []const u8 = try testImageResult(allocator, 96 * 1024);
+    defer allocator.free(@constCast(image));
+    const image_original = try allocator.dupe(u8, image);
+    defer allocator.free(image_original);
+    var text: []const u8 = try allocator.alloc(u8, 32 * 1024);
+    @memset(@constCast(text), 'T');
+    defer allocator.free(@constCast(text));
+    var items = [_]Item{
+        .{ .tool_name = "Read", .content = &image, .is_error = false },
+        .{ .tool_name = "Grep", .content = &text, .is_error = false },
+    };
+    const stats = try project(allocator, &items, .{
+        .session_root = root,
+        .per_result_bytes = 64 * 1024,
+        .per_turn_bytes = 16 * 1024,
+        .preview_bytes = 0,
+    });
+    try std.testing.expectEqualStrings(image_original, image);
+    try std.testing.expectEqual(@as(usize, 1), stats.turn_budget_spills);
+    try std.testing.expect(isRecoverableEnvelope(text));
 }

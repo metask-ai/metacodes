@@ -32,8 +32,8 @@ const READ_DESC =
     \\- When you already know which part of the file you need, only read that part. This can be important for larger files.
     \\- Results are returned using cat -n format, with line numbers starting at 1
     \\- This tool allows MetaCode to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as MetaCode is a multimodal LLM.
-    \\- This tool can read PDF files (.pdf). For large PDFs (more than 10 pages), you MUST provide the pages parameter to read specific page ranges (e.g., pages: "1-5"). Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request.
-    \\- This tool can read Jupyter notebooks (.ipynb files) and returns all cells with their outputs, combining code, text, and visualizations.
+    \\- This tool cannot read PDF files. It has no PDF extraction or page-rendering path and no pages parameter; reading a .pdf here yields its raw bytes, not its contents.
+    \\- Jupyter notebooks (.ipynb files) are read as their raw JSON, not as rendered cells; use NotebookEdit to modify a cell.
     \\- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.
     \\- You will regularly be asked to read screenshots. If the user provides a path to a screenshot, ALWAYS use this tool to view the file at the path. This tool will work with all temporary file paths.
     \\- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.

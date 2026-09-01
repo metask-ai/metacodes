@@ -12,6 +12,8 @@
 //!     - `{"type":"tool_result","tool_use_id":"","content":"...","is_error":bool}`
 //!     - `{"type":"thinking","thinking":"..."}`
 //!     - `{"type":"image","media_type":"image/png","data":"<base64>"}`
+//!     - `{"type":"document","media_type":"application/pdf","title":"<name>","pages":<n|0>,"data":"<base64>"}`
+//!     - `{"type":"reasoning_item","model":"<model>","item":"<provider item JSON>"}`
 //! - **meta.json**：每次写 transcript 后覆盖写入 {model, last_modified_ns, message_count, title_guess}
 //! - **title_guess**：首条 user text 的前 80 字节（去换行）
 //! - **加载**：逐行 parse JSONL 重建 Conversation；meta 用于 /resume 列表
@@ -226,6 +228,27 @@ pub const Writer = struct {
                     try std.json.Stringify.encodeJsonString(img.data, .{}, &aw.writer);
                     try aw.writer.writeAll("}");
                 },
+                .document => |doc| {
+                    // base64 载荷 JSON 安全;resume 后文档语义(MIME/标题/页数/顺序)
+                    // 原样恢复,不依赖宿主原始文件仍然存在或未被改动(issue #25)。
+                    try aw.writer.writeAll("{\"type\":\"document\",\"media_type\":");
+                    try std.json.Stringify.encodeJsonString(doc.media_type, .{}, &aw.writer);
+                    try aw.writer.writeAll(",\"title\":");
+                    try std.json.Stringify.encodeJsonString(doc.title, .{}, &aw.writer);
+                    // pages:null 与 0 互映(0 页不是合法 PDF,映射无歧义)。
+                    try aw.writer.print(",\"pages\":{d},\"data\":", .{doc.pages orelse 0});
+                    try std.json.Stringify.encodeJsonString(doc.data, .{}, &aw.writer);
+                    try aw.writer.writeAll("}");
+                },
+                .reasoning_item => |item| {
+                    // provider 私有的推理续传项:item JSON 作为**字符串**存(不内联
+                    // 展开),resume 后逐字节还原后回传(issue #23)。
+                    try aw.writer.writeAll("{\"type\":\"reasoning_item\",\"model\":");
+                    try std.json.Stringify.encodeJsonString(item.model, .{}, &aw.writer);
+                    try aw.writer.writeAll(",\"item\":");
+                    try std.json.Stringify.encodeJsonString(item.json, .{}, &aw.writer);
+                    try aw.writer.writeAll("}");
+                },
             }
         }
         try aw.writer.writeAll("]}\n");
@@ -253,9 +276,18 @@ pub const Writer = struct {
         if (title.len == 0) {
             outer: for (messages) |m| {
                 if (m.role != .user) continue;
-                for (m.blocks) |b| if (b == .image) {
-                    title = "[image]";
-                    break :outer;
+                for (m.blocks) |b| switch (b) {
+                    .image => {
+                        title = "[image]";
+                        break :outer;
+                    },
+                    // 纯附件会话(--pdf 允许空 prompt)同样不该在 /resume 列表里
+                    // 顶着一个空标题;文档有宿主给的标题时优先用它。
+                    .document => |doc| {
+                        title = if (doc.title.len > 0) doc.title else "[document]";
+                        break :outer;
+                    },
+                    else => {},
                 };
             }
         }
@@ -444,6 +476,33 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
             const t = bv.object.get("thinking") orelse return error.InvalidTranscript;
             if (t != .string) return error.InvalidTranscript;
             blocks[idx] = .{ .thinking = try allocator.dupe(u8, t.string) };
+        } else if (std.mem.eql(u8, tv.string, "document")) {
+            const mt = bv.object.get("media_type") orelse return error.InvalidTranscript;
+            const data = bv.object.get("data") orelse return error.InvalidTranscript;
+            const title = bv.object.get("title") orelse std.json.Value{ .string = "" };
+            const pages = bv.object.get("pages") orelse std.json.Value{ .integer = 0 };
+            if (mt != .string or data != .string or title != .string or pages != .integer)
+                return error.InvalidTranscript;
+            const mt_owned = try allocator.dupe(u8, mt.string);
+            errdefer allocator.free(mt_owned);
+            const title_owned = try allocator.dupe(u8, title.string);
+            errdefer allocator.free(title_owned);
+            blocks[idx] = .{ .document = .{
+                .media_type = mt_owned,
+                .title = title_owned,
+                .pages = if (pages.integer > 0) std.math.cast(u32, pages.integer) else null,
+                .data = try allocator.dupe(u8, data.string),
+            } };
+        } else if (std.mem.eql(u8, tv.string, "reasoning_item")) {
+            const model = bv.object.get("model") orelse return error.InvalidTranscript;
+            const item = bv.object.get("item") orelse return error.InvalidTranscript;
+            if (model != .string or item != .string) return error.InvalidTranscript;
+            const model_owned = try allocator.dupe(u8, model.string);
+            errdefer allocator.free(model_owned);
+            blocks[idx] = .{ .reasoning_item = .{
+                .model = model_owned,
+                .json = try allocator.dupe(u8, item.string),
+            } };
         } else if (std.mem.eql(u8, tv.string, "image")) {
             const mt = bv.object.get("media_type") orelse return error.InvalidTranscript;
             const data = bv.object.get("data") orelse return error.InvalidTranscript;
@@ -835,6 +894,53 @@ test "image + thinking 块 transcript roundtrip(issue #10 会话恢复语义)" {
     const asst_blocks = conv2.messages.items[1].blocks;
     try std.testing.expectEqualStrings("推理内容", asst_blocks[0].thinking);
     try std.testing.expectEqualStrings("两张图分别是…", asst_blocks[1].text);
+}
+
+test "reasoning_item 块 transcript roundtrip(issue #23 跨 resume 的推理续传)" {
+    // `store:false` 下推理状态只存在于客户端:resume 后必须逐字节还原,
+    // 否则续传的会话就把 encrypted_content 永久丢了。
+    const a = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-test-reason-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+
+    var writer = try Writer.init(a, "/dummy", tmp_home, "gpt-5.2", genSessionId());
+    defer writer.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "what time is it");
+
+    const item_json =
+        "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"opaque\\\"quoted\"}";
+    const blks = try a.alloc(msg_mod.Block, 2);
+    blks[0] = .{ .reasoning_item = .{
+        .model = try a.dupe(u8, "gpt-5.2"),
+        .json = try a.dupe(u8, item_json),
+    } };
+    blks[1] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "call_1"),
+        .name = try a.dupe(u8, "get_time"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try conv.append(.{ .role = .assistant, .blocks = blks });
+
+    writer.flush(&conv);
+
+    var conv2 = Conversation.init(a);
+    defer conv2.deinit();
+    try loadTranscript(&conv2, writer.dir, a);
+    try std.testing.expectEqual(@as(usize, 2), conv2.len());
+    const asst = conv2.messages.items[1].blocks;
+    try std.testing.expectEqual(@as(usize, 2), asst.len);
+    try std.testing.expectEqualStrings("gpt-5.2", asst[0].reasoning_item.model);
+    try std.testing.expectEqualStrings(item_json, asst[0].reasoning_item.json);
+    try std.testing.expectEqualStrings("call_1", asst[1].tool_use.id);
 }
 
 test "title_guess: 纯图首条不锁死标题,后续 user text 胜出;全程无 text 才落 [image]" {

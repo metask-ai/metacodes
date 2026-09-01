@@ -118,6 +118,43 @@ const RESPONSES_PARALLEL_SSE =
     "event: response.completed\n" ++
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_p\",\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":6}}}\n\n";
 
+// issue #23:`store:false` 下服务端不保存推理状态,reasoning item(含 encrypted_content)
+// 必须由客户端原样回传。这条 cassette 让同一个 item **同时**出现在 output_item.done 与
+// response.completed 的 output 数组里——两处都要能独立提取,合起来只回传一次。
+const REASONING_ITEM_WIRE =
+    "{\"type\":\"reasoning\",\"id\":\"rs_audit_1\",\"summary\":[],\"encrypted_content\":\"audit-opaque-ciphertext-unchanged\"}";
+
+const RESPONSES_REASONING_TOOLCALL_SSE =
+    "event: response.output_item.added\n" ++
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_audit_1\",\"summary\":[]}}\n\n" ++
+    "event: response.output_item.done\n" ++
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" ++ REASONING_ITEM_WIRE ++ "}\n\n" ++
+    "event: response.output_item.added\n" ++
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_audit_1\",\"name\":\"get_time\",\"arguments\":\"\"}}\n\n" ++
+    "event: response.function_call_arguments.done\n" ++
+    "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"output_index\":1,\"arguments\":\"{}\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r1\",\"status\":\"completed\",\"output\":[" ++ REASONING_ITEM_WIRE ++ ",{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_audit_1\",\"name\":\"get_time\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":3}}}\n\n";
+
+// 同一场景,但服务端**只**在终止事件里给全量 output(没有 output_item.done)。
+// 提取不得依赖某个特定事件出现。
+const RESPONSES_REASONING_TERMINAL_ONLY_SSE =
+    "event: response.output_item.added\n" ++
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_audit_2\",\"name\":\"get_time\",\"arguments\":\"\"}}\n\n" ++
+    "event: response.function_call_arguments.done\n" ++
+    "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_2\",\"output_index\":1,\"arguments\":\"{}\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r2\",\"status\":\"completed\",\"output\":[" ++ REASONING_ITEM_WIRE ++ ",{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_audit_2\",\"name\":\"get_time\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":3}}}\n\n";
+
+// 只有 reasoning、没有任何文本/工具调用的一轮:reasoning 状态不该被留在会话里。
+// 那种消息 buildApiMessages 会整条跳过(永不上 wire),却仍会被 token 估算按
+// REASONING_ITEM_TOKEN_ESTIMATE 计——"发给模型的投影"与"估算"就此分叉。
+const RESPONSES_REASONING_ONLY_SSE =
+    "event: response.output_item.done\n" ++
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" ++ REASONING_ITEM_WIRE ++ "}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r3\",\"status\":\"completed\",\"output\":[" ++ REASONING_ITEM_WIRE ++ "],\"usage\":{\"input_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":1}}}\n\n";
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// 起一个 protocol=.responses 的 OpenAIClient(base_url 指 MockServer——协议仍由
@@ -146,8 +183,12 @@ const DrainResult = struct {
     tools: std.ArrayList(CapturedTool) = .empty,
     usage: ?cc.api_stream.UsageDelta = null,
     saw_done: bool = false,
+    /// provider 私有的推理续传项(owned item JSON,按到达顺序)。
+    reasoning: std.ArrayList([]const u8) = .empty,
     fn deinit(self: *DrainResult, a: std.mem.Allocator) void {
         self.text.deinit(a);
+        for (self.reasoning.items) |item| a.free(item);
+        self.reasoning.deinit(a);
         for (self.tools.items) |t| {
             a.free(t.id);
             a.free(t.name);
@@ -175,6 +216,13 @@ fn drainAll(a: std.mem.Allocator, handle: *cc.api_stream.StreamHandle, out: *Dra
         },
         .usage => |u| out.usage = u,
         .done => out.saw_done = true,
+        // owned:不接管就泄漏(与 tool_use_start 同契约)。
+        .reasoning_item => |bytes| {
+            out.reasoning.append(a, bytes) catch |e| {
+                a.free(bytes);
+                return e;
+            };
+        },
         else => {},
     };
 }
@@ -717,4 +765,195 @@ test "Responses(flag): --openai-protocol responses 解析进 Config;词表外 fa
         try std.testing.expect(config.parse_error != null);
         a.free(config.parse_error.?);
     }
+}
+
+// ── (i) reasoning 续传:store:false 下的推理状态原样回传(issue #23)──────────
+
+/// `needle` 在 `haystack` 中出现的次数(重叠不计)。
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |at| {
+        n += 1;
+        pos = at + needle.len;
+    }
+    return n;
+}
+
+test "Responses(i): 工具续跑的第二请求回放 reasoning item(id/summary/密文原样,顺序在 function_call 前)" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(
+        &[_][]const u8{ RESPONSES_REASONING_TOOLCALL_SSE, RESPONSES_TEXT_SSE },
+        0,
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
+    defer client.deinit();
+
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("get_time", "Get current time", &.{}, getTimeExec, null, false);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "what time is it");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const tool_defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(tool_defs);
+    var render = writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+
+    const result = agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a) catch |e| {
+        std.debug.print("responses reasoning run failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+
+    // conversation 里 reasoning item 与它的 tool_use 同属一条 assistant 消息,
+    // 并且**只有一条**(同一 item 出现在两个事件里也只留存一次)。
+    var reasoning_blocks: usize = 0;
+    for (conv.messages.items) |m| for (m.blocks) |b| switch (b) {
+        .reasoning_item => |item| {
+            reasoning_blocks += 1;
+            try std.testing.expectEqualStrings("gpt-5.2", item.model);
+            try std.testing.expectEqualStrings(REASONING_ITEM_WIRE, item.json);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), reasoning_blocks);
+
+    // 第二请求:user message → reasoning(rs_audit_1) → function_call → function_call_output。
+    const second = srv.requestAt(1).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"store\":false") != null);
+    const reasoning_at = std.mem.indexOf(u8, second, REASONING_ITEM_WIRE) orelse {
+        std.debug.print("second request missing verbatim reasoning item:\n{s}\n", .{second});
+        return error.TestUnexpectedResult;
+    };
+    const user_at = std.mem.indexOf(u8, second, "what time is it").?;
+    const call_at = std.mem.indexOf(u8, second, "\"type\":\"function_call\"").?;
+    const output_at = std.mem.indexOf(u8, second, "\"type\":\"function_call_output\"").?;
+    try std.testing.expect(user_at < reasoning_at);
+    try std.testing.expect(reasoning_at < call_at);
+    try std.testing.expect(call_at < output_at);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"call_id\":\"call_audit_1\"") != null);
+    // function_call_output.output 是 JSON 字符串,工具结果在 wire 上是转义形态。
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"output\":\"{\\\"t\\\":42}\"") != null);
+    // 出现在 output_item.done 与 response.completed 两处,回传只发一次。
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(second, "rs_audit_1"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(second, "audit-opaque-ciphertext-unchanged"));
+}
+
+test "Responses(i2): reasoning item 只出现在终止事件的 output 里时同样回放" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(
+        &[_][]const u8{ RESPONSES_REASONING_TERMINAL_ONLY_SSE, RESPONSES_TEXT_SSE },
+        0,
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
+    defer client.deinit();
+
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("get_time", "Get current time", &.{}, getTimeExec, null, false);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "what time is it");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const tool_defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(tool_defs);
+    var render = writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+
+    _ = agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a) catch |e| {
+        std.debug.print("responses terminal-only reasoning run failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+
+    const second = srv.requestAt(1).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, second, REASONING_ITEM_WIRE) != null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(second, "audit-opaque-ciphertext-unchanged"));
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"call_id\":\"call_audit_2\"") != null);
+}
+
+test "Responses(i3): 无 reasoning 的对照回合 → 第二请求里没有任何 reasoning item" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(
+        &[_][]const u8{ RESPONSES_TOOLCALL_SSE, RESPONSES_TEXT_SSE },
+        0,
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
+    defer client.deinit();
+
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("get_time", "Get current time", &.{}, getTimeExec, null, false);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "what time is it");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const tool_defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(tool_defs);
+    var render = writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+
+    _ = agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a) catch |e| {
+        std.debug.print("responses control run failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+
+    const second = srv.requestAt(1).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"type\":\"reasoning\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"type\":\"function_call_output\"") != null);
+}
+
+test "Responses(i4): 只有 reasoning 的一轮不落进会话(估算与 wire 投影不许分叉)" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{RESPONSES_REASONING_ONLY_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
+    defer client.deinit();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "think but say nothing");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
+    var render = writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+
+    _ = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 2 }, &be, a) catch |e| {
+        std.debug.print("responses reasoning-only run failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+
+    // 该回合什么都没产出 → 没有可续的下文,推理状态不留存。留存的话它永远
+    // 不上 wire,却会一直被计入 token 估算,单调推高 auto-compact 阈值。
+    for (conv.messages.items) |m| for (m.blocks) |b| {
+        try std.testing.expect(b != .reasoning_item);
+    };
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
 }

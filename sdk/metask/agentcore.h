@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 15 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 16 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -17,7 +17,7 @@ extern "C" {
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 15u
+#define METASK_AGENTCORE_ABI_REVISION 16u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -47,6 +47,7 @@ extern "C" {
 #define METASK_AGENTCORE_STATUS_INVALID_MCP_SELECTION 25u
 #define METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE 27u
 #define METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED 28u
+#define METASK_AGENTCORE_STATUS_DOCUMENT_INPUT_UNSUPPORTED 29u
 
 #define METASK_AGENTCORE_PROVIDER_ANTHROPIC 1u
 #define METASK_AGENTCORE_PROVIDER_OPENAI 2u
@@ -97,6 +98,9 @@ extern "C" {
 /* Base64 payload cap for one image part: exactly the standard base64 encoding
  * of the built-in Read tool's 3.75 MB raw-image limit. */
 #define METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 5000000ULL
+/* Base64 payload cap for one document part: exactly the standard base64
+ * encoding of Core's 12 MB raw-PDF admission limit. */
+#define METASK_AGENTCORE_MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1 16000000ULL
 #define METASK_AGENTCORE_MAX_SKILL_CATALOG_SKILLS_V1 1024ULL
 #define METASK_AGENTCORE_MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1 4194304ULL
 #define METASK_AGENTCORE_MAX_SKILL_FILE_CONTENT_BYTES_V1 16777216ULL
@@ -144,6 +148,7 @@ extern "C" {
 #define METASK_AGENTCORE_RUN_INPUT_MULTIMODAL 3u
 #define METASK_AGENTCORE_RUN_INPUT_PART_TEXT 1u
 #define METASK_AGENTCORE_RUN_INPUT_PART_IMAGE 2u
+#define METASK_AGENTCORE_RUN_INPUT_PART_DOCUMENT 3u
 #define METASK_AGENTCORE_SKILL_SOURCE_USER 1u
 #define METASK_AGENTCORE_SKILL_SOURCE_WORKSPACE 2u
 #define METASK_AGENTCORE_COMPACT_COMPACTED 1u
@@ -594,7 +599,12 @@ typedef struct {
  * of the declared kind are populated; every other view is canonical empty.
  * PART_TEXT carries non-empty UTF-8 `text`. PART_IMAGE carries `media_type`
  * (image/png, image/jpeg, image/gif, or image/webp) plus non-empty standard
- * base64 `data` bounded by METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1. */
+ * base64 `data` bounded by METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1.
+ * PART_DOCUMENT carries `media_type` "application/pdf" plus standard base64
+ * `data` of a real, unencrypted PDF inside Core's byte and page admission
+ * limits, bounded by METASK_AGENTCORE_MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1;
+ * its `text` view is an optional document title (a stable host identity such
+ * as a file name, never a local path) and may be canonical empty. */
 typedef struct {
     uint32_t struct_size;
     uint32_t kind_code;
@@ -950,8 +960,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 15u,
-                               "AgentCore revision 15");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 16u,
+                               "AgentCore revision 16");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,

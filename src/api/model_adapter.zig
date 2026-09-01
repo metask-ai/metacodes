@@ -126,6 +126,12 @@ pub const ModelProfile = struct {
     /// 请求含 image block 时必须报显式能力错误(error.ImageInputUnsupported),
     /// 绝不静默丢图/OCR/文本占位。保守默认 false;仅对已验证 vision 家族开 true。
     supports_image_input: bool = false,
+    /// 支持原生文档输入(当前指 PDF)。序列化守门的单一真相:false 的
+    /// (kind, model) 在请求含 document block 时必须报显式能力错误
+    /// (error.DocumentInputUnsupported),绝不静默丢弃/OCR/抽文本/降级成页面图。
+    /// **独立于 supports_image_input**:能看图不等于能读 PDF。保守默认 false;
+    /// 仅对已验证支持原生 PDF 输入的家族开 true。
+    supports_pdf_input: bool = false,
     /// 支持 multimodal functionResponse(图像嵌在 functionResponse.parts 里,官方形态)。
     /// 仅 Gemini 3 系起支持(ai.google.dev function-calling#multimodal + v1beta discovery
     /// doc,2025-12-17 changelog);旧世代 Gemini 走同级 inline_data part 形态。
@@ -160,12 +166,36 @@ fn anthropicProfile(model: []const u8) ModelProfile {
             !hasSubstr(model, "claude-instant") and
             !hasSubstr(model, "claude-1") and
             !hasSubstr(model, "claude-2"),
+        .supports_pdf_input = anthropicPdfInput(model),
     };
     // Claude 4.x 保留 thinking(preserved thinking)
     if (hasSubstr(model, "claude-opus-4") or hasSubstr(model, "claude-sonnet-4") or hasSubstr(model, "claude-haiku-4")) {
         p.preserved_thinking_default = false; // 保留(对齐 Claude Opus 4.5+)
     }
     return p;
+}
+
+/// 原生 PDF 文档输入(issue #25)。**独立于 vision**:能看图不蕴含能读 PDF,
+/// 故这里是一份按家族的保守 allowlist,而不是"claude 就给过"。未列出的名字一律
+/// false —— 宁可在发请求前显式报能力错误,也不把文档丢给读不了它的模型。
+/// 经 Anthropic 兼容网关暴露的第三方文本模型(如 GLM)不含 "claude",自然为 false。
+fn anthropicPdfInput(model: []const u8) bool {
+    if (!hasSubstr(model, "claude")) return false;
+    const families = [_][]const u8{
+        "claude-3-5",
+        "claude-3-7",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-haiku-4",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-haiku-5",
+        "claude-fable-5",
+    };
+    for (families) |family| {
+        if (hasSubstr(model, family)) return true;
+    }
+    return false;
 }
 
 fn openaiProfile(model: []const u8) ModelProfile {
@@ -523,6 +553,23 @@ test "profileFor: vision 能力矩阵(issue #10)" {
     try std.testing.expect(!profileFor(.openai, "minimax-m3").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "mistral-large").supports_image_input);
     try std.testing.expect(!profileFor(.other, "mystery").supports_image_input);
+}
+
+test "supports_pdf_input:能看图 ≠ 能读 PDF(独立能力,保守 allowlist)" {
+    // 支持的家族(Anthropic 原生 document 输入)。
+    try std.testing.expect(profileFor(.anthropic, "claude-sonnet-4-20250514").supports_pdf_input);
+    try std.testing.expect(profileFor(.anthropic, "claude-3-5-sonnet-20241022").supports_pdf_input);
+    try std.testing.expect(profileFor(.anthropic, "claude-opus-4-1").supports_pdf_input);
+    // 老一代 Claude:有 vision 但没有原生文档输入。
+    try std.testing.expect(profileFor(.anthropic, "claude-3-opus-20240229").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "claude-3-opus-20240229").supports_pdf_input);
+    // 经 Anthropic 兼容网关的第三方模型、以及别的协议族:一律 false(本期只做一条
+    // 原生路径,其余显式报能力错误而不是静默降级)。
+    try std.testing.expect(!profileFor(.anthropic, "glm-5.2").supports_pdf_input);
+    try std.testing.expect(!profileFor(.openai, "gpt-4o").supports_pdf_input);
+    try std.testing.expect(!profileFor(.openai, "gpt-5.2").supports_pdf_input);
+    try std.testing.expect(!profileFor(.gemini, "gemini-2.5-pro").supports_pdf_input);
+    try std.testing.expect(!profileFor(.other, "mystery").supports_pdf_input);
 }
 
 test "profileFor: multimodal functionResponse 仅 Gemini 3 系 true" {

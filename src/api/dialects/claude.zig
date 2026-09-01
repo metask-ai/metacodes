@@ -70,12 +70,32 @@ const Claude = struct {
         return true;
     }
 
+    /// 一等文档内容块(issue #25):Anthropic 原生 document block。
+    /// 能力守门在 Dialect.serializeDocumentPart wrapper;本实现只管 wire 形态。
+    /// `title` 非空才发(空标题字段对模型无意义,且会白白改变缓存前缀字节)。
+    fn serializeDocumentPart(ctx: *anyopaque, p: ModelProfile, document: types.DocumentBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+        _ = ctx;
+        _ = p;
+        try out.appendSlice(a, "{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":");
+        try util_json.serializeString(document.media_type, out, a);
+        try out.appendSlice(a, ",\"data\":");
+        try util_json.serializeString(document.data, out, a);
+        try out.appendSlice(a, "}");
+        if (document.title.len > 0) {
+            try out.appendSlice(a, ",\"title\":");
+            try util_json.serializeString(document.title, out, a);
+        }
+        try out.appendSlice(a, "}");
+        return true;
+    }
+
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = serializeToolChoice,
         .serializeImagePartFn = serializeImagePart,
+        .serializeDocumentPartFn = serializeDocumentPart,
     };
 };
 
@@ -108,6 +128,7 @@ const GlmAnthropic = struct {
         .extractThinkingDeltaFn = Claude.extractThinkingDelta,
         .serializeToolChoiceFn = Claude.serializeToolChoice,
         .serializeImagePartFn = Claude.serializeImagePart,
+        .serializeDocumentPartFn = Claude.serializeDocumentPart,
     };
 };
 
@@ -199,5 +220,68 @@ test "Claude dialect: profile 不支持 vision 时 serializeImagePart 返 false 
     try std.testing.expect(!p.supports_image_input);
     const ok = try d.serializeImagePart(p, .{ .media_type = "image/png", .data = "QUJD" }, &out, a);
     try std.testing.expect(!ok);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "Claude dialect: serializeDocumentPart 发 base64 document block(有/无标题两态)" {
+    const d = claudeDialectFor("claude-sonnet-4");
+    const a = std.testing.allocator;
+    const p = d.profileFor(.anthropic, "claude-sonnet-4");
+    try std.testing.expect(p.supports_pdf_input);
+
+    var titled: std.ArrayList(u8) = .empty;
+    defer titled.deinit(a);
+    try std.testing.expect(try d.serializeDocumentPart(
+        p,
+        .{ .media_type = "application/pdf", .data = "JVBE", .title = "r.pdf" },
+        &titled,
+        a,
+    ));
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"JVBE\"},\"title\":\"r.pdf\"}",
+        titled.items,
+    );
+
+    // 空标题不发该字段:空值对模型无意义,还会白白改动缓存前缀字节。
+    var untitled: std.ArrayList(u8) = .empty;
+    defer untitled.deinit(a);
+    try std.testing.expect(try d.serializeDocumentPart(
+        p,
+        .{ .media_type = "application/pdf", .data = "JVBE", .title = "" },
+        &untitled,
+        a,
+    ));
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"JVBE\"}}",
+        untitled.items,
+    );
+}
+
+test "Claude dialect: 无文档能力或类型不符时 serializeDocumentPart 返 false 不输出" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+
+    // ① 有 vision 但没有原生文档输入的老一代 Claude:能力独立,必须拒。
+    const old_gen = claudeDialectFor("claude-3-opus-20240229");
+    const old_profile = old_gen.profileFor(.anthropic, "claude-3-opus-20240229");
+    try std.testing.expect(old_profile.supports_image_input);
+    try std.testing.expect(!old_profile.supports_pdf_input);
+    try std.testing.expect(!try old_gen.serializeDocumentPart(
+        old_profile,
+        .{ .media_type = "application/pdf", .data = "JVBE" },
+        &out,
+        a,
+    ));
+
+    // ② 能力在位但载荷贴错标签:wrapper 的类型守门拦下,绝不当 PDF 发出去。
+    const d = claudeDialectFor("claude-sonnet-4");
+    const p = d.profileFor(.anthropic, "claude-sonnet-4");
+    try std.testing.expect(!try d.serializeDocumentPart(
+        p,
+        .{ .media_type = "image/png", .data = "QUJD" },
+        &out,
+        a,
+    ));
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
