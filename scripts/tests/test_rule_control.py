@@ -862,6 +862,54 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         self.assertIn("aggregate_source_inventory", observation.missing_declarations)
         self.assertTrue(any("case_00_test.zig" in error for error in observation.errors))
 
+    def test_dedicated_exclusion_without_a_build_step_is_observed(self) -> None:
+        """被排除出聚合套件,就必须有自己的 root_source_file。
+
+        build.zig 只验证被排除的文件存在,不验证它还被编译,所以一个测试可以既不在
+        聚合里、又没有专用 step——彻底无人运行而两侧都不报警。
+        """
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        build = root / "build.zig"
+        build.write_text(
+            build.read_text(encoding="utf-8").replace(
+                'const abi_test = b.addTest(.{ .root_source_file = b.path("tests/component/agentcore_abi_test.zig") });\n',
+                "",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertTrue(
+            any("compiled by no build step" in error for error in observation.errors),
+            observation.errors,
+        )
+
+    def test_empty_exclusion_list_is_not_a_parse_failure(self) -> None:
+        """`[_][]const u8{}` 是合法状态(所有测试都进聚合),不是解析失败。"""
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        build = root / "build.zig"
+        build.write_text(
+            build.read_text(encoding="utf-8").replace(
+                'const aggregate_test_exclusions = [_][]const u8{\n'
+                '    "component/agentcore_abi_test.zig",\n'
+                "};\n",
+                "const aggregate_test_exclusions = [_][]const u8{};\n",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(
+            any("cannot parse" in error for error in observation.errors),
+            observation.errors,
+        )
+        # 空清单 → 那个专用测试现在必须出现在聚合里,于是它被正当地报为漏导入。
+        self.assertTrue(
+            any("agentcore_abi_test.zig" in error for error in observation.errors),
+            observation.errors,
+        )
+
     def test_import_text_outside_an_inventory_statement_is_not_wiring(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
