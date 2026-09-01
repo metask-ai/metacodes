@@ -158,6 +158,12 @@ def run_probe(
         "METACODES_KG_API_KEY",
         "METACODES_KG_EXPECTED_BUILD_ID",
         "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
+        # 这三个决定 KgClient 走 CLI 还是 daemon。不清掉的话,开发机上一个
+        # `METACODES_KG_TRANSPORT=cli-exclusive` 就能让整套用例红掉——实测连既有的
+        # client-config 都会失败。探针断言的是代码行为,不该受宿主环境左右。
+        "METACODES_KG_TRANSPORT",
+        "METACODES_KG_STORE",
+        "METACODES_KG_BIN",
         "TINYKG_REMOTE_CONFIG",
         "TINYKG_REMOTE_URL",
         "TINYKG_API_KEY",

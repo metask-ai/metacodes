@@ -496,10 +496,10 @@ pub const KgClient = struct {
     /// 注:末尾的默认值由 `opts.home` 拼出,home 本身为相对时同样拒绝。
     fn resolveStorePath(allocator: std.mem.Allocator, opts: ResolveOptions) ![]u8 {
         if (opts.env_store orelse envGet("METACODES_KG_STORE")) |v| {
-            if (v.len > 0) return dupeAbsolute(allocator, v);
+            if (v.len > 0) return absoluteStorePath(allocator, v, opts.home);
         }
         if (opts.config_store) |v| {
-            if (v.len > 0) return dupeAbsolute(allocator, v);
+            if (v.len > 0) return absoluteStorePath(allocator, v, opts.home);
         }
         const derived = try std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/store.kg", .{opts.home});
         errdefer allocator.free(derived);
@@ -507,9 +507,24 @@ pub const KgClient = struct {
         return derived;
     }
 
-    fn dupeAbsolute(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-        if (!std.fs.path.isAbsolute(path)) return error.RelativeStorePath;
-        return allocator.dupe(u8, path);
+    /// 用户配置的 store 路径补全成绝对路径。
+    ///
+    /// **相对路径不报错**:`init` 的错误被唯一的生产调用方 `app.zig` `catch return`
+    /// 静默吞掉,把一个可信的笔误(`kg_store: "store.kg"`)变成 KG 无声消失。本模块的
+    /// 通行做法是 setDegraded 带修复提示,从不让 init 失败。
+    ///
+    /// 但也不能原样采用:相对值会让 Store 以及由它派生的五个兄弟产物(backup /
+    /// quarantine / auto-migrate marker / md-import tmp / daemon lock)全部落在
+    /// **进程 cwd**——对一个会从任意目录启动的进程,那是不可预测的位置。所以在解析
+    /// 处就以 home 为基准补全,下游每一处使用都继承这个保证,无需各自再校验。
+    fn absoluteStorePath(allocator: std.mem.Allocator, path: []const u8, home: []const u8) ![]u8 {
+        if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+        const joined = try std.fs.path.join(allocator, &.{ home, path });
+        errdefer allocator.free(joined);
+        // home 自身是相对的话补全也救不回来(home 来自 OS,正常不会发生)。
+        if (!std.fs.path.isAbsolute(joined)) return error.RelativeStorePath;
+        log.warn("kg", "relative store path {s} resolved against home: {s}", .{ path, joined });
+        return joined;
     }
 
     /// bin 查找顺序:env METACODES_KG_BIN > config kg_bin > 构建时 staged 的
@@ -735,7 +750,9 @@ pub const KgClient = struct {
         // ——daemon 拥有 Store 的 client 不该走到 CLI 的建库路径上(issue #30 正是从
         // cloneForThread 把这种 client 提升成 .exclusive_cli 溜进来的)。失败关闭。
         const store = self.store.fsPath() orelse {
-            self.setDegraded("内部状态矛盾:CLI 传输却不拥有 Store(store=daemon-owned);未打开本地 Store", .{});
+            // 措辞刻意避开 "未打开本地 Store"——那是 daemon preflight 那条消息的规则标记,
+            // 复用会让它不再唯一:原消息被删掉时规则仍会因为这条而通过。
+            self.setDegraded("内部状态矛盾:CLI 传输却不拥有 Store(store=daemon-owned);拒绝在当前目录建库", .{});
             return;
         };
         // store 缺 → init(先建父目录)。
@@ -3090,6 +3107,32 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
     var c3 = try KgClient.init(a, .{ .home = "/home/u", .domain = "p", .env_store = "", .env_bin = "" });
     defer c3.deinit();
     try testing.expectEqualStrings("/home/u/.metacodes/kg/store.kg", c3.store.argvSlot());
+}
+
+test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
+    const a = testing.allocator;
+    // 相对配置**不报错**(init 的错误会被 app.zig `catch return` 静默吞掉),而是补全。
+    var rel = try KgClient.init(a, .{
+        .home = "/home/u",
+        .domain = "p",
+        .env_store = "",
+        .config_store = "relative/store.kg",
+        .env_bin = "",
+    });
+    defer rel.deinit();
+    try testing.expectEqualStrings("/home/u/relative/store.kg", rel.store.argvSlot());
+    try testing.expect(std.fs.path.isAbsolute(rel.store.fsPath().?));
+
+    // 绝对路径原样保留。
+    var abs = try KgClient.init(a, .{
+        .home = "/home/u",
+        .domain = "p",
+        .env_store = "",
+        .config_store = "/abs/store.kg",
+        .env_bin = "",
+    });
+    defer abs.deinit();
+    try testing.expectEqualStrings("/abs/store.kg", abs.store.argvSlot());
 }
 
 test "issue #30: cloneForThread 不把未配置客户端提升成 CLI-exclusive" {
