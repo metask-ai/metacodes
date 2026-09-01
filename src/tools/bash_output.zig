@@ -23,9 +23,12 @@ const time = @import("../util/time.zig");
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const result_budget = @import("../core/result_budget.zig");
 
 /// 单次 tool_result 中 stdout/stderr 的默认字节上限；避免 100MB 文件塞爆 context。
-const DEFAULT_MAX_BYTES: usize = 64 * 1024;
+/// Fixed JSON scaffolding of one BashOutput result: job id, status, exit code,
+/// both channels' byte counters and truncation flags.
+const ENVELOPE_OVERHEAD_BYTES: result_budget.Encoded = .of(512);
 const MAX_MAX_BYTES: usize = 256 * 1024;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -42,7 +45,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const want_stderr = if (common.extractJsonArg(args, "stderr")) |v| !std.mem.eql(u8, v, "false") else true;
     const stdout_since = parseUsizeArg(args, "stdout_since_byte") orelse 0;
     const stderr_since = parseUsizeArg(args, "stderr_since_byte") orelse 0;
-    const max_bytes = parseUsizeArg(args, "max_bytes") orelse DEFAULT_MAX_BYTES;
+    // Default from the turn's budget, not a private constant. 64 KiB of
+    // *source* bytes was chosen against "do not blow up the context", but the
+    // per-result budget counts *rendered* bytes and tops out at 64 KiB too -
+    // so the default read, in the cheapest possible case of plain ASCII across
+    // one channel, produced a 65_717-byte result that the projection layer
+    // then spilled to an artifact. Polling a background job handed back an
+    // envelope instead of the output, every time.
+    const allowance = ctx.result_budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES);
+    const max_bytes = parseUsizeArg(args, "max_bytes") orelse
+        @max(1, @min(MAX_MAX_BYTES, allowance.raw()));
     if (max_bytes == 0 or max_bytes > MAX_MAX_BYTES) {
         common.setErrorDetail(ctx.error_detail, allocator, "BashOutput max_bytes must be in 1..{d}", .{MAX_MAX_BYTES});
         return error.InvalidMaxBytes;
@@ -68,20 +80,32 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (job.exit_code) |ec| {
         try aw.writer.print(",\"exit_code\":{d}", .{ec});
     }
+    // `max_bytes` bounds the *read*; what the model is charged for is the
+    // rendered result, so the two channels share one encoded allowance the
+    // same way a completed Bash result's channels do. A channel cut here is
+    // still "not finished", which is what `truncated` already means, so the
+    // caller's `since_byte` loop needs no new concept.
+    const shares = result_budget.splitPair(
+        allowance,
+        result_budget.encodedCost(stdout_chunk.data, false),
+        result_budget.encodedCost(stderr_chunk.data, false),
+    );
+    const stdout_shown = result_budget.headCut(stdout_chunk.data, shares.first, false);
+    const stderr_shown = result_budget.headCut(stderr_chunk.data, shares.second, false);
     if (want_stdout) {
         try aw.writer.writeAll(",\"stdout\":");
-        try std.json.Stringify.encodeJsonString(stdout_chunk.data, .{}, &aw.writer);
+        try std.json.Stringify.encodeJsonString(stdout_shown.head(stdout_chunk.data), .{}, &aw.writer);
         try aw.writer.print(",\"stdout_total_bytes\":{d},\"stdout_truncated\":{s}", .{
             stdout_chunk.total_bytes,
-            if (stdout_chunk.truncated) "true" else "false",
+            if (stdout_chunk.truncated or stdout_shown.raw() < stdout_chunk.data.len) "true" else "false",
         });
     }
     if (want_stderr) {
         try aw.writer.writeAll(",\"stderr\":");
-        try std.json.Stringify.encodeJsonString(stderr_chunk.data, .{}, &aw.writer);
+        try std.json.Stringify.encodeJsonString(stderr_shown.head(stderr_chunk.data), .{}, &aw.writer);
         try aw.writer.print(",\"stderr_total_bytes\":{d},\"stderr_truncated\":{s}", .{
             stderr_chunk.total_bytes,
-            if (stderr_chunk.truncated) "true" else "false",
+            if (stderr_chunk.truncated or stderr_shown.raw() < stderr_chunk.data.len) "true" else "false",
         });
     }
     try aw.writer.writeAll("}");
@@ -217,4 +241,42 @@ test "BashOutput max_bytes truncates" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout\":\"ABC\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_total_bytes\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_truncated\":true") != null);
+}
+
+test "BashOutput 的默认读取落在单条预算内,而不是必然被溢出" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // 默认值曾是 64KiB **源**字节,而 per-result 预算数的是**渲染后**字节、上限
+    // 同样是 64KiB —— 于是最省字节的纯 ASCII 单通道默认读也会产出 65_717 字节的
+    // 结果,被投影层溢出成 artifact。模型轮询后台任务,每次拿回的是信封而不是
+    // 输出,还得再花一次 ReadArtifact。
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const j = try registry.spawnBackground("awk 'BEGIN { for(i=0;i<100000;i++) printf \"x\" }'", null);
+    while (registry.get(j.idSlice())) |e| {
+        if (e.status != .running) break;
+        time.sleepMs(20);
+        registry.reapExited();
+    }
+    registry.reapExited();
+
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
+    defer a.free(args);
+
+    // 窄窗口与宽窗口都必须落在各自预算内。
+    for ([_]usize{ 200_000, 1_048_576 }) |window| {
+        const budget = result_budget.Budget.fromModel(window);
+        const ctx = ToolContext{ .allocator = a, .jobs = &registry, .result_budget = budget };
+        const out = try execute(&ctx, args);
+        defer a.free(out);
+        try std.testing.expect(out.len <= budget.per_result_bytes);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+        defer parsed.deinit();
+        // 没读完就得说没读完 —— 调用方靠它决定要不要继续推进 since_byte。
+        try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
+        // 而且仍然给出真正的内容,不是空壳。
+        try std.testing.expect(parsed.value.object.get("stdout").?.string.len > 4096);
+        try std.testing.expectEqual(@as(i64, 100_000), parsed.value.object.get("stdout_total_bytes").?.integer);
+    }
 }
