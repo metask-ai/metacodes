@@ -20,6 +20,16 @@ pub fn main(init: std.process.Init) !void {
         client.ensureReady();
         if (std.mem.eql(u8, action, "client-config")) {
             try std.testing.expect(client.ready);
+            // cloneForThread 的第三个分支(daemon)。前两个分支各有覆盖,这个没有,
+            // 而它正是 issue #30 里被改动过的地方(移除了哨兵的 dupe)。克隆体必须
+            // 仍是 daemon 且仍不拥有 Store——否则工作线程会去开一个本地库。
+            // cloneForSession 不发请求(只分配 + 共享 write fence),所以这里不会
+            // 扰动本套件对 actor/session 计数的断言;也刻意不对克隆体调 ensureReady。
+            var cloned = try client.cloneForThread(init.gpa, "/unused-because-config-is-explicit");
+            defer cloned.deinit();
+            try std.testing.expect(cloned.transport == .daemon);
+            try std.testing.expect(cloned.store.fsPath() == null);
+            try std.testing.expectEqualStrings("daemon-owned", cloned.store.argvSlot());
             const stdout_file = std.Io.File.stdout();
             var config_buffer: [512]u8 = undefined;
             var config_writer = stdout_file.writer(init.io, &config_buffer);
