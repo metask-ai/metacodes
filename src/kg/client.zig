@@ -3135,6 +3135,26 @@ test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
     try testing.expectEqualStrings("/abs/store.kg", abs.store.fsPath().?);
 }
 
+test "issue #30: cloneForThread 把父客户端拥有的 Store 原样传给克隆体" {
+    const a = testing.allocator;
+    var parent = try KgClient.init(a, .{
+        .home = "/home/u",
+        .domain = "p",
+        .env_store = "",
+        .config_store = "/abs/store.kg",
+        .env_bin = "",
+    });
+    defer parent.deinit();
+    try testing.expect(parent.transport == .exclusive_cli);
+
+    // 拥有 Store 的父客户端,克隆体必须拿到**同一个** Store——这是线程克隆的全部意义,
+    // 也是重构时 `config_store` 取值改动最容易出错的地方(取错就静默换了一个库)。
+    var child = try parent.cloneForThread(a, "/home/u");
+    defer child.deinit();
+    try testing.expect(child.transport == .exclusive_cli);
+    try testing.expectEqualStrings("/abs/store.kg", child.store.fsPath().?);
+}
+
 test "issue #30: cloneForThread 不把未配置客户端提升成 CLI-exclusive" {
     const a = testing.allocator;
     // env/config 一个都不传 → injected_cli 假、无 io → transport=.unconfigured,
