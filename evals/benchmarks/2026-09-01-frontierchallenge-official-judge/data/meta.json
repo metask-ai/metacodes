@@ -1,0 +1,15 @@
+{
+  "round": "2026-09-01-frontierchallenge-official-judge",
+  "benchmark": {"name": "FrontierChallenge", "track": "open", "official_denominator": 97, "open_track_tasks": 81, "tasks_attempted": 80, "excluded": ["task_098 (ORCA, upstream #27)"]},
+  "system_under_test": {"scaffold": "metacodes", "commit": "59dd28cdea9ea19a475b2de784703a56795fc1eb", "model": "glm-5.2 @ napi.metask-ai.com (anthropic wire)", "adapter": "metacodes_agent.py headless -p"},
+  "judge": {"model": "gpt-5.6-sol (official pinned, per-task frozen judges, --no-judge-override)", "repeats": 3, "endpoint": "napi.metask-ai.com/v1 (OpenAI route, vision-capable)", "comparability": "definitional configuration; comparable with official-judge reports"},
+  "topology": {"patron": "long(15,conc3)+mainA(43,conc5)", "kunshan": "mainB(22,conc3)"},
+  "disclosures": [
+    "claude-CLI 无关(本轮 scaffold=metacodes);任务镜像含 pip 判分依赖与 CLI 焙层(见上一轮 meta)",
+    "grader 包装加固:judge 每重复至多3次重试(官方judge偶发空分项JSON)、httpx proxies 垫片、fitz/PIL 守卫、dotenv 兜底、mime 跳过、pipchain",
+    "运行事故:早期 tests/.env 0600 权限伤及若干判分、kunshan 首航防火墙/stage 问题——受影响 trial 全部按基建纪律重跑;两题因分片 resume 边界未再入队,按零计",
+    "6 题在3次重试后仍因 judge 返回空分项(ids=[])不可判,按官方口径计零并披露"
+  ],
+  "frozen_results": {"tasks_present": 78, "graded": 72, "passed": 45, "pass_graded": 0.625, "mean_graded_100": 70.4, "median": 0.885, "pass_97": 0.464, "score_97_100": 52.3, "pass_81": 0.556},
+  "reference_rounds": {"glm-judge round (2026-08-31)": "metacodes 55.7%/68.7, claude-code 64.1%/71.9 — judge=glm-5.2×3, 与本轮不可直接比(judge不同)"}
+}

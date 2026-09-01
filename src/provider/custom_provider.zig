@@ -348,7 +348,12 @@ fn parseChannels(
 
         const protocol = try parseProtocol(arena, item.object.get("protocol") orelse return error.UnknownWire);
         const routes = try arena.alloc(profile_mod.ProtocolRoute, 1);
-        routes[0] = .{ .protocol = protocol };
+        // The route carries the definition's own policy. Without it the route
+        // falls back to the default (`require_tls = true`), so a definition
+        // whose base_url passed the check above is rejected again by
+        // `validateProfile` — making the documented `endpoint_policy` inert for
+        // exactly the plaintext relay/proxy case it exists to express.
+        routes[0] = .{ .protocol = protocol, .policy = policy };
 
         out[index] = .{
             .id = channel_id,
@@ -700,6 +705,38 @@ test "a definition that could only produce a rejected URL fails at parse time" {
         \\  "models": [{"request_model_id":"m"}]}}}
     ;
     try testing.expectError(error.InvalidDocument, parse(a, policy_violation));
+}
+
+test "an explicit endpoint_policy governs the route, not just the parse" {
+    const a = testing.allocator;
+    // The same plaintext base the default policy rejects, with the definition
+    // opting in. `validateProfile` checks the base against the profile policy
+    // *and* every route policy, so a parsed policy that never reaches the route
+    // leaves the documented `require_tls: false` unable to express anything.
+    const opted_in =
+        \\{"custom_providers": {"x": {
+        \\  "endpoint_policy": {"require_tls": false},
+        \\  "env_aliases": [{"name":"X_TOKEN","kind":"api_key","canonical":true}],
+        \\  "channels": [{"id":"c","base_url":"http://host.docker.internal:3456",
+        \\                "protocol":{"wire":"anthropic_messages","id":"x_anthropic"}}],
+        \\  "models": [{"request_model_id":"m"}]}}}
+    ;
+    var definitions = try parse(a, opted_in);
+    defer definitions.deinit();
+
+    const built = definitions.find("x").?;
+    try testing.expect(!built.endpoint_policy.require_tls);
+    try testing.expect(!built.channels[0].routes[0].policy.require_tls);
+
+    // The configured endpoint is reachable, not merely parseable.
+    var buffer: [256]u8 = undefined;
+    const url = try built.channels[0].endpointFor(
+        built.endpoint_policy,
+        built.channels[0].routes[0].protocol,
+        null,
+        &buffer,
+    );
+    try testing.expectEqualStrings("http://host.docker.internal:3456/v1/messages", url);
 }
 
 test "structurally incomplete definitions fail before anything is registered" {
