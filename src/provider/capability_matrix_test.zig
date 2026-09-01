@@ -188,13 +188,19 @@ pub const PROFILE = profile_mod.ProviderProfile{
     .default_channel = Slug.lit("standard"),
 };
 
-fn findOffer(catalog: *const registry_mod.OfferCatalog, model: []const u8, channel: []const u8) *const offer.ModelOffer {
+fn findOffer(
+    catalog: *const registry_mod.OfferCatalog,
+    model: []const u8,
+    channel: []const u8,
+) !*const offer.ModelOffer {
     for (catalog.items()) |*candidate| {
         if (!std.mem.eql(u8, candidate.request_model_id, model)) continue;
         if (!candidate.channel_id.eqlText(channel)) continue;
         return candidate;
     }
-    unreachable;
+    // An error, not `unreachable`: a fixture that drifts out of sync with the
+    // profile should fail the test that reads it, not abort the whole run.
+    return error.FixtureOfferMissing;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -207,11 +213,11 @@ test "five vendors, five capability declarations, no name inference" {
     var catalog = try registry.buildCatalog(a, .{ .only_provider = PROFILE.id });
     defer catalog.deinit();
 
-    const deepseek = findOffer(&catalog, "deepseek-v4", "standard");
-    const glm = findOffer(&catalog, "glm-5.3", "standard");
-    const kimi = findOffer(&catalog, "kimi-k3", "standard");
-    const gpt = findOffer(&catalog, "gpt-5.6", "standard");
-    const minimax = findOffer(&catalog, "minimax-m3", "standard");
+    const deepseek = try findOffer(&catalog, "deepseek-v4", "standard");
+    const glm = try findOffer(&catalog, "glm-5.3", "standard");
+    const kimi = try findOffer(&catalog, "kimi-k3", "standard");
+    const gpt = try findOffer(&catalog, "gpt-5.6", "standard");
+    const minimax = try findOffer(&catalog, "minimax-m3", "standard");
 
     // Reasoning differs three ways across five models, and only a declaration
     // could tell them apart.
@@ -250,9 +256,9 @@ test "reasoning vocabularies differ, and a value from the wrong one is refused" 
     var catalog = try registry.buildCatalog(a, .{ .only_provider = PROFILE.id });
     defer catalog.deinit();
 
-    const deepseek = findOffer(&catalog, "deepseek-v4", "standard");
-    const glm = findOffer(&catalog, "glm-5.3", "standard");
-    const gpt = findOffer(&catalog, "gpt-5.6", "standard");
+    const deepseek = try findOffer(&catalog, "deepseek-v4", "standard");
+    const glm = try findOffer(&catalog, "glm-5.3", "standard");
+    const gpt = try findOffer(&catalog, "gpt-5.6", "standard");
 
     // `minimal` is GPT's vocabulary, not DeepSeek's. A shared enum would have
     // accepted it here and produced a request DeepSeek rejects.
@@ -281,9 +287,9 @@ test "a latency tier is present on one model and absent on the rest" {
     var catalog = try registry.buildCatalog(a, .{ .only_provider = PROFILE.id });
     defer catalog.deinit();
 
-    const minimax = findOffer(&catalog, "minimax-m3", "standard");
-    const deepseek = findOffer(&catalog, "deepseek-v4", "standard");
-    const gpt = findOffer(&catalog, "gpt-5.6", "standard");
+    const minimax = try findOffer(&catalog, "minimax-m3", "standard");
+    const deepseek = try findOffer(&catalog, "deepseek-v4", "standard");
+    const gpt = try findOffer(&catalog, "gpt-5.6", "standard");
 
     try testing.expect(controls_mod.findSpec(minimax.controls, "latency_tier") != null);
     try testing.expect(controls_mod.findSpec(deepseek.controls, "latency_tier") == null);
@@ -320,8 +326,8 @@ test "each model appears once per protocol, and the channel narrows both" {
     }
     try testing.expectEqual(@as(usize, 2), protocols_seen);
 
-    const standard = findOffer(&catalog, "glm-5.3", "standard");
-    const narrow = findOffer(&catalog, "glm-5.3", "long-context");
+    const standard = try findOffer(&catalog, "glm-5.3", "standard");
+    const narrow = try findOffer(&catalog, "glm-5.3", "long-context");
     // Channel-specific limits narrow the model's own, and the model keeps its
     // context window because the channel said nothing about it.
     try testing.expectEqual(@as(?u32, 128_000), standard.limits.max_output_tokens);
