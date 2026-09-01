@@ -2269,6 +2269,9 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         };
         const used = app.useAlias(name) catch |err| {
             std.debug.print("\x1b[31m'{s}' did not resolve: {s}\x1b[0m\n", .{ name, @errorName(err) });
+            // Naming the colliding routes is the difference between "it did not
+            // work" and something the user can act on.
+            if (err == error.AmbiguousSelector) reportAliasAmbiguity(app, &store, name);
             return;
         };
         if (!used) {
@@ -2280,6 +2283,34 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
     }
 
     printAliasHelp();
+}
+
+/// Print the routes a floating alias's selector matches.
+///
+/// A second traversal, on the error path only: a floating alias that matches
+/// several routes cannot pick one, and telling the user *which* ones lets them
+/// pin instead.
+fn reportAliasAmbiguity(app: *app_mod.App, store: *const @import("../provider/config_store.zig").Store, name: []const u8) void {
+    const alias_mod = @import("../provider/alias.zig");
+    var document = store.load() catch return;
+    defer document.deinit();
+    const entry = document.alias(name) orelse return;
+    const host = app.providerHost() catch return;
+    const candidates = alias_mod.candidatesFor(host.kernel.catalogSnapshot(), entry);
+    if (candidates.match_count < 2) return;
+
+    std.debug.print("'{s}' matches {d} routes; pin one instead:\n", .{ name, candidates.match_count });
+    for (candidates.samplesSlice()) |sample| {
+        std.debug.print("  {s}/{s} [{s}] {s}\n", .{
+            sample.provider_id.slice(),
+            sample.channel_id.slice(),
+            sample.protocol,
+            &sample.offer_id.render(),
+        });
+    }
+    if (candidates.match_count > candidates.samplesSlice().len) {
+        std.debug.print("  … and {d} more\n", .{candidates.match_count - candidates.samplesSlice().len});
+    }
 }
 
 fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {

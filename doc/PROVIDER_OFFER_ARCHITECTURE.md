@@ -64,6 +64,17 @@ it came from, and a slice into a list that later grows is a dangling pointer.
 1. Write `src/provider/profiles/<vendor>.zig` declaring a `ProviderProfile`.
 2. Add one line to `BUILTIN_PROFILES` in `src/provider/registry.zig`.
 
+A runtime source — the `custom_providers` section, a fetched catalog — registers
+through the same call, and may **replace its own** registrations: re-reading a
+configuration or refreshing a catalog is an ordinary thing to do twice, and a
+registry that only ever appended made the second one fail. It may never take
+over a built-in vendor's id, because letting a config file redefine `openai`
+would change where an existing session's credentials go.
+
+Replacement is validated and capacity-reserved before anything mutates, so a set
+of profiles installs atomically: the registry never ends up holding profiles
+that borrow an arena the same call is about to release.
+
 Nothing in `AgentLoop`, the client factory, the TUI, or the Web UI changes. A
 provider discovered at runtime (user-defined instance, plugin-supplied profile)
 goes through the same `ProviderRegistry.register` call, including validation.
@@ -208,7 +219,9 @@ kernel, mid-turn, against a catalog the user never saw.
 
 `/alias` lists, `/alias pin <name>` names the route the session is on,
 `/alias float <name> <model>` declares a re-resolving one, `/alias use <name>`
-switches to it, and `/alias remove <name>` deletes it.
+switches to it, and `/alias remove <name>` deletes it. A floating alias that
+matches several routes reports which ones, so the answer is "pin one of these"
+rather than "it did not work".
 
 ## Selection persistence
 
@@ -595,6 +608,7 @@ to the historical path, which still serves proxies and server-catalog models.
 | `src/provider/registry.zig` | the extension point + offer catalog |
 | `src/provider/selection.zig` | `RuntimeSelection`, `RoutePolicy`, resolution, legacy migration |
 | `src/provider/alias.zig` | pinned/floating alias resolution |
+| `src/app/route_strings.zig` | one-generation retention of the live route's strings |
 | `src/provider/config_doc.zig` | versioned document model and serialization |
 | `src/provider/config_store.zig` | atomic, revisioned, idempotent writer |
 | `src/provider/control_plane.zig` | UI-independent kernel API and event journal |
