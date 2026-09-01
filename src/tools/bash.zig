@@ -149,11 +149,14 @@ fn appendMemoryChannel(
     // the preview instead of from a size threshold means a channel that fits
     // the allowance whole is never spilled, and a spill always corresponds to
     // bytes the model cannot otherwise see.
-    const stored: ?artifact.Receipt = if (preview.shown_source_bytes < bytes.len)
-        artifact.persist(allocator, artifact_root, bytes) catch null
-    else
-        null;
-    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, bytes.len, digest, stored, capture_complete, null, metrics);
+    var storage_error: ?[]const u8 = null;
+    const stored: ?artifact.Receipt = if (preview.shown_source_bytes < bytes.len) blk: {
+        break :blk artifact.persist(allocator, artifact_root, bytes) catch |err| {
+            storage_error = artifact.storageErrorCode(err);
+            break :blk null;
+        };
+    } else null;
+    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, bytes.len, digest, stored, capture_complete, null, storage_error, metrics);
 }
 
 fn appendFileChannel(
@@ -176,16 +179,19 @@ fn appendFileChannel(
         else
             .{ .content = try allocator.dupe(u8, ""), .shown_source_bytes = 0, .allocator = allocator };
         defer preview.deinit();
-        try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, observed_bytes, null, null, false, path, metrics);
+        try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, observed_bytes, null, null, false, path, artifact.storageErrorCode(error.ArtifactTooLarge), metrics);
         return;
     };
     var preview = try headTailFilePreview(allocator, path, inspected.bytes, allowance);
     defer preview.deinit();
-    const stored: ?artifact.Receipt = if (preview.shown_source_bytes < inspected.bytes)
-        artifact.persistInspectedFile(allocator, artifact_root, path, inspected) catch null
-    else
-        null;
-    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, inspected.bytes, inspected.sha256, stored, true, path, metrics);
+    var storage_error: ?[]const u8 = null;
+    const stored: ?artifact.Receipt = if (preview.shown_source_bytes < inspected.bytes) blk: {
+        break :blk artifact.persistInspectedFile(allocator, artifact_root, path, inspected) catch |err| {
+            storage_error = artifact.storageErrorCode(err);
+            break :blk null;
+        };
+    } else null;
+    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, inspected.bytes, inspected.sha256, stored, true, path, storage_error, metrics);
 }
 
 fn appendChannel(
@@ -199,6 +205,7 @@ fn appendChannel(
     stored: ?artifact.Receipt,
     capture_complete: bool,
     spool_path: ?[]const u8,
+    storage_error: ?[]const u8,
     metrics: ?*ResultMetrics,
 ) !void {
     if (metrics) |m| m.recordCapturedStream(captured_bytes);
@@ -256,8 +263,17 @@ fn appendChannel(
         try writer.print(",\"{s}_path\":", .{label});
         try std.json.Stringify.encodeJsonString(path, .{}, writer);
     }
+    // The generic projection envelope has always reported why a publish
+    // failed; this family reported only `recoverable:false`, so a full disk
+    // and a permanently exhausted session quota looked identical. Same codes,
+    // from the same mapper, so the two families cannot drift.
+    if (storage_error) |code| {
+        try writer.print(",\"{s}_storage_error\":", .{label});
+        try std.json.Stringify.encodeJsonString(code, .{}, writer);
+    }
 }
 
+/// Encoded cost of `source` in the encoding `appendChannel` will pick for it.
 fn encodedCost(source: []const u8, base64: bool) usize {
     if (base64) return std.base64.standard.Encoder.calcSize(source.len);
     return result_budget.encodedLen(source);
@@ -1066,4 +1082,26 @@ test "channelAllowances keeps the two channels inside one per-result budget" {
     const small = channelAllowances(budget, 1000, 20);
     try std.testing.expectEqual(@as(usize, 2000), small.first);
     try std.testing.expectEqual(@as(usize, 40), small.second);
+}
+
+test "an unpublishable Bash channel says why, not just that it failed" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // No artifact root: the channel must spill and cannot. Reporting only
+    // `recoverable:false` made a missing store, a full disk and an exhausted
+    // session quota indistinguishable — the generic projection envelope has
+    // always named the reason, and both families now use the same codes.
+    const ctx = ToolContext{ .allocator = a };
+    const result = try runSizedStdout(a, &ctx, 20_000);
+    defer a.free(result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
+    try std.testing.expect(!parsed.value.object.get("stdout_recoverable").?.bool);
+    try std.testing.expectEqualStrings(
+        "artifact_store_unavailable",
+        parsed.value.object.get("stdout_storage_error").?.string,
+    );
+    // A channel that was never spilled makes no claim either way.
+    try std.testing.expect(parsed.value.object.get("stderr_storage_error") == null);
 }

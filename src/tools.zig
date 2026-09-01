@@ -203,11 +203,12 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Grep",
-        .description = "Search for patterns in files using ripgrep",
+        .description = "Search for patterns in files, or inside a recovered tool-result artifact, using ripgrep",
         .describe_fn = descriptions.describeGrep,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "pattern", .type = "string", .description = "The regular expression pattern to search for in file contents" },
             .{ .name = "path", .type = "string", .description = "File or directory to search in (defaults to cwd)" },
+            .{ .name = "artifact_id", .type = "string", .description = "Search a recovered tool-result artifact instead of a path. Use the sha256 artifact_id from a truncated result to find the part you need in one call, rather than paging it with ReadArtifact. Mutually exclusive with path; output_mode must be content or count" },
             .{ .name = "glob", .type = "string", .description = "Glob pattern to filter files (e.g. *.zig)" },
             .{ .name = "output_mode", .type = "string", .description = "Output mode", .enum_values = &.{ "content", "files_with_matches", "count" } },
             .{ .name = "-i", .type = "boolean", .description = "Case insensitive search" },

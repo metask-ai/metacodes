@@ -30,6 +30,9 @@ pub const Snapshot = struct {
     /// and of those the ones returned to the model in full.
     envelope_regrown_count: u64,
     envelope_reinlined_count: u64,
+    /// High-water mark of the session artifact store, so approaching the
+    /// quota is visible before it turns every later result unrecoverable.
+    session_artifact_bytes: u64,
     budget_exhausted_count: u64,
 };
 
@@ -48,6 +51,7 @@ pub const Metrics = struct {
     image_exempt_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     envelope_regrown_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     envelope_reinlined_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    session_artifact_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     budget_exhausted_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn recordProjection(self: *Metrics, stats: projection.Stats) void {
@@ -62,6 +66,8 @@ pub const Metrics = struct {
         add(&self.image_exempt_count, stats.image_exempt_count);
         add(&self.envelope_regrown_count, stats.envelope_regrown_count);
         add(&self.envelope_reinlined_count, stats.envelope_reinlined_count);
+        // A gauge, not a counter: keep the high-water mark rather than a sum.
+        _ = self.session_artifact_bytes.fetchMax(stats.session_artifact_bytes, .monotonic);
         if (stats.budget_exhausted) add(&self.budget_exhausted_count, 1);
     }
 
@@ -99,6 +105,7 @@ pub const Metrics = struct {
             .image_exempt_count = self.image_exempt_count.load(.monotonic),
             .envelope_regrown_count = self.envelope_regrown_count.load(.monotonic),
             .envelope_reinlined_count = self.envelope_reinlined_count.load(.monotonic),
+            .session_artifact_bytes = self.session_artifact_bytes.load(.monotonic),
             .budget_exhausted_count = self.budget_exhausted_count.load(.monotonic),
         };
     }

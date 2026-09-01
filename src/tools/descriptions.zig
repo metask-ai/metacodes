@@ -125,6 +125,7 @@ pub fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         "\n",
         \\- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use `interface\{\}` to find `interface{}` in Go code)
         \\- Multiline matching: By default patterns match within single lines only. For cross-line patterns like `struct \{[\s\S]*?field`, use `multiline: true`
+        \\- Searching a truncated tool result: pass its artifact_id instead of path. One search answers "where in this output is X" directly; paging the same result with ReadArtifact costs one round-trip per 32KB and re-sends the whole context each time. output_mode must be "content" or "count" (there is only one file to name), and path must be omitted.
         ,
     });
 }

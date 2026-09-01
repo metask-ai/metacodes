@@ -190,6 +190,16 @@ results therefore no longer project byte-identically to builds before this
 change; committed results are still never re-projected for a later request, so
 prompt-cache prefixes are unaffected.
 
+Recovery has two primitives rather than one. `ReadArtifact` returns byte
+ranges, which costs one round trip per `MAX_READ_BYTES` and cannot answer a
+question about the content; `Grep` therefore accepts `artifact_id` in place of
+`path` and searches the stored blob directly. The store path is never exposed:
+filename output is suppressed and `files_with_matches`, whose entire output
+would be that path, is rejected for artifact searches. `Bash` results carry
+`<channel>_path` for the same reason — the process spool is an ordinary file in
+the OS temp directory, so `Read` and `Grep` reach it without the artifact store
+being involved at all, and it remains the only handle when a capture was too
+large to publish.
 
 ### PDF document input
 

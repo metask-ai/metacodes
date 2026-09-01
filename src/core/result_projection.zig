@@ -100,6 +100,12 @@ pub const Stats = struct {
     /// returned to the model in full. A non-zero count here is the signal the
     /// capture path spilled something it never needed to.
     envelope_reinlined_count: usize = 0,
+    /// Bytes this session's artifact store is holding, as last observed by a
+    /// publish. Zero when nothing has been published yet. Exhausting the
+    /// session quota makes every later oversized result permanently
+    /// unrecoverable, and until now the only trace of approaching it was an
+    /// undifferentiated fallback count.
+    session_artifact_bytes: u64 = 0,
     /// Whether the committed results still exceed `per_turn_bytes` in **budget
     /// weight** (`accountedBytes`: an image costs its token estimate, every
     /// other result costs its bytes). Deliberately not derived from
@@ -286,6 +292,8 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
 
     stats.projected_bytes = literalTotal(items);
     stats.budget_exhausted = accountedTotal(items) > config.budget.per_turn_bytes;
+    const usage = artifact.sessionUsage();
+    if (usage.observed) stats.session_artifact_bytes = usage.used_bytes;
     return stats;
 }
 

@@ -16,31 +16,62 @@ const STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 /// pagination and navigation prefixes are rendered into a second bounded
 /// capture, while an unmodified full result can become a CAS receipt directly.
 pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
-    if (ctx.artifact_root.len == 0)
+    const artifact_id = common.extractJsonArg(args, "artifact_id");
+    if (ctx.artifact_root.len == 0) {
+        if (artifact_id != null) return error.ArtifactStoreRequired;
         return ToolResultBody.initInline(try execute(ctx, args));
+    }
 
     const allocator = ctx.allocator;
     const pattern = common.extractJsonArg(args, "pattern") orelse return error.MissingPattern;
-    const path_raw = common.extractJsonArg(args, "path") orelse ".";
     if (pattern.len == 0) return error.EmptyPattern;
-    const path = try path_mod.normalizeChecked(allocator, path_raw, .{
+
+    // Searching a recovered result in place. `ReadArtifact` can only page byte
+    // ranges, so answering "where is the failure in this 40MB log" costs
+    // O(size / 32KiB) round trips and re-sends the context each time; the blob
+    // is an ordinary file, so one ripgrep answers it. The resolved path names
+    // the kernel-private store and must never reach the model, which is why
+    // filename output is suppressed below and `files_with_matches` - the one
+    // mode whose whole output *is* the path - is refused.
+    const path = if (artifact_id) |id| blk: {
+        if (common.extractJsonArg(args, "path") != null) {
+            common.setErrorDetail(ctx.error_detail, allocator, "pass either path or artifact_id, not both", .{});
+            return error.GrepTargetConflict;
+        }
+        break :blk artifact_store.resolveSearchPath(allocator, ctx.artifact_root, id) catch |err| {
+            common.setErrorDetail(ctx.error_detail, allocator, "artifact '{s}' is not searchable: {s}", .{ id, @errorName(err) });
+            return err;
+        };
+    } else try path_mod.normalizeChecked(allocator, common.extractJsonArg(args, "path") orelse ".", .{
         .home = ctx.home_dir,
         .base_dir = ctx.cwd_abs,
         .resolve_relative = ctx.resolve_relative_paths,
     });
     defer allocator.free(path);
-    _ = read_state.statPath(path) catch {
-        common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
-        return error.PathNotFound;
-    };
+    if (artifact_id == null) {
+        _ = read_state.statPath(path) catch {
+            common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
+            return error.PathNotFound;
+        };
+    }
 
     const rg_path = try toolchain.ripgrepPath();
-    const output_mode = common.extractJsonArg(args, "output_mode") orelse "files_with_matches";
+    const output_mode = common.extractJsonArg(args, "output_mode") orelse
+        if (artifact_id != null) "content" else "files_with_matches";
     var base_argv = std.ArrayList([]const u8).empty;
     defer base_argv.deinit(allocator);
     try base_argv.append(allocator, rg_path);
     try base_argv.append(allocator, "--no-messages");
+    if (artifact_id != null) {
+        // Belt and braces: ripgrep already omits the filename for a single
+        // explicit file, and this makes that independent of its heuristics.
+        try base_argv.append(allocator, "--no-filename");
+    }
     if (std.mem.eql(u8, output_mode, "files_with_matches")) {
+        if (artifact_id != null) {
+            common.setErrorDetail(ctx.error_detail, allocator, "output_mode files_with_matches is meaningless for a single artifact; use content or count", .{});
+            return error.InvalidOutputMode;
+        }
         try base_argv.append(allocator, "-l");
     } else if (std.mem.eql(u8, output_mode, "count")) {
         try base_argv.append(allocator, "-c");
@@ -154,7 +185,9 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
         return error.GrepExecFailed;
     }
 
-    const prefix = definitionsPrefix(allocator, pattern, path, ctx);
+    // The LSP definition hitchhiker resolves workspace symbols; an artifact is
+    // not a workspace file and its path must not be handed to the LSP either.
+    const prefix = if (artifact_id != null) null else definitionsPrefix(allocator, pattern, path, ctx);
     defer if (prefix) |value| allocator.free(value);
     const needs_projection = used_note != null or prefix != null or head_limit != 0 or offset != 0;
     if (!needs_projection) {
@@ -947,4 +980,100 @@ test "collapseDoubleBackslashes unit" {
     const c2 = collapseDoubleBackslashes(a, "a\\\\(b").?;
     defer a.free(c2);
     try std.testing.expectEqualStrings("a\\(b", c2);
+}
+
+test "Grep searches a recovered artifact without leaking the store path" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    // A result far past any preview: the answer sits in the middle, where
+    // neither the head nor the tail of a head/tail preview can reach it.
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(a);
+    var line: usize = 0;
+    while (line < 40_000) : (line += 1) {
+        if (line == 20_000) {
+            try payload.appendSlice(a, "fatal: ARTIFACT_NEEDLE not found\n");
+        } else {
+            try payload.appendSlice(a, "ok: routine build line\n");
+        }
+    }
+    const receipt = try artifact_store.persist(a, root, payload.items);
+
+    var ctx = ToolContext{ .allocator = a, .artifact_root = root };
+    const args = try std.fmt.allocPrint(
+        a,
+        "{{\"pattern\":\"ARTIFACT_NEEDLE\",\"artifact_id\":\"{s}\",\"output_mode\":\"content\"}}",
+        .{receipt.id()},
+    );
+    defer a.free(args);
+    var body = try executeBody(&ctx, args);
+    defer body.deinit(a);
+    var rendered = try body.render(a);
+    defer rendered.deinit(a);
+
+    // One call, and the needle is found — versus 20_000 lines of paging.
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "ARTIFACT_NEEDLE") != null);
+    // The kernel-private store must not appear anywhere in the model-visible
+    // result: leaking it would let any file tool read blobs outside the
+    // bounded recovery contract.
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, root) == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "sha256") == null);
+
+    // count mode answers "how many" without naming anything either.
+    const count_args = try std.fmt.allocPrint(
+        a,
+        "{{\"pattern\":\"ARTIFACT_NEEDLE\",\"artifact_id\":\"{s}\",\"output_mode\":\"count\"}}",
+        .{receipt.id()},
+    );
+    defer a.free(count_args);
+    var count_body = try executeBody(&ctx, count_args);
+    defer count_body.deinit(a);
+    var count_rendered = try count_body.render(a);
+    defer count_rendered.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, count_rendered.bytes, "1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, count_rendered.bytes, root) == null);
+}
+
+test "Grep artifact search refuses ambiguous or path-shaped requests" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const receipt = try artifact_store.persist(a, root, "needle here");
+
+    var ctx = ToolContext{ .allocator = a, .artifact_root = root };
+    const both = try std.fmt.allocPrint(
+        a,
+        "{{\"pattern\":\"needle\",\"artifact_id\":\"{s}\",\"path\":\".\"}}",
+        .{receipt.id()},
+    );
+    defer a.free(both);
+    try std.testing.expectError(error.GrepTargetConflict, executeBody(&ctx, both));
+
+    // files_with_matches would emit the store path as its entire output.
+    const listing = try std.fmt.allocPrint(
+        a,
+        "{{\"pattern\":\"needle\",\"artifact_id\":\"{s}\",\"output_mode\":\"files_with_matches\"}}",
+        .{receipt.id()},
+    );
+    defer a.free(listing);
+    try std.testing.expectError(error.InvalidOutputMode, executeBody(&ctx, listing));
+
+    const unknown = "{\"pattern\":\"needle\",\"artifact_id\":\"sha256:" ++ ("b" ** 64) ++ "\"}";
+    try std.testing.expectError(error.ArtifactNotFound, executeBody(&ctx, unknown));
+
+    // Without a store there is nothing to search, and the legacy path must not
+    // silently reinterpret artifact_id as a cwd search.
+    var bare = ToolContext{ .allocator = a };
+    const bare_args = try std.fmt.allocPrint(a, "{{\"pattern\":\"needle\",\"artifact_id\":\"{s}\"}}", .{receipt.id()});
+    defer a.free(bare_args);
+    try std.testing.expectError(error.ArtifactStoreRequired, executeBody(&bare, bare_args));
 }

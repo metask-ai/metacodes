@@ -288,6 +288,24 @@ stdout/stderr 双通道)从这里取额度并按 max-min 公平切分——空 s
 `ReadArtifact` 对投影豁免(否则恢复自身会递归溢出),改由 `min(MAX_READ_BYTES,
 per_result_bytes)` 限界,余量走 `next_offset`。
 
+**恢复面的两个原语**:`ReadArtifact` 只能取字节区间,恢复一个 N 字节结果要
+O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。`Grep` 因此接受
+`artifact_id` 替代 `path`:blob 本来就是普通文件,一次 ripgrep 就能定位。CAS 路径
+**不得**进入模型可见结果(泄漏它等于让任意文件工具绕过有界恢复契约),故 artifact
+模式强制 `--no-filename`,并拒绝 `files_with_matches`——该模式的全部输出就是路径。
+`path` 与 `artifact_id` 互斥;无 artifact store 时传 `artifact_id` 报
+`ArtifactStoreRequired`,不会静默退化成 cwd 搜索。
+
+**配额与可见性**:`MAX_SESSION_BYTES` 检查每次发布都做一次全目录扫描,**刻意保持精确**
+——session root 由子 agent 与跨进程 swarm teammate 共享,缓存总量只能是下界,信它就会
+在别的写者活跃时越过配额;那次扫描的代价(最坏几千次 syscall)相对一次模型往返是噪声。
+扫描顺带写入 `sessionUsage()`(纯遥测,不参与准入),经 `Stats.session_artifact_bytes`
+进 projection 日志行,让"逼近配额"在变成永久不可恢复之前可见。发布失败的原因由
+`artifact.storageErrorCode` 统一命名,generic 信封与 Bash 通道
+(`<channel>_storage_error`)共用同一套码,不再出现"只说 recoverable:false 不说为什么"。
+**没有淘汰策略**:artifact id 已经写进 conversation/transcript 并对模型承诺过
+`recoverable:true`,盲目删除会让该承诺变成悬空指针;安全的淘汰需要一份跨会话的存活
+引用集,artifact 层拿不到,属于独立议题。
 
 静态 `ToolEntry.result_production` 把生产方式收成三种不可混淆的状态：`bounded_inline`、
 `input_derived`、`byte_zero_spool`；comptime 断言禁止 `byte_zero_spool` 工具接回

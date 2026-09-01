@@ -2541,7 +2541,7 @@ pub fn run(
         });
         if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
         if (projection_stats.changed() or projection_stats.budget_exhausted) {
-            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_exempt={d} regrown={d} reinlined={d} budget_exhausted={}", .{
+            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_exempt={d} regrown={d} reinlined={d} session_artifact_bytes={d} budget_exhausted={}", .{
                 projection_stats.raw_bytes,
                 projection_stats.projected_bytes,
                 projection_stats.artifact_bytes,
@@ -2551,6 +2551,7 @@ pub fn run(
                 projection_stats.image_exempt_count,
                 projection_stats.envelope_regrown_count,
                 projection_stats.envelope_reinlined_count,
+                projection_stats.session_artifact_bytes,
                 projection_stats.budget_exhausted,
             });
         }
