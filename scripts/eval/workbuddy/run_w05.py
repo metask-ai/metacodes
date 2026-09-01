@@ -437,7 +437,7 @@ def run_w05(
     metacodes: Path,
     tinykg: Path,
     formal_kernel: Path,
-    ripgrep: Path | None = None,
+    ripgrep: Path,
     project_kernel: Path,
     project_rules: Path,
     metacodes_commit: str,
@@ -459,7 +459,7 @@ def run_w05(
         metacodes=metacodes,
         tinykg=tinykg,
         formal_kernel=formal_kernel,
-        ripgrep=ripgrep.resolve() if ripgrep else None,
+        ripgrep=ripgrep.resolve(),
         project_kernel=project_kernel,
         project_rules=project_rules,
         metacodes_commit=metacodes_commit,
@@ -653,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--formal-kernel", type=Path, required=True)
     parser.add_argument("--project-kernel", type=Path, required=True)
     parser.add_argument("--project-rules", type=Path, required=True)
-    parser.add_argument("--ripgrep", type=Path, default=None)
+    parser.add_argument("--ripgrep", type=Path, required=True)
     parser.add_argument("--metacodes-commit", required=True)
     parser.add_argument("--tinykg-commit", required=True)
     parser.add_argument("--metacodes-license", type=Path, required=True)
