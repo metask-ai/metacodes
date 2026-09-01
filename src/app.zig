@@ -100,6 +100,20 @@ const client_mod = @import("client.zig");
 const api_keys_mod = @import("api/api_keys.zig");
 const openai_mod = @import("api/openai_client.zig");
 const gemini_mod = @import("api/gemini_client.zig");
+const provider_host_mod = @import("provider/host.zig");
+const provider_binding_mod = @import("provider/runtime_binding.zig");
+const provider_control_plane = @import("provider/control_plane.zig");
+const provider_config_store = @import("provider/config_store.zig");
+const provider_selection_mod = @import("provider/selection.zig");
+const provider_ids_mod = @import("provider/ids.zig");
+const provider_credential_mod = @import("provider/credential.zig");
+const provider_config_doc = @import("provider/config_doc.zig");
+const model_picker_mod = @import("repl/model_picker.zig");
+const route_strings_mod = @import("app/route_strings.zig");
+const kg_provider_audit = @import("kg/provider_audit.zig");
+const provider_alias_mod = @import("provider/alias.zig");
+const provider_oauth_mod = @import("provider/oauth.zig");
+const oauth_exchange_mod = @import("api/oauth_exchange.zig");
 const provider_mod = @import("api/provider.zig");
 const request_overrides = @import("api/request_overrides.zig");
 const dialect_mod = @import("api/dialect.zig");
@@ -234,6 +248,8 @@ fn installCliProcessError(
 /// session 内的 binding 指针指向同一个 client；client 必须比 session 活得久。
 pub const McpSessionEntry = @import("core/mcp_session.zig").McpSessionEntry;
 
+pub const PendingOverlay = enum { none, model_picker, transcript };
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     config: types.Config,
@@ -244,6 +260,45 @@ pub const App = struct {
     models_picker_key_index: ?usize = null,
     models_picker_model_index: ?usize = null,
     model_switch_owned: ?[]u8 = null,
+    // ── issue #16: the provider control plane this session talks to ─────────
+    /// Registry + catalog + kernel, created on first use. Null until something
+    /// asks for a provider view, so a session that never opens the picker pays
+    /// nothing for it.
+    provider_host: ?*provider_host_mod.Host = null,
+    /// Cross-UI picker state. Present whether or not it is on screen, so a
+    /// reopened picker does not have to refetch the catalog.
+    model_picker: model_picker_mod.Picker = undefined,
+    /// Strings a committed offer put into borrowing client fields. Owned here
+    /// because `Client.base_url` and `api_key` are borrowed slices that must
+    /// outlive every in-flight request.
+    /// Strings a committed route lends to the live clients. Keeps one previous
+    /// generation readable; see `app/route_strings.zig` for why.
+    route_strings: route_strings_mod.RouteStrings = undefined,
+    /// A slash command asked for a full-region overlay. Commands are handled
+    /// after the input reader returns, so the request is parked here and the
+    /// next read consumes it.
+    pending_overlay: PendingOverlay = .none,
+    /// One OAuth session per provider, kept for the process.
+    ///
+    /// Single flight is a property of a `Session` object, so a fresh one per
+    /// call would let two concurrent callers both refresh — and with a rotating
+    /// refresh token the loser presents one the server already invalidated.
+    /// Holding it here makes the guarantee real across callers rather than
+    /// within one call.
+    oauth_session: ?provider_oauth_mod.Session = null,
+    oauth_session_provider: ?provider_ids_mod.Slug = null,
+    /// Last control-plane event projected into the TinyKG audit plane. Events
+    /// are recorded once; a restart starts from the journal's current head
+    /// rather than replaying a ring that may already have evicted.
+    provider_audit_cursor: u64 = 0,
+    /// Why the most recent catalog refresh skipped a provider, if it did. A
+    /// per-catalog failure must not abort the others, so it is recorded rather
+    /// than propagated — and reported, because a silently skipped refresh looks
+    /// exactly like a successful one.
+    last_catalog_refresh_error: ?[]const u8 = null,
+    /// Why the last committed selection was not written durably, if it was not.
+    /// The route is live regardless; what is lost is surviving a `/resume`.
+    last_persist_error: ?[]const u8 = null,
     /// 模型档位表(~/.metacodes/config.json 的 model_tiers;null=未配置)。
     model_tiers_table: ?@import("api/model_tiers.zig").TierTable = null,
     pending_previous_model_for_compact: ?[]u8 = null,
@@ -432,6 +487,8 @@ pub const App = struct {
             .config = config,
             .api_key = api_key,
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
+            .model_picker = model_picker_mod.Picker.init(allocator),
+            .route_strings = route_strings_mod.RouteStrings.init(allocator),
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
             .session_id = if (config.session_id) |s|
@@ -709,6 +766,7 @@ pub const App = struct {
             .model = app.config.model,
             .provider_kind = app.config.provider_kind,
             .openai_protocol = app.config.openai_protocol,
+            .auth_scheme = app.config.auth_scheme,
             .dialect_resolver = app_dialect_resolver,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
         };
@@ -823,6 +881,10 @@ pub const App = struct {
             app.allocator.free(tok);
         }
         app.api_key_catalog.deinit();
+        app.model_picker.deinit();
+        if (app.oauth_session) |*session| session.deinit();
+        if (app.provider_host) |host| host.destroy();
+        app.route_strings.deinit();
         if (app.selected_api_key_owned) |k| {
             @memset(k, 0);
             app.allocator.free(k);
@@ -900,6 +962,504 @@ pub const App = struct {
                 @import("util/log.zig").debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    // ── issue #16: the cross-UI provider control plane ──────────────────────
+
+    /// The session's provider kernel, created on first use.
+    ///
+    /// Every UI reads offers and commits selections through this one object.
+    /// A client that built its own registry would be a second place identity is
+    /// decided, and the two would disagree the moment either refreshed.
+    pub fn providerHost(app: *App) !*provider_host_mod.Host {
+        if (app.provider_host) |host| return host;
+        const host = try provider_host_mod.Host.create(app.allocator);
+        errdefer host.destroy();
+        // Seed the durable revision and any previously committed global
+        // selection, so `selection.commit` compares against the number the
+        // store actually holds rather than an invented one.
+        var store = provider_config_store.Store.initHome(app.allocator) catch {
+            app.provider_host = host;
+            return host;
+        };
+        defer store.deinit();
+        host.adoptDurableState(&store);
+        if (host.startup_warning) |why| {
+            // Reported once, when the host is built. A broken section otherwise
+            // surfaces much later as "unknown provider" with nothing to connect
+            // it to the configuration that caused it.
+            @import("util/log.zig").warn(
+                "provider",
+                "part of ~/.metacodes/config.json did not apply ({s}); run `metacodes --check-providers`",
+                .{why},
+            );
+        }
+        app.seedStartupSelection(host);
+        app.provider_host = host;
+        return host;
+    }
+
+    /// Tell the kernel which route this session actually started on.
+    ///
+    /// `--provider`/`--offer` and the stored global selection are resolved in
+    /// `main.zig` before an `App` exists, so without this the kernel believes
+    /// the session has no selection: the picker marks nothing current,
+    /// `/alias pin` reports "no selected offer", `/providers` shows no `*`, and
+    /// — the one that actually breaks a session — the turn-boundary OAuth
+    /// refresh, which keys on the effective selection, never runs.
+    fn seedStartupSelection(app: *App, host: *provider_host_mod.Host) void {
+        const rendered = app.config.selected_offer_id orelse return;
+        const offer_id = provider_ids_mod.OfferId.parse(rendered) catch return;
+        const found = host.kernel.catalogSnapshot().find(offer_id) orelse return;
+        host.kernel.seedSessionSelection(provider_selection_mod.RuntimeSelection.pinned(
+            found.offer_id,
+            found.offer_revision,
+            .session,
+        ));
+    }
+
+    /// Materialize the configured credential pool for the current session.
+    ///
+    /// The document holds only references — an id, an environment variable
+    /// name, a kind, a priority — so reading it never touches a secret. The
+    /// secrets are read here, from the process environment, and borrowed for
+    /// the duration of request setup.
+    /// Load the configuration document, or null when there is none to read.
+    /// The caller owns it — see `credentialPoolFrom` for why that matters.
+    pub fn loadConfigDocument(app: *App) ?provider_config_doc.Document {
+        var store = provider_config_store.Store.initHome(app.allocator) catch return null;
+        defer store.deinit();
+        return store.load() catch null;
+    }
+
+    /// Materialize the configured credential pool.
+    ///
+    /// Takes the document by pointer and **does not own it**: the returned
+    /// entries borrow the account label out of it, so a version of this that
+    /// loaded and freed the document internally would hand back dangling
+    /// slices. The caller keeps the document alive for as long as it uses the
+    /// pool.
+    ///
+    /// Secrets come from the named environment variables, never from the
+    /// document: that document is read by several tools and is not mode 0600.
+    pub fn credentialPoolFrom(
+        document: *const provider_config_doc.Document,
+        buffer: []provider_credential_mod.PoolEntry,
+    ) []const provider_credential_mod.PoolEntry {
+        const env = provider_credential_mod.EnvLookup.process();
+        var len: usize = 0;
+        // Iterated by pointer, so `slice()` reads the stored entry rather than
+        // a loop-local copy that dies at the end of the iteration.
+        for (document.providers.items) |*entry| {
+            if (!entry.enabled) continue;
+            for (entry.credentials.items()) |*credential| {
+                if (len == buffer.len) break;
+                const secret = env.get(credential.env.slice()) orelse continue;
+                const kind = provider_credential_mod.parseCredentialKind(credential.kind.slice()) orelse continue;
+                buffer[len] = .{
+                    .id = credential.id,
+                    .kind = kind,
+                    .secret = secret,
+                    .priority = credential.priority,
+                    .account_or_plan = if (credential.account_or_plan) |*label| label.slice() else null,
+                    // Learned state from previous runs: a cooldown recorded
+                    // here is why the next process skips the credential instead
+                    // of rediscovering the same rate limit by hitting it.
+                    .cooldown_until = credential.cooldown_until,
+                    .status = if (credential.invalid) .invalid else .active,
+                };
+                len += 1;
+            }
+        }
+        return buffer[0..len];
+    }
+
+    /// The profile a selection resolves to, if it is still in the catalog.
+    fn resolvedProfileFor(
+        host: *provider_host_mod.Host,
+        selection: provider_selection_mod.RuntimeSelection,
+    ) ?*const @import("provider/profile.zig").ProviderProfile {
+        const resolution = provider_selection_mod.resolve(host.kernel.catalogSnapshot(), selection) catch
+            return null;
+        return host.registry.findById(resolution.primary().provider_id);
+    }
+
+    /// A live access token for a provider whose profile declares an OAuth
+    /// lifecycle, refreshing through the shared single-flight session.
+    ///
+    /// Returns null for every profile that declares none — Metask keeps its
+    /// historical `core/auth.zig` path byte for byte, and a provider with no
+    /// token endpoint has no lifecycle to run.
+    pub fn oauthAccessToken(
+        app: *App,
+        built: *const @import("provider/profile.zig").ProviderProfile,
+        now_seconds: i64,
+    ) !?[]u8 {
+        const token_url = built.oauth_token_url orelse return null;
+        var serves = false;
+        for (built.accepted_credential_kinds) |kind| {
+            if (provider_oauth_mod.servesKind(kind)) serves = true;
+        }
+        if (!serves) return null;
+
+        // One session per provider, kept for the process: single flight is a
+        // property of the object, so a fresh one per call would let two callers
+        // both refresh and make the loser present a rotated-away token.
+        const same_provider = if (app.oauth_session_provider) |id| id.eql(built.id) else false;
+        if (!same_provider) {
+            if (app.oauth_session) |*old_session| old_session.deinit();
+            app.oauth_session = try provider_oauth_mod.Session.initHome(app.allocator, built.id);
+            app.oauth_session_provider = built.id;
+            // No stored login is not an error: the provider simply falls
+            // through to its API-key aliases.
+            if (!(app.oauth_session.?.load() catch false)) {
+                app.oauth_session.?.deinit();
+                app.oauth_session = null;
+                app.oauth_session_provider = null;
+                return null;
+            }
+        }
+        const session = &app.oauth_session.?;
+
+        var exchange = oauth_exchange_mod.HttpExchange{
+            .allocator = app.allocator,
+            .io = app.api_client.http_client.io,
+            .endpoint = .{ .token_url = token_url, .client_id = built.id.slice() },
+        };
+        const before = session.generation;
+        const token = try session.accessToken(now_seconds, exchange.exchange());
+
+        // The session is the only thing that knows this credential's expiry, so
+        // it is the only thing that can warn before a turn fails. A refresh
+        // that happened is also a status change a UI may want to show.
+        if (app.provider_host) |host| {
+            if (session.tokens) |current| {
+                if (current.expires_at - now_seconds <= provider_host_mod.Host.CREDENTIAL_EXPIRY_WARNING_SECONDS) {
+                    host.kernel.noteCredentialExpiring(built.id, built.id, current.expires_at);
+                }
+            }
+            if (session.generation != before) {
+                host.kernel.noteAuthChanged(built.id, built.id, .active);
+            }
+        }
+        return token;
+    }
+
+    /// Refresh the picker's snapshot from the kernel. Called when the picker
+    /// opens and whenever the catalog moves underneath it.
+    pub fn refreshModelPicker(app: *App) !void {
+        const host = try app.providerHost();
+        var page: std.ArrayList(provider_control_plane.OfferSummary) = .empty;
+        defer page.deinit(app.allocator);
+        const listed = host.kernel.modelList(.{}, .{}, app.allocator, &page) catch {
+            app.model_picker.markFailed();
+            return;
+        };
+        try app.model_picker.adopt(listed, host.kernel.currentOfferId());
+    }
+
+    /// Apply a picker commit: validate through the kernel, bind the winning
+    /// offer to real transport parameters, and only then move the session onto
+    /// it. A rejection at any step leaves the previous runtime untouched, which
+    /// is why nothing is mutated until the binding exists.
+    pub fn commitModelSelection(
+        app: *App,
+        commit: model_picker_mod.Commit,
+    ) !provider_control_plane.CommitOutcome {
+        const host = try app.providerHost();
+        app.last_persist_error = null;
+        var candidate = provider_selection_mod.RuntimeSelection.pinned(
+            commit.offer_id,
+            commit.offer_revision,
+            commit.scope,
+        );
+        candidate.controls = commit.controls;
+
+        const outcome = host.kernel.selectionCommit(.{
+            .expected_config_revision = null,
+            .expected_catalog_revision = null,
+        }, candidate, commit.scope);
+        switch (outcome) {
+            .committed => |accepted| {
+                try app.bindCommittedSelection(host, accepted.selection);
+                if (accepted.requires_persist) try app.persistGlobalSelection(host, accepted.selection);
+                // A session-scoped choice is durable *for this session*: it has
+                // to survive a resume, and it must not reach any other session,
+                // which is why it goes to the session's own file.
+                if (accepted.scope == .session) app.persistSessionSelection(accepted.selection) catch |err| {
+                    // The route is live either way; what is lost is surviving a
+                    // `/resume`, and a user told nothing would find that out
+                    // only after resuming.
+                    app.last_persist_error = @errorName(err);
+                };
+            },
+            // The kernel already refused; the old runtime is still the live one.
+            .rejected, .conflict => {},
+        }
+        return outcome;
+    }
+
+    /// `<session_dir>/runtime-selection.json`. Null when this session has no
+    /// transcript directory, which is the case for one-shot and headless runs
+    /// where there is nothing to resume into.
+    fn sessionSelectionStore(app: *App) ?provider_config_store.Store {
+        const writer = app.transcript_writer orelse return null;
+        return provider_config_store.Store.initSessionFile(app.allocator, writer.dir) catch null;
+    }
+
+    fn persistSessionSelection(
+        app: *App,
+        selection: provider_selection_mod.RuntimeSelection,
+    ) !void {
+        var store = app.sessionSelectionStore() orelse return;
+        defer store.deinit();
+        _ = try provider_config_store.setSessionSelection(&store, selection, null, null);
+    }
+
+    /// Restore this session's own selection, if it committed one before.
+    ///
+    /// Ordering against the global selection is deliberate: session scope is
+    /// narrower, so it wins. A resumed session continues on the route it was
+    /// using, not on whatever became global in the meantime.
+    pub fn restoreSessionSelection(app: *App) !bool {
+        var store = app.sessionSelectionStore() orelse return false;
+        defer store.deinit();
+        var document = store.load() catch return false;
+        defer document.deinit();
+        const selection = document.session_selection orelse return false;
+
+        const host = try app.providerHost();
+        const outcome = host.kernel.selectionCommit(.{}, selection, .session);
+        switch (outcome) {
+            .committed => |accepted| {
+                try app.bindCommittedSelection(host, accepted.selection);
+                return true;
+            },
+            // A stored session route that no longer resolves is reported by the
+            // caller, not silently replaced with a different vendor.
+            .rejected, .conflict => return error.SessionSelectionUnavailable,
+        }
+    }
+
+    fn persistGlobalSelection(
+        app: *App,
+        host: *provider_host_mod.Host,
+        selection: provider_selection_mod.RuntimeSelection,
+    ) !void {
+        var store = try provider_config_store.Store.initHome(app.allocator);
+        defer store.deinit();
+        const result = try provider_config_store.setGlobalSelection(
+            &store,
+            selection,
+            null,
+            null,
+        );
+        // The store is the sole authority for this number; feeding it back is
+        // what keeps `expected_config_revision` meaningful on the next commit.
+        host.kernel.adoptConfigRevision(result.config_revision);
+    }
+
+    /// Move the live session onto a committed selection.
+    ///
+    /// Ordering is the correctness argument. Everything that can fail happens
+    /// before anything is mutated, the model mirrors move through the existing
+    /// `switchModel` seam, and only infallible transport assignment follows —
+    /// so there is no state in which the model is new and the endpoint is old.
+    fn bindCommittedSelection(
+        app: *App,
+        host: *provider_host_mod.Host,
+        selection: provider_selection_mod.RuntimeSelection,
+    ) !void {
+        var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
+        const now = @import("util/time.zig").nowUnix();
+
+        // An OAuth provider's live access token is obtained (and refreshed, and
+        // persisted) before resolution, so the resolver sees ordinary stored
+        // material and the OAuth lifecycle stays in one place.
+        var oauth_token: ?[]u8 = null;
+        var oauth_kind: provider_credential_mod.CredentialKind = .openai_oauth;
+        defer if (oauth_token) |value| {
+            std.crypto.secureZero(u8, value);
+            app.allocator.free(value);
+        };
+        if (resolvedProfileFor(host, selection)) |built| {
+            // The kind comes from the profile, not from a constant: a profile
+            // that accepts only `openai_codex_oauth` would reject a token
+            // labelled `openai_oauth`, and the failure would look like a
+            // missing credential rather than a mislabelled one.
+            for (built.accepted_credential_kinds) |kind| {
+                if (provider_oauth_mod.servesKind(kind)) {
+                    oauth_kind = kind;
+                    break;
+                }
+            }
+            oauth_token = app.oauthAccessToken(built, now) catch |err| blk: {
+                // A dead login is worth saying out loud: resolution will fall
+                // through to an environment key, and "it silently used a
+                // different credential" is the confusing outcome.
+                @import("util/log.zig").warn(
+                    "provider",
+                    "OAuth token for '{s}' unavailable ({s}); falling back to other credentials",
+                    .{ built.id.slice(), @errorName(err) },
+                );
+                break :blk null;
+            };
+        }
+
+        // The document outlives the pool it produces: the entries borrow the
+        // account label out of it.
+        var pool_document = app.loadConfigDocument();
+        defer if (pool_document) |*value| value.deinit();
+        var pool_buffer: [provider_config_doc.MAX_POOL_CREDENTIALS]provider_credential_mod.PoolEntry = undefined;
+        const pool = if (pool_document) |*value|
+            credentialPoolFrom(value, &pool_buffer)
+        else
+            &.{};
+
+        const binding = try provider_binding_mod.bind(
+            &host.registry,
+            host.kernel.catalogSnapshot(),
+            selection,
+            .{
+                .pool = pool,
+                .cli_api_key = app.config.api_key,
+                .stored_oauth = if (oauth_token) |value| .{
+                    .kind = oauth_kind,
+                    .secret = value,
+                } else null,
+                .precedence = if (oauth_token != null) .oauth_first else .api_key_first,
+                .env = @import("provider/credential.zig").EnvLookup.process(),
+                .now_seconds = now,
+            },
+            &reference_buffer,
+        );
+
+        const endpoint = try app.allocator.dupe(u8, binding.endpoint_url);
+        errdefer app.allocator.free(endpoint);
+        const secret = try app.allocator.dupe(u8, binding.secret);
+        errdefer {
+            std.crypto.secureZero(u8, secret);
+            app.allocator.free(secret);
+        }
+
+        // Background subagents build their own provider from the registry's
+        // copy of the route. `setRoute` moves key, endpoint, transport, and
+        // auth scheme together — a registry holding this provider's key while
+        // still pointing at the previous provider's endpoint would send the
+        // credential to the wrong vendor. It allocates before it swaps, so a
+        // failure here leaves the previous route intact.
+        const previous_key = app.api_key;
+        const previous_url = app.config.base_url;
+        const previous_kind = app.config.provider_kind;
+        const previous_protocol = app.config.openai_protocol;
+        const previous_scheme = app.config.auth_scheme;
+        var jobs_rerouted = false;
+        // Function-scoped so it also covers a failure in `switchModel` below;
+        // a block-scoped errdefer would have already gone out of scope by then,
+        // leaving the registry on the new route while the session is on the old.
+        errdefer if (jobs_rerouted) {
+            if (app.agent_jobs) |*jobs| jobs.setRoute(
+                previous_key,
+                previous_url,
+                previous_kind,
+                previous_protocol,
+                previous_scheme,
+            ) catch {};
+        };
+        if (app.agent_jobs) |*jobs| {
+            try jobs.setRoute(secret, endpoint, binding.transport, binding.openai_protocol, binding.auth_scheme);
+            jobs_rerouted = true;
+        }
+
+        // The target transport must exist before the model seam runs, or the
+        // new client would never receive the model.
+        const io = app.api_client.http_client.io;
+        switch (binding.transport) {
+            .anthropic => {},
+            .openai => if (app.openai_client == null) {
+                app.openai_client = openai_mod.OpenAIClient.init(
+                    app.allocator,
+                    io,
+                    secret,
+                    binding.request_model_id,
+                    endpoint,
+                );
+                app.openai_client.?.dialect_resolver = app.api_client.dialect_resolver;
+                app.openai_client.?.overrides = buildOverridesFromConfig(app.config);
+            },
+            .gemini => if (app.gemini_client == null) {
+                app.gemini_client = gemini_mod.GeminiClient.init(
+                    app.allocator,
+                    io,
+                    secret,
+                    binding.request_model_id,
+                    endpoint,
+                );
+                app.gemini_client.?.dialect_resolver = app.api_client.dialect_resolver;
+                app.gemini_client.?.overrides = buildOverridesFromConfig(app.config);
+            },
+        }
+
+        try app.switchModel(binding.request_model_id);
+
+        // From here on nothing can fail, so the switch is all-or-nothing.
+        //
+        // The previous endpoint and secret are *retired*, not freed: a
+        // background request thread can read `Client.base_url` and `api_key` at
+        // any moment, those fields carry no mutex, and a torn `{new_ptr,
+        // old_len}` read of a freed buffer is out of bounds. One retained
+        // generation makes the worst case a wrong-but-in-bounds string.
+        app.route_strings.install(endpoint, secret);
+
+        app.config.provider_kind = binding.transport;
+        app.config.openai_protocol = binding.openai_protocol;
+        app.config.auth_scheme = binding.auth_scheme;
+        // `config` is the snapshot subagent and swarm workers are constructed
+        // from, so it has to move with the route or a spawned worker would dial
+        // the previous provider's endpoint.
+        app.config.base_url = endpoint;
+        app.api_key = secret;
+        app.api_client.api_key = secret;
+        app.api_client.base_url = endpoint;
+        app.api_client.auth_scheme = binding.auth_scheme;
+        if (app.openai_client) |*client| {
+            client.api_key = secret;
+            client.base_url = endpoint;
+            client.protocol = binding.openai_protocol;
+            client.auth_scheme = binding.auth_scheme;
+        }
+        if (app.gemini_client) |*client| {
+            client.api_key = secret;
+            client.base_url = endpoint;
+        }
+        // Every out-of-process UI learns the *route*, not just the model name: a
+        // visible model name can come from several providers, channels,
+        // protocols, and accounts, so broadcasting only the name would announce
+        // a change a Web or CLI client cannot tell apart from another.
+        {
+            const rendered = binding.offer_id.render();
+            app.emitConfig(.{ .route = .{
+                .provider_id = binding.provider_id.slice(),
+                .channel_id = binding.channel_id.slice(),
+                .protocol = binding.protocol.id(),
+                .request_model_id = binding.request_model_id,
+                .offer_id = &rendered,
+                .credential_ref = if (binding.credential_ref.id.len > 0)
+                    binding.credential_ref.id.slice()
+                else
+                    null,
+                .scope = @tagName(selection.scope),
+            } });
+        }
+
+        // Swarm teammates are constructed from this context when they spawn, so
+        // it has to move with the route: a teammate started after a switch must
+        // not dial the previous provider with this provider's credential.
+        app.swarm.api_key = secret;
+        app.swarm.base_url = endpoint;
+        app.swarm.provider_kind = binding.transport;
+        app.swarm.openai_protocol = binding.openai_protocol;
+        app.swarm.auth_scheme = binding.auth_scheme;
     }
 
     pub fn selectApiKeyForModels(app: *App, idx: usize) !void {
@@ -1206,6 +1766,344 @@ pub const App = struct {
     pub fn kgReady(app: *const App) bool {
         if (app.kg) |*k| return k.ready;
         return false;
+    }
+
+    /// Default cooldown for a rate-limited credential. Long enough that the
+    /// next turn does not walk straight back into the limit, short enough that
+    /// a brief burst does not retire an account for the session.
+    pub const CREDENTIAL_COOLDOWN_SECONDS: i64 = 5 * 60;
+
+    /// Record a failed request against the credential that made it.
+    ///
+    /// The class is the provider's own classification, not a guess: profiles
+    /// already own `classify_error`, and the difference between "slow down" and
+    /// "this key is dead" is exactly the difference between a cooldown and an
+    /// invalidation. Durable, because a limit rediscovered every run is a limit
+    /// never learned.
+    pub fn noteCredentialFailure(
+        app: *App,
+        provider_id: provider_ids_mod.Slug,
+        credential_id: provider_ids_mod.Slug,
+        class: provider_credential_mod.FailureClass,
+    ) void {
+        if (class == .transient) return;
+        var store = provider_config_store.Store.initHome(app.allocator) catch return;
+        defer store.deinit();
+        const result = provider_config_store.noteCredentialFailure(
+            &store,
+            provider_id,
+            credential_id,
+            class,
+            @import("util/time.zig").nowUnix(),
+            CREDENTIAL_COOLDOWN_SECONDS,
+            null,
+        ) catch |err| {
+            // Not fatal — the request already failed — but a limit that cannot
+            // be recorded is a limit rediscovered by hitting it every run.
+            @import("util/log.zig").warn(
+                "provider",
+                "could not record the credential failure for '{s}' ({s})",
+                .{ credential_id.slice(), @errorName(err) },
+            );
+            return;
+        };
+        if (app.provider_host) |host| {
+            host.kernel.adoptConfigRevision(result.config_revision);
+            host.kernel.noteAuthChanged(
+                provider_id,
+                credential_id,
+                if (class == .invalid) .invalid else .active,
+            );
+        }
+    }
+
+    /// Refresh this session's OAuth access token if it is near expiry, and
+    /// repoint every borrower at the new one.
+    ///
+    /// Called at a turn boundary, not at commit time. A commit copies the token
+    /// that was valid then; a session that runs past its expiry would otherwise
+    /// keep presenting it and start failing with 401s that look like a broken
+    /// key. The single-flight session upstream means concurrent turns still
+    /// perform one exchange.
+    ///
+    /// Returns true when the token was replaced. Providers with no OAuth
+    /// lifecycle — Metask, and every API-key profile — are a no-op.
+    pub fn refreshRouteCredential(app: *App) !bool {
+        // A session that named its provider on the command line and never
+        // opened the picker has no host yet — and reading `provider_host`
+        // directly meant its token was never refreshed at all, which is the
+        // failure this whole path exists to prevent. Build it when the session
+        // is actually on a resolved route; a plain Metask session has no offer
+        // id and skips the work entirely.
+        if (app.provider_host == null and app.config.selected_offer_id == null) return false;
+        const host = try app.providerHost();
+        const selection = host.kernel.effectiveSelection() orelse return false;
+        const built = resolvedProfileFor(host, selection) orelse return false;
+        const token = (try app.oauthAccessToken(built, @import("util/time.zig").nowUnix())) orelse
+            return false;
+        errdefer {
+            std.crypto.secureZero(u8, token);
+            app.allocator.free(token);
+        }
+
+        if (app.route_strings.secret) |current| {
+            if (std.mem.eql(u8, current, token)) {
+                std.crypto.secureZero(u8, token);
+                app.allocator.free(token);
+                return false;
+            }
+        }
+
+        // Background jobs get the new token through the same all-or-nothing
+        // call the route switch uses; a failure here leaves everything on the
+        // previous token rather than splitting the session across two.
+        if (app.agent_jobs) |*jobs| {
+            try jobs.setRoute(
+                token,
+                app.config.base_url,
+                app.config.provider_kind,
+                app.config.openai_protocol,
+                app.config.auth_scheme,
+            );
+        }
+
+        // Repoint every borrower before releasing the old bytes: a background
+        // request thread can read `api_key` at any moment.
+        // Same retention rule as a full route switch: the previous secret stays
+        // readable for one more generation because an in-flight background
+        // request may still be reading it.
+        app.route_strings.installSecret(token);
+        app.api_key = token;
+        app.api_client.api_key = token;
+        if (app.openai_client) |*client| client.api_key = token;
+        if (app.gemini_client) |*client| client.api_key = token;
+        app.swarm.api_key = token;
+        return true;
+    }
+
+    /// Enable, disable, or remove a provider instance through the control
+    /// plane, and re-apply the result to the live catalog.
+    ///
+    /// Disabling preserves the instance's configuration and credential
+    /// references; removing does not. Both take effect in every UI at once,
+    /// because they change the catalog every UI reads.
+    pub fn setProviderEnabled(app: *App, id: provider_ids_mod.Slug, enabled: bool) !void {
+        var store = try provider_config_store.Store.initHome(app.allocator);
+        defer store.deinit();
+        const result = try provider_config_store.setProviderEnabled(&store, id, enabled, null);
+        try app.reapplyProviderConfiguration(&store, result.config_revision);
+    }
+
+    /// True when the session's committed route belongs to `id`.
+    ///
+    /// Disabling or removing a provider does not tear a session off the route
+    /// it is running on — that would be a worse surprise — but saying only
+    /// "Disabled" while the session keeps using it is a message that describes
+    /// something other than what happened.
+    pub fn isRoutedThrough(app: *App, id: provider_ids_mod.Slug) bool {
+        // Creates the host if this is the first thing to need it, which also
+        // seeds the route a `--provider` session started on — without that the
+        // kernel has no current offer and this always answered "no".
+        const host = app.providerHost() catch return false;
+        const current = host.kernel.currentOfferId() orelse return false;
+        // Read from the *retired* catalog too: the rebuild has already dropped
+        // a disabled provider's offers, so the live catalog no longer knows.
+        if (host.kernel.catalogSnapshot().find(current)) |offer| return offer.provider_id.eql(id);
+        if (host.retired) |*previous| {
+            if (previous.find(current)) |offer| return offer.provider_id.eql(id);
+        }
+        return false;
+    }
+
+    pub fn removeProviderConfiguration(app: *App, id: provider_ids_mod.Slug) !void {
+        var store = try provider_config_store.Store.initHome(app.allocator);
+        defer store.deinit();
+        const result = try provider_config_store.removeProvider(&store, id, null);
+        try app.reapplyProviderConfiguration(&store, result.config_revision);
+    }
+
+    fn reapplyProviderConfiguration(
+        app: *App,
+        store: *const provider_config_store.Store,
+        revision: provider_ids_mod.ConfigRevision,
+    ) !void {
+        const host = try app.providerHost();
+        host.kernel.adoptConfigRevision(revision);
+        var document = try store.load();
+        defer document.deinit();
+        try host.applyProviderConfiguration(&document);
+    }
+
+    /// Resolve a local alias and switch this session onto it.
+    ///
+    /// A pinned alias means the same route it always did; a floating one
+    /// re-resolves and records where it landed, so a route stays attributable
+    /// after the fact. Either way the resulting selection is *pinned* — the
+    /// alias already decided, and leaving it auto would let it re-resolve
+    /// mid-turn against a catalog the user never saw.
+    pub fn useAlias(app: *App, name: []const u8) !bool {
+        var store = provider_config_store.Store.initHome(app.allocator) catch return false;
+        defer store.deinit();
+        var document = store.load() catch return false;
+        defer document.deinit();
+        const entry = document.alias(name) orelse return false;
+
+        const host = try app.providerHost();
+        const resolution = try provider_alias_mod.resolve(host.kernel.catalogSnapshot(), entry);
+
+        // The same commit path the picker uses, so an alias switch is durable
+        // for the session exactly like any other session-scoped choice — a
+        // second path that only committed in memory would silently lose the
+        // route on the next `/resume`.
+        const outcome = try app.commitModelSelection(.{
+            .offer_id = resolution.offer_id,
+            .offer_revision = resolution.offer_revision,
+            .controls = .{},
+            .scope = .session,
+        });
+        if (outcome != .committed) return error.AliasUnavailable;
+        // A floating alias that never records where it went cannot explain a
+        // route after the fact.
+        if (resolution.moved) {
+            _ = provider_config_store.setAlias(
+                &store,
+                provider_alias_mod.updated(entry, resolution),
+                null,
+                null,
+            ) catch {};
+        }
+        return true;
+    }
+
+    /// Refresh provider catalogs named by `provider_catalogs` over the network.
+    ///
+    /// The config may give either files or URLs; the host already handles
+    /// files, so this fills in the URLs. A refresh that fails leaves the
+    /// previous catalog in place — a stale catalog is a far better answer than
+    /// an empty one, and every pin stays resolvable because offer ids are
+    /// derived from the stable binding.
+    ///
+    /// Returns the number of providers refreshed.
+    pub fn refreshProviderCatalogs(app: *App) !usize {
+        var store = provider_config_store.Store.initHome(app.allocator) catch return 0;
+        defer store.deinit();
+        const text = store.readText() catch return 0;
+        defer app.allocator.free(text);
+
+        var arena = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const root = std.json.parseFromSliceLeaky(std.json.Value, scratch, text, .{}) catch return 0;
+        if (root != .object) return 0;
+        const section = root.object.get("provider_catalogs") orelse return 0;
+        if (section != .object) return 0;
+
+        const host = try app.providerHost();
+        const io = app.api_client.http_client.io;
+        var refreshed: usize = 0;
+        app.last_catalog_refresh_error = null;
+
+        var it = section.object.iterator();
+        while (it.next()) |pair| {
+            const entry = pair.value_ptr.*;
+            if (entry != .object) continue;
+            const models_url = stringField(entry.object.get("models_url")) orelse continue;
+            const provider_id = provider_ids_mod.Slug.parse(pair.key_ptr.*) catch continue;
+            const bearer = if (stringField(entry.object.get("credential_env"))) |name|
+                provider_credential_mod.EnvLookup.process().get(name)
+            else
+                null;
+
+            const models = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
+                .url = models_url,
+                .bearer = bearer,
+            }) catch |err| {
+                app.last_catalog_refresh_error = @errorName(err);
+                continue;
+            };
+            defer app.allocator.free(models.body);
+
+            var documents: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (documents.items) |document| app.allocator.free(@constCast(document));
+                documents.deinit(app.allocator);
+            }
+            if (entry.object.get("endpoint_urls")) |list| {
+                if (list == .array) {
+                    for (list.array.items) |item| {
+                        const url = stringField(item) orelse continue;
+                        const document = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
+                            .url = url,
+                            .bearer = bearer,
+                        }) catch |err| {
+                            app.last_catalog_refresh_error = @errorName(err);
+                            continue;
+                        };
+                        // The list owns the body from here; on a failed append
+                        // nothing else would ever free it.
+                        documents.append(app.allocator, document.body) catch |err| {
+                            app.allocator.free(document.body);
+                            return err;
+                        };
+                    }
+                }
+            }
+
+            host.ingestOpenRouter(provider_id, models.body, documents.items) catch |err| {
+                app.last_catalog_refresh_error = @errorName(err);
+                continue;
+            };
+            refreshed += 1;
+        }
+        return refreshed;
+    }
+
+    /// Project the provider control plane's new events into the TinyKG audit
+    /// plane (issue #16).
+    ///
+    /// Called at a turn boundary, never on the request path. The audit plane is
+    /// optional in the strongest sense: no route resolution, credential
+    /// resolution, or request setup calls this, and a TinyKG outage is counted
+    /// rather than propagated.
+    ///
+    /// Only *decisions* are recorded — which offer was accepted, which route a
+    /// turn actually took, which selection failed and why — because the event
+    /// payloads are ids and enums by construction, with no field a prompt,
+    /// token, or provider body could travel in.
+    pub fn auditProviderDecisions(app: *App) kg_provider_audit.Summary {
+        const host = app.provider_host orelse return .{};
+        const client = if (app.kg) |*value| value else return .{};
+        if (!client.ready) return .{};
+
+        var events: std.ArrayList(provider_control_plane.ControlPlaneEvent) = .empty;
+        defer events.deinit(app.allocator);
+        const replay = host.kernel.replayEvents(app.provider_audit_cursor, app.allocator, &events) catch
+            return .{};
+        if (replay.events.len == 0) return .{};
+
+        const Bridge = struct {
+            client: *@import("kg/client.zig").KgClient,
+            fn append(ctx: *anyopaque, line: []const u8, schema_type: []const u8) anyerror!u64 {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                // `.decision` is what these are, and session-scoped rather than
+                // global: this machine's routing choices are not shared project
+                // knowledge.
+                return self.client.remember(.decision, line, schema_type, false);
+            }
+        };
+        var bridge = Bridge{ .client = client };
+        const summary = kg_provider_audit.recordAll(
+            .{ .ctx = @ptrCast(&bridge), .appendFn = Bridge.append },
+            replay.events,
+        );
+        // Advance only when nothing failed. A transient TinyKG outage otherwise
+        // drops a whole window of decisions silently, which is the one thing an
+        // audit record must not do; the journal's own eviction bounds how long
+        // an unreachable sink can keep the retry set alive.
+        if (summary.failed == 0) {
+            app.provider_audit_cursor = replay.events[replay.events.len - 1].stream_sequence;
+        }
+        return summary;
     }
 
     /// Versioned immutable plugin inventory for CLI/Web/embedding Hosts.
@@ -2376,4 +3274,12 @@ test "model switch compact is queued only when switching to smaller context wind
     try std.testing.expect(!shouldQueueModelSwitchCompact("same", "same", 200_000, 80_000));
     try std.testing.expect(!shouldQueueModelSwitchCompact("small", "large", 80_000, 200_000));
     try std.testing.expect(!shouldQueueModelSwitchCompact("a", "b", 200_000, 200_000));
+}
+
+fn stringField(value: ?std.json.Value) ?[]const u8 {
+    const found = value orelse return null;
+    return switch (found) {
+        .string => |text| text,
+        else => null,
+    };
 }

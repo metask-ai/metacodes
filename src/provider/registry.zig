@@ -54,18 +54,22 @@ pub const TransportError = error{UnsupportedProtocolTransport};
 /// `inferProviderKind`'s model-name guessing. A custom protocol has no built-in
 /// transport and must fail loudly rather than fall back to Anthropic.
 pub fn transportKindFor(protocol: Protocol) TransportError!types.ProviderKind {
-    return switch (protocol) {
+    // Keyed by the *wire*, so a declarative custom protocol that only changes
+    // the request path still reaches a real transport, while a genuinely novel
+    // wire (no declared wire) fails closed until an adapter is registered.
+    const wire = protocol.wire() orelse return error.UnsupportedProtocolTransport;
+    return switch (wire) {
         .anthropic_messages => .anthropic,
         .openai_chat, .openai_responses => .openai,
         .gemini_generate_content => .gemini,
-        .custom => error.UnsupportedProtocolTransport,
     };
 }
 
 /// The OpenAI wire variant a protocol selects. Never inferred from base URL or
 /// model name — the route says which one it is.
 pub fn openAiProtocolFor(protocol: Protocol) TransportError!types.OpenAIProtocol {
-    return switch (protocol) {
+    const wire = protocol.wire() orelse return error.UnsupportedProtocolTransport;
+    return switch (wire) {
         .openai_chat => .chat_completions,
         .openai_responses => .responses,
         else => error.UnsupportedProtocolTransport,
@@ -85,6 +89,10 @@ pub const ProviderRegistry = struct {
     /// Profile values. String fields are borrowed from static profile data or
     /// from a caller-owned arena that must outlive the registry.
     profiles: std.ArrayList(ProviderProfile) = .empty,
+    /// Profiles below this index came from `BUILTIN_PROFILES` and are comptime
+    /// data. A runtime source may replace its own registration; it may never
+    /// silently take over a built-in vendor's id.
+    builtin_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) ProviderRegistry {
         return .{ .allocator = allocator };
@@ -94,6 +102,7 @@ pub const ProviderRegistry = struct {
         var registry = ProviderRegistry.init(allocator);
         errdefer registry.deinit();
         for (BUILTIN_PROFILES) |profile| try registry.register(profile);
+        registry.builtin_count = registry.profiles.items.len;
         return registry;
     }
 
@@ -105,8 +114,25 @@ pub const ProviderRegistry = struct {
     /// The single extension point. Validation runs here so no consumer has to
     /// defend against an unroutable profile.
     pub fn register(self: *ProviderRegistry, profile: ProviderProfile) RegisterError!void {
+        try self.validateAgainstOthers(profile, null);
+        try self.profiles.append(self.allocator, profile);
+    }
+
+    /// Validate `profile` against every registration except `skip_index`.
+    ///
+    /// Split out so a *replacement* is not rejected for colliding with the
+    /// registration it replaces — which is what made a second catalog refresh
+    /// fail with `DuplicateProviderId`.
+    fn validateAgainstOthers(
+        self: *const ProviderRegistry,
+        profile: ProviderProfile,
+        skip_index: ?usize,
+    ) RegisterError!void {
         try profile_mod.validateProfile(profile);
-        for (self.profiles.items) |existing| {
+        for (self.profiles.items, 0..) |existing, index| {
+            if (skip_index) |skip| {
+                if (index == skip) continue;
+            }
             if (existing.id.eql(profile.id)) return error.DuplicateProviderId;
             if (existing.matchesName(profile.id.slice())) return error.AliasCollision;
             for (profile.aliases) |alias| {
@@ -120,7 +146,51 @@ pub const ProviderRegistry = struct {
                 if (std.mem.eql(u8, alias, other)) return error.AliasCollision;
             }
         }
-        try self.profiles.append(self.allocator, profile);
+    }
+
+    /// Index of a *runtime* registration for `id`, if any.
+    pub fn runtimeIndexOf(self: *const ProviderRegistry, id: Slug) ?usize {
+        for (self.profiles.items[self.builtin_count..], self.builtin_count..) |existing, index| {
+            if (existing.id.eql(id)) return index;
+        }
+        return null;
+    }
+
+    /// Validate a registration or replacement without performing it.
+    ///
+    /// Separating the check from the mutation is what lets a caller install a
+    /// whole set atomically: everything is validated first, capacity is
+    /// reserved, and only then does anything change — so a failure halfway
+    /// through cannot leave the registry referencing an arena the caller is
+    /// about to release.
+    pub fn checkUpsert(self: *const ProviderRegistry, profile: ProviderProfile) RegisterError!void {
+        return self.validateAgainstOthers(profile, self.runtimeIndexOf(profile.id));
+    }
+
+    /// Register `profile`, replacing an existing *runtime* registration for the
+    /// same id. Requires `checkUpsert` to have passed and capacity to be
+    /// reserved, so it cannot fail partway.
+    pub fn upsertAssumeCapacity(self: *ProviderRegistry, profile: ProviderProfile) void {
+        if (self.runtimeIndexOf(profile.id)) |index| {
+            self.profiles.items[index] = profile;
+            return;
+        }
+        self.profiles.appendAssumeCapacity(profile);
+    }
+
+    /// Reserve room for `count` further registrations, so the mutations that
+    /// follow are infallible.
+    pub fn reserve(self: *ProviderRegistry, count: usize) error{OutOfMemory}!void {
+        try self.profiles.ensureUnusedCapacity(self.allocator, count);
+    }
+
+    /// Drop a runtime registration. Built-ins are never removed: a
+    /// configuration that stops naming a provider must not delete a vendor the
+    /// binary ships with.
+    pub fn removeRuntime(self: *ProviderRegistry, id: Slug) bool {
+        const index = self.runtimeIndexOf(id) orelse return false;
+        _ = self.profiles.orderedRemove(index);
+        return true;
     }
 
     /// Resolve by stable id or configuration alias.
@@ -167,17 +237,27 @@ pub const EndpointOverride = struct {
     base_url: []const u8,
 };
 
+/// Upper bound on credentials bound to one channel. Matches the configured pool
+/// bound, which rejects a longer list at parse time; exceeding it here is an
+/// error rather than a truncation, because silently dropping a credential the
+/// caller bound means an account the user configured simply never appears.
+pub const MAX_CHANNEL_BINDINGS: usize = 8;
+
 pub const CatalogOptions = struct {
     revision: CatalogRevision = .initial,
     credential_bindings: []const CredentialBinding = &.{},
     endpoint_overrides: []const EndpointOverride = &.{},
     /// Restrict the catalog to one provider. Null builds every profile.
     only_provider: ?Slug = null,
+    /// Providers the configuration disabled. They keep their configuration and
+    /// credential references — that is what makes disabling different from
+    /// removing — but produce no offers, so nothing can route to them.
+    excluded_providers: []const Slug = &.{},
 };
 
 pub const CatalogError = profile_mod.EndpointError ||
     offer_mod.LimitsError ||
-    error{OutOfMemory};
+    error{ OutOfMemory, TooManyCredentialBindings };
 
 /// Materialized offers plus the arena owning their constructed strings.
 pub const OfferCatalog = struct {
@@ -202,9 +282,26 @@ pub const OfferCatalog = struct {
             if (options.only_provider) |wanted| {
                 if (!profile.id.eql(wanted)) continue;
             }
+            var excluded = false;
+            for (options.excluded_providers) |id| {
+                if (profile.id.eql(id)) excluded = true;
+            }
+            if (excluded) continue;
             for (profile.channels) |channel| {
                 const override = findOverride(options.endpoint_overrides, profile.id, channel.id);
-                const bound_credential = findBinding(options.credential_bindings, profile.id, channel.id);
+                // Every binding that applies to this channel produces its *own*
+                // offer: two accounts on one route are two route identities,
+                // not one route that silently changes identity depending on
+                // which credential resolution happened to pick. `null` is the
+                // unbound case, so a provider with no configured pool builds
+                // exactly the offers it always did.
+                var binding_buffer: [MAX_CHANNEL_BINDINGS]?Slug = undefined;
+                const bound_credentials = try collectBindings(
+                    options.credential_bindings,
+                    profile.id,
+                    channel.id,
+                    &binding_buffer,
+                );
                 for (channel.routes) |route| {
                     var url_buffer: [1024]u8 = undefined;
                     const url = try channel.endpointFor(
@@ -214,45 +311,48 @@ pub const OfferCatalog = struct {
                         &url_buffer,
                     );
                     const endpoint = try arena.dupe(u8, url);
-                    for (profile.inventoryFor(channel)) |entry| {
-                        if (!entry.servesProtocol(route.protocol)) continue;
-                        const limits = try entry.limits.intersect(channel.limits);
-                        const capabilities = offer_mod.CapabilityMatrix.narrow(
-                            entry.capabilities,
-                            channel.capabilities,
-                        );
-                        const quote = if (channel.quote.isKnown()) channel.quote else entry.quote;
-                        const controls = if (channel.controls.len > 0) channel.controls else entry.controls;
-                        const offer_id = OfferId.derive(.{
-                            .provider_id = profile.id,
-                            .channel_id = channel.id,
-                            .protocol = route.protocol.id(),
-                            .endpoint_url = endpoint,
-                            .request_model_id = entry.request_model_id,
-                            .credential_ref = if (bound_credential) |ref| ref.slice() else "",
-                        });
-                        try catalog.offers.append(arena, .{
-                            .offer_id = offer_id,
-                            .provider_id = profile.id,
-                            .channel_id = channel.id,
-                            .canonical_model_id = entry.canonical_model_id,
-                            .model_variant = entry.model_variant,
-                            .request_model_id = entry.request_model_id,
-                            .upstream_model_id = entry.upstream_model_id,
-                            .protocol = route.protocol.id(),
-                            .endpoint_ref = endpoint,
-                            .credential_ref = bound_credential,
-                            .display_name = entry.display_name,
-                            .region = channel.region,
-                            .plan = channel.plan,
-                            .account = channel.account,
-                            .limits = limits,
-                            .capabilities = capabilities,
-                            .quote = quote,
-                            .availability = entry.availability,
-                            .controls = controls,
-                            .catalog_revision = options.revision,
-                        });
+                    for (bound_credentials) |bound_credential| {
+                        for (profile.inventoryFor(channel)) |entry| {
+                            if (!entry.servesProtocol(route.protocol)) continue;
+                            const limits = try entry.limits.intersect(channel.limits);
+                            const capabilities = offer_mod.CapabilityMatrix.narrow(
+                                entry.capabilities,
+                                channel.capabilities,
+                            );
+                            const quote = if (channel.quote.isKnown()) channel.quote else entry.quote;
+                            const controls = if (channel.controls.len > 0) channel.controls else entry.controls;
+                            const offer_id = OfferId.derive(.{
+                                .provider_id = profile.id,
+                                .channel_id = channel.id,
+                                .protocol = route.protocol.id(),
+                                .endpoint_url = endpoint,
+                                .request_model_id = entry.request_model_id,
+                                .credential_ref = if (bound_credential) |ref| ref.slice() else "",
+                            });
+                            try catalog.offers.append(arena, .{
+                                .offer_id = offer_id,
+                                .provider_id = profile.id,
+                                .channel_id = channel.id,
+                                .canonical_model_id = entry.canonical_model_id,
+                                .model_variant = entry.model_variant,
+                                .request_model_id = entry.request_model_id,
+                                .upstream_model_id = entry.upstream_model_id,
+                                .protocol = route.protocol.id(),
+                                .wire = route.protocol.wire(),
+                                .endpoint_ref = endpoint,
+                                .credential_ref = bound_credential,
+                                .display_name = entry.display_name,
+                                .region = channel.region,
+                                .plan = channel.plan,
+                                .account = channel.account,
+                                .limits = limits,
+                                .capabilities = capabilities,
+                                .quote = quote,
+                                .availability = entry.availability,
+                                .controls = controls,
+                                .catalog_revision = options.revision,
+                            });
+                        }
                     }
                 }
             }
@@ -323,21 +423,40 @@ fn findOverride(
     return fallback;
 }
 
-fn findBinding(
+/// Credentials bound to one channel, or a single `null` when none is.
+///
+/// A channel-specific binding is more specific than a provider-wide one, so
+/// when any channel-specific binding exists the provider-wide ones do not also
+/// apply — otherwise "this key, only for this region" would silently also offer
+/// every other key there.
+fn collectBindings(
     bindings: []const CredentialBinding,
     provider_id: Slug,
     channel_id: Slug,
-) ?Slug {
-    var fallback: ?Slug = null;
+    buffer: []?Slug,
+) error{TooManyCredentialBindings}![]const ?Slug {
+    var len: usize = 0;
     for (bindings) |binding| {
         if (!binding.provider_id.eql(provider_id)) continue;
-        if (binding.channel_id) |wanted| {
-            if (wanted.eql(channel_id)) return binding.credential_ref;
-            continue;
-        }
-        fallback = binding.credential_ref;
+        const wanted = binding.channel_id orelse continue;
+        if (!wanted.eql(channel_id)) continue;
+        if (len == buffer.len) return error.TooManyCredentialBindings;
+        buffer[len] = binding.credential_ref;
+        len += 1;
     }
-    return fallback;
+    if (len > 0) return buffer[0..len];
+
+    for (bindings) |binding| {
+        if (!binding.provider_id.eql(provider_id)) continue;
+        if (binding.channel_id != null) continue;
+        if (len == buffer.len) return error.TooManyCredentialBindings;
+        buffer[len] = binding.credential_ref;
+        len += 1;
+    }
+    if (len > 0) return buffer[0..len];
+
+    buffer[0] = null;
+    return buffer[0..1];
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

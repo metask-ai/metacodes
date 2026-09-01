@@ -45,6 +45,10 @@ pub const SwarmContext = struct {
     provider_kind: types_mod.ProviderKind = .anthropic,
     /// OpenAI wire 协议(仅 provider_kind==.openai 时消费):teammate 继承 lead 的显式选择。
     openai_protocol: types_mod.OpenAIProtocol = .chat_completions,
+    /// issue #16:lead 已解析路由的 provider-declared auth scheme。null = 历史
+    /// `authorization: Bearer` 字节。teammate 必须继承——lead 换到用 `x-api-key`
+    /// 的 provider 后,teammate 还发 bearer 就是拿对的密钥打错的头。
+    auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
     /// Immutable App/Runtime-scoped resolver; in-process teammates drain before
     /// the owning plugin Snapshot is destroyed.
     dialect_resolver: dialect_mod.Resolver = .builtin(),

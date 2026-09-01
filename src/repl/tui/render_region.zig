@@ -28,6 +28,7 @@ const msg_queue = @import("../msg_queue.zig");
 const agent_tree = @import("widget/agent_tree.zig");
 const agent_job_registry = @import("../../core/agent_job_registry.zig");
 const ui_mod = @import("ui.zig");
+const model_picker_view = @import("../model_picker_view.zig");
 const event_mod = @import("event.zig");
 const input = @import("../input.zig");
 const ui_state_mod = @import("ui_state.zig");
@@ -527,16 +528,26 @@ pub const RenderRegion = struct {
         new_rows += 1;
         w.writeAll("\r\n") catch {};
 
+        // -- issue #16 model picker:开着时独占菜单区。旧的 /model 与 /models 菜单
+        //    占同一块屏幕位置,同时画会互相盖掉。--
+        const picker_rows: u16 = if (self.ui.picker_open)
+            model_picker_view.render(&app.model_picker, w, self.theme, self.cols)
+        else
+            0;
+        new_rows += picker_rows;
         // -- /models 两级菜单:账号 API key → 该 key 可用模型 --
-        const models_menu_rows = self.drawModelsPickerMenu(w, app, content);
+        const models_menu_rows = if (picker_rows == 0) self.drawModelsPickerMenu(w, app, content) else 0;
         new_rows += models_menu_rows;
         // -- /model 服务端 catalog 菜单(输入 `/model` 后立即在底部显示候选,不等提交)--
-        const model_menu_rows = if (models_menu_rows == 0) self.drawModelCatalogMenu(w, app, content) else 0;
+        const model_menu_rows = if (picker_rows == 0 and models_menu_rows == 0)
+            self.drawModelCatalogMenu(w, app, content)
+        else
+            0;
         new_rows += model_menu_rows;
         // -- slash 命令菜单(`/` 前缀,在下边框与 footer 之间垂直列出)--
-        if (models_menu_rows == 0 and model_menu_rows == 0) new_rows += self.drawSlashMenu(w, content);
+        if (picker_rows == 0 and models_menu_rows == 0 and model_menu_rows == 0) new_rows += self.drawSlashMenu(w, content);
         // -- @-mention 文件菜单(`@token`,同位置;对齐 cc DIFF#5)--
-        new_rows += self.drawAtMenu(w, content, self.input_cursor);
+        if (picker_rows == 0) new_rows += self.drawAtMenu(w, content, self.input_cursor);
 
         // -- footer 区:help_open 时原地展开快捷键菜单(非模态,对齐 cc);否则正常 footer 行 --
         if (self.ui.help_open) {
@@ -1855,6 +1866,11 @@ pub const RenderRegion = struct {
         self.drawBorderLine(w, border_color, false, inner_w);
         R += 1;
         w.writeAll("\r\n") catch {};
+
+        // -- issue #16 model picker(生成期也可用:改选择只影响下一轮)--
+        if (self.ui.picker_open) {
+            R += model_picker_view.render(&app.model_picker, w, self.theme, self.cols);
+        }
 
         // -- footer(末行不 \r\n)或 help 菜单(help_open 时原地展开,对齐输入期 renderFrameInner)--
         if (self.ui.help_open) {

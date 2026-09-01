@@ -30,6 +30,11 @@ pub const ConfigRevision = ids.ConfigRevision;
 
 pub const CONFIG_PATH_ENV = "METACODES_CONFIG_FILE";
 
+/// Filename of the session-scoped selection document. It sits beside the
+/// session's own transcript instead of inside `config.json` so two concurrent
+/// sessions cannot overwrite each other's choice.
+pub const SESSION_SELECTION_FILE = "runtime-selection.json";
+
 /// Fault-injection point, used only by crash-safety tests.
 pub const CrashPoint = enum {
     /// After the temporary file is written but before it is fsynced.
@@ -101,6 +106,17 @@ pub const Store = struct {
         return .{ .allocator = allocator, .path = path };
     }
 
+    /// `<session_dir>/runtime-selection.json`. The caller owns the session
+    /// directory layout; this module only names the file inside it.
+    pub fn initSessionFile(allocator: std.mem.Allocator, session_dir: []const u8) StoreError!Store {
+        const path = std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}",
+            .{ session_dir, SESSION_SELECTION_FILE },
+        ) catch return error.OutOfMemory;
+        return .{ .allocator = allocator, .path = path };
+    }
+
     pub fn deinit(self: *Store) void {
         self.allocator.free(self.path);
         self.* = undefined;
@@ -155,6 +171,13 @@ pub const Store = struct {
         try self.writeAtomic(bytes);
 
         return .{ .config_revision = document.config_revision };
+    }
+
+    /// Raw document text. Callers that need a key this module does not model
+    /// (the `custom_providers` section, for one) parse it themselves rather
+    /// than forcing every such key through `Document`.
+    pub fn readText(self: *const Store) StoreError![]u8 {
+        return self.readAll();
     }
 
     fn readAll(self: *const Store) StoreError![]u8 {
@@ -243,6 +266,99 @@ pub const Store = struct {
     }
 };
 
+/// Enable or disable one provider instance.
+///
+/// Disabling preserves the instance's configuration and credential references,
+/// which is the whole difference between "off for now" and "removed".
+pub fn setProviderEnabled(
+    store: *const Store,
+    id: ids.Slug,
+    enabled: bool,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        id: ids.Slug,
+        enabled: bool,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (document.providers.items) |*entry| {
+                if (!entry.id.eql(self.id)) continue;
+                entry.enabled = self.enabled;
+                return;
+            }
+            // Recording the state for a provider with no entry yet is what
+            // makes "disable a built-in provider" expressible at all.
+            try document.upsertProvider(.{ .id = self.id, .enabled = self.enabled });
+        }
+    };
+    var apply = Apply{ .id = id, .enabled = enabled };
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
+/// Remove one provider instance's configuration entirely.
+pub fn removeProvider(
+    store: *const Store,
+    id: ids.Slug,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        id: ids.Slug,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = document.removeProvider(self.id);
+        }
+    };
+    var apply = Apply{ .id = id };
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
+/// Insert or replace one alias record.
+pub fn setAlias(
+    store: *const Store,
+    entry: config_doc.AliasEntry,
+    expected: ?ConfigRevision,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        value: config_doc.AliasEntry,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try document.upsertAlias(self.value);
+        }
+    };
+    var apply = Apply{ .value = entry };
+    return store.commit(.{
+        .expected_config_revision = expected,
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
+pub fn removeAlias(
+    store: *const Store,
+    name: []const u8,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        name: []const u8,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = document.removeAlias(self.name);
+        }
+    };
+    var apply = Apply{ .name = name };
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
 /// Convenience wrapper for the common "replace the global selection" mutation.
 pub fn setGlobalSelection(
     store: *const Store,
@@ -255,6 +371,81 @@ pub fn setGlobalSelection(
         fn run(ctx: *anyopaque, document: *Document) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             document.global_selection = self.value;
+        }
+    };
+    var apply = Apply{ .value = selection };
+    return store.commit(.{
+        .expected_config_revision = expected,
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
+/// Record a credential failure durably.
+///
+/// The learned state has to outlive the process, or every run rediscovers the
+/// same rate limit by hitting it. Written through the same lock, revision, and
+/// atomic-rename path as every other mutation, so a concurrent picker commit
+/// cannot lose it.
+pub fn noteCredentialFailure(
+    store: *const Store,
+    provider_id: ids.Slug,
+    credential_id: ids.Slug,
+    class: @import("credential.zig").FailureClass,
+    now_seconds: i64,
+    cooldown_seconds: i64,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        provider_id: ids.Slug,
+        credential_id: ids.Slug,
+        class: @import("credential.zig").FailureClass,
+        now_seconds: i64,
+        cooldown_seconds: i64,
+
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (document.providers.items) |*entry| {
+                if (!entry.id.eql(self.provider_id)) continue;
+                for (entry.credentials.entries[0..entry.credentials.len]) |*credential| {
+                    if (!credential.id.eql(self.credential_id)) continue;
+                    switch (self.class) {
+                        .rate_limited => credential.cooldown_until = self.now_seconds + self.cooldown_seconds,
+                        .invalid => credential.invalid = true,
+                        // A transient network failure is nobody's credential's
+                        // fault; marking one would retire a working account.
+                        .transient => {},
+                    }
+                    return;
+                }
+            }
+        }
+    };
+    var apply = Apply{
+        .provider_id = provider_id,
+        .credential_id = credential_id,
+        .class = class,
+        .now_seconds = now_seconds,
+        .cooldown_seconds = cooldown_seconds,
+    };
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+}
+
+/// Convenience wrapper for the common "replace the session selection" mutation.
+pub fn setSessionSelection(
+    store: *const Store,
+    selection: ?config_doc.RuntimeSelection,
+    expected: ?ConfigRevision,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        value: ?config_doc.RuntimeSelection,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            document.session_selection = self.value;
         }
     };
     var apply = Apply{ .value = selection };
@@ -313,4 +504,144 @@ test "the home store resolves either the override or the home path" {
     } else {
         try std.testing.expect(std.mem.endsWith(u8, store.path, "/.metacodes/config.json"));
     }
+}
+
+test "two sessions keep separate selections and neither touches the other" {
+    const a = std.testing.allocator;
+    const dirs = [_][]const u8{
+        "/tmp/metacodes-provider-session-a",
+        "/tmp/metacodes-provider-session-b",
+    };
+    var paths: [dirs.len][]u8 = undefined;
+    var made: usize = 0;
+    defer {
+        var index: usize = 0;
+        while (index < made) : (index += 1) {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+                const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ paths[index], suffix }) catch continue;
+                pfs.unlinkPath(target) catch {};
+            }
+            const dir_z = std.fmt.bufPrintZ(&buffer, "{s}", .{dirs[index]}) catch continue;
+            _ = std.c.rmdir(dir_z.ptr);
+            a.free(paths[index]);
+        }
+    }
+
+    var stores: [dirs.len]Store = undefined;
+    for (dirs, 0..) |dir, index| {
+        stores[index] = try Store.initSessionFile(a, dir);
+        paths[index] = try a.dupe(u8, stores[index].path);
+        made += 1;
+    }
+    defer for (&stores) |*store| store.deinit();
+
+    try std.testing.expect(std.mem.endsWith(u8, stores[0].path, "/runtime-selection.json"));
+    try std.testing.expect(!std.mem.eql(u8, stores[0].path, stores[1].path));
+
+    const first = config_doc.RuntimeSelection.pinned(.{ .digest = @splat(0x11) }, 1, .session);
+    const second = config_doc.RuntimeSelection.pinned(.{ .digest = @splat(0x22) }, 1, .session);
+    _ = try setSessionSelection(&stores[0], first, null, "op-a");
+    _ = try setSessionSelection(&stores[1], second, null, "op-b");
+
+    var loaded_a = try stores[0].load();
+    defer loaded_a.deinit();
+    var loaded_b = try stores[1].load();
+    defer loaded_b.deinit();
+
+    // Session scope is only real if one session's commit is invisible to the
+    // other. A shared key would make the second write win for both.
+    try std.testing.expect(loaded_a.session_selection.?.target.pinned_offer.offer_id.eql(first.target.pinned_offer.offer_id));
+    try std.testing.expect(loaded_b.session_selection.?.target.pinned_offer.offer_id.eql(second.target.pinned_offer.offer_id));
+    try std.testing.expect(loaded_a.global_selection == null);
+
+    // Clearing is an explicit null, not a missing key that reads as "unchanged".
+    _ = try setSessionSelection(&stores[0], null, loaded_a.config_revision, "op-a-clear");
+    var cleared = try stores[0].load();
+    defer cleared.deinit();
+    try std.testing.expect(cleared.session_selection == null);
+}
+
+test "a learned credential failure is durable and leaves the other members alone" {
+    const a = std.testing.allocator;
+    const path = "/tmp/metacodes-provider-credential-failure.json";
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    }
+    defer for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        var cleanup: [std.fs.max_path_bytes]u8 = undefined;
+        const target = std.fmt.bufPrintZ(&cleanup, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    };
+
+    var store = try Store.initPath(a, path);
+    defer store.deinit();
+
+    const Seed = struct {
+        fn run(_: *anyopaque, document: *Document) anyerror!void {
+            var entry = config_doc.ProviderEntry{ .id = ids.Slug.lit("openai") };
+            try entry.credentials.append(.{
+                .id = ids.Slug.lit("work"),
+                .env = try config_doc.AliasName.parse("OPENAI_API_KEY_WORK"),
+                .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+            });
+            try entry.credentials.append(.{
+                .id = ids.Slug.lit("personal"),
+                .env = try config_doc.AliasName.parse("OPENAI_API_KEY_PERSONAL"),
+                .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+            });
+            try document.upsertProvider(entry);
+        }
+    };
+    var anchor: u8 = 0;
+    _ = try store.commit(.{ .mutation = .{ .ctx = @ptrCast(&anchor), .applyFn = Seed.run } });
+
+    _ = try noteCredentialFailure(
+        &store,
+        ids.Slug.lit("openai"),
+        ids.Slug.lit("work"),
+        .rate_limited,
+        1_000,
+        300,
+        "limit-1",
+    );
+    _ = try noteCredentialFailure(
+        &store,
+        ids.Slug.lit("openai"),
+        ids.Slug.lit("personal"),
+        .invalid,
+        1_000,
+        300,
+        "dead-1",
+    );
+
+    var reloaded = try store.load();
+    defer reloaded.deinit();
+    const entry = reloaded.provider(ids.Slug.lit("openai")).?;
+    const members = entry.credentials.items();
+    try std.testing.expectEqual(@as(?i64, 1_300), members[0].cooldown_until);
+    try std.testing.expect(!members[0].invalid);
+    // A dead key is invalidated rather than put on a timer: retrying it only
+    // burns the account's error budget.
+    try std.testing.expect(members[1].invalid);
+    try std.testing.expectEqual(@as(?i64, null), members[1].cooldown_until);
+
+    // A transient failure records nothing — it would retire a working account.
+    _ = try noteCredentialFailure(
+        &store,
+        ids.Slug.lit("openai"),
+        ids.Slug.lit("work"),
+        .transient,
+        9_000,
+        300,
+        "blip-1",
+    );
+    var after = try store.load();
+    defer after.deinit();
+    try std.testing.expectEqual(
+        @as(?i64, 1_300),
+        after.provider(ids.Slug.lit("openai")).?.credentials.items()[0].cooldown_until,
+    );
 }

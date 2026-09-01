@@ -205,6 +205,12 @@ pub const UiState = struct {
     /// agent 数量镜像(由 render/usage 时回写,dispatch 用于 ↓ 选择钳制)。
     /// dispatch 是纯函数无 registry 访问,靠此镜像知道选择上界。
     agent_count: usize = 0,
+
+    /// issue #16: the cross-UI model picker is on screen. Modal for keys —
+    /// while it is open every keystroke belongs to it, including plain
+    /// characters, which are its filter. It is *not* modal for the session:
+    /// the draft in the editor is untouched and a reply keeps streaming.
+    picker_open: bool = false,
 };
 
 // ---- 状态操作 helper(纯逻辑,dispatch 调用)----

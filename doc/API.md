@@ -31,8 +31,24 @@ normative model; the entry points are:
 | `--channel <id>` | narrow to one endpoint/region/plan/account binding |
 | `--offer <offer-id>` | pin one exact reproducible route |
 | `--base-url <url>` | validated against the selected profile and route policy before any request URL is built |
-| `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers`, `aliases`, `global_selection`, `last_operation_id`; written atomically, other keys preserved |
-| `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, replayable event journal |
+| `--check-providers` | validate the configuration and print every route it produces, then exit; no credential is resolved and no request URL is built |
+| `metacodes login --provider <id> --oauth-token-json <file>` | import an OAuth token into that provider's own store; refresh, single flight, and rotated-refresh persistence then run themselves |
+| `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `recent_operation_ids`; written atomically, other keys preserved |
+| `<session_dir>/runtime-selection.json` | `session_selection`; a session-scoped choice never reaches `config.json` |
+| `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
+
+Interactive surfaces: `Ctrl+O` and `/model` open the route picker (transcript
+viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
+and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
+names a route (`pin`, `float`, `use`, `remove`); `/models` still selects the
+account key.
+
+A committed route is broadcast on the UI event stream as `config_changed` →
+`route`, carrying provider, channel, protocol, wire model id, offer id,
+credential *reference*, and scope. The model name alone cannot identify a route,
+so a name-only broadcast would announce a change an out-of-process client cannot
+tell apart from another; the credential reference travels and the secret does
+not.
 
 A newer `config.json` `schema_version` is rejected rather than merged. Sessions
 that name no provider keep the historical Metask credential and model-inference

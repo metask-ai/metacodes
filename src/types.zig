@@ -84,6 +84,9 @@ pub const Config = struct {
     dump_prompt: bool = false,
     /// `--dump-plugins`:打印版本化 immutable plugin inventory JSON 后退出。
     dump_plugins: bool = false,
+    /// `--check-providers`: validate the provider configuration and print every
+    /// route it produces, then exit. No network I/O.
+    check_providers: bool = false,
     /// `--version`:打印 `metacodes <semver>` 到 stdout 后退出(parse 只置位,
     /// main 早退打印,保持 parseArgsForTest 可测)。
     show_version: bool = false,

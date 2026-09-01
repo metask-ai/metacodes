@@ -34,16 +34,25 @@ def csi_u(cp, mod=5):
 
 # ── 输入期键:CSI-u 应与裸字节等效 ──────────────────────────────────────────
 
-def test_csi_u_ctrl_o_opens_transcript(bin_path):
-    # Ctrl+O(cp=111)CSI-u → 打开 transcript viewer(输入期)。裸 0x0f 由 test_overlay 覆盖。
+def test_csi_u_ctrl_o_opens_model_picker(bin_path):
+    # issue #16:Ctrl+O(cp=111)现在开 model picker。要守的 CSI-u 回归没变——
+    # 白名单终端下 'o' 不能解析成 .unknown、让这个键静默失效。
     raw = run(bin_path, ["sleep:0.8", csi_u(111), "sleep:0.4"], per_key_drain=0.15)
-    assert b"Showing detailed transcript" in raw, "CSI-u Ctrl+O 未打开 transcript viewer"
+    final, _ = _final_text(raw)
+    assert "Provider" in final, "CSI-u Ctrl+O 未打开 model picker:\n" + final
+
+
+def test_csi_u_ctrl_o_opens_transcript(bin_path):
+    # transcript 改绑到 Ctrl+X Ctrl+O(裸 0x18 前缀 + CSI-u 的 'o')。裸 0x0f 形式由
+    # test_overlay 覆盖;这里锁白名单终端下的组合仍可达。
+    raw = run(bin_path, ["sleep:0.8", "key:ctrl_x", csi_u(111), "sleep:0.4"], per_key_drain=0.15)
+    assert b"Showing detailed transcript" in raw, "CSI-u Ctrl+X Ctrl+O 未打开 transcript viewer"
     assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"
 
 
 def test_csi_u_ctrl_o_toggle(bin_path):
     # 两次 CSI-u Ctrl+O:开 → 关。最终屏无 transcript footer。
-    raw = run(bin_path, ["sleep:0.8", csi_u(111), "sleep:0.4", csi_u(111), "sleep:0.4"], per_key_drain=0.15)
+    raw = run(bin_path, ["sleep:0.8", "key:ctrl_x", csi_u(111), "sleep:0.4", csi_u(111), "sleep:0.4"], per_key_drain=0.15)
     final, a = _final_text(raw)
     assert "Showing detailed transcript" in raw.decode("utf-8", "replace") or True
     assert "Showing detailed transcript" not in final, "CSI-u 二次 Ctrl+O 未 toggle 关闭:\n" + final
@@ -71,7 +80,7 @@ def test_csi_u_ctrl_o_opens_transcript_during_generation(bin_path):
     # 生成期(agent 运行中)CSI-u Ctrl+O → 打开 transcript。慢 mock 给宽窗口。
     from slow_mock_server import SlowMockServer
     with SlowMockServer(_slow_turn()) as srv:
-        raw = run(bin_path, ["sleep:0.8", "type:go", "key:enter", "sleep:2.0", csi_u(111), "sleep:1.0"],
+        raw = run(bin_path, ["sleep:0.8", "type:go", "key:enter", "sleep:2.0", "key:ctrl_x", csi_u(111), "sleep:1.0"],
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.15)
     assert b"Showing detailed transcript" in raw, "生成期 CSI-u Ctrl+O 未打开 transcript"
 
