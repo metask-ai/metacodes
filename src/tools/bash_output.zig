@@ -6,21 +6,29 @@
 //!   - `stderr`：true/false，默认 true
 //!   - `stdout_since_byte`：从 stdout 文件的第 N 字节开始读（增量）。默认 0（全读）。
 //!   - `stderr_since_byte`：同上对 stderr。
-//!   - `max_bytes`：单次读出上限。默认由 `ctx.result_budget` 派生(不再是写死的 65536),
-//!     上限 262144;读到的内容还会按同一预算裁剪,余量走 `*_next_offset`。
+//!   - `max_bytes`：单次读出上限。**没有固定默认值**,省略时由 `ctx.result_budget`
+//!     派生(200K window 为 24488,预算下限为 7680);硬上限 262144。读到的内容还会
+//!     按同一预算裁剪,余量走 `*_next_offset`。registry 里那份 property description
+//!     由 `tests/component/tool_schema_coverage_test.zig` 绑回这些常量,不会再分叉。
 //!
-//! output:
+//! output:两条通道对称,各带同样的四个字段(此前这里只列了 stdout 的
+//! encoding/next_offset,stderr 的两个实际会发却没写——见 `writeChannel` 调用处)。
 //!   {
 //!     "job_id":"...","status":"running|exited|killed","exit_code":N?,
 //!     "stdout":"...","stdout_encoding":"utf-8"|"base64",
 //!     "stdout_total_bytes":N,"stdout_next_offset":N,"stdout_truncated":bool,
-//!     "stderr":"...","stderr_total_bytes":N,"stderr_truncated":bool
+//!     "stderr":"...","stderr_encoding":"utf-8"|"base64",
+//!     "stderr_total_bytes":N,"stderr_next_offset":N,"stderr_truncated":bool
 //!   }
 //!
-//! 模型应该在下一次轮询时传 stdout_since_byte = 上次 **stdout_next_offset** 做增量。
+//! 续读只认 `*_next_offset`:下一次传 `stdout_since_byte = 上次 stdout_next_offset`。
+//! 它等于 `since + 本次实际展示的字节数`。
 //! `*_total_bytes` 是文件当前大小,**不是游标**——拿它当游标会跳过"本次展示到文件末尾"
 //! 之间的全部内容(读取按预算限界后,这段通常不为空)。
-//! truncated=true 表示本次没读完，需要提高 since_byte（或 max_bytes）。
+//! `truncated=true` 表示本次没读完,继续从 `*_next_offset` 读即可;提高 `max_bytes`
+//! 只在预算允许时有用,并不能替代游标。
+//! `*_encoding` 按通道各自判定:该通道本次展示的字节不是合法 UTF-8 就发 base64
+//! (`stdout` 与 `stderr` 可以一个 base64 一个 utf-8)。
 
 const std = @import("std");
 const time = @import("../util/time.zig");
@@ -32,8 +40,8 @@ const result_budget = @import("../core/result_budget.zig");
 /// 单次 tool_result 中 stdout/stderr 的默认字节上限；避免 100MB 文件塞爆 context。
 /// Fixed JSON scaffolding of one BashOutput result: job id, status, exit code,
 /// both channels' byte counters and truncation flags.
-const ENVELOPE_OVERHEAD_BYTES: result_budget.Encoded = .of(512);
-const MAX_MAX_BYTES: usize = 256 * 1024;
+pub const ENVELOPE_OVERHEAD_BYTES: result_budget.Encoded = .of(512);
+pub const MAX_MAX_BYTES: usize = 256 * 1024;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -142,7 +150,9 @@ const Chunk = struct {
 };
 
 /// 从 path 的 since 字节开始读最多 max 字节。若文件更大，truncated=true。
-/// total_bytes 是文件整体大小（便于模型决定下次 since）。
+/// total_bytes 是文件整体大小,**不是下次的 since**——续读游标由调用方按实际展示的
+/// 字节数算成 `*_next_offset`。这行注释原本写着"便于模型决定下次 since",正是把
+/// 文件长度当游标的那句,与模块头的契约相反。
 fn readFileRange(path: []const u8, since: usize, max: usize, allocator: std.mem.Allocator) !Chunk {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= pbuf.len) return error.PathTooLong;
@@ -425,4 +435,16 @@ test "二进制通道走 base64,结果仍是合法 UTF-8 JSON" {
     try std.testing.expectEqualSlices(u8, "A\xffB\xfe", decoded);
     // 纯文本通道不受影响。
     try std.testing.expectEqualStrings("utf-8", parsed.value.object.get("stderr_encoding").?.string);
+
+    // 两条通道对称:模块头声明各带同样四个字段,stderr 的 encoding/next_offset 曾经
+    // 实际会发但没写进契约。这里把"对称"这句话变成断言,免得它退回成一句自述。
+    inline for (.{ "stdout", "stderr" }) |channel| {
+        inline for (.{ "", "_encoding", "_total_bytes", "_next_offset", "_truncated" }) |suffix| {
+            const field = channel ++ suffix;
+            if (parsed.value.object.get(field) == null) {
+                std.debug.print("BashOutput 信封缺字段: {s}\n", .{field});
+                return error.ChannelFieldMissing;
+            }
+        }
+    }
 }

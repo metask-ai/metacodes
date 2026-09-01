@@ -136,3 +136,60 @@ test "L2 嵌套守卫: AskUserQuestion 两层嵌套 schema 完整序列化进请
     // 嵌套 required:options items 的 required 含 label/description。
     try std.testing.expect(std.mem.indexOf(u8, body, "\"required\":[\"label\",\"description\"]") != null);
 }
+
+/// 取某工具某字段的 description(找不到返回 null)。
+fn propDescription(tool_name: []const u8, field: []const u8) ?[]const u8 {
+    for (tools.registry) |entry| {
+        if (!std.mem.eql(u8, entry.name, tool_name)) continue;
+        const specs = entry.input_schema.prop_specs orelse return null;
+        for (specs) |s| {
+            if (std.mem.eql(u8, s.name, field)) return s.description;
+        }
+        return null;
+    }
+    return null;
+}
+
+test "L2 守卫: BashOutput max_bytes 的 schema 描述与预算实现不分叉" {
+    // 血泪:实现从固定 65536 改成按 `result_budget.payloadAllowance` 派生后,顶层
+    // `.description` 改了,而模型真正据以规划参数的 **property description** 还写着
+    // "default 65536"。声明与实现分叉,且两边都"看起来"被更新过。
+    //
+    // description 是自然语言,不能整体对照实现;但它引用的**每个数字**都能。这里把
+    // 描述里出现的常量逐个绑回真实来源,任何一边动了而另一边没跟,立刻红。
+    const desc = propDescription("BashOutput", "max_bytes") orelse
+        return error.BashOutputMaxBytesSpecMissing;
+
+    // ① 不得再声明固定默认值——这正是分叉过的那句。
+    try std.testing.expect(std.mem.indexOf(u8, desc, "default 65536") == null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "no fixed default") != null);
+
+    // ② 硬上限必须等于实现里的 MAX_MAX_BYTES,**两处都要**。
+    //    只断言"这个数字出现过"太弱:描述里 262144 出现两次(范围 + 显式值上限),
+    //    改其中一处另一处仍在,断言照样通过——实测确认过这个漏网。所以两个短语都
+    //    从常量拼出来验。代价是改写措辞会撞红,这正是想要的:动了文案就得重核数字。
+    var range_buf: [32]u8 = undefined;
+    var cap_buf: [32]u8 = undefined;
+    const cap = cc.tools_bash_output.MAX_MAX_BYTES;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        desc,
+        try std.fmt.bufPrint(&range_buf, "1..{d})", .{cap}),
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        desc,
+        try std.fmt.bufPrint(&cap_buf, "capped at {d}", .{cap}),
+    ) != null);
+
+    // ③ 描述举的两个预算示例必须等于 payloadAllowance 真算出来的值。举例给的是
+    //    具体数字而不是"大约",就是为了能这样绑住。
+    const window_budget = cc.result_budget.Budget.fromModel(200_000);
+    const floor_budget = cc.result_budget.Budget.fromModel(0);
+    inline for (.{ window_budget, floor_budget }) |budget| {
+        const allowance = budget.payloadAllowance(cc.tools_bash_output.ENVELOPE_OVERHEAD_BYTES);
+        var buf: [24]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{d}", .{allowance.raw()});
+        try std.testing.expect(std.mem.indexOf(u8, desc, text) != null);
+    }
+}

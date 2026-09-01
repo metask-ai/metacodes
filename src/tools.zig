@@ -284,7 +284,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "stderr", .type = "boolean", .description = "Include stderr (default true)" },
             .{ .name = "stdout_since_byte", .type = "integer", .description = "Read stdout starting at this byte offset" },
             .{ .name = "stderr_since_byte", .type = "integer", .description = "Read stderr starting at this byte offset" },
-            .{ .name = "max_bytes", .type = "integer", .description = "Maximum bytes per selected channel (1..262144; default 65536)" },
+            .{ .name = "max_bytes", .type = "integer", .description = "Maximum bytes per selected channel (1..262144). There is no fixed default: omit it and the cap is derived from the remaining context budget (24488 bytes on a 200K window, 7680 at the floor), which is usually what you want. An explicit value is still capped at 262144 and is not raised above the budget-derived allowance" },
         }, .required = &.{"job_id"} },
         .execute = .{ .legacy_inline = bash_output_tool.execute },
         .replay = .read_only,

@@ -140,6 +140,69 @@ class SpillRecoveryTest(unittest.TestCase):
         self.assertEqual(summary["spilled_to_artifact"], 0)
         self.assertEqual(summary["spills_recovered"], 0)
 
+    def test_two_spills_before_any_read_are_both_recovered(self):
+        # A single "last spill" slot lost the first one: B overwrote A before
+        # anything reached for it, so this reported 1 of 2. Tools that run in
+        # one batch routinely spill several results before the model reads any.
+        other = "sha256:" + "b" * 64
+        audit = Audit(budget=1000)
+        audit.add_session(
+            "\n".join(
+                [
+                    line(use("a", "Grep", pattern="x"), result("a", envelope("artifact"))),
+                    line(
+                        use("b", "Grep", pattern="y"),
+                        result("b", envelope("artifact", artifact_id=other)),
+                    ),
+                    line(use("c", "ReadArtifact", artifact_id=ARTIFACT_ID)),
+                    line(use("d", "ReadArtifact", artifact_id=other)),
+                ]
+            )
+        )
+        summary = audit.report(top=10)
+        self.assertEqual(summary["spilled_to_artifact"], 2)
+        self.assertEqual(summary["spills_recovered"], 2)
+
+    def test_one_read_recovers_every_spill_of_identical_content(self):
+        # The store is content-addressed, so two calls that produced the same
+        # bytes share an id and one read hands the model the content of both.
+        # Decrementing a counter by one would leave the duplicate permanently
+        # unrecoverable and understate the recovery rate.
+        audit = Audit(budget=1000)
+        audit.add_session(
+            "\n".join(
+                [
+                    line(use("a", "Grep", pattern="x"), result("a", envelope("artifact"))),
+                    line(use("b", "Grep", pattern="x"), result("b", envelope("artifact"))),
+                    line(use("c", "ReadArtifact", artifact_id=ARTIFACT_ID)),
+                ]
+            )
+        )
+        summary = audit.report(top=10)
+        self.assertEqual(summary["spilled_to_artifact"], 2)
+        self.assertEqual(summary["spills_recovered"], 2)
+
+    def test_only_the_matching_spill_is_resolved(self):
+        # Reading A must not retire B: recovered can never exceed spilled, and
+        # a spill nobody reads is the number the audit exists to report.
+        other = "sha256:" + "b" * 64
+        audit = Audit(budget=1000)
+        audit.add_session(
+            "\n".join(
+                [
+                    line(use("a", "Grep", pattern="x"), result("a", envelope("artifact"))),
+                    line(
+                        use("b", "Grep", pattern="y"),
+                        result("b", envelope("artifact", artifact_id=other)),
+                    ),
+                    line(use("c", "ReadArtifact", artifact_id=ARTIFACT_ID)),
+                ]
+            )
+        )
+        summary = audit.report(top=10)
+        self.assertEqual(summary["spilled_to_artifact"], 2)
+        self.assertEqual(summary["spills_recovered"], 1)
+
     def test_a_read_that_does_not_name_the_artifact_is_not_a_recovery(self):
         # Adjacency was the old test. With the staging path gone, only an
         # explicit artifact_id can recover a spill.
