@@ -89,6 +89,10 @@ pub const ProviderRegistry = struct {
     /// Profile values. String fields are borrowed from static profile data or
     /// from a caller-owned arena that must outlive the registry.
     profiles: std.ArrayList(ProviderProfile) = .empty,
+    /// Profiles below this index came from `BUILTIN_PROFILES` and are comptime
+    /// data. A runtime source may replace its own registration; it may never
+    /// silently take over a built-in vendor's id.
+    builtin_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) ProviderRegistry {
         return .{ .allocator = allocator };
@@ -98,6 +102,7 @@ pub const ProviderRegistry = struct {
         var registry = ProviderRegistry.init(allocator);
         errdefer registry.deinit();
         for (BUILTIN_PROFILES) |profile| try registry.register(profile);
+        registry.builtin_count = registry.profiles.items.len;
         return registry;
     }
 
@@ -109,8 +114,25 @@ pub const ProviderRegistry = struct {
     /// The single extension point. Validation runs here so no consumer has to
     /// defend against an unroutable profile.
     pub fn register(self: *ProviderRegistry, profile: ProviderProfile) RegisterError!void {
+        try self.validateAgainstOthers(profile, null);
+        try self.profiles.append(self.allocator, profile);
+    }
+
+    /// Validate `profile` against every registration except `skip_index`.
+    ///
+    /// Split out so a *replacement* is not rejected for colliding with the
+    /// registration it replaces — which is what made a second catalog refresh
+    /// fail with `DuplicateProviderId`.
+    fn validateAgainstOthers(
+        self: *const ProviderRegistry,
+        profile: ProviderProfile,
+        skip_index: ?usize,
+    ) RegisterError!void {
         try profile_mod.validateProfile(profile);
-        for (self.profiles.items) |existing| {
+        for (self.profiles.items, 0..) |existing, index| {
+            if (skip_index) |skip| {
+                if (index == skip) continue;
+            }
             if (existing.id.eql(profile.id)) return error.DuplicateProviderId;
             if (existing.matchesName(profile.id.slice())) return error.AliasCollision;
             for (profile.aliases) |alias| {
@@ -124,7 +146,51 @@ pub const ProviderRegistry = struct {
                 if (std.mem.eql(u8, alias, other)) return error.AliasCollision;
             }
         }
-        try self.profiles.append(self.allocator, profile);
+    }
+
+    /// Index of a *runtime* registration for `id`, if any.
+    pub fn runtimeIndexOf(self: *const ProviderRegistry, id: Slug) ?usize {
+        for (self.profiles.items[self.builtin_count..], self.builtin_count..) |existing, index| {
+            if (existing.id.eql(id)) return index;
+        }
+        return null;
+    }
+
+    /// Validate a registration or replacement without performing it.
+    ///
+    /// Separating the check from the mutation is what lets a caller install a
+    /// whole set atomically: everything is validated first, capacity is
+    /// reserved, and only then does anything change — so a failure halfway
+    /// through cannot leave the registry referencing an arena the caller is
+    /// about to release.
+    pub fn checkUpsert(self: *const ProviderRegistry, profile: ProviderProfile) RegisterError!void {
+        return self.validateAgainstOthers(profile, self.runtimeIndexOf(profile.id));
+    }
+
+    /// Register `profile`, replacing an existing *runtime* registration for the
+    /// same id. Requires `checkUpsert` to have passed and capacity to be
+    /// reserved, so it cannot fail partway.
+    pub fn upsertAssumeCapacity(self: *ProviderRegistry, profile: ProviderProfile) void {
+        if (self.runtimeIndexOf(profile.id)) |index| {
+            self.profiles.items[index] = profile;
+            return;
+        }
+        self.profiles.appendAssumeCapacity(profile);
+    }
+
+    /// Reserve room for `count` further registrations, so the mutations that
+    /// follow are infallible.
+    pub fn reserve(self: *ProviderRegistry, count: usize) error{OutOfMemory}!void {
+        try self.profiles.ensureUnusedCapacity(self.allocator, count);
+    }
+
+    /// Drop a runtime registration. Built-ins are never removed: a
+    /// configuration that stops naming a provider must not delete a vendor the
+    /// binary ships with.
+    pub fn removeRuntime(self: *ProviderRegistry, id: Slug) bool {
+        const index = self.runtimeIndexOf(id) orelse return false;
+        _ = self.profiles.orderedRemove(index);
+        return true;
     }
 
     /// Resolve by stable id or configuration alias.

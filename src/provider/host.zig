@@ -98,10 +98,32 @@ pub const Host = struct {
     pub fn adoptCustomProviders(self: *Host, text: []const u8) custom_provider.DefinitionError!void {
         var definitions = try custom_provider.parse(self.allocator, text);
         errdefer definitions.deinit();
+
+        // Everything is validated and capacity reserved *before* anything is
+        // mutated. A failure halfway through would otherwise leave the registry
+        // holding profiles that borrow this arena while the errdefer releases
+        // it — and re-adopting the same configuration would fail outright,
+        // which is what a second `/providers refresh` does.
         for (definitions.profiles()) |built| {
-            self.registry.register(built) catch return error.DuplicateProviderId;
+            self.registry.checkUpsert(built) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.DuplicateProviderId => error.DuplicateProviderId,
+                else => error.InvalidDocument,
+            };
         }
-        if (self.custom) |*previous| previous.deinit();
+        self.registry.reserve(definitions.profiles().len) catch return error.OutOfMemory;
+
+        // From here nothing fails, so the swap is atomic.
+        for (definitions.profiles()) |built| self.registry.upsertAssumeCapacity(built);
+        if (self.custom) |*previous| {
+            // A provider the configuration no longer declares must be dropped
+            // before its arena is released, or the registry keeps a profile
+            // pointing into freed memory.
+            for (previous.profiles()) |old| {
+                if (definitions.find(old.id.slice()) == null) _ = self.registry.removeRuntime(old.id);
+            }
+            previous.deinit();
+        }
         self.custom = definitions;
         try self.refreshCatalog();
     }
@@ -129,7 +151,10 @@ pub const Host = struct {
         endpoint_documents: []const []const u8,
     ) IngestError!void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
-        errdefer arena.deinit();
+        // Disarmed once the host owns it; releasing it afterwards would leave
+        // the registry holding a profile that borrows from it.
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
         const scratch = arena.allocator();
 
         var models = try openrouter.parseModels(self.allocator, models_json);
@@ -155,7 +180,7 @@ pub const Host = struct {
         const aliases = try scratch.alloc(profile_mod.EnvAlias, 1);
         aliases[0] = .{ .name = "OPENROUTER_API_KEY", .kind = .api_key, .canonical = true };
 
-        try self.registry.register(.{
+        const built = profile_mod.ProviderProfile{
             .id = provider_id,
             .implementation_id = Slug.lit("openrouter"),
             .display_name = "OpenRouter",
@@ -163,10 +188,19 @@ pub const Host = struct {
             .accepted_credential_kinds = kinds,
             .env_aliases = aliases,
             .default_channel = channels.items[0].id,
-        });
+        };
+        // Validate and reserve before mutating: a refresh replaces its own
+        // previous registration, and a half-applied one would leave the
+        // registry pointing into an arena about to be released.
+        try self.registry.checkUpsert(built);
+        try self.registry.reserve(1);
 
+        // Infallible from here, so the registry and the arena that backs it
+        // change together.
+        self.registry.upsertAssumeCapacity(built);
         if (self.catalog_arena) |*previous| previous.deinit();
         self.catalog_arena = arena;
+        moved = true;
         self.refresh() catch return error.OutOfMemory;
         // Prices and health arrived with the catalog, so the events that
         // describe them are emitted here — the kernel does not fetch and cannot
@@ -755,4 +789,99 @@ test "a failed rebuild restores the previous configuration exactly" {
     for (host.kernel.catalogSnapshot().items()) |item| {
         try std.testing.expect(!item.provider_id.eqlText("gemini"));
     }
+}
+
+test "refreshing the same catalog twice replaces it instead of failing" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    const first_models =
+        \\{"data": [{"id": "x/y", "name": "First", "context_length": 1000}]}
+    ;
+    const first_endpoints =
+        \\{"data": {"id": "x/y", "endpoints": [{"provider_name": "Alpha"}]}}
+    ;
+    try host.ingestOpenRouter(Slug.lit("openrouter"), first_models, &.{first_endpoints});
+    try std.testing.expectEqual(before + 1, host.kernel.catalogSnapshot().items().len);
+
+    // `/providers refresh` runs this again. A second registration used to fail
+    // with `DuplicateProviderId`, so refreshing simply did not work.
+    const second_models =
+        \\{"data": [{"id": "x/y", "name": "Second", "context_length": 2000}]}
+    ;
+    const second_endpoints =
+        \\{"data": {"id": "x/y", "endpoints": [
+        \\  {"provider_name": "Alpha"}, {"provider_name": "Beta"}]}}
+    ;
+    try host.ingestOpenRouter(Slug.lit("openrouter"), second_models, &.{second_endpoints});
+
+    // The catalog reflects the *new* document, not a merge of both.
+    try std.testing.expectEqual(before + 2, host.kernel.catalogSnapshot().items().len);
+    var alpha: usize = 0;
+    var beta: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("openrouter")) continue;
+        try std.testing.expectEqual(@as(?u32, 2000), item.limits.context_window);
+        if (item.channel_id.eqlText("alpha")) alpha += 1;
+        if (item.channel_id.eqlText("beta")) beta += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), alpha);
+    try std.testing.expectEqual(@as(usize, 1), beta);
+}
+
+test "re-adopting custom providers replaces them and drops the ones removed" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    try host.adoptCustomProviders(
+        \\{"custom_providers": {
+        \\  "relay-a": {"channels":[{"id":"c","base_url":"https://a.example.com/v1","protocol":"openai_chat"}],
+        \\              "models":[{"request_model_id":"m-a"}]},
+        \\  "relay-b": {"channels":[{"id":"c","base_url":"https://b.example.com/v1","protocol":"openai_chat"}],
+        \\              "models":[{"request_model_id":"m-b"}]}}}
+    );
+    try std.testing.expect(host.registry.find("relay-a") != null);
+    try std.testing.expect(host.registry.find("relay-b") != null);
+
+    // The user edits the config: `relay-b` is gone and `relay-a` changed. A
+    // stale `relay-b` would keep pointing into the arena this call releases.
+    try host.adoptCustomProviders(
+        \\{"custom_providers": {
+        \\  "relay-a": {"channels":[{"id":"c","base_url":"https://a2.example.com/v1","protocol":"openai_chat"}],
+        \\              "models":[{"request_model_id":"m-a2"}]}}}
+    );
+    try std.testing.expect(host.registry.find("relay-b") == null);
+    const updated = host.registry.find("relay-a").?;
+    try std.testing.expectEqualStrings("https://a2.example.com/v1", updated.channels[0].base_url);
+
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("relay-b")) return error.StaleProviderStillRouted;
+        if (item.provider_id.eqlText("relay-a")) {
+            seen += 1;
+            try std.testing.expectEqualStrings("m-a2", item.request_model_id);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen);
+}
+
+test "a configured provider may not take over a built-in vendor's id" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    // Replacement is for a source's *own* registrations. Letting a config file
+    // silently redefine `openai` would change where an existing session's
+    // credentials go.
+    try std.testing.expectError(error.DuplicateProviderId, host.adoptCustomProviders(
+        \\{"custom_providers": {"openai": {
+        \\  "channels":[{"id":"c","base_url":"https://evil.example.com/v1","protocol":"openai_chat"}],
+        \\  "models":[{"request_model_id":"m"}]}}}
+    ));
+    try std.testing.expectEqualStrings(
+        "https://api.openai.com/v1",
+        host.registry.find("openai").?.channels[0].base_url,
+    );
 }
