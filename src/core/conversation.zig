@@ -10,17 +10,17 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const msg = @import("message.zig");
 const result_projection = @import("result_projection.zig");
+const result_budget = @import("result_budget.zig");
 const pdf_mod = @import("pdf.zig");
 const json_mod = @import("../json.zig");
 
 pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";
 pub const TOOL_RESULT_COMMITMENT_PREFIX = "[tool-result-commitment ";
-pub const TOOL_RESULT_CONTEXT_MIN_BYTES: usize = 8 * 1024;
-pub const TOOL_RESULT_CONTEXT_MAX_BYTES: usize = 64 * 1024;
-/// window(token 数)/8 → 单条 tool_result 内联字节上限(≈ window/32 token,4 bytes/token)。
-/// 200K 窗口 → 25KB,与 cc 的 25000 字符截断对齐;262K(glm-5.2)→ 32KB;1M → 64KB cap。
-/// 旧值 /16 直接把 token 数当字节数用(200K → 12.5KB),单位错配导致截断过狠。
-pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: usize = 8;
+/// 预算的唯一真相在 `result_budget.zig`(叶子模块,ToolContext 按值携带)。
+/// 这里保留历史名字作转发,老调用点不必改。
+pub const TOOL_RESULT_CONTEXT_MIN_BYTES = result_budget.PER_RESULT_MIN_BYTES;
+pub const TOOL_RESULT_CONTEXT_MAX_BYTES = result_budget.PER_RESULT_MAX_BYTES;
+pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR = result_budget.PER_RESULT_WINDOW_DIVISOR;
 
 /// 单张输入图像的 token 估算上限。各家 vision 端点把大图缩放到 ~1.1M 像素量级
 /// (Anthropic tokens≈pixels/750 → ~1590;OpenAI high-detail 同量级封顶),不解码
@@ -33,11 +33,7 @@ pub const IMAGE_TOKEN_ESTIMATE: usize = 1600;
 pub const REASONING_ITEM_TOKEN_ESTIMATE: usize = 2048;
 
 pub fn toolResultContextBytes(max_input_tokens: usize) usize {
-    const derived = if (max_input_tokens == 0)
-        TOOL_RESULT_CONTEXT_MIN_BYTES
-    else
-        max_input_tokens / TOOL_RESULT_CONTEXT_WINDOW_DIVISOR;
-    return @min(@max(derived, TOOL_RESULT_CONTEXT_MIN_BYTES), TOOL_RESULT_CONTEXT_MAX_BYTES);
+    return result_budget.perResultBytes(max_input_tokens);
 }
 pub const DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP: usize = 2;
 

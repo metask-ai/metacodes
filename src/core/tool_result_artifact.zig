@@ -886,6 +886,25 @@ fn receiptFor(snapshot: FileSnapshot) Receipt {
     return .{ .artifact_id = artifact_id, .sha256 = snapshot.sha256, .bytes = snapshot.bytes };
 }
 
+/// Stable, model-visible reason a publish failed. Lives here rather than in
+/// the projection layer because both envelope families need the same names:
+/// a Bash channel that could not publish used to report `recoverable:false`
+/// with no reason at all, so an operator could not tell a full disk from a
+/// session whose 1GiB quota is permanently exhausted.
+pub fn storageErrorCode(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ArtifactRootUnavailable => "artifact_store_unavailable",
+        error.ArtifactTooLarge => "artifact_too_large",
+        error.SessionQuotaExceeded => "artifact_session_quota_exceeded",
+        error.ArtifactPathSymlink,
+        error.ArtifactDirectoryUnsafe,
+        error.ArtifactUnsafeFile,
+        error.ArtifactDirectoryUntrusted,
+        => "artifact_store_unsafe",
+        else => "artifact_persist_failed",
+    };
+}
+
 pub fn readChunk(
     allocator: std.mem.Allocator,
     session_root: []const u8,

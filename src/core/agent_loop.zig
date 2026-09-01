@@ -30,6 +30,7 @@ const tool_error = @import("tool_error.zig");
 const context_pressure_mod = @import("context_pressure.zig");
 const compact_kernel = @import("compact_kernel.zig");
 const result_projection = @import("result_projection.zig");
+const result_budget_mod = @import("result_budget.zig");
 const verification_progress_mod = @import("verification_progress.zig");
 const requirement_ledger_mod = @import("requirement_ledger.zig");
 const util_time = @import("../util/time.zig");
@@ -1273,6 +1274,10 @@ pub fn run(
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
             .artifact_root = opts.artifact_root,
+            // Mirrors base_ctx: Bash bounds its own channels against this, so a
+            // prefetched Bash result must be sized by the same window as a
+            // committed one or the two paths render differently.
+            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokens()),
             .tool_result_metrics = opts.tool_result_metrics,
             .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
@@ -2223,6 +2228,10 @@ pub fn run(
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
             .artifact_root = opts.artifact_root,
+            // The same value the projection pass below uses. Deriving it here
+            // is what lets a tool bound its own output against the real window
+            // instead of against the floor the budget can never go under.
+            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokens()),
             .tool_result_metrics = opts.tool_result_metrics,
             .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
@@ -2403,8 +2412,7 @@ pub fn run(
             }
             const suspended_projection_stats = try result_projection.project(allocator, suspended_items, .{
                 .session_root = opts.artifact_root,
-                .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
-                .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+                .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokens()),
             });
             if (opts.tool_result_metrics) |metrics| metrics.recordProjection(suspended_projection_stats);
             // result_blocks 这轮不提交(挂起不落 partial user 消息);释放已 append 的(本应为空)。
@@ -2529,12 +2537,11 @@ pub fn run(
         }
         const projection_stats = try result_projection.project(allocator, projection_items, .{
             .session_root = opts.artifact_root,
-            .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
-            .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+            .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokens()),
         });
         if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
         if (projection_stats.changed() or projection_stats.budget_exhausted) {
-            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_exempt={d} budget_exhausted={}", .{
+            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_exempt={d} regrown={d} reinlined={d} budget_exhausted={}", .{
                 projection_stats.raw_bytes,
                 projection_stats.projected_bytes,
                 projection_stats.artifact_bytes,
@@ -2542,6 +2549,8 @@ pub fn run(
                 projection_stats.unrecoverable_fallback_count,
                 projection_stats.turn_budget_spills,
                 projection_stats.image_exempt_count,
+                projection_stats.envelope_regrown_count,
+                projection_stats.envelope_reinlined_count,
                 projection_stats.budget_exhausted,
             });
         }

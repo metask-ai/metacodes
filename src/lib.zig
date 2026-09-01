@@ -38,6 +38,7 @@ pub const tool_observation_journal = @import("core/tool_observation_journal.zig"
 pub const tool_result_artifact = @import("core/tool_result_artifact.zig");
 pub const tool_result = @import("core/tool_result.zig");
 pub const result_projection = @import("core/result_projection.zig");
+pub const result_budget = @import("core/result_budget.zig");
 pub const pdf = @import("core/pdf.zig");
 pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
 pub const rule_impact_stats = @import("core/rule_impact_stats.zig");

@@ -173,7 +173,23 @@ Detection reuses `dialect.extractImageResult` (the same single truth the wire
 serializers use). Images stay bounded by `Read`'s `MAX_IMAGE_BYTES`, and the
 per-turn budget charges one image at `IMAGE_TOKEN_ESTIMATE` rather than its
 base64 length, so a screenshot no longer evicts unrelated tool results.
-Non-image results project byte-identically to before.
+
+Both caps now come from one place, `core/result_budget.zig`, derived once per
+turn from the provider window and handed to `ToolContext.result_budget` as
+well as to `result_projection`. A tool that bounds its own output (Bash, whose
+two channels share one allowance by max-min fairness) sizes its preview from
+that value rather than from a private constant, and spends it in **encoded**
+bytes so JSON escaping cannot double the rendered result. When a result is
+spilled, its preview is sized from the same budget instead of a fixed 1536
+bytes; when the envelope would be larger than the content it replaces, the
+result is left inline. The per-turn budget lowers a single water line across
+every oversized result rather than evicting the largest one. A result whose
+preview was fixed by the streaming capture path is re-rendered against the
+budget before commit, and re-inlined outright when the original fits. Text
+results therefore no longer project byte-identically to builds before this
+change; committed results are still never re-projected for a later request, so
+prompt-cache prefixes are unaffected.
+
 
 ### PDF document input
 

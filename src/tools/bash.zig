@@ -9,6 +9,7 @@ const ToolContext = @import("context.zig").ToolContext;
 const ToolResultBody = @import("context.zig").ToolResultBody;
 const artifact = @import("../core/tool_result_artifact.zig");
 const ResultMetrics = @import("../core/tool_result_metrics.zig").Metrics;
+const result_budget = @import("../core/result_budget.zig");
 
 /// nowMs：毫秒时间戳，复用 util/time.zig
 fn nowMs() util_time.Millis {
@@ -22,14 +23,44 @@ pub const MAX_TIMEOUT_MS: u64 = 24 * 3600 * 1000;
 /// 同步模式超过此时长自动转后台：与 TS 对齐（ASSISTANT_BLOCKING_BUDGET_MS）
 pub const AUTO_BACKGROUND_MS: u64 = 15_000;
 
-/// 前台 Bash 单股(stdout/stderr)输出上限,超出截断(对齐 Claude Code 30K 字符)。
-/// 防止 `cat huge` / `seq 1000000` 等把整个输出灌进上下文。
+/// 自动转后台时那份**部分快照**里单股输出的上限(`formatAutoBackgrounded`)。
+/// 已完成的结果不走这里:它按 `ToolContext.result_budget` 派生的额度做头尾预览,
+/// 见 `channelAllowances`。(历史上这个常量的注释声称管的是前台输出上限,并被
+/// 工具描述照抄成 "~30KB",实际自 c3d1676 起就只覆盖部分快照这一条路径。)
 pub const MAX_OUTPUT_BYTES: usize = 30_000;
-/// A completed Bash result is a bounded structured envelope. Each channel
-/// keeps only this preview inline; omitted bytes are recovered through the
-/// content-addressed artifact id, keeping the whole JSON below the generic
-/// 8KiB minimum result budget.
-pub const CHANNEL_PREVIEW_BYTES: usize = 1536;
+/// Fixed JSON scaffolding of a completed two-channel envelope: the schema
+/// version, both channels' encodings, sizes, digests, artifact ids, read
+/// instructions and spool paths, plus the exit code. Measured at ~1.3KB with
+/// both channels spilled and a macOS temp path; rounded up so a preview sized
+/// against the remaining allowance cannot push the rendered envelope past the
+/// per-result budget it was derived from.
+pub const ENVELOPE_OVERHEAD_BYTES: usize = 2048;
+
+/// Encoded preview bytes the two channels share, given the turn's budget.
+///
+/// This used to be a hard-coded 1536 per channel, back-computed from the 8KiB
+/// budget *floor* and then applied unchanged on a 262K-window model whose real
+/// allowance is 32KB. Because Bash spills before `result_projection` ever sees
+/// the result, and because microcompact refuses to touch a recoverable
+/// envelope, that constant was the only decision ever made about a Bash
+/// result's size for its whole life in the Conversation.
+fn channelAllowances(budget: result_budget.Budget, stdout_bytes: u64, stderr_bytes: u64) result_budget.Pair {
+    return result_budget.splitPair(
+        budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES),
+        encodedDemand(stdout_bytes),
+        encodedDemand(stderr_bytes),
+    );
+}
+
+/// Upper bound on the encoded size of `raw` source bytes. JSON escaping at
+/// most doubles a byte, and a channel that is not inline-safe is base64'd
+/// instead, which expands only 4:3. Splitting on this bound rather than on the
+/// raw size keeps a quote-dense channel from being cut against a ceiling its
+/// own escaping would exceed; when the escaping does not materialise the only
+/// cost is unused ceiling, which is free.
+fn encodedDemand(raw: u64) u64 {
+    return raw *| 2;
+}
 const PREVIEW_OMISSION_MARKER = "\n...[middle omitted]...\n";
 
 const ChannelPreview = struct {
@@ -87,14 +118,16 @@ fn formatCompletedOutput(
     exit_code: i32,
     artifact_root: []const u8,
     capture_complete: bool,
+    budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
 ) ![]u8 {
+    const allowance = channelAllowances(budget, stdout.len, stderr.len);
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"schema_version\":\"metacodes.bash-result.v2\",");
-    try appendMemoryChannel(&aw.writer, allocator, "stdout", stdout, artifact_root, capture_complete, metrics);
+    try appendMemoryChannel(&aw.writer, allocator, "stdout", stdout, artifact_root, capture_complete, allowance.first, metrics);
     try aw.writer.writeByte(',');
-    try appendMemoryChannel(&aw.writer, allocator, "stderr", stderr, artifact_root, capture_complete, metrics);
+    try appendMemoryChannel(&aw.writer, allocator, "stderr", stderr, artifact_root, capture_complete, allowance.second, metrics);
     try aw.writer.print(",\"exit_code\":{d}}}", .{exit_code});
     return try aw.toOwnedSlice();
 }
@@ -106,15 +139,20 @@ fn appendMemoryChannel(
     bytes: []const u8,
     artifact_root: []const u8,
     capture_complete: bool,
+    allowance: usize,
     metrics: ?*ResultMetrics,
 ) !void {
     const digest = sha256Hex(bytes);
-    const stored: ?artifact.Receipt = if (bytes.len > CHANNEL_PREVIEW_BYTES)
+    var preview = try headTailPreview(allocator, bytes, allowance);
+    defer preview.deinit();
+    // Publish only when the preview actually elides something. Deciding from
+    // the preview instead of from a size threshold means a channel that fits
+    // the allowance whole is never spilled, and a spill always corresponds to
+    // bytes the model cannot otherwise see.
+    const stored: ?artifact.Receipt = if (preview.shown_source_bytes < bytes.len)
         artifact.persist(allocator, artifact_root, bytes) catch null
     else
         null;
-    var preview = try headTailPreview(allocator, bytes, CHANNEL_PREVIEW_BYTES);
-    defer preview.deinit();
     try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, bytes.len, digest, stored, capture_complete, null, metrics);
 }
 
@@ -124,12 +162,13 @@ fn appendFileChannel(
     label: []const u8,
     path: []const u8,
     artifact_root: []const u8,
+    allowance: usize,
     metrics: ?*ResultMetrics,
 ) !void {
     const inspected = artifact.inspectFile(allocator, path) catch {
         const observed_bytes = artifact.observeFileBytes(allocator, path) catch 0;
         var preview: ChannelPreview = if (observed_bytes > 0)
-            headTailFilePreview(allocator, path, observed_bytes, CHANNEL_PREVIEW_BYTES) catch .{
+            headTailFilePreview(allocator, path, observed_bytes, allowance) catch .{
                 .content = try allocator.dupe(u8, ""),
                 .shown_source_bytes = 0,
                 .allocator = allocator,
@@ -140,12 +179,12 @@ fn appendFileChannel(
         try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, observed_bytes, null, null, false, path, metrics);
         return;
     };
-    const stored: ?artifact.Receipt = if (inspected.bytes > CHANNEL_PREVIEW_BYTES)
+    var preview = try headTailFilePreview(allocator, path, inspected.bytes, allowance);
+    defer preview.deinit();
+    const stored: ?artifact.Receipt = if (preview.shown_source_bytes < inspected.bytes)
         artifact.persistInspectedFile(allocator, artifact_root, path, inspected) catch null
     else
         null;
-    var preview = try headTailFilePreview(allocator, path, inspected.bytes, CHANNEL_PREVIEW_BYTES);
-    defer preview.deinit();
     try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, inspected.bytes, inspected.sha256, stored, true, path, metrics);
 }
 
@@ -219,39 +258,93 @@ fn appendChannel(
     }
 }
 
-fn headTailPreview(allocator: std.mem.Allocator, bytes: []const u8, max_bytes: usize) !ChannelPreview {
-    if (bytes.len <= max_bytes or max_bytes <= PREVIEW_OMISSION_MARKER.len) {
-        const shown = @min(bytes.len, max_bytes);
+fn encodedCost(source: []const u8, base64: bool) usize {
+    if (base64) return std.base64.standard.Encoder.calcSize(source.len);
+    return result_budget.encodedLen(source);
+}
+
+/// Longest prefix of `source` costing at most `max_encoded` once encoded.
+fn cutHeadEncoded(source: []const u8, max_encoded: usize, base64: bool) usize {
+    if (base64) return @min(source.len, max_encoded / 4 * 3);
+    return result_budget.encodedPrefixLen(source, max_encoded);
+}
+
+/// Longest suffix of `source` costing at most `max_encoded` once encoded.
+fn cutTailEncoded(source: []const u8, max_encoded: usize, base64: bool) usize {
+    if (base64) return @min(source.len, max_encoded / 4 * 3);
+    return result_budget.encodedSuffixLen(source, max_encoded);
+}
+
+/// Head/tail split of one encoded allowance, three quarters to the head.
+/// The budget is spent in **encoded** bytes: cutting on source length instead
+/// would let a quote- or newline-dense channel render at up to twice the
+/// allowance it was sized against, which on a wide window is the difference
+/// between fitting the per-result budget and having the whole envelope spilled
+/// again by the projection layer.
+fn splitPreviewBudget(
+    head_source: []const u8,
+    tail_source: []const u8,
+    max_encoded: usize,
+    base64: bool,
+) struct { head_len: usize, tail_len: usize } {
+    const head_len = cutHeadEncoded(head_source, max_encoded * 3 / 4, base64);
+    const spent = encodedCost(head_source[0..head_len], base64);
+    const tail_len = cutTailEncoded(tail_source, max_encoded -| spent, base64);
+    return .{ .head_len = head_len, .tail_len = tail_len };
+}
+
+fn headTailPreview(allocator: std.mem.Allocator, bytes: []const u8, max_encoded: usize) !ChannelPreview {
+    // A channel that is inline-safe stays inline-safe under any UTF-8 aligned
+    // cut, so deciding the encoding from the whole channel can only ever
+    // over-budget a preview that turns out to be clean - never under-budget a
+    // preview that turns out not to be.
+    const base64 = !isInlineUtf8(bytes);
+    if (encodedCost(bytes, base64) <= max_encoded) {
         return .{
-            .content = try allocator.dupe(u8, bytes[0..shown]),
-            .shown_source_bytes = shown,
+            .content = try allocator.dupe(u8, bytes),
+            .shown_source_bytes = bytes.len,
             .allocator = allocator,
         };
     }
-    const source_budget = max_bytes - PREVIEW_OMISSION_MARKER.len;
-    const wanted_head = source_budget * 3 / 4;
-    const wanted_tail = source_budget - wanted_head;
-    const valid_utf8 = std.unicode.utf8ValidateSlice(bytes);
-    const head_end = if (valid_utf8) floorUtf8Boundary(bytes, wanted_head) else wanted_head;
-    var tail_start = bytes.len - wanted_tail;
-    if (valid_utf8) tail_start = ceilUtf8Boundary(bytes, tail_start);
-    if (tail_start < head_end) tail_start = head_end;
-    const result = try std.mem.concat(allocator, u8, &.{ bytes[0..head_end], PREVIEW_OMISSION_MARKER, bytes[tail_start..] });
+    const marker_cost = encodedCost(PREVIEW_OMISSION_MARKER, base64);
+    if (max_encoded <= marker_cost) {
+        const head_len = cutHeadEncoded(bytes, max_encoded, base64);
+        return .{
+            .content = try allocator.dupe(u8, bytes[0..head_len]),
+            .shown_source_bytes = head_len,
+            .allocator = allocator,
+        };
+    }
+    const budget = max_encoded - marker_cost;
+    const head_len = cutHeadEncoded(bytes, budget * 3 / 4, base64);
+    const rest = bytes[head_len..];
+    const tail_len = cutTailEncoded(rest, budget -| encodedCost(bytes[0..head_len], base64), base64);
+    const result = try std.mem.concat(allocator, u8, &.{
+        bytes[0..head_len],
+        PREVIEW_OMISSION_MARKER,
+        bytes[bytes.len - tail_len ..],
+    });
     return .{
         .content = result,
-        .shown_source_bytes = head_end + bytes.len - tail_start,
+        .shown_source_bytes = head_len + tail_len,
         .allocator = allocator,
     };
 }
 
-fn headTailFilePreview(allocator: std.mem.Allocator, path: []const u8, total_bytes: u64, max_bytes: usize) !ChannelPreview {
-    if (total_bytes <= max_bytes or max_bytes <= PREVIEW_OMISSION_MARKER.len) {
-        const content = try readWholeFile(path, allocator, max_bytes);
-        return .{ .content = content, .shown_source_bytes = content.len, .allocator = allocator };
+fn headTailFilePreview(allocator: std.mem.Allocator, path: []const u8, total_bytes: u64, max_encoded: usize) !ChannelPreview {
+    if (max_encoded == 0) {
+        return .{ .content = try allocator.dupe(u8, ""), .shown_source_bytes = 0, .allocator = allocator };
     }
-    const source_budget = max_bytes - PREVIEW_OMISSION_MARKER.len;
-    const wanted_head = source_budget * 3 / 4;
-    const wanted_tail = source_budget - wanted_head;
+    // Encoded size is never below source size, so `max_encoded` source bytes
+    // bounds what could possibly fit - and bounds the read for a spool that
+    // may be gigabytes.
+    if (total_bytes <= max_encoded) {
+        const whole = try readWholeFile(path, allocator, max_encoded);
+        defer allocator.free(whole);
+        return try headTailPreview(allocator, whole, max_encoded);
+    }
+    const head_read: usize = max_encoded * 3 / 4;
+    const tail_read: usize = max_encoded - head_read;
     var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= path_buffer.len) return error.PathTooLong;
     @memcpy(path_buffer[0..path.len], path);
@@ -260,14 +353,32 @@ fn headTailFilePreview(allocator: std.mem.Allocator, path: []const u8, total_byt
     if (fd < 0) return error.OpenFailed;
     defer _ = pfs.close(fd);
 
-    const result = try allocator.alloc(u8, wanted_head + PREVIEW_OMISSION_MARKER.len + wanted_tail);
-    errdefer allocator.free(result);
-    try readExactFd(fd, result[0..wanted_head]);
-    @memcpy(result[wanted_head .. wanted_head + PREVIEW_OMISSION_MARKER.len], PREVIEW_OMISSION_MARKER);
-    const tail_offset: i64 = @intCast(total_bytes - wanted_tail);
+    const scratch = try allocator.alloc(u8, head_read + tail_read);
+    defer allocator.free(scratch);
+    try readExactFd(fd, scratch[0..head_read]);
+    const tail_offset: i64 = @intCast(total_bytes - tail_read);
     if (pfs.lseek(fd, tail_offset, .set) != tail_offset) return error.SeekFailed;
-    try readExactFd(fd, result[wanted_head + PREVIEW_OMISSION_MARKER.len ..]);
-    return .{ .content = result, .shown_source_bytes = wanted_head + wanted_tail, .allocator = allocator };
+    try readExactFd(fd, scratch[head_read..]);
+    const head_raw = scratch[0..head_read];
+    const tail_raw = scratch[head_read..];
+
+    // Decide the encoding from the *aligned* cuts, not from the raw chunks: a
+    // read boundary that lands mid-codepoint would otherwise base64 an
+    // ordinary text file.
+    const provisional = splitPreviewBudget(head_raw, tail_raw, max_encoded, false);
+    const base64 = !isInlineUtf8(head_raw[0..provisional.head_len]) or
+        !isInlineUtf8(tail_raw[tail_raw.len - provisional.tail_len ..]);
+    const marker_cost = encodedCost(PREVIEW_OMISSION_MARKER, base64);
+    const cut = if (base64)
+        splitPreviewBudget(head_raw, tail_raw, max_encoded -| marker_cost, true)
+    else
+        splitPreviewBudget(head_raw, tail_raw, max_encoded -| marker_cost, false);
+    const content = try std.mem.concat(allocator, u8, &.{
+        head_raw[0..cut.head_len],
+        PREVIEW_OMISSION_MARKER,
+        tail_raw[tail_raw.len - cut.tail_len ..],
+    });
+    return .{ .content = content, .shown_source_bytes = cut.head_len + cut.tail_len, .allocator = allocator };
 }
 
 fn readExactFd(fd: pfs.Fd, bytes: []u8) !void {
@@ -310,14 +421,23 @@ fn formatCompletedFiles(
     stderr_path: []const u8,
     exit_code: i32,
     artifact_root: []const u8,
+    budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
 ) ![]u8 {
+    // Two extra stats so the split sees real demand: giving each channel a
+    // fixed half would forfeit half the allowance to the empty stderr that
+    // most commands produce.
+    const allowance = channelAllowances(
+        budget,
+        artifact.observeFileBytes(allocator, stdout_path) catch 0,
+        artifact.observeFileBytes(allocator, stderr_path) catch 0,
+    );
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"schema_version\":\"metacodes.bash-result.v2\",");
-    try appendFileChannel(&aw.writer, allocator, "stdout", stdout_path, artifact_root, metrics);
+    try appendFileChannel(&aw.writer, allocator, "stdout", stdout_path, artifact_root, allowance.first, metrics);
     try aw.writer.writeByte(',');
-    try appendFileChannel(&aw.writer, allocator, "stderr", stderr_path, artifact_root, metrics);
+    try appendFileChannel(&aw.writer, allocator, "stderr", stderr_path, artifact_root, allowance.second, metrics);
     try aw.writer.print(",\"exit_code\":{d}}}", .{exit_code});
     return aw.toOwnedSlice();
 }
@@ -426,6 +546,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             cwd_opt,
             ctx.artifact_root,
             ctx.project_rule_gate == null,
+            ctx.result_budget,
             ctx.tool_result_metrics,
         );
     }
@@ -447,6 +568,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             cwd_opt,
             ctx.artifact_root,
             false,
+            ctx.result_budget,
             ctx.tool_result_metrics,
         );
     }
@@ -463,8 +585,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
-    // 截断到 MAX_OUTPUT_BYTES(保留头部),防大输出撑爆上下文。
-    return try formatCompletedOutput(allocator, out.stdout, out.stderr, out.exit_code, ctx.artifact_root, out.capture_complete, ctx.tool_result_metrics);
+    // 无 JobRegistry 也无 artifact root 的兜底路径:管道捕获后按预算做头尾预览。
+    return try formatCompletedOutput(allocator, out.stdout, out.stderr, out.exit_code, ctx.artifact_root, out.capture_complete, ctx.result_budget, ctx.tool_result_metrics);
 }
 
 /// Bash already redirects stdout/stderr to JobRegistry files before the child
@@ -487,6 +609,7 @@ fn runAutoBackgroundable(
     cwd: ?[]const u8,
     artifact_root: []const u8,
     allow_auto_background: bool,
+    budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
 ) ![]u8 {
     const j_entry = try registry.spawnBackground(command, cwd);
@@ -506,7 +629,7 @@ fn runAutoBackgroundable(
         const j = registry.get(job_id[0..]) orelse return error.JobNotFound; // 值快照
         if (j.status != .running) {
             // 正常退出：读文件构造完整输出
-            return try readJobAsSync(allocator, &j, artifact_root, metrics);
+            return try readJobAsSync(allocator, &j, artifact_root, budget, metrics);
         }
 
         const elapsed: u64 = @intCast(nowMs() - start);
@@ -522,8 +645,8 @@ fn runAutoBackgroundable(
     }
 }
 
-fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry, artifact_root: []const u8, metrics: ?*ResultMetrics) ![]u8 {
-    return try formatCompletedFiles(allocator, j.stdout_path, j.stderr_path, j.exit_code orelse 0, artifact_root, metrics);
+fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry, artifact_root: []const u8, budget: result_budget.Budget, metrics: ?*ResultMetrics) ![]u8 {
+    return try formatCompletedFiles(allocator, j.stdout_path, j.stderr_path, j.exit_code orelse 0, artifact_root, budget, metrics);
 }
 
 fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
@@ -693,7 +816,7 @@ test "completed job output becomes a bounded recoverable channel artifact" {
     registry.reapExited();
     const job = registry.get(spawned.idSlice()) orelse return error.JobNotFound;
     var metrics = ResultMetrics{};
-    const result = try readJobAsSync(allocator, &job, root, &metrics);
+    const result = try readJobAsSync(allocator, &job, root, .floor, &metrics);
     defer allocator.free(result);
     try std.testing.expect(result.len < 8 * 1024);
     try std.testing.expect(std.mem.indexOf(u8, result, root) == null);
@@ -778,7 +901,7 @@ test "over-limit completed spool reports true size without a false commitment" {
     if (stderr_fd < 0) return error.OpenFailed;
     _ = pfs.close(stderr_fd);
 
-    const result = try formatCompletedFiles(allocator, stdout_path, stderr_path, 0, root, null);
+    const result = try formatCompletedFiles(allocator, stdout_path, stderr_path, 0, root, .floor, null);
     defer allocator.free(result);
     try std.testing.expect(result.len < 8 * 1024);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
@@ -835,4 +958,112 @@ test "BashTool 大输出 becomes bounded even when artifact storage is unavailab
     // No JobRegistry and no artifact root means no on-disk spool exists, so the
     // path field is absent rather than pointing at nothing.
     try std.testing.expect(std.mem.indexOf(u8, r, "\"stdout_path\"") == null);
+}
+
+/// Run a command that writes exactly `bytes` bytes to stdout and return the
+/// completed envelope, parsed. Caller deinits.
+fn runSizedStdout(a: std.mem.Allocator, ctx: *const ToolContext, bytes: usize) ![]u8 {
+    const command = try std.fmt.allocPrint(
+        a,
+        "{{\"command\":\"awk 'BEGIN {{ for(i=0;i<{d};i++) printf \\\"x\\\" }}'\"}}",
+        .{bytes},
+    );
+    defer a.free(command);
+    return try execute(ctx, command);
+}
+
+test "issue #29: output the budget can afford is delivered inline" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // The reported case: 1890 bytes of stdout, truncated to a 1536-byte
+    // head/tail preview against a per-result budget whose floor is 8KiB. The
+    // envelope grew by more than the truncation saved and the model lost 354
+    // bytes it then spent a round-trip failing to recover.
+    const ctx = ToolContext{ .allocator = a };
+    const result = try runSizedStdout(a, &ctx, 1890);
+    defer a.free(result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("stdout_truncated").?.bool);
+    try std.testing.expectEqual(@as(i64, 1890), parsed.value.object.get("stdout_original_bytes").?.integer);
+    try std.testing.expectEqual(@as(usize, 1890), parsed.value.object.get("stdout").?.string.len);
+    // Nothing was spilled, so nothing needs recovering.
+    try std.testing.expect(parsed.value.object.get("stdout_artifact_id").? == .null);
+    // And the whole envelope still fits the floor budget it was sized against.
+    try std.testing.expect(result.len <= result_budget.PER_RESULT_MIN_BYTES);
+}
+
+test "the channel allowance follows the provider window" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // 10KB sits between the floor allowance (8KiB budget minus scaffolding)
+    // and a 200K-window allowance (25KB minus scaffolding). The same command
+    // must therefore truncate on the small window and stay whole on the large
+    // one - which is exactly what a hard-coded constant could not express.
+    const floor_ctx = ToolContext{ .allocator = a };
+    const floor_result = try runSizedStdout(a, &floor_ctx, 10_000);
+    defer a.free(floor_result);
+    var floor_parsed = try std.json.parseFromSlice(std.json.Value, a, floor_result, .{});
+    defer floor_parsed.deinit();
+    try std.testing.expect(floor_parsed.value.object.get("stdout_truncated").?.bool);
+
+    const wide_ctx = ToolContext{ .allocator = a, .result_budget = .fromModel(200_000) };
+    const wide_result = try runSizedStdout(a, &wide_ctx, 10_000);
+    defer a.free(wide_result);
+    var wide_parsed = try std.json.parseFromSlice(std.json.Value, a, wide_result, .{});
+    defer wide_parsed.deinit();
+    try std.testing.expect(!wide_parsed.value.object.get("stdout_truncated").?.bool);
+    try std.testing.expectEqual(@as(usize, 10_000), wide_parsed.value.object.get("stdout").?.string.len);
+    try std.testing.expect(wide_result.len <= result_budget.perResultBytes(200_000));
+}
+
+test "an empty stderr does not cost stdout half its allowance" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // A fixed half-each split would cap stdout at ~3KB of the floor budget.
+    // Max-min fairness hands the empty channel's share to the one using it.
+    const ctx = ToolContext{ .allocator = a };
+    const result = try runSizedStdout(a, &ctx, 5000);
+    defer a.free(result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("stdout_truncated").?.bool);
+    try std.testing.expectEqual(@as(usize, 5000), parsed.value.object.get("stdout").?.string.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("stderr").?.string.len);
+}
+
+test "a quote-dense channel is budgeted by encoded size, not source length" {
+    const a = std.testing.allocator;
+    // Every byte escapes to two. Budgeting by source length would render an
+    // envelope at roughly twice the per-result budget it was sized against,
+    // and the projection layer would spill the whole thing straight back out.
+    const noisy = try a.alloc(u8, 64 * 1024);
+    defer a.free(noisy);
+    @memset(noisy, '"');
+    const budget = result_budget.Budget.fromModel(200_000);
+    const envelope = try formatCompletedOutput(a, noisy, "", 0, "", true, budget, null);
+    defer a.free(envelope);
+    try std.testing.expect(envelope.len <= budget.per_result_bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
+    // Still a real head/tail preview, not a degenerate one.
+    try std.testing.expect(parsed.value.object.get("stdout").?.string.len > 4096);
+}
+
+test "channelAllowances keeps the two channels inside one per-result budget" {
+    const budget = result_budget.Budget.fromModel(200_000);
+    const payload = budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES);
+    // Both channels huge: the allowance is shared, never doubled.
+    const even = channelAllowances(budget, 1 << 20, 1 << 20);
+    try std.testing.expectEqual(payload, even.first + even.second);
+    // Empty stderr: stdout gets everything.
+    const lopsided = channelAllowances(budget, 1 << 20, 0);
+    try std.testing.expectEqual(payload, lopsided.first);
+    try std.testing.expectEqual(@as(usize, 0), lopsided.second);
+    // Small channels keep headroom for their own escaping rather than being
+    // capped at their raw size.
+    const small = channelAllowances(budget, 1000, 20);
+    try std.testing.expectEqual(@as(usize, 2000), small.first);
+    try std.testing.expectEqual(@as(usize, 40), small.second);
 }

@@ -290,7 +290,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ReadArtifact",
-        .description = "Read a bounded byte range from a recoverable tool-result artifact. Use the sha256 artifact_id returned by a tool-result projection; offset is zero-based bytes and limit is capped at 32768 bytes. The result is always bounded and never spills recursively.",
+        .description = "Read a bounded byte range from a recoverable tool-result artifact. Use this whenever a tool result reports it was truncated and names an artifact_id — re-running the tool costs a full round-trip and still will not return the omitted bytes. offset is zero-based bytes; limit is capped at 32768 and may be reduced further to fit the context budget, in which case next_offset carries the remainder. The result is always bounded and never spills recursively.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "artifact_id", .type = "string", .description = "Content-addressed id in sha256:<64 lowercase hex> form" },
             .{ .name = "offset", .type = "integer", .description = "Zero-based byte offset (default 0)" },

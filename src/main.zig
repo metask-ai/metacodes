@@ -111,6 +111,7 @@ pub const message_repair = @import("core/message_repair.zig");
 pub const tool_result_artifact = @import("core/tool_result_artifact.zig");
 pub const tool_result = @import("core/tool_result.zig");
 pub const result_projection = @import("core/result_projection.zig");
+pub const result_budget = @import("core/result_budget.zig");
 pub const pdf = @import("core/pdf.zig");
 pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
 pub const read_artifact = @import("tools/read_artifact.zig");

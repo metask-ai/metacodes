@@ -274,13 +274,30 @@ envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 S
 仅是失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新
 投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
 
+**字节预算的单一真相**:`core.result_budget.Budget` 由 provider 的 context window 派生
+(`per_result_bytes` 8..64KB、`per_turn_bytes` 16..200KB),`agent_loop` 每轮算一次,同时交给
+`ToolContext.result_budget` 和 `result_projection.project`。自己限界的工具(Bash 的
+stdout/stderr 双通道)从这里取额度并按 max-min 公平切分——空 stderr 不再白占一半;预算按
+**编码后**字节计(`encodedPrefixLen`/`encodedSuffixLen`),否则引号密集的输出经 JSON 转义可能
+渲染成额度的两倍。projection 的 preview 默认也由预算派生而非常量:溢出意味着内容超过了额度,
+不意味着额度消失。turn 预算用水位线(二分)统一下调每条的上限,而不是逐出最大的一条;当封装
+本身比内容还大时**拒绝**溢出,避免"丢了正文还把请求撑大"。流式 capture 路径的
+`artifact.Preview` 是编译期定长数组(1536 字节,在字节流过时就填好,那时既不知道结果多大也
+没有 provider),`project` 因此在提交前按当前预算重渲染该信封——原文放得下就整条回内联
+(`envelope_reinlined_count`),放不下就把 head/tail 扩到额度(`envelope_regrown_count`)。
+`ReadArtifact` 对投影豁免(否则恢复自身会递归溢出),改由 `min(MAX_READ_BYTES,
+per_result_bytes)` 限界,余量走 `next_offset`。
+
+
 静态 `ToolEntry.result_production` 把生产方式收成三种不可混淆的状态：`bounded_inline`、
 `input_derived`、`byte_zero_spool`；comptime 断言禁止 `byte_zero_spool` 工具接回
 `legacy_inline` executor。当前原生 byte-zero 清单是 `Glob`、`Grep`、`CodeMap`、
 `FindSymbol`、`Bash`、`ListMcpResourcesTool`、`ReadMcpResourceTool`、`WebFetch`。
 其中 Bash 在第一个 stdout/stderr 字节前重定向到 JobRegistry 文件；没有长生命周期
 JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次同步调用建立临时 registry，
-不会退回 pipe 全量捕获。MCP stdio、AgentCore MCP connector、process plugin 与公开 Host
+不会退回 pipe 全量捕获。已完成的 Bash 信封同时给出 `<channel>_path`(JobRegistry 落盘位置,
+在 OS 临时目录而非 artifact CAS 内,且不随 registry 销毁而失效):它让 `Read`/`Grep` 能直接
+搜索,并且是捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时**唯一**剩下的句柄。MCP stdio、AgentCore MCP connector、process plugin 与公开 Host
 stream ABI 都复用同一 CAS/receipt/`ReadArtifact` 恢复面。
 
 真实 rollout 的非敏感证据用 `scripts/eval/tool_result_projection_eval.py <cassette>
