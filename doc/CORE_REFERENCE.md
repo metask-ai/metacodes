@@ -274,6 +274,16 @@ envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 S
 仅是失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新
 投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
 
+**读代码给存在性,审计轨迹给频率**:`scripts/audit_trajectories.py` 扫已落盘的
+`transcript.jsonl`,报告各工具的结果大小分布、超预算条数、溢出后**有没有人来取**、以及
+Bash 结果被截断后模型改命令**重跑**的次数(issue #29 那个行为)。只出尺寸/计数/工具名——
+结果内容、命令文本、路径一律不进输出(有测试钉住)。不进任何 gate(它读 `~/.metacodes`,
+CI 没有),但它的解析逻辑有单测且已接 `zig build test`。
+
+存在这个脚本的理由是记录在案的教训:本轮把 `BashOutput` 的缺陷描述成"每次都发生",而审计
+314 条真实结果给出的是中位 164 字节、仅 1 条超预算——**缺陷为真,频率是编的**。构造探针
+证明存在性,审计校准量级,两者不能互相替代(只发生过 1 次的东西,光看审计会判它不存在)。
+
 **单位是类型,只在跨越处强制**:`result_budget.Source`(内容缓冲区里的字节)与
 `result_budget.Encoded`(渲染进信封后占的字节)是两个 non-exhaustive enum,零表示开销。
 切割原语因此签名为"吃 `Encoded` 预算、吐 `Source` 长度"——那次换算正是反复被跳过的一步。

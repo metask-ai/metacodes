@@ -1505,6 +1505,24 @@ pub fn build(b: *std.Build) void {
     );
     tinykg_contract_test_step.dependOn(&tinykg_contract_test_cmd.step);
     test_step.dependOn(&tinykg_contract_test_cmd.step);
+
+    // The trajectory audit itself only runs against a real ~/.metacodes, which
+    // CI does not have - but its parsing does not need one, and two defects in
+    // it were caught by these tests rather than by the real data (which
+    // happened not to exercise them).
+    const audit_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_audit_trajectories",
+        "-v",
+    });
+    const audit_test_step = b.step(
+        "test:trajectory-audit",
+        "Test the session-transcript audit (parsing, pairing, privacy)",
+    );
+    audit_test_step.dependOn(&audit_test_cmd.step);
+    test_step.dependOn(&audit_test_cmd.step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
