@@ -770,6 +770,9 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             "const aggregate_test_exclusions = [_][]const u8{\n"
             '    "component/agentcore_abi_test.zig",\n'
             "};\n"
+            # 被排除 == 有自己的 root_source_file。sensor 现在校验这一点(build.zig
+            # 只验证文件存在,不验证它还被编译),所以夹具也要把这层契约摆出来。
+            'const abi_test = b.addTest(.{ .root_source_file = b.path("tests/component/agentcore_abi_test.zig") });\n'
             'const agentcore_test_step = b.step("agentcore:test", "fixture");\n'
             'const dev_step = b.step("dev", "fixture");\n'
             "dev_step.dependOn(&install_debug.step);\n"

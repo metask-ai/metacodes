@@ -1346,6 +1346,12 @@ def observe_build_test_throughput(repo: Path) -> Observation:
     # 解析不出来就是失败,不是"没有排除项"——后者会让每个专用测试都被误报为漏导入,
     # 把一个解析 bug 伪装成一堆内容 bug。错误在下面 errors 可用处统一登记。
     exclusions_unparsed = not dedicated
+    # 排除清单是逃生门:加一个名字,聚合导入要求和覆盖要求同时消失。build.zig 只验证
+    # 被排除的文件**存在**,不验证它还被任何 step 编译——所以一个被排除又没有专用
+    # root_source_file 的测试会彻底无人运行,且两侧都不报警。这里补上那道守卫。
+    dedicated_unrun = sorted(
+        name for name in dedicated if f'b.path("tests/{name}")' not in sources["build"]
+    )
     aggregate_expected = sorted(set(discovered) - dedicated)
     # Mirror build.zig's exact executable inventory form. A mention in prose,
     # a string literal, or a trailing-comment decoy must not count as wiring.
@@ -1590,6 +1596,11 @@ def observe_build_test_throughput(repo: Path) -> Observation:
     if exclusions_unparsed:
         errors.append(
             "aggregate_source_inventory: cannot parse aggregate_test_exclusions from build.zig"
+        )
+    if dedicated_unrun:
+        errors.append(
+            "aggregate_source_inventory: dedicated tests excluded from the aggregate but "
+            f"compiled by no build step: {', '.join(dedicated_unrun)}"
         )
     if imported_set != set(aggregate_expected):
         omitted = sorted(set(aggregate_expected) - imported_set)
