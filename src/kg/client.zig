@@ -3091,7 +3091,7 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
         .env_bin = "/nonexistent/bin/tinykg",
     });
     defer c1.deinit();
-    try testing.expectEqualStrings("/env/store.kg", c1.store.argvSlot());
+    try testing.expectEqualStrings("/env/store.kg", c1.store.fsPath().?);
     try testing.expect(c1.bin_path == null); // 显式指定但不可执行 → null → degraded 明示
 
     var c2 = try KgClient.init(a, .{
@@ -3102,11 +3102,11 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
         .env_bin = "",
     });
     defer c2.deinit();
-    try testing.expectEqualStrings("/cfg/s.kg", c2.store.argvSlot());
+    try testing.expectEqualStrings("/cfg/s.kg", c2.store.fsPath().?);
 
     var c3 = try KgClient.init(a, .{ .home = "/home/u", .domain = "p", .env_store = "", .env_bin = "" });
     defer c3.deinit();
-    try testing.expectEqualStrings("/home/u/.metacodes/kg/store.kg", c3.store.argvSlot());
+    try testing.expectEqualStrings("/home/u/.metacodes/kg/store.kg", c3.store.fsPath().?);
 }
 
 test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
@@ -3120,7 +3120,7 @@ test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
         .env_bin = "",
     });
     defer rel.deinit();
-    try testing.expectEqualStrings("/home/u/relative/store.kg", rel.store.argvSlot());
+    try testing.expectEqualStrings("/home/u/relative/store.kg", rel.store.fsPath().?);
     try testing.expect(std.fs.path.isAbsolute(rel.store.fsPath().?));
 
     // 绝对路径原样保留。
@@ -3132,7 +3132,7 @@ test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
         .env_bin = "",
     });
     defer abs.deinit();
-    try testing.expectEqualStrings("/abs/store.kg", abs.store.argvSlot());
+    try testing.expectEqualStrings("/abs/store.kg", abs.store.fsPath().?);
 }
 
 test "issue #30: cloneForThread 不把未配置客户端提升成 CLI-exclusive" {
@@ -3143,6 +3143,10 @@ test "issue #30: cloneForThread 不把未配置客户端提升成 CLI-exclusive"
     defer parent.deinit();
     try testing.expect(parent.transport == .unconfigured);
     try testing.expect(parent.bin_path == null);
+    // 占位符是**协议可见**的:daemon 传输拿 argv[1] 与它做等值匹配后再剥掉
+    // (runRaw / runCheckedRetry 的 shape 检查)。改动它会静默改变线上形状,所以钉死。
+    try testing.expectEqualStrings("daemon-owned", parent.store.argvSlot());
+    try testing.expect(parent.store.fsPath() == null);
 
     // 工作线程克隆。父客户端不拥有任何 store,克隆体也不该凭空拥有一个:
     // 提升成 .exclusive_cli 会重新解析出真 bin_path,而 store 仍是哨兵 →
