@@ -116,6 +116,13 @@ pub const Session = struct {
     /// Refreshes actually performed. A single-flight test that cannot count
     /// exchanges cannot prove single flight.
     exchange_count: usize = 0,
+    /// Callers that found a refresh already in flight and waited for it.
+    ///
+    /// Also for the test, and load-bearing there: with one exchange counted and
+    /// zero waiters, the callers simply ran one after another and each found a
+    /// fresh token — an outcome a *broken* implementation produces just as
+    /// happily. Only a non-zero wait count proves the race actually happened.
+    waited_count: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -210,6 +217,7 @@ pub const Session = struct {
                 // Someone else is already exchanging. Wait for them rather than
                 // starting a second exchange: with a rotating refresh token the
                 // second one would present a token the server just killed.
+                self.waited_count += 1;
                 self.settled.wait(&self.mutex);
                 // The in-flight refresh has settled, and its outcome is ours.
                 // Retrying here would perform a second exchange against the
@@ -747,6 +755,11 @@ test "concurrent expiry performs exactly one refresh" {
     // server already rotated away.
     try testing.expectEqual(@as(usize, 1), fake.calls);
     try testing.expectEqual(@as(usize, 1), session.exchange_count);
+    // And the race really happened. One exchange with nobody waiting would mean
+    // the threads merely ran in sequence, each finding a token the previous one
+    // had already refreshed — an outcome a broken implementation produces just
+    // as happily. Verified by probe: serializing the spawns fails this line.
+    try testing.expect(session.waited_count > 0);
 }
 
 test "a rejected refresh reaches every waiter and is not retried as a transport error" {
@@ -784,6 +797,9 @@ test "a rejected refresh reaches every waiter and is not retried as a transport 
             rejected += 1;
         }
     }
+    // The waiters really waited, so the single exchange below is single flight
+    // rather than four calls that happened not to overlap.
+    try testing.expect(session.waited_count > 0);
     // Every caller learns the login is dead; none of them silently proceeds
     // with an expired token.
     try testing.expectEqual(@as(usize, 4), rejected);
