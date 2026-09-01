@@ -44,6 +44,36 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- A KG client that owns no Store can no longer create one (issue #30).
+  `KgClient.store_path` was a single `[]const u8` carrying two meanings — a
+  real path under the CLI transport, and the marker `"daemon-owned"` under the
+  daemon transport, meaning *this client owns no Store*. Nothing in the type
+  stopped the marker from reaching a call that treats it as a path, and
+  `cloneForThread` did exactly that: it guarded on `transport == .daemon`,
+  while the marker is set for `.daemon` **and** `.unconfigured`, so an
+  unconfigured parent fell through to the CLI reconstruction, which re-resolved
+  a real `bin_path` and then ran `tinykg init daemon-owned`. Because the marker
+  is relative, the Store materialised in the process's current directory — for
+  the TTY e2e suite, the git worktree, as untracked `daemon-owned/` and
+  `daemon-owned.tinykg-daemon.lock` that no `.gitignore` rule covered.
+  The field is now `store: StoreRef`, a union of `.owned` (an absolute path)
+  and `.daemon_owned`; `argvSlot()` serves the argv slot the wire protocol
+  reserves, and `fsPath()` returns an optional that every filesystem call must
+  unwrap. A relative store path from config or `METACODES_KG_STORE` is
+  completed against `home` rather than taken as given, so no configuration can
+  steer the Store — or the five sibling artifacts derived from it — into the
+  current directory. **Breaking for source-level consumers:** `store_path` is
+  replaced by `store`.
+- `zig build --build-file control-plane/build.zig rule-check` passes again. It
+  demanded that every discovered test be imported into `tests/integration_suite.zig`
+  while build.zig panics if a *dedicated* test appears there, so the reported
+  omission was unfixable as stated: satisfying the rule aborted the build and
+  took seven rules down with it. The sensor kept a hand-written copy of
+  build.zig's `aggregate_test_exclusions` that had gained neither the second
+  entry nor a way to notice; it now parses that list from build.zig, and
+  additionally requires each excluded test to have its own `root_source_file`,
+  so being excluded from the aggregate means having a home rather than merely
+  having a file.
 - The OpenAI Responses protocol now replays reasoning items across tool
   continuations (issue #23). Requests use `store:false`, so the server keeps no
   copy of the response and reasoning context survives only if the client sends
