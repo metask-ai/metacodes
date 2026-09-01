@@ -3150,6 +3150,13 @@ test "issue #30: cloneForThread 不把未配置客户端提升成 CLI-exclusive"
     var child = try parent.cloneForThread(a, "/home/u");
     defer child.deinit();
     try testing.expect(child.transport == .unconfigured);
+    // 与探针同强度:不拥有 Store、没有 bin(被提升成 CLI 时正是它凭空出现),
+    // 且 ensureReady 必须降级而不是去建库。ensureReady 会分配降级原因,走
+    // testing allocator 顺带覆盖这条路径的泄漏。
+    try testing.expect(child.store.fsPath() == null);
+    try testing.expect(child.bin_path == null);
+    child.ensureReady();
+    try testing.expect(!child.ready);
 }
 
 test "bin 解析:没有 staged artifact 时绝不回退 PATH 或开发 checkout" {

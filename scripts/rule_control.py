@@ -1335,8 +1335,10 @@ def observe_build_test_throughput(repo: Path) -> Observation:
     # tests/integration_suite.zig")。此处从它解析而非手抄——原先这里是一份写死的
     # 副本,build.zig 加了 tool_dispatcher_metadata_test.zig 而副本没跟上,于是这条
     # 规则长期要求一个 build.zig 明令禁止的导入:两边对同一件事的规定相反,谁也修不好。
+    # `\}\s*;` 而非 `\n\};`:去掉尾逗号后 zig fmt 会把列表折成一行,只认多行写法会让
+    # 一次纯格式改动把规则变红(虽然是失败关闭且提示明确,但属于无谓摩擦)。
     exclusions_block = re.search(
-        r"const aggregate_test_exclusions = \[_\]\[\]const u8\{(.*?)\n\};",
+        r"const aggregate_test_exclusions = \[_\]\[\]const u8\{(.*?)\}\s*;",
         sources["build"],
         re.S,
     )
