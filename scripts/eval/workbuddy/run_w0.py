@@ -95,6 +95,7 @@ def run_w0(workbuddy: Path, zig: Path, bash: Path, uv: Path) -> Dict[str, object
             metacodes=fake_binary,
             tinykg=fake_binary,
             formal_kernel=fake_binary,
+            ripgrep=fake_binary,
             metacodes_commit="0" * 40,
             tinykg_commit="0" * 40,
             licenses=(
