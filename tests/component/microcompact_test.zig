@@ -424,9 +424,10 @@ test "L2 microcompact: 两趟压力阀不得毁掉唯一的恢复能力" {
     try std.testing.expectEqual(@as(usize, 0), again.cleared);
 }
 
-test "L2 microcompact: 无法重写的可恢复信封宁可留着也不切坏" {
-    // Bash v2 信封没有 shrink 路径。留着超预算只多花一次请求;切坏则同时毁掉
-    // stdout_artifact_id 与 stdout_path,输出就真没了。
+test "L2 microcompact: Bash 信封被结构化裁剪,而不是切成散文" {
+    // 通用文本截断会把 JSON 切成不可解析的散文,连带丢掉 exit_code /
+    // storage_error / 各种 id 与 flag —— 而它们从来不是结果超限的原因,一两个
+    // 长字符串才是。结构化裁剪只动长字符串,并把描述它的计数器一并改对。
     const a = std.testing.allocator;
     var conv = Conversation.init(a);
     defer conv.deinit();
@@ -435,51 +436,33 @@ test "L2 microcompact: 无法重写的可恢复信封宁可留着也不切坏" {
     const filler = try a.alloc(u8, limit * 2);
     defer a.free(filler);
     @memset(filler, 'B');
+    filler[0] = 'H';
+    filler[filler.len - 1] = 'T';
     const bash = try std.fmt.allocPrint(
         a,
         "{{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"{s}\"," ++
-            "\"stdout_artifact_id\":\"sha256:{s}\",\"stdout_recoverable\":true,\"exit_code\":0}}",
-        .{ filler, "c" ** 64 },
+            "\"stdout_captured_bytes\":{d},\"stdout_truncated\":false," ++
+            "\"stdout_artifact_id\":\"sha256:{s}\",\"stdout_recoverable\":true,\"exit_code\":7}}",
+        .{ filler, filler.len, "c" ** 64 },
     );
     defer a.free(bash);
     try appendToolResult(&conv, a, "tu_bash", bash);
 
     const reduced = conv.truncateLargeToolResults(limit);
-    try std.testing.expectEqual(@as(usize, 0), reduced.truncated);
-    const kept = conv.messages.items[0].blocks[0].tool_result.content;
-    try std.testing.expectEqualStrings(bash, kept);
-    try std.testing.expect(cc.result_projection.hasRecoverableArtifact(kept));
-}
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
 
-test "L2 microcompact: 大到发布不了的 Bash 捕获,靠 spool 路径免于被清空" {
-    // 已完成的 Bash 信封给出 `<channel>_path`,理由正是"捕获超过 MAX_ARTIFACT_BYTES
-    // 无法发布时唯一剩下的句柄"。可 clear 判定原本只看 artifact 字段,于是这条
-    // 结果在下一次上下文压力就被清成 stub——句柄只活了一轮,那份磁盘上完好的
-    // 输出对模型等于没有。
-    const a = std.testing.allocator;
-    var conv = Conversation.init(a);
-    defer conv.deinit();
-
-    const unpublishable =
-        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"head...tail\"," ++
-        "\"stdout_captured_bytes\":200000000,\"stdout_capture_complete\":false," ++
-        "\"stdout_truncated\":true,\"stdout_artifact_id\":null,\"stdout_recoverable\":false," ++
-        "\"stdout_path\":\"/tmp/metacodes-job-abc/stdout\"," ++
-        "\"stdout_storage_error\":\"artifact_too_large\",\"exit_code\":0}";
-    try appendToolResult(&conv, a, "tu_spool", unpublishable);
-
-    // 一条模型已经完整看到的结果作对照:它没有要恢复的东西,该清就清。
-    const whole =
-        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"all of it right here\"," ++
-        "\"stdout_truncated\":false,\"stdout_artifact_id\":null,\"stdout_recoverable\":true," ++
-        "\"stdout_path\":\"/tmp/metacodes-job-def/stdout\"," ++
-        "\"stderr_truncated\":false,\"stderr_path\":\"/tmp/metacodes-job-def/stderr\",\"exit_code\":0}";
-    try appendToolResult(&conv, a, "tu_whole", whole);
-
-    const reduced = conv.microcompactToolResultsByRecentResults(0);
-    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
-    try std.testing.expectEqualStrings(unpublishable, conv.messages.items[0].blocks[0].tool_result.content);
-    try std.testing.expect(cc.conversation.isCommittedToolResultProjection(
-        conv.messages.items[1].blocks[0].tool_result.content,
-    ));
+    const bounded = conv.messages.items[0].blocks[0].tool_result.content;
+    try std.testing.expect(bounded.len <= limit);
+    // 仍是合法 JSON,身份与状态字段一个不少,恢复能力也还在。
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bounded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("exit_code").?.integer);
+    try std.testing.expectEqualStrings("sha256:" ++ "c" ** 64, parsed.value.object.get("stdout_artifact_id").?.string);
+    try std.testing.expect(cc.result_projection.hasRecoverableArtifact(bounded));
+    // 长字符串被裁,头尾都留着,且描述它的 flag 跟着改对。
+    const out = parsed.value.object.get("stdout").?.string;
+    try std.testing.expect(out.len < filler.len);
+    try std.testing.expect(std.mem.startsWith(u8, out, "H"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "T"));
+    try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
 }

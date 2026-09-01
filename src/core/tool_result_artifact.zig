@@ -383,6 +383,7 @@ pub const Spool = struct {
             temp_identity,
             mode,
         );
+        commitQuota(artifact_directory, snapshot.bytes);
         self.published = true;
         return .{ .receipt = receiptFor(snapshot), .preview = self.preview };
     }
@@ -683,6 +684,9 @@ fn persistInspectedFileInternal(
             return err;
         };
     }
+    // Every rollback path above has been passed: the bytes are durable, so the
+    // gauge may finally count them.
+    commitQuota(directory, expected.bytes);
     return switch (mode) {
         .receipt_only => .{ .receipt = receiptFor(expected) },
         .external_completed, .external_inject_cleanup_failure => .{ .completed = .{
@@ -960,6 +964,13 @@ pub fn sessionUsage(session_root: []const u8) SessionUsage {
 
 /// Admission check for `incoming` bytes into `directory`, and the one place
 /// session usage is observed. Caller holds `persist_mutex`.
+///
+/// Records only what the scan actually measured. Counting `incoming` here as
+/// well would be optimistic: publishing can still fail afterwards - the source
+/// open, the copy, the rename, the directory fsync - and the file is then
+/// rolled back while the gauge keeps reporting bytes that do not exist, until
+/// the next successful publish happens to correct it. `commitQuota` adds them
+/// once the bytes are really on disk.
 fn reserveQuota(allocator: std.mem.Allocator, directory: []const u8, incoming: u64) !void {
     const key = usageKey(directory);
     const used = try directoryBytes(allocator, directory);
@@ -967,7 +978,15 @@ fn reserveQuota(allocator: std.mem.Allocator, directory: []const u8, incoming: u
         quota_cache = .{ .key = key, .used = used, .valid = true };
         return error.SessionQuotaExceeded;
     }
-    quota_cache = .{ .key = key, .used = used +| incoming, .valid = true };
+    quota_cache = .{ .key = key, .used = used, .valid = true };
+}
+
+/// Account `incoming` bytes that a publish has just made durable. Caller holds
+/// `persist_mutex`, and must call this only after the file is in place.
+fn commitQuota(directory: []const u8, incoming: u64) void {
+    const key = usageKey(directory);
+    if (!quota_cache.valid or quota_cache.key != key) return;
+    quota_cache.used +|= incoming;
 }
 
 /// Resolve a published artifact to its on-disk blob so a search tool can run
@@ -1726,4 +1745,47 @@ test "a store grown by another writer is still observed by the quota check" {
 
     payload[0] = 'T';
     try std.testing.expectError(error.SessionQuotaExceeded, persist(allocator, root, &payload));
+}
+
+test "a publish that rolls back does not leave its bytes in the usage gauge" {
+    // The gauge used to be credited at admission time, before the source open,
+    // the copy, the rename and the directory fsync had all succeeded. Any of
+    // those can still fail and roll the file back, and the gauge then reported
+    // bytes that do not exist on disk until some later publish happened to
+    // correct it - a "how close am I to the quota" number that overstates.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    var settled: [4096]u8 = undefined;
+    @memset(&settled, 'K');
+    const first = try persist(allocator, root, &settled);
+    const after_success = sessionUsage(root);
+    try std.testing.expect(after_success.observed);
+    try std.testing.expectEqual(first.bytes, after_success.used_bytes);
+
+    // A publish that gets all the way to the CAS and is then rolled back.
+    var spool = try ExternalSpool.begin(allocator, root);
+    defer spool.deinit();
+    const payload = "rolled-back-bytes-must-not-be-counted";
+    const fd = pfs.open(spool.path_z.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactTempOpenFailed;
+    try pfs.makeCloseOnExec(fd);
+    try writeAll(fd, payload);
+    try pfs.fsyncChecked(fd);
+    _ = pfs.close(fd);
+    try std.testing.expectError(
+        error.ArtifactSpoolCleanupInjectedFailure,
+        spool.finishWithMode(.inject_failure_after_publish),
+    );
+
+    // The rolled-back bytes are gone from disk, so they must be gone from the
+    // gauge too - it reports what the last scan actually measured.
+    const after_rollback = sessionUsage(root);
+    try std.testing.expect(after_rollback.observed);
+    try std.testing.expectEqual(first.bytes, after_rollback.used_bytes);
+    try std.testing.expect(after_rollback.used_bytes < first.bytes + payload.len);
 }

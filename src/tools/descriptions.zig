@@ -203,7 +203,7 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
             \\- PowerShell examples: list all incl hidden → `Get-ChildItem -Force`; recursive by name → `Get-ChildItem -Recurse -Filter *.py`; set env var → `$env:FOO='bar'; echo $env:FOO`.
             \\- Windows safety: use one shell end-to-end (do not enumerate in PowerShell then pipe to cmd/batch for delete/move); prefer `Remove-Item`/`Move-Item -LiteralPath`; verify absolute target stays in workspace before any recursive delete/move; pass `Start-Process -WindowStyle Hidden` for background helpers.
             \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
-            \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact, which returns any byte range. "<channel>_path" is the on-disk capture: Read or Grep it directly, and prefer it when you want to search rather than page.{s}{s}
+            \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
         , .{ git_section, readonly_note });
     }
     return std.fmt.allocPrint(allocator,
@@ -218,7 +218,7 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\- If you _still_ need to run `grep`, STOP. ALWAYS USE ripgrep at `rg` first, which all MetaCode users have pre-installed.
         \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.
         \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
-        \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact, which returns any byte range. "<channel>_path" is the on-disk capture: Read or Grep it directly, and prefer it when you want to search rather than page.{s}{s}
+        \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
     , .{ git_section, readonly_note });
 }
 

@@ -419,31 +419,22 @@ pub fn hasRecoverableArtifact(content: []const u8) bool {
         bashChannelRecoverable(parsed.value.object, "stderr");
 }
 
-/// Whether one Bash channel still has a way back to the bytes it elided.
+/// Whether one Bash channel still has a way back to the bytes it elided: a
+/// published artifact, addressed by content.
 ///
-/// Two shapes, and the second is the one that matters most: a capture too
-/// large to publish has no artifact id and no digest to make a
-/// content-addressed promise about, so `<channel>_recoverable` is false - but
-/// the process spool on disk still holds every byte, and it is then the *only*
-/// handle there is. Reading just the artifact keys would let microcompact
-/// clear exactly the result whose bytes are least replaceable.
-///
-/// The published-artifact shape is unchanged; the spool shape is an added
-/// disjunct, gated on the channel having actually elided something.
-/// `<channel>_path` is present on every completed result, so without that gate
-/// a channel the model can already see in full would become unclearable -
-/// which is the whole point of the pass this guards.
+/// A spool-path disjunct was tried here, so that a capture too large to publish
+/// - no artifact id, nothing to make a content-addressed promise about - would
+/// still be protected by the file on disk. It was removed with the field it
+/// read: `doc/API.md`'s prompt-cache contract lists staging paths and random
+/// ids among the things that are never model-visible, and a JobRegistry spool
+/// path is both. Such a capture is genuinely unrecoverable, and
+/// `<channel>_storage_error` says so rather than implying otherwise.
 fn bashChannelRecoverable(object: std.json.ObjectMap, label: []const u8) bool {
     var key_buffer: [32]u8 = undefined;
-    const recoverable = object.get(channelKey(&key_buffer, label, "_recoverable"));
-    if (recoverable != null and recoverable.? == .bool and recoverable.?.bool) {
-        const id = object.get(channelKey(&key_buffer, label, "_artifact_id"));
-        if (id != null and id.? == .string and validArtifactId(id.?.string)) return true;
-    }
-    const truncated = object.get(channelKey(&key_buffer, label, "_truncated")) orelse return false;
-    if (truncated != .bool or !truncated.bool) return false;
-    const path = object.get(channelKey(&key_buffer, label, "_path")) orelse return false;
-    return path == .string and path.string.len > 0;
+    const recoverable = object.get(channelKey(&key_buffer, label, "_recoverable")) orelse return false;
+    if (recoverable != .bool or !recoverable.bool) return false;
+    const id = object.get(channelKey(&key_buffer, label, "_artifact_id")) orelse return false;
+    return id == .string and validArtifactId(id.string);
 }
 
 fn channelKey(buffer: []u8, label: []const u8, suffix: []const u8) []const u8 {
@@ -662,6 +653,161 @@ fn decodePreviewPart(allocator: std.mem.Allocator, value: ?std.json.Value, utf8:
         return null;
     };
     return out;
+}
+
+/// Shrink any structured tool result by trimming only its long string values.
+///
+/// The generic text truncation is the wrong tool for a JSON result: it leaves
+/// unparseable output and takes the short fields down with the long one - the
+/// exit code, the storage error, the ids and flags that are what make the
+/// result actionable in the first place. Those are never what makes a result
+/// oversized; one or two long strings are. So the object is re-emitted with
+/// its own key order, every short value verbatim, and only the long strings
+/// cut to a shared water line found by binary search.
+///
+/// Counters that describe a trimmed string are corrected as they are written.
+/// Both families that have them put the string before its counters
+/// (`stdout` before `stdout_truncated`, `preview_head` before
+/// `preview_head_bytes`), so a single pass in key order is enough - and a
+/// counter that still claimed the original length would be exactly the kind of
+/// quiet lie this whole change is about.
+pub fn shrinkStructuredResult(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    max_bytes: usize,
+) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    // Emitted size is monotone in the water line, so the largest one that fits
+    // is a binary search. `low` is always known-feasible once set.
+    var best: ?[]u8 = null;
+    errdefer if (best) |bytes| allocator.free(bytes);
+    var low: usize = 0;
+    var high: usize = max_bytes;
+    while (low <= high) {
+        const mid = low + (high - low) / 2;
+        const rendered = renderTrimmedObject(allocator, parsed.value.object, mid) catch break;
+        if (rendered.len <= max_bytes) {
+            if (best) |bytes| allocator.free(bytes);
+            best = rendered;
+            low = mid + 1;
+        } else {
+            allocator.free(rendered);
+            if (mid == 0) break;
+            high = mid - 1;
+        }
+    }
+    const out = best orelse return null;
+    if (out.len >= content.len) {
+        allocator.free(out);
+        return null;
+    }
+    return out;
+}
+
+/// Re-emit one JSON object, cutting every string longer than `water` to a
+/// head/tail around `PREVIEW_ELISION`. Key order is preserved because
+/// `std.json.ObjectMap` is an array hash map, which is what lets the counter
+/// correction below be a single pass.
+fn renderTrimmedObject(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    water: usize,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+
+    // What the pass has trimmed so far, so a counter naming it can be fixed.
+    var trimmed_head: ?usize = null;
+    var trimmed_tail: ?usize = null;
+    var trimmed_channel: ?[]const u8 = null;
+    var first = true;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        const key = entry.key_ptr.*;
+        try std.json.Stringify.encodeJsonString(key, .{}, writer);
+        try writer.writeByte(':');
+
+        const value = entry.value_ptr.*;
+        if (value == .string and value.string.len > water) {
+            const kept = try writeTrimmedString(writer, value.string, water);
+            if (std.mem.eql(u8, key, "preview_head")) trimmed_head = kept;
+            if (std.mem.eql(u8, key, "preview_tail")) trimmed_tail = kept;
+            if (std.mem.eql(u8, key, "stdout") or std.mem.eql(u8, key, "stderr")) trimmed_channel = key;
+            continue;
+        }
+        // A counter whose subject this pass just cut must describe the cut.
+        if (trimmed_head != null and std.mem.eql(u8, key, "preview_head_bytes")) {
+            try writer.print("{d}", .{trimmed_head.?});
+            continue;
+        }
+        if (trimmed_tail != null and std.mem.eql(u8, key, "preview_tail_bytes")) {
+            try writer.print("{d}", .{trimmed_tail.?});
+            continue;
+        }
+        if (trimmed_channel) |label| {
+            var key_buffer: [32]u8 = undefined;
+            if (std.mem.eql(u8, key, channelKey(&key_buffer, label, "_truncated"))) {
+                try writer.writeAll("true");
+                continue;
+            }
+        }
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    try writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+const PREVIEW_ELISION = "\n...[trimmed to fit context]...\n";
+
+/// Write `source` cut to roughly `water` source bytes as a head/tail pair, and
+/// return how many source bytes survived. Cuts land on a UTF-8 boundary, and
+/// on a multiple of four for an all-ASCII string so a base64 payload stays
+/// decodable.
+fn writeTrimmedString(writer: *std.Io.Writer, source: []const u8, water: usize) !usize {
+    if (water <= PREVIEW_ELISION.len) {
+        const head = alignedCut(source, @min(water, source.len));
+        try std.json.Stringify.encodeJsonString(source[0..head], .{}, writer);
+        return head;
+    }
+    const budget = water - PREVIEW_ELISION.len;
+    const head_len = alignedCut(source, budget * 3 / 4);
+    const want_tail = budget -| head_len;
+    const tail_start = source.len - alignedCut(source[head_len..], want_tail);
+    try writer.writeByte('"');
+    try writeJsonStringBody(writer, source[0..head_len]);
+    try writeJsonStringBody(writer, PREVIEW_ELISION);
+    try writeJsonStringBody(writer, source[tail_start..]);
+    try writer.writeByte('"');
+    return head_len + (source.len - tail_start);
+}
+
+/// `encodeJsonString` writes its own quotes; a three-part string has to share
+/// one pair, so the body is escaped directly.
+fn writeJsonStringBody(writer: *std.Io.Writer, bytes: []const u8) !void {
+    var scratch: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    try std.json.Stringify.encodeJsonString(bytes, .{}, &scratch.writer);
+    const quoted = scratch.written();
+    try writer.writeAll(quoted[1 .. quoted.len - 1]);
+}
+
+/// Longest prefix of `source` at most `desired` bytes that is safe to cut at:
+/// a UTF-8 boundary always, and a multiple of four when the string is all
+/// ASCII, so base64 keeps decoding to the same bytes.
+fn alignedCut(source: []const u8, desired: usize) usize {
+    const end = result_budget.floorUtf8Boundary(source, @min(desired, source.len));
+    if (end == source.len) return end;
+    for (source[0..end]) |byte| {
+        if (byte >= 0x80) return end;
+    }
+    return end - (end % 4);
 }
 
 /// Re-render a committed artifact envelope so the whole envelope fits
@@ -950,45 +1096,6 @@ test "recoverable artifact detection includes Bash channel envelopes" {
     const bash = "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_artifact_id\":\"" ++ id ++ "\",\"stdout_recoverable\":true}";
     try std.testing.expect(hasRecoverableArtifact(bash));
     try std.testing.expect(!hasRecoverableArtifact("{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_artifact_id\":null,\"stdout_recoverable\":false}"));
-}
-
-test "a capture too large to publish is protected by its spool path" {
-    // The completed Bash envelope hands back `<channel>_path` precisely
-    // because a capture past MAX_ARTIFACT_BYTES has no artifact id to promise
-    // against - the file on disk is all that is left. Keying the guard on the
-    // artifact fields alone let microcompact clear that result to a stub on
-    // the very next context-pressure pass, so the handle survived exactly one
-    // turn.
-    const unpublishable =
-        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"head...tail\"," ++
-        "\"stdout_captured_bytes\":200000000,\"stdout_capture_complete\":false," ++
-        "\"stdout_truncated\":true,\"stdout_artifact_id\":null,\"stdout_recoverable\":false," ++
-        "\"stdout_path\":\"/tmp/metacodes-job-abc/stdout\"," ++
-        "\"stdout_storage_error\":\"artifact_too_large\",\"exit_code\":0}";
-    try std.testing.expect(hasRecoverableArtifact(unpublishable));
-
-    // stderr instead of stdout is the same claim.
-    const stderr_only =
-        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_truncated\":false," ++
-        "\"stderr_truncated\":true,\"stderr_artifact_id\":null,\"stderr_recoverable\":false," ++
-        "\"stderr_path\":\"/tmp/metacodes-job-abc/stderr\",\"exit_code\":1}";
-    try std.testing.expect(hasRecoverableArtifact(stderr_only));
-
-    // A result the model can already see in full stays clearable: every
-    // completed envelope carries a path, so gating on it alone would make
-    // every Bash result permanent.
-    const whole =
-        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"all of it\"," ++
-        "\"stdout_truncated\":false,\"stdout_artifact_id\":null,\"stdout_recoverable\":true," ++
-        "\"stdout_path\":\"/tmp/metacodes-job-abc/stdout\"," ++
-        "\"stderr_truncated\":false,\"stderr_path\":\"/tmp/metacodes-job-abc/stderr\",\"exit_code\":0}";
-    try std.testing.expect(!hasRecoverableArtifact(whole));
-
-    // And an envelope with no handle at all makes no claim.
-    const nothing =
-        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_truncated\":true," ++
-        "\"stdout_artifact_id\":null,\"stdout_recoverable\":false,\"exit_code\":0}";
-    try std.testing.expect(!hasRecoverableArtifact(nothing));
 }
 
 test "missing store yields an explicit valid fallback envelope" {
@@ -1609,4 +1716,89 @@ test "shrinking converges and preserves an incomplete capture's flag" {
 
     // Converged: at the same limit there is nothing left to do.
     try std.testing.expect(shrinkRecoverableEnvelope(allocator, first, limit) == null);
+}
+
+test "a structured result keeps its short fields and stays parseable when trimmed" {
+    // What the generic text truncation destroyed: a bash envelope's exit code
+    // and storage reason, the flags, the ids - none of which is ever what made
+    // the result oversized. Only the one long string is.
+    const allocator = std.testing.allocator;
+    const filler = try allocator.alloc(u8, 40 * 1024);
+    defer allocator.free(filler);
+    @memset(filler, 'o');
+    filler[0] = 'H';
+    filler[filler.len - 1] = 'T';
+    const bash = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"{s}\"," ++
+            "\"stdout_encoding\":\"utf-8\",\"stdout_captured_bytes\":{d},\"stdout_truncated\":false," ++
+            "\"stdout_artifact_id\":null,\"stdout_recoverable\":true," ++
+            "\"stdout_storage_error\":\"artifact_store_unavailable\",\"exit_code\":42}}",
+        .{ filler, filler.len },
+    );
+    defer allocator.free(bash);
+
+    const limit = bash.len / 4;
+    const shrunk = shrinkStructuredResult(allocator, bash, limit) orelse return error.ShrinkRefused;
+    defer allocator.free(shrunk);
+    try std.testing.expect(shrunk.len <= limit);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    // Still JSON, and every short field survived byte for byte.
+    try std.testing.expectEqual(@as(i64, 42), obj.get("exit_code").?.integer);
+    try std.testing.expectEqualStrings("artifact_store_unavailable", obj.get("stdout_storage_error").?.string);
+    try std.testing.expectEqualStrings("metacodes.bash-result.v2", obj.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("utf-8", obj.get("stdout_encoding").?.string);
+    try std.testing.expect(obj.get("stdout_recoverable").?.bool);
+    try std.testing.expectEqual(@as(i64, @intCast(filler.len)), obj.get("stdout_captured_bytes").?.integer);
+    // The long one was cut, head and tail kept, and the flag that describes it
+    // was corrected rather than left claiming the original was intact.
+    const out = obj.get("stdout").?.string;
+    try std.testing.expect(out.len < filler.len);
+    try std.testing.expect(std.mem.startsWith(u8, out, "H"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "T"));
+    try std.testing.expect(obj.get("stdout_truncated").?.bool);
+}
+
+test "trimming a fallback envelope corrects the counters it invalidates" {
+    // A non-recoverable fallback envelope has no artifact to re-render from,
+    // so it goes through the generic string trim - and its preview counters
+    // have to follow the strings they describe.
+    const allocator = std.testing.allocator;
+    const body = try allocator.alloc(u8, 30 * 1024);
+    defer allocator.free(body);
+    @memset(body, 'f');
+    const content: []const u8 = try renderFallbackEnvelope(allocator, "text/plain; charset=utf-8", body, 24 * 1024, "artifact_store_unavailable");
+    defer allocator.free(@constCast(content));
+    try std.testing.expect(isProjectionEnvelope(content));
+    try std.testing.expect(!isRecoverableEnvelope(content));
+
+    var before = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer before.deinit();
+    const before_head = before.value.object.get("preview_head_bytes").?.integer;
+
+    const shrunk = shrinkStructuredResult(allocator, content, content.len / 3) orelse
+        return error.ShrinkRefused;
+    defer allocator.free(shrunk);
+    var after = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+    defer after.deinit();
+    const obj = after.value.object;
+    // Identity and reason survive; the counter matches the string it names.
+    try std.testing.expectEqualStrings("artifact_store_unavailable", obj.get("storage_error").?.string);
+    try std.testing.expect(!obj.get("recoverable").?.bool);
+    try std.testing.expectEqualStrings(
+        before.value.object.get("sha256").?.string,
+        obj.get("sha256").?.string,
+    );
+    // `preview_head_bytes` counts the *original* bytes the field still shows,
+    // so once the field is a head/tail pair it excludes the elision marker.
+    const head = obj.get("preview_head").?.string;
+    try std.testing.expect(head.len < @as(usize, @intCast(before_head)));
+    try std.testing.expect(std.mem.indexOf(u8, head, PREVIEW_ELISION) != null);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(head.len - PREVIEW_ELISION.len)),
+        obj.get("preview_head_bytes").?.integer,
+    );
 }

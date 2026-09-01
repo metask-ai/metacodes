@@ -1276,8 +1276,10 @@ pub fn run(
             .artifact_root = opts.artifact_root,
             // Mirrors base_ctx: Bash bounds its own channels against this, so a
             // prefetched Bash result must be sized by the same window as a
-            // committed one or the two paths render differently.
-            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokens()),
+            // committed one or the two paths render differently. Resolved
+            // against `model_override`, because a subagent shares its parent's
+            // Provider and differs from it only by that field.
+            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
             .tool_result_metrics = opts.tool_result_metrics,
             .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
@@ -2230,8 +2232,10 @@ pub fn run(
             .artifact_root = opts.artifact_root,
             // The same value the projection pass below uses. Deriving it here
             // is what lets a tool bound its own output against the real window
-            // instead of against the floor the budget can never go under.
-            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokens()),
+            // instead of against the floor the budget can never go under - and
+            // against the window of the model this run will actually name, not
+            // the parent's.
+            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
             .tool_result_metrics = opts.tool_result_metrics,
             .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
@@ -2412,7 +2416,7 @@ pub fn run(
             }
             const suspended_projection_stats = try result_projection.project(allocator, suspended_items, .{
                 .session_root = opts.artifact_root,
-                .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokens()),
+                .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
             });
             if (opts.tool_result_metrics) |metrics| metrics.recordProjection(suspended_projection_stats);
             // result_blocks 这轮不提交(挂起不落 partial user 消息);释放已 append 的(本应为空)。
@@ -2537,7 +2541,7 @@ pub fn run(
         }
         const projection_stats = try result_projection.project(allocator, projection_items, .{
             .session_root = opts.artifact_root,
-            .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokens()),
+            .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
         });
         if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
         if (projection_stats.changed() or projection_stats.budget_exhausted) {
@@ -3279,7 +3283,7 @@ fn runAutoCompactIfNeeded(
     var outcome: AutoCompactOutcome = .not_needed;
 
     var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-    var pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+    var pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
     emitContextWarningIfNeeded(backend, sess, pressure, context_warning_emitted);
     // 正常:auto=max(formula, 32K floor);micro=其下一档。强制旋钮(仅测试/power-user)存在时,
     // auto/micro 一起钉到强制值——让短对话也能触发真实 summary 压缩+投影。一次 getenv,不在热路径重复读。
@@ -3299,14 +3303,14 @@ fn runAutoCompactIfNeeded(
         // projection uses, so the `truncated=` field of the line below stops
         // being structurally zero.
         reduced.merge(conversation.truncateLargeToolResults(
-            conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
+            conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
         ));
         if (reduced.changed()) {
             outcome = .compacted;
             log.info("agent", "microcompact: cleared={d} truncated={d} old tool_results bytes={d}->{d} keep_recent_results={d} threshold={d} cause={s}", .{ reduced.cleared, reduced.truncated, reduced.bytes_before, reduced.bytes_after, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP, micro_threshold, trigger_cause });
             emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
             request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
         }
     }
 
@@ -3469,7 +3473,7 @@ fn runAutoCompactIfNeeded(
                 } });
                 outcome = .compacted;
                 request_tokens_before = report.after_tokens;
-                pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+                pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
             },
         }
     }
@@ -3483,13 +3487,13 @@ fn runAutoCompactIfNeeded(
         // single unbounded surviving result is the difference between
         // recovering and returning api_error.
         reduced.merge(conversation.truncateLargeToolResults(
-            conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
+            conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
         ));
         if (reduced.changed()) {
             outcome = .compacted;
             const before_block_tokens = request_tokens_before;
             request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
             log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
             // This is the same lossy operation as the earlier stale-result
             // pressure valve.  Keep the mechanism kind stable; the trigger
@@ -5134,7 +5138,10 @@ test "auto-compact 阈值用 input context window 而非 output max_tokens(防�
     // 压缩、丢掉原始问题。修复:改用 input context window(~200K)扣 output reserve 后的 CC/Rust 阈值。
     // 源级守卫:阈值算式必须调 resolveMaxInputTokens(而非 output 的解析器),且 MIN 不再是早期小值。
     const src = @embedFile("agent_loop.zig");
-    try std.testing.expect(std.mem.indexOf(u8, src, "ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens()") != null);
+    // 仍守"用 input window 而非 output max_tokens",但两者现在都按本次请求真正
+    // 会用的模型解析:subagent 与父共享 Provider,只靠 model_override 区分,拿父
+    // 窗口给子算阈值就是把 200K 的历史发给 32K 端点。
+    try std.testing.expect(std.mem.indexOf(u8, src, "ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override)") != null);
     // 全额输出预留(服务端校验 in+max_tokens ≤ window):200K-32K-13K = 155K。
     try std.testing.expectEqual(@as(usize, 155_000), context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 0).auto_compact_threshold);
     try std.testing.expect(MIN_AUTO_COMPACT_THRESHOLD >= 32_000);
@@ -5155,7 +5162,7 @@ test "微压缩两趟都接线:clear 与 truncate 必须同时在生产路径上
         cursor = at + 1;
         // 同一条语句里必须紧跟着按 provider 窗口派生的预算,不能各自造常量。
         const tail = src[at..@min(src.len, at + 240)];
-        if (std.mem.indexOf(u8, tail, "toolResultContextBytes(provider.maxInputTokens())") != null) count += 1;
+        if (std.mem.indexOf(u8, tail, "toolResultContextBytes(provider.maxInputTokensFor(model_override))") != null) count += 1;
     }
     // 一处在 micro 阈值带,一处在 blocking-limit 恢复。
     try std.testing.expectEqual(@as(usize, 2), count);

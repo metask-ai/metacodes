@@ -277,7 +277,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "BashOutput",
-        .description = "Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks (from stdout_path/stderr_path files) plus status (running|exited|killed). Use stdout_since_byte/stderr_since_byte for incremental reads (pass previous stdout_total_bytes). max_bytes caps a single read (default 64KB, maximum 256KB). NOTE: if the command used shell redirection (>/>>/2>), the redirected output goes to the user-specified file, NOT stdout_path — Read that file directly. For long-running jobs, prefer Read on stdout_path (every Bash result carries stdout_path/stderr_path, whether it completed or auto-backgrounded) over polling BashOutput.",
+        .description = "Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks (from stdout_path/stderr_path files) plus status (running|exited|killed). Use stdout_since_byte/stderr_since_byte for incremental reads (pass previous stdout_total_bytes). max_bytes caps a single read (default 64KB, maximum 256KB). NOTE: if the command used shell redirection (>/>>/2>), the redirected output goes to the user-specified file, NOT stdout_path — Read that file directly. For long-running jobs, prefer Read on stdout_path (returned when the job auto-backgrounded) over polling BashOutput.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to read" },
             .{ .name = "stdout", .type = "boolean", .description = "Include stdout (default true)" },
@@ -295,7 +295,7 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "artifact_id", .type = "string", .description = "Content-addressed id in sha256:<64 lowercase hex> form" },
             .{ .name = "offset", .type = "integer", .description = "Zero-based byte offset (default 0)" },
-            .{ .name = "limit", .type = "integer", .description = "Maximum bytes to return (default 16384, maximum 32768)" },
+            .{ .name = "limit", .type = "integer", .description = "Maximum bytes to return. Omit it to get as much as the context budget allows; an explicit value is capped at 32768 and may still be reduced to fit that budget. Either way next_offset carries whatever did not fit" },
         }, .required = &.{"artifact_id"} },
         .execute = .{ .legacy_inline = read_artifact_tool.execute },
         .replay = .read_only,

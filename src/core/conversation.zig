@@ -767,12 +767,20 @@ fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
 ///
 /// Returns null when the result must be left as it is.
 fn boundToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ?[]u8 {
+    // A recoverable artifact envelope is re-rendered by the layer that owns its
+    // shape, which knows how to recompute every counter exactly.
     if (result_projection.shrinkRecoverableEnvelope(allocator, content, max_bytes)) |shrunk|
         return shrunk;
-    // Known residual: a `metacodes.bash-result.v2` envelope has no shrink
-    // path, so an oversized one (only reachable when the session moved to a
-    // smaller context window than the one it was captured under) stays whole.
-    // Leaving it oversized costs a request; mangling it costs the output.
+    // Anything else structured - `metacodes.bash-result.v2`, a non-recoverable
+    // fallback envelope, any tool's large JSON - keeps its shape by trimming
+    // only its long string values. The text path below would leave
+    // unparseable output and take `exit_code`, `storage_error` and every id
+    // and flag down with the one long string that made the result oversized.
+    if (result_projection.shrinkStructuredResult(allocator, content, max_bytes)) |shrunk|
+        return shrunk;
+    // Structured but unshrinkable, and carrying the only handle back to its
+    // bytes: leaving it oversized costs a request, mangling it costs the
+    // output.
     if (result_projection.hasRecoverableArtifact(content)) return null;
     return truncateToolResultContent(allocator, content, max_bytes) catch null;
 }

@@ -308,8 +308,16 @@ artifact 的结果(那是被省略字节的唯一取回途径),`truncateLargeToo
 sha256 / read 指令一起没,而且下一轮 clear 因为再也看不到 recoverable artifact,会把残骸
 清成 stub。因此该趟先走 `result_projection.shrinkRecoverableEnvelope`:由拥有信封形状的
 那一层原地重渲染 preview(不碰 store,head/tail 从信封自带的 preview 里重切),身份字段
-一个不动、记账数字跟着重算;这一层重写不了的(如 `metacodes.bash-result.v2`,只有会话
-换到更小窗口时才可能超限)宁可留着超限也不切坏——留着多花一次请求,切坏是输出真没了。
+一个不动、记账数字跟着重算;其余结构化结果(`metacodes.bash-result.v2`、不可恢复的
+fallback 信封、任意工具的大 JSON)走通用的**只裁长字符串**:短字段(exit_code、
+storage_error、各种 id 与 flag)从来不是超限的原因,却是结果可用的全部依据,必须原样留下;
+描述被裁字符串的计数器(`<ch>_truncated`、`preview_*_bytes`)在写出时一并改对,否则就是
+另一种"悄悄撒谎"。只有连裁都裁不动的才宁可留着超限——留着多花一次请求,切坏是输出真没了。
+
+**预算按真正会被请求的模型解析**:subagent 与父**共享 Provider**,只靠 `model_override`
+区分。`Provider.maxInputTokensFor(model_override)` / `maxTokensFor` 因此成为所有窗口派生量
+(per-result 预算、turn 预算、auto-compact 阈值)的唯一入口;答不了 per-model 的 provider
+回退到自身窗口(即历史行为)。拿父窗口给子算,就是把 200K 的历史发给 32K 端点。
 
 **恢复面的两个原语**:`ReadArtifact` 只能取字节区间,恢复一个 N 字节结果要
 O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。`Grep` 因此接受
