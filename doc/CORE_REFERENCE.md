@@ -328,9 +328,15 @@ random id,所以后台命令跨 run 仍不逐字节一致。它不能简单换�
 路径把暴露面收窄到每条后台命令一个短不透明 token,并且不再泄露宿主临时目录,但没有做完。
 
 **预算按真正会被请求的模型解析**:subagent 与父**共享 Provider**,只靠 `model_override`
-区分。`Provider.maxInputTokensFor(model_override)` / `maxTokensFor` 因此成为所有窗口派生量
-(per-result 预算、turn 预算、auto-compact 阈值)的唯一入口;答不了 per-model 的 provider
-回退到自身窗口(即历史行为)。拿父窗口给子算,就是把 200K 的历史发给 32K 端点。
+区分。`Provider.maxInputTokensFor(model_override)` / `maxTokensFor` 因此成为**所有**窗口/输出
+派生量的唯一入口——per-result 预算、turn 预算、auto-compact 阈值、请求估算体、request gate
+的准入、agentcore 的预算预留,一处都不能落。答不了 per-model 的 provider 回退到自身窗口
+(即历史行为)。拿父窗口给子算,就是把 200K 的历史发给 32K 端点。
+
+这条规则最容易漏在"同一个字面量里 model 用了 override、maxTokens 没用"——`serializeForEstimation`、
+request gate、`canonicalRequestBytes` 三处都这么漏过。`agent_loop.zig` 里有一条守卫测试直接
+钉住规则本身:生产函数中不得出现无参的 `provider.maxTokens()` / `maxInputTokens()`(判断
+每次出现前最近的顶层声明是 `test` 还是 `fn`,因为测试块在该文件里是穿插的)。
 
 **恢复面的两个原语**:`ReadArtifact` 只能取字节区间,恢复一个 N 字节结果要
 O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。`Grep` 因此接受

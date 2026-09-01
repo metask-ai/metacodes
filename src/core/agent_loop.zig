@@ -1309,7 +1309,10 @@ pub fn run(
                 ) catch std.math.maxInt(u64);
                 if (!gate.allowsRequest(.{
                     .max_input_tokens = max_input_tokens,
-                    .max_output_tokens = provider.maxTokens(),
+                    // Resolved through the override like the estimate above it:
+                    // an admission decision made against the parent's output cap
+                    // admits or refuses a child request on the wrong number.
+                    .max_output_tokens = provider.maxTokensFor(opts.model_override),
                 }))
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
             }
@@ -3014,7 +3017,10 @@ fn serializeForEstimation(
     );
     const body = try json_mod.serializeMessagesRequest(.{
         .model = model_override orelse provider.model(),
-        .max_tokens = provider.maxTokens(),
+        // Same override as the line above. The two describe one request, and
+        // reading them from different models is how an estimate drifts from
+        // what is actually sent.
+        .max_tokens = provider.maxTokensFor(model_override),
         .messages = effective,
         .system = system_prompt,
         .stream = true,
@@ -5330,4 +5336,99 @@ test "usage-anchor 热路径:Read 图像 tool_result 增量按 IMAGE_TOKEN_ESTIM
     const total = estimateMessageTokens(m);
     try std.testing.expect(total >= conversation_mod.IMAGE_TOKEN_ESTIMATE);
     try std.testing.expect(total < 50_000);
+}
+
+test "生产代码不得用无参的 maxTokens()/maxInputTokens()" {
+    // 这条守卫直接编码规则本身,而不是它的某一个实例。
+    //
+    // 三轮 review 下来同一个形状反复出现:规则被断言,然后只在眼前那一处应用。
+    // `maxTokensFor` 加进来之后,`serializeForEstimation` 里 `.model` 用了
+    // override 而同一个字面量的 `.max_tokens` 没用;request gate 的
+    // `max_output_tokens` 也没用;agentcore 的 `canonicalRequestBytes` 同样。
+    // 每一处都是"model 记得,maxTokens 忘了"。
+    //
+    // subagent 与父共享 Provider,只靠 model_override 区分,所以生产路径上任何
+    // 无参变体都是在问错模型。测试区不受限:那里 provider 就是唯一的模型。
+    // 测试块在本文件里是**穿插**的(第一个在文件很靠前处),所以不能用"第一个
+    // test 之后都是测试"来切——那个假设本身就是同一类错误。改判每次出现之前
+    // 最近的顶层声明是 `test` 还是 `fn`。
+    const src = @embedFile("agent_loop.zig");
+    for ([_][]const u8{ "provider.maxTokens()", "provider.maxInputTokens()" }) |needle| {
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, src, cursor, needle)) |at| {
+            cursor = at + needle.len;
+            const before = src[0..at];
+            const in_test = std.mem.lastIndexOf(u8, before, "\ntest \"") orelse 0;
+            const in_fn = @max(
+                std.mem.lastIndexOf(u8, before, "\nfn ") orelse 0,
+                std.mem.lastIndexOf(u8, before, "\npub fn ") orelse 0,
+            );
+            // 最近的顶层声明必须是 test;否则就是生产路径在问错模型。
+            try std.testing.expect(in_test > in_fn);
+        }
+    }
+    // 且 For 变体确实被用上了(否则上面可以靠删掉调用来通过)。
+    try std.testing.expect(std.mem.indexOf(u8, src, "maxInputTokensFor(opts.model_override)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "maxTokensFor(model_override)") != null);
+}
+
+test "估算随 model_override 变化,而不是只换个模型名" {
+    // `serializeForEstimation` 的 `.model` 一直读 override,`.max_tokens` 读的却
+    // 是 provider 自己的——同一个请求体,两个模型。子模型输出上限更小时,估算
+    // 出的请求与真正发出的请求就不是同一个。
+    const a = std.testing.allocator;
+    const Fake = struct {
+        fn model(_: *anyopaque) []const u8 {
+            return "parent";
+        }
+        fn maxTokens(_: *anyopaque) u32 {
+            return 32_000;
+        }
+        fn maxInputTokens(_: *anyopaque) u32 {
+            return 200_000;
+        }
+        fn maxTokensForModel(_: *anyopaque, name: []const u8) u32 {
+            return if (std.mem.eql(u8, name, "child")) 1_024 else 32_000;
+        }
+        fn maxInputTokensFor(_: *anyopaque, _: []const u8) u32 {
+            return 200_000;
+        }
+        fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+            return false;
+        }
+        fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+            return null;
+        }
+    };
+    var ctx: u8 = 0;
+    const provider = provider_mod.Provider{
+        .ctx = &ctx,
+        .modelFn = Fake.model,
+        .sendStreamFn = undefined,
+        .sendStreamRetryFn = undefined,
+        .sendFn = undefined,
+        .maxTokensFn = Fake.maxTokens,
+        .maxInputTokensFn = Fake.maxInputTokens,
+        .maxTokensForFn = Fake.maxTokensForModel,
+        .maxInputTokensForFn = Fake.maxInputTokensFor,
+        .reasoningEffortFn = Fake.reasoningEffort,
+        .supportsFn = Fake.supports,
+    };
+
+    const messages = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hello" }} },
+    };
+
+    // 直接看序列化出来的请求体:估算的 token 数按字节除以 4,32000→1024 只差
+    // 一个字符,除完可能相等,断言不到点上。
+    const parent = try serializeForEstimation(a, provider, &messages, null, &.{}, null);
+    defer a.free(parent.body);
+    try std.testing.expect(std.mem.indexOf(u8, parent.body, "\"model\":\"parent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.body, "\"max_tokens\":32000") != null);
+
+    const child = try serializeForEstimation(a, provider, &messages, null, &.{}, "child");
+    defer a.free(child.body);
+    // 模型换了,输出上限必须跟着换——同一个请求体不能描述两个模型。
+    try std.testing.expect(std.mem.indexOf(u8, child.body, "\"model\":\"child\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, child.body, "\"max_tokens\":1024") != null);
 }
