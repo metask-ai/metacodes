@@ -395,7 +395,11 @@ test "二进制通道走 base64,结果仍是合法 UTF-8 JSON" {
     const a = std.testing.allocator;
     var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer registry.deinit();
-    const j = try registry.spawnBackground("printf 'A\\xffB\\xfe'", null);
+    // 八进制而非 `\xff`:job 走 `/bin/sh -c`,Linux 上那是 dash,它的 printf 不认
+    // 十六进制转义,会原样吐出字面量 `A\xffB\xfe`——纯 ASCII,于是通道被判成 utf-8
+    // 而不是 base64,断言在 Linux 上失败而在 macOS(/bin/sh 即 bash)上通过。
+    // `\ddd` 是 POSIX printf 的八进制转义,dash 与 bash 都实现。
+    const j = try registry.spawnBackground("printf 'A\\377B\\376'", null);
     while (registry.get(j.idSlice())) |e| {
         if (e.status != .running) break;
         time.sleepMs(20);
