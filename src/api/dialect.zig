@@ -389,28 +389,75 @@ pub const Dialect = struct {
 /// 原生图像块;不支持图像输入的模型发短占位文本,**绝不**把含 MB 级 base64 的
 /// 原始 JSON 当纯文本发给模型。
 ///
-/// 只认**规范形态**,逐段匹配而非按字段名搜索:
-/// `{"type":"image","media_type":"<白名单 MIME>","data":"<标准 base64>"}`,
-/// 前后允许空白,对象在 data 之后立即结束。任何偏离(未知 MIME、非 base64、
-/// 嵌套/尾随字段、超过 types.MAX_IMAGE_BASE64_BYTES)都返回 null——那样的载荷
-/// 没有任何 provider 收得下,当普通文本走投影/截断才是有界的。
+/// 只认**规范形态**,做结构化解析而非按字段名搜索:恰好一个 JSON 对象,键恰好是
+/// `type`(值 "image")、`media_type`(白名单 MIME)、`data`(标准 base64,≤
+/// types.MAX_IMAGE_BASE64_BYTES),各出现一次、顺序不限、允许标准 JSON 空白,无其它键、
+/// 无转义、对象之后只允许空白。整条内容先按 types.MAX_IMAGE_RESULT_BYTES 封顶,外围
+/// 空白因此有界。任何偏离都返回 null——那样的载荷没有任何 provider 收得下,当普通
+/// 文本走投影/截断才是有界的。
 pub fn extractImageResult(content: []const u8) ?types.ImageBlock {
-    const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    const prefix = "{\"type\":\"image\",\"media_type\":\"";
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
-    var rest = trimmed[prefix.len..];
-    const mt_end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-    const mt = rest[0..mt_end];
-    if (!types.isSupportedImageMediaType(mt)) return null;
-    rest = rest[mt_end..];
-    const data_key = "\",\"data\":\"";
-    if (!std.mem.startsWith(u8, rest, data_key)) return null;
-    rest = rest[data_key.len..];
-    const data_end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-    const data = rest[0..data_end];
-    if (data.len > types.MAX_IMAGE_BASE64_BYTES or !types.isStandardBase64(data)) return null;
-    if (!std.mem.eql(u8, rest[data_end..], "\"}")) return null;
-    return .{ .media_type = mt, .data = data };
+    if (content.len > types.MAX_IMAGE_RESULT_BYTES) return null;
+    var p = skipJsonWhitespace(content, 0);
+    if (p >= content.len or content[p] != '{') return null;
+    p += 1;
+    var type_seen = false;
+    var media_type: ?[]const u8 = null;
+    var data: ?[]const u8 = null;
+    while (true) {
+        p = skipJsonWhitespace(content, p);
+        const key = readPlainJsonString(content, &p) orelse return null;
+        p = skipJsonWhitespace(content, p);
+        if (p >= content.len or content[p] != ':') return null;
+        p += 1;
+        p = skipJsonWhitespace(content, p);
+        const value = readPlainJsonString(content, &p) orelse return null;
+        if (std.mem.eql(u8, key, "type")) {
+            if (type_seen or !std.mem.eql(u8, value, "image")) return null;
+            type_seen = true;
+        } else if (std.mem.eql(u8, key, "media_type")) {
+            if (media_type != null or !types.isSupportedImageMediaType(value)) return null;
+            media_type = value;
+        } else if (std.mem.eql(u8, key, "data")) {
+            if (data != null or value.len > types.MAX_IMAGE_BASE64_BYTES or !types.isStandardBase64(value)) return null;
+            data = value;
+        } else return null;
+        p = skipJsonWhitespace(content, p);
+        if (p >= content.len) return null;
+        if (content[p] == ',') {
+            p += 1;
+            continue;
+        }
+        if (content[p] == '}') {
+            p += 1;
+            break;
+        }
+        return null;
+    }
+    if (skipJsonWhitespace(content, p) != content.len) return null;
+    if (!type_seen) return null;
+    return .{ .media_type = media_type orelse return null, .data = data orelse return null };
+}
+
+fn skipJsonWhitespace(s: []const u8, start: usize) usize {
+    var i = start;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\n' or s[i] == '\r')) : (i += 1) {}
+    return i;
+}
+
+/// 无转义的 JSON 字符串字面量(规范图像结果的键与三个值都不含转义);成功时 `p`
+/// 移到闭引号之后,返回借用切片。含 `\\` 或控制字符 → null。
+fn readPlainJsonString(s: []const u8, p: *usize) ?[]const u8 {
+    if (p.* >= s.len or s[p.*] != '"') return null;
+    const start = p.* + 1;
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '"') {
+            p.* = i + 1;
+            return s[start..i];
+        }
+        if (s[i] == '\\' or s[i] < 0x20) return null;
+    }
+    return null;
 }
 
 /// tool_result 图像在不支持图像输入的模型上的显式占位文本(绝不发 base64 原文)。
@@ -954,29 +1001,43 @@ test "extractImageResult: 命中 Read 图像形态,忽略普通文本/JSON" {
     try std.testing.expectEqualStrings("AA==", padded.data);
 }
 
-test "extractImageResult: 只认规范形态——非白名单 MIME / 非 base64 / 尾随或嵌套字段 / 超限都不是图像" {
+test "extractImageResult: 结构化——顺序/空白不限,但键集合、类型、MIME、base64、尺寸全部严格" {
+    const a = std.testing.allocator;
+    // 顺序无关 + 标准 JSON 空白:插件/适配器用普通序列化器产出的形态也算图像。
+    const reordered = extractImageResult("{ \"data\" : \"AAAA\" ,\n \"media_type\": \"image/png\",\t\"type\":\"image\" }").?;
+    try std.testing.expectEqualStrings("image/png", reordered.media_type);
+    try std.testing.expectEqualStrings("AAAA", reordered.data);
     // 非白名单 MIME:方言层发出去 provider 会拒收,当文本走投影才有界。
     try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/svg+xml\",\"data\":\"AAAA\"}") == null);
-    // 非标准 base64。
+    // 非标准 base64 / 空载荷。
     try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"not base64!!\"}") == null);
     try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"\"}") == null);
-    // 尾随字段:一个插件把 500 KiB 别的东西挂在 data 后面,不能靠前缀混过豁免。
+    // 多余键 / 重复键 / 缺键 / 嵌套:一个插件把别的东西挂在对象里,不能混过豁免。
     try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\",\"extra\":\"x\"}") == null);
-    // 字段顺序/嵌套:按字段名搜索会命中,逐段匹配不会。
-    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"data\":\"AAAA\",\"media_type\":\"image/png\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\",\"data\":\"BBBB\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"data\":\"AAAA\"}") == null);
     try std.testing.expect(extractImageResult("{\"type\":\"image\",\"meta\":{\"media_type\":\"image/png\",\"data\":\"AAAA\"}}") == null);
-    // 超过任何 provider 都收不下的尺寸:不是图像。
-    const a = std.testing.allocator;
+    // type 必须是 image;值里不允许转义;对象后只允许空白。
+    try std.testing.expect(extractImageResult("{\"type\":\"picture\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image\\/png\",\"data\":\"AAAA\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\"} x") == null);
+    // 超过任何 provider 都收不下的载荷:不是图像;正好在上限内仍是。
     const oversized = try a.alloc(u8, types.MAX_IMAGE_BASE64_BYTES + 4);
     defer a.free(oversized);
     @memset(oversized, 'A');
     const huge = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{oversized});
     defer a.free(huge);
     try std.testing.expect(extractImageResult(huge) == null);
-    // 正好在上限内的规范形态仍是图像。
     const at_limit = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{oversized[0..types.MAX_IMAGE_BASE64_BYTES]});
     defer a.free(at_limit);
     try std.testing.expect(extractImageResult(at_limit) != null);
+    // 外围空白有界:一张小图裹在超过 MAX_IMAGE_RESULT_BYTES 的空白里不是图像。
+    const padded = try a.alloc(u8, types.MAX_IMAGE_RESULT_BYTES + 1);
+    defer a.free(padded);
+    @memset(padded, ' ');
+    const tiny = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AA==\"}";
+    @memcpy(padded[0..tiny.len], tiny);
+    try std.testing.expect(extractImageResult(padded) == null);
 }
 
 test "appendImageOmittedPlaceholder: 纯文本占位含 MIME,不含 base64" {

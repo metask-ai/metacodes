@@ -544,6 +544,7 @@ pub const Conversation = struct {
         const boundary = total - keep_recent_n; // [0, boundary) 是"老"消息
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
+        const undelivered = self.undeliveredSuffixStartLocked();
 
         var cleared: usize = 0;
         var mi: usize = 0;
@@ -554,6 +555,7 @@ pub const Conversation = struct {
                     .tool_result => |tr| {
                         // 已是 stub 的不重复清(幂等)。
                         if (isClearedToolResultProjection(tr.content)) continue;
+                        if (mi >= undelivered and result_projection.isImageResult(tr.content)) continue;
                         if (self.clearToolResultAt(m, bi) == null) continue;
                         self.noteShrinkAtLocked(mi);
                         cleared += 1;
@@ -575,6 +577,7 @@ pub const Conversation = struct {
         defer _ = self.snapshot_mutex.unlock();
         var out = ToolResultReduction{};
         var seen_recent: usize = 0;
+        const undelivered = self.undeliveredSuffixStartLocked();
         var mi = self.messages.items.len;
         while (mi > 0) {
             mi -= 1;
@@ -588,6 +591,7 @@ pub const Conversation = struct {
                 if (seen_recent <= keep_recent_results) continue;
                 const tr = b.tool_result;
                 if (isClearedToolResultProjection(tr.content)) continue;
+                if (mi >= undelivered and result_projection.isImageResult(tr.content)) continue;
                 const before = tr.content.len;
                 const after = self.clearToolResultAt(m, bi) orelse continue;
                 self.noteShrinkAtLocked(mi);
@@ -615,6 +619,9 @@ pub const Conversation = struct {
                 const tr = b.tool_result;
                 if (tr.content.len <= max_bytes) continue;
                 if (isCommittedToolResultProjection(tr.content)) continue;
+                // A truncated base64 payload is neither an image nor useful
+                // text; images are charged at IMAGE_TOKEN_ESTIMATE anyway.
+                if (result_projection.isImageResult(tr.content)) continue;
                 const before = tr.content.len;
                 const new_content = truncateToolResultContent(self.allocator, tr.content, max_bytes) catch continue;
                 self.allocator.free(@constCast(tr.content));
@@ -633,19 +640,30 @@ pub const Conversation = struct {
         return out;
     }
 
+    /// First message index of the not-yet-delivered suffix: everything after
+    /// the last assistant message has never been part of a provider request.
+    /// Image results in that suffix are protected from microcompact: a picture
+    /// is a raw payload here rather than a recoverable envelope (projection
+    /// exempts it), the recent-N valve counts results rather than turns, so a
+    /// Read(image) with two parallel siblings would otherwise be cleared before
+    /// the provider ever saw it. Delivered images clear like any other result,
+    /// so the valve keeps working on image-heavy history. Text results in the
+    /// suffix keep their historical behaviour (see doc/CORE_REFERENCE.md).
+    fn undeliveredSuffixStartLocked(self: *const Conversation) usize {
+        var i = self.messages.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.messages.items[i].role == .assistant) return i + 1;
+        }
+        return 0;
+    }
+
     fn clearToolResultAt(self: *Conversation, m: msg.Message, bi: usize) ?usize {
         const tr = m.blocks[bi].tool_result;
         // Artifact envelopes are already compact and are the only recovery
         // capability for the omitted bytes. Microcompact must not erase that
         // capability merely because the result became old.
         if (result_projection.hasRecoverableArtifact(tr.content)) return null;
-        // Image results are exempt from projection, so a large picture is a
-        // raw payload here rather than a recoverable envelope. It costs the
-        // context only IMAGE_TOKEN_ESTIMATE regardless of its byte size, and
-        // the recent-N valve counts results, not turns: a Read(image) with two
-        // parallel siblings would otherwise be cleared before the provider
-        // ever saw it. Full compact (summary) still retires it later.
-        if (result_projection.isImageResult(tr.content)) return null;
         const new_content = if (toolResultCommitmentLine(tr.content)) |commitment|
             std.fmt.allocPrint(
                 self.allocator,

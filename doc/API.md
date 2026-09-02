@@ -143,12 +143,21 @@ base64 JSON through as tool-result text. Only the canonical shape counts as
 an image (`dialect.extractImageResult`): exactly that field order, a media
 type from `types.SUPPORTED_IMAGE_MEDIA_TYPES` (`image/png`, `image/jpeg`,
 `image/gif`, `image/webp`), standard base64 of at most `types.MAX_IMAGE_BYTES`
-of payload, and nothing after `data`. Anything else is ordinary text and is
-bounded by the tool-result projection like any other result. A canonical
-image result is exempt from that projection, from microcompact clearing, and
-from the AgentCore `tool_result_cap_bytes` artifact promotion, so the picture
-itself reaches the provider; it is charged against context and payload
-budgets at `types.IMAGE_TOKEN_ESTIMATE`, not at its base64 length. Anthropic keeps the base64 `image`
+of payload, and nothing after `data`. Field order and
+standard JSON whitespace do not matter; extra, duplicate or missing keys,
+escapes, or more than `types.MAX_IMAGE_RESULT_BYTES` of raw content do.
+Anything else is ordinary text and is bounded by the tool-result projection
+like any other result. A canonical image result is exempt from that
+projection, from microcompact clearing while it has not yet been delivered
+to the provider (once an assistant reply follows it, it clears like any
+result), from `truncateLargeToolResults`, and from the AgentCore
+`tool_result_cap_bytes` artifact promotion, so the picture itself reaches the
+provider. Two different units apply: context estimation charges one image at
+`types.IMAGE_TOKEN_ESTIMATE` (1,600 tokens); the projection turn budget and
+the AgentCore payload cap charge it at `IMAGE_RESULT_BUDGET_BYTES` (6,400
+budget bytes, four bytes per token). The AgentCore durable budget is charged
+the real bytes. A profile whose `tool_result_cap_bytes` is below 6,400
+rejects every image with `checkpoint_payload_resource_limit`. Anthropic keeps the base64 `image`
 source block inside the `tool_result` content array (byte-identical to
 before). OpenAI chat/completions sends a short pointer as the tool message
 (tool message content officially accepts only text) and attaches the image in

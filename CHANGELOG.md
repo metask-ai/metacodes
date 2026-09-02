@@ -38,6 +38,17 @@ status, compatibility boundaries, and entry points are defined by
   plugin cannot obtain an unbounded exemption by prefixing arbitrary output
   with `{"type":"image"`. `result_projection.Stats.projected_bytes` stays a
   real byte count; the turn-budget decision moved to a new `budget_bytes`.
+  The predicate is structural (any field order, standard JSON whitespace,
+  exactly the three keys, raw content bounded by `MAX_IMAGE_RESULT_BYTES`),
+  so surrounding whitespace cannot smuggle an oversized payload past the
+  budget and an ordinary JSON serializer's output still counts as an image.
+  Microcompact protects only images that have not yet been delivered to the
+  provider (no assistant reply after them); delivered images clear like any
+  result, so the pressure valve keeps working on image-heavy history, and
+  images are never truncated. AgentCore `settleSuccess` now counts live
+  sibling reservations against the hard budget, so an inline image whose
+  durable bytes exceed its own reservation is refused instead of consuming
+  the space a parallel tool had already reserved.
 - Image tool results (the `Read` tool's
   `{"type":"image","media_type":...,"data":...}` form) are now serialized
   natively on every protocol family instead of being passed to the model as a

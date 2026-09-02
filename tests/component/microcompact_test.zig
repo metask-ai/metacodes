@@ -309,7 +309,8 @@ test "L2 usage 锚点接线: message_start usage → conversation.usageAnchor(in
     try std.testing.expectEqual(@as(usize, 1), anchor.msg_count);
 }
 
-/// 规范图片形态(与 tools/read.zig readImage 逐字节同构):投影豁免它,microcompact 也必须豁免。
+/// 规范图片形态(与 tools/read.zig readImage 逐字节同构):投影豁免它,microcompact 对
+/// **未送达**的它也必须豁免;已送达的照常清。
 fn imageToolResult(a: std.mem.Allocator, data_len: usize) ![]u8 {
     const data = try a.alloc(u8, data_len);
     defer a.free(data);
@@ -317,7 +318,20 @@ fn imageToolResult(a: std.mem.Allocator, data_len: usize) ![]u8 {
     return std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
 }
 
-test "L2 microcompact: 图片 tool_result 不被 recent-N 阀清掉,文本兄弟照常清" {
+/// 一条 user 消息里的多个并行 tool_result(agent_loop 一轮并行工具的真实形态)。
+fn appendToolResults(conv: *Conversation, a: std.mem.Allocator, ids: []const []const u8, contents: []const []const u8) !void {
+    const blocks = try a.alloc(msg.Block, ids.len);
+    for (ids, contents, 0..) |id, content, i| {
+        blocks[i] = .{ .tool_result = .{
+            .tool_use_id = try a.dupe(u8, id),
+            .content = try a.dupe(u8, content),
+            .is_error = false,
+        } };
+    }
+    try conv.append(.{ .role = .user, .blocks = blocks });
+}
+
+test "L2 microcompact: 未送达的图片不被 recent-N 阀清掉,已送达的图片与文本照常清" {
     const a = std.testing.allocator;
     var conv = Conversation.init(a);
     defer conv.deinit();
@@ -325,23 +339,51 @@ test "L2 microcompact: 图片 tool_result 不被 recent-N 阀清掉,文本兄弟
     const text = "T" ** 400;
     const image = try imageToolResult(a, 1024);
     defer a.free(image);
-    // 顺序:老文本 → 图片 → 两条更新的文本。keep_recent=2 只保留最后两条。
+    // 历史(已送达,后面都跟着 assistant 回复):老文本、老图片。
     try appendToolResult(&conv, a, "tu_old", text);
-    try appendToolResult(&conv, a, "tu_img", image);
-    try appendToolResult(&conv, a, "tu_mid", text);
-    try appendToolResult(&conv, a, "tu_new", text);
+    try conv.appendText(.assistant, "ok");
+    try appendToolResult(&conv, a, "tu_img_old", image);
+    try conv.appendText(.assistant, "seen");
+    // 当前轮(未送达):Read(image) + 两个并行文本兄弟,图片是三者中最老的。
+    try appendToolResults(&conv, a, &.{ "tu_img_new", "tu_b", "tu_c" }, &.{ image, text, text });
 
-    // 正向:老文本被清成 stub;图片虽在 keep 窗口之外仍原样保留。
+    // keep=2 只保护 tu_c/tu_b;tu_img_new 是第三新 → 本该被清,但它还没送达 → 保护。
+    // 已送达的老图片和老文本照常清:阀对图片密集的历史仍然有效。
     const first = conv.microcompactToolResultsByRecentResults(2);
-    try std.testing.expectEqual(@as(usize, 1), first.cleared);
+    try std.testing.expectEqual(@as(usize, 2), first.cleared);
     try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[0].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
-    try std.testing.expectEqualStrings(image, conv.messages.items[1].blocks[0].tool_result.content);
-    try std.testing.expectEqualStrings(text, conv.messages.items[2].blocks[0].tool_result.content);
-    try std.testing.expectEqualStrings(text, conv.messages.items[3].blocks[0].tool_result.content);
-
-    // 反向:阻塞路径 keep_recent=0 清掉剩下的两条文本,图片仍然完整。
+    try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[2].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expectEqualStrings(image, conv.messages.items[4].blocks[0].tool_result.content);
+    try std.testing.expectEqualStrings(text, conv.messages.items[4].blocks[1].tool_result.content);
+    try std.testing.expectEqualStrings(text, conv.messages.items[4].blocks[2].tool_result.content);
+    // 阻塞路径 keep=0:未送达图片仍受保护(它只记 IMAGE_TOKEN_ESTIMATE,清了也救不了窗口)。
     const blocking = conv.microcompactToolResultsByRecentResults(0);
     try std.testing.expectEqual(@as(usize, 2), blocking.cleared);
-    try std.testing.expectEqualStrings(image, conv.messages.items[1].blocks[0].tool_result.content);
-    try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[3].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expectEqualStrings(image, conv.messages.items[4].blocks[0].tool_result.content);
+
+    // 送达之后(assistant 回复出现)同一张图片就是普通历史,keep=0 清掉它。
+    try conv.appendText(.assistant, "done");
+    const delivered = conv.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 1), delivered.cleared);
+    try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[4].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
+}
+
+test "L2 microcompact: 图片永不被 truncateLargeToolResults 截断,超限文本照常截" {
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    const limit: usize = 8 * 1024;
+    const image = try imageToolResult(a, 4 * limit);
+    defer a.free(image);
+    const big_text = try a.alloc(u8, 4 * limit);
+    defer a.free(big_text);
+    @memset(big_text, 'q');
+    try appendToolResult(&conv, a, "img", image);
+    try appendToolResult(&conv, a, "txt", big_text);
+    try conv.appendText(.assistant, "after");
+
+    const reduced = conv.truncateLargeToolResults(limit);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    try std.testing.expectEqualStrings(image, conv.messages.items[0].blocks[0].tool_result.content);
+    try std.testing.expect(conv.messages.items[1].blocks[0].tool_result.content.len <= limit);
 }

@@ -360,6 +360,10 @@ pub const ImageBlock = struct {
 pub const MAX_IMAGE_BYTES: usize = 3_750_000;
 /// MAX_IMAGE_BYTES 经标准 base64(带填充)后的最大字符数。
 pub const MAX_IMAGE_BASE64_BYTES: usize = std.base64.standard.Encoder.calcSize(MAX_IMAGE_BYTES);
+/// 一条规范图像 tool_result 的**原始字节**上限:base64 载荷 + 三个键、引号、MIME 与
+/// 少量 JSON 空白。`extractImageResult` 先按它拒绝,再解析——外围空白可以容忍,但不能
+/// 成为绕过投影预算的免费通道(否则 40 MiB 空白 + 一张小图只记 6400 预算字节)。
+pub const MAX_IMAGE_RESULT_BYTES: usize = MAX_IMAGE_BASE64_BYTES + 512;
 
 /// 所有已接线 provider 方言都接受的图像 MIME。Read 的扩展名表、headless `--image`、
 /// AgentCore RunInput 校验与 tool_result 图像判定都由此推导。

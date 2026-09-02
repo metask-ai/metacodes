@@ -734,6 +734,8 @@ test "L2 budget 包装:超过 tool_result_cap 的 Read 图片保持 inline 图�
     defer a.free(expected_b64);
     _ = encoder.encode(expected_b64, raw);
     try std.testing.expect(std.mem.indexOf(u8, image, expected_b64) != null);
+    // 耐久预算按真实字节记(checkpoint 真的要存这么多),不是按 6400 的视觉估算。
+    try std.testing.expect(controller.estimated_usage_bytes >= image.len);
 
     // 反向:同尺寸文本结果仍被 cap 兜住,promote 成 artifact 信封。
     const text = try readThroughBudget(a, root, &controller, "big.txt");

@@ -589,7 +589,17 @@ pub const Reservation = struct {
             self.controller.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
             return error.ResourceLimit;
         };
-        if (next > self.controller.profile.hard_bytes -
+        // Live sibling reservations still own their share of the hard budget.
+        // A settle that only fits by eating them (an inline image whose durable
+        // bytes exceed its own payload_cap reservation) is a resource limit
+        // here, not a surprise the sibling discovers after its own side effect.
+        // For a settle within its reservation this is never stricter than the
+        // admission check in beginOperation.
+        const committed = checkedAdd(next, self.controller.reserved_bytes) catch {
+            self.controller.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return error.ResourceLimit;
+        };
+        if (committed > self.controller.profile.hard_bytes -
             self.controller.profile.terminal_reserve_bytes)
         {
             self.controller.markOutcomeLocked(.resource_limit, next);
@@ -1318,6 +1328,39 @@ test "checkpoint limits are intersected with the Session durable profile" {
     try std.testing.expectEqual(@as(usize, 73), bounded.chunk_bytes);
     try std.testing.expectEqual(@as(u64, 321), bounded.max_messages);
     try std.testing.expectEqual(@as(u64, 17), bounded.max_blocks_per_message);
+}
+
+test "settle beyond its own reservation cannot consume a live sibling reservation" {
+    const profile = Profile{
+        .hard_bytes = 4096,
+        .soft_bytes = 3072,
+        .input_cap_bytes = 1024,
+        .provider_request_cap_bytes = 1024,
+        .provider_result_cap_bytes = 512,
+        .tool_result_cap_bytes = 256,
+        .mcp_result_cap_bytes = 256,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    const admitted = try preflight(profile, 1000, &.{"run"});
+    // Reference: alone, a durable delta that fills the hard budget exactly settles.
+    var alone = Controller.init(std.testing.allocator, profile, admitted);
+    var solo = try alone.beginOperation(.tool, 32);
+    const room = profile.hard_bytes - profile.terminal_reserve_bytes - alone.estimated_usage_bytes - profile.audit_reserve_bytes;
+    try solo.settleSuccess(10, room);
+    try std.testing.expectEqual(Outcome.none, alone.outcome());
+
+    // With a sibling reservation live, the same delta would eat the sibling's
+    // share: it must be refused at settle time, and the sibling keeps its space.
+    var controller = Controller.init(std.testing.allocator, profile, admitted);
+    var first = try controller.beginOperation(.tool, 32);
+    var second = try controller.beginOperation(.tool, 32);
+    const sibling_reserved = controller.reserved_bytes / 2;
+    try std.testing.expectError(error.ResourceLimit, first.settleSuccess(10, room));
+    try std.testing.expectEqual(Outcome.resource_limit, controller.outcome());
+    try std.testing.expectEqual(sibling_reserved, controller.reserved_bytes);
+    second.release();
+    try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
 }
 
 test "operation reservations are atomic and preserve terminal space" {
