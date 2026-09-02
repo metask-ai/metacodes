@@ -318,8 +318,8 @@ pub const Conversation = struct {
         for (self.messages.items[snapshot.start_index..], snapshot.items) |live, snap| {
             if (!messageEql(live, snap)) return false;
         }
-        // Version and suffix identity are verified above, so index identity
-        // between live and replacement holds and the watermark can be merged.
+        // Reject before mutating anything so a failed call is mutation-free.
+        if (!sameAllocator(self.allocator, replacement.allocator)) return false;
         self.mergeDeliveredIntoLocked(replacement);
         return self.replaceWithOwnedLocked(replacement);
     }
@@ -327,13 +327,15 @@ pub const Conversation = struct {
     /// Carry the live delivery watermark into a replacement produced off to
     /// the side: a request may have delivered messages while a compact
     /// preview was being summarized, and the preview's copies still say
-    /// `false`. Only a same-shape replacement (equal message count) can be
-    /// merged by index; only the suffix-CAS commit path may call this, since
-    /// it is the only caller that has proven index identity.
+    /// `false`. Delivery is carried only to a replacement message that is the
+    /// same message: equal count, and content-equal at the same index
+    /// (`messageEql`). A reordered or rewritten message never inherits a
+    /// watermark by position, so an undelivered image cannot be marked
+    /// delivered by a replacement that merely has the same length.
     fn mergeDeliveredIntoLocked(self: *const Conversation, replacement: *Conversation) void {
         if (replacement.messages.items.len != self.messages.items.len) return;
         for (replacement.messages.items, self.messages.items) |*rep, live| {
-            if (live.delivered) rep.delivered = true;
+            if (live.delivered and messageEql(live, rep.*)) rep.delivered = true;
         }
     }
 
@@ -976,6 +978,26 @@ test "compact preview commit keeps a delivery watermark set while the preview wa
     // committed history must not regress to the preview's stale `false`.
     try std.testing.expect(c.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation));
     for (c.messages.items) |m| try std.testing.expect(m.delivered);
+}
+
+test "delivery watermark is carried only to the same message, never by position to a rewritten one" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "first");
+    try c.appendText(.assistant, "second");
+    var preview = try c.cloneForCompactPreview(a, 1);
+    defer preview.deinit();
+    c.markDelivered();
+    // Rewrite the first message of the replacement (outside the retained suffix,
+    // so the CAS still passes): it is a different message and must not inherit
+    // the live watermark by index.
+    const rewritten = try a.dupe(u8, "rewritten prefix");
+    a.free(@constCast(preview.conversation.messages.items[0].blocks[0].text));
+    preview.conversation.messages.items[0].blocks[0] = .{ .text = rewritten };
+    try std.testing.expect(c.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation));
+    try std.testing.expect(!c.messages.items[0].delivered);
+    try std.testing.expect(c.messages.items[1].delivered);
 }
 
 test "usage anchor: microcompact clear invalidates it" {

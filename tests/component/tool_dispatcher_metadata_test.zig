@@ -647,8 +647,8 @@ test "L2 验收④: budget∘skill∘mcp∘Selection 一次解析贯穿全栈且
 // 唯一另一个按字节改写 inline 结果的层:超过 tool_result_cap_bytes 的 Read 图片若在这里
 // 被转成 artifact,方言层看到的就是信封而不是图。
 
-/// cap 压到 8 KiB:高于一张图片按视觉估算记的 IMAGE_RESULT_BUDGET_BYTES(6400,否则
-/// 任何图片都会被 settleSuccess 判资源超限——cap 小于单图记账值是配置错误),低于夹具尺寸。
+/// cap 压到 8 KiB:高于一张图片按视觉估算记的 IMAGE_RESULT_BUDGET_BYTES(6400;低于它的
+/// profile 合法,只是收不下规范图片,settleSuccess 会判资源超限——见下一条测试),低于夹具尺寸。
 const TIGHT_CAP: u64 = 8 * 1024;
 
 fn tightProfile() session_budget.Profile {
