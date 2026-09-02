@@ -200,6 +200,13 @@ pub const Provider = struct {
     /// 模型规格:output 上限 / input context window(auto-compact 阈值用)。
     maxTokensFn: *const fn (ctx: *anyopaque) u32,
     maxInputTokensFn: *const fn (ctx: *anyopaque) u32,
+    /// The same two numbers for a *specific* model, so a subagent whose
+    /// `model_override` names something other than this provider's own model
+    /// is budgeted against the window it will actually be sent to. Optional: a
+    /// provider that cannot answer per model keeps returning its own numbers,
+    /// which is what every caller got before these existed.
+    maxTokensForFn: ?*const fn (ctx: *anyopaque, model: []const u8) u32 = null,
+    maxInputTokensForFn: ?*const fn (ctx: *anyopaque, model: []const u8) u32 = null,
     reasoningEffortFn: *const fn (ctx: *anyopaque) ?types.ReasoningEffort,
     /// Scoped subagent/teammate effort override. Optional because some wire
     /// protocols do not expose an equivalent control. A missing setter must
@@ -241,6 +248,25 @@ pub const Provider = struct {
     }
     pub inline fn maxInputTokens(self: Provider) u32 {
         return self.maxInputTokensFn(self.ctx);
+    }
+
+    /// Context window of the model a request will actually name. Every budget
+    /// derived from the window - per-result bytes, the turn budget, the
+    /// auto-compact thresholds - has to use this rather than
+    /// `maxInputTokens()`, because a subagent shares its parent's Provider and
+    /// differs from it only by `model_override`. Sizing a child's results
+    /// against the parent's window is how a 200K parent hands a 32K child a
+    /// history the child's endpoint rejects outright.
+    pub inline fn maxInputTokensFor(self: Provider, model_override: ?[]const u8) u32 {
+        const name = model_override orelse return self.maxInputTokens();
+        const resolve = self.maxInputTokensForFn orelse return self.maxInputTokens();
+        return resolve(self.ctx, name);
+    }
+
+    pub inline fn maxTokensFor(self: Provider, model_override: ?[]const u8) u32 {
+        const name = model_override orelse return self.maxTokens();
+        const resolve = self.maxTokensForFn orelse return self.maxTokens();
+        return resolve(self.ctx, name);
     }
     pub inline fn reasoningEffort(self: Provider) ?types.ReasoningEffort {
         return self.reasoningEffortFn(self.ctx);
@@ -294,4 +320,80 @@ test "RequestAbortRegistry closes pre-registration abort race" {
     );
     defer registry.unregister(&interrupted);
     try std.testing.expect(interrupted);
+}
+
+test "runtime capability bridge covers the full runtime enum" {
+    // **必须绑真枚举**:此前 offer.zig 里是一份手抄副本,于是"加运行时能力却漏
+    // 映射会编译报错"的承诺其实只覆盖副本——issue #25 加 `pdf_input` 时它一声
+    // 没吭。绑 `Capability` 本尊后,这条断言才真正是那个 comptime 守卫。
+    //
+    // 断言住在 api 侧而不是 offer.zig 里,是因为 `subsystem:boundary` 不许
+    // provider 子系统 import 传输层——那正是 `test:provider` 隔离性的全部内容。
+    // offer.zig 的两个 helper 对运行时枚举是泛型的,生产代码因此不跨界;只有这
+    // 条断言需要具体类型,于是它下沉到允许同时看见两层的这一侧。方向是
+    // api → provider,守卫的强度一分未减。
+    const offer = @import("../provider/offer.zig");
+    offer.assertRuntimeCoverage(Capability);
+    try std.testing.expectEqual(offer.Capability.vision, offer.fromRuntimeCapability(Capability.image_input));
+    try std.testing.expectEqual(offer.Capability.reasoning, offer.fromRuntimeCapability(Capability.extended_thinking));
+    try std.testing.expectEqual(offer.Capability.caching, offer.fromRuntimeCapability(Capability.prompt_cache));
+}
+
+test "a subagent's budget follows its model_override, not the shared provider" {
+    // A subagent shares its parent's Provider and differs from it only by
+    // `model_override` (see subagent.zig: "共享:api provider"). Every budget
+    // derived from the context window therefore has to resolve that override,
+    // or a 200K parent sizes a 32K child's results - and its auto-compact
+    // thresholds - against a window the child's endpoint does not have.
+    const Fake = struct {
+        fn model(_: *anyopaque) []const u8 {
+            return "parent-200k";
+        }
+        fn maxTokens(_: *anyopaque) u32 {
+            return 32_000;
+        }
+        fn maxInputTokens(_: *anyopaque) u32 {
+            return 200_000;
+        }
+        fn maxInputTokensFor(_: *anyopaque, name: []const u8) u32 {
+            return if (std.mem.eql(u8, name, "child-32k")) 32_000 else 200_000;
+        }
+        fn maxTokensForModel(_: *anyopaque, name: []const u8) u32 {
+            return if (std.mem.eql(u8, name, "child-32k")) 8_000 else 32_000;
+        }
+        fn supports(_: *anyopaque, _: Capability) bool {
+            return false;
+        }
+        fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+            return null;
+        }
+    };
+    var ctx: u8 = 0;
+    const capable = Provider{
+        .ctx = &ctx,
+        .modelFn = Fake.model,
+        .sendStreamFn = undefined,
+        .sendStreamRetryFn = undefined,
+        .sendFn = undefined,
+        .maxTokensFn = Fake.maxTokens,
+        .maxInputTokensFn = Fake.maxInputTokens,
+        .maxTokensForFn = Fake.maxTokensForModel,
+        .maxInputTokensForFn = Fake.maxInputTokensFor,
+        .reasoningEffortFn = Fake.reasoningEffort,
+        .supportsFn = Fake.supports,
+    };
+    // No override: the provider's own model, exactly as before.
+    try std.testing.expectEqual(@as(u32, 200_000), capable.maxInputTokensFor(null));
+    try std.testing.expectEqual(@as(u32, 32_000), capable.maxTokensFor(null));
+    // Override: the window the request will actually be sent to.
+    try std.testing.expectEqual(@as(u32, 32_000), capable.maxInputTokensFor("child-32k"));
+    try std.testing.expectEqual(@as(u32, 8_000), capable.maxTokensFor("child-32k"));
+
+    // A provider that cannot answer per model keeps its own numbers rather
+    // than guessing - the behavior every caller had before these existed.
+    var plain = capable;
+    plain.maxInputTokensForFn = null;
+    plain.maxTokensForFn = null;
+    try std.testing.expectEqual(@as(u32, 200_000), plain.maxInputTokensFor("child-32k"));
+    try std.testing.expectEqual(@as(u32, 32_000), plain.maxTokensFor("child-32k"));
 }

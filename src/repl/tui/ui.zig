@@ -122,7 +122,35 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
     if (was_x_armed and key == .ctrl_k) {
         return .{ .action = .kill_background }; // Ctrl+X Ctrl+K → 杀后台(两期共用)
     }
+    // issue #16:Ctrl+O 让给 model picker(对齐 Hermes),transcript 查看器改绑
+    // `Ctrl+X Ctrl+O`——同一个字母、复用已有的 Ctrl+X 前缀,肌肉记忆不丢;
+    // `/transcript` 是等价的可发现入口。两条路都在 TTY 回归里锁住。
+    if (was_x_armed and key == .ctrl_o) {
+        return .{ .action = .open_transcript };
+    }
     // (was_x_armed 但下个键非 Ctrl+K:armed 已清,该键照常走下面分发,如 Ctrl+K 单按=kill-line)
+
+    // ── issue #16: model picker 开着时,键盘属于它 ──────────────────────────
+    // 对键模态(普通字符是它的过滤器),对会话不模态:草稿不动、生成不停。
+    // Ctrl+C/Ctrl+D 故意不拦——用户永远有一条不依赖本状态机的退出路径。
+    if (state.picker_open and key != .ctrl_c and key != .ctrl_d) {
+        const mapped: ?@import("../model_picker.zig").Key = switch (key) {
+            .up => .up,
+            .down => .down,
+            .page_up => .page_up,
+            .page_down => .page_down,
+            .enter => .enter,
+            .esc => .escape,
+            .backspace => .backspace,
+            // Tab cycles scope. It cannot be a filter character, so it is the
+            // one key that can carry an explicit choice without stealing input.
+            .tab => .cycle_scope,
+            .char => |byte| .{ .char = byte },
+            else => null,
+        };
+        if (mapped) |picker_key| return .{ .action = .picker_key, .picker_key = picker_key };
+        return .{ .redraw_region = false };
+    }
 
     // `?` 帮助(非模态,对齐 cc onChange):空 editor 打 `?` → toggle help_open,`?` 不进 editor。
     if (key == .char and key.char == '?' and state.editor.view.len == 0) {
@@ -141,11 +169,11 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         help_closed = true; // 标记:末尾 pass_to_editor 要带 redraw_region(让 help 菜单消屏)。
     }
 
-    // Ctrl+O → 打开 transcript 全屏查看器(alt-screen)。dispatch 不碰 fd/raw-mode,
-    // 上抛 .open_transcript,IO 体留调用方(输入期 loop.zig / 生成期 tui_backend.zig
-    // 进 alt-screen 调 transcript_viewer.runWithTheme)。两期共用。
+    // Ctrl+O → 打开 model picker(issue #16;transcript 查看器移到 Ctrl+X Ctrl+O)。
+    // dispatch 不碰 fd/registry/网络,上抛 .open_model_picker,快照刷新与渲染留调用方。
+    // 两期共用:生成中也能开,改动只影响下一轮。
     if (key == .ctrl_o) {
-        return .{ .action = .open_transcript };
+        return .{ .action = .open_model_picker };
     }
     // Ctrl+B → 生成期把主对话转后台续跑(对齐 cc task:background)。仅生成期有意义
     // (输入期没有正在跑的 run,返 redraw no-op 消费掉)。IO 体(深拷贝 conversation +
@@ -367,7 +395,8 @@ pub fn render(w: anytype, in: RenderInputs) !Frame {
 
 /// 快捷键面板(多列;窄终端降级)。对齐 CC `?` for shortcuts。
 const SHORTCUTS = [_][2][]const u8{
-    .{ "Ctrl+O", "Open transcript" },
+    .{ "Ctrl+O", "Model picker" },
+    .{ "Ctrl+X Ctrl+O", "Open transcript" },
     .{ "Shift+Tab", "Cycle mode" },
     .{ "Esc", "Interrupt task" },
     .{ "Ctrl+C", "Cancel / quit" },
@@ -488,4 +517,69 @@ pub fn renderFooterLine(w: anytype, in: RenderInputs) !u16 {
     try w.writeAll(th.reset);
     try w.writeAll("\r\n");
     return 1;
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn press(state: *UiState, k: input.Key) Effect {
+    return dispatch(state, .{ .key = .{ .key = k } });
+}
+
+test "issue #16: Ctrl+O opens the picker and Ctrl+X Ctrl+O still opens the transcript" {
+    var state = UiState{};
+    try testing.expectEqual(event.LoopAction.open_model_picker, press(&state, .ctrl_o).action);
+
+    // The rebinding must not make transcript viewing unreachable: the prefix
+    // form keeps the same letter and the same muscle memory.
+    _ = press(&state, .ctrl_x);
+    try testing.expectEqual(event.LoopAction.open_transcript, press(&state, .ctrl_o).action);
+
+    // And the prefix's original binding is untouched.
+    _ = press(&state, .ctrl_x);
+    try testing.expectEqual(event.LoopAction.kill_background, press(&state, .ctrl_k).action);
+}
+
+test "issue #16: an open picker owns the keyboard without touching the draft" {
+    var state = UiState{};
+    state.editor = .{ .view = "explain this function", .cursor = 4 };
+    state.picker_open = true;
+
+    const typed = press(&state, .{ .char = 'g' });
+    try testing.expectEqual(event.LoopAction.picker_key, typed.action);
+    try testing.expect(typed.picker_key == .char and typed.picker_key.char == 'g');
+    // A plain character while the picker is open is its filter, not editor
+    // input — and the draft the user was writing stays exactly as it was.
+    try testing.expectEqualStrings("explain this function", state.editor.view);
+    try testing.expectEqual(@as(usize, 4), state.editor.cursor);
+
+    try testing.expect(press(&state, .enter).picker_key == .enter);
+    try testing.expect(press(&state, .esc).picker_key == .escape);
+    try testing.expect(press(&state, .up).picker_key == .up);
+    try testing.expect(press(&state, .down).picker_key == .down);
+    // Tab cannot be a filter character, which is what makes it usable for the
+    // one explicit choice the picker needs.
+    try testing.expect(press(&state, .tab).picker_key == .cycle_scope);
+}
+
+test "issue #16: an open picker never traps the session" {
+    var state = UiState{};
+    state.picker_open = true;
+    // Ctrl+C and Ctrl+D keep their normal meaning, so there is always a way
+    // out that does not depend on the picker's own state machine.
+    try testing.expect(press(&state, .ctrl_c).action != .picker_key);
+    try testing.expect(press(&state, .ctrl_d).action != .picker_key);
+}
+
+test "issue #16: `?` help lists both the picker and its replacement binding" {
+    var found_picker = false;
+    var found_transcript = false;
+    for (SHORTCUTS) |row| {
+        if (std.mem.eql(u8, row[0], "Ctrl+O") and std.mem.eql(u8, row[1], "Model picker")) found_picker = true;
+        if (std.mem.eql(u8, row[0], "Ctrl+X Ctrl+O")) found_transcript = true;
+    }
+    // A moved binding that is not documented is a binding users lose.
+    try testing.expect(found_picker);
+    try testing.expect(found_transcript);
 }

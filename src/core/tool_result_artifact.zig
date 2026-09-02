@@ -310,7 +310,15 @@ pub const Spool = struct {
             .NOFOLLOW = true,
         }, 0o600);
         if (fd < 0) return error.ArtifactTempOpenFailed;
-        errdefer _ = pfs.close(fd);
+        // Close *and* unlink: the file exists from the moment `open` with
+        // CREAT succeeds, so a failure in any of the three checks below used to
+        // leave `stream-*.tmp` behind. That was survivable while such a failure
+        // aborted the tool; now that a publication failure degrades to inline
+        // and execution continues, a repeating cause would accumulate orphans.
+        errdefer {
+            _ = pfs.close(fd);
+            pfs.unlinkPath(temp_path.ptr) catch {};
+        }
         try pfs.makeCloseOnExec(fd);
         const info = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
         if (!safeArtifactInfo(info)) return error.ArtifactUnsafeFile;
@@ -371,8 +379,7 @@ pub const Spool = struct {
             self.published = true;
             return .{ .receipt = receiptFor(snapshot), .preview = self.preview };
         }
-        const used = try directoryBytes(self.allocator, artifact_directory);
-        if (snapshot.bytes > MAX_SESSION_BYTES -| used) return error.SessionQuotaExceeded;
+        try reserveQuota(self.allocator, artifact_directory, snapshot.bytes);
 
         try publishPreparedFile(
             self.allocator,
@@ -384,6 +391,7 @@ pub const Spool = struct {
             temp_identity,
             mode,
         );
+        commitQuota(artifact_directory, snapshot.bytes);
         self.published = true;
         return .{ .receipt = receiptFor(snapshot), .preview = self.preview };
     }
@@ -596,8 +604,7 @@ fn persistInspectedFileInternal(
             },
         };
     }
-    const used = try directoryBytes(allocator, directory);
-    if (expected.bytes > MAX_SESSION_BYTES -| used) return error.SessionQuotaExceeded;
+    try reserveQuota(allocator, directory, expected.bytes);
 
     const source_fd = pfs.open(source_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (source_fd < 0) return error.ArtifactSourceOpenFailed;
@@ -685,6 +692,9 @@ fn persistInspectedFileInternal(
             return err;
         };
     }
+    // Every rollback path above has been passed: the bytes are durable, so the
+    // gauge may finally count them.
+    commitQuota(directory, expected.bytes);
     return switch (mode) {
         .receipt_only => .{ .receipt = receiptFor(expected) },
         .external_completed, .external_inject_cleanup_failure => .{ .completed = .{
@@ -886,6 +896,139 @@ fn receiptFor(snapshot: FileSnapshot) Receipt {
     return .{ .artifact_id = artifact_id, .sha256 = snapshot.sha256, .bytes = snapshot.bytes };
 }
 
+/// Stable, model-visible reason a publish failed. Lives here rather than in
+/// the projection layer because both envelope families need the same names:
+/// a Bash channel that could not publish used to report `recoverable:false`
+/// with no reason at all, so an operator could not tell a full disk from a
+/// session whose 1GiB quota is permanently exhausted.
+pub fn storageErrorCode(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ArtifactRootUnavailable => "artifact_store_unavailable",
+        error.ArtifactTooLarge => "artifact_too_large",
+        error.SessionQuotaExceeded => "artifact_session_quota_exceeded",
+        error.ArtifactPathSymlink,
+        error.ArtifactDirectoryUnsafe,
+        error.ArtifactUnsafeFile,
+        error.ArtifactDirectoryUntrusted,
+        => "artifact_store_unsafe",
+        else => "artifact_persist_failed",
+    };
+}
+
+/// Last observed session usage, kept only so approaching the quota is
+/// visible. It is **not** an admission cache.
+///
+/// A cached total would make the quota check O(1) instead of O(artifacts),
+/// but it can only ever be a lower bound: a session root is shared with
+/// subagents and out-of-process swarm teammates, and their publishes are
+/// invisible here. Trusting it would let a session grow past the quota
+/// exactly when another writer is active. The scan it would replace is a few
+/// thousand syscalls in the worst realistic session — noise beside the model
+/// round trip that produced the result — so the check stays exact and the
+/// cache stays telemetry.
+const QuotaCache = struct {
+    /// Which store the figure belongs to. A process publishes into more than
+    /// one session root - subagents and swarm teammates each have their own -
+    /// so a reading without an identity is a number that silently belongs to
+    /// somebody else.
+    key: u64 = 0,
+    used: u64 = 0,
+    valid: bool = false,
+};
+
+fn usageKey(directory: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, directory);
+}
+
+/// Guarded by `persist_mutex`, which every quota check already holds.
+var quota_cache: QuotaCache = .{};
+
+pub const SessionUsage = struct {
+    used_bytes: u64,
+    limit_bytes: u64,
+    /// False when nothing has been published in this process yet, so a caller
+    /// reports "unknown" instead of a confident zero.
+    observed: bool,
+};
+
+/// Last observed usage for `session_root`. Cheap: never scans; reports the
+/// total measured by the most recent publish **into that store**, and reports
+/// `observed = false` for any other one rather than handing back a subagent's
+/// figure as this session's. Telemetry only, never an admission decision.
+pub fn sessionUsage(session_root: []const u8) SessionUsage {
+    const unobserved: SessionUsage = .{ .used_bytes = 0, .limit_bytes = MAX_SESSION_BYTES, .observed = false };
+    if (session_root.len == 0) return unobserved;
+    var buffer: [std.fs.max_path_bytes + ARTIFACT_SUBDIR.len + 1]u8 = undefined;
+    const directory = artifactDirectoryBuf(&buffer, session_root) catch return unobserved;
+    persist_mutex.lock();
+    defer persist_mutex.unlock();
+    if (!quota_cache.valid or quota_cache.key != usageKey(directory)) return unobserved;
+    return .{
+        .used_bytes = quota_cache.used,
+        .limit_bytes = MAX_SESSION_BYTES,
+        .observed = true,
+    };
+}
+
+/// Admission check for `incoming` bytes into `directory`, and the one place
+/// session usage is observed. Caller holds `persist_mutex`.
+///
+/// Records only what the scan actually measured. Counting `incoming` here as
+/// well would be optimistic: publishing can still fail afterwards - the source
+/// open, the copy, the rename, the directory fsync - and the file is then
+/// rolled back while the gauge keeps reporting bytes that do not exist, until
+/// the next successful publish happens to correct it. `commitQuota` adds them
+/// once the bytes are really on disk.
+fn reserveQuota(allocator: std.mem.Allocator, directory: []const u8, incoming: u64) !void {
+    const key = usageKey(directory);
+    const used = try directoryBytes(allocator, directory);
+    if (incoming > MAX_SESSION_BYTES -| used) {
+        quota_cache = .{ .key = key, .used = used, .valid = true };
+        return error.SessionQuotaExceeded;
+    }
+    quota_cache = .{ .key = key, .used = used, .valid = true };
+}
+
+/// Account `incoming` bytes that a publish has just made durable. Caller holds
+/// `persist_mutex`, and must call this only after the file is in place.
+fn commitQuota(directory: []const u8, incoming: u64) void {
+    const key = usageKey(directory);
+    if (!quota_cache.valid or quota_cache.key != key) return;
+    quota_cache.used +|= incoming;
+}
+
+/// Resolve a published artifact to its on-disk blob so a search tool can run
+/// over it in place.
+///
+/// `ReadArtifact` can only hand back byte ranges, which makes recovering a
+/// large result O(size / MAX_READ_BYTES) round trips and cannot answer a
+/// question about the content at all. The blob is an ordinary file, so a
+/// search tool can answer in one call - but the path must never reach the
+/// model: it names the kernel-private store, and exposing it would let any
+/// file tool read blobs outside the bounded recovery contract. Callers pass
+/// this straight to a child process and keep it out of the result.
+pub fn resolveSearchPath(
+    allocator: std.mem.Allocator,
+    session_root: []const u8,
+    artifact_id: []const u8,
+) ![]u8 {
+    if (session_root.len == 0) return error.ArtifactRootUnavailable;
+    const digest = parseArtifactId(artifact_id) orelse return error.InvalidArtifactId;
+    const directory = try artifactDirectory(allocator, session_root);
+    defer allocator.free(directory);
+    try validateSecureDirectory(allocator, session_root, directory);
+    const path = try artifactPath(allocator, directory, digest);
+    errdefer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactNotFound;
+    defer _ = pfs.close(fd);
+    const info = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
+    if (!safeArtifactInfo(info)) return error.ArtifactUnsafeFile;
+    return path;
+}
+
 pub fn readChunk(
     allocator: std.mem.Allocator,
     session_root: []const u8,
@@ -963,8 +1106,16 @@ pub fn sha256Hex(bytes: []const u8) [ID_HEX_BYTES]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+const ARTIFACT_SUBDIR = "/tool-results/sha256";
+
 fn artifactDirectory(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/tool-results/sha256", .{root});
+    return std.fmt.allocPrint(allocator, "{s}" ++ ARTIFACT_SUBDIR, .{root});
+}
+
+/// The same path without an allocation, for callers on a cheap path. Both go
+/// through `ARTIFACT_SUBDIR` so a layout change cannot move only one of them.
+fn artifactDirectoryBuf(buffer: []u8, root: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}" ++ ARTIFACT_SUBDIR, .{root});
 }
 
 fn spoolDirectory(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
@@ -1511,4 +1662,138 @@ test "parallel publishers converge on one verified content address" {
     var recovered = try readChunk(allocator, root, expected.id(), 0, MAX_READ_BYTES);
     defer recovered.deinit();
     try std.testing.expectEqualStrings("parallel-identical-payload", recovered.bytes);
+}
+
+test "session usage is observable without a second scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    var payload: [4096]u8 = undefined;
+    @memset(&payload, 'Q');
+    const first = try persist(allocator, root, &payload);
+    const after_first = sessionUsage(root);
+    try std.testing.expect(after_first.observed);
+    try std.testing.expectEqual(MAX_SESSION_BYTES, after_first.limit_bytes);
+    try std.testing.expectEqual(first.bytes, after_first.used_bytes);
+
+    // A second, different artifact accumulates.
+    payload[0] = 'R';
+    const second = try persist(allocator, root, &payload);
+    const after_second = sessionUsage(root);
+    try std.testing.expectEqual(after_first.used_bytes + second.bytes, after_second.used_bytes);
+
+    // Re-publishing identical content is deduplicated by the CAS and must not
+    // double-count.
+    _ = try persist(allocator, root, &payload);
+    try std.testing.expectEqual(after_second.used_bytes, sessionUsage(root).used_bytes);
+}
+
+test "session usage belongs to the store it was measured in" {
+    // One process publishes into several session roots - every subagent and
+    // swarm teammate has its own. A single global figure reported as "this
+    // session's" is whichever store happened to publish last, so the gauge is
+    // keyed and a root it has not measured reads as unknown, not as zero and
+    // not as somebody else's total.
+    const allocator = std.testing.allocator;
+    var mine = std.testing.tmpDir(.{});
+    defer mine.cleanup();
+    var theirs = std.testing.tmpDir(.{});
+    defer theirs.cleanup();
+    var mine_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var theirs_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const mine_root = mine_buffer[0..try mine.dir.realPath(std.testing.io, &mine_buffer)];
+    const theirs_root = theirs_buffer[0..try theirs.dir.realPath(std.testing.io, &theirs_buffer)];
+
+    var payload: [2048]u8 = undefined;
+    @memset(&payload, 'M');
+    _ = try persist(allocator, mine_root, &payload);
+    try std.testing.expect(sessionUsage(mine_root).observed);
+    try std.testing.expect(!sessionUsage(theirs_root).observed);
+
+    @memset(&payload, 'T');
+    const theirs_receipt = try persist(allocator, theirs_root, &payload);
+    try std.testing.expect(!sessionUsage(mine_root).observed);
+    const after = sessionUsage(theirs_root);
+    try std.testing.expect(after.observed);
+    try std.testing.expectEqual(theirs_receipt.bytes, after.used_bytes);
+
+    // No root at all is unknown too, never a confident zero.
+    try std.testing.expect(!sessionUsage("").observed);
+}
+
+test "a store grown by another writer is still observed by the quota check" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    // Seed the in-process cache with a small, honest total.
+    var payload: [1024]u8 = undefined;
+    @memset(&payload, 'S');
+    _ = try persist(allocator, root, &payload);
+
+    // Now grow the store behind this process's back, the way a subagent or an
+    // out-of-process swarm teammate sharing the session root would. The check
+    // must observe the real directory rather than its own arithmetic — which
+    // is why the usage cache is telemetry only.
+    const directory = try artifactDirectory(allocator, root);
+    defer allocator.free(directory);
+    const filler = try std.fmt.allocPrintSentinel(allocator, "{s}/quota-fixture.blob", .{directory}, 0);
+    defer allocator.free(filler);
+    const fd = pfs.open(filler.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    if (fd < 0) return error.OpenFailed;
+    try pfs.setSize(fd, MAX_SESSION_BYTES);
+    _ = pfs.close(fd);
+
+    payload[0] = 'T';
+    try std.testing.expectError(error.SessionQuotaExceeded, persist(allocator, root, &payload));
+}
+
+test "a publish that rolls back does not leave its bytes in the usage gauge" {
+    // The gauge used to be credited at admission time, before the source open,
+    // the copy, the rename and the directory fsync had all succeeded. Any of
+    // those can still fail and roll the file back, and the gauge then reported
+    // bytes that do not exist on disk until some later publish happened to
+    // correct it - a "how close am I to the quota" number that overstates.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    var settled: [4096]u8 = undefined;
+    @memset(&settled, 'K');
+    const first = try persist(allocator, root, &settled);
+    const after_success = sessionUsage(root);
+    try std.testing.expect(after_success.observed);
+    try std.testing.expectEqual(first.bytes, after_success.used_bytes);
+
+    // A publish that gets all the way to the CAS and is then rolled back.
+    var spool = try ExternalSpool.begin(allocator, root);
+    defer spool.deinit();
+    const payload = "rolled-back-bytes-must-not-be-counted";
+    const fd = pfs.open(spool.path_z.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactTempOpenFailed;
+    try pfs.makeCloseOnExec(fd);
+    try writeAll(fd, payload);
+    try pfs.fsyncChecked(fd);
+    _ = pfs.close(fd);
+    try std.testing.expectError(
+        error.ArtifactSpoolCleanupInjectedFailure,
+        spool.finishWithMode(.inject_failure_after_publish),
+    );
+
+    // The rolled-back bytes are gone from disk, so they must be gone from the
+    // gauge too - it reports what the last scan actually measured.
+    const after_rollback = sessionUsage(root);
+    try std.testing.expect(after_rollback.observed);
+    try std.testing.expectEqual(first.bytes, after_rollback.used_bytes);
+    try std.testing.expect(after_rollback.used_bytes < first.bytes + payload.len);
 }

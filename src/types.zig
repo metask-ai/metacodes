@@ -81,6 +81,9 @@ pub const Config = struct {
     dump_prompt: bool = false,
     /// `--dump-plugins`:打印版本化 immutable plugin inventory JSON 后退出。
     dump_plugins: bool = false,
+    /// `--check-providers`: validate the provider configuration and print every
+    /// route it produces, then exit. No network I/O.
+    check_providers: bool = false,
     /// `--version`:打印 `metacodes <semver>` 到 stdout 后退出(parse 只置位,
     /// main 早退打印,保持 parseArgsForTest 可测)。
     show_version: bool = false,
@@ -345,6 +348,21 @@ pub const ApiContent = union(enum) {
     /// wire 翻译按 provider 方言(dialect.serializeImagePart);不支持图像输入的
     /// (provider, model) 序列化时必须返回显式能力错误,绝不静默丢弃或降级为文本。
     image: ImageBlock,
+    /// Provider 私有的推理续传状态(issue #23)。目前唯一生产者/消费者是 OpenAI
+    /// Responses(`store:false` 下的 `reasoning` item + `encrypted_content`):
+    /// 服务端不存响应,推理上下文只能由客户端原样回传。**不是**可读文本——
+    /// 与 `.thinking` 是两回事,永不展示、永不进 summary、永不当 assistant 正文。
+    /// 其它方言序列化时整块跳过(它们各有自己的推理回传约定或根本不需要)。
+    reasoning_item: ReasoningItemBlock,
+};
+
+/// 一条 provider 私有的推理续传项。`json` 是服务端原样发回的 wire JSON 对象
+/// (含 id / summary / encrypted_content),回传时**逐字节不改**——任何重排都可能
+/// 让服务端拒绝解密。`model` 是产出它的模型名:加密推理状态是模型/响应作用域的,
+/// 会话中途换模型后把旧 item 发给新模型会被服务端拒收,故序列化层按模型名门控。
+pub const ReasoningItemBlock = struct {
+    model: []const u8,
+    json: []const u8,
 };
 
 /// 图像内容块(中立 IR)。data 是 base64 编码字节;media_type 是与内容一致的 MIME

@@ -643,7 +643,7 @@ test "L2 验收④: budget∘skill∘mcp∘Selection 一次解析贯穿全栈且
 
 // ── 图片 tool_result 穿过 budget 包装:不 promoteInline,cap 按视觉估算记 ──────────────
 //
-// Conversation 投影豁免图片(result_projection.isImageResult),budget 包装是投影之前
+// Conversation 投影豁免图片(dialect.extractImageResult),budget 包装是投影之前
 // 唯一另一个按字节改写 inline 结果的层:超过 tool_result_cap_bytes 的 Read 图片若在这里
 // 被转成 artifact,方言层看到的就是信封而不是图。
 
@@ -726,7 +726,7 @@ test "L2 budget 包装:超过 tool_result_cap 的 Read 图片保持 inline 图�
     const image = image_read.content;
     try std.testing.expect(core.result_projection.IMAGE_RESULT_BUDGET_BYTES < TIGHT_CAP);
     try std.testing.expect(image.len > TIGHT_CAP);
-    try std.testing.expect(core.result_projection.isImageResult(image));
+    try std.testing.expect(core.json.extractImageResult(image) != null);
     try std.testing.expect(std.mem.indexOf(u8, image, core.result_projection.SCHEMA) == null);
     const encoder = std.base64.standard.Encoder;
     const expected_b64 = try a.alloc(u8, encoder.calcSize(raw.len));
@@ -741,7 +741,7 @@ test "L2 budget 包装:超过 tool_result_cap 的 Read 图片保持 inline 图�
     defer a.free(text_read.content);
     try std.testing.expect(!text_read.is_error);
     const text = text_read.content;
-    try std.testing.expect(!core.result_projection.isImageResult(text));
+    try std.testing.expect(core.json.extractImageResult(text) == null);
     try std.testing.expect(text.len < TIGHT_CAP);
     try std.testing.expect(std.mem.indexOf(u8, text, core.result_projection.SCHEMA) != null or core.result_projection.hasRecoverableArtifact(text));
 }
@@ -769,7 +769,7 @@ test "L2 budget 包装:cap 低于 IMAGE_RESULT_BUDGET_BYTES 时图片按 6400 �
     // 结果是有界的 resource-limit 标记,不是图片,也不是信封。
     try std.testing.expect(read.is_error);
     try std.testing.expect(std.mem.indexOf(u8, read.content, "checkpoint_payload_resource_limit") != null);
-    try std.testing.expect(!core.result_projection.isImageResult(read.content));
+    try std.testing.expect(core.json.extractImageResult(read.content) == null);
     // 宿主可见的 requirement 就是那 6400 字节的图片记账值(per-operation cap 分支的约定)。
     try std.testing.expectEqual(session_budget.Outcome.resource_limit, controller.outcome());
     try std.testing.expectEqual(@as(u64, core.result_projection.IMAGE_RESULT_BUDGET_BYTES), controller.requiredBytes());

@@ -707,7 +707,7 @@ pub const ToolEnvironment = struct {
         // estimate (what the model actually pays); the durable budget below is
         // charged for the real bytes (what the checkpoint actually stores).
         const inline_image = outcome == .ok and outcome.ok == .@"inline" and
-            core.result_projection.isImageResult(outcome.ok.@"inline".bytes);
+            (core.json.extractImageResult(outcome.ok.@"inline".bytes) != null);
         if (outcome == .ok and outcome.ok == .@"inline" and !inline_image and
             outcome.ok.rawBytes() > payload_cap)
         {
@@ -919,7 +919,10 @@ pub const BudgetedProvider = struct {
         const request_bytes = try canonicalRequestBytes(
             self.allocator,
             model_override orelse self.base.model(),
-            self.base.maxTokens(),
+            // Resolved through the same override as the model beside it: a
+            // reservation sized from the parent's output cap is not the
+            // request the child will send.
+            self.base.maxTokensFor(model_override),
             messages,
             system,
             tools,
@@ -1144,6 +1147,14 @@ fn measureStreamEvent(event: core.api_stream.StreamEvent) Error!MeasuredPayload 
             .payload = @intCast(query.len),
             .durable = 0,
         },
+        // Provider-private continuation state: it crosses the wire in both
+        // directions and is persisted verbatim in the assistant record, so it
+        // is charged like any other stored payload (envelope covers the
+        // transcript block's type/model framing).
+        .reasoning_item => |bytes| .{
+            .payload = @intCast(bytes.len),
+            .durable = try checkedAdd(bytes.len, 32),
+        },
         .usage, .done => .{ .payload = 0, .durable = 0 },
     };
 }
@@ -1186,6 +1197,7 @@ fn deinitStreamEvent(
             allocator.free(result.content_json);
         },
         .web_search_query => |query| allocator.free(query),
+        .reasoning_item => |bytes| allocator.free(bytes),
         .usage, .done => {},
     }
 }
@@ -1209,7 +1221,7 @@ fn canonicalRequestBytes(
     // 16 MiB 图片允量的结果会让纯文本路由误报 checkpoint_budget_exhausted,且这些
     // 结果不可裁剪、后续每轮重复拒绝。首类 .image 块一律加回:不收图的路由在真实
     // 序列化时直接报错,估算偏保守无害。
-    const projection = try core.agent_loop.projectImagesForEstimation(allocator, messages);
+    const projection = try core.agent_loop.projectPayloadsForEstimation(allocator, messages);
     defer if (projection) |p| p.deinit(allocator);
     const effective: []const core.types.ApiMessage = if (projection) |p| p.messages else messages;
     const encoded = try core.json.serializeMessagesRequest(.{

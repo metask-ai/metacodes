@@ -311,9 +311,18 @@ fn serializeContent(
     report: *SerializationReport,
 ) !void {
     try buf.append(allocator, '[');
-    for (content, 0..) |block, i| {
-        if (i > 0) try buf.append(allocator, ',');
+    // `first` 而非下标控制逗号:`.reasoning_item` 在本方言里整块跳过(OpenAI
+    // Responses 私有的加密续传状态,Anthropic wire 无对应形态),用下标算逗号会
+    // 留下多余的 `,`。无 reasoning_item 时输出与旧实现逐字节相同(prompt-cache
+    // 前缀契约不变)。**不变式**(buildApiMessages 保证):含 reasoning_item 的
+    // 消息一定还有别的 block,故这里不会产出空 `[]`。
+    var first = true;
+    for (content) |block| {
+        if (block == .reasoning_item) continue;
+        if (!first) try buf.append(allocator, ',');
+        first = false;
         switch (block) {
+            .reasoning_item => unreachable, // 上面已 continue
             .text => |t| {
                 try buf.append(allocator, '{');
                 try buf.appendSlice(allocator, "\"type\":\"text\",\"text\":");

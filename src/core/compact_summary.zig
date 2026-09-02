@@ -68,6 +68,8 @@ pub fn summarizeWithModel(
                 transcript_buf.appendSlice(allocator, "]") catch return null;
             },
             .thinking => {},
+            // provider 私有的加密推理续传状态:不可读,也不属于会话内容。
+            .reasoning_item => {},
             .image => |img| {
                 // 总结输入的占位标记(被压缩前缀整体替换为摘要,非 model-visible 会话内容)。
                 transcript_buf.appendSlice(allocator, "[image ") catch return null;
@@ -137,6 +139,8 @@ pub fn summarizeAbortable(
                 transcript_buf.appendSlice(allocator, "]") catch return null;
             },
             .thinking => {},
+            // provider 私有的加密推理续传状态:不可读,也不属于会话内容。
+            .reasoning_item => {},
             .image => |img| {
                 // 总结输入的占位标记(被压缩前缀整体替换为摘要,非 model-visible 会话内容)。
                 transcript_buf.appendSlice(allocator, "[image ") catch return null;
@@ -193,6 +197,8 @@ pub fn summarizeAbortable(
                 text.appendSlice(allocator, bytes) catch return null;
             },
             .thinking => |bytes| allocator.free(bytes), // 思考过程不进 summary
+            // 摘要子请求是一次性的,没有下一轮可回传;续传项就地释放。
+            .reasoning_item => |bytes| allocator.free(bytes),
             .usage => |delta| accumulateUsage(usage_out, delta),
             .tool_use_start => |tool| {
                 allocator.free(tool.id);

@@ -65,6 +65,43 @@ pub const ProtocolList = struct {
     }
 };
 
+pub const MAX_POOL_CREDENTIALS: usize = 8;
+
+/// A pool member, by reference. **No secret** — the value lives in the named
+/// environment variable, so a config document that several tools read (and that
+/// is not mode 0600) never holds credential material. That is also why the
+/// export/import round-trip can be lossless.
+pub const CredentialEntry = struct {
+    id: Slug,
+    /// Environment variable holding the secret.
+    env: AliasName,
+    kind: controls_mod.Bounded(32),
+    /// Lower is tried first.
+    priority: u8 = 0,
+    account_or_plan: ?AliasName = null,
+    /// Learned state. A rate limit records a cooldown here so the *next*
+    /// process skips the credential instead of rediscovering the limit; an
+    /// authentication failure records `invalid`, because retrying a key the
+    /// provider rejected only burns the account's error budget.
+    cooldown_until: ?i64 = null,
+    invalid: bool = false,
+};
+
+pub const CredentialList = struct {
+    entries: [MAX_POOL_CREDENTIALS]CredentialEntry = undefined,
+    len: u8 = 0,
+
+    pub fn items(self: *const CredentialList) []const CredentialEntry {
+        return self.entries[0..self.len];
+    }
+
+    pub fn append(self: *CredentialList, entry: CredentialEntry) error{TooManyCredentials}!void {
+        if (self.len == MAX_POOL_CREDENTIALS) return error.TooManyCredentials;
+        self.entries[self.len] = entry;
+        self.len += 1;
+    }
+};
+
 /// One configured provider instance. Independent credentials, channels, and
 /// endpoint policy; disabling preserves everything.
 pub const ProviderEntry = struct {
@@ -77,6 +114,9 @@ pub const ProviderEntry = struct {
     channels: ChannelList = .{},
     protocol_defaults: ProtocolList = .{},
     base_url: ?UrlText = null,
+    /// Credential pool for this provider. Several accounts, each a distinct
+    /// route identity, because the credential participates in the offer id.
+    credentials: CredentialList = .{},
 };
 
 pub const AliasPolicy = enum { pinned, floating };
@@ -103,6 +143,7 @@ pub const DocumentError = error{
     TooManyChannels,
     TooManyProtocols,
     TooManyControls,
+    TooManyCredentials,
     OutOfMemory,
 };
 
@@ -113,6 +154,11 @@ pub const Document = struct {
     providers: std.ArrayList(ProviderEntry) = .empty,
     aliases: std.ArrayList(AliasEntry) = .empty,
     global_selection: ?RuntimeSelection = null,
+    /// Selection scoped to one session, written to a session-local document
+    /// rather than to `config.json`. Two sessions that shared one key would
+    /// overwrite each other's choice, which is exactly what session scope
+    /// promises not to do.
+    session_selection: ?RuntimeSelection = null,
     /// Idempotency keys of the most recent commits, oldest first. A retry
     /// carrying any retained key is a no-op instead of a second revision bump.
     recent_operations: [MAX_RECENT_OPERATIONS]OperationId = undefined,
@@ -170,6 +216,17 @@ pub const Document = struct {
         try self.providers.append(self.allocator, entry);
     }
 
+    /// Remove one provider instance and everything configured about it.
+    /// Returns true when something was removed.
+    pub fn removeProvider(self: *Document, id: Slug) bool {
+        for (self.providers.items, 0..) |entry, index| {
+            if (!entry.id.eql(id)) continue;
+            _ = self.providers.orderedRemove(index);
+            return true;
+        }
+        return false;
+    }
+
     pub fn alias(self: *const Document, name: []const u8) ?AliasEntry {
         for (self.aliases.items) |entry| if (entry.name.eqlText(name)) return entry;
         return null;
@@ -209,6 +266,10 @@ pub const Document = struct {
             try renderSelection(arena, value)
         else
             null;
+        const session = if (self.session_selection) |value|
+            try renderSelection(arena, value)
+        else
+            null;
         var operations: ?[]u8 = null;
         if (self.recent_operation_len > 0) {
             var buffer: std.ArrayList(u8) = .empty;
@@ -227,6 +288,7 @@ pub const Document = struct {
             .{ .key = "providers", .json = providers },
             .{ .key = "aliases", .json = aliases },
             .{ .key = "global_selection", .json = selection },
+            .{ .key = "session_selection", .json = session },
             .{ .key = "recent_operation_ids", .json = operations },
         }) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -257,6 +319,37 @@ pub const Document = struct {
             if (entry.channels.len > 0) {
                 try out.appendSlice(arena, ",\"channels\":");
                 try writeSlugArray(arena, &out, entry.channels.items());
+            }
+            if (entry.credentials.len > 0) {
+                try out.appendSlice(arena, ",\"credentials\":[");
+                for (entry.credentials.items(), 0..) |credential, position| {
+                    if (position > 0) try out.append(arena, ',');
+                    try out.appendSlice(arena, "{\"id\":");
+                    try writeJsonString(arena, &out, credential.id.slice());
+                    try out.appendSlice(arena, ",\"env\":");
+                    try writeJsonString(arena, &out, credential.env.slice());
+                    try out.appendSlice(arena, ",\"kind\":");
+                    try writeJsonString(arena, &out, credential.kind.slice());
+                    try out.appendSlice(arena, try std.fmt.allocPrint(
+                        arena,
+                        ",\"priority\":{d}",
+                        .{credential.priority},
+                    ));
+                    if (credential.account_or_plan) |label| {
+                        try out.appendSlice(arena, ",\"account\":");
+                        try writeJsonString(arena, &out, label.slice());
+                    }
+                    if (credential.cooldown_until) |until| {
+                        try out.appendSlice(arena, try std.fmt.allocPrint(
+                            arena,
+                            ",\"cooldown_until\":{d}",
+                            .{until},
+                        ));
+                    }
+                    if (credential.invalid) try out.appendSlice(arena, ",\"invalid\":true");
+                    try out.append(arena, '}');
+                }
+                try out.append(arena, ']');
             }
             if (entry.protocol_defaults.len > 0) {
                 try out.appendSlice(arena, ",\"protocol_defaults\":[");
@@ -544,6 +637,10 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) DocumentError!Docum
         if (value != .null) document.global_selection = try parseSelection(value);
     }
 
+    if (root.object.get("session_selection")) |value| {
+        if (value != .null) document.session_selection = try parseSelection(value);
+    }
+
     if (root.object.get("recent_operation_ids")) |list| {
         if (list != .array) return error.InvalidDocument;
         for (list.array.items) |item| {
@@ -586,6 +683,40 @@ fn parseProvider(key: []const u8, value: std.json.Value) DocumentError!ProviderE
         for (list.array.items) |item| {
             const text = stringOf(item) orelse return error.InvalidDocument;
             try entry.protocol_defaults.append(text);
+        }
+    }
+    if (value.object.get("credentials")) |list| {
+        if (list != .array) return error.InvalidDocument;
+        for (list.array.items) |item| {
+            if (item != .object) return error.InvalidDocument;
+            const env_name = stringOf(item.object.get("env")) orelse return error.InvalidDocument;
+            // A literal secret here would put credential material into a
+            // document several tools read and that is not mode 0600.
+            if (item.object.get("secret") != null) return error.InvalidDocument;
+            try entry.credentials.append(.{
+                .id = Slug.parse(stringOf(item.object.get("id")) orelse return error.InvalidDocument) catch
+                    return error.InvalidSlug,
+                .env = try AliasName.parse(env_name),
+                .kind = try controls_mod.Bounded(32).parse(stringOf(item.object.get("kind")) orelse "api_key"),
+                .priority = blk: {
+                    const number = item.object.get("priority") orelse break :blk 0;
+                    const value_int = intOf(number) orelse return error.InvalidDocument;
+                    if (value_int < 0 or value_int > 255) return error.InvalidDocument;
+                    break :blk @intCast(value_int);
+                },
+                .account_or_plan = if (stringOf(item.object.get("account"))) |label|
+                    try AliasName.parse(label)
+                else
+                    null,
+                .cooldown_until = if (item.object.get("cooldown_until")) |cooldown|
+                    intOf(cooldown) orelse return error.InvalidDocument
+                else
+                    null,
+                .invalid = if (item.object.get("invalid")) |flag| blk: {
+                    if (flag != .bool) return error.InvalidDocument;
+                    break :blk flag.bool;
+                } else false,
+            });
         }
     }
     return entry;
@@ -1111,4 +1242,104 @@ test "a legacy single-key document upgrades to the ring" {
     const text = try document.merge("{}");
     defer a.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "recent_operation_ids") != null);
+}
+
+test "session and global selections are separate keys, not one shared slot" {
+    const a = std.testing.allocator;
+    var document = Document.init(a);
+    defer document.deinit();
+
+    const global_offer = OfferId.derive(.{
+        .provider_id = Slug.lit("metask"),
+        .channel_id = Slug.lit("default"),
+        .protocol = "anthropic_messages",
+        .endpoint_url = "https://napi.metask-ai.com/v1/messages",
+        .request_model_id = "claude-sonnet-4-6",
+    });
+    const session_offer = OfferId.derive(.{
+        .provider_id = Slug.lit("zai-coding-plan"),
+        .channel_id = Slug.lit("cn-anthropic"),
+        .protocol = "anthropic_messages",
+        .endpoint_url = "https://open.bigmodel.cn/api/anthropic/v1/messages",
+        .request_model_id = "glm-4.6",
+    });
+    document.global_selection = RuntimeSelection.pinned(global_offer, 1, .global);
+    document.session_selection = RuntimeSelection.pinned(session_offer, 2, .session);
+
+    const text = try document.merge("{}");
+    defer a.free(text);
+    var reloaded = try parse(a, text);
+    defer reloaded.deinit();
+
+    // A session choice that overwrote the global one would silently change
+    // every other session on the machine.
+    try std.testing.expect(reloaded.global_selection.?.target.pinned_offer.offer_id.eql(global_offer));
+    try std.testing.expect(reloaded.session_selection.?.target.pinned_offer.offer_id.eql(session_offer));
+    try std.testing.expectEqual(selection_mod.Scope.session, reloaded.session_selection.?.scope);
+}
+
+test "a document with only a session selection leaves the global slot empty" {
+    const a = std.testing.allocator;
+    var document = try parse(a,
+        \\{"schema_version":1,"session_selection":{"target":{"kind":"auto_route","selector":"glm-4.6"},"scope":"session"}}
+    );
+    defer document.deinit();
+    try std.testing.expect(document.global_selection == null);
+    try std.testing.expectEqualStrings("glm-4.6", document.session_selection.?.target.auto_route.selector.slice());
+}
+
+test "a credential pool round-trips, secrets excluded" {
+    const a = std.testing.allocator;
+    var document = Document.init(a);
+    defer document.deinit();
+
+    var entry = ProviderEntry{ .id = Slug.lit("openai"), .credential_ref = Slug.lit("cred-1") };
+    try entry.credentials.append(.{
+        .id = Slug.lit("work"),
+        .env = try AliasName.parse("OPENAI_API_KEY_WORK"),
+        .kind = try controls_mod.Bounded(32).parse("api_key"),
+        .priority = 0,
+        .account_or_plan = try AliasName.parse("acme-workspace"),
+    });
+    try entry.credentials.append(.{
+        .id = Slug.lit("personal"),
+        .env = try AliasName.parse("OPENAI_API_KEY_PERSONAL"),
+        .kind = try controls_mod.Bounded(32).parse("api_key"),
+        .priority = 3,
+        .cooldown_until = 1_700_000_000,
+        .invalid = true,
+    });
+    try document.upsertProvider(entry);
+
+    const text = try document.merge("{\"theme\":\"dark\"}");
+    defer a.free(text);
+
+    // A rename on one side of the serializer would silently drop a field, and
+    // the pool would quietly lose an account or its learned state.
+    var reloaded = try parse(a, text);
+    defer reloaded.deinit();
+    const members = reloaded.provider(Slug.lit("openai")).?.credentials.items();
+    try std.testing.expectEqual(@as(usize, 2), members.len);
+    try std.testing.expect(members[0].id.eqlText("work"));
+    try std.testing.expectEqualStrings("OPENAI_API_KEY_WORK", members[0].env.slice());
+    try std.testing.expectEqualStrings("api_key", members[0].kind.slice());
+    try std.testing.expectEqualStrings("acme-workspace", members[0].account_or_plan.?.slice());
+    try std.testing.expectEqual(@as(u8, 3), members[1].priority);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000), members[1].cooldown_until);
+    try std.testing.expect(members[1].invalid);
+
+    // Another writer's key survives, and no secret was ever written.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sk-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "secret") == null);
+}
+
+test "a credential entry carrying a literal secret is refused" {
+    const a = std.testing.allocator;
+    // The document is read by several tools and is not mode 0600, so a secret
+    // in it is a leak by construction rather than by accident.
+    try std.testing.expectError(error.InvalidDocument, parse(a,
+        \\{"schema_version":1,"providers":{"openai":{"enabled":true,"credentials":[
+        \\  {"id":"work","env":"OPENAI_API_KEY_WORK","secret":"sk-leaked"}]}}}
+    ));
 }

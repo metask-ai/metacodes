@@ -1,10 +1,14 @@
 //! Isolation root for the `src/provider/` subsystem.
 //!
-//! Rooting a test compilation at `src/` lets the provider modules reach
-//! `types.zig`, `util/model.zig`, and the portable `platform` layer while
-//! proving the subsystem pulls in nothing heavier: if a provider module ever
-//! grows a dependency on the TUI, the transport, or a UI protocol, this root
-//! stops compiling.
+//! Rooting a test compilation at `src/` proves the subsystem *builds*
+//! standalone — it needs no named module beyond `platform`.
+//!
+//! It does **not** enforce the import boundary, and used to claim it did:
+//! because the module root is `src/`, adding `src/client.zig` here compiles
+//! cleanly. The rule that the provider kernel may reach only `types.zig`, three
+//! leaf utilities, and `platform` is checked at the source level by
+//! `zig build subsystem:boundary`, which is verified to catch exactly that
+//! reach.
 
 const std = @import("std");
 
@@ -20,6 +24,12 @@ pub const control_plane = @import("provider/control_plane.zig");
 pub const runtime_binding = @import("provider/runtime_binding.zig");
 pub const startup = @import("provider/startup.zig");
 pub const config_store = @import("provider/config_store.zig");
+pub const host = @import("provider/host.zig");
+pub const custom_provider = @import("provider/custom_provider.zig");
+pub const openrouter = @import("provider/openrouter.zig");
+pub const oauth = @import("provider/oauth.zig");
+pub const alias = @import("provider/alias.zig");
+pub const capability_matrix = @import("provider/capability_matrix_test.zig");
 
 test {
     // This std build has no refAllDeclsRecursive; the explicit re-exports above

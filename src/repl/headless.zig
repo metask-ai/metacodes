@@ -78,7 +78,7 @@ const HeadlessToolPolicy = struct {
 fn buildImageUserMessage(
     allocator: std.mem.Allocator,
     text: []const u8,
-    image_paths_nul: []const u8,
+    image_paths_nul: ?[]const u8,
 ) !@import("../core/message.zig").Message {
     const msg_mod = @import("../core/message.zig");
     const read_tool = @import("../tools/read.zig");
@@ -91,36 +91,40 @@ fn buildImageUserMessage(
     }
     if (text.len > 0) try blocks.append(allocator, .{ .text = try allocator.dupe(u8, text) });
 
-    var it = std.mem.splitScalar(u8, image_paths_nul, 0);
-    while (it.next()) |path| {
-        if (path.len == 0) {
-            // 空参数(如未设的 shell 变量 `--image "$SHOT"`)静默丢图违背 issue #10 铁律。
-            std.debug.print("error: --image: empty path argument\n", .{});
-            return error.EmptyImagePath;
+    // null = flag 未出现;"" = 用户真传了 `--image ""`,进循环后按空路径报错。
+    if (image_paths_nul) |image_paths| {
+        var it = std.mem.splitScalar(u8, image_paths, 0);
+        while (it.next()) |path| {
+            if (path.len == 0) {
+                // 空参数(如未设的 shell 变量 `--image "$SHOT"`)静默丢图违背 issue #10 铁律。
+                std.debug.print("error: --image: empty path argument\n", .{});
+                return error.EmptyImagePath;
+            }
+            const media_type = read_tool.imageMediaType(path) orelse {
+                std.debug.print("error: --image {s}: unsupported image type (png/jpg/jpeg/gif/webp)\n", .{path});
+                return error.UnsupportedImageType;
+            };
+            const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
+                std.debug.print("error: --image {s}: FileNotFound\n", .{path});
+                return error.FileNotFound;
+            };
+            defer _ = pfs.close(fd);
+            const raw = common.readAllFromFdCapped(fd, allocator, read_tool.MAX_IMAGE_BYTES) catch |err| {
+                std.debug.print("error: --image {s}: {s}\n", .{ path, @errorName(err) });
+                return err;
+            };
+            defer allocator.free(raw);
+            const enc = std.base64.standard.Encoder;
+            const b64 = try allocator.alloc(u8, enc.calcSize(raw.len));
+            errdefer allocator.free(b64);
+            _ = enc.encode(b64, raw);
+            const mt_owned = try allocator.dupe(u8, media_type);
+            errdefer allocator.free(mt_owned);
+            // b64 所有权直接转移进 block(消除此前经 userMessageWithImages 的二次 MB 拷贝)。
+            try blocks.append(allocator, .{ .image = .{ .media_type = mt_owned, .data = b64 } });
         }
-        const media_type = read_tool.imageMediaType(path) orelse {
-            std.debug.print("error: --image {s}: unsupported image type (png/jpg/jpeg/gif/webp)\n", .{path});
-            return error.UnsupportedImageType;
-        };
-        const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
-            std.debug.print("error: --image {s}: FileNotFound\n", .{path});
-            return error.FileNotFound;
-        };
-        defer _ = pfs.close(fd);
-        const raw = common.readAllFromFdCapped(fd, allocator, read_tool.MAX_IMAGE_BYTES) catch |err| {
-            std.debug.print("error: --image {s}: {s}\n", .{ path, @errorName(err) });
-            return err;
-        };
-        defer allocator.free(raw);
-        const enc = std.base64.standard.Encoder;
-        const b64 = try allocator.alloc(u8, enc.calcSize(raw.len));
-        errdefer allocator.free(b64);
-        _ = enc.encode(b64, raw);
-        const mt_owned = try allocator.dupe(u8, media_type);
-        errdefer allocator.free(mt_owned);
-        // b64 所有权直接转移进 block(消除此前经 userMessageWithImages 的二次 MB 拷贝)。
-        try blocks.append(allocator, .{ .image = .{ .media_type = mt_owned, .data = b64 } });
     }
+
     if (blocks.items.len == 0) return error.EmptyMessage;
     return .{ .role = .user, .blocks = try blocks.toOwnedSlice(allocator) };
 }
@@ -570,7 +574,17 @@ pub fn resumeSuspended(
     // 重建对话(挂起前的完整历史;transcript 是持久真相)。app.conversation 由 init 已建空,
     // loadTranscript 追加历史消息。
     transcript.loadTranscript(&app.conversation, dir, allocator) catch |e| {
-        std.debug.print("error: loadTranscript 失败({s})\n", .{@errorName(e)});
+        // 同 REPL:撤回的 document 块要给出可行动的提示,而不是一个错误名。
+        // loadTranscript 是原子的,失败时 app.conversation 仍是空的。
+        if (e == error.WithdrawnDocumentBlock) {
+            std.debug.print(
+                "error: this session contains a PDF document block from the withdrawn " ++
+                    "first-class document input; it cannot be resumed by this build\n",
+                .{},
+            );
+        } else {
+            std.debug.print("error: loadTranscript 失败({s})\n", .{@errorName(e)});
+        }
         return 1;
     };
 

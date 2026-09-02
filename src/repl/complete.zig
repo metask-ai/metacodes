@@ -22,8 +22,11 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/tools", .desc = "List available tools" },
     .{ .name = "/skills", .desc = "List available skills" },
     .{ .name = "/history", .desc = "Show input history" },
-    .{ .name = "/model", .desc = "Select model by group and capability" },
-    .{ .name = "/models", .desc = "Select account API key and model" },
+    .{ .name = "/model", .desc = "Pick a provider, model, and channel (Ctrl+O)" },
+    .{ .name = "/models", .desc = "Select the account API key for this session" },
+    .{ .name = "/transcript", .desc = "Browse the conversation (Ctrl+X Ctrl+O)" },
+    .{ .name = "/providers", .desc = "List routes; refresh / enable / disable / remove" },
+    .{ .name = "/alias", .desc = "Name a route: pin, float, use, remove" },
     .{ .name = "/resume", .desc = "Resume a previous session" },
     .{ .name = "/retry", .desc = "Retry the last request" },
     .{ .name = "/compact", .desc = "Compact the conversation context" },
@@ -65,9 +68,14 @@ pub fn modelMenuOpen(line: []const u8) bool {
     return false;
 }
 
+/// `/models` 的账号 API key 菜单(**凭证**选择,不是路由选择)。
+///
+/// issue #16 起 `/model` 不再进这个菜单:路由选择归跨 UI model picker
+/// (`/model` 提交或 Ctrl+O),凭证选择仍留在这里——picker 的 credential 阶段
+/// 还没落地(见 doc/PROVIDER_OFFER_ARCHITECTURE.md 的未实现清单)。
 pub fn modelsMenuOpen(line: []const u8) bool {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    return std.mem.eql(u8, trimmed, "/models") or std.mem.eql(u8, trimmed, "/model");
+    return std.mem.eql(u8, trimmed, "/models");
 }
 
 /// 当前 `/` 前缀匹配的命令数(菜单显示的行数,也是导航上限)。

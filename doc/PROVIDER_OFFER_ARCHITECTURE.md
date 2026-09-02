@@ -1,7 +1,11 @@
 # Provider profiles, model offers, and the runtime control plane
 
-Status: delivery slice **P0 shipped**, plus the Z.AI GLM Coding Plan provider
-from P1. Issue: `metask-ai/metacodes#16`.
+Status: **all delivery slices shipped** — P0 identity and kernel boundary, the
+P1 providers (Z.AI GLM Coding Plan, OpenAI/Codex OAuth lifecycle), offer and
+routing metadata with the OpenRouter adapters, controls and the cross-UI picker,
+user-defined providers, and the P2 follow-ups (aliases, credential pools,
+learned failover, the TinyKG audit plane). The P2 signed-adapter slice and the
+four items below are open by their own terms. Issue: `metask-ai/metacodes#16`.
 
 This document is the normative description of the provider identity model, the
 credential contract, and the control-plane API. It also records, explicitly,
@@ -60,6 +64,17 @@ it came from, and a slice into a list that later grows is a dangling pointer.
 1. Write `src/provider/profiles/<vendor>.zig` declaring a `ProviderProfile`.
 2. Add one line to `BUILTIN_PROFILES` in `src/provider/registry.zig`.
 
+A runtime source — the `custom_providers` section, a fetched catalog — registers
+through the same call, and may **replace its own** registrations: re-reading a
+configuration or refreshing a catalog is an ordinary thing to do twice, and a
+registry that only ever appended made the second one fail. It may never take
+over a built-in vendor's id, because letting a config file redefine `openai`
+would change where an existing session's credentials go.
+
+Replacement is validated and capacity-reserved before anything mutates, so a set
+of profiles installs atomically: the registry never ends up holding profiles
+that borrow an arena the same call is about to release.
+
 Nothing in `AgentLoop`, the client factory, the TUI, or the Web UI changes. A
 provider discovered at runtime (user-defined instance, plugin-supplied profile)
 goes through the same `ProviderRegistry.register` call, including validation.
@@ -85,7 +100,19 @@ permissive direction:
   may confirm one; `unknown` is only promoted by a provider declaration, and
   only `supported` permits emitting the wire feature.
 - **Pricing.** `Quote` is a tagged union. A missing price is `unknown`, and any
-  unknown component makes the whole cost unknown. There is no zero.
+  unknown component makes the whole cost unknown. There is no zero. Cached
+  reads and cache writes are separately priced, because folding either into the
+  fresh-input rate misreports the cost in one direction or the other.
+
+  The `metask` profile's quote is derived from `util/pricing.zig` — the same
+  table `UsageTotals.costUsd` already reports with — and a test asserts the two
+  agree, so the picker cannot show a number `/cost` contradicts. It carries
+  `estimated = true`: these are published rates, not a provider bill.
+
+  `zai-coding-plan` stays `unknown` on purpose. The Coding Plan is a
+  subscription, so a per-token list price is not what the user is billed;
+  publishing one would be a fabricated price wearing the same type as a real
+  one. A plan-aware quote needs the account's plan and remaining quota.
 - **Provenance.** Every metadata group carries freshness (`known`/`inherited`/
   `stale`/`unknown`) and source (`builtin_profile`/`provider_catalog`/
   `user_config`/`observed`).
@@ -119,6 +146,100 @@ Error classification is provider-owned: `429` with quota wording is
 (retryable); invalid key, wrong endpoint, and permission failures never retry as
 transport errors.
 
+## Credential pools
+
+A provider can have several credentials — separate accounts, separate plans —
+declared by reference in `config.json`:
+
+```json
+"providers": {
+  "openai": {"credentials": [
+    {"id": "work", "env": "OPENAI_API_KEY_WORK", "kind": "api_key", "priority": 0},
+    {"id": "personal", "env": "OPENAI_API_KEY_PERSONAL", "kind": "api_key", "priority": 1}
+  ]}
+}
+```
+
+**No secret is in the document.** The value lives in the named environment
+variable; the document holds an id, a variable name, a kind, and a priority. A
+literal `secret` key is rejected at parse time — `config.json` is read by
+several tools and is not mode 0600.
+
+A bound credential participates in the offer id, so *each account is its own
+offer*. Two accounts on one route are two rows in the picker, each showing its
+`account=`, and "switch to my work account" is a selectable route rather than an
+invisible side effect of resolution. This is also why the picker needs no
+separate credential stage: the accounts already are offers.
+
+Because the offer names the credential, binding uses **that** member — not the
+pool's highest-priority one. Resolving to a different account would make the
+offer id identify a route the request does not take.
+
+Selection among unbound members is deterministic: priority first, then id, so
+configuration order cannot make a failover irreproducible. A member is skipped
+when it is invalid, cooling down, expired, or empty. `noteFailure` maps a
+provider-classified failure to the right state — a rate limit earns a cooldown,
+an authentication failure marks the credential invalid, since retrying a key the
+provider rejected only burns the account's error budget — and a transient
+network failure changes nothing.
+
+The pool is consulted *after* explicit, runtime-descriptor, environment-alias,
+and single stored credentials, so an existing single-credential setup resolves
+exactly as it did before the pool existed.
+
+Failure state is **learned and durable**. `config_store.noteCredentialFailure`
+records a cooldown or an invalidation through the same lock, revision, and
+atomic-rename path as every other mutation, so the next process skips the
+credential instead of rediscovering the same rate limit by hitting it. The class
+is the provider's own classification — profiles already own `classify_error` —
+because the difference between "slow down" and "this key is dead" is exactly the
+difference between a cooldown and an invalidation. A transient network failure
+records nothing; marking one would retire a working account.
+
+## Aliases
+
+A local alias is a name for a route — `fast`, `cheap`, `review` — and an
+**explicit record**, never a string heuristic. Two policies, and the difference
+between them is the whole point:
+
+| Policy | Stores | Across a catalog refresh |
+|---|---|---|
+| `pinned` | offer id + revision | means the same route; reports an error when that offer is gone |
+| `floating` | selector + last resolved offer + catalog revision | re-resolves, and records what it landed on |
+
+A pinned alias that cannot resolve says so rather than resolving to a
+neighbour — a pin that quietly moves is not a pin. A floating selector matching
+several routes is an error listing the candidates, not a guess: choosing one
+would silently pick a protocol, region, price, and credential the user never
+named.
+
+Either policy produces a *pinned* `RuntimeSelection`. The alias already decided
+which route; leaving it auto would let a floating alias re-resolve inside the
+kernel, mid-turn, against a catalog the user never saw.
+
+`/alias` lists, `/alias pin <name>` names the route the session is on,
+`/alias float <name> <model>` declares a re-resolving one, `/alias use <name>`
+switches to it, and `/alias remove <name>` deletes it. A floating alias that
+matches several routes reports which ones, so the answer is "pin one of these"
+rather than "it did not work".
+
+## Selection persistence
+
+Scope decides *where* a committed selection is written, and the two files never
+share a key:
+
+| Scope | Written to | Restored by |
+|---|---|---|
+| `global` | `~/.metacodes/config.json` → `global_selection` | `applyPersistedGlobalSelection` at startup, before model-name inference |
+| `session` | `<session_dir>/runtime-selection.json` → `session_selection` | `App.restoreSessionSelection` on `/resume` |
+| `once` | nowhere | expires with the turn |
+
+Session scope is narrower, so on resume it wins: a resumed session continues on
+the route it was using, not on whatever became global in the meantime. A stored
+selection that no longer resolves is reported — as a startup error for global,
+as a warning that leaves the current route alone for session — and never
+silently replaced with a different vendor.
+
 ## Credentials
 
 ```text
@@ -138,9 +259,56 @@ its own scope, and the stored Metask model/effort selection is not applied to
 it.
 
 `AuthScheme` is materialized by the transport: `bearer` (default, identical to
-the historical bytes), `api_key_header`, `custom_header`, `api_key_query`
-(rejected by the current transports rather than silently dropped), and
-`signed_adapter` (reviewed adapters, P2).
+the historical bytes), `api_key_header`, `custom_header`, and `signed_adapter`
+(reviewed adapters, P2).
+
+There is deliberately **no query-parameter placement**. A secret in a query
+string lands in server access logs, proxy logs, and referrer headers, and it
+would flow into the endpoint strings this subsystem already refuses to let carry
+credentials — `EndpointPolicy` rejects a URL with userinfo for exactly that
+reason. A provider that only accepts a query key is better served by a relay
+that turns a header into one.
+
+## OAuth
+
+Metask's OAuth stays in `core/auth.zig`, byte for byte. `provider/oauth.zig` is
+the same lifecycle for any profile that declares an OAuth credential kind and a
+token endpoint — OpenAI and Codex first — kept inside the provider subsystem so
+it is reachable from provider-scoped resolution and so a token for one vendor
+can never satisfy another.
+
+Three properties carry the design:
+
+- **Single flight.** N turns discovering an expired access token at once perform
+  *one* refresh. Without it, a rotated refresh token makes the losers of the
+  race present a token the server has already invalidated, and the session dies
+  with an authentication error that looks random. Waiters block on a condition
+  and take the winner's result.
+- **Rotated-refresh persistence is atomic, and happens first.** A provider that
+  returns a new refresh token has already invalidated the old one, so the write
+  (temp file + fsync + rename, 0600) completes *before* the new tokens become
+  the live ones. The worst case is then a token saved but not yet in memory,
+  which the next load recovers; the alternative — used but not saved — locks the
+  user out permanently.
+- **The refresh margin is generous.** A token that expires mid-flight fails the
+  request it was attached to, so refresh triggers `REFRESH_MARGIN_SECONDS`
+  before the server's expiry rather than at it.
+
+`invalid_grant` is terminal: the user must log in again, and reporting it as a
+transport failure would point a retry loop at an endpoint that can only keep
+saying no.
+
+The refresh runs at the **turn boundary**, not only at commit. A commit copies
+the token that was valid then; a session that runs past its expiry would keep
+presenting it and start failing with 401s that look like a broken key. Single
+flight means concurrent turns still perform one exchange, and every borrower —
+clients, subagent registry, swarm context — is repointed before the old bytes
+are released, because a background request thread reads them.
+
+The module performs no I/O. The token exchange is a caller-supplied function, so
+every lifecycle test drives a fake exchange and none needs a network;
+`src/api/oauth_exchange.zig` is the production half, one small auditable
+`refresh_token` grant over HTTP.
 
 ## Controls
 
@@ -243,6 +411,190 @@ legitimately accept private model names — with metadata left unknown.
 
 Sessions that name no provider keep the historical path unchanged.
 
+## User-defined providers
+
+`custom_providers` in `~/.metacodes/config.json` defines provider instances that
+go through the same `ProviderRegistry.register` call and the same validation as
+a built-in profile, so nothing downstream can tell the difference. What differs
+is ownership: a built-in profile is comptime data, while a configured one is
+parsed into an arena that must outlive the registry borrowing its strings.
+
+```json
+"custom_providers": {
+  "house-relay": {
+    "display_name": "House relay",
+    "aliases": ["relay"],
+    "auth": {"kind": "custom_header", "header": "X-Relay-Token", "value_prefix": "Token "},
+    "env_aliases": [{"name": "RELAY_TOKEN", "kind": "api_key", "canonical": true}],
+    "endpoint_policy": {"required_path_fragments": ["/relay"]},
+    "channels": [{
+      "id": "primary", "base_url": "https://relay.example.com/relay/v1", "region": "eu",
+      "protocol": {"wire": "openai_chat", "path_suffix": "/completions", "id": "relay_openai"}
+    }],
+    "models": [{
+      "request_model_id": "relay-glm-pro", "canonical_model_id": "zai/glm-4.6",
+      "limits": {"context_window": 200000, "max_output_tokens": 128000},
+      "capabilities": {"tools": "supported", "vision": "unsupported"},
+      "price": {"currency": "EUR", "input": 2.5, "output": 9, "discount_basis_points": 9000},
+      "controls": [{"id": "reasoning_effort", "kind": "enumeration", "values": ["low", "high"]}]
+    }]
+  }
+}
+```
+
+**The schema is declarative and cannot execute anything.** There is no field for
+code, a callback, a shell command, or a request template, and unknown keys are
+ignored rather than interpreted. A hostile config can misroute the user's own
+traffic — which the endpoint policy still constrains — but it cannot read
+prompts or reach a credential it was not given. `quote_hook` and
+`classify_error` stay at their defaults for configured providers; those are code
+and belong to a reviewed profile.
+
+A protocol is a **wire**, optionally with a different request path. That is what
+relays, gateways, and self-hosted servers actually differ by, and it keeps them
+inside the schema: the wire selects the transport, the path suffix rides along
+in the offer. A genuinely novel wire is rejected (`UnknownWire`) rather than
+guessed — that case needs a reviewed adapter (P2).
+
+`ModelOffer` carries the wire beside the protocol id for this reason. Re-parsing
+the id would report "no transport" for a declarative protocol that has one.
+
+Declared limits, capabilities, prices, and controls carry
+`Provenance.source = user_config` and a price is marked `estimated`: a number
+the user typed is a declaration, not a vendor observation, and must not read as
+one. Everything else about it is ordinary — the picker, `model.list`,
+`quote.estimate`, and token admission treat it exactly like a built-in offer.
+
+The lifecycle is reachable through the control plane, not only by editing the
+file: `/providers` lists routes, `/providers enable|disable <id>` toggles an
+instance, and `/providers remove <id>` deletes its configuration. Disabling
+preserves the instance's configuration and credential references — that is the
+whole difference from removing it — and excludes it from the *catalog*, so
+"disabled" is true in the picker, `model.list`, and `--provider` at once rather
+than being re-checked at three call sites.
+
+`metacodes --check-providers` is the dry run. It builds the provider runtime the
+same way a session does — built-ins, `custom_providers`, configured catalogs,
+the credential pool, the disabled set — so it cannot describe a different set of
+routes than the one a session gets. It validates the configuration and prints
+every route it produces — provider, channel, protocol, endpoint, wire
+model id, context, price — and exits non-zero on a bad definition. No credential
+is resolved and no request URL is built, which is exactly when a bad definition
+should be explained. Validation itself happens at parse time: an endpoint the
+provider's own policy forbids, a plaintext non-loopback host, a URL carrying
+userinfo, a missing channel or model, an unknown auth scheme, or a price in an
+unknown currency all fail before registration.
+
+## Provider catalogs
+
+`src/provider/openrouter.zig` adapts the OpenRouter shape, which is the one
+worth adapting: it is a router, so it already separates the two things a
+metadata source must keep separate.
+
+- **Models** (`GET /models`) describe a canonical model — name, context length,
+  declared pricing, supported parameters.
+- **Endpoints** (`GET /models/{id}/endpoints`) describe the *routes* behind that
+  model, one per upstream provider, each with its own context length, price,
+  quantization, and status.
+
+They are parsed separately and stay separate. A model with three endpoints
+becomes three offers; merging them would reproduce exactly the "a model name
+identifies the route" mistake this whole model corrects. Two endpoints from one
+upstream provider (different quantizations, say) get distinct channel slugs, so
+neither disappears.
+
+Endpoint values win over model values, and only where the endpoint has one: an
+endpoint that omits pricing inherits the model's declared price with
+`inherited` provenance rather than becoming free, and one that omits a context
+length inherits rather than becoming unlimited. An endpoint that never reported
+a status has `unknown` health, which is not the same as having reported "fine".
+A price string that is not a number is an error, not a zero.
+
+Provider preferences compile into `RoutePolicy`. `only`/`ignore` and the numeric
+ceilings become *hard* constraints; `order` and `sort` become preferences that
+never reject — reading a preference as a constraint would silently drop routes
+the user did not exclude. `allow_fallbacks` defaults the kernel's way (off),
+because a selection that silently tries a second route is not the one the user
+inspected. `PriceConstraint` carries per-direction ceilings, since a router's
+price limit is per direction and folding both into one number is wrong in
+whichever direction it rounds.
+
+Router metadata folds into the `ActualRouteEvent` the kernel already derived —
+usage, cost, latency, fallback attempts, status — and deliberately never
+rewrites `requested`. What the user asked for is not something the router gets
+to change after the fact. The upstream provider arrives as a channel slug, not a
+string, because an event payload carries ids and enums only.
+
+Catalogs are named by `provider_catalogs` in `config.json` and may be read from
+disk (`models_file`, `endpoint_files`) or fetched (`models_url`,
+`endpoint_urls`, with an optional `credential_env` for an authenticated
+endpoint). `/providers refresh` performs the fetch. The parsing, offer
+construction, and events are identical either way — the host cannot fetch,
+because a transport dependency there would break the isolation gate, so
+`api/catalog_fetch.zig` does the GET and hands the bytes in. A refresh that
+fails leaves the previous catalog in place: a stale catalog is a far better
+answer than an empty one, and every pin stays resolvable because offer ids are
+derived from the stable binding.
+
+Ingesting a catalog moves the catalog revision and emits `catalog.updated`,
+`pricing.updated`, and — when an endpoint reports degraded or unavailable —
+`provider.degraded`. `auth.changed` and `credential.expiring` have producers on
+the kernel (`noteAuthChanged`, `noteCredentialExpiring`) for the credential
+resolver to call. A pin survives an ingest: `OfferId` is derived from the stable
+binding, so a rebuild reproduces it.
+
+## TUI
+
+`Ctrl+O` and `/model` open the same picker; transcript viewing moved to
+`Ctrl+X Ctrl+O` (same letter, on the existing `Ctrl+X` prefix) with
+`/transcript` as the documented equivalent. Both paths are covered by TTY
+regressions, including the Kitty CSI-u forms, so the rebinding cannot leave
+either action unreachable.
+
+```text
+Provider → Canonical model → Channel/Offer (optional) → Options (optional) → Commit
+```
+
+The channel step is skipped when a canonical model has exactly one offer, and
+the options step when the offer declares no controls. Offers are grouped by
+*canonical id*, never by visible name: two channels serving "GLM-4.6" over
+different protocols, regions, or prices are different routes, and collapsing
+them by display name would hide the choice the offer model exists to give.
+
+The picker is modal for the keyboard and not for the session. Plain characters
+are its filter, so the draft in the input box is untouched and a reply keeps
+streaming; a commit during a reply changes the next turn, not the one in flight.
+`Ctrl+C`/`Ctrl+D` deliberately pass through, so there is always an exit that does
+not depend on the picker's own state machine. `q` closes only on an empty
+filter, which keeps it typeable inside a model name.
+
+Enter commits at the scope the footer names. Session is the default, and `Tab`
+cycles session → global → once, so any durable write is an explicit act the user
+can see before pressing Enter. A successful commit closes the overlay and prints
+one line into the transcript — a picker that vanishes without saying which of
+several same-named routes it chose leaves the user unable to tell.
+
+A committed route is broadcast on the existing UI event stream as a
+`config_changed` → `route` event carrying provider, channel, protocol, wire
+model id, offer id, credential *reference*, and scope. The model name alone
+would not do: a visible name can come from several providers, channels,
+protocols, and accounts, so a name-only broadcast announces a change an
+out-of-process client cannot tell apart from another. The credential reference
+travels; the secret never does.
+
+`src/repl/model_picker.zig` holds the state machine, `model_picker_view.zig` the
+drawing, and `picker_host.zig` performs the commit against the session.
+`zig build test:picker` compiles all three from a root that reaches the provider
+kernel and the terminal theme and nothing else — the mirror of `test:provider`,
+proving the picker stays a *client* of the control plane rather than a second
+place identity is decided.
+
+`/model use <id>` still works. It resolves against the offer catalog first, so a
+model served by another provider or protocol switches in place; a name carried
+by several routes is reported with their offer ids instead of guessed, and an
+offer id is accepted verbatim. Names the catalog does not declare fall through
+to the historical path, which still serves proxies and server-catalog models.
+
 ## Module map
 
 | File | Responsibility |
@@ -255,57 +607,64 @@ Sessions that name no provider keep the historical path unchanged.
 | `src/provider/profiles/*.zig` | one file per built-in provider |
 | `src/provider/registry.zig` | the extension point + offer catalog |
 | `src/provider/selection.zig` | `RuntimeSelection`, `RoutePolicy`, resolution, legacy migration |
+| `src/provider/alias.zig` | pinned/floating alias resolution |
+| `src/app/route_strings.zig` | one-generation retention of the live route's strings |
 | `src/provider/config_doc.zig` | versioned document model and serialization |
 | `src/provider/config_store.zig` | atomic, revisioned, idempotent writer |
 | `src/provider/control_plane.zig` | UI-independent kernel API and event journal |
 | `src/provider/runtime_binding.zig` | selection → transport parameters |
 | `src/provider/startup.zig` | CLI/bootstrap route resolution |
+| `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
+| `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
+| `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
+| `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
+| `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
+| `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
+| `src/repl/model_picker.zig` | picker state machine (pure) |
+| `src/repl/model_picker_view.zig` | picker rendering |
+| `src/repl/picker_host.zig` | commit + rebind against the session |
 | `src/api/auth_header.zig` | transport-side auth materialization |
 | `src/util/json_merge.zig` | order-preserving JSON object merge |
 
-`zig build test:provider` compiles the subsystem from a root that reaches only
-`std`, `types.zig`, `util/model.zig`, and the portable `platform` layer
-(sync/fs). If a provider module ever grows a dependency on the transport, the
-TUI, or a UI protocol, that step stops compiling.
+`zig build test:provider` compiles the subsystem from a narrow root, proving it
+builds standalone. It does **not** enforce the import boundary — that root sits
+at `src/`, so every file below it is importable, and adding `src/client.zig`
+compiles cleanly.
+
+`zig build subsystem:boundary` enforces the rule where the rule lives, in the
+source: every `@import` in `src/provider/**` must resolve inside the subsystem,
+to one of six named leaf files, or to `std`/`builtin`/`platform`; the picker's
+two files may reach the provider kernel and the terminal theme and nothing else.
+Imports are resolved against the importing file, so `../ids.zig` from a profile
+and `ids.zig` from the kernel are checked as the one path they name — and the
+gate is verified to reject `../client.zig` from the kernel, `../../client.zig`
+from a profile, and `../app.zig` from the picker.
 
 ## Not implemented yet
 
-Listed rather than left silent. Each is a later delivery slice from the issue.
+Listed rather than left silent. Each is a decision with a reason, not an
+omission — and none of them is an acceptance criterion of the issue.
 
-- **OAuth lifecycle for OpenAI/Codex (P1).** The profile declares the accepted
-  kinds and the transport auth shape; the device/PKCE flow, single-flight
-  refresh, and rotated-refresh-token persistence are not implemented. Only
-  Metask OAuth works today, on its historical path.
-- **Provider catalog refresh and health hooks (P1).** Offers come from compiled
-  profile data. There is no `GET /models` ingestion, no per-offer health or
-  capacity observation, and no OpenRouter model/endpoint adapter. The data model
-  carries these fields and `adoptCatalog` can swap in a refreshed catalog, but
-  nothing produces one yet, so health and capacity read `unknown`. The
-  `pricing.updated`, `auth.changed`, `credential.expiring`, and
-  `provider.degraded` event types wait on the same work.
-- **Built-in price tables (P1).** `ProviderProfile.quote_hook` and
-  `ModelEntry.quote` are wired end to end — the hook is reached through
-  `quote.estimate` and the static quote through `model.list` — but no built-in
-  profile ships a price table, so built-in quotes read `unknown` until a
-  provider catalog or user config supplies one.
-- **User-defined providers (P1).** A profile can be registered at runtime
-  through the same extension point, but there is no `CustomProviderDefinition`
-  config schema, no `DeclarativeProtocolSpec`, and no dry-run/connection test.
-- **TUI picker migration (P1).** `/model`, `/models`, and the `Ctrl+O`
-  rebinding are unchanged. The control-plane API they should call exists and is
-  tested; the TUI does not call it yet.
-- **Auth scheme inheritance beyond `AgentJobRegistry`.** `App`'s own clients and
-  background subagent jobs carry the resolved route's auth scheme. Swarm
-  teammates and `AgentCore` sessions still construct providers with the default
-  bearer scheme; they are unaffected today because every built-in profile except
-  Gemini uses bearer, and the Gemini transport fixes its own header.
-- **`api_key_query` placement.** Rejected by both transports rather than
-  silently dropped; it needs URL rewriting in the request path.
-- **Session-scoped `runtime-selection.json`.** `config_store.Store` accepts an
-  arbitrary path and is the intended writer, but no session host writes one yet,
-  and no startup path calls `Store.initHome` — the durable global selection is
-  readable and writable through the store, just not yet loaded at boot.
-- **Credential pool rotation (P2).** `CredentialRef` carries priority, cooldown,
-  and last-error, and resolution honours cooldown and invalid status, but only
-  one credential per provider is offered to it.
-- **TinyKG audit plane.** No decision/verification nodes are appended.
+- **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
+  signed adapter reference, which needs review and signing infrastructure. The
+  declarative schema covers relays, gateways, and self-hosted servers, which
+  differ by path rather than by wire; anything else is rejected (`UnknownWire`)
+  rather than guessed.
+
+- **Interactive OAuth login for non-Metask providers (P1).** The lifecycle —
+  refresh, single flight, rotated-refresh persistence — is implemented and
+  reachable; obtaining the *first* token still means
+  `metacodes login --provider <id> --oauth-token-json <file>`. The browser /
+  device / PKCE flow is Metask-only.
+- **Per-offer capacity.** Throughput stays `unknown`: OpenRouter's endpoint rows
+  do not carry it, so `hard_min_throughput_tps` can only ever reject. Latency is
+  in the same position until a health plane observes it.
+- **Catalog- and config-sourced prices (P1).** The `metask` profile ships a
+  real quote (see *Pricing*), so `model.list` and `quote.estimate` return known
+  prices for it. `openai` and `gemini` stay `unknown` until a provider catalog
+  or user config supplies rates; `zai-coding-plan` stays `unknown` by design.
+- **Auth scheme over the AgentCore C ABI.** `App`, background subagent jobs,
+  swarm teammates, and `AgentSession` all carry the resolved route's auth
+  scheme. `AgentSession.Config` accepts it, but `agentcore/abi_v1.zig` does not
+  expose it, so a C embedder still gets the default bearer — adding it is an ABI
+  revision, not a wiring fix.

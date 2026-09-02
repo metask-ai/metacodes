@@ -112,6 +112,8 @@ jobs:
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
       - name: ripgrep binary-contract unit tests
         run: python3 -m unittest scripts.tests.test_stage_ripgrep_binary -v
+      - name: Trajectory audit unit tests
+        run: python3 -m unittest scripts.tests.test_audit_trajectories -v
       - name: Verify native bundle and fresh-store contract
         shell: bash
         run: |

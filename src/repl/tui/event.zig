@@ -36,9 +36,17 @@ pub const LoopAction = enum {
     complete,
     /// Ctrl+R 反向搜索(调用方进独占 fd 读循环)。
     reverse_search,
-    /// Ctrl+O 打开 transcript 全屏查看器(调用方进 alt-screen 独占 fd 读循环,
+    /// 打开 transcript 全屏查看器(调用方进 alt-screen 独占 fd 读循环,
     /// 复用 transcript_viewer.runWithTheme)。两期共用。
+    /// issue #16 起绑定 `Ctrl+X Ctrl+O`(Ctrl+O 让给 model picker,对齐 Hermes);
+    /// `/transcript` 命令是等价的可发现入口。
     open_transcript,
+    /// issue #16: Ctrl+O / `/model` 打开跨 UI model picker。调用方刷新快照后置
+    /// `ui.picker_open`。两期共用——生成中改选择只影响下一轮。
+    open_model_picker,
+    /// picker 开着时的按键已由 dispatch 交给 picker 状态机;调用方按 Outcome
+    /// 重画、关闭或提交。key 见 Effect.picker_key。
+    picker_key,
     /// Ctrl+G 外部编辑器(调用方暂退 raw mode 起 $EDITOR)。
     external_edit,
     /// Ctrl+L 清屏重画。
@@ -126,4 +134,6 @@ pub const Effect = struct {
     action: LoopAction = .none,
     /// nav 方向:true=down(下/选下一个),false=up。仅 action==.at_nav/.model_nav/.models_nav 时有意义。
     at_nav_dir: bool = true,
+    /// 仅 action==.picker_key 时有意义:要喂给 picker 状态机的键。
+    picker_key: @import("../model_picker.zig").Key = .escape,
 };

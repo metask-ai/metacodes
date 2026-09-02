@@ -55,7 +55,41 @@ pub const Protocol = union(enum) {
         id: []const u8,
         path_suffix: []const u8,
         shape: EndpointShape = .absolute_request_url,
+        /// The built-in wire this declarative protocol speaks.
+        ///
+        /// A relay that serves the OpenAI wire under a different path is a
+        /// *path* difference, not a new protocol, and saying so keeps it inside
+        /// the declarative schema — no adapter, no code. Null means a genuinely
+        /// novel wire format, which has no transport until a reviewed adapter
+        /// is registered (P2); that case still fails closed.
+        wire: ?Wire = null,
     };
+
+    /// The four wire formats a transport exists for.
+    pub const Wire = enum {
+        anthropic_messages,
+        openai_chat,
+        openai_responses,
+        gemini_generate_content,
+
+        pub fn parse(text: []const u8) ?Wire {
+            inline for (@typeInfo(Wire).@"enum".fields) |field| {
+                if (std.mem.eql(u8, text, field.name)) return @field(Wire, field.name);
+            }
+            return null;
+        }
+    };
+
+    /// The wire this protocol speaks, if any transport can serve it.
+    pub fn wire(self: Protocol) ?Wire {
+        return switch (self) {
+            .anthropic_messages => .anthropic_messages,
+            .openai_chat => .openai_chat,
+            .openai_responses => .openai_responses,
+            .gemini_generate_content => .gemini_generate_content,
+            .custom => |value| value.wire,
+        };
+    }
 
     pub fn id(self: Protocol) []const u8 {
         return switch (self) {
@@ -384,6 +418,10 @@ pub const ProviderProfile = struct {
     endpoint_policy: EndpointPolicy = .{},
     classify_error: ClassifyFn = defaultClassifyError,
     quote_hook: ?QuoteFn = null,
+    /// RFC 6749 token endpoint for this provider's OAuth kinds. Null means the
+    /// profile declares no OAuth lifecycle here — Metask's lives in
+    /// `core/auth.zig` and keeps its historical path.
+    oauth_token_url: ?[]const u8 = null,
 
     pub fn matchesName(self: ProviderProfile, name: []const u8) bool {
         if (self.id.eqlText(name)) return true;

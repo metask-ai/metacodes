@@ -89,6 +89,18 @@ def lake_path() -> Path | None:
     return toolchain if toolchain.is_file() else None
 
 
+def sdk_olean_path() -> Path:
+    """The prebuilt SDK artifact `build_project_rule.build` links against.
+
+    `.lake/` is gitignored, so a fresh worktree never has it. Checking only the
+    toolchain let the guard pass on any machine with Lean installed, and the
+    test then *errored* on a precondition it had not established rather than
+    skipping. `scripts/rule_control.py`, the real driver, runs
+    `lake build MetaCodesControl` itself before it gets here.
+    """
+    return ROOT / "control-plane/lean/.lake/build/lib/MetaCodesControl/ProjectRule.olean"
+
+
 def isolation_available() -> bool:
     if sys.platform == "darwin":
         return Path("/usr/bin/sandbox-exec").is_file()
@@ -168,8 +180,8 @@ class ProjectRuleBuildTests(unittest.TestCase):
 
     def test_real_isolated_build_exports_exact_spec_and_empty_axiom_set(self) -> None:
         lake = lake_path()
-        if lake is None or not isolation_available():
-            self.skipTest("Lean 4.14 plus native OS sandbox is unavailable")
+        if lake is None or not isolation_available() or not sdk_olean_path().is_file():
+            self.skipTest("Lean 4.14, a native OS sandbox and a built project-rule SDK are unavailable")
         identity, raw = candidate(GOOD_SOURCE)
         with tempfile.TemporaryDirectory(prefix="metacodes-rule-build-") as directory:
             root = Path(directory)
@@ -201,8 +213,8 @@ class ProjectRuleBuildTests(unittest.TestCase):
 
     def test_real_isolated_build_accepts_v4_rule_author_candidate(self) -> None:
         lake = lake_path()
-        if lake is None or not isolation_available():
-            self.skipTest("Lean 4.14 plus native OS sandbox is unavailable")
+        if lake is None or not isolation_available() or not sdk_olean_path().is_file():
+            self.skipTest("Lean 4.14, a native OS sandbox and a built project-rule SDK are unavailable")
         identity, raw = candidate(
             GOOD_SOURCE,
             schema="metacodes-rule-candidate-v4",

@@ -143,7 +143,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def run_probe(binary: str, url: str, action: str, *, env: dict[str, str] | None = None) -> str:
+def run_probe(
+    binary: str,
+    url: str,
+    action: str,
+    *,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> str:
     child_env = dict(os.environ)
     for key in (
         "METACODES_KG_CONFIG",
@@ -151,6 +158,12 @@ def run_probe(binary: str, url: str, action: str, *, env: dict[str, str] | None 
         "METACODES_KG_API_KEY",
         "METACODES_KG_EXPECTED_BUILD_ID",
         "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
+        # 这三个决定 KgClient 走 CLI 还是 daemon。不清掉的话,开发机上一个
+        # `METACODES_KG_TRANSPORT=cli-exclusive` 就能让整套用例红掉——实测连既有的
+        # client-config 都会失败。探针断言的是代码行为,不该受宿主环境左右。
+        "METACODES_KG_TRANSPORT",
+        "METACODES_KG_STORE",
+        "METACODES_KG_BIN",
         "TINYKG_REMOTE_CONFIG",
         "TINYKG_REMOTE_URL",
         "TINYKG_API_KEY",
@@ -158,14 +171,17 @@ def run_probe(binary: str, url: str, action: str, *, env: dict[str, str] | None 
     ):
         child_env.pop(key, None)
     child_env.update(env or {})
+    # `cwd` 会改子进程的工作目录,而 --probe 传进来的是相对路径 → 必须先绝对化,
+    # 否则换了 cwd 就找不到探针二进制。
     result = subprocess.run(
-        [binary, url, API_KEY, BUILD_ID, SCHEMA_DIGEST, action],
+        [os.path.abspath(binary), url, API_KEY, BUILD_ID, SCHEMA_DIGEST, action],
         check=True,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=15,
         env=child_env,
+        cwd=cwd,
     )
     return result.stdout
 
@@ -236,6 +252,21 @@ def main() -> int:
             )
             assert "unsafe_local_daemon_config=degraded" in missing
             assert ACTOR.request_count == before_invalid
+        # issue #30: an unconfigured client cloned for a worker thread must not be
+        # promoted to CLI-exclusive and must not materialise a Store. The probe
+        # asserts the in-process invariants; the empty cwd afterwards is the
+        # observable one — the original defect wrote `daemon-owned/` and
+        # `daemon-owned.tinykg-daemon.lock` into whatever directory the process
+        # happened to be in, which for the e2e suite was the git worktree.
+        before_clone = ACTOR.request_count
+        with tempfile.TemporaryDirectory() as probe_cwd:
+            cloned = run_probe(
+                args.probe, url, "unconfigured-clone-no-store", cwd=probe_cwd,
+            )
+            assert "unconfigured_clone_owns_no_store=pass" in cloned
+            leaked = sorted(os.listdir(probe_cwd))
+            assert leaked == [], f"unconfigured clone leaked store artifacts into cwd: {leaked}"
+        assert ACTOR.request_count == before_clone
         server.mode = "backpressure"  # type: ignore[attr-defined]
         assert "backpressure=observed" in run_probe(args.probe, url, "backpressure")
         assert "backpressure_write_no_commit=observed" in run_probe(args.probe, url, "backpressure-write")

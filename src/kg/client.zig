@@ -172,6 +172,47 @@ pub const TaskStatus = enum {
     }
 };
 
+/// argv 里给 store 路径预留的槽位,在 daemon 拥有 store 时填这个占位符。
+/// 具名而非内联:此前它是散在两处的裸字面量,没有共享常量——对齐 CHAT_SENTINEL 的做法。
+pub const DAEMON_OWNED_SLOT = "daemon-owned";
+
+/// 本 client 的 Store 在哪。
+///
+/// **刻意不是一个 `[]const u8`**:CLI 传输下本 client 拥有磁盘上的 Store,daemon 传输下
+/// Store 归 daemon,这里没有任何东西是文件系统位置。两种含义共用一个字符串字段,正是
+/// issue #30 里占位符一路流进 `tinykg init` 的原因——类型不携带信息,安全就只能靠
+/// 跨字段的远距离不变量维持,而编译器查不了那种不变量。
+pub const StoreRef = union(enum) {
+    /// 本 client 拥有的 Store 绝对路径(owned)。可建、可改名、可派生兄弟路径。
+    owned: []u8,
+    /// **本 client 不拥有 Store**——daemon 传输下是 daemon 拥有,未配置时则根本没有
+    /// Store。两种情况在这里等价且必须等价:都不许把它当路径用。
+    ///
+    /// 名字刻意不叫 `.daemon_owned`:未配置的 client 也是这个状态,而那时**没有 daemon**,
+    /// 那个名字对一半用法是假陈述。argv 槽位仍填协议约定的 `DAEMON_OWNED_SLOT`——那是
+    /// 线上形状,与所有权语义是两回事。
+    unowned,
+
+    /// CLI 为 store 路径预留的 argv 槽位。两种状态都合法——daemon 传输会在发送前
+    /// 剥掉 argv[1]。
+    pub fn argvSlot(self: StoreRef) []const u8 {
+        return switch (self) {
+            .owned => |p| p,
+            .unowned => DAEMON_OWNED_SLOT,
+        };
+    }
+
+    /// 磁盘位置;本 client 不拥有 Store 时为 null。**所有**文件系统调用必须经由此处
+    /// 并处理 null——这正是这个 union 存在的全部意义:把一条没人写下来的不变量,变成
+    /// 编译器当场强制的局部约束。
+    pub fn fsPath(self: StoreRef) ?[]const u8 {
+        return switch (self) {
+            .owned => |p| p,
+            .unowned => null,
+        };
+    }
+};
+
 pub const KgClient = struct {
     const Transport = union(enum) {
         daemon: transport_mod.WebTransport,
@@ -188,8 +229,9 @@ pub const KgClient = struct {
     transport: Transport,
     /// tinykg 二进制绝对路径(owned)。null = 未解析到 → degraded。
     bin_path: ?[]u8 = null,
-    /// store 目录绝对路径(owned)。
-    store_path: []u8,
+    /// Store 的位置。`.owned` 携带绝对路径(owned 内存),`.unowned` 不是路径。
+    /// 取 argv 槽位用 `store.argvSlot()`,取磁盘路径用 `store.fsPath()`(返回 optional)。
+    store: StoreRef,
     /// 当前项目 domain id(owned)。跨项目记忆用 "global"。
     domain: []u8,
     /// 就绪:二进制存在 + store 可用 + 版本门通过。
@@ -253,7 +295,10 @@ pub const KgClient = struct {
             .exclusive_cli, .unconfigured => {},
         }
         if (self.bin_path) |p| self.allocator.free(p);
-        self.allocator.free(self.store_path);
+        switch (self.store) {
+            .owned => |p| self.allocator.free(p),
+            .unowned => {}, // 占位符是编译期常量,没有 owned 内存
+        }
         self.allocator.free(self.domain);
         if (self.degraded_reason) |r| self.allocator.free(r);
         if (self.last_detail) |d| self.allocator.free(d);
@@ -299,11 +344,16 @@ pub const KgClient = struct {
         else
             false;
         const use_cli = injected_cli or env_cli;
-        const store = if (use_cli)
-            try resolveStorePath(allocator, opts)
+        // 只有拥有 Store 时才有路径可言。非 CLI 传输拿到的是 `.unowned` 这个
+        // **不是路径**的状态,而不是一个恰好长得像路径的字符串。
+        const store: StoreRef = if (use_cli)
+            .{ .owned = try resolveStorePath(allocator, opts) }
         else
-            try allocator.dupe(u8, "daemon-owned");
-        errdefer allocator.free(store);
+            .unowned;
+        errdefer switch (store) {
+            .owned => |p| allocator.free(p),
+            .unowned => {},
+        };
         const domain = try allocator.dupe(u8, opts.domain);
         errdefer allocator.free(domain);
         const bin = if (use_cli) try resolveBinPath(allocator, opts) else null;
@@ -319,7 +369,7 @@ pub const KgClient = struct {
             .allocator = allocator,
             .transport = transport,
             .bin_path = bin,
-            .store_path = store,
+            .store = store,
             .domain = domain,
             .scoped_types = std.StringHashMap(void).init(allocator),
             .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
@@ -331,31 +381,50 @@ pub const KgClient = struct {
     /// 用途(Linus SW3 H1):swarm teammate 各线程定时 poll frontier/claim,共享一个 client 会在
     /// **非线程安全的 App arena** 上并发 alloc/free(runRaw dupeZ + frontier 行解析都在 self.allocator
     /// 外锁)→ 堆损坏。每线程一个 c_allocator 客户端隔离 arena;tinykg 的 store-dir 锁仍串行化跨
-    /// 客户端的执行,数据一致。self 的 store_path/domain/bin_path init 后不可变,并发读安全。
+    /// 客户端的执行,数据一致。self 的 store/domain/bin_path init 后不可变,并发读安全。
     /// 返回的 client 由调用线程 own(deinit 释放);未 ensureReady——调用方自行 ensureReady。
     pub fn cloneForThread(self: *const KgClient, allocator: std.mem.Allocator, home: []const u8) !KgClient {
         if (self.transport == .daemon) {
             const domain = try allocator.dupe(u8, self.domain);
             errdefer allocator.free(domain);
-            const store = try allocator.dupe(u8, "daemon-owned");
-            errdefer allocator.free(store);
             const daemon = try self.transport.daemon.cloneForSession(allocator);
             return .{
                 .allocator = allocator,
                 .transport = .{ .daemon = daemon },
                 .bin_path = null,
-                .store_path = store,
+                .store = .unowned,
                 .domain = domain,
                 .scoped_types = std.StringHashMap(void).init(allocator),
                 .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
                 .execution_ledger = execution_knowledge.Ledger.init(allocator),
             };
         }
+        // issue #30:此前这里只判 `.daemon`,于是 `.unconfigured` 客户端落到下面的
+        // CLI 重建路径——把不拥有 Store 的 client 提升成 `.exclusive_cli`,并重新解析出
+        // 一个真 bin_path。而"没有 bin 就没法把 store 当路径用"正是另外三处窄守卫赖以
+        // 安全的前提,这里亲手把它补上了,占位符随即被当成相对路径跑 `tinykg init`。
+        //
+        // 不拥有 Store 的客户端,克隆体也不该凭空拥有一个:保持未配置,由调用方的
+        // ensureReady 照常 degraded。
+        const owned_store = self.store.fsPath() orelse {
+            const domain = try allocator.dupe(u8, self.domain);
+            errdefer allocator.free(domain);
+            return .{
+                .allocator = allocator,
+                .transport = .unconfigured,
+                .bin_path = null,
+                .store = .unowned,
+                .domain = domain,
+                .scoped_types = std.StringHashMap(void).init(allocator),
+                .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
+                .execution_ledger = execution_knowledge.Ledger.init(allocator),
+            };
+        };
         return KgClient.init(allocator, .{
             .home = home,
             .domain = self.domain,
             .config_bin = self.bin_path,
-            .config_store = self.store_path,
+            .config_store = owned_store,
             .env_bin = "", // 屏蔽 env 重解析,直接用 self 已解析的路径
             .env_store = "",
             .exclusive_cli = true,
@@ -425,14 +494,42 @@ pub const KgClient = struct {
         return self.execution_ledger.pendingForTask(task_id);
     }
 
+    /// Store 路径必须是绝对的。相对路径会让 Store(以及由它派生的 backup/quarantine/
+    /// lock/tmp 五个兄弟产物)落在**进程 cwd**——对一个会 chdir 或从任意目录启动的
+    /// 进程来说,那是不可预测的位置。仓库在 workspace_policy / rule_evaluation /
+    /// project_rule_bundle 等处都强制 isAbsolute,这里补齐同一条纪律。
+    /// 注:末尾的默认值由 `opts.home` 拼出,home 本身为相对时同样拒绝。
     fn resolveStorePath(allocator: std.mem.Allocator, opts: ResolveOptions) ![]u8 {
         if (opts.env_store orelse envGet("METACODES_KG_STORE")) |v| {
-            if (v.len > 0) return allocator.dupe(u8, v);
+            if (v.len > 0) return absoluteStorePath(allocator, v, opts.home);
         }
         if (opts.config_store) |v| {
-            if (v.len > 0) return allocator.dupe(u8, v);
+            if (v.len > 0) return absoluteStorePath(allocator, v, opts.home);
         }
-        return std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/store.kg", .{opts.home});
+        const derived = try std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/store.kg", .{opts.home});
+        errdefer allocator.free(derived);
+        if (!std.fs.path.isAbsolute(derived)) return error.RelativeStorePath;
+        return derived;
+    }
+
+    /// 用户配置的 store 路径补全成绝对路径。
+    ///
+    /// **相对路径不报错**:`init` 的错误被唯一的生产调用方 `app.zig` `catch return`
+    /// 静默吞掉,把一个可信的笔误(`kg_store: "store.kg"`)变成 KG 无声消失。本模块的
+    /// 通行做法是 setDegraded 带修复提示,从不让 init 失败。
+    ///
+    /// 但也不能原样采用:相对值会让 Store 以及由它派生的五个兄弟产物(backup /
+    /// quarantine / auto-migrate marker / md-import tmp / daemon lock)全部落在
+    /// **进程 cwd**——对一个会从任意目录启动的进程,那是不可预测的位置。所以在解析
+    /// 处就以 home 为基准补全,下游每一处使用都继承这个保证,无需各自再校验。
+    fn absoluteStorePath(allocator: std.mem.Allocator, path: []const u8, home: []const u8) ![]u8 {
+        if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+        const joined = try std.fs.path.join(allocator, &.{ home, path });
+        errdefer allocator.free(joined);
+        // home 自身是相对的话补全也救不回来(home 来自 OS,正常不会发生)。
+        if (!std.fs.path.isAbsolute(joined)) return error.RelativeStorePath;
+        log.warn("kg", "relative store path {s} resolved against home: {s}", .{ path, joined });
+        return joined;
     }
 
     /// bin 查找顺序:env METACODES_KG_BIN > config kg_bin > 构建时 staged 的
@@ -654,18 +751,27 @@ pub const KgClient = struct {
             self.setDegraded("tinykg 二进制未找到。只接受 METACODES_KG_BIN、config kg_bin 或构建时从 checked-in bundle staged 的 <prefix>/vendor/tinykg/tinykg。源码仓库不构建 TinyKG；见 doc/TINYKG_INTEGRATION.md", .{});
             return;
         };
+        // 与 bin 同一套写法:在边界解包一次,往下传参。`.unowned` 到这里就是矛盾
+        // ——daemon 拥有 Store 的 client 不该走到 CLI 的建库路径上(issue #30 正是从
+        // cloneForThread 把这种 client 提升成 .exclusive_cli 溜进来的)。失败关闭。
+        const store = self.store.fsPath() orelse {
+            // 措辞刻意避开 "未打开本地 Store"——那是 daemon preflight 那条消息的规则标记,
+            // 复用会让它不再唯一:原消息被删掉时规则仍会因为这条而通过。
+            self.setDegraded("内部状态矛盾:CLI 传输却不拥有 Store(store=daemon-owned);拒绝在当前目录建库", .{});
+            return;
+        };
         // store 缺 → init(先建父目录)。
-        if (!dirExists(self.store_path)) {
-            switch (self.recoverInterruptedAutoMigration(bin)) {
+        if (!dirExists(store)) {
+            switch (self.recoverInterruptedAutoMigration(bin, store)) {
                 .not_needed => {},
                 .recovered => {},
                 .failed => return,
             }
         }
-        if (!dirExists(self.store_path)) {
-            ensureParentDir(self.allocator, self.store_path) catch {};
-            const out = self.runRaw(&.{ "init", self.store_path }) catch {
-                self.setDegraded("tinykg init 失败(bin={s} store={s});检查磁盘/权限", .{ bin, self.store_path });
+        if (!dirExists(store)) {
+            ensureParentDir(self.allocator, store) catch {};
+            const out = self.runRaw(&.{ "init", store }) catch {
+                self.setDegraded("tinykg init 失败(bin={s} store={s});检查磁盘/权限", .{ bin, store });
                 return;
             };
             defer self.freeOut(out);
@@ -675,18 +781,18 @@ pub const KgClient = struct {
             }
         }
         // 版本门(含 legacy 自动 migrate)。
-        if (!self.checkStoreVersionOrMigrate(bin)) return;
+        if (!self.checkStoreVersionOrMigrate(bin, store)) return;
         // v42 连续性完整性门(导入侧):版本门只读头部元数据,损坏 store 能带着
         // 完好版本字段通过,然后在首个作用域读上全灭。深探针 + 隔离重建。
-        if (!self.deepProbeOrQuarantine(bin)) return;
+        if (!self.deepProbeOrQuarantine(bin, store)) return;
         self.ready = true;
-        log.info("kg", "ready bin={s} store={s} domain={s}", .{ bin, self.store_path, self.domain });
+        log.info("kg", "ready bin={s} store={s} domain={s}", .{ bin, store, self.domain });
     }
 
     /// 版本门检查;legacy store 自动 migrate 到 v2 后重新验证。true=通过,false=已 setDegraded。
-    fn checkStoreVersionOrMigrate(self: *KgClient, bin: []const u8) bool {
-        const out = self.runRaw(&.{ "store-info", self.store_path }) catch {
-            self.setDegraded("tinykg store-info 失败(bin={s} store={s})", .{ bin, self.store_path });
+    fn checkStoreVersionOrMigrate(self: *KgClient, bin: []const u8, store: []const u8) bool {
+        const out = self.runRaw(&.{ "store-info", store }) catch {
+            self.setDegraded("tinykg store-info 失败(bin={s} store={s})", .{ bin, store });
             return false;
         };
         defer self.freeOut(out);
@@ -702,7 +808,7 @@ pub const KgClient = struct {
             if (!std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION)) {
                 self.setDegraded(
                     "store schema 版本不符:期望 {s} 实际 {s}(store={s})。不要原地改 canonical store;请先运行 `tinykg migrate-store-v2 {s} <new-store> --task-status-v1 --verify`,核验后再切换 store",
-                    .{ EXPECTED_SCHEMA_VERSION, schema_ver, self.store_path, self.store_path },
+                    .{ EXPECTED_SCHEMA_VERSION, schema_ver, store, store },
                 );
                 return false;
             }
@@ -710,15 +816,15 @@ pub const KgClient = struct {
         }
         // storage_format 不符:仅 legacy 自动 migrate,其它版本直接 degraded
         if (!std.mem.eql(u8, ver, "legacy")) {
-            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});手动跑 `tinykg upgrade {s} <new-store>` 核验后替换,见 deps/tinykg.json", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, self.store_path, self.store_path });
+            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});手动跑 `tinykg upgrade {s} <new-store>` 核验后替换,见 deps/tinykg.json", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, store, store });
             return false;
         }
         // legacy → current format 自动 migrate(本机 KG 是基础特性,不应让用户手动跑 tinykg 命令)
-        if (!self.autoMigrateLegacyStore()) {
-            self.setDegraded("store legacy→v2 自动 migrate 失败(bin={s} store={s});手动跑 `tinykg migrate-store-v2 {s} <new> --task-status-v1 --verify` 后替换", .{ bin, self.store_path, self.store_path });
+        if (!self.autoMigrateLegacyStore(store)) {
+            self.setDegraded("store legacy→v2 自动 migrate 失败(bin={s} store={s});手动跑 `tinykg migrate-store-v2 {s} <new> --task-status-v1 --verify` 后替换", .{ bin, store, store });
             return false;
         }
-        log.info("kg", "legacy→v2 自动 migrate 成功 store={s}", .{self.store_path});
+        log.info("kg", "legacy→v2 自动 migrate 成功 store={s}", .{store});
         // autoMigrateLegacyStore only returns true after probeStore reopens canonical
         // and sees the exact 2/3 pair; do not add a third redundant subprocess here.
         return true;
@@ -733,8 +839,8 @@ pub const KgClient = struct {
     /// 全,可取证)+ 重建空店(剂量由结局根在 ingest 重新摄取,损失有界);
     /// transient 失败不隔离(环境抖动不该核爆记忆)。返回 false 仅当隔离/
     /// 重建本身失败(已 setDegraded)。
-    fn deepProbeOrQuarantine(self: *KgClient, bin: []const u8) bool {
-        const out = self.runRaw(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" }) catch {
+    fn deepProbeOrQuarantine(self: *KgClient, bin: []const u8, store: []const u8) bool {
+        const out = self.runRaw(&.{ "list-recent", store, "--kind", "project", "--limit", "200" }) catch {
             // spawn 失败是环境问题不是店问题:交给后续 op 的重试/降级路径。
             return true;
         };
@@ -749,30 +855,30 @@ pub const KgClient = struct {
             return true;
         }
         // 与 migrate 共用 host lock:并发进程只允许一个执行隔离。
-        var lock = self.acquireMigrationLock() catch |err| {
-            self.setDegraded("store integrity quarantine lock failed: {s}(store={s})", .{ @errorName(err), self.store_path });
+        var lock = self.acquireMigrationLock(store) catch |err| {
+            self.setDegraded("store integrity quarantine lock failed: {s}(store={s})", .{ @errorName(err), store });
             return false;
         };
         defer lock.release();
         // 等锁期间另一进程可能已隔离并重建:重探针,通过即完成。
-        if (self.runRaw(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" })) |re_out| {
+        if (self.runRaw(&.{ "list-recent", store, "--kind", "project", "--limit", "200" })) |re_out| {
             const re_exit = re_out.exit_code;
             self.freeOut(re_out);
             if (re_exit == 0) return true;
         } else |_| {}
         const ts: u64 = @intCast(@max(0, time.nowUnix()));
-        const quarantine_path = std.fmt.allocPrint(self.allocator, "{s}.quarantined.{d}", .{ self.store_path, ts }) catch {
-            self.setDegraded("store integrity quarantine path allocation failed(err={s} store={s})", .{ err_name, self.store_path });
+        const quarantine_path = std.fmt.allocPrint(self.allocator, "{s}.quarantined.{d}", .{ store, ts }) catch {
+            self.setDegraded("store integrity quarantine path allocation failed(err={s} store={s})", .{ err_name, store });
             return false;
         };
         defer self.allocator.free(quarantine_path);
-        if (!renamePath(self.store_path, quarantine_path)) {
-            self.setDegraded("store integrity quarantine rename failed(err={s} store={s})", .{ err_name, self.store_path });
+        if (!renamePath(store, quarantine_path)) {
+            self.setDegraded("store integrity quarantine rename failed(err={s} store={s})", .{ err_name, store });
             return false;
         }
         log.warn("kg", "store integrity quarantine: deep probe failed err={s}; broken store preserved at {s}; initializing FRESH store (outcome-root re-ingest restores dose)", .{ err_name, quarantine_path });
-        const init_out = self.runRaw(&.{ "init", self.store_path }) catch {
-            self.setDegraded("post-quarantine tinykg init failed(bin={s} store={s})", .{ bin, self.store_path });
+        const init_out = self.runRaw(&.{ "init", store }) catch {
+            self.setDegraded("post-quarantine tinykg init failed(bin={s} store={s})", .{ bin, store });
             return false;
         };
         defer self.freeOut(init_out);
@@ -798,16 +904,16 @@ pub const KgClient = struct {
         return .incompatible;
     }
 
-    fn migrationBackupPath(self: *KgClient) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}.legacy.bak", .{self.store_path});
+    fn migrationBackupPath(self: *KgClient, store: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.legacy.bak", .{store});
     }
 
-    fn migrationLockTarget(self: *KgClient) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}.metacodes-auto-migrate", .{self.store_path});
+    fn migrationLockTarget(self: *KgClient, store: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.metacodes-auto-migrate", .{store});
     }
 
-    fn acquireMigrationLock(self: *KgClient) !file_lock.Lock {
-        const target = try self.migrationLockTarget();
+    fn acquireMigrationLock(self: *KgClient, store: []const u8) !file_lock.Lock {
+        const target = try self.migrationLockTarget(store);
         defer self.allocator.free(target);
         // tinykg subprocess timeout is 35s. The host lock must not be stolen while that
         // child is alive, while a crashed holder must still be recoverable within the
@@ -817,74 +923,74 @@ pub const KgClient = struct {
 
     /// Crash recovery runs before `init`: if canonical disappeared after legacy→backup,
     /// resume TinyKG's idempotent migration rather than creating a new empty store.
-    fn recoverInterruptedAutoMigration(self: *KgClient, bin: []const u8) MigrationRecovery {
-        const backup = self.migrationBackupPath() catch {
-            self.setDegraded("legacy migrate recovery path allocation failed(store={s})", .{self.store_path});
+    fn recoverInterruptedAutoMigration(self: *KgClient, bin: []const u8, store: []const u8) MigrationRecovery {
+        const backup = self.migrationBackupPath(store) catch {
+            self.setDegraded("legacy migrate recovery path allocation failed(store={s})", .{store});
             return .failed;
         };
         defer self.allocator.free(backup);
         if (!dirExists(backup)) return .not_needed;
 
-        var lock = self.acquireMigrationLock() catch |err| {
-            self.setDegraded("legacy migrate recovery lock failed: {s}(store={s})", .{ @errorName(err), self.store_path });
+        var lock = self.acquireMigrationLock(store) catch |err| {
+            self.setDegraded("legacy migrate recovery lock failed: {s}(store={s})", .{ @errorName(err), store });
             return .failed;
         };
         defer lock.release();
-        if (dirExists(self.store_path)) return .recovered; // another process completed while we waited
+        if (dirExists(store)) return .recovered; // another process completed while we waited
         if (self.probeStore(backup) != .legacy) {
             self.setDegraded("legacy migrate recovery found an incompatible rollback artifact(bin={s} backup={s})", .{ bin, backup });
             return .failed;
         }
-        if (self.migrateBackupToCanonical(backup)) return .recovered;
-        if (!dirExists(self.store_path)) {
-            if (!renamePath(backup, self.store_path)) {
-                self.setDegraded("legacy migrate recovery failed and rollback rename failed(bin={s} backup={s} store={s})", .{ bin, backup, self.store_path });
+        if (self.migrateBackupToCanonical(backup, store)) return .recovered;
+        if (!dirExists(store)) {
+            if (!renamePath(backup, store)) {
+                self.setDegraded("legacy migrate recovery failed and rollback rename failed(bin={s} backup={s} store={s})", .{ bin, backup, store });
                 return .failed;
             }
         }
-        self.setDegraded("legacy migrate recovery failed; original store restored, automatic retry disabled for this session(bin={s} store={s})", .{ bin, self.store_path });
+        self.setDegraded("legacy migrate recovery failed; original store restored, automatic retry disabled for this session(bin={s} store={s})", .{ bin, store });
         return .failed;
     }
 
     /// legacy → v2/v3：先在 host lock 内把 canonical 原子改名为 rollback backup，
     /// 再让 TinyKG 自己从 backup 事务化发布 canonical target。这样只有一个 host rename，
     /// 发布、verify、staging recovery 仍由 TinyKG 原生实现；backup 始终保留可回滚原店。
-    fn autoMigrateLegacyStore(self: *KgClient) bool {
-        var lock = self.acquireMigrationLock() catch return false;
+    fn autoMigrateLegacyStore(self: *KgClient, store: []const u8) bool {
+        var lock = self.acquireMigrationLock(store) catch return false;
         defer lock.release();
 
         // Another metacodes process may have completed while this one waited.
-        switch (self.probeStore(self.store_path)) {
+        switch (self.probeStore(store)) {
             .expected => return true,
             .legacy => {},
             else => return false,
         }
-        const backup = self.migrationBackupPath() catch return false;
+        const backup = self.migrationBackupPath(store) catch return false;
         defer self.allocator.free(backup);
         // Never rotate or overwrite an unknown rollback artifact automatically.
         if (dirExists(backup)) return false;
-        if (!renamePath(self.store_path, backup)) return false;
+        if (!renamePath(store, backup)) return false;
 
-        if (self.migrateBackupToCanonical(backup)) {
+        if (self.migrateBackupToCanonical(backup, store)) {
             log.info("kg", "auto migrate: verified legacy backup retained at {s}", .{backup});
             return true;
         }
         // A failed/timeout migration is allowed to have published already; only restore
         // when canonical is still absent. Never overwrite a possibly committed target.
-        if (!dirExists(self.store_path)) _ = renamePath(backup, self.store_path);
+        if (!dirExists(store)) _ = renamePath(backup, store);
         return false;
     }
 
-    fn migrateBackupToCanonical(self: *KgClient, backup: []const u8) bool {
-        const out = self.runRaw(&.{ "migrate-store-v2", backup, self.store_path, "--task-status-v1", "--verify" }) catch {
-            return self.probeStore(self.store_path) == .expected;
+    fn migrateBackupToCanonical(self: *KgClient, backup: []const u8, store: []const u8) bool {
+        const out = self.runRaw(&.{ "migrate-store-v2", backup, store, "--task-status-v1", "--verify" }) catch {
+            return self.probeStore(store) == .expected;
         };
         defer self.freeOut(out);
         if (out.exit_code != 0) {
             log.warn("kg", "auto migrate subprocess failed exit={d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
-            return self.probeStore(self.store_path) == .expected;
+            return self.probeStore(store) == .expected;
         }
-        return self.probeStore(self.store_path) == .expected;
+        return self.probeStore(store) == .expected;
     }
 
     /// 同父目录 rename；canonical 缺失时 POSIX/Windows 都是原子路径切换。
@@ -924,7 +1030,7 @@ pub const KgClient = struct {
     /// 200 上限窗口)。只把 Data 类(空 store 等)视作"没有";Degraded/Transient 传播——
     /// 吞掉会把降级伪装成"库中无记忆"(版本门测试抓的正是这个静默)。
     fn lookupProjectNodeId(self: *KgClient, name: []const u8) KgError!?u64 {
-        const out = self.runChecked(&.{ "find", self.store_path, "project", name }) catch |e| switch (e) {
+        const out = self.runChecked(&.{ "find", self.store.argvSlot(), "project", name }) catch |e| switch (e) {
             KgError.Data => return null,
             else => return e,
         };
@@ -972,7 +1078,7 @@ pub const KgClient = struct {
             return null;
         }
         const out = try self.runCheckedWrite(&.{
-            "ensure-node", self.store_path, "project", name, "--schema-type", "project",
+            "ensure-node", self.store.argvSlot(), "project", name, "--schema-type", "project",
         });
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse return self.dataError("ensure project 节点输出不可解析: {s}", .{trimForLog(out.stdout)});
@@ -1030,7 +1136,7 @@ pub const KgClient = struct {
             return self.dataError("project 节点解析失败({s} 锚不可得)", .{kind.cliName()});
         var pbuf: [24]u8 = undefined;
         const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{pid}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{ "ensure-anchor", self.store_path, p_str, kind.cliName() });
+        const out = try self.runCheckedWrite(&.{ "ensure-anchor", self.store.argvSlot(), p_str, kind.cliName() });
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse
             return self.dataError("ensure-anchor 输出不可解析: {s}", .{trimForLog(out.stdout)});
@@ -1073,7 +1179,7 @@ pub const KgClient = struct {
             // TinyKG 仍兼容旧 task→task contains)。contains 属于 markdown 有序组合。
             // add-edge 幂等(同 src/rel/dst 去重),schema_type 已在 add-node 时写。
             .task => {
-                const out = self.runCheckedWrite(&.{ "add-edge", self.store_path, a_str, "contain", n_str }) catch |e| {
+                const out = self.runCheckedWrite(&.{ "add-edge", self.store.argvSlot(), a_str, "contain", n_str }) catch |e| {
                     self.invalidateAnchor(scope_global, kind);
                     return e;
                 };
@@ -1082,7 +1188,7 @@ pub const KgClient = struct {
             // 文档/记忆面:治理归属 contain(govern-node 同时写 schema_type 属性)。
             .docs, .memory => {
                 const out = self.runCheckedWrite(&.{
-                    "govern-node", self.store_path, n_str, "--parent", a_str, "--schema-type", schema_type,
+                    "govern-node", self.store.argvSlot(), n_str, "--parent", a_str, "--schema-type", schema_type,
                 }) catch |e| {
                     self.invalidateAnchor(scope_global, kind);
                     return e;
@@ -1125,7 +1231,7 @@ pub const KgClient = struct {
         var pbuf: [24]u8 = undefined;
         const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{pid}) catch unreachable;
         const out = try self.runCheckedWrite(&.{
-            "schema-scope", self.store_path, schema_type, "--project", p_str, "--if-absent", "--enforce", "block",
+            "schema-scope", self.store.argvSlot(), schema_type, "--project", p_str, "--if-absent", "--enforce", "block",
         });
         self.freeOut(out);
         // 入 session 缓存(key 深拷贝,owned)。
@@ -1153,7 +1259,7 @@ pub const KgClient = struct {
     /// (orphan 不进 --project 召回 = 静默丢失,必须让模型/用户可见可重试)。
     pub fn remember(self: *KgClient, kind: MemoryKind, text: []const u8, schema_type: []const u8, scope_global: bool) KgError!u64 {
         const out = try self.runCheckedWrite(&.{
-            "add-node", self.store_path, kind.label(), text, "--schema-type", schema_type,
+            "add-node", self.store.argvSlot(), kind.label(), text, "--schema-type", schema_type,
         });
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse return self.dataError("add-node 输出不可解析: {s}", .{trimForLog(out.stdout)});
@@ -1232,9 +1338,9 @@ pub const KgClient = struct {
     /// 返回 tinykg 输出摘要(owned)。
     pub fn gcMdOrphans(self: *KgClient, apply: bool) KgError![]u8 {
         const out = if (apply)
-            try self.runCheckedWrite(&.{ "gc-md-orphans", self.store_path, "--apply" })
+            try self.runCheckedWrite(&.{ "gc-md-orphans", self.store.argvSlot(), "--apply" })
         else
-            try self.runChecked(&.{ "gc-md-orphans", self.store_path });
+            try self.runChecked(&.{ "gc-md-orphans", self.store.argvSlot() });
         defer self.freeOut(out);
         return self.allocator.dupe(u8, std.mem.trim(u8, out.stdout, " \r\n")) catch KgError.OutOfMemory;
     }
@@ -1261,14 +1367,18 @@ pub const KgClient = struct {
             };
             return doc_id;
         }
-        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.{x}.tmp", .{ self.store_path, path_key }) catch return KgError.OutOfMemory;
+        // 临时文件与 Store 同级(`{store}.mdimport.*.tmp`),所以必须先确认本 client 真的
+        // 拥有 Store——否则这一行会在进程 cwd 里落文件。顺带纠正了顺序:原先文件先写出去,
+        // ready 检查要到下面 runCheckedWrite 里才发生。
+        const store = self.store.fsPath() orelse return KgError.Degraded;
+        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.{x}.tmp", .{ store, path_key }) catch return KgError.OutOfMemory;
         defer self.allocator.free(tmp_path);
         writeTmpFile(self.allocator, tmp_path, markdown) catch return self.dataError("写 md 临时文件失败", .{});
         defer deleteTmpFile(self.allocator, tmp_path);
 
         var argv = std.ArrayList([]const u8).empty;
         defer argv.deinit(self.allocator);
-        argv.appendSlice(self.allocator, &.{ "import-md-doc", self.store_path, tmp_path }) catch return KgError.OutOfMemory;
+        argv.appendSlice(self.allocator, &.{ "import-md-doc", store, tmp_path }) catch return KgError.OutOfMemory;
         if (source_label) |sl| argv.appendSlice(self.allocator, &.{ "--source-label", sl }) catch return KgError.OutOfMemory;
         const out = try self.runCheckedWrite(argv.items);
         defer self.freeOut(out);
@@ -1289,7 +1399,7 @@ pub const KgClient = struct {
     pub fn renderMarkdownDoc(self: *KgClient, doc_id: u64) KgError![]u8 {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{doc_id}) catch unreachable;
-        const out = try self.runChecked(&.{ "render-md-doc", self.store_path, id_str });
+        const out = try self.runChecked(&.{ "render-md-doc", self.store.argvSlot(), id_str });
         defer self.freeOut(out);
         return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
     }
@@ -1303,7 +1413,7 @@ pub const KgClient = struct {
     /// 挂接进项目子树(list-recent --project / search --project 可见)。
     pub fn createTask(self: *KgClient, text: []const u8, schema_type: []const u8) KgError!u64 {
         const out = try self.runCheckedWrite(&.{
-            "add-node", self.store_path, "task", text, "--schema-type", schema_type,
+            "add-node", self.store.argvSlot(), "task", text, "--schema-type", schema_type,
         });
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse return self.dataError("createTask 输出不可解析: {s}", .{trimForLog(out.stdout)});
@@ -1318,7 +1428,7 @@ pub const KgClient = struct {
     /// (membership 下钻),直挂是拍平反模式。深树子任务/计划步骤/inbox todo 用此。
     pub fn createChildTask(self: *KgClient, parent_id: u64, text: []const u8, schema_type: []const u8) KgError!u64 {
         const out = try self.runCheckedWrite(&.{
-            "add-node", self.store_path, "task", text, "--schema-type", schema_type,
+            "add-node", self.store.argvSlot(), "task", text, "--schema-type", schema_type,
         });
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse return self.dataError("createChildTask 输出不可解析: {s}", .{trimForLog(out.stdout)});
@@ -1335,7 +1445,7 @@ pub const KgClient = struct {
         var dbuf: [24]u8 = undefined;
         const s_str = std.fmt.bufPrint(&sbuf, "{d}", .{src}) catch unreachable;
         const d_str = std.fmt.bufPrint(&dbuf, "{d}", .{dst}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{ "add-edge", self.store_path, s_str, rel, d_str });
+        const out = try self.runCheckedWrite(&.{ "add-edge", self.store.argvSlot(), s_str, rel, d_str });
         self.freeOut(out);
     }
 
@@ -1368,7 +1478,7 @@ pub const KgClient = struct {
         var dbuf: [24]u8 = undefined;
         const s_str = std.fmt.bufPrint(&sbuf, "{d}", .{src}) catch unreachable;
         const d_str = std.fmt.bufPrint(&dbuf, "{d}", .{dst}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{ "add-edge", self.store_path, s_str, rel, d_str });
+        const out = try self.runCheckedWrite(&.{ "add-edge", self.store.argvSlot(), s_str, rel, d_str });
         defer self.freeOut(out);
         const edge_id = parseEdgeIdLine(out.stdout) orelse return self.dataError("add-edge 输出不可解析: {s}", .{trimForLog(out.stdout)});
         try self.setEdgeState(edge_id, confirmed);
@@ -1378,7 +1488,7 @@ pub const KgClient = struct {
         var ebuf: [24]u8 = undefined;
         const e_str = std.fmt.bufPrint(&ebuf, "{d}", .{edge_id}) catch unreachable;
         const state: []const u8 = if (confirmed) "confirmed" else "tentative";
-        const sp = try self.runCheckedWrite(&.{ "set-edge-property", self.store_path, e_str, "state", state });
+        const sp = try self.runCheckedWrite(&.{ "set-edge-property", self.store.argvSlot(), e_str, "state", state });
         self.freeOut(sp);
     }
 
@@ -1394,14 +1504,14 @@ pub const KgClient = struct {
     /// (那个拒 concept 是**记忆 remember 路径**防催收池;投影目标是本体实体,concept 正确)。
     pub fn ensureConcept(self: *KgClient, name: []const u8) KgError!u64 {
         const out = try self.runCheckedWrite(&.{
-            "ensure-node", self.store_path, "concept", name, "--schema-type", "concept",
+            "ensure-node", self.store.argvSlot(), "concept", name, "--schema-type", "concept",
         });
         defer self.freeOut(out);
         return parseNodeIdLine(out.stdout) orelse self.dataError("ensure concept 输出不可解析: {s}", .{trimForLog(out.stdout)});
     }
 
     fn addKindNode(self: *KgClient, kind_label: []const u8, text: []const u8) KgError!u64 {
-        const out = try self.runCheckedWrite(&.{ "add-node", self.store_path, kind_label, text });
+        const out = try self.runCheckedWrite(&.{ "add-node", self.store.argvSlot(), kind_label, text });
         defer self.freeOut(out);
         return parseNodeIdLine(out.stdout) orelse self.dataError("add-node {s} 输出不可解析: {s}", .{ kind_label, trimForLog(out.stdout) });
     }
@@ -1417,7 +1527,7 @@ pub const KgClient = struct {
     fn findEdge(self: *KgClient, src: u64, rel: []const u8, dst: u64) KgError!?RefEdgeMatch {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{src}) catch unreachable;
-        const out = try self.runChecked(&.{ "neighbors", self.store_path, id_str, rel, "--limit", "200", "--format", "json" });
+        const out = try self.runChecked(&.{ "neighbors", self.store.argvSlot(), id_str, rel, "--limit", "200", "--format", "json" });
         defer self.freeOut(out);
         const Props = struct { state: ?[]const u8 = null };
         const Edge = struct { id: u64, rel: []const u8, dst: u64, props: Props = .{} };
@@ -1454,7 +1564,7 @@ pub const KgClient = struct {
     fn deleteEdge(self: *KgClient, edge_id: u64) KgError!void {
         var ebuf: [24]u8 = undefined;
         const e_str = std.fmt.bufPrint(&ebuf, "{d}", .{edge_id}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{ "delete-edge", self.store_path, e_str });
+        const out = try self.runCheckedWrite(&.{ "delete-edge", self.store.argvSlot(), e_str });
         self.freeOut(out);
     }
 
@@ -1517,7 +1627,7 @@ pub const KgClient = struct {
         var limbuf: [16]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
         const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
-        const out = try self.runChecked(&.{ "neighbors", self.store_path, id_str, "--limit", lim_str });
+        const out = try self.runChecked(&.{ "neighbors", self.store.argvSlot(), id_str, "--limit", lim_str });
         defer self.freeOut(out);
         return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
     }
@@ -1528,7 +1638,7 @@ pub const KgClient = struct {
         var limbuf: [16]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
         const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
-        const out = try self.runChecked(&.{ "neighbors", self.store_path, id_str, "--limit", lim_str, "--format", "json" });
+        const out = try self.runChecked(&.{ "neighbors", self.store.argvSlot(), id_str, "--limit", lim_str, "--format", "json" });
         defer self.freeOut(out);
         return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
     }
@@ -1540,7 +1650,7 @@ pub const KgClient = struct {
         var limbuf: [16]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
         const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
-        const out = try self.runChecked(&.{ "task-packet", self.store_path, id_str, "--limit", lim_str });
+        const out = try self.runChecked(&.{ "task-packet", self.store.argvSlot(), id_str, "--limit", lim_str });
         defer self.freeOut(out);
         return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
     }
@@ -1565,9 +1675,9 @@ pub const KgClient = struct {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{root_id}) catch unreachable;
         const out = try self.runChecked(&.{
-            "task-snapshot", self.store_path, id_str,
-            "--max-tasks",   "256",           "--max-edges",
-            "1024",          "--max-chars",   "200000",
+            "task-snapshot", self.store.argvSlot(), id_str,
+            "--max-tasks",   "256",                 "--max-edges",
+            "1024",          "--max-chars",         "200000",
         });
         defer self.freeOut(out);
         const snapshot = stripCliLineFraming(out.stdout) orelse
@@ -1598,18 +1708,18 @@ pub const KgClient = struct {
         // 只可能由我们写入;恒等写入幂等,快照端仍做最终匹配校验。
         {
             const bind_sha = try self.runChecked(&.{
-                "set-node-property", self.store_path,              id_str,
+                "set-node-property", self.store.argvSlot(),        id_str,
                 "project_sha256",    expected_project_sha256[0..],
             });
             self.freeOut(bind_sha);
             const bind_key = try self.runChecked(&.{
-                "set-node-property", self.store_path,      id_str,
+                "set-node-property", self.store.argvSlot(), id_str,
                 "project_key",       expected_project_key,
             });
             self.freeOut(bind_key);
         }
         const out = try self.runChecked(&.{
-            "ontology-rule-snapshot", self.store_path,              id_str,
+            "ontology-rule-snapshot", self.store.argvSlot(),        id_str,
             "--project-sha256",       expected_project_sha256[0..], "--project-key",
             expected_project_key,     "--max-items",                "48",
             "--max-chars",            "200000",
@@ -1652,7 +1762,7 @@ pub const KgClient = struct {
         evidence_sha256_hex: *const [64]u8,
     ) KgError!u64 {
         const add_out = try self.runCheckedWrite(&.{
-            "add-node", self.store_path, MemoryKind.observation.label(), text, "--schema-type", ontology_kind,
+            "add-node", self.store.argvSlot(), MemoryKind.observation.label(), text, "--schema-type", ontology_kind,
         });
         const id = parseNodeIdLine(add_out.stdout) orelse {
             self.freeOut(add_out);
@@ -1676,7 +1786,7 @@ pub const KgClient = struct {
         };
         for (steps) |step| {
             const out = try self.runChecked(&.{
-                "set-node-property", self.store_path, id_str, step[0], step[1],
+                "set-node-property", self.store.argvSlot(), id_str, step[0], step[1],
             });
             self.freeOut(out);
         }
@@ -1776,10 +1886,10 @@ pub const KgClient = struct {
         const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
         const chars_str = std.fmt.bufPrint(&charsbuf, "{d}", .{max_chars}) catch unreachable;
         const out = try self.runChecked(&.{
-            "task-packet", self.store_path, id_str,
-            "--limit",     lim_str,         "--format",
-            "json",        "--meta",        "--max-nodes",
-            "16",          "--max-edges",   "24",
+            "task-packet", self.store.argvSlot(), id_str,
+            "--limit",     lim_str,               "--format",
+            "json",        "--meta",              "--max-nodes",
+            "16",          "--max-edges",         "24",
             "--max-chars", chars_str,
         });
         defer self.freeOut(out);
@@ -1833,9 +1943,9 @@ pub const KgClient = struct {
         defer self.allocator.free(verification_text);
         const terminal_str = @tagName(terminal);
         const out = if (agent_ident) |by| try self.runCheckedWrite(&.{
-            "task-close", self.store_path, id_str, terminal_str, "--by", by, "--evidence-text", verification_text,
+            "task-close", self.store.argvSlot(), id_str, terminal_str, "--by", by, "--evidence-text", verification_text,
         }) else try self.runCheckedWrite(&.{
-            "task-close", self.store_path, id_str, terminal_str, "--evidence-text", verification_text,
+            "task-close", self.store.argvSlot(), id_str, terminal_str, "--evidence-text", verification_text,
         });
         self.freeOut(out);
     }
@@ -1849,7 +1959,7 @@ pub const KgClient = struct {
     pub fn taskReadiness(self: *KgClient, task_id: u64) KgError!FrontierRow.Readiness {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
-        const out = try self.runChecked(&.{ "task-ready", self.store_path, id_str });
+        const out = try self.runChecked(&.{ "task-ready", self.store.argvSlot(), id_str });
         defer self.freeOut(out);
         const v = std.mem.trim(u8, out.stdout, " \r\n");
         if (std.mem.eql(u8, v, "ready")) return .ready;
@@ -1862,7 +1972,7 @@ pub const KgClient = struct {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch return;
         const out = self.runChecked(&.{
-            "set-property", self.store_path, id_str, "session_id", session_id,
+            "set-property", self.store.argvSlot(), id_str, "session_id", session_id,
         }) catch return;
         self.freeOut(out);
     }
@@ -1950,8 +2060,8 @@ pub const KgClient = struct {
         var argv = std.ArrayList([]const u8).empty;
         defer argv.deinit(self.allocator);
         argv.appendSlice(self.allocator, &.{
-            "search",    self.store_path, query,      "--project", p_str,            "--limit", raw_limit,
-            "--profile", "agent-memory",  "--format", "json",      "--include-text",
+            "search",    self.store.argvSlot(), query,      "--project", p_str,            "--limit", raw_limit,
+            "--profile", "agent-memory",        "--format", "json",      "--include-text",
         }) catch return KgError.OutOfMemory;
         if (type_filter) |tf| argv.appendSlice(self.allocator, &.{ "--schema-type", tf }) catch return KgError.OutOfMemory;
         if (kind_filter) |kind| argv.appendSlice(self.allocator, &.{ "--kind", kind }) catch return KgError.OutOfMemory;
@@ -2056,7 +2166,7 @@ pub const KgClient = struct {
         const none = MemorySource{ .label = null, .md_derived = false };
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
-        const out = self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json" }) catch return none;
+        const out = self.runChecked(&.{ "get", self.store.argvSlot(), id_str, "--format", "json" }) catch return none;
         defer self.freeOut(out);
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, out.stdout, .{}) catch return none;
         defer parsed.deinit();
@@ -2076,7 +2186,7 @@ pub const KgClient = struct {
 
     /// project 节点列表("  id  名称\n" 多行,owned;/kg projects 用——merge 的 id 唯一出口)。
     pub fn listProjects(self: *KgClient, allocator: std.mem.Allocator) KgError![]u8 {
-        const out = try self.runChecked(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" });
+        const out = try self.runChecked(&.{ "list-recent", self.store.argvSlot(), "--kind", "project", "--limit", "200" });
         defer self.freeOut(out);
         var b: std.ArrayList(u8) = .empty;
         errdefer b.deinit(allocator);
@@ -2098,7 +2208,7 @@ pub const KgClient = struct {
     /// 重复 project 检测(状态页提示):同名(escaped text)project ≥2 → 返回名字串(owned);无 → null。
     /// 旧 bug 时代增殖的重复让一半记忆召回不可见,用户自己不可能发现,必须主动提示。
     pub fn duplicateProjectHint(self: *KgClient, allocator: std.mem.Allocator) ?[]u8 {
-        const out = self.runChecked(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" }) catch return null;
+        const out = self.runChecked(&.{ "list-recent", self.store.argvSlot(), "--kind", "project", "--limit", "200" }) catch return null;
         defer self.freeOut(out);
         var seen = std.StringHashMap(void).init(allocator);
         defer {
@@ -2134,7 +2244,7 @@ pub const KgClient = struct {
         var tbuf: [24]u8 = undefined;
         const f_str = std.fmt.bufPrint(&fbuf, "{d}", .{from}) catch unreachable;
         const t_str = std.fmt.bufPrint(&tbuf, "{d}", .{to}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{ "reparent-contain", self.store_path, f_str, t_str });
+        const out = try self.runCheckedWrite(&.{ "reparent-contain", self.store.argvSlot(), f_str, t_str });
         defer self.freeOut(out);
         return self.allocator.dupe(u8, std.mem.trim(u8, out.stdout, " \r\n")) catch KgError.OutOfMemory;
     }
@@ -2153,7 +2263,7 @@ pub const KgClient = struct {
     fn fetchNodeRecord(self: *KgClient, node_id: u64) KgError!NodeRecord {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
-        const out = try self.runChecked(&.{ "get", self.store_path, id_str });
+        const out = try self.runChecked(&.{ "get", self.store.argvSlot(), id_str });
         defer self.freeOut(out);
         const line_end = std.mem.indexOfScalar(u8, out.stdout, '\n') orelse out.stdout.len;
         const line = out.stdout[0..line_end];
@@ -2180,9 +2290,9 @@ pub const KgClient = struct {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
         const out = if (include_text)
-            try self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json", "--meta", "--include-text" })
+            try self.runChecked(&.{ "get", self.store.argvSlot(), id_str, "--format", "json", "--meta", "--include-text" })
         else
-            try self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json", "--meta" });
+            try self.runChecked(&.{ "get", self.store.argvSlot(), id_str, "--format", "json", "--meta" });
         defer self.freeOut(out);
         return self.allocator.dupe(u8, std.mem.trim(u8, out.stdout, " \t\r\n")) catch KgError.OutOfMemory;
     }
@@ -2194,7 +2304,7 @@ pub const KgClient = struct {
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{root_id}) catch unreachable;
         const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
         const out = try self.runChecked(&.{
-            "task-frontier", self.store_path, id_str, "--limit", lim_str,
+            "task-frontier", self.store.argvSlot(), id_str, "--limit", lim_str,
         });
         defer self.freeOut(out);
 
@@ -2293,7 +2403,7 @@ pub const KgClient = struct {
     pub fn claimTask(self: *KgClient, task_id: u64, agent: []const u8) KgError!void {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{ "task-claim", self.store_path, id_str, "--by", agent });
+        const out = try self.runCheckedWrite(&.{ "task-claim", self.store.argvSlot(), id_str, "--by", agent });
         self.freeOut(out);
     }
 
@@ -2302,7 +2412,7 @@ pub const KgClient = struct {
     pub fn releaseTask(self: *KgClient, task_id: u64, agent: []const u8) KgError!void {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{ "task-release", self.store_path, id_str, "--by", agent });
+        const out = try self.runCheckedWrite(&.{ "task-release", self.store.argvSlot(), id_str, "--by", agent });
         self.freeOut(out);
     }
 
@@ -2311,7 +2421,7 @@ pub const KgClient = struct {
     /// per-domain 计数原语;绝大多数早期用户单项目,误差可接受)。失败返 0(不阻塞)。
     pub fn memoryCount(self: *KgClient) usize {
         if (!self.ready) return 0;
-        const out = self.runChecked(&.{ "stats", self.store_path }) catch return 0;
+        const out = self.runChecked(&.{ "stats", self.store.argvSlot() }) catch return 0;
         defer self.freeOut(out);
         // **bug 修复**:stats 输出是**空格分隔单行** `nodes=3 edges=0`,不能用按行的 extractInfoField
         // (它会返回 "3 edges=0" → parseInt 失败 → 恒 0 → "共 N 条持久记忆"注入锚永不出现)。
@@ -2369,7 +2479,7 @@ pub const KgClient = struct {
     fn facetScan(self: *KgClient, project_id: u64, display: []const []const u8, counts: []usize, other: *usize) void {
         var pbuf: [24]u8 = undefined;
         const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{project_id}) catch unreachable;
-        const out = self.runChecked(&.{ "list-recent", self.store_path, "--project", p_str, "--with-type", "--limit", "200" }) catch return;
+        const out = self.runChecked(&.{ "list-recent", self.store.argvSlot(), "--project", p_str, "--with-type", "--limit", "200" }) catch return;
         defer self.freeOut(out);
         var it = std.mem.splitScalar(u8, out.stdout, '\n');
         while (it.next()) |line| {
@@ -2395,7 +2505,7 @@ pub const KgClient = struct {
     pub fn forget(self: *KgClient, node_id: u64) KgError!void {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{ "delete-node", self.store_path, id_str });
+        const out = try self.runCheckedWrite(&.{ "delete-node", self.store.argvSlot(), id_str });
         self.freeOut(out);
     }
 
@@ -2437,7 +2547,7 @@ pub const KgClient = struct {
         var pbuf: [24]u8 = undefined;
         const raw = std.fmt.bufPrint(&limbuf, "{d}", .{limit * 2 + 4}) catch unreachable;
         const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{project_id}) catch unreachable;
-        const out = self.runChecked(&.{ "list-recent", self.store_path, "--project", p_str, "--limit", raw }) catch |e| switch (e) {
+        const out = self.runChecked(&.{ "list-recent", self.store.argvSlot(), "--project", p_str, "--limit", raw }) catch |e| switch (e) {
             KgError.Data => return, // 空 store / 空子树 → 跳过
             else => return e,
         };
@@ -2484,7 +2594,7 @@ pub const KgClient = struct {
     pub fn nodeIsTask(self: *KgClient, node_id: u64) KgError!bool {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
-        const out = self.runChecked(&.{ "get", self.store_path, id_str }) catch |e| switch (e) {
+        const out = self.runChecked(&.{ "get", self.store.argvSlot(), id_str }) catch |e| switch (e) {
             KgError.Data => return false, // NotFound → 不存在
             else => return e,
         };
@@ -2511,7 +2621,7 @@ pub const KgClient = struct {
     /// 跑一条 tinykg 命令(不做 ready 检查——ensureReady 自己用)。
     fn runRaw(self: *KgClient, args: []const []const u8) !Out {
         if (self.transport == .daemon) {
-            if (args.len < 2 or !std.mem.eql(u8, args[1], self.store_path)) return error.InvalidRemoteCommandShape;
+            if (args.len < 2 or !std.mem.eql(u8, args[1], self.store.argvSlot())) return error.InvalidRemoteCommandShape;
             const result = try self.transport.daemon.run(args[0], args[2..], false);
             return .{ .stdout = result.stdout, .stderr = result.stderr, .exit_code = result.exit_code };
         }
@@ -2554,7 +2664,7 @@ pub const KgClient = struct {
     fn runCheckedRetry(self: *KgClient, args: []const []const u8, retry: bool) KgError!Out {
         if (!self.ready) return KgError.Degraded;
         if (self.transport == .daemon) {
-            if (args.len < 2 or !std.mem.eql(u8, args[1], self.store_path))
+            if (args.len < 2 or !std.mem.eql(u8, args[1], self.store.argvSlot()))
                 return self.dataError("invalid remote command shape", .{});
             const result = self.transport.daemon.run(args[0], args[2..], !retry) catch |err|
                 return self.mapTransportError(err);
@@ -2986,7 +3096,7 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
         .env_bin = "/nonexistent/bin/tinykg",
     });
     defer c1.deinit();
-    try testing.expectEqualStrings("/env/store.kg", c1.store_path);
+    try testing.expectEqualStrings("/env/store.kg", c1.store.fsPath().?);
     try testing.expect(c1.bin_path == null); // 显式指定但不可执行 → null → degraded 明示
 
     var c2 = try KgClient.init(a, .{
@@ -2997,11 +3107,85 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
         .env_bin = "",
     });
     defer c2.deinit();
-    try testing.expectEqualStrings("/cfg/s.kg", c2.store_path);
+    try testing.expectEqualStrings("/cfg/s.kg", c2.store.fsPath().?);
 
     var c3 = try KgClient.init(a, .{ .home = "/home/u", .domain = "p", .env_store = "", .env_bin = "" });
     defer c3.deinit();
-    try testing.expectEqualStrings("/home/u/.metacodes/kg/store.kg", c3.store_path);
+    try testing.expectEqualStrings("/home/u/.metacodes/kg/store.kg", c3.store.fsPath().?);
+}
+
+test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
+    const a = testing.allocator;
+    // 相对配置**不报错**(init 的错误会被 app.zig `catch return` 静默吞掉),而是补全。
+    var rel = try KgClient.init(a, .{
+        .home = "/home/u",
+        .domain = "p",
+        .env_store = "",
+        .config_store = "relative/store.kg",
+        .env_bin = "",
+    });
+    defer rel.deinit();
+    try testing.expectEqualStrings("/home/u/relative/store.kg", rel.store.fsPath().?);
+    try testing.expect(std.fs.path.isAbsolute(rel.store.fsPath().?));
+
+    // 绝对路径原样保留。
+    var abs = try KgClient.init(a, .{
+        .home = "/home/u",
+        .domain = "p",
+        .env_store = "",
+        .config_store = "/abs/store.kg",
+        .env_bin = "",
+    });
+    defer abs.deinit();
+    try testing.expectEqualStrings("/abs/store.kg", abs.store.fsPath().?);
+}
+
+test "issue #30: cloneForThread 把父客户端拥有的 Store 原样传给克隆体" {
+    const a = testing.allocator;
+    var parent = try KgClient.init(a, .{
+        .home = "/home/u",
+        .domain = "p",
+        .env_store = "",
+        .config_store = "/abs/store.kg",
+        .env_bin = "",
+    });
+    defer parent.deinit();
+    try testing.expect(parent.transport == .exclusive_cli);
+
+    // 拥有 Store 的父客户端,克隆体必须拿到**同一个** Store——这是线程克隆的全部意义,
+    // 也是重构时 `config_store` 取值改动最容易出错的地方(取错就静默换了一个库)。
+    var child = try parent.cloneForThread(a, "/home/u");
+    defer child.deinit();
+    try testing.expect(child.transport == .exclusive_cli);
+    try testing.expectEqualStrings("/abs/store.kg", child.store.fsPath().?);
+}
+
+test "issue #30: cloneForThread 不把未配置客户端提升成 CLI-exclusive" {
+    const a = testing.allocator;
+    // env/config 一个都不传 → injected_cli 假、无 io → transport=.unconfigured,
+    // store 被赋成哨兵 "daemon-owned"(不是路径),bin_path=null。
+    var parent = try KgClient.init(a, .{ .home = "/home/u", .domain = "p" });
+    defer parent.deinit();
+    try testing.expect(parent.transport == .unconfigured);
+    try testing.expect(parent.bin_path == null);
+    // 占位符是**协议可见**的:daemon 传输拿 argv[1] 与它做等值匹配后再剥掉
+    // (runRaw / runCheckedRetry 的 shape 检查)。改动它会静默改变线上形状,所以钉死。
+    try testing.expectEqualStrings("daemon-owned", parent.store.argvSlot());
+    try testing.expect(parent.store.fsPath() == null);
+
+    // 工作线程克隆。父客户端不拥有任何 store,克隆体也不该凭空拥有一个:
+    // 提升成 .exclusive_cli 会重新解析出真 bin_path,而 store 仍是哨兵 →
+    // ensureReady 拿它当相对路径跑 `tinykg init daemon-owned`,在 cwd 建库。
+    var child = try parent.cloneForThread(a, "/home/u");
+    defer child.deinit();
+    try testing.expect(child.transport == .unconfigured);
+    // 与探针同强度:不拥有 Store、没有 bin(被提升成 CLI 时正是它凭空出现),
+    // 且 ensureReady 必须降级而不是去建库。ensureReady 会分配降级原因,走
+    // testing allocator 顺带覆盖这条路径的泄漏。
+    try testing.expect(child.store.fsPath() == null);
+    try testing.expect(child.bin_path == null);
+    child.ensureReady();
+    try testing.expect(!child.ready);
 }
 
 test "bin 解析:没有 staged artifact 时绝不回退 PATH 或开发 checkout" {

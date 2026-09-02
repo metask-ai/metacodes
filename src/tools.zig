@@ -203,11 +203,12 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Grep",
-        .description = "Search for patterns in files using ripgrep",
+        .description = "Search for patterns in files, or inside a recovered tool-result artifact, using ripgrep",
         .describe_fn = descriptions.describeGrep,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "pattern", .type = "string", .description = "The regular expression pattern to search for in file contents" },
             .{ .name = "path", .type = "string", .description = "File or directory to search in (defaults to cwd)" },
+            .{ .name = "artifact_id", .type = "string", .description = "Search a recovered tool-result artifact instead of a path. Use the sha256 artifact_id from a truncated result to find the part you need in one call, rather than paging it with ReadArtifact. Mutually exclusive with path; output_mode must be content or count" },
             .{ .name = "glob", .type = "string", .description = "Glob pattern to filter files (e.g. *.zig)" },
             .{ .name = "output_mode", .type = "string", .description = "Output mode", .enum_values = &.{ "content", "files_with_matches", "count" } },
             .{ .name = "-i", .type = "boolean", .description = "Case insensitive search" },
@@ -276,25 +277,25 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "BashOutput",
-        .description = "Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks (from stdout_path/stderr_path files) plus status (running|exited|killed). Use stdout_since_byte/stderr_since_byte for incremental reads (pass previous stdout_total_bytes). max_bytes caps a single read (default 64KB, maximum 256KB). NOTE: if the command used shell redirection (>/>>/2>), the redirected output goes to the user-specified file, NOT stdout_path — Read that file directly. For long-running jobs, prefer Read on stdout_path (returned when the job auto-backgrounded) over polling BashOutput.",
+        .description = "Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks plus status (running|exited|killed). Use stdout_since_byte/stderr_since_byte for incremental reads. max_bytes caps a single read; omit it to get as much as the context budget allows (maximum 262144, and a large explicit value may still be reduced to fit that budget). To follow a long job, pass the previous stdout_next_offset/stderr_next_offset as the next stdout_since_byte/stderr_since_byte — those are the resume cursors. stdout_total_bytes/stderr_total_bytes report the file's current size, NOT a cursor: using them as one skips everything between what was shown and the end of the file. NOTE: if the command used shell redirection (>/>>/2>), the redirected output went to the file you named and BashOutput will not show it — Read that file directly.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to read" },
             .{ .name = "stdout", .type = "boolean", .description = "Include stdout (default true)" },
             .{ .name = "stderr", .type = "boolean", .description = "Include stderr (default true)" },
             .{ .name = "stdout_since_byte", .type = "integer", .description = "Read stdout starting at this byte offset" },
             .{ .name = "stderr_since_byte", .type = "integer", .description = "Read stderr starting at this byte offset" },
-            .{ .name = "max_bytes", .type = "integer", .description = "Maximum bytes per selected channel (1..262144; default 65536)" },
+            .{ .name = "max_bytes", .type = "integer", .description = "Maximum bytes per selected channel (1..262144). There is no fixed default: omit it and the cap is derived from the remaining context budget (24488 bytes on a 200K window, 7680 at the floor), which is usually what you want. An explicit value is still capped at 262144 and is not raised above the budget-derived allowance" },
         }, .required = &.{"job_id"} },
         .execute = .{ .legacy_inline = bash_output_tool.execute },
         .replay = .read_only,
     },
     .{
         .name = "ReadArtifact",
-        .description = "Read a bounded byte range from a recoverable tool-result artifact. Use the sha256 artifact_id returned by a tool-result projection; offset is zero-based bytes and limit is capped at 32768 bytes. The result is always bounded and never spills recursively.",
+        .description = "Read a bounded byte range from a recoverable tool-result artifact. Use this whenever a tool result reports it was truncated and names an artifact_id — re-running the tool costs a full round-trip and still will not return the omitted bytes. offset is zero-based bytes; limit is capped at 32768 and may be reduced further to fit the context budget, in which case next_offset carries the remainder. The result is always bounded and never spills recursively.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "artifact_id", .type = "string", .description = "Content-addressed id in sha256:<64 lowercase hex> form" },
             .{ .name = "offset", .type = "integer", .description = "Zero-based byte offset (default 0)" },
-            .{ .name = "limit", .type = "integer", .description = "Maximum bytes to return (default 16384, maximum 32768)" },
+            .{ .name = "limit", .type = "integer", .description = "Maximum bytes to return. Omit it to get as much as the context budget allows; an explicit value is capped at 32768 and may still be reduced to fit that budget. Either way next_offset carries whatever did not fit" },
         }, .required = &.{"artifact_id"} },
         .execute = .{ .legacy_inline = read_artifact_tool.execute },
         .replay = .read_only,

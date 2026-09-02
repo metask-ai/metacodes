@@ -594,7 +594,8 @@ typedef struct {
  * of the declared kind are populated; every other view is canonical empty.
  * PART_TEXT carries non-empty UTF-8 `text`. PART_IMAGE carries `media_type`
  * (image/png, image/jpeg, image/gif, or image/webp) plus non-empty standard
- * base64 `data` bounded by METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1. */
+ * base64 `data` bounded by METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1.
+ */
 typedef struct {
     uint32_t struct_size;
     uint32_t kind_code;

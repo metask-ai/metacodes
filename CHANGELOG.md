@@ -10,6 +10,49 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- The provider-offer capability vocabulary's comptime coverage guard now binds
+  the real runtime capability enum instead of a hand-copied duplicate, so the
+  next runtime capability added without an offer mapping is a compile error
+  rather than a silent gap.
+
+### Removed
+
+- First-class PDF document input is withdrawn (issue #25). Agent Core carries
+  cross-format, cross-provider, cross-host input modalities; parsing a
+  container format, judging its pages, encryption and structure, and
+  attributing budget from that judgement are not Core's job — and a lexical
+  scan could not answer those questions correctly anyway, which is how it
+  produced three ways to reject a valid document. Removed: the `document`
+  block and its neutral IR, `core/pdf.zig`, `supports_pdf_input` /
+  `Capability.pdf_input`, the dialect document serializer, transcript and
+  checkpoint persistence, `RUN_INPUT_PART_DOCUMENT`, and the headless `--pdf`
+  flag. The `Read` tool description stays corrected: it still does not claim
+  PDF reading or a `pages` parameter.
+  Compatibility: a transcript or checkpoint recorded with a document block is
+  refused explicitly rather than partially read — the transcript loader is now
+  atomic and reports a dedicated error with an actionable message, and the
+  checkpoint decoder reports `UNSUPPORTED` (not `CORRUPT`) for an intact
+  checkpoint carrying the permanently reserved block tag `7`, and only after
+  its digest has been verified. While the observation channel stays usable, the
+  terminal `run_state` snapshot is published exactly once from the Run's final
+  result: a post-admission cleanup failure closes it as `poisoned`, an abort accepted from
+  the `finalizing` callback is reflected as `aborted` (it used to leave a
+  `completed` snapshot beside `STOP_ABORTED`), Runs that never ran the loop — a
+  clean failure, a Skill aborted during activation, a synthetic completion —
+  no longer stay at `starting`, degraded tool-set observation no longer
+  suppresses the closure, and a Host that rejects the terminal snapshot — or
+  any callback failure the Session already recorded — fails the Run with the
+  recorded callback status and poisons the Session instead of being reported a
+  successful Run.
+- AgentCore ABI v1 returns to **revision 15**; `RUN_INPUT_PART_DOCUMENT`,
+  `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1` and status
+  `DOCUMENT_INPUT_UNSUPPORTED` are gone. No bundle was ever published from a
+  revision-16 tree (the only release, `0.1.0`, is revision 14, has no assets,
+  and no workflow publishes or uploads a bundle), so revision 15 keeps a single meaning and
+  the codes need no tombstone. SDK package version returns to `0.2.0-dev`.
+
 ### Fixed
 
 - AgentCore's request preflight (`canonicalRequestBytes`) charges image tool
@@ -47,21 +90,11 @@ status, compatibility boundaries, and entry points are defined by
   message), and Gemini appends it as trailing text parts of the same user
   content. Covered by serializer tests and by the hook-pipeline component
   test, which now asserts the context on the wire.
-- Image tool results larger than the per-result projection bound (64 KiB of
-  base64, roughly a 48 KiB picture) reached the provider as a
-  `metacodes.tool-result-projection` artifact envelope instead of an image:
-  the one-shot tool-result projection ran before the provider dialects and
-  spilled the `{"type":"image",...}` payload like any oversized text, so
-  `extractImageResult` never matched and Anthropic, OpenAI, and Gemini
-  received a base64 preview string. Image-shaped results are now exempt from
-  both projection passes and charged against the turn budget at the vision
-  token estimate (`IMAGE_TOKEN_ESTIMATE`, the same figure auto-compact uses)
-  rather than their base64 length, so one screenshot no longer evicts every
-  text sibling from the turn or reports the budget as permanently exhausted.
-  Covered end to end by an agent-loop test that reads an 80 KiB-base64 PNG
-  through the real `Read` tool and asserts the image block on the wire.
-  The same exemption now also holds at the two other layers that rewrite a
-  tool result before serialization: microcompact no longer clears an image
+- The image projection exemption (issue #26, below) is covered end to end by
+  an agent-loop test that reads an 80 KiB-base64 PNG through the real `Read`
+  tool and asserts the image block on the wire, and the same exemption now
+  also holds at the two other layers that rewrite a tool result before
+  serialization: microcompact no longer clears an image
   result under the recent-N pressure valve (a `Read(image)` with two parallel
   siblings was cleared before the provider ever saw it), and the AgentCore
   `ToolEnvironment` no longer promotes an image above `tool_result_cap_bytes`
@@ -91,6 +124,73 @@ status, compatibility boundaries, and entry points are defined by
   sibling reservations against the hard budget, so an inline image whose
   durable bytes exceed its own reservation is refused instead of consuming
   the space a parallel tool had already reserved.
+- Transcript resume no longer treats a failed `read` as end-of-file: `EINTR` (a
+  Ctrl+C or terminal resize during `/resume`) is retried, and any other read error
+  makes `loadTranscript` and the compact-state meta loader fail with `ReadFailed`
+  instead of silently restoring a truncated or empty history. The `/resume`
+  listing keeps skipping a session whose `meta.json` cannot be read. Surfaced by
+  the Codex cross-review on #46.
+- Restoring a persisted compact projection is all-or-nothing: `restoreCompactState`
+  allocates the summary before touching either field, so an allocation failure
+  during resume leaves a genuine full replay rather than an advanced boundary with
+  no summary (and no dangling summary pointer).
+- A KG client that owns no Store can no longer create one (issue #30).
+  `KgClient.store_path` was a single `[]const u8` carrying two meanings — a
+  real path under the CLI transport, and the marker `"daemon-owned"` under the
+  daemon transport, meaning *this client owns no Store*. Nothing in the type
+  stopped the marker from reaching a call that treats it as a path, and
+  `cloneForThread` did exactly that: it guarded on `transport == .daemon`,
+  while the marker is set for `.daemon` **and** `.unconfigured`, so an
+  unconfigured parent fell through to the CLI reconstruction, which re-resolved
+  a real `bin_path` and then ran `tinykg init daemon-owned`. Because the marker
+  is relative, the Store materialised in the process's current directory — for
+  the TTY e2e suite, the git worktree, as untracked `daemon-owned/` and
+  `daemon-owned.tinykg-daemon.lock` that no `.gitignore` rule covered.
+  The field is now `store: StoreRef`, a union of `.owned` (an absolute path)
+  and `.unowned`; `argvSlot()` serves the argv slot the wire protocol
+  reserves, and `fsPath()` returns an optional that every filesystem call must
+  unwrap. A relative store path from config or `METACODES_KG_STORE` is
+  completed against `home` rather than taken as given, so no configuration can
+  steer the Store — or the five sibling artifacts derived from it — into the
+  current directory. **Breaking for source-level consumers:** `store_path` is
+  replaced by `store`.
+- `zig build --build-file control-plane/build.zig rule-check` passes again. It
+  demanded that every discovered test be imported into `tests/integration_suite.zig`
+  while build.zig panics if a *dedicated* test appears there, so the reported
+  omission was unfixable as stated: satisfying the rule aborted the build and
+  took seven rules down with it. The sensor kept a hand-written copy of
+  build.zig's `aggregate_test_exclusions` that had gained neither the second
+  entry nor a way to notice; it now parses that list from build.zig, and
+  additionally requires each excluded test to have its own `root_source_file`,
+  so being excluded from the aggregate means having a home rather than merely
+  having a file.
+- The OpenAI Responses protocol now replays reasoning items across tool
+  continuations (issue #23). Requests use `store:false`, so the server keeps no
+  copy of the response and reasoning context survives only if the client sends
+  the server's own `reasoning` items — `id`, `summary`, `encrypted_content` —
+  back verbatim; previously they were parsed away and the next request carried
+  only the function call and its result. Items are captured from
+  `response.output_item.done` **and** from the terminal response's `output`
+  array, deduplicated by id so an item present in both is replayed exactly
+  once, and emitted first among their message's `input` items, matching the
+  server's own output order. Replay is model-scoped: after a mid-session model
+  switch the stale encrypted state is dropped rather than sent to a model that
+  would reject it. Reasoning items persist through the JSONL transcript and the
+  AgentCore checkpoint (block tag 6). A conversation without reasoning items
+  serializes byte-identically to before.
+- Image tool results are no longer spilled into artifact envelopes before the
+  dialect layer can serialize them (issue #26). `result_projection` rewrote any
+  tool result above a `clamp(window/8, 8 KB, 64 KB)` threshold, while the
+  `Read` tool accepts images up to 3.75 MB — so essentially every real
+  screenshot became an envelope and the native image serialization added in
+  #24 never ran on it, on every provider. Image-shaped results (detected with
+  the existing `dialect.extractImageResult`, not a second sniffer) are now
+  exempt from byte-length spilling in both projection passes, and the per-turn
+  budget charges an image at `IMAGE_TOKEN_ESTIMATE` instead of its base64
+  length, so one screenshot no longer evicts unrelated tool results. Images
+  stay bounded by `MAX_IMAGE_BYTES`, and non-image results project
+  byte-identically to before.
+
 - Image tool results (the `Read` tool's
   `{"type":"image","media_type":...,"data":...}` form) are now serialized
   natively on every protocol family instead of being passed to the model as a
@@ -150,6 +250,195 @@ status, compatibility boundaries, and entry points are defined by
   — the kernel mirrors it through `adoptConfigRevision` rather than keeping a
   second counter — and idempotency keys are a bounded ring, so a retry is still
   recognized after other commits have landed.
+
+- Cross-UI model picker, durable selection at startup, and built-in pricing
+  (issue #16, further P1 slices). `Ctrl+O` and `/model` open one picker —
+  provider → canonical model → channel/offer → options → commit — that reads
+  offers from the control plane and mutates only through it. Offers are grouped
+  by canonical id, never by visible name, so two channels serving "GLM-4.6"
+  over different protocols, regions, or prices stay separate rows showing their
+  endpoint, wire model id, limits, price, and health. The picker is modal for
+  the keyboard and not for the session: typing filters, the draft in the input
+  box is untouched, a reply keeps streaming, and a mid-stream commit takes
+  effect on the next turn. Session is the default scope and `Tab` cycles to
+  `global`/`once`, so a durable write is always an explicit act the footer
+  spells out before Enter. Transcript viewing moves to `Ctrl+X Ctrl+O` — same
+  letter, on the existing `Ctrl+X` prefix — with `/transcript` as the
+  documented equivalent; TTY regressions cover both paths, including their
+  Kitty CSI-u forms. `/model use <id>` now resolves against the offer catalog
+  first, so a model served by another provider or protocol switches in place; a
+  name carried by several routes reports their offer ids instead of guessing,
+  and an offer id is accepted verbatim. `/models` keeps account-key selection,
+  which is a credential choice rather than a route.
+  A selection committed with `global` scope is now read back at startup:
+  `applyPersistedGlobalSelection` applies it before model-name inference, and a
+  stored pin the catalog no longer offers is a startup error naming the offer
+  and the way out — never a silent fallback to another vendor. Session scope
+  gets its own document and its own file (`<session>/runtime-selection.json`)
+  rather than sharing the global key, so one session's choice cannot become
+  everyone's. The `metask` profile ships a real quote derived from
+  `util/pricing.zig` — the same table `/cost` reports with, asserted equal
+  field by field — while `zai-coding-plan` deliberately stays `unknown` because
+  a Coding Plan subscription is not billed per token. `Quote` gains a cache-write
+  rate so an estimate over a cached turn is not silently low.
+  New gate `zig build test:picker` compiles the picker from a root reaching the
+  provider kernel and the terminal theme and nothing else.
+
+- User-defined providers (issue #16, P1). A `custom_providers` section in
+  `~/.metacodes/config.json` defines provider instances that go through the same
+  registration and validation as a built-in profile, so the picker, `--provider`,
+  `model.list`, `quote.estimate`, and token admission treat them identically.
+  The schema is declarative and cannot execute anything: there is no field for
+  code, a callback, a shell command, or a request template, and unknown keys are
+  ignored rather than interpreted. A protocol is a *wire* plus an optional
+  request path — what relays and gateways actually differ by — so a relay needs
+  no adapter, while a genuinely novel wire is rejected rather than guessed.
+  Declared limits, capabilities, prices, and controls carry
+  `user_config` provenance and a configured price is marked estimated, because a
+  number the user typed is a declaration and not a vendor observation. New
+  `--check-providers` dry run validates the configuration and prints every route
+  it produces — provider, channel, protocol, endpoint, wire model id, context,
+  price — with no credential resolved and no request URL built.
+
+- Provider catalog adapters and the events they enable (issue #16, P1).
+  `src/provider/openrouter.zig` parses model and endpoint documents
+  *separately* — a model with three endpoints becomes three offers, because a
+  model name is not a route — and merges them so an endpoint's own values win
+  while an absent one inherits with `inherited` provenance instead of becoming
+  free or unlimited. An endpoint that never reported a status has `unknown`
+  health, not healthy; a price string that is not a number is an error, not a
+  zero. Provider preferences compile into `RoutePolicy` with `only`/`ignore` and
+  the numeric ceilings as hard constraints and `order`/`sort` as preferences
+  that never reject, and `PriceConstraint` gained per-direction ceilings because
+  a router's price limit is per direction. Router metadata folds usage, cost,
+  latency, and fallback attempts into the `ActualRouteEvent` the kernel derived
+  without rewriting what was requested. Ingesting a catalog moves the catalog
+  revision and emits `catalog.updated`, `pricing.updated`, and
+  `provider.degraded`; `auth.changed` and `credential.expiring` gained kernel
+  producers. Catalogs are named by a `provider_catalogs` section in
+  `config.json` and read from disk, so no transport dependency enters the
+  provider subsystem.
+
+- Provider-scoped OAuth lifecycle (issue #16, P1). `provider/oauth.zig` runs
+  refresh, single flight, and rotated-refresh persistence for any profile that
+  declares an OAuth credential kind and a token endpoint — OpenAI and Codex
+  first; Metask keeps its historical `core/auth.zig` path byte for byte. N turns
+  discovering an expired token at once perform exactly one refresh, because with
+  a rotating refresh token the losers of that race would present a token the
+  server already invalidated. The rotated token is persisted atomically (temp
+  file + fsync + rename, 0600) *before* it becomes the live one: a provider that
+  rotated has already killed the old token, so "used but not saved" locks the
+  user out while "saved but not yet live" is recovered by the next load. Refresh
+  triggers a margin before expiry, since a token that expires mid-flight fails
+  the request it was attached to, and `invalid_grant` is terminal rather than a
+  transport error a retry loop would chew on. The module performs no I/O — the
+  exchange is a function pointer, with `api/oauth_exchange.zig` as the
+  production `refresh_token` grant — so every lifecycle test drives a fake and
+  none needs a network. `metacodes login --provider <id> --oauth-token-json
+  <file>` imports the first token into that provider's own store.
+
+- Selection scope, auth-scheme inheritance, and the query-auth decision
+  (issue #16). A `session`-scoped commit is now written to the session's own
+  `runtime-selection.json` and restored by `/resume`; because session scope is
+  narrower than global, a resumed session continues on the route it was using
+  rather than whatever became global meanwhile, and a stored route that no
+  longer resolves is reported instead of silently replaced. The resolved route's
+  auth scheme now reaches swarm teammates and `AgentSession` as well as `App`
+  and background subagent jobs — a worker sending bearer at an `x-api-key`
+  endpoint has the right key and the wrong header — and a route switch moves the
+  swarm context with it so a teammate spawned afterwards cannot dial the
+  previous provider. `AgentJobRegistry.setRoute` moves key, endpoint, transport,
+  and scheme together for the same reason.
+  `AuthScheme.api_key_query` is **removed** rather than implemented. A secret in
+  a query string lands in server access logs, proxy logs, and referrer headers,
+  and it would flow into the endpoint strings this subsystem already refuses to
+  let carry credentials — the endpoint policy rejects userinfo URLs for exactly
+  that reason.
+
+- Credential pools: several accounts per provider, each its own route
+  (issue #16, P2). A `credentials` list on a configured provider declares
+  accounts **by reference** — id, environment-variable name, kind, priority —
+  so no secret enters `config.json`, which several tools read and which is not
+  mode 0600; a literal `secret` key is rejected at parse time. A bound
+  credential participates in the offer id, so each account becomes its own offer
+  and appears as its own row in the picker with an `account=` column. That also
+  removes the need for a separate credential stage: the accounts already are
+  offers. Because the offer names the credential, binding uses that member
+  rather than the pool's highest-priority one — resolving to a different account
+  would make the offer id identify a route the request does not take. Selection
+  among unbound members is deterministic (priority, then id) so configuration
+  order cannot make a failover irreproducible, and members that are invalid,
+  cooling down, expired, or empty are skipped. `noteFailure` maps a
+  provider-classified failure to the right state: a rate limit earns a cooldown,
+  an authentication failure marks the credential invalid, and a transient
+  network error changes nothing. The pool is consulted after every existing
+  source, so a single-credential setup resolves exactly as before.
+  `credential.expiring` and `auth.changed` now have producers on the OAuth path,
+  which is the only thing that knows a credential's expiry.
+
+- TinyKG decision audit plane (issue #16). Control-plane events are projected
+  into an append-only record under `metacodes/provider-decisions` at the turn
+  boundary — accepted and rejected selections with the catalog and config
+  revisions that make them reproducible, actual routes with fallback attempts
+  and cost/latency aggregates, failovers, catalog and pricing refreshes, and
+  credential status changes. `provider.degraded` health samples are deliberately
+  excluded: the requirement names high-frequency observations as something that
+  must not accumulate in the graph. The projection is safe by construction —
+  event payloads are ids and enums with no free-form field — and a test asserts
+  no recorded line contains a quote, a URL, `Bearer`, or `sk-`. The plane is
+  optional: nothing on the request path calls it, and a TinyKG outage is counted
+  rather than propagated into routing.
+
+- Catalog fetching and learned credential failover (issue #16). Provider
+  catalogs may now be fetched (`models_url`, `endpoint_urls`, optional
+  `credential_env`) as well as read from disk, with `/providers refresh` driving
+  it; a refresh that fails leaves the previous catalog in place, because a stale
+  catalog is a better answer than an empty one and every pin stays resolvable.
+  The fetch lives in `api/catalog_fetch.zig` rather than in the provider
+  subsystem, which must not depend on a transport. `/providers` also lists every
+  route with its account, context, and price. Credential failure state is now
+  learned and durable: a rate limit records a cooldown and an authentication
+  failure records an invalidation, through the same lock, revision, and atomic
+  write as every other mutation, so the next process skips the credential
+  instead of rediscovering the limit by hitting it. The class is the provider's
+  own classification, and a transient network failure records nothing.
+
+- Local route aliases (issue #16, P2 follow-up). `AliasEntry` was a declared
+  record with no producer or consumer; `/alias` now creates, lists, resolves,
+  and removes them. A **pinned** alias stores the offer and revision and means
+  the same route across catalog refreshes — reporting an error when that route
+  is gone rather than resolving to a neighbour, because a pin that quietly moves
+  is not a pin. A **floating** alias stores the selector and re-resolves, and
+  records what it landed on so a route stays attributable after the fact; a
+  selector matching several routes is an error listing the candidates, not a
+  guess. Either policy produces a *pinned* runtime selection, since the alias
+  already decided and leaving it auto would let it re-resolve mid-turn against a
+  catalog the user never saw.
+
+- Provider lifecycle through the control plane, and a five-vendor capability
+  fixture (issue #16). `/providers enable|disable|remove <id>` manages a
+  provider instance without editing `config.json` by hand; disabling preserves
+  its configuration and credential references — the difference from removing it
+  — and excludes it from the *catalog*, so "disabled" is true in the picker,
+  `model.list`, and `--provider` at once instead of being re-checked at three
+  call sites. A new capability-matrix fixture declares DeepSeek V4, GLM-5.3,
+  Kimi K3, GPT-5.6, and MiniMax M3 with timestamped, provider-declared
+  capabilities and four different control vocabularies, and asserts what no
+  name-inference rule could get right: reasoning supported / unsupported /
+  unknown across three models, GLM's peer `reasoning_content` as a separate
+  capability, a latency tier on one model and a service tier on another, and
+  channel-specific limits narrowing a model's own. New L2 coverage proves a
+  control change alters the bytes actually sent (and that leaving it unset
+  smuggles no default onto the wire), and that a provider's opaque control
+  metadata round-trips through `model.list` into the picker without any core,
+  TUI, or Web change.
+  A committed route is also broadcast on the existing UI event stream as a
+  `config_changed` → `route` event carrying provider, channel, protocol, wire
+  model id, offer id, credential reference, and scope — the model name alone
+  would announce a change an out-of-process client cannot tell apart from
+  another, since one visible name can come from several providers, channels,
+  protocols, and accounts. The credential reference travels; the secret does
+  not.
 
 - AgentCore ABI v1 revision 15: `session_run_input` gains
   `RUN_INPUT_MULTIMODAL` — an ordered `RunInputPartV1` array of text and

@@ -68,7 +68,7 @@ metacodes-core 是一个**无 UI、无 CLI** 的 LLM 编码-agent 引擎。它�
 | 模块 | 职责 | 关键导出 |
 |------|------|----------|
 | `agent_loop` | 一个 agent 回合的完整循环:流式请求→收 tool_use→执行→回灌→再循环 | `run()`, `Options`, `RunResult`, `StopReason`, `UsageSink`, `ProgressReporter` |
-| `conversation` / `message` | 对话状态(messages → blocks);压缩/microcompact | `Conversation`, `Message`, `Block`(text/tool_use/tool_result/thinking/image) |
+| `conversation` / `message` | 对话状态(messages → blocks);压缩/microcompact | `Conversation`, `Message`, `Block`(text/tool_use/tool_result/thinking/image/reasoning_item) |
 | `subagent` | 父 agent spawn 子 agent(隔离 Conversation + TaskStore) | `spawnAgent`, `spawnAgentSink`, `SpawnOptions`, `SubagentResult` |
 | `tool_exec` | 工具批量执行(按并发安全分批;每 job 独立 arena + per-worker 值拷贝 ctx) | `executeSlots`, `Slot` |
 | `tools` | 工具注册表 + dispatch(静态 + 动态 Skill/MCP) | `dispatch`, `registry`, `isConcurrencySafe(Input)` |
@@ -264,6 +264,106 @@ emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工
 tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)/ 达 max_turns / abort /
 挂起(`suspended`,见 §5)。`tool_loop` 枚举值保留为 ABI 兼容(无生产者,对齐 codex 无主动熔断)。
 
+### 4.1 工具结果如何进入上下文
+
+本节先给心智模型和数字,后面的段落是每条决定背后的缺陷史。**读顺序:先这里,再往下。**
+
+**从来不是摘要。** 结果级路径全程确定性,不调模型、同输入同字节。会调模型做摘要的只有
+**对话级** auto-compact(付费的 summary 压缩),那是整段历史的事,与单条结果无关。模型能
+看到的结果有四态:
+
+| 形态 | 何时 | 内容 | 可恢复 |
+|---|---|---|---|
+| **原文** | 结果 ≤ 本轮**水位线** | 逐字节原样 | — |
+| **artifact 信封** | 超水位线,且发布成功 | head + tail 摘录 + `artifact_id` + sha256 + 读取指令 | ✅ `ReadArtifact` / `Grep(artifact_id)` |
+| **fallback 信封** | 超水位线,但**发布失败**(会话配额满、存储错误),且捕获完整并 ≤ `PER_RESULT_MAX_BYTES` | head + tail + `storage_error` 如实命名原因,无 `artifact_id` | ❌,但说得出为什么 |
+| **清空桩** | 仅压缩期,且**该结果没有 artifact** | `[tool result cleared to save context]` + 承诺行(`original_bytes` + sha256) | ❌ |
+
+fallback 那一行的限定条件不是修辞:发布失败后要渲染 head/tail 就得把字节拿回内存,
+所以只有完整且 ≤ `PER_RESULT_MAX_BYTES`(64KB)的捕获退得回来。更大的捕获、不完整的
+捕获、以及 OOM,发布失败时仍然上抛成工具错误——那也正是阈值改动之前的行为。
+
+水位线在无 turn 压力时**就是** per-result 预算;兄弟结果多到装不下 `per_turn` 时它会被二分
+压低,那时 ≤ per-result 的结果**也会**被溢出(见下方水位线一节与 T2)。所以判据是水位线,
+不是 per-result——这里最早写成后者,而本仓自己的 T2 就是反例。
+
+信封的实际形状(`renderArtifactEnvelope`):
+
+```json
+{"schema_version":"metacodes.tool-result-projection.v1","projection":"artifact",
+ "artifact_id":"sha256:…","media_type":"text/plain; charset=utf-8",
+ "original_bytes":412903,"sha256":"…","capture_complete":true,"recoverable":true,
+ "preview_encoding":"utf-8","preview_head":"…","preview_tail":"…",
+ "preview_head_bytes":12000,"preview_tail_bytes":12000,"omitted_bytes":388903,
+ "read":{"tool":"ReadArtifact","offset":0,"limit_max":32768}}
+```
+
+头尾都留,不是只留头:日志类输出的信息通常同时在头部(跑了什么)和尾部(怎么失败的)。
+读取指令**内联在信封里**,不指望模型记得工具目录里有 `ReadArtifact`——这一条直接对应
+issue #29 的行为(不知道能取回,就改命令重跑)。
+
+**预算在字节存在之前就生效。** `ToolEntry.result_production` 把生产方式分三类,其中
+`byte_zero_spool`(Glob/Grep/CodeMap/FindSymbol/Bash/两个 MCP 读取/WebFetch)在第一个字节前
+就重定向到内核 Spool,**全量内容从不进内核内存**。所以这不是"先拿到 40MB 再截断"。
+
+**artifact 有两个产生点,但只有一个阈值。** 工具层(`result_spool.finishCaptureAsBody`)在捕获
+完成时决定"这些字节要不要进内存":完整且 ≤ `per_result_bytes` 的抬回 inline,否则直接发布进
+CAS;projection 层在本轮结果就绪后决定"模型该看到多少"。两层分开是信息时序决定的——工具不知道
+兄弟结果,projection 不能把已进内存的字节反物化——但**判定用同一个数**:工具层按值接收
+`ctx.result_budget`,只读 `per_result_bytes`(`result_spool.zig` 内的守卫测试禁止它碰
+`per_turn` 等不属于它的字段,并断言六个调用方逐字传 `ctx.result_budget`)。此前工具层用的是
+常量 64KB(`PER_RESULT_MAX_BYTES` 抄了一遍),在 window < 524,288 的每个模型上留下
+`[per_result, 64KB]` 死区:落入其中的结果先被抬进内存,再被 projection 写回 CAS,同一份字节搬
+两次。统一后无 turn 压力时两层严格一致;有压力时(兄弟结果压低水位线)工具层正确内联的结果仍会
+被 projection 溢出——这不可避免且有界(≤ per_result),`tests/component/inline_threshold_test.zig`
+的 T2 验证这类二次转存零丢失、小结果零牵连、压完恰在预算内。
+
+**两个预算,都是 context window 的纯函数**(`result_budget.perResultBytes`/`perTurnBytes`):
+
+```
+per_result = clamp(window / 8,     8KB, 64KB)     单条结果
+per_turn   = clamp(window * 6 / 5, 16KB, 200KB)   本轮所有结果合计
+```
+
+`6/5` = 4 字节/token × 分给工具结果的 30%。落到实际:
+
+| window | per_result | per_turn |
+|---|---|---|
+| 未知(0) | 8,192 | 16,384 |
+| 128K | 16,000 | 153,600 |
+| 200K | 25,000 | 204,800 |
+| 1M | 65,536(封顶) | 204,800(封顶) |
+
+**一轮的处理顺序**(`result_projection.project`,每轮一次,只作用于本轮新结果):
+
+1. **regrow** — 在更小预算下落成的信封,若现在额度够就读回 artifact 重新内联/扩大 preview。
+   这是唯一会把结果**变大**的一步,所以先按整轮定价(`regrowCeiling`)再执行。
+2. **定 plan** — 标记豁免:图片(按 token 计价,不按字节)、错误、已是信封的、`ReadArtifact`
+   (它自己再溢出就递归了)。
+3. **水位线** — 二分搜出"全轮能装进 `per_turn` 的最大单条上限"。低于水位线的一个字节不动,
+   只削高于它的;**不是逐出最大的那条**。
+4. **溢出** — 全量写进 session CAS,换成信封。`Allowance.cost` 里的 `@min(len, spillCost)` 让
+   "用 ~640 字节脚手架的信封换掉一条 700 字节结果"这种既丢内容又撑大请求的负和交易不可表示。
+
+**历史走另一条路。** projection 只在提交那一刻生效,**从不重投历史**——重写历史字节会让
+provider 的 prompt cache 前缀失效。因此 `/resume` 载入的旧记录、或中途换成小 window 模型,
+只由 `Conversation.truncateLargeToolResults` 这一趟兜底(详见下方"压力阀不得毁掉唯一的恢复能力")。
+
+**provider 只提供一个数字,而这个数字并不可靠。** 整条链路从 provider 拿的就是
+`maxInputTokens`,其余全是它的纯函数。但它有三个来源:`/v1/models` catalog 的
+`max_input_tokens`;各 client 的硬编码默认(OpenAI 128K、Gemini 1M——各持**一个**常量,
+不区分 model,所以这两家的 per-model 解析实际退化成 client 默认);都拿不到就是 0。
+`catalog.nonZero` 把 0 当**未知**而不是"窗口为零"(Anthropic 官方 `/v1/models` 常把
+`max_input_tokens` 返成占位 0),于是退到地板值 8KB/16KB,而不是把所有预算塌成 0。
+subagent 与父共享 Provider、只差 `model_override`,故必须走 `maxInputTokensFor` ——
+见下方"预算按真正会被请求的模型解析"。
+
+**为什么这块牵扯面宽**,一句话版:决定"一条结果值多少字节"要同时满足互不相干的五个约束——
+prompt cache 不许改历史(所以历史必须另开一趟)、图片按 token 计价而文本按字节(所以字节
+记账里必须挖掉图片)、JSON 转义/base64 让"字节"有两种含义(所以有 `Source`/`Encoded` 两个
+单位)、subagent 与父同 Provider 不同 window(所以窗口必须按 override 解析)、以及最后一环
+在模型自己身上(它不知道能恢复就会重跑,而这一环 code review 看不出来,只能靠轨迹审计量)。
+
 **大结果提交协议**:工具统一返回 `ToolResultBody`。旧工具经 `legacy_inline` adapter 仍先产生
 完整 bytes；byte-zero 原生工具和 process plugin 则在产生第一字节前取得 kernel Spool，最终直接
 返回 artifact receipt。`executeSlots`、PostToolUse hook 和 backend 观察该类型的确定性模型投影：
@@ -290,20 +390,133 @@ transcript resume 恢复持久化的水位（没有该字段的旧记录一律�
 `ToolEnvironment` 不 `promoteInline` 图片，payload cap 按视觉估算记，耐久预算按实际字节记，且
 `settleSuccess` 把仍存活的兄弟预留计入硬预算，结算不能吃掉并行工具已预留的空间。
 
+**读代码给存在性,审计轨迹给频率**:`scripts/audit_trajectories.py` 扫已落盘的
+`transcript.jsonl`,报告各工具的结果大小分布、超预算条数、溢出后**有没有人来取**、以及
+Bash 结果被截断后模型改命令**重跑**的次数(issue #29 那个行为)。只出尺寸/计数/工具名——
+结果内容、命令文本、路径一律不进输出(有测试钉住)。不进任何 gate(它读 `~/.metacodes`,
+CI 没有),但它的解析逻辑有单测且已接 `zig build test`。
+
+存在这个脚本的理由是记录在案的教训:本轮把 `BashOutput` 的缺陷描述成"每次都发生",而审计
+314 条真实结果给出的是中位 164 字节、仅 1 条超预算——**缺陷为真,频率是编的**。构造探针
+证明存在性,审计校准量级,两者不能互相替代(只发生过 1 次的东西,光看审计会判它不存在)。
+
+**单位是类型,只在跨越处强制**:`result_budget.Source`(内容缓冲区里的字节)与
+`result_budget.Encoded`(渲染进信封后占的字节)是两个 non-exhaustive enum,零表示开销。
+切割原语因此签名为"吃 `Encoded` 预算、吐 `Source` 长度"——那次换算正是反复被跳过的一步。
+一个 base64 字符串本身是 `Encoded`,它解码出来的才是 `Source`,所以不需要第三个单位。
+
+**范围是量出来的,不是凭感觉划的**:只有发生**换算**的地方强制单位(cut/cost 原语、
+`payloadAllowance`、preview 计数)。`Budget` 的字段刻意保持 `usize`——它们几乎只与结果自身
+长度比较,同单位、无从混淆;试着把它们也类型化后 `.raw()` 从 42 涨到 73,十七处新增全在从无
+危险的边界上、一个缺陷也抓不到,遂回退。**类型在没有防止混淆的地方就是纯税。**
+另注:`Source.head(buf)/.tail(buf)` 只是省掉 `.raw()` 的人体工程学,**不保证**长度与缓冲区
+配对(`head(错缓冲区)` 照样编译),那需要 phantom 参数,缓冲区错配仍归测试管。
+
+**编码后字节是唯一记账单位**:凡是"这条结果值多少字节"的判断,量的都是**渲染进信封之后**
+的字节——preview 经 JSON 转义最多翻倍、经 base64 涨 4:3。三处都踩过同一个坑(Bash 通道按
+整条通道选编码却按 preview 渲染、`regrowCommittedEnvelope` 按源字节下刀、`ReadArtifact`
+按源字节 clamp),共同后果都是"信封比它被派生自的预算大 1.4~2 倍",而这三种结果又都对
+projection 的溢出趟豁免,下游没有任何一层会把它们收回来。cut/cost 原语因此只有一份
+(`result_budget.encodedCost`/`headCut`/`tailCut`),做预算的那次决定(含 utf-8 还是 base64)
+必须**带着**传给渲染方,不允许渲染方自己再判一次。
+
+**字节预算的单一真相**:`core.result_budget.Budget` 由 provider 的 context window 派生
+(`per_result_bytes` 8..64KB、`per_turn_bytes` 16..200KB),`agent_loop` 每轮算一次,同时交给
+`ToolContext.result_budget` 和 `result_projection.project`。自己限界的工具(Bash 的
+stdout/stderr 双通道)从这里取额度并按 max-min 公平切分——空 stderr 不再白占一半;预算按
+**编码后**字节计(`encodedPrefixLen`/`encodedSuffixLen`),否则引号密集的输出经 JSON 转义可能
+渲染成额度的两倍。projection 的 preview 默认也由预算派生而非常量:溢出意味着内容超过了额度,
+不意味着额度消失。turn 预算用水位线(二分)统一下调每条的上限,而不是逐出最大的一条;当封装
+本身比内容还大时**拒绝**溢出,避免"丢了正文还把请求撑大"。流式 capture 路径的
+`artifact.Preview` 是编译期定长数组(1536 字节,在字节流过时就填好,那时既不知道结果多大也
+没有 provider),`project` 因此在提交前按当前预算重渲染该信封——原文放得下就整条回内联
+(`envelope_reinlined_count`),放不下就把 head/tail 扩到额度(`envelope_regrown_count`)。
+这一趟是**唯一会把结果变大**的一步,而它的产物又对溢出趟豁免,所以额度必须先按整轮定价
+(`regrowCeiling`):否则要么一条信封按 per-result 内联完再被 turn 水位线原样溢出去(读一遍
+artifact、写一遍、同时报"整条回给模型"和"已溢出"),要么并行 10 个工具调用各自涨到
+per_result_bytes,合计十倍于单条预算、且下游没有任何一层收得回来。
+`ReadArtifact` 对投影豁免(否则恢复自身会递归溢出),改由 `min(MAX_READ_BYTES,
+per_result_bytes)` 限界——同样按**编码后**字节,并扣掉自身信封开销:chunk 是 JSON 转义
+(或 base64)进 `data` 的,按源字节限界会让引号密集内容渲染成预算的两倍,即"给超预算结果
+的恢复,比结果本身更超预算"。余量走 `next_offset`,一个字节都不丢。
+
+**压力阀不得毁掉唯一的恢复能力**:`microcompact` 的 clear 趟明确跳过带 recoverable
+artifact 的结果(那是被省略字节的唯一取回途径),`truncateLargeToolResults` 必须守同一条
+承诺——它的通用头尾截断是**文本**操作,套到信封上会切出不可解析的 JSON,artifact_id /
+sha256 / read 指令一起没,而且下一轮 clear 因为再也看不到 recoverable artifact,会把残骸
+清成 stub。因此该趟先走 `result_projection.shrinkRecoverableEnvelope`:由拥有信封形状的
+那一层原地重渲染 preview(不碰 store,head/tail 从信封自带的 preview 里重切),身份字段
+一个不动、记账数字跟着重算;其余结构化结果(`metacodes.bash-result.v2`、不可恢复的
+fallback 信封、任意工具的大 JSON)走通用的**只裁长字符串**:短字段(exit_code、
+storage_error、各种 id 与 flag)从来不是超限的原因,却是结果可用的全部依据,必须原样留下;
+描述被裁字符串的计数器(`<ch>_truncated`、`preview_*_bytes`)在写出时一并改对,否则就是
+另一种"悄悄撒谎"(`omitted_bytes` 必须继续满足 head+tail+omitted==original)。裁剪递归到
+任意深度——`{"rows":[{"text":<40KB>}]}` 顶层没有长字符串,只裁顶层等于没裁。**连裁都裁不动的
+(体量不在字符串里,如超大数值数组)一律留着超限,通用文本截断只用于本来就不是结构化的内容**:
+多花一次请求可以恢复,切成不可解析的散文不能。
+
+**staging 路径在 Bash 一侧全面不可见**:已完成信封、auto-backgrounded 快照、显式
+`run_in_background` 三条路径都不再交出 `stdout_path`/`stderr_path`,统一改用 `job_id`
+(BashOutput 本来就按它读,还支持 `*_since_byte` 增量),能力不减。
+
+**已登记的缺口(别当成已解决)**:`job_id` 自身由随机字节生成,按 contract 的定义它就是
+random id,所以后台命令跨 run 仍不逐字节一致。它不能简单换成序号——同一个值同时用作
+`/tmp/metacodes-jobs/<uid>/<id>.out` 的文件名,而该目录跨进程共享,序号会撞。真正修法是把
+**文件标识**与**模型可见句柄**分开,属于 JobRegistry 所有权议题(与 spool 清理同源)。删掉
+路径把暴露面收窄到每条后台命令一个短不透明 token,并且不再泄露宿主临时目录,但没有做完。
+
+**预算按真正会被请求的模型解析**:subagent 与父**共享 Provider**,只靠 `model_override`
+区分。`Provider.maxInputTokensFor(model_override)` / `maxTokensFor` 因此成为**所有**窗口/输出
+派生量的唯一入口——per-result 预算、turn 预算、auto-compact 阈值、请求估算体、request gate
+的准入、agentcore 的预算预留,一处都不能落。答不了 per-model 的 provider 回退到自身窗口
+(即历史行为)。拿父窗口给子算,就是把 200K 的历史发给 32K 端点。
+
+这条规则最容易漏在"同一个字面量里 model 用了 override、maxTokens 没用"——`serializeForEstimation`、
+request gate、`canonicalRequestBytes` 三处都这么漏过。`agent_loop.zig` 里有一条守卫测试直接
+钉住规则本身:生产函数中不得出现无参的 `provider.maxTokens()` / `maxInputTokens()`(判断
+每次出现前最近的顶层声明是 `test` 还是 `fn`,因为测试块在该文件里是穿插的)。
+
+**恢复面的两个原语**:`ReadArtifact` 只能取字节区间,恢复一个 N 字节结果要
+O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。`Grep` 因此接受
+`artifact_id` 替代 `path`:blob 本来就是普通文件,一次 ripgrep 就能定位。CAS 路径
+**不得**进入模型可见结果(泄漏它等于让任意文件工具绕过有界恢复契约),故 artifact
+模式强制 `--no-filename`,并拒绝 `files_with_matches`——该模式的全部输出就是路径。
+`path` 与 `artifact_id` 互斥;无 artifact store 时传 `artifact_id` 报
+`ArtifactStoreRequired`,不会静默退化成 cwd 搜索。
+
+**配额与可见性**:`MAX_SESSION_BYTES` 检查每次发布都做一次全目录扫描,**刻意保持精确**
+——session root 由子 agent 与跨进程 swarm teammate 共享,缓存总量只能是下界,信它就会
+在别的写者活跃时越过配额;那次扫描的代价(最坏几千次 syscall)相对一次模型往返是噪声。
+扫描顺带写入 `sessionUsage(session_root)`(纯遥测,不参与准入;按 store 键控,一个进程会
+往多个 session root 发布——每个子 agent、每个 swarm teammate 一个——所以没测量过的 root
+读出来是"未知"而不是别人的总量),经 `Stats.session_artifact_bytes` 进 projection 日志行,
+让"逼近配额"在变成永久不可恢复之前可见。发布失败的原因由
+`artifact.storageErrorCode` 统一命名,generic 信封与 Bash 通道
+(`<channel>_storage_error`)共用同一套码,不再出现"只说 recoverable:false 不说为什么"。
+**没有淘汰策略**:artifact id 已经写进 conversation/transcript 并对模型承诺过
+`recoverable:true`,盲目删除会让该承诺变成悬空指针;安全的淘汰需要一份跨会话的存活
+引用集,artifact 层拿不到,属于独立议题。
+
 静态 `ToolEntry.result_production` 把生产方式收成三种不可混淆的状态：`bounded_inline`、
 `input_derived`、`byte_zero_spool`；comptime 断言禁止 `byte_zero_spool` 工具接回
 `legacy_inline` executor。当前原生 byte-zero 清单是 `Glob`、`Grep`、`CodeMap`、
 `FindSymbol`、`Bash`、`ListMcpResourcesTool`、`ReadMcpResourceTool`、`WebFetch`。
 其中 Bash 在第一个 stdout/stderr 字节前重定向到 JobRegistry 文件；没有长生命周期
 JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次同步调用建立临时 registry，
-不会退回 pipe 全量捕获。MCP stdio、AgentCore MCP connector、process plugin 与公开 Host
-stream ABI 都复用同一 CAS/receipt/`ReadArtifact` 恢复面。
+不会退回 pipe 全量捕获。已完成的 Bash 信封**不**给出 spool 路径:`<channel>_path` 曾经存在
+并被 `hasRecoverableArtifact` 当作恢复句柄,后按上方 prompt-cache contract 一并移除(staging
+path + 随机 id,两条都踩)。恢复面只有内容寻址的 `<channel>_artifact_id`(配 `Grep(artifact_id)`
+就地搜索);捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时就是**真的不可恢复**,由
+`<channel>_storage_error` 如实命名原因,而不是靠一条违约的句柄把它装成可恢复。后台作业则用
+稳定的 `job_id` + `BashOutput`(`*_next_offset` 是续读游标)。MCP stdio、AgentCore MCP
+connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt/`ReadArtifact`
+恢复面。
 
 真实 rollout 的非敏感证据用 `scripts/eval/tool_result_projection_eval.py <cassette>
 --headless-result <result.ndjson> --time-file <time.txt>` 导出；报告只含尺寸、hash、usage、
 恢复/前缀判定和时延，原始 cassette、artifact 与模型文本必须留在隔离本地目录。
 
-### 4.1 Options(全可选,`.{}` 即最简跑)
+### 4.2 Options(全可选,`.{}` 即最简跑)
 
 字段较多,分四类——理解分类比记字段重要:
 
@@ -317,10 +530,10 @@ stream ABI 都复用同一 CAS/receipt/`ReadArtifact` 恢复面。
   `mcp_sessions` `output_ledger`(§3.2.1) `file_change_journal`(§3.2.2) …
 - **SESSION/身份**:`session: SessionId` `session_id` `project_dir` `cwd_abs` `home_dir`
   `parent_model` `plan_file_path` `artifact_root` …
-- **接口回调/观察(类型安全,见 §4.2)**:`ui_requester` `host_services` `tool_observer`
+- **接口回调/观察(类型安全,见 §4.3)**:`ui_requester` `host_services` `tool_observer`
   `spawn_tick_fn`；usage/progress 由 `CoreEvent`/`EventSink` 投影，不再注入私有 sink。
 
-### 4.2 接口/事件结构(宿主接 core 的类型安全面)
+### 4.3 接口/事件结构(宿主接 core 的类型安全面)
 
 回调接口统一把 context 与函数指针收进类型安全的 value；usage/progress 则走
 `CoreEvent`，不是已经移除的私有 `UsageSink`/`ProgressReporter` 回调:

@@ -91,6 +91,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
         &capture,
         .text_utf8,
         true,
+        ctx.result_budget,
     );
 }
 

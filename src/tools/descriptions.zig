@@ -32,8 +32,8 @@ const READ_DESC =
     \\- When you already know which part of the file you need, only read that part. This can be important for larger files.
     \\- Results are returned using cat -n format, with line numbers starting at 1
     \\- This tool allows MetaCode to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as MetaCode is a multimodal LLM.
-    \\- This tool can read PDF files (.pdf). For large PDFs (more than 10 pages), you MUST provide the pages parameter to read specific page ranges (e.g., pages: "1-5"). Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request.
-    \\- This tool can read Jupyter notebooks (.ipynb files) and returns all cells with their outputs, combining code, text, and visualizations.
+    \\- This tool cannot read PDF files. It has no PDF extraction or page-rendering path and no pages parameter; reading a .pdf here yields its raw bytes, not its contents.
+    \\- Jupyter notebooks (.ipynb files) are read as their raw JSON, not as rendered cells; use NotebookEdit to modify a cell.
     \\- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.
     \\- You will regularly be asked to read screenshots. If the user provides a path to a screenshot, ALWAYS use this tool to view the file at the path. This tool will work with all temporary file paths.
     \\- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.
@@ -125,6 +125,7 @@ pub fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         "\n",
         \\- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use `interface\{\}` to find `interface{}` in Go code)
         \\- Multiline matching: By default patterns match within single lines only. For cross-line patterns like `struct \{[\s\S]*?field`, use `multiline: true`
+        \\- Searching a truncated tool result: pass its artifact_id instead of path. One search answers "where in this output is X" directly; paging the same result with ReadArtifact costs one round-trip per 32KB and re-sends the whole context each time. output_mode must be "content" or "count" (there is only one file to name), and path must be omitted.
         ,
     });
 }
@@ -201,7 +202,8 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
             \\- Chain multiple commands with ';'. DO NOT use newlines.
             \\- PowerShell examples: list all incl hidden → `Get-ChildItem -Force`; recursive by name → `Get-ChildItem -Recurse -Filter *.py`; set env var → `$env:FOO='bar'; echo $env:FOO`.
             \\- Windows safety: use one shell end-to-end (do not enumerate in PowerShell then pipe to cmd/batch for delete/move); prefer `Remove-Item`/`Move-Item -LiteralPath`; verify absolute target stays in workspace before any recursive delete/move; pass `Start-Process -WindowStyle Hidden` for background helpers.
-            \\- Output (stdout/stderr) is truncated to ~30KB; a "[N lines truncated]" marker indicates this.{s}{s}
+            \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
+            \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
         , .{ git_section, readonly_note });
     }
     return std.fmt.allocPrint(allocator,
@@ -215,7 +217,8 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\- VERY IMPORTANT: You MUST avoid using search commands like `find` and `grep`. Instead use Grep, Glob, or Agent to search. You MUST avoid read tools like `cat`, `head`, `tail`, and `ls`, and use Read and LS to read files.
         \\- If you _still_ need to run `grep`, STOP. ALWAYS USE ripgrep at `rg` first, which all MetaCode users have pre-installed.
         \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.
-        \\- Output (stdout/stderr) is truncated to ~30KB; a "[N lines truncated]" marker indicates this. Pipe through `head`/`tail` or write to a file and Read a range when you need more.{s}{s}
+        \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
+        \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
     , .{ git_section, readonly_note });
 }
 

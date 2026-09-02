@@ -435,6 +435,9 @@ pub const Priced = struct {
     input_price_micros: ?u64 = null,
     output_price_micros: ?u64 = null,
     cached_input_price_micros: ?u64 = null,
+    /// Rate for tokens written into the provider's cache. Null = unknown, and
+    /// unknown makes an estimate that needs it unknown rather than cheap.
+    cache_write_price_micros: ?u64 = null,
     /// Multiplier applied by an active discount, in basis points (10000 = no
     /// discount). Null = unknown.
     discount_basis_points: ?u16 = null,
@@ -477,22 +480,30 @@ pub const Quote = union(enum) {
             .per_token => 1,
             .per_request, .provider_defined => return null,
         };
-        // `input_tokens` is the total; `cached_input_tokens` is the subset the
-        // provider served from cache. Billing cached tokens at the full rate
-        // would over-report, so an unknown cached rate makes the estimate
-        // unknown rather than expensive.
+        // `input_tokens` is the total; `cached_input_tokens` and
+        // `cache_write_tokens` are the subsets the provider served from cache
+        // and wrote into it. Billing either at the fresh rate misreports the
+        // cost in one direction or the other, so an unknown rate for a subset
+        // that is actually present makes the estimate unknown.
         const cached = @min(usage.cached_input_tokens, usage.input_tokens);
-        const fresh = usage.input_tokens - cached;
+        const written = @min(usage.cache_write_tokens, usage.input_tokens - cached);
+        const fresh = usage.input_tokens - cached - written;
         const cached_rate = if (cached == 0)
             @as(u64, 0)
         else
             price.cached_input_price_micros orelse return null;
+        const write_rate = if (written == 0)
+            @as(u64, 0)
+        else
+            price.cache_write_price_micros orelse return null;
 
         const fresh_cost = std.math.mul(u64, fresh, input_rate) catch return null;
         const cached_cost = std.math.mul(u64, cached, cached_rate) catch return null;
+        const write_cost = std.math.mul(u64, written, write_rate) catch return null;
         const output_cost = std.math.mul(u64, usage.output_tokens, output_rate) catch return null;
         const input_total = std.math.add(u64, fresh_cost, cached_cost) catch return null;
-        const gross = std.math.add(u64, input_total / divisor, output_cost / divisor) catch return null;
+        const with_writes = std.math.add(u64, input_total, write_cost) catch return null;
+        const gross = std.math.add(u64, with_writes / divisor, output_cost / divisor) catch return null;
         const basis = price.discount_basis_points orelse return gross;
         const discounted = std.math.mul(u64, gross, basis) catch return null;
         return discounted / 10_000;
@@ -502,7 +513,12 @@ pub const Quote = union(enum) {
 pub const Usage = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
+    /// Subset of `input_tokens` the provider served from an existing cache.
     cached_input_tokens: u64 = 0,
+    /// Subset of `input_tokens` the provider wrote into its cache. Several
+    /// vendors bill this above the fresh-input rate, so it cannot be folded
+    /// into `input_tokens` without under-reporting the cost.
+    cache_write_tokens: u64 = 0,
 };
 
 // ── capacity and health ──────────────────────────────────────────────────────
@@ -552,6 +568,12 @@ pub const ModelOffer = struct {
     upstream_model_id: ?[]const u8 = null,
 
     protocol: []const u8,
+    /// The wire this protocol speaks, carried alongside its id so the transport
+    /// can be chosen without parsing the id back into a built-in enum. A
+    /// declarative custom protocol has its own id and a real wire; re-parsing
+    /// the id would lose that and report "no transport" for a route that has
+    /// one. Null is a genuinely novel wire, which fails closed.
+    wire: ?@import("profile.zig").Protocol.Wire = null,
     /// Fully constructed request endpoint for this protocol on this channel.
     endpoint_ref: []const u8,
     credential_ref: ?Slug = null,
@@ -802,20 +824,4 @@ test "group key prefers canonical identity over the wire model name" {
     };
     try std.testing.expectEqualStrings("zai/glm-5.3", offer.groupKey());
     try std.testing.expectEqualStrings("relay-glm-pro", offer.request_model_id);
-}
-
-test "runtime capability bridge covers the full runtime enum" {
-    const RuntimeCapability = enum {
-        web_search,
-        extended_thinking,
-        prompt_cache,
-        structured_output,
-        server_tool,
-        reasoning_content,
-        image_input,
-    };
-    assertRuntimeCoverage(RuntimeCapability);
-    try std.testing.expectEqual(Capability.vision, fromRuntimeCapability(RuntimeCapability.image_input));
-    try std.testing.expectEqual(Capability.reasoning, fromRuntimeCapability(RuntimeCapability.extended_thinking));
-    try std.testing.expectEqual(Capability.caching, fromRuntimeCapability(RuntimeCapability.prompt_cache));
 }

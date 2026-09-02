@@ -629,6 +629,10 @@ pub const SessionConfig = struct {
     /// OpenAI wire protocol. Public adapters validate provider/protocol
     /// pairing before this typed configuration reaches the Session.
     openai_protocol: types.OpenAIProtocol = .chat_completions,
+    /// issue #16: provider-declared authentication for the resolved route.
+    /// Null keeps the historical `authorization: Bearer` bytes, so an embedder
+    /// that names no provider is byte-identical.
+    auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
     api_key: []const u8,
     model: []const u8,
     base_url: ?[]const u8 = null,
@@ -971,10 +975,13 @@ pub const AdmittedRun = struct {
     }
 
     /// Continue an admitted Run with one multimodal user record built from
-    /// ordered text/image parts. Part bytes are borrowed and copied during
-    /// append. Appends and provider execution retain the ordinary poison
-    /// semantics; a non-vision model still fails the provider serializer with
-    /// `error.ImageInputUnsupported` before any network I/O.
+    /// ordered text/image parts. Part bytes are borrowed and copied while the
+    /// record is built, which happens **before** the Run is claimed: a build
+    /// failure returns its error with the Run finished cleanly, no provider
+    /// request sent, and the session left usable for the next Run. Provider
+    /// execution retains the ordinary poison semantics; a non-vision model
+    /// still fails the provider serializer with `error.ImageInputUnsupported`
+    /// before any network I/O.
     pub fn runUserParts(
         self: *AdmittedRun,
         parts: []const message_mod.UserContentPart,
@@ -1016,12 +1023,29 @@ pub const AdmittedRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         }
+        // 构造记录先于认领 Run:构造失败(输入不合法、OOM)是这次输入的问题,
+        // 该走与上面 parts.len==0 同一条干净退出(Run 正常收尾、不发请求、
+        // 会话可继续下一个 Run),而不是把会话毒掉。
+        const record = message_mod.userMessageFromParts(
+            self.session.conversation.allocator,
+            parts,
+        ) catch |err| {
+            _ = try self.finishWithoutConversation();
+            return err;
+        };
+        // 显式转移标志而非裸 errdefer:Conversation.append 失败时**不**接管
+        // record,成功后所有权归 conversation。裸 errdefer 会在 append 成功之后
+        // 的任何错误(runLoop 返错是常态)上二次释放。
+        var record_owned = true;
+        errdefer if (record_owned) record.deinit(self.session.conversation.allocator);
         try self.session.claimAdmittedRun(self.identity_value);
         self.completed = true;
-        self.session.conversation.appendUserParts(parts) catch |err| {
+        // 此后失败才是普通的 admitted-Run poison 语义。
+        self.session.conversation.append(record) catch |err| {
             _ = self.session.poisonRun();
             return err;
         };
+        record_owned = false;
         return self.session.runLoop(
             self.identity_value,
             max_turns,
@@ -1128,6 +1152,10 @@ pub const AgentSession = struct {
     model: []u8,
     base_url: ?[]u8,
     openai_protocol: types.OpenAIProtocol,
+    /// Carried so a tool-scoped provider authenticates the way the session's
+    /// own route does; a subagent sending bearer at an `x-api-key` endpoint has
+    /// the right key and the wrong header.
+    auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
     provider: provider_factory.OwnedProvider,
     conversation: Conversation,
     workspace: workspace_mod.WorkspacePolicy,
@@ -1172,7 +1200,7 @@ pub const AgentSession = struct {
 
     fn makeToolProvider(raw: *anyopaque) anyerror!provider_factory.OwnedProvider {
         const self: *AgentSession = @ptrCast(@alignCast(raw));
-        return provider_factory.makeProviderWithDialectResolver(
+        return provider_factory.makeProviderWithOptions(
             std.heap.c_allocator,
             self.provider.kind(),
             self.api_key,
@@ -1180,6 +1208,7 @@ pub const AgentSession = struct {
             self.base_url,
             self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = self.auth_scheme },
         );
     }
 
@@ -1262,7 +1291,7 @@ pub const AgentSession = struct {
             Conversation.init(allocator);
         errdefer conversation.deinit();
 
-        const owned_provider = try provider_factory.makeProviderWithDialectResolver(
+        const owned_provider = try provider_factory.makeProviderWithOptions(
             allocator,
             config.provider_kind,
             api_key,
@@ -1270,6 +1299,7 @@ pub const AgentSession = struct {
             base_url,
             config.openai_protocol,
             runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = config.auth_scheme },
         );
         errdefer owned_provider.deinit();
 
@@ -1305,6 +1335,7 @@ pub const AgentSession = struct {
             .model = model,
             .base_url = base_url,
             .openai_protocol = config.openai_protocol,
+            .auth_scheme = config.auth_scheme,
             .provider = owned_provider,
             .conversation = conversation,
             .workspace = workspace,

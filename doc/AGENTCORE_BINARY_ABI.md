@@ -380,7 +380,16 @@ event sequence number, cursor, replay, or exactly-once contract; only
 `on_event` is mandatory in Revision 15. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
-and advances only for emitted RunState snapshots. Usage remains authoritative
+and advances only for emitted RunState snapshots. While the observation
+channel stays usable, terminal closure is published exactly once, from the
+Run's final result — an abort accepted from the `finalizing` callback is
+reflected as `aborted`, a Run that never ran the loop still receives it, and a
+post-admission cleanup failure closes it as `poisoned` — and it is delivered
+even when tool-set observation was degraded. A Host that rejects any snapshot
+(the terminal one included) fails the Run with `CALLBACK_FAILED` and poisons
+the Session; a snapshot that could not be built fails it with the recorded
+status (`OUT_OF_MEMORY`) the same way. No terminal snapshot is delivered after
+that, and no later Run on that Session can report success. Usage remains authoritative
 in the existing usage event stream.
 
 Visible assistant output is bracketed by `output_segment_begin` and
@@ -635,19 +644,26 @@ The checkpoint `max_messages` limit counts that materialized summary as one
 message in addition to the encoded active-message count.
 
 Conversation blocks are encoded with tag bytes `1=text`, `2=tool_use`,
-`3=tool_result`, `4=thinking`, `5=image`. An image block carries two encoded
-strings, `media_type` then base64 `data`; raw image bytes never enter the
-envelope, so every string still satisfies the UTF-8 validation rule. Tag `5`
-is an additive extension: checkpoints written before it decode unchanged,
-while an older reader that encounters tag `5` fails closed with `Corrupt`
-instead of silently dropping model-visible image content.
+`3=tool_result`, `4=thinking`, `5=image`, `6=reasoning_item`. An image block
+carries two encoded strings, `media_type` then base64 `data`; raw image bytes
+never enter the envelope, so every string still satisfies the UTF-8 validation
+rule. A reasoning-item block also carries two encoded strings, the owning
+`model` then the provider's verbatim item JSON (UTF-8 by construction: it is
+the server's own wire text). Tags `5` and `6` are additive extensions:
+checkpoints written before them decode unchanged, while an older reader that
+encounters either fails closed with `Corrupt` instead of silently dropping
+model-visible image content or provider reasoning continuity.
 
-Reachability note: the Revision 14 run-input surface (`RUN_INPUT_TEXT` /
-`RUN_INPUT_SKILL`) cannot inject image blocks, so a tag `5` envelope is
-currently produced only by hosts that populate the Conversation through the
-Zig surface. The C-ABI consumer round-trip for image-bearing checkpoints
-lands together with the planned `RUN_INPUT_MULTIMODAL` input (a Revision 15
-change), which is the first way a pure C host can create one.
+Tag `7` is permanently reserved and never written. It carried the document
+block of the withdrawn first-class PDF input; a checkpoint containing one is
+intact rather than damaged, so decoding reports `UNSUPPORTED` (schema this
+build no longer supports) rather than `CORRUPT`, which would send a Host
+hunting for storage faults. Integrity is established first: the block is
+stepped over through the hasher in its revision-16 layout, the digest is
+verified, and only then is `UNSUPPORTED` reported — a damaged file whose bytes
+merely read as tag `7` still reports `CORRUPT`. The tag stays reserved because any build that ran
+that revision could have written one, and reusing `7` for a different block
+would silently misread those files.
 Hosts that require verbatim historical audit must persist the event/transcript
 stream separately. This projection is what allows compact to reduce durable
 usage for a near-hard Session.

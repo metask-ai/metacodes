@@ -1,0 +1,45 @@
+{
+  "round": "2026-08-31-frontierchallenge-glm52",
+  "dates": {"setup": "2026-08-29", "claude_code_run": "2026-08-29/30", "metacodes_run": "2026-08-31"},
+  "host": {"name": "patron (vm-ubuntu3)", "ssh": "shuzuan@58.211.6.130:103", "cpu": 16, "ram_gb": 31, "os": "Ubuntu 22.04.5", "workdir": "~/frontier-bench"},
+  "benchmark": {
+    "name": "FrontierChallenge",
+    "source": "ApodexAI/FrontierAgent benchmarks/frontierchallenge",
+    "track": "open",
+    "official_denominator": 97,
+    "open_track_tasks": 81,
+    "tasks_attempted": 80,
+    "excluded": [{"task": "task_098_orca_claisen_thermochemistry", "reason": "upstream registry labels it open-image but preflight requires licensed ORCA 6.0.1"}],
+    "orca_tasks_skipped": 16,
+    "image": {"ref": "frontierchallenge/cpu-open:2026.08", "pinned_id": "sha256:976ec5b4b90e", "modified_id": "43bfc3d8eb14", "modification": "claude CLI 2.1.251 + nodejs baked via npmmirror (downloads.claude.ai unreachable from CN); pristine image kept as :2026.08-orig"}
+  },
+  "model": {"id": "glm-5.2", "gateway": "https://napi.metask-ai.com/v1/messages", "protocol": "anthropic-messages"},
+  "judge": {
+    "model": "glm-5.2", "repeats": 3,
+    "official_pinned": "gpt-5.6-sol per-task frozen judges",
+    "comparability": "scores are internally comparable between the two scaffold runs; NOT comparable with official-judge results",
+    "transport": "litellm shim on 172.17.0.1:4400 (OpenAI->anthropic), thinking disabled via extra_body, max_tokens floor 16384, image parts replaced by text placeholder (text-only judge), non-image artifacts skipped, component-id compliance note appended (active for claude-code final retry round and all metacodes tasks)"
+  },
+  "scaffolds": {
+    "claude-code": {"version": "2.1.251", "adapter": "harbor built-in", "job": "glm52-open-full"},
+    "metacodes": {"commit": "59dd28c", "commit_title": "fix(lsp): qualify symbol capability loss, and enable LSP by default with --no-lsp (#18)", "built_with": "zig 0.16.0 on patron, ReleaseSafe", "adapter": "custom metacodes_agent.py (headless -p, --permission bypassPermissions, --add-dir /app, binary served over docker bridge)", "job": "metacodes-open-full"}
+  },
+  "grader_wrapper_patches": [
+    "run_frontier_verifier.py: one retry per failed judge repetition",
+    "run_judge.py: httpx 'proxies' kwarg compat shim (after __future__ imports)",
+    "run_judge.py: fitz/PIL import guards (indentation-aware)",
+    "run_judge.py: explicit /tests/.env dotenv fallback + tests/.env credential file",
+    "run_judge.py: non-image artifact mime rejection converted to skip-with-note",
+    "test.sh: pip install fallback chain (env mirror -> direct pypi -> pip upgrade)"
+  ],
+  "rerun_policy": "trials whose verifier/harness failed for infrastructure reasons were deleted and rerun; genuine agent failures (missing deliverables) kept from their original attempt; task_072 failed verifier-env chronically in BOTH runs and counts zero in both",
+  "network_notes": "CN network: HF via Mac relay (xet CDN + tree pagination broken via mirror), npm via npmmirror, apt via TUNA, pip via TUNA with fallback chain, model+judge traffic via metask gateway",
+  "olympiad_context": {
+    "benchmark": "FrontierScience-Olympiad (FrontierAgent public harness, stateful-react-agent, closed-book --no-web)",
+    "date": "2026-08-29",
+    "first_run_accuracy": 0.70,
+    "after_retry_accuracy": 0.74,
+    "retry_note": "11 no-answer questions retried once with identical config; primary number is the single fixed run (70%)",
+    "judge": "glm-5.2 single call (upstream pin openai/gpt-5 overridden)"
+  }
+}

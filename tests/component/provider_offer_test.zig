@@ -776,3 +776,1111 @@ test "L2: --offer and --channel may not contradict each other" {
     try std.testing.expect(std.mem.indexOf(u8, text, "cn-anthropic") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cn-openai") != null);
 }
+
+// ── restart: a durable selection is what the next process actually routes to ──
+
+fn setEnvZ(name: [*:0]const u8, value: [*:0]const u8) void {
+    @import("platform").paths.setEnv(name, value);
+}
+
+fn unsetEnvZ(name: [*:0]const u8) void {
+    @import("platform").paths.unsetEnv(name);
+}
+
+test "L2: a globally committed selection routes the next process, model inference does not" {
+    const a = std.testing.allocator;
+    const path = try tempConfigPath(a, "restart");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    setEnvZ(cc.provider_config_store.CONFIG_PATH_ENV, path_z);
+    defer unsetEnvZ(cc.provider_config_store.CONFIG_PATH_ENV);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+    // The OpenAI-wire GLM route: proof the transport comes from the offer's
+    // protocol and not from the model name, which starts with "glm".
+    var target: *const cc.provider_offer.ModelOffer = undefined;
+    for (catalog.items()) |*candidate| {
+        if (candidate.channel_id.eqlText("cn-openai") and
+            std.mem.eql(u8, candidate.request_model_id, "glm-4.6")) target = candidate;
+    }
+
+    {
+        var store = try cc.provider_config_store.Store.initHome(a);
+        defer store.deinit();
+        _ = try cc.provider_config_store.setGlobalSelection(
+            &store,
+            cc.provider_selection.RuntimeSelection.pinned(target.offer_id, target.offer_revision, .global),
+            null,
+            "restart-commit",
+        );
+    }
+
+    // A fresh process: nothing on the command line names a provider.
+    var config = cc.types_mod.Config{};
+    try std.testing.expect(cc.applyPersistedGlobalSelection(&config, a));
+    defer {
+        if (config.selected_offer_id) |value| a.free(value);
+        if (config.resolved_provider_id) |value| a.free(value);
+        if (config.base_url) |value| a.free(value);
+        a.free(config.model);
+    }
+
+    try std.testing.expectEqualStrings("glm-4.6", config.model);
+    try std.testing.expectEqualStrings(target.endpoint_ref, config.base_url.?);
+    try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, config.provider_kind);
+    // Credential scope has to follow the restored route, or the session would
+    // re-enter the Metask credential path for a Z.AI endpoint.
+    try std.testing.expectEqualStrings("zai-coding-plan", config.provider_profile.?);
+    try std.testing.expect(!cc.selectedProfileIsMetask(config));
+    // Model-name inference would have said `anthropic` for "glm-4.6".
+    try std.testing.expect(cc.inferProviderKind(config.model) != config.provider_kind);
+}
+
+test "L2: a stored pin the catalog no longer offers is never silently remapped" {
+    const a = std.testing.allocator;
+    const path = try tempConfigPath(a, "stale-pin");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    var store = try cc.provider_config_store.Store.initPath(a, path);
+    defer store.deinit();
+    const missing = cc.provider_ids.OfferId{ .digest = @splat(0x5A) };
+    _ = try cc.provider_config_store.setGlobalSelection(
+        &store,
+        cc.provider_selection.RuntimeSelection.pinned(missing, 1, .global),
+        null,
+        "stale-commit",
+    );
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var reloaded = try store.load();
+    defer reloaded.deinit();
+
+    // Resolution reports the pin as unresolved instead of picking a neighbour;
+    // `applyPersistedGlobalSelection` turns exactly this into a startup error.
+    const outcome = try cc.provider_startup.resolveSelection(a, &registry, reloaded.global_selection.?);
+    try std.testing.expect(outcome == .failure);
+    try std.testing.expect(outcome.failure == .unresolved_selection);
+}
+
+test "L2: a session selection is written beside the session, not into config.json" {
+    const a = std.testing.allocator;
+    const config_path = try tempConfigPath(a, "session-scope");
+    defer a.free(config_path);
+    removeTempDir(config_path);
+    defer removeTempDir(config_path);
+
+    const session_dir = std.fs.path.dirname(config_path).?;
+    var config_store = try cc.provider_config_store.Store.initPath(a, config_path);
+    defer config_store.deinit();
+    var session_store = try cc.provider_config_store.Store.initSessionFile(a, session_dir);
+    defer session_store.deinit();
+    defer removeTempDir(session_store.path);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+    const global_target = catalog.items()[0];
+    const session_target = catalog.items()[1];
+
+    _ = try cc.provider_config_store.setGlobalSelection(
+        &config_store,
+        cc.provider_selection.RuntimeSelection.pinned(global_target.offer_id, global_target.offer_revision, .global),
+        null,
+        "global-commit",
+    );
+    _ = try cc.provider_config_store.setSessionSelection(
+        &session_store,
+        cc.provider_selection.RuntimeSelection.pinned(session_target.offer_id, session_target.offer_revision, .session),
+        null,
+        "session-commit",
+    );
+
+    // A session-scoped choice must not become everyone's choice.
+    var global_doc = try config_store.load();
+    defer global_doc.deinit();
+    try std.testing.expect(global_doc.session_selection == null);
+    try std.testing.expect(global_doc.global_selection.?.target.pinned_offer.offer_id.eql(global_target.offer_id));
+
+    var session_doc = try session_store.load();
+    defer session_doc.deinit();
+    try std.testing.expect(session_doc.global_selection == null);
+    try std.testing.expect(session_doc.session_selection.?.target.pinned_offer.offer_id.eql(session_target.offer_id));
+}
+
+// ── the picker as a control-plane client ─────────────────────────────────────
+
+const picker_mod = @import("cc").repl_model_picker;
+
+fn seedPicker(
+    picker: *picker_mod.Picker,
+    kernel: *cc.provider_control_plane.Kernel,
+    a: std.mem.Allocator,
+) !void {
+    var page: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try kernel.modelList(.{}, .{}, a, &page);
+    try picker.adopt(listed, kernel.currentOfferId());
+}
+
+test "L2: a picker-driven selection reaches the endpoint, path, and wire model it named" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+    const base = try std.fmt.allocPrint(a, "{s}/api/coding/paas/v4", .{origin});
+    defer a.free(base);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{
+        .only_provider = Slug.lit("zai-coding-plan"),
+        .endpoint_overrides = &.{.{
+            .provider_id = Slug.lit("zai-coding-plan"),
+            .channel_id = Slug.lit("cn-openai"),
+            .base_url = base,
+        }},
+    });
+    defer catalog.deinit();
+
+    var kernel = cc.provider_control_plane.Kernel.init(a, &catalog);
+    defer kernel.deinit();
+    kernel.registry = &registry;
+
+    var picker = picker_mod.Picker.init(a);
+    defer picker.deinit();
+    try seedPicker(&picker, &kernel, a);
+
+    // Drive the picker exactly as a keyboard would: provider → model → offer.
+    _ = picker.onKey(.enter);
+    for ("glm46") |byte| _ = picker.onKey(.{ .char = byte });
+    _ = picker.onKey(.enter);
+    try std.testing.expectEqual(picker_mod.Stage.offer, picker.stage);
+
+    // Walk to the OpenAI-wire China channel and commit it.
+    var scratch: [picker_mod.Picker.MAX_ROWS]picker_mod.Row = undefined;
+    var guard: usize = 0;
+    while (guard < scratch.len) : (guard += 1) {
+        const rows = picker.rows(&scratch);
+        const candidate = picker.offers.items[rows[picker.cursor].offer.offer_index];
+        if (candidate.channel_id.eqlText("cn-openai")) break;
+        _ = picker.onKey(.down);
+    }
+    const outcome = picker.onKey(.enter);
+    try std.testing.expect(outcome == .commit);
+
+    const commit = outcome.commit;
+    var candidate_selection = cc.provider_selection.RuntimeSelection.pinned(
+        commit.offer_id,
+        commit.offer_revision,
+        commit.scope,
+    );
+    candidate_selection.controls = commit.controls;
+    const committed = kernel.selectionCommit(.{}, candidate_selection, commit.scope);
+    try std.testing.expect(committed == .committed);
+    // Session is the default scope, so nothing durable was written by a plain
+    // Enter on the picker.
+    try std.testing.expectEqual(cc.provider_selection.Scope.session, committed.committed.scope);
+    try std.testing.expect(!committed.committed.requires_persist);
+
+    // The kernel's effective selection is what the transport must bind.
+    var reference_buffer: [cc.provider_ids.MAX_SLUG_LEN]u8 = undefined;
+    const binding = try cc.provider_runtime_binding.bind(
+        &registry,
+        kernel.catalogSnapshot(),
+        kernel.effectiveSelection().?,
+        .{ .cli_api_key = "picked-secret" },
+        &reference_buffer,
+    );
+    try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, binding.transport);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.api_openai.OpenAIClient.init(
+        a,
+        io_runtime.io(),
+        binding.secret,
+        binding.request_model_id,
+        binding.endpoint_url,
+    );
+    client.protocol = binding.openai_protocol;
+    client.auth_scheme = binding.auth_scheme;
+    defer client.deinit();
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = client.provider().sendStream(&messages, null, null, null, null, null, "") catch
+        return error.SkipZigTest;
+    while (handle.next() catch null) |event| switch (event) {
+        .text => |text| a.free(text),
+        else => {},
+    };
+    handle.deinit();
+
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    // What the user picked is what went on the wire.
+    try std.testing.expect(std.mem.indexOf(u8, requestLine(captured), "/api/coding/paas/v4") != null);
+    try std.testing.expectEqualStrings("Bearer picked-secret", headerValue(captured, "authorization").?);
+    const model_field = captured.jsonField("model") orelse return error.ModelFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-4.6") != null);
+}
+
+test "L2: the TUI picker and a second client see one catalog and one selection" {
+    const a = std.testing.allocator;
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+
+    var picker = picker_mod.Picker.init(a);
+    defer picker.deinit();
+    try seedPicker(&picker, &host.kernel, a);
+
+    // A "web client" reads the same kernel through the same API.
+    var web_page: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer web_page.deinit(a);
+    const web_view = try host.kernel.modelList(.{}, .{}, a, &web_page);
+    try std.testing.expectEqual(web_view.offers.len, picker.offers.items.len);
+
+    // The TUI commits; the second client observes it without being told.
+    const target = host.kernel.catalogSnapshot().items()[0];
+    const committed = host.kernel.selectionCommit(
+        .{},
+        cc.provider_selection.RuntimeSelection.pinned(target.offer_id, target.offer_revision, .session),
+        .session,
+    );
+    try std.testing.expect(committed == .committed);
+
+    var after: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer after.deinit(a);
+    const refreshed = try host.kernel.modelList(.{}, .{}, a, &after);
+    var marked: usize = 0;
+    for (refreshed.offers) |summary| {
+        if (summary.is_current) marked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), marked);
+
+    // And the picker's own snapshot goes stale until it re-reads — it does not
+    // silently claim to be current.
+    try seedPicker(&picker, &host.kernel, a);
+    try std.testing.expect(picker.current_offer.?.eql(target.offer_id));
+}
+
+// ── user-defined providers ───────────────────────────────────────────────────
+
+test "L2: a configured relay reaches its own path, header, and wire model id" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    const definition = try std.fmt.allocPrint(a,
+        \\{{"custom_providers": {{"house-relay": {{
+        \\  "display_name": "House relay",
+        \\  "aliases": ["relay"],
+        \\  "auth": {{"kind": "custom_header", "header": "X-Relay-Token", "value_prefix": "Token "}},
+        \\  "env_aliases": [{{"name": "RELAY_TOKEN", "kind": "api_key", "canonical": true}}],
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/v1",
+        \\    "protocol": {{"wire": "openai_chat", "path_suffix": "/completions", "id": "relay_openai"}},
+        \\    "region": "eu"}}],
+        \\  "models": [{{"request_model_id": "relay-glm-pro", "display_name": "GLM-4.6 (relay)",
+        \\    "canonical_model_id": "zai/glm-5.3",
+        \\    "limits": {{"context_window": 200000, "max_output_tokens": 128000}},
+        \\    "capabilities": {{"tools": "supported"}},
+        \\    "price": {{"currency": "EUR", "input": 2.5, "output": 9}}}}]}}}}}}
+    , .{origin});
+    defer a.free(definition);
+
+    var definitions = try cc.provider_custom.parse(a, definition);
+    defer definitions.deinit();
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    for (definitions.profiles()) |built| try registry.register(built);
+
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{ .provider = "relay" });
+    try std.testing.expect(outcome == .route);
+    var route = outcome.route;
+    defer route.deinit();
+
+    // A relay only moved the path, so the OpenAI transport serves it — no
+    // adapter, no code, and no fallback to a wire the server does not speak.
+    try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, route.transport);
+    try std.testing.expectEqualStrings("relay-glm-pro", route.request_model_id);
+    try std.testing.expectEqual(@as(?u32, 200_000), route.limits.context_window);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.api_openai.OpenAIClient.init(
+        a,
+        io_runtime.io(),
+        "relay-secret",
+        route.request_model_id,
+        route.endpoint_url,
+    );
+    client.protocol = route.openai_protocol;
+    client.auth_scheme = route.auth_scheme;
+    defer client.deinit();
+
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = client.provider().sendStream(&messages, null, null, null, null, null, "") catch
+        return error.SkipZigTest;
+    while (handle.next() catch null) |event| switch (event) {
+        .text => |text| a.free(text),
+        else => {},
+    };
+    handle.deinit();
+
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    // The declared path suffix, the declared header with its prefix, and the
+    // relay's own model id — the canonical mapping is display identity and
+    // must not leak onto the wire.
+    try std.testing.expect(std.mem.indexOf(u8, requestLine(captured), "/v1/completions") != null);
+    try std.testing.expectEqualStrings("Token relay-secret", headerValue(captured, "X-Relay-Token").?);
+    try std.testing.expect(headerValue(captured, "authorization") == null);
+    const model_field = captured.jsonField("model") orelse return error.ModelFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "relay-glm-pro") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-5.3") == null);
+}
+
+test "L2: a configured provider's declared metadata reaches every client the same way" {
+    const a = std.testing.allocator;
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+
+    try host.adoptCustomProviders(
+        \\{"custom_providers": {"house-relay": {
+        \\  "channels": [{"id":"primary","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"relay-glm-pro","canonical_model_id":"zai/glm-5.3",
+        \\    "limits": {"context_window": 200000},
+        \\    "price": {"currency":"EUR","input":2.5,"output":9,"discount_basis_points":9000},
+        \\    "controls": [{"id":"reasoning_effort","label":"Reasoning","kind":"enumeration","values":["low","high"]}]}]}}}
+    );
+
+    var page: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try host.kernel.modelList(.{}, .{ .provider_id = Slug.lit("house-relay") }, a, &page);
+    try std.testing.expectEqual(@as(usize, 1), listed.offers.len);
+    const summary = listed.offers[0];
+
+    // Everything the definition declared is on the summary every UI reads.
+    try std.testing.expectEqual(@as(?u32, 200_000), summary.limits.context_window);
+    try std.testing.expectEqualStrings("EUR", summary.quote.priced().?.currency.slice());
+    try std.testing.expectEqual(@as(?u16, 9_000), summary.quote.priced().?.discount_basis_points);
+    try std.testing.expectEqual(@as(usize, 1), summary.controls.len);
+    try std.testing.expectEqualStrings("reasoning_effort", summary.controls[0].id);
+
+    // And the picker renders it without knowing it was user-defined.
+    var picker = picker_mod.Picker.init(a);
+    defer picker.deinit();
+    try seedPicker(&picker, &host.kernel, a);
+    // A filter specific enough to name one provider: the stage matches what a
+    // provider serves as well as its id, so a single letter is not unique.
+    for ("house-relay") |byte| _ = picker.onKey(.{ .char = byte });
+    var scratch: [picker_mod.Picker.MAX_ROWS]picker_mod.Row = undefined;
+    const rows = picker.rows(&scratch);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(picker.offers.items[rows[0].provider.offer_index].provider_id.eqlText("house-relay"));
+
+    // Token admission uses the declared limit, so a prompt that cannot fit is
+    // rejected before any request exists.
+    const admission = summary.limits.admit(
+        .{ .input_tokens = 500_000, .requested_output_tokens = 1_000 },
+        .{},
+    );
+    try std.testing.expect(admission == .rejected);
+}
+
+// ── provider-scoped OAuth lifecycle ──────────────────────────────────────────
+
+fn oauthTempPath(a: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "/tmp/metacodes-oauth-l2-{s}.json", .{name});
+}
+
+test "L2: an expired provider token refreshes over real HTTP and persists the rotation" {
+    const a = std.testing.allocator;
+    // A 200 with a JSON body: the token endpoint's actual shape.
+    var server = try harness.MockServer.startWithStatus(
+        \\{"access_token":"at-2","refresh_token":"rt-2","token_type":"Bearer","expires_in":3600}
+    , 0, "HTTP/1.1 200 OK");
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    const path = try oauthTempPath(a, "refresh");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    var session = try cc.provider_oauth.Session.init(a, Slug.lit("openai"), path);
+    defer session.deinit();
+    try session.importOutcome(.{
+        .access_token = "at-1",
+        .refresh_token = "rt-1",
+        .expires_in_seconds = 10,
+    }, 1_000);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var exchange = cc.api_oauth_exchange.HttpExchange{
+        .allocator = a,
+        .io = io_runtime.io(),
+        .endpoint = .{ .token_url = origin, .client_id = "metacodes-test" },
+    };
+
+    // Well past expiry: the lifecycle must refresh rather than present a dead
+    // token and let the request fail.
+    const token = session.accessToken(9_000, exchange.exchange()) catch return error.SkipZigTest;
+    defer a.free(token);
+    try std.testing.expectEqualStrings("at-2", token);
+
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, captured.raw, "grant_type=refresh_token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.raw, "refresh_token=rt-1") != null);
+
+    // The provider rotated, so `rt-1` is already dead. The file must hold the
+    // replacement before the process could possibly crash.
+    const stored = try readWholeFile(a, path);
+    defer a.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "rt-2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"rt-1\"") == null);
+}
+
+test "L2: a rejected refresh is terminal and leaves the stored login untouched" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startWithStatus(
+        \\{"error":"invalid_grant","error_description":"expired"}
+    , 0, "HTTP/1.1 400 Bad Request");
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    const path = try oauthTempPath(a, "rejected");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    var session = try cc.provider_oauth.Session.init(a, Slug.lit("openai"), path);
+    defer session.deinit();
+    try session.importOutcome(.{
+        .access_token = "at-1",
+        .refresh_token = "rt-1",
+        .expires_in_seconds = 10,
+    }, 1_000);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var exchange = cc.api_oauth_exchange.HttpExchange{
+        .allocator = a,
+        .io = io_runtime.io(),
+        .endpoint = .{ .token_url = origin, .client_id = "metacodes-test" },
+    };
+
+    // `invalid_grant` means the user must log in again. Reporting it as a
+    // transport failure would send a retry loop at an endpoint that can only
+    // keep saying no.
+    try std.testing.expectError(
+        error.RefreshRejected,
+        session.accessToken(9_000, exchange.exchange()),
+    );
+
+    // Nothing was overwritten: the user's stored login is still the one they
+    // have, and a re-login replaces it deliberately rather than by accident.
+    const stored = try readWholeFile(a, path);
+    defer a.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "rt-1") != null);
+}
+
+test "L2: an OAuth access token authenticates the provider's own route" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{
+        .only_provider = Slug.lit("openai"),
+        .endpoint_overrides = &.{.{ .provider_id = Slug.lit("openai"), .base_url = origin }},
+    });
+    defer catalog.deinit();
+
+    var reference_buffer: [cc.provider_ids.MAX_SLUG_LEN]u8 = undefined;
+    const binding = try cc.provider_runtime_binding.bindOffer(
+        &registry,
+        &catalog.items()[0],
+        .{
+            // The OAuth access token arrives as stored material of an OAuth
+            // kind; an API key for another vendor still cannot satisfy it.
+            .stored_oauth = .{ .kind = .openai_oauth, .secret = "oauth-access-token" },
+            .precedence = .oauth_first,
+        },
+        &reference_buffer,
+        false,
+    );
+    try std.testing.expectEqualStrings("oauth-access-token", binding.secret);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.api_openai.OpenAIClient.init(
+        a,
+        io_runtime.io(),
+        binding.secret,
+        binding.request_model_id,
+        binding.endpoint_url,
+    );
+    client.protocol = binding.openai_protocol;
+    client.auth_scheme = binding.auth_scheme;
+    defer client.deinit();
+
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = client.provider().sendStream(&messages, null, null, null, null, null, "") catch
+        return error.SkipZigTest;
+    while (handle.next() catch null) |event| switch (event) {
+        .text => |text| a.free(text),
+        else => {},
+    };
+    handle.deinit();
+
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expectEqualStrings("Bearer oauth-access-token", headerValue(captured, "authorization").?);
+}
+
+// ── scope decides where a selection is written ───────────────────────────────
+
+test "L2: a session-scoped commit never reaches config.json, and a global one does" {
+    const a = std.testing.allocator;
+    const config_path = try tempConfigPath(a, "scope-split");
+    defer a.free(config_path);
+    removeTempDir(config_path);
+    defer removeTempDir(config_path);
+
+    const session_dir = std.fs.path.dirname(config_path).?;
+    var config_store = try cc.provider_config_store.Store.initPath(a, config_path);
+    defer config_store.deinit();
+    var session_store = try cc.provider_config_store.Store.initSessionFile(a, session_dir);
+    defer session_store.deinit();
+    defer removeTempDir(session_store.path);
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{});
+    defer catalog.deinit();
+    var kernel = cc.provider_control_plane.Kernel.init(a, &catalog);
+    defer kernel.deinit();
+
+    const session_target = catalog.items()[0];
+    const global_target = catalog.items()[1];
+
+    const session_commit = kernel.selectionCommit(
+        .{},
+        cc.provider_selection.RuntimeSelection.pinned(session_target.offer_id, session_target.offer_revision, .session),
+        .session,
+    );
+    // Session scope is not durable *globally*: the kernel does not ask for a
+    // config write, and the host writes the session's own file instead.
+    try std.testing.expect(!session_commit.committed.requires_persist);
+    _ = try cc.provider_config_store.setSessionSelection(
+        &session_store,
+        session_commit.committed.selection,
+        null,
+        "session-op",
+    );
+
+    const global_commit = kernel.selectionCommit(
+        .{},
+        cc.provider_selection.RuntimeSelection.pinned(global_target.offer_id, global_target.offer_revision, .global),
+        .global,
+    );
+    try std.testing.expect(global_commit.committed.requires_persist);
+    _ = try cc.provider_config_store.setGlobalSelection(
+        &config_store,
+        global_commit.committed.selection,
+        null,
+        "global-op",
+    );
+
+    // Each file holds exactly one of the two, so a session choice cannot
+    // become everyone's and a global one cannot be mistaken for this session's.
+    var config_doc = try config_store.load();
+    defer config_doc.deinit();
+    try std.testing.expect(config_doc.session_selection == null);
+    try std.testing.expect(config_doc.global_selection.?.target.pinned_offer.offer_id.eql(global_target.offer_id));
+
+    var session_doc = try session_store.load();
+    defer session_doc.deinit();
+    try std.testing.expect(session_doc.global_selection == null);
+    try std.testing.expect(session_doc.session_selection.?.target.pinned_offer.offer_id.eql(session_target.offer_id));
+
+    // Restoring is session-first: the narrower scope wins on resume.
+    const restored = session_doc.session_selection.?;
+    const resolution = try cc.provider_selection.resolve(&catalog, restored);
+    try std.testing.expect(resolution.primary().offer_id.eql(session_target.offer_id));
+}
+
+// ── controls reach the wire ──────────────────────────────────────────────────
+
+test "L2: a control the offer declares changes the bytes actually sent" {
+    const a = std.testing.allocator;
+
+    // One server per request: `MockServer.start` accepts exactly one
+    // connection, so reusing it for the second capture would block forever.
+    const Capture = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            effort: ?cc.types_mod.ReasoningEffort,
+        ) ![]u8 {
+            var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+            defer server.stop();
+            const origin = try server.urlOwned(allocator);
+            defer allocator.free(origin);
+
+            var registry = try ProviderRegistry.initWithBuiltins(allocator);
+            defer registry.deinit();
+            var catalog = try registry.buildCatalog(allocator, .{
+                .only_provider = Slug.lit("openai"),
+                .endpoint_overrides = &.{.{ .provider_id = Slug.lit("openai"), .base_url = origin }},
+            });
+            defer catalog.deinit();
+
+            var reference_buffer: [cc.provider_ids.MAX_SLUG_LEN]u8 = undefined;
+            const bound = try cc.provider_runtime_binding.bindOffer(
+                &registry,
+                &catalog.items()[0],
+                .{ .cli_api_key = "sk-control" },
+                &reference_buffer,
+                false,
+            );
+
+            var io_runtime = std.Io.Threaded.init(allocator, .{});
+            defer io_runtime.deinit();
+            var client = cc.api_openai.OpenAIClient.init(
+                allocator,
+                io_runtime.io(),
+                bound.secret,
+                bound.request_model_id,
+                bound.endpoint_url,
+            );
+            client.protocol = bound.openai_protocol;
+            client.auth_scheme = bound.auth_scheme;
+            client.reasoning_effort = effort;
+            defer client.deinit();
+
+            const messages = [_]cc.types_mod.ApiMessage{
+                .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+            };
+            var handle = client.provider().sendStream(&messages, null, null, null, null, null, "") catch
+                return error.SkipZigTest;
+            while (handle.next() catch null) |event| switch (event) {
+                .text => |text| allocator.free(text),
+                else => {},
+            };
+            handle.deinit();
+            const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+            return allocator.dupe(u8, captured.raw);
+        }
+    };
+
+    const without = try Capture.run(a, null);
+    defer a.free(without);
+    const with_high = try Capture.run(a, .high);
+    defer a.free(with_high);
+
+    // The control is not decoration: setting it changes the request body, and
+    // leaving it unset does not smuggle a default onto the wire.
+    try std.testing.expect(std.mem.indexOf(u8, without, "reasoning_effort") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_high, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(!std.mem.eql(u8, without, with_high));
+}
+
+test "L2: a provider metadata extension round-trips through the generic client view" {
+    const a = std.testing.allocator;
+    // A control carrying an opaque provider payload: the kernel must move it
+    // through `model.list` untouched, so a client can render vendor-specific
+    // metadata without any core, TUI, or Web change.
+    var definitions = try cc.provider_custom.parse(a,
+        \\{"custom_providers": {"vendor-x": {
+        \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"m","controls":[
+        \\    {"id":"thinking","label":"Thinking","kind":"enumeration","values":["on","off"],
+        \\     "cost_latency_warning":"slower and pricier"}]}]}}}
+    );
+    defer definitions.deinit();
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    for (definitions.profiles()) |built| try registry.register(built);
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("vendor-x") });
+    defer catalog.deinit();
+
+    var kernel = cc.provider_control_plane.Kernel.init(a, &catalog);
+    defer kernel.deinit();
+    var page: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try kernel.modelList(.{}, .{}, a, &page);
+    try std.testing.expectEqual(@as(usize, 1), listed.offers.len);
+
+    const spec = listed.offers[0].controls[0];
+    try std.testing.expectEqualStrings("thinking", spec.id);
+    try std.testing.expectEqualStrings("Thinking", spec.label);
+    try std.testing.expectEqual(@as(usize, 2), spec.allowed_values.len);
+    // Provider-owned metadata the kernel neither interprets nor drops.
+    try std.testing.expectEqualStrings("slower and pricier", spec.cost_latency_warning.?);
+
+    // And the picker renders it without knowing which vendor it came from.
+    var picker = picker_mod.Picker.init(a);
+    defer picker.deinit();
+    try seedPicker(&picker, &kernel, a);
+    _ = picker.onKey(.enter);
+    _ = picker.onKey(.enter);
+    try std.testing.expectEqual(picker_mod.Stage.options, picker.stage);
+    try std.testing.expectEqual(@as(usize, 1), picker.rowCount());
+}
+
+// ── cross-UI: an out-of-process client sees the route, not just the name ─────
+
+test "L2: a route change is broadcast as an ordered, replayable event carrying identity" {
+    const a = std.testing.allocator;
+    const ui_event = cc.ui_event;
+
+    const Collector = struct {
+        lines: std.ArrayList([]u8) = .empty,
+        allocator: std.mem.Allocator,
+
+        fn emit(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // The same serialization the Web journal performs, so the test sees
+            // exactly what a browser would.
+            const line = std.json.Stringify.valueAlloc(
+                self.allocator,
+                .{ .config_changed = ev },
+                .{},
+            ) catch return;
+            self.lines.append(self.allocator, line) catch self.allocator.free(line);
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.lines.items) |line| self.allocator.free(line);
+            self.lines.deinit(self.allocator);
+        }
+    };
+
+    var collector = Collector{ .allocator = a };
+    defer collector.deinit();
+    const sink = ui_event.ConfigEventSink{
+        .ctx = @ptrCast(&collector),
+        .emitFn = struct {
+            fn run(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
+                Collector.emit(ctx, ev);
+            }
+        }.run,
+    };
+
+    // A route event as `bindCommittedSelection` produces one.
+    sink.emit(.{ .route = .{
+        .provider_id = "zai-coding-plan",
+        .channel_id = "cn-openai",
+        .protocol = "openai_chat",
+        .request_model_id = "glm-4.6",
+        .offer_id = "offer-0123456789abcdef0123456789abcdef",
+        .credential_ref = "work",
+        .scope = "session",
+    } });
+
+    try std.testing.expectEqual(@as(usize, 1), collector.lines.items.len);
+    const line = collector.lines.items[0];
+    // Identity, not just a display name: a second client can tell this route
+    // from another that shows the same model name.
+    for ([_][]const u8{
+        "\"config_changed\"",
+        "\"route\"",
+        "zai-coding-plan",
+        "cn-openai",
+        "openai_chat",
+        "glm-4.6",
+        "offer-0123456789abcdef0123456789abcdef",
+        "\"credential_ref\":\"work\"",
+        "\"scope\":\"session\"",
+    }) |needle| {
+        std.testing.expect(std.mem.indexOf(u8, line, needle) != null) catch |err| {
+            std.debug.print("missing from route event: {s}\n{s}\n", .{ needle, line });
+            return err;
+        };
+    }
+    // The credential *reference* travels; the secret never does.
+    try std.testing.expect(std.mem.indexOf(u8, line, "sk-") == null);
+}
+
+test "L2: a configured provider carries several model families and their variants" {
+    const a = std.testing.allocator;
+    var definitions = try cc.provider_custom.parse(a,
+        \\{"custom_providers": {"house": {
+        \\  "channels": [
+        \\    {"id":"chat","base_url":"https://house.example.com/v1","protocol":"openai_chat"},
+        \\    {"id":"messages","base_url":"https://house.example.com/anthropic",
+        \\     "protocol":{"wire":"anthropic_messages","path_suffix":"/v1/messages","id":"house_anthropic"}}],
+        \\  "models": [
+        \\    {"request_model_id":"house-large","canonical_model_id":"house/large","model_variant":"fp8",
+        \\     "limits":{"context_window":200000,"token_counting":"local_estimate"}},
+        \\    {"request_model_id":"house-large-bf16","canonical_model_id":"house/large","model_variant":"bf16",
+        \\     "limits":{"context_window":200000}},
+        \\    {"request_model_id":"house-small","canonical_model_id":"house/small",
+        \\     "limits":{"context_window":32000}}]}}}
+    );
+    defer definitions.deinit();
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    for (definitions.profiles()) |built| try registry.register(built);
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("house") });
+    defer catalog.deinit();
+
+    // Two families × three model rows × two channels: every combination is its
+    // own route, and two variants of one family stay separate offers.
+    try std.testing.expectEqual(@as(usize, 6), catalog.items().len);
+
+    var large_variants: usize = 0;
+    var small: usize = 0;
+    var local_estimate: usize = 0;
+    for (catalog.items()) |item| {
+        if (std.mem.eql(u8, item.canonical_model_id.?, "house/large")) {
+            if (item.channel_id.eqlText("chat")) large_variants += 1;
+        }
+        if (std.mem.eql(u8, item.canonical_model_id.?, "house/small")) small += 1;
+        if (item.limits.token_counting.mode == .local_estimate) local_estimate += 1;
+    }
+    // Many request ids to one canonical model — the many-to-one mapping a relay
+    // or a quantization split produces, preserved without any name heuristic.
+    try std.testing.expectEqual(@as(usize, 2), large_variants);
+    try std.testing.expectEqual(@as(usize, 2), small);
+    // Token-counting mode is declared per model and reaches the offer, which is
+    // what admission reads.
+    try std.testing.expectEqual(@as(usize, 2), local_estimate);
+
+    // And the two protocols really are different wires on different endpoints.
+    var saw_openai = false;
+    var saw_anthropic = false;
+    for (catalog.items()) |item| {
+        if (std.mem.eql(u8, item.protocol, "openai_chat")) saw_openai = true;
+        if (std.mem.eql(u8, item.protocol, "house_anthropic")) {
+            saw_anthropic = true;
+            try std.testing.expect(std.mem.endsWith(u8, item.endpoint_ref, "/anthropic/v1/messages"));
+        }
+    }
+    try std.testing.expect(saw_openai and saw_anthropic);
+}
+
+test "L2: an opaque upstream identity is preserved rather than derived" {
+    const a = std.testing.allocator;
+    var definitions = try cc.provider_custom.parse(a,
+        \\{"custom_providers": {"opaque": {
+        \\  "channels": [{"id":"c","base_url":"https://opaque.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [
+        \\    {"request_model_id":"model-a","upstream_model_id":"7f3c9e"},
+        \\    {"request_model_id":"model-b"}]}}}
+    );
+    defer definitions.deinit();
+
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    for (definitions.profiles()) |built| try registry.register(built);
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("opaque") });
+    defer catalog.deinit();
+
+    for (catalog.items()) |item| {
+        if (std.mem.eql(u8, item.request_model_id, "model-a")) {
+            // An opaque backend name is carried verbatim; nothing tries to make
+            // it look like a model name.
+            try std.testing.expectEqualStrings("7f3c9e", item.upstream_model_id.?);
+        } else {
+            // And an absent one stays absent rather than being derived from the
+            // request id.
+            try std.testing.expect(item.upstream_model_id == null);
+        }
+        // No canonical id was declared, so grouping falls back to the request
+        // id rather than inventing one.
+        try std.testing.expect(item.canonical_model_id == null);
+    }
+}
+
+test "L2: a configured pool entry's account label outlives the read that produced it" {
+    const a = std.testing.allocator;
+    const path = try tempConfigPath(a, "pool-lifetime");
+    defer a.free(path);
+    removeTempDir(path);
+    defer removeTempDir(path);
+
+    var store = try cc.provider_config_store.Store.initPath(a, path);
+    defer store.deinit();
+
+    const Seed = struct {
+        fn run(_: *anyopaque, document: *cc.provider_config_doc.Document) anyerror!void {
+            var entry = cc.provider_config_doc.ProviderEntry{ .id = Slug.lit("openai") };
+            try entry.credentials.append(.{
+                .id = Slug.lit("work"),
+                .env = try cc.provider_config_doc.AliasName.parse("METACODES_POOL_LIFETIME_KEY"),
+                .kind = try cc.provider_controls.Bounded(32).parse("api_key"),
+                .account_or_plan = try cc.provider_config_doc.AliasName.parse("acme-workspace"),
+            });
+            try document.upsertProvider(entry);
+        }
+    };
+    var anchor: u8 = 0;
+    _ = try store.commit(.{ .mutation = .{ .ctx = @ptrCast(&anchor), .applyFn = Seed.run } });
+
+    setEnvZ("METACODES_POOL_LIFETIME_KEY", "sk-pool-lifetime");
+    defer unsetEnvZ("METACODES_POOL_LIFETIME_KEY");
+
+    // Read the document, build the pool, and keep only the pool — the shape a
+    // caller that freed the document too early would produce.
+    var document = try store.load();
+    defer document.deinit();
+    var buffer: [cc.provider_config_doc.MAX_POOL_CREDENTIALS]cc.provider_credential.PoolEntry = undefined;
+    const pool = cc.app_module.App.credentialPoolFrom(&document, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), pool.len);
+
+    // Everything the entry borrows must still read correctly while the document
+    // is alive — including the account label, which lives inside it.
+    try std.testing.expectEqualStrings("sk-pool-lifetime", pool[0].secret);
+    try std.testing.expectEqualStrings("acme-workspace", pool[0].account_or_plan.?);
+    try std.testing.expect(pool[0].id.eqlText("work"));
+
+    // The label is not a copy: it points into the *stored* entry, which is
+    // exactly why the document has to outlive the pool. Reading it out of a
+    // by-value `provider()` lookup would compare against a temporary — the
+    // same mistake that made the pool builder hand back dangling slices.
+    const stored = &document.providers.items[0].credentials.entries[0];
+    try std.testing.expect(pool[0].account_or_plan.?.ptr == stored.account_or_plan.?.slice().ptr);
+}
+
+test "L2: a session that named its provider on the command line has a current offer" {
+    const a = std.testing.allocator;
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+
+    // Before seeding, the kernel believes there is no selection — which is what
+    // makes the picker mark nothing current, `/alias pin` refuse, and the
+    // turn-boundary token refresh never run.
+    try std.testing.expect(host.kernel.currentOfferId() == null);
+
+    const target = host.kernel.catalogSnapshot().items()[3];
+    host.kernel.seedSessionSelection(cc.provider_selection.RuntimeSelection.pinned(
+        target.offer_id,
+        target.offer_revision,
+        .session,
+    ));
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(target.offer_id));
+    try std.testing.expect(host.kernel.effectiveSelection() != null);
+
+    // Seeding is not a commit: no event, no revision bump, and it never
+    // overwrites a selection the user actually made.
+    const other = host.kernel.catalogSnapshot().items()[0];
+    host.kernel.seedSessionSelection(cc.provider_selection.RuntimeSelection.pinned(
+        other.offer_id,
+        other.offer_revision,
+        .session,
+    ));
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(target.offer_id));
+
+    // A real commit still wins over the seed.
+    const committed = host.kernel.selectionCommit(
+        .{},
+        cc.provider_selection.RuntimeSelection.pinned(other.offer_id, other.offer_revision, .session),
+        .session,
+    );
+    try std.testing.expect(committed == .committed);
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(other.offer_id));
+}
+
+test "L2: a catalog endpoint answering non-2xx releases its body exactly once" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startWithStatus(
+        \\{"error":"unauthorized"}
+    , 0, "HTTP/1.1 401 Unauthorized");
+    defer server.stop();
+    const origin = try server.urlOwned(a);
+    defer a.free(origin);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+
+    // The failure path freed the body *and* let an errdefer free it again, so
+    // an ordinary 401 from a catalog endpoint corrupted the heap.
+    // `std.testing.allocator` fails on a double free or a leak, so this test is
+    // the check.
+    // A refused credential is distinguished from an outage: one the user must
+    // act on, the other a retry can fix.
+    try std.testing.expectError(error.Unauthorized, cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{
+        .url = origin,
+        .bearer = "sk-catalog",
+    }));
+}
+
+test "L2: an unreachable catalog endpoint leaves the previous catalog in place" {
+    const a = std.testing.allocator;
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    // Port 1 on loopback refuses immediately.
+    try std.testing.expect(cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{
+        .url = "http://127.0.0.1:1/models",
+    }) == error.RequestFailed);
+
+    // A stale catalog is a far better answer than an empty one, and every pin
+    // stays resolvable.
+    try std.testing.expectEqual(before, host.kernel.catalogSnapshot().items().len);
+}
+
+test "L2: a `--provider` startup route is a resolvable selection before any command runs" {
+    const a = std.testing.allocator;
+    // The turn-boundary credential refresh keys on the *effective selection*.
+    // A session that named its provider on the command line and never opened
+    // the picker has to reach one, or its OAuth token is never refreshed and it
+    // runs past expiry into 401s.
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{ .provider = "openai" });
+    var route = outcome.route;
+    defer route.deinit();
+
+    // This is what `applyStartupOutcome` puts into `Config.selected_offer_id`.
+    const rendered = route.offer_id.render();
+
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+    // And this is what `seedStartupSelection` does with it.
+    const offer_id = try cc.provider_ids.OfferId.parse(&rendered);
+    const found = host.kernel.catalogSnapshot().find(offer_id) orelse
+        return error.StartupOfferMissingFromCatalog;
+    host.kernel.seedSessionSelection(cc.provider_selection.RuntimeSelection.pinned(
+        found.offer_id,
+        found.offer_revision,
+        .session,
+    ));
+
+    // The refresh path's precondition now holds, and it resolves to the profile
+    // that owns the OAuth lifecycle.
+    const selection = host.kernel.effectiveSelection() orelse
+        return error.NoEffectiveSelection;
+    const resolution = try cc.provider_selection.resolve(host.kernel.catalogSnapshot(), selection);
+    const profile = host.registry.findById(resolution.primary().provider_id).?;
+    try std.testing.expect(profile.id.eqlText("openai"));
+    try std.testing.expect(profile.oauth_token_url != null);
+}

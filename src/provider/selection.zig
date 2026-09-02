@@ -87,7 +87,23 @@ pub const ChannelList = struct {
 pub const PriceConstraint = struct {
     currency: offer_mod.Currency,
     billing_unit: offer_mod.BillingUnit,
+    /// Ceiling applied to every priced component that has no more specific
+    /// bound below.
     max_micros: u64,
+    /// Per-component ceilings. Routers express price limits per direction, and
+    /// folding them into one number is wrong in whichever direction it rounds:
+    /// taking the larger admits routes the tighter bound excludes, taking the
+    /// smaller rejects routes the user allowed.
+    max_input_micros: ?u64 = null,
+    max_output_micros: ?u64 = null,
+
+    pub fn inputCeiling(self: PriceConstraint) u64 {
+        return self.max_input_micros orelse self.max_micros;
+    }
+
+    pub fn outputCeiling(self: PriceConstraint) u64 {
+        return self.max_output_micros orelse self.max_micros;
+    }
 };
 
 pub const SortPreference = enum { price, throughput, latency, provider_defined };
@@ -313,7 +329,8 @@ pub fn rejectionFor(
         if (price.billing_unit != constraint.billing_unit) return .price_incomparable_units;
         const input_rate = price.input_price_micros orelse return .price_unknown_under_hard_max;
         const output_rate = price.output_price_micros orelse return .price_unknown_under_hard_max;
-        if (@max(input_rate, output_rate) > constraint.max_micros) return .price_above_hard_max;
+        if (input_rate > constraint.inputCeiling()) return .price_above_hard_max;
+        if (output_rate > constraint.outputCeiling()) return .price_above_hard_max;
     }
 
     if (policy.require_parameters) {

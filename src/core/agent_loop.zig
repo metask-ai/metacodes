@@ -29,6 +29,7 @@ const tool_error = @import("tool_error.zig");
 const context_pressure_mod = @import("context_pressure.zig");
 const compact_kernel = @import("compact_kernel.zig");
 const result_projection = @import("result_projection.zig");
+const result_budget_mod = @import("result_budget.zig");
 const verification_progress_mod = @import("verification_progress.zig");
 const requirement_ledger_mod = @import("requirement_ledger.zig");
 const util_time = @import("../util/time.zig");
@@ -1213,6 +1214,15 @@ pub fn run(
         var thinking_text = std.ArrayList(u8).empty;
         defer thinking_text.deinit(allocator);
 
+        // provider 私有的推理续传项(issue #23,当前唯一生产者是 OpenAI Responses):
+        // 按到达顺序收集 owned item JSON,turn 末转成 reasoning_item block 存进
+        // assistant message,下轮同模型请求逐字节回传。丢弃残缺回合时随之释放。
+        var reasoning_items = std.ArrayList([]u8).empty;
+        defer {
+            for (reasoning_items.items) |item| allocator.free(item);
+            reasoning_items.deinit(allocator);
+        }
+
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);
 
@@ -1268,6 +1278,12 @@ pub fn run(
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
             .artifact_root = opts.artifact_root,
+            // Mirrors base_ctx: Bash bounds its own channels against this, so a
+            // prefetched Bash result must be sized by the same window as a
+            // committed one or the two paths render differently. Resolved
+            // against `model_override`, because a subagent shares its parent's
+            // Provider and differs from it only by that field.
+            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
             .tool_result_metrics = opts.tool_result_metrics,
             .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
@@ -1311,7 +1327,10 @@ pub fn run(
                 ) catch std.math.maxInt(u64);
                 if (!gate.allowsRequest(.{
                     .max_input_tokens = max_input_tokens,
-                    .max_output_tokens = provider.maxTokens(),
+                    // Resolved through the override like the estimate above it:
+                    // an admission decision made against the parent's output cap
+                    // admits or refuses a child request on the wrong number.
+                    .max_output_tokens = provider.maxTokensFor(opts.model_override),
                 }))
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
             }
@@ -1537,6 +1556,12 @@ pub fn run(
                         // 主对话不消费 query_update 进度(仅 web_search.zig 子请求驱动 TUI);释放。
                         allocator.free(q);
                     },
+                    .reasoning_item => |item_json| {
+                        // 不可读、不展示、不进 assistant_text——只按序留存供下轮回传。
+                        // append 失败则就地释放(所有权尚未转移)。
+                        log.debugId("agent", rid, "reasoning item bytes={d}", .{item_json.len});
+                        reasoning_items.append(allocator, item_json) catch allocator.free(item_json);
+                    },
                     .usage => |u| {
                         // L1:usage 走 CoreEvent 总线(顶层 TuiBackend 累加进 app.usage;
                         // JobEntry 后端累加进 .tokens 供进度树)——取代旧 opts.usage_sink 私有回调。
@@ -1630,6 +1655,8 @@ pub fn run(
                 }
                 tool_uses.clearRetainingCapacity();
 
+                for (reasoning_items.items) |item| allocator.free(item);
+                reasoning_items.clearRetainingCapacity();
                 if (assistant_text.items.len > 0) {
                     const text_owned = try allocator.dupe(u8, assistant_text.items);
                     errdefer allocator.free(text_owned);
@@ -1668,6 +1695,8 @@ pub fn run(
                 assistant_blocks.clearRetainingCapacity();
                 assistant_text.clearRetainingCapacity();
                 thinking_text.clearRetainingCapacity();
+                for (reasoning_items.items) |item| allocator.free(item);
+                reasoning_items.clearRetainingCapacity();
                 if (can_recover_context_error) {
                     if (!recoverContextWindowExceeded(
                         conversation,
@@ -1707,9 +1736,35 @@ pub fn run(
         }
         const rid = rid_for_turn;
 
-        // 4. 把 thinking + assistant text + tool_uses 组装成 Message 追加到 conversation。
-        // 顺序:thinking block 先于 text(对齐 Anthropic content[] 规范;OpenAI-compatible
-        // 的 reasoning_content 平级字段由 request.zig 序列化时处理,block 顺序无害)。
+        // 4. 把 reasoning items + thinking + assistant text + tool_uses 组装成 Message
+        // 追加到 conversation。顺序:thinking block 先于 text(对齐 Anthropic content[] 规范;
+        // OpenAI-compatible 的 reasoning_content 平级字段由 request.zig 序列化时处理,
+        // block 顺序无害)。
+        // reasoning_item 排在最前:OpenAI Responses 的 `output` 就是 reasoning 在前,
+        // 回传 `input` 亦然(reasoning → message/function_call)。
+        // **不产出只有 reasoning 的 assistant 消息**:那种消息 buildApiMessages 会整条
+        // 跳过(Anthropic 的 content 数组会空),于是它永远不上 wire,却仍被
+        // estimateMessageTokens 按 REASONING_ITEM_TOKEN_ESTIMATE 计入——"发给模型的
+        // 投影"与"token 估算"就此分叉,估算单调虚高、误触发 auto-compact。何况一个
+        // 什么都没产出的回合,它的推理状态也没有可续的下文。这条不变式让
+        // buildApiMessages 的 n_substantive 守卫在本进程内不可能被触发。
+        const turn_has_content = assistant_text.items.len > 0 or tool_uses.items.len > 0;
+        if (!turn_has_content) {
+            for (reasoning_items.items) |item| allocator.free(item);
+            reasoning_items.clearRetainingCapacity();
+        }
+        // 逐项**先摘表再转移**:append/dupe 在 OOM 下失败时,已转移项不再留在
+        // reasoning_items 里,顶部 defer 与 assistant_blocks 的 errdefer 不会双释放。
+        while (reasoning_items.items.len > 0) {
+            const item_json = reasoning_items.orderedRemove(0);
+            errdefer allocator.free(item_json);
+            const model_owned = try allocator.dupe(u8, opts.model_override orelse provider.model());
+            errdefer allocator.free(model_owned);
+            try assistant_blocks.append(allocator, .{ .reasoning_item = .{
+                .model = model_owned,
+                .json = item_json,
+            } });
+        }
         if (thinking_text.items.len > 0) {
             const th_owned = try allocator.dupe(u8, thinking_text.items);
             errdefer allocator.free(th_owned);
@@ -2206,6 +2261,12 @@ pub fn run(
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
             .artifact_root = opts.artifact_root,
+            // The same value the projection pass below uses. Deriving it here
+            // is what lets a tool bound its own output against the real window
+            // instead of against the floor the budget can never go under - and
+            // against the window of the model this run will actually name, not
+            // the parent's.
+            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
             .tool_result_metrics = opts.tool_result_metrics,
             .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
@@ -2386,8 +2447,7 @@ pub fn run(
             }
             const suspended_projection_stats = try result_projection.project(allocator, suspended_items, .{
                 .session_root = opts.artifact_root,
-                .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
-                .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+                .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
                 .per_turn_image_bytes = opts.image_request_bytes_cap -| conversation.nonTrimmableImageBytes(),
             });
             if (opts.tool_result_metrics) |metrics| metrics.recordProjection(suspended_projection_stats);
@@ -2513,15 +2573,14 @@ pub fn run(
         }
         const projection_stats = try result_projection.project(allocator, projection_items, .{
             .session_root = opts.artifact_root,
-            .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
-            .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+            .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
             // Fresh results get whatever the cap leaves after the images no trim
             // may remove (user images, undelivered results already in history).
             .per_turn_image_bytes = opts.image_request_bytes_cap -| conversation.nonTrimmableImageBytes(),
         });
         if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
         if (projection_stats.changed() or projection_stats.budget_exhausted) {
-            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_spills={d} budget_exhausted={}", .{
+            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_spills={d} image_exempt={d} regrown={d} reinlined={d} session_artifact_bytes={d} budget_exhausted={}", .{
                 projection_stats.raw_bytes,
                 projection_stats.projected_bytes,
                 projection_stats.artifact_bytes,
@@ -2529,6 +2588,10 @@ pub fn run(
                 projection_stats.unrecoverable_fallback_count,
                 projection_stats.turn_budget_spills,
                 projection_stats.image_spills,
+                projection_stats.image_exempt_count,
+                projection_stats.envelope_regrown_count,
+                projection_stats.envelope_reinlined_count,
+                projection_stats.session_artifact_bytes,
                 projection_stats.budget_exhausted,
             });
         }
@@ -2772,14 +2835,25 @@ fn buildApiMessages(
     for (conversation.activeMessages()) |m| {
         // thinking block 不回 API(模型自己产);先算实际要回的 block 数
         var n_actual: usize = 0;
-        for (m.blocks) |b| {
-            if (@as(std.meta.Tag(msg.Block), b) != .thinking) n_actual += 1;
-        }
+        // reasoning_item 是 provider 私有的续传状态,不是"内容":只有 OpenAI
+        // Responses 序列化器会用它,别的方言整块跳过。它单独存在时**不足以**
+        // 撑起一条消息(Anthropic 的 content 数组会空),故不计入实质 block。
+        // 本进程写出的会话不会有这种消息(见上方 turn_has_content 不变式);
+        // 这里是针对外部/未来版本 transcript 的防线,而不是热路径。
+        var n_substantive: usize = 0;
+        for (m.blocks) |b| switch (b) {
+            .thinking => {},
+            .reasoning_item => n_actual += 1,
+            else => {
+                n_actual += 1;
+                n_substantive += 1;
+            },
+        };
         // max_tokens 可能恰好截断在 thinking 末尾：Conversation 会保留该
         // thinking block 供本地审计，但 provider-visible 投影不能生成
         // `content: []` 的空 assistant 消息。跳过后，紧随的 continuation user
         // 会由 normalizeApiMessages 与前一条 user 合并，维持合法角色/content。
-        if (n_actual == 0) continue;
+        if (n_substantive == 0) continue;
         const contents = try allocator.alloc(types.ApiContent, n_actual);
         var idx: usize = 0;
         for (m.blocks) |b| {
@@ -2792,6 +2866,7 @@ fn buildApiMessages(
                     .is_error = tr.is_error,
                 } },
                 .image => |img| .{ .image = .{ .media_type = img.media_type, .data = img.data } },
+                .reasoning_item => |item| .{ .reasoning_item = .{ .model = item.model, .json = item.json } },
                 .thinking => continue, // 不发回 API
             };
             contents[idx] = c;
@@ -2863,6 +2938,10 @@ fn estimateMessageTokens(m: msg.Message) usize {
                 Conversation.estimateTokens(tr.content),
             .thinking => {},
             .image => total += conversation_mod.IMAGE_TOKEN_ESTIMATE,
+            // 加密推理状态:回传时 provider 按它编码的**推理 token** 计费,不是
+            // 按密文字节。密文没有可本地推断的 token 数,取保守常量高估——
+            // auto-compact 宁可早触发,绝不因低估爆窗口(与图像同一取向)。
+            .reasoning_item => total += conversation_mod.REASONING_ITEM_TOKEN_ESTIMATE,
         }
     }
     return total;
@@ -2887,7 +2966,9 @@ pub const EstimationProjection = struct {
     }
 };
 
-fn contentIsImage(c: types.ApiContent) bool {
+/// 需要在估算前换成占位的载荷块:base64 直接进字节估算会把一张图计成上百万
+/// token,且会撞上非 Claude 模型的能力守门。
+fn contentNeedsProjection(c: types.ApiContent) bool {
     return switch (c) {
         .image => true,
         .tool_result => |tr| json_mod.extractImageResult(tr.content) != null,
@@ -2895,10 +2976,10 @@ fn contentIsImage(c: types.ApiContent) bool {
     };
 }
 
-pub fn projectImagesForEstimation(allocator: std.mem.Allocator, messages: []const types.ApiMessage) !?EstimationProjection {
+pub fn projectPayloadsForEstimation(allocator: std.mem.Allocator, messages: []const types.ApiMessage) !?EstimationProjection {
     var image_count: usize = 0;
     for (messages) |m| for (m.content) |c| {
-        if (contentIsImage(c)) image_count += 1;
+        if (contentNeedsProjection(c)) image_count += 1;
     };
     if (image_count == 0) return null;
     const out = try allocator.alloc(types.ApiMessage, messages.len);
@@ -2939,13 +3020,16 @@ fn serializeForEstimation(
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
 ) !EstimationBody {
-    const projection = try projectImagesForEstimation(allocator, messages);
+    const projection = try projectPayloadsForEstimation(allocator, messages);
     defer if (projection) |p| p.deinit(allocator);
     const effective: []const types.ApiMessage = if (projection) |p| p.messages else messages;
     const image_tokens: u64 = @intCast((if (projection) |p| p.image_count else 0) * conversation_mod.IMAGE_TOKEN_ESTIMATE);
     const body = try json_mod.serializeMessagesRequest(.{
         .model = model_override orelse provider.model(),
-        .max_tokens = provider.maxTokens(),
+        // Same override as the line above. The two describe one request, and
+        // reading them from different models is how an estimate drifts from
+        // what is actually sent.
+        .max_tokens = provider.maxTokensFor(model_override),
         .messages = effective,
         .system = system_prompt,
         .stream = true,
@@ -3017,6 +3101,12 @@ fn canonicalAgentRequestSha256(
         .image => |img| {
             try parts.append(allocator, img.media_type);
             try parts.append(allocator, img.data);
+        },
+        // 推理续传项不进 Anthropic canonical 序列化(那是 Responses 私有形态),
+        // 但两个只在它上有差别的请求确实是不同的请求 IR —— 一并进身份哈希。
+        .reasoning_item => |item| {
+            try parts.append(allocator, item.model);
+            try parts.append(allocator, item.json);
         },
         .tool_result => |tr| if (json_mod.extractImageResult(tr.content) != null) {
             try parts.append(allocator, tr.content);
@@ -3203,7 +3293,7 @@ fn runAutoCompactIfNeeded(
     var outcome: AutoCompactOutcome = .not_needed;
 
     var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-    var pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+    var pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
     emitContextWarningIfNeeded(backend, sess, pressure, context_warning_emitted);
     // 正常:auto=max(formula, 32K floor);micro=其下一档。强制旋钮(仅测试/power-user)存在时,
     // auto/micro 一起钉到强制值——让短对话也能触发真实 summary 压缩+投影。一次 getenv,不在热路径重复读。
@@ -3213,13 +3303,24 @@ fn runAutoCompactIfNeeded(
     const micro_threshold = forced_threshold orelse
         @max(@min(pressure.warning_threshold, auto_threshold), MIN_AUTO_COMPACT_THRESHOLD);
     if (request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
-        const reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
+        var reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
+        // Clearing deliberately preserves the most recent results, and skips
+        // anything whose artifact envelope is its only recovery capability.
+        // Neither exemption bounds a single oversized result that entered the
+        // Conversation under a different budget (a /resume'd transcript, or a
+        // switch to a smaller window), because projection never re-runs on
+        // history. Bound those here against the same per-result budget
+        // projection uses, so the `truncated=` field of the line below stops
+        // being structurally zero.
+        reduced.merge(conversation.truncateLargeToolResults(
+            conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
+        ));
         if (reduced.changed()) {
             outcome = .compacted;
             log.info("agent", "microcompact: cleared={d} truncated={d} old tool_results bytes={d}->{d} keep_recent_results={d} threshold={d} cause={s}", .{ reduced.cleared, reduced.truncated, reduced.bytes_before, reduced.bytes_after, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP, micro_threshold, trigger_cause });
             emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
             request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
         }
     }
 
@@ -3382,7 +3483,7 @@ fn runAutoCompactIfNeeded(
                 } });
                 outcome = .compacted;
                 request_tokens_before = report.after_tokens;
-                pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+                pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
             },
         }
     }
@@ -3390,12 +3491,19 @@ fn runAutoCompactIfNeeded(
     if (outcome == .skipped_no_savings) return outcome;
 
     if (pressure.isAtBlockingLimit()) {
-        const reduced = conversation.microcompactToolResultsByRecentResults(0);
+        var reduced = conversation.microcompactToolResultsByRecentResults(0);
+        // Same rationale as the stale-result valve above, and it matters more
+        // here: at the blocking limit the request is otherwise rejected, so a
+        // single unbounded surviving result is the difference between
+        // recovering and returning api_error.
+        reduced.merge(conversation.truncateLargeToolResults(
+            conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
+        ));
         if (reduced.changed()) {
             outcome = .compacted;
             const before_block_tokens = request_tokens_before;
             request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
             log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
             // This is the same lossy operation as the earlier stale-result
             // pressure valve.  Keep the mechanism kind stable; the trigger
@@ -5040,10 +5148,34 @@ test "auto-compact 阈值用 input context window 而非 output max_tokens(防�
     // 压缩、丢掉原始问题。修复:改用 input context window(~200K)扣 output reserve 后的 CC/Rust 阈值。
     // 源级守卫:阈值算式必须调 resolveMaxInputTokens(而非 output 的解析器),且 MIN 不再是早期小值。
     const src = @embedFile("agent_loop.zig");
-    try std.testing.expect(std.mem.indexOf(u8, src, "ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens()") != null);
+    // 仍守"用 input window 而非 output max_tokens",但两者现在都按本次请求真正
+    // 会用的模型解析:subagent 与父共享 Provider,只靠 model_override 区分,拿父
+    // 窗口给子算阈值就是把 200K 的历史发给 32K 端点。
+    try std.testing.expect(std.mem.indexOf(u8, src, "ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override)") != null);
     // 全额输出预留(服务端校验 in+max_tokens ≤ window):200K-32K-13K = 155K。
     try std.testing.expectEqual(@as(usize, 155_000), context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 0).auto_compact_threshold);
     try std.testing.expect(MIN_AUTO_COMPACT_THRESHOLD >= 32_000);
+}
+
+test "微压缩两趟都接线:clear 与 truncate 必须同时在生产路径上" {
+    // 回归守卫:`truncateLargeToolResults` 曾经零生产调用者——全仓每一个调用点
+    // 都在 test 块内,而下面这条日志行一直打印 `truncated={d}`,该字段结构性
+    // 恒为 0。projection 只在结果**提交那一刻**限界且从不重投影历史,所以
+    // /resume 载入的历史、或切到更小窗口的模型,其超限结果没有任何一层管得到。
+    // 两个压力阀点都必须按 provider 窗口派生的同一预算跑截断趟。
+    // 只数标识符,不数空白:钉死缩进会让这条守卫在任何一次重新格式化后失效,
+    // 而它要守的是"两个压力阀都调了这一趟",跟版式无关。
+    const src = @embedFile("agent_loop.zig");
+    var count: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, src, cursor, "reduced.merge(conversation.truncateLargeToolResults(")) |at| {
+        cursor = at + 1;
+        // 同一条语句里必须紧跟着按 provider 窗口派生的预算,不能各自造常量。
+        const tail = src[at..@min(src.len, at + 240)];
+        if (std.mem.indexOf(u8, tail, "toolResultContextBytes(provider.maxInputTokensFor(model_override))") != null) count += 1;
+    }
+    // 一处在 micro 阈值带,一处在 blocking-limit 恢复。
+    try std.testing.expectEqual(@as(usize, 2), count);
 }
 
 test "parseForcedAutoCompactThreshold: 合法强制值 + 坏值回退 null" {
@@ -5084,12 +5216,12 @@ test "估算投影:image 按 IMAGE_TOKEN_ESTIMATE 计,不按 base64 字节(防�
     try std.testing.expect(reserve >= 2 * @as(u64, conversation_mod.IMAGE_TOKEN_ESTIMATE));
 }
 
-test "projectImagesForEstimation: 无图返 null(零拷贝),有图替换占位并计数" {
+test "projectPayloadsForEstimation: 无图返 null(零拷贝),有图替换占位并计数" {
     const a = std.testing.allocator;
     const text_only = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
     };
-    try std.testing.expect((try projectImagesForEstimation(a, &text_only)) == null);
+    try std.testing.expect((try projectPayloadsForEstimation(a, &text_only)) == null);
 
     const mixed = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{
@@ -5098,7 +5230,7 @@ test "projectImagesForEstimation: 无图返 null(零拷贝),有图替换占位�
             .{ .image = .{ .media_type = "image/jpeg", .data = "YYYY" } },
         } },
     };
-    const proj = (try projectImagesForEstimation(a, &mixed)).?;
+    const proj = (try projectPayloadsForEstimation(a, &mixed)).?;
     defer proj.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), proj.image_count);
     try std.testing.expectEqualStrings("a", proj.messages[0].content[0].text);
@@ -5119,7 +5251,7 @@ test "估算投影覆盖 tool_result 图像形态(Read 截图不爆表)" {
         .{ .tool_result = .{ .tool_use_id = "t1", .content = tr_content } },
     };
     const messages = [_]types.ApiMessage{.{ .role = .user, .content = &contents }};
-    const proj = (try projectImagesForEstimation(a, &messages)).?;
+    const proj = (try projectPayloadsForEstimation(a, &messages)).?;
     defer proj.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), proj.image_count);
     try std.testing.expectEqualStrings("[image tool result]", proj.messages[0].content[0].tool_result.content);
@@ -5176,4 +5308,99 @@ test "usage-anchor 热路径:Read 图像 tool_result 增量按 IMAGE_TOKEN_ESTIM
     const total = estimateMessageTokens(m);
     try std.testing.expect(total >= conversation_mod.IMAGE_TOKEN_ESTIMATE);
     try std.testing.expect(total < 50_000);
+}
+
+test "生产代码不得用无参的 maxTokens()/maxInputTokens()" {
+    // 这条守卫直接编码规则本身,而不是它的某一个实例。
+    //
+    // 三轮 review 下来同一个形状反复出现:规则被断言,然后只在眼前那一处应用。
+    // `maxTokensFor` 加进来之后,`serializeForEstimation` 里 `.model` 用了
+    // override 而同一个字面量的 `.max_tokens` 没用;request gate 的
+    // `max_output_tokens` 也没用;agentcore 的 `canonicalRequestBytes` 同样。
+    // 每一处都是"model 记得,maxTokens 忘了"。
+    //
+    // subagent 与父共享 Provider,只靠 model_override 区分,所以生产路径上任何
+    // 无参变体都是在问错模型。测试区不受限:那里 provider 就是唯一的模型。
+    // 测试块在本文件里是**穿插**的(第一个在文件很靠前处),所以不能用"第一个
+    // test 之后都是测试"来切——那个假设本身就是同一类错误。改判每次出现之前
+    // 最近的顶层声明是 `test` 还是 `fn`。
+    const src = @embedFile("agent_loop.zig");
+    for ([_][]const u8{ "provider.maxTokens()", "provider.maxInputTokens()" }) |needle| {
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, src, cursor, needle)) |at| {
+            cursor = at + needle.len;
+            const before = src[0..at];
+            const in_test = std.mem.lastIndexOf(u8, before, "\ntest \"") orelse 0;
+            const in_fn = @max(
+                std.mem.lastIndexOf(u8, before, "\nfn ") orelse 0,
+                std.mem.lastIndexOf(u8, before, "\npub fn ") orelse 0,
+            );
+            // 最近的顶层声明必须是 test;否则就是生产路径在问错模型。
+            try std.testing.expect(in_test > in_fn);
+        }
+    }
+    // 且 For 变体确实被用上了(否则上面可以靠删掉调用来通过)。
+    try std.testing.expect(std.mem.indexOf(u8, src, "maxInputTokensFor(opts.model_override)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "maxTokensFor(model_override)") != null);
+}
+
+test "估算随 model_override 变化,而不是只换个模型名" {
+    // `serializeForEstimation` 的 `.model` 一直读 override,`.max_tokens` 读的却
+    // 是 provider 自己的——同一个请求体,两个模型。子模型输出上限更小时,估算
+    // 出的请求与真正发出的请求就不是同一个。
+    const a = std.testing.allocator;
+    const Fake = struct {
+        fn model(_: *anyopaque) []const u8 {
+            return "parent";
+        }
+        fn maxTokens(_: *anyopaque) u32 {
+            return 32_000;
+        }
+        fn maxInputTokens(_: *anyopaque) u32 {
+            return 200_000;
+        }
+        fn maxTokensForModel(_: *anyopaque, name: []const u8) u32 {
+            return if (std.mem.eql(u8, name, "child")) 1_024 else 32_000;
+        }
+        fn maxInputTokensFor(_: *anyopaque, _: []const u8) u32 {
+            return 200_000;
+        }
+        fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+            return false;
+        }
+        fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+            return null;
+        }
+    };
+    var ctx: u8 = 0;
+    const provider = provider_mod.Provider{
+        .ctx = &ctx,
+        .modelFn = Fake.model,
+        .sendStreamFn = undefined,
+        .sendStreamRetryFn = undefined,
+        .sendFn = undefined,
+        .maxTokensFn = Fake.maxTokens,
+        .maxInputTokensFn = Fake.maxInputTokens,
+        .maxTokensForFn = Fake.maxTokensForModel,
+        .maxInputTokensForFn = Fake.maxInputTokensFor,
+        .reasoningEffortFn = Fake.reasoningEffort,
+        .supportsFn = Fake.supports,
+    };
+
+    const messages = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hello" }} },
+    };
+
+    // 直接看序列化出来的请求体:估算的 token 数按字节除以 4,32000→1024 只差
+    // 一个字符,除完可能相等,断言不到点上。
+    const parent = try serializeForEstimation(a, provider, &messages, null, &.{}, null);
+    defer a.free(parent.body);
+    try std.testing.expect(std.mem.indexOf(u8, parent.body, "\"model\":\"parent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.body, "\"max_tokens\":32000") != null);
+
+    const child = try serializeForEstimation(a, provider, &messages, null, &.{}, "child");
+    defer a.free(child.body);
+    // 模型换了,输出上限必须跟着换——同一个请求体不能描述两个模型。
+    try std.testing.expect(std.mem.indexOf(u8, child.body, "\"model\":\"child\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, child.body, "\"max_tokens\":1024") != null);
 }

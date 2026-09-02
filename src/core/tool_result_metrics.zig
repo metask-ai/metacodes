@@ -7,9 +7,11 @@ const std = @import("std");
 const projection = @import("result_projection.zig");
 
 pub const Snapshot = struct {
-    /// Bytes returned by tools at the Conversation projection seam. Bash v2
-    /// envelopes are small here; their actual stdout/stderr volume is tracked
-    /// separately as captured_stream_bytes.
+    /// Bytes tools produced, measured at the Conversation projection seam. A
+    /// Bash v2 envelope is billed by what its channels actually captured, not
+    /// by the small envelope that carries them, so this and `projected_bytes`
+    /// really are a before/after pair. `captured_stream_bytes` remains the
+    /// independent count taken inside the Bash channel writer.
     raw_bytes: u64,
     projected_bytes: u64,
     captured_stream_bytes: u64,
@@ -18,9 +20,21 @@ pub const Snapshot = struct {
     artifact_recovery_calls: u64,
     artifact_recovered_bytes: u64,
     unrecoverable_fallback_count: u64,
+    /// Tool-emitted JSON bodies; projection envelopes excluded (see
+    /// `result_projection.Stats.structured_result_count`).
     structured_result_count: u64,
     structured_projection_failures: u64,
     turn_budget_spills: u64,
+    /// Image results kept inline that byte-length rules would otherwise have
+    /// spilled (over the per-result cap); see result_projection.Stats.
+    image_exempt_count: u64,
+    /// Committed artifact envelopes re-rendered against this turn's budget,
+    /// and of those the ones returned to the model in full.
+    envelope_regrown_count: u64,
+    envelope_reinlined_count: u64,
+    /// High-water mark of the session artifact store, so approaching the
+    /// quota is visible before it turns every later result unrecoverable.
+    session_artifact_bytes: u64,
     budget_exhausted_count: u64,
 };
 
@@ -36,6 +50,10 @@ pub const Metrics = struct {
     structured_result_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     structured_projection_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     turn_budget_spills: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    image_exempt_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    envelope_regrown_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    envelope_reinlined_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    session_artifact_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     budget_exhausted_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn recordProjection(self: *Metrics, stats: projection.Stats) void {
@@ -47,6 +65,11 @@ pub const Metrics = struct {
         add(&self.structured_result_count, stats.structured_result_count);
         add(&self.structured_projection_failures, stats.structured_projection_failures);
         add(&self.turn_budget_spills, stats.turn_budget_spills);
+        add(&self.image_exempt_count, stats.image_exempt_count);
+        add(&self.envelope_regrown_count, stats.envelope_regrown_count);
+        add(&self.envelope_reinlined_count, stats.envelope_reinlined_count);
+        // A gauge, not a counter: keep the high-water mark rather than a sum.
+        _ = self.session_artifact_bytes.fetchMax(stats.session_artifact_bytes, .monotonic);
         if (stats.budget_exhausted) add(&self.budget_exhausted_count, 1);
     }
 
@@ -81,6 +104,10 @@ pub const Metrics = struct {
             .structured_result_count = self.structured_result_count.load(.monotonic),
             .structured_projection_failures = self.structured_projection_failures.load(.monotonic),
             .turn_budget_spills = self.turn_budget_spills.load(.monotonic),
+            .image_exempt_count = self.image_exempt_count.load(.monotonic),
+            .envelope_regrown_count = self.envelope_regrown_count.load(.monotonic),
+            .envelope_reinlined_count = self.envelope_reinlined_count.load(.monotonic),
+            .session_artifact_bytes = self.session_artifact_bytes.load(.monotonic),
             .budget_exhausted_count = self.budget_exhausted_count.load(.monotonic),
         };
     }

@@ -44,6 +44,7 @@ const theme_mod = @import("theme.zig");
 const input = @import("../input.zig");
 const app_mod = @import("../../app.zig");
 const transcript_viewer = @import("../transcript_viewer.zig");
+const picker_host = @import("../picker_host.zig");
 const term = @import("term.zig");
 const ask_dialog = @import("dialog/ask_question.zig");
 const perm_dialog = @import("dialog/permission.zig");
@@ -599,6 +600,24 @@ pub const TuiBackend = struct {
                 // .backgrounded;loop.zig 据此深拷贝 conversation 转后台 + reset 前台。watcher 这里
                 // 只 store 信号(对齐 esc 直戳 abort),不碰 conversation/IO(那是主线程 run 返回后的事)。
                 app.background_request.store(true, .release);
+                return;
+            },
+            .open_model_picker => {
+                // 生成期也能开(要求:picker 在流式回复期间可用)。不碰 alt-screen:
+                // picker 画在固定区内,回复继续往 scrollback 走;改动只影响下一轮。
+                picker_host.open(app, &self.region.ui);
+                self.region.redrawGen(app);
+                return;
+            },
+            .picker_key => {
+                if (picker_host.onKey(app, &self.region.ui, eff.picker_key) == .committed) {
+                    // Mid-stream the confirmation goes into scrollback through
+                    // the same path streamed text uses, so it survives the
+                    // overlay closing without fighting the region for stdout.
+                    self.region.writeGenText(picker_host.lastNotice(app));
+                    self.region.writeGenText("\n");
+                }
+                self.region.redrawGen(app);
                 return;
             },
             .open_transcript => {

@@ -1,6 +1,7 @@
 //! Structured conversation message types.
 //!
-//! Content 是 tagged union，区分三种类型：text / tool_use / tool_result。
+//! Content 是 tagged union：text / tool_use / tool_result / thinking / image /
+//! reasoning_item。
 //! 这是为了对齐 Anthropic Messages API 契约，也是消除 "所有内容扁平为 text" hack
 //! 和假想的 `__TOOL_RESULT__:` 字符串前缀的唯一正确路径。
 //!
@@ -28,6 +29,10 @@ pub const Block = union(enum) {
     /// 用户输入的一等图像内容(issue #10)。base64 载荷 + MIME,与 text 按序混排,
     /// 参与当前请求、后续轮次与 session 恢复。绝不以 OCR/描述/占位文本替代。
     image: Image,
+    /// Provider 私有的推理续传状态(issue #23):OpenAI Responses 在 `store:false`
+    /// 下发回的 `reasoning` item(含 `encrypted_content`)。**不可读、不展示**,
+    /// 只为下一次请求原样回传;与 `.thinking`(可展示的思考文本)是两个概念。
+    reasoning_item: ReasoningItem,
 
     pub fn deinit(self: Block, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -45,6 +50,10 @@ pub const Block = union(enum) {
             .image => |img| {
                 allocator.free(img.media_type);
                 allocator.free(img.data);
+            },
+            .reasoning_item => |item| {
+                allocator.free(item.model);
+                allocator.free(item.json);
             },
         }
     }
@@ -75,6 +84,12 @@ pub const Block = union(enum) {
                 const data = try dst.dupe(u8, img.data);
                 break :blk Block{ .image = .{ .media_type = mt, .data = data } };
             },
+            .reasoning_item => |item| blk: {
+                const model = try dst.dupe(u8, item.model);
+                errdefer dst.free(model);
+                const json = try dst.dupe(u8, item.json);
+                break :blk Block{ .reasoning_item = .{ .model = model, .json = json } };
+            },
         };
     }
 };
@@ -99,6 +114,14 @@ pub const ToolResult = struct {
 pub const Image = struct {
     media_type: []const u8,
     data: []const u8,
+};
+
+/// 一条 provider 私有的推理续传项(见 `types.ReasoningItemBlock`)。
+/// `json` 逐字节就是服务端发回的 item 对象;`model` 是产出它的模型名,
+/// 序列化层据此拒绝把 A 模型的加密推理状态发给 B 模型。
+pub const ReasoningItem = struct {
+    model: []const u8,
+    json: []const u8,
 };
 
 /// 一条对话消息（role + blocks）。所有 block 内部字节为 allocator 拥有。
