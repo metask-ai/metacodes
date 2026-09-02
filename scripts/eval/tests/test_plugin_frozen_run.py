@@ -20,6 +20,7 @@ import os
 import platform
 import shutil
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -117,10 +118,15 @@ class FreezeAndVerifyTest(unittest.TestCase):
             # The host is frozen too: rollouts record platform/python into
             # their environment fingerprint, so a run or analysis elsewhere
             # is refused by name before any money moves.
+            environment = manifest["environment"]
             self.assertEqual(
-                {"platform": platform.platform(), "python": platform.python_version()},
-                manifest["environment"],
+                {"platform", "python", "implementation", "cache_tag", "executable", "executable_sha256", "prefix"},
+                set(environment),
             )
+            self.assertEqual(platform.platform(), environment["platform"])
+            self.assertEqual(platform.python_version(), environment["python"])
+            self.assertEqual(str(Path(sys.prefix).resolve()), environment["prefix"])
+            self.assertEqual(hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest(), environment["executable_sha256"])
             self.assertEqual(manifest["manifest_sha256"], verify_frozen_manifest(manifest, _live_fields(path, runtime)))
 
     def test_every_field_is_load_bearing(self) -> None:

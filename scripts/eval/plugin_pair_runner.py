@@ -18,6 +18,7 @@ import os
 import platform
 import stat
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -176,6 +177,32 @@ def _arm_identities(
     return wrappers, wrapper_hashes, inventory_hashes
 
 
+def _execution_environment() -> dict[str, Any]:
+    """What the freeze records about the environment a paid run executes in.
+
+    Not a host identity, and not a claim that the interpreter is pinned:
+    the interpreter, its prefix and the libraries it loads are inside the
+    operator's trust boundary, like the binaries on PATH. It exists so that a
+    run or an analysis started somewhere else - another machine or OS build,
+    another interpreter build or venv - is a named `environment` refusal
+    before any authorization, instead of a batch of honest rows failing
+    their environment fingerprint after the money is spent. `platform` and
+    `python` are exactly what the harness writes into that fingerprint; the
+    rest tells one interpreter installation from another with the same
+    version.
+    """
+    executable = Path(sys.executable).resolve()
+    return {
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+        "cache_tag": sys.implementation.cache_tag,
+        "executable": str(executable),
+        "executable_sha256": _sha256(executable),
+        "prefix": str(Path(sys.prefix).resolve()),
+    }
+
+
 def frozen_run_fields(
     root: Path,
     protocol: Mapping[str, Any],
@@ -198,12 +225,7 @@ def frozen_run_fields(
         "inventory_sha256": dict(inventory_hashes),
         "schedule_sha256": _canonical_sha256(list(schedule)),
         "model_fingerprint": _canonical_sha256(protocol["coding_pair"]["model"]),
-        # The host the run executes on. The harness records platform and
-        # Python version into every rollout's environment fingerprint, so
-        # the freeze pins them: a run or an analysis on another host is a
-        # named refusal up front, not a batch of honest rows failing their
-        # fingerprints after the money is spent.
-        "environment": {"platform": platform.platform(), "python": platform.python_version()},
+        "environment": _execution_environment(),
     }
 
 

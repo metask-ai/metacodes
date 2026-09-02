@@ -207,6 +207,40 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                     journal.abort_pre_request(authorized["transaction_id"])
                 self.assertTrue(issubclass(TransactionNotAbortable, ValidationError))
 
+    def test_abort_after_an_authorization_that_landed_but_was_not_observed(self):
+        # The authorization write reached disk; the exception hit before the
+        # in-memory state moved. The abort must recognise its own one-step
+        # successor and refuse as not-abortable - not report drift, and not
+        # abort a durably authorized request.
+        with tempfile.TemporaryDirectory() as directory:
+            with BudgetJournal(Path(directory) / "b.json", self.authority()) as journal:
+                reserved = journal.reserve(self.transaction())
+                stale_document, stale_state = journal._document, journal._state
+                journal.authorize_request(
+                    reserved["transaction_id"],
+                    expected_revision=reserved["journal_revision"],
+                    expected_head_sha256=reserved["journal_head_sha256"],
+                )
+                journal._document, journal._state = stale_document, stale_state
+                with self.assertRaises(TransactionNotAbortable):
+                    journal.abort_pre_request(reserved["transaction_id"])
+                self.assertEqual("request_authorized", journal.transaction_receipt(reserved["transaction_id"])["state"])
+            # Two steps ahead (authorized and committed) is not "our own
+            # interrupted write": that is drift, and it is still refused.
+            with BudgetJournal(Path(directory) / "c.json", self.authority()) as journal:
+                reserved = journal.reserve(self.transaction())
+                stale_document, stale_state = journal._document, journal._state
+                authorized = journal.authorize_request(
+                    reserved["transaction_id"],
+                    expected_revision=reserved["journal_revision"],
+                    expected_head_sha256=reserved["journal_head_sha256"],
+                )
+                journal.commit(authorized["transaction_id"], actual_cost_microusd=1, actual_metered_tokens=1)
+                journal._document, journal._state = stale_document, stale_state
+                with self.assertRaisesRegex(ValidationError, "revision or head drift") as caught:
+                    journal.abort_pre_request(reserved["transaction_id"])
+                self.assertNotIsInstance(caught.exception, TransactionNotAbortable)
+
     def test_abort_is_only_legal_before_authorization(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"

@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.eval.model import ValidationError
-from scripts.eval.paired_runner import _run_once, _runner_env, hermetic_env
+from scripts.eval.paired_runner import _run_once, _runner_env, hermetic_env, interpreter_shim
 from scripts.eval.plugin_pair_runner import (
     INVENTORY_IDENTITY,
     _canonical_sha256,
@@ -380,14 +380,22 @@ class PluginPairRunnerTest(unittest.TestCase):
         environment, with a `python3` shim for this interpreter first on
         PATH - otherwise the unit tests above guard nothing."""
         captured = {}
+        real_run = subprocess.run
 
         def fake_run(argv, **kwargs):
             env = kwargs["env"]
             shim = env["PATH"].split(os.pathsep)[0]
+            launcher = Path(shim) / "python3"
             captured.update(
                 env=env,
                 shim=shim,
-                python3=os.path.realpath(os.path.join(shim, "python3")),
+                launcher=launcher.read_text(encoding="utf-8"),
+                executable=os.access(launcher, os.X_OK),
+                # The launcher must really run this interpreter, venv and all.
+                reported=real_run(
+                    [str(launcher), "-c", "import sys; print(sys.executable, sys.prefix)"],
+                    stdout=subprocess.PIPE, text=True, check=True, env=env,
+                ).stdout.split(),
                 argv=argv,
             )
             return subprocess.CompletedProcess(argv, 0)
@@ -420,8 +428,23 @@ class PluginPairRunnerTest(unittest.TestCase):
         self.assertNotIn("BASH_ENV", captured["env"])
         self.assertNotIn("METASK_API_KEY", captured["env"])
         self.assertIn("metacodes-eval-python-", captured["shim"])
-        self.assertEqual(os.path.realpath(sys.executable), captured["python3"])
+        self.assertTrue(captured["executable"])
+        self.assertIn(sys.executable, captured["launcher"])
+        self.assertEqual([sys.executable, sys.prefix], captured["reported"])
         self.assertFalse(Path(captured["shim"]).exists())
+
+    def test_interpreter_shim_fails_closed(self) -> None:
+        """A run that cannot pin its interpreter must not start: falling
+        back to the ambient `python3` is exactly the post-authorization
+        fingerprint mismatch the shim exists to prevent."""
+        with mock.patch("scripts.eval.paired_runner.sys.executable", ""):
+            with self.assertRaisesRegex(ValidationError, "cannot pin the harness interpreter"):
+                with interpreter_shim({"PATH": "/usr/bin"}):
+                    pass
+        with mock.patch("scripts.eval.paired_runner.os.chmod", side_effect=OSError("read-only")):
+            with self.assertRaisesRegex(ValidationError, "cannot pin the harness interpreter: read-only"):
+                with interpreter_shim({"PATH": "/usr/bin"}):
+                    pass
 
     def test_paid_resume_rejects_persisted_invalid_rollout(self) -> None:
         invalid = {

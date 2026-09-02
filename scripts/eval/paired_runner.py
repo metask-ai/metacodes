@@ -140,18 +140,30 @@ def interpreter_shim(env: Mapping[str, str]) -> Iterator[Dict[str, str]]:
     rollouts with its own interpreter's `platform.python_version()`. If the
     two differ, every honest row fails the environment fingerprint after the
     money is spent. A shim directory first on PATH makes them one
-    interpreter; the frozen manifest pins that interpreter and the host.
+    interpreter. The shim is a launcher that execs the absolute
+    `sys.executable`, not a symlink: CPython discovers a venv from the path
+    it was invoked through, so a symlink would silently drop the runner's
+    venv. It fails closed - a run that cannot pin its interpreter must not
+    start, since the inventory preflight runs this before any authorization.
     """
-    if not sys.executable:
-        yield dict(env)
-        return
+    executable = sys.executable
+    if not executable or not os.path.isabs(executable) or not os.access(executable, os.X_OK):
+        raise ValidationError(
+            "cannot pin the harness interpreter: sys.executable is not an absolute executable"
+        )
     with tempfile.TemporaryDirectory(prefix="metacodes-eval-python-") as shim:
+        launcher = os.path.join(shim, "python3")
         try:
-            os.symlink(sys.executable, os.path.join(shim, "python3"))
-        except OSError:
-            yield dict(env)
-            return
+            with open(launcher, "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/sh\nexec " + _shell_quote(executable) + ' "$@"\n')
+            os.chmod(launcher, 0o700)
+        except OSError as exc:
+            raise ValidationError(f"cannot pin the harness interpreter: {exc}") from exc
         yield {**env, "PATH": shim + os.pathsep + env.get("PATH", "")}
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
 
 
 def _require_budget(

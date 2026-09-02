@@ -375,9 +375,13 @@ python3 scripts/eval/plugin_pair_runner.py --freeze \
 产出 `metacodes.plugin-frozen-run/v1`:协议字节哈希、git HEAD、**完整**实现指纹、
 **路径集摘要**(`implementation_paths` 与 `pinned_evaluator_files` 的成员名集合,
 与内容无关)、运行时/两个 wrapper/两个 inventory 的哈希、schedule 哈希、模型指纹、**运行环境**
-(`platform` 与 `python` 版本:rollout 的 `environment_fingerprint` 记录的就是它们,冻结后
-run 与 analyze 必须在同一环境,换主机或换解释器是一条**具名**拒绝,而不是花完钱后整批诚实
-行过不了指纹),以及对以上字段的规范化哈希 `manifest_sha256`。文件以 0600 创建,**拒绝覆盖**。
+(`platform` 与 `python` 版本——rollout 的 `environment_fingerprint` 记录的就是这两项——外加
+解释器实现、cache tag、`sys.executable` 的 realpath 与哈希、`sys.prefix`,用来区分同版本的
+不同安装/venv),以及对以上字段的规范化哈希 `manifest_sha256`。运行环境**不是主机身份**,
+也不是"钉住解释器":解释器、它的 prefix 和加载的库同 PATH 上的二进制一样在操作者的信任边界
+之内;记录它的意义是让换机器、换 OS 构建、换解释器安装或 venv 成为授权之前的一条**具名**
+`environment` 拒绝,而不是花完钱后整批诚实行过不了指纹。`platform.platform()` 含内核构建串,
+OS 补丁也会触发它——重新冻结是一个要看着 diff 做的动作,不是可以顺手跳过的告警。文件以 0600 创建,**拒绝覆盖**。
 
 用户 authority 升到 `metacodes.plugin-paid-authority/v2`,在 v1 字段之上**必须**携带
 `manifest_sha256`:用户签的是这份清单,而不只是协议。
@@ -408,8 +412,10 @@ rollout 记录的 `plugin_treatment`。
 
 **预授权失败可回滚。** reserve 之后、`authorize_request` 尚未落盘就失败(信号、异常),
 runner 试图 `abort_pre_request`:日志仍是 `reserved` 则中止落账、续跑不被一笔没花的预留
-挡住;若授权其实已落盘,日志以 `TransactionNotAbortable` 拒绝中止,交易保持
-`request_authorized`——请求可能已被放行,续跑照旧拒绝。中止本身落盘失败(存储故障)是
+挡住;若授权其实已落盘(包括写已落地、异常恰好打在内存态更新之前:`abort_pre_request` 先
+重读磁盘,恰好多出本笔 `request_authorized` 一个事件就认领它),日志以
+`TransactionNotAbortable` 拒绝中止,交易保持 `request_authorized`——请求可能已被放行,
+续跑照旧拒绝;磁盘多出的不止这一步则仍按锁内漂移拒绝。中止本身落盘失败(存储故障)是
 第三种情形:预留搁浅在盘上,runner 以原始失败为 cause 报出"abort could not be recorded",
 不装作已清理。
 
@@ -432,9 +438,11 @@ inventory 预检在临时 HOME 下、`METACODES_NO_PROBE=1` 执行:`--dump-plugi
 `run_e2e.sh` 是非交互 bash,`BASH_ENV` 指向的钩子能重定义它用来拼装 prompt 的 `awk`,在
 不改动树上任何文件的情况下改变候选臂收到的输入。`PATH` 保留:它上面的二进制是操作者的
 信任边界,固定工具路径在自托管 runner 上活不下来;唯一例外是 **`python3`**——子进程 PATH
-最前面放一个指向 runner 自身解释器的 shim(`interpreter_shim`),harness 的 helper 与
-`#!/usr/bin/env python3` 的 wrapper 都用它,rollout 记录的 Python 身份因此等于冻结与校验
-所用的那一个。rollout 侧还剥掉 `METASK_*`:宿主凭证与 runner 的匿名凭证 fd 并存时 lib.sh
+最前面放一个 `exec` 到 runner 自身 `sys.executable` 的启动脚本(`interpreter_shim`;不用
+符号链接,CPython 按被调用的路径找 `pyvenv.cfg`,符号链接会悄悄丢掉 runner 的 venv),
+harness 的 helper 与 `#!/usr/bin/env python3` 的 wrapper 都用它,rollout 记录的 Python 身份
+因此等于冻结与校验所用的那一个。shim 建不出来(`sys.executable` 不可用、临时目录不可写)
+即 fail-closed,由于 inventory 预检在 `_observe` 里先跑,它发生在任何授权之前。rollout 侧还剥掉 `METASK_*`:宿主凭证与 runner 的匿名凭证 fd 并存时 lib.sh
 判定"ambiguous E2E provider credentials"、请求根本不发,而交易已经授权,留下一笔挡住续跑的
 孤儿。
 

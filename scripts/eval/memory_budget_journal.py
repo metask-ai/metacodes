@@ -1002,10 +1002,42 @@ class BudgetJournal:
             evidence_sha256=evidence_sha256,
         )
 
+    def _adopt_durable_authorization(self, transaction_id: str) -> bool:
+        """After an interrupted `authorize_request`: if the durable journal is
+        exactly this process's state plus that one authorization event, adopt
+        it (the write landed; only the in-memory state is behind) and report
+        True. Any other drift under the lock is still corruption."""
+        assert self._document is not None and self._state is not None
+        self._reject_temporary()
+        current = self._read_document()
+        current_state = _replay_document(current)
+        if (
+            current_state["revision"] == self._state["revision"]
+            and current_state["head_sha256"] == self._state["head_sha256"]
+            and current_state["journal_id"] == self._state["journal_id"]
+        ):
+            return False
+        ours = list(self._document["events"])
+        events = current["events"]
+        if (
+            current_state["journal_id"] == self._state["journal_id"]
+            and len(events) == len(ours) + 1
+            and events[: len(ours)] == ours
+            and events[-1]["action"] == "request_authorized"
+            and events[-1]["transaction_id"] == transaction_id
+        ):
+            self._document = current
+            self._state = current_state
+            return True
+        _fail("budget journal", "revision or head drift while lock is held")
+        return False  # unreachable; _fail raises
+
     def abort_pre_request(self, transaction_id: str) -> Mapping[str, Any]:
         current = self._transaction(transaction_id)
         if current["state"] == "aborted_pre_request":
             return self.transaction_receipt(transaction_id)
+        if current["state"] == "reserved" and self._adopt_durable_authorization(transaction_id):
+            current = self._transaction(transaction_id)
         if current["state"] != "reserved":
             raise TransactionNotAbortable(
                 "budget transaction: authorized or committed requests cannot be aborted"
