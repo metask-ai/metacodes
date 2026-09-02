@@ -895,7 +895,10 @@ pub const BudgetedProvider = struct {
         const request_bytes = try canonicalRequestBytes(
             self.allocator,
             model_override orelse self.base.model(),
-            self.base.maxTokens(),
+            // Resolved through the same override as the model beside it: a
+            // reservation sized from the parent's output cap is not the
+            // request the child will send.
+            self.base.maxTokensFor(model_override),
             messages,
             system,
             tools,

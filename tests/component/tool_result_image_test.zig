@@ -128,8 +128,7 @@ fn projectedOversizeImage(a: std.mem.Allocator, max_input_tokens: usize) !Projec
     };
     const stats = try cc.result_projection.project(a, &items, .{
         .session_root = "",
-        .per_result_bytes = cc.conversation.toolResultContextBytes(max_input_tokens),
-        .per_turn_bytes = cc.result_projection.turnBudgetBytes(max_input_tokens),
+        .budget = cc.result_budget.Budget.fromModel(max_input_tokens),
     });
     try std.testing.expect(content.len > cc.conversation.toolResultContextBytes(max_input_tokens));
     try std.testing.expectEqual(@as(usize, 0), stats.artifact_spill_count);
@@ -441,8 +440,7 @@ test "L2 ⑨: 同一轮里图像不与文本竞争 turn 预算(文本先被 spil
     // 超预算的是那段文本——它才是唯一的 spill 受害者。
     const stats = try cc.result_projection.project(a, &items, .{
         .session_root = root_buffer[0..root_len],
-        .per_result_bytes = 64 * 1024,
-        .per_turn_bytes = cc.result_projection.turnBudgetBytes(0),
+        .budget = .{ .per_result_bytes = 64 * 1024, .per_turn_bytes = cc.result_projection.turnBudgetBytes(0) },
     });
     try std.testing.expect(std.mem.eql(u8, image_before, image));
     try std.testing.expectEqual(@as(usize, 1), stats.turn_budget_spills);

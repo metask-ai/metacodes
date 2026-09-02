@@ -181,6 +181,13 @@ receipt 或 bounded structured error。两种 executor 不能同时存在，也�
 `byte_zero_spool`，并在 comptime 禁止 byte-zero 声明接到 legacy callback。
 `StructuredToolError` 只接受不超过 1 MiB 的 `{"error": {...}}` JSON 对象。
 
+模型可见字节的额度由 `core.result_budget.Budget` 统一给出:`Budget.fromModel(max_input_tokens)`
+派生 `per_result_bytes`/`per_turn_bytes`,`agent_loop` 每轮算一次并同时放进 `ToolContext.result_budget`
+与 `result_projection.Config.budget`。自己做限界的工具从 `ToolContext.result_budget` 取额度
+(`payloadAllowance` 扣掉信封开销,`splitPair` 在多通道间做 max-min 公平切分),不要再引入私有常量;
+额度按编码后字节计,`encodedPrefixLen`/`encodedSuffixLen` 负责在 UTF-8 边界上按编码代价下刀。
+嵌入者不提供 Provider 时字段保持 `.floor` 默认(8KiB/16KiB),行为等同历史下限。
+
 首方 byte-zero 工具为 `Glob`、`Grep`、`CodeMap`、`FindSymbol`、`Bash`、
 `ListMcpResourcesTool`、`ReadMcpResourceTool` 和 `WebFetch`。Bash 的 JobRegistry、
 MCP stdio、大型 WebFetch/curl、ripgrep 与代码索引输出都在子进程/生产者发出第一个字节前
