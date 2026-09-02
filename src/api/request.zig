@@ -150,8 +150,8 @@ fn canonicalProjectionProfile(
 /// immutable plugin Snapshot; plugin metadata/generation never enters the
 /// serialized request, preserving provider prefix-cache identity.
 /// 序列化器对图像 tool_result 的**实际**决定:每命中一个规范图像结果 `image_results += 1`;
-/// 走占位分支(方言/profile 不发原生图像块)`image_placeholders += 1`。客户端据此填
-/// StreamHandle.image_results_native——送达水位只认序列化器自己的报告,绝不事后重算能力
+/// 走占位分支(方言/profile 不发原生图像块)`image_placeholders += 1` 并记下其 tool_use_id。
+/// 客户端据此填 StreamHandle.image_placeholder_ids——送达水位只认序列化器自己的报告,绝不事后重算能力
 /// (插件方言可以在 profile 声称支持时仍拒绝发图,默认 Dialect 就是这样 fail-closed)。
 pub const SerializationReport = struct {
     image_results: usize = 0,

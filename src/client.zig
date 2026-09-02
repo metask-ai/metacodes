@@ -327,12 +327,14 @@ pub const Client = struct {
     fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!provider_mod.StreamHandle {
         const c = asClient(ctx);
         var sr = try c.sendMessageStreamFull(messages, system, tools, abort, model_override, tool_choice);
+        errdefer sr.deinit();
         sr.user_query = user_query;
         return boxHandle(c.allocator, sr);
     }
     fn pSendStreamRetry(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, max_retries: u32, retry_base_ms: u64, reporter: ?RetryReporter, user_query: []const u8) anyerror!provider_mod.StreamHandle {
         const c = asClient(ctx);
         var sr = try c.sendMessageStreamFullRetry(messages, system, tools, abort, model_override, tool_choice, max_retries, retry_base_ms, reporter);
+        errdefer sr.deinit();
         sr.user_query = user_query;
         return boxHandle(c.allocator, sr);
     }
@@ -570,6 +572,9 @@ pub const Client = struct {
         switch (result) {
             .streaming_response => |r| {
                 var sr = StreamResponse.init(client.allocator, r, abort);
+                // sr owns the accepted response from here: an allocation failure
+                // below must release it instead of leaking the connection.
+                errdefer sr.deinit();
                 sr.image_placeholder_ids = try report.placeholder_ids.toOwnedSlice(client.allocator);
                 return sr;
             },

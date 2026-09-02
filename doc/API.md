@@ -159,8 +159,11 @@ delivery, a resumed transcript starts undelivered until the next accepted
 request, and a request through a model without image input, which only
 carries the placeholder, does not deliver messages holding an image result —
 that decision is the serializer's own, carried back on the accepted stream
-handle (`StreamHandle.image_results_native`) rather than re-derived, so it
-always matches the bytes sent; messages behind the compact boundary and
+handle as the tool_use ids whose picture went out as a placeholder
+(`StreamHandle.image_placeholder_ids`; `null` = unknown, treated as all
+placeholders) rather than re-derived, so it always matches the bytes sent
+and a parallel turn's natively-sent siblings are not pinned by one
+placeholder (the flag lives on each tool_result block); messages behind the compact boundary and
 orphan image results the normalizer strips are delivered regardless, since no
 later request can carry them), from `truncateLargeToolResults`, and from the AgentCore
 artifact promotion above the operation's cap (`tool_result_cap_bytes` for
@@ -175,7 +178,12 @@ on the wire are capped separately at `types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST`
 projection spills the largest images of the current turn beyond the cap into
 artifact envelopes, and before each request the agent loop stubs the oldest
 already-delivered image results until the active history fits
-(`agent_loop.Options.image_request_bytes_cap`). On Gemini 3, `image/gif`
+(`agent_loop.Options.image_request_bytes_cap`, also applied as the
+projection's per-turn image cap). The total counts first-class user images
+too (they are never cleared but consume the allowance), and after a
+transcript resume, where every delivery flag is restored as false, image
+results that a later assistant reply answered are treated as delivered for
+trimming; a result of the trailing, unanswered turn is never touched. On Gemini 3, `image/gif`
 results travel as a sibling `inline_data` part rather than inside the
 multimodal function response, whose `inlineData` accepts only PNG, JPEG and
 WebP. A profile whose cap for that operation kind is below 6,400

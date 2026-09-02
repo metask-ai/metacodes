@@ -583,7 +583,7 @@ pub const Conversation = struct {
                     .tool_result => |tr| {
                         // 已是 stub 的不重复清(幂等)。
                         if (isClearedToolResultProjection(tr.content)) continue;
-                        if (!m.delivered and result_projection.isImageResult(tr.content)) continue;
+                        if (!tr.delivered and result_projection.isImageResult(tr.content)) continue;
                         if (self.clearToolResultAt(m, bi) == null) continue;
                         self.noteShrinkAtLocked(mi);
                         cleared += 1;
@@ -618,7 +618,7 @@ pub const Conversation = struct {
                 if (seen_recent <= keep_recent_results) continue;
                 const tr = b.tool_result;
                 if (isClearedToolResultProjection(tr.content)) continue;
-                if (!m.delivered and result_projection.isImageResult(tr.content)) continue;
+                if (!tr.delivered and result_projection.isImageResult(tr.content)) continue;
                 const before = tr.content.len;
                 const after = self.clearToolResultAt(m, bi) orelse continue;
                 self.noteShrinkAtLocked(mi);
@@ -727,6 +727,10 @@ pub const Conversation = struct {
             // would be stripped as an orphan. Leaving it undelivered would only
             // pin its base64 forever.
             if (i < active_start) {
+                for (m.blocks) |*b| switch (b.*) {
+                    .tool_result => |*tr| tr.delivered = true,
+                    else => {},
+                };
                 m.delivered = true;
                 continue;
             }
@@ -744,25 +748,38 @@ pub const Conversation = struct {
                 continue;
             }
             // The vision exception only protects an image that some later
-            // natively-serializing request could still carry: a paired result.
-            // An orphan (or duplicate) image result is stripped by the request
-            // normalizer and delivers unconditionally.
+            // natively-serializing request could still carry: a paired result
+            // whose id the serializer reported as a placeholder. An orphan (or
+            // duplicate) image result is stripped by the request normalizer and
+            // delivers unconditionally. The flag is per block so a placeholder
+            // sibling in a parallel turn cannot pin its natively-sent siblings.
             var protected = false;
-            for (m.blocks) |b| switch (b) {
-                .tool_result => |tr| {
+            for (m.blocks) |*b| switch (b.*) {
+                .tool_result => |*tr| {
                     const paired = outstanding.remove(tr.tool_use_id) or oom;
-                    if (paired and result_projection.isImageResult(tr.content) and opts.placeholderFor(tr.tool_use_id)) protected = true;
+                    tr.delivered = !(paired and result_projection.isImageResult(tr.content) and opts.placeholderFor(tr.tool_use_id));
+                    if (!tr.delivered) protected = true;
                 },
                 else => {},
             };
-            if (!protected) m.delivered = true;
+            m.delivered = !protected;
         }
     }
 
-    /// Keep the base64 bytes of active image results under `cap` before a
-    /// request: clears (stubs, with the usual sha256 commitment) the oldest
-    /// *delivered* image results first and never an undelivered one — those
-    /// belong to the turn about to be sent and are bounded by the projection's
+    /// Keep the base64 bytes of active images under `cap` before a request.
+    /// The total counts image tool results *and* first-class `.image` blocks
+    /// (user inputs — never cleared, but they consume the allowance). Clears
+    /// (stubs, with the usual sha256 commitment) image result blocks oldest
+    /// first: pass 1 takes blocks the watermark marked delivered; pass 2 — used
+    /// only while *no* message of the active range carries a watermark, i.e.
+    /// a resumed transcript before its first accepted request — takes blocks
+    /// that a later provider-visible assistant message answered, the reply
+    /// being the evidence they were delivered in the earlier session. Once any
+    /// request was accepted the flags are authoritative and the inference is
+    /// off, so a locally appended assistant message (an AgentCore budget
+    /// terminal marker after a rejected request) can never make a picture the
+    /// model has not seen trimmable. A result of the trailing turn (nothing
+    /// answered it yet) is never touched: it is bounded by the projection's
     /// per-turn image cap. Envelopes and stubs are not images and are not
     /// counted. Returns what was cleared.
     pub fn trimDeliveredImageBytes(self: *Conversation, cap: usize) ToolResultReduction {
@@ -771,29 +788,46 @@ pub const Conversation = struct {
         var out = ToolResultReduction{};
         const active_start = @min(self.compact_boundary, self.messages.items.len);
         var total: usize = 0;
-        for (self.messages.items[active_start..]) |m| for (m.blocks) |b| switch (b) {
-            .tool_result => |tr| if (result_projection.isImageResult(tr.content)) {
-                total +|= tr.content.len;
-            },
-            else => {},
-        };
+        var last_visible_assistant: ?usize = null;
+        var any_delivered = false;
+        for (self.messages.items[active_start..], active_start..) |m, mi| {
+            if (m.delivered) any_delivered = true;
+            if (m.role == .assistant and assistantIsProviderVisible(m)) last_visible_assistant = mi;
+            for (m.blocks) |b| switch (b) {
+                .tool_result => |tr| if (result_projection.isImageResult(tr.content)) {
+                    total +|= tr.content.len;
+                },
+                .image => |img| total +|= img.data.len,
+                else => {},
+            };
+        }
         if (total <= cap) return out;
-        var mi = active_start;
-        while (mi < self.messages.items.len and total > cap) : (mi += 1) {
-            const m = self.messages.items[mi];
-            if (!m.delivered) continue;
-            for (m.blocks, 0..) |b, bi| {
-                if (total <= cap) break;
-                if (b != .tool_result) continue;
-                const tr = b.tool_result;
-                if (!result_projection.isImageResult(tr.content)) continue;
-                const before = tr.content.len;
-                const after = self.clearToolResultAt(m, bi) orelse continue;
-                self.noteShrinkAtLocked(mi);
-                out.cleared += 1;
-                out.bytes_before += before;
-                out.bytes_after += after;
-                total -= before;
+        const answered_before = last_visible_assistant orelse active_start;
+        const passes: u8 = if (any_delivered) 1 else 2;
+        var pass: u8 = 0;
+        while (pass < passes and total > cap) : (pass += 1) {
+            var mi = active_start;
+            while (mi < self.messages.items.len and total > cap) : (mi += 1) {
+                const m = self.messages.items[mi];
+                if (m.role != .user) continue;
+                for (m.blocks, 0..) |b, bi| {
+                    if (total <= cap) break;
+                    if (b != .tool_result) continue;
+                    const tr = b.tool_result;
+                    if (!result_projection.isImageResult(tr.content)) continue;
+                    const eligible = switch (pass) {
+                        0 => tr.delivered,
+                        else => mi < answered_before,
+                    };
+                    if (!eligible) continue;
+                    const before = tr.content.len;
+                    const after = self.clearToolResultAt(m, bi) orelse continue;
+                    self.noteShrinkAtLocked(mi);
+                    out.cleared += 1;
+                    out.bytes_before += before;
+                    out.bytes_after += after;
+                    total -= before;
+                }
             }
         }
         if (out.changed()) self.mutation_version +%= 1;
@@ -1268,6 +1302,127 @@ test "trimDeliveredImageBytes stubs the oldest delivered images first and never 
     try std.testing.expectEqual(@as(usize, 1), tight.cleared);
     try std.testing.expect(result_projection.isImageResult(c.messages.items[5].blocks[0].tool_result.content));
     try std.testing.expect(!c.trimDeliveredImageBytes(one / 2).changed());
+}
+
+test "trimDeliveredImageBytes: resumed history (all flags false) trims answered turns, never the trailing one" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, 4096);
+            defer al.free(data);
+            @memset(data, 'A');
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try T.imageTurn(&c, a, "t1"); // 0,1 answered by 2
+    try c.appendText(.assistant, "first reply");
+    try T.imageTurn(&c, a, "t2"); // 3,4 answered by 5
+    try c.appendText(.assistant, "second reply");
+    try T.imageTurn(&c, a, "t3"); // 6,7 trailing, unanswered
+    // No markDelivered: exactly the state after a transcript resume.
+    const one = c.messages.items[1].blocks[0].tool_result.content.len;
+    const reduced = c.trimDeliveredImageBytes(one + 16);
+    try std.testing.expectEqual(@as(usize, 2), reduced.cleared);
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[4].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expect(result_projection.isImageResult(c.messages.items[7].blocks[0].tool_result.content));
+    // Only the trailing image remains and it is over a tighter cap: still untouched.
+    try std.testing.expect(!c.trimDeliveredImageBytes(one / 2).changed());
+}
+
+test "trimDeliveredImageBytes: once any watermark exists, a local assistant append cannot make an unseen image trimmable" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, 4096);
+            defer al.free(data);
+            @memset(data, 'A');
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try c.appendText(.user, "start");
+    c.markDelivered(.{ .image_placeholder_ids = &.{} }); // an accepted request exists: flags are authoritative
+    try T.imageTurn(&c, a, "t1"); // 1,2 undelivered: the next request was rejected...
+    try c.appendText(.assistant, "{\"agentcore\":\"checkpoint_payload_resource_limit\"}"); // ...and a local marker followed
+    const one = c.messages.items[2].blocks[0].tool_result.content.len;
+    // The marker is not delivery evidence: the unseen image is not trimmable.
+    try std.testing.expect(!c.trimDeliveredImageBytes(one / 2).changed());
+    try std.testing.expect(result_projection.isImageResult(c.messages.items[2].blocks[0].tool_result.content));
+}
+
+test "trimDeliveredImageBytes: first-class user images consume the allowance but are never cleared" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const inputs = [_]msg.ImageInput{.{ .media_type = "image/png", .data = "A" ** 4096 }};
+    var user_image = try msg.userMessageWithImages(a, "look", &inputs);
+    errdefer user_image.deinit(a);
+    try c.append(user_image);
+    const tu = try a.alloc(msg.Block, 1);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t1"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const data = try a.alloc(u8, 4096);
+    defer a.free(data);
+    @memset(data, 'B');
+    const img = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t1"), .content = img, .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
+    // Cap would admit the tool image alone, but the user image already takes 4096:
+    // the delivered tool image is cleared, the user image block stays.
+    const reduced = c.trimDeliveredImageBytes(img.len + 100);
+    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expect(c.messages.items[0].blocks[1] == .image);
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[2].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
+}
+
+test "delivery watermark: a placeholder sibling in a parallel turn does not pin its natively-sent siblings" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const tu = try a.alloc(msg.Block, 2);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t_png"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    tu[1] = .{ .tool_use = .{ .id = try a.dupe(u8, "t_webp"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const data = try a.alloc(u8, 4096);
+    defer a.free(data);
+    @memset(data, 'A');
+    const png = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+    const webp = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/webp\",\"data\":\"{s}\"}}", .{data});
+    const blocks = try a.alloc(msg.Block, 2);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t_png"), .content = png, .is_error = false } };
+    blocks[1] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t_webp"), .content = webp, .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    const placeholders = [_][]const u8{"t_webp"};
+    c.markDelivered(.{ .image_placeholder_ids = &placeholders });
+    try std.testing.expect(!c.messages.items[1].delivered);
+    try std.testing.expect(c.messages.items[1].blocks[0].tool_result.delivered);
+    try std.testing.expect(!c.messages.items[1].blocks[1].tool_result.delivered);
+    // The wire cap can trim the delivered PNG while the WebP stays protected.
+    const reduced = c.trimDeliveredImageBytes(webp.len + 16);
+    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expect(result_projection.isImageResult(c.messages.items[1].blocks[1].tool_result.content));
+    // Microcompact under pressure likewise clears only the delivered block.
+    const micro = c.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 0), micro.cleared);
 }
 
 test "compact preview commit keeps a delivery watermark set while the preview was in flight" {

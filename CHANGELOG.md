@@ -18,7 +18,10 @@ status, compatibility boundaries, and entry points are defined by
   the base64 image bytes per request: the projection spills the largest
   images of the current turn beyond the cap into artifact envelopes, and the
   agent loop stubs the oldest already-delivered image results before each
-  request until the history fits. Gemini 3 function responses embed only
+  request until the history fits (first-class user images count against
+  the allowance; after a transcript resume, results a later assistant reply
+  answered are trimmable even though their flags were not persisted).
+  Gemini 3 function responses embed only
   PNG/JPEG/WebP; `image/gif` results now go out as a sibling `inline_data`
   part instead of being rejected. The stream handle reports the exact
   tool_use ids whose image went out as a placeholder, so a plugin dialect
@@ -69,8 +72,9 @@ status, compatibility boundaries, and entry points are defined by
   (`Message.delivered`) advanced by the agent loop once the provider has
   accepted a request for streaming — and, for messages holding an image
   result, only when the serializer actually sent native image parts (a
-  non-vision model only received the placeholder; the decision travels back
-  on `StreamHandle.image_results_native`) — never inferred from a locally
+  non-vision model only received the placeholder; the serializer reports the
+  affected tool_use ids back on `StreamHandle.image_placeholder_ids`, and the
+  flag lives on each tool_result block) — never inferred from a locally
   appended assistant message; delivered
   images clear like any result, so the pressure valve keeps working on
   image-heavy history, and images are never truncated. AgentCore `settleSuccess` now counts live

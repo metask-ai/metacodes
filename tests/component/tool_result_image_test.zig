@@ -569,6 +569,72 @@ test "L2 ⑬: 请求级图片字节上限——历史里最老的已送达图片
     try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[2].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
 }
 
+/// 一轮 Read(image):assistant tool_use + user 图像结果(4096 字节 `fill` 的 base64 载荷)。
+fn appendImageTurn(c: *cc.conversation.Conversation, al: std.mem.Allocator, id: []const u8, fill: u8) !void {
+    const tu = try al.alloc(cc.core_message.Block, 1);
+    tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const data = try al.alloc(u8, 4096);
+    defer al.free(data);
+    @memset(data, fill);
+    const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+    const blocks = try al.alloc(cc.core_message.Block, 1);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+}
+
+test "L2 ⑭: transcript resume 后(送达标记全部丢失)请求级图片上限仍生效——被回复过的旧图片被裁掉,wire 上只剩一张" {
+    const a = std.testing.allocator;
+    const tmp_home = "/tmp/cc-zig-image-cap-resume-l2";
+    cc.util_fs.testing.rmrfBestEffort(tmp_home);
+    defer cc.util_fs.testing.rmrfBestEffort(tmp_home);
+    var writer = try cc.transcript.Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4-20250514", cc.transcript.genSessionId());
+    defer writer.deinit();
+    {
+        // 会话 A:两轮已被回复的图片 + 新的 user 提问,落盘。
+        var conv_a = cc.conversation.Conversation.init(a);
+        defer conv_a.deinit();
+        try conv_a.appendText(.user, "look at both pictures");
+        try appendImageTurn(&conv_a, a, "t1", 'A');
+        try conv_a.appendText(.assistant, "saw the first");
+        try appendImageTurn(&conv_a, a, "t2", 'B');
+        try conv_a.appendText(.assistant, "saw the second");
+        try conv_a.appendText(.user, "and now?");
+        writer.flush(&conv_a);
+    }
+    // 会话 B:恢复 → 每条消息 delivered=false(transcript 不持久化水位)。
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try cc.transcript.loadTranscript(&conv, writer.dir, a);
+    try std.testing.expectEqual(@as(usize, 8), conv.messages.items.len);
+    for (conv.messages.items) |m| try std.testing.expect(!m.delivered);
+    const one = conv.messages.items[2].blocks[0].tool_result.content.len;
+
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ANTHROPIC_OK_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), &.{}, &perm, .{
+        .max_turns = 1,
+        .image_request_bytes_cap = one + 64,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    // 被 assistant 回复过的最老图片被裁掉;wire 上只有第二张。
+    const body = srv.lastRequest().?.body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\""));
+    try std.testing.expect(std.mem.indexOf(u8, body, "BBBB") != null);
+    try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[2].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
+}
+
 test "L2 ⑩: model_override 决定送达——基础模型非 vision、override 为 vision 时图片上 wire 且送达" {
     const a = std.testing.allocator;
     const r = try runOverrideDelivery(a, "glm-5.2", "claude-sonnet-4-20250514");

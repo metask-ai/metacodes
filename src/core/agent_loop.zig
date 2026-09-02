@@ -2382,6 +2382,7 @@ pub fn run(
                 .session_root = opts.artifact_root,
                 .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
                 .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+                .per_turn_image_bytes = opts.image_request_bytes_cap,
             });
             if (opts.tool_result_metrics) |metrics| metrics.recordProjection(suspended_projection_stats);
             // result_blocks 这轮不提交(挂起不落 partial user 消息);释放已 append 的(本应为空)。
@@ -2508,6 +2509,7 @@ pub fn run(
             .session_root = opts.artifact_root,
             .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
             .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+            .per_turn_image_bytes = opts.image_request_bytes_cap,
         });
         if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
         if (projection_stats.changed() or projection_stats.budget_exhausted) {

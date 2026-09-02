@@ -279,7 +279,8 @@ vision 路由的方言原生消费它（image block / data URL / inlineData）�
 字节/token）计入，`Stats.projected_bytes` 仍是真实字节数。microcompact 对**未送达**的图片同样豁免：
 送达是 `Message.delivered` 显式水位，只由 agent_loop 在 provider 接受请求并返回流句柄后 `markDelivered` 推进
 （被 HTTP 错误拒绝的请求不算送达；不支持图像输入的模型只收到占位文本，这样的请求不算送达含图消息——
-这个判断由序列化器定案并随 `StreamHandle.image_results_native` 回传，不在 agent_loop 重算；压缩边界之后
+这个判断由序列化器定案并随 `StreamHandle.image_placeholder_ids`（走占位的 tool_use_id 列表，null = 未知按全占位处理）
+回传、按 `ToolResult.delivered` 逐块记录，不在 agent_loop 重算；压缩边界之后
 和被规范化器剥掉的孤儿图片则一律标记送达，因为没有后续请求能再携带它们），
 本地追加的 assistant 消息（如 AgentCore 预算终止标记）不算送达，
 transcript resume 出来的消息一律未送达、下一次被接受的请求后自愈；compact 预览提交时把 live 的水位按索引合并进
