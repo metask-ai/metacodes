@@ -273,6 +273,9 @@ envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 S
 模型只看到稳定 SHA-256、head/tail 预览和 `ReadArtifact(offset,limit)` 指令。最后的通用字节截断
 仅是失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新
 投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
+图像形态结果（`Read` 读图返回的 `{"type":"image",...}`，`result_projection.isImageResult`）豁免两轮投影：
+provider 方言原生消费它（image block / data URL / inlineData），信封只会把图片变成 base64 预览文本；
+轮预算按 `IMAGE_RESULT_BUDGET_BYTES`（= `IMAGE_TOKEN_ESTIMATE` × 4 字节/token）计入，不按 base64 长度。
 
 静态 `ToolEntry.result_production` 把生产方式收成三种不可混淆的状态：`bounded_inline`、
 `input_derived`、`byte_zero_spool`；comptime 断言禁止 `byte_zero_spool` 工具接回

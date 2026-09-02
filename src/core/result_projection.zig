@@ -9,11 +9,20 @@
 const std = @import("std");
 const artifact = @import("tool_result_artifact.zig");
 const tool_result = @import("tool_result.zig");
+const conversation = @import("conversation.zig");
+const json_mod = @import("../json.zig");
 
 pub const SCHEMA = tool_result.PROJECTION_SCHEMA;
 pub const ENVELOPE_PREFIX = tool_result.ENVELOPE_PREFIX;
 pub const BASH_SCHEMA = "metacodes.bash-result.v2";
 pub const DEFAULT_PREVIEW_BYTES: usize = 1536;
+/// Turn-budget charge for one image-shaped result. The provider dialects
+/// consume these natively (`extractImageResult` → image block / data URL /
+/// inlineData), so the model never pays for the base64 length; it pays the
+/// vision estimate that already drives auto-compact and request estimation
+/// (`conversation.IMAGE_TOKEN_ESTIMATE`), at this module's four-bytes-per-token
+/// convention (see `conversation.toolResultContextBytes`).
+pub const IMAGE_RESULT_BUDGET_BYTES: usize = conversation.IMAGE_TOKEN_ESTIMATE * 4;
 
 pub const Item = struct {
     tool_name: []const u8,
@@ -29,7 +38,10 @@ pub const Config = struct {
 };
 
 pub const Stats = struct {
+    /// Bytes the tools actually produced (envelopes count their original size).
     raw_bytes: usize = 0,
+    /// Model-visible bytes after projection, measured in turn-budget units:
+    /// text at its length, image results at `IMAGE_RESULT_BUDGET_BYTES`.
     projected_bytes: usize = 0,
     artifact_bytes: usize = 0,
     artifact_spill_count: usize = 0,
@@ -52,10 +64,20 @@ pub fn turnBudgetBytes(max_input_tokens: usize) usize {
     return @min(@max(scaled, 16 * 1024), 200 * 1024);
 }
 
+/// Image-shaped tool result (`{"type":"image","media_type":...,"data":...}`,
+/// the `Read` tool's picture form). Never spilled: an artifact envelope would
+/// turn the picture into a base64 preview string that no dialect recognizes
+/// as an image, so every provider would receive text instead of the picture.
+pub fn isImageResult(content: []const u8) bool {
+    return json_mod.extractImageResult(content) != null;
+}
+
 pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Stats {
     var stats = Stats{};
     const structured = try allocator.alloc(bool, items.len);
     defer allocator.free(structured);
+    const image = try allocator.alloc(bool, items.len);
+    defer allocator.free(image);
     for (items, 0..) |item, index| {
         if (recoverableEnvelopeOriginalBytes(item.content.*)) |original_bytes| {
             stats.raw_bytes +|= original_bytes;
@@ -66,6 +88,7 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         }
         structured[index] = isStructuredJson(item.content.*);
         if (structured[index]) stats.structured_result_count += 1;
+        image[index] = isImageResult(item.content.*);
     }
 
     // Per-result bound first. ReadArtifact is itself hard-bounded and must not
@@ -76,17 +99,22 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         // content. Replacing them would hide the exact recovery contract from
         // the model; the aggregate budget may report exhaustion instead.
         if (item.is_error) continue;
+        // Image results bypass both passes: the dialects serialize them
+        // natively and the budget below charges them at
+        // IMAGE_RESULT_BUDGET_BYTES, never at their base64 length.
+        if (image[index]) continue;
         if (item.content.*.len <= config.per_result_bytes) continue;
         try spillOne(allocator, item, structured[index], config, &stats, false);
     }
 
-    var total = totalBytes(items);
+    var total = budgetBytes(items, image);
     while (total > config.per_turn_bytes) {
         var biggest: ?usize = null;
         var biggest_len: usize = 0;
         for (items, 0..) |item, index| {
             if (std.mem.eql(u8, item.tool_name, "ReadArtifact")) continue;
             if (item.is_error) continue;
+            if (image[index]) continue;
             if (isProjectionEnvelope(item.content.*)) continue;
             // Strict > preserves the original ordinal as the deterministic
             // tie-breaker for equal-size parallel results.
@@ -102,7 +130,7 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         total = total - before + after;
         if (after >= before) break;
     }
-    stats.projected_bytes = totalBytes(items);
+    stats.projected_bytes = budgetBytes(items, image);
     stats.budget_exhausted = stats.projected_bytes > config.per_turn_bytes;
     return stats;
 }
@@ -301,10 +329,85 @@ fn isStructuredJson(content: []const u8) bool {
     }
 }
 
-fn totalBytes(items: []const Item) usize {
+/// Turn-budget size of the result set: text at its length, image results at
+/// `IMAGE_RESULT_BUDGET_BYTES` (a 5 MB base64 screenshot must not evict every
+/// text sibling from the turn, nor report the budget as exhausted forever).
+fn budgetBytes(items: []const Item, image: []const bool) usize {
     var total: usize = 0;
-    for (items) |item| total +|= item.content.*.len;
+    for (items, image) |item, is_image| {
+        total +|= if (is_image) IMAGE_RESULT_BUDGET_BYTES else item.content.*.len;
+    }
     return total;
+}
+
+fn testImageContent(allocator: std.mem.Allocator, data_len: usize) ![]const u8 {
+    const data = try allocator.alloc(u8, data_len);
+    defer allocator.free(data);
+    @memset(data, 'A');
+    return std.fmt.allocPrint(allocator, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+}
+
+test "image results bypass the per-result bound while an equal-size text sibling spills" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var image_content: []const u8 = try testImageContent(allocator, 4096);
+    defer allocator.free(@constCast(image_content));
+    const image_before = try allocator.dupe(u8, image_content);
+    defer allocator.free(image_before);
+    var text_content: []const u8 = try allocator.alloc(u8, image_content.len);
+    @memset(@constCast(text_content), 'x');
+    var items = [_]Item{
+        .{ .tool_name = "Read", .content = &image_content, .is_error = false },
+        .{ .tool_name = "Read", .content = &text_content, .is_error = false },
+    };
+    const stats = try project(allocator, &items, .{ .session_root = root, .per_result_bytes = 64, .per_turn_bytes = 1 << 20 });
+    defer allocator.free(@constCast(text_content));
+    try std.testing.expect(isImageResult(image_content));
+    try std.testing.expectEqualStrings(image_before, image_content);
+    try std.testing.expect(isRecoverableEnvelope(text_content));
+    try std.testing.expectEqual(@as(usize, 1), stats.artifact_spill_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.turn_budget_spills);
+}
+
+test "image results are charged at IMAGE_RESULT_BUDGET_BYTES in the turn budget, never spilled" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    // The base64 payload alone is several times the whole turn budget.
+    var image_content: []const u8 = try testImageContent(allocator, 4 * IMAGE_RESULT_BUDGET_BYTES);
+    defer allocator.free(@constCast(image_content));
+    const image_before = try allocator.dupe(u8, image_content);
+    defer allocator.free(image_before);
+    var text_content: []const u8 = try allocator.alloc(u8, 4096);
+    @memset(@constCast(text_content), 'y');
+    var items = [_]Item{
+        .{ .tool_name = "Read", .content = &image_content, .is_error = false },
+        .{ .tool_name = "Grep", .content = &text_content, .is_error = false },
+    };
+
+    // Positive: the text sibling fits next to the image's charged estimate, so nothing spills.
+    const fits = try project(allocator, &items, .{ .session_root = root, .per_result_bytes = 1 << 20, .per_turn_bytes = IMAGE_RESULT_BUDGET_BYTES + 4096 });
+    defer allocator.free(@constCast(text_content));
+    try std.testing.expectEqual(@as(usize, 0), fits.turn_budget_spills);
+    try std.testing.expect(!fits.budget_exhausted);
+    try std.testing.expectEqual(IMAGE_RESULT_BUDGET_BYTES + 4096, fits.projected_bytes);
+    try std.testing.expectEqualStrings(image_before, image_content);
+    try std.testing.expectEqual(@as(usize, 4096), text_content.len);
+
+    // Negative: tighten the budget below the pair. Only the text sibling is a
+    // spill candidate; the image stays byte-identical and the budget recovers.
+    const tight = try project(allocator, &items, .{ .session_root = root, .per_result_bytes = 1 << 20, .per_turn_bytes = IMAGE_RESULT_BUDGET_BYTES + 1024, .preview_bytes = 0 });
+    try std.testing.expectEqual(@as(usize, 1), tight.turn_budget_spills);
+    try std.testing.expect(isRecoverableEnvelope(text_content));
+    try std.testing.expectEqualStrings(image_before, image_content);
+    try std.testing.expect(!tight.budget_exhausted);
 }
 
 test "structured spill remains valid JSON and exposes no local path" {

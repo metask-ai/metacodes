@@ -12,6 +12,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Image tool results larger than the per-result projection bound (64 KiB of
+  base64, roughly a 48 KiB picture) reached the provider as a
+  `metacodes.tool-result-projection` artifact envelope instead of an image:
+  the one-shot tool-result projection ran before the provider dialects and
+  spilled the `{"type":"image",...}` payload like any oversized text, so
+  `extractImageResult` never matched and Anthropic, OpenAI, and Gemini
+  received a base64 preview string. Image-shaped results are now exempt from
+  both projection passes and charged against the turn budget at the vision
+  token estimate (`IMAGE_TOKEN_ESTIMATE`, the same figure auto-compact uses)
+  rather than their base64 length, so one screenshot no longer evicts every
+  text sibling from the turn or reports the budget as permanently exhausted.
+  Covered end to end by an agent-loop test that reads an 80 KiB-base64 PNG
+  through the real `Read` tool and asserts the image block on the wire.
 - Image tool results (the `Read` tool's
   `{"type":"image","media_type":...,"data":...}` form) are now serialized
   natively on every protocol family instead of being passed to the model as a

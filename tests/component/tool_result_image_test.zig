@@ -188,3 +188,109 @@ test "L2 ⑥: Gemini 3 — 官方 multimodal functionResponse(嵌套 inlineData)
     try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached]\"},\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"" ++ RED_PIXEL_PNG_B64 ++ "\"}}]}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
 }
+
+// ── ⑦ 投影层:超限图片必须原样穿过 result_projection 到达 wire ──────────────────
+//
+// 上面 ①-⑥ 直接调 Provider vtable,绕开了 agent_loop 的一次性 tool-result 投影。
+// 修复前:base64 超过 TOOL_RESULT_CONTEXT_MAX_BYTES(64 KiB)的图片结果在到达方言
+// 序列化器之前就被 spillOne 换成 artifact 信封,extractImageResult 永不命中,三家
+// provider 收到的是 base64 预览文本而不是图。本测试走真实 Read 工具 + 真实 agent_loop。
+
+const pfs = @import("platform").fs;
+
+/// Anthropic 脚本:模型对 `path` 发 Read tool_use(input 经 input_json_delta 累积)。
+fn readToolSse(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_read\",\"name\":\"Read\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"file_path\\\":\\\"{s}\\\"}}\"}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+        "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+        "data: {{\"type\":\"message_stop\"}}\n\n", .{path});
+}
+
+fn writeFixture(path: [*:0]const u8, content: []const u8) !void {
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    var written: usize = 0;
+    while (written < content.len) {
+        const n = pfs.write(fd, content[written..]);
+        if (n <= 0) return error.WriteFailed;
+        written += @intCast(n);
+    }
+}
+
+test "L2 ⑦: 超过投影上限的真实 Read 图片经 agent_loop 到达 wire 仍是 image block,不被投影信封替换" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+
+    // 60000 原始字节 → 80000 base64 字符:高于 TOOL_RESULT_CONTEXT_MAX_BYTES(64 KiB),
+    // 不论模型窗口多大,修复前一定被 per-result 投影 spill。Read 只按扩展名定 media type、
+    // 不校验图片魔数,确定性伪随机字节足够。
+    const raw_len: usize = 60_000;
+    const raw = try a.alloc(u8, raw_len);
+    defer a.free(raw);
+    var seed: u32 = 0x9E37_79B9;
+    for (raw) |*byte| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        byte.* = @truncate(seed);
+    }
+    const path = try std.fmt.allocPrint(a, "{s}/big.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, raw);
+
+    const encoder = std.base64.standard.Encoder;
+    const expected_b64 = try a.alloc(u8, encoder.calcSize(raw_len));
+    defer a.free(expected_b64);
+    _ = encoder.encode(expected_b64, raw);
+    try std.testing.expect(expected_b64.len > cc.conversation.TOOL_RESULT_CONTEXT_MAX_BYTES);
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at big.png");
+
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        // 真实 artifact store:修复前这里产生的是 *可恢复* 信封,不是失存储兜底。
+        .artifact_root = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const body = srv.lastRequest().?.body();
+    // 图片本体以 Anthropic image source block 到达,base64 逐字节一致。
+    const expected_block = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}}}", .{expected_b64});
+    defer a.free(expected_block);
+    try std.testing.expect(std.mem.indexOf(u8, body, expected_block) != null);
+    // 投影信封绝不出现(schema 字面量在原文/JSON 转义两种形态下都无引号,可直接 grep)。
+    try std.testing.expect(std.mem.indexOf(u8, body, cc.result_projection.SCHEMA) == null);
+    // 原始 `{"type":"image",...}` JSON 也绝不作为转义文本发出。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
