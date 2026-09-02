@@ -42,9 +42,9 @@ status, compatibility boundaries, and entry points are defined by
   `completed` snapshot beside `STOP_ABORTED`), Runs that never ran the loop — a
   clean failure, a Skill aborted during activation, a synthetic completion —
   no longer stay at `starting`, degraded tool-set observation no longer
-  suppresses the closure, and a Host that rejects the terminal snapshot — or an
-  observation channel that already failed — fails the Run with the recorded
-  callback status and poisons the Session instead of being reported a
+  suppresses the closure, and a Host that rejects the terminal snapshot — or
+  any callback failure the Session already recorded — fails the Run with the
+  recorded callback status and poisons the Session instead of being reported a
   successful Run.
 - AgentCore ABI v1 returns to **revision 15**; `RUN_INPUT_PART_DOCUMENT`,
   `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1` and status
