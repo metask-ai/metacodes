@@ -195,7 +195,9 @@ class PluginReleaseGateTest(unittest.TestCase):
         with self.assertRaises(PluginGateError):
             _benchmark_row(json.dumps(row), protocol["deterministic_gate"])
 
-    def test_symlinked_protocol_file_is_rejected(self) -> None:
+    def test_symlinked_pinned_file_is_rejected(self) -> None:
+        # The symlink is a *candidate* file named by the protocol, not the
+        # protocol path itself - that was never symlink-checked.
         protocol = _fresh_protocol(self)
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             temporary = Path(directory)
@@ -387,6 +389,40 @@ class RunGateSnapshotTest(unittest.TestCase):
             path, runtime = self._protocol_with_fake_runtime(Path(directory))
             with self.assertRaisesRegex(PluginGateError, "git HEAD moved"):
                 self._run_gate(path, runtime, mutate_last=lambda: None, root_heads=["a" * 40, "b" * 40])
+
+    def test_stale_pin_is_rejected_at_entry_before_any_subprocess(self) -> None:
+        # The gate must not spend minutes of subprocesses on a protocol whose
+        # pin is stale; every RunGateSnapshotTest input is repinned, so this
+        # is the one test that proves entry is strict.
+        with tempfile.TemporaryDirectory() as directory:
+            path, runtime = self._protocol_with_fake_runtime(Path(directory))
+            raw = path.read_text(encoding="utf-8")
+            pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
+            path.write_text(raw.replace(pinned, "0f" * 32), encoding="utf-8")
+            calls = []
+            with mock.patch("scripts.eval.plugin_release_gate._run", lambda *a, **k: calls.append(a) or {"argv": [], "elapsed_ms": 0, "output_sha256": "", "output": ""}):
+                with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+                    run_gate(ROOT, path, dsh=Path("/nonexistent-dsh"), runtime_binary=runtime)
+            self.assertEqual([], calls)
+
+    def test_pinned_source_drifting_during_the_gate_rejects_the_receipt(self) -> None:
+        # Protocol bytes unchanged, but a pinned source changed while the
+        # subprocesses ran: the final re-validation of the same bytes against
+        # the tree is the only check that can see it. The live tree is not
+        # touched; the fingerprint the tree *would* produce is what changes.
+        with tempfile.TemporaryDirectory() as directory:
+            path, runtime = self._protocol_with_fake_runtime(Path(directory))
+            gate = __import__("scripts.eval.plugin_release_gate", fromlist=["implementation_fingerprint"])
+            real = gate.implementation_fingerprint
+            drifted = {"now": False}
+
+            def fingerprint_that_drifts(root, protocol):
+                value = real(root, protocol)
+                return ("f" * 64) if drifted["now"] else value
+
+            with mock.patch("scripts.eval.plugin_release_gate.implementation_fingerprint", fingerprint_that_drifts):
+                with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+                    self._run_gate(path, runtime, mutate_last=lambda: drifted.update(now=True))
 
     def test_gate_reads_the_protocol_file_exactly_twice_and_never_as_text(self) -> None:
         # The object the checks run with and the hash the receipt carries must

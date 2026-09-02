@@ -141,9 +141,11 @@ def load_protocol(root: Path, path: Path) -> dict[str, Any]:
     implementation fingerprint against the live tree.
 
     This is the loader for anything that is about to run, measure or judge:
-    ``run_gate``, ``plugin_pair_runner.build_plan`` / ``run_paid_pair`` and its
-    per-request reloads, and ``plugin_pair_analysis.analyze``. It is strict by
-    construction rather than by a flag a caller could forget.
+    ``plugin_pair_runner.build_plan`` / ``run_paid_pair`` and its per-request
+    reloads, and ``plugin_pair_analysis.analyze``. ``run_gate`` validates the
+    same way through ``validate_protocol_payload``, because it must hash the
+    exact bytes it validated. Both are strict by construction rather than by a
+    flag a caller could forget.
     """
     return _load_and_validate(root, path, check_implementation=True)
 
@@ -173,6 +175,18 @@ def _load_and_validate(root: Path, path: Path, *, check_implementation: bool) ->
     except OSError as exc:
         raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
     return _validate_payload(root, raw, check_implementation=check_implementation)
+
+
+def validate_protocol_payload(root: Path, raw: bytes) -> dict[str, Any]:
+    """Strictly validate one exact byte payload - every pin, including the
+    implementation fingerprint against the live tree.
+
+    This is `load_protocol` for callers that already hold the bytes and need
+    the hash of *those* bytes to describe what they validated: the release
+    gate's snapshot. Strict by construction, like `load_protocol`; there is
+    no flag to forget.
+    """
+    return _validate_payload(root, raw, check_implementation=True)
 
 
 def _validate_payload(root: Path, raw: bytes, *, check_implementation: bool) -> dict[str, Any]:
@@ -384,10 +398,12 @@ class _GateSnapshot:
     the file must still hold the same bytes, those bytes must still pass the
     full strict validation against the tree (every pin, not only the
     implementation fingerprint), and the Git HEAD must be the one captured.
-    What this does *not* detect is a pinned input changed and restored between
-    the two observations while a subprocess consumed the changed version;
-    closing that needs the subprocesses to run inside a materialized checkout
-    of the snapshot (issue #49).
+    What this does *not* detect: a pinned input changed and restored between
+    the two observations while a subprocess consumed the changed version
+    (ABA); and a pinned input changed *during* either validation scan after
+    its bytes were already hashed - the scan reads ~130 files one by one and
+    is not atomic. Both need the subprocesses and the hashing to run inside a
+    materialized checkout of the snapshot (issue #49).
     """
 
     protocol_sha256: str
@@ -400,7 +416,7 @@ class _GateSnapshot:
             raw = protocol_path.read_bytes()
         except OSError as exc:
             raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
-        protocol = _validate_payload(root, raw, check_implementation=True)
+        protocol = validate_protocol_payload(root, raw)
         snapshot = cls(
             protocol_sha256=_sha256_bytes(raw),
             git_head=_git_head(root),
@@ -416,7 +432,7 @@ class _GateSnapshot:
         if _sha256_bytes(final_raw) != self.protocol_sha256:
             raise PluginGateError("protocol changed while the gate was running")
         # Same bytes; now the same bytes must still hold against the tree.
-        _validate_payload(root, final_raw, check_implementation=True)
+        validate_protocol_payload(root, final_raw)
         if _git_head(root) != self.git_head:
             raise PluginGateError("git HEAD moved while the gate was running")
 
@@ -766,7 +782,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
-        protocol = load_protocol(root, args.protocol.resolve())
         if args.output is None:
             raise PluginGateError("--output is required unless --validate-only is used")
         if args.runtime_binary is None:
