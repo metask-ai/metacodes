@@ -400,7 +400,14 @@ class RunGateSnapshotTest(unittest.TestCase):
             pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
             path.write_text(raw.replace(pinned, "0f" * 32), encoding="utf-8")
             calls = []
-            with mock.patch("scripts.eval.plugin_release_gate._run", lambda *a, **k: calls.append(a) or {"argv": [], "elapsed_ms": 0, "output_sha256": "", "output": ""}):
+            expected_dsh = json.loads(raw)["upstream"]["deepseek_harness_commit"]
+            # `_git_head` is patched too: without it, an implementation that
+            # let a stale pin past entry crashed on the nonexistent DSH path
+            # with FileNotFoundError - a non-PluginGateError that escaped
+            # assertRaises and reported as an ERROR, hiding the assertion
+            # this test exists for.
+            with mock.patch("scripts.eval.plugin_release_gate._run", lambda *a, **k: calls.append(a) or {"argv": [], "elapsed_ms": 0, "output_sha256": "", "output": ""}), \
+                 mock.patch("scripts.eval.plugin_release_gate._git_head", lambda p: expected_dsh):
                 with self.assertRaises(PluginGateError) as caught:
                     run_gate(ROOT, path, dsh=Path("/nonexistent-dsh"), runtime_binary=runtime)
             # The key assertion first, so a gate that *did* run subprocesses
