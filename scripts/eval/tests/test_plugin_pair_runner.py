@@ -23,6 +23,7 @@ from scripts.eval.plugin_release_gate import (
     load_protocol_structure,
     refresh_implementation_fingerprint,
 )
+from scripts.eval.plugin_pair_analysis import analyze
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -231,3 +232,51 @@ class PluginPairRunnerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProductionEntryPointsStayStrictTest(unittest.TestCase):
+    """Every path that plans, executes or judges rejects a stale pin before it
+    has any side effect. These exist because the routine tests above feed
+    production entry points a repinned copy - which means switching one of
+    them to the structural loader would not have turned anything red."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.temporary = Path(self._tmp.name)
+        self.stale = self.temporary / "protocol.json"
+        self.stale.write_text(PROTOCOL.read_text(encoding="utf-8"), encoding="utf-8")
+        refresh_implementation_fingerprint(ROOT, self.stale)
+        raw = self.stale.read_text(encoding="utf-8")
+        pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
+        self.stale.write_text(raw.replace(pinned, "0f" * 32), encoding="utf-8")
+
+    def test_build_plan_rejects_a_stale_pin(self) -> None:
+        with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+            build_plan(ROOT, self.stale)
+
+    def test_run_paid_pair_rejects_a_stale_pin_before_any_side_effect(self) -> None:
+        output_dir = self.temporary / "output"
+        with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+            run_paid_pair(
+                ROOT,
+                self.stale,
+                runtime_binary=self.temporary / "no-runtime",
+                output_dir=output_dir,
+                budget_journal_path=self.temporary / "budget.jsonl",
+                provider_auth_file=self.temporary / "missing-provider-auth",
+                user_authority_file=self.temporary / "missing-user-authority",
+            )
+        self.assertFalse(output_dir.exists())
+        self.assertFalse((self.temporary / "budget.jsonl").exists())
+
+    def test_analyze_rejects_a_stale_pin(self) -> None:
+        with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+            analyze(
+                ROOT,
+                self.stale,
+                runtime_binary=self.temporary / "no-runtime",
+                baseline_path=self.temporary / "no-baseline",
+                candidate_path=self.temporary / "no-candidate",
+                budget_journal_path=self.temporary / "no-journal",
+            )

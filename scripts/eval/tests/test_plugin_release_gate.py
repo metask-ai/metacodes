@@ -9,6 +9,7 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 from scripts.eval.plugin_release_gate import (
     PluginGateError,
@@ -18,6 +19,7 @@ from scripts.eval.plugin_release_gate import (
     implementation_fingerprint,
     load_protocol,
     load_protocol_structure,
+    run_gate,
     main,
     refresh_implementation_fingerprint,
 )
@@ -72,13 +74,11 @@ class PluginReleaseGateTest(unittest.TestCase):
             protocol["coding_pair"]["status"],
         )
         self.assertEqual(64, len(protocol["coding_pair"]["runtime_binary_sha256"]))
-        # And the live tree is freezable: a repinned copy passes the strict
-        # loader, with the pin equal to the fingerprint of this very tree.
-        frozen = _fresh_protocol(self)
-        self.assertEqual(
-            implementation_fingerprint(ROOT, frozen),
-            frozen["coding_pair"]["implementation_fingerprint"],
-        )
+        # And the live tree is freezable: a copy repinned against it passes
+        # the strict loader. (Asserting the repinned value equals the tree's
+        # fingerprint would be tautological - refresh just wrote that value;
+        # what carries weight is that the strict load succeeds.)
+        _fresh_protocol(self)
 
     def test_structural_load_tolerates_a_stale_implementation_pin_but_nothing_else(self) -> None:
         # The one thing the structural loader forgives, and proof that it
@@ -100,6 +100,13 @@ class PluginReleaseGateTest(unittest.TestCase):
             broken["candidate"]["files"][first] = "00" * 32
             path.write_text(json.dumps(broken), encoding="utf-8")
             with self.assertRaisesRegex(PluginGateError, "candidate files drifted"):
+                load_protocol_structure(ROOT, path)
+            # And the evaluator pins - the daily protection this PR documents -
+            # are not behind the implementation switch either.
+            broken = json.loads(raw)
+            broken["pinned_evaluator_files"]["scripts/eval/plugin_release_gate.py"] = "00" * 32
+            path.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertRaisesRegex(PluginGateError, "evaluator files drifted"):
                 load_protocol_structure(ROOT, path)
 
     def test_static_protocol_rejects_malformed_runtime_identity(self) -> None:
@@ -128,13 +135,32 @@ class PluginReleaseGateTest(unittest.TestCase):
             self.assertEqual(expected, attestation.sha256)
 
     def test_validate_only_needs_no_runtime_artifact(self) -> None:
+        # Inspection must work in the normal stale-by-design state: it loads
+        # structurally and reports the pin's state rather than failing on it.
         output = StringIO()
-        with tempfile.TemporaryDirectory() as directory, redirect_stdout(output):
-            path = _repinned_copy(Path(directory))
-            self.assertEqual(0, main(["--validate-only", "--protocol", str(path)]))
+        with redirect_stdout(output):
+            self.assertEqual(0, main(["--validate-only"]))
         value = json.loads(output.getvalue())
         self.assertEqual("metacodes.plugin-evaluation/v1", value["schema"])
         self.assertEqual(0, value["provider_requests"])
+        self.assertIn(value["implementation_pin"], {"current", "stale"})
+        self.assertEqual(value["freeze_ready"], value["implementation_pin"] == "current")
+        self.assertEqual(64, len(value["observed_implementation_fingerprint"]))
+
+    def test_validate_only_reports_a_stale_pin_instead_of_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = _repinned_copy(Path(directory))
+            raw = path.read_text(encoding="utf-8")
+            pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
+            path.write_text(raw.replace(pinned, "0f" * 32), encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(0, main(["--validate-only", "--protocol", str(path)]))
+            value = json.loads(output.getvalue())
+            self.assertEqual("stale", value["implementation_pin"])
+            self.assertFalse(value["freeze_ready"])
+            self.assertEqual("0f" * 32, value["pinned_implementation_fingerprint"])
+            self.assertEqual(pinned, value["observed_implementation_fingerprint"])
 
     def test_candidate_hash_drift_fails_closed(self) -> None:
         protocol = _fresh_protocol(self)
@@ -256,3 +282,87 @@ class PluginReleaseGateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunGateSnapshotTest(unittest.TestCase):
+    """The gate's inputs must be the same at the end as at the start.
+
+    Everything the real gate shells out to is faked with outputs that satisfy
+    the parsers, so the only thing under test is the snapshot discipline.
+    """
+
+    def _protocol_with_fake_runtime(self, directory: Path) -> tuple[Path, Path]:
+        runtime = directory / "metacodes-release-small"
+        runtime.write_bytes(b"fake-release-small")
+        os.chmod(runtime, 0o700)
+        path = _repinned_copy(directory)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["coding_pair"]["runtime_binary_sha256"] = hashlib.sha256(runtime.read_bytes()).hexdigest()
+        path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        return path, runtime
+
+    def _fake_run(self, protocol_path: Path, mutate_last: callable):
+        deterministic = json.loads(protocol_path.read_text(encoding="utf-8"))["deterministic_gate"]
+        plugin_id = json.loads(protocol_path.read_text(encoding="utf-8"))["candidate"]["plugin_id"]
+        benchmark = json.dumps({
+            "schema": "metacodes.plugin-benchmark/v1",
+            "quality_evidence": False,
+            "passed": True,
+            "thresholds": {
+                "max_static_plugin_p95_overhead_ns": deterministic["max_static_plugin_p95_overhead_ns"],
+                "max_inventory_avg_ns": deterministic["max_inventory_avg_ns"],
+            },
+            "static_plugin_p95_overhead_ns": 1,
+            "inventory_avg_ns": 1,
+        })
+        empty = json.dumps({"schema": "metacodes.plugin-inventory/v1", "plugins": []})
+        one = json.dumps({"schema": "metacodes.plugin-inventory/v1", "plugins": [{"id": plugin_id, "capabilities": ["skill_bundle"]}]})
+
+        def fake(root, args, *, env, timeout=600):
+            argv = list(args)
+            if "plugin:bench" in argv:
+                output = benchmark
+            elif argv[0].endswith("plugin_baseline.py"):
+                output = empty
+            elif argv[0].endswith("plugin_candidate.py"):
+                output = one
+                mutate_last()  # the last subprocess of the gate
+            else:
+                output = "ok"
+            return {"argv": argv, "elapsed_ms": 1, "output_sha256": hashlib.sha256(output.encode()).hexdigest(), "output": output}
+        return fake
+
+    def _run_gate(self, protocol_path: Path, runtime: Path, mutate_last: callable):
+        expected_dsh = json.loads(protocol_path.read_text(encoding="utf-8"))["upstream"]["deepseek_harness_commit"]
+        real_git_head = __import__("scripts.eval.plugin_release_gate", fromlist=["_git_head"])._git_head
+        with mock.patch("scripts.eval.plugin_release_gate._run", self._fake_run(protocol_path, mutate_last)), \
+             mock.patch("scripts.eval.plugin_release_gate._git_head",
+                        lambda path: expected_dsh if path != ROOT else real_git_head(ROOT)):
+            return run_gate(ROOT, protocol_path, dsh=Path("/nonexistent-dsh"), runtime_binary=runtime)
+
+    def test_gate_with_unchanged_inputs_produces_a_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, runtime = self._protocol_with_fake_runtime(Path(directory))
+            receipt = self._run_gate(path, runtime, mutate_last=lambda: None)
+            self.assertEqual("metacodes.plugin-zero-provider-receipt/v1", receipt["schema"])
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), receipt["protocol_sha256"])
+
+    def test_protocol_bytes_changed_by_the_last_subprocess_reject_the_receipt(self) -> None:
+        # Same JSON, different bytes: the receipt would otherwise carry a
+        # protocol_sha256 for a file its fields were not read from.
+        with tempfile.TemporaryDirectory() as directory:
+            path, runtime = self._protocol_with_fake_runtime(Path(directory))
+            def reformat():
+                path.write_text(json.dumps(json.loads(path.read_text(encoding="utf-8")), indent=4), encoding="utf-8")
+            with self.assertRaisesRegex(PluginGateError, "protocol changed while the gate was running"):
+                self._run_gate(path, runtime, mutate_last=reformat)
+
+    def test_pin_changed_by_the_last_subprocess_rejects_the_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, runtime = self._protocol_with_fake_runtime(Path(directory))
+            def stale_pin():
+                raw = path.read_text(encoding="utf-8")
+                pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
+                path.write_text(raw.replace(pinned, "0f" * 32), encoding="utf-8")
+            with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+                self._run_gate(path, runtime, mutate_last=stale_pin)

@@ -357,6 +357,38 @@ def _git_head(path: Path) -> str:
     return completed.stdout.strip()
 
 
+@dataclass(frozen=True)
+class _GateSnapshot:
+    """What a zero-provider receipt describes, captured before the gate runs.
+
+    ``require_unchanged`` is the gate's last act before the receipt exists: a
+    full strict reload (every pin, not only the implementation fingerprint),
+    plus byte-equality of the protocol file and equality of the Git HEAD.
+    """
+
+    protocol_sha256: str
+    git_head: str
+    implementation_fingerprint: str
+
+    @classmethod
+    def capture(cls, root: Path, protocol_path: Path) -> "_GateSnapshot":
+        protocol = load_protocol(root, protocol_path)
+        return cls(
+            protocol_sha256=_sha256(protocol_path),
+            git_head=_git_head(root),
+            implementation_fingerprint=protocol["coding_pair"]["implementation_fingerprint"],
+        )
+
+    def require_unchanged(self, root: Path, protocol_path: Path) -> None:
+        final = load_protocol(root, protocol_path)
+        if _sha256(protocol_path) != self.protocol_sha256:
+            raise PluginGateError("protocol changed while the gate was running")
+        if final["coding_pair"]["implementation_fingerprint"] != self.implementation_fingerprint:
+            raise PluginGateError("implementation pin changed while the gate was running")
+        if _git_head(root) != self.git_head:
+            raise PluginGateError("git HEAD moved while the gate was running")
+
+
 def run_gate(
     root: Path,
     protocol_path: Path,
@@ -364,6 +396,12 @@ def run_gate(
     runtime_binary: Path,
 ) -> dict[str, Any]:
     protocol = load_protocol(root, protocol_path)
+    # Snapshot what this receipt will describe: the protocol bytes and the
+    # tree identity at the moment every pin was checked. The receipt is built
+    # minutes of subprocesses later, and used to hash the protocol file *then*
+    # - so a protocol.json edited mid-gate produced a receipt whose fields came
+    # from one file and whose sha256 came from another.
+    snapshot = _GateSnapshot.capture(root, protocol_path)
     runtime = attest_runtime_artifact(protocol, runtime_binary)
     expected_dsh = protocol["upstream"]["deepseek_harness_commit"]
     observed_dsh = _git_head(dsh)
@@ -497,12 +535,12 @@ def run_gate(
         missing = sorted(required_checks - observed_checks)
         raise PluginGateError(f"zero-provider receipt is missing required checks: {missing}")
 
-    # The protocol was checked against the tree once, before any subprocess
-    # ran. Everything above took minutes; re-check now so the receipt cannot
-    # describe a tree other than the one the checks were run on.
-    final_fingerprint = implementation_fingerprint(root, protocol)
-    if final_fingerprint != protocol["coding_pair"]["implementation_fingerprint"]:
-        raise PluginGateError("implementation drifted while the gate was running")
+    # Every pin was checked once, before any subprocess ran. Re-run the whole
+    # strict load now - not just the implementation fingerprint: candidate,
+    # scenario and evaluator hashes are pins too - and require the protocol
+    # bytes and the tree identity to be the ones captured at the start, so
+    # the receipt cannot describe a different snapshot than the checks did.
+    snapshot.require_unchanged(root, protocol_path)
 
     overheads = [int(row["static_plugin_p95_overhead_ns"]) for row in benchmark_rows]
     inventories = [int(row["inventory_avg_ns"]) for row in benchmark_rows]
@@ -510,9 +548,9 @@ def run_gate(
         "schema": RECEIPT_SCHEMA,
         "quality_evidence": False,
         "provider_requests": 0,
-        "protocol_sha256": _sha256(protocol_path),
-        "metacodes_git_head": _git_head(root),
-        "implementation_fingerprint": final_fingerprint,
+        "protocol_sha256": snapshot.protocol_sha256,
+        "metacodes_git_head": snapshot.git_head,
+        "implementation_fingerprint": snapshot.implementation_fingerprint,
         "deepseek_harness_commit": observed_dsh,
         "candidate": {
             "plugin_id": protocol["candidate"]["plugin_id"],
@@ -674,8 +712,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
-        protocol = load_protocol(root, args.protocol.resolve())
         if args.validate_only:
+            # Inspection, not certification. Between freezes the committed pin
+            # is stale by design, so this loads structurally and *reports* the
+            # pin's state instead of failing on it. Exit 0 here says "the
+            # protocol is well-formed and every other pin holds"; it does not
+            # say the tree is frozen - `implementation_pin` does.
+            protocol = load_protocol_structure(root, args.protocol.resolve())
+            pinned = protocol["coding_pair"]["implementation_fingerprint"]
+            observed = implementation_fingerprint(root, protocol)
             print(
                 json.dumps(
                     {
@@ -683,12 +728,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "status": protocol["status"],
                         "quality_evidence": False,
                         "provider_requests": 0,
-                        "implementation_fingerprint": implementation_fingerprint(root, protocol),
+                        "pinned_implementation_fingerprint": pinned,
+                        "observed_implementation_fingerprint": observed,
+                        "implementation_pin": "current" if pinned == observed else "stale",
+                        "freeze_ready": pinned == observed,
                     },
                     sort_keys=True,
                 )
             )
             return 0
+        protocol = load_protocol(root, args.protocol.resolve())
         if args.output is None:
             raise PluginGateError("--output is required unless --validate-only is used")
         if args.runtime_binary is None:
