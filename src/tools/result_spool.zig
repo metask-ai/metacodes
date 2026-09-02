@@ -209,7 +209,13 @@ test "guard: callers hand over ctx.result_budget verbatim, and this file reads o
     inline for (forbidden_here) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, self_src, needle) == null);
     }
-    try std.testing.expect(std.mem.indexOf(u8, self_src, "budget.per_result_bytes") != null);
+    // Spliced like the forbidden needles above, and for the same reason: this
+    // assertion's own text lives in the file it embeds. Written literally, the
+    // guard stayed green after production stopped reading the field, because
+    // the only remaining occurrence was this line. A required-field check that
+    // satisfies itself is worse than none - it reports confidence it has not
+    // earned.
+    try std.testing.expect(std.mem.indexOf(u8, self_src, "budget." ++ "per_result_bytes") != null);
 
     const callers = .{
         .{ "grep.zig", @embedFile("grep.zig") },

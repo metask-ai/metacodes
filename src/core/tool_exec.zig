@@ -1260,7 +1260,8 @@ pub fn executeSlots(
     // misleading: a byte-zero tool whose capture exceeds the per-result budget
     // publishes at the tool layer, so what hooks observe is that tool's own
     // bounded envelope with its streaming preview - projection later regrows
-    // the preview to the budget. Only inline results reach hooks verbatim.
+    // the preview to the budget. Inline results and structured errors reach
+    // hooks verbatim; artifact-backed ones do not.
 }
 
 fn observeSuccessfulExecutions(slots: []const Slot, base_ctx: *const ToolContext) void {

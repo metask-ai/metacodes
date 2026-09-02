@@ -276,8 +276,12 @@ tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)
 |---|---|---|---|
 | **原文** | 结果 ≤ 本轮**水位线** | 逐字节原样 | — |
 | **artifact 信封** | 超水位线,且发布成功 | head + tail 摘录 + `artifact_id` + sha256 + 读取指令 | ✅ `ReadArtifact` / `Grep(artifact_id)` |
-| **fallback 信封** | 超水位线,但**发布失败**(会话配额满、存储错误) | head + tail + `storage_error` 如实命名原因,无 `artifact_id` | ❌,但说得出为什么 |
+| **fallback 信封** | 超水位线,但**发布失败**(会话配额满、存储错误),且捕获完整并 ≤ `PER_RESULT_MAX_BYTES` | head + tail + `storage_error` 如实命名原因,无 `artifact_id` | ❌,但说得出为什么 |
 | **清空桩** | 仅压缩期,且**该结果没有 artifact** | `[tool result cleared to save context]` + 承诺行(`original_bytes` + sha256) | ❌ |
+
+fallback 那一行的限定条件不是修辞:发布失败后要渲染 head/tail 就得把字节拿回内存,
+所以只有完整且 ≤ `PER_RESULT_MAX_BYTES`(64KB)的捕获退得回来。更大的捕获、不完整的
+捕获、以及 OOM,发布失败时仍然上抛成工具错误——那也正是阈值改动之前的行为。
 
 水位线在无 turn 压力时**就是** per-result 预算;兄弟结果多到装不下 `per_turn` 时它会被二分
 压低,那时 ≤ per-result 的结果**也会**被溢出(见下方水位线一节与 T2)。所以判据是水位线,

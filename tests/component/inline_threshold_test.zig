@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const pfs = @import("platform").fs;
 
 const artifact = cc.tool_result_artifact;
 const projection = cc.result_projection;
@@ -305,13 +306,21 @@ test "T4 inline threshold: a tool-layer envelope is not a structured tool result
 }
 
 test "T5 inline threshold: a result that cannot be published degrades to a fallback envelope, not a tool error" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // sparse-file quota fixture is POSIX
     // Lowering the threshold moved publication into the tool layer, and the
     // tool layer used to propagate a CAS failure straight out - so a full
     // session quota turned a perfectly good 40KB Grep result into
     // "Grep failed with SessionQuotaExceeded". Before the change the same
     // bytes stayed inline and met the full store in `spillOne`, which renders
-    // a bounded fallback carrying head, tail and `storage_error`. That
-    // degradation has to survive the move.
+    // a bounded fallback carrying head, tail and `storage_error`.
+    //
+    // The failure is injected the way the artifact layer's own quota tests do
+    // it - a sparse filler file inside the store - specifically so publication
+    // fails at `Spool.finish`'s quota admission. An earlier draft passed an
+    // empty `artifact_root`, which fails in `Spool.begin` before the capture is
+    // ever copied: that would have stayed green against an implementation that
+    // fell back for `ArtifactRootUnavailable` and still propagated
+    // `SessionQuotaExceeded`, which is the case that actually matters.
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -319,6 +328,19 @@ test "T5 inline threshold: a result that cannot be published degrades to a fallb
     const root = try tmpRoot(&tmp, &buf);
     const budget = result_budget.Budget.fromModel(WINDOW);
     const size: usize = 40_000;
+
+    // Create the store, then fill it behind our back.
+    const seed = try artifact.persist(a, root, "seed");
+    _ = seed;
+    // `/tool-results/sha256` is the store layout (ARTIFACT_SUBDIR); it exists
+    // because the seed publish above created it. A failure to open here is a
+    // real failure, not a reason to skip - a skipped test reports nothing.
+    const filler = try std.fmt.allocPrintSentinel(a, "{s}/tool-results/sha256/quota-fixture.blob", .{root}, 0);
+    defer a.free(filler);
+    const fd = pfs.open(filler.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    if (fd < 0) return error.QuotaFixtureOpenFailed;
+    try pfs.setSize(fd, artifact.MAX_SESSION_BYTES);
+    _ = pfs.close(fd);
 
     var capture = try artifact.Capture.begin(a, root, artifact.MAX_ARTIFACT_BYTES);
     defer capture.deinit();
@@ -328,19 +350,17 @@ test "T5 inline threshold: a result that cannot be published degrades to a fallb
     try capture.write(payload);
     try capture.seal();
 
-    // An artifact_root that cannot be published into: publication fails for a
-    // reason that is not OOM, which is the whole class this path is for.
-    var body = try cc.result_spool.finishCaptureAsBody(a, "", &capture, .text_utf8, true, budget);
+    // Publication now fails at quota admission, and the bytes come back inline
+    // so projection can still say something useful about them.
+    var body = try cc.result_spool.finishCaptureAsBody(a, root, &capture, .text_utf8, true, budget);
     defer body.deinit(a);
     try std.testing.expect(body == .@"inline");
     try std.testing.expectEqual(size, body.@"inline".bytes.len);
 
-    // And projection turns those bytes into the bounded fallback: not
-    // recoverable, but it names why and still carries head and tail.
     var content = try committed(a, &body);
     defer a.free(@constCast(content));
     var items = [_]projection.Item{.{ .tool_name = "Grep", .content = &content, .is_error = false }};
-    const stats = try projection.project(a, &items, .{ .session_root = "", .budget = budget });
+    const stats = try projection.project(a, &items, .{ .session_root = root, .budget = budget });
     try std.testing.expectEqual(@as(usize, 1), stats.unrecoverable_fallback_count);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, a, content, .{});
