@@ -137,6 +137,37 @@ def attest_runtime_artifact(
 
 
 def load_protocol(root: Path, path: Path) -> dict[str, Any]:
+    """Load the protocol and fail closed on *every* pin, including the
+    implementation fingerprint against the live tree.
+
+    This is the loader for anything that is about to run, measure or judge:
+    ``run_gate``, ``plugin_pair_runner.build_plan`` / ``run_paid_pair`` and its
+    per-request reloads, and ``plugin_pair_analysis.analyze``. It is strict by
+    construction rather than by a flag a caller could forget.
+    """
+    return _load_and_validate(root, path, check_implementation=True)
+
+
+def load_protocol_structure(root: Path, path: Path) -> dict[str, Any]:
+    """Load the protocol and validate everything except implementation drift.
+
+    The implementation fingerprint pins ~130 source, test, SDK and doc paths,
+    and is meant to be refreshed only when a release or paid run is *frozen*
+    (see ``refresh_implementation_fingerprint``). Between freezes the pin is
+    stale by design. Routine tests and inspection tools that only need a valid
+    protocol object must therefore not compare it against the moving tree -
+    doing so made every commit that touched a pinned path repin the protocol,
+    which is how 30 consecutive commits on main came to edit this file and why
+    two parallel branches could not auto-merge (each carried a pin correct
+    only for its own tree). Every other check - schema, status, cost
+    authority, candidate, scenario and evaluator hashes - still fails closed.
+
+    Never use this from a path that executes, measures or publishes.
+    """
+    return _load_and_validate(root, path, check_implementation=False)
+
+
+def _load_and_validate(root: Path, path: Path, *, check_implementation: bool) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -190,7 +221,8 @@ def load_protocol(root: Path, path: Path) -> dict[str, Any]:
         raise PluginGateError("coding pair cost authority changed")
     if pair.get("max_cumulative_metered_tokens") != 72_000_000:
         raise PluginGateError("coding pair token authority changed")
-    if pair.get("implementation_fingerprint") != implementation_fingerprint(root, value):
+    _require_sha256(pair.get("implementation_fingerprint"), "coding pair implementation_fingerprint")
+    if check_implementation and pair.get("implementation_fingerprint") != implementation_fingerprint(root, value):
         raise PluginGateError("coding pair implementation fingerprint drifted")
     _require_sha256(
         pair.get("runtime_binary_sha256"),
@@ -465,6 +497,13 @@ def run_gate(
         missing = sorted(required_checks - observed_checks)
         raise PluginGateError(f"zero-provider receipt is missing required checks: {missing}")
 
+    # The protocol was checked against the tree once, before any subprocess
+    # ran. Everything above took minutes; re-check now so the receipt cannot
+    # describe a tree other than the one the checks were run on.
+    final_fingerprint = implementation_fingerprint(root, protocol)
+    if final_fingerprint != protocol["coding_pair"]["implementation_fingerprint"]:
+        raise PluginGateError("implementation drifted while the gate was running")
+
     overheads = [int(row["static_plugin_p95_overhead_ns"]) for row in benchmark_rows]
     inventories = [int(row["inventory_avg_ns"]) for row in benchmark_rows]
     receipt = {
@@ -473,7 +512,7 @@ def run_gate(
         "provider_requests": 0,
         "protocol_sha256": _sha256(protocol_path),
         "metacodes_git_head": _git_head(root),
-        "implementation_fingerprint": implementation_fingerprint(root, protocol),
+        "implementation_fingerprint": final_fingerprint,
         "deepseek_harness_commit": observed_dsh,
         "candidate": {
             "plugin_id": protocol["candidate"]["plugin_id"],

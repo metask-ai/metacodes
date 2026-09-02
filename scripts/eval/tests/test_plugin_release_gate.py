@@ -17,6 +17,7 @@ from scripts.eval.plugin_release_gate import (
     attest_runtime_artifact,
     implementation_fingerprint,
     load_protocol,
+    load_protocol_structure,
     main,
     refresh_implementation_fingerprint,
 )
@@ -24,6 +25,33 @@ from scripts.eval.plugin_release_gate import (
 
 ROOT = Path(__file__).resolve().parents[3]
 PROTOCOL = ROOT / "evals/plugin-v1/protocol.json"
+
+
+
+def _repinned_copy(directory: Path) -> Path:
+    """The checked-in protocol, copied and repinned against the live tree.
+
+    Between freezes the committed implementation fingerprint is stale by
+    design (see load_protocol_structure). A test that must exercise the
+    *strict* loader - because it asserts some other fail-closed check that
+    sits behind the fingerprint comparison - seeds from this copy, so the
+    stale pin cannot pre-empt the error the test is actually about.
+    """
+    path = directory / "protocol.json"
+    path.write_text(PROTOCOL.read_text(encoding="utf-8"), encoding="utf-8")
+    refresh_implementation_fingerprint(ROOT, path)
+    return path
+
+
+def _fresh_protocol(case: unittest.TestCase) -> dict:
+    """A strictly loaded protocol object whose pin matches the live tree.
+
+    Owns its own temporary directory for the life of the test case, so the
+    caller's control flow does not have to change shape.
+    """
+    directory = tempfile.TemporaryDirectory()
+    case.addCleanup(directory.cleanup)
+    return load_protocol(ROOT, _repinned_copy(Path(directory.name)))
 
 
 class PluginReleaseGateTest(unittest.TestCase):
@@ -34,21 +62,48 @@ class PluginReleaseGateTest(unittest.TestCase):
             _median_int([])
 
     def test_checked_in_protocol_is_valid_and_zero_provider(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        # Structural: every pin except the implementation fingerprint, which
+        # is stale between freezes by design and must not fail this test.
+        protocol = load_protocol_structure(ROOT, PROTOCOL)
         self.assertFalse(protocol["quality_evidence"])
         self.assertEqual(0, protocol["deterministic_gate"]["provider_requests"])
         self.assertEqual(
             "blocked_pending_explicit_paid_authority",
             protocol["coding_pair"]["status"],
         )
-        self.assertEqual(
-            implementation_fingerprint(ROOT, protocol),
-            protocol["coding_pair"]["implementation_fingerprint"],
-        )
         self.assertEqual(64, len(protocol["coding_pair"]["runtime_binary_sha256"]))
+        # And the live tree is freezable: a repinned copy passes the strict
+        # loader, with the pin equal to the fingerprint of this very tree.
+        frozen = _fresh_protocol(self)
+        self.assertEqual(
+            implementation_fingerprint(ROOT, frozen),
+            frozen["coding_pair"]["implementation_fingerprint"],
+        )
+
+    def test_structural_load_tolerates_a_stale_implementation_pin_but_nothing_else(self) -> None:
+        # The one thing the structural loader forgives, and proof that it
+        # forgives only that.
+        with tempfile.TemporaryDirectory() as directory:
+            path = _repinned_copy(Path(directory))
+            raw = path.read_text(encoding="utf-8")
+            pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
+            stale = "0f" * 32
+            self.assertNotEqual(stale, pinned)
+            path.write_text(raw.replace(pinned, stale), encoding="utf-8")
+            with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+                load_protocol(ROOT, path)
+            tolerated = load_protocol_structure(ROOT, path)
+            self.assertEqual(stale, tolerated["coding_pair"]["implementation_fingerprint"])
+            # Every other pin still fails closed under the structural loader.
+            broken = json.loads(raw)
+            first = next(iter(broken["candidate"]["files"]))
+            broken["candidate"]["files"][first] = "00" * 32
+            path.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertRaisesRegex(PluginGateError, "candidate files drifted"):
+                load_protocol_structure(ROOT, path)
 
     def test_static_protocol_rejects_malformed_runtime_identity(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        protocol = _fresh_protocol(self)
         protocol["coding_pair"]["runtime_binary_sha256"] = "0" * 63
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "protocol.json"
@@ -57,7 +112,7 @@ class PluginReleaseGateTest(unittest.TestCase):
                 load_protocol(ROOT, path)
 
     def test_runtime_attestation_uses_only_the_explicit_artifact(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        protocol = load_protocol_structure(ROOT, PROTOCOL)
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory) / "metacodes-release-small"
             runtime.write_bytes(b"portable-runtime-fixture")
@@ -74,14 +129,15 @@ class PluginReleaseGateTest(unittest.TestCase):
 
     def test_validate_only_needs_no_runtime_artifact(self) -> None:
         output = StringIO()
-        with redirect_stdout(output):
-            self.assertEqual(0, main(["--validate-only"]))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(output):
+            path = _repinned_copy(Path(directory))
+            self.assertEqual(0, main(["--validate-only", "--protocol", str(path)]))
         value = json.loads(output.getvalue())
         self.assertEqual("metacodes.plugin-evaluation/v1", value["schema"])
         self.assertEqual(0, value["provider_requests"])
 
     def test_candidate_hash_drift_fails_closed(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        protocol = _fresh_protocol(self)
         tampered = copy.deepcopy(protocol)
         key = next(iter(tampered["candidate"]["files"]))
         tampered["candidate"]["files"][key] = "0" * 64
@@ -92,13 +148,13 @@ class PluginReleaseGateTest(unittest.TestCase):
                 load_protocol(ROOT, path)
 
     def test_unsafe_implementation_path_is_rejected(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        protocol = load_protocol_structure(ROOT, PROTOCOL)
         protocol["implementation_paths"] = ["../outside"]
         with self.assertRaises(PluginGateError):
             implementation_fingerprint(ROOT, protocol)
 
     def test_benchmark_thresholds_are_bound_to_protocol(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        protocol = load_protocol_structure(ROOT, PROTOCOL)
         row = {
             "schema": "metacodes.plugin-benchmark/v1",
             "quality_evidence": False,
@@ -114,7 +170,7 @@ class PluginReleaseGateTest(unittest.TestCase):
             _benchmark_row(json.dumps(row), protocol["deterministic_gate"])
 
     def test_symlinked_protocol_file_is_rejected(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        protocol = _fresh_protocol(self)
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             temporary = Path(directory)
             link = temporary / "candidate.json"

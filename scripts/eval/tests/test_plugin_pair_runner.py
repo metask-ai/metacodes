@@ -17,7 +17,12 @@ from scripts.eval.plugin_pair_runner import (
     load_user_authority,
     run_paid_pair,
 )
-from scripts.eval.plugin_release_gate import PluginGateError, load_protocol
+from scripts.eval.plugin_release_gate import (
+    PluginGateError,
+    load_protocol,
+    load_protocol_structure,
+    refresh_implementation_fingerprint,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -25,8 +30,19 @@ PROTOCOL = ROOT / "evals/plugin-v1/protocol.json"
 
 
 class PluginPairRunnerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # build_plan / run_paid_pair load strictly, as production must. The
+        # committed pin is stale between freezes by design, so they are fed
+        # a copy repinned against the live tree; the live file is read only
+        # structurally.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.protocol_path = Path(self._tmp.name) / "protocol.json"
+        self.protocol_path.write_text(PROTOCOL.read_text(encoding="utf-8"), encoding="utf-8")
+        refresh_implementation_fingerprint(ROOT, self.protocol_path)
+
     def test_default_plan_is_zero_provider_and_complete(self) -> None:
-        plan = build_plan(ROOT, PROTOCOL)
+        plan = build_plan(ROOT, self.protocol_path)
         self.assertEqual(0, plan["provider_requests"])
         self.assertFalse(plan["quality_evidence"])
         self.assertEqual(36, len(plan["schedule"]))
@@ -38,7 +54,7 @@ class PluginPairRunnerTest(unittest.TestCase):
         self.assertEqual(
             {
                 "state": "not_attested",
-                "expected_sha256": load_protocol(ROOT, PROTOCOL)["coding_pair"][
+                "expected_sha256": load_protocol_structure(ROOT, PROTOCOL)["coding_pair"][
                     "runtime_binary_sha256"
                 ],
             },
@@ -46,7 +62,7 @@ class PluginPairRunnerTest(unittest.TestCase):
         )
 
     def test_plan_attests_only_an_explicit_matching_runtime(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        protocol = load_protocol(ROOT, self.protocol_path)
         with tempfile.TemporaryDirectory() as directory:
             temporary = Path(directory)
             runtime = temporary / "metacodes-release-small"
@@ -74,7 +90,7 @@ class PluginPairRunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(PluginGateError, "ReleaseSmall runtime drifted"):
                 run_paid_pair(
                     ROOT,
-                    PROTOCOL,
+                    self.protocol_path,
                     runtime_binary=runtime,
                     output_dir=temporary / "output",
                     budget_journal_path=temporary / "budget.jsonl",
@@ -107,7 +123,7 @@ class PluginPairRunnerTest(unittest.TestCase):
             self.assertFalse(inventory["runtime_selector_visible"])
 
     def test_paid_authority_must_bind_exact_protocol_and_permissions(self) -> None:
-        plan = build_plan(ROOT, PROTOCOL)
+        plan = build_plan(ROOT, self.protocol_path)
         value = {
             "schema": "metacodes.plugin-paid-authority/v1",
             "protocol_sha256": plan["protocol_sha256"],
@@ -138,7 +154,7 @@ class PluginPairRunnerTest(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "POSIX permissions required")
     def test_paid_authority_rejects_group_readable_file(self) -> None:
-        plan = build_plan(ROOT, PROTOCOL)
+        plan = build_plan(ROOT, self.protocol_path)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "authority.json"
             path.write_text(
@@ -163,7 +179,7 @@ class PluginPairRunnerTest(unittest.TestCase):
                 )
 
     def test_paid_inventory_projects_the_stable_treatment_fields(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        protocol = load_protocol_structure(ROOT, PROTOCOL)
         full_inventory = {
             "schema": "metacodes.plugin-inventory/v1",
             "contract_version": 1,

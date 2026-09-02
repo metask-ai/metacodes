@@ -326,3 +326,35 @@ tokens，低于用户 US$1,000 总上限。尚未运行外部 WorkBuddy。
   cohort；本次没有运行 WorkBuddy 全量 benchmark；
 - 任何候选晋升仍必须走 TinyKG provenance、Lean/native verdict 与 CAS promotion，
   不能由生成候选的 agent 自批。
+
+## 7. 三个钉住集合,以及什么时候 repin
+
+`evals/plugin-v1/protocol.json` 钉住三类东西,校验时机各不相同——混淆它们正是
+2026-09 之前"每次提交都要 repin"的根源(main 上连续 30 次提交全都改了这个文件,
+两条并行分支各自 repin 后合并树上两个值都错,auto-merge 被卡死)。
+
+| 集合 | 字段 | 钉的是什么 | 谁校验、何时 |
+|---|---|---|---|
+| **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头与写 receipt 前各一次)、`plugin_pair_runner.build_plan` / `run_paid_pair` 及每次请求前后的重载、`plugin_pair_analysis.analyze`。全部经 `load_protocol`,严格是**构造出来的**,不是可忘记的开关 |
+| **评测器** | `pinned_evaluator_files` | 做测量与判定的代码(gate、runner、analysis、e2e 脚本、门禁阈值)以及 Lean 形式化证据 | **每次加载**都校验,包括日常测试;**永远不由工具自动 repin**——一个门禁给自己的代码重钉哈希是自证漏洞(c7c2aa9) |
+| **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件 | 每次加载都校验 |
+
+**日常提交不 repin。** 测试与巡检用 `load_protocol_structure`:除实现指纹相等以外全部
+照旧 fail-closed。两次冻结之间实现指纹**按设计陈旧**,这不是漂移事故,是正常状态。
+
+**冻结时 repin。** 要发布(`run_gate` 出 receipt)或授权付费运行(创建 user authority)
+之前,跑一次:
+
+```bash
+python3 scripts/eval/plugin_release_gate.py --refresh-implementation-fingerprint
+```
+
+它宽松读入、重算、只替换那一个值、再用严格加载复核结果。repin 提交就是"冻结"这个
+动作在 git 里的痕迹,应当单独成 commit、写明冻结的是哪次评测。
+
+**列表本身的变动要显式。** 摘要包含路径名,删一条路径会让旧 pin 对不上;但 repin 之后
+就没有任何东西记得列表曾经更长。改 `implementation_paths` 成员必须在 commit message
+里说明增删了什么、为什么——把某条路径归到错误的集合是真实发生过的错误(两个 Lean 文件
+曾被当作"实现"钉住,而它们不进二进制、只被评测脚本消费,2026-09 移入评测器集合;
+`sdk/zig/protocol.zig` 与 `sdk/zig/build.zig` 被 `agentcore:test` 编译却一直不在列表里)。
+路径集合的独立摘要与授权绑定的冻结清单是下一阶段的工作。

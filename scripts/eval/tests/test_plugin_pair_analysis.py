@@ -8,7 +8,7 @@ from scripts.eval.memory_budget_journal import usd_to_microusd
 from scripts.eval.model import ValidationError
 from scripts.eval.plugin_pair_analysis import validate_paid_row
 from scripts.eval.plugin_pair_runner import _canonical_sha256
-from scripts.eval.plugin_release_gate import load_protocol
+from scripts.eval.plugin_release_gate import load_protocol_structure
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -49,7 +49,7 @@ def row(protocol_sha256: str, model_fingerprint: str) -> dict:
 
 class PluginPairAnalysisTest(unittest.TestCase):
     def test_paid_row_binds_treatment_budget_and_usage(self) -> None:
-        protocol = load_protocol(ROOT, PROTOCOL)
+        protocol = load_protocol_structure(ROOT, PROTOCOL)
         protocol_sha256 = __import__("hashlib").sha256(PROTOCOL.read_bytes()).hexdigest()
         value = row(protocol_sha256, _canonical_sha256(protocol["coding_pair"]["model"]))
         validate_paid_row(
