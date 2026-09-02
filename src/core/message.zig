@@ -101,6 +101,11 @@ pub const Image = struct {
 pub const Message = struct {
     role: Role,
     blocks: []Block,
+    /// 是否已随某次 provider 请求发出(agent_loop 在请求成功发出后统一置位)。
+    /// 只能由送达证据推进:本地追加的 assistant 消息(AgentCore 预算终止标记等)不算,
+    /// transcript resume 出来的消息一律 false,直到下一次请求带上它们。microcompact 据此
+    /// 保护尚未被模型看到的图片结果。
+    delivered: bool = false,
 
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         for (self.blocks) |b| b.deinit(allocator);
@@ -117,7 +122,7 @@ pub const Message = struct {
             blocks[i] = try b.dupe(dst);
             n = i + 1;
         }
-        return .{ .role = self.role, .blocks = blocks };
+        return .{ .role = self.role, .blocks = blocks, .delivered = self.delivered };
     }
 };
 

@@ -293,4 +293,13 @@ test "L2 ⑦: 超过投影上限的真实 Read 图片经 agent_loop 到达 wire 
     try std.testing.expect(std.mem.indexOf(u8, body, cc.result_projection.SCHEMA) == null);
     // 原始 `{"type":"image",...}` JSON 也绝不作为转义文本发出。
     try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+
+    // 送达水位由真实请求推进:tool_result 所在的 user 消息随第二次请求发出 → delivered;
+    // 最后的 assistant 回复之后没有再发请求 → 仍未送达。
+    const items = conv.messages.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expect(items[2].blocks[0] == .tool_result);
+    try std.testing.expect(items[2].delivered);
+    try std.testing.expect(items[3].role == .assistant);
+    try std.testing.expect(!items[3].delivered);
 }

@@ -41,11 +41,13 @@ status, compatibility boundaries, and entry points are defined by
   The predicate is structural (any field order, standard JSON whitespace,
   exactly the three keys, raw content bounded by `MAX_IMAGE_RESULT_BYTES`),
   so surrounding whitespace cannot smuggle an oversized payload past the
-  budget and an ordinary JSON serializer's output still counts as an image.
-  Microcompact protects only images that have not yet been delivered to the
-  provider (no assistant reply after them); delivered images clear like any
-  result, so the pressure valve keeps working on image-heavy history, and
-  images are never truncated. AgentCore `settleSuccess` now counts live
+  budget and a JSON serializer that does not escape `/` still produces an
+  image. Microcompact protects only images that have not yet been delivered
+  to the provider, where delivery is an explicit per-message watermark
+  (`Message.delivered`) advanced by the agent loop once a request is on the
+  wire, never inferred from a locally appended assistant message; delivered
+  images clear like any result, so the pressure valve keeps working on
+  image-heavy history, and images are never truncated. AgentCore `settleSuccess` now counts live
   sibling reservations against the hard budget, so an inline image whose
   durable bytes exceed its own reservation is refused instead of consuming
   the space a parallel tool had already reserved.

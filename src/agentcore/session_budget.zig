@@ -602,7 +602,10 @@ pub const Reservation = struct {
         if (committed > self.controller.profile.hard_bytes -
             self.controller.profile.terminal_reserve_bytes)
         {
-            self.controller.markOutcomeLocked(.resource_limit, next);
+            // `committed` (not `next`) is what violated the limit; the
+            // sibling reservations are part of the requirement reported as
+            // required_checkpoint_bytes.
+            self.controller.markOutcomeLocked(.resource_limit, committed);
             return error.ResourceLimit;
         }
         self.controller.estimated_usage_bytes = next;
@@ -1359,6 +1362,11 @@ test "settle beyond its own reservation cannot consume a live sibling reservatio
     try std.testing.expectError(error.ResourceLimit, first.settleSuccess(10, room));
     try std.testing.expectEqual(Outcome.resource_limit, controller.outcome());
     try std.testing.expectEqual(sibling_reserved, controller.reserved_bytes);
+    // The reported requirement includes the sibling share that caused the refusal.
+    try std.testing.expectEqual(
+        profile.hard_bytes - profile.terminal_reserve_bytes + sibling_reserved,
+        controller.requiredBytes(),
+    );
     second.release();
     try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
 }

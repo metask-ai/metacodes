@@ -140,24 +140,29 @@ Tool results can also carry an image: the `Read` tool returns
 `{"type":"image","media_type":...,"data":...}` for image files, and every
 protocol family now serializes that form natively instead of passing the raw
 base64 JSON through as tool-result text. Only the canonical shape counts as
-an image (`dialect.extractImageResult`): exactly that field order, a media
-type from `types.SUPPORTED_IMAGE_MEDIA_TYPES` (`image/png`, `image/jpeg`,
-`image/gif`, `image/webp`), standard base64 of at most `types.MAX_IMAGE_BYTES`
-of payload, and nothing after `data`. Field order and
-standard JSON whitespace do not matter; extra, duplicate or missing keys,
-escapes, or more than `types.MAX_IMAGE_RESULT_BYTES` of raw content do.
+an image (`dialect.extractImageResult`): one JSON object with exactly those
+three keys in any order, `type` equal to `image`, a media type from
+`types.SUPPORTED_IMAGE_MEDIA_TYPES` (`image/png`, `image/jpeg`, `image/gif`,
+`image/webp`), standard base64 of at most `types.MAX_IMAGE_BYTES` of payload,
+and only whitespace after the closing brace. Standard JSON whitespace between
+tokens does not matter; extra, duplicate or missing keys, JSON escapes (so a
+serializer that writes `image\/png` does not produce an image), or more than
+`types.MAX_IMAGE_RESULT_BYTES` of raw content do.
 Anything else is ordinary text and is bounded by the tool-result projection
 like any other result. A canonical image result is exempt from that
 projection, from microcompact clearing while it has not yet been delivered
-to the provider (once an assistant reply follows it, it clears like any
-result), from `truncateLargeToolResults`, and from the AgentCore
-`tool_result_cap_bytes` artifact promotion, so the picture itself reaches the
-provider. Two different units apply: context estimation charges one image at
+to the provider (delivery is an explicit per-message watermark set by the
+agent loop once a request is on the wire; a locally appended assistant
+message is not delivery, and a resumed transcript starts undelivered until
+the next request), from `truncateLargeToolResults`, and from the AgentCore
+artifact promotion above the operation's cap (`tool_result_cap_bytes` for
+built-in and host tools, `mcp_result_cap_bytes` for external tools), so the
+picture itself reaches the provider. Two different units apply: context estimation charges one image at
 `types.IMAGE_TOKEN_ESTIMATE` (1,600 tokens); the projection turn budget and
 the AgentCore payload cap charge it at `IMAGE_RESULT_BUDGET_BYTES` (6,400
 budget bytes, four bytes per token). The AgentCore durable budget is charged
-the real bytes. A profile whose `tool_result_cap_bytes` is below 6,400
-rejects every image with `checkpoint_payload_resource_limit`. Anthropic keeps the base64 `image`
+the real bytes. A profile whose cap for that operation kind is below 6,400
+rejects images of that kind with `checkpoint_payload_resource_limit`. Anthropic keeps the base64 `image`
 source block inside the `tool_result` content array (byte-identical to
 before). OpenAI chat/completions sends a short pointer as the tool message
 (tool message content officially accepts only text) and attaches the image in

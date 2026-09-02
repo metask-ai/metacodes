@@ -1401,6 +1401,11 @@ pub fn run(
                     },
                 }
             };
+            // Everything in this request is now provider-visible, so microcompact
+            // may treat it as history. Only this evidence advances delivery: local
+            // appends (assistant terminal markers) and resumed transcripts stay
+            // undelivered until a request actually carries them.
+            conversation.markDelivered();
             defer stream.deinit();
 
             rid_for_turn = stream.requestId();

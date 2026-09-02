@@ -331,7 +331,7 @@ fn appendToolResults(conv: *Conversation, a: std.mem.Allocator, ids: []const []c
     try conv.append(.{ .role = .user, .blocks = blocks });
 }
 
-test "L2 microcompact: 未送达的图片不被 recent-N 阀清掉,已送达的图片与文本照常清" {
+test "L2 microcompact: 未送达的图片不被 recent-N 阀清掉,已送达的图片与文本照常清,本地 assistant 追加不算送达" {
     const a = std.testing.allocator;
     var conv = Conversation.init(a);
     defer conv.deinit();
@@ -339,11 +339,12 @@ test "L2 microcompact: 未送达的图片不被 recent-N 阀清掉,已送达的�
     const text = "T" ** 400;
     const image = try imageToolResult(a, 1024);
     defer a.free(image);
-    // 历史(已送达,后面都跟着 assistant 回复):老文本、老图片。
+    // 历史:老文本、老图片,随请求发出过(markDelivered 是 agent_loop 发请求后的唯一送达证据)。
     try appendToolResult(&conv, a, "tu_old", text);
     try conv.appendText(.assistant, "ok");
     try appendToolResult(&conv, a, "tu_img_old", image);
     try conv.appendText(.assistant, "seen");
+    conv.markDelivered();
     // 当前轮(未送达):Read(image) + 两个并行文本兄弟,图片是三者中最老的。
     try appendToolResults(&conv, a, &.{ "tu_img_new", "tu_b", "tu_c" }, &.{ image, text, text });
 
@@ -361,8 +362,14 @@ test "L2 microcompact: 未送达的图片不被 recent-N 阀清掉,已送达的�
     try std.testing.expectEqual(@as(usize, 2), blocking.cleared);
     try std.testing.expectEqualStrings(image, conv.messages.items[4].blocks[0].tool_result.content);
 
-    // 送达之后(assistant 回复出现)同一张图片就是普通历史,keep=0 清掉它。
-    try conv.appendText(.assistant, "done");
+    // 本地追加的 assistant 消息(AgentCore 预算终止标记那类)不是 provider 回复:图片仍受保护。
+    try conv.appendText(.assistant, "{\"agentcore\":\"checkpoint_payload_resource_limit\"}");
+    const local_marker = conv.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 0), local_marker.cleared);
+    try std.testing.expectEqualStrings(image, conv.messages.items[4].blocks[0].tool_result.content);
+
+    // 真正随请求发出之后,同一张图片就是普通历史,keep=0 清掉它。
+    conv.markDelivered();
     const delivered = conv.microcompactToolResultsByRecentResults(0);
     try std.testing.expectEqual(@as(usize, 1), delivered.cleared);
     try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[4].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
