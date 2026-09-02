@@ -387,7 +387,9 @@ reflected as `aborted`, a Run that never ran the loop still receives it, and a
 post-admission cleanup failure closes it as `poisoned` — and it is delivered
 even when tool-set observation was degraded. A Host that rejects any snapshot
 (the terminal one included) fails the Run with `CALLBACK_FAILED` and poisons
-the Session; no terminal snapshot is delivered after that. Usage remains authoritative
+the Session; a snapshot that could not be built fails it with the recorded
+status (`OUT_OF_MEMORY`) the same way. No terminal snapshot is delivered after
+that, and no later Run on that Session can report success. Usage remains authoritative
 in the existing usage event stream.
 
 Visible assistant output is bracketed by `output_segment_begin` and

@@ -1416,20 +1416,23 @@ const AbiSession = struct {
     /// that cannot be built, ends the Run as a callback failure instead — no
     /// terminal can be delivered then.) Degraded tool-set observation does not
     /// suppress it (`closeForTerminal` clears the tool set, so the snapshot is
-    /// bounded). Returns false when the Host rejected the snapshot or it could
-    /// not be built; the caller must then treat the Run as a callback failure
-    /// (ABI rule: any non-continue `on_event` result aborts the Run and
-    /// poisons the Session). Returns true without emitting when the Run is
-    /// already terminal, when the callback has already failed, or when the
-    /// projector belongs to a different Run (the failure happened before this
-    /// Run's `starting`).
+    /// bounded). Returns false when the Host rejected the snapshot, when it
+    /// could not be built, **or when the observation channel is already
+    /// unusable** — an earlier snapshot was rejected or could not be built and
+    /// `callback_status` is sticky: a channel that died silently must not let
+    /// this or any later Run report success while its terminal is skipped. The
+    /// caller then fails the Run with the recorded callback status and poisons
+    /// the facade (ABI rule: any non-continue `on_event` result aborts the Run
+    /// and poisons the Session). Returns true without emitting only when the
+    /// Run is already terminal or the projector belongs to a different Run
+    /// (the failure happened before this Run's `starting`).
     fn emitTerminalRunStateIfOpen(
         self: *AbiSession,
         session_id: core.session_id.SessionId,
         run_id: u64,
         phase: public_protocol.RunStatePhase,
     ) bool {
-        if (self.callback_status.load(.acquire) != wire.STATUS_OK) return true;
+        if (self.callback_status.load(.acquire) != wire.STATUS_OK) return false;
         if (self.run_state_projector.run_id != run_id) return true;
         if (self.run_state_projector.isTerminal()) return true;
         self.run_state_projector.closeForTerminal(phase);
@@ -1442,7 +1445,9 @@ const AbiSession = struct {
     /// reported successful after its Host callback failed.
     fn terminalSnapshotRejected(self: *AbiSession, out_error: ?*wire.OwnedBytesV1) u32 {
         self.facade_poisoned.store(true, .release);
-        return failError(self.callbackFailureStatus(), error.CallbackFailed, out_error);
+        const status = self.callbackFailureStatus();
+        const cause: anyerror = if (status == wire.STATUS_OUT_OF_MEMORY) error.OutOfMemory else error.CallbackFailed;
+        return failError(status, cause, out_error);
     }
 
     /// Error reconciliation shared by the three `run_input` kinds. `status` is
@@ -9527,19 +9532,66 @@ test "reconcileRunFailure: cleanup failure after an idle Core still closes as po
     try std.testing.expectEqual(public_protocol.RunStatePhase.failed, fake.run_state_projector.phase);
     try std.testing.expect(!fake.facade_poisoned.load(.acquire));
 
-    // The Host rejects the terminal snapshot: callback failure supersedes the
-    // original error, for the poisoned outcome as much as for the failed one.
+    // An observation channel that already died (an earlier snapshot rejected or
+    // unbuildable; callback_status is sticky) is a rejection, not a no-op: the
+    // Run fails with the recorded status and the facade is poisoned, so no later
+    // Run can report success while its terminal is silently skipped.
+    fake.facade_poisoned.store(false, .release);
+    try std.testing.expect(fake.startRunState(.single, 13));
+    fake.callback_status.store(wire.STATUS_OUT_OF_MEMORY, .release);
+    try std.testing.expectEqual(
+        wire.STATUS_OUT_OF_MEMORY,
+        fake.reconcileRunFailure(.single, 13, wire.STATUS_CORE_ERROR, error.CallbackFailed, false, null),
+    );
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.starting, fake.run_state_projector.phase);
+}
+
+test "reconcileRunFailure: a Host rejecting the poisoned terminal fails the Run with CALLBACK_FAILED (real Core session)" {
+    // The fatal callback reaches core_session.noteCallbackFailure, so this
+    // fixture needs a real Core session rather than the undefined placeholder.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
     var fatal = FatalEventCallback{};
-    fake.callbacks.ctx = &fatal;
-    fake.callbacks.on_event = FatalEventCallback.event;
-    fake.run_state_projector.begin(13); // silent begin: no `starting` snapshot reaches the fatal callback
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &fatal;
+    callbacks.on_event = FatalEventCallback.event;
+    var session = AbiSession{
+        .callbacks = callbacks,
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .run_state_projector = run_state.Projector.init(std.testing.allocator),
+    };
+    defer session.run_state_projector.deinit();
+
+    // Silent begin: no `starting` snapshot reaches the fatal callback first, so
+    // the terminal is the first (and only) snapshot it rejects.
+    session.run_state_projector.begin(21);
     try std.testing.expectEqual(
         wire.STATUS_CALLBACK_FAILED,
-        fake.reconcileRunFailure(.single, 13, wire.STATUS_CORE_ERROR, error.RunJournalFailed, true, null),
+        session.reconcileRunFailure(native_session.session_id, 21, wire.STATUS_CORE_ERROR, error.RunJournalFailed, true, null),
     );
     try std.testing.expectEqual(@as(usize, 1), fatal.calls);
-    try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, fake.run_state_projector.phase);
-    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, session.run_state_projector.phase);
+    try std.testing.expect(session.facade_poisoned.load(.acquire));
 }
 
 test "Host schema admission rejects ambiguous object contracts" {
