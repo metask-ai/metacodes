@@ -685,7 +685,14 @@ pub const ToolEnvironment = struct {
             .mcp => self.controller.profile.mcp_result_cap_bytes,
             .provider => unreachable,
         };
-        if (outcome == .ok and outcome.ok == .@"inline" and
+        // Image results mirror the Conversation projection seam: promoting a
+        // picture to an artifact would hand the dialects an envelope instead of
+        // an image, so it stays inline. The payload cap is charged at the vision
+        // estimate (what the model actually pays); the durable budget below is
+        // charged for the real bytes (what the checkpoint actually stores).
+        const inline_image = outcome == .ok and outcome.ok == .@"inline" and
+            core.result_projection.isImageResult(outcome.ok.@"inline".bytes);
+        if (outcome == .ok and outcome.ok == .@"inline" and !inline_image and
             outcome.ok.rawBytes() > payload_cap)
         {
             _ = outcome.ok.promoteInline(
@@ -703,7 +710,10 @@ pub const ToolEnvironment = struct {
             };
         }
         const payload_bytes: u64 = switch (outcome) {
-            .ok => |*body| @intCast(try body.modelVisibleBytes(tool_ctx.allocator)),
+            .ok => |*body| if (inline_image)
+                core.result_projection.IMAGE_RESULT_BUDGET_BYTES
+            else
+                @intCast(try body.modelVisibleBytes(tool_ctx.allocator)),
             .host_failed, .host_rejected => |maybe| if (maybe) |bytes|
                 @intCast(bytes.len)
             else
@@ -713,7 +723,8 @@ pub const ToolEnvironment = struct {
                 return outcome;
             },
         };
-        const durable_delta = checkedAdd(payload_bytes, 32) catch
+        const durable_bytes: u64 = if (inline_image) outcome.ok.rawBytes() else payload_bytes;
+        const durable_delta = checkedAdd(durable_bytes, 32) catch
             std.math.maxInt(u64);
         reservation.settleSuccess(payload_bytes, durable_delta) catch {
             outcome.deinit(tool_ctx.allocator);

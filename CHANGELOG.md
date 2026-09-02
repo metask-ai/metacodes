@@ -25,6 +25,19 @@ status, compatibility boundaries, and entry points are defined by
   text sibling from the turn or reports the budget as permanently exhausted.
   Covered end to end by an agent-loop test that reads an 80 KiB-base64 PNG
   through the real `Read` tool and asserts the image block on the wire.
+  The same exemption now also holds at the two other layers that rewrite a
+  tool result before serialization: microcompact no longer clears an image
+  result under the recent-N pressure valve (a `Read(image)` with two parallel
+  siblings was cleared before the provider ever saw it), and the AgentCore
+  `ToolEnvironment` no longer promotes an image above `tool_result_cap_bytes`
+  to an artifact (the payload cap is charged at the vision estimate, the
+  durable budget at the real bytes). In exchange the shared predicate
+  `extractImageResult` only accepts the canonical Read shape: allowlisted
+  media type (`image/png|jpeg|gif|webp`), standard base64, at most
+  `MAX_IMAGE_BYTES` of payload, and nothing after the `data` field, so a
+  plugin cannot obtain an unbounded exemption by prefixing arbitrary output
+  with `{"type":"image"`. `result_projection.Stats.projected_bytes` stays a
+  real byte count; the turn-budget decision moved to a new `budget_bytes`.
 - Image tool results (the `Read` tool's
   `{"type":"image","media_type":...,"data":...}` form) are now serialized
   natively on every protocol family instead of being passed to the model as a

@@ -308,3 +308,40 @@ test "L2 usage 锚点接线: message_start usage → conversation.usageAnchor(in
     // usage 到达时 assistant 消息尚未 append → 锚点只覆盖请求时的 1 条消息。
     try std.testing.expectEqual(@as(usize, 1), anchor.msg_count);
 }
+
+/// 规范图片形态(与 tools/read.zig readImage 逐字节同构):投影豁免它,microcompact 也必须豁免。
+fn imageToolResult(a: std.mem.Allocator, data_len: usize) ![]u8 {
+    const data = try a.alloc(u8, data_len);
+    defer a.free(data);
+    @memset(data, 'A');
+    return std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+}
+
+test "L2 microcompact: 图片 tool_result 不被 recent-N 阀清掉,文本兄弟照常清" {
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+
+    const text = "T" ** 400;
+    const image = try imageToolResult(a, 1024);
+    defer a.free(image);
+    // 顺序:老文本 → 图片 → 两条更新的文本。keep_recent=2 只保留最后两条。
+    try appendToolResult(&conv, a, "tu_old", text);
+    try appendToolResult(&conv, a, "tu_img", image);
+    try appendToolResult(&conv, a, "tu_mid", text);
+    try appendToolResult(&conv, a, "tu_new", text);
+
+    // 正向:老文本被清成 stub;图片虽在 keep 窗口之外仍原样保留。
+    const first = conv.microcompactToolResultsByRecentResults(2);
+    try std.testing.expectEqual(@as(usize, 1), first.cleared);
+    try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[0].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expectEqualStrings(image, conv.messages.items[1].blocks[0].tool_result.content);
+    try std.testing.expectEqualStrings(text, conv.messages.items[2].blocks[0].tool_result.content);
+    try std.testing.expectEqualStrings(text, conv.messages.items[3].blocks[0].tool_result.content);
+
+    // 反向:阻塞路径 keep_recent=0 清掉剩下的两条文本,图片仍然完整。
+    const blocking = conv.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 2), blocking.cleared);
+    try std.testing.expectEqualStrings(image, conv.messages.items[1].blocks[0].tool_result.content);
+    try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[3].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
+}

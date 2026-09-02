@@ -139,7 +139,16 @@ keeps `--image`.
 Tool results can also carry an image: the `Read` tool returns
 `{"type":"image","media_type":...,"data":...}` for image files, and every
 protocol family now serializes that form natively instead of passing the raw
-base64 JSON through as tool-result text. Anthropic keeps the base64 `image`
+base64 JSON through as tool-result text. Only the canonical shape counts as
+an image (`dialect.extractImageResult`): exactly that field order, a media
+type from `types.SUPPORTED_IMAGE_MEDIA_TYPES` (`image/png`, `image/jpeg`,
+`image/gif`, `image/webp`), standard base64 of at most `types.MAX_IMAGE_BYTES`
+of payload, and nothing after `data`. Anything else is ordinary text and is
+bounded by the tool-result projection like any other result. A canonical
+image result is exempt from that projection, from microcompact clearing, and
+from the AgentCore `tool_result_cap_bytes` artifact promotion, so the picture
+itself reaches the provider; it is charged against context and payload
+budgets at `types.IMAGE_TOKEN_ESTIMATE`, not at its base64 length. Anthropic keeps the base64 `image`
 source block inside the `tool_result` content array (byte-identical to
 before). OpenAI chat/completions sends a short pointer as the tool message
 (tool message content officially accepts only text) and attaches the image in

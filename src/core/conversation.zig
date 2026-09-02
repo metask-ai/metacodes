@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
+const types = @import("../types.zig");
 const msg = @import("message.zig");
 const result_projection = @import("result_projection.zig");
 const json_mod = @import("../json.zig");
@@ -21,10 +22,8 @@ pub const TOOL_RESULT_CONTEXT_MAX_BYTES: usize = 64 * 1024;
 /// 旧值 /16 直接把 token 数当字节数用(200K → 12.5KB),单位错配导致截断过狠。
 pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: usize = 8;
 
-/// 单张输入图像的 token 估算上限。各家 vision 端点把大图缩放到 ~1.1M 像素量级
-/// (Anthropic tokens≈pixels/750 → ~1590;OpenAI high-detail 同量级封顶),不解码
-/// 图像尺寸时取缩放上限做保守高估——auto-compact 阈值宁可早触发,绝不因低估爆窗口。
-pub const IMAGE_TOKEN_ESTIMATE: usize = 1600;
+/// 单张输入图像的 token 估算上限;定义见 types.IMAGE_TOKEN_ESTIMATE(IR 层单一口径)。
+pub const IMAGE_TOKEN_ESTIMATE: usize = types.IMAGE_TOKEN_ESTIMATE;
 
 pub fn toolResultContextBytes(max_input_tokens: usize) usize {
     const derived = if (max_input_tokens == 0)
@@ -640,6 +639,13 @@ pub const Conversation = struct {
         // capability for the omitted bytes. Microcompact must not erase that
         // capability merely because the result became old.
         if (result_projection.hasRecoverableArtifact(tr.content)) return null;
+        // Image results are exempt from projection, so a large picture is a
+        // raw payload here rather than a recoverable envelope. It costs the
+        // context only IMAGE_TOKEN_ESTIMATE regardless of its byte size, and
+        // the recent-N valve counts results, not turns: a Read(image) with two
+        // parallel siblings would otherwise be cleared before the provider
+        // ever saw it. Full compact (summary) still retires it later.
+        if (result_projection.isImageResult(tr.content)) return null;
         const new_content = if (toolResultCommitmentLine(tr.content)) |commitment|
             std.fmt.allocPrint(
                 self.allocator,

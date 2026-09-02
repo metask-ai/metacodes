@@ -354,6 +354,53 @@ pub const ImageBlock = struct {
     data: []const u8,
 };
 
+/// 图像读取上限(base64 前的原始字节)。Anthropic 单图 ~5MB 限制,留余量取 3.75MB;
+/// Read 工具、headless `--image`、AgentCore RunInput 图像 part 与 tool_result 图像
+/// 判定共用同一上限——超过它的载荷任何已接线 provider 都收不下,不算图像。
+pub const MAX_IMAGE_BYTES: usize = 3_750_000;
+/// MAX_IMAGE_BYTES 经标准 base64(带填充)后的最大字符数。
+pub const MAX_IMAGE_BASE64_BYTES: usize = std.base64.standard.Encoder.calcSize(MAX_IMAGE_BYTES);
+
+/// 所有已接线 provider 方言都接受的图像 MIME。Read 的扩展名表、headless `--image`、
+/// AgentCore RunInput 校验与 tool_result 图像判定都由此推导。
+pub const SUPPORTED_IMAGE_MEDIA_TYPES = [_][]const u8{
+    "image/png", "image/jpeg", "image/gif", "image/webp",
+};
+
+pub fn isSupportedImageMediaType(media_type: []const u8) bool {
+    for (SUPPORTED_IMAGE_MEDIA_TYPES) |candidate| {
+        if (std.mem.eql(u8, media_type, candidate)) return true;
+    }
+    return false;
+}
+
+/// 标准 base64(带 `=` 填充、无空白):长度为 4 的倍数,字母表 `A-Z a-z 0-9 + /`,
+/// 至多两个 `=` 且只在末尾。
+pub fn isStandardBase64(data: []const u8) bool {
+    if (data.len == 0 or data.len % 4 != 0) return false;
+    var padding: usize = 0;
+    for (data) |byte| {
+        if (byte == '=') {
+            padding += 1;
+            if (padding > 2) return false;
+            continue;
+        }
+        if (padding != 0) return false;
+        const in_alphabet = (byte >= 'A' and byte <= 'Z') or
+            (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or byte == '+' or byte == '/';
+        if (!in_alphabet) return false;
+    }
+    return true;
+}
+
+/// 单张输入图像的 token 估算上限。各家 vision 端点把大图缩放到 ~1.1M 像素量级
+/// (Anthropic tokens≈pixels/750 → ~1590;OpenAI high-detail 同量级封顶),不解码
+/// 图像尺寸时取缩放上限做保守高估——auto-compact 阈值宁可早触发,绝不因低估爆窗口。
+/// 放在 IR 层:conversation(估算)、agent_loop(预留)、result_projection(轮预算)
+/// 共用同一口径,且互不依赖。
+pub const IMAGE_TOKEN_ESTIMATE: usize = 1600;
+
 /// 工具调用块
 pub const ToolUseBlock = struct {
     id: []const u8,

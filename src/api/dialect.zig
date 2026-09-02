@@ -382,16 +382,34 @@ pub const Dialect = struct {
 
 /// 检测 tool_result content 是否为 Read 工具的图像形态
 /// (`{"type":"image","media_type":..,"data":..}`,见 tools/read.zig readImage)。
-/// 仅当以 `{"type":"image"` 开头且含 media_type + data 字段时返回;否则 null(当文本处理)。
+/// 仅当内容是下述规范形态时返回;否则 null(当文本处理)。
 /// 返回的 slice 借用 content 内部字节(未 unescape)——base64/media_type 无需转义,直接透传。
-/// 三个协议族的 tool_result 序列化共用本检测(单一真相):命中后经
-/// serializeImagePart 发方言原生图像块;不支持图像输入的模型发短占位文本,
-/// **绝不**把含 MB 级 base64 的原始 JSON 当纯文本发给模型。
+/// 三个协议族的 tool_result 序列化、Conversation 投影豁免、microcompact 豁免与
+/// AgentCore 预算包装共用本检测(单一真相):命中后经 serializeImagePart 发方言
+/// 原生图像块;不支持图像输入的模型发短占位文本,**绝不**把含 MB 级 base64 的
+/// 原始 JSON 当纯文本发给模型。
+///
+/// 只认**规范形态**,逐段匹配而非按字段名搜索:
+/// `{"type":"image","media_type":"<白名单 MIME>","data":"<标准 base64>"}`,
+/// 前后允许空白,对象在 data 之后立即结束。任何偏离(未知 MIME、非 base64、
+/// 嵌套/尾随字段、超过 types.MAX_IMAGE_BASE64_BYTES)都返回 null——那样的载荷
+/// 没有任何 provider 收得下,当普通文本走投影/截断才是有界的。
 pub fn extractImageResult(content: []const u8) ?types.ImageBlock {
-    const trimmed = std.mem.trimStart(u8, content, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "{\"type\":\"image\"")) return null;
-    const mt = util_json.extractStringField(trimmed, "media_type") orelse return null;
-    const data = util_json.extractStringField(trimmed, "data") orelse return null;
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    const prefix = "{\"type\":\"image\",\"media_type\":\"";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    var rest = trimmed[prefix.len..];
+    const mt_end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    const mt = rest[0..mt_end];
+    if (!types.isSupportedImageMediaType(mt)) return null;
+    rest = rest[mt_end..];
+    const data_key = "\",\"data\":\"";
+    if (!std.mem.startsWith(u8, rest, data_key)) return null;
+    rest = rest[data_key.len..];
+    const data_end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    const data = rest[0..data_end];
+    if (data.len > types.MAX_IMAGE_BASE64_BYTES or !types.isStandardBase64(data)) return null;
+    if (!std.mem.eql(u8, rest[data_end..], "\"}")) return null;
     return .{ .media_type = mt, .data = data };
 }
 
@@ -931,6 +949,34 @@ test "extractImageResult: 命中 Read 图像形态,忽略普通文本/JSON" {
     const img = extractImageResult("{\"type\":\"image\",\"media_type\":\"image/gif\",\"data\":\"AAAA\"}").?;
     try std.testing.expectEqualStrings("image/gif", img.media_type);
     try std.testing.expectEqualStrings("AAAA", img.data);
+    // 前后空白容忍(SSE/transcript 回放可能带换行)。
+    const padded = extractImageResult("\n {\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AA==\"}\n").?;
+    try std.testing.expectEqualStrings("AA==", padded.data);
+}
+
+test "extractImageResult: 只认规范形态——非白名单 MIME / 非 base64 / 尾随或嵌套字段 / 超限都不是图像" {
+    // 非白名单 MIME:方言层发出去 provider 会拒收,当文本走投影才有界。
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/svg+xml\",\"data\":\"AAAA\"}") == null);
+    // 非标准 base64。
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"not base64!!\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"\"}") == null);
+    // 尾随字段:一个插件把 500 KiB 别的东西挂在 data 后面,不能靠前缀混过豁免。
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\",\"extra\":\"x\"}") == null);
+    // 字段顺序/嵌套:按字段名搜索会命中,逐段匹配不会。
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"data\":\"AAAA\",\"media_type\":\"image/png\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"meta\":{\"media_type\":\"image/png\",\"data\":\"AAAA\"}}") == null);
+    // 超过任何 provider 都收不下的尺寸:不是图像。
+    const a = std.testing.allocator;
+    const oversized = try a.alloc(u8, types.MAX_IMAGE_BASE64_BYTES + 4);
+    defer a.free(oversized);
+    @memset(oversized, 'A');
+    const huge = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{oversized});
+    defer a.free(huge);
+    try std.testing.expect(extractImageResult(huge) == null);
+    // 正好在上限内的规范形态仍是图像。
+    const at_limit = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{oversized[0..types.MAX_IMAGE_BASE64_BYTES]});
+    defer a.free(at_limit);
+    try std.testing.expect(extractImageResult(at_limit) != null);
 }
 
 test "appendImageOmittedPlaceholder: 纯文本占位含 MIME,不含 base64" {

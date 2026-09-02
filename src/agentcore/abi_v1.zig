@@ -3819,37 +3819,16 @@ comptime {
         @compileError("MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 must match the Read tool image cap");
 }
 
-/// The image media types every wired provider dialect accepts. This is the
-/// same allowlist the built-in Read tool and the headless `--image` entry
-/// derive from file extensions.
+/// The image media types every wired provider dialect accepts, and the
+/// standard-base64 check: both live in `types.zig` so the Read tool, the
+/// headless `--image` entry, this RunInput validation, and the tool_result
+/// image predicate (`dialect.extractImageResult`) share one definition.
 fn isSupportedImageMediaType(media_type: []const u8) bool {
-    const supported = [_][]const u8{
-        "image/png", "image/jpeg", "image/gif", "image/webp",
-    };
-    for (supported) |candidate| {
-        if (std.mem.eql(u8, media_type, candidate)) return true;
-    }
-    return false;
+    return core.types.isSupportedImageMediaType(media_type);
 }
 
-/// Standard base64 with `=` padding and no whitespace: length divisible by
-/// four, alphabet `A-Z a-z 0-9 + /`, at most two `=` and only at the end.
 fn isStandardBase64(data: []const u8) bool {
-    if (data.len == 0 or data.len % 4 != 0) return false;
-    var padding: usize = 0;
-    for (data) |byte| {
-        if (byte == '=') {
-            padding += 1;
-            if (padding > 2) return false;
-            continue;
-        }
-        if (padding != 0) return false;
-        const in_alphabet = (byte >= 'A' and byte <= 'Z') or
-            (byte >= 'a' and byte <= 'z') or
-            (byte >= '0' and byte <= '9') or byte == '+' or byte == '/';
-        if (!in_alphabet) return false;
-    }
-    return true;
+    return core.types.isStandardBase64(data);
 }
 
 /// Wire validation for one RUN_INPUT_MULTIMODAL parts array. Every declared

@@ -9,20 +9,21 @@
 const std = @import("std");
 const artifact = @import("tool_result_artifact.zig");
 const tool_result = @import("tool_result.zig");
-const conversation = @import("conversation.zig");
+const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
 
 pub const SCHEMA = tool_result.PROJECTION_SCHEMA;
 pub const ENVELOPE_PREFIX = tool_result.ENVELOPE_PREFIX;
 pub const BASH_SCHEMA = "metacodes.bash-result.v2";
 pub const DEFAULT_PREVIEW_BYTES: usize = 1536;
-/// Turn-budget charge for one image-shaped result. The provider dialects
+/// Turn-budget charge for one image-shaped result. Vision-capable routes
 /// consume these natively (`extractImageResult` → image block / data URL /
-/// inlineData), so the model never pays for the base64 length; it pays the
+/// inlineData) and non-vision routes replace them with a short bounded
+/// placeholder, so the model never pays for the base64 length; it pays the
 /// vision estimate that already drives auto-compact and request estimation
-/// (`conversation.IMAGE_TOKEN_ESTIMATE`), at this module's four-bytes-per-token
-/// convention (see `conversation.toolResultContextBytes`).
-pub const IMAGE_RESULT_BUDGET_BYTES: usize = conversation.IMAGE_TOKEN_ESTIMATE * 4;
+/// (`types.IMAGE_TOKEN_ESTIMATE`), at the four-bytes-per-token convention of
+/// `conversation.toolResultContextBytes`.
+pub const IMAGE_RESULT_BUDGET_BYTES: usize = types.IMAGE_TOKEN_ESTIMATE * 4;
 
 pub const Item = struct {
     tool_name: []const u8,
@@ -40,9 +41,14 @@ pub const Config = struct {
 pub const Stats = struct {
     /// Bytes the tools actually produced (envelopes count their original size).
     raw_bytes: usize = 0,
-    /// Model-visible bytes after projection, measured in turn-budget units:
-    /// text at its length, image results at `IMAGE_RESULT_BUDGET_BYTES`.
+    /// Actual byte length of the committed results after projection. An
+    /// exempt image keeps its full base64 length here; this is what the
+    /// metrics snapshot and the projection log report as bytes.
     projected_bytes: usize = 0,
+    /// The same result set in turn-budget units: text at its length, image
+    /// results at `IMAGE_RESULT_BUDGET_BYTES`. `budget_exhausted` is decided
+    /// on this figure, never on `projected_bytes`.
+    budget_bytes: usize = 0,
     artifact_bytes: usize = 0,
     artifact_spill_count: usize = 0,
     unrecoverable_fallback_count: usize = 0,
@@ -65,9 +71,10 @@ pub fn turnBudgetBytes(max_input_tokens: usize) usize {
 }
 
 /// Image-shaped tool result (`{"type":"image","media_type":...,"data":...}`,
-/// the `Read` tool's picture form). Never spilled: an artifact envelope would
-/// turn the picture into a base64 preview string that no dialect recognizes
-/// as an image, so every provider would receive text instead of the picture.
+/// the `Read` tool's picture form; the exact canonical shape is defined by
+/// `extractImageResult`). Never spilled: an artifact envelope would turn the
+/// picture into a base64 preview string that no dialect recognizes as an
+/// image, so every provider would receive text instead of the picture.
 pub fn isImageResult(content: []const u8) bool {
     return json_mod.extractImageResult(content) != null;
 }
@@ -130,8 +137,9 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         total = total - before + after;
         if (after >= before) break;
     }
-    stats.projected_bytes = budgetBytes(items, image);
-    stats.budget_exhausted = stats.projected_bytes > config.per_turn_bytes;
+    stats.projected_bytes = totalBytes(items);
+    stats.budget_bytes = budgetBytes(items, image);
+    stats.budget_exhausted = stats.budget_bytes > config.per_turn_bytes;
     return stats;
 }
 
@@ -329,6 +337,12 @@ fn isStructuredJson(content: []const u8) bool {
     }
 }
 
+fn totalBytes(items: []const Item) usize {
+    var total: usize = 0;
+    for (items) |item| total +|= item.content.*.len;
+    return total;
+}
+
 /// Turn-budget size of the result set: text at its length, image results at
 /// `IMAGE_RESULT_BUDGET_BYTES` (a 5 MB base64 screenshot must not evict every
 /// text sibling from the turn, nor report the budget as exhausted forever).
@@ -397,7 +411,10 @@ test "image results are charged at IMAGE_RESULT_BUDGET_BYTES in the turn budget,
     defer allocator.free(@constCast(text_content));
     try std.testing.expectEqual(@as(usize, 0), fits.turn_budget_spills);
     try std.testing.expect(!fits.budget_exhausted);
-    try std.testing.expectEqual(IMAGE_RESULT_BUDGET_BYTES + 4096, fits.projected_bytes);
+    try std.testing.expectEqual(IMAGE_RESULT_BUDGET_BYTES + 4096, fits.budget_bytes);
+    // projected_bytes stays a real byte count: the exempt image is reported at
+    // its full length, so metrics never imply the picture was removed.
+    try std.testing.expectEqual(image_content.len + 4096, fits.projected_bytes);
     try std.testing.expectEqualStrings(image_before, image_content);
     try std.testing.expectEqual(@as(usize, 4096), text_content.len);
 
