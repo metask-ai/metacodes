@@ -310,7 +310,15 @@ pub const Spool = struct {
             .NOFOLLOW = true,
         }, 0o600);
         if (fd < 0) return error.ArtifactTempOpenFailed;
-        errdefer _ = pfs.close(fd);
+        // Close *and* unlink: the file exists from the moment `open` with
+        // CREAT succeeds, so a failure in any of the three checks below used to
+        // leave `stream-*.tmp` behind. That was survivable while such a failure
+        // aborted the tool; now that a publication failure degrades to inline
+        // and execution continues, a repeating cause would accumulate orphans.
+        errdefer {
+            _ = pfs.close(fd);
+            pfs.unlinkPath(temp_path.ptr) catch {};
+        }
         try pfs.makeCloseOnExec(fd);
         const info = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
         if (!safeArtifactInfo(info)) return error.ArtifactUnsafeFile;

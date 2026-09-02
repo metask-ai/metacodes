@@ -206,6 +206,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
             &spawned.stdout,
             .text_utf8,
             spawned.capture_complete,
+            ctx.result_budget,
         );
     }
 
@@ -229,6 +230,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
         &projected,
         .text_utf8,
         spawned.capture_complete,
+        ctx.result_budget,
     );
 }
 

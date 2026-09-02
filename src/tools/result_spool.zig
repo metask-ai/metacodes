@@ -4,12 +4,25 @@
 //! kernel-private Capture. Small complete results are lifted back to inline;
 //! large or incomplete results are copied into the Session CAS without ever
 //! materializing the whole payload.
+//!
+//! "Small" is the projection layer's own per-result budget, handed in by the
+//! caller - never a constant of this file's. There used to be one, 64KB, which
+//! is `PER_RESULT_MAX_BYTES` copied once more: on every window below 524,288
+//! tokens it sat above `per_result_bytes` and left a dead zone in which a
+//! result was lifted into memory here only to be spilled straight back to the
+//! CAS by projection - the same bytes handled twice. The two layers decide
+//! different things at different times (whether bytes enter memory at all,
+//! versus how much the model sees), which is why they stay two layers; but
+//! they decide against the same number.
+//!
+//! This file reads `per_result_bytes` and nothing else off the budget. The
+//! turn budget is a projection concern - it depends on sibling results this
+//! writer cannot see - and a guard test below keeps it that way.
 
 const std = @import("std");
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const tool_result = @import("../core/tool_result.zig");
-
-pub const INLINE_DECISION_BYTES: usize = 64 * 1024;
+const result_budget = @import("../core/result_budget.zig");
 
 /// Unbuffered std.Io.Writer adapter over Capture. The vtable has only one
 /// possible owner and latches the underlying typed error before presenting
@@ -56,14 +69,19 @@ pub const CaptureWriter = struct {
     }
 };
 
+/// `budget` is the caller's `ctx.result_budget`, passed whole so a caller
+/// cannot hand over a number it computed itself; only `per_result_bytes` is
+/// read. An incomplete capture is always published: it has no complete inline
+/// form, whatever its size.
 pub fn finishCaptureAsBody(
     allocator: std.mem.Allocator,
     artifact_root: []const u8,
     capture: *artifact_store.Capture,
     media_type: tool_result.MediaType,
     capture_complete: bool,
+    budget: result_budget.Budget,
 ) !tool_result.ToolResultBody {
-    if (capture_complete and capture.bytes <= INLINE_DECISION_BYTES) {
+    if (capture_complete and capture.bytes <= budget.per_result_bytes) {
         return tool_result.ToolResultBody.initInline(try capture.readRangeAlloc(
             allocator,
             0,
@@ -71,12 +89,55 @@ pub fn finishCaptureAsBody(
         ));
     }
 
+    return publish(allocator, artifact_root, capture, media_type, capture_complete) catch |err|
+        inlineAfterFailedPublish(allocator, capture, capture_complete, err);
+}
+
+fn publish(
+    allocator: std.mem.Allocator,
+    artifact_root: []const u8,
+    capture: *artifact_store.Capture,
+    media_type: tool_result.MediaType,
+    capture_complete: bool,
+) !tool_result.ToolResultBody {
     var spool = try artifact_store.Spool.begin(allocator, artifact_root);
     defer spool.deinit();
     try capture.copyRangeTo(&spool, 0, capture.bytes);
     var completed = try spool.finish();
     completed.receipt.capture_complete = capture_complete;
     return tool_result.ToolResultBody.fromCompletedSpool(completed, media_type);
+}
+
+/// Publication failed. Hand the bytes back inline when that is possible, so
+/// projection can still render its bounded fallback envelope - head, tail and
+/// `storage_error` - instead of the whole result becoming a tool error.
+///
+/// This is what lowering the inline threshold would otherwise have taken away.
+/// A 40KB Grep result on a 200K window used to stay inline here and meet a
+/// full CAS in `spillOne`, which degrades gracefully; publishing it at this
+/// layer made the same quota failure surface as "Grep failed with
+/// SessionQuotaExceeded" and lose the output entirely.
+///
+/// Three cases still propagate, each matching the behaviour that predates the
+/// threshold change: OOM, which no fallback can help; a capture too large to
+/// materialize - `PER_RESULT_MAX_BYTES` is the ceiling of what was ever inline
+/// here, so re-inlining inside it restores the old degradation without
+/// reintroducing an unbounded read; and an incomplete capture, which has no
+/// complete inline form and always published.
+fn inlineAfterFailedPublish(
+    allocator: std.mem.Allocator,
+    capture: *artifact_store.Capture,
+    capture_complete: bool,
+    err: anyerror,
+) !tool_result.ToolResultBody {
+    if (err == error.OutOfMemory) return err;
+    if (!capture_complete) return err;
+    if (capture.bytes > result_budget.PER_RESULT_MAX_BYTES) return err;
+    return tool_result.ToolResultBody.initInline(try capture.readRangeAlloc(
+        allocator,
+        0,
+        @intCast(capture.bytes),
+    ));
 }
 
 pub fn copyAll(source: *artifact_store.Capture, destination: *artifact_store.Capture) !void {
@@ -104,8 +165,139 @@ test "CaptureWriter streams formatting and preserves small inline result" {
     try output.check();
     try capture.seal();
 
-    var body = try finishCaptureAsBody(allocator, root, &capture, .text_utf8, true);
+    // `.floor` is the smallest budget there is; a 9-byte result must stay inline under it.
+    var body = try finishCaptureAsBody(allocator, root, &capture, .text_utf8, true, .floor);
     defer body.deinit(allocator);
     try std.testing.expect(body == .@"inline");
     try std.testing.expectEqualStrings("native-42", body.@"inline".bytes);
+}
+
+/// `src` with every comment-only line (`//`, `///`, `//!` after leading blanks)
+/// removed, so a guard that scans this file's text judges its code rather than
+/// its explanations of that code. Runs at test time on purpose: a comptime
+/// version tripped the default evaluation-branch quota on a file this size and
+/// would need the quota bumped every time the file grew.
+fn codeOnly(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |line| {
+        const body = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, body, "//")) continue;
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Index just past the `)` that closes the call opened at `open` (the index of
+/// its `(`), or null if unbalanced.
+///
+/// Counts parentheses and nothing else. Every call site passes plain
+/// identifiers and field accesses, so that is enough; the guard below rejects
+/// any argument span holding a string literal or comment rather than letting
+/// this miscount one and quietly compare the wrong slice.
+fn callEnd(src: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var i = open;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+test "guard: callers hand over ctx.result_budget verbatim, and this file reads only per_result_bytes" {
+    // The behaviour tests in tests/component/inline_threshold_test.zig are the
+    // real check. This one only closes the two ways the number could fork
+    // again without any behaviour test noticing on the day it happens:
+    // a caller passing a budget it derived itself, or this file starting to
+    // read turn-level fields that belong to projection.
+    //
+    // Needles are spliced at comptime so this test's own source, which is
+    // embedded below, cannot satisfy or trip them.
+    const forbidden_here = .{ "per_" ++ "turn", "payload" ++ "Allowance", "INLINE_DECISION" ++ "_BYTES" };
+    // Scan code, not prose. A comment that merely *names* the turn budget to
+    // explain why this file must not read it should not trip the check, and a
+    // comment that quotes the required field must not satisfy it. Comment-only
+    // lines are dropped before either scan; in-line trailing comments are rare
+    // enough here that the splice above still covers the test's own text.
+    const self_src = try codeOnly(std.testing.allocator, @embedFile("result_spool.zig"));
+    defer std.testing.allocator.free(self_src);
+    inline for (forbidden_here) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, self_src, needle) == null);
+    }
+    // Spliced like the forbidden needles above, and for the same reason: this
+    // assertion's own text lives in the file it embeds. Written literally, the
+    // guard stayed green after production stopped reading the field, because
+    // the only remaining occurrence was this line. A required-field check that
+    // satisfies itself is worse than none - it reports confidence it has not
+    // earned.
+    try std.testing.expect(std.mem.indexOf(u8, self_src, "budget." ++ "per_result_bytes") != null);
+
+    const callers = .{
+        .{ "grep.zig", @embedFile("grep.zig") },
+        .{ "mcp_resources.zig", @embedFile("mcp_resources.zig") },
+        .{ "code_map.zig", @embedFile("code_map.zig") },
+        .{ "web_fetch.zig", @embedFile("web_fetch.zig") },
+        .{ "find_symbol.zig", @embedFile("find_symbol.zig") },
+    };
+    var seen: usize = 0;
+    inline for (callers) |entry| {
+        const name, const src = entry;
+        try std.testing.expect(std.mem.indexOf(u8, src, "INLINE_DECISION" ++ "_BYTES") == null);
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, src, cursor, "finishCaptureAsBody(")) |at| {
+            const open = at + "finishCaptureAsBody".len;
+            const end = callEnd(src, open) orelse {
+                std.debug.print("{s}: unbalanced finishCaptureAsBody( call\n", .{name});
+                return error.UnbalancedCall;
+            };
+            const args = std.mem.trim(u8, src[open + 1 .. end - 1], " \t\r\n,");
+            // The paren counter is not a Zig parser. If a call ever carries a
+            // string literal or a comment, say so instead of comparing a slice
+            // that may have been cut in the wrong place.
+            const unsupported = std.mem.indexOfScalar(u8, args, '"') != null or
+                std.mem.indexOfScalar(u8, args, '\'') != null or
+                std.mem.indexOf(u8, args, "//") != null or
+                std.mem.indexOf(u8, args, "/*") != null;
+            if (unsupported) {
+                std.debug.print(
+                    "{s}: a finishCaptureAsBody call now holds a string literal, character literal or comment; " ++
+                        "this guard's paren counter cannot place its last argument. Extend it before trusting it.\n",
+                    .{name},
+                );
+                return error.UnsupportedCallShape;
+            }
+            const last_comma = std.mem.lastIndexOfScalar(u8, args, ',') orelse {
+                std.debug.print("{s}: finishCaptureAsBody called with too few arguments\n", .{name});
+                return error.TooFewArguments;
+            };
+            const last = std.mem.trim(u8, args[last_comma + 1 ..], " \t\r\n");
+            if (!std.mem.eql(u8, last, "ctx.result_budget")) {
+                std.debug.print(
+                    "{s}: finishCaptureAsBody's budget argument is `{s}`, expected `ctx.result_budget`. " ++
+                        "The tool layer must hand over the caller's budget whole, never one it computed itself.\n",
+                    .{ name, last },
+                );
+                return error.BudgetArgumentNotForwarded;
+            }
+            seen += 1;
+            cursor = end;
+        }
+    }
+    if (seen != 6) {
+        std.debug.print(
+            "finishCaptureAsBody call sites: expected 6, found {d}. A caller was added, removed or moved: " ++
+                "update the `callers` list in this guard so the new site is checked too.\n",
+            .{seen},
+        );
+        return error.CallerCountChanged;
+    }
 }
