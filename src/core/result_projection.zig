@@ -36,6 +36,11 @@ pub const Config = struct {
     per_result_bytes: usize,
     per_turn_bytes: usize,
     preview_bytes: usize = DEFAULT_PREVIEW_BYTES,
+    /// Aggregate base64 bytes of native image results the turn may keep.
+    /// Images bypass the byte budgets above, but providers cap the request
+    /// size (types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST); beyond this the
+    /// largest images spill into recoverable envelopes.
+    per_turn_image_bytes: usize = types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST,
 };
 
 pub const Stats = struct {
@@ -55,6 +60,8 @@ pub const Stats = struct {
     structured_result_count: usize = 0,
     structured_projection_failures: usize = 0,
     turn_budget_spills: usize = 0,
+    /// Image results spilled because the turn exceeded `per_turn_image_bytes`.
+    image_spills: usize = 0,
     budget_exhausted: bool = false,
 
     pub fn changed(self: Stats) bool {
@@ -112,6 +119,31 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         if (image[index]) continue;
         if (item.content.*.len <= config.per_result_bytes) continue;
         try spillOne(allocator, item, structured[index], config, &stats, false);
+    }
+
+    // Wire-size cap for the turn's native images: spill the largest first
+    // (strict > keeps the ordinal as the deterministic tie-breaker). A spilled
+    // image becomes an ordinary envelope from here on.
+    var image_bytes: usize = 0;
+    for (items, image) |item, is_image| {
+        if (is_image) image_bytes +|= item.content.*.len;
+    }
+    while (image_bytes > config.per_turn_image_bytes) {
+        var biggest: ?usize = null;
+        var biggest_len: usize = 0;
+        for (items, 0..) |item, index| {
+            if (!image[index]) continue;
+            if (item.content.*.len > biggest_len) {
+                biggest = index;
+                biggest_len = item.content.*.len;
+            }
+        }
+        const index = biggest orelse break;
+        const before = items[index].content.*.len;
+        try spillOne(allocator, items[index], structured[index], config, &stats, false);
+        image[index] = false;
+        stats.image_spills += 1;
+        image_bytes -= before;
     }
 
     var total = budgetBytes(items, image);
@@ -518,4 +550,34 @@ test "aggregate spill uses original ordinal as equal-size tie break" {
     try std.testing.expectEqual(@as(usize, 1), stats.turn_budget_spills);
     try std.testing.expect(isRecoverableEnvelope(first));
     try std.testing.expectEqualStrings("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", second);
+}
+
+test "per-turn image byte cap spills the largest images into envelopes, keeps the rest native" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var small: []const u8 = try testImageContent(allocator, 2048);
+    defer allocator.free(@constCast(small));
+    var big: []const u8 = try testImageContent(allocator, 8192);
+    const big_before = try allocator.dupe(u8, big);
+    defer allocator.free(big_before);
+    var mid: []const u8 = try testImageContent(allocator, 4096);
+    defer allocator.free(@constCast(mid));
+    var items = [_]Item{
+        .{ .tool_name = "Read", .content = &small, .is_error = false },
+        .{ .tool_name = "Read", .content = &big, .is_error = false },
+        .{ .tool_name = "Read", .content = &mid, .is_error = false },
+    };
+    // Cap admits small + mid but not big: exactly the largest one spills.
+    const stats = try project(allocator, &items, .{ .session_root = root, .per_result_bytes = 1 << 20, .per_turn_bytes = 1 << 20, .per_turn_image_bytes = 8000, .preview_bytes = 0 });
+    defer allocator.free(@constCast(big));
+    try std.testing.expectEqual(@as(usize, 1), stats.image_spills);
+    try std.testing.expect(isRecoverableEnvelope(big));
+    try std.testing.expect(isImageResult(small));
+    try std.testing.expect(isImageResult(mid));
+    // The spilled image is charged as text from here on, the others at the estimate.
+    try std.testing.expectEqual(2 * IMAGE_RESULT_BUDGET_BYTES + big.len, stats.budget_bytes);
 }

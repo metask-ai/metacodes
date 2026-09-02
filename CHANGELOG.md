@@ -12,6 +12,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Image results now have a wire-size safety net: they bypass the byte
+  budgets, so five parallel 3.75 MB pictures could produce a request no
+  provider accepts. `types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST` (16 MiB) caps
+  the base64 image bytes per request: the projection spills the largest
+  images of the current turn beyond the cap into artifact envelopes, and the
+  agent loop stubs the oldest already-delivered image results before each
+  request until the history fits. Gemini 3 function responses embed only
+  PNG/JPEG/WebP; `image/gif` results now go out as a sibling `inline_data`
+  part instead of being rejected. The stream handle reports the exact
+  tool_use ids whose image went out as a placeholder, so a plugin dialect
+  that serializes some MIME types natively and refuses others no longer pins
+  the natively-sent pictures.
 - OpenAI chat/completions and Gemini dropped every text block that shared a
   message with tool results: the PostToolUse `additionalContext`, the
   verification checkpoint, the requirement-ledger prompt and similar host

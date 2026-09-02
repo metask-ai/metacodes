@@ -988,7 +988,7 @@ const StreamWrapper = struct {
         return .{
             .ctx = self,
             // The serialization decision belongs to the base stream; pass it through untouched.
-            .image_results_native = self.base.image_results_native,
+            .image_placeholder_ids = self.base.image_placeholder_ids,
             .nextFn = next,
             .deinitFn = deinit,
             .stopReasonFn = stopReason,

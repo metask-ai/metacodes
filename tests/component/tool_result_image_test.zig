@@ -520,6 +520,55 @@ test "L2 ⑫: 运行时方言 profile 说支持图像但序列化器拒绝时—
     try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
 }
 
+test "L2 ⑬: 请求级图片字节上限——历史里最老的已送达图片被清成 stub,wire 上只剩上限内的图片" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ANTHROPIC_OK_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at both pictures");
+    const T = struct {
+        fn imageTurn(c: *cc.conversation.Conversation, al: std.mem.Allocator, id: []const u8, fill: u8) !void {
+            const tu = try al.alloc(cc.core_message.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try c.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, 4096);
+            defer al.free(data);
+            @memset(data, fill);
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(cc.core_message.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try c.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try T.imageTurn(&conv, a, "t1", 'A');
+    try T.imageTurn(&conv, a, "t2", 'B');
+    // Both pictures were delivered by earlier requests.
+    conv.markDelivered(.{ .image_placeholder_ids = &.{} });
+    const one = conv.messages.items[2].blocks[0].tool_result.content.len;
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), &.{}, &perm, .{
+        .max_turns = 1,
+        .image_request_bytes_cap = one + 64,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const body = srv.lastRequest().?.body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\""));
+    try std.testing.expect(std.mem.indexOf(u8, body, "BBBB") != null); // the newer picture survives
+    try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[2].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
+}
+
 test "L2 ⑩: model_override 决定送达——基础模型非 vision、override 为 vision 时图片上 wire 且送达" {
     const a = std.testing.allocator;
     const r = try runOverrideDelivery(a, "glm-5.2", "claude-sonnet-4-20250514");

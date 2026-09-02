@@ -344,7 +344,7 @@ test "L2 microcompact: 未送达的图片不被 recent-N 阀清掉,已送达的�
     try conv.appendText(.assistant, "ok");
     try appendToolResult(&conv, a, "tu_img_old", image);
     try conv.appendText(.assistant, "seen");
-    conv.markDelivered(.{ .images_visible = true });
+    conv.markDelivered(.{ .image_placeholder_ids = &.{} });
     // 当前轮(未送达):Read(image) + 两个并行文本兄弟,图片是三者中最老的。
     try appendToolResults(&conv, a, &.{ "tu_img_new", "tu_b", "tu_c" }, &.{ image, text, text });
 
@@ -369,7 +369,7 @@ test "L2 microcompact: 未送达的图片不被 recent-N 阀清掉,已送达的�
     try std.testing.expectEqualStrings(image, conv.messages.items[4].blocks[0].tool_result.content);
 
     // 真正随请求发出之后,同一张图片就是普通历史,keep=0 清掉它。
-    conv.markDelivered(.{ .images_visible = true });
+    conv.markDelivered(.{ .image_placeholder_ids = &.{} });
     const delivered = conv.microcompactToolResultsByRecentResults(0);
     try std.testing.expectEqual(@as(usize, 1), delivered.cleared);
     try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[4].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));

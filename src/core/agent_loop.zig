@@ -267,6 +267,11 @@ pub const Options = struct {
     lsp: ?*@import("../lsp/service.zig").Service = null,
     /// 自动 compact 的 token 阈值。null → 按 input context window 扣输出保留区后动态算。
     auto_compact_threshold: ?usize = null,
+    /// Wire-size safety net for image results (they bypass the byte budgets):
+    /// before each request the oldest *delivered* image results are stubbed
+    /// until the active history's image bytes fit under this cap. Defaults to
+    /// types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST; tests lower it.
+    image_request_bytes_cap: usize = types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST,
     /// 自动 compact 保留的消息数（最新的 N 条）
     auto_compact_keep_recent: usize = 10,
     /// Bash 后台作业注册表（给 ToolContext 用，工具侧 Bash/BashOutput/KillShell 用）
@@ -1279,6 +1284,14 @@ pub fn run(
         request_recovery: while (true) {
             const model_request_started_ns = util_time.nowNs();
             var stream: api_stream.StreamHandle = undefined;
+            // Images bypass the byte budgets (charged at IMAGE_TOKEN_ESTIMATE), but
+            // every wired provider caps the request size with inline images. Stub
+            // the oldest delivered image results until the history fits; the
+            // current turn is bounded by the projection's per-turn image cap.
+            const image_trim = conversation.trimDeliveredImageBytes(opts.image_request_bytes_cap);
+            if (image_trim.changed()) {
+                log.info("agent", "image wire cap: cleared {d} delivered image result(s) bytes={d}->{d} cap={d}", .{ image_trim.cleared, image_trim.bytes_before, image_trim.bytes_after, opts.image_request_bytes_cap });
+            }
             var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
             defer freeApiMessages(&api_messages, allocator);
             if (opts.request_gate) |gate| {
@@ -1410,7 +1423,7 @@ pub fn run(
             // the serializer's own decision, carried back on the stream handle —
             // never re-derived here, so it matches the bytes sent even under a
             // runtime dialect override or a concurrent model change.
-            conversation.markDelivered(.{ .images_visible = stream.image_results_native });
+            conversation.markDelivered(.{ .image_placeholder_ids = stream.image_placeholder_ids });
             defer stream.deinit();
 
             rid_for_turn = stream.requestId();
@@ -2498,13 +2511,14 @@ pub fn run(
         });
         if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
         if (projection_stats.changed() or projection_stats.budget_exhausted) {
-            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} budget_exhausted={}", .{
+            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_spills={d} budget_exhausted={}", .{
                 projection_stats.raw_bytes,
                 projection_stats.projected_bytes,
                 projection_stats.artifact_bytes,
                 projection_stats.artifact_spill_count,
                 projection_stats.unrecoverable_fallback_count,
                 projection_stats.turn_budget_spills,
+                projection_stats.image_spills,
                 projection_stats.budget_exhausted,
             });
         }

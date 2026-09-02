@@ -360,6 +360,12 @@ pub const ImageBlock = struct {
 pub const MAX_IMAGE_BYTES: usize = 3_750_000;
 /// MAX_IMAGE_BYTES 经标准 base64(带填充)后的最大字符数。
 pub const MAX_IMAGE_BASE64_BYTES: usize = std.base64.standard.Encoder.calcSize(MAX_IMAGE_BYTES);
+/// 一次请求里所有规范图像结果 base64 字节的上限。图片绕过按字节的投影/轮预算(只按
+/// IMAGE_TOKEN_ESTIMATE 记账),但 wire 有硬上限:Gemini 含内联图片的请求 20 MB,Anthropic
+/// 请求 32 MB;取 16 MiB 给提示词与 JSON 留余量。投影把当前轮超限的图片按最大优先 spill
+/// 成信封;agent_loop 发请求前把活跃历史里最老的**已送达**图片清成 stub。
+pub const MAX_IMAGE_RESULT_BYTES_PER_REQUEST: usize = 16 * 1024 * 1024;
+
 /// 一条规范图像 tool_result 的**原始字节**上限:base64 载荷 + 三个键、引号、MIME 与
 /// 少量 JSON 空白。`extractImageResult` 先按它拒绝,再解析——外围空白可以容忍,但不能
 /// 成为绕过投影预算的免费通道(否则 40 MiB 空白 + 一张小图只记 6400 预算字节)。

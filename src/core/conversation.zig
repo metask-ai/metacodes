@@ -696,12 +696,14 @@ pub const Conversation = struct {
     /// working on image-heavy history. Undelivered text results keep their
     /// historical behaviour (see doc/CORE_REFERENCE.md).
     ///
-    /// `images_visible` is the serializer's report for the accepted request
-    /// (`StreamHandle.image_results_native`): false means every image result
-    /// went out as a bounded placeholder, so a message carrying a paired image
-    /// result is not delivered by that request — a later request that does
-    /// serialize images natively must still be able to carry it before
-    /// microcompact may clear it.
+    /// `image_placeholder_ids` is the serializer's report for the accepted
+    /// request (`StreamHandle.image_placeholder_ids`): the tool_use ids of the
+    /// image results that went out as a bounded placeholder. A message whose
+    /// paired image result is in that list is not delivered by that request —
+    /// a later request that serializes it natively must still be able to carry
+    /// it before microcompact may clear it. `null` means the stream did not
+    /// report (test fakes, unwired wrappers): every paired image is then
+    /// treated as a placeholder, the conservative direction.
     ///
     /// Pairing follows the request normalizer (message_repair) over the same
     /// provider-visible projection buildApiMessages sends: a thinking-only
@@ -749,12 +751,53 @@ pub const Conversation = struct {
             for (m.blocks) |b| switch (b) {
                 .tool_result => |tr| {
                     const paired = outstanding.remove(tr.tool_use_id) or oom;
-                    if (paired and !opts.images_visible and result_projection.isImageResult(tr.content)) protected = true;
+                    if (paired and result_projection.isImageResult(tr.content) and opts.placeholderFor(tr.tool_use_id)) protected = true;
                 },
                 else => {},
             };
             if (!protected) m.delivered = true;
         }
+    }
+
+    /// Keep the base64 bytes of active image results under `cap` before a
+    /// request: clears (stubs, with the usual sha256 commitment) the oldest
+    /// *delivered* image results first and never an undelivered one — those
+    /// belong to the turn about to be sent and are bounded by the projection's
+    /// per-turn image cap. Envelopes and stubs are not images and are not
+    /// counted. Returns what was cleared.
+    pub fn trimDeliveredImageBytes(self: *Conversation, cap: usize) ToolResultReduction {
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
+        var out = ToolResultReduction{};
+        const active_start = @min(self.compact_boundary, self.messages.items.len);
+        var total: usize = 0;
+        for (self.messages.items[active_start..]) |m| for (m.blocks) |b| switch (b) {
+            .tool_result => |tr| if (result_projection.isImageResult(tr.content)) {
+                total +|= tr.content.len;
+            },
+            else => {},
+        };
+        if (total <= cap) return out;
+        var mi = active_start;
+        while (mi < self.messages.items.len and total > cap) : (mi += 1) {
+            const m = self.messages.items[mi];
+            if (!m.delivered) continue;
+            for (m.blocks, 0..) |b, bi| {
+                if (total <= cap) break;
+                if (b != .tool_result) continue;
+                const tr = b.tool_result;
+                if (!result_projection.isImageResult(tr.content)) continue;
+                const before = tr.content.len;
+                const after = self.clearToolResultAt(m, bi) orelse continue;
+                self.noteShrinkAtLocked(mi);
+                out.cleared += 1;
+                out.bytes_before += before;
+                out.bytes_after += after;
+                total -= before;
+            }
+        }
+        if (out.changed()) self.mutation_version +%= 1;
+        return out;
     }
 
     /// Mirrors buildApiMessages: thinking blocks are never sent, so an
@@ -766,11 +809,18 @@ pub const Conversation = struct {
 
     pub const DeliveryOptions = struct {
         /// The serializer's own report for the accepted request
-        /// (`StreamHandle.image_results_native`): true iff every image result
-        /// in it went out as a native image part. Never route capability —
-        /// a plugin dialect may refuse to emit images although the model's
-        /// profile says it could.
-        images_visible: bool,
+        /// (`StreamHandle.image_placeholder_ids`): tool_use ids of the image
+        /// results that went out as a placeholder. `null` = unknown, treat
+        /// every paired image as a placeholder; empty = all native. Never
+        /// route capability — a plugin dialect may refuse to emit some images
+        /// although the model's profile says it could.
+        image_placeholder_ids: ?[]const []const u8,
+
+        fn placeholderFor(self: DeliveryOptions, tool_use_id: []const u8) bool {
+            const ids = self.image_placeholder_ids orelse return true;
+            for (ids) |id| if (std.mem.eql(u8, id, tool_use_id)) return true;
+            return false;
+        }
     };
 
     fn clearToolResultAt(self: *Conversation, m: msg.Message, bi: usize) ?usize {
@@ -1075,12 +1125,12 @@ test "delivery watermark: a non-vision route leaves image-result messages undeli
     } };
     try c.append(.{ .role = .user, .blocks = blocks });
     // Non-vision request: the placeholder went out, not the picture.
-    c.markDelivered(.{ .images_visible = false });
+    c.markDelivered(.{ .image_placeholder_ids = null });
     try std.testing.expect(c.messages.items[0].delivered);
     try std.testing.expect(c.messages.items[1].delivered);
     try std.testing.expect(!c.messages.items[2].delivered);
     // A vision-capable request delivers it.
-    c.markDelivered(.{ .images_visible = true });
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
     try std.testing.expect(c.messages.items[2].delivered);
 }
 
@@ -1108,11 +1158,11 @@ test "delivery watermark: non-vision requests still deliver inactive and orphan 
     try T.imageResult(&c, a, "t1"); // 4: active, legitimately paired
     try c.restoreCompactState(1, null);
 
-    c.markDelivered(.{ .images_visible = false });
+    c.markDelivered(.{ .image_placeholder_ids = null });
     try std.testing.expect(c.messages.items[0].delivered);
     try std.testing.expect(c.messages.items[2].delivered);
     try std.testing.expect(!c.messages.items[4].delivered);
-    c.markDelivered(.{ .images_visible = true });
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
     try std.testing.expect(c.messages.items[4].delivered);
 }
 
@@ -1129,7 +1179,7 @@ test "delivery watermark: a second result for an already-answered id is an orpha
     try c.append(.{ .role = .user, .blocks = blocks });
     // The text result consumed `x`; the image is a duplicate the normalizer strips,
     // so a non-vision request must still deliver (not pin) this message.
-    c.markDelivered(.{ .images_visible = false });
+    c.markDelivered(.{ .image_placeholder_ids = null });
     try std.testing.expect(c.messages.items[1].delivered);
 }
 
@@ -1148,9 +1198,76 @@ test "delivery watermark: a thinking-only assistant message does not break the t
     const blocks = try a.alloc(msg.Block, 1);
     blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "x"), .content = try a.dupe(u8, "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}"), .is_error = false } };
     try c.append(.{ .role = .user, .blocks = blocks });
-    c.markDelivered(.{ .images_visible = false });
+    c.markDelivered(.{ .image_placeholder_ids = null });
     try std.testing.expect(c.messages.items[1].delivered);
     try std.testing.expect(!c.messages.items[2].delivered);
+}
+
+test "delivery watermark: a mixed report protects only the messages whose image went out as a placeholder" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn turn(conv: *Conversation, al: std.mem.Allocator, id: []const u8, mime: []const u8) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"{s}\",\"data\":\"AAAA\"}}", .{mime});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try T.turn(&c, a, "t_png", "image/png"); // 0,1
+    try T.turn(&c, a, "t_webp", "image/webp"); // 2,3
+    // A plugin dialect sent the PNG natively but replaced the WebP: only the WebP
+    // message stays protected; the PNG one must not be pinned by association.
+    const placeholders = [_][]const u8{"t_webp"};
+    c.markDelivered(.{ .image_placeholder_ids = &placeholders });
+    try std.testing.expect(c.messages.items[1].delivered);
+    try std.testing.expect(!c.messages.items[3].delivered);
+    // Unknown report (null) protects both; an empty report delivers both.
+    c.markDelivered(.{ .image_placeholder_ids = null });
+    try std.testing.expect(!c.messages.items[3].delivered);
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
+    try std.testing.expect(c.messages.items[3].delivered);
+}
+
+test "trimDeliveredImageBytes stubs the oldest delivered images first and never an undelivered one" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8, data_len: usize) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, data_len);
+            defer al.free(data);
+            @memset(data, 'A');
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try T.imageTurn(&c, a, "t1", 4096); // 0,1 oldest
+    try T.imageTurn(&c, a, "t2", 4096); // 2,3
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
+    try T.imageTurn(&c, a, "t3", 4096); // 4,5 undelivered (current turn)
+    const one = c.messages.items[1].blocks[0].tool_result.content.len;
+    // Cap admits two images: only the oldest delivered one is stubbed; the undelivered
+    // current-turn image is never touched even though it is the newest.
+    const reduced = c.trimDeliveredImageBytes(2 * one + 16);
+    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expect(result_projection.isImageResult(c.messages.items[3].blocks[0].tool_result.content));
+    try std.testing.expect(result_projection.isImageResult(c.messages.items[5].blocks[0].tool_result.content));
+    // A cap that only the undelivered image could satisfy still leaves it alone.
+    const tight = c.trimDeliveredImageBytes(one / 2);
+    try std.testing.expectEqual(@as(usize, 1), tight.cleared);
+    try std.testing.expect(result_projection.isImageResult(c.messages.items[5].blocks[0].tool_result.content));
+    try std.testing.expect(!c.trimDeliveredImageBytes(one / 2).changed());
 }
 
 test "compact preview commit keeps a delivery watermark set while the preview was in flight" {
@@ -1162,7 +1279,7 @@ test "compact preview commit keeps a delivery watermark set while the preview wa
     var preview = try c.cloneForCompactPreview(a, 2);
     defer preview.deinit();
     // A provider request goes out while the summary is still being produced.
-    c.markDelivered(.{ .images_visible = true });
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
     try std.testing.expect(!preview.conversation.messages.items[0].delivered);
     // The suffix CAS still matches (delivery is not a content mutation), and the
     // committed history must not regress to the preview's stale `false`.
@@ -1178,7 +1295,7 @@ test "delivery watermark is carried only to the same message, never by position 
     try c.appendText(.assistant, "second");
     var preview = try c.cloneForCompactPreview(a, 1);
     defer preview.deinit();
-    c.markDelivered(.{ .images_visible = true });
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
     // Rewrite the first message of the replacement (outside the retained suffix,
     // so the CAS still passes): it is a different message and must not inherit
     // the live watermark by index.
@@ -1197,7 +1314,7 @@ test "delivery watermark copied into a preview is cleared when the preview rewri
     try c.appendText(.user, "first");
     try c.appendText(.assistant, "second");
     // Delivered BEFORE cloning: Message.dupe copies `delivered = true` into the preview.
-    c.markDelivered(.{ .images_visible = true });
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
     var preview = try c.cloneForCompactPreview(a, 1);
     defer preview.deinit();
     try std.testing.expect(preview.conversation.messages.items[0].delivered);

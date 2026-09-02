@@ -156,6 +156,19 @@ fn canonicalProjectionProfile(
 pub const SerializationReport = struct {
     image_results: usize = 0,
     image_placeholders: usize = 0,
+    /// 走占位分支的每个图像结果的 tool_use_id(借用请求消息里的字节)。客户端把它交给
+    /// 流句柄,送达水位据此只保护**模型没看到图**的那些消息——插件方言可能按 MIME 一部分
+    /// 发原生块、一部分占位,单个布尔表达不了。
+    placeholder_ids: std.ArrayList([]const u8) = .empty,
+
+    pub fn deinit(self: *SerializationReport, allocator: std.mem.Allocator) void {
+        self.placeholder_ids.deinit(allocator);
+    }
+
+    pub fn notePlaceholder(self: *SerializationReport, allocator: std.mem.Allocator, tool_use_id: []const u8) !void {
+        self.image_placeholders += 1;
+        try self.placeholder_ids.append(allocator, tool_use_id);
+    }
 
     pub fn imagesNative(self: SerializationReport) bool {
         return self.image_placeholders == 0;
@@ -168,6 +181,7 @@ pub fn serializeMessagesRequestWithDialect(
     dialect: @import("dialect.zig").Dialect,
 ) ![]u8 {
     var scratch = SerializationReport{};
+    defer scratch.deinit(allocator);
     return serializeMessagesRequestWithDialectReport(req, allocator, dialect, &scratch);
 }
 
@@ -343,7 +357,7 @@ fn serializeContent(
                         break :image;
                     }
                     buf.shrinkRetainingCapacity(mark);
-                    report.image_placeholders += 1;
+                    try report.notePlaceholder(allocator, tr.tool_use_id);
                     var placeholder: std.ArrayList(u8) = .empty;
                     defer placeholder.deinit(allocator);
                     try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
@@ -1080,13 +1094,17 @@ test "SerializationReport: fail-closed 方言把图像结果计入占位,内建 
     const req = MessagesRequest{ .model = "claude-sonnet-4-20250514", .max_tokens = 16, .messages = &msgs };
     // 默认 Dialect:profile 是内建(支持 vision),serializeImagePart 却 fail-closed 返回 false。
     var closed = SerializationReport{};
+    defer closed.deinit(a);
     const body_closed = try serializeMessagesRequestWithDialectReport(req, a, .{ .ctx = undefined }, &closed);
     defer a.free(body_closed);
     try std.testing.expectEqual(@as(usize, 1), closed.image_results);
     try std.testing.expectEqual(@as(usize, 1), closed.image_placeholders);
     try std.testing.expect(!closed.imagesNative());
+    try std.testing.expectEqual(@as(usize, 1), closed.placeholder_ids.items.len);
+    try std.testing.expectEqualStrings("t1", closed.placeholder_ids.items[0]);
     try std.testing.expect(std.mem.indexOf(u8, body_closed, "was read successfully but omitted") != null);
     var native = SerializationReport{};
+    defer native.deinit(a);
     const body_native = try serializeMessagesRequestWithDialectReport(req, a, dialect_mod.Resolver.builtin().resolve(.anthropic, req.model), &native);
     defer a.free(body_native);
     try std.testing.expectEqual(@as(usize, 1), native.image_results);

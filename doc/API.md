@@ -169,7 +169,16 @@ picture itself reaches the provider. Two different units apply: context estimati
 `types.IMAGE_TOKEN_ESTIMATE` (1,600 tokens); the projection turn budget and
 the AgentCore payload cap charge it at `IMAGE_RESULT_BUDGET_BYTES` (6,400
 budget bytes, four bytes per token). The AgentCore durable budget is charged
-the real bytes. A profile whose cap for that operation kind is below 6,400
+the real bytes. Because images bypass the byte budgets, the bytes they put
+on the wire are capped separately at `types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST`
+(16 MiB, under every wired provider's inline-image request limit): the
+projection spills the largest images of the current turn beyond the cap into
+artifact envelopes, and before each request the agent loop stubs the oldest
+already-delivered image results until the active history fits
+(`agent_loop.Options.image_request_bytes_cap`). On Gemini 3, `image/gif`
+results travel as a sibling `inline_data` part rather than inside the
+multimodal function response, whose `inlineData` accepts only PNG, JPEG and
+WebP. A profile whose cap for that operation kind is below 6,400
 rejects images of that kind with `checkpoint_payload_resource_limit`. Anthropic keeps the base64 `image`
 source block inside the `tool_result` content array (byte-identical to
 before). OpenAI chat/completions sends a short pointer as the tool message

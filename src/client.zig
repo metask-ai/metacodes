@@ -552,6 +552,7 @@ pub const Client = struct {
         // 图像 tool_result 是发原生块还是占位文本,由序列化器**实际**报告(插件方言可以在
         // profile 声称支持时仍拒绝发图),随流句柄回传给 agent_loop 的送达水位。
         var report = json_mod.SerializationReport{};
+        defer report.deinit(client.allocator);
         const req_body = try json_mod.serializeMessagesRequestWithDialectReport(.{
             .model = effective_model,
             .max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override), // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
@@ -569,7 +570,7 @@ pub const Client = struct {
         switch (result) {
             .streaming_response => |r| {
                 var sr = StreamResponse.init(client.allocator, r, abort);
-                sr.image_results_native = report.imagesNative();
+                sr.image_placeholder_ids = try report.placeholder_ids.toOwnedSlice(client.allocator);
                 return sr;
             },
             .full_body => unreachable,
@@ -944,8 +945,8 @@ pub const StreamResponse = struct {
     done: bool = false,
     /// 本轮用户原始输入(borrowed),透传给 EventIterator 供 web_search 显示真实 query。
     user_query: []const u8 = "",
-    /// 序列化时对图像 tool_result 的定案(原生块 / 占位),随 StreamHandle 回传给 agent_loop。
-    image_results_native: bool = false,
+    /// 序列化时走占位的图像 tool_result id(owned 切片,元素借用),随 StreamHandle 回传给 agent_loop。
+    image_placeholder_ids: ?[]const []const u8 = null,
     /// 本次流式请求的 request_id，所有下游（stream event、agent loop、工具调用）
     /// 用它把日志串起来。
     id: log.RequestId,
@@ -960,6 +961,7 @@ pub const StreamResponse = struct {
     }
 
     pub fn deinit(self: *StreamResponse) void {
+        if (self.image_placeholder_ids) |ids| self.allocator.free(ids);
         // EventIterator 可能持有未 emit 的 pending_tool(流中途断开时残留),释放它。
         if (self.iter_initialized) self.event_iter.deinit(self.allocator);
         if (self.stream_result.abort_registry) |registry|
@@ -980,7 +982,7 @@ pub const StreamResponse = struct {
         std.debug.assert(!self.iter_initialized);
         return .{
             .ctx = @ptrCast(self),
-            .image_results_native = self.image_results_native,
+            .image_placeholder_ids = self.image_placeholder_ids,
             .nextFn = &hNext,
             .deinitFn = &hDeinit,
             .stopReasonFn = &hStopReason,

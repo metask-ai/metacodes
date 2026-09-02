@@ -787,11 +787,13 @@ pub const ApiResponse = struct {
 /// **借用契约**:handle 的 ctx 借用底层 StreamResponse;底层必须比 handle 活得久(同步消费)。
 pub const StreamHandle = struct {
     ctx: *anyopaque,
-    /// 本次请求里图像形态 tool_result 是否以**原生图像块**发出(false = 发的是有界占位文本,
-    /// 模型看不到图)。由具体客户端在序列化的同一时刻、用同一个方言 profile 与同一个模型快照
-    /// 填写;agent_loop 的送达水位对含图消息只认它,绝不事后重算(否则运行时方言覆盖或并发
-    /// setModel 会让判断与真正发出的字节不一致)。默认 false = 不知道就按未送达保守处理。
-    image_results_native: bool = false,
+    /// 本次请求里以**占位文本**发出(模型看不到图)的图像 tool_result 的 tool_use_id——
+    /// 序列化器的实际报告,由具体客户端在序列化的同一时刻填写,agent_loop 的送达水位只认它,
+    /// 绝不事后重算能力(运行时方言覆盖、并发 setModel、按 MIME 部分拒绝都只有序列化器知道)。
+    /// null = 不知道(测试桩/未接线的包装器)→ 所有配对图片按未送达保守处理;空切片 = 全部
+    /// 原生发出。切片由流对象拥有、随其 deinit 释放;元素借用请求消息里的 id 字节,只在
+    /// agent_loop 紧接请求之后做送达判断时读取。
+    image_placeholder_ids: ?[]const []const u8 = null,
     nextFn: *const fn (ctx: *anyopaque) anyerror!?StreamEvent,
     deinitFn: *const fn (ctx: *anyopaque) void,
     stopReasonFn: *const fn (ctx: *anyopaque) StopReason,

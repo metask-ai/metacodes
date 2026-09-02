@@ -185,17 +185,21 @@ pub const OpenAIClient = struct {
         const dialect = self.dialect_resolver.resolve(.openai, model);
         // 图像 tool_result 定案(原生块 / 占位)由序列化器实际报告,随流句柄回传。
         var report = json_mod.SerializationReport{};
+        defer report.deinit(self.allocator);
         // wire 协议分派:chat/completions(默认)或 Responses API(typed SSE)。
         const body = switch (self.protocol) {
             .chat_completions => try serializeOpenAIRequestWithOverridesAndDialectReport(self.allocator, model, messages, system, tools, o, dialect, &report),
             .responses => try serializeOpenAIResponsesRequestReport(self.allocator, model, messages, system, tools, o, dialect, &report),
         };
         defer self.allocator.free(body);
-        return self.doStream(body, abort, dialect, report.imagesNative());
+        const placeholder_ids = try report.placeholder_ids.toOwnedSlice(self.allocator);
+        return self.doStream(body, abort, dialect, placeholder_ids);
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
-    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_results_native: bool) !StreamHandle {
+    /// `image_placeholder_ids` 所有权转入本函数:失败路径释放,成功后归 OpenAIStream。
+    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_placeholder_ids: []const []const u8) !StreamHandle {
+        errdefer self.allocator.free(image_placeholder_ids);
         const rid = log.genRequestId();
         log.infoId(
             "openai",
@@ -258,7 +262,7 @@ pub const OpenAIClient = struct {
         const heap = try self.allocator.create(OpenAIStream);
         heap.* = .{
             .allocator = self.allocator,
-            .image_results_native = image_results_native,
+            .image_placeholder_ids = image_placeholder_ids,
             .model = self.model,
             .dialect = dialect,
             .protocol = self.protocol,
@@ -299,8 +303,8 @@ const OpenAIStream = struct {
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
-    /// 序列化时对图像 tool_result 的定案,随 StreamHandle 回传。
-    image_results_native: bool = false,
+    /// 序列化时走占位的图像 tool_result id(owned),随 StreamHandle 回传。
+    image_placeholder_ids: []const []const u8 = &.{},
     done: bool = false,
     /// Responses 协议:终止事件(completed/incomplete)已发 usage,flush 队列排空后
     /// 补发一个 .done(Responses 无 [DONE] 哨兵行)。
@@ -316,7 +320,7 @@ const OpenAIStream = struct {
     flushed: bool = false,
 
     fn handle(self: *OpenAIStream) StreamHandle {
-        return .{ .ctx = @ptrCast(self), .image_results_native = self.image_results_native, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
+        return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
         return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).next();
@@ -335,6 +339,7 @@ const OpenAIStream = struct {
     }
 
     fn deinit(self: *OpenAIStream) void {
+        self.allocator.free(self.image_placeholder_ids);
         for (self.tcs.items) |*tc| tc.deinit(self.allocator);
         self.tcs.deinit(self.allocator);
         // 异常拆解时未 drain 的 flush 事件仍持 owned id/name/input_json → 释放,防泄漏。
@@ -862,6 +867,7 @@ pub fn serializeOpenAIRequestWithOverridesAndDialect(
     dialect: dialect_mod.Dialect,
 ) ![]u8 {
     var scratch = json_mod.SerializationReport{};
+    defer scratch.deinit(allocator);
     return serializeOpenAIRequestWithOverridesAndDialectReport(allocator, model, messages, system, tools, overrides, dialect, &scratch);
 }
 
@@ -1027,7 +1033,7 @@ fn serializeOpenAIMessage(
                         try util_json.serializeString(pointer.items, out, allocator);
                     } else {
                         image_parts.shrinkRetainingCapacity(mark);
-                        report.image_placeholders += 1;
+                        try report.notePlaceholder(allocator, tr.tool_use_id);
                         var placeholder: std.ArrayList(u8) = .empty;
                         defer placeholder.deinit(allocator);
                         try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
@@ -1169,6 +1175,7 @@ pub fn serializeOpenAIResponsesRequest(
     dialect: dialect_mod.Dialect,
 ) ![]u8 {
     var scratch = json_mod.SerializationReport{};
+    defer scratch.deinit(allocator);
     return serializeOpenAIResponsesRequestReport(allocator, model, messages, system, tools, overrides, dialect, &scratch);
 }
 
@@ -1383,7 +1390,7 @@ fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayLis
                     try out.appendSlice(allocator, "\"}]");
                 } else {
                     // 非 vision:显式占位文本,绝不把 base64 原文当 output 字符串发。
-                    report.image_placeholders += 1;
+                    try report.notePlaceholder(allocator, tr.tool_use_id);
                     var placeholder: std.ArrayList(u8) = .empty;
                     defer placeholder.deinit(allocator);
                     try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
@@ -1809,6 +1816,7 @@ test "SerializationReport(OpenAI): chat 走 fail-closed 方言计占位;Response
     const msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &tool_result } };
     // chat/completions + 默认 fail-closed 方言(gpt-4o 的 profile 支持 vision,方言仍拒绝)。
     var chat_closed = json_mod.SerializationReport{};
+    defer chat_closed.deinit(a);
     const body_closed = try serializeOpenAIRequestWithOverridesAndDialectReport(a, "gpt-4o", &msgs, null, null, .{}, .{ .ctx = undefined }, &chat_closed);
     defer a.free(body_closed);
     try std.testing.expectEqual(@as(usize, 1), chat_closed.image_results);
@@ -1816,15 +1824,18 @@ test "SerializationReport(OpenAI): chat 走 fail-closed 方言计占位;Response
     try std.testing.expect(!chat_closed.imagesNative());
     // chat/completions + 内建方言:原生 image_url,不计占位。
     var chat_native = json_mod.SerializationReport{};
+    defer chat_native.deinit(a);
     const body_native = try serializeOpenAIRequestWithOverridesAndDialectReport(a, "gpt-4o", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-4o"), &chat_native);
     defer a.free(body_native);
     try std.testing.expect(chat_native.imagesNative());
     // Responses:非 vision 模型计占位,vision 模型不计。
     var resp_closed = json_mod.SerializationReport{};
+    defer resp_closed.deinit(a);
     const body_resp_closed = try serializeOpenAIResponsesRequestReport(a, "deepseek-chat", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "deepseek-chat"), &resp_closed);
     defer a.free(body_resp_closed);
     try std.testing.expectEqual(@as(usize, 1), resp_closed.image_placeholders);
     var resp_native = json_mod.SerializationReport{};
+    defer resp_native.deinit(a);
     const body_resp_native = try serializeOpenAIResponsesRequestReport(a, "gpt-5.2", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-5.2"), &resp_native);
     defer a.free(body_resp_native);
     try std.testing.expect(resp_native.imagesNative());
