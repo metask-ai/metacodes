@@ -376,11 +376,12 @@ python3 scripts/eval/plugin_pair_runner.py --freeze \
 **路径集摘要**(`implementation_paths` 与 `pinned_evaluator_files` 的成员名集合,
 与内容无关)、运行时/两个 wrapper/两个 inventory 的哈希、schedule 哈希、模型指纹、**运行环境**
 (`platform` 与 `python` 版本——rollout 的 `environment_fingerprint` 记录的就是这两项——外加
-解释器实现、cache tag、`sys.executable` 的 realpath 与哈希、`sys.prefix`,用来区分同版本的
-不同安装/venv),以及对以上字段的规范化哈希 `manifest_sha256`。运行环境**不是主机身份**,
-也不是"钉住解释器":解释器、它的 prefix 和加载的库同 PATH 上的二进制一样在操作者的信任边界
-之内;记录它的意义是让换机器、换 OS 构建、换解释器安装或 venv 成为授权之前的一条**具名**
-`environment` 拒绝,而不是花完钱后整批诚实行过不了指纹。`platform.platform()` 含内核构建串,
+解释器实现、cache tag、`sys.executable` 的 realpath 与哈希、`sys.prefix`/`exec_prefix`/
+`base_prefix`,用来区分同版本的不同安装/venv),以及对以上字段的规范化哈希 `manifest_sha256`。
+运行环境**不是主机身份**(两台配置、路径、哈希全同的机器在这里分不出来),也不是"钉住解释器":
+解释器、它的 prefix 和加载的库同 PATH 上的二进制一样在操作者的信任边界之内;记录它的意义是
+让**观测结果不同**的 OS/解释器环境——另一个 OS 构建、另一个解释器安装或 venv——成为授权之前
+的一条**具名** `environment` 拒绝,而不是花完钱后整批诚实行过不了指纹。`platform.platform()` 含内核构建串,
 OS 补丁也会触发它——重新冻结是一个要看着 diff 做的动作,不是可以顺手跳过的告警。文件以 0600 创建,**拒绝覆盖**。
 
 用户 authority 升到 `metacodes.plugin-paid-authority/v2`,在 v1 字段之上**必须**携带

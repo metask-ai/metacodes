@@ -1004,9 +1004,13 @@ class BudgetJournal:
 
     def _adopt_durable_authorization(self, transaction_id: str) -> bool:
         """After an interrupted `authorize_request`: if the durable journal is
-        exactly this process's state plus that one authorization event, adopt
-        it (the write landed; only the in-memory state is behind) and report
-        True. Any other drift under the lock is still corruption."""
+        exactly this process's state plus one valid `request_authorized`
+        event for this transaction, adopt it and report True. That is the
+        exact valid one-step successor, not a proof it was this process's
+        own write - under the lock only this process should write, and a
+        same-UID writer ignoring the lock can already rewrite this unsigned
+        journal; adoption only makes the abort refuse conservatively. Any
+        other drift under the lock is still refused as corruption."""
         assert self._document is not None and self._state is not None
         self._reject_temporary()
         current = self._read_document()

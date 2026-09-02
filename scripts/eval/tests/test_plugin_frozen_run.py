@@ -115,12 +115,13 @@ class FreezeAndVerifyTest(unittest.TestCase):
             self.assertEqual(FROZEN_RUN_SCHEMA, manifest["schema"])
             self.assertEqual(manifest_sha256_of(manifest), manifest["manifest_sha256"])
             self.assertEqual(64, len(manifest["implementation_fingerprint"]))
-            # The host is frozen too: rollouts record platform/python into
-            # their environment fingerprint, so a run or analysis elsewhere
-            # is refused by name before any money moves.
+            # The observed OS/interpreter environment is frozen too: rollouts
+            # record platform/python into their environment fingerprint, so a
+            # run or analysis in a differently observed environment is
+            # refused by name before any money moves.
             environment = manifest["environment"]
             self.assertEqual(
-                {"platform", "python", "implementation", "cache_tag", "executable", "executable_sha256", "prefix"},
+                {"platform", "python", "implementation", "cache_tag", "executable", "executable_sha256", "prefix", "exec_prefix", "base_prefix"},
                 set(environment),
             )
             self.assertEqual(platform.platform(), environment["platform"])

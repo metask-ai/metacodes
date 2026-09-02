@@ -392,10 +392,12 @@ class PluginPairRunnerTest(unittest.TestCase):
                 launcher=launcher.read_text(encoding="utf-8"),
                 executable=os.access(launcher, os.X_OK),
                 # The launcher must really run this interpreter, venv and all.
-                reported=real_run(
-                    [str(launcher), "-c", "import sys; print(sys.executable, sys.prefix)"],
+                # JSON, not whitespace splitting: interpreter paths may hold
+                # spaces, and the launcher quotes them.
+                reported=json.loads(real_run(
+                    [str(launcher), "-c", "import json, sys; print(json.dumps([sys.executable, sys.prefix]))"],
                     stdout=subprocess.PIPE, text=True, check=True, env=env,
-                ).stdout.split(),
+                ).stdout),
                 argv=argv,
             )
             return subprocess.CompletedProcess(argv, 0)
@@ -429,7 +431,7 @@ class PluginPairRunnerTest(unittest.TestCase):
         self.assertNotIn("METASK_API_KEY", captured["env"])
         self.assertIn("metacodes-eval-python-", captured["shim"])
         self.assertTrue(captured["executable"])
-        self.assertIn(sys.executable, captured["launcher"])
+        self.assertTrue(captured["launcher"].startswith("#!/bin/sh\nexec "))
         self.assertEqual([sys.executable, sys.prefix], captured["reported"])
         self.assertFalse(Path(captured["shim"]).exists())
 

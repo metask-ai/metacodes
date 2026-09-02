@@ -180,16 +180,18 @@ def _arm_identities(
 def _execution_environment() -> dict[str, Any]:
     """What the freeze records about the environment a paid run executes in.
 
-    Not a host identity, and not a claim that the interpreter is pinned:
-    the interpreter, its prefix and the libraries it loads are inside the
-    operator's trust boundary, like the binaries on PATH. It exists so that a
-    run or an analysis started somewhere else - another machine or OS build,
-    another interpreter build or venv - is a named `environment` refusal
-    before any authorization, instead of a batch of honest rows failing
-    their environment fingerprint after the money is spent. `platform` and
-    `python` are exactly what the harness writes into that fingerprint; the
-    rest tells one interpreter installation from another with the same
-    version.
+    Not a host identity - two identically provisioned machines with the
+    same paths and hashes are indistinguishable here - and not a claim that
+    the interpreter is pinned: the interpreter, its prefixes and the
+    libraries it loads are inside the operator's trust boundary, like the
+    binaries on PATH. It exists so that a run or an analysis started in a
+    *differently observed* OS/interpreter environment - another OS build,
+    another interpreter build, another venv - is a named `environment`
+    refusal before any authorization, instead of a batch of honest rows
+    failing their environment fingerprint after the money is spent.
+    `platform` and `python` are exactly what the harness writes into that
+    fingerprint; the rest tells one interpreter installation from another
+    with the same version.
     """
     executable = Path(sys.executable).resolve()
     return {
@@ -200,6 +202,8 @@ def _execution_environment() -> dict[str, Any]:
         "executable": str(executable),
         "executable_sha256": _sha256(executable),
         "prefix": str(Path(sys.prefix).resolve()),
+        "exec_prefix": str(Path(sys.exec_prefix).resolve()),
+        "base_prefix": str(Path(sys.base_prefix).resolve()),
     }
 
 
