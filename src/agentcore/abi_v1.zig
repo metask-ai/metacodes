@@ -1418,14 +1418,16 @@ const AbiSession = struct {
     /// suppress it (`closeForTerminal` clears the tool set, so the snapshot is
     /// bounded). Returns false when the Host rejected the snapshot, when it
     /// could not be built, **or when the observation channel is already
-    /// unusable** — an earlier snapshot was rejected or could not be built and
-    /// `callback_status` is sticky: a channel that died silently must not let
-    /// this or any later Run report success while its terminal is skipped. The
-    /// caller then fails the Run with the recorded callback status and poisons
-    /// the facade (ABI rule: any non-continue `on_event` result aborts the Run
-    /// and poisons the Session). Returns true without emitting only when the
-    /// Run is already terminal or the projector belongs to a different Run
-    /// (the failure happened before this Run's `starting`).
+    /// dead** — `callback_status` is sticky and records the first failure,
+    /// whether a rejected snapshot or public event, an unbuildable payload, or
+    /// an internal publication step (permission provenance, schema admission)
+    /// that failed: a channel that died silently must not let this or any
+    /// later Run report success while its terminal is skipped. The caller then
+    /// fails the Run with the recorded status and poisons the facade (ABI rule:
+    /// any non-continue `on_event` result aborts the Run and poisons the
+    /// Session). Returns true without emitting only when the Run is already
+    /// terminal or the projector belongs to a different Run (the failure
+    /// happened before this Run's `starting`).
     fn emitTerminalRunStateIfOpen(
         self: *AbiSession,
         session_id: core.session_id.SessionId,
@@ -1439,14 +1441,21 @@ const AbiSession = struct {
         return self.emitRunStateSnapshot(session_id, run_id);
     }
 
-    /// The Host rejected a terminal RunState snapshot, or it could not be
-    /// built. That is a callback failure like any other: it fails the Run with
-    /// the recorded callback status and poisons the Session, so a Run is never
-    /// reported successful after its Host callback failed.
-    fn terminalSnapshotRejected(self: *AbiSession, out_error: ?*wire.OwnedBytesV1) u32 {
+    /// The observation channel is dead: the Host rejected a snapshot or a
+    /// public event, a snapshot could not be built, or an internal step of
+    /// event publication (permission provenance, schema admission) failed and
+    /// recorded its status. Whatever the first failure was, the Run cannot be
+    /// reported successful after it: the facade is poisoned and the Run fails
+    /// with the recorded status, the diagnostic naming that cause.
+    fn failOnDeadObservationChannel(self: *AbiSession, out_error: ?*wire.OwnedBytesV1) u32 {
         self.facade_poisoned.store(true, .release);
         const status = self.callbackFailureStatus();
-        const cause: anyerror = if (status == wire.STATUS_OUT_OF_MEMORY) error.OutOfMemory else error.CallbackFailed;
+        const cause: anyerror = switch (status) {
+            wire.STATUS_OUT_OF_MEMORY => error.OutOfMemory,
+            wire.STATUS_RESOURCE_LIMIT => error.ResourceLimit,
+            wire.STATUS_INTERNAL_ERROR => error.InternalError,
+            else => error.CallbackFailed,
+        };
         return failError(status, cause, out_error);
     }
 
@@ -1476,7 +1485,7 @@ const AbiSession = struct {
             .failed;
         if (phase == .poisoned) self.facade_poisoned.store(true, .release);
         if (!self.emitTerminalRunStateIfOpen(session_id, run_id, phase))
-            return self.terminalSnapshotRejected(out_error);
+            return self.failOnDeadObservationChannel(out_error);
         return failError(status, err, out_error);
     }
 
@@ -6872,7 +6881,7 @@ fn sessionRunInput(
     const result = switch (execution) {
         .aborted => {
             if (!self.emitTerminalRunStateIfOpen(self.core_session.session_id, run_id, .aborted))
-                return self.terminalSnapshotRejected(out_error);
+                return self.failOnDeadObservationChannel(out_error);
             out.* = .{
                 .struct_size = @sizeOf(wire.RunResultV1),
                 .stop_reason_code = wire.STOP_ABORTED,
@@ -6896,7 +6905,7 @@ fn sessionRunInput(
         self.core_session.session_id,
         run_id,
         terminalPhaseForStopReason(result.stop_reason),
-    )) return self.terminalSnapshotRejected(out_error);
+    )) return self.failOnDeadObservationChannel(out_error);
     const stop_code = switch (self.budget_state.last_outcome) {
         .budget_exhausted => wire.STOP_CHECKPOINT_BUDGET_EXHAUSTED,
         .resource_limit => wire.STOP_CHECKPOINT_RESOURCE_LIMIT,
@@ -9544,7 +9553,17 @@ test "reconcileRunFailure: cleanup failure after an idle Core still closes as po
         fake.reconcileRunFailure(.single, 13, wire.STATUS_CORE_ERROR, error.CallbackFailed, false, null),
     );
     try std.testing.expect(fake.facade_poisoned.load(.acquire));
-    try std.testing.expectEqual(public_protocol.RunStatePhase.starting, fake.run_state_projector.phase);
+
+    // Any recorded first failure counts, not only OOM and rejections: an
+    // internal publication step that recorded RESOURCE_LIMIT is returned as such.
+    fake.facade_poisoned.store(false, .release);
+    fake.callback_status.store(wire.STATUS_RESOURCE_LIMIT, .release);
+    try std.testing.expect(fake.startRunState(.single, 14));
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        fake.reconcileRunFailure(.single, 14, wire.STATUS_CORE_ERROR, error.CallbackFailed, false, null),
+    );
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
 }
 
 test "reconcileRunFailure: a Host rejecting the poisoned terminal fails the Run with CALLBACK_FAILED (real Core session)" {
