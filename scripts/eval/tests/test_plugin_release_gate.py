@@ -280,8 +280,6 @@ class PluginReleaseGateTest(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RunGateSnapshotTest(unittest.TestCase):
@@ -332,12 +330,21 @@ class RunGateSnapshotTest(unittest.TestCase):
             return {"argv": argv, "elapsed_ms": 1, "output_sha256": hashlib.sha256(output.encode()).hexdigest(), "output": output}
         return fake
 
-    def _run_gate(self, protocol_path: Path, runtime: Path, mutate_last: callable):
+    def _run_gate(self, protocol_path: Path, runtime: Path, mutate_last: callable, root_heads: list | None = None, before_call: callable = lambda: None):
         expected_dsh = json.loads(protocol_path.read_text(encoding="utf-8"))["upstream"]["deepseek_harness_commit"]
         real_git_head = __import__("scripts.eval.plugin_release_gate", fromlist=["_git_head"])._git_head
+        heads = list(root_heads) if root_heads is not None else None
+
+        def fake_git_head(path):
+            if path != ROOT:
+                return expected_dsh
+            if heads:
+                return heads.pop(0)
+            return real_git_head(ROOT)
+
         with mock.patch("scripts.eval.plugin_release_gate._run", self._fake_run(protocol_path, mutate_last)), \
-             mock.patch("scripts.eval.plugin_release_gate._git_head",
-                        lambda path: expected_dsh if path != ROOT else real_git_head(ROOT)):
+             mock.patch("scripts.eval.plugin_release_gate._git_head", fake_git_head):
+            before_call()  # test setup above may have read the protocol itself
             return run_gate(ROOT, protocol_path, dsh=Path("/nonexistent-dsh"), runtime_binary=runtime)
 
     def test_gate_with_unchanged_inputs_produces_a_receipt(self) -> None:
@@ -358,11 +365,61 @@ class RunGateSnapshotTest(unittest.TestCase):
                 self._run_gate(path, runtime, mutate_last=reformat)
 
     def test_pin_changed_by_the_last_subprocess_rejects_the_receipt(self) -> None:
+        # A *semantic* change, not just formatting. It is caught by the same
+        # byte-equality check as the formatting case - any change to the file
+        # is - which is why the gate no longer carries a separate pin
+        # comparison; this test keeps the semantic case from regressing if the
+        # byte check were ever narrowed.
         with tempfile.TemporaryDirectory() as directory:
             path, runtime = self._protocol_with_fake_runtime(Path(directory))
             def stale_pin():
                 raw = path.read_text(encoding="utf-8")
                 pinned = json.loads(raw)["coding_pair"]["implementation_fingerprint"]
                 path.write_text(raw.replace(pinned, "0f" * 32), encoding="utf-8")
-            with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+            with self.assertRaisesRegex(PluginGateError, "protocol changed while the gate was running"):
                 self._run_gate(path, runtime, mutate_last=stale_pin)
+
+    def test_git_head_moving_during_the_gate_rejects_the_receipt(self) -> None:
+        # Deleting the HEAD comparison left every other snapshot test green:
+        # they all see the same real HEAD twice. Feed a different one the
+        # second time.
+        with tempfile.TemporaryDirectory() as directory:
+            path, runtime = self._protocol_with_fake_runtime(Path(directory))
+            with self.assertRaisesRegex(PluginGateError, "git HEAD moved"):
+                self._run_gate(path, runtime, mutate_last=lambda: None, root_heads=["a" * 40, "b" * 40])
+
+    def test_gate_reads_the_protocol_file_exactly_twice_and_never_as_text(self) -> None:
+        # The object the checks run with and the hash the receipt carries must
+        # come from ONE read at the start; the final check is the second. A
+        # third read - hashing the file separately, or reloading it - is the
+        # window an atomic replacement slips through.
+        with tempfile.TemporaryDirectory() as directory:
+            path, runtime = self._protocol_with_fake_runtime(Path(directory))
+            target = path.resolve()
+            reads = {"bytes": 0, "text": 0}
+            real_read_bytes, real_read_text = Path.read_bytes, Path.read_text
+
+            def counting_read_bytes(self_path, *args, **kwargs):
+                if self_path.resolve() == target:
+                    reads["bytes"] += 1
+                return real_read_bytes(self_path, *args, **kwargs)
+
+            def counting_read_text(self_path, *args, **kwargs):
+                if self_path.resolve() == target:
+                    reads["text"] += 1
+                return real_read_text(self_path, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_bytes", counting_read_bytes), \
+                 mock.patch.object(Path, "read_text", counting_read_text):
+                # Only reads performed by run_gate itself count: the helpers
+                # read the protocol to build their fakes, which is not the
+                # discipline under test.
+                receipt = self._run_gate(
+                    path, runtime, mutate_last=lambda: None,
+                    before_call=lambda: reads.update(bytes=0, text=0),
+                )
+            self.assertEqual({"bytes": 2, "text": 0}, reads)
+            self.assertEqual(hashlib.sha256(real_read_bytes(path)).hexdigest(), receipt["protocol_sha256"])
+
+if __name__ == "__main__":
+    unittest.main()

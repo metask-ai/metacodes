@@ -169,8 +169,20 @@ def load_protocol_structure(root: Path, path: Path) -> dict[str, Any]:
 
 def _load_and_validate(root: Path, path: Path, *, check_implementation: bool) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
+    return _validate_payload(root, raw, check_implementation=check_implementation)
+
+
+def _validate_payload(root: Path, raw: bytes, *, check_implementation: bool) -> dict[str, Any]:
+    """Validate one exact byte payload. Callers that need the payload's hash to
+    describe the same object they validated - the gate's receipt - hash `raw`
+    themselves rather than re-reading the file, so there is no second read
+    for a concurrent writer to slip between."""
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         raise PluginGateError("unsupported plugin evaluation protocol")
@@ -359,11 +371,23 @@ def _git_head(path: Path) -> str:
 
 @dataclass(frozen=True)
 class _GateSnapshot:
-    """What a zero-provider receipt describes, captured before the gate runs.
+    """What a zero-provider receipt describes.
 
-    ``require_unchanged`` is the gate's last act before the receipt exists: a
-    full strict reload (every pin, not only the implementation fingerprint),
-    plus byte-equality of the protocol file and equality of the Git HEAD.
+    ``open`` reads the protocol file **once** and returns both the validated
+    object the gate will run with and the hash of the very bytes it was parsed
+    from. An earlier draft loaded the object and then hashed the file in a
+    second read, which let an atomic replacement between the two produce a
+    receipt whose ``protocol_sha256`` named one protocol while the checks had
+    run with another's parameters.
+
+    ``require_unchanged`` is the gate's last act before the receipt exists:
+    the file must still hold the same bytes, those bytes must still pass the
+    full strict validation against the tree (every pin, not only the
+    implementation fingerprint), and the Git HEAD must be the one captured.
+    What this does *not* detect is a pinned input changed and restored between
+    the two observations while a subprocess consumed the changed version;
+    closing that needs the subprocesses to run inside a materialized checkout
+    of the snapshot (issue #49).
     """
 
     protocol_sha256: str
@@ -371,20 +395,28 @@ class _GateSnapshot:
     implementation_fingerprint: str
 
     @classmethod
-    def capture(cls, root: Path, protocol_path: Path) -> "_GateSnapshot":
-        protocol = load_protocol(root, protocol_path)
-        return cls(
-            protocol_sha256=_sha256(protocol_path),
+    def open(cls, root: Path, protocol_path: Path) -> tuple[dict[str, Any], "_GateSnapshot"]:
+        try:
+            raw = protocol_path.read_bytes()
+        except OSError as exc:
+            raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
+        protocol = _validate_payload(root, raw, check_implementation=True)
+        snapshot = cls(
+            protocol_sha256=_sha256_bytes(raw),
             git_head=_git_head(root),
             implementation_fingerprint=protocol["coding_pair"]["implementation_fingerprint"],
         )
+        return protocol, snapshot
 
     def require_unchanged(self, root: Path, protocol_path: Path) -> None:
-        final = load_protocol(root, protocol_path)
-        if _sha256(protocol_path) != self.protocol_sha256:
+        try:
+            final_raw = protocol_path.read_bytes()
+        except OSError as exc:
+            raise PluginGateError(f"cannot re-read plugin evaluation protocol: {exc}") from exc
+        if _sha256_bytes(final_raw) != self.protocol_sha256:
             raise PluginGateError("protocol changed while the gate was running")
-        if final["coding_pair"]["implementation_fingerprint"] != self.implementation_fingerprint:
-            raise PluginGateError("implementation pin changed while the gate was running")
+        # Same bytes; now the same bytes must still hold against the tree.
+        _validate_payload(root, final_raw, check_implementation=True)
         if _git_head(root) != self.git_head:
             raise PluginGateError("git HEAD moved while the gate was running")
 
@@ -395,13 +427,10 @@ def run_gate(
     dsh: Path,
     runtime_binary: Path,
 ) -> dict[str, Any]:
-    protocol = load_protocol(root, protocol_path)
-    # Snapshot what this receipt will describe: the protocol bytes and the
-    # tree identity at the moment every pin was checked. The receipt is built
-    # minutes of subprocesses later, and used to hash the protocol file *then*
-    # - so a protocol.json edited mid-gate produced a receipt whose fields came
-    # from one file and whose sha256 came from another.
-    snapshot = _GateSnapshot.capture(root, protocol_path)
+    # One read: the object the gate runs with and the hash the receipt will
+    # carry come from the same bytes. The receipt is built minutes of
+    # subprocesses later; it must describe this snapshot and nothing else.
+    protocol, snapshot = _GateSnapshot.open(root, protocol_path)
     runtime = attest_runtime_artifact(protocol, runtime_binary)
     expected_dsh = protocol["upstream"]["deepseek_harness_commit"]
     observed_dsh = _git_head(dsh)

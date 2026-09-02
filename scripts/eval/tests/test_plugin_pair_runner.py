@@ -230,8 +230,6 @@ class PluginPairRunnerTest(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ProductionEntryPointsStayStrictTest(unittest.TestCase):
@@ -280,3 +278,6 @@ class ProductionEntryPointsStayStrictTest(unittest.TestCase):
                 candidate_path=self.temporary / "no-candidate",
                 budget_journal_path=self.temporary / "no-journal",
             )
+
+if __name__ == "__main__":
+    unittest.main()

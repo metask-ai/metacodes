@@ -335,7 +335,7 @@ tokens，低于用户 US$1,000 总上限。尚未运行外部 WorkBuddy。
 
 | 集合 | 字段 | 钉的是什么 | 谁校验、何时 |
 |---|---|---|---|
-| **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头严格加载;写 receipt 前**再做一次完整严格重载**,并要求协议文件字节与 git HEAD 与开头捕获的快照一致——receipt 只描述那份快照)、`plugin_pair_runner.build_plan` / `run_paid_pair` 及每次请求前后的重载、`plugin_pair_analysis.analyze`。全部经 `load_protocol`,严格是**构造出来的**,不是可忘记的开关 |
+| **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头**一次读取**协议字节:运行用的对象与 receipt 携带的哈希出自同一份字节;写 receipt 前要求文件仍是这份字节、这份字节仍通过完整严格校验、git HEAD 未变。它**不能**察觉子进程运行期间被钉输入"改了又改回"——那需要在物化的不可变 checkout 里跑门禁,见 #49)、`plugin_pair_runner.build_plan` / `run_paid_pair` 及每次请求前后的重载、`plugin_pair_analysis.analyze`。全部经 `load_protocol`,严格是**构造出来的**,不是可忘记的开关 |
 | **评测器** | `pinned_evaluator_files` | 做测量与判定的代码(gate、runner、analysis、e2e 脚本、门禁阈值)以及 Lean 形式化证据(它们由 CI 单独编译、被评测脚本消费,**不链接进运行时二进制**) | **每次加载**都校验,包括日常测试;**永远不由工具自动 repin**——一个门禁给自己的代码重钉哈希是自证漏洞(c7c2aa9) |
 | **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件 | 每次加载都校验 |
 
