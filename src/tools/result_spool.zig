@@ -131,6 +131,11 @@ test "CaptureWriter streams formatting and preserves small inline result" {
 
 /// Index just past the `)` that closes the call opened at `open` (the index of
 /// its `(`), or null if unbalanced.
+///
+/// Counts parentheses and nothing else. Every call site passes plain
+/// identifiers and field accesses, so that is enough; the guard below rejects
+/// any argument span holding a string literal or comment rather than letting
+/// this miscount one and quietly compare the wrong slice.
 fn callEnd(src: []const u8, open: usize) ?usize {
     var depth: usize = 0;
     var i = open;
@@ -164,23 +169,48 @@ test "guard: callers hand over ctx.result_budget verbatim, and this file reads o
     try std.testing.expect(std.mem.indexOf(u8, self_src, "budget.per_result_bytes") != null);
 
     const callers = .{
-        @embedFile("grep.zig"),
-        @embedFile("mcp_resources.zig"),
-        @embedFile("code_map.zig"),
-        @embedFile("web_fetch.zig"),
-        @embedFile("find_symbol.zig"),
+        .{ "grep.zig", @embedFile("grep.zig") },
+        .{ "mcp_resources.zig", @embedFile("mcp_resources.zig") },
+        .{ "code_map.zig", @embedFile("code_map.zig") },
+        .{ "web_fetch.zig", @embedFile("web_fetch.zig") },
+        .{ "find_symbol.zig", @embedFile("find_symbol.zig") },
     };
     var seen: usize = 0;
-    inline for (callers) |src| {
+    inline for (callers) |entry| {
+        const name, const src = entry;
         try std.testing.expect(std.mem.indexOf(u8, src, "INLINE_DECISION" ++ "_BYTES") == null);
         var cursor: usize = 0;
         while (std.mem.indexOfPos(u8, src, cursor, "finishCaptureAsBody(")) |at| {
             const open = at + "finishCaptureAsBody".len;
-            const end = callEnd(src, open) orelse return error.UnbalancedCall;
+            const end = callEnd(src, open) orelse {
+                std.debug.print("{s}: unbalanced finishCaptureAsBody( call\n", .{name});
+                return error.UnbalancedCall;
+            };
             const args = std.mem.trim(u8, src[open + 1 .. end - 1], " \t\r\n,");
-            const last_comma = std.mem.lastIndexOfScalar(u8, args, ',') orelse return error.TooFewArguments;
+            // The paren counter is not a Zig parser. If a call ever carries a
+            // string literal or a comment, say so instead of comparing a slice
+            // that may have been cut in the wrong place.
+            if (std.mem.indexOfScalar(u8, args, '"') != null or std.mem.indexOf(u8, args, "//") != null) {
+                std.debug.print(
+                    "{s}: a finishCaptureAsBody call now holds a string literal or comment; " ++
+                        "this guard's paren counter cannot place its last argument. Extend it before trusting it.\n",
+                    .{name},
+                );
+                return error.UnsupportedCallShape;
+            }
+            const last_comma = std.mem.lastIndexOfScalar(u8, args, ',') orelse {
+                std.debug.print("{s}: finishCaptureAsBody called with too few arguments\n", .{name});
+                return error.TooFewArguments;
+            };
             const last = std.mem.trim(u8, args[last_comma + 1 ..], " \t\r\n");
-            try std.testing.expectEqualStrings("ctx.result_budget", last);
+            if (!std.mem.eql(u8, last, "ctx.result_budget")) {
+                std.debug.print(
+                    "{s}: finishCaptureAsBody's budget argument is `{s}`, expected `ctx.result_budget`. " ++
+                        "The tool layer must hand over the caller's budget whole, never one it computed itself.\n",
+                    .{ name, last },
+                );
+                return error.BudgetArgumentNotForwarded;
+            }
             seen += 1;
             cursor = end;
         }

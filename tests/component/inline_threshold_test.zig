@@ -160,8 +160,14 @@ test "T2 inline threshold: siblings that drive the water line below per_result f
         defer body.deinit(a);
         // Every one of the eighteen is correctly inlined by the tool layer.
         try std.testing.expect(body == .@"inline");
-        originals[i] = try a.dupe(u8, body.@"inline".bytes);
-        contents[i] = try committed(a, &body);
+        // Record both or neither: assigning `originals[i]` and then failing in
+        // `committed` would leave a live allocation the deferred loop, which
+        // only walks `built` entries, never frees.
+        const original = try a.dupe(u8, body.@"inline".bytes);
+        errdefer a.free(original);
+        const content = try committed(a, &body);
+        originals[i] = original;
+        contents[i] = content;
         built += 1;
         items[i] = .{ .tool_name = "Grep", .content = &contents[i], .is_error = false };
     }
