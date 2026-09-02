@@ -147,7 +147,11 @@ def load_protocol(root: Path, path: Path) -> dict[str, Any]:
     exact bytes it validated. Both are strict by construction rather than by a
     flag a caller could forget.
     """
-    return _load_and_validate(root, path, check_implementation=True)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
+    return validate_protocol_payload(root, raw)
 
 
 def load_protocol_structure(root: Path, path: Path) -> dict[str, Any]:
@@ -398,12 +402,15 @@ class _GateSnapshot:
     the file must still hold the same bytes, those bytes must still pass the
     full strict validation against the tree (every pin, not only the
     implementation fingerprint), and the Git HEAD must be the one captured.
-    What this does *not* detect: a pinned input changed and restored between
-    the two observations while a subprocess consumed the changed version
-    (ABA); and a pinned input changed *during* either validation scan after
-    its bytes were already hashed - the scan reads ~130 files one by one and
-    is not atomic. Both need the subprocesses and the hashing to run inside a
-    materialized checkout of the snapshot (issue #49).
+    What this does *not* detect is any mutation after an input's **last
+    observation**: a pinned input changed and restored between the two
+    observations while a subprocess consumed the changed version (ABA); a
+    pinned input changed *during* either validation scan after its bytes were
+    already hashed (the scan reads ~130 files one by one and is not atomic);
+    and any input changed after the final read but before the receipt is
+    returned and persisted. All of these need the subprocesses and the
+    hashing to run inside a materialized checkout of the snapshot, and the
+    receipt to be sealed there (issue #49).
     """
 
     protocol_sha256: str

@@ -401,9 +401,13 @@ class RunGateSnapshotTest(unittest.TestCase):
             path.write_text(raw.replace(pinned, "0f" * 32), encoding="utf-8")
             calls = []
             with mock.patch("scripts.eval.plugin_release_gate._run", lambda *a, **k: calls.append(a) or {"argv": [], "elapsed_ms": 0, "output_sha256": "", "output": ""}):
-                with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+                with self.assertRaises(PluginGateError) as caught:
                     run_gate(ROOT, path, dsh=Path("/nonexistent-dsh"), runtime_binary=runtime)
+            # The key assertion first, so a gate that *did* run subprocesses
+            # and then failed for some other reason is reported as exactly
+            # that, not as a message mismatch.
             self.assertEqual([], calls)
+            self.assertRegex(str(caught.exception), "fingerprint drifted")
 
     def test_pinned_source_drifting_during_the_gate_rejects_the_receipt(self) -> None:
         # Protocol bytes unchanged, but a pinned source changed while the
