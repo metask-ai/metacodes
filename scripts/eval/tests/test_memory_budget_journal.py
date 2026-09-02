@@ -12,6 +12,7 @@ from scripts.eval.memory_budget_journal import (
     BudgetAuthority,
     BudgetJournal,
     BudgetTransaction,
+    TransactionNotAbortable,
     _canonical_sha256,
     reopen_checkpoint_transaction,
     usd_to_microusd,
@@ -194,6 +195,17 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 authorized = self.authorize(plain, transaction)
                 plain.commit(authorized["transaction_id"], actual_cost_microusd=1, actual_metered_tokens=1)
                 self.assertIsNone(plain.transaction_evidence_sha256(authorized["transaction_id"]))
+
+    def test_refused_abort_of_an_authorized_transaction_is_typed(self):
+        # Callers that abort after a failed authorization must be able to
+        # tell "correctly refused, the authorization is durable" from "the
+        # abort itself could not be recorded": only the former is typed.
+        with tempfile.TemporaryDirectory() as directory:
+            with BudgetJournal(Path(directory) / "b.json", self.authority()) as journal:
+                authorized = self.authorize(journal, self.transaction())
+                with self.assertRaises(TransactionNotAbortable):
+                    journal.abort_pre_request(authorized["transaction_id"])
+                self.assertTrue(issubclass(TransactionNotAbortable, ValidationError))
 
     def test_abort_is_only_legal_before_authorization(self):
         with tempfile.TemporaryDirectory() as directory:

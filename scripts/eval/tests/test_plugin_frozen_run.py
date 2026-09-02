@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import os
+import platform
 import shutil
 import stat
 import tempfile
@@ -32,6 +33,7 @@ from scripts.eval.memory_budget_journal import (
     usd_to_microusd,
     validate_checkpoint_payload,
 )
+from scripts.eval.model import ValidationError as JournalValidationError
 from scripts.eval.model import ValidationError, load_rollouts
 from scripts.eval.paired_runner import scenario_selector
 from scripts.eval.plugin_pair_analysis import analyze
@@ -112,6 +114,13 @@ class FreezeAndVerifyTest(unittest.TestCase):
             self.assertEqual(FROZEN_RUN_SCHEMA, manifest["schema"])
             self.assertEqual(manifest_sha256_of(manifest), manifest["manifest_sha256"])
             self.assertEqual(64, len(manifest["implementation_fingerprint"]))
+            # The host is frozen too: rollouts record platform/python into
+            # their environment fingerprint, so a run or analysis elsewhere
+            # is refused by name before any money moves.
+            self.assertEqual(
+                {"platform": platform.platform(), "python": platform.python_version()},
+                manifest["environment"],
+            )
             self.assertEqual(manifest["manifest_sha256"], verify_frozen_manifest(manifest, _live_fields(path, runtime)))
 
     def test_every_field_is_load_bearing(self) -> None:
@@ -535,6 +544,26 @@ class PreAuthorizationFailureTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "replay is forbidden"):
                 fixture.run()
 
+    def test_an_abort_that_cannot_be_recorded_is_reported_not_swallowed(self) -> None:
+        # The authorization never became durable *and* the abort could not
+        # be persisted (storage failure): the reservation is stranded on
+        # disk. That is reported, with the original failure as the cause,
+        # rather than hidden behind "aborted".
+        fixture = self.fixture
+        with mock.patch.object(
+            BudgetJournal, "authorize_request", side_effect=RuntimeError("lost before the write")
+        ), mock.patch.object(
+            BudgetJournal,
+            "abort_pre_request",
+            side_effect=JournalValidationError("budget journal: cannot create temporary file: EACCES"),
+        ):
+            with _FakeProvider(fixture).installed():
+                with self.assertRaisesRegex(ValidationError, "abort could not be recorded") as caught:
+                    fixture.run()
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+        journal = validate_checkpoint_payload(fixture.journal.read_bytes())
+        self.assertEqual(["reserved"], [t["state"] for t in journal["transactions"].values()])
+
 
 class AnalysisBindsTheJournalTest(unittest.TestCase):
     """The receipt's `budget_journal_sha256` is the hash of a journal that
@@ -703,6 +732,20 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("journal_revision", row["budget_transaction"]["commit_revision"] + 1))
         with self.assertRaisesRegex(ValidationError, "not bound to its commit revision/head"):
             self.fixture.analyze()
+
+    def test_resume_applies_the_same_receipt_binding_as_analysis(self) -> None:
+        # A receipt with a foreign field, or one pointing at another journal
+        # position, is refused on resume exactly as in analysis: the two
+        # share one validator.
+        self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("note", "x"))
+        with _FakeProvider(self.fixture).installed():
+            with self.assertRaisesRegex(ValidationError, "unexpected or missing fields"):
+                self.fixture.run()
+        self.setUp()
+        self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("journal_revision", row["budget_transaction"]["commit_revision"] + 1))
+        with _FakeProvider(self.fixture).installed():
+            with self.assertRaisesRegex(ValidationError, "not bound to its commit revision/head"):
+                self.fixture.run()
 
     def test_a_row_the_harness_recorded_with_the_wrong_identity_is_refused(self) -> None:
         # The body is authentic - the journal sealed it - but its task

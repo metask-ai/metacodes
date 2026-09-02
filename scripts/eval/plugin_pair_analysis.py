@@ -35,6 +35,7 @@ if __package__ in {None, ""}:
         _observe,
         _pair_fields,
         _read_private_json,
+        _require_receipt_bound,
         _revision,
         _transaction,
         rollout_evidence_sha256,
@@ -63,6 +64,7 @@ else:
         _observe,
         _pair_fields,
         _read_private_json,
+        _require_receipt_bound,
         _revision,
         _transaction,
         rollout_evidence_sha256,
@@ -210,38 +212,15 @@ def bind_row_to_journal(
     *,
     arm: str,
 ) -> str:
-    """Match one rollout's receipt to the journal transaction it names, and
-    that transaction to the identity this frozen run would have reserved for
-    this arm/task/trial. Returns the transaction id so the caller can find
-    journal transactions no rollout accounts for."""
+    """Match one rollout's receipt to the journal transaction it names -
+    the same receipt-binding rule resume applies - and its body to the
+    digest the journal sealed at commit. Returns the transaction id so the
+    caller can find journal transactions no rollout accounts for."""
     receipt = row["budget_transaction"]
     transaction_id = receipt.get("transaction_id")
     if not isinstance(transaction_id, str) or transaction_id not in state["transactions"]:
         raise ValidationError(
             "paid plugin row names a transaction the budget journal does not contain"
-        )
-    live = _transaction_receipt_from_state(state, transaction_id)
-    if set(receipt) != set(live):
-        raise ValidationError("paid plugin row budget receipt has unexpected or missing fields")
-    immutable = set(live) - {"journal_revision", "journal_head_sha256"}
-    if any(receipt.get(key) != live.get(key) for key in immutable):
-        raise ValidationError("paid plugin row budget receipt drifted from the journal")
-    # The receipt a row carries is the one taken at commit: its journal
-    # position is the commit's, not an earlier or later revision.
-    if (
-        receipt["journal_revision"] != receipt["commit_revision"]
-        or receipt["journal_head_sha256"] != receipt["commit_head_sha256"]
-    ):
-        raise ValidationError(
-            "paid plugin row budget receipt is not bound to its commit revision/head"
-        )
-    # The journal sealed a digest of the rollout body at commit. A receipt
-    # transplanted onto another body, or a body edited after the run, does
-    # not match it; a transaction committed without one is not this runner's.
-    sealed = state["transactions"][transaction_id].get("evidence_sha256")
-    if sealed is None or sealed != rollout_evidence_sha256(row):
-        raise ValidationError(
-            "paid plugin row body does not match the evidence sealed in the journal"
         )
     rollout_cost, rollout_tokens, _, _ = _pair_fields(observation.protocol)
     expected = _transaction(
@@ -258,9 +237,14 @@ def bind_row_to_journal(
         max_cost_usd=rollout_cost,
         max_metered_tokens=rollout_tokens,
     )
-    if any(receipt.get(key) != value for key, value in expected.record().items()):
+    _require_receipt_bound(receipt, _transaction_receipt_from_state(state, transaction_id), expected)
+    # The journal sealed a digest of the rollout body at commit. A receipt
+    # transplanted onto another body, or a body edited after the run, does
+    # not match it; a transaction committed without one is not this runner's.
+    sealed = state["transactions"][transaction_id].get("evidence_sha256")
+    if sealed is None or sealed != rollout_evidence_sha256(row):
         raise ValidationError(
-            "paid plugin row budget transaction identity does not match this frozen run"
+            "paid plugin row body does not match the evidence sealed in the journal"
         )
     return transaction_id
 

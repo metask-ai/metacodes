@@ -374,8 +374,10 @@ python3 scripts/eval/plugin_pair_runner.py --freeze \
 
 产出 `metacodes.plugin-frozen-run/v1`:协议字节哈希、git HEAD、**完整**实现指纹、
 **路径集摘要**(`implementation_paths` 与 `pinned_evaluator_files` 的成员名集合,
-与内容无关)、运行时/两个 wrapper/两个 inventory 的哈希、schedule 哈希、模型指纹,以及
-对以上字段的规范化哈希 `manifest_sha256`。文件以 0600 创建,**拒绝覆盖**。
+与内容无关)、运行时/两个 wrapper/两个 inventory 的哈希、schedule 哈希、模型指纹、**运行环境**
+(`platform` 与 `python` 版本:rollout 的 `environment_fingerprint` 记录的就是它们,冻结后
+run 与 analyze 必须在同一环境,换主机或换解释器是一条**具名**拒绝,而不是花完钱后整批诚实
+行过不了指纹),以及对以上字段的规范化哈希 `manifest_sha256`。文件以 0600 创建,**拒绝覆盖**。
 
 用户 authority 升到 `metacodes.plugin-paid-authority/v2`,在 v1 字段之上**必须**携带
 `manifest_sha256`:用户签的是这份清单,而不只是协议。
@@ -406,8 +408,14 @@ rollout 记录的 `plugin_treatment`。
 
 **预授权失败可回滚。** reserve 之后、`authorize_request` 尚未落盘就失败(信号、异常),
 runner 试图 `abort_pre_request`:日志仍是 `reserved` 则中止落账、续跑不被一笔没花的预留
-挡住;若授权其实已落盘,日志拒绝中止(状态不对或锁内 head 漂移),交易保持
-`request_authorized`——请求可能已被放行,续跑照旧拒绝。
+挡住;若授权其实已落盘,日志以 `TransactionNotAbortable` 拒绝中止,交易保持
+`request_authorized`——请求可能已被放行,续跑照旧拒绝。中止本身落盘失败(存储故障)是
+第三种情形:预留搁浅在盘上,runner 以原始失败为 cause 报出"abort could not be recorded",
+不装作已清理。
+
+**续跑与 analysis 共用一条 receipt 绑定规则**(`_require_receipt_bound`:键集合与投影完全
+相同、除 revision/head 外逐字段相等、revision/head 等于 commit 时的、交易身份等于本冻结
+应当预留的),两个入口不可能接受不同的 checkpoint。
 
 **inventory 哈希与 checkout 位置无关。** 运行时把插件根目录报告为绝对 realpath;冻结的
 `inventory_sha256` 哈希的是 `metacodes.plugin-inventory-identity/v1` 投影:候选插件的
@@ -423,7 +431,12 @@ inventory 预检在临时 HOME 下、`METACODES_NO_PROBE=1` 执行:`--dump-plugi
 (`BASH_FUNC_*`)、`PYTHON*`、`LD_*`/`DYLD_*`、`NODE_OPTIONS`/`PERL5OPT`/`PERL5LIB`/`RUBYOPT`。
 `run_e2e.sh` 是非交互 bash,`BASH_ENV` 指向的钩子能重定义它用来拼装 prompt 的 `awk`,在
 不改动树上任何文件的情况下改变候选臂收到的输入。`PATH` 保留:它上面的二进制是操作者的
-信任边界,固定工具路径在自托管 runner 上活不下来。
+信任边界,固定工具路径在自托管 runner 上活不下来;唯一例外是 **`python3`**——子进程 PATH
+最前面放一个指向 runner 自身解释器的 shim(`interpreter_shim`),harness 的 helper 与
+`#!/usr/bin/env python3` 的 wrapper 都用它,rollout 记录的 Python 身份因此等于冻结与校验
+所用的那一个。rollout 侧还剥掉 `METASK_*`:宿主凭证与 runner 的匿名凭证 fd 并存时 lib.sh
+判定"ambiguous E2E provider credentials"、请求根本不发,而交易已经授权,留下一笔挡住续跑的
+孤儿。
 
 `analyze` 在读取任何证据之前做同样的清单校验,然后**回放 budget journal**:日志的
 authority 哈希必须等于用日志自记的总额重建的 `_authority_manifest`(即绑定同一冻结清单),

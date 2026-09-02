@@ -41,6 +41,13 @@ def _fail(where: str, message: str) -> None:
     raise ValidationError(f"{where}: {message}")
 
 
+class TransactionNotAbortable(ValidationError):
+    """`abort_pre_request` on a transaction already authorized or committed:
+    the abort was correctly refused and nothing is stranded. Callers that
+    abort after a failed authorization suppress exactly this, and nothing
+    else."""
+
+
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
 
@@ -1000,7 +1007,9 @@ class BudgetJournal:
         if current["state"] == "aborted_pre_request":
             return self.transaction_receipt(transaction_id)
         if current["state"] != "reserved":
-            _fail("budget transaction", "authorized or committed requests cannot be aborted")
+            raise TransactionNotAbortable(
+                "budget transaction: authorized or committed requests cannot be aborted"
+            )
         return self._append(
             action="aborted_pre_request",
             transaction_id=transaction_id,

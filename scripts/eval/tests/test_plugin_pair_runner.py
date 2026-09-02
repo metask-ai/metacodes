@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from scripts.eval.model import ValidationError
-from scripts.eval.paired_runner import _runner_env, hermetic_env
+from scripts.eval.paired_runner import _run_once, _runner_env, hermetic_env
 from scripts.eval.plugin_pair_runner import (
     INVENTORY_IDENTITY,
     _canonical_sha256,
@@ -335,6 +337,7 @@ class PluginPairRunnerTest(unittest.TestCase):
                 "print(json.dumps({"
                 "'schema':'metacodes.plugin-inventory/v1',"
                 "'contract_version':1,'plugins':[],"
+                "'path_head':os.environ['PATH'].split(os.pathsep)[0],"
                 "'seen':sorted(k for k in os.environ if k in %r)}))\n" % sorted(injected),
                 encoding="utf-8",
             )
@@ -344,6 +347,9 @@ class PluginPairRunnerTest(unittest.TestCase):
                     ROOT, ROOT / "scripts/eval/fixtures/plugin_baseline.py", runtime
                 )
         self.assertEqual([], inventory["seen"])
+        # And `python3` on the child's PATH is this interpreter (the shim),
+        # so the wrapper's `#!/usr/bin/env python3` is the runner's Python.
+        self.assertIn("metacodes-eval-python-", inventory["path_head"])
 
     def test_child_environments_drop_injection_vectors_and_keep_the_rest(self) -> None:
         base = {
@@ -359,11 +365,63 @@ class PluginPairRunnerTest(unittest.TestCase):
         )
         # The rollout side uses the same filter on top of its treatment-knob
         # stripping.
-        with mock.patch.dict(os.environ, {"BASH_ENV": "/tmp/hook.sh", "METACODES_X": "1", "KEEP_ME": "1"}):
+        with mock.patch.dict(os.environ, {"BASH_ENV": "/tmp/hook.sh", "METACODES_X": "1", "METASK_API_KEY": "old-key", "KEEP_ME": "1"}):
             env = _runner_env()
         self.assertNotIn("BASH_ENV", env)
         self.assertNotIn("METACODES_X", env)
+        # A host credential beside the anonymous credential FD is refused
+        # by lib.sh as ambiguous - after the transaction is authorized.
+        self.assertNotIn("METASK_API_KEY", env)
         self.assertEqual("1", env["KEEP_ME"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX harness only")
+    def test_run_once_spawns_the_harness_with_that_environment_and_this_interpreter(self) -> None:
+        """The wiring seam: `_run_once` must hand the harness the filtered
+        environment, with a `python3` shim for this interpreter first on
+        PATH - otherwise the unit tests above guard nothing."""
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            env = kwargs["env"]
+            shim = env["PATH"].split(os.pathsep)[0]
+            captured.update(
+                env=env,
+                shim=shim,
+                python3=os.path.realpath(os.path.join(shim, "python3")),
+                argv=argv,
+            )
+            return subprocess.CompletedProcess(argv, 0)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"BASH_ENV": "/tmp/hook.sh", "METASK_API_KEY": "old-key"}
+        ), mock.patch("scripts.eval.paired_runner.subprocess.run", side_effect=fake_run):
+            # A stand-in repository root: `_run_once` only needs the harness
+            # path (mocked) and the runs directory it diffs before/after.
+            root = Path(directory)
+            (root / "tests/e2e/runs").mkdir(parents=True)
+            with self.assertRaisesRegex(ValidationError, "run"):  # no run directory was produced
+                _run_once(
+                    root,
+                    ROOT / "scripts/eval/fixtures/plugin_baseline.py",
+                    "baseline",
+                    0,
+                    "00_smoke",
+                    "anthropic",
+                    "glm-5.2",
+                    ROOT / "evals/plugin-v1/coding-suite.json",
+                    "rev",
+                    harness_config_id="plugin-v1:none",
+                    timeout_seconds=1,
+                    max_metered_tokens=1,
+                    max_cost_usd=1.0,
+                    runtime_api_key="k",
+                )
+        self.assertTrue(captured["argv"][0].endswith("tests/e2e/run_e2e.sh"))
+        self.assertNotIn("BASH_ENV", captured["env"])
+        self.assertNotIn("METASK_API_KEY", captured["env"])
+        self.assertIn("metacodes-eval-python-", captured["shim"])
+        self.assertEqual(os.path.realpath(sys.executable), captured["python3"])
+        self.assertFalse(Path(captured["shim"]).exists())
 
     def test_paid_resume_rejects_persisted_invalid_rollout(self) -> None:
         invalid = {

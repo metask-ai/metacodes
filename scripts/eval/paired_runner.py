@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
 import math
 import os
 import subprocess
+import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Sequence, Tuple
 
 from .e2e_adapter import comparison_fingerprints, import_run
 from .experiment import (
@@ -115,12 +118,40 @@ def _runner_env() -> Dict[str, str]:
             key: value
             for key, value in os.environ.items()
             if not key.startswith("METACODES_")
+            # A host credential next to the runner's anonymous credential
+            # FD is "ambiguous E2E provider credentials" in lib.sh: the
+            # request never happens, and the authorized transaction is left
+            # an orphan that blocks resume.
+            and not key.startswith("METASK_")
             and not key.startswith("TINYKG_")
             and not key.startswith("E2E_")
             and not key.startswith("CLAUDE_CODE_")
             and key != "RG_BIN"
         }
     )
+
+
+@contextlib.contextmanager
+def interpreter_shim(env: Mapping[str, str]) -> Iterator[Dict[str, str]]:
+    """A child environment whose `python3` is this process's interpreter.
+
+    The harness resolves `python3` - its helpers and every
+    `#!/usr/bin/env python3` wrapper - from PATH, while the runner validates
+    rollouts with its own interpreter's `platform.python_version()`. If the
+    two differ, every honest row fails the environment fingerprint after the
+    money is spent. A shim directory first on PATH makes them one
+    interpreter; the frozen manifest pins that interpreter and the host.
+    """
+    if not sys.executable:
+        yield dict(env)
+        return
+    with tempfile.TemporaryDirectory(prefix="metacodes-eval-python-") as shim:
+        try:
+            os.symlink(sys.executable, os.path.join(shim, "python3"))
+        except OSError:
+            yield dict(env)
+            return
+        yield {**env, "PATH": shim + os.pathsep + env.get("PATH", "")}
 
 
 def _require_budget(
@@ -830,13 +861,14 @@ def _run_once(
             credential_write_fd = -1
             env["E2E_API_KEY_FD"] = str(credential_read_fd)
             subprocess_options["pass_fds"] = (credential_read_fd,)
-        completed = subprocess.run(
-            [str(repo_root / "tests/e2e/run_e2e.sh"), scenario_glob],
-            cwd=repo_root,
-            env=env,
-            check=False,
-            **subprocess_options,
-        )
+        with interpreter_shim(env) as child_env:
+            completed = subprocess.run(
+                [str(repo_root / "tests/e2e/run_e2e.sh"), scenario_glob],
+                cwd=repo_root,
+                env=child_env,
+                check=False,
+                **subprocess_options,
+            )
     finally:
         if credential_write_fd >= 0:
             os.close(credential_write_fd)

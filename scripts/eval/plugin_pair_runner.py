@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import stat
 import subprocess
 import tempfile
@@ -32,6 +33,7 @@ if __package__ in {None, ""}:
         BudgetAuthority,
         BudgetJournal,
         BudgetTransaction,
+        TransactionNotAbortable,
         usd_to_microusd,
         usd_to_microusd_ceiling,
     )
@@ -52,6 +54,7 @@ if __package__ in {None, ""}:
         _run_once,
         alternating_schedule,
         hermetic_env,
+        interpreter_shim,
         scenario_selector,
     )
     from scripts.eval.plugin_release_gate import (  # type: ignore
@@ -67,6 +70,7 @@ else:
         BudgetAuthority,
         BudgetJournal,
         BudgetTransaction,
+        TransactionNotAbortable,
         usd_to_microusd,
         usd_to_microusd_ceiling,
     )
@@ -81,6 +85,7 @@ else:
         _run_once,
         alternating_schedule,
         hermetic_env,
+        interpreter_shim,
         scenario_selector,
     )
     from .plugin_release_gate import (
@@ -193,6 +198,12 @@ def frozen_run_fields(
         "inventory_sha256": dict(inventory_hashes),
         "schedule_sha256": _canonical_sha256(list(schedule)),
         "model_fingerprint": _canonical_sha256(protocol["coding_pair"]["model"]),
+        # The host the run executes on. The harness records platform and
+        # Python version into every rollout's environment fingerprint, so
+        # the freeze pins them: a run or an analysis on another host is a
+        # named refusal up front, not a batch of honest rows failing their
+        # fingerprints after the money is spent.
+        "environment": {"platform": platform.platform(), "python": platform.python_version()},
     }
 
 
@@ -573,12 +584,13 @@ def _inventory(
     )
     clean_env["METACODES_PLUGIN_RUNTIME_BINARY"] = str(runtime_binary)
     clean_env["METACODES_NO_PROBE"] = "1"
-    with tempfile.TemporaryDirectory(prefix="metacodes-plugin-inventory-home-") as home:
-        clean_env["HOME"] = home
+    with tempfile.TemporaryDirectory(
+        prefix="metacodes-plugin-inventory-home-"
+    ) as home, interpreter_shim({**clean_env, "HOME": home}) as child_env:
         completed = subprocess.run(
             [str(executable), "--dump-plugins"],
             cwd=root,
-            env=clean_env,
+            env=child_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -720,6 +732,30 @@ def _transaction(
 
 def _metered_tokens(rollout: Mapping[str, Any]) -> int:
     return sum(int(rollout["metrics"][key]) for key in TOKEN_METRICS)
+
+
+def _require_receipt_bound(
+    receipt: Mapping[str, Any],
+    live: Mapping[str, Any],
+    transaction: BudgetTransaction,
+) -> None:
+    """One receipt-binding rule for resume and analysis: the persisted
+    receipt is exactly the journal's projection of that transaction, taken
+    at its commit, for the identity this run would have reserved. The two
+    entry points calling this same function is what keeps them from
+    accepting different checkpoints."""
+    if set(receipt) != set(live):
+        raise ValidationError("budget receipt has unexpected or missing fields")
+    immutable = set(live) - {"journal_revision", "journal_head_sha256"}
+    if any(receipt.get(key) != live.get(key) for key in immutable):
+        raise ValidationError("budget receipt drifted from the journal")
+    if (
+        receipt["journal_revision"] != receipt["commit_revision"]
+        or receipt["journal_head_sha256"] != receipt["commit_head_sha256"]
+    ):
+        raise ValidationError("budget receipt is not bound to its commit revision/head")
+    if any(receipt.get(key) != value for key, value in transaction.record().items()):
+        raise ValidationError("budget receipt transaction identity does not match this frozen run")
 
 
 def rollout_evidence_sha256(rollout: Mapping[str, Any]) -> str:
@@ -867,15 +903,9 @@ def run_paid_pair(
                 if not isinstance(receipt, dict) or receipt.get("state") != "committed":
                     raise ValidationError("checkpoint is missing a committed budget receipt")
                 transaction_id = str(receipt.get("transaction_id", ""))
-                live = journal.transaction_receipt(transaction_id)
-                immutable = set(live) - {"journal_revision", "journal_head_sha256"}
-                if any(receipt.get(key) != live.get(key) for key in immutable):
-                    raise ValidationError("checkpoint budget receipt drifted from journal")
-                if any(
-                    receipt.get(key) != value
-                    for key, value in transaction.record().items()
-                ):
-                    raise ValidationError("checkpoint budget transaction identity drifted")
+                _require_receipt_bound(
+                    receipt, journal.transaction_receipt(transaction_id), transaction
+                )
                 if (
                     receipt.get("actual_cost_microusd")
                     != usd_to_microusd_ceiling(row["metrics"]["cost_usd"])
@@ -947,18 +977,25 @@ def run_paid_pair(
                     expected_revision=int(reserved["journal_revision"]),
                     expected_head_sha256=str(reserved["journal_head_sha256"]),
                 )
-            except BaseException:
+            except BaseException as failure:
                 # Nothing has been sent. If the authorization never became
                 # durable the journal still says `reserved` and the abort
                 # lands, so a resume is not blocked by a reservation nobody
-                # spent; if it did become durable the journal refuses the
-                # abort (wrong state, or head drift under the lock) and the
-                # transaction stays authorized - the conservative state, a
-                # request may have been admitted.
+                # spent. If it did become durable the journal refuses the
+                # abort as not abortable and the transaction stays
+                # authorized - the conservative state, a request may have
+                # been admitted. Any other failure of the abort means the
+                # reservation is stranded on disk: say so, with the original
+                # failure as the cause, rather than pretend it was cleaned up.
                 try:
                     journal.abort_pre_request(transaction_id)
-                except ValidationError:
+                except TransactionNotAbortable:
                     pass
+                except ValidationError as abort_failure:
+                    raise ValidationError(
+                        f"pre-authorization failure left transaction {transaction_id} "
+                        f"reserved and its abort could not be recorded: {abort_failure}"
+                    ) from failure
                 raise
             run_dir = _run_once(
                 root,
