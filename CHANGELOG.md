@@ -12,35 +12,35 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
-- PDF documents are first-class user input (issue #25). A user message can
-  carry ordered text, image, and PDF parts; Core models a document as
-  `Block.document {media_type, data, title, pages}` and hands the bytes to the
-  provider's native document format, never to OCR, extracted text, page
-  images, or a summary. Document capability is its own truth
-  (`ModelProfile.supports_pdf_input` / `Capability.pdf_input`) and is checked
-  independently of vision — the first slice supports Anthropic Claude 3.5+
-  natively and fails every other provider/model with
-  `error.DocumentInputUnsupported` before any network I/O. Admission runs
-  before encoding and before dispatch (`core/pdf.zig`): not-a-PDF, encrypted,
-  over 12 MB raw, or over 100 countable pages each fail with their own typed
-  outcome, and an undeterminable page count is reported as unknown rather than
-  guessed. Token accounting charges a document by pages, not base64 length.
-  Documents round-trip through the JSONL transcript and the AgentCore
-  checkpoint (block tag 7), so a restored session resends the original bytes
-  with no dependence on the host file. Reachable from source-level hosts
-  (`message.UserContentPart.document`), from binary consumers
-  (`RUN_INPUT_PART_DOCUMENT`, ABI revision 16, preflight status 29), and from
-  the headless CLI (`--pdf <path>`, repeatable, order kept). The provider-offer
-  vocabulary gains a matching `documents` capability, again separate from
-  `vision`; its comptime coverage guard now binds the real runtime capability
-  enum instead of a hand-copied duplicate, so the next capability added without
-  a mapping is a compile error rather than a silent gap.
-- AgentCore ABI v1 **revision 16** (hard cut over 15): adds
-  `RUN_INPUT_PART_DOCUMENT`, `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1`,
-  status `DOCUMENT_INPUT_UNSUPPORTED` (29), and checkpoint block tag 7.
-  `RunInputPartV1` keeps its 72-byte layout — a document part reuses
-  `media_type`, `data`, and `text` (its title). SDK package version
-  `0.2.0-dev` → `0.3.0-dev`; Rust `raw.rs` regenerated with bindgen 0.72.1.
+- The provider-offer capability vocabulary's comptime coverage guard now binds
+  the real runtime capability enum instead of a hand-copied duplicate, so the
+  next runtime capability added without an offer mapping is a compile error
+  rather than a silent gap.
+
+### Removed
+
+- First-class PDF document input is withdrawn (issue #25). Agent Core carries
+  cross-format, cross-provider, cross-host input modalities; parsing a
+  container format, judging its pages, encryption and structure, and
+  attributing budget from that judgement are not Core's job — and a lexical
+  scan could not answer those questions correctly anyway, which is how it
+  produced three ways to reject a valid document. Removed: the `document`
+  block and its neutral IR, `core/pdf.zig`, `supports_pdf_input` /
+  `Capability.pdf_input`, the dialect document serializer, transcript and
+  checkpoint persistence, `RUN_INPUT_PART_DOCUMENT`, and the headless `--pdf`
+  flag. The `Read` tool description stays corrected: it still does not claim
+  PDF reading or a `pages` parameter.
+  Compatibility: a transcript or checkpoint recorded with a document block is
+  refused explicitly rather than partially read — the transcript loader is now
+  atomic and reports a dedicated error with an actionable message, and the
+  checkpoint decoder reports `UNSUPPORTED` (not `CORRUPT`) for the permanently
+  reserved block tag `7`.
+- AgentCore ABI v1 returns to **revision 15**; `RUN_INPUT_PART_DOCUMENT`,
+  `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1` and status
+  `DOCUMENT_INPUT_UNSUPPORTED` are gone. No bundle was ever published from a
+  revision-16 tree (the only release, `0.1.0`, is revision 14, has no assets,
+  and no workflow builds a bundle), so revision 15 keeps a single meaning and
+  the codes need no tombstone. SDK package version returns to `0.2.0-dev`.
 
 ### Fixed
 

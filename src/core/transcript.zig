@@ -12,7 +12,6 @@
 //!     - `{"type":"tool_result","tool_use_id":"","content":"...","is_error":bool}`
 //!     - `{"type":"thinking","thinking":"..."}`
 //!     - `{"type":"image","media_type":"image/png","data":"<base64>"}`
-//!     - `{"type":"document","media_type":"application/pdf","title":"<name>","pages":<n|0>,"data":"<base64>"}`
 //!     - `{"type":"reasoning_item","model":"<model>","item":"<provider item JSON>"}`
 //! - **meta.json**：每次写 transcript 后覆盖写入 {model, last_modified_ns, message_count, title_guess}
 //! - **title_guess**：首条 user text 的前 80 字节（去换行）
@@ -228,18 +227,6 @@ pub const Writer = struct {
                     try std.json.Stringify.encodeJsonString(img.data, .{}, &aw.writer);
                     try aw.writer.writeAll("}");
                 },
-                .document => |doc| {
-                    // base64 载荷 JSON 安全;resume 后文档语义(MIME/标题/页数/顺序)
-                    // 原样恢复,不依赖宿主原始文件仍然存在或未被改动(issue #25)。
-                    try aw.writer.writeAll("{\"type\":\"document\",\"media_type\":");
-                    try std.json.Stringify.encodeJsonString(doc.media_type, .{}, &aw.writer);
-                    try aw.writer.writeAll(",\"title\":");
-                    try std.json.Stringify.encodeJsonString(doc.title, .{}, &aw.writer);
-                    // pages:null 与 0 互映(0 页不是合法 PDF,映射无歧义)。
-                    try aw.writer.print(",\"pages\":{d},\"data\":", .{doc.pages orelse 0});
-                    try std.json.Stringify.encodeJsonString(doc.data, .{}, &aw.writer);
-                    try aw.writer.writeAll("}");
-                },
                 .reasoning_item => |item| {
                     // provider 私有的推理续传项:item JSON 作为**字符串**存(不内联
                     // 展开),resume 后逐字节还原后回传(issue #23)。
@@ -276,18 +263,9 @@ pub const Writer = struct {
         if (title.len == 0) {
             outer: for (messages) |m| {
                 if (m.role != .user) continue;
-                for (m.blocks) |b| switch (b) {
-                    .image => {
-                        title = "[image]";
-                        break :outer;
-                    },
-                    // 纯附件会话(--pdf 允许空 prompt)同样不该在 /resume 列表里
-                    // 顶着一个空标题;文档有宿主给的标题时优先用它。
-                    .document => |doc| {
-                        title = if (doc.title.len > 0) doc.title else "[document]";
-                        break :outer;
-                    },
-                    else => {},
+                for (m.blocks) |b| if (b == .image) {
+                    title = "[image]";
+                    break :outer;
                 };
             }
         }
@@ -357,7 +335,13 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
 
-    // 按行解析
+    // 按行解析。**全解析成功才提交**:此前是边解析边 append,任何一行失败都会
+    // 给调用方留下一个半填充的 conversation——一个"恢复了一半的会话"比明确失败
+    // 危险得多,模型会拿着残缺历史继续往下写。先落到暂存表,全部成功再整体转移。
+    var staged: std.ArrayList(msg_mod.Message) = .empty;
+    defer staged.deinit(allocator);
+    errdefer for (staged.items) |m| m.deinit(allocator);
+
     var line_start: usize = 0;
     while (line_start < all.items.len) {
         const nl = std.mem.indexOfScalarPos(u8, all.items, line_start, '\n') orelse all.items.len;
@@ -365,9 +349,12 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
         line_start = nl + 1;
         if (line.len == 0) continue;
 
-        const msg = try parseMessageLine(line, allocator);
-        try conversation.append(msg);
+        const parsed = try parseMessageLine(line, allocator);
+        errdefer parsed.deinit(allocator);
+        try staged.append(allocator, parsed);
     }
+    for (staged.items) |m| try conversation.append(m);
+    staged.clearRetainingCapacity(); // 所有权已转移给 conversation
 
     // A:恢复投影状态(compact_boundary/summary)。失败非致命——退回全量重放(旧行为),不阻断 resume。
     loadCompactStateFromMeta(conversation, session_dir, allocator) catch |err| {
@@ -476,23 +463,6 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
             const t = bv.object.get("thinking") orelse return error.InvalidTranscript;
             if (t != .string) return error.InvalidTranscript;
             blocks[idx] = .{ .thinking = try allocator.dupe(u8, t.string) };
-        } else if (std.mem.eql(u8, tv.string, "document")) {
-            const mt = bv.object.get("media_type") orelse return error.InvalidTranscript;
-            const data = bv.object.get("data") orelse return error.InvalidTranscript;
-            const title = bv.object.get("title") orelse std.json.Value{ .string = "" };
-            const pages = bv.object.get("pages") orelse std.json.Value{ .integer = 0 };
-            if (mt != .string or data != .string or title != .string or pages != .integer)
-                return error.InvalidTranscript;
-            const mt_owned = try allocator.dupe(u8, mt.string);
-            errdefer allocator.free(mt_owned);
-            const title_owned = try allocator.dupe(u8, title.string);
-            errdefer allocator.free(title_owned);
-            blocks[idx] = .{ .document = .{
-                .media_type = mt_owned,
-                .title = title_owned,
-                .pages = if (pages.integer > 0) std.math.cast(u32, pages.integer) else null,
-                .data = try allocator.dupe(u8, data.string),
-            } };
         } else if (std.mem.eql(u8, tv.string, "reasoning_item")) {
             const model = bv.object.get("model") orelse return error.InvalidTranscript;
             const item = bv.object.get("item") orelse return error.InvalidTranscript;
@@ -513,6 +483,12 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
                 .media_type = mt_owned,
                 .data = try allocator.dupe(u8, data.string),
             } };
+        } else if (std.mem.eql(u8, tv.string, "document")) {
+            // 撤回的一等 PDF 文档输入(见 issue #25 的复盘)。这类会话的语义
+            // 本进程已经无法忠实重建——**明确拒绝**,而不是丢块继续:少一个
+            // 文档的"恢复"是在悄悄改写用户看过的历史。与通用 InvalidTranscript
+            // 分开,好让上层给出可行动的提示而不是"文件坏了"。
+            return error.WithdrawnDocumentBlock;
         } else {
             return error.InvalidTranscript;
         }
@@ -996,4 +972,86 @@ fn readMetaForTest(allocator: std.mem.Allocator, session_dir: []const u8) ![]u8 
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
     return all.toOwnedSlice(allocator);
+}
+
+test "旧的含 PDF 会话:明确拒绝,且绝不半读(撤回兼容策略)" {
+    const a = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-withdrawn-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4", genSessionId());
+    defer writer.deinit();
+
+    // 手写一份 revision-16 时代写下的 transcript:两条正常消息 + 一条 document 块。
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/transcript.jsonl\x00", .{writer.dir});
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.SkipZigTest;
+    const legacy =
+        "{\"role\":\"user\",\"blocks\":[{\"type\":\"text\",\"text\":\"first\"}]}\n" ++
+        "{\"role\":\"assistant\",\"blocks\":[{\"type\":\"text\",\"text\":\"second\"}]}\n" ++
+        "{\"role\":\"user\",\"blocks\":[{\"type\":\"document\",\"media_type\":\"application/pdf\"," ++
+        "\"title\":\"r.pdf\",\"pages\":2,\"data\":\"JVBERi0xLjcK\"}]}\n";
+    _ = pfs.write(fd, legacy);
+    pfs.close(fd);
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    // ① 明确、专属的错误 —— 不是通用 InvalidTranscript,上层据此给可行动提示。
+    try std.testing.expectError(error.WithdrawnDocumentBlock, loadTranscript(&conv, writer.dir, a));
+    // ② 绝不半读:失败前那两条已解析成功的消息一条都不许进 conversation。
+    try std.testing.expectEqual(@as(usize, 0), conv.len());
+}
+
+test "回退边界:thinking round-trip 与 [image] 标题兜底必须完好" {
+    const a = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-boundary-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4", genSessionId());
+    defer writer.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    // 纯图会话(无任何 user text):标题兜底必须仍是 [image]。
+    const user_blocks = try a.alloc(msg_mod.Block, 1);
+    user_blocks[0] = .{ .image = .{
+        .media_type = try a.dupe(u8, "image/png"),
+        .data = try a.dupe(u8, "UE5HREFUQQ=="),
+    } };
+    try conv.append(.{ .role = .user, .blocks = user_blocks });
+    // thinking 块必须写得出、也读得回(#10 时代修好的 round-trip)。
+    const asst_blocks = try a.alloc(msg_mod.Block, 2);
+    asst_blocks[0] = .{ .thinking = try a.dupe(u8, "推理内容") };
+    asst_blocks[1] = .{ .text = try a.dupe(u8, "答案") };
+    try conv.append(.{ .role = .assistant, .blocks = asst_blocks });
+    writer.flush(&conv);
+
+    var restored = Conversation.init(a);
+    defer restored.deinit();
+    try loadTranscript(&restored, writer.dir, a);
+    try std.testing.expectEqual(@as(usize, 2), restored.len());
+    try std.testing.expectEqualStrings("image/png", restored.messages.items[0].blocks[0].image.media_type);
+    try std.testing.expectEqualStrings("推理内容", restored.messages.items[1].blocks[0].thinking);
+    try std.testing.expectEqualStrings("答案", restored.messages.items[1].blocks[1].text);
+
+    var meta_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const meta_path = try std.fmt.bufPrint(&meta_buf, "{s}/meta.json\x00", .{writer.dir});
+    const meta_fd = pfs.open(@ptrCast(meta_path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (meta_fd < 0) return error.SkipZigTest;
+    defer _ = pfs.close(meta_fd);
+    var meta: [1024]u8 = undefined;
+    const n = pfs.read(meta_fd, &meta);
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.indexOf(u8, meta[0..@intCast(n)], "[image]") != null);
 }

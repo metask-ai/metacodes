@@ -140,9 +140,6 @@ pub const Capability = enum {
     /// 原生图像输入(vision)。宿主入口预检用;序列化层守门以
     /// ModelProfile.supports_image_input 为单一真相(capability.zig 转发查表)。
     image_input,
-    /// 原生文档输入(PDF,issue #25)。**与 image_input 独立**——能看图不蕴含
-    /// 能读 PDF。序列化层守门以 ModelProfile.supports_pdf_input 为单一真相。
-    pdf_input,
 };
 
 /// LLM 后端接口。ctx 是后端实例(Client / 未来 OpenAIClient)的 type-erased 指针。
@@ -338,8 +335,6 @@ test "runtime capability bridge covers the full runtime enum" {
     const offer = @import("../provider/offer.zig");
     offer.assertRuntimeCoverage(Capability);
     try std.testing.expectEqual(offer.Capability.vision, offer.fromRuntimeCapability(Capability.image_input));
-    // vision 与 documents 是两个能力,绝不映射到同一个。
-    try std.testing.expectEqual(offer.Capability.documents, offer.fromRuntimeCapability(Capability.pdf_input));
     try std.testing.expectEqual(offer.Capability.reasoning, offer.fromRuntimeCapability(Capability.extended_thinking));
     try std.testing.expectEqual(offer.Capability.caching, offer.fromRuntimeCapability(Capability.prompt_cache));
 }

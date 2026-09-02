@@ -201,11 +201,10 @@ pub fn encodedTextMessageBytes(bytes: []const u8) Error!u64 {
     return checkedAdd(14, bytes.len);
 }
 
-/// Exact encoded delta for one user Message built from ordered text/image/
-/// document parts, matching `measureMessage` byte for byte: 1 role byte + 4
-/// count bytes, then per block one tag byte plus 8-byte-length-prefixed
-/// strings (text; media_type then base64 data; or media_type, base64 data and
-/// title followed by a 4-byte page count).
+/// Exact encoded delta for one user Message built from ordered text/image
+/// parts, matching `measureMessage` byte for byte: 1 role byte + 4 count
+/// bytes, then per block one tag byte plus 8-byte-length-prefixed strings
+/// (text, or media_type then base64 data).
 pub fn encodedUserPartsMessageBytes(parts: []const message.UserContentPart) Error!u64 {
     if (parts.len == 0) return error.Corrupt;
     var size: u64 = 1 + 4;
@@ -222,16 +221,6 @@ pub fn encodedUserPartsMessageBytes(parts: []const message.UserContentPart) Erro
                     return error.Corrupt;
                 size = try checkedAdd(try checkedAdd(size, 8), image.media_type.len);
                 size = try checkedAdd(try checkedAdd(size, 8), image.data.len);
-            },
-            .document => |document| {
-                if (!std.unicode.utf8ValidateSlice(document.media_type) or
-                    !std.unicode.utf8ValidateSlice(document.data) or
-                    !std.unicode.utf8ValidateSlice(document.title))
-                    return error.Corrupt;
-                size = try checkedAdd(try checkedAdd(size, 8), document.media_type.len);
-                size = try checkedAdd(try checkedAdd(size, 8), document.data.len);
-                size = try checkedAdd(try checkedAdd(size, 8), document.title.len);
-                size = try checkedAdd(size, 4); // page count
             },
         }
     }
@@ -467,18 +456,6 @@ fn measureMessage(item: message.Message, limits: Limits) Error!u64 {
                     return error.Corrupt;
                 size = try addEncodedString(size, image.media_type, limits);
                 size = try addEncodedString(size, image.data, limits);
-            },
-            .document => |document| {
-                // 载荷是 base64(UTF-8 安全),原始文档字节绝不入 envelope。
-                // 页数是准入时数出来的元数据,定长编码(0 = 不可判定)。
-                if (!std.unicode.utf8ValidateSlice(document.media_type) or
-                    !std.unicode.utf8ValidateSlice(document.data) or
-                    !std.unicode.utf8ValidateSlice(document.title))
-                    return error.Corrupt;
-                size = try addEncodedString(size, document.media_type, limits);
-                size = try addEncodedString(size, document.data, limits);
-                size = try addEncodedString(size, document.title, limits);
-                size = try checkedAdd(size, 4);
             },
             .reasoning_item => |reasoning| {
                 // Provider-private continuation JSON (UTF-8 by construction:
@@ -767,13 +744,6 @@ fn writeMessage(writer: *Writer, item: message.Message) Error!void {
             try writeString(writer, image.media_type);
             try writeString(writer, image.data);
         },
-        .document => |document| {
-            try writeInt(writer, u8, 7);
-            try writeString(writer, document.media_type);
-            try writeString(writer, document.data);
-            try writeString(writer, document.title);
-            try writeInt(writer, u32, document.pages orelse 0);
-        },
         .reasoning_item => |reasoning| {
             try writeInt(writer, u8, 6);
             try writeString(writer, reasoning.model);
@@ -834,21 +804,17 @@ fn readMessage(
                 const data = try readString(reader, allocator, messages_end, limits);
                 break :image .{ .image = .{ .media_type = media_type, .data = data } };
             },
-            7 => document: {
-                const media_type = try readString(reader, allocator, messages_end, limits);
-                errdefer allocator.free(media_type);
-                const data = try readString(reader, allocator, messages_end, limits);
-                errdefer allocator.free(data);
-                const title = try readString(reader, allocator, messages_end, limits);
-                errdefer allocator.free(title);
-                const pages = try readInt(reader, u32, messages_end);
-                break :document .{ .document = .{
-                    .media_type = media_type,
-                    .data = data,
-                    .title = title,
-                    .pages = if (pages == 0) null else pages,
-                } };
-            },
+            // Tag 7 was revision 16's document block, withdrawn together with
+            // first-class PDF input. A checkpoint carrying it is intact, not
+            // damaged, so it must not report Corrupt — that would send a Host
+            // hunting for storage faults. It is a schema this build no longer
+            // supports, and the tag stays permanently reserved: any build that
+            // ran main between the two revisions could have written one, so
+            // reusing 7 for a different block would silently misread those
+            // files. (The ABI revision number itself could safely return to 15
+            // because no bundle was ever published at 16; a checkpoint on disk
+            // has the wider exposure of the two.)
+            7 => return error.UnsupportedSchema,
             6 => reasoning_item: {
                 const model = try readString(reader, allocator, messages_end, limits);
                 errdefer allocator.free(model);
@@ -1296,99 +1262,6 @@ test "checkpoint round-trips image blocks (tag 5, issue #10)" {
     try std.testing.expectEqualStrings("SlBFRw==", restored[2].image.data);
 }
 
-test "checkpoint round-trips document blocks (tag 7, issue #25)" {
-    // Document semantics (MIME, title, counted pages, base64 payload, block
-    // order) survive export/restore, so a restored Run resends the original
-    // bytes without depending on the host file the document came from.
-    const allocator = std.testing.allocator;
-    var conversation = Conversation.init(allocator);
-    defer conversation.deinit();
-    const blocks = try allocator.alloc(message.Block, 2);
-    blocks[0] = .{ .text = try allocator.dupe(u8, "summarize the attached report") };
-    blocks[1] = .{ .document = .{
-        .media_type = try allocator.dupe(u8, "application/pdf"),
-        .data = try allocator.dupe(u8, "JVBERi0xLjcKJSVFT0YK"),
-        .title = try allocator.dupe(u8, "report.pdf"),
-        .pages = 2,
-    } };
-    try conversation.append(.{ .role = .user, .blocks = blocks });
-
-    const id = core.session_id.gen();
-    var sink = TestSink{ .allocator = allocator };
-    defer sink.deinit();
-    const limits = Limits{ .hard_bytes = 1024 * 1024 };
-    _ = try exportToSink(.{
-        .session_id = id,
-        .checkpoint_generation = 1,
-        .last_run_id = 1,
-        .last_compact_id = 0,
-        .terminal_kind = .run,
-        .terminal_id = 1,
-        .model = "claude-sonnet-4",
-        .conversation = &conversation,
-        .policy_generation = 1,
-        .catalog_generation = 1,
-        .authority = .{ .skill = "", .permission = "", .mcp = "" },
-    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
-
-    var source = TestSource{ .bytes = sink.bytes.items, .step = 5 };
-    var decoded = try decodeFromSource(
-        allocator,
-        .{ .ctx = &source, .read_fn = TestSource.read },
-        limits,
-    );
-    defer decoded.deinit();
-    const restored = decoded.conversation.messages.items[0].blocks;
-    try std.testing.expectEqual(@as(usize, 2), restored.len);
-    try std.testing.expectEqualStrings("summarize the attached report", restored[0].text);
-    try std.testing.expectEqualStrings("application/pdf", restored[1].document.media_type);
-    try std.testing.expectEqualStrings("JVBERi0xLjcKJSVFT0YK", restored[1].document.data);
-    try std.testing.expectEqualStrings("report.pdf", restored[1].document.title);
-    try std.testing.expectEqual(@as(?u32, 2), restored[1].document.pages);
-}
-
-test "checkpoint maps an undeterminable page count to null rather than zero pages" {
-    const allocator = std.testing.allocator;
-    var conversation = Conversation.init(allocator);
-    defer conversation.deinit();
-    const blocks = try allocator.alloc(message.Block, 1);
-    blocks[0] = .{ .document = .{
-        .media_type = try allocator.dupe(u8, "application/pdf"),
-        .data = try allocator.dupe(u8, "JVBERi0xLjcKJSVFT0YK"),
-        .title = try allocator.dupe(u8, ""),
-        .pages = null,
-    } };
-    try conversation.append(.{ .role = .user, .blocks = blocks });
-
-    var sink = TestSink{ .allocator = allocator };
-    defer sink.deinit();
-    const limits = Limits{ .hard_bytes = 1024 * 1024 };
-    _ = try exportToSink(.{
-        .session_id = core.session_id.gen(),
-        .checkpoint_generation = 1,
-        .last_run_id = 1,
-        .last_compact_id = 0,
-        .terminal_kind = .run,
-        .terminal_id = 1,
-        .model = "claude-sonnet-4",
-        .conversation = &conversation,
-        .policy_generation = 1,
-        .catalog_generation = 1,
-        .authority = .{ .skill = "", .permission = "", .mcp = "" },
-    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
-
-    var source = TestSource{ .bytes = sink.bytes.items, .step = 7 };
-    var decoded = try decodeFromSource(
-        allocator,
-        .{ .ctx = &source, .read_fn = TestSource.read },
-        limits,
-    );
-    defer decoded.deinit();
-    const restored = decoded.conversation.messages.items[0].blocks;
-    try std.testing.expectEqual(@as(?u32, null), restored[0].document.pages);
-    try std.testing.expectEqualStrings("", restored[0].document.title);
-}
-
 test "checkpoint round-trips reasoning_item blocks (tag 6, issue #23)" {
     // A restored Run must still be able to replay the provider's encrypted
     // reasoning state, so both the owning model and the verbatim item survive.
@@ -1448,14 +1321,6 @@ test "encodedUserPartsMessageBytes 与真实编码字节精确一致(多模态�
     const parts = [_]message.UserContentPart{
         .{ .text = "看这张截图" },
         .{ .image = .{ .media_type = "image/png", .data = "UE5HREFUQQ==" } },
-        // 文档部分同样必须"预留 == 提交":否则一次多模态 Run 可能通过预算准入
-        // 却写不进 checkpoint,留下半准入状态。
-        .{ .document = .{
-            .media_type = "application/pdf",
-            .data = "JVBERi0xLjcK",
-            .title = "report.pdf",
-            .pages = 2,
-        } },
         .{ .text = "以及后记" },
     };
     try conversation.appendUserParts(&parts);
@@ -1484,4 +1349,48 @@ test "encodedUserPartsMessageBytes 与真实编码字节精确一致(多模态�
         try encodedUserPartsMessageBytes(&text_only),
     );
     try std.testing.expectError(error.Corrupt, encodedUserPartsMessageBytes(&.{}));
+}
+
+test "旧的 revision-16 checkpoint(tag 7)按 schema 拒绝,而不是报 Corrupt" {
+    // 完好但来自被撤回 revision 的 checkpoint。报 Corrupt 会把 Host 引去查
+    // 存储故障;正确答案是"这个 schema 本 build 不再支持"。
+    const allocator = std.testing.allocator;
+    var conversation = Conversation.init(allocator);
+    defer conversation.deinit();
+    const blocks = try allocator.alloc(message.Block, 1);
+    blocks[0] = .{ .text = try allocator.dupe(u8, "placeholder") };
+    try conversation.append(.{ .role = .user, .blocks = blocks });
+
+    var sink = TestSink{ .allocator = allocator };
+    defer sink.deinit();
+    const limits = Limits{ .hard_bytes = 1024 * 1024 };
+    _ = try exportToSink(.{
+        .session_id = core.session_id.gen(),
+        .checkpoint_generation = 1,
+        .last_run_id = 1,
+        .last_compact_id = 0,
+        .terminal_kind = .run,
+        .terminal_id = 1,
+        .model = "claude-sonnet-4",
+        .conversation = &conversation,
+        .policy_generation = 1,
+        .catalog_generation = 1,
+        .authority = .{ .skill = "", .permission = "", .mcp = "" },
+    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
+
+    // 把那条 text block 的 tag(1)改写成撤回的 document tag(7),模拟
+    // revision-16 时代写下的存档;头部 marker 未变,所以它过得了头部校验。
+    var patched = try allocator.dupe(u8, sink.bytes.items);
+    defer allocator.free(patched);
+    // 定位 messages 段里第一个 block tag:role(1) 之后是 count(4),再之后是 tag。
+    const needle = "placeholder";
+    const at = std.mem.indexOf(u8, patched, needle) orelse return error.SkipZigTest;
+    patched[at - 9] = 7; // tag byte 在 8 字节长度前缀之前
+
+    var source = TestSource{ .bytes = patched, .step = 7 };
+    try std.testing.expectError(error.UnsupportedSchema, decodeFromSource(
+        allocator,
+        .{ .ctx = &source, .read_fn = TestSource.read },
+        limits,
+    ));
 }

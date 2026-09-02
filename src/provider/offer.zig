@@ -107,10 +107,6 @@ pub const Tri = enum {
 pub const Capability = enum {
     tools,
     vision,
-    /// Native document (PDF) input. Deliberately **not** folded into `vision`:
-    /// a model that can see an image is not thereby able to read a PDF, and
-    /// conflating them is exactly what issue #25 forbids.
-    documents,
     reasoning,
     /// Provider returns a peer `reasoning_content` field rather than a
     /// thinking block.
@@ -157,7 +153,6 @@ fn mapRuntimeName(comptime name: []const u8) ?Capability {
     if (eql(u8, name, "server_tool")) return .server_tool;
     if (eql(u8, name, "reasoning_content")) return .reasoning_content;
     if (eql(u8, name, "image_input")) return .vision;
-    if (eql(u8, name, "pdf_input")) return .documents;
     return null;
 }
 

@@ -264,52 +264,6 @@ Provider and differs from it only by `model_override`, so sizing a child's
 results — or its auto-compact thresholds — against the parent's window is how a
 200K parent hands a 32K child a history that endpoint rejects.
 
-### PDF document input
-
-A user message can also carry a PDF as first-class content. Core represents it
-as `Block.document {media_type, data, title, pages}`: `data` is the base64
-payload, `media_type` is `application/pdf` (the only admitted type today),
-`title` is a stable host-supplied identity such as a file name — never a local
-path, which would both leak the environment and break the provider cache
-prefix — and `pages` is the counted page total, or null when the page tree
-lives in a compressed object stream and is not determinable without a full
-parser. It is never a guess.
-
-Documents are modelled separately from images because the capability is
-separate. `ModelProfile.supports_pdf_input` (queryable as
-`Capability.pdf_input`) is its own truth: `supports_image_input` being true
-never implies it. The first slice supports exactly one native path — Anthropic
-Claude 3.5 and later, which emit a base64 `document` source block. Every other
-provider/model fails the request with `error.DocumentInputUnsupported` before
-any network I/O. A document is never silently replaced by extracted text, OCR,
-a summary, or page images; any future conversion path has to be explicit about
-its representation and information loss.
-
-Admission runs before encoding and before any provider dispatch
-(`core/pdf.zig`): a payload that is not really a PDF fails with
-`InvalidPdfDocument`, a password-protected one with `EncryptedPdfUnsupported`,
-one over 12 MB raw with `PdfTooLarge`, and one over 100 countable pages with
-`PdfTooManyPages`. Token accounting charges a document by its page count
-(`pdf.estimateTokens`), not by its base64 length, so one attachment cannot
-push a turn past the auto-compaction threshold on byte size alone.
-
-Document blocks round-trip through the JSONL transcript and the AgentCore
-checkpoint (block tag 7), so a restored session resends the original bytes,
-title, and page count with no dependence on the host file still existing or
-being unchanged.
-
-Embedders reach the capability the same three ways as images: source-level
-hosts build `message.UserContentPart{ .document = ... }` slices;
-AgentCore binary consumers submit `RUN_INPUT_PART_DOCUMENT` inside a
-`RUN_INPUT_MULTIMODAL` parts array (ABI revision 16, capability preflight
-status 29); the headless CLI takes `--pdf <path>` (repeatable, order kept).
-The headless block order is prompt text, then each `--image` in command-line
-order, then each `--pdf` in command-line order.
-
-The `Read` tool does **not** read PDFs. It has no extraction or page-rendering
-path and no `pages` parameter, and its description now says so; native PDF
-*input* does not imply local PDF *reading*.
-
 ### Provider reasoning continuity (OpenAI Responses)
 
 The Responses protocol is used with `store:false`: the server keeps no copy of

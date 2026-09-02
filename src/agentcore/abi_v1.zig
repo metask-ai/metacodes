@@ -3814,10 +3814,6 @@ comptime {
     // The wire image cap is exactly the standard base64 encoding of the Read
     // tool's raw-image limit: one image the built-in Read tool can attach is
     // also submittable through RUN_INPUT_MULTIMODAL, and nothing larger is.
-    // The wire document cap is exactly the base64 encoding of Core's raw-PDF
-    // admission limit, taken from the one place that derives it.
-    if (wire.MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1 != core.pdf.MAX_PDF_BASE64_BYTES)
-        @compileError("MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1 must match the Core PDF admission cap");
     if (wire.MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 !=
         std.base64.standard.Encoder.calcSize(core.tool_read.MAX_IMAGE_BYTES))
         @compileError("MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 must match the Read tool image cap");
@@ -3864,7 +3860,6 @@ fn parseMultimodalParts(
     parts_ptr: ?[*]const wire.RunInputPartV1,
     part_count: u64,
     out_has_image: *bool,
-    out_has_document: *bool,
 ) ![]core.message.UserContentPart {
     if (part_count == 0) return error.EmptyMultimodalInput;
     if (part_count > wire.MAX_RUN_INPUT_PARTS_V1) return error.ResourceLimit;
@@ -3883,14 +3878,10 @@ fn parseMultimodalParts(
         if (part.kind_code == wire.RUN_INPUT_PART_IMAGE and
             part.data.len > wire.MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1)
             return error.ResourceLimit;
-        if (part.kind_code == wire.RUN_INPUT_PART_DOCUMENT and
-            part.data.len > wire.MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1)
-            return error.ResourceLimit;
     }
     if (total_payload > wire.MAX_PROMPT_BYTES_V1) return error.ResourceLimit;
     const parsed = try arena.alloc(core.message.UserContentPart, count);
     var has_image = false;
-    var has_document = false;
     for (raw_parts, parsed) |part, *slot| {
         switch (part.kind_code) {
             wire.RUN_INPUT_PART_TEXT => {
@@ -3910,33 +3901,10 @@ fn parseMultimodalParts(
                 has_image = true;
                 slot.* = .{ .image = .{ .media_type = media_type, .data = data } };
             },
-            wire.RUN_INPUT_PART_DOCUMENT => {
-                const media_type = try text(part.media_type);
-                const data = try borrowed(part.data);
-                // `text` is the optional title here rather than a canonical
-                // empty view, so it is validated as UTF-8 instead of rejected.
-                const title = try text(part.text);
-                if (!std.mem.eql(u8, media_type, core.pdf.MEDIA_TYPE))
-                    return error.UnsupportedDocumentMediaType;
-                if (!isStandardBase64(data)) return error.InvalidDocumentBase64;
-                // Admission before admission: a payload that is not really an
-                // unencrypted, in-bounds PDF is rejected here, before the Run
-                // is admitted and before any Provider request. Decoding is
-                // bounded by the cap already enforced above.
-                const pages = try core.pdf.inspectBase64(arena, data);
-                has_document = true;
-                slot.* = .{ .document = .{
-                    .media_type = media_type,
-                    .data = data,
-                    .title = title,
-                    .pages = pages,
-                } };
-            },
             else => return error.UnknownRunInputPartKind,
         }
     }
     out_has_image.* = has_image;
-    out_has_document.* = has_document;
     return parsed;
 }
 
@@ -4017,11 +3985,7 @@ fn statusText(status: u32) []const u8 {
 fn inputErrorStatus(err: anyerror) u32 {
     return if (err == error.OutOfMemory)
         wire.STATUS_OUT_OF_MEMORY
-    else if (err == error.ResourceLimit or
-        // Bounded document caps are resource limits, not malformed input;
-        // everything else the PDF admission rejects (not a PDF, encrypted,
-        // wrong media type, bad base64) is an argument error.
-        err == error.PdfTooLarge or err == error.PdfTooManyPages)
+    else if (err == error.ResourceLimit)
         wire.STATUS_RESOURCE_LIMIT
     else
         wire.STATUS_INVALID_ARGUMENT;
@@ -4167,9 +4131,6 @@ fn runErrorStatus(self: *const AbiSession, err: anyerror) u32 {
         error.CallbackFailed => self.callbackFailureStatus(),
         error.CheckpointBudgetRequired => wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
         error.ImageInputUnsupported => wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
-        error.DocumentInputUnsupported,
-        error.DocumentWithToolResultUnsupported,
-        => wire.STATUS_DOCUMENT_INPUT_UNSUPPORTED,
         else => wire.STATUS_CORE_ERROR,
     };
 }
@@ -6798,29 +6759,19 @@ fn sessionRunInput(
             var scratch = std.heap.ArenaAllocator.init(allocator);
             defer scratch.deinit();
             var has_image = false;
-            var has_document = false;
             const parts = parseMultimodalParts(
                 scratch.allocator(),
                 input.parts,
                 input.part_count,
                 &has_image,
-                &has_document,
             ) catch |err| return failError(inputErrorStatus(err), err, out_error);
-            // Capability preflight (single truth: ModelProfile.supports_image_input
-            // and .supports_pdf_input, checked independently — vision does not
-            // imply document input). Rejection happens before admission and
-            // before any Provider request, so the Run ID stays reusable and
-            // Conversation is untouched.
+            // Capability preflight (single truth: ModelProfile.supports_image_input).
+            // Rejection happens before admission and before any Provider request,
+            // so the Run ID stays reusable and Conversation is untouched.
             if (has_image and !self.core_session.provider.provider().supports(.image_input))
                 return fail(
                     wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
                     "session model does not support image input",
-                    out_error,
-                );
-            if (has_document and !self.core_session.provider.provider().supports(.pdf_input))
-                return fail(
-                    wire.STATUS_DOCUMENT_INPUT_UNSUPPORTED,
-                    "session model does not support PDF document input",
                     out_error,
                 );
             const multimodal_execution = self.runMultimodalWithBoundSkills(
@@ -7312,7 +7263,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 16), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 15), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 64), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);

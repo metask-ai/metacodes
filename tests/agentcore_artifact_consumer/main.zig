@@ -4,7 +4,7 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 16 or
+    if (wire.ABI_REVISION != 15 or
         @intFromEnum(wire.Status.skill_catalog_incomplete) != 27 or
         @intFromEnum(wire.Status.image_input_unsupported) != 28 or
         wire.RUN_INPUT_MULTIMODAL != 3 or
@@ -27,7 +27,7 @@ comptime {
         @compileError("source-free Revision 15 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 16 must not expose the removed catalog refresh entry");
+        @compileError("revision 15 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -829,31 +829,8 @@ pub fn main(init: std.process.Init) !void {
     if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn)
         return error.UnexpectedRunResult;
 
-    // Revision 16: document capability is preflighted independently of vision.
-    // gpt-5.2 has native image input but no native document input, so a PDF
-    // part on this Session is refused with the document status before any
-    // provider request, and the Run id it was submitted under stays reusable.
-    const document_parts = [_]wire.RunInputPartV1{
-        sdk.textPart("summarize the attached report"),
-        sdk.documentPart(
-            "application/pdf",
-            "JVBERi0xLjcKMSAwIG9iago8PCAvVHlwZSAvUGFnZSA+PgplbmRvYmoKdHJhaWxlcgo8PCA+PgolJUVPRgo=",
-            "report.pdf",
-        ),
-    };
-    try expectStatus(.document_input_unsupported, api.session().runMultimodal(
-        session,
-        4,
-        &document_parts,
-        &options,
-        &result,
-        &diagnostic,
-    ), diagnostic);
-    api.bufferRelease()(&diagnostic);
-
-    // Revision 16 multimodal input over the same restored Responses Session:
-    // an ordered text+image parts array is a first-class Run input, and the
-    // Run id refused above is still available.
+    // Revision 15 multimodal input over the same restored Responses Session:
+    // an ordered text+image parts array is a first-class Run input.
     const multimodal_parts = [_]wire.RunInputPartV1{
         sdk.textPart("describe the attached icon"),
         sdk.imagePart("image/png", "aWNvbi1ieXRlcw=="),
@@ -877,7 +854,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 16 Agent Runtime, OpenAI Responses, multimodal text/image input with independent document capability preflight, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 15 Agent Runtime, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

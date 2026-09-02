@@ -71,9 +71,6 @@ pub const Config = struct {
     /// 构成一条按序 text+images 的 user 消息。多个路径用 `\x00` 分隔拼一串
     /// (同 add_dirs 的 appendNulList 约定)。null = 无图像。
     images: ?[]const u8 = null,
-    /// `--pdf <path>`(headless,可重复):与 images 同形的 `\x00` 分隔路径串。
-    /// 块顺序:prompt 文本 → 各 image → 各 document。null = 未传该 flag。
-    documents: ?[]const u8 = null,
     /// `--json`：headless 下用 NDJSON 事件流输出，便于 CI/脚本消费。
     json_output: bool = false,
     /// `--stream-json`:headless 运行期实时 NDJSON 事件流(text/tool/usage/turn),
@@ -351,12 +348,6 @@ pub const ApiContent = union(enum) {
     /// wire 翻译按 provider 方言(dialect.serializeImagePart);不支持图像输入的
     /// (provider, model) 序列化时必须返回显式能力错误,绝不静默丢弃或降级为文本。
     image: ImageBlock,
-    /// 用户消息中的一等文档内容(issue #25)。当前仅 PDF(application/pdf)。
-    /// **与 image 分开建模**:文档不是图片,能力也不同——`supports_image_input`
-    /// 为真绝不蕴含 `supports_pdf_input`。wire 翻译按 provider 方言
-    /// (dialect.serializeDocumentPart);不支持文档输入的 (provider, model)
-    /// 序列化时返回显式能力错误,绝不静默丢弃、OCR、抽文本或降级成页面图。
-    document: DocumentBlock,
     /// Provider 私有的推理续传状态(issue #23)。目前唯一生产者/消费者是 OpenAI
     /// Responses(`store:false` 下的 `reasoning` item + `encrypted_content`):
     /// 服务端不存响应,推理上下文只能由客户端原样回传。**不是**可读文本——
@@ -379,20 +370,6 @@ pub const ReasoningItemBlock = struct {
 pub const ImageBlock = struct {
     media_type: []const u8,
     data: []const u8,
-};
-
-/// 文档内容块(中立 IR,issue #25)。`data` 是 base64 编码的原始文档字节,
-/// `media_type` 必须与内容一致(当前唯一受理值 `core/pdf.zig` 的 MEDIA_TYPE)。
-/// `title` 是**宿主给的文档身份**(如原始文件名),可为空;它是稳定标识,
-/// 绝不放绝对路径、时间戳或任何每次运行都会变的东西——那会污染 provider 可见
-/// 字节的缓存前缀契约。字节所有权跟随所在 ApiMessage 的借用契约。
-pub const DocumentBlock = struct {
-    media_type: []const u8,
-    data: []const u8,
-    title: []const u8 = "",
-    /// 准入时数出来的页数;null = 页树在压缩对象流里,不完整解析数不出来
-    /// (见 core/pdf.zig)。**不是猜测值**,只用于 token 估算与预算,不上 wire。
-    pages: ?u32 = null,
 };
 
 /// 工具调用块

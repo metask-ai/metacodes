@@ -598,23 +598,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_sixteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 16);
+    fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 15);
         assert_eq!(raw::METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE, 27);
         assert_eq!(raw::METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED, 28);
-        assert_eq!(raw::METASK_AGENTCORE_STATUS_DOCUMENT_INPUT_UNSUPPORTED, 29);
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_MULTIMODAL, 3);
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_PART_TEXT, 1);
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_PART_IMAGE, 2);
-        assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_PART_DOCUMENT, 3);
         assert_eq!(raw::METASK_AGENTCORE_MAX_RUN_INPUT_PARTS_V1, 64);
         assert_eq!(
             raw::METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1,
             5_000_000
-        );
-        assert_eq!(
-            raw::METASK_AGENTCORE_MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1,
-            16_000_000
         );
         assert_eq!(size_of::<raw::metask_agentcore_run_input_part_v1>(), 72);
         assert_eq!(size_of::<raw::metask_agentcore_run_input_v1>(), 104);
