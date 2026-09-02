@@ -9,11 +9,17 @@
 //! within the size and page bounds we are willing to submit.
 //!
 //! Deliberate limits of the inspection, stated rather than hidden:
-//!   - Page counting scans for uncompressed `/Type /Page` objects. A PDF that
-//!     keeps its page tree inside a compressed object stream (`/ObjStm`, common
-//!     for PDF 1.5+) yields `pages == null`, meaning "not determinable without
-//!     a full parser". Such a document is still admitted; the byte cap remains
-//!     its bound, and the provider enforces its own page limit.
+//!   - Page counting is a lexical scan, not a parse. It tracks PDF token
+//!     structure well enough to stay out of comments, literal and hex strings,
+//!     and stream bodies, then counts `/Type /Page`名 pairs in what remains.
+//!     It does not resolve the page tree, so a PDF that keeps its objects
+//!     inside a compressed object stream (`/ObjStm`, common for PDF 1.5+)
+//!     yields `pages == null`, meaning "not determinable without a full
+//!     parser". So does any file whose lexing hits an unterminated string or
+//!     stream. Such a document is still admitted; the byte cap remains its
+//!     bound, and the provider enforces its own page limit. The direction of
+//!     the remaining error is deliberate: never over-count (which would reject
+//!     a valid document), only under-count or report unknown.
 //!   - Encryption is detected from `/Encrypt` in the authoritative trailer: the
 //!     tail window, plus the window at the offset the last `startxref` names.
 //!     That is where every conforming writer puts it (an incremental update's
@@ -90,11 +96,19 @@ pub const Error = error{
 /// document, success returns its counted page total, or null when the page
 /// tree is not readable without a full PDF parser. Never a guessed count.
 /// Pure: no allocation, no I/O, no mutation of the input.
+///
+/// What "valid" means here, precisely: the header and `%%EOF` marker are
+/// present, at least one indirect object and the mandatory `startxref` pointer
+/// exist, no trailer declares `/Encrypt`, and the lexically countable pages
+/// are within bounds. It is **not** a full structural validator — a document
+/// whose xref table is inconsistent still reaches the provider and is rejected
+/// there.
 pub fn inspect(bytes: []const u8) Error!?u32 {
     if (bytes.len == 0) return error.InvalidPdfDocument;
     if (bytes.len > MAX_PDF_BYTES) return error.PdfTooLarge;
     if (!hasHeader(bytes)) return error.InvalidPdfDocument;
     if (std.mem.indexOf(u8, bytes, "%%EOF") == null) return error.InvalidPdfDocument;
+    if (!hasStructuralMarkers(bytes)) return error.InvalidPdfDocument;
     if (looksEncrypted(bytes)) return error.EncryptedPdfUnsupported;
     const pages = countPages(bytes) orelse return null;
     if (pages > MAX_PDF_PAGES) return error.PdfTooManyPages;
@@ -158,24 +172,141 @@ fn lastStartxrefOffset(bytes: []const u8) ?usize {
     return std.fmt.parseInt(usize, digits, 10) catch null;
 }
 
-/// Counts `/Type` `/Page` objects (never `/Pages`, the tree node). Returns
-/// null when none are visible, which means the page tree is compressed rather
-/// than that the document has no pages.
+/// Counts `/Type` `/Page` name pairs (never `/Pages`, the tree node) in the
+/// document's *token* stream. A plain substring search is not good enough: a
+/// content stream, an XMP packet, an embedded file, or a comment may contain
+/// that byte sequence, and counting those would reject a perfectly valid
+/// document as `PdfTooManyPages`. So this steps over comments, literal and hex
+/// strings, and stream bodies.
+///
+/// Returns null when the count is not trustworthy — no page object is visible
+/// (compressed object streams), or lexing hit an unterminated string or
+/// stream. Null means "not determinable", never "zero pages".
+///
+/// Known residual: a binary stream whose bytes happen to contain the literal
+/// `endstream` resumes lexing early. That can only *lose* a page (the safe
+/// direction) or resume inside binary; it is bounded by the same null result.
 fn countPages(bytes: []const u8) ?usize {
     var count: usize = 0;
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, bytes, pos, "/Type")) |at| {
-        pos = at + "/Type".len;
-        var i = pos;
-        while (i < bytes.len and isPdfSpace(bytes[i])) : (i += 1) {}
-        if (!std.mem.startsWith(u8, bytes[i..], "/Page")) continue;
-        const after = i + "/Page".len;
-        // `/Pages` is the tree node, not a page; any other name character
-        // means a different key entirely.
-        if (after < bytes.len and !isPdfDelimiter(bytes[after])) continue;
-        count += 1;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        switch (bytes[i]) {
+            // Comment: everything to the end of line is not a token.
+            '%' => {
+                i += 1;
+                while (i < bytes.len and bytes[i] != '\n' and bytes[i] != '\r') : (i += 1) {}
+            },
+            '(' => i = skipLiteralString(bytes, i) orelse return null,
+            '<' => {
+                // `<<` opens a dictionary; a lone `<` opens a hex string.
+                if (i + 1 < bytes.len and bytes[i + 1] == '<') {
+                    i += 2;
+                } else {
+                    i = skipHexString(bytes, i) orelse return null;
+                }
+            },
+            's' => {
+                if (isKeywordAt(bytes, i, "stream")) {
+                    i = skipStreamBody(bytes, i) orelse return null;
+                } else i += 1;
+            },
+            '/' => {
+                if (!isNameAt(bytes, i, "Type")) {
+                    i += 1;
+                    continue;
+                }
+                var j = i + 1 + "Type".len;
+                while (j < bytes.len and isPdfSpace(bytes[j])) : (j += 1) {}
+                if (isNameAt(bytes, j, "Page")) {
+                    count += 1;
+                    i = j + 1 + "Page".len;
+                } else {
+                    i = j;
+                }
+            },
+            else => i += 1,
+        }
     }
     return if (count == 0) null else count;
+}
+
+/// `bytes[i]` starts the name `/<name>`, ending at a delimiter or EOF, so
+/// `/Pages` never matches `Page` and `/Types` never matches `Type`.
+fn isNameAt(bytes: []const u8, i: usize, name: []const u8) bool {
+    if (i >= bytes.len or bytes[i] != '/') return false;
+    const rest = bytes[i + 1 ..];
+    if (!std.mem.startsWith(u8, rest, name)) return false;
+    const after = i + 1 + name.len;
+    return after >= bytes.len or isPdfDelimiter(bytes[after]);
+}
+
+/// A bare keyword (`stream`, `obj`, ...) at a token boundary on both sides, so
+/// the `stream` inside `endstream` and the `obj` inside `endobj` do not match.
+fn isKeywordAt(bytes: []const u8, i: usize, keyword: []const u8) bool {
+    if (!std.mem.startsWith(u8, bytes[i..], keyword)) return false;
+    if (i > 0 and !isPdfDelimiter(bytes[i - 1])) return false;
+    const after = i + keyword.len;
+    return after >= bytes.len or isPdfDelimiter(bytes[after]);
+}
+
+/// `(` ... `)` with backslash escapes and balanced nesting. Returns the index
+/// just past the closing paren, or null when unterminated.
+fn skipLiteralString(bytes: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var i = open;
+    while (i < bytes.len) : (i += 1) {
+        switch (bytes[i]) {
+            '\\' => i += 1, // escape consumes the next byte, whatever it is
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// `<` ... `>` hex string. Returns the index just past `>`, or null when
+/// unterminated.
+fn skipHexString(bytes: []const u8, open: usize) ?usize {
+    const close = std.mem.indexOfScalarPos(u8, bytes, open + 1, '>') orelse return null;
+    return close + 1;
+}
+
+/// Stream body from the `stream` keyword to just past `endstream`. The body is
+/// arbitrary binary and must never be lexed. Null when unterminated.
+fn skipStreamBody(bytes: []const u8, at: usize) ?usize {
+    const start = at + "stream".len;
+    const end = std.mem.indexOfPos(u8, bytes, start, "endstream") orelse return null;
+    return end + "endstream".len;
+}
+
+/// Minimal structural evidence that this is a PDF and not merely something
+/// that starts with `%PDF-` and ends with `%%EOF`: at least one indirect
+/// object and the mandatory `startxref` pointer. This is not a validator — a
+/// structurally broken document can still reach the provider — but it stops
+/// the trivially malformed payload the header/EOF pair alone would admit.
+fn hasStructuralMarkers(bytes: []const u8) bool {
+    var saw_obj = false;
+    var saw_startxref = false;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        // First-byte gate: over a 12 MB document this is the difference
+        // between two keyword probes per byte and two per candidate.
+        switch (bytes[i]) {
+            'o' => if (!saw_obj and isKeywordAt(bytes, i, "obj")) {
+                saw_obj = true;
+            },
+            's' => if (!saw_startxref and isKeywordAt(bytes, i, "startxref")) {
+                saw_startxref = true;
+            },
+            else => continue,
+        }
+        if (saw_obj and saw_startxref) return true;
+    }
+    return false;
 }
 
 fn isPdfSpace(byte: u8) bool {
@@ -242,7 +373,7 @@ test "inspect rejects non-PDF, truncated, encrypted and over-long documents" {
     // document stays well formed.
     var far: std.ArrayList(u8) = .empty;
     defer far.deinit(allocator);
-    try far.appendSlice(allocator, "%PDF-1.7\n");
+    try far.appendSlice(allocator, "%PDF-1.7\n1 0 obj\n<< /Type /Page >>\nendobj\n");
     const xref_at = far.items.len;
     try far.appendSlice(allocator, "trailer\n<< /Encrypt 9 0 R /Root 1 0 R >>\n");
     try far.append(allocator, '%');
@@ -291,5 +422,76 @@ test "estimateTokens uses the counted pages, and stays bounded without them" {
     try std.testing.expectEqual(
         @as(usize, MAX_PDF_PAGES * PAGE_TOKEN_ESTIMATE),
         estimateTokens(400, 100_000),
+    );
+}
+
+// ── follow-up regressions (post-#25 review) ──────────────────────────────────
+
+/// 一份合法的单页 PDF,但内容流/注释/字符串里塞了 `count` 个假的 `/Type /Page`
+/// 标记。真实页数恒为 1。
+fn testPdfWithDecoyPages(allocator: std.mem.Allocator, count: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "%PDF-1.7\n");
+    try out.appendSlice(allocator, "1 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n");
+    try out.appendSlice(allocator, "3 0 obj\n<< /Length 999 >>\nstream\n");
+    for (0..count) |_| try out.appendSlice(allocator, "BT (/Type /Page) Tj ET\n");
+    try out.appendSlice(allocator, "endstream\nendobj\n");
+    try out.appendSlice(allocator, "% comment mentioning /Type /Page twice: /Type /Page\n");
+    try out.appendSlice(allocator, "4 0 obj\n(a literal string with /Type /Page inside)\nendobj\n");
+    try out.appendSlice(allocator, "trailer\n<< /Root 2 0 R >>\nstartxref\n0\n%%EOF\n");
+    return out.toOwnedSlice(allocator);
+}
+
+test "REGRESSION: content-stream/comment/string decoys must not be counted as pages" {
+    const allocator = std.testing.allocator;
+    const doc = try testPdfWithDecoyPages(allocator, MAX_PDF_PAGES + 50);
+    defer allocator.free(doc);
+    // 只有一个真实页对象;其余全在 stream / comment / string 里。
+    try std.testing.expectEqual(@as(?u32, 1), try inspect(doc));
+}
+
+test "REGRESSION: header+EOF alone is not a PDF" {
+    try std.testing.expectError(error.InvalidPdfDocument, inspect("%PDF-1.7\njunk\n%%EOF\n"));
+}
+
+test "page lexer: nesting, escapes, hex strings and unterminated input" {
+    const allocator = std.testing.allocator;
+
+    // 嵌套括号 + 转义右括号:字符串必须整体跳过,里面的诱饵不计数。
+    const nested = "%PDF-1.7\n1 0 obj\n<< /Type /Page >>\nendobj\n" ++
+        "2 0 obj\n(outer (inner /Type /Page) still\\) inside /Type /Page)\nendobj\n" ++
+        "trailer\n<< >>\nstartxref\n0\n%%EOF\n";
+    try std.testing.expectEqual(@as(?u32, 1), try inspect(nested));
+
+    // 十六进制字符串里的诱饵同样不计数;`<<` 仍要当字典开头,不能当 hex string。
+    const hex = "%PDF-1.7\n1 0 obj\n<< /Type /Page /Meta <2F54797065202F50616765> >>\nendobj\n" ++
+        "trailer\n<< >>\nstartxref\n0\n%%EOF\n";
+    try std.testing.expectEqual(@as(?u32, 1), try inspect(hex));
+
+    // 未闭合的 stream:数不可信 → null(仍准入,由字节上限与 provider 兜底),
+    // 绝不拿一个半截扫描出来的数字去拒绝文档。
+    const truncated_stream = "%PDF-1.7\n1 0 obj\n<< /Type /Page >>\nendobj\n" ++
+        "2 0 obj\n<< /Length 9 >>\nstream\nbinary /Type /Page\n" ++
+        "trailer\n<< >>\nstartxref\n0\n%%EOF\n";
+    try std.testing.expectEqual(@as(?u32, null), try inspect(truncated_stream));
+    _ = allocator;
+}
+
+test "structural markers: obj and startxref are both required" {
+    // 有 obj 无 startxref。
+    try std.testing.expectError(
+        error.InvalidPdfDocument,
+        inspect("%PDF-1.7\n1 0 obj\n<< /Type /Page >>\nendobj\n%%EOF\n"),
+    );
+    // 有 startxref 无 obj(`endobj` 里的 obj 不算 —— 关键字要两侧边界)。
+    try std.testing.expectError(
+        error.InvalidPdfDocument,
+        inspect("%PDF-1.7\nendobj\nstartxref\n0\n%%EOF\n"),
+    );
+    // 两者齐全:放行。
+    try std.testing.expectEqual(
+        @as(?u32, 1),
+        try inspect("%PDF-1.7\n1 0 obj\n<< /Type /Page >>\nendobj\ntrailer\n<< >>\nstartxref\n0\n%%EOF\n"),
     );
 }

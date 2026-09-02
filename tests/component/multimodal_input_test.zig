@@ -214,7 +214,7 @@ fn tinyPdfBase64(a: std.mem.Allocator) ![]u8 {
 fn appendMixedPartsMessage(conv: *cc.conversation.Conversation, a: std.mem.Allocator) !void {
     const b64 = try tinyPdfBase64(a);
     defer a.free(b64);
-    const pages = try cc.pdf.inspect(TINY_PDF);
+    // 页数不由调用方声明:userMessageFromParts 自己跑准入并数出来。
     const parts = [_]msg_mod.UserContentPart{
         .{ .text = "summarize the attached report" },
         .{ .image = .{ .media_type = "image/png", .data = RED_PIXEL_PNG_B64 } },
@@ -222,7 +222,6 @@ fn appendMixedPartsMessage(conv: *cc.conversation.Conversation, a: std.mem.Alloc
             .media_type = cc.pdf.MEDIA_TYPE,
             .data = b64,
             .title = "report.pdf",
-            .pages = pages.?,
         } },
     };
     var m = try msg_mod.userMessageFromParts(a, &parts);

@@ -8788,7 +8788,8 @@ test "Revision 16 document wire validation rejects malformed, non-PDF, encrypted
     defer a.free(not_pdf);
     _ = encoder.encode(not_pdf, not_pdf_raw);
 
-    const encrypted_raw = "%PDF-1.7\ntrailer\n<< /Encrypt 9 0 R /Root 1 0 R >>\n%%EOF\n";
+    const encrypted_raw = "%PDF-1.7\n1 0 obj\n<< /Type /Page >>\nendobj\n" ++
+        "trailer\n<< /Encrypt 9 0 R /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
     const encrypted = try a.alloc(u8, encoder.calcSize(encrypted_raw.len));
     defer a.free(encrypted);
     _ = encoder.encode(encrypted, encrypted_raw);

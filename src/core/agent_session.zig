@@ -975,10 +975,16 @@ pub const AdmittedRun = struct {
     }
 
     /// Continue an admitted Run with one multimodal user record built from
-    /// ordered text/image parts. Part bytes are borrowed and copied during
-    /// append. Appends and provider execution retain the ordinary poison
-    /// semantics; a non-vision model still fails the provider serializer with
-    /// `error.ImageInputUnsupported` before any network I/O.
+    /// ordered text/image/document parts. Part bytes are borrowed and copied
+    /// during append. Document parts go through PDF admission while building
+    /// the record, i.e. **before** the Run is claimed: a malformed, encrypted,
+    /// oversized or over-long document returns its typed error with the Run
+    /// finished cleanly, no provider request sent, and the session left usable
+    /// for the next Run (the Run id itself was already spent by `admitRun`).
+    /// Provider execution retains
+    /// the ordinary poison semantics; a model without the matching capability
+    /// still fails the serializer with `error.ImageInputUnsupported` /
+    /// `error.DocumentInputUnsupported` before any network I/O.
     pub fn runUserParts(
         self: *AdmittedRun,
         parts: []const message_mod.UserContentPart,
@@ -1020,12 +1026,31 @@ pub const AdmittedRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         }
+        // 构造(含 document 准入)先于认领 Run:一份不合格的 PDF 是**输入错误**,
+        // 该以显式错误退出,而不是把会话毒掉。与上面 parts.len==0 走同一条干净
+        // 退出路径(finishWithoutConversation:Run 正常收尾、不发任何请求、会话
+        // 仍可继续下一个 Run)。注意这里的 run id 已被 admitRun 消耗——"id 仍可
+        // 复用"只属于 AgentCore ABI 那条在 admitRun **之前**就拒的路径。
+        const record = message_mod.userMessageFromParts(
+            self.session.conversation.allocator,
+            parts,
+        ) catch |err| {
+            _ = try self.finishWithoutConversation();
+            return err;
+        };
+        // 显式转移标志而非裸 errdefer:Conversation.append 失败时**不**接管
+        // record(见其实现),成功后所有权归 conversation。裸 errdefer 会在
+        // append 成功之后的任何错误(runLoop 返错是常态)上二次释放。
+        var record_owned = true;
+        errdefer if (record_owned) record.deinit(self.session.conversation.allocator);
         try self.session.claimAdmittedRun(self.identity_value);
         self.completed = true;
-        self.session.conversation.appendUserParts(parts) catch |err| {
+        // 此后失败才是普通的 admitted-Run poison 语义(只剩 OOM 类)。
+        self.session.conversation.append(record) catch |err| {
             _ = self.session.poisonRun();
             return err;
         };
+        record_owned = false;
         return self.session.runLoop(
             self.identity_value,
             max_turns,

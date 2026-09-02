@@ -1450,11 +1450,11 @@ test "encodedUserPartsMessageBytes 与真实编码字节精确一致(多模态�
         .{ .image = .{ .media_type = "image/png", .data = "UE5HREFUQQ==" } },
         // 文档部分同样必须"预留 == 提交":否则一次多模态 Run 可能通过预算准入
         // 却写不进 checkpoint,留下半准入状态。
+        // 真实可准入的最小 PDF:构造函数会跑准入并自己数页数,调用方无从声明。
         .{ .document = .{
             .media_type = "application/pdf",
-            .data = "JVBERi0xLjcK",
+            .data = "JVBERi0xLjcKMSAwIG9iago8PCAvVHlwZSAvUGFnZSA+PgplbmRvYmoKdHJhaWxlcgo8PCA+PgpzdGFydHhyZWYKMAolJUVPRgo=",
             .title = "report.pdf",
-            .pages = 2,
         } },
         .{ .text = "以及后记" },
     };

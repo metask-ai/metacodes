@@ -171,9 +171,11 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("[example] METACODES_PDF {s}: {s}\n", .{ pdf_path, @errorName(err) });
             return;
         };
-        // Admission before encoding: not a PDF, encrypted, or over the byte or
-        // page limit fails here rather than being converted to something else.
-        const pages = mc.pdf.inspect(raw) catch |err| {
+        // Admission before encoding, so a bad document is reported here with a
+        // machine-stable code instead of surfacing as a Run error. The Core
+        // constructor admits it again and derives the page count itself; a host
+        // cannot declare one.
+        _ = mc.pdf.inspect(raw) catch |err| {
             std.debug.print("[example] METACODES_PDF {s}: {s}\n", .{ pdf_path, mc.pdf.errorCode(err) });
             return;
         };
@@ -188,7 +190,6 @@ pub fn main(init: std.process.Init) !void {
                     .media_type = mc.pdf.MEDIA_TYPE,
                     .data = encoded,
                     .title = std.fs.path.basename(pdf_path),
-                    .pages = pages,
                 } },
             },
             4,

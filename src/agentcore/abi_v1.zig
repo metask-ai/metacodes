@@ -3921,16 +3921,16 @@ fn parseMultimodalParts(
                 if (!isStandardBase64(data)) return error.InvalidDocumentBase64;
                 // Admission before admission: a payload that is not really an
                 // unencrypted, in-bounds PDF is rejected here, before the Run
-                // is admitted and before any Provider request. Decoding is
-                // bounded by the cap already enforced above.
-                const pages = try core.pdf.inspectBase64(arena, data);
+                // is admitted and before any Provider request, so the Run id
+                // stays reusable. Decoding is bounded by the cap enforced
+                // above. The page count is deliberately discarded — the
+                // message constructor recomputes it, because a count carried
+                // across a boundary is a count somebody can get wrong.
+                _ = try core.pdf.inspectBase64(arena, data);
                 has_document = true;
-                slot.* = .{ .document = .{
-                    .media_type = media_type,
-                    .data = data,
-                    .title = title,
-                    .pages = pages,
-                } };
+                slot.* = .{
+                    .document = .{ .media_type = media_type, .data = data, .title = title },
+                };
             },
             else => return error.UnknownRunInputPartKind,
         }

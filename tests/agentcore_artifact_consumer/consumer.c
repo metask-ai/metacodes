@@ -62,12 +62,13 @@ typedef pthread_t thread_handle;
 #define SHUTDOWN_BOTH SHUT_RDWR
 #endif
 
-/* Minimal real PDF (header, one page object, trailer, %%EOF) and its standard
- * base64. Kept short on purpose: the whole payload is the rolling-scan needle,
- * so the source-free consumer proves the document bytes themselves reach the
- * provider request, not merely that a document block was emitted. */
+/* Minimal admissible PDF (header, one page object, startxref, %%EOF) and its
+ * standard base64. Kept short on purpose: the whole payload is the rolling-scan
+ * needle, so the source-free consumer proves the document bytes themselves
+ * reach the provider request, not merely that a document block was emitted.
+ * The needle must stay within the scan's carry buffer (96 bytes). */
 static const char TINY_PDF_BASE64[] =
-    "JVBERi0xLjcKMSAwIG9iago8PCAvVHlwZSAvUGFnZSA+PgplbmRvYmoKdHJhaWxlcgo8PCA+PgolJUVPRgo=";
+    "JVBERi0xLjcKMSAwIG9iago8PCAvVHlwZSAvUGFnZSA+PgplbmRvYmoKc3RhcnR4cmVmCjAKJSVFT0YK";
 
 static const char RESPONSE_BODY[] =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"c1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"

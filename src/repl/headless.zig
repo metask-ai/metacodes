@@ -1016,7 +1016,7 @@ const TEST_PDF =
     "1 0 obj\n<< /Type /Pages /Count 2 >>\nendobj\n" ++
     "2 0 obj\n<< /Type /Page >>\nendobj\n" ++
     "3 0 obj\n<< /Type /Page >>\nendobj\n" ++
-    "trailer\n<< /Root 1 0 R >>\n%%EOF\n";
+    "trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
 
 test "buildAttachmentUserMessage: --pdf → document block(MIME/标题/页数/base64 正确,顺序在图之后)" {
     const a = std.testing.allocator;
@@ -1063,7 +1063,8 @@ test "buildAttachmentUserMessage: 非 PDF / 加密 PDF / 空路径 → 显式错
     const encrypted = try writeTempFile(
         scratch,
         "cc-headless-encrypted.pdf",
-        "%PDF-1.7\ntrailer\n<< /Encrypt 9 0 R /Root 1 0 R >>\n%%EOF\n",
+        "%PDF-1.7\n1 0 obj\n<< /Type /Page >>\nendobj\n" ++
+            "trailer\n<< /Encrypt 9 0 R /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
     );
     defer @import("../util/fs.zig").testing.rmrfBestEffort(encrypted);
     try std.testing.expectError(

@@ -837,7 +837,7 @@ pub fn main(init: std.process.Init) !void {
         sdk.textPart("summarize the attached report"),
         sdk.documentPart(
             "application/pdf",
-            "JVBERi0xLjcKMSAwIG9iago8PCAvVHlwZSAvUGFnZSA+PgplbmRvYmoKdHJhaWxlcgo8PCA+PgolJUVPRgo=",
+            "JVBERi0xLjcKMSAwIG9iago8PCAvVHlwZSAvUGFnZSA+PgplbmRvYmoKc3RhcnR4cmVmCjAKJSVFT0YK",
             "report.pdf",
         ),
     };

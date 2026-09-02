@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const pdf = @import("pdf.zig");
 
 /// Role 直接复用 types.MessageRole，避免两套枚举互转。
 pub const Role = types.MessageRole;
@@ -187,15 +188,18 @@ pub const ImageInput = struct {
     data: []const u8,
 };
 
-/// 输入文档描述(路径无关的纯内容三元组,issue #25):宿主先读文件并 base64,
-/// 再交构造函数。`title` 是可选的稳定身份(如文件名),绝不是绝对路径。
+/// 输入文档描述(路径无关的纯内容对 + 可选标题,issue #25):宿主先读文件并
+/// base64,再交构造函数。`title` 是可选的稳定身份(如文件名),绝不是绝对路径。
+///
+/// **刻意没有 `pages` 字段**:页数是准入时从载荷数出来的派生值,而它直接决定
+/// token 预算。如果让调用方填,一个 500 页的 PDF 就能声明 `pages = 1`,预算与
+/// auto-compact 全部失真——而 Zig 没有字段私有性,唯一让它不可伪造的办法就是
+/// 根本不提供这个字段。构造函数(`userMessageFromParts`)自己算。
 pub const DocumentInput = struct {
     media_type: []const u8,
     /// base64 编码字节。
     data: []const u8,
     title: []const u8 = "",
-    /// 准入时数出来的页数;null = 不可判定。
-    pages: ?u32 = null,
 };
 
 /// 构造多模态 user Message:可选前置 text + 按序图像列表(全部字节 dupe 成 owned)。
@@ -237,6 +241,13 @@ pub const UserContentPart = union(enum) {
 
 /// 构造 text/image/document 任意有序混排的 user Message(全部字节 dupe 成 owned)。
 /// parts 为空 → error.EmptyMessage(不产出空 content 消息)。
+///
+/// **document part 在此过准入**(`core/pdf.zig`):不是真 PDF、加密、超字节或超
+/// 页数上限一律以显式错误退出,页数由载荷算出而非由调用方声明。这条路径是
+/// source-level 嵌入方的唯一入口,所以准入必须长在这里——把它留在 CLI 和 C ABI
+/// 里,等于"公共 Zig API 可以绕过所有文档门禁"。
+/// 代价是 AgentCore 路径会解码两次(它自己还要在 Run 被认领**之前**先拒一次,
+/// 以保住 run id 可复用的契约);解码有 12MB 上限,这个重复是值得的。
 pub fn userMessageFromParts(
     allocator: std.mem.Allocator,
     parts: []const UserContentPart,
@@ -256,12 +267,15 @@ pub fn userMessageFromParts(
                 break :blk .{ .image = .{ .media_type = mt, .data = data } };
             },
             .document => |doc| blk: {
+                if (!std.mem.eql(u8, doc.media_type, pdf.MEDIA_TYPE))
+                    return error.UnsupportedDocumentMediaType;
+                const pages = try pdf.inspectBase64(allocator, doc.data);
                 const mt = try allocator.dupe(u8, doc.media_type);
                 errdefer allocator.free(mt);
                 const data = try allocator.dupe(u8, doc.data);
                 errdefer allocator.free(data);
                 const title = try allocator.dupe(u8, doc.title);
-                break :blk .{ .document = .{ .media_type = mt, .data = data, .title = title, .pages = doc.pages } };
+                break :blk .{ .document = .{ .media_type = mt, .data = data, .title = title, .pages = pages } };
             },
         };
         built += 1;
@@ -389,4 +403,53 @@ test "userMessageFromParts: 任意有序混排(text-image-text, owned dupe)" {
     try std.testing.expectEqualStrings("UE5H", m.blocks[1].image.data);
     try std.testing.expectEqualStrings("后文", m.blocks[2].text);
     try std.testing.expectError(error.EmptyMessage, userMessageFromParts(a, &.{}));
+}
+
+test "userMessageFromParts: document 必须过准入,页数由载荷算出而非调用方声明" {
+    const a = std.testing.allocator;
+    const encoder = std.base64.standard.Encoder;
+
+    // 两页的真实 PDF。调用方**无法**声明页数(DocumentInput 没有该字段),
+    // 构造函数自己数——预算再也不会被一个手填的 pages=1 骗过去。
+    const real =
+        "%PDF-1.7\n1 0 obj\n<< /Type /Pages /Count 2 >>\nendobj\n" ++
+        "2 0 obj\n<< /Type /Page >>\nendobj\n3 0 obj\n<< /Type /Page >>\nendobj\n" ++
+        "trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
+    const real_b64 = try a.alloc(u8, encoder.calcSize(real.len));
+    defer a.free(real_b64);
+    _ = encoder.encode(real_b64, real);
+
+    const parts = [_]UserContentPart{
+        .{ .text = "summarize" },
+        .{ .document = .{ .media_type = "application/pdf", .data = real_b64, .title = "r.pdf" } },
+    };
+    var m = try userMessageFromParts(a, &parts);
+    defer m.deinit(a);
+    try std.testing.expectEqual(@as(?u32, 2), m.blocks[1].document.pages);
+
+    // 非 PDF / 加密 / 超页数:公共 source-level 入口一律显式拒,不再只有
+    // CLI 和 C ABI 有门禁。
+    const junk_b64 = try a.alloc(u8, encoder.calcSize("not a pdf at all".len));
+    defer a.free(junk_b64);
+    _ = encoder.encode(junk_b64, "not a pdf at all");
+    const junk = [_]UserContentPart{
+        .{ .document = .{ .media_type = "application/pdf", .data = junk_b64 } },
+    };
+    try std.testing.expectError(error.InvalidPdfDocument, userMessageFromParts(a, &junk));
+
+    const mislabeled = [_]UserContentPart{
+        .{ .document = .{ .media_type = "image/png", .data = real_b64 } },
+    };
+    try std.testing.expectError(
+        error.UnsupportedDocumentMediaType,
+        userMessageFromParts(a, &mislabeled),
+    );
+
+    // 早期 part 已经 dupe 出来的字节在失败路径上必须回收(testing.allocator 抓泄漏)。
+    const late_failure = [_]UserContentPart{
+        .{ .text = "leading text" },
+        .{ .image = .{ .media_type = "image/png", .data = "UE5H" } },
+        .{ .document = .{ .media_type = "application/pdf", .data = junk_b64 } },
+    };
+    try std.testing.expectError(error.InvalidPdfDocument, userMessageFromParts(a, &late_failure));
 }

@@ -689,3 +689,71 @@ test "L2 AgentSession Bash 子进程 cwd 绑 workspace.root(缺陷 B 回归)" {
     const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.count(u8, body, root_basename) >= 2);
 }
+
+test "L2 source-level document admission rejects cleanly: no request, session still usable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(allocator, .{ .core_profile = .none });
+    defer runtime.destroy() catch unreachable;
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "claude-sonnet-4-20250514",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{},
+    });
+    defer session.destroy() catch unreachable;
+
+    const encoder = std.base64.standard.Encoder;
+    const junk = "this is not a pdf";
+    const junk_b64 = try allocator.alloc(u8, encoder.calcSize(junk.len));
+    defer allocator.free(junk_b64);
+    _ = encoder.encode(junk_b64, junk);
+
+    // 一个 source-level 嵌入方递进来的坏文档:必须在 Run 被认领**之前**被拒,
+    // 不发任何请求,也不把会话毒掉。此前这条路径上根本没有文档门禁——坏 PDF
+    // 会一路走到 provider 才炸,或者被当成 1 页去算预算。
+    var sink_state: u8 = 0;
+    {
+        var admitted = try session.admitRun(1, .{ .ctx = &sink_state, .emit = Sink.emit });
+        const bad = [_]cc.message.UserContentPart{
+            .{ .text = "summarize this" },
+            .{ .document = .{ .media_type = "application/pdf", .data = junk_b64, .title = "r.pdf" } },
+        };
+        try std.testing.expectError(error.InvalidPdfDocument, admitted.runUserParts(&bad, 1));
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    // 会话没有被毒掉:下一个 Run 照常跑通(被拒的那个 run id 已由 admitRun
+    // 消耗,这是既有的 admitted-Run 生命周期,不是本次改动引入的)。
+    const real =
+        "%PDF-1.7\n1 0 obj\n<< /Type /Page >>\nendobj\ntrailer\n<< >>\nstartxref\n0\n%%EOF\n";
+    const real_b64 = try allocator.alloc(u8, encoder.calcSize(real.len));
+    defer allocator.free(real_b64);
+    _ = encoder.encode(real_b64, real);
+
+    var admitted = try session.admitRun(2, .{ .ctx = &sink_state, .emit = Sink.emit });
+    const good = [_]cc.message.UserContentPart{
+        .{ .text = "summarize this" },
+        .{ .document = .{ .media_type = "application/pdf", .data = real_b64, .title = "r.pdf" } },
+    };
+    const result = try admitted.runUserParts(&good, 1);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+
+    const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"document\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, real_b64) != null);
+}

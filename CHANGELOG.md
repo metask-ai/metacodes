@@ -10,6 +10,32 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- PDF admission follow-ups from the #25 review. Page counting was a plain
+  substring search, so a valid document whose content stream, embedded file, or
+  comments contained the bytes `/Type /Page` more than 100 times was rejected
+  as `PdfTooManyPages` — a wrongful rejection of a legitimate PDF. It is now a
+  lexical scan that steps over comments, literal and hex strings, and stream
+  bodies, and reports `null` ("not determinable") whenever the count would be
+  untrustworthy rather than guessing; the remaining error direction is
+  undercount or unknown, never overcount.
+- The public source-level document path enforced nothing. `DocumentInput`
+  carried a caller-supplied `pages`, and `userMessageFromParts` only copied
+  bytes, so an embedder could submit a non-PDF, an oversized or 500-page
+  document, or understate a large PDF as one page and defeat the token budget —
+  the CLI and C ABI had admission, the public Zig API did not. `DocumentInput`
+  no longer has a `pages` field (Zig has no field privacy, so the only way to
+  make it unforgeable is to not offer it), and `userMessageFromParts` runs
+  admission and derives the count itself. On the `AgentSession` path this now
+  happens before the Run is claimed, so a rejected document finishes the Run
+  cleanly with no provider request instead of poisoning the session.
+- `pdf.inspect` admitted anything between `%PDF-` and `%%EOF`, contradicting
+  its own "is this really a PDF" contract and deferring obvious garbage to the
+  provider. It now also requires at least one indirect object and the mandatory
+  `startxref` pointer, and its documentation states exactly what it does and
+  does not validate.
+
 ### Added
 
 - PDF documents are first-class user input (issue #25). A user message can

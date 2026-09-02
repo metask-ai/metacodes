@@ -289,9 +289,31 @@ Admission runs before encoding and before any provider dispatch
 (`core/pdf.zig`): a payload that is not really a PDF fails with
 `InvalidPdfDocument`, a password-protected one with `EncryptedPdfUnsupported`,
 one over 12 MB raw with `PdfTooLarge`, and one over 100 countable pages with
-`PdfTooManyPages`. Token accounting charges a document by its page count
-(`pdf.estimateTokens`), not by its base64 length, so one attachment cannot
-push a turn past the auto-compaction threshold on byte size alone.
+`PdfTooManyPages`. "Really a PDF" means header, `%%EOF`, at least one indirect
+object and the mandatory `startxref` pointer; it is not a full structural
+validator, and a document with an inconsistent xref table is still rejected by
+the provider rather than here.
+
+Page counting is a lexical scan that steps over comments, literal and hex
+strings, and stream bodies, so a content stream or embedded file containing
+the bytes `/Type /Page` cannot inflate the count and get a valid document
+rejected. When the count is not trustworthy — no page object is visible
+because the objects live in a compressed object stream, or lexing hit an
+unterminated string or stream — it reports `null` ("not determinable"), never a
+guess and never zero. The residual error direction is deliberate: undercount or
+unknown, never overcount.
+
+Token accounting charges a document by its page count (`pdf.estimateTokens`),
+not by its base64 length, so one attachment cannot push a turn past the
+auto-compaction threshold on byte size alone. That count is never supplied by
+the caller: `message.DocumentInput` deliberately has no `pages` field, and
+`message.userMessageFromParts` — the single constructor every source-level
+host goes through — runs admission itself and derives the count from the
+payload. A host cannot submit an unadmitted document, and cannot understate a
+500-page PDF as one page to defeat the budget. On the `AgentSession` path that
+admission happens while building the record, *before* the Run is claimed, so a
+rejected document finishes the Run cleanly with no provider request and leaves
+the session usable instead of poisoning it.
 
 Document blocks round-trip through the JSONL transcript and the AgentCore
 checkpoint (block tag 7), so a restored session resends the original bytes,
@@ -299,7 +321,8 @@ title, and page count with no dependence on the host file still existing or
 being unchanged.
 
 Embedders reach the capability the same three ways as images: source-level
-hosts build `message.UserContentPart{ .document = ... }` slices;
+hosts build `message.UserContentPart{ .document = ... }` slices (admission is
+enforced for them, not assumed);
 AgentCore binary consumers submit `RUN_INPUT_PART_DOCUMENT` inside a
 `RUN_INPUT_MULTIMODAL` parts array (ABI revision 16, capability preflight
 status 29); the headless CLI takes `--pdf <path>` (repeatable, order kept).
