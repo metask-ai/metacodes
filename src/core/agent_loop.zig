@@ -1289,8 +1289,14 @@ pub fn run(
             // the oldest delivered image results until the history fits; the
             // current turn is bounded by the projection's per-turn image cap.
             const image_trim = conversation.trimDeliveredImageBytes(opts.image_request_bytes_cap);
-            if (image_trim.changed()) {
-                log.info("agent", "image wire cap: cleared {d} delivered image result(s) bytes={d}->{d} cap={d}", .{ image_trim.cleared, image_trim.bytes_before, image_trim.bytes_after, opts.image_request_bytes_cap });
+            if (image_trim.reduction.changed()) {
+                log.info("agent", "image wire cap: cleared {d} delivered image result(s) bytes={d}->{d} cap={d}", .{ image_trim.reduction.cleared, image_trim.reduction.bytes_before, image_trim.reduction.bytes_after, opts.image_request_bytes_cap });
+            }
+            if (image_trim.remaining_over_cap > 0) {
+                // Only non-trimmable images remain (user images, pictures no
+                // request has delivered natively): say so instead of silently
+                // dropping one; the provider's own limit decides the request.
+                log.warn("agent", "image wire cap exceeded by non-trimmable images: over_by={d} cap={d}", .{ image_trim.remaining_over_cap, opts.image_request_bytes_cap });
             }
             var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
             defer freeApiMessages(&api_messages, allocator);
@@ -2382,7 +2388,7 @@ pub fn run(
                 .session_root = opts.artifact_root,
                 .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
                 .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
-                .per_turn_image_bytes = opts.image_request_bytes_cap,
+                .per_turn_image_bytes = opts.image_request_bytes_cap -| conversation.nonTrimmableImageBytes(),
             });
             if (opts.tool_result_metrics) |metrics| metrics.recordProjection(suspended_projection_stats);
             // result_blocks 这轮不提交(挂起不落 partial user 消息);释放已 append 的(本应为空)。
@@ -2509,7 +2515,9 @@ pub fn run(
             .session_root = opts.artifact_root,
             .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
             .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
-            .per_turn_image_bytes = opts.image_request_bytes_cap,
+            // Fresh results get whatever the cap leaves after the images no trim
+            // may remove (user images, undelivered results already in history).
+            .per_turn_image_bytes = opts.image_request_bytes_cap -| conversation.nonTrimmableImageBytes(),
         });
         if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
         if (projection_stats.changed() or projection_stats.budget_exhausted) {

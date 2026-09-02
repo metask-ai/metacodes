@@ -151,8 +151,9 @@ serializer that writes `image\/png` does not produce an image), or more than
 Anything else is ordinary text and is bounded by the tool-result projection
 like any other result. A canonical image result is exempt from that
 projection, from microcompact clearing while it has not yet been delivered
-to the provider (delivery is an explicit per-message watermark set by the
-agent loop once the provider has accepted a request for streaming, i.e. a
+to the provider (delivery is an explicit per-tool_result watermark, persisted in the
+transcript, set by the agent loop once the provider has accepted a request
+for streaming, i.e. a
 stream handle was returned; a request the provider rejects with an HTTP
 error does not deliver, a locally appended assistant message is not
 delivery, a resumed transcript starts undelivered until the next accepted
@@ -180,10 +181,11 @@ artifact envelopes, and before each request the agent loop stubs the oldest
 already-delivered image results until the active history fits
 (`agent_loop.Options.image_request_bytes_cap`, also applied as the
 projection's per-turn image cap). The total counts first-class user images
-too (they are never cleared but consume the allowance), and after a
-transcript resume, where every delivery flag is restored as false, image
-results that a later assistant reply answered are treated as delivered for
-trimming; a result of the trailing, unanswered turn is never touched. On Gemini 3, `image/gif`
+too (they are never cleared but consume the allowance) and a fresh tool turn
+is projected against what the cap leaves after such non-trimmable images.
+Only results whose persisted watermark says the picture was received
+natively are ever trimmed; when the non-trimmable remainder still exceeds
+the cap the agent loop logs it explicitly and lets the provider decide. On Gemini 3, `image/gif`
 results travel as a sibling `inline_data` part rather than inside the
 multimodal function response, whose `inlineData` accepts only PNG, JPEG and
 WebP. A profile whose cap for that operation kind is below 6,400

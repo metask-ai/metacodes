@@ -583,7 +583,66 @@ fn appendImageTurn(c: *cc.conversation.Conversation, al: std.mem.Allocator, id: 
     try c.append(.{ .role = .user, .blocks = blocks });
 }
 
-test "L2 ⑭: transcript resume 后(送达标记全部丢失)请求级图片上限仍生效——被回复过的旧图片被裁掉,wire 上只剩一张" {
+test "L2 ⑮: 一等用户图片占掉额度后,新读入的图片结果在投影阶段被 spill,wire 上只有用户图片" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const raw = try a.alloc(u8, 4096);
+    defer a.free(raw);
+    @memset(raw, 0x42);
+    const path = try std.fmt.allocPrint(a, "{s}/fresh.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, raw);
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    // 用户先贴了一张一等图片(4096 字节 base64):它永远不可裁剪,只能压缩新结果的额度。
+    const user_png = "A" ** 4096;
+    const inputs = [_]cc.core_message.ImageInput{.{ .media_type = "image/png", .data = user_png }};
+    {
+        // Ownership moves into the conversation on append: the errdefer must not
+        // outlive the append, or a later failed assertion double-frees the blocks.
+        var user_msg = try cc.core_message.userMessageWithImages(a, "compare with fresh.png", &inputs);
+        errdefer user_msg.deinit(a);
+        try conv.append(user_msg);
+    }
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        // 额度只够用户图片 + 1000 字节:新读入的 5.4 KB 图片结果必须在投影阶段 spill 成信封。
+        .image_request_bytes_cap = user_png.len + 1000,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    const body = srv.lastRequest().?.body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\""));
+    try std.testing.expect(std.mem.indexOf(u8, body, cc.result_projection.SCHEMA) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "QkJCQkJC") == null); // the fresh picture's base64 never reaches the wire
+}
+
+test "L2 ⑭: transcript resume 后(送达标记随 transcript 持久化)请求级图片上限仍生效——最老的已送达图片被裁掉,wire 上只剩一张" {
     const a = std.testing.allocator;
     const tmp_home = "/tmp/cc-zig-image-cap-resume-l2";
     cc.util_fs.testing.rmrfBestEffort(tmp_home);
@@ -599,15 +658,19 @@ test "L2 ⑭: transcript resume 后(送达标记全部丢失)请求级图片上�
         try conv_a.appendText(.assistant, "saw the first");
         try appendImageTurn(&conv_a, a, "t2", 'B');
         try conv_a.appendText(.assistant, "saw the second");
+        // Both pictures were carried natively by accepted requests of session A.
+        conv_a.markDelivered(.{ .image_placeholder_ids = &.{} });
         try conv_a.appendText(.user, "and now?");
         writer.flush(&conv_a);
     }
-    // 会话 B:恢复 → 每条消息 delivered=false(transcript 不持久化水位)。
+    // 会话 B:恢复 → 水位随 transcript 持久化:两张图片的块级标记为 true,新提问为 false。
     var conv = cc.conversation.Conversation.init(a);
     defer conv.deinit();
     try cc.transcript.loadTranscript(&conv, writer.dir, a);
     try std.testing.expectEqual(@as(usize, 8), conv.messages.items.len);
-    for (conv.messages.items) |m| try std.testing.expect(!m.delivered);
+    try std.testing.expect(conv.messages.items[2].blocks[0].tool_result.delivered);
+    try std.testing.expect(conv.messages.items[5].blocks[0].tool_result.delivered);
+    try std.testing.expect(!conv.messages.items[7].delivered);
     const one = conv.messages.items[2].blocks[0].tool_result.content.len;
 
     var srv = try harness.MockServer.startCassette(&[_][]const u8{ANTHROPIC_OK_SSE}, 0);

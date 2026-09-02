@@ -808,9 +808,16 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
                 try out.appendSlice(allocator, ",\"response\":{\"result\":");
                 if (dialect_mod.extractImageResult(tr.content)) |img| {
                     report.image_results += 1;
-                    if (profile.supports_image_input and profile.supports_multimodal_function_response and
-                        functionResponseInlineDataSupports(img.media_type))
-                    {
+                    // Gemini 3 官方 multimodal functionResponse 直接内嵌 inlineData,但发不发图
+                    // 仍由方言定案(插件方言可拒绝):先让 serializeImagePart 在 scratch 里裁决,
+                    // 拒绝则与旧世代同路走占位。
+                    var gemini3_native = false;
+                    if (profile.supports_multimodal_function_response and functionResponseInlineDataSupports(img.media_type)) {
+                        var probe: std.ArrayList(u8) = .empty;
+                        defer probe.deinit(allocator);
+                        gemini3_native = try dialect.serializeImagePart(profile, img, &probe, allocator);
+                    }
+                    if (gemini3_native) {
                         var pointer: std.ArrayList(u8) = .empty;
                         defer pointer.deinit(allocator);
                         try pointer.appendSlice(allocator, "[image (");
@@ -1183,6 +1190,21 @@ test "Gemini: tool_result 消息里的同消息 text(hook 上下文/检查点)�
     const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Bash\",\"response\":{\"result\":\"ok\"}}},{\"text\":\"[PostToolUse hook]\\npost-check ok\"}]}") != null);
+}
+
+test "Gemini 3: fail-closed 方言拒绝发图时 functionResponse 只带占位,不内嵌 inlineData,报告计占位" {
+    const a = std.testing.allocator;
+    const tool_use = [_]types.ApiContent{.{ .tool_use = .{ .id = "t1", .name = "Read", .input = "{}" } }};
+    const png = [_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "t1", .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}" } }};
+    const msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &png } };
+    var report = json_mod.SerializationReport{};
+    defer report.deinit(a);
+    const body = try serializeGeminiRequestWithOverridesAndDialectReport(a, &msgs, null, null, null, "gemini-3-flash", .{}, .{ .ctx = undefined }, &report);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "inlineData") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "inline_data") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "was read successfully but omitted") != null);
+    try std.testing.expectEqual(@as(usize, 1), report.image_placeholders);
 }
 
 test "Gemini 3: GIF 图像结果不进 functionResponse.inlineData,走同级 inline_data part" {

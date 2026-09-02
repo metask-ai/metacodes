@@ -19,8 +19,10 @@ status, compatibility boundaries, and entry points are defined by
   images of the current turn beyond the cap into artifact envelopes, and the
   agent loop stubs the oldest already-delivered image results before each
   request until the history fits (first-class user images count against
-  the allowance; after a transcript resume, results a later assistant reply
-  answered are trimmable even though their flags were not persisted).
+  the allowance and a fresh tool turn is projected against what they leave;
+  the block-level watermark is persisted in the transcript, so a resumed
+  session trims exactly the pictures earlier requests delivered natively and
+  reports explicitly when only non-trimmable images exceed the cap).
   Gemini 3 function responses embed only
   PNG/JPEG/WebP; `image/gif` results now go out as a sibling `inline_data`
   part instead of being rejected. The stream handle reports the exact

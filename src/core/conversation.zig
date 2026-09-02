@@ -345,7 +345,14 @@ pub const Conversation = struct {
             return;
         }
         for (replacement.messages.items, self.messages.items) |*rep, live| {
-            rep.delivered = live.delivered and messageEql(live, rep.*);
+            const same = messageEql(live, rep.*);
+            rep.delivered = live.delivered and same;
+            // Block-level watermarks travel with their message: content-identical
+            // blocks take the live flag, a rewritten message loses all of them.
+            for (rep.blocks, 0..) |*rb, bi| switch (rb.*) {
+                .tool_result => |*rt| rt.delivered = same and live.blocks[bi].tool_result.delivered,
+                else => {},
+            };
         }
     }
 
@@ -677,7 +684,8 @@ pub const Conversation = struct {
     /// Nothing else may claim delivery: a local assistant append such as the
     /// AgentCore budget terminal marker is not a provider reply.
     ///
-    /// Granularity is the message. A tool_result the request normalizer
+    /// Granularity is the tool_result block (`ToolResult.delivered`);
+    /// `Message.delivered` is derived. A tool_result the request normalizer
     /// strips as an orphan (no matching tool_use in the immediately preceding
     /// assistant turn, see message_repair.stripOrphanToolResults) is marked as
     /// well, deliberately: pairing is sequential, later assistant turns come
@@ -766,72 +774,75 @@ pub const Conversation = struct {
         }
     }
 
+    pub const ImageTrim = struct {
+        reduction: ToolResultReduction = .{},
+        /// Image bytes still above the cap after trimming: only non-trimmable
+        /// images remain (first-class user images, undelivered results). The
+        /// caller reports this explicitly; the provider decides the request.
+        remaining_over_cap: usize = 0,
+    };
+
     /// Keep the base64 bytes of active images under `cap` before a request.
     /// The total counts image tool results *and* first-class `.image` blocks
     /// (user inputs — never cleared, but they consume the allowance). Clears
-    /// (stubs, with the usual sha256 commitment) image result blocks oldest
-    /// first: pass 1 takes blocks the watermark marked delivered; pass 2 — used
-    /// only while *no* message of the active range carries a watermark, i.e.
-    /// a resumed transcript before its first accepted request — takes blocks
-    /// that a later provider-visible assistant message answered, the reply
-    /// being the evidence they were delivered in the earlier session. Once any
-    /// request was accepted the flags are authoritative and the inference is
-    /// off, so a locally appended assistant message (an AgentCore budget
-    /// terminal marker after a rejected request) can never make a picture the
-    /// model has not seen trimmable. A result of the trailing turn (nothing
-    /// answered it yet) is never touched: it is bounded by the projection's
-    /// per-turn image cap. Envelopes and stubs are not images and are not
-    /// counted. Returns what was cleared.
-    pub fn trimDeliveredImageBytes(self: *Conversation, cap: usize) ToolResultReduction {
+    /// (stubs, with the usual sha256 commitment) image result blocks whose
+    /// block-level watermark says the provider received the picture natively,
+    /// oldest first. Nothing else is ever cleared: an undelivered result (the
+    /// turn about to be sent, a placeholder-only picture, or a resumed record
+    /// whose persisted flag is false) is exactly what the watermark protects.
+    /// Envelopes and stubs are not images and are not counted. Returns what
+    /// was cleared and how far the non-trimmable remainder still exceeds the cap.
+    pub fn trimDeliveredImageBytes(self: *Conversation, cap: usize) ImageTrim {
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
-        var out = ToolResultReduction{};
+        var out = ImageTrim{};
         const active_start = @min(self.compact_boundary, self.messages.items.len);
-        var total: usize = 0;
-        var last_visible_assistant: ?usize = null;
-        var any_delivered = false;
-        for (self.messages.items[active_start..], active_start..) |m, mi| {
-            if (m.delivered) any_delivered = true;
-            if (m.role == .assistant and assistantIsProviderVisible(m)) last_visible_assistant = mi;
-            for (m.blocks) |b| switch (b) {
-                .tool_result => |tr| if (result_projection.isImageResult(tr.content)) {
-                    total +|= tr.content.len;
-                },
-                .image => |img| total +|= img.data.len,
-                else => {},
-            };
-        }
+        var total = self.activeImageBytesLocked(active_start, false);
         if (total <= cap) return out;
-        const answered_before = last_visible_assistant orelse active_start;
-        const passes: u8 = if (any_delivered) 1 else 2;
-        var pass: u8 = 0;
-        while (pass < passes and total > cap) : (pass += 1) {
-            var mi = active_start;
-            while (mi < self.messages.items.len and total > cap) : (mi += 1) {
-                const m = self.messages.items[mi];
-                if (m.role != .user) continue;
-                for (m.blocks, 0..) |b, bi| {
-                    if (total <= cap) break;
-                    if (b != .tool_result) continue;
-                    const tr = b.tool_result;
-                    if (!result_projection.isImageResult(tr.content)) continue;
-                    const eligible = switch (pass) {
-                        0 => tr.delivered,
-                        else => mi < answered_before,
-                    };
-                    if (!eligible) continue;
-                    const before = tr.content.len;
-                    const after = self.clearToolResultAt(m, bi) orelse continue;
-                    self.noteShrinkAtLocked(mi);
-                    out.cleared += 1;
-                    out.bytes_before += before;
-                    out.bytes_after += after;
-                    total -= before;
-                }
+        var mi = active_start;
+        while (mi < self.messages.items.len and total > cap) : (mi += 1) {
+            const m = self.messages.items[mi];
+            if (m.role != .user) continue;
+            for (m.blocks, 0..) |b, bi| {
+                if (total <= cap) break;
+                if (b != .tool_result) continue;
+                const tr = b.tool_result;
+                if (!tr.delivered or !result_projection.isImageResult(tr.content)) continue;
+                const before = tr.content.len;
+                const after = self.clearToolResultAt(m, bi) orelse continue;
+                self.noteShrinkAtLocked(mi);
+                out.reduction.cleared += 1;
+                out.reduction.bytes_before += before;
+                out.reduction.bytes_after += after;
+                total -= before;
             }
         }
-        if (out.changed()) self.mutation_version +%= 1;
+        if (out.reduction.changed()) self.mutation_version +%= 1;
+        out.remaining_over_cap = total -| cap;
         return out;
+    }
+
+    /// Bytes of active images that no trim may clear: first-class `.image`
+    /// blocks plus image results whose watermark is false. The agent loop
+    /// projects a fresh tool turn against `cap - this`, so the request cannot
+    /// exceed the cap through images no one is allowed to remove.
+    pub fn nonTrimmableImageBytes(self: *Conversation) usize {
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
+        const active_start = @min(self.compact_boundary, self.messages.items.len);
+        return self.activeImageBytesLocked(active_start, true);
+    }
+
+    fn activeImageBytesLocked(self: *const Conversation, active_start: usize, only_non_trimmable: bool) usize {
+        var total: usize = 0;
+        for (self.messages.items[active_start..]) |m| for (m.blocks) |b| switch (b) {
+            .tool_result => |tr| if (result_projection.isImageResult(tr.content)) {
+                if (!only_non_trimmable or !tr.delivered) total +|= tr.content.len;
+            },
+            .image => |img| total +|= img.data.len,
+            else => {},
+        };
+        return total;
     }
 
     /// Mirrors buildApiMessages: thinking blocks are never sent, so an
@@ -1293,18 +1304,20 @@ test "trimDeliveredImageBytes stubs the oldest delivered images first and never 
     // Cap admits two images: only the oldest delivered one is stubbed; the undelivered
     // current-turn image is never touched even though it is the newest.
     const reduced = c.trimDeliveredImageBytes(2 * one + 16);
-    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
     try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
     try std.testing.expect(result_projection.isImageResult(c.messages.items[3].blocks[0].tool_result.content));
     try std.testing.expect(result_projection.isImageResult(c.messages.items[5].blocks[0].tool_result.content));
     // A cap that only the undelivered image could satisfy still leaves it alone.
     const tight = c.trimDeliveredImageBytes(one / 2);
-    try std.testing.expectEqual(@as(usize, 1), tight.cleared);
+    try std.testing.expectEqual(@as(usize, 1), tight.reduction.cleared);
     try std.testing.expect(result_projection.isImageResult(c.messages.items[5].blocks[0].tool_result.content));
-    try std.testing.expect(!c.trimDeliveredImageBytes(one / 2).changed());
+    const rest = c.trimDeliveredImageBytes(one / 2);
+    try std.testing.expect(!rest.reduction.changed());
+    try std.testing.expectEqual(one - one / 2, rest.remaining_over_cap);
 }
 
-test "trimDeliveredImageBytes: resumed history (all flags false) trims answered turns, never the trailing one" {
+test "trimDeliveredImageBytes: a resumed history whose persisted flags are false stays protected and reports the remainder" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
     defer c.deinit();
@@ -1327,15 +1340,22 @@ test "trimDeliveredImageBytes: resumed history (all flags false) trims answered 
     try T.imageTurn(&c, a, "t2"); // 3,4 answered by 5
     try c.appendText(.assistant, "second reply");
     try T.imageTurn(&c, a, "t3"); // 6,7 trailing, unanswered
-    // No markDelivered: exactly the state after a transcript resume.
+    // No watermark anywhere (an old transcript, or pictures a non-vision model
+    // never saw natively): nothing is trimmable, and the caller learns how far
+    // the request still exceeds the cap instead of silently losing a picture.
     const one = c.messages.items[1].blocks[0].tool_result.content.len;
-    const reduced = c.trimDeliveredImageBytes(one + 16);
-    try std.testing.expectEqual(@as(usize, 2), reduced.cleared);
-    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
-    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[4].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
+    const trim = c.trimDeliveredImageBytes(one + 16);
+    try std.testing.expectEqual(@as(usize, 0), trim.reduction.cleared);
+    try std.testing.expectEqual(3 * one - (one + 16), trim.remaining_over_cap);
+    try std.testing.expect(result_projection.isImageResult(c.messages.items[1].blocks[0].tool_result.content));
+    try std.testing.expectEqual(3 * one, c.nonTrimmableImageBytes());
+    // Once the watermark says the first two were received natively, they trim oldest first.
+    c.messages.items[1].blocks[0].tool_result.delivered = true;
+    c.messages.items[4].blocks[0].tool_result.delivered = true;
+    const trimmed = c.trimDeliveredImageBytes(one + 16);
+    try std.testing.expectEqual(@as(usize, 2), trimmed.reduction.cleared);
+    try std.testing.expectEqual(@as(usize, 0), trimmed.remaining_over_cap);
     try std.testing.expect(result_projection.isImageResult(c.messages.items[7].blocks[0].tool_result.content));
-    // Only the trailing image remains and it is over a tighter cap: still untouched.
-    try std.testing.expect(!c.trimDeliveredImageBytes(one / 2).changed());
 }
 
 test "trimDeliveredImageBytes: once any watermark exists, a local assistant append cannot make an unseen image trimmable" {
@@ -1362,7 +1382,7 @@ test "trimDeliveredImageBytes: once any watermark exists, a local assistant appe
     try c.appendText(.assistant, "{\"agentcore\":\"checkpoint_payload_resource_limit\"}"); // ...and a local marker followed
     const one = c.messages.items[2].blocks[0].tool_result.content.len;
     // The marker is not delivery evidence: the unseen image is not trimmable.
-    try std.testing.expect(!c.trimDeliveredImageBytes(one / 2).changed());
+    try std.testing.expect(!c.trimDeliveredImageBytes(one / 2).reduction.changed());
     try std.testing.expect(result_projection.isImageResult(c.messages.items[2].blocks[0].tool_result.content));
 }
 
@@ -1388,8 +1408,10 @@ test "trimDeliveredImageBytes: first-class user images consume the allowance but
     // Cap would admit the tool image alone, but the user image already takes 4096:
     // the delivered tool image is cleared, the user image block stays.
     const reduced = c.trimDeliveredImageBytes(img.len + 100);
-    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
     try std.testing.expect(c.messages.items[0].blocks[1] == .image);
+    // The user image is what remains non-trimmable.
+    try std.testing.expectEqual(@as(usize, 4096), c.nonTrimmableImageBytes());
     try std.testing.expect(std.mem.startsWith(u8, c.messages.items[2].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
 }
 
@@ -1417,7 +1439,7 @@ test "delivery watermark: a placeholder sibling in a parallel turn does not pin 
     try std.testing.expect(!c.messages.items[1].blocks[1].tool_result.delivered);
     // The wire cap can trim the delivered PNG while the WebP stays protected.
     const reduced = c.trimDeliveredImageBytes(webp.len + 16);
-    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
     try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
     try std.testing.expect(result_projection.isImageResult(c.messages.items[1].blocks[1].tool_result.content));
     // Microcompact under pressure likewise clears only the delivered block.
@@ -1430,16 +1452,25 @@ test "compact preview commit keeps a delivery watermark set while the preview wa
     var c = Conversation.init(a);
     defer c.deinit();
     try c.appendText(.user, "look at the picture");
+    const tu = try a.alloc(msg.Block, 1);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t1"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t1"), .content = try a.dupe(u8, "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}"), .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
     try c.appendText(.assistant, "ok");
     var preview = try c.cloneForCompactPreview(a, 2);
     defer preview.deinit();
     // A provider request goes out while the summary is still being produced.
     c.markDelivered(.{ .image_placeholder_ids = &.{} });
-    try std.testing.expect(!preview.conversation.messages.items[0].delivered);
+    try std.testing.expect(!preview.conversation.messages.items[2].delivered);
+    try std.testing.expect(!preview.conversation.messages.items[2].blocks[0].tool_result.delivered);
     // The suffix CAS still matches (delivery is not a content mutation), and the
-    // committed history must not regress to the preview's stale `false`.
+    // committed history must not regress to the preview's stale `false` — at
+    // message level and at block level.
     try std.testing.expect(c.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation));
     for (c.messages.items) |m| try std.testing.expect(m.delivered);
+    try std.testing.expect(c.messages.items[2].blocks[0].tool_result.delivered);
 }
 
 test "delivery watermark is carried only to the same message, never by position to a rewritten one" {

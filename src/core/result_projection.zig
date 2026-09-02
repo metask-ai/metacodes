@@ -79,9 +79,10 @@ pub fn turnBudgetBytes(max_input_tokens: usize) usize {
 
 /// Image-shaped tool result (`{"type":"image","media_type":...,"data":...}`,
 /// the `Read` tool's picture form; the exact canonical shape is defined by
-/// `extractImageResult`). Never spilled: an artifact envelope would turn the
-/// picture into a base64 preview string that no dialect recognizes as an
-/// image, so every provider would receive text instead of the picture.
+/// `extractImageResult`). Exempt from the byte budgets: an artifact envelope
+/// would turn the picture into a base64 preview string that no dialect
+/// recognizes as an image. Only the per-turn image byte cap (a wire-size
+/// limit, not a budget) can spill one.
 pub fn isImageResult(content: []const u8) bool {
     return json_mod.extractImageResult(content) != null;
 }
@@ -140,7 +141,12 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         }
         const index = biggest orelse break;
         const before = items[index].content.*.len;
-        try spillOne(allocator, items[index], structured[index], config, &stats, false);
+        // A base64 preview of a picture is noise for the model and would put
+        // part of the payload on the wire anyway; the envelope keeps the
+        // artifact id and sha256 for ReadArtifact recovery.
+        var image_config = config;
+        image_config.preview_bytes = 0;
+        try spillOne(allocator, items[index], structured[index], image_config, &stats, false);
         image[index] = false;
         stats.image_spills += 1;
         image_bytes -= before;
