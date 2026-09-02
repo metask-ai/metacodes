@@ -358,4 +358,33 @@ python3 scripts/eval/plugin_release_gate.py --refresh-implementation-fingerprint
 里说明增删了什么、为什么——把某条路径归到错误的集合是真实发生过的错误(两个 Lean 文件
 曾被当作"实现"钉住,而它们不链接进运行时二进制、属于形式化证据,2026-09 移入评测器集合;
 `sdk/zig/protocol.zig` 与 `sdk/zig/build.zig` 被 `agentcore:test` 编译却一直不在列表里)。
-路径集合的独立摘要与授权绑定的冻结清单是下一阶段的工作。
+路径集合的独立摘要与授权绑定的冻结清单见下一小节。
+
+### 7.1 冻结清单:付费运行的预注册
+
+付费运行之前必须先**冻结**:
+
+```bash
+python3 scripts/eval/plugin_pair_runner.py --freeze \
+  --runtime-binary <ReleaseSmall 二进制> --frozen-manifest <manifest.json>
+```
+
+产出 `metacodes.plugin-frozen-run/v1`:协议字节哈希、git HEAD、**完整**实现指纹、
+**路径集摘要**(`implementation_paths` 与 `pinned_evaluator_files` 的成员名集合,
+与内容无关)、运行时/两个 wrapper/两个 inventory 的哈希、schedule 哈希、模型指纹,以及
+对以上字段的规范化哈希 `manifest_sha256`。文件以 0600 创建,**拒绝覆盖**。
+
+用户 authority 升到 `metacodes.plugin-paid-authority/v2`,在 v1 字段之上**必须**携带
+`manifest_sha256`:用户签的是这份清单,而不只是协议。
+
+`run_paid_pair` 的顺序是**先校验清单、再打开 authority**:对着活树重算每一个字段,
+任何一项不等即以 `frozen-run manifest drifted: <字段>` 拒绝,此时 authority 文件根本
+没有被打开;随后要求 authority 的 `manifest_sha256` 等于校验通过的清单哈希。清单哈希
+进入预算日志的 `BudgetAuthority`(续跑不匹配即拒)和每条 rollout 记录的
+`plugin_treatment`。`analyze` 在读取任何证据之前做同样的校验,并要求每一行都带着同一个
+清单哈希;receipt 携带 `frozen_manifest_sha256`、`implementation_fingerprint` 与
+`path_set_digest`。
+
+路径集摘要解决的是内容指纹**原理上**做不到的事:删掉一条被钉路径再 repin,协议里没有
+任何东西记得列表曾经更长;而清单是在授权那一刻冻结的,列表一变,`path_set_digest`
+就是一条**有名字的**不匹配。

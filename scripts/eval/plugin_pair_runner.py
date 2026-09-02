@@ -87,7 +87,8 @@ else:
     )
 
 
-AUTHORITY_SCHEMA = "metacodes.plugin-paid-authority/v1"
+AUTHORITY_SCHEMA = "metacodes.plugin-paid-authority/v2"
+FROZEN_RUN_SCHEMA = "metacodes.plugin-frozen-run/v1"
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -114,6 +115,115 @@ def _git_head(root: Path) -> str:
     if result.returncode != 0:
         raise ValidationError("cannot resolve metacodes Git revision")
     return result.stdout.strip()
+
+
+def path_set_digest(protocol: Mapping[str, Any]) -> str:
+    """Identity of *which* paths are pinned, independent of their contents.
+
+    The implementation fingerprint hashes path names together with bytes, so
+    once it is repinned nothing remembers that the list used to be longer. A
+    manifest that carries this digest makes a shrunk or reshuffled pin set a
+    named mismatch at every verification point.
+    """
+    return _canonical_sha256(
+        {
+            "implementation_paths": sorted(protocol["implementation_paths"]),
+            "pinned_evaluator_files": sorted(protocol["pinned_evaluator_files"]),
+        }
+    )
+
+
+def _arm_identities(
+    root: Path,
+    protocol: Mapping[str, Any],
+    runtime_binary: Path,
+) -> tuple[dict[str, Path], dict[str, str], dict[str, str]]:
+    """The two arm wrappers, their hashes, and their attested inventories -
+    the identities the paid pair, the freeze step and the analysis must all
+    agree on. One function so they cannot drift apart."""
+    pair = protocol["coding_pair"]
+    wrappers = {
+        "baseline": root / pair["baseline_executable"],
+        "candidate": root / pair["treatment_executable"],
+    }
+    for arm, executable in wrappers.items():
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise ValidationError(f"{arm} wrapper is not executable")
+    wrapper_hashes = {arm: _sha256(path) for arm, path in wrappers.items()}
+    inventory_hashes = {
+        arm: _verify_arm_inventory(root, protocol, arm, executable, runtime_binary)
+        for arm, executable in wrappers.items()
+    }
+    return wrappers, wrapper_hashes, inventory_hashes
+
+
+def frozen_run_fields(
+    root: Path,
+    protocol: Mapping[str, Any],
+    *,
+    protocol_sha256: str,
+    runtime_sha256: str,
+    wrapper_hashes: Mapping[str, str],
+    inventory_hashes: Mapping[str, str],
+    schedule: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Everything a paid run is frozen against, as observed *now*."""
+    return {
+        "schema": FROZEN_RUN_SCHEMA,
+        "protocol_sha256": protocol_sha256,
+        "git_head": _git_head(root),
+        "implementation_fingerprint": implementation_fingerprint(root, protocol),
+        "path_set_digest": path_set_digest(protocol),
+        "runtime_sha256": runtime_sha256,
+        "wrapper_sha256": dict(wrapper_hashes),
+        "inventory_sha256": dict(inventory_hashes),
+        "schedule_sha256": _canonical_sha256(list(schedule)),
+        "model_fingerprint": _canonical_sha256(protocol["coding_pair"]["model"]),
+    }
+
+
+def manifest_sha256_of(fields: Mapping[str, Any]) -> str:
+    return _canonical_sha256({k: v for k, v in fields.items() if k != "manifest_sha256"})
+
+
+def freeze_run(root: Path, protocol_path: Path, runtime_binary: Path) -> dict[str, Any]:
+    """Produce the frozen-run manifest: the pre-registration a user authority
+    binds to *before* any provider request. Strict on every pin."""
+    protocol = load_protocol(root, protocol_path)
+    runtime = attest_runtime_artifact(protocol, runtime_binary)
+    plan = build_plan(root, protocol_path, runtime_binary=runtime.path)
+    _, wrapper_hashes, inventory_hashes = _arm_identities(root, protocol, runtime.path)
+    fields = frozen_run_fields(
+        root,
+        protocol,
+        protocol_sha256=_sha256(protocol_path),
+        runtime_sha256=runtime.sha256,
+        wrapper_hashes=wrapper_hashes,
+        inventory_hashes=inventory_hashes,
+        schedule=plan["schedule"],
+    )
+    return {**fields, "manifest_sha256": manifest_sha256_of(fields)}
+
+
+def verify_frozen_manifest(manifest: Mapping[str, Any], live: Mapping[str, Any]) -> str:
+    """Every field of the frozen manifest must equal what the tree, the
+    runtime and the wrappers look like now. Returns the manifest hash so the
+    caller can bind authority, journal and rows to it."""
+    if not isinstance(manifest, dict) or manifest.get("schema") != FROZEN_RUN_SCHEMA:
+        raise ValidationError("frozen-run manifest has an unsupported schema")
+    expected_keys = set(live) | {"manifest_sha256"}
+    if set(manifest) != expected_keys:
+        raise ValidationError("frozen-run manifest has unsupported or missing fields")
+    drifted = sorted(key for key, value in live.items() if manifest[key] != value)
+    if drifted:
+        # All of them, not the first: an operator deciding whether to re-freeze
+        # needs to know that the list shrank *and* the protocol bytes moved,
+        # not just whichever field happens to sort first.
+        raise ValidationError("frozen-run manifest drifted: " + ", ".join(drifted))
+    digest = manifest_sha256_of(manifest)
+    if manifest["manifest_sha256"] != digest:
+        raise ValidationError("frozen-run manifest hash does not match its fields")
+    return digest
 
 
 def _pair_fields(protocol: Mapping[str, Any]) -> tuple[float, int, float, int]:
@@ -216,6 +326,15 @@ def build_plan(
     }
 
 
+def _write_private_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Create `path` 0600, refusing to overwrite: a frozen manifest is a
+    commitment, and silently replacing one is how a run ends up bound to a
+    manifest nobody looked at."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(stable_json(value) + "\n")
+
+
 def _read_private_json(path: Path, label: str) -> dict[str, Any]:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -261,6 +380,7 @@ def load_user_authority(
     path: Path,
     *,
     protocol_sha256: str,
+    manifest_sha256: str,
     max_cost_usd: float,
     max_metered_tokens: int,
 ) -> dict[str, Any]:
@@ -268,6 +388,7 @@ def load_user_authority(
     expected_keys = {
         "schema",
         "protocol_sha256",
+        "manifest_sha256",
         "max_cost_usd",
         "max_metered_tokens",
         "authorized_by_user",
@@ -276,6 +397,11 @@ def load_user_authority(
         raise ValidationError("plugin paid authority has unsupported fields or schema")
     if value.get("protocol_sha256") != protocol_sha256:
         raise ValidationError("plugin paid authority is bound to another protocol")
+    # The authority is the user's commitment *before* the run: it names the
+    # frozen manifest, so the run can only proceed against the exact tree,
+    # runtime, wrappers and schedule the user saw when they authorized.
+    if value.get("manifest_sha256") != manifest_sha256:
+        raise ValidationError("plugin paid authority is bound to another frozen-run manifest")
     cost = value.get("max_cost_usd")
     tokens = value.get("max_metered_tokens")
     if (
@@ -437,6 +563,7 @@ def run_paid_pair(
     budget_journal_path: Path,
     provider_auth_file: Path,
     user_authority_file: Path,
+    frozen_manifest_file: Path,
 ) -> dict[str, Any]:
     protocol = load_protocol(root, protocol_path)
     runtime = attest_runtime_artifact(protocol, runtime_binary)
@@ -445,9 +572,28 @@ def run_paid_pair(
     pair = protocol["coding_pair"]
     rollout_cost, rollout_tokens, total_cost, total_tokens = _pair_fields(protocol)
     protocol_sha256 = _sha256(protocol_path)
+
+    # Freeze first, authorize second: the manifest the user signed must still
+    # describe this tree before their authority is even opened.
+    wrappers, wrapper_hashes, inventory_hashes = _arm_identities(root, protocol, runtime_binary)
+    plan = build_plan(root, protocol_path, runtime_binary=runtime_binary)
+    live_fields = frozen_run_fields(
+        root,
+        protocol,
+        protocol_sha256=protocol_sha256,
+        runtime_sha256=runtime_sha256,
+        wrapper_hashes=wrapper_hashes,
+        inventory_hashes=inventory_hashes,
+        schedule=plan["schedule"],
+    )
+    frozen_manifest_sha256 = verify_frozen_manifest(
+        _read_private_json(frozen_manifest_file.expanduser().resolve(), "frozen-run manifest"),
+        live_fields,
+    )
     user_authority = load_user_authority(
         user_authority_file.expanduser().resolve(),
         protocol_sha256=protocol_sha256,
+        manifest_sha256=frozen_manifest_sha256,
         max_cost_usd=total_cost,
         max_metered_tokens=total_tokens,
     )
@@ -465,24 +611,6 @@ def run_paid_pair(
     if sorted(expected_tasks) != sorted(pair["task_ids"]):
         raise ValidationError("suite tasks drifted from the plugin protocol")
 
-    wrappers = {
-        "baseline": root / pair["baseline_executable"],
-        "candidate": root / pair["treatment_executable"],
-    }
-    for arm, executable in wrappers.items():
-        if not executable.is_file() or not os.access(executable, os.X_OK):
-            raise ValidationError(f"{arm} wrapper is not executable")
-    wrapper_hashes = {arm: _sha256(path) for arm, path in wrappers.items()}
-    inventory_hashes = {
-        arm: _verify_arm_inventory(
-            root,
-            protocol,
-            arm,
-            executable,
-            runtime_binary,
-        )
-        for arm, executable in wrappers.items()
-    }
     revision = f"{_git_head(root)}+{implementation_fingerprint(root, protocol)[:16]}"
     config_ids = {
         "baseline": "plugin-v1:none",
@@ -499,6 +627,7 @@ def run_paid_pair(
         "wrapper_sha256": wrapper_hashes,
         "inventory_sha256": inventory_hashes,
         "revision": revision,
+        "frozen_manifest_sha256": frozen_manifest_sha256,
         "authorized_cost_microusd": usd_to_microusd(authorized_cost),
         "authorized_metered_tokens": authorized_tokens,
     }
@@ -545,6 +674,7 @@ def run_paid_pair(
                 )
                 expected_attestation = {
                     "protocol_sha256": protocol_sha256,
+                    "frozen_manifest_sha256": frozen_manifest_sha256,
                     "arm": arm,
                     "inventory_sha256": inventory_hashes[arm],
                 }
@@ -703,6 +833,7 @@ def run_paid_pair(
                 row["budget_transaction"] = dict(receipt)
                 row["plugin_treatment"] = {
                     "protocol_sha256": protocol_sha256,
+                    "frozen_manifest_sha256": frozen_manifest_sha256,
                     "arm": arm,
                     "inventory_sha256": inventory_hashes[arm],
                 }
@@ -727,11 +858,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--budget-journal", type=Path)
     parser.add_argument("--auth-file", type=Path)
     parser.add_argument("--user-authority", type=Path)
+    parser.add_argument(
+        "--frozen-manifest",
+        type=Path,
+        help="frozen-run manifest: written by --freeze, required by --allow-paid-rollouts",
+    )
+    parser.add_argument(
+        "--freeze",
+        action="store_true",
+        help="write the frozen-run manifest for this tree to --frozen-manifest and exit",
+    )
     args = parser.parse_args(argv)
     try:
         runtime_binary = (
             args.runtime_binary.expanduser() if args.runtime_binary is not None else None
         )
+        if args.freeze:
+            if args.allow_paid_rollouts or runtime_binary is None or args.frozen_manifest is None:
+                raise ValidationError("--freeze requires --runtime-binary and --frozen-manifest, and no paid flags")
+            manifest = freeze_run(root, args.protocol.resolve(), runtime_binary)
+            _write_private_json(args.frozen_manifest.expanduser().resolve(), manifest)
+            print(json.dumps(manifest, sort_keys=True))
+            return 0
         plan = build_plan(
             root,
             args.protocol.resolve(),
@@ -747,6 +895,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ("--budget-journal", args.budget_journal),
                 ("--auth-file", args.auth_file),
                 ("--user-authority", args.user_authority),
+                ("--frozen-manifest", args.frozen_manifest),
                 ("--runtime-binary", runtime_binary),
             )
             if value is None
@@ -761,6 +910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             budget_journal_path=args.budget_journal,
             provider_auth_file=args.auth_file,
             user_authority_file=args.user_authority,
+            frozen_manifest_file=args.frozen_manifest,
         )
     except (OSError, subprocess.SubprocessError, ValidationError, PluginGateError) as exc:
         parser.error(str(exc))

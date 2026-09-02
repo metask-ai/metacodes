@@ -97,6 +97,7 @@ class PluginPairRunnerTest(unittest.TestCase):
                     budget_journal_path=temporary / "budget.jsonl",
                     provider_auth_file=temporary / "missing-provider-auth",
                     user_authority_file=temporary / "missing-user-authority",
+                    frozen_manifest_file=temporary / "missing-manifest",
                 )
 
     @unittest.skipIf(os.name == "nt", "POSIX executable fixture required")
@@ -125,9 +126,11 @@ class PluginPairRunnerTest(unittest.TestCase):
 
     def test_paid_authority_must_bind_exact_protocol_and_permissions(self) -> None:
         plan = build_plan(ROOT, self.protocol_path)
+        manifest = "a" * 64
         value = {
-            "schema": "metacodes.plugin-paid-authority/v1",
+            "schema": "metacodes.plugin-paid-authority/v2",
             "protocol_sha256": plan["protocol_sha256"],
+            "manifest_sha256": manifest,
             "max_cost_usd": 30.0,
             "max_metered_tokens": 30000000,
             "authorized_by_user": True,
@@ -139,16 +142,41 @@ class PluginPairRunnerTest(unittest.TestCase):
             observed = load_user_authority(
                 path,
                 protocol_sha256=plan["protocol_sha256"],
+                manifest_sha256=manifest,
                 max_cost_usd=30.0,
                 max_metered_tokens=30000000,
             )
             self.assertEqual(value, observed)
+            # Bound to another manifest: the run the user authorized is not
+            # this one.
+            with self.assertRaisesRegex(ValidationError, "another frozen-run manifest"):
+                load_user_authority(
+                    path,
+                    protocol_sha256=plan["protocol_sha256"],
+                    manifest_sha256="b" * 64,
+                    max_cost_usd=30.0,
+                    max_metered_tokens=30000000,
+                )
             value["protocol_sha256"] = "0" * 64
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaises(ValidationError):
                 load_user_authority(
                     path,
                     protocol_sha256=plan["protocol_sha256"],
+                    manifest_sha256=manifest,
+                    max_cost_usd=30.0,
+                    max_metered_tokens=30000000,
+                )
+            # v1 authorities carry no manifest and are refused outright.
+            v1 = {k: v for k, v in value.items() if k != "manifest_sha256"}
+            v1["schema"] = "metacodes.plugin-paid-authority/v1"
+            v1["protocol_sha256"] = plan["protocol_sha256"]
+            path.write_text(json.dumps(v1), encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "unsupported fields or schema"):
+                load_user_authority(
+                    path,
+                    protocol_sha256=plan["protocol_sha256"],
+                    manifest_sha256=manifest,
                     max_cost_usd=30.0,
                     max_metered_tokens=30000000,
                 )
@@ -161,8 +189,9 @@ class PluginPairRunnerTest(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "schema": "metacodes.plugin-paid-authority/v1",
+                        "schema": "metacodes.plugin-paid-authority/v2",
                         "protocol_sha256": plan["protocol_sha256"],
+                        "manifest_sha256": "a" * 64,
                         "max_cost_usd": 30.0,
                         "max_metered_tokens": 30000000,
                         "authorized_by_user": True,
@@ -175,6 +204,7 @@ class PluginPairRunnerTest(unittest.TestCase):
                 load_user_authority(
                     path,
                     protocol_sha256=plan["protocol_sha256"],
+                    manifest_sha256="a" * 64,
                     max_cost_usd=30.0,
                     max_metered_tokens=30000000,
                 )
@@ -264,6 +294,7 @@ class ProductionEntryPointsStayStrictTest(unittest.TestCase):
                 budget_journal_path=self.temporary / "budget.jsonl",
                 provider_auth_file=self.temporary / "missing-provider-auth",
                 user_authority_file=self.temporary / "missing-user-authority",
+                frozen_manifest_file=self.temporary / "no-manifest",
             )
         self.assertFalse(output_dir.exists())
         self.assertFalse((self.temporary / "budget.jsonl").exists())
@@ -277,6 +308,7 @@ class ProductionEntryPointsStayStrictTest(unittest.TestCase):
                 baseline_path=self.temporary / "no-baseline",
                 candidate_path=self.temporary / "no-candidate",
                 budget_journal_path=self.temporary / "no-journal",
+                frozen_manifest_file=self.temporary / "no-manifest",
             )
 
 if __name__ == "__main__":

@@ -17,7 +17,12 @@ if __package__ in {None, ""}:
     from scripts.eval.analysis import gate  # type: ignore
     from scripts.eval.memory_budget_journal import usd_to_microusd_ceiling  # type: ignore
     from scripts.eval.model import ValidationError, load_rollouts  # type: ignore
-    from scripts.eval.plugin_pair_runner import (  # type: ignore
+    from scripts.eval.plugin_pair_runner import (
+        _arm_identities,
+        frozen_run_fields,
+        verify_frozen_manifest,
+        _read_private_json,
+        build_plan,  # type: ignore
         TOKEN_METRICS,
         _canonical_sha256,
         _metered_tokens,
@@ -33,6 +38,11 @@ else:
     from .memory_budget_journal import usd_to_microusd_ceiling
     from .model import ValidationError, load_rollouts
     from .plugin_pair_runner import (
+        _arm_identities,
+        frozen_run_fields,
+        verify_frozen_manifest,
+        _read_private_json,
+        build_plan,
         TOKEN_METRICS,
         _canonical_sha256,
         _metered_tokens,
@@ -66,6 +76,7 @@ def validate_paid_row(
     *,
     protocol: Mapping[str, Any],
     protocol_sha256: str,
+    frozen_manifest_sha256: str,
     arm: str,
     inventory_sha256: str,
 ) -> None:
@@ -78,6 +89,7 @@ def validate_paid_row(
         raise ValidationError("paid plugin row has incorrect runtime budget provenance")
     if row.get("plugin_treatment") != {
         "protocol_sha256": protocol_sha256,
+        "frozen_manifest_sha256": frozen_manifest_sha256,
         "arm": arm,
         "inventory_sha256": inventory_sha256,
     }:
@@ -108,10 +120,28 @@ def analyze(
     baseline_path: Path,
     candidate_path: Path,
     budget_journal_path: Path,
+    frozen_manifest_file: Path,
 ) -> dict[str, Any]:
     protocol = load_protocol(root, protocol_path)
     runtime = attest_runtime_artifact(protocol, runtime_binary)
     protocol_sha256 = _sha256(protocol_path)
+    # The evidence is judged against the same frozen manifest the run was
+    # authorized under, re-verified against the tree as it is now.
+    _, wrapper_hashes, inventory_hashes = _arm_identities(root, protocol, runtime.path)
+    plan = build_plan(root, protocol_path, runtime_binary=runtime.path)
+    live_fields = frozen_run_fields(
+        root,
+        protocol,
+        protocol_sha256=protocol_sha256,
+        runtime_sha256=runtime.sha256,
+        wrapper_hashes=wrapper_hashes,
+        inventory_hashes=inventory_hashes,
+        schedule=plan["schedule"],
+    )
+    frozen_manifest_sha256 = verify_frozen_manifest(
+        _read_private_json(frozen_manifest_file.expanduser().resolve(), "frozen-run manifest"),
+        live_fields,
+    )
     baseline = load_rollouts(baseline_path)
     candidate = load_rollouts(candidate_path)
     expected = _expected_keys(protocol)
@@ -120,26 +150,13 @@ def analyze(
         if observed != expected or len(rows) != len(expected):
             raise ValidationError(f"{arm} evidence is not the complete frozen pair")
     pair = protocol["coding_pair"]
-    wrappers = {
-        "baseline": root / pair["baseline_executable"],
-        "candidate": root / pair["treatment_executable"],
-    }
-    inventory_hashes = {
-        arm: _verify_arm_inventory(
-            root,
-            protocol,
-            arm,
-            executable,
-            runtime.path,
-        )
-        for arm, executable in wrappers.items()
-    }
     for arm, rows in (("baseline", baseline), ("candidate", candidate)):
         for row in rows:
             validate_paid_row(
                 row,
                 protocol=protocol,
                 protocol_sha256=protocol_sha256,
+                frozen_manifest_sha256=frozen_manifest_sha256,
                 arm=arm,
                 inventory_sha256=inventory_hashes[arm],
             )
@@ -185,6 +202,9 @@ def analyze(
         "schema": RECEIPT_SCHEMA,
         "quality_evidence": True,
         "protocol_sha256": protocol_sha256,
+        "frozen_manifest_sha256": frozen_manifest_sha256,
+        "implementation_fingerprint": live_fields["implementation_fingerprint"],
+        "path_set_digest": live_fields["path_set_digest"],
         "baseline_sha256": _sha256(baseline_path),
         "candidate_sha256": _sha256(candidate_path),
         "budget_journal_sha256": _sha256(budget_journal_path),
@@ -232,6 +252,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--budget-journal", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--frozen-manifest", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         receipt = analyze(
@@ -241,6 +262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.baseline.resolve(),
             args.candidate.resolve(),
             args.budget_journal.expanduser().resolve(),
+            frozen_manifest_file=args.frozen_manifest,
         )
         _write_new(args.output.resolve(), receipt)
     except (OSError, ValidationError, PluginGateError) as exc:

@@ -25,6 +25,7 @@ def row(protocol_sha256: str, model_fingerprint: str) -> dict:
         },
         "plugin_treatment": {
             "protocol_sha256": protocol_sha256,
+            "frozen_manifest_sha256": "manifest",
             "arm": "candidate",
             "inventory_sha256": "inventory",
         },
@@ -56,6 +57,7 @@ class PluginPairAnalysisTest(unittest.TestCase):
             value,
             protocol=protocol,
             protocol_sha256=protocol_sha256,
+            frozen_manifest_sha256="manifest",
             arm="candidate",
             inventory_sha256="inventory",
         )
@@ -66,6 +68,7 @@ class PluginPairAnalysisTest(unittest.TestCase):
                 tampered,
                 protocol=protocol,
                 protocol_sha256=protocol_sha256,
+                frozen_manifest_sha256="manifest",
                 arm="candidate",
                 inventory_sha256="inventory",
             )
