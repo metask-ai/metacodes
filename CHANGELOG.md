@@ -35,10 +35,15 @@ status, compatibility boundaries, and entry points are defined by
   atomic and reports a dedicated error with an actionable message, and the
   checkpoint decoder reports `UNSUPPORTED` (not `CORRUPT`) for an intact
   checkpoint carrying the permanently reserved block tag `7`, and only after
-  its digest has been verified. A Run that ends after admission without a
-  run_done event — a clean failure, a Skill aborted during activation, a
-  synthetic completion from budget reconciliation — now closes its `run_state`
-  with the matching terminal phase instead of leaving it at `starting`.
+  its digest has been verified. The terminal `run_state` snapshot is now
+  published exactly once from the Run's final result: an abort accepted from
+  the `finalizing` callback is reflected as `aborted` (it used to leave a
+  `completed` snapshot beside `STOP_ABORTED`), Runs that never ran the loop — a
+  clean failure, a Skill aborted during activation, a synthetic completion —
+  no longer stay at `starting`, degraded tool-set observation no longer
+  suppresses the closure, and a Host that rejects the terminal snapshot fails
+  the Run with `CALLBACK_FAILED` and poisons the Session instead of being
+  reported a successful Run.
 - AgentCore ABI v1 returns to **revision 15**; `RUN_INPUT_PART_DOCUMENT`,
   `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1` and status
   `DOCUMENT_INPUT_UNSUPPORTED` are gone. No bundle was ever published from a

@@ -312,12 +312,6 @@ fn roleStr(r: types.MessageRole) []const u8 {
 
 // nowNs 下沉到 util/time.zig（这里用的是 wall clock REALTIME）
 
-// ============================================================================
-// 加载器：从 transcript.jsonl 重建 Conversation
-// ============================================================================
-
-/// 从 session 目录加载 transcript，把所有 message append 到 conversation。
-/// 失败则 conversation 保持调用前状态。
 /// 读一块 transcript/meta 字节。负值是 I/O 错误,不是 EOF:当 EOF 处理会把一个
 /// 被截断的前缀当作完整历史"成功"恢复(PR #46 review B)。其中 EINTR 直接重试——
 /// SIGINT/SIGWINCH 处理器未设 SA_RESTART,/resume 读文件期间一次 Ctrl+C 或终端
@@ -333,6 +327,12 @@ fn readChunk(fd: c_int, buf: []u8) error{ReadFailed}!usize {
     }
 }
 
+// ============================================================================
+// 加载器：从 transcript.jsonl 重建 Conversation
+// ============================================================================
+
+/// 从 session 目录加载 transcript，把所有 message append 到 conversation。
+/// 失败则 conversation 保持调用前状态。
 pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allocator: std.mem.Allocator) !void {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl\x00", .{session_dir});

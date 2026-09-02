@@ -8734,3 +8734,199 @@ test "L2 RunState: a Skill aborted during activation still closes run_state as a
     try std.testing.expect(probe.sequence_valid);
     try std.testing.expectEqual(@as(usize, 0), probe.snapshots_after_terminal);
 }
+
+/// PR #46 review round 3 (finding 2):Host 在 `finalizing` 快照的回调里 abort,core 会把
+/// 结果改写成 aborted;终态快照必须跟着结果走,而不是循环自己的 end_turn。
+const AbortAtFinalizingProbe = struct {
+    api: sdk.Api,
+    abort_status: u32 = std.math.maxInt(u32),
+    saw_finalizing: bool = false,
+    saw_aborted: bool = false,
+    saw_completed: bool = false,
+    snapshots_after_terminal: usize = 0,
+    last_seq: u64 = 0,
+    sequence_valid: bool = true,
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *AbortAtFinalizingProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .known => |known| switch (known) {
+                .run_state => |state| {
+                    if (state.transition_seq != self.last_seq + 1) self.sequence_valid = false;
+                    self.last_seq = state.transition_seq;
+                    if (self.saw_aborted or self.saw_completed) self.snapshots_after_terminal += 1;
+                    switch (state.phase) {
+                        .finalizing => {
+                            if (self.saw_finalizing) return wire.EVENT_CONTINUE;
+                            self.saw_finalizing = true;
+                            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+                            self.abort_status = self.api.session().abort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+                            self.api.bufferRelease()(&diagnostic);
+                        },
+                        .aborted => self.saw_aborted = true,
+                        .completed => self.saw_completed = true,
+                        else => {},
+                    }
+                },
+                else => {},
+            },
+            .unknown => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+/// PR #46 review round 3 (finding 1):Host 拒绝**终态**快照 = 回调失败,Run 必须以
+/// CALLBACK_FAILED 失败并毒化 Session,而不是被报成一次成功的 Run。
+const FatalOnTerminalProbe = struct {
+    saw_terminal: bool = false,
+
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *FatalOnTerminalProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .known => |known| switch (known) {
+                .run_state => |state| switch (state.phase) {
+                    .completed, .failed, .aborted, .poisoned => {
+                        self.saw_terminal = true;
+                        return wire.EVENT_FATAL;
+                    },
+                    else => {},
+                },
+                else => {},
+            },
+            .unknown => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+fn createTextRunSession(
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle,
+    url: []const u8,
+    root: []const u8,
+    callbacks: *wire.SessionCallbacksV1,
+    diagnostic: *wire.OwnedBytesV1,
+) !?*wire.SessionHandle {
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("run-state-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    var session_config = sessionCreateConfig(&host_config, "run-state-model");
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, callbacks, &session, diagnostic));
+    return session;
+}
+
+test "L2 RunState: an abort accepted from the finalizing callback yields one terminal snapshot, aborted, matching STOP_ABORTED" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{FINAL_SSE};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer {
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
+    }
+
+    var probe = AbortAtFinalizingProbe{ .api = api };
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = AbortAtFinalizingProbe.event;
+    const session = try createTextRunSession(api, runtime, url, root, &callbacks, &diagnostic);
+    defer {
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
+    }
+
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, 1, sdk.bytesView("finish normally, then abort late"), &options, &result, &diagnostic),
+    );
+    try std.testing.expect(probe.saw_finalizing);
+    try std.testing.expectEqual(wire.STATUS_OK, probe.abort_status);
+    // core 把结果改写成 aborted……
+    try std.testing.expectEqual(wire.STOP_ABORTED, result.stop_reason_code);
+    // ……终态快照必须与之一致,且只有这一个终态(修复前:completed + STOP_ABORTED)。
+    try std.testing.expect(probe.saw_aborted);
+    try std.testing.expect(!probe.saw_completed);
+    try std.testing.expectEqual(@as(usize, 0), probe.snapshots_after_terminal);
+    try std.testing.expect(probe.sequence_valid);
+}
+
+test "L2 RunState: a Host rejecting the terminal snapshot fails the Run with CALLBACK_FAILED and poisons the Session" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer {
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
+    }
+
+    var probe = FatalOnTerminalProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = FatalOnTerminalProbe.event;
+    const session = try createTextRunSession(api, runtime, url, root, &callbacks, &diagnostic);
+    defer {
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
+    }
+
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var result: wire.RunResultV1 = undefined;
+    // 修复前:终态快照被拒绝的结果被丢弃,这里返回 STATUS_OK。
+    try std.testing.expectEqual(
+        wire.STATUS_CALLBACK_FAILED,
+        api.session().runText(session, 1, sdk.bytesView("reject my terminal"), &options, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expect(probe.saw_terminal);
+    // 回调失败毒化 Session:后续 Run 一律 INVALID_STATE。
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_STATE,
+        api.session().runText(session, 2, sdk.bytesView("after poison"), &options, &result, &diagnostic),
+    );
+}

@@ -189,10 +189,12 @@ pub const Conversation = struct {
     /// 调用方若按"全部还是我的"释放就是二次释放(PR #46 review 发现 A)。
     /// 与 `append` 同一把快照锁;整批只 bump 一次 mutation_version(前缀未变)。
     /// 前置条件:`items` 不得与 `self.messages.items` 重叠——重叠会浅拷贝出双重
-    /// 所有权(deinit 二次释放),且预留触发的 realloc 会先让 `items` 失效。
+    /// 所有权(deinit 二次释放),且预留触发的 realloc 会先让 `items` 失效。违反
+    /// 时返回 `error.OverlappingItems` 而不是 assert:公共 API 的前置条件在任何
+    /// 构建模式下都要成立,也才测得到。
     pub fn appendAllOwned(self: *Conversation, items: []const msg.Message) !void {
         if (items.len == 0) return; // 空批次不是一次 mutation
-        std.debug.assert(!overlaps(items, self.messages.items));
+        if (overlaps(items, self.messages.items)) return error.OverlappingItems;
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
         try self.messages.ensureUnusedCapacity(self.allocator, items.len);
@@ -1462,13 +1464,17 @@ test "restoreCompactState:分配失败时 boundary 与 summary 都不动(不留�
     try std.testing.expectEqualStrings("old summary", conv.compact_summary.?);
 }
 
-test "appendAllOwned:空批次不 bump mutation_version,也不动消息;overlaps 判定正确" {
+test "appendAllOwned:空批次不 bump mutation_version;重叠输入被拒绝且不动状态;overlaps 判定正确" {
     const a = std.testing.allocator;
     var conv = Conversation.init(a);
     defer conv.deinit();
     try conv.appendText(.user, "one");
     const before = conv.mutation_version;
     try conv.appendAllOwned(&.{});
+    try std.testing.expectEqual(before, conv.mutation_version);
+    try std.testing.expectEqual(@as(usize, 1), conv.len());
+    // 把自己的消息再交给自己:双重所有权,必须拒绝,且拒绝后一切如故。
+    try std.testing.expectError(error.OverlappingItems, conv.appendAllOwned(conv.messages.items));
     try std.testing.expectEqual(before, conv.mutation_version);
     try std.testing.expectEqual(@as(usize, 1), conv.len());
 
