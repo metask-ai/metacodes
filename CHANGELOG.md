@@ -35,8 +35,9 @@ status, compatibility boundaries, and entry points are defined by
   atomic and reports a dedicated error with an actionable message, and the
   checkpoint decoder reports `UNSUPPORTED` (not `CORRUPT`) for an intact
   checkpoint carrying the permanently reserved block tag `7`, and only after
-  its digest has been verified. The terminal `run_state` snapshot is now
-  published exactly once from the Run's final result: an abort accepted from
+  its digest has been verified. While the observation channel stays usable, the
+  terminal `run_state` snapshot is published exactly once from the Run's final
+  result: a post-admission cleanup failure closes it as `poisoned`, an abort accepted from
   the `finalizing` callback is reflected as `aborted` (it used to leave a
   `completed` snapshot beside `STOP_ABORTED`), Runs that never ran the loop — a
   clean failure, a Skill aborted during activation, a synthetic completion —

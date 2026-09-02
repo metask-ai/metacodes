@@ -1403,23 +1403,18 @@ const AbiSession = struct {
         return self.emitRunStateSnapshot(session_id, run_id);
     }
 
-    fn emitPoisonedRunState(self: *AbiSession, run_id: u64) void {
-        if (self.callback_status.load(.acquire) != wire.STATUS_OK) return;
-        // Degraded tool-set observation suppresses intermediate snapshots
-        // only; every admitted Run still receives its terminal closure.
-        self.run_state_projector.closeForTerminal(.poisoned);
-        _ = self.emitRunStateSnapshot(self.core_session.session_id, run_id);
-    }
-
     /// Terminal closure for an admitted Run, published from the **returned**
     /// execution so it carries the Run's final stop reason: the loop's
     /// run_done only reaches `finalizing`, because an abort accepted from that
     /// very callback still rewrites the result to `aborted`. It also covers
     /// Runs that never ran the loop — the multimodal root record could not be
     /// built, a Skill was aborted during activation, budget reconciliation
-    /// produced a synthetic completion. Every started Run ends with exactly one
-    /// terminal snapshot; otherwise a Host watching `run_state` sees it stuck
-    /// in `starting` or `finalizing`. Degraded tool-set observation does not
+    /// produced a synthetic completion. While the observation channel stays
+    /// usable, every started Run ends with exactly one terminal snapshot;
+    /// otherwise a Host watching `run_state` sees it stuck in `starting` or
+    /// `finalizing`. (A Host that rejected an earlier snapshot, or a snapshot
+    /// that cannot be built, ends the Run as a callback failure instead — no
+    /// terminal can be delivered then.) Degraded tool-set observation does not
     /// suppress it (`closeForTerminal` clears the tool set, so the snapshot is
     /// bounded). Returns false when the Host rejected the snapshot or it could
     /// not be built; the caller must then treat the Run as a callback failure
@@ -1448,6 +1443,36 @@ const AbiSession = struct {
     fn terminalSnapshotRejected(self: *AbiSession, out_error: ?*wire.OwnedBytesV1) u32 {
         self.facade_poisoned.store(true, .release);
         return failError(self.callbackFailureStatus(), error.CallbackFailed, out_error);
+    }
+
+    /// Error reconciliation shared by the three `run_input` kinds. `status` is
+    /// the kind's own mapping of `err`; `core_poisoned` is passed in rather than
+    /// read so the fake facade can exercise every branch. Two outcomes:
+    /// - poisoned: the Core poisoned itself, or post-admission cleanup failed
+    ///   after the Core already returned to idle (`AdmittedCleanupFailed`). The
+    ///   facade is poisoned either way, and the Host's terminal must say
+    ///   `poisoned` — not leave the Run at `finalizing`;
+    /// - failed: a non-poisoning failure after admission.
+    /// A Host rejecting the terminal snapshot is a callback failure and
+    /// supersedes the original error (the same precedence the admitted-Run
+    /// cleanup applies to `error.CallbackFailed`).
+    fn reconcileRunFailure(
+        self: *AbiSession,
+        session_id: core.session_id.SessionId,
+        run_id: u64,
+        status: u32,
+        err: anyerror,
+        core_poisoned: bool,
+        out_error: ?*wire.OwnedBytesV1,
+    ) u32 {
+        const phase: public_protocol.RunStatePhase = if (err == error.AdmittedCleanupFailed or core_poisoned)
+            .poisoned
+        else
+            .failed;
+        if (phase == .poisoned) self.facade_poisoned.store(true, .release);
+        if (!self.emitTerminalRunStateIfOpen(session_id, run_id, phase))
+            return self.terminalSnapshotRejected(out_error);
+        return failError(status, err, out_error);
     }
 
     fn emit(raw: *anyopaque, session_id: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
@@ -6735,21 +6760,16 @@ fn sessionRunInput(
                 prompt,
                 options.max_turns,
             ) catch |err| {
-                const status = runErrorStatus(self, err);
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
-                if (err == error.AdmittedCleanupFailed or
-                    self.core_session.isPoisoned())
-                {
-                    if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
-                    self.facade_poisoned.store(true, .release);
-                } else if (!self.emitTerminalRunStateIfOpen(self.core_session.session_id, run_id, .failed)) {
-                    // Non-poisoning failure after admission closes the Run's
-                    // RunState as failed; if the Host rejects that snapshot,
-                    // the callback failure supersedes the original error.
-                    return self.terminalSnapshotRejected(out_error);
-                }
-                return failError(status, err, out_error);
+                return self.reconcileRunFailure(
+                    self.core_session.session_id,
+                    run_id,
+                    runErrorStatus(self, err),
+                    err,
+                    self.core_session.isPoisoned(),
+                    out_error,
+                );
             };
             break :text_run text_execution;
         },
@@ -6780,21 +6800,16 @@ fn sessionRunInput(
                 arguments,
                 options.max_turns,
             ) catch |err| {
-                const status = skillRunErrorStatus(self, err);
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
-                if (err == error.AdmittedCleanupFailed or
-                    self.core_session.isPoisoned())
-                {
-                    if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
-                    self.facade_poisoned.store(true, .release);
-                } else if (!self.emitTerminalRunStateIfOpen(self.core_session.session_id, run_id, .failed)) {
-                    // Non-poisoning failure after admission closes the Run's
-                    // RunState as failed; if the Host rejects that snapshot,
-                    // the callback failure supersedes the original error.
-                    return self.terminalSnapshotRejected(out_error);
-                }
-                return failError(status, err, out_error);
+                return self.reconcileRunFailure(
+                    self.core_session.session_id,
+                    run_id,
+                    skillRunErrorStatus(self, err),
+                    err,
+                    self.core_session.isPoisoned(),
+                    out_error,
+                );
             };
         },
         wire.RUN_INPUT_MULTIMODAL => multimodal_run: {
@@ -6825,21 +6840,16 @@ fn sessionRunInput(
                 parts,
                 options.max_turns,
             ) catch |err| {
-                const status = runErrorStatus(self, err);
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
-                if (err == error.AdmittedCleanupFailed or
-                    self.core_session.isPoisoned())
-                {
-                    if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
-                    self.facade_poisoned.store(true, .release);
-                } else if (!self.emitTerminalRunStateIfOpen(self.core_session.session_id, run_id, .failed)) {
-                    // Non-poisoning failure after admission closes the Run's
-                    // RunState as failed; if the Host rejects that snapshot,
-                    // the callback failure supersedes the original error.
-                    return self.terminalSnapshotRejected(out_error);
-                }
-                return failError(status, err, out_error);
+                return self.reconcileRunFailure(
+                    self.core_session.session_id,
+                    run_id,
+                    runErrorStatus(self, err),
+                    err,
+                    self.core_session.isPoisoned(),
+                    out_error,
+                );
             };
             break :multimodal_run multimodal_execution;
         },
@@ -9470,6 +9480,66 @@ test "run_done only reaches finalizing; the terminal follows the returned result
     try std.testing.expect(fake.emitTerminalRunStateIfOpen(.single, 9, .completed));
     try std.testing.expectEqual(public_protocol.RunStatePhase.completed, fake.run_state_projector.phase);
     try std.testing.expectEqual(@as(usize, 0), fake.run_state_projector.inFlightCount());
+}
+
+const FatalEventCallback = struct {
+    calls: usize = 0,
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *FatalEventCallback = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        self.calls += 1;
+        return wire.EVENT_FATAL;
+    }
+};
+
+test "reconcileRunFailure: cleanup failure after an idle Core still closes as poisoned; a rejected terminal is a callback failure" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+        .run_state_projector = run_state.Projector.init(std.testing.allocator),
+    };
+    defer fake.run_state_projector.deinit();
+
+    // Post-loop cleanup failure with the Core already idle: the facade is
+    // poisoned, and the Host's terminal says so instead of staying at finalizing.
+    try std.testing.expect(fake.startRunState(.single, 10));
+    try std.testing.expectEqual(
+        wire.STATUS_CORE_ERROR,
+        fake.reconcileRunFailure(.single, 10, wire.STATUS_CORE_ERROR, error.AdmittedCleanupFailed, false, null),
+    );
+    try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, fake.run_state_projector.phase);
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+
+    // A Core-poisoned Run closes as poisoned too; a plain failure closes as failed
+    // and leaves the facade usable.
+    fake.facade_poisoned.store(false, .release);
+    try std.testing.expect(fake.startRunState(.single, 11));
+    _ = fake.reconcileRunFailure(.single, 11, wire.STATUS_CORE_ERROR, error.RunJournalFailed, true, null);
+    try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, fake.run_state_projector.phase);
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+    fake.facade_poisoned.store(false, .release);
+    try std.testing.expect(fake.startRunState(.single, 12));
+    try std.testing.expectEqual(
+        wire.STATUS_OUT_OF_MEMORY,
+        fake.reconcileRunFailure(.single, 12, wire.STATUS_OUT_OF_MEMORY, error.OutOfMemory, false, null),
+    );
+    try std.testing.expectEqual(public_protocol.RunStatePhase.failed, fake.run_state_projector.phase);
+    try std.testing.expect(!fake.facade_poisoned.load(.acquire));
+
+    // The Host rejects the terminal snapshot: callback failure supersedes the
+    // original error, for the poisoned outcome as much as for the failed one.
+    var fatal = FatalEventCallback{};
+    fake.callbacks.ctx = &fatal;
+    fake.callbacks.on_event = FatalEventCallback.event;
+    fake.run_state_projector.begin(13); // silent begin: no `starting` snapshot reaches the fatal callback
+    try std.testing.expectEqual(
+        wire.STATUS_CALLBACK_FAILED,
+        fake.reconcileRunFailure(.single, 13, wire.STATUS_CORE_ERROR, error.RunJournalFailed, true, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fatal.calls);
+    try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, fake.run_state_projector.phase);
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
 }
 
 test "Host schema admission rejects ambiguous object contracts" {

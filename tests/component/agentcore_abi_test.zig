@@ -8742,7 +8742,7 @@ const AbortAtFinalizingProbe = struct {
     abort_status: u32 = std.math.maxInt(u32),
     saw_finalizing: bool = false,
     saw_aborted: bool = false,
-    saw_completed: bool = false,
+    terminal_count: usize = 0,
     snapshots_after_terminal: usize = 0,
     last_seq: u64 = 0,
     sequence_valid: bool = true,
@@ -8758,7 +8758,7 @@ const AbortAtFinalizingProbe = struct {
                 .run_state => |state| {
                     if (state.transition_seq != self.last_seq + 1) self.sequence_valid = false;
                     self.last_seq = state.transition_seq;
-                    if (self.saw_aborted or self.saw_completed) self.snapshots_after_terminal += 1;
+                    if (self.terminal_count != 0) self.snapshots_after_terminal += 1;
                     switch (state.phase) {
                         .finalizing => {
                             if (self.saw_finalizing) return wire.EVENT_CONTINUE;
@@ -8767,8 +8767,11 @@ const AbortAtFinalizingProbe = struct {
                             self.abort_status = self.api.session().abort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
                             self.api.bufferRelease()(&diagnostic);
                         },
-                        .aborted => self.saw_aborted = true,
-                        .completed => self.saw_completed = true,
+                        .aborted => {
+                            self.saw_aborted = true;
+                            self.terminal_count += 1;
+                        },
+                        .completed, .failed, .poisoned => self.terminal_count += 1,
                         else => {},
                     }
                 },
@@ -8874,9 +8877,9 @@ test "L2 RunState: an abort accepted from the finalizing callback yields one ter
     try std.testing.expectEqual(wire.STATUS_OK, probe.abort_status);
     // core 把结果改写成 aborted……
     try std.testing.expectEqual(wire.STOP_ABORTED, result.stop_reason_code);
-    // ……终态快照必须与之一致,且只有这一个终态(修复前:completed + STOP_ABORTED)。
+    // ……终态快照必须与之一致,且四种终态里恰好只出现这一个(修复前:completed + STOP_ABORTED)。
     try std.testing.expect(probe.saw_aborted);
-    try std.testing.expect(!probe.saw_completed);
+    try std.testing.expectEqual(@as(usize, 1), probe.terminal_count);
     try std.testing.expectEqual(@as(usize, 0), probe.snapshots_after_terminal);
     try std.testing.expect(probe.sequence_valid);
 }

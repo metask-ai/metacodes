@@ -380,12 +380,14 @@ event sequence number, cursor, replay, or exactly-once contract; only
 `on_event` is mandatory in Revision 15. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
-and advances only for emitted RunState snapshots. Terminal closure is published
-exactly once, from the Run's final result — an abort accepted from the
-`finalizing` callback is reflected as `aborted`, and a Run that never ran the
-loop still receives it — and it is delivered even when tool-set observation was
-degraded; a Host that rejects it fails the Run with `CALLBACK_FAILED` and
-poisons the Session like any other rejected event. Usage remains authoritative
+and advances only for emitted RunState snapshots. While the observation
+channel stays usable, terminal closure is published exactly once, from the
+Run's final result — an abort accepted from the `finalizing` callback is
+reflected as `aborted`, a Run that never ran the loop still receives it, and a
+post-admission cleanup failure closes it as `poisoned` — and it is delivered
+even when tool-set observation was degraded. A Host that rejects any snapshot
+(the terminal one included) fails the Run with `CALLBACK_FAILED` and poisons
+the Session; no terminal snapshot is delivered after that. Usage remains authoritative
 in the existing usage event stream.
 
 Visible assistant output is bracketed by `output_segment_begin` and
