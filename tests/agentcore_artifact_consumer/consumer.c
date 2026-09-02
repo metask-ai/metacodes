@@ -6,20 +6,17 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 16 must not retain historical callback aliases"
+#error "revision 15 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 16u || \
+#if METASK_AGENTCORE_ABI_REVISION != 15u || \
     METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE != 27u || \
     METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED != 28u || \
     METASK_AGENTCORE_RUN_INPUT_MULTIMODAL != 3u || \
     METASK_AGENTCORE_RUN_INPUT_PART_TEXT != 1u || \
     METASK_AGENTCORE_RUN_INPUT_PART_IMAGE != 2u || \
-    METASK_AGENTCORE_RUN_INPUT_PART_DOCUMENT != 3u || \
-    METASK_AGENTCORE_STATUS_DOCUMENT_INPUT_UNSUPPORTED != 29u || \
     METASK_AGENTCORE_MAX_RUN_INPUT_PARTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 != 5000000u || \
-    METASK_AGENTCORE_MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1 != 16000000u || \
     METASK_AGENTCORE_PROTOCOL_DEFAULT != 0u || \
     METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES != 1u || \
     METASK_AGENTCORE_MCP_NEGOTIATION_AUTO != 1u || \
@@ -61,13 +58,6 @@ typedef pthread_t thread_handle;
 #define INVALID_SOCKET_HANDLE (-1)
 #define SHUTDOWN_BOTH SHUT_RDWR
 #endif
-
-/* Minimal real PDF (header, one page object, trailer, %%EOF) and its standard
- * base64. Kept short on purpose: the whole payload is the rolling-scan needle,
- * so the source-free consumer proves the document bytes themselves reach the
- * provider request, not merely that a document block was emitted. */
-static const char TINY_PDF_BASE64[] =
-    "JVBERi0xLjcKMSAwIG9iago8PCAvVHlwZSAvUGFnZSA+PgplbmRvYmoKdHJhaWxlcgo8PCA+PgolJUVPRgo=";
 
 static const char RESPONSE_BODY[] =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"c1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
@@ -499,7 +489,7 @@ int main(void) {
         return release_error(api, &diagnostic, 13);
     }
     struct test_server server;
-    if (start_server(&server, 2, TINY_PDF_BASE64) != 0) {
+    if (start_server(&server, 2, "\"data\":\"aWNvbi1ieXRlcw==\"") != 0) {
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 14);
     }
@@ -596,7 +586,7 @@ int main(void) {
      * capability and malformed wire is rejected outright. Neither request
      * reaches the mock provider (both response rounds stay unconsumed) and
      * the rejected Run id stays reusable. */
-    metask_agentcore_run_input_part_v1 image_parts[3];
+    metask_agentcore_run_input_part_v1 image_parts[2];
     memset(image_parts, 0, sizeof(image_parts));
     image_parts[0].struct_size = (uint32_t)sizeof(image_parts[0]);
     image_parts[0].kind_code = METASK_AGENTCORE_RUN_INPUT_PART_TEXT;
@@ -605,16 +595,11 @@ int main(void) {
     image_parts[1].kind_code = METASK_AGENTCORE_RUN_INPUT_PART_IMAGE;
     image_parts[1].media_type = view("image/png");
     image_parts[1].data = view("aWNvbi1ieXRlcw==");
-    image_parts[2].struct_size = (uint32_t)sizeof(image_parts[2]);
-    image_parts[2].kind_code = METASK_AGENTCORE_RUN_INPUT_PART_DOCUMENT;
-    image_parts[2].media_type = view("application/pdf");
-    image_parts[2].data = view(TINY_PDF_BASE64);
-    image_parts[2].text = view("report.pdf");
     metask_agentcore_run_input_v1 multimodal = {0};
     multimodal.struct_size = sizeof(multimodal);
     multimodal.kind_code = METASK_AGENTCORE_RUN_INPUT_MULTIMODAL;
     multimodal.parts = image_parts;
-    multimodal.part_count = 3;
+    multimodal.part_count = 2;
     metask_agentcore_run_result_v1 result = {0};
     if (api->session->run_input(session, 1, &multimodal, &options, &result,
                                 &diagnostic) !=
@@ -625,23 +610,6 @@ int main(void) {
         api->buffer_release(&diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 21);
-    }
-    api->buffer_release(&diagnostic);
-    /* Document capability is preflighted independently of vision: the same
-     * input restricted to its document part is rejected with the document
-     * status, still without reaching the provider. */
-    metask_agentcore_run_input_v1 document_only = multimodal;
-    document_only.parts = &image_parts[2];
-    document_only.part_count = 1;
-    if (api->session->run_input(session, 1, &document_only, &options, &result,
-                                &diagnostic) !=
-        METASK_AGENTCORE_STATUS_DOCUMENT_INPUT_UNSUPPORTED) {
-        api->buffer_release(&diagnostic);
-        stop_server(&server);
-        api->session->destroy(session, &diagnostic);
-        api->buffer_release(&diagnostic);
-        api->runtime->destroy(runtime, &diagnostic);
-        return release_error(api, &diagnostic, 25);
     }
     api->buffer_release(&diagnostic);
     metask_agentcore_run_input_v1 malformed = multimodal;
@@ -669,8 +637,8 @@ int main(void) {
     }
     api->buffer_release(&diagnostic);
 
-    /* Vision- and document-capable model for the two real provider rounds. */
-    if (api->session_control->set_model(session, view("claude-sonnet-4-c-consumer"),
+    /* Vision-capable model for the two real provider rounds. */
+    if (api->session_control->set_model(session, view("claude-c-consumer"),
                                         &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         stop_server(&server);
         api->session->destroy(session, &diagnostic);
@@ -696,9 +664,9 @@ int main(void) {
         return release_error(api, &diagnostic, 18);
     }
 
-    /* End-to-end multimodal Run: the ordered text+image+document parts must
-     * reach the captured provider request bytes (the complete PDF base64
-     * payload is verified by the mock server's rolling scan). */
+    /* End-to-end multimodal Run: the ordered text+image parts must reach the
+     * captured provider request bytes (base64 payload verified by the mock
+     * server's rolling scan). */
     active_run_id = 2;
     run_status = api->session->run_input(session, 2, &multimodal, &options,
                                          &result, &diagnostic);
@@ -722,6 +690,6 @@ int main(void) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);
-    puts("AgentCore source-free C consumer: ABI table, callback, multimodal text/image/document input and lifecycle OK");
+    puts("AgentCore source-free C consumer: ABI table, callback, multimodal input and lifecycle OK");
     return 0;
 }

@@ -83,6 +83,23 @@ pub const Projector = struct {
         self.phase = phase;
     }
 
+    /// True once the Run reached a terminal phase. A terminal Run must not be
+    /// closed again with a different verdict by a later, weaker reconciliation
+    /// path (the ABI's non-poisoning failure closure checks this first).
+    pub fn isTerminal(self: *const Projector) bool {
+        return switch (self.phase) {
+            .completed, .failed, .aborted, .poisoned => true,
+            .starting,
+            .generating,
+            .executing_tools,
+            .waiting_ui,
+            .retrying,
+            .compacting,
+            .finalizing,
+            => false,
+        };
+    }
+
     pub fn nextSnapshot(self: *Projector) Error!protocol.RunState {
         const view = try self.allocator.alloc(protocol.RunStateTool, self.tools.items.len);
         for (self.tools.items, view) |tool, *dest| {
@@ -161,4 +178,19 @@ test "progress sampling cannot leave generating with in-flight tools" {
     _ = projector.observeProgress(1, 1);
     try std.testing.expectEqual(protocol.RunStatePhase.executing_tools, projector.phase);
     try std.testing.expectEqual(@as(usize, 1), projector.inFlightCount());
+}
+
+test "isTerminal distinguishes closed Runs from every live phase" {
+    var projector = Projector.init(std.testing.allocator);
+    defer projector.deinit();
+    projector.begin(1);
+    try std.testing.expect(!projector.isTerminal());
+    inline for (.{ .generating, .executing_tools, .waiting_ui, .retrying, .compacting, .finalizing }) |phase| {
+        _ = projector.setPhase(phase);
+        try std.testing.expect(!projector.isTerminal());
+    }
+    inline for (.{ .completed, .failed, .aborted, .poisoned }) |phase| {
+        projector.closeForTerminal(phase);
+        try std.testing.expect(projector.isTerminal());
+    }
 }

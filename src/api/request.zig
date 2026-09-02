@@ -124,12 +124,12 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
 }
 
 /// Provider 中立的 canonical 请求投影(预算记账/journal 身份/token 估算用)。
-/// 不是真实 provider 请求:图像/文档能力门属于真实发送路径(与 AgentCore 预检),
+/// 不是真实 provider 请求:图像能力门属于真实发送路径(与 AgentCore 预检),
 /// 投影必须对任意 Session model 可计算——否则非 claude 命名的 vision 模型
 /// (如 gpt-*/gemini-*)带图时,记账序列化自己先报 ImageInputUnsupported,
-/// 真实请求反而从未发出。故此处强制放行 image 与 pdf 位,始终按 Anthropic 的
-/// base64 image / document block 形态计字节;text-only 请求字节与
-/// serializeMessagesRequest 完全一致。
+/// 真实请求反而从未发出。故此处强制放行 image 位,始终按 Anthropic base64
+/// image source block 形态计字节;text-only 请求字节与 serializeMessagesRequest
+/// 完全一致。
 pub fn serializeCanonicalRequestProjection(req: MessagesRequest, allocator: std.mem.Allocator) ![]u8 {
     var dialect = dialect_mod.dialectFor(.anthropic, req.model);
     dialect.profileFn = canonicalProjectionProfile;
@@ -143,7 +143,6 @@ fn canonicalProjectionProfile(
 ) @import("dialect.zig").ModelProfile {
     var profile = @import("model_adapter.zig").profileFor(kind, model);
     profile.supports_image_input = true;
-    profile.supports_pdf_input = true;
     return profile;
 }
 
@@ -345,14 +344,6 @@ fn serializeContent(
                 // 绝不静默丢图或降级为文本。
                 const emitted = try dialect.serializeImagePart(profile, img, buf, allocator);
                 if (!emitted) return error.ImageInputUnsupported;
-            },
-            .document => |doc| {
-                // 一等文档内容(issue #25):同图像的 fail-closed 契约,但**能力独立**
-                // (supports_pdf_input,不看 supports_image_input)。方言返 false =
-                // 该 (provider, model) 无原生文档输入 → 显式能力错误,绝不静默丢弃、
-                // OCR、抽文本或降级成页面图。
-                const emitted = try dialect.serializeDocumentPart(profile, doc, buf, allocator);
-                if (!emitted) return error.DocumentInputUnsupported;
             },
         }
     }
@@ -1061,26 +1052,4 @@ test "canonical 投影:非 claude 命名的 vision 模型带图可计量,text-on
     const canonical = try serializeCanonicalRequestProjection(.{ .model = "gpt-5.2", .messages = &text_messages }, a);
     defer a.free(canonical);
     try std.testing.expectEqualStrings(plain, canonical);
-
-    // 文档同理(issue #25):真实路径按 supports_pdf_input 守门,记账投影必须
-    // 对任意模型可计算,否则带 PDF 的 Run 会在预算记账里先报能力错误。
-    const document_messages = [_]types.ApiMessage{
-        .{ .role = .user, .content = &[_]types.ApiContent{
-            .{ .document = .{ .media_type = "application/pdf", .data = "JVBE", .title = "r.pdf" } },
-        } },
-    };
-    try std.testing.expectError(
-        error.DocumentInputUnsupported,
-        serializeMessagesRequest(.{ .model = "gpt-5.2", .messages = &document_messages }, a),
-    );
-    const document_projection = try serializeCanonicalRequestProjection(
-        .{ .model = "gpt-5.2", .messages = &document_messages },
-        a,
-    );
-    defer a.free(document_projection);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        document_projection,
-        "{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"JVBE\"},\"title\":\"r.pdf\"}",
-    ) != null);
 }

@@ -1068,9 +1068,6 @@ fn serializeOpenAIMessage(
         // 不上 wire。text 静默丢是既有已知行为(message_repair 合并守护防产出);image
         // 受 issue #10"绝不静默丢"铁律保护,防御性显式报错(正常路径永不产出此混合)。
         for (m.content) |c| if (c == .image) return error.ImageWithToolResultUnsupported;
-        // 文档同理(issue #25):tool_result 消息的 wire 投影里没有它的位置,
-        // 静默丢弃违反"绝不悄悄丢一等内容"的铁律。
-        for (m.content) |c| if (c == .document) return error.DocumentWithToolResultUnsupported;
         // OpenAI 要求每个 tool_result 是独立 {role:"tool"} message。并行工具一轮有多个
         // tool_result,**全部展开**成逗号分隔的多条 message(P0.1:旧版只发首个 → 并行回合
         // 下一次请求缺 tool_call_id 配对被 OpenAI 400)。调用方在本消息前已加分隔逗号。
@@ -1144,9 +1141,6 @@ fn serializeOpenAIMessage(
     for (m.content) |c| switch (c) {
         .tool_use => has_tool_use = true,
         .image => has_image = true,
-        // 一等文档(issue #25):本协议族本期没有原生文档输入路径。发请求前显式
-        // 报能力错误——绝不静默丢弃、也绝不把 base64 当文本塞进 content。
-        .document => return error.DocumentInputUnsupported,
         else => {},
     };
     try out.appendSlice(allocator, ",\"content\":");
@@ -1377,8 +1371,6 @@ fn serializeResponsesInputItems(
         .image => has_image = true,
         .tool_result => has_tool_result = true,
         .text => |t| text_len += t.len,
-        // 同 chat 路径:Responses 本期不做原生文档输入,显式能力错误而非静默丢弃。
-        .document => return error.DocumentInputUnsupported,
         else => {},
     };
     if (has_image) {

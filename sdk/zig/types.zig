@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 16;
+pub const ABI_REVISION: u32 = 15;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 16 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 15 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -40,7 +40,6 @@ pub const Status = enum(u32) {
     invalid_mcp_selection = 25,
     skill_catalog_incomplete = 27,
     image_input_unsupported = 28,
-    document_input_unsupported = 29,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -72,7 +71,6 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.invalid_mcp_selection) => .invalid_mcp_selection,
             @intFromEnum(Status.skill_catalog_incomplete) => .skill_catalog_incomplete,
             @intFromEnum(Status.image_input_unsupported) => .image_input_unsupported,
-            @intFromEnum(Status.document_input_unsupported) => .document_input_unsupported,
             else => error.UnknownStatus,
         };
     }
@@ -106,7 +104,6 @@ pub const STATUS_MCP_NOT_REFRESHED: u32 = @intFromEnum(Status.mcp_not_refreshed)
 pub const STATUS_INVALID_MCP_SELECTION: u32 = @intFromEnum(Status.invalid_mcp_selection);
 pub const STATUS_SKILL_CATALOG_INCOMPLETE: u32 = @intFromEnum(Status.skill_catalog_incomplete);
 pub const STATUS_IMAGE_INPUT_UNSUPPORTED: u32 = @intFromEnum(Status.image_input_unsupported);
-pub const STATUS_DOCUMENT_INPUT_UNSUPPORTED: u32 = @intFromEnum(Status.document_input_unsupported);
 
 pub const ProviderKind = enum(u32) {
     anthropic = 1,
@@ -203,10 +200,6 @@ pub const MAX_RUN_INPUT_PARTS_V1: u64 = 64;
 /// encoding of the Read tool's 3.75 MB raw-image limit, so an image that the
 /// built-in Read tool can attach is also submittable through the ABI.
 pub const MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1: u64 = 5_000_000;
-/// Base64 payload cap for one document part. This is exactly the standard
-/// base64 encoding of Core's 12 MB raw-PDF admission limit, so a document Core
-/// admits through the headless CLI is also submittable through the ABI.
-pub const MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1: u64 = 16_000_000;
 pub const MAX_SKILL_CATALOG_SKILLS_V1: u64 = 1024;
 pub const MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1: u64 = 4 * 1024 * 1024;
 pub const MAX_SKILL_FILE_CONTENT_BYTES_V1: u64 = 16 * 1024 * 1024;
@@ -255,7 +248,6 @@ pub const RUN_INPUT_MULTIMODAL: u32 = 3;
 
 pub const RUN_INPUT_PART_TEXT: u32 = 1;
 pub const RUN_INPUT_PART_IMAGE: u32 = 2;
-pub const RUN_INPUT_PART_DOCUMENT: u32 = 3;
 
 pub const SKILL_SOURCE_USER: u32 = 1;
 pub const SKILL_SOURCE_WORKSPACE: u32 = 2;
@@ -783,11 +775,6 @@ pub const SkillCatalogQueryV1 = extern struct {
 /// - RUN_INPUT_PART_IMAGE: `media_type` is one of `image/png`, `image/jpeg`,
 ///   `image/gif`, `image/webp`; `data` is non-empty standard base64 with `=`
 ///   padding and no whitespace, at most MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1.
-/// - RUN_INPUT_PART_DOCUMENT: `media_type` is `application/pdf`; `data` is
-///   standard base64 of a real, unencrypted PDF within Core's byte and page
-///   admission limits, at most MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1; `text`
-///   carries an optional document title (a stable host-supplied identity such
-///   as a file name — never a local path), and may be canonical empty.
 pub const RunInputPartV1 = extern struct {
     struct_size: u32,
     kind_code: u32,
@@ -1222,8 +1209,7 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(26));
     try std.testing.expectEqual(Status.skill_catalog_incomplete, try Status.fromCode(27));
     try std.testing.expectEqual(Status.image_input_unsupported, try Status.fromCode(28));
-    try std.testing.expectEqual(Status.document_input_unsupported, try Status.fromCode(29));
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(30));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(29));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
     try std.testing.expectEqual(StopReason.checkpoint_resource_limit, try StopReason.fromCode(8));
@@ -1245,9 +1231,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 16 keeps MCP wire codes stable" {
+test "Revision 15 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 16), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 15), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

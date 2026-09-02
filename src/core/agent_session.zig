@@ -975,10 +975,13 @@ pub const AdmittedRun = struct {
     }
 
     /// Continue an admitted Run with one multimodal user record built from
-    /// ordered text/image parts. Part bytes are borrowed and copied during
-    /// append. Appends and provider execution retain the ordinary poison
-    /// semantics; a non-vision model still fails the provider serializer with
-    /// `error.ImageInputUnsupported` before any network I/O.
+    /// ordered text/image parts. Part bytes are borrowed and copied while the
+    /// record is built, which happens **before** the Run is claimed: a build
+    /// failure returns its error with the Run finished cleanly, no provider
+    /// request sent, and the session left usable for the next Run. Provider
+    /// execution retains the ordinary poison semantics; a non-vision model
+    /// still fails the provider serializer with `error.ImageInputUnsupported`
+    /// before any network I/O.
     pub fn runUserParts(
         self: *AdmittedRun,
         parts: []const message_mod.UserContentPart,
@@ -1020,12 +1023,29 @@ pub const AdmittedRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         }
+        // 构造记录先于认领 Run:构造失败(输入不合法、OOM)是这次输入的问题,
+        // 该走与上面 parts.len==0 同一条干净退出(Run 正常收尾、不发请求、
+        // 会话可继续下一个 Run),而不是把会话毒掉。
+        const record = message_mod.userMessageFromParts(
+            self.session.conversation.allocator,
+            parts,
+        ) catch |err| {
+            _ = try self.finishWithoutConversation();
+            return err;
+        };
+        // 显式转移标志而非裸 errdefer:Conversation.append 失败时**不**接管
+        // record,成功后所有权归 conversation。裸 errdefer 会在 append 成功之后
+        // 的任何错误(runLoop 返错是常态)上二次释放。
+        var record_owned = true;
+        errdefer if (record_owned) record.deinit(self.session.conversation.allocator);
         try self.session.claimAdmittedRun(self.identity_value);
         self.completed = true;
-        self.session.conversation.appendUserParts(parts) catch |err| {
+        // 此后失败才是普通的 admitted-Run poison 语义。
+        self.session.conversation.append(record) catch |err| {
             _ = self.session.poisonRun();
             return err;
         };
+        record_owned = false;
         return self.session.runLoop(
             self.identity_value,
             max_turns,

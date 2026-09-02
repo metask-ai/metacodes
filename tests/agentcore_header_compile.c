@@ -1,6 +1,6 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 16,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 15,
                "AgentCore revision changed");
 _Static_assert(sizeof(metask_agentcore_api_v1) == 64,
                "AgentCore root layout changed");
@@ -35,13 +35,8 @@ _Static_assert(sizeof(metask_agentcore_run_input_part_v1) == 72,
                "multimodal part layout changed");
 _Static_assert(METASK_AGENTCORE_RUN_INPUT_MULTIMODAL == 3u &&
                    METASK_AGENTCORE_RUN_INPUT_PART_TEXT == 1u &&
-                   METASK_AGENTCORE_RUN_INPUT_PART_IMAGE == 2u &&
-                   METASK_AGENTCORE_RUN_INPUT_PART_DOCUMENT == 3u,
+                   METASK_AGENTCORE_RUN_INPUT_PART_IMAGE == 2u,
                "multimodal run input codes changed");
-_Static_assert(METASK_AGENTCORE_MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1 == 16000000ULL,
-               "document part payload cap changed");
-_Static_assert(METASK_AGENTCORE_STATUS_DOCUMENT_INPUT_UNSUPPORTED == 29u,
-               "document capability status changed");
 _Static_assert(METASK_AGENTCORE_MAX_RUN_INPUT_PARTS_V1 == 64ULL,
                "multimodal part-count limit changed");
 _Static_assert(METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 == 5000000ULL,

@@ -4041,7 +4041,18 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     errdefer if (staged_owned_here) staged.deinit();
 
     transcript_mod.loadTranscript(&staged, path, allocator) catch |err| {
-        std.debug.print("load failed: {s} (session state unchanged)\n", .{@errorName(err)});
+        // 明确区分"存档坏了"与"这个会话用了已撤回的特性":后者文件是好的,
+        // 让用户去查磁盘是误导。loadTranscript 是原子的,失败时 staged 为空。
+        if (err == error.WithdrawnDocumentBlock) {
+            std.debug.print(
+                "load failed: this session contains a PDF document block from the withdrawn " ++
+                    "first-class document input; it cannot be resumed faithfully by this build " ++
+                    "(session state unchanged)\n",
+                .{},
+            );
+        } else {
+            std.debug.print("load failed: {s} (session state unchanged)\n", .{@errorName(err)});
+        }
         staged.deinit();
         staged_owned_here = false;
         return;

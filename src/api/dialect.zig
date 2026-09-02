@@ -24,7 +24,6 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
-const pdf_mod = @import("../core/pdf.zig");
 const model_adapter = @import("model_adapter.zig");
 const openai_dialects = @import("dialects/openai.zig");
 const claude_dialects = @import("dialects/claude.zig");
@@ -325,20 +324,6 @@ pub const Dialect = struct {
         allocator: std.mem.Allocator,
     ) anyerror!bool = defaultSerializeImagePart,
 
-    /// 一等文档内容块的 wire 形态(issue #25,当前仅 PDF)。返回 true=已写入 out;
-    /// false=该 (provider, model) 不支持原生文档输入 → 调用方**必须**报显式能力错误
-    /// (error.DocumentInputUnsupported),绝不静默丢弃或降级成文本/图像。
-    /// - Claude dialect:{"type":"document","source":{"type":"base64",...},"title":..}
-    /// default = 返回 false(fail-closed:未实现原生文档输入的方言一律拒)。
-    /// **与图像分开的能力**:supports_image_input 为真不蕴含 supports_pdf_input。
-    serializeDocumentPartFn: *const fn (
-        ctx: *anyopaque,
-        profile: ModelProfile,
-        document: types.DocumentBlock,
-        out: *std.ArrayList(u8),
-        allocator: std.mem.Allocator,
-    ) anyerror!bool = defaultSerializeDocumentPart,
-
     /// 暴露纯数据 profile 供 UI/agent_loop 快速问能力。单一真相源收口(step 8 后)。
     /// default = 返回 profileFor 的结果。
     profileFn: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
@@ -382,16 +367,6 @@ pub const Dialect = struct {
         // profile.supports_image_input(issue #10 铁律由构造保证,不靠每个实现自觉)。
         if (!p.supports_image_input) return false;
         return try self.serializeImagePartFn(self.ctx, p, image, out, a);
-    }
-    pub fn serializeDocumentPart(self: Dialect, p: ModelProfile, document: types.DocumentBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
-        // 能力守门集中在 wrapper(同 serializeImagePart):vendor 覆盖
-        // serializeDocumentPartFn 也绕不开 profile.supports_pdf_input。
-        if (!p.supports_pdf_input) return false;
-        // 类型守门同样放在 wrapper:Core 今天只受理 PDF(core/pdf.zig 的准入是
-        // 唯一入口),一个被贴错标签的载荷不该因为某个方言实现忘了自查就以
-        // document block 上线。方言实现只管 wire 形态。
-        if (!std.mem.eql(u8, document.media_type, pdf_mod.MEDIA_TYPE)) return false;
-        return try self.serializeDocumentPartFn(self.ctx, p, document, out, a);
     }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
         return self.profileFn(self.ctx, kind, model);
@@ -562,16 +537,6 @@ fn defaultSerializeParallelToolCalls(ctx: *anyopaque, p: ModelProfile, enabled: 
     _ = enabled;
     _ = out;
     _ = a;
-    return false;
-}
-
-fn defaultSerializeDocumentPart(ctx: *anyopaque, p: ModelProfile, document: types.DocumentBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
-    _ = ctx;
-    _ = p;
-    _ = document;
-    _ = out;
-    _ = a;
-    // fail-closed:没有原生文档输入形态的方言一律返回 false,调用方报能力错误。
     return false;
 }
 

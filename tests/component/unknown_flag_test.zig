@@ -186,32 +186,3 @@ test "--image without -p/--print fails closed (no silent drop into TUI/serve)" {
     defer if (config.images) |imgs| a.free(imgs);
     try parseErr(config, "--image requires -p/--print");
 }
-
-test "--pdf collects repeatable paths with -p (issue #25 flag wiring)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const argv = [_][*:0]const u8{ "metacodes", "--pdf", "a.pdf", "--pdf", "b.pdf", "-p", "hi" };
-    const config = cc.parseArgsForTest(&argv, a);
-    try std.testing.expect(config.parse_error == null);
-    try std.testing.expectEqualStrings("a.pdf\x00b.pdf", config.documents.?);
-    try std.testing.expect(config.images == null);
-    try std.testing.expectEqualStrings("hi", config.prompt.?);
-}
-
-test "--pdf without a value is rejected" {
-    const a = std.testing.allocator;
-    const argv = [_][*:0]const u8{ "metacodes", "--pdf" };
-    const config = cc.parseArgsForTest(&argv, a);
-    defer freeErr(a, config);
-    try parseErr(config, "missing value for --pdf");
-}
-
-test "--pdf without -p/--print fails closed (no silent drop into TUI/serve)" {
-    const a = std.testing.allocator;
-    const argv = [_][*:0]const u8{ "metacodes", "--pdf", "a.pdf" };
-    const config = cc.parseArgsForTest(&argv, a);
-    defer freeErr(a, config);
-    defer if (config.documents) |docs| a.free(docs);
-    try parseErr(config, "--pdf requires -p/--print");
-}
