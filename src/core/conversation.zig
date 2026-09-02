@@ -97,9 +97,14 @@ pub const Conversation = struct {
     /// resume 恢复投影状态(A:transcript 持久化 boundary/summary)。boundary 防御性 cap 到已加载
     /// 消息数(meta 陈旧/损坏时不越界);summary dupe 成 owned(传 null 清)。释放旧 summary 防泄漏。
     pub fn restoreCompactState(self: *Conversation, boundary: usize, summary: ?[]const u8) !void {
-        self.compact_boundary = @min(boundary, self.messages.items.len);
+        // 先分配、后提交:dupe 失败时 boundary 与 summary 都不动。半恢复的投影
+        // (boundary 已推进、summary 却为空)会让 activeMessages() 悄悄丢掉前缀,
+        // 而调用方把这次失败当"退回全量重放"吞掉;旧 summary 若已释放,字段还会
+        // 悬空(PR #46 review F1)。
+        const owned: ?[]u8 = if (summary) |s| try self.allocator.dupe(u8, s) else null;
         if (self.compact_summary) |old| self.allocator.free(old);
-        self.compact_summary = if (summary) |s| try self.allocator.dupe(u8, s) else null;
+        self.compact_summary = owned;
+        self.compact_boundary = @min(boundary, self.messages.items.len);
     }
 
     /// 把一段文本追加到 compact_summary 末尾(PostCompact hook 注入 skill/plan/MCP 上下文用)。
@@ -183,7 +188,11 @@ pub const Conversation = struct {
     /// 逐条 `append` 做不到这一点:第 k>0 条扩容失败时前 k 条已归 conversation,
     /// 调用方若按"全部还是我的"释放就是二次释放(PR #46 review 发现 A)。
     /// 与 `append` 同一把快照锁;整批只 bump 一次 mutation_version(前缀未变)。
+    /// 前置条件:`items` 不得与 `self.messages.items` 重叠——重叠会浅拷贝出双重
+    /// 所有权(deinit 二次释放),且预留触发的 realloc 会先让 `items` 失效。
     pub fn appendAllOwned(self: *Conversation, items: []const msg.Message) !void {
+        if (items.len == 0) return; // 空批次不是一次 mutation
+        std.debug.assert(!overlaps(items, self.messages.items));
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
         try self.messages.ensureUnusedCapacity(self.allocator, items.len);
@@ -1424,4 +1433,48 @@ test "totalTokens: Read 图像形态 tool_result 按 IMAGE_TOKEN_ESTIMATE 计(fa
     const total = c.totalTokens();
     try std.testing.expect(total >= IMAGE_TOKEN_ESTIMATE);
     try std.testing.expect(total < 50_000); // 远小于按字节计的 ~10 万
+}
+
+fn overlaps(a: []const msg.Message, b: []const msg.Message) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const a0 = @intFromPtr(a.ptr);
+    const a1 = a0 + a.len * @sizeOf(msg.Message);
+    const b0 = @intFromPtr(b.ptr);
+    const b1 = b0 + b.len * @sizeOf(msg.Message);
+    return a0 < b1 and b0 < a1;
+}
+
+test "restoreCompactState:分配失败时 boundary 与 summary 都不动(不留半恢复、不悬空;PR #46 review F1)" {
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const a = fa.allocator();
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "one");
+    try conv.appendText(.assistant, "two");
+    try conv.appendText(.user, "three");
+    try conv.restoreCompactState(2, "old summary");
+    try std.testing.expectEqual(@as(usize, 2), conv.compact_boundary);
+
+    // 下一次分配(新 summary 的 dupe)失败。
+    fa.fail_index = fa.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, conv.restoreCompactState(3, "new summary"));
+    try std.testing.expectEqual(@as(usize, 2), conv.compact_boundary);
+    try std.testing.expectEqualStrings("old summary", conv.compact_summary.?);
+}
+
+test "appendAllOwned:空批次不 bump mutation_version,也不动消息;overlaps 判定正确" {
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "one");
+    const before = conv.mutation_version;
+    try conv.appendAllOwned(&.{});
+    try std.testing.expectEqual(before, conv.mutation_version);
+    try std.testing.expectEqual(@as(usize, 1), conv.len());
+
+    try std.testing.expect(overlaps(conv.messages.items, conv.messages.items));
+    try std.testing.expect(overlaps(conv.messages.items[0..1], conv.messages.items));
+    var other: [1]msg.Message = undefined;
+    try std.testing.expect(!overlaps(&other, conv.messages.items));
+    try std.testing.expect(!overlaps(&.{}, conv.messages.items));
 }

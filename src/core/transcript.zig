@@ -318,6 +318,21 @@ fn roleStr(r: types.MessageRole) []const u8 {
 
 /// 从 session 目录加载 transcript，把所有 message append 到 conversation。
 /// 失败则 conversation 保持调用前状态。
+/// 读一块 transcript/meta 字节。负值是 I/O 错误,不是 EOF:当 EOF 处理会把一个
+/// 被截断的前缀当作完整历史"成功"恢复(PR #46 review B)。其中 EINTR 直接重试——
+/// SIGINT/SIGWINCH 处理器未设 SA_RESTART,/resume 读文件期间一次 Ctrl+C 或终端
+/// resize 就会打断 read,这不该让恢复失败(review F5);其它错误才是 ReadFailed。
+fn readChunk(fd: c_int, buf: []u8) error{ReadFailed}!usize {
+    while (true) {
+        const n = pfs.read(fd, buf);
+        if (n >= 0) return @intCast(n);
+        if (comptime @import("builtin").os.tag != .windows) {
+            if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+        }
+        return error.ReadFailed;
+    }
+}
+
 pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allocator: std.mem.Allocator) !void {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl\x00", .{session_dir});
@@ -330,11 +345,7 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
     defer all.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = pfs.read(fd, &buf);
-        // 负值是 I/O 错误(EINTR/EIO/EISDIR…),不是 EOF:当 EOF 处理会把一个
-        // 被截断的前缀当作完整历史"成功"恢复。SIGINT/SIGWINCH 处理器未设
-        // SA_RESTART,/resume 读文件期间一次 Ctrl+C 或终端 resize 就能触发。
-        if (n < 0) return error.ReadFailed;
+        const n = try readChunk(fd, &buf);
         if (n == 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
@@ -382,8 +393,7 @@ fn loadCompactStateFromMeta(conversation: *Conversation, session_dir: []const u8
     defer all.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = pfs.read(fd, &buf);
-        if (n < 0) return error.ReadFailed; // 负值是错误不是 EOF,理由见 loadTranscript
+        const n = try readChunk(fd, &buf);
         if (n == 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
@@ -595,8 +605,7 @@ fn readMeta(session_dir: []const u8, allocator: std.mem.Allocator) !struct {
     defer all.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = pfs.read(fd, &buf);
-        if (n < 0) return error.ReadFailed; // 负值是错误不是 EOF,理由见 loadTranscript
+        const n = try readChunk(fd, &buf);
         if (n == 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
@@ -1065,14 +1074,25 @@ test "回退边界:thinking round-trip 与 [image] 标题兜底必须完好" {
     try std.testing.expect(std.mem.indexOf(u8, meta[0..@intCast(n)], "[image]") != null);
 }
 
-fn loadIntoFreshConversation(a: std.mem.Allocator, dir: []const u8) !usize {
+const LoadOutcome = union(enum) {
+    /// loadTranscript 报错;载荷 = 失败后 conversation 里剩下的消息数(必须为 0)。
+    failed: usize,
+    /// loadTranscript 成功(注入的失败可能被非致命的 meta 路径吸收)。
+    loaded: struct { len: usize, boundary: usize, has_summary: bool },
+};
+
+fn loadIntoFreshConversation(a: std.mem.Allocator, dir: []const u8) !LoadOutcome {
     var conv = Conversation.init(a);
     defer conv.deinit();
     loadTranscript(&conv, dir, a) catch |e| {
         try std.testing.expectEqual(error.OutOfMemory, e);
-        return conv.len();
+        return .{ .failed = conv.len() };
     };
-    return std.math.maxInt(usize);
+    return .{ .loaded = .{
+        .len = conv.len(),
+        .boundary = conv.compact_boundary,
+        .has_summary = conv.compact_summary != null,
+    } };
 }
 
 test "原子提交:任意分配点失败都不留半填充、不二次释放(FailingAllocator 逐点扫描;PR #46 review A)" {
@@ -1096,17 +1116,29 @@ test "原子提交:任意分配点失败都不留半填充、不二次释放(Fai
         while (i < 128) : (i += 1) {
             try conv.appendText(if (i % 2 == 0) .user else .assistant, "message body");
         }
+        // 带一份持久化的压缩投影:meta 路径的失败被 loadTranscript 当非致命吞掉,
+        // 所以它只允许"整体没恢复"(0/null),不允许半恢复(boundary 推进、summary
+        // 为空)——那会让模型悄悄丢掉前缀(review F1)。
+        conv.compact_boundary = 1;
+        conv.compact_summary = try base.dupe(u8, "SUMMARY");
         writer.flush(&conv);
     }
 
     var idx: usize = 0;
     while (idx < 100_000) : (idx += 1) {
         var fa = std.testing.FailingAllocator.init(base, .{ .fail_index = idx });
-        const left = try loadIntoFreshConversation(fa.allocator(), writer.dir);
+        const outcome = try loadIntoFreshConversation(fa.allocator(), writer.dir);
         if (!fa.has_induced_failure) break; // 这一轮没注入失败 = 扫描完毕
-        // 注入了失败的一轮:要么 loadTranscript 仍成功(失败被非致命的 meta
-        // 路径吸收),要么 conversation 一条都不留。半填充是唯一不允许的结果。
-        if (left != std.math.maxInt(usize)) try std.testing.expectEqual(@as(usize, 0), left);
+        switch (outcome) {
+            // 报错的一轮:conversation 一条都不许留。半填充是唯一不允许的结果。
+            .failed => |left| try std.testing.expectEqual(@as(usize, 0), left),
+            // 成功的一轮:消息齐全,投影要么完整恢复、要么完全未恢复。
+            .loaded => |l| {
+                try std.testing.expectEqual(@as(usize, 128), l.len);
+                try std.testing.expect((l.boundary == 1 and l.has_summary) or
+                    (l.boundary == 0 and !l.has_summary));
+            },
+        }
     }
     try std.testing.expect(idx < 100_000); // 扫描必须自然收敛
 }

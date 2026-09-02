@@ -1415,22 +1415,28 @@ const AbiSession = struct {
         _ = self.emitRunStateSnapshot(self.core_session.session_id, run_id);
     }
 
-    /// Terminal closure for an admitted Run that failed **without** poisoning
-    /// the session — e.g. the multimodal root record could not be built after
-    /// admission, which `AdmittedRun.runUserParts` finishes cleanly. The Run
-    /// already published `starting` through `startRunState`, and the contract
-    /// is that every started Run ends with a terminal snapshot; without this a
-    /// Host watching `run_state` sees the Run stuck in `starting` until the
-    /// next one begins. No-op when the Run already reached a terminal phase
-    /// through its own events, when observation is degraded, when the callback
-    /// is gone, or when the projector belongs to a different Run (the failure
-    /// happened before this Run's `starting`).
-    fn emitFailedRunStateIfOpen(self: *AbiSession, session_id: core.session_id.SessionId, run_id: u64) void {
+    /// Terminal closure for an admitted Run that ended **without** a run_done
+    /// event and without poisoning the session: the multimodal root record could
+    /// not be built after admission (`AdmittedRun.runUserParts` finishes it
+    /// cleanly), a Skill was aborted during activation, or budget reconciliation
+    /// produced a synthetic completion. The Run already published `starting`
+    /// through `startRunState`, and the contract is that every started Run ends
+    /// with a terminal snapshot; without this a Host watching `run_state` sees
+    /// the Run stuck in `starting` until the next one begins. No-op when the Run
+    /// already reached a terminal phase through its own events, when observation
+    /// is degraded, when the callback is gone, or when the projector belongs to a
+    /// different Run (the failure happened before this Run's `starting`).
+    fn emitTerminalRunStateIfOpen(
+        self: *AbiSession,
+        session_id: core.session_id.SessionId,
+        run_id: u64,
+        phase: public_protocol.RunStatePhase,
+    ) void {
         if (self.callback_status.load(.acquire) != wire.STATUS_OK) return;
         if (self.run_state_observation_disabled) return;
         if (self.run_state_projector.run_id != run_id) return;
         if (self.run_state_projector.isTerminal()) return;
-        self.run_state_projector.closeForTerminal(.failed);
+        self.run_state_projector.closeForTerminal(phase);
         _ = self.emitRunStateSnapshot(session_id, run_id);
     }
 
@@ -6731,7 +6737,7 @@ fn sessionRunInput(
                     // Non-poisoning failure after admission: the Run already
                     // published `starting`, so close it, or the Host sees it
                     // stuck there until the next Run begins.
-                    self.emitFailedRunStateIfOpen(self.core_session.session_id, run_id);
+                    self.emitTerminalRunStateIfOpen(self.core_session.session_id, run_id, .failed);
                 }
                 return failError(status, err, out_error);
             };
@@ -6776,7 +6782,7 @@ fn sessionRunInput(
                     // Non-poisoning failure after admission: the Run already
                     // published `starting`, so close it, or the Host sees it
                     // stuck there until the next Run begins.
-                    self.emitFailedRunStateIfOpen(self.core_session.session_id, run_id);
+                    self.emitTerminalRunStateIfOpen(self.core_session.session_id, run_id, .failed);
                 }
                 return failError(status, err, out_error);
             };
@@ -6821,7 +6827,7 @@ fn sessionRunInput(
                     // Non-poisoning failure after admission: the Run already
                     // published `starting`, so close it, or the Host sees it
                     // stuck there until the next Run begins.
-                    self.emitFailedRunStateIfOpen(self.core_session.session_id, run_id);
+                    self.emitTerminalRunStateIfOpen(self.core_session.session_id, run_id, .failed);
                 }
                 return failError(status, err, out_error);
             };
@@ -6829,6 +6835,19 @@ fn sessionRunInput(
         },
         else => return fail(wire.STATUS_INVALID_ARGUMENT, "unknown RunInputV1 kind", out_error),
     };
+    // Executions that ended without a run_done event — a Skill aborted during
+    // activation, a synthetic completion from budget reconciliation — never
+    // closed the RunState they started. Close them here with the verdict the
+    // loop itself would have published; Runs that ran the loop are already
+    // terminal and are left untouched (PR #46 review F2).
+    switch (execution) {
+        .aborted => self.emitTerminalRunStateIfOpen(self.core_session.session_id, run_id, .aborted),
+        .completed => |completed| self.emitTerminalRunStateIfOpen(
+            self.core_session.session_id,
+            run_id,
+            terminalPhaseForStopReason(completed.stop_reason),
+        ),
+    }
     // Budget-aware paths already recorded their stronger terminal kind. Keep
     // this fallback for any pre-budget internal fixture path.
     if (self.last_terminal_id != run_id)
@@ -6873,6 +6892,16 @@ fn sessionRunInput(
     };
     writeRunBudgetFields(self, out);
     return wire.STATUS_OK;
+}
+
+/// The terminal RunState phase a completed execution maps to — the same table
+/// `observeRunState` applies to a run_done event's stop reason name.
+fn terminalPhaseForStopReason(stop_reason: core.agent_loop.StopReason) public_protocol.RunStatePhase {
+    return switch (stop_reason) {
+        .aborted => .aborted,
+        .end_turn, .max_turns => .completed,
+        .tool_error, .api_error, .tool_loop, .suspended, .backgrounded, .budget => .failed,
+    };
 }
 
 fn writeRunBudgetFields(self: *const AbiSession, out: *wire.RunResultV1) void {
@@ -9366,19 +9395,30 @@ test "non-poisoning Run failure after `starting` closes RunState as failed; term
     // Run 3 published `starting` and then failed before any CoreEvent — the
     // multimodal root record could not be built after admission.
     try std.testing.expect(fake.startRunState(.single, 3));
-    fake.emitFailedRunStateIfOpen(.single, 3);
+    fake.emitTerminalRunStateIfOpen(.single, 3, .failed);
     try std.testing.expectEqual(public_protocol.RunStatePhase.failed, fake.run_state_projector.phase);
 
     // A Run that already reached its own terminal keeps that verdict.
     try std.testing.expect(fake.startRunState(.single, 4));
     fake.run_state_projector.closeForTerminal(.completed);
-    fake.emitFailedRunStateIfOpen(.single, 4);
+    fake.emitTerminalRunStateIfOpen(.single, 4, .failed);
     try std.testing.expectEqual(public_protocol.RunStatePhase.completed, fake.run_state_projector.phase);
 
     // A failure before this Run's `starting` leaves the previous Run alone.
-    fake.emitFailedRunStateIfOpen(.single, 5);
+    fake.emitTerminalRunStateIfOpen(.single, 5, .failed);
     try std.testing.expectEqual(public_protocol.RunStatePhase.completed, fake.run_state_projector.phase);
     try std.testing.expectEqual(@as(u64, 4), fake.run_state_projector.run_id);
+
+    // A Skill aborted during activation closes as aborted, not failed.
+    try std.testing.expect(fake.startRunState(.single, 6));
+    fake.emitTerminalRunStateIfOpen(.single, 6, .aborted);
+    try std.testing.expectEqual(public_protocol.RunStatePhase.aborted, fake.run_state_projector.phase);
+
+    // Synthetic completions map through the same table as run_done.
+    try std.testing.expectEqual(public_protocol.RunStatePhase.failed, terminalPhaseForStopReason(.api_error));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.completed, terminalPhaseForStopReason(.end_turn));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.completed, terminalPhaseForStopReason(.max_turns));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.aborted, terminalPhaseForStopReason(.aborted));
 }
 
 test "Host schema admission rejects ambiguous object contracts" {

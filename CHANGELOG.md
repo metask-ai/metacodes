@@ -35,9 +35,10 @@ status, compatibility boundaries, and entry points are defined by
   atomic and reports a dedicated error with an actionable message, and the
   checkpoint decoder reports `UNSUPPORTED` (not `CORRUPT`) for an intact
   checkpoint carrying the permanently reserved block tag `7`, and only after
-  its digest has been verified. A Run that fails after admission without
-  poisoning the session now closes its `run_state` as `failed` instead of
-  leaving it at `starting`.
+  its digest has been verified. A Run that ends after admission without a
+  run_done event — a clean failure, a Skill aborted during activation, a
+  synthetic completion from budget reconciliation — now closes its `run_state`
+  with the matching terminal phase instead of leaving it at `starting`.
 - AgentCore ABI v1 returns to **revision 15**; `RUN_INPUT_PART_DOCUMENT`,
   `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1` and status
   `DOCUMENT_INPUT_UNSUPPORTED` are gone. No bundle was ever published from a
@@ -47,11 +48,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
-- Transcript resume no longer treats a failed `read` as end-of-file: `loadTranscript`,
-  the compact-state meta loader and the `/resume` listing now report `ReadFailed`
-  instead of silently restoring a truncated or empty history (an `EINTR` from
-  Ctrl+C or a terminal resize during `/resume` was enough). Surfaced by the Codex
-  cross-review on #46.
+- Transcript resume no longer treats a failed `read` as end-of-file: `EINTR` (a
+  Ctrl+C or terminal resize during `/resume`) is retried, and any other read error
+  makes `loadTranscript` and the compact-state meta loader fail with `ReadFailed`
+  instead of silently restoring a truncated or empty history. The `/resume`
+  listing keeps skipping a session whose `meta.json` cannot be read. Surfaced by
+  the Codex cross-review on #46.
+- Restoring a persisted compact projection is all-or-nothing: `restoreCompactState`
+  allocates the summary before touching either field, so an allocation failure
+  during resume leaves a genuine full replay rather than an advanced boundary with
+  no summary (and no dangling summary pointer).
 - A KG client that owns no Store can no longer create one (issue #30).
   `KgClient.store_path` was a single `[]const u8` carrying two meanings — a
   real path under the CLI transport, and the marker `"daemon-owned"` under the
