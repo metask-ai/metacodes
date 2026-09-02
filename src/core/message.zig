@@ -108,7 +108,7 @@ pub const Message = struct {
     /// 是否已被 provider 接受进入流式响应(agent_loop 在拿到流句柄后统一置位;被 HTTP
     /// 错误拒绝的请求不算)。
     /// 只能由送达证据推进:本地追加的 assistant 消息(AgentCore 预算终止标记等)不算,
-    /// transcript resume 出来的消息一律 false,直到下一次请求带上它们。microcompact 据此
+    /// 水位随 transcript 持久化(消息级与块级);没有该字段的旧记录恢复为 false。microcompact 据此
     /// 保护尚未被模型看到的图片结果。
     delivered: bool = false,
 

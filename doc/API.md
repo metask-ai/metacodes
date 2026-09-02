@@ -156,8 +156,8 @@ transcript, set by the agent loop once the provider has accepted a request
 for streaming, i.e. a
 stream handle was returned; a request the provider rejects with an HTTP
 error does not deliver, a locally appended assistant message is not
-delivery, a resumed transcript starts undelivered until the next accepted
-request, and a request through a model without image input, which only
+delivery, a resumed transcript restores the persisted flags (records written
+before this field restore as undelivered until the next accepted request), and a request through a model without image input, which only
 carries the placeholder, does not deliver messages holding an image result —
 that decision is the serializer's own, carried back on the accepted stream
 handle as the tool_use ids whose picture went out as a placeholder

@@ -12,6 +12,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- AgentCore's request preflight (`canonicalRequestBytes`) charges image tool
+  results as native bytes only when the configured model accepts image
+  input; on a text-only route the estimate is exactly the placeholder request
+  the serializer sends. Previously the full base64 length was added back
+  unconditionally, so a few large image results on deepseek-chat / glm-5.2
+  returned `checkpoint_budget_exhausted` for a request of a few hundred
+  bytes, and repeated it on every later run because those results are
+  non-trimmable.
 - Image results now have a wire-size safety net: they bypass the byte
   budgets, so five parallel 3.75 MB pictures could produce a request no
   provider accepts. `types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST` (16 MiB) caps

@@ -914,6 +914,8 @@ pub const BudgetedProvider = struct {
         tool_choice: ?core.json.ToolChoice,
         model_override: ?[]const u8,
     ) anyerror!Reservation {
+        // 路由能否原生收图决定图片工具结果在 wire 上是 base64 还是占位符(见
+        // request.zig 的序列化);按配置模型判定,model_override 跨能力类别时估算偏保守。
         const request_bytes = try canonicalRequestBytes(
             self.allocator,
             model_override orelse self.base.model(),
@@ -922,6 +924,7 @@ pub const BudgetedProvider = struct {
             system,
             tools,
             tool_choice,
+            self.base.supports(.image_input),
         );
         return self.controller.beginOperation(.provider, request_bytes) catch
             return error.CheckpointBudgetExhausted;
@@ -1195,11 +1198,17 @@ fn canonicalRequestBytes(
     system: ?[]const u8,
     tools: ?[]const core.json.ToolDefinition,
     tool_choice: ?core.json.ToolChoice,
+    images_native: bool,
 ) anyerror!u64 {
     // 图像经估算投影序列化(占位替换):canonical 测量统一走 Anthropic 序列化器,
     // 非 claude vision 模型带图会因守门报错 → 预算 admission 拒绝一个 provider 本会
     // 接受的请求。真实载荷字节(base64 data + MIME + 每图 ~64B wire 信封)在投影后
     // 加回,保持"每请求 wire 字节"的测量语义与无图请求的既有口径一致。
+    // 图片工具结果只在路由原生收图时加回:纯文本路由的真实序列化器发的是短占位符
+    // (request.zig),投影后的占位已计入 encoded;若仍按 base64 长度加回,四张接近
+    // 16 MiB 图片允量的结果会让纯文本路由误报 checkpoint_budget_exhausted,且这些
+    // 结果不可裁剪、后续每轮重复拒绝。首类 .image 块一律加回:不收图的路由在真实
+    // 序列化时直接报错,估算偏保守无害。
     const projection = try core.agent_loop.projectImagesForEstimation(allocator, messages);
     defer if (projection) |p| p.deinit(allocator);
     const effective: []const core.types.ApiMessage = if (projection) |p| p.messages else messages;
@@ -1216,7 +1225,7 @@ fn canonicalRequestBytes(
     var payload_bytes: u64 = 0;
     for (messages) |m| for (m.content) |c| switch (c) {
         .image => |img| payload_bytes +|= @as(u64, img.data.len) +| img.media_type.len +| 64,
-        .tool_result => |tr| if (core.json.extractImageResult(tr.content) != null) {
+        .tool_result => |tr| if (images_native and core.json.extractImageResult(tr.content) != null) {
             payload_bytes +|= @as(u64, tr.content.len);
         },
         else => {},
@@ -2073,12 +2082,38 @@ test "canonicalRequestBytes: 非 claude vision 模型带图可测量,载荷字�
         .{ .image = .{ .media_type = "image/png", .data = "QUJDREVGRw==" } },
     };
     const messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &contents }};
-    const with_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &messages, null, null, null);
+    const with_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &messages, null, null, null, true);
 
     const text_only = [_]core.types.ApiContent{.{ .text = "look" }};
     const text_messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &text_only }};
-    const without_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &text_messages, null, null, null);
+    const without_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &text_messages, null, null, null, true);
 
     // 真实载荷字节(base64+MIME+信封)计入测量:带图严格大于纯文本 + 载荷长度。
     try std.testing.expect(with_image > without_image + 12);
+}
+
+test "canonicalRequestBytes: 纯文本路由的图片工具结果按占位符计,不按 base64 加回" {
+    // review 轮 16 Medium:纯文本路由(deepseek-chat/glm-5.2)真实 wire 是短占位符,
+    // 预检却把原始 base64 长度加回 → 四张接近 16 MiB 允量的图误报 budget exhausted。
+    const allocator = std.testing.allocator;
+    const data = "A" ** 4096;
+    const image_result = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"" ++ data ++ "\"}";
+    const contents = [_]core.types.ApiContent{
+        .{ .tool_result = .{ .tool_use_id = "toolu_1", .content = image_result, .is_error = false } },
+    };
+    const messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &contents }};
+    const text_contents = [_]core.types.ApiContent{
+        .{ .tool_result = .{ .tool_use_id = "toolu_1", .content = "[image tool result]", .is_error = false } },
+    };
+    const text_messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &text_contents }};
+
+    // 模型名只是估算体里的一个标签(会进序列化字节),三次调用固定同一个,路由标志才是变量。
+    const placeholder_only = try canonicalRequestBytes(allocator, "deepseek-chat", 1024, &text_messages, null, null, null, false);
+    const text_route = try canonicalRequestBytes(allocator, "deepseek-chat", 1024, &messages, null, null, null, false);
+    const vision_route = try canonicalRequestBytes(allocator, "deepseek-chat", 1024, &messages, null, null, null, true);
+
+    // 纯文本路由:估算就是投影后的占位符请求,一个字节的 base64 都不加回。
+    try std.testing.expectEqual(placeholder_only, text_route);
+    // 原生收图的路由:整条图片结果的 JSON 长度加回。
+    try std.testing.expectEqual(text_route + image_result.len, vision_route);
 }

@@ -283,7 +283,7 @@ vision 路由的方言原生消费它（image block / data URL / inlineData）�
 回传、按 `ToolResult.delivered` 逐块记录并随 transcript 持久化，不在 agent_loop 重算；压缩边界之后
 和被规范化器剥掉的孤儿图片则一律标记送达，因为没有后续请求能再携带它们），
 本地追加的 assistant 消息（如 AgentCore 预算终止标记）不算送达，
-transcript resume 出来的消息一律未送达、下一次被接受的请求后自愈；compact 预览提交时把 live 的水位按索引合并进
+transcript resume 恢复持久化的水位（没有该字段的旧记录一律未送达、下一次被接受的请求后自愈）；compact 预览提交时把 live 的水位按索引合并进
 替换集（仅 CAS 路径），在途的送达不会被过期预览覆盖。
 这避免 Read(image) 带并行兄弟时在 provider 看到之前就被 recent-N 阀清掉；已送达的图片照常清，阀对图片密集的
 历史仍有效（未送达的文本沿用历史行为——按数量保留，这是既有的通用问题，不在图像契约内）。图片永不被 `truncateLargeToolResults` 截断。AgentCore 的

@@ -341,7 +341,13 @@ pub const Conversation = struct {
     /// and self-heals at the next accepted request.
     fn mergeDeliveredIntoLocked(self: *const Conversation, replacement: *Conversation) void {
         if (replacement.messages.items.len != self.messages.items.len) {
-            for (replacement.messages.items) |*rep| rep.delivered = false;
+            for (replacement.messages.items) |*rep| {
+                rep.delivered = false;
+                for (rep.blocks) |*b| switch (b.*) {
+                    .tool_result => |*tr| tr.delivered = false,
+                    else => {},
+                };
+            }
             return;
         }
         for (replacement.messages.items, self.messages.items) |*rep, live| {
