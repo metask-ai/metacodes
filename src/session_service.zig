@@ -378,6 +378,10 @@ pub fn shellExecImpl(self: *SessionService, alloc: std.mem.Allocator, command: [
         .jobs = if (self.app.jobs) |*j| j else null,
         .agent_jobs = if (self.app.agent_jobs) |*aj| aj else null,
         .artifact_root = self.app.sessionDir() orelse "",
+        // `!cmd` output lands in the same Conversation as any tool result, so
+        // it is bounded by the same window-derived budget. Left at the field
+        // default it would be capped at the 8KiB floor on a 200K-window model.
+        .result_budget = .fromModel(self.app.provider().maxInputTokens()),
         .tool_result_metrics = &self.app.tool_result_metrics,
         .file_change_journal = &self.app.file_change_journal,
     };

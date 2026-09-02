@@ -6,27 +6,42 @@
 //!   - `stderr`：true/false，默认 true
 //!   - `stdout_since_byte`：从 stdout 文件的第 N 字节开始读（增量）。默认 0（全读）。
 //!   - `stderr_since_byte`：同上对 stderr。
-//!   - `max_bytes`：单次读出上限（防单 turn tool_result 塞爆 context）。默认 65536。
+//!   - `max_bytes`：单次读出上限。**没有固定默认值**,省略时由 `ctx.result_budget`
+//!     派生(200K window 为 24488,预算下限为 7680);硬上限 262144。读到的内容还会
+//!     按同一预算裁剪,余量走 `*_next_offset`。registry 里那份 property description
+//!     由 `tests/component/tool_schema_coverage_test.zig` 绑回这些常量,不会再分叉。
 //!
-//! output:
+//! output:两条通道对称,各带同样的四个字段(此前这里只列了 stdout 的
+//! encoding/next_offset,stderr 的两个实际会发却没写——见 `writeChannel` 调用处)。
 //!   {
 //!     "job_id":"...","status":"running|exited|killed","exit_code":N?,
-//!     "stdout":"...","stdout_total_bytes":N,"stdout_truncated":bool,
-//!     "stderr":"...","stderr_total_bytes":N,"stderr_truncated":bool
+//!     "stdout":"...","stdout_encoding":"utf-8"|"base64",
+//!     "stdout_total_bytes":N,"stdout_next_offset":N,"stdout_truncated":bool,
+//!     "stderr":"...","stderr_encoding":"utf-8"|"base64",
+//!     "stderr_total_bytes":N,"stderr_next_offset":N,"stderr_truncated":bool
 //!   }
 //!
-//! 模型应该在下一次轮询时传 stdout_since_byte = 上次 stdout_total_bytes 做增量。
-//! truncated=true 表示本次没读完，需要提高 since_byte（或 max_bytes）。
+//! 续读只认 `*_next_offset`:下一次传 `stdout_since_byte = 上次 stdout_next_offset`。
+//! 它等于 `since + 本次实际展示的字节数`。
+//! `*_total_bytes` 是文件当前大小,**不是游标**——拿它当游标会跳过"本次展示到文件末尾"
+//! 之间的全部内容(读取按预算限界后,这段通常不为空)。
+//! `truncated=true` 表示本次没读完,继续从 `*_next_offset` 读即可;提高 `max_bytes`
+//! 只在预算允许时有用,并不能替代游标。
+//! `*_encoding` 按通道各自判定:该通道本次展示的字节不是合法 UTF-8 就发 base64
+//! (`stdout` 与 `stderr` 可以一个 base64 一个 utf-8)。
 
 const std = @import("std");
 const time = @import("../util/time.zig");
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const result_budget = @import("../core/result_budget.zig");
 
 /// 单次 tool_result 中 stdout/stderr 的默认字节上限；避免 100MB 文件塞爆 context。
-const DEFAULT_MAX_BYTES: usize = 64 * 1024;
-const MAX_MAX_BYTES: usize = 256 * 1024;
+/// Fixed JSON scaffolding of one BashOutput result: job id, status, exit code,
+/// both channels' byte counters and truncation flags.
+pub const ENVELOPE_OVERHEAD_BYTES: result_budget.Encoded = .of(512);
+pub const MAX_MAX_BYTES: usize = 256 * 1024;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -42,7 +57,23 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const want_stderr = if (common.extractJsonArg(args, "stderr")) |v| !std.mem.eql(u8, v, "false") else true;
     const stdout_since = parseUsizeArg(args, "stdout_since_byte") orelse 0;
     const stderr_since = parseUsizeArg(args, "stderr_since_byte") orelse 0;
-    const max_bytes = parseUsizeArg(args, "max_bytes") orelse DEFAULT_MAX_BYTES;
+    // Default from the turn's budget, not a private constant. 64 KiB of
+    // *source* bytes was chosen against "do not blow up the context", but the
+    // per-result budget counts *rendered* bytes and tops out at 64 KiB too -
+    // two different 64Ks - so a default read of a large enough job produced a
+    // 65_717-byte result that the projection layer then spilled to an
+    // artifact, handing the model an envelope instead of the output it had
+    // just asked for.
+    //
+    // How often, measured rather than assumed: across 314 real BashOutput
+    // results the median is 164 bytes and exactly one exceeded a 200K-window
+    // budget. Most polls of a background job return very little. So this is a
+    // tail case, not the common path - worth fixing because the failure is
+    // silent and the fix is the same one `ReadArtifact` already got, not
+    // because it was happening constantly.
+    const allowance = ctx.result_budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES);
+    const max_bytes = parseUsizeArg(args, "max_bytes") orelse
+        @max(1, @min(MAX_MAX_BYTES, allowance.raw()));
     if (max_bytes == 0 or max_bytes > MAX_MAX_BYTES) {
         common.setErrorDetail(ctx.error_detail, allocator, "BashOutput max_bytes must be in 1..{d}", .{MAX_MAX_BYTES});
         return error.InvalidMaxBytes;
@@ -68,20 +99,40 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (job.exit_code) |ec| {
         try aw.writer.print(",\"exit_code\":{d}", .{ec});
     }
+    // `max_bytes` bounds the *read*; what the model is charged for is the
+    // rendered result, so the two channels share one encoded allowance the
+    // same way a completed Bash result's channels do. A channel cut here is
+    // still "not finished", which is what `truncated` already means, so the
+    // caller's `since_byte` loop needs no new concept.
+    // A channel that is not valid UTF-8 cannot go into a JSON string: Zig's
+    // writer escapes control bytes but passes 0x80..0xff through unchanged, so
+    // `printf '\xff'` produced a result that is not UTF-8 at all. The completed
+    // Bash envelope has always picked per channel and said which; this one
+    // wrote everything as text. Budget, cut and render all read the same flag,
+    // for the reason the completed path learned the hard way.
+    const stdout_base64 = !std.unicode.utf8ValidateSlice(stdout_chunk.data);
+    const stderr_base64 = !std.unicode.utf8ValidateSlice(stderr_chunk.data);
+    const shares = result_budget.splitPair(
+        allowance,
+        result_budget.encodedCost(stdout_chunk.data, stdout_base64),
+        result_budget.encodedCost(stderr_chunk.data, stderr_base64),
+    );
+    const stdout_shown = result_budget.headCut(stdout_chunk.data, shares.first, stdout_base64);
+    const stderr_shown = result_budget.headCut(stderr_chunk.data, shares.second, stderr_base64);
     if (want_stdout) {
-        try aw.writer.writeAll(",\"stdout\":");
-        try std.json.Stringify.encodeJsonString(stdout_chunk.data, .{}, &aw.writer);
-        try aw.writer.print(",\"stdout_total_bytes\":{d},\"stdout_truncated\":{s}", .{
+        try writeChannel(&aw.writer, allocator, "stdout", stdout_shown.head(stdout_chunk.data), stdout_base64);
+        try aw.writer.print(",\"stdout_total_bytes\":{d},\"stdout_next_offset\":{d},\"stdout_truncated\":{s}", .{
             stdout_chunk.total_bytes,
-            if (stdout_chunk.truncated) "true" else "false",
+            stdout_since + stdout_shown.raw(),
+            if (stdout_chunk.truncated or stdout_shown.raw() < stdout_chunk.data.len) "true" else "false",
         });
     }
     if (want_stderr) {
-        try aw.writer.writeAll(",\"stderr\":");
-        try std.json.Stringify.encodeJsonString(stderr_chunk.data, .{}, &aw.writer);
-        try aw.writer.print(",\"stderr_total_bytes\":{d},\"stderr_truncated\":{s}", .{
+        try writeChannel(&aw.writer, allocator, "stderr", stderr_shown.head(stderr_chunk.data), stderr_base64);
+        try aw.writer.print(",\"stderr_total_bytes\":{d},\"stderr_next_offset\":{d},\"stderr_truncated\":{s}", .{
             stderr_chunk.total_bytes,
-            if (stderr_chunk.truncated) "true" else "false",
+            stderr_since + stderr_shown.raw(),
+            if (stderr_chunk.truncated or stderr_shown.raw() < stderr_chunk.data.len) "true" else "false",
         });
     }
     try aw.writer.writeAll("}");
@@ -99,7 +150,9 @@ const Chunk = struct {
 };
 
 /// 从 path 的 since 字节开始读最多 max 字节。若文件更大，truncated=true。
-/// total_bytes 是文件整体大小（便于模型决定下次 since）。
+/// total_bytes 是文件整体大小,**不是下次的 since**——续读游标由调用方按实际展示的
+/// 字节数算成 `*_next_offset`。这行注释原本写着"便于模型决定下次 since",正是把
+/// 文件长度当游标的那句,与模块头的契约相反。
 fn readFileRange(path: []const u8, since: usize, max: usize, allocator: std.mem.Allocator) !Chunk {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= pbuf.len) return error.PathTooLong;
@@ -141,6 +194,33 @@ fn readFileRange(path: []const u8, since: usize, max: usize, allocator: std.mem.
         .total_bytes = total_u,
         .truncated = truncated,
     };
+}
+
+/// Write one channel plus the encoding it is in. `*_next_offset` is the cursor
+/// to resume from: `total_bytes` is the file's current size, and a caller that
+/// used it as the next `since_byte` - which the schema told it to - skipped
+/// everything between what was shown and the end of the file. With the read
+/// bounded by a budget rather than by 64 KiB, that gap became the common case:
+/// a 100 KB log showed 24 KB and lost 75 KB with `truncated: true` and no
+/// usable position to continue from.
+fn writeChannel(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    data: []const u8,
+    base64: bool,
+) !void {
+    try writer.print(",\"{s}\":", .{label});
+    if (base64) {
+        const encoder = std.base64.standard.Encoder;
+        const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
+        defer allocator.free(encoded);
+        _ = encoder.encode(encoded, data);
+        try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+    } else {
+        try std.json.Stringify.encodeJsonString(data, .{}, writer);
+    }
+    try writer.print(",\"{s}_encoding\":\"{s}\"", .{ label, if (base64) "base64" else "utf-8" });
 }
 
 fn parseUsizeArg(args: []const u8, field: []const u8) ?usize {
@@ -217,4 +297,154 @@ test "BashOutput max_bytes truncates" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout\":\"ABC\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_total_bytes\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_truncated\":true") != null);
+}
+
+test "BashOutput 的默认读取落在单条预算内" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // 默认值曾是 64KiB **源**字节,而 per-result 预算数的是**渲染后**字节、上限
+    // 同样是 64KiB —— 两个不同的 64K。输出足够大时(下面构造的 100KB 纯 ASCII,
+    // 已是最省字节的情形)默认读会产出 65_717 字节的结果,被投影层溢出成
+    // artifact,模型拿回信封而不是它刚要的输出。
+    //
+    // 尾部情形而非常态:审计 314 次真实 BashOutput 结果,中位 164 字节,只有 1 次
+    // 超过 200K 窗口的预算。值得修是因为它静默失败、且修法与 ReadArtifact 同源,
+    // 不是因为它频繁发生。
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const j = try registry.spawnBackground("awk 'BEGIN { for(i=0;i<100000;i++) printf \"x\" }'", null);
+    while (registry.get(j.idSlice())) |e| {
+        if (e.status != .running) break;
+        time.sleepMs(20);
+        registry.reapExited();
+    }
+    registry.reapExited();
+
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
+    defer a.free(args);
+
+    // 窄窗口与宽窗口都必须落在各自预算内。
+    for ([_]usize{ 200_000, 1_048_576 }) |window| {
+        const budget = result_budget.Budget.fromModel(window);
+        const ctx = ToolContext{ .allocator = a, .jobs = &registry, .result_budget = budget };
+        const out = try execute(&ctx, args);
+        defer a.free(out);
+        try std.testing.expect(out.len <= budget.per_result_bytes);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+        defer parsed.deinit();
+        // 没读完就得说没读完 —— 调用方靠它决定要不要继续推进 since_byte。
+        try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
+        // 而且仍然给出真正的内容,不是空壳。
+        try std.testing.expect(parsed.value.object.get("stdout").?.string.len > 4096);
+        try std.testing.expectEqual(@as(i64, 100_000), parsed.value.object.get("stdout_total_bytes").?.integer);
+    }
+}
+
+test "增量游标能真正续读,不跳过被预算裁掉的部分" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // `*_total_bytes` 是文件当前大小;schema 曾让模型拿它当下次 since_byte。
+    // 读取按预算限界后,"展示到文件末尾"之间就有一大段——实测 100KB 文件首轮展示
+    // 24488 字节,按 total 续读会永久跳过 75512 字节,而 truncated=true 却没给出
+    // 任何可用位置。`*_next_offset` 就是那个位置。
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const j = try registry.spawnBackground("awk 'BEGIN { for(i=0;i<100000;i++) printf \"x\" }'", null);
+    while (registry.get(j.idSlice())) |e| {
+        if (e.status != .running) break;
+        time.sleepMs(20);
+        registry.reapExited();
+    }
+    registry.reapExited();
+    const ctx = ToolContext{
+        .allocator = a,
+        .jobs = &registry,
+        .result_budget = result_budget.Budget.fromModel(200_000),
+    };
+
+    const first_args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
+    defer a.free(first_args);
+    const first = try execute(&ctx, first_args);
+    defer a.free(first);
+    var first_parsed = try std.json.parseFromSlice(std.json.Value, a, first, .{});
+    defer first_parsed.deinit();
+    const shown_first = first_parsed.value.object.get("stdout").?.string.len;
+    const next = first_parsed.value.object.get("stdout_next_offset").?.integer;
+    try std.testing.expect(first_parsed.value.object.get("stdout_truncated").?.bool);
+    // 游标 == 已展示的字节数,而不是文件总长。
+    try std.testing.expectEqual(@as(i64, @intCast(shown_first)), next);
+    try std.testing.expectEqual(@as(i64, 100_000), first_parsed.value.object.get("stdout_total_bytes").?.integer);
+
+    // 第二轮从游标续读:必须真的拿到后面的内容,而不是空。
+    const second_args = try std.fmt.allocPrint(
+        a,
+        "{{\"job_id\":\"{s}\",\"stdout_since_byte\":{d}}}",
+        .{ j.idSlice(), next },
+    );
+    defer a.free(second_args);
+    const second = try execute(&ctx, second_args);
+    defer a.free(second);
+    var second_parsed = try std.json.parseFromSlice(std.json.Value, a, second, .{});
+    defer second_parsed.deinit();
+    const shown_second = second_parsed.value.object.get("stdout").?.string.len;
+    try std.testing.expect(shown_second > 0);
+    // 两轮相加严格前进;若拿 total 当游标,第二轮会是 0。
+    try std.testing.expect(shown_first + shown_second > shown_first);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(shown_first + shown_second)),
+        second_parsed.value.object.get("stdout_next_offset").?.integer,
+    );
+}
+
+test "二进制通道走 base64,结果仍是合法 UTF-8 JSON" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // Zig 的 JSON writer 只转义控制符,0x80..0xff 原样写出——含非 UTF-8 字节的
+    // 通道因此产出的根本不是合法 UTF-8。完成态信封一直按通道选编码并携带
+    // `*_encoding`,这里没有。
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    // 八进制而非 `\xff`:job 走 `/bin/sh -c`,Linux 上那是 dash,它的 printf 不认
+    // 十六进制转义,会原样吐出字面量 `A\xffB\xfe`——纯 ASCII,于是通道被判成 utf-8
+    // 而不是 base64,断言在 Linux 上失败而在 macOS(/bin/sh 即 bash)上通过。
+    // `\ddd` 是 POSIX printf 的八进制转义,dash 与 bash 都实现。
+    const j = try registry.spawnBackground("printf 'A\\377B\\376'", null);
+    while (registry.get(j.idSlice())) |e| {
+        if (e.status != .running) break;
+        time.sleepMs(20);
+        registry.reapExited();
+    }
+    registry.reapExited();
+    const ctx = ToolContext{ .allocator = a, .jobs = &registry };
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
+    defer a.free(args);
+    const out = try execute(&ctx, args);
+    defer a.free(out);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("base64", parsed.value.object.get("stdout_encoding").?.string);
+    // 而且解出来就是原始字节。
+    const encoded = parsed.value.object.get("stdout").?.string;
+    const decoder = std.base64.standard.Decoder;
+    const decoded = try a.alloc(u8, try decoder.calcSizeForSlice(encoded));
+    defer a.free(decoded);
+    try decoder.decode(decoded, encoded);
+    try std.testing.expectEqualSlices(u8, "A\xffB\xfe", decoded);
+    // 纯文本通道不受影响。
+    try std.testing.expectEqualStrings("utf-8", parsed.value.object.get("stderr_encoding").?.string);
+
+    // 两条通道对称:模块头声明各带同样四个字段,stderr 的 encoding/next_offset 曾经
+    // 实际会发但没写进契约。这里把"对称"这句话变成断言,免得它退回成一句自述。
+    inline for (.{ "stdout", "stderr" }) |channel| {
+        inline for (.{ "", "_encoding", "_total_bytes", "_next_offset", "_truncated" }) |suffix| {
+            const field = channel ++ suffix;
+            if (parsed.value.object.get(field) == null) {
+                std.debug.print("BashOutput 信封缺字段: {s}\n", .{field});
+                return error.ChannelFieldMissing;
+            }
+        }
+    }
 }

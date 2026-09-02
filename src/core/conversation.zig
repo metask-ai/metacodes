@@ -10,17 +10,17 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const msg = @import("message.zig");
 const result_projection = @import("result_projection.zig");
+const result_budget = @import("result_budget.zig");
 const pdf_mod = @import("pdf.zig");
 const json_mod = @import("../json.zig");
 
 pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";
 pub const TOOL_RESULT_COMMITMENT_PREFIX = "[tool-result-commitment ";
-pub const TOOL_RESULT_CONTEXT_MIN_BYTES: usize = 8 * 1024;
-pub const TOOL_RESULT_CONTEXT_MAX_BYTES: usize = 64 * 1024;
-/// window(token 数)/8 → 单条 tool_result 内联字节上限(≈ window/32 token,4 bytes/token)。
-/// 200K 窗口 → 25KB,与 cc 的 25000 字符截断对齐;262K(glm-5.2)→ 32KB;1M → 64KB cap。
-/// 旧值 /16 直接把 token 数当字节数用(200K → 12.5KB),单位错配导致截断过狠。
-pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: usize = 8;
+/// 预算的唯一真相在 `result_budget.zig`(叶子模块,ToolContext 按值携带)。
+/// 这里保留历史名字作转发,老调用点不必改。
+pub const TOOL_RESULT_CONTEXT_MIN_BYTES = result_budget.PER_RESULT_MIN_BYTES;
+pub const TOOL_RESULT_CONTEXT_MAX_BYTES = result_budget.PER_RESULT_MAX_BYTES;
+pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR = result_budget.PER_RESULT_WINDOW_DIVISOR;
 
 /// 单张输入图像的 token 估算上限。各家 vision 端点把大图缩放到 ~1.1M 像素量级
 /// (Anthropic tokens≈pixels/750 → ~1590;OpenAI high-detail 同量级封顶),不解码
@@ -33,11 +33,7 @@ pub const IMAGE_TOKEN_ESTIMATE: usize = 1600;
 pub const REASONING_ITEM_TOKEN_ESTIMATE: usize = 2048;
 
 pub fn toolResultContextBytes(max_input_tokens: usize) usize {
-    const derived = if (max_input_tokens == 0)
-        TOOL_RESULT_CONTEXT_MIN_BYTES
-    else
-        max_input_tokens / TOOL_RESULT_CONTEXT_WINDOW_DIVISOR;
-    return @min(@max(derived, TOOL_RESULT_CONTEXT_MIN_BYTES), TOOL_RESULT_CONTEXT_MAX_BYTES);
+    return result_budget.perResultBytes(max_input_tokens);
 }
 pub const DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP: usize = 2;
 
@@ -499,6 +495,17 @@ pub const Conversation = struct {
         pub fn changed(self: ToolResultReduction) bool {
             return self.cleared > 0 or self.truncated > 0;
         }
+
+        /// Accumulate a second pass over the same Conversation. The two passes
+        /// are disjoint by construction: clearing skips results that are
+        /// already stubs, and truncation skips both stubs and results it has
+        /// already truncated, so no result is double-counted.
+        pub fn merge(self: *ToolResultReduction, other: ToolResultReduction) void {
+            self.cleared +|= other.cleared;
+            self.truncated +|= other.truncated;
+            self.bytes_before +|= other.bytes_before;
+            self.bytes_after +|= other.bytes_after;
+        }
     };
 
     pub fn compactWithSummaryReport(
@@ -617,6 +624,14 @@ pub const Conversation = struct {
     /// model, but as a head/tail preview instead of an unbounded blob. This is
     /// intentionally independent of full compact: a single recent tool result
     /// can be enough to exceed the context window.
+    ///
+    /// `result_projection` bounds results only at the moment they are
+    /// committed, and never re-projects history. This pass is therefore the
+    /// only bound that applies to results which entered the Conversation under
+    /// a different budget: a transcript loaded by /resume, or a session that
+    /// switched to a smaller-window model. It runs beside the microcompact
+    /// clear pass in `maybeAutoCompact`; both are no-ops when every result
+    /// already fits.
     pub fn truncateLargeToolResults(self: *Conversation, max_bytes: usize) ToolResultReduction {
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
@@ -629,7 +644,7 @@ pub const Conversation = struct {
                 if (tr.content.len <= max_bytes) continue;
                 if (isCommittedToolResultProjection(tr.content)) continue;
                 const before = tr.content.len;
-                const new_content = truncateToolResultContent(self.allocator, tr.content, max_bytes) catch continue;
+                const new_content = boundToolResultContent(self.allocator, tr.content, max_bytes) orelse continue;
                 self.allocator.free(@constCast(tr.content));
                 m.blocks[bi] = .{ .tool_result = .{
                     .tool_use_id = tr.tool_use_id,
@@ -736,6 +751,42 @@ fn blockEql(a: msg.Block, b: msg.Block) bool {
 
 fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
     return a.ptr == b.ptr and a.vtable == b.vtable;
+}
+
+/// Bring one oversized tool result under `max_bytes` without ever destroying
+/// the only way its omitted bytes can be recovered.
+///
+/// `truncateToolResultContent` is a *text* edit. Applied to an artifact
+/// envelope it produces unparseable JSON, which takes the artifact id, the
+/// digest and the read instruction down with it - and the next microcompact
+/// pass, no longer able to see a recoverable artifact, then clears the wreck
+/// to a stub. `clearToolResultAt` explicitly refuses to erase that capability;
+/// this pass has to keep the same promise, so an envelope is re-rendered by
+/// the layer that owns its shape and anything that layer cannot rewrite is
+/// left alone.
+///
+/// Returns null when the result must be left as it is.
+fn boundToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ?[]u8 {
+    // A recoverable artifact envelope is re-rendered by the layer that owns its
+    // shape, which knows how to recompute every counter exactly.
+    if (result_projection.shrinkRecoverableEnvelope(allocator, content, max_bytes)) |shrunk|
+        return shrunk;
+    // Anything else structured - `metacodes.bash-result.v2`, a non-recoverable
+    // fallback envelope, any tool's large JSON - keeps its shape by trimming
+    // only its long string values. The text path below would leave
+    // unparseable output and take `exit_code`, `storage_error` and every id
+    // and flag down with the one long string that made the result oversized.
+    if (result_projection.shrinkStructuredResult(allocator, content, max_bytes)) |shrunk|
+        return shrunk;
+    // Structured but unshrinkable - a result whose bulk is not in its strings,
+    // say a large numeric array. Trimming found nothing to give back, and the
+    // text path would emit unparseable output, so it is left oversized: that
+    // costs one request, where destroying the schema costs the result. Same
+    // reasoning as the recoverable-artifact case, and the reason the text path
+    // below is reserved for content that was never structured.
+    if (result_projection.hasRecoverableArtifact(content)) return null;
+    if (result_projection.isStructuredObject(content)) return null;
+    return truncateToolResultContent(allocator, content, max_bytes) catch null;
 }
 
 fn truncateToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ![]u8 {

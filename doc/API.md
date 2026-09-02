@@ -189,7 +189,80 @@ Detection reuses `dialect.extractImageResult` (the same single truth the wire
 serializers use). Images stay bounded by `Read`'s `MAX_IMAGE_BYTES`, and the
 per-turn budget charges one image at `IMAGE_TOKEN_ESTIMATE` rather than its
 base64 length, so a screenshot no longer evicts unrelated tool results.
-Non-image results project byte-identically to before.
+
+Both caps now come from one place, `core/result_budget.zig`, derived once per
+turn from the provider window and handed to `ToolContext.result_budget` as
+well as to `result_projection`. A tool that bounds its own output (Bash, whose
+two channels share one allowance by max-min fairness) sizes its preview from
+that value rather than from a private constant, and spends it in **encoded**
+bytes so JSON escaping cannot double the rendered result. When a result is
+spilled, its preview is sized from the same budget instead of a fixed 1536
+bytes; when the envelope would be larger than the content it replaces, the
+result is left inline. The per-turn budget lowers a single water line across
+every oversized result rather than evicting the largest one. A result whose
+preview was fixed by the streaming capture path is re-rendered against the
+budget before commit, and re-inlined outright when the original fits. Text
+results therefore no longer project byte-identically to builds before this
+change; committed results are still never re-projected for a later request, so
+prompt-cache prefixes are unaffected.
+
+"Encoded" is the unit everywhere, including on the two paths that are exempt
+from the spill pass and therefore have no second chance: a committed envelope
+re-rendered against the budget, and `ReadArtifact`. Both cut their payload by
+what it will cost once escaped, and the encoding chosen while budgeting is
+carried to whatever renders it rather than being decided a second time.
+
+The Conversation-level pressure valves bound results that entered under a
+different budget - a `/resume`d transcript, or a switch to a smaller window.
+Their generic head/tail truncation is a text edit, so an artifact envelope is
+first offered to `result_projection.shrinkRecoverableEnvelope`, which
+re-renders it in place with a smaller preview and every identity field intact.
+Anything else structured — a Bash envelope, a non-recoverable fallback, any
+tool's large JSON — keeps its shape by trimming only its string values, at any
+depth, with every counter that describes a trimmed string corrected as it is
+written (`<channel>_truncated`, `preview_head_bytes`, `preview_tail_bytes`, and
+`omitted_bytes`, which has to keep satisfying head + tail + omitted ==
+original). The short fields are what make a result actionable and are never
+what made it oversized.
+
+A structured result that cannot be shrunk — one whose bulk is not in its
+strings — is left oversized rather than mangled, and the generic text
+truncation is reserved for content that was never structured. Being one request
+too large is recoverable; an unparseable result is not. `clearToolResultAt`
+already refuses to erase a result's only recovery capability for the same
+reason.
+
+Recovery has two primitives rather than one. `ReadArtifact` returns byte
+ranges, which costs one round trip per `MAX_READ_BYTES` and cannot answer a
+question about the content; `Grep` therefore accepts `artifact_id` in place of
+`path` and searches the stored blob directly. The store path is never exposed:
+filename output is suppressed, `files_with_matches` — whose entire output would
+be that path — is rejected for artifact searches, and the child's stderr is
+scrubbed of it before it can reach a tool error.
+
+No staging path is model-visible from Bash at all - not on a completed
+channel, not in the auto-backgrounded snapshot, and not on the explicit
+`run_in_background` response. All three handed one back for `Read` until they
+were replaced by the `job_id` that `BashOutput` already takes. A capture too
+large to publish is therefore genuinely unrecoverable, and
+`<channel>_storage_error` says which of the reasons it was rather than implying
+a handle exists.
+
+Known gap, recorded rather than implied away: `job_id` is itself generated from
+random bytes, so it is a random id by the contract's own definition and a
+backgrounded command still does not serialize identically across runs. It
+cannot simply become a counter, because the same value names the spool file
+under a directory shared between processes, where a counter would collide.
+Closing it means separating the file identity from the model-visible handle -
+tracked with the JobRegistry ownership work, not here. Removing the paths
+narrows the exposure to one short opaque token per backgrounded command and
+stops leaking the host temp directory; it does not finish the job.
+
+Every budget derived from the context window resolves the model the request
+will actually name, not the Provider's own. A subagent shares its parent's
+Provider and differs from it only by `model_override`, so sizing a child's
+results — or its auto-compact thresholds — against the parent's window is how a
+200K parent hands a 32K child a history that endpoint rejects.
 
 ### PDF document input
 

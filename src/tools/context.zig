@@ -470,6 +470,13 @@ pub const ToolContext = struct {
     /// Empty means persistence/recovery is unavailable and projection must
     /// return an explicit non-recoverable fallback envelope.
     artifact_root: []const u8 = "",
+    /// This turn's byte budget for model-visible results, derived once by
+    /// `agent_loop` from the provider context window and shared with
+    /// `result_projection`. A tool that bounds its own output sizes it from
+    /// here instead of a private constant, so the two layers cannot disagree
+    /// about what one result may cost. Plain data on purpose: an embedder with
+    /// no Provider keeps the `.floor` default rather than losing the field.
+    result_budget: @import("../core/result_budget.zig").Budget = .floor,
     /// Optional UI-independent counters shared by all execution depths in a
     /// session. Atomic fields make parallel tools/subagents safe observers.
     tool_result_metrics: ?*@import("../core/tool_result_metrics.zig").Metrics = null,

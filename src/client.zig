@@ -314,6 +314,8 @@ pub const Client = struct {
             .cancelFn = &pCancel,
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
+            .maxTokensForFn = &pMaxTokensFor,
+            .maxInputTokensForFn = &pMaxInputTokensFor,
             .reasoningEffortFn = &pReasoningEffort,
             .setReasoningEffortFn = &pSetReasoningEffort,
             // Anthropic 不支持方言字段覆盖(Claude 无 prompt_cache_key/parallel_tool_calls/response_format 方言字段);
@@ -356,6 +358,13 @@ pub const Client = struct {
     }
     fn pMaxInputTokens(ctx: *anyopaque) u32 {
         return asClient(ctx).resolveMaxInputTokens();
+    }
+    fn pMaxTokensFor(ctx: *anyopaque, model: []const u8) u32 {
+        const client = asClient(ctx);
+        return client.catalog.maxTokensFor(model, client.max_tokens_override);
+    }
+    fn pMaxInputTokensFor(ctx: *anyopaque, model: []const u8) u32 {
+        return asClient(ctx).resolveMaxInputTokensFor(model);
     }
     fn pReasoningEffort(ctx: *anyopaque) ?types.ReasoningEffort {
         return asClient(ctx).reasoning_effort;

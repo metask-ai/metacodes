@@ -341,8 +341,7 @@ test "L2 transcript resume preserves artifact capability without embedding the r
     var items = [_]cc.result_projection.Item{.{ .tool_name = "KgContext", .content = &projected, .is_error = false }};
     const stats = try cc.result_projection.project(allocator, &items, .{
         .session_root = root,
-        .per_result_bytes = 8 * 1024,
-        .per_turn_bytes = 32 * 1024,
+        .budget = .{ .per_result_bytes = 8 * 1024, .per_turn_bytes = 32 * 1024 },
     });
     try std.testing.expectEqual(@as(usize, 1), stats.artifact_spill_count);
 
@@ -544,7 +543,14 @@ test "L2 native Grep spools 17MiB from byte zero and keeps the cached tool prefi
     }
     const envelope_text = envelope_bytes orelse return error.MissingProjectedResult;
     try std.testing.expect(cc.result_projection.isRecoverableEnvelope(envelope_text));
-    try std.testing.expect(envelope_text.len < 8 * 1024);
+    // Bounded by this turn's per-result budget rather than by a constant. The
+    // streaming capture path picks its preview from a compile-time array
+    // (1536 bytes) before the result exists; projection then re-renders it
+    // against the window the model actually has, so a 200K-context run sees
+    // ~25KB of head/tail instead of 1.5KB.
+    const per_result = cc.result_budget.perResultBytes(200_000);
+    try std.testing.expect(envelope_text.len <= per_result);
+    try std.testing.expect(envelope_text.len > 8 * 1024);
     var envelope = try std.json.parseFromSlice(std.json.Value, allocator, envelope_text, .{});
     defer envelope.deinit();
     const artifact_id = envelope.value.object.get("artifact_id").?.string;

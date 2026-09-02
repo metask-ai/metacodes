@@ -308,3 +308,161 @@ test "L2 usage 锚点接线: message_start usage → conversation.usageAnchor(in
     // usage 到达时 assistant 消息尚未 append → 锚点只覆盖请求时的 1 条消息。
     try std.testing.expectEqual(@as(usize, 1), anchor.msg_count);
 }
+
+test "L2 microcompact: 生产组合(先清后截)——clear 保留的最近大结果由 truncate 兜底" {
+    // 回归守卫:`truncateLargeToolResults` 曾经零生产调用者,而
+    // `agent_loop` 的 microcompact 日志行一直打印 `truncated={d}`——那个字段
+    // 结构性恒为 0。本测试复刻生产里两趟的组合顺序与预算,证明 clear 故意
+    // 保留的最近结果确实会被 truncate 兜住。
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+
+    const limit = cc.conversation.toolResultContextBytes(200_000);
+
+    // 两条老结果(会被清成 stub)。
+    try appendToolResult(&conv, a, "old0", "old tool output 0 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    try appendToolResult(&conv, a, "old1", "old tool output 1 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+    // 最近两条:clear 按 keep_recent=2 全部保留。其中一条远超单条预算——
+    // 这正是 projection 管不到的形态(/resume 的历史、或切到更小窗口的模型)。
+    try appendToolResult(&conv, a, "recent_small", "recent small tool output");
+    const huge = try a.alloc(u8, limit * 2);
+    defer a.free(huge);
+    @memset(huge, 'A');
+    huge[huge.len - 1] = 'Z';
+    try appendToolResult(&conv, a, "recent_huge", huge);
+
+    // 与 agent_loop.runAutoCompactIfNeeded 完全同序、同预算。
+    var reduced = conv.microcompactToolResultsByRecentResults(
+        cc.conversation.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
+    );
+    reduced.merge(conv.truncateLargeToolResults(limit));
+
+    try std.testing.expectEqual(@as(usize, 2), reduced.cleared);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    try std.testing.expect(reduced.bytes_before > reduced.bytes_after);
+
+    // 老的两条被清成 stub。
+    try std.testing.expect(cc.conversation.isCommittedToolResultProjection(conv.messages.items[0].blocks[0].tool_result.content));
+    try std.testing.expect(cc.conversation.isCommittedToolResultProjection(conv.messages.items[1].blocks[0].tool_result.content));
+    // 最近的小结果原样保留:truncate 不该动它。
+    try std.testing.expectEqualStrings("recent small tool output", conv.messages.items[2].blocks[0].tool_result.content);
+    // 最近的大结果被 clear 保留、被 truncate 兜住:有界、留 sha256 承诺、保尾部。
+    const bounded = conv.messages.items[3].blocks[0].tool_result.content;
+    try std.testing.expect(bounded.len <= limit);
+    try std.testing.expect(std.mem.indexOf(u8, bounded, "original_bytes=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounded, "sha256=") != null);
+    try std.testing.expect(std.mem.endsWith(u8, bounded, "Z"));
+
+    // 幂等:再跑一遍两趟都不该有新动作。
+    var again = conv.microcompactToolResultsByRecentResults(
+        cc.conversation.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
+    );
+    again.merge(conv.truncateLargeToolResults(limit));
+    try std.testing.expect(!again.changed());
+}
+
+test "L2 microcompact: 两趟压力阀不得毁掉唯一的恢复能力" {
+    // `clearToolResultAt` 明确拒绝清掉带 recoverable artifact 的结果(那是被省略
+    // 字节的唯一取回途径)。本 PR 把 `truncateLargeToolResults` 接进同两个压力阀,
+    // 而它原来只跳过已清/已截的 stub——于是 clear 特意保下来的信封,紧接着就被
+    // 通用头尾截断切成不可解析的 JSON:artifact_id / sha256 / read 指令一起没了,
+    // 且下一轮 clear 因为再也看不到 recoverable artifact,会把残骸清成 stub。
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    const limit = cc.conversation.toolResultContextBytes(200_000);
+
+    // 超预算的可恢复信封:切到更小窗口的模型 / /resume 的历史就是这个形态。
+    const id = "sha256:" ++ ("a" ** 64);
+    const filler = try a.alloc(u8, limit * 2);
+    defer a.free(filler);
+    @memset(filler, 'P');
+    filler[0] = 'H';
+    filler[filler.len - 1] = 'T';
+    const envelope = try std.fmt.allocPrint(
+        a,
+        "{{\"schema_version\":\"metacodes.tool-result-projection.v1\",\"projection\":\"artifact\"," ++
+            "\"artifact_id\":\"{s}\",\"media_type\":\"text/plain; charset=utf-8\",\"original_bytes\":999999," ++
+            "\"sha256\":\"{s}\",\"capture_complete\":true,\"recoverable\":true," ++
+            "\"preview_encoding\":\"utf-8\",\"preview_head\":\"{s}\",\"preview_tail\":\"TAILMARK\"," ++
+            "\"preview_head_bytes\":{d},\"preview_tail_bytes\":8,\"omitted_bytes\":1," ++
+            "\"read\":{{\"tool\":\"ReadArtifact\",\"offset\":0,\"limit_max\":32768}}}}",
+        .{ id, "b" ** 64, filler, filler.len },
+    );
+    defer a.free(envelope);
+    try appendToolResult(&conv, a, "tu_env", envelope);
+
+    // 生产同序:先 clear(keep_recent=2 → 两条都保),再 truncate。
+    var reduced = conv.microcompactToolResultsByRecentResults(
+        cc.conversation.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
+    );
+    reduced.merge(conv.truncateLargeToolResults(limit));
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+
+    const bounded = conv.messages.items[0].blocks[0].tool_result.content;
+    // 有界了,而且仍然是合法 JSON、仍然可恢复、身份字段一个不少。
+    try std.testing.expect(bounded.len <= limit);
+    try std.testing.expect(bounded.len < envelope.len);
+    try std.testing.expect(cc.result_projection.hasRecoverableArtifact(bounded));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bounded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(id, parsed.value.object.get("artifact_id").?.string);
+    try std.testing.expectEqualStrings("b" ** 64, parsed.value.object.get("sha256").?.string);
+    try std.testing.expect(parsed.value.object.get("recoverable").?.bool);
+    try std.testing.expectEqual(@as(i64, 999999), parsed.value.object.get("original_bytes").?.integer);
+    try std.testing.expect(parsed.value.object.get("read").? == .object);
+    // 预览还是真预览:头尾都在,记账数字跟着重算而不是留旧值。
+    try std.testing.expect(std.mem.startsWith(u8, parsed.value.object.get("preview_head").?.string, "H"));
+    try std.testing.expectEqualStrings("TAILMARK", parsed.value.object.get("preview_tail").?.string);
+    try std.testing.expect(parsed.value.object.get("preview_head_bytes").?.integer < @as(i64, @intCast(filler.len)));
+    try std.testing.expect(parsed.value.object.get("omitted_bytes").?.integer > 1);
+
+    // 且下一轮 clear 仍然看得见恢复能力,不会把它清成 stub。
+    const again = conv.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 0), again.cleared);
+}
+
+test "L2 microcompact: Bash 信封被结构化裁剪,而不是切成散文" {
+    // 通用文本截断会把 JSON 切成不可解析的散文,连带丢掉 exit_code /
+    // storage_error / 各种 id 与 flag —— 而它们从来不是结果超限的原因,一两个
+    // 长字符串才是。结构化裁剪只动长字符串,并把描述它的计数器一并改对。
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    const limit = cc.conversation.toolResultContextBytes(200_000);
+
+    const filler = try a.alloc(u8, limit * 2);
+    defer a.free(filler);
+    @memset(filler, 'B');
+    filler[0] = 'H';
+    filler[filler.len - 1] = 'T';
+    const bash = try std.fmt.allocPrint(
+        a,
+        "{{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"{s}\"," ++
+            "\"stdout_captured_bytes\":{d},\"stdout_truncated\":false," ++
+            "\"stdout_artifact_id\":\"sha256:{s}\",\"stdout_recoverable\":true,\"exit_code\":7}}",
+        .{ filler, filler.len, "c" ** 64 },
+    );
+    defer a.free(bash);
+    try appendToolResult(&conv, a, "tu_bash", bash);
+
+    const reduced = conv.truncateLargeToolResults(limit);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+
+    const bounded = conv.messages.items[0].blocks[0].tool_result.content;
+    try std.testing.expect(bounded.len <= limit);
+    // 仍是合法 JSON,身份与状态字段一个不少,恢复能力也还在。
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bounded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("exit_code").?.integer);
+    try std.testing.expectEqualStrings("sha256:" ++ "c" ** 64, parsed.value.object.get("stdout_artifact_id").?.string);
+    try std.testing.expect(cc.result_projection.hasRecoverableArtifact(bounded));
+    // 长字符串被裁,头尾都留着,且描述它的 flag 跟着改对。
+    const out = parsed.value.object.get("stdout").?.string;
+    try std.testing.expect(out.len < filler.len);
+    try std.testing.expect(std.mem.startsWith(u8, out, "H"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "T"));
+    try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
+}
