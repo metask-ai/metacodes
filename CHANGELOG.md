@@ -44,8 +44,9 @@ status, compatibility boundaries, and entry points are defined by
   budget and a JSON serializer that does not escape `/` still produces an
   image. Microcompact protects only images that have not yet been delivered
   to the provider, where delivery is an explicit per-message watermark
-  (`Message.delivered`) advanced by the agent loop once a request is on the
-  wire, never inferred from a locally appended assistant message; delivered
+  (`Message.delivered`) advanced by the agent loop once the provider has
+  accepted a request for streaming, never inferred from a locally appended
+  assistant message; delivered
   images clear like any result, so the pressure valve keeps working on
   image-heavy history, and images are never truncated. AgentCore `settleSuccess` now counts live
   sibling reservations against the hard budget, so an inline image whose

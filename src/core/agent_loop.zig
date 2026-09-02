@@ -1401,10 +1401,11 @@ pub fn run(
                     },
                 }
             };
-            // Everything in this request is now provider-visible, so microcompact
-            // may treat it as history. Only this evidence advances delivery: local
+            // The provider accepted this request for streaming (a stream handle
+            // came back), so microcompact may treat everything in it as history.
+            // Only this evidence advances delivery: a rejected request, local
             // appends (assistant terminal markers) and resumed transcripts stay
-            // undelivered until a request actually carries them.
+            // undelivered until a request is actually accepted with them.
             conversation.markDelivered();
             defer stream.deinit();
 

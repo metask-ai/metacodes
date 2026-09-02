@@ -152,9 +152,11 @@ Anything else is ordinary text and is bounded by the tool-result projection
 like any other result. A canonical image result is exempt from that
 projection, from microcompact clearing while it has not yet been delivered
 to the provider (delivery is an explicit per-message watermark set by the
-agent loop once a request is on the wire; a locally appended assistant
-message is not delivery, and a resumed transcript starts undelivered until
-the next request), from `truncateLargeToolResults`, and from the AgentCore
+agent loop once the provider has accepted a request for streaming, i.e. a
+stream handle was returned; a request the provider rejects with an HTTP
+error does not deliver, a locally appended assistant message is not
+delivery, and a resumed transcript starts undelivered until the next
+accepted request), from `truncateLargeToolResults`, and from the AgentCore
 artifact promotion above the operation's cap (`tool_result_cap_bytes` for
 built-in and host tools, `mcp_result_cap_bytes` for external tools), so the
 picture itself reaches the provider. Two different units apply: context estimation charges one image at

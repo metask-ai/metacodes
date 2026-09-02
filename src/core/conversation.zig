@@ -299,9 +299,10 @@ pub const Conversation = struct {
         };
     }
 
-    /// Replace this conversation with an owned replacement produced off to the
-    /// side. Used by compact preview paths so the live history is only mutated
-    /// after savings/boundary checks pass. `replacement` is drained on success.
+    /// Literal replacement with an owned conversation: no suffix CAS and no
+    /// delivery-watermark merge (the replacement's own flags are taken as is).
+    /// Production compaction goes through `replaceWithOwnedIfSuffixUnchanged`;
+    /// this entry has no production caller. `replacement` is drained on success.
     pub fn replaceWithOwned(self: *Conversation, replacement: *Conversation) bool {
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
@@ -317,6 +318,9 @@ pub const Conversation = struct {
         for (self.messages.items[snapshot.start_index..], snapshot.items) |live, snap| {
             if (!messageEql(live, snap)) return false;
         }
+        // Version and suffix identity are verified above, so index identity
+        // between live and replacement holds and the watermark can be merged.
+        self.mergeDeliveredIntoLocked(replacement);
         return self.replaceWithOwnedLocked(replacement);
     }
 
@@ -324,7 +328,8 @@ pub const Conversation = struct {
     /// the side: a request may have delivered messages while a compact
     /// preview was being summarized, and the preview's copies still say
     /// `false`. Only a same-shape replacement (equal message count) can be
-    /// merged by index; the suffix CAS guarantees that for compact commits.
+    /// merged by index; only the suffix-CAS commit path may call this, since
+    /// it is the only caller that has proven index identity.
     fn mergeDeliveredIntoLocked(self: *const Conversation, replacement: *Conversation) void {
         if (replacement.messages.items.len != self.messages.items.len) return;
         for (replacement.messages.items, self.messages.items) |*rep, live| {
@@ -334,7 +339,6 @@ pub const Conversation = struct {
 
     fn replaceWithOwnedLocked(self: *Conversation, replacement: *Conversation) bool {
         if (!sameAllocator(self.allocator, replacement.allocator)) return false;
-        self.mergeDeliveredIntoLocked(replacement);
         for (self.messages.items) |m| m.deinit(self.allocator);
         self.messages.deinit(self.allocator);
         self.messages = replacement.messages;
@@ -654,8 +658,10 @@ pub const Conversation = struct {
     /// Delivery watermark: the entire retained history is treated as
     /// delivered — every active message was carried by the request just
     /// sent, and compacted prefix messages sit behind the boundary and are
-    /// never sent again. Called by agent_loop once the request is on the
-    /// wire; nothing else may claim delivery (a local
+    /// never sent again. Called by agent_loop once the provider has accepted
+    /// the request for streaming (a stream handle came back; a request the
+    /// provider rejected with an HTTP error does not deliver); nothing else
+    /// may claim delivery (a local
     /// assistant append such as the AgentCore budget terminal marker is not a
     /// provider reply). Image results that are not yet delivered are protected
     /// from microcompact: a picture is a raw payload here rather than a

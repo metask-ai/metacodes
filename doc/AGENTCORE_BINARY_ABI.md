@@ -1362,9 +1362,10 @@ operation's payload cap at 6,400 payload-budget bytes
 bytes. Two situations yield `checkpoint_payload_resource_limit`: a cap
 below 6,400 (the per-operation cap check; `required_checkpoint_bytes` is then
 the 6,400-byte payload charge that exceeded it), and a settle whose real
-bytes would consume a live sibling reservation (`required_checkpoint_bytes`
-is then the full requirement: committed usage plus live reservations plus
-the terminal reserve, the same convention as an admission refusal). The 16 MiB completed-buffer callback boundary remains an
+durable bytes, plus every live reservation and the terminal reserve, would
+exceed `hard_bytes` — with or without sibling reservations
+(`required_checkpoint_bytes` is then that full requirement, the same
+convention as an admission refusal). The 16 MiB completed-buffer callback boundary remains an
 ABI safety cap: legacy synchronous Host results beyond it cannot enter the
 library and therefore cannot be recovered. Native/process tools and
 `HostStreamToolV1` callbacks that use the byte-zero spool avoid constructing
