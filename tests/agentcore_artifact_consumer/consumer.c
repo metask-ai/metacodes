@@ -612,6 +612,31 @@ int main(void) {
         return release_error(api, &diagnostic, 21);
     }
     api->buffer_release(&diagnostic);
+    metask_agentcore_run_input_v1 malformed = multimodal;
+    malformed.parts = (const metask_agentcore_run_input_part_v1 *)0;
+    malformed.part_count = 0;
+    metask_agentcore_run_input_v1 text_with_parts = {0};
+    text_with_parts.struct_size = sizeof(text_with_parts);
+    text_with_parts.kind_code = METASK_AGENTCORE_RUN_INPUT_TEXT;
+    text_with_parts.text = view("text with stray parts");
+    text_with_parts.parts = image_parts;
+    text_with_parts.part_count = 1;
+    if (api->session->run_input(session, 1, &malformed, &options, &result,
+                                &diagnostic) !=
+            METASK_AGENTCORE_STATUS_INVALID_ARGUMENT ||
+        (api->buffer_release(&diagnostic),
+         api->session->run_input(session, 1, &text_with_parts, &options,
+                                 &result, &diagnostic)) !=
+            METASK_AGENTCORE_STATUS_INVALID_ARGUMENT) {
+        api->buffer_release(&diagnostic);
+        stop_server(&server);
+        api->session->destroy(session, &diagnostic);
+        api->buffer_release(&diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 22);
+    }
+    api->buffer_release(&diagnostic);
+
     /* Vision-capable model for the two real provider rounds. */
     if (api->session_control->set_model(session, view("claude-c-consumer"),
                                         &diagnostic) != METASK_AGENTCORE_STATUS_OK) {

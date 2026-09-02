@@ -177,6 +177,20 @@ pub const Conversation = struct {
         self.mutation_version +%= 1; // append 只 bump mutation,不 bump shrink(不改前缀)
     }
 
+    /// 批量接管一组**已构造**消息的所有权,**要么全进要么一条不进**。先为整批
+    /// 预留容量,再逐条 `appendAssumeCapacity`——预留成功后追加不可能失败;失败
+    /// 只发生在预留阶段,此时 `items` 仍全部归调用方所有,调用方照常释放。
+    /// 逐条 `append` 做不到这一点:第 k>0 条扩容失败时前 k 条已归 conversation,
+    /// 调用方若按"全部还是我的"释放就是二次释放(PR #46 review 发现 A)。
+    /// 与 `append` 同一把快照锁;整批只 bump 一次 mutation_version(前缀未变)。
+    pub fn appendAllOwned(self: *Conversation, items: []const msg.Message) !void {
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
+        try self.messages.ensureUnusedCapacity(self.allocator, items.len);
+        for (items) |m| self.messages.appendAssumeCapacity(m);
+        self.mutation_version +%= 1;
+    }
+
     /// 便利方法：追加仅 text 的消息。字节被复制。
     pub fn appendText(self: *Conversation, role: msg.Role, text: []const u8) !void {
         const m = try msg.textMessage(role, text, self.allocator);

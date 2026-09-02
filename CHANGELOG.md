@@ -44,6 +44,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Transcript resume no longer treats a failed `read` as end-of-file: `loadTranscript`,
+  the compact-state meta loader and the `/resume` listing now report `ReadFailed`
+  instead of silently restoring a truncated or empty history (an `EINTR` from
+  Ctrl+C or a terminal resize during `/resume` was enough). Surfaced by the Codex
+  cross-review on #46.
 - A KG client that owns no Store can no longer create one (issue #30).
   `KgClient.store_path` was a single `[]const u8` carrying two meanings — a
   real path under the CLI transport, and the marker `"daemon-owned"` under the

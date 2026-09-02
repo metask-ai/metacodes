@@ -331,7 +331,11 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = pfs.read(fd, &buf);
-        if (n <= 0) break;
+        // 负值是 I/O 错误(EINTR/EIO/EISDIR…),不是 EOF:当 EOF 处理会把一个
+        // 被截断的前缀当作完整历史"成功"恢复。SIGINT/SIGWINCH 处理器未设
+        // SA_RESTART,/resume 读文件期间一次 Ctrl+C 或终端 resize 就能触发。
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
 
@@ -353,7 +357,10 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
         errdefer parsed.deinit(allocator);
         try staged.append(allocator, parsed);
     }
-    for (staged.items) |m| try conversation.append(m);
+    // 批量接管:预留成功后逐条追加不可能失败,所以要么一条不进、要么全进。
+    // 逐条 append 在第 k>0 条扩容失败时会让前 k 条同时归 conversation 和上面的
+    // errdefer 所有——调用方 deinit conversation 就是 use-after-free。
+    try conversation.appendAllOwned(staged.items);
     staged.clearRetainingCapacity(); // 所有权已转移给 conversation
 
     // A:恢复投影状态(compact_boundary/summary)。失败非致命——退回全量重放(旧行为),不阻断 resume。
@@ -376,7 +383,8 @@ fn loadCompactStateFromMeta(conversation: *Conversation, session_dir: []const u8
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = pfs.read(fd, &buf);
-        if (n <= 0) break;
+        if (n < 0) return error.ReadFailed; // 负值是错误不是 EOF,理由见 loadTranscript
+        if (n == 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
 
@@ -588,7 +596,8 @@ fn readMeta(session_dir: []const u8, allocator: std.mem.Allocator) !struct {
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = pfs.read(fd, &buf);
-        if (n <= 0) break;
+        if (n < 0) return error.ReadFailed; // 负值是错误不是 EOF,理由见 loadTranscript
+        if (n == 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
 
@@ -1054,4 +1063,75 @@ test "回退边界:thinking round-trip 与 [image] 标题兜底必须完好" {
     const n = pfs.read(meta_fd, &meta);
     try std.testing.expect(n > 0);
     try std.testing.expect(std.mem.indexOf(u8, meta[0..@intCast(n)], "[image]") != null);
+}
+
+fn loadIntoFreshConversation(a: std.mem.Allocator, dir: []const u8) !usize {
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    loadTranscript(&conv, dir, a) catch |e| {
+        try std.testing.expectEqual(error.OutOfMemory, e);
+        return conv.len();
+    };
+    return std.math.maxInt(usize);
+}
+
+test "原子提交:任意分配点失败都不留半填充、不二次释放(FailingAllocator 逐点扫描;PR #46 review A)" {
+    const base = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(base, "{s}/cc-zig-transcript-oomsweep-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        base.free(tmp_home);
+    }
+    var writer = try Writer.init(base, "/dummy", tmp_home, "claude-sonnet-4", genSessionId());
+    defer writer.deinit();
+    {
+        var conv = Conversation.init(base);
+        defer conv.deinit();
+        // 128 条:足以让 messages 列表在转移期间多次扩容——旧实现正是在第 k>0 次
+        // 扩容失败时把已转移的前缀二次释放(4 条消息时初始容量已够,扫不到)。
+        var i: usize = 0;
+        while (i < 128) : (i += 1) {
+            try conv.appendText(if (i % 2 == 0) .user else .assistant, "message body");
+        }
+        writer.flush(&conv);
+    }
+
+    var idx: usize = 0;
+    while (idx < 100_000) : (idx += 1) {
+        var fa = std.testing.FailingAllocator.init(base, .{ .fail_index = idx });
+        const left = try loadIntoFreshConversation(fa.allocator(), writer.dir);
+        if (!fa.has_induced_failure) break; // 这一轮没注入失败 = 扫描完毕
+        // 注入了失败的一轮:要么 loadTranscript 仍成功(失败被非致命的 meta
+        // 路径吸收),要么 conversation 一条都不留。半填充是唯一不允许的结果。
+        if (left != std.math.maxInt(usize)) try std.testing.expectEqual(@as(usize, 0), left);
+    }
+    try std.testing.expect(idx < 100_000); // 扫描必须自然收敛
+}
+
+test "transcript.jsonl 读失败(EISDIR)→ 明确 ReadFailed,不当 EOF 静默恢复空会话(PR #46 review B)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const tmp_home = blk_home: {
+        var _tb: [512]u8 = undefined;
+        break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-readfail-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
+    };
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+    // 把 transcript.jsonl 做成目录:open(O_RDONLY) 成功,read 返回 -1(EISDIR)。
+    // 旧实现把 -1 当 EOF → 零行 → "成功"恢复出一个空会话。
+    const session_dir = try std.fmt.allocPrint(a, "{s}/sess", .{tmp_home});
+    defer a.free(session_dir);
+    const bogus = try std.fmt.allocPrint(a, "{s}/transcript.jsonl", .{session_dir});
+    defer a.free(bogus);
+    try util_fs.mkdirParents(bogus);
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try std.testing.expectError(error.ReadFailed, loadTranscript(&conv, session_dir, a));
+    try std.testing.expectEqual(@as(usize, 0), conv.len());
 }
