@@ -1110,10 +1110,12 @@ test "原子提交:任意分配点失败都不留半填充、不二次释放(Fai
     {
         var conv = Conversation.init(base);
         defer conv.deinit();
-        // 128 条:足以让 messages 列表在转移期间多次扩容——旧实现正是在第 k>0 次
-        // 扩容失败时把已转移的前缀二次释放(4 条消息时初始容量已够,扫不到)。
+        // 48 条:让 messages 列表在转移期间跨过 5/12/23/39 四个扩容点——旧实现正是
+        // 在第 k>0 次扩容失败时把已转移的前缀二次释放(4 条消息时初始容量已够,
+        // 扫不到)。扫描代价随消息数平方增长(每个分配点都重跑一次加载),128 条在
+        // Debug 下要 20 秒以上,会挤压同机并行的时序敏感 L2;48 条约 3 秒,覆盖不变。
         var i: usize = 0;
-        while (i < 128) : (i += 1) {
+        while (i < 48) : (i += 1) {
             try conv.appendText(if (i % 2 == 0) .user else .assistant, "message body");
         }
         // 带一份持久化的压缩投影:meta 路径的失败被 loadTranscript 当非致命吞掉,
@@ -1134,7 +1136,7 @@ test "原子提交:任意分配点失败都不留半填充、不二次释放(Fai
             .failed => |left| try std.testing.expectEqual(@as(usize, 0), left),
             // 成功的一轮:消息齐全,投影要么完整恢复、要么完全未恢复。
             .loaded => |l| {
-                try std.testing.expectEqual(@as(usize, 128), l.len);
+                try std.testing.expectEqual(@as(usize, 48), l.len);
                 try std.testing.expect((l.boundary == 1 and l.has_summary) or
                     (l.boundary == 0 and !l.has_summary));
             },
