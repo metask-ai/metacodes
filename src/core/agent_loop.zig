@@ -268,6 +268,11 @@ pub const Options = struct {
     lsp: ?*@import("../lsp/service.zig").Service = null,
     /// 自动 compact 的 token 阈值。null → 按 input context window 扣输出保留区后动态算。
     auto_compact_threshold: ?usize = null,
+    /// Wire-size safety net for image results (they bypass the byte budgets):
+    /// before each request the oldest *delivered* image results are stubbed
+    /// until the active history's image bytes fit under this cap. Defaults to
+    /// types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST; tests lower it.
+    image_request_bytes_cap: usize = types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST,
     /// 自动 compact 保留的消息数（最新的 N 条）
     auto_compact_keep_recent: usize = 10,
     /// Bash 后台作业注册表（给 ToolContext 用，工具侧 Bash/BashOutput/KillShell 用）
@@ -1295,6 +1300,20 @@ pub fn run(
         request_recovery: while (true) {
             const model_request_started_ns = util_time.nowNs();
             var stream: api_stream.StreamHandle = undefined;
+            // Images bypass the byte budgets (charged at IMAGE_TOKEN_ESTIMATE), but
+            // every wired provider caps the request size with inline images. Stub
+            // the oldest delivered image results until the history fits; the
+            // current turn is bounded by the projection's per-turn image cap.
+            const image_trim = conversation.trimDeliveredImageBytes(opts.image_request_bytes_cap);
+            if (image_trim.reduction.changed()) {
+                log.info("agent", "image wire cap: cleared {d} delivered image result(s) bytes={d}->{d} cap={d}", .{ image_trim.reduction.cleared, image_trim.reduction.bytes_before, image_trim.reduction.bytes_after, opts.image_request_bytes_cap });
+            }
+            if (image_trim.remaining_over_cap > 0) {
+                // Only non-trimmable images remain (user images, pictures no
+                // request has delivered natively): say so instead of silently
+                // dropping one; the provider's own limit decides the request.
+                log.warn("agent", "image wire cap exceeded by non-trimmable images: over_by={d} cap={d}", .{ image_trim.remaining_over_cap, opts.image_request_bytes_cap });
+            }
             var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
             defer freeApiMessages(&api_messages, allocator);
             if (opts.request_gate) |gate| {
@@ -1420,6 +1439,16 @@ pub fn run(
                     },
                 }
             };
+            // The provider accepted this request for streaming (a stream handle
+            // came back), so microcompact may treat everything in it as history.
+            // Only this evidence advances delivery: a rejected request, local
+            // appends (assistant terminal markers) and resumed transcripts stay
+            // undelivered until a request is actually accepted with them. Whether
+            // image results went out as native image parts or as placeholders is
+            // the serializer's own decision, carried back on the stream handle —
+            // never re-derived here, so it matches the bytes sent even under a
+            // runtime dialect override or a concurrent model change.
+            conversation.markDelivered(.{ .image_placeholder_ids = stream.image_placeholder_ids });
             defer stream.deinit();
 
             rid_for_turn = stream.requestId();
@@ -2419,6 +2448,7 @@ pub fn run(
             const suspended_projection_stats = try result_projection.project(allocator, suspended_items, .{
                 .session_root = opts.artifact_root,
                 .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
+                .per_turn_image_bytes = opts.image_request_bytes_cap -| conversation.nonTrimmableImageBytes(),
             });
             if (opts.tool_result_metrics) |metrics| metrics.recordProjection(suspended_projection_stats);
             // result_blocks 这轮不提交(挂起不落 partial user 消息);释放已 append 的(本应为空)。
@@ -2544,16 +2574,20 @@ pub fn run(
         const projection_stats = try result_projection.project(allocator, projection_items, .{
             .session_root = opts.artifact_root,
             .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
+            // Fresh results get whatever the cap leaves after the images no trim
+            // may remove (user images, undelivered results already in history).
+            .per_turn_image_bytes = opts.image_request_bytes_cap -| conversation.nonTrimmableImageBytes(),
         });
         if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
         if (projection_stats.changed() or projection_stats.budget_exhausted) {
-            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_exempt={d} regrown={d} reinlined={d} session_artifact_bytes={d} budget_exhausted={}", .{
+            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_spills={d} image_exempt={d} regrown={d} reinlined={d} session_artifact_bytes={d} budget_exhausted={}", .{
                 projection_stats.raw_bytes,
                 projection_stats.projected_bytes,
                 projection_stats.artifact_bytes,
                 projection_stats.artifact_spill_count,
                 projection_stats.unrecoverable_fallback_count,
                 projection_stats.turn_budget_spills,
+                projection_stats.image_spills,
                 projection_stats.image_exempt_count,
                 projection_stats.envelope_regrown_count,
                 projection_stats.envelope_reinlined_count,

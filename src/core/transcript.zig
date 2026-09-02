@@ -188,7 +188,9 @@ pub const Writer = struct {
 
         try aw.writer.writeAll("{\"role\":\"");
         try aw.writer.writeAll(roleStr(m.role));
-        try aw.writer.writeAll("\",\"blocks\":[");
+        // 送达水位随消息持久化(消息级 + 每个 tool_result 块级):resume 后图片结果的
+        // microcompact 保护与请求级裁剪都靠它,不再从消息位置推断。旧文件缺字段 → false(保守)。
+        try aw.writer.print("\",\"delivered\":{s},\"blocks\":[", .{if (m.delivered) "true" else "false"});
         for (m.blocks, 0..) |b, i| {
             if (i > 0) try aw.writer.writeAll(",");
             switch (b) {
@@ -211,7 +213,7 @@ pub const Writer = struct {
                     try std.json.Stringify.encodeJsonString(tr.tool_use_id, .{}, &aw.writer);
                     try aw.writer.writeAll(",\"content\":");
                     try std.json.Stringify.encodeJsonString(tr.content, .{}, &aw.writer);
-                    try aw.writer.print(",\"is_error\":{s}", .{if (tr.is_error) "true" else "false"});
+                    try aw.writer.print(",\"is_error\":{s},\"delivered\":{s}", .{ if (tr.is_error) "true" else "false", if (tr.delivered) "true" else "false" });
                     try aw.writer.writeAll("}");
                 },
                 .thinking => |t| {
@@ -427,6 +429,7 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
     else
         return error.InvalidTranscript;
 
+    const msg_delivered = if (root.object.get("delivered")) |dv| (dv == .bool and dv.bool) else false;
     const blocks_v = root.object.get("blocks") orelse return error.InvalidTranscript;
     if (blocks_v != .array) return error.InvalidTranscript;
 
@@ -467,6 +470,7 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
             const tuid = bv.object.get("tool_use_id") orelse return error.InvalidTranscript;
             const c = bv.object.get("content") orelse return error.InvalidTranscript;
             const is_err = bv.object.get("is_error") orelse std.json.Value{ .bool = false };
+            const delivered_v = bv.object.get("delivered") orelse std.json.Value{ .bool = false };
             if (tuid != .string or c != .string) return error.InvalidTranscript;
             const tuid_owned = try allocator.dupe(u8, tuid.string);
             errdefer allocator.free(tuid_owned);
@@ -474,6 +478,7 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
                 .tool_use_id = tuid_owned,
                 .content = try allocator.dupe(u8, c.string),
                 .is_error = if (is_err == .bool) is_err.bool else false,
+                .delivered = if (delivered_v == .bool) delivered_v.bool else false,
             } };
         } else if (std.mem.eql(u8, tv.string, "thinking")) {
             // 写侧一直会写 thinking 块,读侧此前缺此分支 → 任何带 thinking 的会话
@@ -513,7 +518,7 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
         constructed += 1;
     }
 
-    return .{ .role = role, .blocks = blocks };
+    return .{ .role = role, .blocks = blocks, .delivered = msg_delivered };
 }
 
 // ============================================================================
@@ -694,6 +699,41 @@ test "write then load roundtrip" {
     try std.testing.expectEqualStrings("hello", conv2.messages.items[0].blocks[0].text);
     try std.testing.expectEqualStrings("hi there", conv2.messages.items[1].blocks[0].text);
     try std.testing.expectEqualStrings("follow up", conv2.messages.items[2].blocks[0].text);
+}
+
+test "delivery watermark round-trip:消息级与块级 delivered 随 transcript 持久化,缺字段默认 false" {
+    const a = std.testing.allocator;
+    const tmp_home = "/tmp/cc-zig-transcript-delivered-rt";
+    @import("../util/fs.zig").testing.rmrfBestEffort(tmp_home);
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(tmp_home);
+    var writer = try Writer.init(a, "/dummy", tmp_home, "m", genSessionId());
+    defer writer.deinit();
+    {
+        var conv = Conversation.init(a);
+        defer conv.deinit();
+        const tu = try a.alloc(msg_mod.Block, 1);
+        tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t1"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+        try conv.append(.{ .role = .assistant, .blocks = tu });
+        const blocks = try a.alloc(msg_mod.Block, 1);
+        blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t1"), .content = try a.dupe(u8, "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}"), .is_error = false } };
+        try conv.append(.{ .role = .user, .blocks = blocks });
+        conv.markDelivered(.{ .image_placeholder_ids = &.{} });
+        try conv.appendText(.assistant, "seen"); // appended after the request: not delivered
+        writer.flush(&conv);
+    }
+    var loaded = Conversation.init(a);
+    defer loaded.deinit();
+    try loadTranscript(&loaded, writer.dir, a);
+    try std.testing.expectEqual(@as(usize, 3), loaded.messages.items.len);
+    try std.testing.expect(loaded.messages.items[0].delivered);
+    try std.testing.expect(loaded.messages.items[1].delivered);
+    try std.testing.expect(loaded.messages.items[1].blocks[0].tool_result.delivered);
+    try std.testing.expect(!loaded.messages.items[2].delivered);
+    // A record without the field (older transcript) restores as undelivered.
+    var legacy = try parseMessageLine("{\"role\":\"user\",\"blocks\":[{\"type\":\"tool_result\",\"tool_use_id\":\"x\",\"content\":\"c\"}]}", a);
+    defer legacy.deinit(a);
+    try std.testing.expect(!legacy.delivered);
+    try std.testing.expect(!legacy.blocks[0].tool_result.delivered);
 }
 
 test "A:compact 投影状态 round-trip(flush 存 meta → load 恢复 boundary/summary)" {

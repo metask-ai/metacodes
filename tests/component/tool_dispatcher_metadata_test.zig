@@ -640,3 +640,137 @@ test "L2 验收④: budget∘skill∘mcp∘Selection 一次解析贯穿全栈且
         dispatcher.dispatch(&ctx, "Grep", "{\"pattern\":\"x\"}"),
     );
 }
+
+// ── 图片 tool_result 穿过 budget 包装:不 promoteInline,cap 按视觉估算记 ──────────────
+//
+// Conversation 投影豁免图片(dialect.extractImageResult),budget 包装是投影之前
+// 唯一另一个按字节改写 inline 结果的层:超过 tool_result_cap_bytes 的 Read 图片若在这里
+// 被转成 artifact,方言层看到的就是信封而不是图。
+
+/// cap 压到 8 KiB:高于一张图片按视觉估算记的 IMAGE_RESULT_BUDGET_BYTES(6400;低于它的
+/// profile 合法,只是收不下规范图片,settleSuccess 会判资源超限——见下一条测试),低于夹具尺寸。
+const TIGHT_CAP: u64 = 8 * 1024;
+
+fn tightProfile() session_budget.Profile {
+    var profile = openProfile();
+    profile.tool_result_cap_bytes = TIGHT_CAP;
+    return profile;
+}
+
+const BudgetRead = struct { content: []u8, is_error: bool };
+
+/// 经 budget 包装读 `name`,返回 owned 的 done.content(调用方 free)与 is_error。
+fn readThroughBudget(a: std.mem.Allocator, root: []const u8, controller: *session_budget.Controller, name: []const u8) !BudgetRead {
+    var catalog = try core.tool_catalog.Catalog.initBuiltins(a, &.{"Read"});
+    defer catalog.deinit();
+    var selection = try core.tool_catalog.Selection.init(a, &catalog, &.{"Read"});
+    defer selection.deinit();
+    var budget = session_budget.ToolEnvironment{
+        .controller = controller,
+        .base = .{ .definitions = selection.definitions, .dispatcher = selection.dispatcher() },
+    };
+    var ctx = core.tool_context.ToolContext{
+        .allocator = a,
+        .cwd_abs = root,
+        .artifact_root = root,
+        .resolve_relative_paths = true,
+        .tool_dispatcher = budget.surface().dispatcher,
+    };
+    const input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\"}}", .{name});
+    defer a.free(input);
+    const result = try core.tool_exec.executeOne(&ctx, "Read", input, "budget-read", a, test_rid);
+    defer result.freeFileChanges(a);
+    switch (result) {
+        .done => |done| {
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(a);
+                a.free(refs);
+            };
+            return .{ .content = done.content orelse return error.MissingContent, .is_error = done.is_error };
+        },
+        else => return error.UnexpectedToolOutcome,
+    }
+}
+
+test "L2 budget 包装:超过 tool_result_cap 的 Read 图片保持 inline 图像,同尺寸文本照常 promote" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+
+    // 9000 原始字节 → 12000 base64:高于 8 KiB 的 cap。
+    const raw = try a.alloc(u8, 9000);
+    defer a.free(raw);
+    for (raw, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% 7);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.png", .data = raw });
+    // 多行文本(Read 会截断超长单行,单行夹具到不了 cap):300 行 × 41 字节 ≈ 12.3 KB。
+    const txt = try a.alloc(u8, 300 * 41);
+    defer a.free(txt);
+    for (0..300) |line| {
+        @memset(txt[line * 41 .. line * 41 + 40], 'x');
+        txt[line * 41 + 40] = '\n';
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = txt });
+
+    var controller = session_budget.Controller.init(a, tightProfile(), .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 256,
+        .minimum_required_bytes = 256,
+    });
+
+    // 正向:图片结果原样 inline,方言层仍能识别为图像;没有投影信封。
+    const image_read = try readThroughBudget(a, root, &controller, "big.png");
+    defer a.free(image_read.content);
+    try std.testing.expect(!image_read.is_error);
+    const image = image_read.content;
+    try std.testing.expect(core.result_projection.IMAGE_RESULT_BUDGET_BYTES < TIGHT_CAP);
+    try std.testing.expect(image.len > TIGHT_CAP);
+    try std.testing.expect(core.json.extractImageResult(image) != null);
+    try std.testing.expect(std.mem.indexOf(u8, image, core.result_projection.SCHEMA) == null);
+    const encoder = std.base64.standard.Encoder;
+    const expected_b64 = try a.alloc(u8, encoder.calcSize(raw.len));
+    defer a.free(expected_b64);
+    _ = encoder.encode(expected_b64, raw);
+    try std.testing.expect(std.mem.indexOf(u8, image, expected_b64) != null);
+    // 耐久预算按真实字节记(checkpoint 真的要存这么多),不是按 6400 的视觉估算。
+    try std.testing.expect(controller.estimated_usage_bytes >= image.len);
+
+    // 反向:同尺寸文本结果仍被 cap 兜住,promote 成 artifact 信封。
+    const text_read = try readThroughBudget(a, root, &controller, "big.txt");
+    defer a.free(text_read.content);
+    try std.testing.expect(!text_read.is_error);
+    const text = text_read.content;
+    try std.testing.expect(core.json.extractImageResult(text) == null);
+    try std.testing.expect(text.len < TIGHT_CAP);
+    try std.testing.expect(std.mem.indexOf(u8, text, core.result_projection.SCHEMA) != null or core.result_projection.hasRecoverableArtifact(text));
+}
+
+test "L2 budget 包装:cap 低于 IMAGE_RESULT_BUDGET_BYTES 时图片按 6400 记账被 cap 拒绝,required_checkpoint_bytes 恰为 6400" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const raw = try a.alloc(u8, 9000);
+    defer a.free(raw);
+    for (raw, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% 3);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.png", .data = raw });
+
+    var profile = openProfile();
+    profile.tool_result_cap_bytes = core.result_projection.IMAGE_RESULT_BUDGET_BYTES - 1;
+    var controller = session_budget.Controller.init(a, profile, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 256,
+        .minimum_required_bytes = 256,
+    });
+    const read = try readThroughBudget(a, root, &controller, "big.png");
+    defer a.free(read.content);
+    // 结果是有界的 resource-limit 标记,不是图片,也不是信封。
+    try std.testing.expect(read.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, read.content, "checkpoint_payload_resource_limit") != null);
+    try std.testing.expect(core.json.extractImageResult(read.content) == null);
+    // 宿主可见的 requirement 就是那 6400 字节的图片记账值(per-operation cap 分支的约定)。
+    try std.testing.expectEqual(session_budget.Outcome.resource_limit, controller.outcome());
+    try std.testing.expectEqual(@as(u64, core.result_projection.IMAGE_RESULT_BUDGET_BYTES), controller.requiredBytes());
+}

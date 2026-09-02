@@ -65,15 +65,15 @@ const IMG_MESSAGES = [_]cc.types_mod.ApiMessage{
 };
 
 /// 发流式请求并 drain 到底(只为让 MockServer 捕获完整请求;响应内容无关紧要)。
+/// 发流式请求并 drain 到底(只为让 MockServer 捕获完整请求;响应内容无关紧要)。
+/// 任何序列化/传输错误都是失败,不是跳过:否则某个方言开始报 ImageInputUnsupported 时
+/// 这些传输测试会全部静默变绿。
 fn drainMessages(
     a: std.mem.Allocator,
     provider: cc.api_provider.Provider,
     messages: []const cc.types_mod.ApiMessage,
 ) !void {
-    const handle = provider.sendStreamRetry(messages, null, null, null, null, null, 1, 1, null, "") catch |e| {
-        std.debug.print("tool_result image stream failed: {s}\n", .{@errorName(e)});
-        return error.SkipZigTest;
-    };
+    const handle = try provider.sendStreamRetry(messages, null, null, null, null, null, 1, 1, null, "");
     defer handle.deinit();
     while (handle.next() catch null) |ev| switch (ev) {
         .text => |t| a.free(t),
@@ -288,6 +288,530 @@ test "L2 ⑥: Gemini 3 — 官方 multimodal functionResponse(嵌套 inlineData)
     const body = srv.lastRequest().?.body();
     try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached]\"},\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"" ++ RED_PIXEL_PNG_B64 ++ "\"}}]}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
+
+// ── ⑯ 投影层:超限图片必须原样穿过 result_projection 到达 wire ──────────────────
+//
+// 上面 ①-⑥ 直接调 Provider vtable,绕开了 agent_loop 的一次性 tool-result 投影。
+// 修复前:base64 超过 TOOL_RESULT_CONTEXT_MAX_BYTES(64 KiB)的图片结果在到达方言
+// 序列化器之前就被 spillOne 换成 artifact 信封,extractImageResult 永不命中,三家
+// provider 收到的是 base64 预览文本而不是图。本测试走真实 Read 工具 + 真实 agent_loop。
+
+const pfs = @import("platform").fs;
+
+/// Anthropic 脚本:模型对 `path` 发 Read tool_use(input 经 input_json_delta 累积)。
+fn readToolSse(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_read\",\"name\":\"Read\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"file_path\\\":\\\"{s}\\\"}}\"}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+        "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+        "data: {{\"type\":\"message_stop\"}}\n\n", .{path});
+}
+
+fn writeFixture(path: [*:0]const u8, content: []const u8) !void {
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    var written: usize = 0;
+    while (written < content.len) {
+        const n = pfs.write(fd, content[written..]);
+        if (n <= 0) return error.WriteFailed;
+        written += @intCast(n);
+    }
+}
+
+test "L2 ⑯: 超过投影上限的真实 Read 图片经 agent_loop 到达 wire 仍是 image block,不被投影信封替换" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+
+    // 60000 原始字节 → 80000 base64 字符:高于 TOOL_RESULT_CONTEXT_MAX_BYTES(64 KiB),
+    // 不论模型窗口多大,修复前一定被 per-result 投影 spill。Read 只按扩展名定 media type、
+    // 不校验图片魔数,确定性伪随机字节足够。
+    const raw_len: usize = 60_000;
+    const raw = try a.alloc(u8, raw_len);
+    defer a.free(raw);
+    var seed: u32 = 0x9E37_79B9;
+    for (raw) |*byte| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        byte.* = @truncate(seed);
+    }
+    const path = try std.fmt.allocPrint(a, "{s}/big.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, raw);
+
+    const encoder = std.base64.standard.Encoder;
+    const expected_b64 = try a.alloc(u8, encoder.calcSize(raw_len));
+    defer a.free(expected_b64);
+    _ = encoder.encode(expected_b64, raw);
+    try std.testing.expect(expected_b64.len > cc.conversation.TOOL_RESULT_CONTEXT_MAX_BYTES);
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at big.png");
+
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        // 真实 artifact store:修复前这里产生的是 *可恢复* 信封,不是失存储兜底。
+        .artifact_root = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const body = srv.lastRequest().?.body();
+    // 图片本体以 Anthropic image source block 到达,base64 逐字节一致。
+    const expected_block = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}}}", .{expected_b64});
+    defer a.free(expected_block);
+    try std.testing.expect(std.mem.indexOf(u8, body, expected_block) != null);
+    // 投影信封绝不出现(schema 字面量在原文/JSON 转义两种形态下都无引号,可直接 grep)。
+    try std.testing.expect(std.mem.indexOf(u8, body, cc.result_projection.SCHEMA) == null);
+    // 原始 `{"type":"image",...}` JSON 也绝不作为转义文本发出。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+
+    // 送达水位由真实请求推进:tool_result 所在的 user 消息随第二次请求发出 → delivered;
+    // 最后的 assistant 回复之后没有再发请求 → 仍未送达。
+    const items = conv.messages.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expect(items[2].blocks[0] == .tool_result);
+    try std.testing.expect(items[2].delivered);
+    try std.testing.expect(items[3].role == .assistant);
+    try std.testing.expect(!items[3].delivered);
+}
+
+test "L2 ⑰: 第二次请求被 4xx 拒绝时 tool_result 保持未送达——水位只在请求上线时推进,不在每轮开头" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const raw = "PNG-ish fixture bytes, size is irrelevant for delivery";
+    const path = try std.fmt.allocPrint(a, "{s}/small.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, raw);
+
+    // 第一轮 200(模型发 Read tool_use);第二轮 400(带着 tool_result 的请求被拒,没有流句柄)。
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startHttpCassette(
+        &[_][]const u8{ tool_sse, "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"nope\"}}" },
+        &[_][]const u8{ "HTTP/1.1 200 OK", "HTTP/1.1 400 Bad Request" },
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at small.png");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+
+    // 第一次请求上线 → 首条 user 消息已送达;第二次请求没有拿到流句柄 → tool_use/tool_result 未送达。
+    const items = conv.messages.items;
+    try std.testing.expect(items.len >= 3);
+    try std.testing.expect(items[0].delivered);
+    try std.testing.expect(items[1].role == .assistant and !items[1].delivered);
+    try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
+}
+
+test "L2 ⑱: 非 vision 网关模型(glm-5.2)只收到占位文本——含图消息不算送达,文本消息照常送达" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const raw = "tiny fixture; delivery semantics only";
+    const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, raw);
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "glm-5.2", url);
+    defer client.deinit();
+    try std.testing.expect(!client.provider().supports(.image_input));
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at pic.png");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    // wire 上是占位文本,不是图片。
+    const body = srv.lastRequest().?.body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "was read successfully but omitted: this model does not support image input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\",\"source\"") == null);
+    // 第二次请求被接受:首条 user 消息与 tool_use 消息送达;含图的 tool_result 消息保持未送达。
+    const items = conv.messages.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expect(items[0].delivered);
+    try std.testing.expect(items[1].delivered);
+    try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
+    try std.testing.expect(!items[3].delivered);
+}
+
+/// 跑一次"Read 图片 → 回复"的两轮会话,返回 (第二次请求体含图像块?, tool_result 消息已送达?)。
+fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?[]const u8) !struct { image_on_wire: bool, delivered: bool } {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, "override fixture");
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", base_model, url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at pic.png");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        .model_override = override,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    const body = srv.lastRequest().?.body();
+    const items = conv.messages.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expect(items[2].blocks[0] == .tool_result);
+    return .{
+        .image_on_wire = std.mem.indexOf(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\"") != null,
+        .delivered = items[2].delivered,
+    };
+}
+
+/// 与 dialect.zig 默认 Dialect 相同的 fail-closed 方言:profile 声称支持图像,serializeImagePart
+/// 却返回 false——插件/运行时方言覆盖的真实形态。
+fn failClosedResolve(_: *const anyopaque, _: cc.api_dialect.ProviderKind, _: []const u8) cc.api_dialect.Dialect {
+    return .{ .ctx = undefined };
+}
+
+test "L2 ㉑: 运行时方言 profile 说支持图像但序列化器拒绝时——wire 是占位文本,含图消息不算送达" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, "fail-closed dialect fixture");
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    // vision 模型 + fail-closed 方言:能力表说能看图,序列化器实际发的是占位。
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    client.dialect_resolver = .{ .resolveFn = failClosedResolve };
+    try std.testing.expect(client.provider().supports(.image_input));
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at pic.png");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    const body = srv.lastRequest().?.body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "was read successfully but omitted: this model does not support image input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\",\"source\"") == null);
+    const items = conv.messages.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expect(items[0].delivered and items[1].delivered);
+    try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
+}
+
+test "L2 ㉒: 请求级图片字节上限——历史里最老的已送达图片被清成 stub,wire 上只剩上限内的图片" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ANTHROPIC_OK_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at both pictures");
+    const T = struct {
+        fn imageTurn(c: *cc.conversation.Conversation, al: std.mem.Allocator, id: []const u8, fill: u8) !void {
+            const tu = try al.alloc(cc.core_message.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try c.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, 4096);
+            defer al.free(data);
+            @memset(data, fill);
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(cc.core_message.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try c.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try T.imageTurn(&conv, a, "t1", 'A');
+    try T.imageTurn(&conv, a, "t2", 'B');
+    // Both pictures were delivered by earlier requests.
+    conv.markDelivered(.{ .image_placeholder_ids = &.{} });
+    const one = conv.messages.items[2].blocks[0].tool_result.content.len;
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), &.{}, &perm, .{
+        .max_turns = 1,
+        .image_request_bytes_cap = one + 64,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const body = srv.lastRequest().?.body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\""));
+    try std.testing.expect(std.mem.indexOf(u8, body, "BBBB") != null); // the newer picture survives
+    try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[2].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
+}
+
+/// 一轮 Read(image):assistant tool_use + user 图像结果(4096 字节 `fill` 的 base64 载荷)。
+fn appendImageTurn(c: *cc.conversation.Conversation, al: std.mem.Allocator, id: []const u8, fill: u8) !void {
+    const tu = try al.alloc(cc.core_message.Block, 1);
+    tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const data = try al.alloc(u8, 4096);
+    defer al.free(data);
+    @memset(data, fill);
+    const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+    const blocks = try al.alloc(cc.core_message.Block, 1);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+}
+
+test "L2 ㉔: 一等用户图片占掉额度后,新读入的图片结果在投影阶段被 spill,wire 上只有用户图片" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const raw = try a.alloc(u8, 4096);
+    defer a.free(raw);
+    @memset(raw, 0x42);
+    const path = try std.fmt.allocPrint(a, "{s}/fresh.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, raw);
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    // 用户先贴了一张一等图片(4096 字节 base64):它永远不可裁剪,只能压缩新结果的额度。
+    const user_png = "A" ** 4096;
+    const inputs = [_]cc.core_message.ImageInput{.{ .media_type = "image/png", .data = user_png }};
+    {
+        // Ownership moves into the conversation on append: the errdefer must not
+        // outlive the append, or a later failed assertion double-frees the blocks.
+        var user_msg = try cc.core_message.userMessageWithImages(a, "compare with fresh.png", &inputs);
+        errdefer user_msg.deinit(a);
+        try conv.append(user_msg);
+    }
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        // 额度只够用户图片 + 1000 字节:新读入的 5.4 KB 图片结果必须在投影阶段 spill 成信封。
+        .image_request_bytes_cap = user_png.len + 1000,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    const body = srv.lastRequest().?.body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\""));
+    try std.testing.expect(std.mem.indexOf(u8, body, cc.result_projection.SCHEMA) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "QkJCQkJC") == null); // the fresh picture's base64 never reaches the wire
+}
+
+test "L2 ㉓: transcript resume 后(送达标记随 transcript 持久化)请求级图片上限仍生效——最老的已送达图片被裁掉,wire 上只剩一张" {
+    const a = std.testing.allocator;
+    const tmp_home = "/tmp/cc-zig-image-cap-resume-l2";
+    cc.util_fs.testing.rmrfBestEffort(tmp_home);
+    defer cc.util_fs.testing.rmrfBestEffort(tmp_home);
+    var writer = try cc.transcript.Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4-20250514", cc.transcript.genSessionId());
+    defer writer.deinit();
+    {
+        // 会话 A:两轮已被回复的图片 + 新的 user 提问,落盘。
+        var conv_a = cc.conversation.Conversation.init(a);
+        defer conv_a.deinit();
+        try conv_a.appendText(.user, "look at both pictures");
+        try appendImageTurn(&conv_a, a, "t1", 'A');
+        try conv_a.appendText(.assistant, "saw the first");
+        try appendImageTurn(&conv_a, a, "t2", 'B');
+        try conv_a.appendText(.assistant, "saw the second");
+        // Both pictures were carried natively by accepted requests of session A.
+        conv_a.markDelivered(.{ .image_placeholder_ids = &.{} });
+        try conv_a.appendText(.user, "and now?");
+        writer.flush(&conv_a);
+    }
+    // 会话 B:恢复 → 水位随 transcript 持久化:两张图片的块级标记为 true,新提问为 false。
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try cc.transcript.loadTranscript(&conv, writer.dir, a);
+    try std.testing.expectEqual(@as(usize, 8), conv.messages.items.len);
+    try std.testing.expect(conv.messages.items[2].blocks[0].tool_result.delivered);
+    try std.testing.expect(conv.messages.items[5].blocks[0].tool_result.delivered);
+    try std.testing.expect(!conv.messages.items[7].delivered);
+    const one = conv.messages.items[2].blocks[0].tool_result.content.len;
+
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ANTHROPIC_OK_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), &.{}, &perm, .{
+        .max_turns = 1,
+        .image_request_bytes_cap = one + 64,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    // 被 assistant 回复过的最老图片被裁掉;wire 上只有第二张。
+    const body = srv.lastRequest().?.body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\""));
+    try std.testing.expect(std.mem.indexOf(u8, body, "BBBB") != null);
+    try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[2].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
+}
+
+test "L2 ⑲: model_override 决定送达——基础模型非 vision、override 为 vision 时图片上 wire 且送达" {
+    const a = std.testing.allocator;
+    const r = try runOverrideDelivery(a, "glm-5.2", "claude-sonnet-4-20250514");
+    try std.testing.expect(r.image_on_wire);
+    try std.testing.expect(r.delivered);
+}
+
+test "L2 ⑳: model_override 决定送达——基础模型 vision、override 非 vision 时只发占位且不送达" {
+    const a = std.testing.allocator;
+    const r = try runOverrideDelivery(a, "claude-sonnet-4-20250514", "glm-5.2");
+    try std.testing.expect(!r.image_on_wire);
+    try std.testing.expect(!r.delivered);
 }
 
 test "L2 ⑦: 超阈值图像经真实投影后仍以 Anthropic 原生 image block 到达 wire" {

@@ -373,6 +373,22 @@ envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 S
 模型只看到稳定 SHA-256、head/tail 预览和 `ReadArtifact(offset,limit)` 指令。最后的通用字节截断
 仅是失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新
 投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
+图像形态结果（`Read` 读图返回的 `{"type":"image",...}`，`result_projection.isImageResult`）豁免两轮投影：
+vision 路由的方言原生消费它（image block / data URL / inlineData），非 vision 路由收到有界占位文本，
+信封只会把图片变成 base64 预览文本；轮预算按 `IMAGE_RESULT_BUDGET_BYTES`（= `IMAGE_TOKEN_ESTIMATE` × 4
+字节/token）计入，`Stats.projected_bytes` 仍是真实字节数。microcompact 对**未送达**的图片同样豁免：
+送达是 `Message.delivered` 显式水位，只由 agent_loop 在 provider 接受请求并返回流句柄后 `markDelivered` 推进
+（被 HTTP 错误拒绝的请求不算送达；不支持图像输入的模型只收到占位文本，这样的请求不算送达含图消息——
+这个判断由序列化器定案并随 `StreamHandle.image_placeholder_ids`（走占位的 tool_use_id 列表，null = 未知按全占位处理）
+回传、按 `ToolResult.delivered` 逐块记录并随 transcript 持久化，不在 agent_loop 重算；压缩边界之后
+和被规范化器剥掉的孤儿图片则一律标记送达，因为没有后续请求能再携带它们），
+本地追加的 assistant 消息（如 AgentCore 预算终止标记）不算送达，
+transcript resume 恢复持久化的水位（没有该字段的旧记录一律未送达、下一次被接受的请求后自愈）；compact 预览提交时把 live 的水位按索引合并进
+替换集（仅 CAS 路径），在途的送达不会被过期预览覆盖。
+这避免 Read(image) 带并行兄弟时在 provider 看到之前就被 recent-N 阀清掉；已送达的图片照常清，阀对图片密集的
+历史仍有效（未送达的文本沿用历史行为——按数量保留，这是既有的通用问题，不在图像契约内）。图片永不被 `truncateLargeToolResults` 截断。AgentCore 的
+`ToolEnvironment` 不 `promoteInline` 图片，payload cap 按视觉估算记，耐久预算按实际字节记，且
+`settleSuccess` 把仍存活的兄弟预留计入硬预算，结算不能吃掉并行工具已预留的空间。
 
 **读代码给存在性,审计轨迹给频率**:`scripts/audit_trajectories.py` 扫已落盘的
 `transcript.jsonl`,报告各工具的结果大小分布、超预算条数、溢出后**有没有人来取**、以及

@@ -76,7 +76,7 @@ pub const Block = union(enum) {
                 const tid = try dst.dupe(u8, tr.tool_use_id);
                 errdefer dst.free(tid);
                 const content = try dst.dupe(u8, tr.content);
-                break :blk Block{ .tool_result = .{ .tool_use_id = tid, .content = content, .is_error = tr.is_error } };
+                break :blk Block{ .tool_result = .{ .tool_use_id = tid, .content = content, .is_error = tr.is_error, .delivered = tr.delivered } };
             },
             .image => |img| blk: {
                 const mt = try dst.dupe(u8, img.media_type);
@@ -104,6 +104,10 @@ pub const ToolResult = struct {
     tool_use_id: []const u8,
     content: []const u8,
     is_error: bool = false,
+    /// 块级送达水位(见 Conversation.markDelivered):图像结果是否已被 provider 以原生图像块
+    /// 收到。并行结果共享一条 user 消息,一个走占位的兄弟不能拖住其它已原生发出的图片——
+    /// microcompact 与请求级图片裁剪都按块判断。文本结果的该位无意义(恒 true)。
+    delivered: bool = false,
 };
 
 /// 图像块(base64 载荷)。media_type 必须与实际内容一致(至少 image/png、image/jpeg)。
@@ -124,6 +128,12 @@ pub const ReasoningItem = struct {
 pub const Message = struct {
     role: Role,
     blocks: []Block,
+    /// 是否已被 provider 接受进入流式响应(agent_loop 在拿到流句柄后统一置位;被 HTTP
+    /// 错误拒绝的请求不算)。
+    /// 只能由送达证据推进:本地追加的 assistant 消息(AgentCore 预算终止标记等)不算,
+    /// 水位随 transcript 持久化(消息级与块级);没有该字段的旧记录恢复为 false。microcompact 据此
+    /// 保护尚未被模型看到的图片结果。
+    delivered: bool = false,
 
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         for (self.blocks) |b| b.deinit(allocator);
@@ -140,7 +150,7 @@ pub const Message = struct {
             blocks[i] = try b.dupe(dst);
             n = i + 1;
         }
-        return .{ .role = self.role, .blocks = blocks };
+        return .{ .role = self.role, .blocks = blocks, .delivered = self.delivered };
     }
 };
 

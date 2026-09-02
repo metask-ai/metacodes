@@ -589,10 +589,26 @@ pub const Reservation = struct {
             self.controller.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
             return error.ResourceLimit;
         };
-        if (next > self.controller.profile.hard_bytes -
-            self.controller.profile.terminal_reserve_bytes)
-        {
-            self.controller.markOutcomeLocked(.resource_limit, next);
+        // Live sibling reservations still own their share of the hard budget.
+        // A settle that only fits by eating them (an inline image whose durable
+        // bytes exceed its own payload_cap reservation) is a resource limit
+        // here, not a surprise the sibling discovers after its own side effect.
+        // For a settle within its reservation this is never stricter than the
+        // admission check in beginOperation.
+        const committed = checkedAdd(next, self.controller.reserved_bytes) catch {
+            self.controller.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return error.ResourceLimit;
+        };
+        // Same convention as beginOperation: the requirement reported as
+        // required_checkpoint_bytes is what must fit under hard_bytes, i.e.
+        // committed usage plus live sibling reservations plus the terminal
+        // reserve. A host can compare it with hard_bytes directly.
+        const required = checkedAdd(committed, self.controller.profile.terminal_reserve_bytes) catch {
+            self.controller.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return error.ResourceLimit;
+        };
+        if (required > self.controller.profile.hard_bytes) {
+            self.controller.markOutcomeLocked(.resource_limit, required);
             return error.ResourceLimit;
         }
         self.controller.estimated_usage_bytes = next;
@@ -685,7 +701,14 @@ pub const ToolEnvironment = struct {
             .mcp => self.controller.profile.mcp_result_cap_bytes,
             .provider => unreachable,
         };
-        if (outcome == .ok and outcome.ok == .@"inline" and
+        // Image results mirror the Conversation projection seam: promoting a
+        // picture to an artifact would hand the dialects an envelope instead of
+        // an image, so it stays inline. The payload cap is charged at the vision
+        // estimate (what the model actually pays); the durable budget below is
+        // charged for the real bytes (what the checkpoint actually stores).
+        const inline_image = outcome == .ok and outcome.ok == .@"inline" and
+            (core.json.extractImageResult(outcome.ok.@"inline".bytes) != null);
+        if (outcome == .ok and outcome.ok == .@"inline" and !inline_image and
             outcome.ok.rawBytes() > payload_cap)
         {
             _ = outcome.ok.promoteInline(
@@ -703,7 +726,10 @@ pub const ToolEnvironment = struct {
             };
         }
         const payload_bytes: u64 = switch (outcome) {
-            .ok => |*body| @intCast(try body.modelVisibleBytes(tool_ctx.allocator)),
+            .ok => |*body| if (inline_image)
+                core.result_projection.IMAGE_RESULT_BUDGET_BYTES
+            else
+                @intCast(try body.modelVisibleBytes(tool_ctx.allocator)),
             .host_failed, .host_rejected => |maybe| if (maybe) |bytes|
                 @intCast(bytes.len)
             else
@@ -713,7 +739,8 @@ pub const ToolEnvironment = struct {
                 return outcome;
             },
         };
-        const durable_delta = checkedAdd(payload_bytes, 32) catch
+        const durable_bytes: u64 = if (inline_image) outcome.ok.rawBytes() else payload_bytes;
+        const durable_delta = checkedAdd(durable_bytes, 32) catch
             std.math.maxInt(u64);
         reservation.settleSuccess(payload_bytes, durable_delta) catch {
             outcome.deinit(tool_ctx.allocator);
@@ -887,6 +914,8 @@ pub const BudgetedProvider = struct {
         tool_choice: ?core.json.ToolChoice,
         model_override: ?[]const u8,
     ) anyerror!Reservation {
+        // 路由能否原生收图决定图片工具结果在 wire 上是 base64 还是占位符(见
+        // request.zig 的序列化);按配置模型判定,model_override 跨能力类别时估算偏保守。
         const request_bytes = try canonicalRequestBytes(
             self.allocator,
             model_override orelse self.base.model(),
@@ -898,6 +927,7 @@ pub const BudgetedProvider = struct {
             system,
             tools,
             tool_choice,
+            self.base.supports(.image_input),
         );
         return self.controller.beginOperation(.provider, request_bytes) catch
             return error.CheckpointBudgetExhausted;
@@ -963,6 +993,8 @@ const StreamWrapper = struct {
     fn handle(self: *StreamWrapper) core.api_provider.StreamHandle {
         return .{
             .ctx = self,
+            // The serialization decision belongs to the base stream; pass it through untouched.
+            .image_placeholder_ids = self.base.image_placeholder_ids,
             .nextFn = next,
             .deinitFn = deinit,
             .stopReasonFn = stopReason,
@@ -1178,11 +1210,17 @@ fn canonicalRequestBytes(
     system: ?[]const u8,
     tools: ?[]const core.json.ToolDefinition,
     tool_choice: ?core.json.ToolChoice,
+    images_native: bool,
 ) anyerror!u64 {
     // 图像经估算投影序列化(占位替换):canonical 测量统一走 Anthropic 序列化器,
     // 非 claude vision 模型带图会因守门报错 → 预算 admission 拒绝一个 provider 本会
     // 接受的请求。真实载荷字节(base64 data + MIME + 每图 ~64B wire 信封)在投影后
     // 加回,保持"每请求 wire 字节"的测量语义与无图请求的既有口径一致。
+    // 图片工具结果只在路由原生收图时加回:纯文本路由的真实序列化器发的是短占位符
+    // (request.zig),投影后的占位已计入 encoded;若仍按 base64 长度加回,四张接近
+    // 16 MiB 图片允量的结果会让纯文本路由误报 checkpoint_budget_exhausted,且这些
+    // 结果不可裁剪、后续每轮重复拒绝。首类 .image 块一律加回:不收图的路由在真实
+    // 序列化时直接报错,估算偏保守无害。
     const projection = try core.agent_loop.projectPayloadsForEstimation(allocator, messages);
     defer if (projection) |p| p.deinit(allocator);
     const effective: []const core.types.ApiMessage = if (projection) |p| p.messages else messages;
@@ -1199,7 +1237,7 @@ fn canonicalRequestBytes(
     var payload_bytes: u64 = 0;
     for (messages) |m| for (m.content) |c| switch (c) {
         .image => |img| payload_bytes +|= @as(u64, img.data.len) +| img.media_type.len +| 64,
-        .tool_result => |tr| if (core.json.extractImageResult(tr.content) != null) {
+        .tool_result => |tr| if (images_native and core.json.extractImageResult(tr.content) != null) {
             payload_bytes +|= @as(u64, tr.content.len);
         },
         else => {},
@@ -1319,6 +1357,49 @@ test "checkpoint limits are intersected with the Session durable profile" {
     try std.testing.expectEqual(@as(usize, 73), bounded.chunk_bytes);
     try std.testing.expectEqual(@as(u64, 321), bounded.max_messages);
     try std.testing.expectEqual(@as(u64, 17), bounded.max_blocks_per_message);
+}
+
+test "settle beyond its own reservation cannot consume a live sibling reservation" {
+    const profile = Profile{
+        .hard_bytes = 4096,
+        .soft_bytes = 3072,
+        .input_cap_bytes = 1024,
+        .provider_request_cap_bytes = 1024,
+        .provider_result_cap_bytes = 512,
+        .tool_result_cap_bytes = 256,
+        .mcp_result_cap_bytes = 256,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    const admitted = try preflight(profile, 1000, &.{"run"});
+    // Reference: alone, a durable delta that fills the hard budget exactly settles.
+    var alone = Controller.init(std.testing.allocator, profile, admitted);
+    var solo = try alone.beginOperation(.tool, 32);
+    const room = profile.hard_bytes - profile.terminal_reserve_bytes - alone.estimated_usage_bytes - profile.audit_reserve_bytes;
+    try solo.settleSuccess(10, room);
+    try std.testing.expectEqual(Outcome.none, alone.outcome());
+
+    // With a sibling reservation live, the same delta would eat the sibling's
+    // share: it must be refused at settle time, and the sibling keeps its space.
+    var controller = Controller.init(std.testing.allocator, profile, admitted);
+    var first = try controller.beginOperation(.tool, 32);
+    var second = try controller.beginOperation(.tool, 32);
+    const sibling_reserved = controller.reserved_bytes / 2;
+    try std.testing.expectError(error.ResourceLimit, first.settleSuccess(10, room));
+    try std.testing.expectEqual(Outcome.resource_limit, controller.outcome());
+    try std.testing.expectEqual(sibling_reserved, controller.reserved_bytes);
+    // The reported requirement is what would have to fit under hard_bytes:
+    // committed usage + the sibling share that caused the refusal + terminal reserve.
+    try std.testing.expectEqual(profile.hard_bytes + sibling_reserved, controller.requiredBytes());
+    second.release();
+    try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+
+    // No sibling, but the delta lands between hard - terminal and hard: refused,
+    // and the report includes the terminal reserve so it exceeds hard_bytes.
+    var terminal_case = Controller.init(std.testing.allocator, profile, admitted);
+    var only = try terminal_case.beginOperation(.tool, 32);
+    try std.testing.expectError(error.ResourceLimit, only.settleSuccess(10, room + 64));
+    try std.testing.expectEqual(profile.hard_bytes + 64, terminal_case.requiredBytes());
 }
 
 test "operation reservations are atomic and preserve terminal space" {
@@ -2013,12 +2094,38 @@ test "canonicalRequestBytes: 非 claude vision 模型带图可测量,载荷字�
         .{ .image = .{ .media_type = "image/png", .data = "QUJDREVGRw==" } },
     };
     const messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &contents }};
-    const with_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &messages, null, null, null);
+    const with_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &messages, null, null, null, true);
 
     const text_only = [_]core.types.ApiContent{.{ .text = "look" }};
     const text_messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &text_only }};
-    const without_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &text_messages, null, null, null);
+    const without_image = try canonicalRequestBytes(allocator, "gpt-4o", 1024, &text_messages, null, null, null, true);
 
     // 真实载荷字节(base64+MIME+信封)计入测量:带图严格大于纯文本 + 载荷长度。
     try std.testing.expect(with_image > without_image + 12);
+}
+
+test "canonicalRequestBytes: 纯文本路由的图片工具结果按占位符计,不按 base64 加回" {
+    // review 轮 16 Medium:纯文本路由(deepseek-chat/glm-5.2)真实 wire 是短占位符,
+    // 预检却把原始 base64 长度加回 → 四张接近 16 MiB 允量的图误报 budget exhausted。
+    const allocator = std.testing.allocator;
+    const data = "A" ** 4096;
+    const image_result = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"" ++ data ++ "\"}";
+    const contents = [_]core.types.ApiContent{
+        .{ .tool_result = .{ .tool_use_id = "toolu_1", .content = image_result, .is_error = false } },
+    };
+    const messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &contents }};
+    const text_contents = [_]core.types.ApiContent{
+        .{ .tool_result = .{ .tool_use_id = "toolu_1", .content = "[image tool result]", .is_error = false } },
+    };
+    const text_messages = [_]core.types.ApiMessage{.{ .role = .user, .content = &text_contents }};
+
+    // 模型名只是估算体里的一个标签(会进序列化字节),三次调用固定同一个,路由标志才是变量。
+    const placeholder_only = try canonicalRequestBytes(allocator, "deepseek-chat", 1024, &text_messages, null, null, null, false);
+    const text_route = try canonicalRequestBytes(allocator, "deepseek-chat", 1024, &messages, null, null, null, false);
+    const vision_route = try canonicalRequestBytes(allocator, "deepseek-chat", 1024, &messages, null, null, null, true);
+
+    // 纯文本路由:估算就是投影后的占位符请求,一个字节的 base64 都不加回。
+    try std.testing.expectEqual(placeholder_only, text_route);
+    // 原生收图的路由:整条图片结果的 JSON 长度加回。
+    try std.testing.expectEqual(text_route + image_result.len, vision_route);
 }

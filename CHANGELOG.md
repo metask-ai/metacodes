@@ -55,6 +55,75 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- AgentCore's request preflight (`canonicalRequestBytes`) charges image tool
+  results as native bytes only when the configured model accepts image
+  input; on a text-only route the estimate is exactly the placeholder request
+  the serializer sends. Previously the full base64 length was added back
+  unconditionally, so a few large image results on deepseek-chat / glm-5.2
+  returned `checkpoint_budget_exhausted` for a request of a few hundred
+  bytes, and repeated it on every later run because those results are
+  non-trimmable.
+- Image results now have a wire-size safety net: they bypass the byte
+  budgets, so five parallel 3.75 MB pictures could produce a request no
+  provider accepts. `types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST` (16 MiB) caps
+  the base64 image bytes per request: the projection spills the largest
+  images of the current turn beyond the cap into artifact envelopes, and the
+  agent loop stubs the oldest already-delivered image results before each
+  request until the history fits (first-class user images count against
+  the allowance and a fresh tool turn is projected against what they leave;
+  the block-level watermark is persisted in the transcript, so a resumed
+  session trims exactly the pictures earlier requests delivered natively and
+  reports explicitly when only non-trimmable images exceed the cap).
+  Gemini 3 function responses embed only
+  PNG/JPEG/WebP; `image/gif` results now go out as a sibling `inline_data`
+  part instead of being rejected. The stream handle reports the exact
+  tool_use ids whose image went out as a placeholder, so a plugin dialect
+  that serializes some MIME types natively and refuses others no longer pins
+  the natively-sent pictures.
+- OpenAI chat/completions and Gemini dropped every text block that shared a
+  message with tool results: the PostToolUse `additionalContext`, the
+  verification checkpoint, the requirement-ledger prompt and similar host
+  text that the agent loop appends to the tool-result user message never
+  reached those providers (Anthropic and the OpenAI Responses protocol were
+  unaffected). The chat serializer now re-sends that text as a user message
+  after the tool messages (or as the last part of the image follow-up
+  message), and Gemini appends it as trailing text parts of the same user
+  content. Covered by serializer tests and by the hook-pipeline component
+  test, which now asserts the context on the wire.
+- The image projection exemption (issue #26, below) is covered end to end by
+  an agent-loop test that reads an 80 KiB-base64 PNG through the real `Read`
+  tool and asserts the image block on the wire, and the same exemption now
+  also holds at the two other layers that rewrite a tool result before
+  serialization: microcompact no longer clears an image
+  result under the recent-N pressure valve (a `Read(image)` with two parallel
+  siblings was cleared before the provider ever saw it), and the AgentCore
+  `ToolEnvironment` no longer promotes an image above `tool_result_cap_bytes`
+  to an artifact (the payload cap is charged at the vision estimate, the
+  durable budget at the real bytes). In exchange the shared predicate
+  `extractImageResult` only accepts the canonical Read shape: allowlisted
+  media type (`image/png|jpeg|gif|webp`), standard base64, at most
+  `MAX_IMAGE_BYTES` of payload, exactly the three keys in any order with only
+  whitespace after the closing brace, so a plugin cannot obtain an unbounded
+  exemption by prefixing arbitrary output with `{"type":"image"`. `result_projection.Stats.projected_bytes` stays a
+  real byte count; the turn-budget decision moved to a new `budget_bytes`.
+  The predicate is structural (any field order, standard JSON whitespace,
+  exactly the three keys, raw content bounded by `MAX_IMAGE_RESULT_BYTES`),
+  so surrounding whitespace cannot smuggle an oversized payload past the
+  budget and a JSON serializer that does not escape `/` still produces an
+  image. Microcompact protects only images that have not yet been delivered
+  to the provider, where delivery is an explicit per-message watermark
+  (`Message.delivered`) advanced by the agent loop once the provider has
+  accepted a request for streaming — and, for messages holding an image
+  result, only when the serializer actually sent native image parts (a
+  non-vision model only received the placeholder; the serializer reports the
+  affected tool_use ids back on `StreamHandle.image_placeholder_ids`, and the
+  flag lives on each tool_result block) — never inferred from a locally
+  appended assistant message; delivered
+  images clear like any result, so the pressure valve keeps working on
+  image-heavy history, and images are never truncated. AgentCore `settleSuccess` now counts live
+  sibling reservations against the hard budget, so an inline image whose
+  durable bytes exceed its own reservation is refused instead of consuming
+  the space a parallel tool had already reserved.
 - Transcript resume no longer treats a failed `read` as end-of-file: `EINTR` (a
   Ctrl+C or terminal resize during `/resume`) is retried, and any other read error
   makes `loadTranscript` and the compact-state meta loader fail with `ReadFailed`
