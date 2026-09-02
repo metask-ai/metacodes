@@ -501,9 +501,9 @@ fn hasImage(m: types.ApiMessage) bool {
 
 /// 合并相邻同角色消息:新 content = 两者拼接。就地改写(旧数组 free,新数组 owned)。
 /// **provider 安全**:OpenAI/Gemini 的序列化把含 tool_result 的消息当 wire 层 `role:"tool"`/
-/// functionResponse,且遇 tool_result 消息**早返回丢弃同消息内 text/image**。故绝不合并出
-/// "text/image + tool_result 混合"消息——若合并后会同时含用户可见内容(text 或 image)与
-/// tool_result 则跳过。text+text(inject+首 user)、text+image(上下文注入+多模态 user)
+/// functionResponse;同消息 text 现在会在其后补发,但一等 image 块在 tool_result 消息里
+/// 仍是显式错误。故绝不合并出"text/image + tool_result 混合"消息——若合并后会同时含
+/// 用户可见内容(text 或 image)与 tool_result 则跳过(保持 wire 形态稳定)。text+text(inject+首 user)、text+image(上下文注入+多模态 user)
 /// 和 tool_result+tool_result(补桩+真结果)都安全,照合。
 fn mergeConsecutiveRoles(allocator: std.mem.Allocator, list: *std.ArrayList(types.ApiMessage)) !void {
     var i: usize = 0;

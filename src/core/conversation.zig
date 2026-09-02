@@ -696,71 +696,72 @@ pub const Conversation = struct {
     /// working on image-heavy history. Undelivered text results keep their
     /// historical behaviour (see doc/CORE_REFERENCE.md).
     ///
-    /// `images_visible` is the route's `supports(.image_input)`: a non-vision
-    /// model receives a bounded placeholder instead of the picture
-    /// (request.zig), so a message carrying an image result is not delivered
-    /// by such a request — switching to a vision model later must still let
-    /// it see the picture before microcompact may clear it.
+    /// `images_visible` is the serializer's report for the accepted request
+    /// (`StreamHandle.image_results_native`): false means every image result
+    /// went out as a bounded placeholder, so a message carrying a paired image
+    /// result is not delivered by that request — a later request that does
+    /// serialize images natively must still be able to carry it before
+    /// microcompact may clear it.
+    ///
+    /// Pairing follows the request normalizer (message_repair) over the same
+    /// provider-visible projection buildApiMessages sends: a thinking-only
+    /// assistant message is not part of the request and therefore does not
+    /// start a new pairing scope; each tool_use id answers once, in message
+    /// and block order. Everything is computed in one forward pass with one
+    /// outstanding-id set. On OOM every result counts as paired (protected).
     pub fn markDelivered(self: *Conversation, opts: DeliveryOptions) void {
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
         const active_start = @min(self.compact_boundary, self.messages.items.len);
+        var outstanding = std.StringHashMap(void).init(self.allocator);
+        defer outstanding.deinit();
+        var oom = false;
         for (self.messages.items, 0..) |*m, i| {
-            // The vision exception only protects an image that some later
-            // vision-capable request could still carry: an active message whose
-            // image result is paired with the nearest preceding assistant turn.
             // A message behind the compact boundary cannot be carried paired
-            // again: the boundary only moves forward, and the one backwards
+            // again: the boundary only moves forward (compactBoundaryForItems
+            // even skips leading tool_result messages), and the one backwards
             // move (`rollbackForRetry`) re-admits from the selected user message
             // itself, never the assistant turn that precedes it, so the result
-            // would be stripped as an orphan. An orphan image result is stripped
-            // by the request normalizer for the same reason. Leaving either
-            // undelivered would only pin its base64 forever.
-            if (!opts.images_visible and i >= active_start and
-                messageHasImageResult(m.*) and !self.imageResultsAreOrphansLocked(i, active_start))
+            // would be stripped as an orphan. Leaving it undelivered would only
+            // pin its base64 forever.
+            if (i < active_start) {
+                m.delivered = true;
                 continue;
-            m.delivered = true;
+            }
+            if (m.role == .assistant) {
+                if (assistantIsProviderVisible(m.*)) {
+                    outstanding.clearRetainingCapacity();
+                    for (m.blocks) |b| switch (b) {
+                        .tool_use => |tu| outstanding.put(tu.id, {}) catch {
+                            oom = true;
+                        },
+                        else => {},
+                    };
+                }
+                m.delivered = true;
+                continue;
+            }
+            // The vision exception only protects an image that some later
+            // natively-serializing request could still carry: a paired result.
+            // An orphan (or duplicate) image result is stripped by the request
+            // normalizer and delivers unconditionally.
+            var protected = false;
+            for (m.blocks) |b| switch (b) {
+                .tool_result => |tr| {
+                    const paired = outstanding.remove(tr.tool_use_id) or oom;
+                    if (paired and !opts.images_visible and result_projection.isImageResult(tr.content)) protected = true;
+                },
+                else => {},
+            };
+            if (!protected) m.delivered = true;
         }
     }
 
-    /// Whether every image result in message `index` is an orphan under the
-    /// request normalizer's sequential pairing (message_repair): its id must
-    /// be outstanding from the nearest preceding assistant turn of the active
-    /// range, and each id answers only once, in message and block order — a
-    /// second result for an already-answered id is an orphan too. On OOM the
-    /// message is treated as paired (kept protected).
-    fn imageResultsAreOrphansLocked(self: *const Conversation, index: usize, active_start: usize) bool {
-        var turn_index: ?usize = null;
-        var i = index;
-        while (i > active_start) {
-            i -= 1;
-            if (self.messages.items[i].role == .assistant) {
-                turn_index = i;
-                break;
-            }
-        }
-        const turn = turn_index orelse return true;
-        var outstanding = std.StringHashMap(void).init(self.allocator);
-        defer outstanding.deinit();
-        for (self.messages.items[turn].blocks) |b| switch (b) {
-            .tool_use => |tu| outstanding.put(tu.id, {}) catch return false,
-            else => {},
-        };
-        var j = turn + 1;
-        while (j < index) : (j += 1) {
-            for (self.messages.items[j].blocks) |b| switch (b) {
-                .tool_result => |tr| _ = outstanding.remove(tr.tool_use_id),
-                else => {},
-            };
-        }
-        for (self.messages.items[index].blocks) |b| switch (b) {
-            .tool_result => |tr| {
-                const paired = outstanding.remove(tr.tool_use_id);
-                if (paired and result_projection.isImageResult(tr.content)) return false;
-            },
-            else => {},
-        };
-        return true;
+    /// Mirrors buildApiMessages: thinking blocks are never sent, so an
+    /// assistant message made only of them is invisible to the provider.
+    fn assistantIsProviderVisible(m: msg.Message) bool {
+        for (m.blocks) |b| if (b != .thinking) return true;
+        return false;
     }
 
     pub const DeliveryOptions = struct {
@@ -771,14 +772,6 @@ pub const Conversation = struct {
         /// profile says it could.
         images_visible: bool,
     };
-
-    fn messageHasImageResult(m: msg.Message) bool {
-        for (m.blocks) |b| switch (b) {
-            .tool_result => |tr| if (result_projection.isImageResult(tr.content)) return true,
-            else => {},
-        };
-        return false;
-    }
 
     fn clearToolResultAt(self: *Conversation, m: msg.Message, bi: usize) ?usize {
         const tr = m.blocks[bi].tool_result;
@@ -1138,6 +1131,26 @@ test "delivery watermark: a second result for an already-answered id is an orpha
     // so a non-vision request must still deliver (not pin) this message.
     c.markDelivered(.{ .images_visible = false });
     try std.testing.expect(c.messages.items[1].delivered);
+}
+
+test "delivery watermark: a thinking-only assistant message does not break the tool_use pairing" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const tu = try a.alloc(msg.Block, 1);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "x"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    // buildApiMessages drops this message entirely (thinking is never sent), so
+    // the normalizer still pairs the result below with `x`; delivery must agree.
+    const th = try a.alloc(msg.Block, 1);
+    th[0] = .{ .thinking = try a.dupe(u8, "let me look") };
+    try c.append(.{ .role = .assistant, .blocks = th });
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "x"), .content = try a.dupe(u8, "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}"), .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    c.markDelivered(.{ .images_visible = false });
+    try std.testing.expect(c.messages.items[1].delivered);
+    try std.testing.expect(!c.messages.items[2].delivered);
 }
 
 test "compact preview commit keeps a delivery watermark set while the preview was in flight" {

@@ -978,9 +978,11 @@ fn serializeOpenAIMessage(
         has_tool_result = true;
     };
     if (has_tool_result) {
-        // tool_result 消息在 OpenAI wire 上只投影 {role:"tool"} 项——同消息内其它块
-        // 不上 wire。text 静默丢是既有已知行为(message_repair 合并守护防产出);image
-        // 受 issue #10"绝不静默丢"铁律保护,防御性显式报错(正常路径永不产出此混合)。
+        // tool_result 消息在 OpenAI wire 上先投影 {role:"tool"} 项。同消息内的 text 块
+        // (agent_loop 追加进同一 user 消息的 PostToolUse additionalContext、验证检查点、
+        // 需求台账提示等)不能内联进 tool 消息(官方 content 只收工具输出),在所有 tool
+        // 消息之后以一条 user 消息补发——此前被静默丢弃,模型从未收到这些控制文本。
+        // image 受 issue #10"绝不静默丢"铁律保护,防御性显式报错(正常路径永不产出此混合)。
         for (m.content) |c| if (c == .image) return error.ImageWithToolResultUnsupported;
         // OpenAI 要求每个 tool_result 是独立 {role:"tool"} message。并行工具一轮有多个
         // tool_result,**全部展开**成逗号分隔的多条 message(P0.1:旧版只发首个 → 并行回合
@@ -1038,10 +1040,25 @@ fn serializeOpenAIMessage(
             },
             else => {},
         };
+        var trailing_text: std.ArrayList(u8) = .empty;
+        defer trailing_text.deinit(allocator);
+        for (m.content) |c| switch (c) {
+            .text => |t| try trailing_text.appendSlice(allocator, t),
+            else => {},
+        };
         if (image_parts.items.len > 0) {
             try out.appendSlice(allocator, ",{\"role\":\"user\",\"content\":[");
             try out.appendSlice(allocator, image_parts.items);
+            if (trailing_text.items.len > 0) {
+                try out.appendSlice(allocator, ",{\"type\":\"text\",\"text\":");
+                try util_json.serializeString(trailing_text.items, out, allocator);
+                try out.append(allocator, '}');
+            }
             try out.appendSlice(allocator, "]}");
+        } else if (trailing_text.items.len > 0) {
+            try out.appendSlice(allocator, ",{\"role\":\"user\",\"content\":");
+            try util_json.serializeString(trailing_text.items, out, allocator);
+            try out.append(allocator, '}');
         }
         return;
     }
@@ -1811,4 +1828,30 @@ test "SerializationReport(OpenAI): chat 走 fail-closed 方言计占位;Response
     const body_resp_native = try serializeOpenAIResponsesRequestReport(a, "gpt-5.2", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-5.2"), &resp_native);
     defer a.free(body_resp_native);
     try std.testing.expect(resp_native.imagesNative());
+}
+
+test "OpenAI chat: tool_result 消息里的同消息 text(hook 上下文/检查点)在 tool 消息之后以 user 消息补发" {
+    const a = std.testing.allocator;
+    const tool_use = [_]types.ApiContent{.{ .tool_use = .{ .id = "call_1", .name = "Bash", .input = "{}" } }};
+    const mixed = [_]types.ApiContent{
+        .{ .tool_result = .{ .tool_use_id = "call_1", .content = "ok" } },
+        .{ .text = "[PostToolUse hook]\npost-check ok" },
+    };
+    const msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &mixed } };
+    const body = try serializeOpenAIRequestWithOverridesAndDialect(a, "gpt-4o", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-4o"));
+    defer a.free(body);
+    const tool_at = std.mem.indexOf(u8, body, "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"ok\"}").?;
+    const text_at = std.mem.indexOf(u8, body, "{\"role\":\"user\",\"content\":\"[PostToolUse hook]\\npost-check ok\"}").?;
+    try std.testing.expect(tool_at < text_at);
+    // 图像结果 + 文本:文本作为紧随 user 消息的最后一个 text part。
+    const img_mixed = [_]types.ApiContent{
+        .{ .tool_result = .{ .tool_use_id = "call_1", .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}" } },
+        .{ .text = "post-check ok" },
+    };
+    const img_msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &img_mixed } };
+    const img_body = try serializeOpenAIRequestWithOverridesAndDialect(a, "gpt-4o", &img_msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-4o"));
+    defer a.free(img_body);
+    const image_at = std.mem.indexOf(u8, img_body, "{\"type\":\"image_url\"").?;
+    const part_at = std.mem.indexOf(u8, img_body, ",{\"type\":\"text\",\"text\":\"post-check ok\"}]}").?;
+    try std.testing.expect(image_at < part_at);
 }

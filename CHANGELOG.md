@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- OpenAI chat/completions and Gemini dropped every text block that shared a
+  message with tool results: the PostToolUse `additionalContext`, the
+  verification checkpoint, the requirement-ledger prompt and similar host
+  text that the agent loop appends to the tool-result user message never
+  reached those providers (Anthropic and the OpenAI Responses protocol were
+  unaffected). The chat serializer now re-sends that text as a user message
+  after the tool messages (or as the last part of the image follow-up
+  message), and Gemini appends it as trailing text parts of the same user
+  content. Covered by serializer tests and by the hook-pipeline component
+  test, which now asserts the context on the wire.
 - Image tool results larger than the per-result projection bound (64 KiB of
   base64, roughly a 48 KiB picture) reached the provider as a
   `metacodes.tool-result-projection` artifact envelope instead of an image:

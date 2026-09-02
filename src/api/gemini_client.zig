@@ -760,8 +760,10 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
         has_tool_result = true;
     };
     if (has_tool_result) {
-        // 同 OpenAI:tool_result 消息只投影 functionResponse parts,同消息 image 会被
-        // 静默丢——issue #10 铁律下防御性显式报错(正常路径经 merge 守护永不产出)。
+        // 同 OpenAI:tool_result 消息先投影 functionResponse parts;同消息内的 text 块
+        // (agent_loop 追加的 PostToolUse additionalContext、验证检查点等)作为同一 user
+        // content 的收尾 text parts 补发——此前被静默丢弃。一等 image 块仍是 issue #10
+        // 铁律下的防御性显式报错(正常路径经 merge 守护永不产出)。
         for (m.content) |c| if (c == .image) return error.ImageWithToolResultUnsupported;
         // P0.1 并行:一轮多个 tool_result → **全部**作为同一 user content 的多个 functionResponse
         // parts(旧版只发首个 → 并行回合下一次请求缺 functionResponse 配对)。
@@ -840,6 +842,14 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
             else => {},
         };
         try out.appendSlice(allocator, sibling_parts.items);
+        for (m.content) |c| switch (c) {
+            .text => |t| {
+                try out.appendSlice(allocator, ",{\"text\":");
+                try util_json.serializeString(t, out, allocator);
+                try out.append(allocator, '}');
+            },
+            else => {},
+        };
         try out.appendSlice(allocator, "]}");
         return;
     }
@@ -1142,6 +1152,20 @@ test "Gemini 2.5: 图像 tool_result → functionResponse 指向文本 + 同级 
     try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached in this message]\"}}},{\"text\":\"Image result of Read:\"},{\"inline_data\":{\"mime_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}]}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "inlineData") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
+
+test "Gemini: tool_result 消息里的同消息 text(hook 上下文/检查点)作为收尾 text part 补发" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{.{ .tool_use = .{ .id = "t1", .name = "Bash", .input = "{}" } }} },
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok" } },
+            .{ .text = "[PostToolUse hook]\npost-check ok" },
+        } },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Bash\",\"response\":{\"result\":\"ok\"}}},{\"text\":\"[PostToolUse hook]\\npost-check ok\"}]}") != null);
 }
 
 test "Gemini functionResponse.name 按最近一轮配对:后轮复用 id 不取前轮的名字" {
