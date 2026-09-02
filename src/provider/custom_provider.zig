@@ -168,6 +168,7 @@ fn buildProfile(
         channels[0].id;
 
     const aliases = try parseAliases(arena, value.object.get("aliases"));
+    const oauth = try parseOAuth(arena, value.object.get("oauth"));
 
     const built = ProviderProfile{
         .id = id,
@@ -181,12 +182,55 @@ fn buildProfile(
         .auth = auth,
         .default_channel = default_channel,
         .endpoint_policy = policy,
+        .oauth_token_url = oauth.token_url,
+        .oauth_authorize_url = oauth.authorize_url,
+        .oauth_device_authorization_url = oauth.device_authorization_url,
+        .oauth_client_id = oauth.client_id,
+        .oauth_scope = oauth.scope,
     };
     // The same structural validation a built-in profile goes through. Doing it
     // here means a malformed definition fails at parse time rather than at the
     // first request.
     profile_mod.validateProfile(built) catch return error.InvalidDocument;
     return built;
+}
+
+const OAuthDefinition = struct {
+    token_url: ?[]const u8 = null,
+    authorize_url: ?[]const u8 = null,
+    device_authorization_url: ?[]const u8 = null,
+    client_id: ?[]const u8 = null,
+    scope: []const u8 = "",
+};
+
+/// `"oauth": { "token_url", "authorize_url", "device_authorization_url",
+/// "client_id", "scope" }` (issue #33).
+///
+/// A configured provider is exactly the case where the OAuth client belongs in
+/// configuration rather than in the binary: whoever runs the relay or gateway
+/// registered it. Declaring the endpoints here is what makes
+/// `metacodes login --provider <id>` a real flow for it.
+fn parseOAuth(arena: std.mem.Allocator, value: ?std.json.Value) DefinitionError!OAuthDefinition {
+    const object = value orelse return .{};
+    if (object != .object) return error.InvalidDocument;
+    const token_url = try dupeOptional(arena, stringOf(object.object.get("token_url")));
+    const authorize_url = try dupeOptional(arena, stringOf(object.object.get("authorize_url")));
+    const device_url = try dupeOptional(
+        arena,
+        stringOf(object.object.get("device_authorization_url")),
+    );
+    // Without a token endpoint neither grant can be completed and no refresh
+    // can ever run, so an authorization endpoint on its own is a definition
+    // that could only fail later.
+    if (token_url == null and (authorize_url != null or device_url != null))
+        return error.InvalidDocument;
+    return .{
+        .token_url = token_url,
+        .authorize_url = authorize_url,
+        .device_authorization_url = device_url,
+        .client_id = try dupeOptional(arena, stringOf(object.object.get("client_id"))),
+        .scope = try dupe(arena, stringOf(object.object.get("scope")) orelse ""),
+    };
 }
 
 fn parseAliases(arena: std.mem.Allocator, value: ?std.json.Value) DefinitionError![]const []const u8 {

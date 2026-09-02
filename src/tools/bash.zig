@@ -477,7 +477,10 @@ fn runAutoBackgroundable(
     allow_auto_background: bool,
     metrics: ?*ResultMetrics,
 ) ![]u8 {
-    const j_entry = try registry.spawnBackground(command, cwd);
+    // Spooled as private to this call. Every exit below either renders the
+    // output and releases the files, or hands the job id to the model and
+    // promotes the job so its spool survives for `BashOutput` (issue #37).
+    const j_entry = try registry.spawnSynchronous(command, cwd);
     const job_id = j_entry.id; // 值拷贝，不持指针（registry 可能扩容移动）
 
     const effective_budget = if (allow_auto_background) @min(timeout_ms, AUTO_BACKGROUND_MS) else timeout_ms;
@@ -486,6 +489,7 @@ fn runAutoBackgroundable(
     while (true) {
         if (abort) |a| if (a.isAborted()) {
             registry.kill(job_id[0..]) catch {};
+            registry.releaseSpool(job_id[0..]);
             return error.Aborted;
         };
         util_time.sleepMs(100);
@@ -493,7 +497,9 @@ fn runAutoBackgroundable(
         registry.reapExited();
         const j = registry.get(job_id[0..]) orelse return error.JobNotFound; // 值快照
         if (j.status != .running) {
-            // 正常退出：读文件构造完整输出
+            // 正常退出：读文件构造完整输出。渲染完成（含 CAS 导入）后 spool 无人
+            // 再读——包括非零退出码与渲染失败这两条路径。
+            defer registry.releaseSpool(job_id[0..]);
             return try readJobAsSync(allocator, &j, artifact_root, metrics);
         }
 
@@ -501,10 +507,13 @@ fn runAutoBackgroundable(
         if (elapsed >= timeout_ms) {
             // 真 timeout：kill + 错误
             registry.kill(job_id[0..]) catch {};
+            registry.releaseSpool(job_id[0..]);
             return error.Timeout;
         }
         if (allow_auto_background and elapsed >= effective_budget) {
-            // 达到 auto-background 阈值但未到 timeout：返回 auto_backgrounded
+            // 达到 auto-background 阈值但未到 timeout：返回 auto_backgrounded。
+            // 此刻 job id 与两个路径进入模型可见结果 → 转为 background 保留期。
+            registry.promoteToBackground(job_id[0..]);
             return try formatAutoBackgrounded(allocator, &j);
         }
     }
@@ -728,6 +737,99 @@ test "BashTool embedding without JobRegistry still spools from byte zero" {
     var tail = try artifact.readChunk(allocator, root, artifact_id, 39_990, 32);
     defer tail.deinit();
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "EMBED_TAIL") != null);
+}
+
+fn spoolExists(path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&buf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return false;
+    _ = pfs.close(fd);
+    return true;
+}
+
+test "a synchronous run leaves no spool behind once its output is durable" {
+    // issue #37: the durable import copied the bytes into the CAS and kept the
+    // staging source, so the recoverable artifact and the raw spool both
+    // survived — the second one forever.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(allocator);
+    defer registry.deinit();
+    const ctx = ToolContext{ .allocator = allocator, .jobs = &registry, .artifact_root = root };
+    const result = try execute(&ctx, "{\"command\":\"awk 'BEGIN { for(i=0;i<4000;i++) printf \\\"x\\\" }'\"}");
+    defer allocator.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    // The bytes stayed recoverable: cleanup must not cost the model its
+    // ability to read the full output back.
+    try std.testing.expect(parsed.value.object.get("stdout_artifact_id").? != .null);
+    try std.testing.expect(parsed.value.object.get("stdout_recoverable").?.bool);
+
+    try std.testing.expectEqual(@as(usize, 1), registry.jobs.items.len);
+    const job = registry.jobs.items[0];
+    try std.testing.expect(!spoolExists(job.stdout_path));
+    try std.testing.expect(!spoolExists(job.stderr_path));
+}
+
+test "a synchronous run with output too small to publish still releases its spool" {
+    // The short-output path never publishes an artifact at all, so a fix that
+    // only unlinked after a durable import would leave these files behind —
+    // and they are the common case.
+    const allocator = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(allocator);
+    defer registry.deinit();
+    const ctx = ToolContext{ .allocator = allocator, .jobs = &registry };
+    const result = try execute(&ctx, "{\"command\":\"echo small\"}");
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "small") != null);
+
+    try std.testing.expectEqual(@as(usize, 1), registry.jobs.items.len);
+    const job = registry.jobs.items[0];
+    try std.testing.expect(!spoolExists(job.stdout_path));
+    try std.testing.expect(!spoolExists(job.stderr_path));
+}
+
+test "an explicitly backgrounded run keeps its spool readable" {
+    // The retention boundary in the other direction: BashOutput must still
+    // find the files after the tool result has been rendered.
+    const allocator = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(allocator);
+    defer registry.deinit();
+    const ctx = ToolContext{ .allocator = allocator, .jobs = &registry };
+    const result = try execute(&ctx, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\"}");
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"status\":\"started\"") != null);
+
+    try std.testing.expectEqual(@as(usize, 1), registry.jobs.items.len);
+    const job = registry.jobs.items[0];
+    try std.testing.expect(spoolExists(job.stdout_path));
+    try std.testing.expect(spoolExists(job.stderr_path));
+    registry.kill(job.idSlice()) catch {};
+}
+
+test "a timed-out run releases the spool of the process it killed" {
+    const allocator = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(allocator);
+    defer registry.deinit();
+    const ctx = ToolContext{ .allocator = allocator, .jobs = &registry };
+    try std.testing.expectError(
+        error.Timeout,
+        execute(&ctx, "{\"command\":\"sleep 30\",\"timeout\":300}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), registry.jobs.items.len);
+    const job = registry.jobs.items[0];
+    try std.testing.expect(!spoolExists(job.stdout_path));
+    try std.testing.expect(!spoolExists(job.stderr_path));
 }
 
 test "over-limit completed spool reports true size without a false commitment" {

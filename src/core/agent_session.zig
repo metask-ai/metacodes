@@ -1155,6 +1155,13 @@ pub const AgentSession = struct {
     abort_signal: AbortSignal,
     compact_abort_signal: AbortSignal,
     active_sink: ?EventSink = null,
+    /// Run-scoped candidate-response boundary (issue #34).
+    ///
+    /// Installed by the embedding facade around one Run, alongside whatever
+    /// Provider override that facade supplies, and cleared when the Run
+    /// finishes. Null is the ordinary path: the loop assembles and commits
+    /// exactly as before, unobserved.
+    response_observer: ?@import("response_candidate.zig").Observer = null,
 
     mutex: sync.Mutex = .{},
     callback_mutex: sync.Mutex = .{},
@@ -1840,6 +1847,18 @@ pub const AgentSession = struct {
         return admitted.runUserParts(parts, max_turns);
     }
 
+    /// Install the candidate-response boundary for the Runs that follow, or
+    /// clear it with null. Paired with the facade-owned Provider override: the
+    /// override decides what a response costs, the observer decides whether an
+    /// assembled one may become Conversation state, and installing one without
+    /// the other would leave a policy that can measure but not refuse.
+    pub fn setResponseObserver(
+        self: *AgentSession,
+        observer: ?@import("response_candidate.zig").Observer,
+    ) void {
+        self.response_observer = observer;
+    }
+
     pub fn admitRun(
         self: *AgentSession,
         run_id: u64,
@@ -1935,6 +1954,7 @@ pub const AgentSession = struct {
                     .host_session_ctx = hctx,
                 } else null,
                 .ui_requester = self.permission_ctx.ui_requester,
+                .response_observer = self.response_observer,
                 .emit_tool_cards = true,
                 .project_dir = self.workspace.root,
                 .cwd_abs = self.workspace.root,

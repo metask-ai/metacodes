@@ -4,6 +4,12 @@
 //! browser-based authorization-code + PKCE flow with a short-lived loopback
 //! callback server. The token JSON import path remains for headless CI and
 //! recovery.
+//!
+//! Metask's own resolution and storage stay here byte for byte. The PKCE,
+//! loopback-callback, authorize-URL and form-encoding primitives are exported
+//! because `api/oauth_login.zig` runs the same RFC 6749 flow for other
+//! providers (issue #33); one implementation of state validation and redirect
+//! parsing is worth more than a second copy that can drift from it.
 
 const std = @import("std");
 const rng = @import("platform").rng;
@@ -355,18 +361,18 @@ pub fn loginWithBrowser(allocator: std.mem.Allocator, opts: BrowserLoginOptions)
     return importOAuthTokenResponse(allocator, token_body, nowUnixSeconds());
 }
 
-const PkceCodes = struct {
+pub const PkceCodes = struct {
     code_verifier: []u8,
     code_challenge: []u8,
 
-    fn deinit(self: *PkceCodes, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *PkceCodes, allocator: std.mem.Allocator) void {
         secureFree(allocator, self.code_verifier);
         secureFree(allocator, self.code_challenge);
         self.* = undefined;
     }
 };
 
-fn generatePkce(allocator: std.mem.Allocator) !PkceCodes {
+pub fn generatePkce(allocator: std.mem.Allocator) !PkceCodes {
     const verifier = try randomBase64Url(allocator, 64);
     errdefer secureFree(allocator, verifier);
     var digest: [32]u8 = undefined;
@@ -377,7 +383,7 @@ fn generatePkce(allocator: std.mem.Allocator) !PkceCodes {
     return .{ .code_verifier = verifier, .code_challenge = challenge };
 }
 
-fn randomBase64Url(allocator: std.mem.Allocator, nbytes: usize) ![]u8 {
+pub fn randomBase64Url(allocator: std.mem.Allocator, nbytes: usize) ![]u8 {
     const bytes = try allocator.alloc(u8, nbytes);
     defer {
         @memset(bytes, 0);
@@ -414,7 +420,7 @@ fn buildAuthorizeUrlFromEnv(
     return buildAuthorizeUrl(allocator, authorize_url, client_id, scope, redirect_uri, code_challenge, state);
 }
 
-fn buildAuthorizeUrl(
+pub fn buildAuthorizeUrl(
     allocator: std.mem.Allocator,
     authorize_url: []const u8,
     client_id: []const u8,
@@ -437,11 +443,11 @@ fn buildAuthorizeUrl(
     return try aw.toOwnedSlice();
 }
 
-const CallbackServer = struct {
+pub const CallbackServer = struct {
     sock: net.Socket,
     port: u16,
 
-    fn bind(preferred_port: u16) !CallbackServer {
+    pub fn bind(preferred_port: u16) !CallbackServer {
         return bindOnPort(preferred_port) catch |err| switch (err) {
             error.BindFailed => bindOnPort(FALLBACK_LOGIN_PORT) catch bindOnPort(0),
             else => return err,
@@ -454,11 +460,11 @@ const CallbackServer = struct {
         return .{ .sock = l.sock, .port = l.port };
     }
 
-    fn close(self: *CallbackServer) void {
+    pub fn close(self: *CallbackServer) void {
         net.closeSocket(self.sock);
     }
 
-    fn waitForAuthorizationCode(self: *CallbackServer, allocator: std.mem.Allocator, expected_state: []const u8) ![]u8 {
+    pub fn waitForAuthorizationCode(self: *CallbackServer, allocator: std.mem.Allocator, expected_state: []const u8) ![]u8 {
         while (true) {
             const conn_fd = net.acceptConn(self.sock) orelse return error.AcceptFailed;
             defer net.closeSocket(conn_fd);
@@ -629,7 +635,7 @@ fn postTokenForm(allocator: std.mem.Allocator, form: []const u8) ![]u8 {
     return response_body;
 }
 
-fn openBrowser(allocator: std.mem.Allocator, url: []const u8) !void {
+pub fn openBrowser(allocator: std.mem.Allocator, url: []const u8) !void {
     const opener = if (std.c.getenv("BROWSER")) |b| std.mem.span(b) else "xdg-open";
     const env_path = "/usr/bin/env";
     const env_z = try allocator.dupeZ(u8, env_path);
@@ -835,7 +841,7 @@ fn buildRefreshRequestBody(allocator: std.mem.Allocator, refresh_token: []const 
     return try aw.toOwnedSlice();
 }
 
-fn appendFormField(writer: *std.Io.Writer, name: []const u8, value: []const u8, first: bool) !void {
+pub fn appendFormField(writer: *std.Io.Writer, name: []const u8, value: []const u8, first: bool) !void {
     if (!first) try writer.writeByte('&');
     try appendFormEncoded(writer, name);
     try writer.writeByte('=');
@@ -859,7 +865,7 @@ fn appendFormEncoded(writer: *std.Io.Writer, value: []const u8) !void {
     }
 }
 
-fn classifyOAuthEndpointError(status_code: u16, body: []const u8) anyerror {
+pub fn classifyOAuthEndpointError(status_code: u16, body: []const u8) anyerror {
     if (parseOAuthErrorCode(body)) |code| {
         defer std.heap.c_allocator.free(code);
         if (std.mem.eql(u8, code, "invalid_grant")) return error.OAuthLoginRequired;
@@ -958,7 +964,7 @@ fn nowUnixSeconds() i64 {
     return time.nowUnix();
 }
 
-fn secureFree(allocator: std.mem.Allocator, bytes: []u8) void {
+pub fn secureFree(allocator: std.mem.Allocator, bytes: []u8) void {
     @memset(bytes, 0);
     allocator.free(bytes);
 }

@@ -104,6 +104,14 @@ pub const Session = struct {
     provider_id: Slug,
     /// Where rotated tokens are persisted. Owned.
     path: []u8,
+    /// The OAuth client that obtained this login (issue #33). Owned.
+    ///
+    /// It travels with the tokens because the refresh grant must present the
+    /// same client the authorization grant was issued to; re-deriving it from
+    /// configuration would break a login the moment that configuration moved,
+    /// and a profile need not declare one at all. Written at login and at
+    /// load, never during a refresh, so a borrow is stable for the exchange.
+    client_id: ?[]u8 = null,
 
     mutex: sync.Mutex = .{},
     settled: sync.Condition = .{},
@@ -159,8 +167,43 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         if (self.tokens) |*set| set.deinit(self.allocator);
+        if (self.client_id) |value| self.allocator.free(value);
         self.allocator.free(self.path);
         self.* = undefined;
+    }
+
+    /// Which OAuth client the refresh grant must present.
+    ///
+    /// The login's own record wins: the refresh grant has to present the same
+    /// client the authorization grant was issued to, and configuration may
+    /// well have moved since. `declared` is what the profile says, for a login
+    /// persisted before the client was recorded. The provider id is the last
+    /// resort — it is what this code sent before any of this existed, and it
+    /// is wrong for every real provider, so it survives only to avoid changing
+    /// the behavior of a login that predates the field.
+    pub fn clientIdFor(self: *const Session, declared: ?[]const u8) []const u8 {
+        if (self.client_id) |recorded| return recorded;
+        return declared orelse self.provider_id.slice();
+    }
+
+    /// Record which OAuth client obtained this login, before importing it.
+    /// Copies; passing null clears a previously recorded client.
+    pub fn setClientId(self: *Session, client_id: ?[]const u8) OAuthError!void {
+        const owned = if (client_id) |value|
+            (self.allocator.dupe(u8, value) catch return error.OutOfMemory)
+        else
+            null;
+        self.adoptClientId(owned);
+    }
+
+    /// Same, taking ownership. Infallible, which is what lets `load` install a
+    /// parsed record without an allocation that could fail between parsing and
+    /// adopting — and therefore leak the rest of what was parsed.
+    pub fn adoptClientId(self: *Session, owned: ?[]u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.client_id) |old| self.allocator.free(old);
+        self.client_id = owned;
     }
 
     /// Install tokens obtained by an initial login. Takes ownership.
@@ -191,7 +234,12 @@ pub const Session = struct {
         defer secureFree(self.allocator, text);
         if (text.len == 0) return false;
         const parsed = try parseStored(self.allocator, text);
-        self.adopt(parsed);
+        // Both halves are adopted, not copied: nothing between the parse and
+        // the adoption can fail, so neither half can be stranded. A login
+        // persisted before the client existed simply has none recorded, and
+        // the caller falls back to what the profile declares.
+        self.adoptClientId(parsed.client_id);
+        self.adopt(parsed.tokens);
         return true;
     }
 
@@ -297,7 +345,7 @@ pub const Session = struct {
     fn persist(self: *Session, tokens: TokenSet) OAuthError!void {
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(self.allocator);
-        renderStored(self.allocator, &buffer, tokens) catch return error.OutOfMemory;
+        renderStored(self.allocator, &buffer, tokens, self.client_id) catch return error.OutOfMemory;
         writeAtomicPrivate(self.allocator, self.path, buffer.items) catch return error.PersistFailed;
     }
 };
@@ -376,7 +424,12 @@ pub fn classifyTokenError(status: u16, body: []const u8) OAuthError {
 
 // ── persistence ──────────────────────────────────────────────────────────────
 
-fn renderStored(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tokens: TokenSet) !void {
+fn renderStored(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    tokens: TokenSet,
+    client_id: ?[]const u8,
+) !void {
     try out.appendSlice(allocator, "{\"schema_version\":1,\"access_token\":");
     try writeJsonString(allocator, out, tokens.access_token);
     try out.appendSlice(allocator, ",\"refresh_token\":");
@@ -390,10 +443,21 @@ fn renderStored(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tokens: T
         try out.appendSlice(allocator, ",\"scope\":");
         try writeJsonString(allocator, out, value);
     }
+    if (client_id) |value| {
+        try out.appendSlice(allocator, ",\"client_id\":");
+        try writeJsonString(allocator, out, value);
+    }
     try out.append(allocator, '}');
 }
 
-fn parseStored(allocator: std.mem.Allocator, text: []const u8) OAuthError!TokenSet {
+/// What one persisted login file holds. The client id is owned separately from
+/// the token set because it is configuration, not a secret.
+const StoredLogin = struct {
+    tokens: TokenSet,
+    client_id: ?[]u8,
+};
+
+fn parseStored(allocator: std.mem.Allocator, text: []const u8) OAuthError!StoredLogin {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{}) catch
@@ -413,11 +477,19 @@ fn parseStored(allocator: std.mem.Allocator, text: []const u8) OAuthError!TokenS
     const refresh_owned = allocator.dupe(u8, refresh) catch return error.OutOfMemory;
     errdefer secureFree(allocator, refresh_owned);
     const type_owned = allocator.dupe(u8, token_type) catch return error.OutOfMemory;
+    errdefer allocator.free(type_owned);
+    const client_owned = if (stringOf(root.object.get("client_id"))) |value|
+        (allocator.dupe(u8, value) catch return error.OutOfMemory)
+    else
+        null;
     return .{
-        .access_token = access_owned,
-        .refresh_token = refresh_owned,
-        .expires_at = expires,
-        .token_type = type_owned,
+        .tokens = .{
+            .access_token = access_owned,
+            .refresh_token = refresh_owned,
+            .expires_at = expires,
+            .token_type = type_owned,
+        },
+        .client_id = client_owned,
     };
 }
 

@@ -310,6 +310,41 @@ every lifecycle test drives a fake exchange and none needs a network;
 `src/api/oauth_exchange.zig` is the production half, one small auditable
 `refresh_token` grant over HTTP.
 
+### Obtaining the first token
+
+The lifecycle above starts from a token that already exists. `metacodes login
+--provider <id>` is how one is obtained (issue #33), and it runs in
+`src/api/oauth_login.zig` — the kernel side, so a front end invokes a flow
+rather than implementing one. Two grants, because one does not cover the field:
+
+- **Loopback redirect + PKCE** is the default. A browser and a short-lived
+  listening socket on the same machine is the normal desktop case, and PKCE is
+  what keeps an observed redirect from being replayable.
+- **Device code (RFC 8628)** is the flow for headless and SSH sessions, which
+  have no browser to open and no loopback address an authorization server could
+  redirect to. `authorization_pending` and `slow_down` are the normal course of
+  such a flow; `access_denied` and `expired_token` end it.
+
+Both end in the same durable import as `--oauth-token-json`, which stays
+supported and is still the right path for CI and recovery. An interactive login
+and an imported token response are therefore indistinguishable to everything
+downstream.
+
+The **OAuth client is recorded with the login**, not re-derived at refresh time.
+The refresh grant must present the same client the authorization grant was
+issued to, so a client that lives only in configuration would break the login
+the moment that configuration moved. A profile may declare one
+(`oauth_client_id`); a configured provider declares it under
+`custom_providers.<id>.oauth`; `--client-id` supplies one for a profile that
+declares none. Built-in profiles deliberately declare no client id: the client
+an installation presents is registered by whoever runs it, and shipping a
+guessed one would point every user's first exchange at a client that is not
+theirs.
+
+A profile that declares neither an authorization nor a device endpoint has no
+interactive flow, and says so at the entry point instead of failing later at a
+null URL.
+
 ## Controls
 
 `ControlSpec` is provider-declared and versioned; the kernel owns no control
@@ -619,6 +654,7 @@ to the historical path, which still serves proxies and server-catalog models.
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
 | `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
+| `src/api/oauth_login.zig` | the interactive first-token grants (PKCE, device) |
 | `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
 | `src/repl/model_picker.zig` | picker state machine (pure) |
 | `src/repl/model_picker_view.zig` | picker rendering |
@@ -651,11 +687,6 @@ omission — and none of them is an acceptance criterion of the issue.
   differ by path rather than by wire; anything else is rejected (`UnknownWire`)
   rather than guessed.
 
-- **Interactive OAuth login for non-Metask providers (P1).** The lifecycle —
-  refresh, single flight, rotated-refresh persistence — is implemented and
-  reachable; obtaining the *first* token still means
-  `metacodes login --provider <id> --oauth-token-json <file>`. The browser /
-  device / PKCE flow is Metask-only.
 - **Per-offer capacity.** Throughput stays `unknown`: OpenRouter's endpoint rows
   do not carry it, so `hard_min_throughput_tps` can only ever reject. Latency is
   in the same position until a health plane observes it.

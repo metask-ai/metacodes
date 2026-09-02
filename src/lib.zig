@@ -30,6 +30,7 @@ pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const execution_effect = @import("core/execution_effect.zig");
+pub const response_candidate = @import("core/response_candidate.zig"); // candidate Provider response -> Conversation commit boundary
 pub const run_recovery = @import("core/run_recovery.zig");
 pub const file_reference = @import("core/file_reference.zig");
 pub const file_change = @import("core/file_change.zig"); // stable actual-file-modification contract

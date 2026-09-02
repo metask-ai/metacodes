@@ -112,6 +112,17 @@ pub const InputSchema = struct {
     /// 内置工具 comptime 声明的 properties。非 null 时优先于 properties 序列化。
     prop_specs: ?[]const PropSpec = null,
     required: ?[]const []const u8 = null,
+    /// Root-object `additionalProperties`, boolean form only (issue #35).
+    ///
+    /// `null` means the tool declared nothing, and the serialized schema is
+    /// byte-identical to what it was before this field existed — provider
+    /// prefix caches must not move because a representation gap was closed.
+    /// The schema-valued form (`additionalProperties: {...}`) is deliberately
+    /// not representable here; a boundary that cannot preserve it must reject
+    /// it rather than accept and silently drop it. Nothing in Core enforces
+    /// the constraint locally: it is declaration passed through to the model
+    /// provider, which remains the authority on JSON Schema semantics.
+    additional_properties: ?bool = null,
 };
 
 /// 序列化请求为 JSON 字节串。调用方 free。
@@ -438,6 +449,13 @@ pub fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), alloca
             try util_json.serializeString(r, buf, allocator);
         }
         try buf.append(allocator, ']');
+    }
+    // Emitted only when the tool declared it, so a schema that says nothing
+    // about undeclared properties serializes exactly as it did before this
+    // field existed.
+    if (schema.additional_properties) |additional| {
+        try buf.appendSlice(allocator, ",\"additionalProperties\":");
+        try buf.appendSlice(allocator, if (additional) "true" else "false");
     }
     try buf.append(allocator, '}');
 }
@@ -1007,6 +1025,51 @@ test "serializeInputSchema: prop_specs 输出具名字段+类型+说明(根治�
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"subject\":{\"type\":\"string\",\"description\":\"A brief title for the task\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"description\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"required\":[\"subject\",\"description\"]") != null);
+}
+
+test "serializeInputSchema emits a declared boolean additionalProperties" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+
+    const closed = InputSchema{
+        .type = "object",
+        .prop_specs = &.{.{ .name = "text", .type = "string" }},
+        .required = &.{"text"},
+        .additional_properties = false,
+    };
+    try serializeInputSchema(closed, &buf, std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}}," ++
+            "\"required\":[\"text\"],\"additionalProperties\":false}",
+        buf.items,
+    );
+
+    buf.clearRetainingCapacity();
+    try serializeInputSchema(
+        .{ .type = "object", .additional_properties = true },
+        &buf,
+        std.testing.allocator,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":true}",
+        buf.items,
+    );
+}
+
+test "serializeInputSchema omits additionalProperties when the tool declared none" {
+    // Provider-visible bytes are a cache contract: adding the field to the
+    // type must not move one byte of a schema that never mentions it.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try serializeInputSchema(
+        .{ .type = "object", .prop_specs = &.{.{ .name = "text", .type = "string" }}, .required = &.{"text"} },
+        &buf,
+        std.testing.allocator,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}",
+        buf.items,
+    );
 }
 
 test "serializeInputSchema: prop_specs 支持 array items 与 enum" {

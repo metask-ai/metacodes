@@ -1121,10 +1121,17 @@ pub const App = struct {
         }
         const session = &app.oauth_session.?;
 
+        // The refresh grant must present the same OAuth client the
+        // authorization grant was issued to. The login records it; the profile
+        // supplies it when it declares one; the provider id is the historical
+        // last resort for a login persisted before either existed.
         var exchange = oauth_exchange_mod.HttpExchange{
             .allocator = app.allocator,
             .io = app.api_client.http_client.io,
-            .endpoint = .{ .token_url = token_url, .client_id = built.id.slice() },
+            .endpoint = .{
+                .token_url = token_url,
+                .client_id = session.clientIdFor(built.oauth_client_id),
+            },
         };
         const before = session.generation;
         const token = try session.accessToken(now_seconds, exchange.exchange());

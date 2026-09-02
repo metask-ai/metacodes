@@ -14,6 +14,7 @@ const provider_mod = @import("../api/provider.zig");
 const dialect_mod = @import("../api/dialect.zig");
 const request_gate_mod = @import("request_gate.zig");
 const execution_effect = @import("execution_effect.zig");
+const response_candidate = @import("response_candidate.zig");
 const json_mod = @import("../json.zig");
 const tools_mod = @import("../tools.zig");
 const permission_mod = @import("../permission.zig");
@@ -233,6 +234,18 @@ pub const Options = struct {
     /// Optional execution-effect boundary. Null preserves the direct embedded
     /// path; durable Hosts and deterministic tests install an explicit adapter.
     execution_boundary: ?execution_effect.Boundary = null,
+    /// Optional candidate-response boundary (issue #34).
+    ///
+    /// The observer sees each Provider response as this loop assembles it and
+    /// may refuse one before it becomes Conversation state. Null is the whole
+    /// existing behavior, unobserved and unvetoable; a durable Host installs
+    /// one so it can admit content incrementally without letting a response it
+    /// cannot checkpoint reach the Conversation.
+    ///
+    /// Deliberately **not** passed to a subagent. A child Run commits to its
+    /// own Conversation; what reaches this one is a tool result, already
+    /// governed by the tool-result side of whatever policy installed this.
+    response_observer: ?response_candidate.Observer = null,
     /// 本次 run 归属的会话(emit/poll 路由用)。默认 .single(N=1/TUI);M6 多 Session 时
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
@@ -1193,6 +1206,26 @@ pub fn run(
         const context_recovery_cap = @max(conversation.len(), 1);
         var turn_stop_reason: api_stream.StopReason = .unknown;
         var rid_for_turn: log.RequestId = undefined;
+        // Re-issue counter for this turn. A context recovery or a mid-stream
+        // retry produces a *different* Provider response, so it opens a new
+        // candidate rather than continuing the abandoned one.
+        var candidate_attempt: u32 = 0;
+        // The candidate currently open, and whether it is still unsettled.
+        // Declared at turn scope because the commit-or-discard decision lives
+        // after `break :request_recovery`, and it is the decision the boundary
+        // exists to report.
+        var candidate = response_candidate.CandidateId{ .turn = turns + 1, .attempt = 0 };
+        var candidate_open = false;
+        // Totality: every candidate that begins settles exactly once. The
+        // paths below settle explicitly with the reason they know; this one
+        // catches the rest — an allocation failure between assembly and
+        // commit, and any early return a later change adds to this turn.
+        defer settleCandidate(
+            opts.response_observer,
+            &candidate_open,
+            candidate,
+            .{ .discarded = .run_error },
+        );
 
         // 3. 收集响应 blocks。声明在 request_recovery 外层，使 SSE context
         // recovery 可以清空临时状态后重试同一 turn。
@@ -1422,6 +1455,13 @@ pub fn run(
             // after a retry succeeds even when colorization is disabled.
             backend.emitEvent(sess, .stream_begin);
             output_channel.begin(turns + 1);
+            // From here to the commit-or-discard decision below, one candidate
+            // response is open. Every exit path settles it exactly once.
+            candidate = .{ .turn = turns + 1, .attempt = candidate_attempt };
+            candidate_attempt += 1;
+            if (opts.response_observer) |observer| observer.begin(candidate);
+            candidate_open = opts.response_observer != null;
+            var candidate_rejected = false;
             var aborted_during_stream = false;
             var stream_error = false;
             var stream_context_window_exceeded = false;
@@ -1452,8 +1492,17 @@ pub fn run(
                         output_channel.note(text.len);
                         try assistant_text.appendSlice(allocator, text);
                         log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
+                        const admission = observeCandidate(
+                            opts.response_observer,
+                            candidate,
+                            .{ .text = text },
+                        );
                         // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
                         allocator.free(text);
+                        if (admission == .reject) {
+                            candidate_rejected = true;
+                            break;
+                        }
                     },
                     .thinking => |text| {
                         // 思考过程:不混入 assistant_text(最终回答),单独 emit 给 UI 折叠显示。
@@ -1462,7 +1511,16 @@ pub fn run(
                         backend.emitEvent(sess, .{ .thinking_chunk = text });
                         try thinking_text.appendSlice(allocator, text);
                         log.debugId("agent", rid, "thinking chunk bytes={d}", .{text.len});
+                        const admission = observeCandidate(
+                            opts.response_observer,
+                            candidate,
+                            .{ .thinking = text },
+                        );
                         allocator.free(text);
+                        if (admission == .reject) {
+                            candidate_rejected = true;
+                            break;
+                        }
                     },
                     .tool_use_start => |tu_in| {
                         var tu = tu_in;
@@ -1485,6 +1543,17 @@ pub fn run(
                             .name = tu.name,
                             .input = tu.input_json,
                         });
+                        // Observed *before* any prefetch starts: a rejected
+                        // response tail must not start a tool effect that
+                        // should not occur.
+                        if (observeCandidate(opts.response_observer, candidate, .{ .tool_use = .{
+                            .id = tu.id,
+                            .name = tu.name,
+                            .input = tu.input_json,
+                        } }) == .reject) {
+                            candidate_rejected = true;
+                            break;
+                        }
                         // 流式执行(边流边跑):concurrency-safe(只读语义)+ 可流(非 WebSearch,不竞争
                         // 模型 client)+ 权限 allow(纯判定不 prompt)+ 无 PreToolUse hook → 立即开线程执行,
                         // 流末 executeSlots 直接用结果。广播自 P0.4 只读白名单(Read/Grep/Glob)到全 safe 集
@@ -1522,7 +1591,16 @@ pub fn run(
                         // 不可读、不展示、不进 assistant_text——只按序留存供下轮回传。
                         // append 失败则就地释放(所有权尚未转移)。
                         log.debugId("agent", rid, "reasoning item bytes={d}", .{item_json.len});
+                        const admission = observeCandidate(
+                            opts.response_observer,
+                            candidate,
+                            .{ .reasoning_item = item_json },
+                        );
                         reasoning_items.append(allocator, item_json) catch allocator.free(item_json);
+                        if (admission == .reject) {
+                            candidate_rejected = true;
+                            break;
+                        }
                     },
                     .usage => |u| {
                         // L1:usage 走 CoreEvent 总线(顶层 TuiBackend 累加进 app.usage;
@@ -1601,7 +1679,51 @@ pub fn run(
                 stream_error,
             });
 
+            // A runtime policy refused this candidate. Treat it exactly like a
+            // discarded partial — the visible bytes are withdrawn, nothing is
+            // committed, no further tool effect starts — and end the Run
+            // rather than re-issuing: a policy rejection is deterministic, so
+            // a retry would buy the identical response a second time.
+            if (candidate_rejected) {
+                log.warnId("agent", rid, "candidate response rejected by runtime policy at turn {d}", .{turns + 1});
+                output_channel.close(.discarded, assistant_text.items);
+                // Join before freeing: a prefetch thread borrows the tool_use
+                // bytes about to be released.
+                prefetch.joinAll();
+                for (tool_uses.items) |tu| {
+                    allocator.free(tu.id);
+                    allocator.free(tu.name);
+                    allocator.free(tu.input);
+                }
+                tool_uses.clearRetainingCapacity();
+                // This path always returns, so the list is released outright
+                // rather than cleared for a re-issue that will not happen.
+                for (assistant_blocks.items) |b| b.deinit(allocator);
+                assistant_blocks.deinit(allocator);
+                assistant_text.clearRetainingCapacity();
+                thinking_text.clearRetainingCapacity();
+                for (reasoning_items.items) |item| allocator.free(item);
+                reasoning_items.clearRetainingCapacity();
+                return rejectedCandidateRun(
+                    backend,
+                    sess,
+                    trace_id,
+                    depth,
+                    turns + 1,
+                    total_tool_calls,
+                    opts.response_observer,
+                    &candidate_open,
+                    candidate,
+                );
+            }
+
             if (aborted_during_stream) {
+                settleCandidate(
+                    opts.response_observer,
+                    &candidate_open,
+                    candidate,
+                    .{ .discarded = .aborted },
+                );
                 // 保留已流出的 partial assistant text（对齐 TS 原版 `onCancel` 行为）：
                 // 让用户看到已生成的内容；下次用 /retry 能继续。**语义**:可见但未完成 → partial,
                 // 绝不能被上层当成最终结果。
@@ -1638,6 +1760,12 @@ pub fn run(
             // context-window-exceeded 若发生在任何 assistant payload 之前，可以安全删老
             // history 并重开同一 turn；一旦已经流出内容，就不能假装 UI 可回滚。
             if (stream_error) {
+                settleCandidate(
+                    opts.response_observer,
+                    &candidate_open,
+                    candidate,
+                    .{ .discarded = .stream_error },
+                );
                 // 残缺 assistant_text 下面会被整体丢弃(不 commit 到 conversation)→ discarded。
                 // 消费者据此丢掉已缓冲的该段字节,不会把残片误当结果。
                 output_channel.close(.discarded, assistant_text.items);
@@ -1743,12 +1871,45 @@ pub fn run(
         // 清空 tool_uses 的所有权转移表示：此后 tool_uses.items 内的字节归 assistant_blocks 所有
         tool_uses.clearRetainingCapacity();
 
+        // The last question before the assembled message becomes Conversation
+        // state. A policy that can only decide once the response is complete
+        // answers here; one that already refused mid-stream never reaches it.
+        // `candidate_open` is only ever set from a non-null observer, which is
+        // what makes the unwrap below total.
+        if (candidate_open and assistant_blocks.items.len > 0 and
+            opts.response_observer.?.admit(candidate) == .reject)
+        {
+            log.warnId("agent", rid, "assembled candidate refused at commit, turn {d}", .{turns + 1});
+            output_channel.close(.discarded, assistant_text.items);
+            prefetch.joinAll();
+            for (assistant_blocks.items) |b| b.deinit(allocator);
+            assistant_blocks.deinit(allocator);
+            return rejectedCandidateRun(
+                backend,
+                sess,
+                trace_id,
+                depth,
+                turns + 1,
+                total_tool_calls,
+                opts.response_observer,
+                &candidate_open,
+                candidate,
+            );
+        }
+
         if (assistant_blocks.items.len > 0) {
             const blocks_slice = try assistant_blocks.toOwnedSlice(allocator);
             try conversation.append(.{ .role = .assistant, .blocks = blocks_slice });
+            settleCandidate(opts.response_observer, &candidate_open, candidate, .committed);
         } else {
             // 空响应，避免 deinit 释放已归还的 slice
             assistant_blocks.deinit(allocator);
+            settleCandidate(
+                opts.response_observer,
+                &candidate_open,
+                candidate,
+                .{ .discarded = .empty },
+            );
         }
 
         // 5. 如果这一轮没有 tool_use，整个请求结束
@@ -3522,6 +3683,61 @@ fn estimateNextRequestTokensFallback(
     return total;
 }
 
+/// The one way a Run ends because a runtime policy refused a candidate.
+///
+/// Both rejection sites — mid-stream and at the commit question — end here so
+/// they cannot drift on the settlement, the turn count, or the stop reason.
+/// `.budget` is the existing "a governor stopped this Run" reason; the caller
+/// that installed the observer is the one that knows which governor.
+fn rejectedCandidateRun(
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    turn: u32,
+    tool_calls: u32,
+    observer: ?response_candidate.Observer,
+    open: *bool,
+    candidate: response_candidate.CandidateId,
+) RunResult {
+    settleCandidate(observer, open, candidate, .{ .discarded = .rejected });
+    backend.emitEvent(sess, .{ .diag_turn_end = .{
+        .trace_id = trace_id,
+        .depth = depth,
+        .turn = turn,
+        .tool_calls = tool_calls,
+    } });
+    return finishRun(backend, sess, trace_id, depth, .{
+        .stop_reason = .budget,
+        .turns = turn,
+        .tool_calls = tool_calls,
+    });
+}
+
+/// One place where "no observer installed" means "accept". Keeping the
+/// `null` branch here rather than at each call site is what makes the
+/// unobserved path — the whole existing behavior — impossible to change by
+/// accident when a new observation point is added.
+fn observeCandidate(
+    observer: ?response_candidate.Observer,
+    candidate: response_candidate.CandidateId,
+    increment: response_candidate.Increment,
+) response_candidate.Admission {
+    const installed = observer orelse return .accept;
+    return installed.observe(candidate, increment);
+}
+
+fn settleCandidate(
+    observer: ?response_candidate.Observer,
+    open: *bool,
+    candidate: response_candidate.CandidateId,
+    settlement: response_candidate.Settlement,
+) void {
+    if (!open.*) return;
+    open.* = false;
+    if (observer) |installed| installed.settle(candidate, settlement);
+}
+
 fn estimateInputSchemaTokens(schema: json_mod.InputSchema) usize {
     var total = Conversation.estimateTokens(schema.type);
     if (schema.prop_specs) |props| {
@@ -3534,6 +3750,10 @@ fn estimateInputSchemaTokens(schema: json_mod.InputSchema) usize {
         var it = props.iterator();
         while (it.next()) |entry| total += Conversation.estimateTokens(entry.key_ptr.*);
     }
+    // Serialized only when declared, so the estimate only grows for a tool
+    // whose provider-visible schema actually grew.
+    if (schema.additional_properties != null)
+        total += Conversation.estimateTokens("additionalProperties");
     return total;
 }
 
@@ -5274,4 +5494,480 @@ test "usage-anchor 热路径:Read 图像 tool_result 增量按 IMAGE_TOKEN_ESTIM
     const total = estimateMessageTokens(m);
     try std.testing.expect(total >= conversation_mod.IMAGE_TOKEN_ESTIMATE);
     try std.testing.expect(total < 50_000);
+}
+
+// ── candidate-response boundary (issue #34) ─────────────────────────────────
+
+/// A Provider whose stream is scripted, and whose tail can be withheld until
+/// the test releases it. Withholding is the point: it is what proves an
+/// observation reaches the boundary *before* the response completes, which no
+/// amount of after-the-fact inspection can distinguish from buffering.
+const CandidateFake = struct {
+    const Script = enum { text_then_tail, text_then_error, text_then_tool_then_tail };
+
+    allocator: std.mem.Allocator,
+    script: Script,
+    /// Set by the test to let the blocked stream continue.
+    release: std.atomic.Value(bool) = .init(false),
+    /// Set by the stream when it has started waiting for that release.
+    blocked: std.atomic.Value(bool) = .init(false),
+    /// Observed by the test: still false while the response is incomplete.
+    completed: std.atomic.Value(bool) = .init(false),
+    abort_here: ?*AbortSignal = null,
+    index: u32 = 0,
+    sends: u32 = 0,
+    rid: log.RequestId = undefined,
+
+    fn state(ctx: *anyopaque) *CandidateFake {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// Block until the test releases the tail. A real Provider surfaces a
+    /// cancellation as `error.Aborted` out of `next()`; this reproduces that
+    /// so the loop's abort path is the one under test rather than a
+    /// test-only shortcut.
+    fn waitForRelease(self: *CandidateFake) !void {
+        self.blocked.store(true, .release);
+        var spins: usize = 0;
+        while (!self.release.load(.acquire) and spins < 2000) : (spins += 1)
+            util_time.sleepMs(1);
+        if (self.abort_here) |signal| {
+            if (signal.isAborted()) return error.Aborted;
+        }
+    }
+
+    fn next(ctx: *anyopaque) anyerror!?api_stream.StreamEvent {
+        const self = state(ctx);
+        const step = self.index;
+        self.index += 1;
+        switch (self.script) {
+            .text_then_tail => switch (step) {
+                0 => return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "first") },
+                1 => {
+                    try self.waitForRelease();
+                    return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "-tail") };
+                },
+                else => {
+                    self.completed.store(true, .release);
+                    return null;
+                },
+            },
+            .text_then_error => switch (step) {
+                0 => return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "first") },
+                else => {
+                    self.completed.store(true, .release);
+                    return error.ConnectionResetByPeer;
+                },
+            },
+            .text_then_tool_then_tail => switch (step) {
+                0 => return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "first") },
+                1 => return api_stream.StreamEvent{ .tool_use_start = .{
+                    .id = try self.allocator.dupe(u8, "tu_1"),
+                    .name = try self.allocator.dupe(u8, "Read"),
+                    .input_json = try self.allocator.dupe(u8, "{\"file_path\":\"/nonexistent\"}"),
+                } },
+                2 => return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "-tail") },
+                else => {
+                    self.completed.store(true, .release);
+                    return null;
+                },
+            },
+        }
+    }
+
+    fn streamDeinit(_: *anyopaque) void {}
+
+    fn stop(_: *anyopaque) api_stream.StopReason {
+        return .end_turn;
+    }
+
+    fn requestId(ctx: *anyopaque) log.RequestId {
+        return state(ctx).rid;
+    }
+
+    fn sendStreamRetry(
+        ctx: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const json_mod.ToolDefinition,
+        _: ?*const AbortSignal,
+        _: ?[]const u8,
+        _: ?json_mod.ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?provider_mod.RetryReporter,
+        _: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        const self = state(ctx);
+        if (self.sends > 0) return error.UnexpectedTestCall;
+        self.sends += 1;
+        self.index = 0;
+        self.rid = log.genRequestId();
+        return .{
+            .ctx = ctx,
+            .nextFn = next,
+            .deinitFn = streamDeinit,
+            .stopReasonFn = stop,
+            .requestIdFn = requestId,
+        };
+    }
+
+    fn sendStream(
+        ctx: *anyopaque,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const json_mod.ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?json_mod.ToolChoice,
+        user_query: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        return sendStreamRetry(ctx, messages, system, tools, abort, model_override, tool_choice, 0, 0, null, user_query);
+    }
+
+    fn send(
+        _: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const json_mod.ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!provider_mod.ApiResponse {
+        return error.UnexpectedTestCall;
+    }
+
+    fn model(_: *anyopaque) []const u8 {
+        return "fake";
+    }
+    fn maxTokens(_: *anyopaque) u32 {
+        return 32_000;
+    }
+    fn maxInputTokens(_: *anyopaque) u32 {
+        return 200_000;
+    }
+    fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
+    }
+    fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+        return false;
+    }
+
+    fn provider(self: *CandidateFake) provider_mod.Provider {
+        return .{
+            .ctx = @ptrCast(self),
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+};
+
+const CandidateSegments = struct {
+    allocator: std.mem.Allocator,
+    text: std.ArrayList(u8) = .empty,
+    dispositions: std.ArrayList(output_semantics.Disposition) = .empty,
+
+    fn deinit(self: *CandidateSegments) void {
+        self.text.deinit(self.allocator);
+        self.dispositions.deinit(self.allocator);
+    }
+
+    fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+        const self: *CandidateSegments = @ptrCast(@alignCast(ctx));
+        switch (ev) {
+            .text_chunk => |t| self.text.appendSlice(self.allocator, t) catch {},
+            .output_segment_end => |e| self.dispositions.append(self.allocator, e.disposition) catch {},
+            else => {},
+        }
+    }
+
+    fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+        return null;
+    }
+};
+
+const CandidateRun = struct {
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    permission: *const permission_mod.PermissionContext,
+    backend: *const UiBackend,
+    observer: response_candidate.Observer,
+    abort: ?*AbortSignal = null,
+    allocator: std.mem.Allocator,
+    result: ?anyerror!RunResult = null,
+
+    fn go(self: *CandidateRun) void {
+        self.result = run(
+            self.conversation,
+            self.provider,
+            &.{},
+            self.permission,
+            .{
+                .max_turns = 1,
+                .colorize = false,
+                .response_observer = self.observer,
+                .abort = self.abort,
+            },
+            self.backend,
+            self.allocator,
+        );
+    }
+};
+
+test "a candidate observation reaches the boundary before the response completes" {
+    // Issue #34's verification, exactly: emit the first text event, block, and
+    // check that the observation is already visible while the Provider still
+    // has a tail to send. Anything that buffered the whole response first
+    // would fail here and only here.
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tail };
+    var recorder = response_candidate.Recorder{ .allocator = a };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    var driver = CandidateRun{
+        .conversation = &conversation,
+        .provider = fake.provider(),
+        .permission = &perm,
+        .backend = &backend,
+        .observer = recorder.observer(),
+        .allocator = a,
+    };
+    var thread = try std.Thread.spawn(.{}, CandidateRun.go, .{&driver});
+
+    var spins: usize = 0;
+    while (!fake.blocked.load(.acquire) and spins < 2000) : (spins += 1)
+        util_time.sleepMs(1);
+    try std.testing.expect(fake.blocked.load(.acquire));
+    // The response has not completed, and the first increment is already at
+    // the boundary.
+    try std.testing.expect(!fake.completed.load(.acquire));
+    try std.testing.expect(recorder.count(.began) == 1);
+    try std.testing.expect(recorder.textAt(1, "first".len));
+
+    fake.release.store(true, .release);
+    thread.join();
+
+    const result = try (driver.result orelse return error.RunDidNotFinish);
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(
+        response_candidate.Settlement.committed,
+        recorder.settlement().?,
+    );
+    // Both halves of the response were assembled and committed as one message.
+    try std.testing.expectEqual(@as(usize, 2), conversation.len());
+    try std.testing.expectEqualStrings("first-tail", conversation.messages.items[1].blocks[0].text);
+    try std.testing.expectEqualStrings("first-tail", segments.text.items);
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.final, segments.dispositions.items[0]);
+}
+
+test "a stream error settles the candidate as discarded and commits nothing" {
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_error };
+    var recorder = response_candidate.Recorder{ .allocator = a };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(
+        &conversation,
+        fake.provider(),
+        &.{},
+        &perm,
+        .{
+            .max_turns = 1,
+            .colorize = false,
+            .response_observer = recorder.observer(),
+            // One attempt only: a same-turn re-issue would open a second
+            // candidate and this test is about the first one's settlement.
+            .max_stream_turn_retries = 0,
+        },
+        &backend,
+        a,
+    );
+    try std.testing.expectEqual(StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.began));
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.settled));
+    try std.testing.expectEqual(
+        response_candidate.Settlement{ .discarded = .stream_error },
+        recorder.settlement().?,
+    );
+    // The partial is withdrawn from the visible stream and never reaches
+    // Conversation, so the next turn cannot continue a fragment.
+    try std.testing.expectEqual(@as(usize, 1), conversation.len());
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.discarded, segments.dispositions.items[0]);
+}
+
+test "a cancellation settles the candidate as aborted" {
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var abort = AbortSignal.init();
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tail };
+    fake.abort_here = &abort;
+    var recorder = response_candidate.Recorder{ .allocator = a };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    var driver = CandidateRun{
+        .conversation = &conversation,
+        .provider = fake.provider(),
+        .permission = &perm,
+        .backend = &backend,
+        .observer = recorder.observer(),
+        .abort = &abort,
+        .allocator = a,
+    };
+    var thread = try std.Thread.spawn(.{}, CandidateRun.go, .{&driver});
+
+    var spins: usize = 0;
+    while (!fake.blocked.load(.acquire) and spins < 2000) : (spins += 1)
+        util_time.sleepMs(1);
+    abort.abort(.user_interrupt);
+    fake.release.store(true, .release);
+    thread.join();
+
+    const result = try (driver.result orelse return error.RunDidNotFinish);
+    try std.testing.expectEqual(StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(
+        response_candidate.Settlement{ .discarded = .aborted },
+        recorder.settlement().?,
+    );
+    // A cancelled response keeps what the user already saw, as `partial`.
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.partial, segments.dispositions.items[0]);
+}
+
+test "a rejected tail neither commits nor starts the tool effect it named" {
+    // text -> tool_use -> rejected tail. The rejection lands on the tool call,
+    // which is the observation that decides whether an effect starts at all.
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tool_then_tail };
+    // Observation 0 is the text; observation 1 is the assembled tool call.
+    var recorder = response_candidate.Recorder{ .allocator = a, .reject_observe_at = 1 };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(
+        &conversation,
+        fake.provider(),
+        &.{},
+        &perm,
+        .{ .max_turns = 2, .colorize = false, .response_observer = recorder.observer() },
+        &backend,
+        a,
+    );
+
+    try std.testing.expectEqual(StopReason.budget, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls);
+    try std.testing.expectEqual(
+        response_candidate.Settlement{ .discarded = .rejected },
+        recorder.settlement().?,
+    );
+    // Nothing reached Conversation: the user turn is still the only message.
+    try std.testing.expectEqual(@as(usize, 1), conversation.len());
+    // The published prefix is withdrawn rather than left standing as an answer.
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.discarded, segments.dispositions.items[0]);
+    // The rejection stopped the stream: the tail was never read.
+    try std.testing.expect(!fake.completed.load(.acquire));
+}
+
+test "a candidate refused at the commit question drops its assembled tool calls" {
+    // The other rejection door: every increment was accepted, the response
+    // completed, and only the assembled message is refused. The cleanup shape
+    // differs — the tool calls now live in `assistant_blocks`, and a prefetch
+    // thread may already be borrowing their bytes — so it needs its own cover.
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tool_then_tail };
+    fake.release.store(true, .release);
+    var recorder = response_candidate.Recorder{ .allocator = a, .reject_admit = true };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(
+        &conversation,
+        fake.provider(),
+        &.{},
+        &perm,
+        .{ .max_turns = 2, .colorize = false, .response_observer = recorder.observer() },
+        &backend,
+        a,
+    );
+
+    // The whole response was read — this rejection is not an early stop.
+    try std.testing.expect(fake.completed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.admitted));
+    try std.testing.expectEqual(StopReason.budget, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.tool_calls);
+    try std.testing.expectEqual(
+        response_candidate.Settlement{ .discarded = .rejected },
+        recorder.settlement().?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), conversation.len());
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.discarded, segments.dispositions.items[0]);
+}
+
+test "the unobserved path is unchanged" {
+    // Null observer is the whole existing behavior. Asserting it here means a
+    // later observation point cannot quietly change what an embedder without
+    // one sees.
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tail };
+    fake.release.store(true, .release);
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(&conversation, fake.provider(), &.{}, &perm, .{
+        .max_turns = 1,
+        .colorize = false,
+    }, &backend, a);
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), conversation.len());
+    try std.testing.expectEqualStrings("first-tail", conversation.messages.items[1].blocks[0].text);
 }

@@ -23,6 +23,11 @@ pub const BASE_URL = "https://api.openai.com/v1";
 /// `provider/oauth.zig`; only the URL is profile data.
 pub const OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
 
+/// RFC 6749 authorization endpoint, the companion of the token endpoint above.
+/// It is what makes `metacodes login --provider openai` a real browser flow
+/// (issue #33) rather than a request to produce a token response by hand.
+pub const OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
+
 fn entry(
     comptime request_model_id: []const u8,
     comptime display_name: []const u8,
@@ -81,6 +86,13 @@ pub const PROFILE = profile.ProviderProfile{
     .auth = .bearer,
     .default_channel = Slug.lit("default"),
     .oauth_token_url = OAUTH_TOKEN_URL,
+    .oauth_authorize_url = OAUTH_AUTHORIZE_URL,
+    // Deliberately undeclared: the OAuth client an installation presents is
+    // registered by whoever runs it, and inventing one here would send every
+    // user's first exchange to a client that is not theirs. `metacodes login
+    // --provider openai --client-id <id>` supplies it, and a `custom_providers`
+    // entry persists it.
+    .oauth_client_id = null,
 };
 
 test "openai profile routes both wire families from one channel" {
@@ -118,4 +130,14 @@ test "the profile declares a token endpoint for the OAuth kinds it accepts" {
     }
     try std.testing.expect(accepts_oauth);
     try std.testing.expect(PROFILE.oauth_token_url != null);
+}
+
+test "the profile declares a browser entry point for its first token" {
+    // Without an authorization endpoint the only way in is an out-of-band
+    // token response, which is the gap issue #33 reports.
+    try std.testing.expect(PROFILE.declaresInteractiveOAuth());
+    try std.testing.expectEqualStrings(
+        "https://auth.openai.com/oauth/authorize",
+        PROFILE.oauth_authorize_url.?,
+    );
 }

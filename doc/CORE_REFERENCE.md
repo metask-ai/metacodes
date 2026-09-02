@@ -165,6 +165,35 @@ core 因此把它**已经知道**的判定发出来。一个 **段** = 一次 pr
 `ledger.finalText()` / `partialText()`(续写组已拼好)。**账本不传给 subagent**:子 agent 的
 输出是父 Run 的工具结果,不是父 Run 的答案。
 
+#### 3.2.1.1 候选响应边界:这条响应能不能进 Conversation(`core/response_candidate.zig`)
+
+段的定性回答"这段文本算什么";候选响应边界回答的是上一个问题——**这条 provider 响应最终
+被接受了吗**,以及 runtime policy 有没有机会说不。
+
+一条 provider 响应的生命周期(消费 StreamEvent → 装配 text/thinking/tool_use → 发布可见输出
+→ 可能启动 tool 预取 → 组装 assistant message → commit 或丢弃)一直只存在于 AgentLoop 的局部
+状态里。外部要在 commit 前设闸,唯一办法是在上游把整条响应缓存下来先判定——AgentCore 的
+durable budget 层正是这么做的,代价是首个 content event 必须等整条响应收完(E9)。
+
+`Options.response_observer` 就是那条边界。按顺序:
+
+| 钩子 | 时机 | 语义 |
+|------|------|------|
+| `begin` | provider 响应开始 | 一个 candidate 打开(`turn` + `attempt`;同轮重发是**不同** candidate) |
+| `observe` | 每个 canonical 增量 | text / thinking / reasoning_item / **装配完成的** tool_use;返回 `.reject` 立即停流 |
+| `admit` | commit 前最后一问 | 只有收完整条响应才能判定的策略在此回答 |
+| `settle` | 决定已作出 | `committed` 或 `discarded`(aborted / stream_error / rejected / empty / run_error) |
+
+`begin` 与 `settle` **严格配对**:任何路径(含 abort、流错误、否决、装配期 OOM)都恰好 settle
+一次,所以 observer 可以把 `settle` 当作 `begin` 处预留资源的释放点。
+
+被否决的 candidate 不是错误,走的是与"丢弃的残段"完全相同的路径:可见段以 `discarded` 收尾
+(前端丢掉已缓冲字节)、不进 Conversation、**尚未启动的 tool effect 不会启动**(tool_use 在预取
+之前就被观察),Run 以 `stop_reason=budget` 结束——policy 否决是确定性的,重发只会再买一次同样
+的响应。
+
+observer 为 null 时行为与从前逐字节一致:不观察、不可否决。
+
 #### 3.2.2 文件修改结果:实际改了什么(`core/file_change.zig`)
 
 `file_refs` 只说"碰了哪些文件";`tool_result.content` 里的 `gitDiff` 是**工具私有渲染字段**

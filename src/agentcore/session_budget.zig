@@ -950,17 +950,27 @@ pub const BudgetedProvider = struct {
     }
 };
 
+/// Streams the Provider response through to the shared agent loop while it is
+/// still arriving, measuring as it goes (issue #34).
+///
+/// This used to buffer the complete response first and release it only once
+/// the whole thing was known to fit, so no consumer could see a first content
+/// event until the Provider had finished — the E9 behavioral debt. The
+/// candidate-response boundary replaces that compensation: an oversized
+/// response stops the stream *and* marks the controller outcome, and the
+/// observer below refuses the candidate before the agent loop can commit any
+/// of it to Conversation. Checkpointability is preserved by the veto rather
+/// than by withholding bytes.
 const StreamWrapper = struct {
     allocator: std.mem.Allocator,
     controller: *Controller,
     base: core.api_provider.StreamHandle,
     reservation: Reservation,
-    buffered: std.ArrayList(core.api_stream.StreamEvent) = .empty,
-    next_index: usize = 0,
     payload_bytes: u64 = 0,
     durable_delta_bytes: u64 = 0,
-    loaded: bool = false,
-    complete: bool = false,
+    /// The reservation has been settled or released; `deinit` must not do it
+    /// again.
+    settled: bool = false,
 
     fn handle(self: *StreamWrapper) core.api_provider.StreamHandle {
         return .{
@@ -974,95 +984,75 @@ const StreamWrapper = struct {
 
     fn next(raw: *anyopaque) anyerror!?core.api_stream.StreamEvent {
         const self = cast(raw);
-        if (!self.loaded) try self.loadAndValidate();
-        if (self.next_index == self.buffered.items.len) return null;
-        const event = self.buffered.items[self.next_index];
-        self.next_index += 1;
+        // An outcome already recorded — by this stream or by an earlier
+        // operation in the same Run — means nothing further may be admitted.
+        if (self.settled or self.controller.outcome() != .none) {
+            self.finish(.release);
+            return null;
+        }
+        const maybe_event = self.base.next() catch |err| {
+            self.finish(.release);
+            return translateContextError(err);
+        };
+        const event = maybe_event orelse {
+            self.finish(.settle);
+            return null;
+        };
+        const measured = measureStreamEvent(event) catch {
+            deinitStreamEvent(self.allocator, event);
+            self.failResourceLimit(std.math.maxInt(u64));
+            return null;
+        };
+        const next_payload = checkedAdd(self.payload_bytes, measured.payload) catch {
+            deinitStreamEvent(self.allocator, event);
+            self.failResourceLimit(std.math.maxInt(u64));
+            return null;
+        };
+        const next_durable = checkedAdd(self.durable_delta_bytes, measured.durable) catch {
+            deinitStreamEvent(self.allocator, event);
+            self.failResourceLimit(std.math.maxInt(u64));
+            return null;
+        };
+        if (next_payload > self.reservation.payloadCap()) {
+            deinitStreamEvent(self.allocator, event);
+            self.failResourceLimit(next_payload);
+            return null;
+        }
+        self.payload_bytes = next_payload;
+        self.durable_delta_bytes = next_durable;
         return event;
     }
 
-    /// Provider streams are held behind this bounded spool until the complete
-    /// canonical response is known to fit. Releasing chunks optimistically
-    /// would let an oversized tail leave an uncheckpointable partial response
-    /// in the shared agent loop.
-    fn loadAndValidate(self: *StreamWrapper) anyerror!void {
-        std.debug.assert(!self.loaded);
-        if (self.controller.outcome() != .none) {
-            self.reservation.release();
-            self.loaded = true;
-            self.complete = true;
-            return;
-        }
-        while (true) {
-            const maybe_event = self.base.next() catch |err| {
-                self.clearBuffered();
-                self.reservation.release();
-                return translateContextError(err);
-            };
-            const event = maybe_event orelse break;
-            const measured = measureStreamEvent(event) catch {
-                deinitStreamEvent(self.allocator, event);
-                self.clearBuffered();
-                self.reservation.failResourceLimit(std.math.maxInt(u64));
-                self.loaded = true;
-                self.complete = true;
-                return;
-            };
-            const next_payload = checkedAdd(
+    const Finish = enum { settle, release };
+
+    fn finish(self: *StreamWrapper, mode: Finish) void {
+        if (self.settled) return;
+        self.settled = true;
+        switch (mode) {
+            .settle => self.reservation.settleSuccess(
                 self.payload_bytes,
-                measured.payload,
-            ) catch {
-                deinitStreamEvent(self.allocator, event);
-                self.clearBuffered();
-                self.reservation.failResourceLimit(std.math.maxInt(u64));
-                self.loaded = true;
-                self.complete = true;
-                return;
-            };
-            const next_durable = checkedAdd(
                 self.durable_delta_bytes,
-                measured.durable,
-            ) catch {
-                deinitStreamEvent(self.allocator, event);
-                self.clearBuffered();
-                self.reservation.failResourceLimit(std.math.maxInt(u64));
-                self.loaded = true;
-                self.complete = true;
-                return;
-            };
-            if (next_payload > self.reservation.payloadCap()) {
-                deinitStreamEvent(self.allocator, event);
-                self.clearBuffered();
-                self.reservation.failResourceLimit(next_payload);
-                self.loaded = true;
-                self.complete = true;
-                return;
-            }
-            self.buffered.append(self.allocator, event) catch {
-                deinitStreamEvent(self.allocator, event);
-                self.clearBuffered();
-                self.reservation.release();
-                return error.OutOfMemory;
-            };
-            self.payload_bytes = next_payload;
-            self.durable_delta_bytes = next_durable;
+            ) catch {},
+            .release => self.reservation.release(),
         }
-        self.reservation.settleSuccess(
-            self.payload_bytes,
-            self.durable_delta_bytes,
-        ) catch {
-            self.clearBuffered();
-        };
-        self.loaded = true;
-        self.complete = true;
+    }
+
+    /// Record the overrun and stop the stream. The prefix already delivered is
+    /// withdrawn by the candidate observer, which refuses to admit a candidate
+    /// while an outcome stands.
+    fn failResourceLimit(self: *StreamWrapper, required: u64) void {
+        if (self.settled) return;
+        self.settled = true;
+        self.reservation.failResourceLimit(required);
     }
 
     fn deinit(raw: *anyopaque) void {
         const self = cast(raw);
         self.base.deinit();
-        if (!self.complete) self.reservation.release();
-        self.clearBuffered();
-        self.buffered.deinit(self.allocator);
+        // A stream torn down before its end — an abort, or a candidate the
+        // loop stopped consuming — releases rather than settles: those bytes
+        // never become durable state.
+        self.finish(.release);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -1082,12 +1072,59 @@ const StreamWrapper = struct {
     fn cast(raw: *anyopaque) *StreamWrapper {
         return @ptrCast(@alignCast(raw));
     }
+};
 
-    fn clearBuffered(self: *StreamWrapper) void {
-        for (self.buffered.items[self.next_index..]) |event|
-            deinitStreamEvent(self.allocator, event);
-        self.buffered.clearRetainingCapacity();
-        self.next_index = 0;
+/// The durable-admission side of the candidate-response boundary.
+///
+/// Deliberately tiny: all the accounting already happens in the Controller and
+/// the stream wrapper, so this only has to answer the one question the shared
+/// loop asks — may this candidate become Conversation state? It says no
+/// exactly when an outcome stands, which is the same condition that makes the
+/// Run terminal, so a rejected candidate can never be a false negative that
+/// silently drops a response the Session could have kept.
+pub const RunAdmission = struct {
+    controller: *Controller,
+
+    pub fn observer(self: *RunAdmission) core.response_candidate.Observer {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable = core.response_candidate.Observer.VTable{
+        .begin = beginFn,
+        .observe = observeFn,
+        .admit = admitFn,
+        .settle = settleFn,
+    };
+
+    fn beginFn(_: *anyopaque, _: core.response_candidate.CandidateId) void {}
+
+    fn observeFn(
+        raw: *anyopaque,
+        _: core.response_candidate.CandidateId,
+        _: core.response_candidate.Increment,
+    ) core.response_candidate.Admission {
+        return admission(cast(raw));
+    }
+
+    fn admitFn(
+        raw: *anyopaque,
+        _: core.response_candidate.CandidateId,
+    ) core.response_candidate.Admission {
+        return admission(cast(raw));
+    }
+
+    fn settleFn(
+        _: *anyopaque,
+        _: core.response_candidate.CandidateId,
+        _: core.response_candidate.Settlement,
+    ) void {}
+
+    fn admission(self: *RunAdmission) core.response_candidate.Admission {
+        return if (self.controller.outcome() == .none) .accept else .reject;
+    }
+
+    fn cast(raw: *anyopaque) *RunAdmission {
+        return @ptrCast(@alignCast(raw));
     }
 };
 
@@ -1219,6 +1256,49 @@ fn translateContextError(err: anyerror) anyerror {
 fn checkedAdd(left: anytype, right: anytype) Error!u64 {
     return std.math.add(u64, @intCast(left), @intCast(right)) catch
         return error.ResourceLimit;
+}
+
+test "run admission refuses a candidate exactly when an outcome stands" {
+    // The observer is the only thing standing between an oversized Provider
+    // response and Conversation now that the stream is no longer withheld, so
+    // the condition it decides on is worth pinning: it must accept while the
+    // Run is healthy and refuse the moment the controller has recorded any
+    // outcome — never the reverse, which would drop a response the Session
+    // could have kept.
+    var controller = Controller.init(std.testing.allocator, .{}, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 0,
+        .minimum_required_bytes = 0,
+    });
+    var admission = RunAdmission{ .controller = &controller };
+    var recorder = core.response_candidate.Recorder{ .allocator = std.testing.allocator };
+    defer recorder.deinit();
+    const observer = admission.observer();
+    const candidate = core.response_candidate.CandidateId{ .turn = 1, .attempt = 0 };
+
+    observer.begin(candidate);
+    try std.testing.expectEqual(
+        core.response_candidate.Admission.accept,
+        observer.observe(candidate, .{ .text = "early" }),
+    );
+    try std.testing.expectEqual(
+        core.response_candidate.Admission.accept,
+        observer.admit(candidate),
+    );
+
+    // What the stream wrapper does when a response outgrows its cap.
+    controller.markResourceLimit(4096);
+    try std.testing.expectEqual(
+        core.response_candidate.Admission.reject,
+        observer.observe(candidate, .{ .text = "tail" }),
+    );
+    try std.testing.expectEqual(
+        core.response_candidate.Admission.reject,
+        observer.admit(candidate),
+    );
+    // Settling is the loop's business; the observer must not object to any
+    // disposition it is told about.
+    observer.settle(candidate, .{ .discarded = .rejected });
 }
 
 test "pre-admission budget rejection consumes no operation state" {
