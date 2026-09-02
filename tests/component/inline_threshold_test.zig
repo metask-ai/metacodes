@@ -9,9 +9,11 @@
 //! still spilled - and that second transfer has to be lossless. T3 pins the
 //! seam itself from both sides.
 //!
-//! No Windows skip: nothing here spawns a process or probes POSIX file modes.
-//! The artifact layer runs on Windows in production, and `result_spool`'s own
-//! test runs there; a skip would let the Windows gate go green without these.
+//! T1-T4 do not skip on Windows: nothing in them spawns a process or probes
+//! POSIX file modes, the artifact layer runs on Windows in production, and
+//! `result_spool`'s own test runs there - a skip would let the Windows gate go
+//! green without them. T5 alone skips there: its quota fixture is a sparse
+//! file sized by `setSize`, which `_chsize_s` does not make cheap on Windows.
 
 const std = @import("std");
 const cc = @import("cc");
@@ -339,8 +341,8 @@ test "T5 inline threshold: a result that cannot be published degrades to a fallb
     defer a.free(filler);
     const fd = pfs.open(filler.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     if (fd < 0) return error.QuotaFixtureOpenFailed;
+    defer _ = pfs.close(fd); // a failing setSize must not return with the fd open
     try pfs.setSize(fd, artifact.MAX_SESSION_BYTES);
-    _ = pfs.close(fd);
 
     var capture = try artifact.Capture.begin(a, root, artifact.MAX_ARTIFACT_BYTES);
     defer capture.deinit();
@@ -368,7 +370,10 @@ test "T5 inline threshold: a result that cannot be published degrades to a fallb
     const o = parsed.value.object;
     try std.testing.expectEqualStrings("fallback", o.get("projection").?.string);
     try std.testing.expect(!o.get("recoverable").?.bool);
-    try std.testing.expect(o.get("storage_error").?.string.len > 0);
+    // Not merely "some reason": the model must be told *which* reason. A
+    // generic "artifact_persist_failed" here would keep this green while the
+    // model-visible cause silently degraded.
+    try std.testing.expectEqualStrings("artifact_session_quota_exceeded", o.get("storage_error").?.string);
     const head: u64 = @intCast(o.get("preview_head_bytes").?.integer);
     const tail: u64 = @intCast(o.get("preview_tail_bytes").?.integer);
     try std.testing.expect(head + tail > 0);

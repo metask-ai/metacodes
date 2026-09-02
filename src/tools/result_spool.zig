@@ -118,12 +118,12 @@ fn publish(
 /// layer made the same quota failure surface as "Grep failed with
 /// SessionQuotaExceeded" and lose the output entirely.
 ///
-/// Two cases still propagate, both matching the behaviour that predates the
-/// threshold change: OOM, which no fallback can help, and a capture too large
-/// to materialize - `PER_RESULT_MAX_BYTES` is the ceiling of what was ever
-/// inline here, so re-inlining inside it can restore the old degradation
-/// without reintroducing an unbounded read. An incomplete capture has no
-/// complete inline form and always published, so it propagates too.
+/// Three cases still propagate, each matching the behaviour that predates the
+/// threshold change: OOM, which no fallback can help; a capture too large to
+/// materialize - `PER_RESULT_MAX_BYTES` is the ceiling of what was ever inline
+/// here, so re-inlining inside it restores the old degradation without
+/// reintroducing an unbounded read; and an incomplete capture, which has no
+/// complete inline form and always published.
 fn inlineAfterFailedPublish(
     allocator: std.mem.Allocator,
     capture: *artifact_store.Capture,
@@ -172,6 +172,24 @@ test "CaptureWriter streams formatting and preserves small inline result" {
     try std.testing.expectEqualStrings("native-42", body.@"inline".bytes);
 }
 
+/// `src` with every comment-only line (`//`, `///`, `//!` after leading blanks)
+/// removed, so a guard that scans this file's text judges its code rather than
+/// its explanations of that code. Runs at test time on purpose: a comptime
+/// version tripped the default evaluation-branch quota on a file this size and
+/// would need the quota bumped every time the file grew.
+fn codeOnly(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |line| {
+        const body = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, body, "//")) continue;
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Index just past the `)` that closes the call opened at `open` (the index of
 /// its `(`), or null if unbalanced.
 ///
@@ -205,7 +223,13 @@ test "guard: callers hand over ctx.result_budget verbatim, and this file reads o
     // Needles are spliced at comptime so this test's own source, which is
     // embedded below, cannot satisfy or trip them.
     const forbidden_here = .{ "per_" ++ "turn", "payload" ++ "Allowance", "INLINE_DECISION" ++ "_BYTES" };
-    const self_src = @embedFile("result_spool.zig");
+    // Scan code, not prose. A comment that merely *names* the turn budget to
+    // explain why this file must not read it should not trip the check, and a
+    // comment that quotes the required field must not satisfy it. Comment-only
+    // lines are dropped before either scan; in-line trailing comments are rare
+    // enough here that the splice above still covers the test's own text.
+    const self_src = try codeOnly(std.testing.allocator, @embedFile("result_spool.zig"));
+    defer std.testing.allocator.free(self_src);
     inline for (forbidden_here) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, self_src, needle) == null);
     }
