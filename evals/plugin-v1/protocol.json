@@ -11,7 +11,9 @@
     "plugin_id": "metacodes.benchmark-coding",
     "plugin_version": "1.2.0",
     "form": "data_package",
-    "capabilities": ["skill_bundle"],
+    "capabilities": [
+      "skill_bundle"
+    ],
     "root": "evals/plugin-v1/coding-plugin",
     "files": {
       "evals/plugin-v1/coding-plugin/.metacodes-plugin/plugin.json": "e91ccc4446c4796a10509dda49af4a6357cb41aa03a3b391e697678e789147e1",
@@ -52,7 +54,11 @@
     "runner": "scripts.eval.paired_runner",
     "suite": "evals/plugin-v1/coding-suite.json",
     "suite_sha256": "936e3e97241239df2ae9034610065cadac8e9ea090bfc35df72eb5eba033c03d",
-    "task_ids": ["00_smoke", "02_html_game", "04_modify_feature"],
+    "task_ids": [
+      "00_smoke",
+      "02_html_game",
+      "04_modify_feature"
+    ],
     "scenario_sha256": {
       "00_smoke": "a5fac2330fa47cf7190423316414b7bb877cc5e687d65f6b4af9137d94b669d7",
       "02_html_game": "48e8610148ae1d3b85e0566eb528b5374b993b43175b962a7503b08e984a0c07",
@@ -63,10 +69,13 @@
     "treatment_executable": "scripts/eval/fixtures/plugin_candidate.py",
     "treatment_executable_sha256": "1a80f4f240e80df798521cb4cacd9a59d12d494cbee06468412b4fe751f28a61",
     "single_factor": "one namespaced Skill data package",
-    "implementation_fingerprint": "396dc4e2562c7bf510fd81c9f4e578b803a3bf80163c0e8d4736a532e7339203",
+    "implementation_fingerprint": "e549936ef283d8f5df35eb108fe751aaa3eb4424df31ac9093f5afc9df824190",
     "runtime_binary_sha256": "fd330c2e4c4120a129fb8148091011f014d29d2c496f4a24ffdd8232c5cce054",
     "evaluation_contract_version": 4,
-    "model": {"provider": "anthropic", "id": "glm-5.2"},
+    "model": {
+      "provider": "anthropic",
+      "id": "glm-5.2"
+    },
     "max_output_tokens": 8192,
     "request_input_reserve": {
       "strategy": "max_double_estimate_or_ceil_bytes_div_2_plus_framing",
@@ -124,12 +133,14 @@
     "scripts/eval/promotion.py": "65f566244d3880b367a0c9adee858b2160ed63d5b1644ea38202e79a34fb79f3",
     "scripts/eval/treatment_activation.py": "28b976feaf8caab1d03a42d58794b067b9ca892de248e72a2f4ab22eebe769b0",
     "scripts/eval/cli.py": "5646573271b8280dc3ad644ee477c22daa3059f36445686235d166c3e87afb0b",
-    "scripts/eval/plugin_release_gate.py": "729b9755ee52234c676f4cb36619181c9cf1be7eedf0f1a723a75db2f9fb3585",
+    "scripts/eval/plugin_release_gate.py": "45ddc26d466eaf3fe12971ca98e82d91d29df308e6cc3f6b46e31293e00a2856",
     "scripts/eval/plugin_pair_runner.py": "08713fcdc417e7bf81315c6024c3d911192adc407d08c8259dc1f3a4d6ac709b",
     "scripts/eval/plugin_pair_analysis.py": "7aa81f79d843f52b8de96a1f33f533a18f699bd6205255356187604f604126ff",
     "tests/e2e/run_e2e.sh": "38b21bdc939682e870846cc57731c90b2a114aec285b8df6d8019ba7a59314f3",
     "tests/e2e/lib.sh": "6d7de5cd8fe0e70929b32ea82364a12d16787e690687ab098d6eb8a52383c43a",
-    "evals/gates/default.json": "542ea99c4576cf585bccdd9470a87482b9f308de69cb4f197be7434d466a2faa"
+    "evals/gates/default.json": "542ea99c4576cf585bccdd9470a87482b9f308de69cb4f197be7434d466a2faa",
+    "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean": "9e2c42b1a1d99912f9cf96fb54c83ddcaace2e1f6e2511721d42768a32c739d8",
+    "control-plane/lean/MetaCodesControl/ObligationGate.lean": "c07307865b182cdebc73c72ed007bb6ae0514833b1247b86fcccb770503e426c"
   },
   "implementation_paths": [
     "build.zig",
@@ -222,6 +233,8 @@
     "src/web/session.zig",
     "src/repl/tui/widget/tool_card.zig",
     "sdk/metask/agentcore.h",
+    "sdk/zig/protocol.zig",
+    "sdk/zig/build.zig",
     "sdk/zig/root.zig",
     "sdk/zig/types.zig",
     "sdk/rust/build.rs",
@@ -255,8 +268,6 @@
     "tests/integration/skills_e2e_test.zig",
     "tests/agentcore_artifact_consumer/consumer.c",
     "tests/agentcore_artifact_consumer/main.zig",
-    "tests/agentcore_artifact_consumer/manifest_contract.zig",
-    "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean",
-    "control-plane/lean/MetaCodesControl/ObligationGate.lean"
+    "tests/agentcore_artifact_consumer/manifest_contract.zig"
   ]
 }
