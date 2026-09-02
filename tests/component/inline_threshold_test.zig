@@ -130,6 +130,13 @@ test "T1 inline threshold: a result above per_result is published once by the to
     try std.testing.expect(content.len <= budget.per_result_bytes);
 }
 
+// Unlike T1, T3 and T4, this one does **not** discriminate the threshold
+// change: mutation-tested, it stays green with the old 64KB constant restored,
+// because all eighteen results are under 64KB either way. That is on purpose
+// and worth stating so nobody later reads it as protecting the seam. It guards
+// the orthogonal property the threshold change makes more likely to be hit -
+// that when siblings drive the water line below `per_result_bytes`, the
+// resulting second transfer is lossless and leaves small results alone.
 test "T2 inline threshold: siblings that drive the water line below per_result force a second transfer, and it loses nothing" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
