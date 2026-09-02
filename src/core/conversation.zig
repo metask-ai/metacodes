@@ -302,8 +302,9 @@ pub const Conversation = struct {
     /// Literal replacement with an owned conversation: no suffix CAS and no
     /// delivery-watermark merge (the replacement's own flags are taken as is).
     /// Production compaction goes through `replaceWithOwnedIfSuffixUnchanged`;
-    /// this entry has no production caller. `replacement` is drained on success.
-    pub fn replaceWithOwned(self: *Conversation, replacement: *Conversation) bool {
+    /// this entry exists only for the allocator-boundary tests in this file and
+    /// is deliberately not public. `replacement` is drained on success.
+    fn replaceWithOwned(self: *Conversation, replacement: *Conversation) bool {
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
         return self.replaceWithOwnedLocked(replacement);
@@ -333,9 +334,11 @@ pub const Conversation = struct {
     /// both carries a watermark set while the preview was in flight and
     /// clears a stale `true` that `Message.dupe` copied into a message the
     /// preview later rewrote; a reordered or rewritten message can never end
-    /// up delivered by position. When the counts differ (never the case on
-    /// the suffix-CAS path) every replacement flag is cleared: undelivered is
-    /// the conservative direction and self-heals at the next request.
+    /// up delivered by position. When the counts differ (a compact preview
+    /// always yields an equal count; the suffix CAS does not itself constrain
+    /// the replacement's length, so any other caller lands here) every
+    /// replacement flag is cleared: undelivered is the conservative direction
+    /// and self-heals at the next accepted request.
     fn mergeDeliveredIntoLocked(self: *const Conversation, replacement: *Conversation) void {
         if (replacement.messages.items.len != self.messages.items.len) {
             for (replacement.messages.items) |*rep| rep.delivered = false;
@@ -666,14 +669,22 @@ pub const Conversation = struct {
 
     /// Delivery watermark: the entire retained history is treated as
     /// delivered — every active message was carried by the request just
-    /// sent, and compacted prefix messages sit behind the boundary and are
-    /// never sent again. Called by agent_loop once the provider has accepted
-    /// the request for streaming (a stream handle came back; a request the
-    /// provider rejected with an HTTP error does not deliver); nothing else
-    /// may claim delivery (a local
-    /// assistant append such as the AgentCore budget terminal marker is not a
-    /// provider reply). Image results that are not yet delivered are protected
-    /// from microcompact: a picture is a raw payload here rather than a
+    /// accepted, and compacted prefix messages sit behind the boundary and
+    /// are never sent again. Called by agent_loop once the provider has
+    /// accepted the request for streaming (a stream handle came back; a
+    /// request the provider rejected with an HTTP error does not deliver).
+    /// Nothing else may claim delivery: a local assistant append such as the
+    /// AgentCore budget terminal marker is not a provider reply.
+    ///
+    /// Granularity is the message. A tool_result the request normalizer
+    /// strips as an orphan (no matching tool_use in the active range, see
+    /// message_repair.normalizeApiMessages) is marked as well, deliberately:
+    /// the active range only ever shrinks from the front, so an orphan can
+    /// never reach a provider in any later request either, and protecting it
+    /// from microcompact would only pin dead bytes.
+    ///
+    /// Image results that are not yet delivered are protected from
+    /// microcompact: a picture is a raw payload here rather than a
     /// recoverable envelope (projection exempts it), and the recent-N valve
     /// counts results rather than turns, so a Read(image) with two parallel
     /// siblings would otherwise be cleared before the provider ever saw it.
