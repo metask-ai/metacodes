@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
 import math
 import os
 import subprocess
+import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Sequence, Tuple
 
 from .e2e_adapter import comparison_fingerprints, import_run
 from .experiment import (
@@ -74,17 +77,93 @@ class InfrastructureRunError(ValidationError):
         )
 
 
-def _runner_env() -> Dict[str, str]:
-    """Remove host treatment knobs before applying the frozen runtime env."""
+# Variables through which the invoking shell changes what a child bash,
+# python or dynamically linked binary executes without any file in the tree
+# changing: startup-file hooks, exported functions, module search paths,
+# loader preloads. Dropped from every child environment the evaluation
+# spawns. PATH stays: the binaries on it are the operator's trust boundary,
+# and a fixed tool path would not survive the self-hosted runners.
+HOST_INJECTION_ENV_KEYS = frozenset(
+    {
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "CDPATH",
+        "GLOBIGNORE",
+        "PERL5OPT",
+        "PERL5LIB",
+        "NODE_OPTIONS",
+        "RUBYOPT",
+    }
+)
+HOST_INJECTION_ENV_PREFIXES = ("BASH_FUNC_", "DYLD_", "LD_", "PYTHON")
+
+
+def hermetic_env(base: Mapping[str, str]) -> Dict[str, str]:
+    """`base` without the shell / interpreter / loader injection vectors."""
     return {
         key: value
-        for key, value in os.environ.items()
-        if not key.startswith("METACODES_")
-        and not key.startswith("TINYKG_")
-        and not key.startswith("E2E_")
-        and not key.startswith("CLAUDE_CODE_")
-        and key != "RG_BIN"
+        for key, value in base.items()
+        if key not in HOST_INJECTION_ENV_KEYS
+        and not key.startswith(HOST_INJECTION_ENV_PREFIXES)
     }
+
+
+def _runner_env() -> Dict[str, str]:
+    """Remove host treatment knobs and injection vectors before applying the
+    frozen runtime env."""
+    return hermetic_env(
+        {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("METACODES_")
+            # A host credential next to the runner's anonymous credential
+            # FD is "ambiguous E2E provider credentials" in lib.sh: the
+            # request never happens, and the authorized transaction is left
+            # an orphan that blocks resume.
+            and not key.startswith("METASK_")
+            and not key.startswith("TINYKG_")
+            and not key.startswith("E2E_")
+            and not key.startswith("CLAUDE_CODE_")
+            and key != "RG_BIN"
+        }
+    )
+
+
+@contextlib.contextmanager
+def interpreter_shim(env: Mapping[str, str]) -> Iterator[Dict[str, str]]:
+    """A child environment whose `python3` is this process's interpreter.
+
+    The harness resolves `python3` - its helpers and every
+    `#!/usr/bin/env python3` wrapper - from PATH, while the runner validates
+    rollouts with its own interpreter's `platform.python_version()`. If the
+    two differ, every honest row fails the environment fingerprint after the
+    money is spent. A shim directory first on PATH makes them one
+    interpreter. The shim is a launcher that execs the absolute
+    `sys.executable`, not a symlink: CPython discovers a venv from the path
+    it was invoked through, so a symlink would silently drop the runner's
+    venv. It fails closed - a run that cannot pin its interpreter must not
+    start, since the inventory preflight runs this before any authorization.
+    """
+    executable = sys.executable
+    if not executable or not os.path.isabs(executable) or not os.access(executable, os.X_OK):
+        raise ValidationError(
+            "cannot pin the harness interpreter: sys.executable is not an absolute executable"
+        )
+    with tempfile.TemporaryDirectory(prefix="metacodes-eval-python-") as shim:
+        launcher = os.path.join(shim, "python3")
+        try:
+            with open(launcher, "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/sh\nexec " + _shell_quote(executable) + ' "$@"\n')
+            os.chmod(launcher, 0o700)
+        except OSError as exc:
+            raise ValidationError(f"cannot pin the harness interpreter: {exc}") from exc
+        yield {**env, "PATH": shim + os.pathsep + env.get("PATH", "")}
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
 
 
 def _require_budget(
@@ -585,7 +664,44 @@ def _load_checkpoint(
 ) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
-    rollouts = load_rollouts(path)
+    return _validate_checkpoint_rows(
+        load_rollouts(path),
+        variant=variant,
+        suite=suite,
+        repo_root=repo_root,
+        binary=binary,
+        trials=trials,
+        expected_tasks=expected_tasks,
+        model_provider=model_provider,
+        model_id=model_id,
+        harness_revision=harness_revision,
+        harness_config_id=harness_config_id,
+        require_runtime_budget=require_runtime_budget,
+        treatment_verifier=treatment_verifier,
+    )
+
+
+def _validate_checkpoint_rows(
+    rollouts: List[Dict[str, Any]],
+    *,
+    variant: str,
+    suite: Dict[str, Any],
+    repo_root: Path,
+    binary: Path,
+    trials: int,
+    expected_tasks: Mapping[str, Dict[str, Any]],
+    model_provider: str,
+    model_id: str,
+    harness_revision: str,
+    harness_config_id: str | None = None,
+    require_runtime_budget: bool = False,
+    treatment_verifier: tuple[Path, str] | None = None,
+) -> List[Dict[str, Any]]:
+    """The grounded-identity validation every persisted rollout must pass:
+    unique keys, scoring validity, and every fingerprint equal to what this
+    suite / binary / model / revision would produce. Resume runs it on a
+    checkpoint; the plugin analysis runs it on the evidence it judges, so
+    the two cannot accept different rows."""
     keys = [(item["task_id"], item["trial"]) for item in rollouts]
     duplicates = sorted(key for key, count in Counter(keys).items() if count > 1)
     if duplicates:
@@ -757,13 +873,14 @@ def _run_once(
             credential_write_fd = -1
             env["E2E_API_KEY_FD"] = str(credential_read_fd)
             subprocess_options["pass_fds"] = (credential_read_fd,)
-        completed = subprocess.run(
-            [str(repo_root / "tests/e2e/run_e2e.sh"), scenario_glob],
-            cwd=repo_root,
-            env=env,
-            check=False,
-            **subprocess_options,
-        )
+        with interpreter_shim(env) as child_env:
+            completed = subprocess.run(
+                [str(repo_root / "tests/e2e/run_e2e.sh"), scenario_glob],
+                cwd=repo_root,
+                env=child_env,
+                check=False,
+                **subprocess_options,
+            )
     finally:
         if credential_write_fd >= 0:
             os.close(credential_write_fd)

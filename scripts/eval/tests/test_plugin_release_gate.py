@@ -15,6 +15,7 @@ from scripts.eval.plugin_release_gate import (
     PluginGateError,
     _benchmark_row,
     _median_int,
+    _require_exact_tree,
     attest_runtime_artifact,
     implementation_fingerprint,
     load_protocol,
@@ -467,6 +468,84 @@ class RunGateSnapshotTest(unittest.TestCase):
                 )
             self.assertEqual({"bytes": 2, "text": 0}, reads)
             self.assertEqual(hashlib.sha256(real_read_bytes(path)).hexdigest(), receipt["protocol_sha256"])
+
+class CandidateTreeIsPinnedExactlyTest(unittest.TestCase):
+    """`candidate.files` hashes prove the pinned files are unchanged; the
+    tree check proves they are the only files. A file added beside a pinned
+    Skill needs no protocol edit, so nothing else would notice it."""
+
+    PINNED = {"plugin/plugin.json": "x", "plugin/skills/verify/SKILL.md": "y"}
+
+    def _tree(self, root: Path) -> Path:
+        skill = root / "plugin/skills/verify"
+        skill.mkdir(parents=True)
+        (root / "plugin/plugin.json").write_text("{}", encoding="utf-8")
+        (skill / "SKILL.md").write_text("skill", encoding="utf-8")
+        return skill
+
+    def test_exactly_the_pinned_files_and_nothing_else(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = self._tree(root)
+            _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            extra = skill / "reference.md"
+            extra.write_text("unpinned", encoding="utf-8")
+            with self.assertRaisesRegex(PluginGateError, r"unpinned \['plugin/skills/verify/reference.md'\], missing \[\]"):
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            extra.unlink()
+            (root / "plugin/plugin.json").unlink()
+            with self.assertRaisesRegex(PluginGateError, r"unpinned \[\], missing \['plugin/plugin.json'\]"):
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            (root / "plugin/plugin.json").write_text("{}", encoding="utf-8")
+            _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            # Directory names are part of the runtime's Skill identity: an
+            # empty directory the pins do not imply is a different candidate.
+            (skill / "resources").mkdir()
+            with self.assertRaisesRegex(PluginGateError, r"directories its pins do not imply: unpinned \['plugin/skills/verify/resources'\]"):
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            (skill / "resources").rmdir()
+            with self.assertRaisesRegex(PluginGateError, "not a directory"):
+                _require_exact_tree(root, "plugin/plugin.json", self.PINNED, "candidate")
+            with self.assertRaisesRegex(PluginGateError, "unsafe protocol path"):
+                _require_exact_tree(root, "../plugin", self.PINNED, "candidate")
+
+    @unittest.skipIf(os.name == "nt", "symlink and mode-bit fixtures require POSIX")
+    def test_symlinks_and_executable_files_under_the_candidate_root_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = self._tree(root)
+            # A symlink is refused even when it points at a pinned file: what
+            # the runtime would read is not what the pin describes.
+            (skill / "alias.md").symlink_to(skill / "SKILL.md")
+            with self.assertRaisesRegex(PluginGateError, "contains a symlink: plugin/skills/verify/alias.md"):
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            (skill / "alias.md").unlink()
+            # The executable bit is hashed into the Skill content revision;
+            # identical bytes with +x are a different candidate.
+            os.chmod(skill / "SKILL.md", 0o755)
+            with self.assertRaisesRegex(PluginGateError, "executable or special file: plugin/skills/verify/SKILL.md"):
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            os.chmod(skill / "SKILL.md", 0o644)
+            _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+
+    def test_every_loader_checks_the_candidate_tree(self) -> None:
+        with mock.patch(
+            "scripts.eval.plugin_release_gate._require_exact_tree",
+            side_effect=PluginGateError("candidate tree probe"),
+        ) as probe:
+            with self.assertRaisesRegex(PluginGateError, "candidate tree probe"):
+                load_protocol_structure(ROOT, PROTOCOL)
+            with tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(PluginGateError, "candidate tree probe"):
+                    load_protocol(ROOT, _repinned_copy(Path(directory)))
+        protocol = json.loads(PROTOCOL.read_text(encoding="utf-8"))
+        for call in probe.call_args_list:
+            self.assertEqual(
+                (ROOT, protocol["candidate"]["root"], protocol["candidate"]["files"], "candidate"),
+                call.args,
+            )
+        self.assertGreaterEqual(len(probe.call_args_list), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

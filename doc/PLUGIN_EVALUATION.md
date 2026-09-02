@@ -138,10 +138,12 @@ policy violation 为 0。
 `scripts/eval/plugin_pair_runner.py` 默认只打印 0-provider 计划。付费执行同时要求：
 
 1. `--allow-paid-rollouts`；
-2. 0600 私有用户授权文件，绑定精确 protocol hash 和预算；
-3. 0600 provider auth 文件；
-4. 位于输出目录之外的独占、崩溃保守 budget journal。
-5. `--runtime-binary <path>` 显式指定与 protocol SHA-256 pin 一致的
+2. `--frozen-manifest <manifest.json>`：先用 `--freeze` 写出的冻结清单（§7.1）；
+3. 0600 私有用户授权文件（`metacodes.plugin-paid-authority/v2`），绑定精确 protocol hash、
+   该清单的 `manifest_sha256` 和预算；
+4. 0600 provider auth 文件；
+5. 位于输出目录之外的独占、崩溃保守 budget journal；
+6. `--runtime-binary <path>` 显式指定与 protocol SHA-256 pin 一致的
    ReleaseSmall artifact；不得从环境中的 `zig-out` 隐式选择。
 
 无 `--runtime-binary` 的计划使用 `metacodes.plugin-paid-plan/v2` 的
@@ -152,7 +154,8 @@ policy violation 为 0。
 每个 rollout 在请求前持久化 authorization，运行时再由 metacodes 原生 evaluation
 backend 强制 token/cost 双限额。任何已授权但未形成 checkpoint 的请求都会阻止自动
 恢复，避免隐式重复付费。`scripts/eval/plugin_pair_analysis.py` 只接受完整 18 对、
-committed budget receipt 和 treatment attestation；即使门禁通过，也只输出
+committed budget receipt、treatment attestation，以及能整体回放、authority 绑定同一
+冻结清单、每笔已授权交易都有对应 rollout 的 budget journal（§7.1）；即使门禁通过，也只输出
 `development_gate_passed`。只有成功率改善且 McNemar exact `p <= 0.05` 时才记录
 本地 paired improvement，公开 benchmark claim 始终为 `not_permitted`。
 
@@ -335,9 +338,9 @@ tokens，低于用户 US$1,000 总上限。尚未运行外部 WorkBuddy。
 
 | 集合 | 字段 | 钉的是什么 | 谁校验、何时 |
 |---|---|---|---|
-| **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头**一次读取**协议字节:运行用的对象与 receipt 携带的哈希出自同一份字节;写 receipt 前要求文件仍是这份字节、这份字节仍通过完整严格校验、git HEAD 未变。它**不能**察觉任何发生在某个输入**最后一次被观测之后**的改动:子进程运行期间被钉输入"改了又改回"(ABA);校验扫描进行中、某文件已被哈希之后才被改动(扫描逐个读 ~130 个文件,不是原子的);以及最后一次读取之后、receipt 返回并持久化之前的单向改动——这些都需要在物化的不可变 checkout 里跑门禁、在那里哈希并封存 receipt,见 #49)、`plugin_pair_runner.build_plan` / `run_paid_pair` 及每次请求前后的重载、`plugin_pair_analysis.analyze`。三者经 `load_protocol`;`run_gate` 经 `validate_protocol_payload`(它要哈希自己校验过的那份字节)。两个入口都没有布尔开关,严格是**构造出来的** |
+| **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头**一次读取**协议字节:运行用的对象与 receipt 携带的哈希出自同一份字节;写 receipt 前要求文件仍是这份字节、这份字节仍通过完整严格校验、git HEAD 未变。它**不能**察觉任何发生在某个输入**最后一次被观测之后**的改动:子进程运行期间被钉输入"改了又改回"(ABA);校验扫描进行中、某文件已被哈希之后才被改动(扫描逐个读 ~130 个文件,不是原子的);以及最后一次读取之后、receipt 返回并持久化之前的单向改动——这些都需要在物化的不可变 checkout 里跑门禁、在那里哈希并封存 receipt,见 #49)、`plugin_pair_runner.build_plan`,以及 freeze、`run_paid_pair` 起点与每次请求前后、`plugin_pair_analysis.analyze` 共用的同一次观测 `_observe`(§7.1)。它们与 `run_gate` 一样经 `validate_protocol_payload`(哈希自己校验过的那份字节)。没有布尔开关,严格是**构造出来的** |
 | **评测器** | `pinned_evaluator_files` | 做测量与判定的代码(gate、runner、analysis、e2e 脚本、门禁阈值)以及 Lean 形式化证据(它们由 CI 单独编译、被评测脚本消费,**不链接进运行时二进制**) | **每次加载**都校验,包括日常测试;**永远不由工具自动 repin**——一个门禁给自己的代码重钉哈希是自证漏洞(c7c2aa9) |
-| **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件 | 每次加载都校验 |
+| **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.root` + `candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件。`candidate.root` 下的文件集合必须**恰好**等于 `candidate.files`,目录集合恰好等于这些文件蕴含的父目录,无符号链接、无可执行位、无特殊文件:哈希证明钉住的文件还是原样,集合相等证明它们就是全部——否则在被钉 Skill 旁边放一个文件、加一个空目录或 `chmod +x` 都不需要改协议,而运行时把目录名和可执行位哈希进 Skill 身份(`computeContentRevision`),任何 pin、指纹或清单字段都不会察觉 | 每次加载都校验 |
 
 **日常提交不 repin。** 测试与巡检(含 `--validate-only`)用 `load_protocol_structure`:除实现指纹
 相等以外全部照旧 fail-closed;`--validate-only` 打印 pinned / observed 两个值和
@@ -358,4 +361,114 @@ python3 scripts/eval/plugin_release_gate.py --refresh-implementation-fingerprint
 里说明增删了什么、为什么——把某条路径归到错误的集合是真实发生过的错误(两个 Lean 文件
 曾被当作"实现"钉住,而它们不链接进运行时二进制、属于形式化证据,2026-09 移入评测器集合;
 `sdk/zig/protocol.zig` 与 `sdk/zig/build.zig` 被 `agentcore:test` 编译却一直不在列表里)。
-路径集合的独立摘要与授权绑定的冻结清单是下一阶段的工作。
+路径集合的独立摘要与授权绑定的冻结清单见下一小节。
+
+### 7.1 冻结清单:付费运行的预注册
+
+付费运行之前必须先**冻结**:
+
+```bash
+python3 scripts/eval/plugin_pair_runner.py --freeze \
+  --runtime-binary <ReleaseSmall 二进制> --frozen-manifest <manifest.json>
+```
+
+产出 `metacodes.plugin-frozen-run/v1`:协议字节哈希、git HEAD、**完整**实现指纹、
+**路径集摘要**(`implementation_paths` 与 `pinned_evaluator_files` 的成员名集合,
+与内容无关)、运行时/两个 wrapper/两个 inventory 的哈希、schedule 哈希、模型指纹、**运行环境**
+(`platform` 与 `python` 版本——rollout 的 `environment_fingerprint` 记录的就是这两项——外加
+解释器实现、cache tag、`sys.executable` 的 realpath 与哈希、`sys.prefix`/`exec_prefix`/
+`base_prefix`,用来区分同版本的不同安装/venv),以及对以上字段的规范化哈希 `manifest_sha256`。
+运行环境**不是主机身份**(两台配置、路径、哈希全同的机器在这里分不出来),也不是"钉住解释器":
+解释器、它的 prefix 和加载的库同 PATH 上的二进制一样在操作者的信任边界之内;记录它的意义是
+让**观测结果不同**的 OS/解释器环境——另一个 OS 构建、另一个解释器安装或 venv——成为授权之前
+的一条**具名** `environment` 拒绝,而不是花完钱后整批诚实行过不了指纹。`platform.platform()` 含内核构建串,
+OS 补丁也会触发它——重新冻结是一个要看着 diff 做的动作,不是可以顺手跳过的告警。文件以 0600 创建,**拒绝覆盖**。
+
+用户 authority 升到 `metacodes.plugin-paid-authority/v2`,在 v1 字段之上**必须**携带
+`manifest_sha256`:用户签的是这份清单,而不只是协议。
+
+`run_paid_pair` 的顺序是**先校验清单、再打开 authority**:对着活树重算每一个字段
+(`_observe`:协议字节只读一次,解析与哈希出自同一份字节),任何一项不等即以
+`frozen-run manifest drifted: <全部不等字段>` 拒绝,此时 authority 文件根本没有被打开;
+随后要求 authority 的 `manifest_sha256` 等于校验通过的清单哈希。
+
+**每次 provider 请求前后各做一次同样的整体校验**(`_require_still_frozen`,错误尾缀
+`(before request)` / `(after request)`),而不是只重载磁盘上的协议:一份冻结之后被改写又
+自洽 repin 的协议(换掉候选 Skill、更新它的哈希)能通过严格加载,却通不过与清单的逐字段
+比对。请求后的校验发生在导入该次证据之前;未通过则该笔交易停留在 `request_authorized`、
+没有 checkpoint,续跑被既有的孤儿交易规则挡住,不会隐式重付。括号内"改了又改回"的变动
+仍然看不见(#49)。
+
+清单哈希进入预算日志的 `BudgetAuthority`(其 `manifest_sha256` 由 `_authority_manifest`
+唯一构造:协议哈希、运行时、wrapper、inventory、revision、冻结清单哈希、授权总额)和每条
+rollout 记录的 `plugin_treatment`。
+
+**证据正文封入日志。** runner 在 commit 之前先挂上 `plugin_treatment`,再对整行(除
+`budget_transaction` 外的一切:outcome、trajectory、judgement、metrics、artifacts、attestation)
+取规范化摘要,以 `evidence_sha256` 封入 committed 事件——它在事件哈希链之内。没有它,
+日志只能证明"这笔钱花在了某个 arm/task/trial 上",证明不了付的是哪份正文:同一冻结的两次
+运行 journal_id、交易 id 集合完全相同,把 B 的 receipt 移植到 A 的行上、或把一行的 outcome
+与 judgement 一起翻转,都过得了 receipt 校验。续跑和 analysis 都要求每行正文的摘要等于日志
+里封的那个;memory benchmark 的 runner 不封该字段,回放对它保持可选。
+
+**预授权失败可回滚。** reserve 之后、`authorize_request` 尚未落盘就失败(信号、异常),
+runner 试图 `abort_pre_request`:日志仍是 `reserved` 则中止落账、续跑不被一笔没花的预留
+挡住;若授权其实已落盘(包括写已落地、异常恰好打在内存态更新之前:`abort_pre_request` 先
+重读磁盘,恰好多出本笔 `request_authorized` 一个事件就认领它),日志以
+`TransactionNotAbortable` 拒绝中止,交易保持 `request_authorized`——请求可能已被放行,
+续跑照旧拒绝;磁盘多出的不止这一步则仍按锁内漂移拒绝。中止本身落盘失败(存储故障)是
+第三种情形:预留搁浅在盘上,runner 以原始失败为 cause 报出"abort could not be recorded",
+不装作已清理。
+
+**续跑与 analysis 共用一条 receipt 绑定规则**(`_require_receipt_bound`:键集合与投影完全
+相同、除 revision/head 外逐字段相等、revision/head 等于 commit 时的、交易身份等于本冻结
+应当预留的),两个入口不可能接受不同的 checkpoint。
+
+**inventory 哈希与 checkout 位置无关。** 运行时把插件根目录报告为绝对 realpath;冻结的
+`inventory_sha256` 哈希的是 `metacodes.plugin-inventory-identity/v1` 投影:候选插件的
+`source_root` 必须与协议声明的 `candidate.root` realpath 相等,并记录为该仓内相对名;
+`generation` 是进程计数器,不进身份;id/version/form/layer/lifecycle/capabilities/
+contribution_count 全部保留。同一 commit、同一运行时在另一路径的 checkout 上得到同一份清单。
+inventory 预检在临时 HOME 下、`METACODES_NO_PROBE=1` 执行:`--dump-plugins` 应答前运行时
+会构造完整 App,在真实 HOME 下会留下 session 目录、读 `~/.metacodes/config.json` 并拉起
+其中的 MCP server、探测模型目录。
+
+**子进程环境去注入向量。** 预检与 rollout(`paired_runner._runner_env`)共用 `hermetic_env`:
+剥掉 `BASH_ENV`/`ENV`/`SHELLOPTS`/`BASHOPTS`/`CDPATH`/`GLOBIGNORE`、导出的 shell 函数
+(`BASH_FUNC_*`)、`PYTHON*`、`LD_*`/`DYLD_*`、`NODE_OPTIONS`/`PERL5OPT`/`PERL5LIB`/`RUBYOPT`。
+`run_e2e.sh` 是非交互 bash,`BASH_ENV` 指向的钩子能重定义它用来拼装 prompt 的 `awk`,在
+不改动树上任何文件的情况下改变候选臂收到的输入。`PATH` 保留:它上面的二进制是操作者的
+信任边界,固定工具路径在自托管 runner 上活不下来;唯一例外是 **`python3`**——子进程 PATH
+最前面放一个 `exec` 到 runner 自身 `sys.executable` 的启动脚本(`interpreter_shim`;不用
+符号链接,CPython 按被调用的路径找 `pyvenv.cfg`,符号链接会悄悄丢掉 runner 的 venv),
+harness 的 helper 与 `#!/usr/bin/env python3` 的 wrapper 都用它,rollout 记录的 Python 身份
+因此等于冻结与校验所用的那一个。shim 建不出来(`sys.executable` 不可用、临时目录不可写)
+即 fail-closed,由于 inventory 预检在 `_observe` 里先跑,它发生在任何授权之前。rollout 侧还剥掉 `METASK_*`:宿主凭证与 runner 的匿名凭证 fd 并存时 lib.sh
+判定"ambiguous E2E provider credentials"、请求根本不发,而交易已经授权,留下一笔挡住续跑的
+孤儿。
+
+`analyze` 在读取任何证据之前做同样的清单校验,然后**回放 budget journal**:日志的
+authority 哈希必须等于用日志自记的总额重建的 `_authority_manifest`(即绑定同一冻结清单),
+模型指纹与 provider 一致,总额不超过协议的累计上限;每一行的 `budget_transaction` 必须
+命名日志里存在的交易、键集合与 receipt 投影完全相同、除 `journal_revision`/
+`journal_head_sha256` 外逐字段相等且这两项等于 commit 时的 revision/head,交易身份
+(run_id、harness_fingerprint 等)等于本冻结对该 arm/task/trial 应当预留的身份,正文摘要等于
+日志封入的 `evidence_sha256`;日志里任何已预留/已授权/已提交而没有对应 rollout 的交易都导致
+拒绝(只有 `aborted_pre_request` 例外)。authority 总额除不超累计上限外,还必须**够覆盖**
+`rollouts × max_rollout_*`——runner 拒绝的 authority,analysis 同样不认。每行还要过续跑同款
+的落地身份校验(`_validate_checkpoint_rows`:task/model/harness/grader 指纹必须是本 suite、
+wrapper、model、revision 产出的那些),不是两臂之间互相一致就行。
+receipt 的 `budget_journal_sha256`、`baseline_sha256`、`candidate_sha256` 是**被校验的那份
+字节**的哈希,另携带 `frozen_manifest_sha256`、`implementation_fingerprint` 与
+`path_set_digest`。这里建立的是**一致性**而非签名:日志和清单都不带签名,能证明的是证据、
+日志、冻结描述的是同一次运行,不是"某个用户授权过它"——后者是 runner 的门(authority
+文件),不是 analysis 的输入。
+
+**重新冻结。** 清单文件以 `O_EXCL` 创建、拒绝覆盖;树变了要重新冻结时,换一个文件名,或先把
+旧清单移走归档,再 `--freeze`;随后 authority 也要重写(它绑定的是旧清单哈希)。v1 authority
+会被拒绝,错误信息直接指向这两步。
+
+`path_set_digest` 不提供 `protocol_sha256` 之外的保护——协议字节已经绑定了两张列表——
+它提供的是**名字**:删掉一条被钉路径再 repin,协议里没有任何东西记得列表曾经更长,而校验
+会把 `path_set_digest` 和 `protocol_sha256` 并列报出,操作者不必 diff 两份协议才知道动的
+是列表。它按成员集合计算(排序后),顺序变化对它不可见。

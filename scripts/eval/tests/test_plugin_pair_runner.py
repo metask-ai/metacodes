@@ -3,13 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from scripts.eval.model import ValidationError
+from scripts.eval.paired_runner import _run_once, _runner_env, hermetic_env, interpreter_shim
 from scripts.eval.plugin_pair_runner import (
+    INVENTORY_IDENTITY,
+    _canonical_sha256,
     _inventory,
     _require_scoring_checkpoints,
     _verify_arm_inventory,
@@ -97,6 +102,7 @@ class PluginPairRunnerTest(unittest.TestCase):
                     budget_journal_path=temporary / "budget.jsonl",
                     provider_auth_file=temporary / "missing-provider-auth",
                     user_authority_file=temporary / "missing-user-authority",
+                    frozen_manifest_file=temporary / "missing-manifest",
                 )
 
     @unittest.skipIf(os.name == "nt", "POSIX executable fixture required")
@@ -125,9 +131,11 @@ class PluginPairRunnerTest(unittest.TestCase):
 
     def test_paid_authority_must_bind_exact_protocol_and_permissions(self) -> None:
         plan = build_plan(ROOT, self.protocol_path)
+        manifest = "a" * 64
         value = {
-            "schema": "metacodes.plugin-paid-authority/v1",
+            "schema": "metacodes.plugin-paid-authority/v2",
             "protocol_sha256": plan["protocol_sha256"],
+            "manifest_sha256": manifest,
             "max_cost_usd": 30.0,
             "max_metered_tokens": 30000000,
             "authorized_by_user": True,
@@ -139,16 +147,41 @@ class PluginPairRunnerTest(unittest.TestCase):
             observed = load_user_authority(
                 path,
                 protocol_sha256=plan["protocol_sha256"],
+                manifest_sha256=manifest,
                 max_cost_usd=30.0,
                 max_metered_tokens=30000000,
             )
             self.assertEqual(value, observed)
+            # Bound to another manifest: the run the user authorized is not
+            # this one.
+            with self.assertRaisesRegex(ValidationError, "another frozen-run manifest"):
+                load_user_authority(
+                    path,
+                    protocol_sha256=plan["protocol_sha256"],
+                    manifest_sha256="b" * 64,
+                    max_cost_usd=30.0,
+                    max_metered_tokens=30000000,
+                )
             value["protocol_sha256"] = "0" * 64
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaises(ValidationError):
                 load_user_authority(
                     path,
                     protocol_sha256=plan["protocol_sha256"],
+                    manifest_sha256=manifest,
+                    max_cost_usd=30.0,
+                    max_metered_tokens=30000000,
+                )
+            # v1 authorities carry no manifest and are refused outright.
+            v1 = {k: v for k, v in value.items() if k != "manifest_sha256"}
+            v1["schema"] = "metacodes.plugin-paid-authority/v1"
+            v1["protocol_sha256"] = plan["protocol_sha256"]
+            path.write_text(json.dumps(v1), encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "unsupported fields or schema"):
+                load_user_authority(
+                    path,
+                    protocol_sha256=plan["protocol_sha256"],
+                    manifest_sha256=manifest,
                     max_cost_usd=30.0,
                     max_metered_tokens=30000000,
                 )
@@ -161,8 +194,9 @@ class PluginPairRunnerTest(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "schema": "metacodes.plugin-paid-authority/v1",
+                        "schema": "metacodes.plugin-paid-authority/v2",
                         "protocol_sha256": plan["protocol_sha256"],
+                        "manifest_sha256": "a" * 64,
                         "max_cost_usd": 30.0,
                         "max_metered_tokens": 30000000,
                         "authorized_by_user": True,
@@ -175,44 +209,244 @@ class PluginPairRunnerTest(unittest.TestCase):
                 load_user_authority(
                     path,
                     protocol_sha256=plan["protocol_sha256"],
+                    manifest_sha256="a" * 64,
                     max_cost_usd=30.0,
                     max_metered_tokens=30000000,
                 )
 
-    def test_paid_inventory_projects_the_stable_treatment_fields(self) -> None:
+    def test_paid_inventory_identity_is_location_independent(self) -> None:
+        """The runtime reports the plugin root as an absolute realpath. The
+        frozen inventory hash must not depend on where the checkout lives -
+        only on what the runtime says about the plugin - and the candidate
+        root must be the one the protocol declares."""
         protocol = load_protocol_structure(ROOT, PROTOCOL)
-        full_inventory = {
-            "schema": "metacodes.plugin-inventory/v1",
-            "contract_version": 1,
-            "generation": 1,
-            "plugins": [
+        declared = protocol["candidate"]["root"]
+
+        def inventory(source_root: str, generation: int = 1) -> dict:
+            return {
+                "schema": "metacodes.plugin-inventory/v1",
+                "contract_version": 1,
+                "generation": generation,
+                "plugins": [
+                    {
+                        "id": "metacodes.benchmark-coding",
+                        "version": protocol["candidate"]["plugin_version"],
+                        "form": "data_package",
+                        "layer": "session",
+                        "lifecycle": "active",
+                        "capabilities": ["skill_bundle"],
+                        "contribution_count": 1,
+                        "source_root": source_root,
+                    }
+                ],
+            }
+
+        def digest_of(value: dict) -> str:
+            with mock.patch(
+                "scripts.eval.plugin_pair_runner._inventory", return_value=value
+            ), mock.patch("scripts.eval.plugin_pair_runner.attest_runtime_artifact") as attest:
+                digest = _verify_arm_inventory(
+                    ROOT, protocol, "candidate", ROOT / "unused-wrapper", ROOT / "unused-runtime"
+                )
+            self.assertEqual(2, attest.call_count)
+            return digest
+
+        canonical = digest_of(inventory(str((ROOT / declared).resolve())))
+        self.assertEqual(
+            _canonical_sha256(
                 {
-                    "id": "metacodes.benchmark-coding",
-                    "version": protocol["candidate"]["plugin_version"],
-                    "form": "data_package",
-                    "layer": "session",
-                    "lifecycle": "active",
-                    "capabilities": ["skill_bundle"],
-                    "contribution_count": 1,
-                    "source_root": "/private/frozen-plugin-root",
+                    "projection": INVENTORY_IDENTITY,
+                    "contract_version": 1,
+                    "plugins": [
+                        {
+                            "id": "metacodes.benchmark-coding",
+                            "version": protocol["candidate"]["plugin_version"],
+                            "form": "data_package",
+                            "layer": "session",
+                            "lifecycle": "active",
+                            "capabilities": ["skill_bundle"],
+                            "contribution_count": 1,
+                            "source_root": declared,
+                        }
+                    ],
                 }
-            ],
-        }
-        with mock.patch(
-            "scripts.eval.plugin_pair_runner._inventory",
-            return_value=full_inventory,
-        ), mock.patch(
-            "scripts.eval.plugin_pair_runner.attest_runtime_artifact"
-        ) as attest:
-            digest = _verify_arm_inventory(
-                ROOT,
-                protocol,
-                "candidate",
-                ROOT / "unused-wrapper",
-                ROOT / "unused-runtime",
+            ),
+            canonical,
+        )
+        # The same directory reached through another name, from another
+        # runtime generation, is the same identity...
+        with tempfile.TemporaryDirectory() as directory:
+            alias = Path(directory) / "alias"
+            alias.symlink_to((ROOT / declared).resolve(), target_is_directory=True)
+            self.assertEqual(canonical, digest_of(inventory(str(alias), generation=7)))
+        # ...while a plugin loaded from anywhere else is not this candidate,
+        # whatever it calls itself.
+        with self.assertRaisesRegex(ValidationError, "not rooted at the frozen candidate root"):
+            digest_of(inventory("/private/somewhere-else"))
+        # And what the runtime says about the plugin is load-bearing.
+        richer = inventory(str((ROOT / declared).resolve()))
+        richer["plugins"][0]["contribution_count"] = 2
+        self.assertNotEqual(canonical, digest_of(richer))
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture required")
+    def test_inventory_runs_the_runtime_under_a_private_home(self) -> None:
+        """`--dump-plugins` builds a full App first: under the caller's HOME
+        it would leave a session directory behind, read their config (and
+        spawn any MCP server in it) and probe the catalog. The preflight
+        gives it a throwaway HOME and takes it away afterwards."""
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime.py"
+            runtime.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os\n"
+                "print(json.dumps({"
+                "'schema':'metacodes.plugin-inventory/v1',"
+                "'contract_version':1,'plugins':[],"
+                "'home':os.environ.get('HOME'),"
+                "'no_probe':os.environ.get('METACODES_NO_PROBE')}))\n",
+                encoding="utf-8",
             )
-        self.assertEqual(64, len(digest))
-        self.assertEqual(2, attest.call_count)
+            os.chmod(runtime, 0o700)
+            with mock.patch.dict(os.environ, {"METACODES_NO_PROBE": "0"}):
+                inventory = _inventory(
+                    ROOT, ROOT / "scripts/eval/fixtures/plugin_baseline.py", runtime
+                )
+        self.assertEqual("1", inventory["no_probe"])
+        self.assertNotEqual(os.environ.get("HOME"), inventory["home"])
+        self.assertIn("metacodes-plugin-inventory-home-", inventory["home"])
+        self.assertFalse(Path(inventory["home"]).exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture required")
+    def test_inventory_does_not_inherit_shell_or_interpreter_injection_vectors(self) -> None:
+        """`BASH_ENV`, exported functions, `PYTHONPATH`, loader preloads: each
+        lets the invoking shell change what the child executes without any
+        file in the tree changing, so none of them reaches the runtime."""
+        injected = {
+            "BASH_ENV": "/tmp/hook.sh",
+            "BASH_FUNC_awk%%": "() { echo pwned; }",
+            "PYTHONPATH": "/tmp/shadow",
+            "DYLD_INSERT_LIBRARIES": "/tmp/x.dylib",
+            "LD_PRELOAD": "/tmp/x.so",
+            "SHELLOPTS": "xtrace",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime.py"
+            runtime.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os\n"
+                "print(json.dumps({"
+                "'schema':'metacodes.plugin-inventory/v1',"
+                "'contract_version':1,'plugins':[],"
+                "'path_head':os.environ['PATH'].split(os.pathsep)[0],"
+                "'seen':sorted(k for k in os.environ if k in %r)}))\n" % sorted(injected),
+                encoding="utf-8",
+            )
+            os.chmod(runtime, 0o700)
+            with mock.patch.dict(os.environ, injected):
+                inventory = _inventory(
+                    ROOT, ROOT / "scripts/eval/fixtures/plugin_baseline.py", runtime
+                )
+        self.assertEqual([], inventory["seen"])
+        # And `python3` on the child's PATH is this interpreter (the shim),
+        # so the wrapper's `#!/usr/bin/env python3` is the runner's Python.
+        self.assertIn("metacodes-eval-python-", inventory["path_head"])
+
+    def test_child_environments_drop_injection_vectors_and_keep_the_rest(self) -> None:
+        base = {
+            "HOME": "/h", "PATH": "/usr/bin", "LANG": "C", "TERM": "xterm",
+            "BASH_ENV": "/tmp/hook.sh", "ENV": "/tmp/hook.sh", "SHELLOPTS": "xtrace",
+            "BASH_FUNC_ls%%": "() { :; }", "PYTHONPATH": "/x", "PYTHONHOME": "/x",
+            "LD_PRELOAD": "/x.so", "LD_LIBRARY_PATH": "/x", "DYLD_INSERT_LIBRARIES": "/x",
+            "NODE_OPTIONS": "--require /x", "PERL5OPT": "-M/x",
+        }
+        self.assertEqual(
+            {"HOME": "/h", "PATH": "/usr/bin", "LANG": "C", "TERM": "xterm"},
+            hermetic_env(base),
+        )
+        # The rollout side uses the same filter on top of its treatment-knob
+        # stripping.
+        with mock.patch.dict(os.environ, {"BASH_ENV": "/tmp/hook.sh", "METACODES_X": "1", "METASK_API_KEY": "old-key", "KEEP_ME": "1"}):
+            env = _runner_env()
+        self.assertNotIn("BASH_ENV", env)
+        self.assertNotIn("METACODES_X", env)
+        # A host credential beside the anonymous credential FD is refused
+        # by lib.sh as ambiguous - after the transaction is authorized.
+        self.assertNotIn("METASK_API_KEY", env)
+        self.assertEqual("1", env["KEEP_ME"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX harness only")
+    def test_run_once_spawns_the_harness_with_that_environment_and_this_interpreter(self) -> None:
+        """The wiring seam: `_run_once` must hand the harness the filtered
+        environment, with a `python3` shim for this interpreter first on
+        PATH - otherwise the unit tests above guard nothing."""
+        captured = {}
+        real_run = subprocess.run
+
+        def fake_run(argv, **kwargs):
+            env = kwargs["env"]
+            shim = env["PATH"].split(os.pathsep)[0]
+            launcher = Path(shim) / "python3"
+            captured.update(
+                env=env,
+                shim=shim,
+                launcher=launcher.read_text(encoding="utf-8"),
+                executable=os.access(launcher, os.X_OK),
+                # The launcher must really run this interpreter, venv and all.
+                # JSON, not whitespace splitting: interpreter paths may hold
+                # spaces, and the launcher quotes them.
+                reported=json.loads(real_run(
+                    [str(launcher), "-c", "import json, sys; print(json.dumps([sys.executable, sys.prefix]))"],
+                    stdout=subprocess.PIPE, text=True, check=True, env=env,
+                ).stdout),
+                argv=argv,
+            )
+            return subprocess.CompletedProcess(argv, 0)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"BASH_ENV": "/tmp/hook.sh", "METASK_API_KEY": "old-key"}
+        ), mock.patch("scripts.eval.paired_runner.subprocess.run", side_effect=fake_run):
+            # A stand-in repository root: `_run_once` only needs the harness
+            # path (mocked) and the runs directory it diffs before/after.
+            root = Path(directory)
+            (root / "tests/e2e/runs").mkdir(parents=True)
+            with self.assertRaisesRegex(ValidationError, "run"):  # no run directory was produced
+                _run_once(
+                    root,
+                    ROOT / "scripts/eval/fixtures/plugin_baseline.py",
+                    "baseline",
+                    0,
+                    "00_smoke",
+                    "anthropic",
+                    "glm-5.2",
+                    ROOT / "evals/plugin-v1/coding-suite.json",
+                    "rev",
+                    harness_config_id="plugin-v1:none",
+                    timeout_seconds=1,
+                    max_metered_tokens=1,
+                    max_cost_usd=1.0,
+                    runtime_api_key="k",
+                )
+        self.assertTrue(captured["argv"][0].endswith("tests/e2e/run_e2e.sh"))
+        self.assertNotIn("BASH_ENV", captured["env"])
+        self.assertNotIn("METASK_API_KEY", captured["env"])
+        self.assertIn("metacodes-eval-python-", captured["shim"])
+        self.assertTrue(captured["executable"])
+        self.assertTrue(captured["launcher"].startswith("#!/bin/sh\nexec "))
+        self.assertEqual([sys.executable, sys.prefix], captured["reported"])
+        self.assertFalse(Path(captured["shim"]).exists())
+
+    def test_interpreter_shim_fails_closed(self) -> None:
+        """A run that cannot pin its interpreter must not start: falling
+        back to the ambient `python3` is exactly the post-authorization
+        fingerprint mismatch the shim exists to prevent."""
+        with mock.patch("scripts.eval.paired_runner.sys.executable", ""):
+            with self.assertRaisesRegex(ValidationError, "cannot pin the harness interpreter"):
+                with interpreter_shim({"PATH": "/usr/bin"}):
+                    pass
+        with mock.patch("scripts.eval.paired_runner.os.chmod", side_effect=OSError("read-only")):
+            with self.assertRaisesRegex(ValidationError, "cannot pin the harness interpreter: read-only"):
+                with interpreter_shim({"PATH": "/usr/bin"}):
+                    pass
 
     def test_paid_resume_rejects_persisted_invalid_rollout(self) -> None:
         invalid = {
@@ -264,6 +498,7 @@ class ProductionEntryPointsStayStrictTest(unittest.TestCase):
                 budget_journal_path=self.temporary / "budget.jsonl",
                 provider_auth_file=self.temporary / "missing-provider-auth",
                 user_authority_file=self.temporary / "missing-user-authority",
+                frozen_manifest_file=self.temporary / "no-manifest",
             )
         self.assertFalse(output_dir.exists())
         self.assertFalse((self.temporary / "budget.jsonl").exists())
@@ -277,6 +512,7 @@ class ProductionEntryPointsStayStrictTest(unittest.TestCase):
                 baseline_path=self.temporary / "no-baseline",
                 candidate_path=self.temporary / "no-candidate",
                 budget_journal_path=self.temporary / "no-journal",
+                frozen_manifest_file=self.temporary / "no-manifest",
             )
 
 if __name__ == "__main__":
