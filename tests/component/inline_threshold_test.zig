@@ -8,6 +8,10 @@
 //! below `per_result_bytes`, so a result the tool layer correctly inlined is
 //! still spilled - and that second transfer has to be lossless. T3 pins the
 //! seam itself from both sides.
+//!
+//! No Windows skip: nothing here spawns a process or probes POSIX file modes.
+//! The artifact layer runs on Windows in production, and `result_spool`'s own
+//! test runs there; a skip would let the Windows gate go green without these.
 
 const std = @import("std");
 const cc = @import("cc");
@@ -72,7 +76,6 @@ const Envelope = struct {
 };
 
 test "T1 inline threshold: a result above per_result is published once by the tool layer and never written again by projection" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -128,7 +131,6 @@ test "T1 inline threshold: a result above per_result is published once by the to
 }
 
 test "T2 inline threshold: siblings that drive the water line below per_result force a second transfer, and it loses nothing" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -190,7 +192,6 @@ test "T2 inline threshold: siblings that drive the water line below per_result f
 }
 
 test "T3 inline threshold: the seam is per_result_bytes exactly, from both sides" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -225,4 +226,36 @@ test "T3 inline threshold: the seam is per_result_bytes exactly, from both sides
         defer body.deinit(a);
         try std.testing.expect(body == .@"inline");
     }
+}
+
+test "T4 inline threshold: a tool-layer envelope is not a structured tool result, a JSON body still is" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &buf);
+    const budget = result_budget.Budget.fromModel(WINDOW);
+
+    // A text result the tool layer published: its envelope is JSON, the
+    // result is not. Before the fix this counted as structured, and with the
+    // tool layer publishing everything above per_result it inflated the
+    // metric for every large Grep.
+    var text_body = try captureBody(a, root, 40_000, 't', budget);
+    defer text_body.deinit(a);
+    try std.testing.expect(text_body == .artifact);
+    var text_content = try committed(a, &text_body);
+    defer a.free(@constCast(text_content));
+
+    // A JSON body the tool itself emitted, inline: this is what the counter
+    // is for.
+    var json_content: []const u8 = try a.dupe(u8, "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"ok\",\"exit_code\":0}");
+    defer a.free(@constCast(json_content));
+
+    var items = [_]projection.Item{
+        .{ .tool_name = "Grep", .content = &text_content, .is_error = false },
+        .{ .tool_name = "Bash", .content = &json_content, .is_error = false },
+    };
+    const stats = try projection.project(a, &items, .{ .session_root = root, .budget = budget });
+    try std.testing.expectEqual(@as(usize, 1), stats.structured_result_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.turn_budget_spills);
 }

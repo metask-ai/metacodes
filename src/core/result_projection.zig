@@ -90,6 +90,9 @@ pub const Stats = struct {
     artifact_bytes: usize = 0,
     artifact_spill_count: usize = 0,
     unrecoverable_fallback_count: usize = 0,
+    /// Results whose *tool* emitted a JSON body (Bash's `bash-result.v2`,
+    /// a bounded `rows/cursor/total` envelope). Projection envelopes are JSON
+    /// too and are deliberately not counted: they are this layer's artifact.
     structured_result_count: usize = 0,
     structured_projection_failures: usize = 0,
     turn_budget_spills: usize = 0,
@@ -275,7 +278,15 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         } else {
             stats.raw_bytes +|= content.len;
         }
-        const structured = isStructuredJson(content);
+        // A projection envelope is a JSON document too, but it is this layer's
+        // own artifact, not a structured body the *tool* emitted. Counting it
+        // made `structured_result_count` rise with every byte-zero result that
+        // published at the tool layer - and once the tool layer's threshold
+        // became the per-result budget, that was every text result above it.
+        // Bash's `metacodes.bash-result.v2` carries no projection prefix and
+        // still counts. Behaviour is unaffected: envelopes are exempt below and
+        // never reach `spillOne`, which is the only other consumer of this flag.
+        const structured = !isProjectionEnvelope(content) and isStructuredJson(content);
         if (structured) stats.structured_result_count += 1;
         const image = isImageResult(content);
         const exempt = image or

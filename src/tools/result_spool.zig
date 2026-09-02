@@ -185,5 +185,12 @@ test "guard: callers hand over ctx.result_budget verbatim, and this file reads o
             cursor = end;
         }
     }
-    try std.testing.expectEqual(@as(usize, 6), seen);
+    if (seen != 6) {
+        std.debug.print(
+            "finishCaptureAsBody call sites: expected 6, found {d}. A caller was added, removed or moved: " ++
+                "update the `callers` list in this guard so the new site is checked too.\n",
+            .{seen},
+        );
+        return error.CallerCountChanged;
+    }
 }
