@@ -278,15 +278,7 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         } else {
             stats.raw_bytes +|= content.len;
         }
-        // A projection envelope is a JSON document too, but it is this layer's
-        // own artifact, not a structured body the *tool* emitted. Counting it
-        // made `structured_result_count` rise with every byte-zero result that
-        // published at the tool layer - and once the tool layer's threshold
-        // became the per-result budget, that was every text result above it.
-        // Bash's `metacodes.bash-result.v2` carries no projection prefix and
-        // still counts. Behaviour is unaffected: envelopes are exempt below and
-        // never reach `spillOne`, which is the only other consumer of this flag.
-        const structured = !isProjectionEnvelope(content) and isStructuredJson(content);
+        const structured = toolEmittedStructured(content);
         if (structured) stats.structured_result_count += 1;
         const image = isImageResult(content);
         const exempt = image or
@@ -1172,6 +1164,25 @@ fn isInlineUtf8(content: []const u8) bool {
         if (byte < 0x20 and byte != '\n' and byte != '\r' and byte != '\t') return false;
     }
     return true;
+}
+
+/// Whether the **tool** emitted a structured body.
+///
+/// Asking `isStructuredJson` directly gets this wrong in both directions once
+/// the tool layer publishes. A projection envelope is a JSON document, so a
+/// plain-text Grep result wrapped in one counted as structured; excluding every
+/// envelope instead lost the opposite case, a WebFetch JSON body that the tool
+/// layer published - the envelope is the wrapper, and what it wraps is recorded
+/// in its own `media_type`. So: for an envelope, believe its media type; for
+/// anything else, look at the bytes.
+fn toolEmittedStructured(content: []const u8) bool {
+    if (!isProjectionEnvelope(content)) return isStructuredJson(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const media = parsed.value.object.get("media_type") orelse return false;
+    if (media != .string) return false;
+    return std.mem.startsWith(u8, media.string, "application/json");
 }
 
 fn isStructuredJson(content: []const u8) bool {

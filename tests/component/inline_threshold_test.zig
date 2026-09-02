@@ -46,6 +46,25 @@ fn captureBody(
     return cc.result_spool.finishCaptureAsBody(allocator, root, &capture, .text_utf8, true, budget);
 }
 
+/// Same, but for a tool whose body is a declared media type other than text.
+fn captureBodyTyped(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    len: usize,
+    fill: u8,
+    budget: result_budget.Budget,
+    media_type: cc.tool_result.MediaType,
+) !cc.tool_result.ToolResultBody {
+    var capture = try artifact.Capture.begin(allocator, root, artifact.MAX_ARTIFACT_BYTES);
+    defer capture.deinit();
+    const payload = try allocator.alloc(u8, len);
+    defer allocator.free(payload);
+    @memset(payload, fill);
+    try capture.write(payload);
+    try capture.seal();
+    return cc.result_spool.finishCaptureAsBody(allocator, root, &capture, media_type, true, budget);
+}
+
 /// The bytes production commits for a body (`tool_exec` renders the same
 /// way), as one owned slice the projection pass may replace.
 fn committed(allocator: std.mem.Allocator, body: *cc.tool_result.ToolResultBody) ![]const u8 {
@@ -264,11 +283,74 @@ test "T4 inline threshold: a tool-layer envelope is not a structured tool result
     var json_content: []const u8 = try a.dupe(u8, "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"ok\",\"exit_code\":0}");
     defer a.free(@constCast(json_content));
 
+    // A JSON body the tool layer published: the envelope is the wrapper, and
+    // what it wraps is recorded as its media_type. Excluding every envelope
+    // outright lost exactly this case - the fix Codex caught in cross-review.
+    var json_body = try captureBodyTyped(a, root, 40_000, 'j', budget, .json);
+    defer json_body.deinit(a);
+    try std.testing.expect(json_body == .artifact);
+    var published_json = try committed(a, &json_body);
+    defer a.free(@constCast(published_json));
+
     var items = [_]projection.Item{
         .{ .tool_name = "Grep", .content = &text_content, .is_error = false },
         .{ .tool_name = "Bash", .content = &json_content, .is_error = false },
+        .{ .tool_name = "WebFetch", .content = &published_json, .is_error = false },
     };
     const stats = try projection.project(a, &items, .{ .session_root = root, .budget = budget });
-    try std.testing.expectEqual(@as(usize, 1), stats.structured_result_count);
+    // Inline Bash JSON + published WebFetch JSON = 2. The published *text*
+    // result is not structured, however JSON-shaped its envelope is.
+    try std.testing.expectEqual(@as(usize, 2), stats.structured_result_count);
     try std.testing.expectEqual(@as(usize, 0), stats.turn_budget_spills);
+}
+
+test "T5 inline threshold: a result that cannot be published degrades to a fallback envelope, not a tool error" {
+    // Lowering the threshold moved publication into the tool layer, and the
+    // tool layer used to propagate a CAS failure straight out - so a full
+    // session quota turned a perfectly good 40KB Grep result into
+    // "Grep failed with SessionQuotaExceeded". Before the change the same
+    // bytes stayed inline and met the full store in `spillOne`, which renders
+    // a bounded fallback carrying head, tail and `storage_error`. That
+    // degradation has to survive the move.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &buf);
+    const budget = result_budget.Budget.fromModel(WINDOW);
+    const size: usize = 40_000;
+
+    var capture = try artifact.Capture.begin(a, root, artifact.MAX_ARTIFACT_BYTES);
+    defer capture.deinit();
+    const payload = try a.alloc(u8, size);
+    defer a.free(payload);
+    @memset(payload, 'q');
+    try capture.write(payload);
+    try capture.seal();
+
+    // An artifact_root that cannot be published into: publication fails for a
+    // reason that is not OOM, which is the whole class this path is for.
+    var body = try cc.result_spool.finishCaptureAsBody(a, "", &capture, .text_utf8, true, budget);
+    defer body.deinit(a);
+    try std.testing.expect(body == .@"inline");
+    try std.testing.expectEqual(size, body.@"inline".bytes.len);
+
+    // And projection turns those bytes into the bounded fallback: not
+    // recoverable, but it names why and still carries head and tail.
+    var content = try committed(a, &body);
+    defer a.free(@constCast(content));
+    var items = [_]projection.Item{.{ .tool_name = "Grep", .content = &content, .is_error = false }};
+    const stats = try projection.project(a, &items, .{ .session_root = "", .budget = budget });
+    try std.testing.expectEqual(@as(usize, 1), stats.unrecoverable_fallback_count);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, content, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings("fallback", o.get("projection").?.string);
+    try std.testing.expect(!o.get("recoverable").?.bool);
+    try std.testing.expect(o.get("storage_error").?.string.len > 0);
+    const head: u64 = @intCast(o.get("preview_head_bytes").?.integer);
+    const tail: u64 = @intCast(o.get("preview_tail_bytes").?.integer);
+    try std.testing.expect(head + tail > 0);
+    try std.testing.expectEqual(@as(u64, size), head + tail + @as(u64, @intCast(o.get("omitted_bytes").?.integer)));
 }

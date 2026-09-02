@@ -270,13 +270,18 @@ tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)
 
 **从来不是摘要。** 结果级路径全程确定性,不调模型、同输入同字节。会调模型做摘要的只有
 **对话级** auto-compact(付费的 summary 压缩),那是整段历史的事,与单条结果无关。模型能
-看到的结果只有三态:
+看到的结果有四态:
 
 | 形态 | 何时 | 内容 | 可恢复 |
 |---|---|---|---|
-| **原文** | 结果 ≤ per-result 预算 | 逐字节原样 | — |
-| **信封** | 超预算 → 溢出到 CAS | head + tail 摘录 + `artifact_id` + sha256 + 读取指令 | ✅ `ReadArtifact` / `Grep(artifact_id)` |
+| **原文** | 结果 ≤ 本轮**水位线** | 逐字节原样 | — |
+| **artifact 信封** | 超水位线,且发布成功 | head + tail 摘录 + `artifact_id` + sha256 + 读取指令 | ✅ `ReadArtifact` / `Grep(artifact_id)` |
+| **fallback 信封** | 超水位线,但**发布失败**(会话配额满、存储错误) | head + tail + `storage_error` 如实命名原因,无 `artifact_id` | ❌,但说得出为什么 |
 | **清空桩** | 仅压缩期,且**该结果没有 artifact** | `[tool result cleared to save context]` + 承诺行(`original_bytes` + sha256) | ❌ |
+
+水位线在无 turn 压力时**就是** per-result 预算;兄弟结果多到装不下 `per_turn` 时它会被二分
+压低,那时 ≤ per-result 的结果**也会**被溢出(见下方水位线一节与 T2)。所以判据是水位线,
+不是 per-result——这里最早写成后者,而本仓自己的 T2 就是反例。
 
 信封的实际形状(`renderArtifactEnvelope`):
 

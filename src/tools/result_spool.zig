@@ -89,12 +89,55 @@ pub fn finishCaptureAsBody(
         ));
     }
 
+    return publish(allocator, artifact_root, capture, media_type, capture_complete) catch |err|
+        inlineAfterFailedPublish(allocator, capture, capture_complete, err);
+}
+
+fn publish(
+    allocator: std.mem.Allocator,
+    artifact_root: []const u8,
+    capture: *artifact_store.Capture,
+    media_type: tool_result.MediaType,
+    capture_complete: bool,
+) !tool_result.ToolResultBody {
     var spool = try artifact_store.Spool.begin(allocator, artifact_root);
     defer spool.deinit();
     try capture.copyRangeTo(&spool, 0, capture.bytes);
     var completed = try spool.finish();
     completed.receipt.capture_complete = capture_complete;
     return tool_result.ToolResultBody.fromCompletedSpool(completed, media_type);
+}
+
+/// Publication failed. Hand the bytes back inline when that is possible, so
+/// projection can still render its bounded fallback envelope - head, tail and
+/// `storage_error` - instead of the whole result becoming a tool error.
+///
+/// This is what lowering the inline threshold would otherwise have taken away.
+/// A 40KB Grep result on a 200K window used to stay inline here and meet a
+/// full CAS in `spillOne`, which degrades gracefully; publishing it at this
+/// layer made the same quota failure surface as "Grep failed with
+/// SessionQuotaExceeded" and lose the output entirely.
+///
+/// Two cases still propagate, both matching the behaviour that predates the
+/// threshold change: OOM, which no fallback can help, and a capture too large
+/// to materialize - `PER_RESULT_MAX_BYTES` is the ceiling of what was ever
+/// inline here, so re-inlining inside it can restore the old degradation
+/// without reintroducing an unbounded read. An incomplete capture has no
+/// complete inline form and always published, so it propagates too.
+fn inlineAfterFailedPublish(
+    allocator: std.mem.Allocator,
+    capture: *artifact_store.Capture,
+    capture_complete: bool,
+    err: anyerror,
+) !tool_result.ToolResultBody {
+    if (err == error.OutOfMemory) return err;
+    if (!capture_complete) return err;
+    if (capture.bytes > result_budget.PER_RESULT_MAX_BYTES) return err;
+    return tool_result.ToolResultBody.initInline(try capture.readRangeAlloc(
+        allocator,
+        0,
+        @intCast(capture.bytes),
+    ));
 }
 
 pub fn copyAll(source: *artifact_store.Capture, destination: *artifact_store.Capture) !void {
@@ -190,9 +233,13 @@ test "guard: callers hand over ctx.result_budget verbatim, and this file reads o
             // The paren counter is not a Zig parser. If a call ever carries a
             // string literal or a comment, say so instead of comparing a slice
             // that may have been cut in the wrong place.
-            if (std.mem.indexOfScalar(u8, args, '"') != null or std.mem.indexOf(u8, args, "//") != null) {
+            const unsupported = std.mem.indexOfScalar(u8, args, '"') != null or
+                std.mem.indexOfScalar(u8, args, '\'') != null or
+                std.mem.indexOf(u8, args, "//") != null or
+                std.mem.indexOf(u8, args, "/*") != null;
+            if (unsupported) {
                 std.debug.print(
-                    "{s}: a finishCaptureAsBody call now holds a string literal or comment; " ++
+                    "{s}: a finishCaptureAsBody call now holds a string literal, character literal or comment; " ++
                         "this guard's paren counter cannot place its last argument. Extend it before trusting it.\n",
                     .{name},
                 );
