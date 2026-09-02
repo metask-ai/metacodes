@@ -123,6 +123,7 @@ pub const pdf = @import("core/pdf.zig");
 pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
 pub const read_artifact = @import("tools/read_artifact.zig");
 pub const tools_bash_output = @import("tools/bash_output.zig"); // 预算常量供 schema 防分叉守卫绑定
+pub const result_spool = @import("tools/result_spool.zig"); // 内联阈值缝合点,供 L2 行为测试直接驱动
 pub const cache_break = @import("core/cache_break.zig");
 pub const core_message = @import("core/message.zig");
 pub const transcript = @import("core/transcript.zig");

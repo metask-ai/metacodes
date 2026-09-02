@@ -81,6 +81,7 @@ pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
         &capture,
         .json,
         true,
+        ctx.result_budget,
     );
 }
 

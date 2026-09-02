@@ -297,6 +297,18 @@ issue #29 的行为(不知道能取回,就改命令重跑)。
 `byte_zero_spool`(Glob/Grep/CodeMap/FindSymbol/Bash/两个 MCP 读取/WebFetch)在第一个字节前
 就重定向到内核 Spool,**全量内容从不进内核内存**。所以这不是"先拿到 40MB 再截断"。
 
+**artifact 有两个产生点,但只有一个阈值。** 工具层(`result_spool.finishCaptureAsBody`)在捕获
+完成时决定"这些字节要不要进内存":完整且 ≤ `per_result_bytes` 的抬回 inline,否则直接发布进
+CAS;projection 层在本轮结果就绪后决定"模型该看到多少"。两层分开是信息时序决定的——工具不知道
+兄弟结果,projection 不能把已进内存的字节反物化——但**判定用同一个数**:工具层按值接收
+`ctx.result_budget`,只读 `per_result_bytes`(`result_spool.zig` 内的守卫测试禁止它碰
+`per_turn` 等不属于它的字段,并断言六个调用方逐字传 `ctx.result_budget`)。此前工具层用的是
+常量 64KB(`PER_RESULT_MAX_BYTES` 抄了一遍),在 window < 524,288 的每个模型上留下
+`[per_result, 64KB]` 死区:落入其中的结果先被抬进内存,再被 projection 写回 CAS,同一份字节搬
+两次。统一后无 turn 压力时两层严格一致;有压力时(兄弟结果压低水位线)工具层正确内联的结果仍会
+被 projection 溢出——这不可避免且有界(≤ per_result),`tests/component/inline_threshold_test.zig`
+的 T2 验证这类二次转存零丢失、小结果零牵连、压完恰在预算内。
+
 **两个预算,都是 context window 的纯函数**(`result_budget.perResultBytes`/`perTurnBytes`):
 
 ```
