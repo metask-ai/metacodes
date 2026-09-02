@@ -33,13 +33,16 @@ status, compatibility boundaries, and entry points are defined by
   Compatibility: a transcript or checkpoint recorded with a document block is
   refused explicitly rather than partially read — the transcript loader is now
   atomic and reports a dedicated error with an actionable message, and the
-  checkpoint decoder reports `UNSUPPORTED` (not `CORRUPT`) for the permanently
-  reserved block tag `7`.
+  checkpoint decoder reports `UNSUPPORTED` (not `CORRUPT`) for an intact
+  checkpoint carrying the permanently reserved block tag `7`, and only after
+  its digest has been verified. A Run that fails after admission without
+  poisoning the session now closes its `run_state` as `failed` instead of
+  leaving it at `starting`.
 - AgentCore ABI v1 returns to **revision 15**; `RUN_INPUT_PART_DOCUMENT`,
   `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1` and status
   `DOCUMENT_INPUT_UNSUPPORTED` are gone. No bundle was ever published from a
   revision-16 tree (the only release, `0.1.0`, is revision 14, has no assets,
-  and no workflow builds a bundle), so revision 15 keeps a single meaning and
+  and no workflow publishes or uploads a bundle), so revision 15 keeps a single meaning and
   the codes need no tombstone. SDK package version returns to `0.2.0-dev`.
 
 ### Fixed

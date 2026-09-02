@@ -649,7 +649,10 @@ Tag `7` is permanently reserved and never written. It carried the document
 block of the withdrawn first-class PDF input; a checkpoint containing one is
 intact rather than damaged, so decoding reports `UNSUPPORTED` (schema this
 build no longer supports) rather than `CORRUPT`, which would send a Host
-hunting for storage faults. The tag stays reserved because any build that ran
+hunting for storage faults. Integrity is established first: the block is
+stepped over through the hasher in its revision-16 layout, the digest is
+verified, and only then is `UNSUPPORTED` reported — a damaged file whose bytes
+merely read as tag `7` still reports `CORRUPT`. The tag stays reserved because any build that ran
 that revision could have written one, and reusing `7` for a different block
 would silently misread those files.
 Hosts that require verbatim historical audit must persist the event/transcript

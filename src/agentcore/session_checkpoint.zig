@@ -315,6 +315,11 @@ pub fn decodeFromSource(
     if (extra != 0) return error.Corrupt;
     if (reader.position != parsed.measurement.total_bytes)
         return error.Corrupt;
+    // Every byte has been hashed and the digest verified: the file is intact.
+    // Only now may a withdrawn revision-16 document block (tag 7) turn the
+    // result into "unsupported schema"; any earlier, the same answer could have
+    // masked corruption. The decoded state is released by the errdefer chain.
+    if (reader.withdrawn_blocks != 0) return error.UnsupportedSchema;
 
     return .{
         .allocator = allocator,
@@ -659,6 +664,9 @@ const Reader = struct {
     expected_total: u64 = ABSOLUTE_MAX_CHECKPOINT_BYTES,
     position: u64 = 0,
     hasher: std.crypto.hash.sha2.Sha256,
+    /// Revision-16 document blocks (tag 7) stepped over so far. Their schema
+    /// verdict is delivered by `decodeFromSource` only after the digest verifies.
+    withdrawn_blocks: u64 = 0,
 
     fn init(source: Source, limits: Limits) Reader {
         return .{
@@ -814,7 +822,26 @@ fn readMessage(
             // files. (The ABI revision number itself could safely return to 15
             // because no bundle was ever published at 16; a checkpoint on disk
             // has the wider exposure of the two.)
-            7 => return error.UnsupportedSchema,
+            //
+            // The verdict is not delivered here: a damaged file whose bytes
+            // merely happen to read as tag 7 would then report Unsupported and
+            // hide real corruption. The block is stepped over through the
+            // hasher in its revision-16 layout (three length-prefixed strings:
+            // media_type, data, title; then a u32 page count), decoding
+            // continues to the digest, and `decodeFromSource` fails closed with
+            // UnsupportedSchema only once integrity has been verified.
+            7 => withdrawn: {
+                try skipString(reader, messages_end, limits);
+                try skipString(reader, messages_end, limits);
+                try skipString(reader, messages_end, limits);
+                _ = try readInt(reader, u32, messages_end);
+                reader.withdrawn_blocks += 1;
+                // Placeholder keeps `blocks` fully initialized for the cleanup
+                // chain; it is never observable because the decode cannot
+                // succeed once a withdrawn block was seen.
+                break :withdrawn .{ .text = allocator.dupe(u8, "") catch
+                    return error.OutOfMemory };
+            },
             6 => reasoning_item: {
                 const model = try readString(reader, allocator, messages_end, limits);
                 errdefer allocator.free(model);
@@ -846,6 +873,22 @@ fn readString(
         return error.Corrupt;
     }
     return bytes;
+}
+
+/// Consume one length-prefixed string through the hasher without keeping it,
+/// under the same length and section bounds as `readString`. Used to step over
+/// a withdrawn block so the digest can still be verified.
+fn skipString(reader: *Reader, messages_end: u64, limits: Limits) Error!void {
+    const length = try readInt(reader, u64, messages_end);
+    if (length > limits.max_string_bytes) return error.ResourceLimit;
+    if (try checkedAdd(reader.position, length) > messages_end) return error.Corrupt;
+    var remaining = length;
+    var scratch: [512]u8 = undefined;
+    while (remaining != 0) {
+        const count: usize = @intCast(@min(remaining, scratch.len));
+        try reader.readHashed(scratch[0..count]);
+        remaining -= count;
+    }
 }
 
 fn writeInt(writer: *Writer, comptime T: type, value: T) Error!void {
@@ -1351,9 +1394,9 @@ test "encodedUserPartsMessageBytes 与真实编码字节精确一致(多模态�
     try std.testing.expectError(error.Corrupt, encodedUserPartsMessageBytes(&.{}));
 }
 
-test "旧的 revision-16 checkpoint(tag 7)按 schema 拒绝,而不是报 Corrupt" {
-    // 完好但来自被撤回 revision 的 checkpoint。报 Corrupt 会把 Host 引去查
-    // 存储故障;正确答案是"这个 schema 本 build 不再支持"。
+test "tag 字节损坏成 7 但 digest 不符 → Corrupt(完整性判定先于 schema 判定)" {
+    // 同一份改动在 review 之前会得到 UnsupportedSchema:tag 7 一出现就返回,
+    // 从未走到 digest 校验,于是"文件坏了"被伪装成"schema 不支持"。
     const allocator = std.testing.allocator;
     var conversation = Conversation.init(allocator);
     defer conversation.deinit();
@@ -1378,14 +1421,66 @@ test "旧的 revision-16 checkpoint(tag 7)按 schema 拒绝,而不是报 Corrupt
         .authority = .{ .skill = "", .permission = "", .mcp = "" },
     }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
 
-    // 把那条 text block 的 tag(1)改写成撤回的 document tag(7),模拟
-    // revision-16 时代写下的存档;头部 marker 未变,所以它过得了头部校验。
     var patched = try allocator.dupe(u8, sink.bytes.items);
     defer allocator.free(patched);
-    // 定位 messages 段里第一个 block tag:role(1) 之后是 count(4),再之后是 tag。
     const needle = "placeholder";
     const at = std.mem.indexOf(u8, patched, needle) orelse return error.SkipZigTest;
-    patched[at - 9] = 7; // tag byte 在 8 字节长度前缀之前
+    patched[at - 9] = 7; // tag byte 在 8 字节长度前缀之前;digest 未重算
+
+    var source = TestSource{ .bytes = patched, .step = 7 };
+    try std.testing.expectError(error.Corrupt, decodeFromSource(
+        allocator,
+        .{ .ctx = &source, .read_fn = TestSource.read },
+        limits,
+    ));
+}
+
+test "完整的 revision-16 checkpoint(tag 7,digest 正确)→ UnsupportedSchema,跳过后流仍对齐" {
+    const allocator = std.testing.allocator;
+    var conversation = Conversation.init(allocator);
+    defer conversation.deinit();
+    // 48 字节的 text block 与 rev-16 的 tag-7 块(15+8+5 字节的三个 string + u32
+    // 页数)编码等长(各 57 字节):原地替换不动任何长度字段,头部尺寸照旧成立。
+    const needle = "p" ** 48;
+    try conversation.appendText(.user, needle);
+    // 第二条消息紧跟在被撤回块之后:跳过若少读/多读一个字节,这里会先报 Corrupt。
+    try conversation.appendText(.assistant, "after the withdrawn block");
+
+    var sink = TestSink{ .allocator = allocator };
+    defer sink.deinit();
+    const limits = Limits{ .hard_bytes = 1024 * 1024 };
+    _ = try exportToSink(.{
+        .session_id = core.session_id.gen(),
+        .checkpoint_generation = 1,
+        .last_run_id = 1,
+        .last_compact_id = 0,
+        .terminal_kind = .run,
+        .terminal_id = 1,
+        .model = "claude-sonnet-4",
+        .conversation = &conversation,
+        .policy_generation = 1,
+        .catalog_generation = 1,
+        .authority = .{ .skill = "", .permission = "", .mcp = "" },
+    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
+
+    var patched = try allocator.dupe(u8, sink.bytes.items);
+    defer allocator.free(patched);
+    const at = std.mem.indexOf(u8, patched, needle) orelse return error.SkipZigTest;
+    var w = at - 9; // tag byte
+    patched[w] = 7;
+    w += 1;
+    inline for (.{ "application/pdf", "JVBERi0=", "r.pdf" }) |field| {
+        std.mem.writeInt(u64, patched[w..][0..8], field.len, .little);
+        w += 8;
+        @memcpy(patched[w..][0..field.len], field);
+        w += field.len;
+    }
+    std.mem.writeInt(u32, patched[w..][0..4], 2, .little);
+    w += 4;
+    try std.testing.expectEqual(at + needle.len, w); // 等长替换,后续消息未移位
+    // digest 覆盖尾部 32 字节之前的全部内容:重算,让文件在完整性上无可挑剔。
+    const body = patched[0 .. patched.len - DIGEST_BYTES];
+    std.crypto.hash.sha2.Sha256.hash(body, patched[patched.len - DIGEST_BYTES ..][0..DIGEST_BYTES], .{});
 
     var source = TestSource{ .bytes = patched, .step = 7 };
     try std.testing.expectError(error.UnsupportedSchema, decodeFromSource(

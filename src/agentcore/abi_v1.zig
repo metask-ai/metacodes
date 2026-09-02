@@ -1415,6 +1415,25 @@ const AbiSession = struct {
         _ = self.emitRunStateSnapshot(self.core_session.session_id, run_id);
     }
 
+    /// Terminal closure for an admitted Run that failed **without** poisoning
+    /// the session — e.g. the multimodal root record could not be built after
+    /// admission, which `AdmittedRun.runUserParts` finishes cleanly. The Run
+    /// already published `starting` through `startRunState`, and the contract
+    /// is that every started Run ends with a terminal snapshot; without this a
+    /// Host watching `run_state` sees the Run stuck in `starting` until the
+    /// next one begins. No-op when the Run already reached a terminal phase
+    /// through its own events, when observation is degraded, when the callback
+    /// is gone, or when the projector belongs to a different Run (the failure
+    /// happened before this Run's `starting`).
+    fn emitFailedRunStateIfOpen(self: *AbiSession, session_id: core.session_id.SessionId, run_id: u64) void {
+        if (self.callback_status.load(.acquire) != wire.STATUS_OK) return;
+        if (self.run_state_observation_disabled) return;
+        if (self.run_state_projector.run_id != run_id) return;
+        if (self.run_state_projector.isTerminal()) return;
+        self.run_state_projector.closeForTerminal(.failed);
+        _ = self.emitRunStateSnapshot(session_id, run_id);
+    }
+
     fn emit(raw: *anyopaque, session_id: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         if (!self.publishStagedPermission(session_id, run_id, event))
@@ -6708,6 +6727,11 @@ fn sessionRunInput(
                 {
                     if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
                     self.facade_poisoned.store(true, .release);
+                } else {
+                    // Non-poisoning failure after admission: the Run already
+                    // published `starting`, so close it, or the Host sees it
+                    // stuck there until the next Run begins.
+                    self.emitFailedRunStateIfOpen(self.core_session.session_id, run_id);
                 }
                 return failError(status, err, out_error);
             };
@@ -6748,6 +6772,11 @@ fn sessionRunInput(
                 {
                     if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
                     self.facade_poisoned.store(true, .release);
+                } else {
+                    // Non-poisoning failure after admission: the Run already
+                    // published `starting`, so close it, or the Host sees it
+                    // stuck there until the next Run begins.
+                    self.emitFailedRunStateIfOpen(self.core_session.session_id, run_id);
                 }
                 return failError(status, err, out_error);
             };
@@ -6788,6 +6817,11 @@ fn sessionRunInput(
                 {
                     if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
                     self.facade_poisoned.store(true, .release);
+                } else {
+                    // Non-poisoning failure after admission: the Run already
+                    // published `starting`, so close it, or the Host sees it
+                    // stuck there until the next Run begins.
+                    self.emitFailedRunStateIfOpen(self.core_session.session_id, run_id);
                 }
                 return failError(status, err, out_error);
             };
@@ -9317,6 +9351,34 @@ test "RunState observation capacity does not poison the admitted run" {
     try std.testing.expectEqual(public_protocol.RunStatePhase.retrying, fake.run_state_projector.phase);
     try std.testing.expect(fake.observeRunState(.single, 2, .stream_begin));
     try std.testing.expectEqual(public_protocol.RunStatePhase.generating, fake.run_state_projector.phase);
+}
+
+test "non-poisoning Run failure after `starting` closes RunState as failed; terminal Runs keep their verdict" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+        .run_state_projector = run_state.Projector.init(std.testing.allocator),
+    };
+    defer fake.run_state_projector.deinit();
+
+    // Run 3 published `starting` and then failed before any CoreEvent — the
+    // multimodal root record could not be built after admission.
+    try std.testing.expect(fake.startRunState(.single, 3));
+    fake.emitFailedRunStateIfOpen(.single, 3);
+    try std.testing.expectEqual(public_protocol.RunStatePhase.failed, fake.run_state_projector.phase);
+
+    // A Run that already reached its own terminal keeps that verdict.
+    try std.testing.expect(fake.startRunState(.single, 4));
+    fake.run_state_projector.closeForTerminal(.completed);
+    fake.emitFailedRunStateIfOpen(.single, 4);
+    try std.testing.expectEqual(public_protocol.RunStatePhase.completed, fake.run_state_projector.phase);
+
+    // A failure before this Run's `starting` leaves the previous Run alone.
+    fake.emitFailedRunStateIfOpen(.single, 5);
+    try std.testing.expectEqual(public_protocol.RunStatePhase.completed, fake.run_state_projector.phase);
+    try std.testing.expectEqual(@as(u64, 4), fake.run_state_projector.run_id);
 }
 
 test "Host schema admission rejects ambiguous object contracts" {
