@@ -357,3 +357,123 @@ test "L2 ⑧: 第二次请求被 4xx 拒绝时 tool_result 保持未送达——
     try std.testing.expect(items[1].role == .assistant and !items[1].delivered);
     try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
 }
+
+test "L2 ⑨: 非 vision 网关模型(glm-5.2)只收到占位文本——含图消息不算送达,文本消息照常送达" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const raw = "tiny fixture; delivery semantics only";
+    const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, raw);
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "glm-5.2", url);
+    defer client.deinit();
+    try std.testing.expect(!client.provider().supports(.image_input));
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at pic.png");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    // wire 上是占位文本,不是图片。
+    const body = srv.lastRequest().?.body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "was read successfully but omitted: this model does not support image input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\",\"source\"") == null);
+    // 第二次请求被接受:首条 user 消息与 tool_use 消息送达;含图的 tool_result 消息保持未送达。
+    const items = conv.messages.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expect(items[0].delivered);
+    try std.testing.expect(items[1].delivered);
+    try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
+    try std.testing.expect(!items[3].delivered);
+}
+
+/// 跑一次"Read 图片 → 回复"的两轮会话,返回 (第二次请求体含图像块?, tool_result 消息已送达?)。
+fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?[]const u8) !struct { image_on_wire: bool, delivered: bool } {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, "override fixture");
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", base_model, url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at pic.png");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        .model_override = override,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    const body = srv.lastRequest().?.body();
+    const items = conv.messages.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expect(items[2].blocks[0] == .tool_result);
+    return .{
+        .image_on_wire = std.mem.indexOf(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\"") != null,
+        .delivered = items[2].delivered,
+    };
+}
+
+test "L2 ⑩: model_override 决定送达——基础模型非 vision、override 为 vision 时图片上 wire 且送达" {
+    const a = std.testing.allocator;
+    const r = try runOverrideDelivery(a, "glm-5.2", "claude-sonnet-4-20250514");
+    try std.testing.expect(r.image_on_wire);
+    try std.testing.expect(r.delivered);
+}
+
+test "L2 ⑪: model_override 决定送达——基础模型 vision、override 非 vision 时只发占位且不送达" {
+    const a = std.testing.allocator;
+    const r = try runOverrideDelivery(a, "claude-sonnet-4-20250514", "glm-5.2");
+    try std.testing.expect(!r.image_on_wire);
+    try std.testing.expect(!r.delivered);
+}

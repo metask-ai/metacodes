@@ -278,7 +278,8 @@ vision 路由的方言原生消费它（image block / data URL / inlineData）�
 信封只会把图片变成 base64 预览文本；轮预算按 `IMAGE_RESULT_BUDGET_BYTES`（= `IMAGE_TOKEN_ESTIMATE` × 4
 字节/token）计入，`Stats.projected_bytes` 仍是真实字节数。microcompact 对**未送达**的图片同样豁免：
 送达是 `Message.delivered` 显式水位，只由 agent_loop 在 provider 接受请求并返回流句柄后 `markDelivered` 推进
-（被 HTTP 错误拒绝的请求不算送达），本地追加的 assistant 消息（如 AgentCore 预算终止标记）不算送达，
+（被 HTTP 错误拒绝的请求不算送达；不支持图像输入的模型只收到占位文本，这样的请求不算送达含图消息），
+本地追加的 assistant 消息（如 AgentCore 预算终止标记）不算送达，
 transcript resume 出来的消息一律未送达、下一次被接受的请求后自愈；compact 预览提交时把 live 的水位按索引合并进
 替换集（仅 CAS 路径），在途的送达不会被过期预览覆盖。
 这避免 Read(image) 带并行兄弟时在 provider 看到之前就被 recent-N 阀清掉；已送达的图片照常清，阀对图片密集的

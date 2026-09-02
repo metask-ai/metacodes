@@ -669,19 +669,23 @@ pub const Conversation = struct {
 
     /// Delivery watermark: the entire retained history is treated as
     /// delivered — every active message was carried by the request just
-    /// accepted, and compacted prefix messages sit behind the boundary and
-    /// are never sent again. Called by agent_loop once the provider has
+    /// accepted, and compacted prefix messages were delivered before they
+    /// were compacted (`rollbackForRetry` may re-admit some of them; they are
+    /// then re-sent as already-delivered history). Called by agent_loop once the provider has
     /// accepted the request for streaming (a stream handle came back; a
     /// request the provider rejected with an HTTP error does not deliver).
     /// Nothing else may claim delivery: a local assistant append such as the
     /// AgentCore budget terminal marker is not a provider reply.
     ///
     /// Granularity is the message. A tool_result the request normalizer
-    /// strips as an orphan (no matching tool_use in the active range, see
-    /// message_repair.normalizeApiMessages) is marked as well, deliberately:
-    /// the active range only ever shrinks from the front, so an orphan can
-    /// never reach a provider in any later request either, and protecting it
-    /// from microcompact would only pin dead bytes.
+    /// strips as an orphan (no matching tool_use in the immediately preceding
+    /// assistant turn, see message_repair.stripOrphanToolResults) is marked as
+    /// well, deliberately: pairing is sequential, later assistant turns come
+    /// after the result, and the active range only shrinks from the front
+    /// (the one backwards move, rollbackForRetry, deletes everything after
+    /// the retried user message first), so an orphan can never reach a
+    /// provider in any later request either; protecting it from microcompact
+    /// would only pin dead bytes.
     ///
     /// Image results that are not yet delivered are protected from
     /// microcompact: a picture is a raw payload here rather than a
@@ -691,10 +695,32 @@ pub const Conversation = struct {
     /// Delivered images clear like any other result, so the valve keeps
     /// working on image-heavy history. Undelivered text results keep their
     /// historical behaviour (see doc/CORE_REFERENCE.md).
-    pub fn markDelivered(self: *Conversation) void {
+    ///
+    /// `images_visible` is the route's `supports(.image_input)`: a non-vision
+    /// model receives a bounded placeholder instead of the picture
+    /// (request.zig), so a message carrying an image result is not delivered
+    /// by such a request — switching to a vision model later must still let
+    /// it see the picture before microcompact may clear it.
+    pub fn markDelivered(self: *Conversation, opts: DeliveryOptions) void {
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
-        for (self.messages.items) |*m| m.delivered = true;
+        for (self.messages.items) |*m| {
+            if (!opts.images_visible and messageHasImageResult(m.*)) continue;
+            m.delivered = true;
+        }
+    }
+
+    pub const DeliveryOptions = struct {
+        /// Whether the accepted request serialized image results natively.
+        images_visible: bool,
+    };
+
+    fn messageHasImageResult(m: msg.Message) bool {
+        for (m.blocks) |b| switch (b) {
+            .tool_result => |tr| if (result_projection.isImageResult(tr.content)) return true,
+            else => {},
+        };
+        return false;
     }
 
     fn clearToolResultAt(self: *Conversation, m: msg.Message, bi: usize) ?usize {
@@ -981,6 +1007,27 @@ test "usage anchor: append keeps it valid, shrink invalidates it" {
     try std.testing.expect(c.usageAnchor() == null);
 }
 
+test "delivery watermark: a non-vision route leaves image-result messages undelivered" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "look");
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}"),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    // Non-vision request: the placeholder went out, not the picture.
+    c.markDelivered(.{ .images_visible = false });
+    try std.testing.expect(c.messages.items[0].delivered);
+    try std.testing.expect(!c.messages.items[1].delivered);
+    // A vision-capable request delivers it.
+    c.markDelivered(.{ .images_visible = true });
+    try std.testing.expect(c.messages.items[1].delivered);
+}
+
 test "compact preview commit keeps a delivery watermark set while the preview was in flight" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
@@ -990,7 +1037,7 @@ test "compact preview commit keeps a delivery watermark set while the preview wa
     var preview = try c.cloneForCompactPreview(a, 2);
     defer preview.deinit();
     // A provider request goes out while the summary is still being produced.
-    c.markDelivered();
+    c.markDelivered(.{ .images_visible = true });
     try std.testing.expect(!preview.conversation.messages.items[0].delivered);
     // The suffix CAS still matches (delivery is not a content mutation), and the
     // committed history must not regress to the preview's stale `false`.
@@ -1006,7 +1053,7 @@ test "delivery watermark is carried only to the same message, never by position 
     try c.appendText(.assistant, "second");
     var preview = try c.cloneForCompactPreview(a, 1);
     defer preview.deinit();
-    c.markDelivered();
+    c.markDelivered(.{ .images_visible = true });
     // Rewrite the first message of the replacement (outside the retained suffix,
     // so the CAS still passes): it is a different message and must not inherit
     // the live watermark by index.
@@ -1025,7 +1072,7 @@ test "delivery watermark copied into a preview is cleared when the preview rewri
     try c.appendText(.user, "first");
     try c.appendText(.assistant, "second");
     // Delivered BEFORE cloning: Message.dupe copies `delivered = true` into the preview.
-    c.markDelivered();
+    c.markDelivered(.{ .images_visible = true });
     var preview = try c.cloneForCompactPreview(a, 1);
     defer preview.deinit();
     try std.testing.expect(preview.conversation.messages.items[0].delivered);

@@ -155,8 +155,11 @@ to the provider (delivery is an explicit per-message watermark set by the
 agent loop once the provider has accepted a request for streaming, i.e. a
 stream handle was returned; a request the provider rejects with an HTTP
 error does not deliver, a locally appended assistant message is not
-delivery, and a resumed transcript starts undelivered until the next
-accepted request), from `truncateLargeToolResults`, and from the AgentCore
+delivery, a resumed transcript starts undelivered until the next accepted
+request, and a request through a model without image input, which only
+carries the placeholder, does not deliver messages holding an image result;
+image support is judged for the model the request actually used, i.e. a
+per-request model override when one is set), from `truncateLargeToolResults`, and from the AgentCore
 artifact promotion above the operation's cap (`tool_result_cap_bytes` for
 built-in and host tools, `mcp_result_cap_bytes` for external tools), so the
 picture itself reaches the provider. Two different units apply: context estimation charges one image at

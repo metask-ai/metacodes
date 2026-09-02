@@ -319,6 +319,7 @@ pub const Client = struct {
             // Anthropic 不支持方言字段覆盖(Claude 无 prompt_cache_key/parallel_tool_calls/response_format 方言字段);
             // requestOverridesFn 走 default(返全 null),setRequestOverridesFn 留 null(setter 调用返 error)
             .supportsFn = &pSupports,
+            .supportsForModelFn = &pSupportsForModel,
         };
     }
     fn pModel(ctx: *anyopaque) []const u8 {
@@ -362,6 +363,10 @@ pub const Client = struct {
     }
     fn pSetReasoningEffort(ctx: *anyopaque, effort: ?types.ReasoningEffort) void {
         asClient(ctx).reasoning_effort = effort;
+    }
+    fn pSupportsForModel(_: *anyopaque, model_name: []const u8, cap: provider_mod.Capability) bool {
+        const capability = @import("api/capability.zig");
+        return capability.supports(.anthropic, model_name, cap);
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         // P2:走 capability 表(单一真相源),按当前 model 真判, 不再恒 true stub。

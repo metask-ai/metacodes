@@ -791,6 +791,7 @@ pub const BudgetedProvider = struct {
             .maxInputTokensFn = maxInputTokens,
             .reasoningEffortFn = reasoningEffort,
             .supportsFn = supports,
+            .supportsForModelFn = supportsForModel,
         };
     }
 
@@ -965,6 +966,9 @@ pub const BudgetedProvider = struct {
 
     fn supports(raw: *anyopaque, capability: core.api_provider.Capability) bool {
         return cast(raw).base.supports(capability);
+    }
+    fn supportsForModel(raw: *anyopaque, model_name: []const u8, capability: core.api_provider.Capability) bool {
+        return cast(raw).base.supportsForModel(model_name, capability);
     }
 
     fn cast(raw: *anyopaque) *BudgetedProvider {
