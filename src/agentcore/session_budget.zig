@@ -599,13 +599,16 @@ pub const Reservation = struct {
             self.controller.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
             return error.ResourceLimit;
         };
-        if (committed > self.controller.profile.hard_bytes -
-            self.controller.profile.terminal_reserve_bytes)
-        {
-            // `committed` (not `next`) is what violated the limit; the
-            // sibling reservations are part of the requirement reported as
-            // required_checkpoint_bytes.
-            self.controller.markOutcomeLocked(.resource_limit, committed);
+        // Same convention as beginOperation: the requirement reported as
+        // required_checkpoint_bytes is what must fit under hard_bytes, i.e.
+        // committed usage plus live sibling reservations plus the terminal
+        // reserve. A host can compare it with hard_bytes directly.
+        const required = checkedAdd(committed, self.controller.profile.terminal_reserve_bytes) catch {
+            self.controller.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return error.ResourceLimit;
+        };
+        if (required > self.controller.profile.hard_bytes) {
+            self.controller.markOutcomeLocked(.resource_limit, required);
             return error.ResourceLimit;
         }
         self.controller.estimated_usage_bytes = next;
@@ -1362,13 +1365,18 @@ test "settle beyond its own reservation cannot consume a live sibling reservatio
     try std.testing.expectError(error.ResourceLimit, first.settleSuccess(10, room));
     try std.testing.expectEqual(Outcome.resource_limit, controller.outcome());
     try std.testing.expectEqual(sibling_reserved, controller.reserved_bytes);
-    // The reported requirement includes the sibling share that caused the refusal.
-    try std.testing.expectEqual(
-        profile.hard_bytes - profile.terminal_reserve_bytes + sibling_reserved,
-        controller.requiredBytes(),
-    );
+    // The reported requirement is what would have to fit under hard_bytes:
+    // committed usage + the sibling share that caused the refusal + terminal reserve.
+    try std.testing.expectEqual(profile.hard_bytes + sibling_reserved, controller.requiredBytes());
     second.release();
     try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+
+    // No sibling, but the delta lands between hard - terminal and hard: refused,
+    // and the report includes the terminal reserve so it exceeds hard_bytes.
+    var terminal_case = Controller.init(std.testing.allocator, profile, admitted);
+    var only = try terminal_case.beginOperation(.tool, 32);
+    try std.testing.expectError(error.ResourceLimit, only.settleSuccess(10, room + 64));
+    try std.testing.expectEqual(profile.hard_bytes + 64, terminal_case.requiredBytes());
 }
 
 test "operation reservations are atomic and preserve terminal space" {

@@ -34,9 +34,9 @@ status, compatibility boundaries, and entry points are defined by
   durable budget at the real bytes). In exchange the shared predicate
   `extractImageResult` only accepts the canonical Read shape: allowlisted
   media type (`image/png|jpeg|gif|webp`), standard base64, at most
-  `MAX_IMAGE_BYTES` of payload, and nothing after the `data` field, so a
-  plugin cannot obtain an unbounded exemption by prefixing arbitrary output
-  with `{"type":"image"`. `result_projection.Stats.projected_bytes` stays a
+  `MAX_IMAGE_BYTES` of payload, exactly the three keys in any order with only
+  whitespace after the closing brace, so a plugin cannot obtain an unbounded
+  exemption by prefixing arbitrary output with `{"type":"image"`. `result_projection.Stats.projected_bytes` stays a
   real byte count; the turn-budget decision moved to a new `budget_bytes`.
   The predicate is structural (any field order, standard JSON whitespace,
   exactly the three keys, raw content bounded by `MAX_IMAGE_RESULT_BYTES`),

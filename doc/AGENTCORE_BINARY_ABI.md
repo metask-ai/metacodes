@@ -1316,7 +1316,7 @@ allocations or unbounded work:
 | top-level schema properties/required entries | 1024 |
 | one synchronous UI response | 1 MiB |
 | one raw Host callback success result or failure/rejection detail | 16 MiB |
-| default durable Tool/MCP result cap before artifact promotion | 2 MiB |
+| default durable Tool/MCP result cap before artifact promotion (canonical image results stay inline, see below) | 2 MiB |
 | one Tool Result artifact / one Session artifact CAS | 128 MiB / 1 GiB |
 | one `ReadArtifact` chunk | 32 KiB |
 | one encoded model-visible Host tool error payload | 1 MiB |
@@ -1353,7 +1353,18 @@ AgentCore releases every Host callback buffer exactly once. A successful
 inline Tool or MCP result larger than its configured durable result cap is
 first promoted into the Session CAS and only the bounded recovery envelope is
 settled against the durable budget; the raw success is not discarded before
-artifact projection. The 16 MiB completed-buffer callback boundary remains an
+artifact projection. The one exception is a canonical image result (the
+`{"type":"image","media_type":…,"data":…}` shape defined in
+[doc/API.md](API.md)): it is never promoted, because an envelope would reach
+the provider as text instead of a picture. It is settled against the
+operation's payload cap at 6,400 payload-budget bytes
+(`IMAGE_RESULT_BUDGET_BYTES`) and against the durable budget at its real
+bytes. Two situations yield `checkpoint_payload_resource_limit`: a cap
+below 6,400 (the per-operation cap check; `required_checkpoint_bytes` is then
+the 6,400-byte payload charge that exceeded it), and a settle whose real
+bytes would consume a live sibling reservation (`required_checkpoint_bytes`
+is then the full requirement: committed usage plus live reservations plus
+the terminal reserve, the same convention as an admission refusal). The 16 MiB completed-buffer callback boundary remains an
 ABI safety cap: legacy synchronous Host results beyond it cannot enter the
 library and therefore cannot be recovered. Native/process tools and
 `HostStreamToolV1` callbacks that use the byte-zero spool avoid constructing

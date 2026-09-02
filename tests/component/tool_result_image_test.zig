@@ -303,3 +303,57 @@ test "L2 ⑦: 超过投影上限的真实 Read 图片经 agent_loop 到达 wire 
     try std.testing.expect(items[3].role == .assistant);
     try std.testing.expect(!items[3].delivered);
 }
+
+test "L2 ⑧: 第二次请求被 4xx 拒绝时 tool_result 保持未送达——水位只在请求上线时推进,不在每轮开头" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const raw = "PNG-ish fixture bytes, size is irrelevant for delivery";
+    const path = try std.fmt.allocPrint(a, "{s}/small.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, raw);
+
+    // 第一轮 200(模型发 Read tool_use);第二轮 400(带着 tool_result 的请求被拒,没有流句柄)。
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startHttpCassette(
+        &[_][]const u8{ tool_sse, "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"nope\"}}" },
+        &[_][]const u8{ "HTTP/1.1 200 OK", "HTTP/1.1 400 Bad Request" },
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at small.png");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+
+    // 第一次请求上线 → 首条 user 消息已送达;第二次请求没有拿到流句柄 → tool_use/tool_result 未送达。
+    const items = conv.messages.items;
+    try std.testing.expect(items.len >= 3);
+    try std.testing.expect(items[0].delivered);
+    try std.testing.expect(items[1].role == .assistant and !items[1].delivered);
+    try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
+}

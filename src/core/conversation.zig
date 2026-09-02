@@ -320,8 +320,21 @@ pub const Conversation = struct {
         return self.replaceWithOwnedLocked(replacement);
     }
 
+    /// Carry the live delivery watermark into a replacement produced off to
+    /// the side: a request may have delivered messages while a compact
+    /// preview was being summarized, and the preview's copies still say
+    /// `false`. Only a same-shape replacement (equal message count) can be
+    /// merged by index; the suffix CAS guarantees that for compact commits.
+    fn mergeDeliveredIntoLocked(self: *const Conversation, replacement: *Conversation) void {
+        if (replacement.messages.items.len != self.messages.items.len) return;
+        for (replacement.messages.items, self.messages.items) |*rep, live| {
+            if (live.delivered) rep.delivered = true;
+        }
+    }
+
     fn replaceWithOwnedLocked(self: *Conversation, replacement: *Conversation) bool {
         if (!sameAllocator(self.allocator, replacement.allocator)) return false;
+        self.mergeDeliveredIntoLocked(replacement);
         for (self.messages.items) |m| m.deinit(self.allocator);
         self.messages.deinit(self.allocator);
         self.messages = replacement.messages;
@@ -638,9 +651,11 @@ pub const Conversation = struct {
         return out;
     }
 
-    /// Delivery watermark: every message currently in the conversation has
-    /// just been carried by a provider request. Called by agent_loop once the
-    /// request is on the wire; nothing else may claim delivery (a local
+    /// Delivery watermark: the entire retained history is treated as
+    /// delivered — every active message was carried by the request just
+    /// sent, and compacted prefix messages sit behind the boundary and are
+    /// never sent again. Called by agent_loop once the request is on the
+    /// wire; nothing else may claim delivery (a local
     /// assistant append such as the AgentCore budget terminal marker is not a
     /// provider reply). Image results that are not yet delivered are protected
     /// from microcompact: a picture is a raw payload here rather than a
@@ -938,6 +953,23 @@ test "usage anchor: append keeps it valid, shrink invalidates it" {
     try c.appendText(.assistant, "fourth");
     _ = c.compactKeepRecent(2);
     try std.testing.expect(c.usageAnchor() == null);
+}
+
+test "compact preview commit keeps a delivery watermark set while the preview was in flight" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "look at the picture");
+    try c.appendText(.assistant, "ok");
+    var preview = try c.cloneForCompactPreview(a, 2);
+    defer preview.deinit();
+    // A provider request goes out while the summary is still being produced.
+    c.markDelivered();
+    try std.testing.expect(!preview.conversation.messages.items[0].delivered);
+    // The suffix CAS still matches (delivery is not a content mutation), and the
+    // committed history must not regress to the preview's stale `false`.
+    try std.testing.expect(c.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation));
+    for (c.messages.items) |m| try std.testing.expect(m.delivered);
 }
 
 test "usage anchor: microcompact clear invalidates it" {
