@@ -20,6 +20,8 @@ pub const Snapshot = struct {
     artifact_recovery_calls: u64,
     artifact_recovered_bytes: u64,
     unrecoverable_fallback_count: u64,
+    /// Tool-emitted JSON bodies; projection envelopes excluded (see
+    /// `result_projection.Stats.structured_result_count`).
     structured_result_count: u64,
     structured_projection_failures: u64,
     turn_budget_spills: u64,
