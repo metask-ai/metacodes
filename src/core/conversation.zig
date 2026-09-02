@@ -327,15 +327,22 @@ pub const Conversation = struct {
     /// Carry the live delivery watermark into a replacement produced off to
     /// the side: a request may have delivered messages while a compact
     /// preview was being summarized, and the preview's copies still say
-    /// `false`. Delivery is carried only to a replacement message that is the
-    /// same message: equal count, and content-equal at the same index
-    /// (`messageEql`). A reordered or rewritten message never inherits a
-    /// watermark by position, so an undelivered image cannot be marked
-    /// delivered by a replacement that merely has the same length.
+    /// `false`. The replacement's watermarks are derived exclusively from
+    /// live identity: a replacement message is delivered iff the live message
+    /// at the same index is delivered and content-equal (`messageEql`). This
+    /// both carries a watermark set while the preview was in flight and
+    /// clears a stale `true` that `Message.dupe` copied into a message the
+    /// preview later rewrote; a reordered or rewritten message can never end
+    /// up delivered by position. When the counts differ (never the case on
+    /// the suffix-CAS path) every replacement flag is cleared: undelivered is
+    /// the conservative direction and self-heals at the next request.
     fn mergeDeliveredIntoLocked(self: *const Conversation, replacement: *Conversation) void {
-        if (replacement.messages.items.len != self.messages.items.len) return;
+        if (replacement.messages.items.len != self.messages.items.len) {
+            for (replacement.messages.items) |*rep| rep.delivered = false;
+            return;
+        }
         for (replacement.messages.items, self.messages.items) |*rep, live| {
-            if (live.delivered and messageEql(live, rep.*)) rep.delivered = true;
+            rep.delivered = live.delivered and messageEql(live, rep.*);
         }
     }
 
@@ -992,6 +999,28 @@ test "delivery watermark is carried only to the same message, never by position 
     // Rewrite the first message of the replacement (outside the retained suffix,
     // so the CAS still passes): it is a different message and must not inherit
     // the live watermark by index.
+    const rewritten = try a.dupe(u8, "rewritten prefix");
+    a.free(@constCast(preview.conversation.messages.items[0].blocks[0].text));
+    preview.conversation.messages.items[0].blocks[0] = .{ .text = rewritten };
+    try std.testing.expect(c.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation));
+    try std.testing.expect(!c.messages.items[0].delivered);
+    try std.testing.expect(c.messages.items[1].delivered);
+}
+
+test "delivery watermark copied into a preview is cleared when the preview rewrites that message" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "first");
+    try c.appendText(.assistant, "second");
+    // Delivered BEFORE cloning: Message.dupe copies `delivered = true` into the preview.
+    c.markDelivered();
+    var preview = try c.cloneForCompactPreview(a, 1);
+    defer preview.deinit();
+    try std.testing.expect(preview.conversation.messages.items[0].delivered);
+    // The preview rewrites the prefix message (outside the retained suffix, CAS
+    // still passes). It is a different message the provider has never seen, so
+    // the stale copied watermark must not survive the commit.
     const rewritten = try a.dupe(u8, "rewritten prefix");
     a.free(@constCast(preview.conversation.messages.items[0].blocks[0].text));
     preview.conversation.messages.items[0].blocks[0] = .{ .text = rewritten };
