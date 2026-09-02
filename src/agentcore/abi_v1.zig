@@ -9558,21 +9558,24 @@ test "reconcileRunFailure: cleanup failure after an idle Core still closes as po
     try std.testing.expect(fake.facade_poisoned.load(.acquire));
 
     // Any recorded first failure counts, not only OOM and rejections. The Run
-    // starts first; the status is recorded afterwards, as an internal
-    // publication step (schema admission) would record RESOURCE_LIMIT mid-Run.
+    // starts on a healthy channel; then an internal publication step (schema
+    // admission) records RESOURCE_LIMIT through the real recorder, mid-Run.
     // The diagnostic must name that cause, not "CallbackFailed".
     fake.facade_poisoned.store(false, .release);
+    fake.callback_status.store(wire.STATUS_OK, .release);
     try std.testing.expect(fake.startRunState(.single, 14));
-    fake.callback_status.store(wire.STATUS_RESOURCE_LIMIT, .release);
+    fake.recordCallbackStatus(wire.STATUS_RESOURCE_LIMIT);
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
         fake.reconcileRunFailure(.single, 14, wire.STATUS_CORE_ERROR, error.CallbackFailed, false, &diagnostic),
     );
     try std.testing.expect(fake.facade_poisoned.load(.acquire));
+    // The status text is documented as unstable; the cause component is the claim.
     const detail = diagnostic.ptr.?[0..@intCast(diagnostic.len)];
-    try std.testing.expectEqualStrings("resource limit: ResourceLimit", detail);
-    bufferRelease(&diagnostic);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "ResourceLimit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "CallbackFailed") == null);
 }
 
 test "reconcileRunFailure: a Host rejecting the poisoned terminal fails the Run with CALLBACK_FAILED (real Core session)" {
