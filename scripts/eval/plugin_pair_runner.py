@@ -17,6 +17,8 @@ import math
 import os
 import stat
 import subprocess
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -55,7 +57,7 @@ if __package__ in {None, ""}:
         PluginGateError,
         attest_runtime_artifact,
         implementation_fingerprint,
-        load_protocol,
+        validate_protocol_payload,
     )
 else:
     from .e2e_adapter import import_run
@@ -83,12 +85,19 @@ else:
         PluginGateError,
         attest_runtime_artifact,
         implementation_fingerprint,
-        load_protocol,
+        validate_protocol_payload,
     )
 
 
 AUTHORITY_SCHEMA = "metacodes.plugin-paid-authority/v2"
 FROZEN_RUN_SCHEMA = "metacodes.plugin-frozen-run/v1"
+# What the budget journal's authority hash is a function of (see
+# `_authority_manifest`); a journal sealed under another contract is refused.
+AUTHORITY_MANIFEST_CONTRACT = "metacodes-plugin-pair-authority-v1"
+# The hashed projection of an arm's `--dump-plugins` inventory (see
+# `_inventory_identity`); versioned so a change to what it binds is a named,
+# deliberate change of every inventory hash rather than a silent one.
+INVENTORY_IDENTITY = "metacodes.plugin-inventory-identity/v1"
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -120,10 +129,13 @@ def _git_head(root: Path) -> str:
 def path_set_digest(protocol: Mapping[str, Any]) -> str:
     """Identity of *which* paths are pinned, independent of their contents.
 
-    The implementation fingerprint hashes path names together with bytes, so
-    once it is repinned nothing remembers that the list used to be longer. A
-    manifest that carries this digest makes a shrunk or reshuffled pin set a
-    named mismatch at every verification point.
+    Membership only: both lists are sorted, so reordering is invisible here
+    by design. `protocol_sha256` already binds the exact bytes of both lists,
+    so this digest adds no protection over it - it adds a *name*. Once a
+    narrower list is repinned nothing in protocol.json remembers it used to
+    be longer; verification then reports `path_set_digest` next to
+    `protocol_sha256` instead of leaving the operator to diff two protocol
+    files to learn what moved.
     """
     return _canonical_sha256(
         {
@@ -189,19 +201,7 @@ def manifest_sha256_of(fields: Mapping[str, Any]) -> str:
 def freeze_run(root: Path, protocol_path: Path, runtime_binary: Path) -> dict[str, Any]:
     """Produce the frozen-run manifest: the pre-registration a user authority
     binds to *before* any provider request. Strict on every pin."""
-    protocol = load_protocol(root, protocol_path)
-    runtime = attest_runtime_artifact(protocol, runtime_binary)
-    plan = build_plan(root, protocol_path, runtime_binary=runtime.path)
-    _, wrapper_hashes, inventory_hashes = _arm_identities(root, protocol, runtime.path)
-    fields = frozen_run_fields(
-        root,
-        protocol,
-        protocol_sha256=_sha256(protocol_path),
-        runtime_sha256=runtime.sha256,
-        wrapper_hashes=wrapper_hashes,
-        inventory_hashes=inventory_hashes,
-        schedule=plan["schedule"],
-    )
+    fields = _observe(root, protocol_path, runtime_binary).fields
     return {**fields, "manifest_sha256": manifest_sha256_of(fields)}
 
 
@@ -264,21 +264,20 @@ def _pair_fields(protocol: Mapping[str, Any]) -> tuple[float, int, float, int]:
     return float(rollout_cost), rollout_tokens, float(total_cost), total_tokens
 
 
-def build_plan(
+def _schedule(
     root: Path,
-    protocol_path: Path,
-    *,
-    runtime_binary: Path | None = None,
-) -> dict[str, Any]:
-    protocol = load_protocol(root, protocol_path)
+    protocol: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """The suite and the exact rollout order the protocol commits to. Pure
+    given the protocol - no runtime, no subprocess - and the one derivation
+    shared by the plan, the freeze, the paid run and the analysis."""
     pair = protocol["coding_pair"]
-    rollout_cost, rollout_tokens, total_cost, total_tokens = _pair_fields(protocol)
     suite_path = root / pair["suite"]
     suite = load_json(suite_path)
     validate_suite(suite, root)
     task_ids = sorted(str(value) for value in pair["task_ids"])
-    observed = sorted(task["id"] for task in suite["tasks"])
-    if observed != task_ids:
+    tasks = {task["id"]: task for task in suite["tasks"]}
+    if sorted(tasks) != task_ids:
         raise ValidationError("frozen plugin suite tasks do not match the protocol")
     schedule = [
         {"trial": trial, "arm": arm, "task_id": task_id}
@@ -287,6 +286,130 @@ def build_plan(
     ]
     if len(schedule) != pair["rollouts"]:
         raise ValidationError("planned plugin schedule length drifted")
+    return suite_path, suite, tasks, schedule
+
+
+@dataclass(frozen=True)
+class _Observation:
+    """Everything a paid run is frozen against, as the tree looks *now*, from
+    one read of the protocol: the parsed object and the hash the manifest is
+    held against come from the same bytes."""
+
+    protocol: dict[str, Any]
+    protocol_sha256: str
+    runtime_path: Path
+    runtime_sha256: str
+    wrappers: dict[str, Path]
+    wrapper_hashes: dict[str, str]
+    inventory_hashes: dict[str, str]
+    suite_path: Path
+    suite: dict[str, Any]
+    tasks: dict[str, dict[str, Any]]
+    schedule: list[dict[str, Any]]
+    fields: dict[str, Any]
+
+
+def _observe(root: Path, protocol_path: Path, runtime_binary: Path) -> _Observation:
+    """Strict on every pin. This is the one predicate behind the freeze, the
+    start of a paid run, the bracket around every provider request and the
+    analysis - the same function everywhere, so there is no weaker second
+    definition of "the tree still matches" for a request to slip through."""
+    raw = protocol_path.read_bytes()
+    protocol = validate_protocol_payload(root, raw)
+    runtime = attest_runtime_artifact(protocol, runtime_binary)
+    wrappers, wrapper_hashes, inventory_hashes = _arm_identities(root, protocol, runtime.path)
+    suite_path, suite, tasks, schedule = _schedule(root, protocol)
+    fields = frozen_run_fields(
+        root,
+        protocol,
+        protocol_sha256=_sha256_bytes(raw),
+        runtime_sha256=runtime.sha256,
+        wrapper_hashes=wrapper_hashes,
+        inventory_hashes=inventory_hashes,
+        schedule=schedule,
+    )
+    return _Observation(
+        protocol=protocol,
+        protocol_sha256=fields["protocol_sha256"],
+        runtime_path=runtime.path,
+        runtime_sha256=runtime.sha256,
+        wrappers=wrappers,
+        wrapper_hashes=wrapper_hashes,
+        inventory_hashes=inventory_hashes,
+        suite_path=suite_path,
+        suite=suite,
+        tasks=tasks,
+        schedule=schedule,
+        fields=fields,
+    )
+
+
+def _require_still_frozen(
+    root: Path,
+    protocol_path: Path,
+    runtime_binary: Path,
+    manifest: Mapping[str, Any],
+    *,
+    moment: str,
+) -> None:
+    """Re-derive every frozen field and hold it against the manifest the user
+    authorized. Validating whatever self-consistent protocol is on disk is
+    not that: a protocol repinned after the freeze - a swapped candidate
+    Skill with its hash updated - passes the strict loader, and the rollout
+    would still be labelled with this manifest."""
+    try:
+        verify_frozen_manifest(manifest, _observe(root, protocol_path, runtime_binary).fields)
+    except ValidationError as exc:
+        raise ValidationError(f"{exc} ({moment})") from exc
+
+
+def _revision(fields: Mapping[str, Any]) -> str:
+    return f"{fields['git_head']}+{fields['implementation_fingerprint'][:16]}"
+
+
+def _config_ids(protocol: Mapping[str, Any]) -> dict[str, str]:
+    candidate = protocol["candidate"]
+    return {
+        "baseline": "plugin-v1:none",
+        "candidate": f"plugin-v1:{candidate['plugin_id']}@{candidate['plugin_version']}",
+    }
+
+
+def _authority_manifest(
+    observation: _Observation,
+    *,
+    frozen_manifest_sha256: str,
+    authorized_cost_microusd: int,
+    authorized_metered_tokens: int,
+) -> dict[str, Any]:
+    """What the budget journal's authority hash is a function of. Built here
+    and only here: the paid run seals it into the journal and the analysis
+    rebuilds it from the tree, so a journal from another freeze - or one
+    whose authority never named a frozen manifest - is a named mismatch."""
+    return {
+        "contract": AUTHORITY_MANIFEST_CONTRACT,
+        "protocol_sha256": observation.protocol_sha256,
+        "runtime_sha256": observation.runtime_sha256,
+        "wrapper_sha256": dict(observation.wrapper_hashes),
+        "inventory_sha256": dict(observation.inventory_hashes),
+        "revision": _revision(observation.fields),
+        "frozen_manifest_sha256": frozen_manifest_sha256,
+        "authorized_cost_microusd": authorized_cost_microusd,
+        "authorized_metered_tokens": authorized_metered_tokens,
+    }
+
+
+def build_plan(
+    root: Path,
+    protocol_path: Path,
+    *,
+    runtime_binary: Path | None = None,
+) -> dict[str, Any]:
+    raw = protocol_path.read_bytes()
+    protocol = validate_protocol_payload(root, raw)
+    pair = protocol["coding_pair"]
+    rollout_cost, rollout_tokens, total_cost, total_tokens = _pair_fields(protocol)
+    _, _, _, schedule = _schedule(root, protocol)
     if runtime_binary is None:
         runtime = {
             "state": "not_attested",
@@ -303,7 +426,7 @@ def build_plan(
         "schema": "metacodes.plugin-paid-plan/v2",
         "provider_requests": 0,
         "quality_evidence": False,
-        "protocol_sha256": _sha256(protocol_path),
+        "protocol_sha256": _sha256_bytes(raw),
         "implementation_fingerprint": implementation_fingerprint(root, protocol),
         "model": pair["model"],
         "runtime": runtime,
@@ -394,7 +517,11 @@ def load_user_authority(
         "authorized_by_user",
     }
     if set(value) != expected_keys or value.get("schema") != AUTHORITY_SCHEMA:
-        raise ValidationError("plugin paid authority has unsupported fields or schema")
+        raise ValidationError(
+            "plugin paid authority has unsupported fields or schema: expected "
+            f"{AUTHORITY_SCHEMA} carrying manifest_sha256 - run --freeze first, "
+            "then write an authority naming that manifest"
+        )
     if value.get("protocol_sha256") != protocol_sha256:
         raise ValidationError("plugin paid authority is bound to another protocol")
     # The authority is the user's commitment *before* the run: it names the
@@ -425,6 +552,14 @@ def _inventory(
     executable: Path,
     runtime_binary: Path,
 ) -> dict[str, Any]:
+    """One arm's credential-free inventory, hermetically.
+
+    The runtime builds a full App before `--dump-plugins` answers; run with
+    the caller's HOME it leaves a session directory behind, reads
+    ~/.metacodes/config.json (spawning any MCP server declared there) and
+    probes the model catalog. Executing the pinned runtime is the point of
+    this preflight; executing it against the operator's account is not.
+    """
     clean_env = {
         key: value
         for key, value in os.environ.items()
@@ -433,16 +568,19 @@ def _inventory(
         and not key.startswith("E2E_")
     }
     clean_env["METACODES_PLUGIN_RUNTIME_BINARY"] = str(runtime_binary)
-    completed = subprocess.run(
-        [str(executable), "--dump-plugins"],
-        cwd=root,
-        env=clean_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-        timeout=60,
-    )
+    clean_env["METACODES_NO_PROBE"] = "1"
+    with tempfile.TemporaryDirectory(prefix="metacodes-plugin-inventory-home-") as home:
+        clean_env["HOME"] = home
+        completed = subprocess.run(
+            [str(executable), "--dump-plugins"],
+            cwd=root,
+            env=clean_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=60,
+        )
     if completed.returncode != 0:
         raise ValidationError("credential-free plugin inventory preflight failed")
     for line in reversed(completed.stdout.splitlines()):
@@ -455,6 +593,56 @@ def _inventory(
     raise ValidationError("plugin inventory preflight returned no inventory")
 
 
+def _inventory_identity(
+    root: Path,
+    protocol: Mapping[str, Any],
+    arm: str,
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The location-independent identity of one arm's inventory.
+
+    The runtime reports `source_root` as the realpath of the plugin
+    directory, so hashing the raw inventory would tie a frozen manifest to
+    the checkout's absolute path: a byte-identical tree at another path
+    would fail to verify for no reason the manifest means to express. The
+    candidate root is instead *checked* against the root the protocol
+    declares and recorded under that repo-relative name. `generation` is a
+    counter of the runtime process, not a property of the plugin, and is
+    dropped; everything else the runtime says about a plugin is kept.
+    """
+    plugins = value.get("plugins")
+    if value.get("contract_version") != 1 or not isinstance(plugins, list):
+        raise ValidationError(f"{arm} plugin inventory has an invalid contract")
+    identity = []
+    for plugin in plugins:
+        if not isinstance(plugin, dict):
+            raise ValidationError(f"{arm} plugin inventory has a malformed entry")
+        source_root = plugin.get("source_root")
+        if arm == "candidate":
+            declared = str(protocol["candidate"]["root"])
+            if (
+                not isinstance(source_root, str)
+                or Path(source_root).resolve() != (root / declared).resolve()
+            ):
+                raise ValidationError(
+                    "candidate plugin inventory is not rooted at the frozen candidate root"
+                )
+            source_root = declared
+        identity.append(
+            {
+                "id": plugin.get("id"),
+                "version": plugin.get("version"),
+                "form": plugin.get("form"),
+                "layer": plugin.get("layer"),
+                "lifecycle": plugin.get("lifecycle"),
+                "capabilities": plugin.get("capabilities"),
+                "contribution_count": plugin.get("contribution_count"),
+                "source_root": source_root,
+            }
+        )
+    return {"projection": INVENTORY_IDENTITY, "contract_version": 1, "plugins": identity}
+
+
 def _verify_arm_inventory(
     root: Path,
     protocol: Mapping[str, Any],
@@ -465,21 +653,11 @@ def _verify_arm_inventory(
     attest_runtime_artifact(protocol, runtime_binary)
     value = _inventory(root, executable, runtime_binary)
     attest_runtime_artifact(protocol, runtime_binary)
-    plugins = value.get("plugins")
-    if value.get("contract_version") != 1 or not isinstance(plugins, list):
-        raise ValidationError(f"{arm} plugin inventory has an invalid contract")
-    stable_plugins = []
-    for plugin in plugins:
-        if not isinstance(plugin, dict):
-            raise ValidationError(f"{arm} plugin inventory has a malformed entry")
-        stable_plugins.append(
-            {
-                "id": plugin.get("id"),
-                "version": plugin.get("version"),
-                "form": plugin.get("form"),
-                "capabilities": plugin.get("capabilities"),
-            }
-        )
+    identity = _inventory_identity(root, protocol, arm, value)
+    stable_plugins = [
+        {key: plugin[key] for key in ("id", "version", "form", "capabilities")}
+        for plugin in identity["plugins"]
+    ]
     expected = [] if arm == "baseline" else [
         {
             "id": protocol["candidate"]["plugin_id"],
@@ -490,7 +668,7 @@ def _verify_arm_inventory(
     ]
     if stable_plugins != expected:
         raise ValidationError(f"{arm} plugin inventory does not match its frozen treatment")
-    return _canonical_sha256(value)
+    return _canonical_sha256(identity)
 
 
 def _transaction(
@@ -565,31 +743,22 @@ def run_paid_pair(
     user_authority_file: Path,
     frozen_manifest_file: Path,
 ) -> dict[str, Any]:
-    protocol = load_protocol(root, protocol_path)
-    runtime = attest_runtime_artifact(protocol, runtime_binary)
-    runtime_binary = runtime.path
-    runtime_sha256 = runtime.sha256
-    pair = protocol["coding_pair"]
-    rollout_cost, rollout_tokens, total_cost, total_tokens = _pair_fields(protocol)
-    protocol_sha256 = _sha256(protocol_path)
-
     # Freeze first, authorize second: the manifest the user signed must still
     # describe this tree before their authority is even opened.
-    wrappers, wrapper_hashes, inventory_hashes = _arm_identities(root, protocol, runtime_binary)
-    plan = build_plan(root, protocol_path, runtime_binary=runtime_binary)
-    live_fields = frozen_run_fields(
-        root,
-        protocol,
-        protocol_sha256=protocol_sha256,
-        runtime_sha256=runtime_sha256,
-        wrapper_hashes=wrapper_hashes,
-        inventory_hashes=inventory_hashes,
-        schedule=plan["schedule"],
+    observation = _observe(root, protocol_path, runtime_binary)
+    manifest = _read_private_json(
+        frozen_manifest_file.expanduser().resolve(), "frozen-run manifest"
     )
-    frozen_manifest_sha256 = verify_frozen_manifest(
-        _read_private_json(frozen_manifest_file.expanduser().resolve(), "frozen-run manifest"),
-        live_fields,
-    )
+    frozen_manifest_sha256 = verify_frozen_manifest(manifest, observation.fields)
+    protocol = observation.protocol
+    protocol_sha256 = observation.protocol_sha256
+    runtime_binary = observation.runtime_path
+    runtime_sha256 = observation.runtime_sha256
+    wrappers = observation.wrappers
+    wrapper_hashes = observation.wrapper_hashes
+    inventory_hashes = observation.inventory_hashes
+    pair = protocol["coding_pair"]
+    rollout_cost, rollout_tokens, total_cost, total_tokens = _pair_fields(protocol)
     user_authority = load_user_authority(
         user_authority_file.expanduser().resolve(),
         protocol_sha256=protocol_sha256,
@@ -604,33 +773,18 @@ def run_paid_pair(
     if rollout_tokens * int(pair["rollouts"]) > authorized_tokens:
         raise ValidationError("user token authority cannot cover the complete frozen schedule")
 
-    suite_path = root / pair["suite"]
-    suite = load_json(suite_path)
-    validate_suite(suite, root)
-    expected_tasks = {task["id"]: task for task in suite["tasks"]}
-    if sorted(expected_tasks) != sorted(pair["task_ids"]):
-        raise ValidationError("suite tasks drifted from the plugin protocol")
-
-    revision = f"{_git_head(root)}+{implementation_fingerprint(root, protocol)[:16]}"
-    config_ids = {
-        "baseline": "plugin-v1:none",
-        "candidate": (
-            f"plugin-v1:{protocol['candidate']['plugin_id']}@"
-            f"{protocol['candidate']['plugin_version']}"
-        ),
-    }
+    suite_path = observation.suite_path
+    suite = observation.suite
+    expected_tasks = observation.tasks
+    revision = _revision(observation.fields)
+    config_ids = _config_ids(protocol)
     model = pair["model"]
-    authority_manifest = {
-        "contract": "metacodes-plugin-pair-authority-v1",
-        "protocol_sha256": protocol_sha256,
-        "runtime_sha256": runtime_sha256,
-        "wrapper_sha256": wrapper_hashes,
-        "inventory_sha256": inventory_hashes,
-        "revision": revision,
-        "frozen_manifest_sha256": frozen_manifest_sha256,
-        "authorized_cost_microusd": usd_to_microusd(authorized_cost),
-        "authorized_metered_tokens": authorized_tokens,
-    }
+    authority_manifest = _authority_manifest(
+        observation,
+        frozen_manifest_sha256=frozen_manifest_sha256,
+        authorized_cost_microusd=usd_to_microusd(authorized_cost),
+        authorized_metered_tokens=authorized_tokens,
+    )
     budget_authority = BudgetAuthority(
         manifest_sha256=_canonical_sha256(authority_manifest),
         model_fingerprint=_canonical_sha256(model),
@@ -745,19 +899,14 @@ def run_paid_pair(
             for task_id in sorted(expected_tasks):
                 if (task_id, trial) in completed[arm]:
                     continue
-                live_protocol = load_protocol(root, protocol_path)
-                attest_runtime_artifact(live_protocol, runtime_binary)
-                if _sha256(wrappers[arm]) != wrapper_hashes[arm]:
-                    raise ValidationError("plugin experiment executable drifted before request")
-                observed_inventory = _verify_arm_inventory(
-                    root,
-                    protocol,
-                    arm,
-                    wrappers[arm],
-                    runtime_binary,
+                # The bracket around every request is the startup check
+                # itself: the whole manifest against the whole tree. It
+                # cannot see a change made and reverted inside the bracket
+                # (#49); it does see everything that is still different
+                # when the request ends, before its evidence is imported.
+                _require_still_frozen(
+                    root, protocol_path, runtime_binary, manifest, moment="before request"
                 )
-                if observed_inventory != inventory_hashes[arm]:
-                    raise ValidationError("plugin inventory drifted before request")
                 transaction = _transaction(
                     authority=budget_authority,
                     protocol_sha256=protocol_sha256,
@@ -805,10 +954,9 @@ def run_paid_pair(
                         "METACODES_PLUGIN_RUNTIME_BINARY": str(runtime_binary),
                     },
                 )
-                live_protocol = load_protocol(root, protocol_path)
-                attest_runtime_artifact(live_protocol, runtime_binary)
-                if _sha256(wrappers[arm]) != wrapper_hashes[arm]:
-                    raise ValidationError("plugin experiment executable drifted during request")
+                _require_still_frozen(
+                    root, protocol_path, runtime_binary, manifest, moment="after request"
+                )
                 imported = import_run(suite, root, run_dir)
                 selected = [
                     row
@@ -880,12 +1028,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_private_json(args.frozen_manifest.expanduser().resolve(), manifest)
             print(json.dumps(manifest, sort_keys=True))
             return 0
-        plan = build_plan(
-            root,
-            args.protocol.resolve(),
-            runtime_binary=runtime_binary,
-        )
         if not args.allow_paid_rollouts:
+            plan = build_plan(
+                root,
+                args.protocol.resolve(),
+                runtime_binary=runtime_binary,
+            )
             print(json.dumps(plan, sort_keys=True))
             return 0
         missing = [

@@ -10,6 +10,8 @@ from unittest import mock
 
 from scripts.eval.model import ValidationError
 from scripts.eval.plugin_pair_runner import (
+    INVENTORY_IDENTITY,
+    _canonical_sha256,
     _inventory,
     _require_scoring_checkpoints,
     _verify_arm_inventory,
@@ -209,40 +211,107 @@ class PluginPairRunnerTest(unittest.TestCase):
                     max_metered_tokens=30000000,
                 )
 
-    def test_paid_inventory_projects_the_stable_treatment_fields(self) -> None:
+    def test_paid_inventory_identity_is_location_independent(self) -> None:
+        """The runtime reports the plugin root as an absolute realpath. The
+        frozen inventory hash must not depend on where the checkout lives -
+        only on what the runtime says about the plugin - and the candidate
+        root must be the one the protocol declares."""
         protocol = load_protocol_structure(ROOT, PROTOCOL)
-        full_inventory = {
-            "schema": "metacodes.plugin-inventory/v1",
-            "contract_version": 1,
-            "generation": 1,
-            "plugins": [
+        declared = protocol["candidate"]["root"]
+
+        def inventory(source_root: str, generation: int = 1) -> dict:
+            return {
+                "schema": "metacodes.plugin-inventory/v1",
+                "contract_version": 1,
+                "generation": generation,
+                "plugins": [
+                    {
+                        "id": "metacodes.benchmark-coding",
+                        "version": protocol["candidate"]["plugin_version"],
+                        "form": "data_package",
+                        "layer": "session",
+                        "lifecycle": "active",
+                        "capabilities": ["skill_bundle"],
+                        "contribution_count": 1,
+                        "source_root": source_root,
+                    }
+                ],
+            }
+
+        def digest_of(value: dict) -> str:
+            with mock.patch(
+                "scripts.eval.plugin_pair_runner._inventory", return_value=value
+            ), mock.patch("scripts.eval.plugin_pair_runner.attest_runtime_artifact") as attest:
+                digest = _verify_arm_inventory(
+                    ROOT, protocol, "candidate", ROOT / "unused-wrapper", ROOT / "unused-runtime"
+                )
+            self.assertEqual(2, attest.call_count)
+            return digest
+
+        canonical = digest_of(inventory(str((ROOT / declared).resolve())))
+        self.assertEqual(
+            _canonical_sha256(
                 {
-                    "id": "metacodes.benchmark-coding",
-                    "version": protocol["candidate"]["plugin_version"],
-                    "form": "data_package",
-                    "layer": "session",
-                    "lifecycle": "active",
-                    "capabilities": ["skill_bundle"],
-                    "contribution_count": 1,
-                    "source_root": "/private/frozen-plugin-root",
+                    "projection": INVENTORY_IDENTITY,
+                    "contract_version": 1,
+                    "plugins": [
+                        {
+                            "id": "metacodes.benchmark-coding",
+                            "version": protocol["candidate"]["plugin_version"],
+                            "form": "data_package",
+                            "layer": "session",
+                            "lifecycle": "active",
+                            "capabilities": ["skill_bundle"],
+                            "contribution_count": 1,
+                            "source_root": declared,
+                        }
+                    ],
                 }
-            ],
-        }
-        with mock.patch(
-            "scripts.eval.plugin_pair_runner._inventory",
-            return_value=full_inventory,
-        ), mock.patch(
-            "scripts.eval.plugin_pair_runner.attest_runtime_artifact"
-        ) as attest:
-            digest = _verify_arm_inventory(
-                ROOT,
-                protocol,
-                "candidate",
-                ROOT / "unused-wrapper",
-                ROOT / "unused-runtime",
+            ),
+            canonical,
+        )
+        # The same directory reached through another name, from another
+        # runtime generation, is the same identity...
+        with tempfile.TemporaryDirectory() as directory:
+            alias = Path(directory) / "alias"
+            alias.symlink_to((ROOT / declared).resolve(), target_is_directory=True)
+            self.assertEqual(canonical, digest_of(inventory(str(alias), generation=7)))
+        # ...while a plugin loaded from anywhere else is not this candidate,
+        # whatever it calls itself.
+        with self.assertRaisesRegex(ValidationError, "not rooted at the frozen candidate root"):
+            digest_of(inventory("/private/somewhere-else"))
+        # And what the runtime says about the plugin is load-bearing.
+        richer = inventory(str((ROOT / declared).resolve()))
+        richer["plugins"][0]["contribution_count"] = 2
+        self.assertNotEqual(canonical, digest_of(richer))
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture required")
+    def test_inventory_runs_the_runtime_under_a_private_home(self) -> None:
+        """`--dump-plugins` builds a full App first: under the caller's HOME
+        it would leave a session directory behind, read their config (and
+        spawn any MCP server in it) and probe the catalog. The preflight
+        gives it a throwaway HOME and takes it away afterwards."""
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime.py"
+            runtime.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os\n"
+                "print(json.dumps({"
+                "'schema':'metacodes.plugin-inventory/v1',"
+                "'contract_version':1,'plugins':[],"
+                "'home':os.environ.get('HOME'),"
+                "'no_probe':os.environ.get('METACODES_NO_PROBE')}))\n",
+                encoding="utf-8",
             )
-        self.assertEqual(64, len(digest))
-        self.assertEqual(2, attest.call_count)
+            os.chmod(runtime, 0o700)
+            with mock.patch.dict(os.environ, {"METACODES_NO_PROBE": "0"}):
+                inventory = _inventory(
+                    ROOT, ROOT / "scripts/eval/fixtures/plugin_baseline.py", runtime
+                )
+        self.assertEqual("1", inventory["no_probe"])
+        self.assertNotEqual(os.environ.get("HOME"), inventory["home"])
+        self.assertIn("metacodes-plugin-inventory-home-", inventory["home"])
+        self.assertFalse(Path(inventory["home"]).exists())
 
     def test_paid_resume_rejects_persisted_invalid_rollout(self) -> None:
         invalid = {

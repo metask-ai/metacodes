@@ -140,10 +140,10 @@ def load_protocol(root: Path, path: Path) -> dict[str, Any]:
     """Load the protocol and fail closed on *every* pin, including the
     implementation fingerprint against the live tree.
 
-    This is the loader for anything that is about to run, measure or judge:
-    ``plugin_pair_runner.build_plan`` / ``run_paid_pair`` and its per-request
-    reloads, and ``plugin_pair_analysis.analyze``. ``run_gate`` validates the
-    same way through ``validate_protocol_payload``, because it must hash the
+    The path-taking form of ``validate_protocol_payload``. Everything that is
+    about to run, measure or judge - ``run_gate``, ``plugin_pair_runner``
+    (``build_plan``, and ``_observe`` behind freeze / paid run / analysis) -
+    calls ``validate_protocol_payload`` directly, because each must hash the
     exact bytes it validated. Both are strict by construction rather than by a
     flag a caller could forget.
     """

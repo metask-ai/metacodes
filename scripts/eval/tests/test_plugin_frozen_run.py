@@ -23,12 +23,24 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts.eval.model import ValidationError
+from scripts.eval.e2e_adapter import comparison_fingerprints
+from scripts.eval.memory_budget_journal import (
+    BudgetAuthority,
+    BudgetJournal,
+    BudgetTransaction,
+    usd_to_microusd,
+    validate_checkpoint_payload,
+)
+from scripts.eval.model import ValidationError, load_rollouts
+from scripts.eval.paired_runner import scenario_selector
 from scripts.eval.plugin_pair_analysis import analyze
 from scripts.eval.plugin_pair_runner import (
     AUTHORITY_SCHEMA,
     FROZEN_RUN_SCHEMA,
     _arm_identities,
+    _authority_manifest,
+    _canonical_sha256,
+    _observe,
     build_plan,
     freeze_run,
     frozen_run_fields,
@@ -38,6 +50,7 @@ from scripts.eval.plugin_pair_runner import (
     path_set_digest,
     run_paid_pair,
     verify_frozen_manifest,
+    write_rollouts,
 )
 from scripts.eval.plugin_release_gate import (
     PluginGateError,
@@ -241,6 +254,300 @@ class FreezeCliTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 main(["--freeze", "--protocol", str(path), "--runtime-binary", str(runtime), "--frozen-manifest", str(out)])
             self.assertEqual(written, json.loads(out.read_text(encoding="utf-8")))
+
+
+# --- a paid run, end to end, without a provider ---------------------------
+
+
+class _PaidFixture:
+    """A repinned protocol copy shrunk to one trial (six rollouts), a fake
+    runtime, the frozen manifest for that tree, and a v2 authority naming
+    the manifest. The provider key loader is patched by the tests; the auth
+    file path never has to exist."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.runtime = directory / "metacodes-release-small"
+        self.runtime.write_bytes(b"fake-release-small")
+        os.chmod(self.runtime, 0o700)
+        self.protocol = directory / "protocol.json"
+        value = json.loads(PROTOCOL.read_text(encoding="utf-8"))
+        pair = value["coding_pair"]
+        pair["trials"] = 1
+        pair["rollouts"] = 2 * len(pair["task_ids"])
+        pair["runtime_binary_sha256"] = hashlib.sha256(self.runtime.read_bytes()).hexdigest()
+        self.protocol.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        refresh_implementation_fingerprint(ROOT, self.protocol)
+        self.manifest = freeze_run(ROOT, self.protocol, self.runtime)
+        self.manifest_path = directory / "frozen.json"
+        _write_private(self.manifest_path, self.manifest)
+        self.authority = directory / "authority.json"
+        _write_private(self.authority, {
+            "schema": AUTHORITY_SCHEMA,
+            "protocol_sha256": hashlib.sha256(self.protocol.read_bytes()).hexdigest(),
+            "manifest_sha256": self.manifest["manifest_sha256"],
+            "max_cost_usd": 2.0 * pair["rollouts"],
+            "max_metered_tokens": 2_000_000 * pair["rollouts"],
+            "authorized_by_user": True,
+        })
+        self.output = directory / "output"
+        self.journal = directory / "budget.jsonl"
+
+    def run(self, **overrides):
+        arguments = dict(
+            runtime_binary=self.runtime,
+            output_dir=self.output,
+            budget_journal_path=self.journal,
+            provider_auth_file=self.directory / "never-opened-provider-auth",
+            user_authority_file=self.authority,
+            frozen_manifest_file=self.manifest_path,
+        )
+        arguments.update(overrides)
+        return run_paid_pair(ROOT, self.protocol, **arguments)
+
+    def analyze(self, **overrides):
+        arguments = dict(
+            baseline_path=self.output / "baseline.jsonl",
+            candidate_path=self.output / "candidate.jsonl",
+            budget_journal_path=self.journal,
+            frozen_manifest_file=self.manifest_path,
+        )
+        arguments.update(overrides)
+        return analyze(ROOT, self.protocol, self.runtime, **arguments)
+
+    def rewrite_protocol(self) -> None:
+        """A self-consistent edit after the freeze. The real shape of the
+        attack swaps the candidate Skill and updates its pin - which this
+        test cannot do without editing the repository tree - but the frozen
+        mechanism refuses *any* change to the protocol bytes, so a field the
+        strict loader accepts stands in exactly."""
+        value = json.loads(self.protocol.read_text(encoding="utf-8"))
+        value["coding_pair"]["max_output_tokens"] = 4096
+        self.protocol.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+class _FakeProvider:
+    """Stands in for the e2e harness: records each request, returns rows the
+    real pipeline accepts (identities from `comparison_fingerprints`), and
+    lets a test act at a chosen moment inside a request."""
+
+    def __init__(self, fixture: _PaidFixture, *, during_request=None) -> None:
+        self.fixture = fixture
+        self.during_request = during_request
+        self.requests: list[tuple[str, int, str]] = []
+        self.imports = 0
+        self._state: dict[Path, tuple] = {}
+        suite = json.loads((ROOT / "evals/plugin-v1/coding-suite.json").read_text(encoding="utf-8"))
+        self.suite_id = suite["suite_id"]
+        self.tasks = {task["id"]: task for task in suite["tasks"]}
+        self.by_selector = {scenario_selector([task_id]): task_id for task_id in self.tasks}
+
+    def run_once(self, repo_root, binary, variant, trial, selector, provider, model_id, suite_path, revision, *, harness_config_id=None, runtime_env=None, allow_invalid_run=False, timeout_seconds=None, max_metered_tokens=None, max_cost_usd=None, runtime_api_key=None):
+        token = self.fixture.directory / f"run-{len(self.requests)}"
+        self.requests.append((variant, trial, selector))
+        self._state[token] = (binary, variant, trial, selector, provider, model_id, revision, harness_config_id, max_metered_tokens, max_cost_usd)
+        if self.during_request is not None:
+            self.during_request()
+        return token
+
+    def import_run(self, suite, repo_root, run_dir):
+        self.imports += 1
+        binary, variant, trial, selector, provider, model_id, revision, config_id, max_tokens, max_cost = self._state[run_dir]
+        task_id = self.by_selector[selector]
+        task = self.tasks[task_id]
+        identity = comparison_fingerprints(
+            task, ROOT, model_provider=provider, model_id=model_id, harness_config_id=config_id,
+            harness_revision=revision, permission_mode=task["constraints"]["permission_mode"], binary_path=binary,
+        )
+        return [{
+            "schema_version": 1,
+            "run_id": f"{variant}:{task_id}:{trial}",
+            "suite_id": self.suite_id,
+            "task_id": task_id,
+            "task_fingerprint": identity["task_fingerprint"],
+            "task_fingerprint_provenance": "recorded_at_execution",
+            "trial": trial,
+            "layers": task["layers"],
+            "model": {"provider": provider, "id": model_id, "fingerprint": identity["model_fingerprint"]},
+            "harness": {
+                "config_id": config_id, "revision": revision, "fingerprint": identity["harness_fingerprint"],
+                "permission_mode": identity["permission_mode"], "environment_fingerprint": identity["environment_fingerprint"],
+                "runtime_budget": {"max_metered_tokens": max_tokens, "max_cost_usd": max_cost},
+            },
+            "readiness": {"status": "pass", "checks": []},
+            "execution": {"status": "completed", "exit_code": 0, "invalid_reasons": []},
+            "outcome": {"status": "pass", "checks": []},
+            "trajectory": {"status": "pass", "checks": [], "tool_failures": []},
+            "evaluator": {"status": "ready", "kind": "deterministic_workspace", "version": "plugin-v1", "fingerprint": identity["grader_fingerprint"], "errors": []},
+            "judgement": {"valid_for_scoring": True, "trustworthy_success": True},
+            "metrics": {
+                "cost_usd": 0.01, "input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                "wall_time_ms": 1000, "model_request_time_ms": 600, "tool_stage_time_ms": 300, "harness_time_ms": 100,
+                "policy_violations": 0, "model_tool_errors": 0, "tool_calls": 1,
+            },
+            "attribution": [],
+            "artifacts": {},
+        }]
+
+    @contextlib.contextmanager
+    def installed(self):
+        with mock.patch("scripts.eval.plugin_pair_runner._run_once", side_effect=self.run_once), mock.patch(
+            "scripts.eval.plugin_pair_runner.import_run", side_effect=self.import_run
+        ), mock.patch("scripts.eval.plugin_pair_runner._load_api_key", return_value="test-only-key"):
+            yield
+
+
+class PaidRunStaysFrozenTest(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch(
+            "scripts.eval.plugin_pair_runner._verify_arm_inventory",
+            lambda root, protocol, arm, executable, runtime: "inventory-" + arm,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.fixture = _PaidFixture(Path(self._tmp.name))
+
+    def test_a_complete_pair_is_bound_to_the_manifest_end_to_end(self) -> None:
+        fixture = self.fixture
+        fake = _FakeProvider(fixture)
+        with fake.installed():
+            self.assertEqual({"baseline": 3, "candidate": 3}, fixture.run())
+        self.assertEqual(6, len(fake.requests))
+        self.assertEqual(6, fake.imports)
+        journal_bytes = fixture.journal.read_bytes()
+        journal = validate_checkpoint_payload(journal_bytes)
+        self.assertEqual(6, len(journal["transactions"]))
+        self.assertEqual({"committed"}, {t["state"] for t in journal["transactions"].values()})
+        for arm in ("baseline", "candidate"):
+            for row in load_rollouts(fixture.output / f"{arm}.jsonl"):
+                self.assertEqual(fixture.manifest["manifest_sha256"], row["plugin_treatment"]["frozen_manifest_sha256"])
+        receipt = fixture.analyze()
+        self.assertEqual("development_gate_passed", receipt["release_status"])
+        self.assertEqual(fixture.manifest["manifest_sha256"], receipt["frozen_manifest_sha256"])
+        self.assertEqual(fixture.manifest["implementation_fingerprint"], receipt["implementation_fingerprint"])
+        self.assertEqual(fixture.manifest["path_set_digest"], receipt["path_set_digest"])
+        self.assertEqual(hashlib.sha256(journal_bytes).hexdigest(), receipt["budget_journal_sha256"])
+        self.assertEqual(3, receipt["pair_count"])
+        self.assertEqual(6, receipt["provider_requests_upper_bound"])
+
+    def test_a_protocol_rewritten_during_a_request_is_refused_before_its_evidence_is_imported(self) -> None:
+        fixture = self.fixture
+        fake = _FakeProvider(fixture, during_request=fixture.rewrite_protocol)
+        with fake.installed():
+            with self.assertRaisesRegex(ValidationError, r"drifted: protocol_sha256 \(after request\)"):
+                fixture.run()
+        self.assertEqual(1, len(fake.requests))
+        self.assertEqual(0, fake.imports)
+        journal = validate_checkpoint_payload(fixture.journal.read_bytes())
+        self.assertEqual(["request_authorized"], [t["state"] for t in journal["transactions"].values()])
+        self.assertFalse((fixture.output / "baseline.jsonl").exists())
+
+    def test_a_protocol_rewritten_between_requests_is_refused_before_the_next_request(self) -> None:
+        fixture = self.fixture
+        fake = _FakeProvider(fixture)
+        written = []
+
+        def write_then_rewrite(path, rows):
+            write_rollouts(path, rows)
+            written.append(path)
+            if len(written) == 1:
+                fixture.rewrite_protocol()
+
+        with fake.installed(), mock.patch(
+            "scripts.eval.plugin_pair_runner.write_rollouts", side_effect=write_then_rewrite
+        ):
+            with self.assertRaisesRegex(ValidationError, r"drifted: protocol_sha256 \(before request\)"):
+                fixture.run()
+        self.assertEqual(1, len(fake.requests))
+        journal = validate_checkpoint_payload(fixture.journal.read_bytes())
+        self.assertEqual(["committed"], [t["state"] for t in journal["transactions"].values()])
+        self.assertEqual(1, len(load_rollouts(fixture.output / "baseline.jsonl")))
+
+
+class AnalysisBindsTheJournalTest(unittest.TestCase):
+    """The receipt's `budget_journal_sha256` is the hash of a journal that
+    replayed, whose authority names this frozen run, and whose transactions
+    are exactly the rollouts' receipts - not of whatever file was passed."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch(
+            "scripts.eval.plugin_pair_runner._verify_arm_inventory",
+            lambda root, protocol, arm, executable, runtime: "inventory-" + arm,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.fixture = _PaidFixture(Path(self._tmp.name))
+        with _FakeProvider(self.fixture).installed():
+            self.fixture.run()
+        self.state = validate_checkpoint_payload(self.fixture.journal.read_bytes())
+
+    def _rewrite_candidate(self, mutate) -> None:
+        path = self.fixture.output / "candidate.jsonl"
+        rows = load_rollouts(path)
+        mutate(rows[0])
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def test_an_unrelated_readable_file_is_not_a_budget_journal(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "budget journal"):
+            self.fixture.analyze(budget_journal_path=self.fixture.protocol)
+
+    def test_a_journal_sealed_without_this_frozen_manifest_is_refused(self) -> None:
+        foreign = self.fixture.directory / "foreign-budget.jsonl"
+        authority = dict(self.state["authority"], manifest_sha256="c" * 64)
+        with BudgetJournal(foreign, BudgetAuthority(**authority)):
+            pass
+        with self.assertRaisesRegex(ValidationError, "does not bind this frozen run"):
+            self.fixture.analyze(budget_journal_path=foreign)
+
+    def test_a_row_naming_an_unknown_transaction_is_refused(self) -> None:
+        self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("transaction_id", "0" * 64))
+        with self.assertRaisesRegex(ValidationError, "the budget journal does not contain"):
+            self.fixture.analyze()
+
+    def test_a_receipt_that_drifted_from_the_journal_is_refused(self) -> None:
+        self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("identity_sha256", "0" * 64))
+        with self.assertRaisesRegex(ValidationError, "drifted from the journal"):
+            self.fixture.analyze()
+
+    def test_an_authorized_transaction_without_a_rollout_is_refused(self) -> None:
+        authority = self.state["authority"]
+        extra = BudgetTransaction(
+            run_id="plugin-v1:candidate:00_smoke:1",
+            manifest_sha256=authority["manifest_sha256"],
+            model_fingerprint=authority["model_fingerprint"],
+            harness_fingerprint="f" * 64,
+            provider_identity=authority["provider_identity"],
+            max_cost_microusd=usd_to_microusd(2.0),
+            max_metered_tokens=2_000_000,
+        )
+        with BudgetJournal(self.fixture.journal, BudgetAuthority(**authority)) as journal:
+            reserved = journal.reserve(extra)
+            journal.authorize_request(
+                str(reserved["transaction_id"]),
+                expected_revision=int(reserved["journal_revision"]),
+                expected_head_sha256=str(reserved["journal_head_sha256"]),
+            )
+        with self.assertRaisesRegex(ValidationError, "without a matching rollout"):
+            self.fixture.analyze()
+
+    def test_the_journal_authority_is_a_function_of_the_frozen_manifest(self) -> None:
+        observation = _observe(ROOT, self.fixture.protocol, self.fixture.runtime)
+        hashes = {
+            _canonical_sha256(
+                _authority_manifest(
+                    observation,
+                    frozen_manifest_sha256=digest,
+                    authorized_cost_microusd=1,
+                    authorized_metered_tokens=1,
+                )
+            )
+            for digest in ("a" * 64, "b" * 64)
+        }
+        self.assertEqual(2, len(hashes))
 
 
 if __name__ == "__main__":

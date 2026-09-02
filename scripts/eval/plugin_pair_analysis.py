@@ -15,51 +15,63 @@ if __package__ in {None, ""}:
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.eval.analysis import gate  # type: ignore
-    from scripts.eval.memory_budget_journal import usd_to_microusd_ceiling  # type: ignore
-    from scripts.eval.model import ValidationError, load_rollouts  # type: ignore
-    from scripts.eval.plugin_pair_runner import (
-        _arm_identities,
-        frozen_run_fields,
-        verify_frozen_manifest,
-        _read_private_json,
-        build_plan,  # type: ignore
+    from scripts.eval.memory_budget_journal import (  # type: ignore
+        MAX_JOURNAL_BYTES,
+        BudgetAuthority,
+        _transaction_receipt_from_state,
+        usd_to_microusd,
+        usd_to_microusd_ceiling,
+        validate_checkpoint_payload,
+    )
+    from scripts.eval.model import ValidationError, parse_rollouts  # type: ignore
+    from scripts.eval.plugin_pair_runner import (  # type: ignore
         TOKEN_METRICS,
+        _Observation,
+        _authority_manifest,
         _canonical_sha256,
+        _config_ids,
         _metered_tokens,
-        _verify_arm_inventory,
+        _observe,
+        _pair_fields,
+        _read_private_json,
+        _revision,
+        _transaction,
+        verify_frozen_manifest,
     )
-    from scripts.eval.plugin_release_gate import (  # type: ignore
-        PluginGateError,
-        attest_runtime_artifact,
-        load_protocol,
-    )
+    from scripts.eval.plugin_release_gate import PluginGateError  # type: ignore
 else:
     from .analysis import gate
-    from .memory_budget_journal import usd_to_microusd_ceiling
-    from .model import ValidationError, load_rollouts
+    from .memory_budget_journal import (
+        MAX_JOURNAL_BYTES,
+        BudgetAuthority,
+        _transaction_receipt_from_state,
+        usd_to_microusd,
+        usd_to_microusd_ceiling,
+        validate_checkpoint_payload,
+    )
+    from .model import ValidationError, parse_rollouts
     from .plugin_pair_runner import (
-        _arm_identities,
-        frozen_run_fields,
-        verify_frozen_manifest,
-        _read_private_json,
-        build_plan,
         TOKEN_METRICS,
+        _Observation,
+        _authority_manifest,
         _canonical_sha256,
+        _config_ids,
         _metered_tokens,
-        _verify_arm_inventory,
+        _observe,
+        _pair_fields,
+        _read_private_json,
+        _revision,
+        _transaction,
+        verify_frozen_manifest,
     )
-    from .plugin_release_gate import (
-        PluginGateError,
-        attest_runtime_artifact,
-        load_protocol,
-    )
+    from .plugin_release_gate import PluginGateError
 
 
 RECEIPT_SCHEMA = "metacodes.plugin-paid-quality-receipt/v1"
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _expected_keys(protocol: Mapping[str, Any]) -> set[tuple[str, int]]:
@@ -113,6 +125,128 @@ def validate_paid_row(
         raise ValidationError("paid plugin row has incomplete token telemetry")
 
 
+def _read_journal(path: Path) -> tuple[bytes, Mapping[str, Any]]:
+    """One read: the replayed state and the hash the receipt carries come
+    from the same bytes, and a file that does not replay as a budget journal
+    is refused here rather than hashed into a receipt as "provenance"."""
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise ValidationError(f"cannot read budget journal: {exc}") from exc
+    if not payload or len(payload) > MAX_JOURNAL_BYTES:
+        raise ValidationError("budget journal size is empty or exceeds the safety limit")
+    return payload, validate_checkpoint_payload(payload)
+
+
+def _read_rollouts(path: Path) -> tuple[bytes, list[dict[str, Any]]]:
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise ValidationError(f"cannot read rollout JSONL {path}: {exc}") from exc
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValidationError(f"{path}: invalid UTF-8: {exc}") from exc
+    return payload, parse_rollouts(text, str(path))
+
+
+def verify_journal_authority(
+    state: Mapping[str, Any],
+    observation: _Observation,
+    *,
+    frozen_manifest_sha256: str,
+) -> BudgetAuthority:
+    """The journal must be *this* frozen run's journal.
+
+    Its authority hash is rebuilt from the tree, the frozen manifest and the
+    totals the journal itself records, and those totals must sit inside the
+    protocol's cumulative ceiling. This binds consistency, not intent: the
+    journal is unsigned, so what is established is that the evidence, the
+    journal and the freeze describe one run - not that a user authorized it
+    (that file is the runner's gate, not the analysis's input)."""
+    pair = observation.protocol["coding_pair"]
+    authority = state["authority"]
+    expected = _authority_manifest(
+        observation,
+        frozen_manifest_sha256=frozen_manifest_sha256,
+        authorized_cost_microusd=int(authority["total_cost_microusd"]),
+        authorized_metered_tokens=int(authority["total_metered_tokens"]),
+    )
+    if authority["manifest_sha256"] != _canonical_sha256(expected):
+        raise ValidationError("budget journal authority does not bind this frozen run")
+    model = pair["model"]
+    if (
+        authority["model_fingerprint"] != _canonical_sha256(model)
+        or authority["provider_identity"] != f"{model['provider']}:{model['id']}"
+    ):
+        raise ValidationError("budget journal authority names another model")
+    _, _, total_cost, total_tokens = _pair_fields(observation.protocol)
+    if (
+        int(authority["total_cost_microusd"]) > usd_to_microusd(total_cost)
+        or int(authority["total_metered_tokens"]) > int(total_tokens)
+    ):
+        raise ValidationError("budget journal authority exceeds the frozen cumulative ceiling")
+    return BudgetAuthority(**authority)
+
+
+def bind_row_to_journal(
+    row: Mapping[str, Any],
+    state: Mapping[str, Any],
+    observation: _Observation,
+    authority: BudgetAuthority,
+    *,
+    arm: str,
+) -> str:
+    """Match one rollout's receipt to the journal transaction it names, and
+    that transaction to the identity this frozen run would have reserved for
+    this arm/task/trial. Returns the transaction id so the caller can find
+    journal transactions no rollout accounts for."""
+    receipt = row["budget_transaction"]
+    transaction_id = receipt.get("transaction_id")
+    if not isinstance(transaction_id, str) or transaction_id not in state["transactions"]:
+        raise ValidationError(
+            "paid plugin row names a transaction the budget journal does not contain"
+        )
+    live = _transaction_receipt_from_state(state, transaction_id)
+    immutable = set(live) - {"journal_revision", "journal_head_sha256"}
+    if any(receipt.get(key) != live.get(key) for key in immutable):
+        raise ValidationError("paid plugin row budget receipt drifted from the journal")
+    rollout_cost, rollout_tokens, _, _ = _pair_fields(observation.protocol)
+    expected = _transaction(
+        authority=authority,
+        protocol_sha256=observation.protocol_sha256,
+        task=observation.tasks[str(row["task_id"])],
+        arm=arm,
+        trial=int(row["trial"]),
+        revision=_revision(observation.fields),
+        config_id=_config_ids(observation.protocol)[arm],
+        wrapper_sha256=observation.wrapper_hashes[arm],
+        runtime_sha256=observation.runtime_sha256,
+        inventory_sha256=observation.inventory_hashes[arm],
+        max_cost_usd=rollout_cost,
+        max_metered_tokens=rollout_tokens,
+    )
+    if any(receipt.get(key) != value for key, value in expected.record().items()):
+        raise ValidationError(
+            "paid plugin row budget transaction identity does not match this frozen run"
+        )
+    return transaction_id
+
+
+def _require_no_orphan_transactions(state: Mapping[str, Any], claimed: set[str]) -> None:
+    """Same rule as the runner's resume guard: every journal transaction that
+    was authorized - let alone committed - must be accounted for by exactly
+    one rollout; only a pre-request abort leaves no evidence behind."""
+    for transaction_id, transaction in state["transactions"].items():
+        if transaction["state"] == "aborted_pre_request":
+            continue
+        if transaction_id not in claimed:
+            raise ValidationError(
+                "budget journal contains an authorized, reserved, or committed "
+                "transaction without a matching rollout"
+            )
+
+
 def analyze(
     root: Path,
     protocol_path: Path,
@@ -122,34 +256,29 @@ def analyze(
     budget_journal_path: Path,
     frozen_manifest_file: Path,
 ) -> dict[str, Any]:
-    protocol = load_protocol(root, protocol_path)
-    runtime = attest_runtime_artifact(protocol, runtime_binary)
-    protocol_sha256 = _sha256(protocol_path)
     # The evidence is judged against the same frozen manifest the run was
-    # authorized under, re-verified against the tree as it is now.
-    _, wrapper_hashes, inventory_hashes = _arm_identities(root, protocol, runtime.path)
-    plan = build_plan(root, protocol_path, runtime_binary=runtime.path)
-    live_fields = frozen_run_fields(
-        root,
-        protocol,
-        protocol_sha256=protocol_sha256,
-        runtime_sha256=runtime.sha256,
-        wrapper_hashes=wrapper_hashes,
-        inventory_hashes=inventory_hashes,
-        schedule=plan["schedule"],
-    )
+    # authorized under, re-verified against the tree as it is now - before
+    # the journal, before any rollout is read.
+    observation = _observe(root, protocol_path, runtime_binary)
     frozen_manifest_sha256 = verify_frozen_manifest(
         _read_private_json(frozen_manifest_file.expanduser().resolve(), "frozen-run manifest"),
-        live_fields,
+        observation.fields,
     )
-    baseline = load_rollouts(baseline_path)
-    candidate = load_rollouts(candidate_path)
+    protocol = observation.protocol
+    protocol_sha256 = observation.protocol_sha256
+    journal_payload, journal = _read_journal(budget_journal_path)
+    authority = verify_journal_authority(
+        journal, observation, frozen_manifest_sha256=frozen_manifest_sha256
+    )
+    baseline_payload, baseline = _read_rollouts(baseline_path)
+    candidate_payload, candidate = _read_rollouts(candidate_path)
     expected = _expected_keys(protocol)
     for arm, rows in (("baseline", baseline), ("candidate", candidate)):
         observed = {(str(row["task_id"]), int(row["trial"])) for row in rows}
         if observed != expected or len(rows) != len(expected):
             raise ValidationError(f"{arm} evidence is not the complete frozen pair")
     pair = protocol["coding_pair"]
+    claimed: set[str] = set()
     for arm, rows in (("baseline", baseline), ("candidate", candidate)):
         for row in rows:
             validate_paid_row(
@@ -158,8 +287,13 @@ def analyze(
                 protocol_sha256=protocol_sha256,
                 frozen_manifest_sha256=frozen_manifest_sha256,
                 arm=arm,
-                inventory_sha256=inventory_hashes[arm],
+                inventory_sha256=observation.inventory_hashes[arm],
             )
+            transaction_id = bind_row_to_journal(row, journal, observation, authority, arm=arm)
+            if transaction_id in claimed:
+                raise ValidationError("two paid plugin rows claim the same budget transaction")
+            claimed.add(transaction_id)
+    _require_no_orphan_transactions(journal, claimed)
 
     thresholds = pair["release_thresholds"]
     judgement = gate(
@@ -203,11 +337,11 @@ def analyze(
         "quality_evidence": True,
         "protocol_sha256": protocol_sha256,
         "frozen_manifest_sha256": frozen_manifest_sha256,
-        "implementation_fingerprint": live_fields["implementation_fingerprint"],
-        "path_set_digest": live_fields["path_set_digest"],
-        "baseline_sha256": _sha256(baseline_path),
-        "candidate_sha256": _sha256(candidate_path),
-        "budget_journal_sha256": _sha256(budget_journal_path),
+        "implementation_fingerprint": observation.fields["implementation_fingerprint"],
+        "path_set_digest": observation.fields["path_set_digest"],
+        "baseline_sha256": _sha256_bytes(baseline_payload),
+        "candidate_sha256": _sha256_bytes(candidate_payload),
+        "budget_journal_sha256": _sha256_bytes(journal_payload),
         "pair_count": len(expected),
         "provider_requests_upper_bound": int(pair["rollouts"]),
         "observed_cost_usd": total_cost,
