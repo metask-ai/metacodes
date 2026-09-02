@@ -319,7 +319,6 @@ pub const Client = struct {
             // Anthropic 不支持方言字段覆盖(Claude 无 prompt_cache_key/parallel_tool_calls/response_format 方言字段);
             // requestOverridesFn 走 default(返全 null),setRequestOverridesFn 留 null(setter 调用返 error)
             .supportsFn = &pSupports,
-            .supportsForModelFn = &pSupportsForModel,
         };
     }
     fn pModel(ctx: *anyopaque) []const u8 {
@@ -363,10 +362,6 @@ pub const Client = struct {
     }
     fn pSetReasoningEffort(ctx: *anyopaque, effort: ?types.ReasoningEffort) void {
         asClient(ctx).reasoning_effort = effort;
-    }
-    fn pSupportsForModel(_: *anyopaque, model_name: []const u8, cap: provider_mod.Capability) bool {
-        const capability = @import("api/capability.zig");
-        return capability.supports(.anthropic, model_name, cap);
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         // P2:走 capability 表(单一真相源),按当前 model 真判, 不再恒 true stub。
@@ -553,6 +548,10 @@ pub const Client = struct {
         retry_hint: ?*RetryHint,
     ) !StreamResponse {
         const effective_model = model_override orelse client.modelSnapshot();
+        const dialect = client.dialect_resolver.resolve(.anthropic, effective_model);
+        // 与下面序列化用的同一 profile:图像 tool_result 是发原生块还是占位文本,在这里定案
+        // 并随流句柄回传(serializeImagePart 内部就是按 supports_image_input 分支)。
+        const image_results_native = dialect.profileFor(.anthropic, effective_model).supports_image_input;
         const req_body = try json_mod.serializeMessagesRequestWithDialect(.{
             .model = effective_model,
             .max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override), // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
@@ -562,14 +561,16 @@ pub const Client = struct {
             .tools = tools,
             .tool_choice = tool_choice,
             .reasoning_effort = client.reasoning_effort,
-        }, client.allocator, client.dialect_resolver.resolve(.anthropic, effective_model));
+        }, client.allocator, dialect);
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
 
         const result = try client.doRequest(req_body, true, abort, retry_hint);
         switch (result) {
             .streaming_response => |r| {
-                return StreamResponse.init(client.allocator, r, abort);
+                var sr = StreamResponse.init(client.allocator, r, abort);
+                sr.image_results_native = image_results_native;
+                return sr;
             },
             .full_body => unreachable,
         }
@@ -943,6 +944,8 @@ pub const StreamResponse = struct {
     done: bool = false,
     /// 本轮用户原始输入(borrowed),透传给 EventIterator 供 web_search 显示真实 query。
     user_query: []const u8 = "",
+    /// 序列化时对图像 tool_result 的定案(原生块 / 占位),随 StreamHandle 回传给 agent_loop。
+    image_results_native: bool = false,
     /// 本次流式请求的 request_id，所有下游（stream event、agent loop、工具调用）
     /// 用它把日志串起来。
     id: log.RequestId,
@@ -977,6 +980,7 @@ pub const StreamResponse = struct {
         std.debug.assert(!self.iter_initialized);
         return .{
             .ctx = @ptrCast(self),
+            .image_results_native = self.image_results_native,
             .nextFn = &hNext,
             .deinitFn = &hDeinit,
             .stopReasonFn = &hStopReason,

@@ -791,7 +791,6 @@ pub const BudgetedProvider = struct {
             .maxInputTokensFn = maxInputTokens,
             .reasoningEffortFn = reasoningEffort,
             .supportsFn = supports,
-            .supportsForModelFn = supportsForModel,
         };
     }
 
@@ -967,9 +966,6 @@ pub const BudgetedProvider = struct {
     fn supports(raw: *anyopaque, capability: core.api_provider.Capability) bool {
         return cast(raw).base.supports(capability);
     }
-    fn supportsForModel(raw: *anyopaque, model_name: []const u8, capability: core.api_provider.Capability) bool {
-        return cast(raw).base.supportsForModel(model_name, capability);
-    }
 
     fn cast(raw: *anyopaque) *BudgetedProvider {
         return @ptrCast(@alignCast(raw));
@@ -991,6 +987,8 @@ const StreamWrapper = struct {
     fn handle(self: *StreamWrapper) core.api_provider.StreamHandle {
         return .{
             .ctx = self,
+            // The serialization decision belongs to the base stream; pass it through untouched.
+            .image_results_native = self.base.image_results_native,
             .nextFn = next,
             .deinitFn = deinit,
             .stopReasonFn = stopReason,

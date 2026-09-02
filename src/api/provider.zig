@@ -216,10 +216,6 @@ pub const Provider = struct {
 
     /// 能力查询(P2 真接表;P0 实现可恒按 Anthropic 能力答)。
     supportsFn: *const fn (ctx: *anyopaque, cap: Capability) bool,
-    /// 按**指定模型**查能力:一次请求若带 model_override,序列化用的是 override 模型的
-    /// profile,能力判断必须问同一个模型。真实客户端实现;包装型 provider 转发;测试桩
-    /// 可留 null → supportsForModel 回落到 supportsFn(配置模型)。
-    supportsForModelFn: ?*const fn (ctx: *anyopaque, model: []const u8, cap: Capability) bool = null,
 
     // ── 便利转发 ──────────────────────────────────────────────────────────
     pub inline fn model(self: Provider) []const u8 {
@@ -260,13 +256,6 @@ pub const Provider = struct {
         const setter = self.setRequestOverridesFn orelse return error.OverridesUnsupportedProvider;
         setter(self.ctx, o);
     }
-    /// 一次请求实际使用的模型的能力:`model_override`(每请求)优先,否则配置模型。
-    pub fn supportsForModel(self: Provider, model_override: ?[]const u8, cap: Capability) bool {
-        const override = model_override orelse return self.supports(cap);
-        if (self.supportsForModelFn) |f| return f(self.ctx, override, cap);
-        return self.supports(cap);
-    }
-
     pub inline fn supports(self: Provider, cap: Capability) bool {
         return self.supportsFn(self.ctx, cap);
     }

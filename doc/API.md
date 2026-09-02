@@ -157,9 +157,12 @@ stream handle was returned; a request the provider rejects with an HTTP
 error does not deliver, a locally appended assistant message is not
 delivery, a resumed transcript starts undelivered until the next accepted
 request, and a request through a model without image input, which only
-carries the placeholder, does not deliver messages holding an image result;
-image support is judged for the model the request actually used, i.e. a
-per-request model override when one is set), from `truncateLargeToolResults`, and from the AgentCore
+carries the placeholder, does not deliver messages holding an image result —
+that decision is the serializer's own, carried back on the accepted stream
+handle (`StreamHandle.image_results_native`) rather than re-derived, so it
+always matches the bytes sent; messages behind the compact boundary and
+orphan image results the normalizer strips are delivered regardless, since no
+later request can carry them), from `truncateLargeToolResults`, and from the AgentCore
 artifact promotion above the operation's cap (`tool_result_cap_bytes` for
 built-in and host tools, `mcp_result_cap_bytes` for external tools), so the
 picture itself reaches the provider. Two different units apply: context estimation charges one image at

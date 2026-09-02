@@ -704,10 +704,44 @@ pub const Conversation = struct {
     pub fn markDelivered(self: *Conversation, opts: DeliveryOptions) void {
         _ = self.snapshot_mutex.lock();
         defer _ = self.snapshot_mutex.unlock();
-        for (self.messages.items) |*m| {
-            if (!opts.images_visible and messageHasImageResult(m.*)) continue;
+        const active_start = @min(self.compact_boundary, self.messages.items.len);
+        for (self.messages.items, 0..) |*m, i| {
+            // The vision exception only protects an image that some later
+            // vision-capable request could still carry: an active message whose
+            // image result is paired with the nearest preceding assistant turn.
+            // Messages behind the compact boundary are never sent again, and an
+            // orphan image result is stripped by the request normalizer, so
+            // leaving either undelivered would only pin its base64 forever.
+            if (!opts.images_visible and i >= active_start and
+                messageHasImageResult(m.*) and !self.imageResultsAreOrphansLocked(i, active_start))
+                continue;
             m.delivered = true;
         }
+    }
+
+    /// Whether every image result in message `index` is an orphan under the
+    /// request normalizer's sequential pairing: no tool_use with its id in the
+    /// nearest preceding assistant message of the active range.
+    fn imageResultsAreOrphansLocked(self: *const Conversation, index: usize, active_start: usize) bool {
+        var turn: ?msg.Message = null;
+        var i = index;
+        while (i > active_start) {
+            i -= 1;
+            if (self.messages.items[i].role == .assistant) {
+                turn = self.messages.items[i];
+                break;
+            }
+        }
+        for (self.messages.items[index].blocks) |b| switch (b) {
+            .tool_result => |tr| if (result_projection.isImageResult(tr.content)) {
+                if (turn) |am| for (am.blocks) |ab| switch (ab) {
+                    .tool_use => |tu| if (std.mem.eql(u8, tu.id, tr.tool_use_id)) return false,
+                    else => {},
+                };
+            },
+            else => {},
+        };
+        return true;
     }
 
     pub const DeliveryOptions = struct {
@@ -1012,6 +1046,11 @@ test "delivery watermark: a non-vision route leaves image-result messages undeli
     var c = Conversation.init(a);
     defer c.deinit();
     try c.appendText(.user, "look");
+    // The image result must be paired with a preceding tool_use: an unpaired
+    // (orphan) result is stripped by the normalizer and delivers unconditionally.
+    const tu = try a.alloc(msg.Block, 1);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t1"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
     const blocks = try a.alloc(msg.Block, 1);
     blocks[0] = .{ .tool_result = .{
         .tool_use_id = try a.dupe(u8, "t1"),
@@ -1022,10 +1061,43 @@ test "delivery watermark: a non-vision route leaves image-result messages undeli
     // Non-vision request: the placeholder went out, not the picture.
     c.markDelivered(.{ .images_visible = false });
     try std.testing.expect(c.messages.items[0].delivered);
-    try std.testing.expect(!c.messages.items[1].delivered);
+    try std.testing.expect(c.messages.items[1].delivered);
+    try std.testing.expect(!c.messages.items[2].delivered);
     // A vision-capable request delivers it.
     c.markDelivered(.{ .images_visible = true });
-    try std.testing.expect(c.messages.items[1].delivered);
+    try std.testing.expect(c.messages.items[2].delivered);
+}
+
+test "delivery watermark: non-vision requests still deliver inactive and orphan image messages" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const img = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}";
+    const T = struct {
+        fn imageResult(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = try al.dupe(u8, img), .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+        fn toolUse(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = blocks });
+        }
+    };
+    try T.imageResult(&c, a, "old"); // 0: behind the boundary after resume
+    try c.appendText(.assistant, "seen"); // 1
+    try T.imageResult(&c, a, "ghost"); // 2: active orphan (nearest assistant turn has no tool_use "ghost")
+    try T.toolUse(&c, a, "t1"); // 3
+    try T.imageResult(&c, a, "t1"); // 4: active, legitimately paired
+    try c.restoreCompactState(1, null);
+
+    c.markDelivered(.{ .images_visible = false });
+    try std.testing.expect(c.messages.items[0].delivered);
+    try std.testing.expect(c.messages.items[2].delivered);
+    try std.testing.expect(!c.messages.items[4].delivered);
+    c.markDelivered(.{ .images_visible = true });
+    try std.testing.expect(c.messages.items[4].delivered);
 }
 
 test "compact preview commit keeps a delivery watermark set while the preview was in flight" {

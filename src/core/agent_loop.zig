@@ -1405,10 +1405,12 @@ pub fn run(
             // came back), so microcompact may treat everything in it as history.
             // Only this evidence advances delivery: a rejected request, local
             // appends (assistant terminal markers) and resumed transcripts stay
-            // undelivered until a request is actually accepted with them. A
-            // non-vision route sent placeholders for image results, so those
-            // messages stay undelivered until a vision-capable request carries them.
-            conversation.markDelivered(.{ .images_visible = provider.supportsForModel(opts.model_override, .image_input) });
+            // undelivered until a request is actually accepted with them. Whether
+            // image results went out as native image parts or as placeholders is
+            // the serializer's own decision, carried back on the stream handle —
+            // never re-derived here, so it matches the bytes sent even under a
+            // runtime dialect override or a concurrent model change.
+            conversation.markDelivered(.{ .images_visible = stream.image_results_native });
             defer stream.deinit();
 
             rid_for_turn = stream.requestId();

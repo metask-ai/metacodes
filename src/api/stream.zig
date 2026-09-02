@@ -787,6 +787,11 @@ pub const ApiResponse = struct {
 /// **借用契约**:handle 的 ctx 借用底层 StreamResponse;底层必须比 handle 活得久(同步消费)。
 pub const StreamHandle = struct {
     ctx: *anyopaque,
+    /// 本次请求里图像形态 tool_result 是否以**原生图像块**发出(false = 发的是有界占位文本,
+    /// 模型看不到图)。由具体客户端在序列化的同一时刻、用同一个方言 profile 与同一个模型快照
+    /// 填写;agent_loop 的送达水位对含图消息只认它,绝不事后重算(否则运行时方言覆盖或并发
+    /// setModel 会让判断与真正发出的字节不一致)。默认 false = 不知道就按未送达保守处理。
+    image_results_native: bool = false,
     nextFn: *const fn (ctx: *anyopaque) anyerror!?StreamEvent,
     deinitFn: *const fn (ctx: *anyopaque) void,
     stopReasonFn: *const fn (ctx: *anyopaque) StopReason,

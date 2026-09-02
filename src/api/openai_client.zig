@@ -117,7 +117,6 @@ pub const OpenAIClient = struct {
             .requestOverridesFn = &pRequestOverrides,
             .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
-            .supportsForModelFn = &pSupportsForModel,
         };
     }
     inline fn cast(ctx: *anyopaque) *OpenAIClient {
@@ -155,9 +154,6 @@ pub const OpenAIClient = struct {
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         return capability.supports(.openai, cast(ctx).model, cap);
     }
-    fn pSupportsForModel(_: *anyopaque, model_name: []const u8, cap: provider_mod.Capability) bool {
-        return capability.supports(.openai, model_name, cap);
-    }
     fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!provider_mod.ApiResponse {
         // P3 MVP:非流式不实现(compact summary 在 OpenAI 路径下退回纯丢老消息)。诚实返回空。
         _ = ctx;
@@ -187,17 +183,19 @@ pub const OpenAIClient = struct {
         if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
         o.tool_choice = tool_choice;
         const dialect = self.dialect_resolver.resolve(.openai, model);
+        // 图像 tool_result 定案(原生块 / 占位)与序列化同一 profile,随流句柄回传。
+        const image_results_native = dialect.profileFor(.openai, model).supports_image_input;
         // wire 协议分派:chat/completions(默认)或 Responses API(typed SSE)。
         const body = switch (self.protocol) {
             .chat_completions => try serializeOpenAIRequestWithOverridesAndDialect(self.allocator, model, messages, system, tools, o, dialect),
             .responses => try serializeOpenAIResponsesRequest(self.allocator, model, messages, system, tools, o, dialect),
         };
         defer self.allocator.free(body);
-        return self.doStream(body, abort, dialect);
+        return self.doStream(body, abort, dialect, image_results_native);
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
-    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect) !StreamHandle {
+    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_results_native: bool) !StreamHandle {
         const rid = log.genRequestId();
         log.infoId(
             "openai",
@@ -260,6 +258,7 @@ pub const OpenAIClient = struct {
         const heap = try self.allocator.create(OpenAIStream);
         heap.* = .{
             .allocator = self.allocator,
+            .image_results_native = image_results_native,
             .model = self.model,
             .dialect = dialect,
             .protocol = self.protocol,
@@ -300,6 +299,8 @@ const OpenAIStream = struct {
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
+    /// 序列化时对图像 tool_result 的定案,随 StreamHandle 回传。
+    image_results_native: bool = false,
     done: bool = false,
     /// Responses 协议:终止事件(completed/incomplete)已发 usage,flush 队列排空后
     /// 补发一个 .done(Responses 无 [DONE] 哨兵行)。
@@ -315,7 +316,7 @@ const OpenAIStream = struct {
     flushed: bool = false,
 
     fn handle(self: *OpenAIStream) StreamHandle {
-        return .{ .ctx = @ptrCast(self), .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
+        return .{ .ctx = @ptrCast(self), .image_results_native = self.image_results_native, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
         return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).next();

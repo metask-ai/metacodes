@@ -158,7 +158,6 @@ pub const GeminiClient = struct {
             .requestOverridesFn = &pRequestOverrides,
             .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
-            .supportsForModelFn = &pSupportsForModel,
         };
     }
     inline fn cast(ctx: *anyopaque) *GeminiClient {
@@ -190,9 +189,6 @@ pub const GeminiClient = struct {
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         return capability.supports(.gemini, cast(ctx).model, cap);
     }
-    fn pSupportsForModel(_: *anyopaque, model_name: []const u8, cap: provider_mod.Capability) bool {
-        return capability.supports(.gemini, model_name, cap);
-    }
     fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!provider_mod.ApiResponse {
         _ = ctx;
         _ = messages;
@@ -223,6 +219,8 @@ pub const GeminiClient = struct {
         if (overrides.reasoning_effort == null) overrides.reasoning_effort = self.reasoning_effort;
         overrides.tool_choice = tool_choice;
         const dialect = self.dialect_resolver.resolve(.gemini, model);
+        // 图像 tool_result 定案(原生块 / 占位)与序列化同一 profile,随流句柄回传。
+        const image_results_native = dialect.profileFor(.gemini, model).supports_image_input;
         const body = try serializeGeminiRequestWithOverridesAndDialect(
             self.allocator,
             messages,
@@ -234,11 +232,11 @@ pub const GeminiClient = struct {
             dialect,
         );
         defer self.allocator.free(body);
-        return self.doStream(model, body, abort);
+        return self.doStream(model, body, abort, image_results_native);
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle。URL 拼 model + :streamGenerateContent?alt=sse。
-    fn doStream(self: *GeminiClient, model: []const u8, body: []const u8, abort: ?*const AbortSignal) !StreamHandle {
+    fn doStream(self: *GeminiClient, model: []const u8, body: []const u8, abort: ?*const AbortSignal, image_results_native: bool) !StreamHandle {
         const rid = log.genRequestId();
         // {base}/v1beta/models/{model}:streamGenerateContent?alt=sse
         const url = try std.fmt.allocPrint(self.allocator, "{s}/v1beta/models/{s}:streamGenerateContent?alt=sse", .{ self.base_url, model });
@@ -299,6 +297,7 @@ pub const GeminiClient = struct {
         // 正常返回,两个 errdefer 都不触发。
         heap.* = .{
             .allocator = self.allocator,
+            .image_results_native = image_results_native,
             .request = req_ptr,
             .response = response,
             .abort = abort,
@@ -319,6 +318,8 @@ const GeminiStream = struct {
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
+    /// 序列化时对图像 tool_result 的定案,随 StreamHandle 回传。
+    image_results_native: bool = false,
     done: bool = false,
     last_stop: StopReason = .unknown,
     fc_counter: u32 = 0, // functionCall 计数(Gemini 无 id,自生成 call_N)
@@ -332,7 +333,7 @@ const GeminiStream = struct {
     pending_usage: ?UsageDelta = null,
 
     fn handle(self: *GeminiStream) StreamHandle {
-        return .{ .ctx = @ptrCast(self), .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
+        return .{ .ctx = @ptrCast(self), .image_results_native = self.image_results_native, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
         return @as(*GeminiStream, @ptrCast(@alignCast(ctx))).next();
@@ -655,10 +656,10 @@ pub fn serializeGeminiRequestWithOverridesAndDialect(
     if (!first_top) try out.append(allocator, ',');
     try out.appendSlice(allocator, "\"contents\":[");
     var first_msg = true;
-    for (messages) |m| {
+    for (messages, 0..) |m, mi| {
         if (!first_msg) try out.append(allocator, ',');
         first_msg = false;
-        try serializeGeminiContent(allocator, &out, m, messages, dialect, profile);
+        try serializeGeminiContent(allocator, &out, m, mi, messages, dialect, profile);
     }
     try out.append(allocator, ']');
     // tools:[{function_declarations:[...]}]
@@ -717,17 +718,25 @@ pub fn serializeGeminiRequestWithOverridesAndDialect(
     return out.toOwnedSlice(allocator);
 }
 
-/// 从全量消息里按 tool_use_id 找回原 functionCall 的真实 name(Gemini functionResponse 靠 name 配对)。
-/// 找不到 → null(调用方退回用 id 占位)。
-fn findToolUseName(messages: []const types.ApiMessage, id: []const u8) ?[]const u8 {
-    for (messages) |mm| for (mm.content) |c| switch (c) {
-        .tool_use => |tu| if (std.mem.eql(u8, tu.id, id)) return tu.name,
-        else => {},
-    };
+/// 从**最近一条 model(assistant)消息**里按 tool_use_id 找回原 functionCall 的真实 name
+/// (Gemini functionResponse 靠 name 配对)。与 message_repair 的顺序配对同口径:结果只答复
+/// 紧邻的上一轮,后一轮复用同一 id 时不能拿到前一轮的名字。找不到 → null(调用方退回用 id)。
+fn findToolUseName(messages: []const types.ApiMessage, msg_index: usize, id: []const u8) ?[]const u8 {
+    var i = msg_index;
+    while (i > 0) {
+        i -= 1;
+        const mm = messages[i];
+        if (mm.role != .assistant) continue;
+        for (mm.content) |c| switch (c) {
+            .tool_use => |tu| if (std.mem.eql(u8, tu.id, id)) return tu.name,
+            else => {},
+        };
+        return null;
+    }
     return null;
 }
 
-fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, all_messages: []const types.ApiMessage, dialect: dialect_mod.Dialect, profile: dialect_mod.ModelProfile) !void {
+fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, msg_index: usize, all_messages: []const types.ApiMessage, dialect: dialect_mod.Dialect, profile: dialect_mod.ModelProfile) !void {
     // tool_result → user 角色的 functionResponse part(Gemini 特有)。
     var has_tool_result = false;
     for (m.content) |c| if (c == .tool_result) {
@@ -759,7 +768,7 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
             .tool_result => |tr| {
                 if (!first_fr) try out.append(allocator, ',');
                 first_fr = false;
-                const fname = findToolUseName(all_messages, tr.tool_use_id) orelse tr.tool_use_id;
+                const fname = findToolUseName(all_messages, msg_index, tr.tool_use_id) orelse tr.tool_use_id;
                 try out.appendSlice(allocator, "{\"functionResponse\":{\"name\":");
                 try util_json.serializeString(fname, out, allocator);
                 try out.appendSlice(allocator, ",\"response\":{\"result\":");
@@ -1114,6 +1123,22 @@ test "Gemini 2.5: 图像 tool_result → functionResponse 指向文本 + 同级 
     try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached in this message]\"}}},{\"text\":\"Image result of Read:\"},{\"inline_data\":{\"mime_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}]}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "inlineData") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
+
+test "Gemini functionResponse.name 按最近一轮配对:后轮复用 id 不取前轮的名字" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{.{ .tool_use = .{ .id = "call_0", .name = "Read", .input = "{}" } }} },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "call_0", .content = "r1" } }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{.{ .tool_use = .{ .id = "call_0", .name = "Grep", .input = "{}" } }} },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "call_0", .content = "r2" } }} },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    const first = std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\"").?;
+    const second = std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Grep\"").?;
+    try std.testing.expect(first < second);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "{\"functionResponse\":{\"name\":"));
 }
 
 test "Gemini 2.5 并行: 文本+图像 tool_result → functionResponse 数保持,图像同级 part 收尾" {

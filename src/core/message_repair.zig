@@ -406,14 +406,18 @@ fn stripOrphanToolResults(allocator: std.mem.Allocator, list: *std.ArrayList(typ
             i += 1;
             continue;
         }
-        // 该消息有多少孤儿 tool_result?
+        // 该消息里哪些 tool_result 合法?id 在本轮未决集合里的首个答复**消费**该 id;
+        // 同一 id 的第二个答复和无对应调用的答复都是孤儿(一个调用只能有一个结果)。
+        const keep_flags = try allocator.alloc(bool, m.content.len);
+        defer allocator.free(keep_flags);
         var orphan: usize = 0;
-        for (m.content) |c| switch (c) {
-            .tool_result => |tr| {
-                if (!outstanding.contains(tr.tool_use_id)) orphan += 1;
-            },
-            else => {},
-        };
+        for (m.content, 0..) |c, k| {
+            keep_flags[k] = switch (c) {
+                .tool_result => |tr| outstanding.remove(tr.tool_use_id),
+                else => true,
+            };
+            if (!keep_flags[k]) orphan += 1;
+        }
         if (orphan == 0) {
             i += 1;
             continue;
@@ -429,12 +433,8 @@ fn stripOrphanToolResults(allocator: std.mem.Allocator, list: *std.ArrayList(typ
         }
         const new_content = try allocator.alloc(types.ApiContent, keep);
         var idx: usize = 0;
-        for (m.content) |c| {
-            const is_orphan = switch (c) {
-                .tool_result => |tr| !outstanding.contains(tr.tool_use_id),
-                else => false,
-            };
-            if (is_orphan) continue;
+        for (m.content, 0..) |c, k| {
+            if (!keep_flags[k]) continue;
             new_content[idx] = c;
             idx += 1;
         }
@@ -749,6 +749,24 @@ test "normalizeApiMessages: 后轮复用同一 id 不能复活早已成为孤儿
     try testing.expectEqual(@as(usize, 2), list.items.len);
     try testing.expectEqual(types.MessageRole.assistant, list.items[0].role);
     try testing.expectEqualStrings("fresh", list.items[1].content[0].tool_result.content);
+}
+
+test "normalizeApiMessages: 同一调用的第二个答复是孤儿(id 被首个答复消费)" {
+    const a = testing.allocator;
+    var list = std.ArrayList(types.ApiMessage).empty;
+    defer freeList(a, &list);
+    const c0 = try a.alloc(types.ApiContent, 1);
+    c0[0] = .{ .tool_use = .{ .id = "x", .name = "Read", .input = "{}" } };
+    try list.append(a, .{ .role = .assistant, .content = c0 });
+    const c1 = try a.alloc(types.ApiContent, 2);
+    c1[0] = .{ .tool_result = .{ .tool_use_id = "x", .content = "first" } };
+    c1[1] = .{ .tool_result = .{ .tool_use_id = "x", .content = "duplicate" } };
+    try list.append(a, .{ .role = .user, .content = c1 });
+
+    try normalizeApiMessages(a, &list);
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expectEqual(@as(usize, 1), list.items[1].content.len);
+    try testing.expectEqualStrings("first", list.items[1].content[0].tool_result.content);
 }
 
 test "normalizeApiMessages: 补桩按轮判定,后轮同 id 的结果不算前轮的答复" {

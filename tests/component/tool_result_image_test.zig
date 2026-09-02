@@ -66,10 +66,9 @@ const IMG_MESSAGES = [_]cc.types_mod.ApiMessage{
 
 /// 发流式请求并 drain 到底(只为让 MockServer 捕获完整请求;响应内容无关紧要)。
 fn drainStream(a: std.mem.Allocator, provider: cc.api_provider.Provider) !void {
-    const handle = provider.sendStreamRetry(&IMG_MESSAGES, null, null, null, null, null, 1, 1, null, "") catch |e| {
-        std.debug.print("tool_result image stream failed: {s}\n", .{@errorName(e)});
-        return error.SkipZigTest;
-    };
+    // 任何序列化/传输错误都是失败,不是跳过:否则某个方言开始报 ImageInputUnsupported 时六条
+    // 传输测试会全部静默变绿。
+    const handle = try provider.sendStreamRetry(&IMG_MESSAGES, null, null, null, null, null, 1, 1, null, "");
     defer handle.deinit();
     while (handle.next() catch null) |ev| switch (ev) {
         .text => |t| a.free(t),
