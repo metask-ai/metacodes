@@ -92,6 +92,55 @@ def _require_hashes(root: Path, rows: Mapping[str, Any], label: str) -> None:
             )
 
 
+def _require_exact_tree(
+    root: Path,
+    relative: str,
+    pinned: Mapping[str, Any],
+    label: str,
+) -> None:
+    """The directory holds exactly the pinned regular files: nothing added,
+    nothing missing, no symlinks anywhere beneath it.
+
+    ``_require_hashes`` proves the pinned files are what they were; this
+    proves they are all there is. Without it a file dropped next to a pinned
+    Skill needs no protocol edit at all, so no pin, no fingerprint and no
+    frozen-manifest field would notice a candidate that executes differently.
+    """
+    path = PurePosixPath(relative)
+    if (
+        not relative
+        or path.is_absolute()
+        or path.as_posix() != relative
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise PluginGateError(f"unsafe protocol path: {relative!r}")
+    cursor = root
+    for part in path.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise PluginGateError(f"protocol path contains a symlink: {relative}")
+    directory = root / path
+    if not directory.is_dir():
+        raise PluginGateError(f"{label} root is not a directory: {relative}")
+    present: set[str] = set()
+    for current, dirnames, filenames in os.walk(directory, followlinks=False):
+        current_path = Path(current)
+        for name in [*dirnames, *filenames]:
+            entry = current_path / name
+            if entry.is_symlink():
+                raise PluginGateError(
+                    f"{label} root contains a symlink: {entry.relative_to(root).as_posix()}"
+                )
+        for name in filenames:
+            present.add((current_path / name).relative_to(root).as_posix())
+    expected = set(pinned)
+    if present != expected:
+        raise PluginGateError(
+            f"{label} root does not match its pins: "
+            f"unpinned {sorted(present - expected)}, missing {sorted(expected - present)}"
+        )
+
+
 def _require_sha256(value: Any, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -222,6 +271,10 @@ def _validate_payload(root: Path, raw: bytes, *, check_implementation: bool) -> 
     if not isinstance(candidate, dict):
         raise PluginGateError("candidate is missing")
     _require_hashes(root, candidate.get("files"), "candidate files")
+    candidate_root = candidate.get("root")
+    if not isinstance(candidate_root, str):
+        raise PluginGateError("candidate root must be a repository-relative path")
+    _require_exact_tree(root, candidate_root, candidate["files"], "candidate")
 
     pair = value.get("coding_pair")
     if not isinstance(pair, dict):

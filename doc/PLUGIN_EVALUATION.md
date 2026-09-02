@@ -340,7 +340,7 @@ tokens，低于用户 US$1,000 总上限。尚未运行外部 WorkBuddy。
 |---|---|---|---|
 | **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头**一次读取**协议字节:运行用的对象与 receipt 携带的哈希出自同一份字节;写 receipt 前要求文件仍是这份字节、这份字节仍通过完整严格校验、git HEAD 未变。它**不能**察觉任何发生在某个输入**最后一次被观测之后**的改动:子进程运行期间被钉输入"改了又改回"(ABA);校验扫描进行中、某文件已被哈希之后才被改动(扫描逐个读 ~130 个文件,不是原子的);以及最后一次读取之后、receipt 返回并持久化之前的单向改动——这些都需要在物化的不可变 checkout 里跑门禁、在那里哈希并封存 receipt,见 #49)、`plugin_pair_runner.build_plan`,以及 freeze、`run_paid_pair` 起点与每次请求前后、`plugin_pair_analysis.analyze` 共用的同一次观测 `_observe`(§7.1)。它们与 `run_gate` 一样经 `validate_protocol_payload`(哈希自己校验过的那份字节)。没有布尔开关,严格是**构造出来的** |
 | **评测器** | `pinned_evaluator_files` | 做测量与判定的代码(gate、runner、analysis、e2e 脚本、门禁阈值)以及 Lean 形式化证据(它们由 CI 单独编译、被评测脚本消费,**不链接进运行时二进制**) | **每次加载**都校验,包括日常测试;**永远不由工具自动 repin**——一个门禁给自己的代码重钉哈希是自证漏洞(c7c2aa9) |
-| **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件 | 每次加载都校验 |
+| **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.root` + `candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件。`candidate.root` 下的文件集合必须**恰好**等于 `candidate.files`(无未钉文件、无缺失、无符号链接):哈希证明钉住的文件还是原样,集合相等证明它们就是全部——否则在被钉 Skill 旁边放一个文件不需要改协议,任何 pin、指纹或清单字段都不会察觉 | 每次加载都校验 |
 
 **日常提交不 repin。** 测试与巡检(含 `--validate-only`)用 `load_protocol_structure`:除实现指纹
 相等以外全部照旧 fail-closed;`--validate-only` 打印 pinned / observed 两个值和
