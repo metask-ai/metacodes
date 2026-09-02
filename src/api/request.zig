@@ -149,10 +149,33 @@ fn canonicalProjectionProfile(
 /// Runtime-scoped variant. The selected Dialect is pinned by the Session's
 /// immutable plugin Snapshot; plugin metadata/generation never enters the
 /// serialized request, preserving provider prefix-cache identity.
+/// 序列化器对图像 tool_result 的**实际**决定:每命中一个规范图像结果 `image_results += 1`;
+/// 走占位分支(方言/profile 不发原生图像块)`image_placeholders += 1`。客户端据此填
+/// StreamHandle.image_results_native——送达水位只认序列化器自己的报告,绝不事后重算能力
+/// (插件方言可以在 profile 声称支持时仍拒绝发图,默认 Dialect 就是这样 fail-closed)。
+pub const SerializationReport = struct {
+    image_results: usize = 0,
+    image_placeholders: usize = 0,
+
+    pub fn imagesNative(self: SerializationReport) bool {
+        return self.image_placeholders == 0;
+    }
+};
+
 pub fn serializeMessagesRequestWithDialect(
     req: MessagesRequest,
     allocator: std.mem.Allocator,
     dialect: @import("dialect.zig").Dialect,
+) ![]u8 {
+    var scratch = SerializationReport{};
+    return serializeMessagesRequestWithDialectReport(req, allocator, dialect, &scratch);
+}
+
+pub fn serializeMessagesRequestWithDialectReport(
+    req: MessagesRequest,
+    allocator: std.mem.Allocator,
+    dialect: @import("dialect.zig").Dialect,
+    report: *SerializationReport,
 ) ![]u8 {
     var result: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
     errdefer result.deinit(allocator);
@@ -168,7 +191,7 @@ pub fn serializeMessagesRequestWithDialect(
     const profile = dialect.profileFor(.anthropic, req.model);
 
     try result.appendSlice(allocator, ",\"messages\":");
-    try serializeMessages(req.messages, &result, allocator, dialect, profile);
+    try serializeMessages(req.messages, &result, allocator, dialect, profile, report);
 
     const visible_capabilities = @import("dialect.zig").visibleCapabilities(req.tools);
     var system_buf: std.ArrayList(u8) = .empty;
@@ -247,6 +270,7 @@ fn serializeMessages(
     allocator: std.mem.Allocator,
     dialect: @import("dialect.zig").Dialect,
     profile: @import("model_adapter.zig").ModelProfile,
+    report: *SerializationReport,
 ) !void {
     try buf.append(allocator, '[');
     for (messages, 0..) |msg, i| {
@@ -258,7 +282,7 @@ fn serializeMessages(
             .assistant => "assistant",
         }, buf, allocator);
         try buf.appendSlice(allocator, ",\"content\":");
-        try serializeContent(msg.content, buf, allocator, dialect, profile);
+        try serializeContent(msg.content, buf, allocator, dialect, profile, report);
         try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
@@ -270,6 +294,7 @@ fn serializeContent(
     allocator: std.mem.Allocator,
     dialect: @import("dialect.zig").Dialect,
     profile: @import("model_adapter.zig").ModelProfile,
+    report: *SerializationReport,
 ) !void {
     try buf.append(allocator, '[');
     for (content, 0..) |block, i| {
@@ -310,6 +335,7 @@ fn serializeContent(
                 // 非 vision(如经 Anthropic 网关的 GLM 文本模型,方言返 false)发短
                 // 占位文本——绝不把 MB 级 base64(文本或 block 形态)塞给无法看图的模型。
                 if (dialect_mod.extractImageResult(tr.content)) |img| image: {
+                    report.image_results += 1;
                     const mark = buf.items.len;
                     try buf.append(allocator, '[');
                     if (try dialect.serializeImagePart(profile, img, buf, allocator)) {
@@ -317,6 +343,7 @@ fn serializeContent(
                         break :image;
                     }
                     buf.shrinkRetainingCapacity(mark);
+                    report.image_placeholders += 1;
                     var placeholder: std.ArrayList(u8) = .empty;
                     defer placeholder.deinit(allocator);
                     try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
@@ -1043,4 +1070,26 @@ test "canonical 投影:非 claude 命名的 vision 模型带图可计量,text-on
     const canonical = try serializeCanonicalRequestProjection(.{ .model = "gpt-5.2", .messages = &text_messages }, a);
     defer a.free(canonical);
     try std.testing.expectEqualStrings(plain, canonical);
+}
+
+test "SerializationReport: fail-closed 方言把图像结果计入占位,内建 vision 方言不计" {
+    const a = std.testing.allocator;
+    const tool_use = [_]types.ApiContent{.{ .tool_use = .{ .id = "t1", .name = "Read", .input = "{}" } }};
+    const tool_result = [_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "t1", .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}" } }};
+    const msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &tool_result } };
+    const req = MessagesRequest{ .model = "claude-sonnet-4-20250514", .max_tokens = 16, .messages = &msgs };
+    // 默认 Dialect:profile 是内建(支持 vision),serializeImagePart 却 fail-closed 返回 false。
+    var closed = SerializationReport{};
+    const body_closed = try serializeMessagesRequestWithDialectReport(req, a, .{ .ctx = undefined }, &closed);
+    defer a.free(body_closed);
+    try std.testing.expectEqual(@as(usize, 1), closed.image_results);
+    try std.testing.expectEqual(@as(usize, 1), closed.image_placeholders);
+    try std.testing.expect(!closed.imagesNative());
+    try std.testing.expect(std.mem.indexOf(u8, body_closed, "was read successfully but omitted") != null);
+    var native = SerializationReport{};
+    const body_native = try serializeMessagesRequestWithDialectReport(req, a, dialect_mod.Resolver.builtin().resolve(.anthropic, req.model), &native);
+    defer a.free(body_native);
+    try std.testing.expectEqual(@as(usize, 1), native.image_results);
+    try std.testing.expectEqual(@as(usize, 0), native.image_placeholders);
+    try std.testing.expect(native.imagesNative());
 }

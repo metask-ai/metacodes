@@ -549,10 +549,10 @@ pub const Client = struct {
     ) !StreamResponse {
         const effective_model = model_override orelse client.modelSnapshot();
         const dialect = client.dialect_resolver.resolve(.anthropic, effective_model);
-        // 与下面序列化用的同一 profile:图像 tool_result 是发原生块还是占位文本,在这里定案
-        // 并随流句柄回传(serializeImagePart 内部就是按 supports_image_input 分支)。
-        const image_results_native = dialect.profileFor(.anthropic, effective_model).supports_image_input;
-        const req_body = try json_mod.serializeMessagesRequestWithDialect(.{
+        // 图像 tool_result 是发原生块还是占位文本,由序列化器**实际**报告(插件方言可以在
+        // profile 声称支持时仍拒绝发图),随流句柄回传给 agent_loop 的送达水位。
+        var report = json_mod.SerializationReport{};
+        const req_body = try json_mod.serializeMessagesRequestWithDialectReport(.{
             .model = effective_model,
             .max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override), // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
             .messages = messages,
@@ -561,7 +561,7 @@ pub const Client = struct {
             .tools = tools,
             .tool_choice = tool_choice,
             .reasoning_effort = client.reasoning_effort,
-        }, client.allocator, dialect);
+        }, client.allocator, dialect, &report);
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
 
@@ -569,7 +569,7 @@ pub const Client = struct {
         switch (result) {
             .streaming_response => |r| {
                 var sr = StreamResponse.init(client.allocator, r, abort);
-                sr.image_results_native = image_results_native;
+                sr.image_results_native = report.imagesNative();
                 return sr;
             },
             .full_body => unreachable,

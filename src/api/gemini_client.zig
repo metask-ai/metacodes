@@ -219,9 +219,9 @@ pub const GeminiClient = struct {
         if (overrides.reasoning_effort == null) overrides.reasoning_effort = self.reasoning_effort;
         overrides.tool_choice = tool_choice;
         const dialect = self.dialect_resolver.resolve(.gemini, model);
-        // 图像 tool_result 定案(原生块 / 占位)与序列化同一 profile,随流句柄回传。
-        const image_results_native = dialect.profileFor(.gemini, model).supports_image_input;
-        const body = try serializeGeminiRequestWithOverridesAndDialect(
+        // 图像 tool_result 定案(原生块 / 占位)由序列化器实际报告,随流句柄回传。
+        var report = json_mod.SerializationReport{};
+        const body = try serializeGeminiRequestWithOverridesAndDialectReport(
             self.allocator,
             messages,
             system,
@@ -230,9 +230,10 @@ pub const GeminiClient = struct {
             model,
             overrides,
             dialect,
+            &report,
         );
         defer self.allocator.free(body);
-        return self.doStream(model, body, abort, image_results_native);
+        return self.doStream(model, body, abort, report.imagesNative());
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle。URL 拼 model + :streamGenerateContent?alt=sse。
@@ -621,6 +622,22 @@ pub fn serializeGeminiRequestWithOverridesAndDialect(
     overrides: request_overrides.RequestOverrides,
     dialect: dialect_mod.Dialect,
 ) ![]u8 {
+    var scratch = json_mod.SerializationReport{};
+    return serializeGeminiRequestWithOverridesAndDialectReport(allocator, messages, system, tools, cached_ref, model, overrides, dialect, &scratch);
+}
+
+/// 同上,并把图像 tool_result 的实际序列化决定写入 `report`(见 request.SerializationReport)。
+pub fn serializeGeminiRequestWithOverridesAndDialectReport(
+    allocator: std.mem.Allocator,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    cached_ref: ?[]const u8,
+    model: []const u8,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+    report: *json_mod.SerializationReport,
+) ![]u8 {
     const profile = dialect.profileFor(.gemini, model);
     const visible_capabilities = dialect_mod.visibleCapabilities(tools);
     var out: std.ArrayList(u8) = .empty;
@@ -659,7 +676,7 @@ pub fn serializeGeminiRequestWithOverridesAndDialect(
     for (messages, 0..) |m, mi| {
         if (!first_msg) try out.append(allocator, ',');
         first_msg = false;
-        try serializeGeminiContent(allocator, &out, m, mi, messages, dialect, profile);
+        try serializeGeminiContent(allocator, &out, m, mi, messages, dialect, profile, report);
     }
     try out.append(allocator, ']');
     // tools:[{function_declarations:[...]}]
@@ -736,7 +753,7 @@ fn findToolUseName(messages: []const types.ApiMessage, msg_index: usize, id: []c
     return null;
 }
 
-fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, msg_index: usize, all_messages: []const types.ApiMessage, dialect: dialect_mod.Dialect, profile: dialect_mod.ModelProfile) !void {
+fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, msg_index: usize, all_messages: []const types.ApiMessage, dialect: dialect_mod.Dialect, profile: dialect_mod.ModelProfile, report: *json_mod.SerializationReport) !void {
     // tool_result → user 角色的 functionResponse part(Gemini 特有)。
     var has_tool_result = false;
     for (m.content) |c| if (c == .tool_result) {
@@ -773,6 +790,7 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
                 try util_json.serializeString(fname, out, allocator);
                 try out.appendSlice(allocator, ",\"response\":{\"result\":");
                 if (dialect_mod.extractImageResult(tr.content)) |img| {
+                    report.image_results += 1;
                     if (profile.supports_image_input and profile.supports_multimodal_function_response) {
                         var pointer: std.ArrayList(u8) = .empty;
                         defer pointer.deinit(allocator);
@@ -808,6 +826,7 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
                             try result_text.appendSlice(allocator, ") attached in this message]");
                         } else {
                             sibling_parts.shrinkRetainingCapacity(mark);
+                            report.image_placeholders += 1;
                             try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &result_text, allocator);
                         }
                         try util_json.serializeString(result_text.items, out, allocator);
@@ -1169,8 +1188,13 @@ test "Gemini 防御分支: 方言不支持图像输入 → functionResponse 占�
     const msgs = imageToolResultMsgs();
     // defaultDialect 的 serializeImagePart 恒返 false(fail-closed),但 profileFor 仍是
     // 内建 Gemini profile——覆盖"profile 声称支持、方言拒绝"的插件方言防御路径。
-    const body = try serializeGeminiRequestWithOverridesAndDialect(a, &msgs, null, null, null, "gemini-2.5-pro", .{}, .{ .ctx = undefined });
+    // 报告必须反映这个实际决定:profile 说支持不算数。
+    var report = json_mod.SerializationReport{};
+    const body = try serializeGeminiRequestWithOverridesAndDialectReport(a, &msgs, null, null, null, "gemini-2.5-pro", .{}, .{ .ctx = undefined }, &report);
     defer a.free(body);
+    try std.testing.expectEqual(@as(usize, 1), report.image_results);
+    try std.testing.expectEqual(@as(usize, 1), report.image_placeholders);
+    try std.testing.expect(!report.imagesNative());
     try std.testing.expect(std.mem.indexOf(u8, body, "\"result\":\"[image (image/png) was read successfully but omitted: this model does not support image input]\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "inline_data") == null);

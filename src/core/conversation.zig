@@ -709,9 +709,13 @@ pub const Conversation = struct {
             // The vision exception only protects an image that some later
             // vision-capable request could still carry: an active message whose
             // image result is paired with the nearest preceding assistant turn.
-            // Messages behind the compact boundary are never sent again, and an
-            // orphan image result is stripped by the request normalizer, so
-            // leaving either undelivered would only pin its base64 forever.
+            // A message behind the compact boundary cannot be carried paired
+            // again: the boundary only moves forward, and the one backwards
+            // move (`rollbackForRetry`) re-admits from the selected user message
+            // itself, never the assistant turn that precedes it, so the result
+            // would be stripped as an orphan. An orphan image result is stripped
+            // by the request normalizer for the same reason. Leaving either
+            // undelivered would only pin its base64 forever.
             if (!opts.images_visible and i >= active_start and
                 messageHasImageResult(m.*) and !self.imageResultsAreOrphansLocked(i, active_start))
                 continue;
@@ -720,24 +724,39 @@ pub const Conversation = struct {
     }
 
     /// Whether every image result in message `index` is an orphan under the
-    /// request normalizer's sequential pairing: no tool_use with its id in the
-    /// nearest preceding assistant message of the active range.
+    /// request normalizer's sequential pairing (message_repair): its id must
+    /// be outstanding from the nearest preceding assistant turn of the active
+    /// range, and each id answers only once, in message and block order — a
+    /// second result for an already-answered id is an orphan too. On OOM the
+    /// message is treated as paired (kept protected).
     fn imageResultsAreOrphansLocked(self: *const Conversation, index: usize, active_start: usize) bool {
-        var turn: ?msg.Message = null;
+        var turn_index: ?usize = null;
         var i = index;
         while (i > active_start) {
             i -= 1;
             if (self.messages.items[i].role == .assistant) {
-                turn = self.messages.items[i];
+                turn_index = i;
                 break;
             }
         }
+        const turn = turn_index orelse return true;
+        var outstanding = std.StringHashMap(void).init(self.allocator);
+        defer outstanding.deinit();
+        for (self.messages.items[turn].blocks) |b| switch (b) {
+            .tool_use => |tu| outstanding.put(tu.id, {}) catch return false,
+            else => {},
+        };
+        var j = turn + 1;
+        while (j < index) : (j += 1) {
+            for (self.messages.items[j].blocks) |b| switch (b) {
+                .tool_result => |tr| _ = outstanding.remove(tr.tool_use_id),
+                else => {},
+            };
+        }
         for (self.messages.items[index].blocks) |b| switch (b) {
-            .tool_result => |tr| if (result_projection.isImageResult(tr.content)) {
-                if (turn) |am| for (am.blocks) |ab| switch (ab) {
-                    .tool_use => |tu| if (std.mem.eql(u8, tu.id, tr.tool_use_id)) return false,
-                    else => {},
-                };
+            .tool_result => |tr| {
+                const paired = outstanding.remove(tr.tool_use_id);
+                if (paired and result_projection.isImageResult(tr.content)) return false;
             },
             else => {},
         };
@@ -745,7 +764,11 @@ pub const Conversation = struct {
     }
 
     pub const DeliveryOptions = struct {
-        /// Whether the accepted request serialized image results natively.
+        /// The serializer's own report for the accepted request
+        /// (`StreamHandle.image_results_native`): true iff every image result
+        /// in it went out as a native image part. Never route capability —
+        /// a plugin dialect may refuse to emit images although the model's
+        /// profile says it could.
         images_visible: bool,
     };
 
@@ -1098,6 +1121,23 @@ test "delivery watermark: non-vision requests still deliver inactive and orphan 
     try std.testing.expect(!c.messages.items[4].delivered);
     c.markDelivered(.{ .images_visible = true });
     try std.testing.expect(c.messages.items[4].delivered);
+}
+
+test "delivery watermark: a second result for an already-answered id is an orphan, like in the normalizer" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const tu = try a.alloc(msg.Block, 1);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "x"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const blocks = try a.alloc(msg.Block, 2);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "x"), .content = try a.dupe(u8, "text answer"), .is_error = false } };
+    blocks[1] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "x"), .content = try a.dupe(u8, "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}"), .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    // The text result consumed `x`; the image is a duplicate the normalizer strips,
+    // so a non-vision request must still deliver (not pin) this message.
+    c.markDelivered(.{ .images_visible = false });
+    try std.testing.expect(c.messages.items[1].delivered);
 }
 
 test "compact preview commit keeps a delivery watermark set while the preview was in flight" {

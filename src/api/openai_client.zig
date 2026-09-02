@@ -183,15 +183,15 @@ pub const OpenAIClient = struct {
         if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
         o.tool_choice = tool_choice;
         const dialect = self.dialect_resolver.resolve(.openai, model);
-        // 图像 tool_result 定案(原生块 / 占位)与序列化同一 profile,随流句柄回传。
-        const image_results_native = dialect.profileFor(.openai, model).supports_image_input;
+        // 图像 tool_result 定案(原生块 / 占位)由序列化器实际报告,随流句柄回传。
+        var report = json_mod.SerializationReport{};
         // wire 协议分派:chat/completions(默认)或 Responses API(typed SSE)。
         const body = switch (self.protocol) {
-            .chat_completions => try serializeOpenAIRequestWithOverridesAndDialect(self.allocator, model, messages, system, tools, o, dialect),
-            .responses => try serializeOpenAIResponsesRequest(self.allocator, model, messages, system, tools, o, dialect),
+            .chat_completions => try serializeOpenAIRequestWithOverridesAndDialectReport(self.allocator, model, messages, system, tools, o, dialect, &report),
+            .responses => try serializeOpenAIResponsesRequestReport(self.allocator, model, messages, system, tools, o, dialect, &report),
         };
         defer self.allocator.free(body);
-        return self.doStream(body, abort, dialect, image_results_native);
+        return self.doStream(body, abort, dialect, report.imagesNative());
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
@@ -861,6 +861,21 @@ pub fn serializeOpenAIRequestWithOverridesAndDialect(
     overrides: request_overrides.RequestOverrides,
     dialect: dialect_mod.Dialect,
 ) ![]u8 {
+    var scratch = json_mod.SerializationReport{};
+    return serializeOpenAIRequestWithOverridesAndDialectReport(allocator, model, messages, system, tools, overrides, dialect, &scratch);
+}
+
+/// 同上,并把图像 tool_result 的实际序列化决定写入 `report`(见 request.SerializationReport)。
+pub fn serializeOpenAIRequestWithOverridesAndDialectReport(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+    report: *json_mod.SerializationReport,
+) ![]u8 {
     const profile = dialect.profileFor(.openai, model);
     const visible_capabilities = dialect_mod.visibleCapabilities(tools);
     var out: std.ArrayList(u8) = .empty;
@@ -903,7 +918,7 @@ pub fn serializeOpenAIRequestWithOverridesAndDialect(
     for (messages) |m| {
         if (!first) try out.append(allocator, ',');
         first = false;
-        try serializeOpenAIMessage(allocator, &out, m, dialect, profile);
+        try serializeOpenAIMessage(allocator, &out, m, dialect, profile, report);
     }
     try out.append(allocator, ']');
     // tools → OpenAI function 形态
@@ -953,6 +968,7 @@ fn serializeOpenAIMessage(
     m: types.ApiMessage,
     dialect: dialect_mod.Dialect,
     profile: dialect_mod.ModelProfile,
+    report: *json_mod.SerializationReport,
 ) !void {
     // 收集 text / tool_use / tool_result。OpenAI:assistant 的 tool_use → tool_calls;
     // tool_result → 独立 {role:"tool"} 消息。MVP:每个 tool_result 拆成单独 message。
@@ -987,6 +1003,7 @@ fn serializeOpenAIMessage(
                 try util_json.serializeString(tr.tool_use_id, out, allocator);
                 try out.appendSlice(allocator, ",\"content\":");
                 if (dialect_mod.extractImageResult(tr.content)) |img| {
+                    report.image_results += 1;
                     // scratch 先渲染方言图像 part:方言返回值是 vision/占位的唯一分支决策点,
                     // 指向文本与图像本体不可能不一致。
                     const mark = image_parts.items.len;
@@ -1008,6 +1025,7 @@ fn serializeOpenAIMessage(
                         try util_json.serializeString(pointer.items, out, allocator);
                     } else {
                         image_parts.shrinkRetainingCapacity(mark);
+                        report.image_placeholders += 1;
                         var placeholder: std.ArrayList(u8) = .empty;
                         defer placeholder.deinit(allocator);
                         try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
@@ -1133,6 +1151,21 @@ pub fn serializeOpenAIResponsesRequest(
     overrides: request_overrides.RequestOverrides,
     dialect: dialect_mod.Dialect,
 ) ![]u8 {
+    var scratch = json_mod.SerializationReport{};
+    return serializeOpenAIResponsesRequestReport(allocator, model, messages, system, tools, overrides, dialect, &scratch);
+}
+
+/// 同上,并把图像 tool_result 的实际序列化决定写入 `report`。
+pub fn serializeOpenAIResponsesRequestReport(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+    report: *json_mod.SerializationReport,
+) ![]u8 {
     const profile = dialect.profileFor(.openai, model);
     const visible_capabilities = dialect_mod.visibleCapabilities(tools);
     var out: std.ArrayList(u8) = .empty;
@@ -1180,7 +1213,7 @@ pub fn serializeOpenAIResponsesRequest(
     try out.appendSlice(allocator, ",\"input\":[");
     var first = true;
     for (messages) |m| {
-        try serializeResponsesInputItems(allocator, &out, m, &first, profile);
+        try serializeResponsesInputItems(allocator, &out, m, &first, profile, report);
     }
     try out.append(allocator, ']');
     // tools:Responses 扁平形态(name/description/parameters 顶层;strict:false 不强制 schema 严格模式)。
@@ -1238,7 +1271,7 @@ pub fn serializeOpenAIResponsesRequest(
 /// protocol=responses 是显式 OpenAI 原生配置),能力守门仍查 profile.supports_image_input。
 /// 图像 tool_result(Read 工具形态)→ vision 模型 output 发 input_image parts 数组
 /// (官方 2025-09-26 起支持,call_id 原生配对);非 vision 模型 output 发短占位文本。
-fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, first: *bool, profile: dialect_mod.ModelProfile) !void {
+fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, first: *bool, profile: dialect_mod.ModelProfile, report: *json_mod.SerializationReport) !void {
     var has_image = false;
     var has_tool_result = false;
     var text_len: usize = 0;
@@ -1321,6 +1354,7 @@ fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayLis
             try util_json.serializeString(tr.tool_use_id, out, allocator);
             try out.appendSlice(allocator, ",\"output\":");
             if (dialect_mod.extractImageResult(tr.content)) |img| {
+                report.image_results += 1;
                 if (profile.supports_image_input) {
                     // 官方形态(2025-09-26 起):output 接受 content parts **数组**(真数组,
                     // 非 JSON 字符串化数组);input_image 与一等图像输入同 responses-local
@@ -1332,6 +1366,7 @@ fn serializeResponsesInputItems(allocator: std.mem.Allocator, out: *std.ArrayLis
                     try out.appendSlice(allocator, "\"}]");
                 } else {
                     // 非 vision:显式占位文本,绝不把 base64 原文当 output 字符串发。
+                    report.image_placeholders += 1;
                     var placeholder: std.ArrayList(u8) = .empty;
                     defer placeholder.deinit(allocator);
                     try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
@@ -1748,4 +1783,32 @@ test "responses: 非 vision 模型的图像 tool_result → output 占位字符�
     try std.testing.expect(std.mem.indexOf(u8, body, "\"output\":\"[image (image/png) was read successfully but omitted: this model does not support image input]\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "input_image") == null);
+}
+
+test "SerializationReport(OpenAI): chat 走 fail-closed 方言计占位;Responses 按 profile 计" {
+    const a = std.testing.allocator;
+    const tool_use = [_]types.ApiContent{.{ .tool_use = .{ .id = "call_img", .name = "Read", .input = "{}" } }};
+    const tool_result = [_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "call_img", .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}" } }};
+    const msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &tool_result } };
+    // chat/completions + 默认 fail-closed 方言(gpt-4o 的 profile 支持 vision,方言仍拒绝)。
+    var chat_closed = json_mod.SerializationReport{};
+    const body_closed = try serializeOpenAIRequestWithOverridesAndDialectReport(a, "gpt-4o", &msgs, null, null, .{}, .{ .ctx = undefined }, &chat_closed);
+    defer a.free(body_closed);
+    try std.testing.expectEqual(@as(usize, 1), chat_closed.image_results);
+    try std.testing.expectEqual(@as(usize, 1), chat_closed.image_placeholders);
+    try std.testing.expect(!chat_closed.imagesNative());
+    // chat/completions + 内建方言:原生 image_url,不计占位。
+    var chat_native = json_mod.SerializationReport{};
+    const body_native = try serializeOpenAIRequestWithOverridesAndDialectReport(a, "gpt-4o", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-4o"), &chat_native);
+    defer a.free(body_native);
+    try std.testing.expect(chat_native.imagesNative());
+    // Responses:非 vision 模型计占位,vision 模型不计。
+    var resp_closed = json_mod.SerializationReport{};
+    const body_resp_closed = try serializeOpenAIResponsesRequestReport(a, "deepseek-chat", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "deepseek-chat"), &resp_closed);
+    defer a.free(body_resp_closed);
+    try std.testing.expectEqual(@as(usize, 1), resp_closed.image_placeholders);
+    var resp_native = json_mod.SerializationReport{};
+    const body_resp_native = try serializeOpenAIResponsesRequestReport(a, "gpt-5.2", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-5.2"), &resp_native);
+    defer a.free(body_resp_native);
+    try std.testing.expect(resp_native.imagesNative());
 }

@@ -70,7 +70,7 @@ fn drainStream(a: std.mem.Allocator, provider: cc.api_provider.Provider) !void {
     // 传输测试会全部静默变绿。
     const handle = try provider.sendStreamRetry(&IMG_MESSAGES, null, null, null, null, null, 1, 1, null, "");
     defer handle.deinit();
-    while (handle.next() catch null) |ev| switch (ev) {
+    while (try handle.next()) |ev| switch (ev) {
         .text => |t| a.free(t),
         else => {},
     };
@@ -461,6 +461,63 @@ fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?
         .image_on_wire = std.mem.indexOf(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\"") != null,
         .delivered = items[2].delivered,
     };
+}
+
+/// 与 dialect.zig 默认 Dialect 相同的 fail-closed 方言:profile 声称支持图像,serializeImagePart
+/// 却返回 false——插件/运行时方言覆盖的真实形态。
+fn failClosedResolve(_: *const anyopaque, _: cc.api_dialect.ProviderKind, _: []const u8) cc.api_dialect.Dialect {
+    return .{ .ctx = undefined };
+}
+
+test "L2 ⑫: 运行时方言 profile 说支持图像但序列化器拒绝时——wire 是占位文本,含图消息不算送达" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try writeFixture(path_z, "fail-closed dialect fixture");
+
+    const tool_sse = try readToolSse(a, path);
+    defer a.free(tool_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    // vision 模型 + fail-closed 方言:能力表说能看图,序列化器实际发的是占位。
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    client.dialect_resolver = .{ .resolveFn = failClosedResolve };
+    try std.testing.expect(client.provider().supports(.image_input));
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "look at pic.png");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .cwd_abs = root,
+        .home_dir = root,
+        .artifact_root = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    const body = srv.lastRequest().?.body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "was read successfully but omitted: this model does not support image input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\",\"source\"") == null);
+    const items = conv.messages.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expect(items[0].delivered and items[1].delivered);
+    try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
 }
 
 test "L2 ⑩: model_override 决定送达——基础模型非 vision、override 为 vision 时图片上 wire 且送达" {
