@@ -373,6 +373,75 @@ test "L2 provider login: the recorded client is the one the refresh grant presen
     try std.testing.expectEqualStrings("openai", legacy.clientIdFor(null));
 }
 
+test "L2 provider login: an imported token response records the explicit client" {
+    // `--client-id` was accepted on the `--oauth-token-json` path and then
+    // ignored: the import always took the profile's declared client, which for
+    // the built-in openai profile is none, so the stored login refreshed as
+    // `client_id=openai`. This drives the wiring itself, not the parts.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const oauth_dir = try a.dupeZ(u8, root_buffer[0..root_len]);
+    defer a.free(oauth_dir);
+    ppaths.setEnv("METACODES_OAUTH_DIR", oauth_dir.ptr);
+    defer ppaths.unsetEnv("METACODES_OAUTH_DIR");
+
+    const openai = &cc.provider_registry.openai.PROFILE;
+    try std.testing.expect(openai.oauth_client_id == null);
+    const token_json =
+        \\{"access_token":"imported-access","refresh_token":"imported-refresh","token_type":"Bearer","expires_in":3600}
+    ;
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        cc.loginProviderWithTokenResponse(a, openai, token_json, "explicit-client"),
+    );
+
+    var session = try provider_oauth.Session.initHome(a, openai.id);
+    defer session.deinit();
+    try std.testing.expect(try session.load());
+    try std.testing.expectEqualStrings("imported-access", session.tokens.?.access_token);
+    // The refresh grant will present the client the user named, not the
+    // provider id.
+    try std.testing.expectEqualStrings("explicit-client", session.clientIdFor(openai.oauth_client_id));
+}
+
+test "L2 provider login: a provider that accepts no OAuth kind is refused before anything is stored" {
+    // Credential resolution opens the OAuth session only for kinds
+    // `servesKind` recognizes. A login stored for any other profile would be
+    // reported as a success and then never consulted.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const oauth_dir = try a.dupeZ(u8, root_buffer[0..root_len]);
+    defer a.free(oauth_dir);
+    ppaths.setEnv("METACODES_OAUTH_DIR", oauth_dir.ptr);
+    defer ppaths.unsetEnv("METACODES_OAUTH_DIR");
+
+    const Slug = cc.provider_ids.Slug;
+    const key_only = cc.provider_profile.ProviderProfile{
+        .id = Slug.lit("keyonly"),
+        .implementation_id = Slug.lit("keyonly"),
+        .display_name = "Key only",
+        .channels = &.{},
+        .accepted_credential_kinds = &.{.api_key},
+        .oauth_token_url = "https://example.invalid/token",
+    };
+    const token_json =
+        \\{"access_token":"a","refresh_token":"r","token_type":"Bearer","expires_in":3600}
+    ;
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        cc.loginProviderWithTokenResponse(a, &key_only, token_json, "some-client"),
+    );
+    var session = try provider_oauth.Session.initHome(a, key_only.id);
+    defer session.deinit();
+    try std.testing.expect(!(try session.load()));
+}
+
 test "L2 provider login: a configured provider declares its own OAuth endpoints" {
     // The client an installation presents is registered by whoever runs it, so
     // for a configured provider it belongs in configuration. Without this the
@@ -396,6 +465,17 @@ test "L2 provider login: a configured provider declares its own OAuth endpoints"
     try std.testing.expectEqualStrings("https://relay.invalid/device", built.oauth_device_authorization_url.?);
     try std.testing.expectEqualStrings("relay-cli", built.oauth_client_id.?);
     try std.testing.expectEqualStrings("offline", built.oauth_scope);
+
+    // An `oauth` block on a provider that accepts no OAuth credential kind
+    // describes a login the runtime would never consult; it is rejected where
+    // the definition is, not after a successful-looking login.
+    try std.testing.expectError(error.OAuthWithoutOAuthCredentialKind, cc.provider_custom.parse(a,
+        \\{"custom_providers":{"relay":{
+        \\  "models":[{"request_model_id":"m","display_name":"M"}],
+        \\  "channels":[{"id":"default","base_url":"https://relay.invalid/v1","protocol":"openai_chat"}],
+        \\  "oauth":{"token_url":"https://relay.invalid/token","client_id":"relay-cli"}
+        \\}}}
+    ));
 
     // An authorization endpoint with nowhere to exchange the code is a
     // definition that could only fail at login time.

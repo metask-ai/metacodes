@@ -728,7 +728,8 @@ fn runAutoBackgroundable(
         }
         if (allow_auto_background and elapsed >= effective_budget) {
             // 达到 auto-background 阈值但未到 timeout：返回 auto_backgrounded。
-            // 此刻 job id 与两个路径进入模型可见结果 → 转为 background 保留期。
+            // 此刻 job id 进入模型可见结果，BashOutput 随后任何一轮都可能凭它来读
+            // → 转为 background 保留期。
             registry.promoteToBackground(job_id[0..]);
             return try formatAutoBackgrounded(allocator, &j);
         }

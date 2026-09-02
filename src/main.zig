@@ -884,7 +884,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
             // recovery need a way in that does not involve a browser or a
             // polling loop, and it is the only path when a token was minted
             // somewhere else entirely.
-            .oauth_json => return storeProviderOAuthToken(allocator, name, value.?),
+            .oauth_json => return storeProviderOAuthToken(allocator, name, value.?, client_id),
             .browser => return runProviderOAuthLogin(allocator, init.io, name, .{
                 .method = login_method,
                 .open_browser = open_browser,
@@ -1254,6 +1254,7 @@ fn storeProviderOAuthToken(
     allocator: std.mem.Allocator,
     provider_name: []const u8,
     path: []const u8,
+    explicit_client_id: ?[]const u8,
 ) u8 {
     // The same runtime a session builds, so a provider defined in the config —
     // or one that came from a catalog — can be logged into by name.
@@ -1264,13 +1265,6 @@ fn storeProviderOAuthToken(
         std.debug.print("error: unknown provider '{s}'\n", .{provider_name});
         return 2;
     };
-    if (built.oauth_token_url == null) {
-        std.debug.print(
-            "error: provider '{s}' declares no OAuth token endpoint\n",
-            .{built.id.slice()},
-        );
-        return 2;
-    }
 
     const text = readFileArg(allocator, path) catch |err| {
         std.debug.print("error: could not read {s}: {s}\n", .{ path, @errorName(err) });
@@ -1281,7 +1275,67 @@ fn storeProviderOAuthToken(
         allocator.free(text);
     }
 
-    return importProviderTokenResponse(allocator, built.id, text, built.oauth_client_id);
+    return loginProviderWithTokenResponse(allocator, built, text, explicit_client_id);
+}
+
+/// True when at least one credential kind this profile accepts is an OAuth
+/// kind — which is the only case in which a stored OAuth login is ever
+/// consulted. Credential resolution opens the OAuth session for those kinds
+/// and no others, so a login stored for a profile that accepts none is a
+/// success message followed by silence.
+fn providerServesOAuth(built: *const provider_profile.ProviderProfile) bool {
+    for (built.accepted_credential_kinds) |kind| {
+        if (provider_oauth.servesKind(kind)) return true;
+    }
+    return false;
+}
+
+/// Refuse, with the reason, a provider whose stored login could never be used.
+/// Both login paths ask this before doing anything the user would have to
+/// undo — the token-JSON import before it writes, the interactive flow before
+/// it sends anyone to a browser.
+fn requireOAuthCapableProvider(built: *const provider_profile.ProviderProfile) bool {
+    if (built.oauth_token_url == null) {
+        std.debug.print(
+            "error: provider '{s}' declares no OAuth token endpoint\n",
+            .{built.id.slice()},
+        );
+        return false;
+    }
+    if (!providerServesOAuth(built)) {
+        std.debug.print(
+            "error: provider '{s}' accepts no OAuth credential kind; " ++
+                "a stored login would never be consulted. Declare one under " ++
+                "credential_kinds (e.g. \"openai_oauth\") for a configured provider.\n",
+            .{built.id.slice()},
+        );
+        return false;
+    }
+    return true;
+}
+
+/// Finish a provider login from a token response, the way both entry points
+/// do. Public so the wiring — not just the parts — is testable against a
+/// profile, without a provider host or a home directory.
+///
+/// `explicit_client_id` is what the user passed on the command line; it wins
+/// over what the profile declares, and for a profile that declares none it is
+/// the only way the refresh grant can present the right client. Ignoring it
+/// here while accepting it on the command line is exactly the defect this
+/// function replaced.
+pub fn loginProviderWithTokenResponse(
+    allocator: std.mem.Allocator,
+    built: *const provider_profile.ProviderProfile,
+    token_json: []const u8,
+    explicit_client_id: ?[]const u8,
+) u8 {
+    if (!requireOAuthCapableProvider(built)) return 2;
+    return importProviderTokenResponse(
+        allocator,
+        built.id,
+        token_json,
+        explicit_client_id orelse built.oauth_client_id,
+    );
 }
 
 pub const ProviderLoginOptions = struct {
@@ -1314,13 +1368,9 @@ fn runProviderOAuthLogin(
         std.debug.print("error: unknown provider '{s}'\n", .{provider_name});
         return 2;
     };
-    const token_url = built.oauth_token_url orelse {
-        std.debug.print(
-            "error: provider '{s}' declares no OAuth token endpoint\n",
-            .{built.id.slice()},
-        );
-        return 2;
-    };
+    if (!requireOAuthCapableProvider(built)) return 2;
+    // Checked above; unwrapped here so the flow gets a plain URL.
+    const token_url = built.oauth_token_url.?;
     // A profile with no authorization or device endpoint has no interactive
     // flow to run; say so instead of failing later at a null URL.
     const endpoint_declared = switch (options.method) {

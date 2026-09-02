@@ -342,10 +342,24 @@ fn intField(root: std.json.Value, name: []const u8) ?i64 {
     const value = root.object.get(name) orelse return null;
     return switch (value) {
         .integer => |number| number,
-        .float => |number| @intFromFloat(number),
+        // RFC 8628's numeric fields are integers. A float from an untrusted
+        // endpoint counts only if it names one exactly: `1.5` is malformed,
+        // not "1", and a value past i64 is malformed, not a panic inside
+        // `@intFromFloat`.
+        .float => |number| integralFloat(number),
         .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
         else => null,
     };
+}
+
+fn integralFloat(number: f64) ?i64 {
+    if (!std.math.isFinite(number) or number != @trunc(number)) return null;
+    // 2^53: every integer up to here is exactly representable as f64, so the
+    // conversion below cannot round, and no interval or expiry is anywhere
+    // near it.
+    const exact_limit: f64 = 9007199254740992.0;
+    if (number > exact_limit or number < -exact_limit) return null;
+    return @intFromFloat(number);
 }
 
 const RawResponse = struct {
@@ -482,6 +496,27 @@ test "device authorization responses are parsed, including the RFC's optional fi
     try std.testing.expectError(Error.MalformedDeviceAuthorizationResponse, parseDeviceAuthorization(a,
         \\{"device_code":"dev","user_code":"C","verification_uri":"https://example.invalid/d","expires_in":0}
     ));
+
+    // Floats that name an integer exactly are that integer; anything else from
+    // an untrusted endpoint is malformed rather than truncated or, past i64,
+    // a runtime panic.
+    const float_exact = try parseDeviceAuthorization(a,
+        \\{"device_code":"dev","user_code":"C","verification_uri":"https://example.invalid/d","expires_in":600.0,"interval":2.0}
+    );
+    try std.testing.expectEqual(@as(u32, 600), float_exact.expires_in);
+    try std.testing.expectEqual(@as(u32, 2), float_exact.interval);
+    try std.testing.expectError(Error.MalformedDeviceAuthorizationResponse, parseDeviceAuthorization(a,
+        \\{"device_code":"dev","user_code":"C","verification_uri":"https://example.invalid/d","expires_in":1.5}
+    ));
+    try std.testing.expectError(Error.MalformedDeviceAuthorizationResponse, parseDeviceAuthorization(a,
+        \\{"device_code":"dev","user_code":"C","verification_uri":"https://example.invalid/d","expires_in":1e300}
+    ));
+    // A fractional interval falls back to the RFC default rather than
+    // becoming a malformed grant: the interval is advisory, the expiry is not.
+    const fractional_interval = try parseDeviceAuthorization(a,
+        \\{"device_code":"dev","user_code":"C","verification_uri":"https://example.invalid/d","expires_in":600,"interval":2.5}
+    );
+    try std.testing.expectEqual(DEFAULT_DEVICE_POLL_SECONDS, fractional_interval.interval);
 }
 
 test "device poll classification separates waiting from failing" {

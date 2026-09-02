@@ -330,6 +330,13 @@ supported and is still the right path for CI and recovery. An interactive login
 and an imported token response are therefore indistinguishable to everything
 downstream.
 
+A `custom_providers.<id>.oauth` block must be paired with an OAuth credential
+kind in `credential_kinds` (`openai_oauth` or `openai_codex_oauth`). Credential
+resolution opens the OAuth session only for those kinds, so a definition
+without one describes a login that would be stored and never consulted; it is
+rejected at parse time as `OAuthWithoutOAuthCredentialKind`, and both login
+paths refuse such a provider before writing or opening a browser.
+
 The **OAuth client is recorded with the login**, not re-derived at refresh time.
 The refresh grant must present the same client the authorization grant was
 issued to, so a client that lives only in configuration would break the login
@@ -681,6 +688,17 @@ from a profile, and `../app.zig` from the picker.
 Listed rather than left silent. Each is a decision with a reason, not an
 omission — and none of them is an acceptance criterion of the issue.
 
+- **Picker OAuth setup, and a default OpenAI client (issue #33, remaining).**
+  `metacodes login --provider <id>` is the interactive entry point, and the
+  flow lives in the kernel layer (`api/oauth_login.zig`) so a front end invokes
+  it rather than reimplementing it. The picker's credential stage itself is not
+  implemented yet — the `/models` handler says so — so there is nothing to wire
+  an OAuth setup path into; when that stage lands it should call the kernel
+  flow with a TUI `Notify` sink. Separately, the built-in `openai` profile
+  declares no `oauth_client_id`: the client an installation presents is a
+  registration decision, not something to guess in a profile, so
+  `metacodes login --provider openai` needs `--client-id` until the
+  maintainers settle one. #33 stays open on exactly those two points.
 - **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
   signed adapter reference, which needs review and signing infrastructure. The
   declarative schema covers relays, gateways, and self-hosted servers, which
