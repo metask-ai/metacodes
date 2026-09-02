@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -34,6 +35,7 @@ from scripts.eval.memory_budget_journal import (
 from scripts.eval.model import ValidationError, load_rollouts
 from scripts.eval.paired_runner import scenario_selector
 from scripts.eval.plugin_pair_analysis import analyze
+from scripts.eval.plugin_pair_analysis import verify_journal_authority
 from scripts.eval.plugin_pair_runner import (
     AUTHORITY_SCHEMA,
     FROZEN_RUN_SCHEMA,
@@ -48,6 +50,7 @@ from scripts.eval.plugin_pair_runner import (
     main,
     manifest_sha256_of,
     path_set_digest,
+    rollout_evidence_sha256,
     run_paid_pair,
     verify_frozen_manifest,
     write_rollouts,
@@ -331,9 +334,10 @@ class _FakeProvider:
     real pipeline accepts (identities from `comparison_fingerprints`), and
     lets a test act at a chosen moment inside a request."""
 
-    def __init__(self, fixture: _PaidFixture, *, during_request=None) -> None:
+    def __init__(self, fixture: _PaidFixture, *, during_request=None, mutate_row=None) -> None:
         self.fixture = fixture
         self.during_request = during_request
+        self.mutate_row = mutate_row
         self.requests: list[tuple[str, int, str]] = []
         self.imports = 0
         self._state: dict[Path, tuple] = {}
@@ -359,7 +363,13 @@ class _FakeProvider:
             task, ROOT, model_provider=provider, model_id=model_id, harness_config_id=config_id,
             harness_revision=revision, permission_mode=task["constraints"]["permission_mode"], binary_path=binary,
         )
-        return [{
+        row = self._row(task, task_id, variant, trial, provider, model_id, revision, config_id, max_tokens, max_cost, identity)
+        if self.mutate_row is not None:
+            self.mutate_row(row)
+        return [row]
+
+    def _row(self, task, task_id, variant, trial, provider, model_id, revision, config_id, max_tokens, max_cost, identity):
+        return {
             "schema_version": 1,
             "run_id": f"{variant}:{task_id}:{trial}",
             "suite_id": self.suite_id,
@@ -387,7 +397,7 @@ class _FakeProvider:
             },
             "attribution": [],
             "artifacts": {},
-        }]
+        }
 
     @contextlib.contextmanager
     def installed(self):
@@ -423,6 +433,16 @@ class PaidRunStaysFrozenTest(unittest.TestCase):
         for arm in ("baseline", "candidate"):
             for row in load_rollouts(fixture.output / f"{arm}.jsonl"):
                 self.assertEqual(fixture.manifest["manifest_sha256"], row["plugin_treatment"]["frozen_manifest_sha256"])
+                # The committed event sealed this exact body (attestation
+                # included, receipt excluded).
+                sealed = journal["transactions"][row["budget_transaction"]["transaction_id"]]["evidence_sha256"]
+                self.assertEqual(rollout_evidence_sha256(row), sealed)
+        # A resume of the completed pair re-validates the persisted bodies
+        # against the sealed digests and makes no further request.
+        resumed = _FakeProvider(fixture)
+        with resumed.installed():
+            self.assertEqual({"baseline": 3, "candidate": 3}, fixture.run())
+        self.assertEqual(0, len(resumed.requests))
         receipt = fixture.analyze()
         self.assertEqual("development_gate_passed", receipt["release_status"])
         self.assertEqual(fixture.manifest["manifest_sha256"], receipt["frozen_manifest_sha256"])
@@ -464,6 +484,56 @@ class PaidRunStaysFrozenTest(unittest.TestCase):
         journal = validate_checkpoint_payload(fixture.journal.read_bytes())
         self.assertEqual(["committed"], [t["state"] for t in journal["transactions"].values()])
         self.assertEqual(1, len(load_rollouts(fixture.output / "baseline.jsonl")))
+
+
+class PreAuthorizationFailureTest(unittest.TestCase):
+    """A failure between reservation and durable authorization spent nothing;
+    the reservation is aborted so a resume is not blocked by it. A failure
+    after the authorization became durable leaves it authorized: a request
+    may have been admitted, and resume must stay refused."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch(
+            "scripts.eval.plugin_pair_runner._verify_arm_inventory",
+            lambda root, protocol, arm, executable, runtime: "inventory-" + arm,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.fixture = _PaidFixture(Path(self._tmp.name))
+
+    def test_a_failure_before_the_authorization_is_durable_aborts_the_reservation(self) -> None:
+        fixture = self.fixture
+        with mock.patch.object(BudgetJournal, "authorize_request", side_effect=RuntimeError("lost before the write")):
+            with _FakeProvider(fixture).installed():
+                with self.assertRaisesRegex(RuntimeError, "lost before the write"):
+                    fixture.run()
+        journal = validate_checkpoint_payload(fixture.journal.read_bytes())
+        self.assertEqual(["aborted_pre_request"], [t["state"] for t in journal["transactions"].values()])
+        # ...and the pair then completes on a plain retry.
+        fake = _FakeProvider(fixture)
+        with fake.installed():
+            self.assertEqual({"baseline": 3, "candidate": 3}, fixture.run())
+        self.assertEqual(6, len(fake.requests))
+
+    def test_a_failure_after_the_authorization_is_durable_keeps_it_and_blocks_resume(self) -> None:
+        fixture = self.fixture
+        real = BudgetJournal.authorize_request
+
+        def authorize_then_die(self, *args, **kwargs):
+            real(self, *args, **kwargs)
+            raise RuntimeError("lost after the write")
+
+        with mock.patch.object(BudgetJournal, "authorize_request", authorize_then_die):
+            with _FakeProvider(fixture).installed():
+                with self.assertRaisesRegex(RuntimeError, "lost after the write"):
+                    fixture.run()
+        journal = validate_checkpoint_payload(fixture.journal.read_bytes())
+        self.assertEqual(["request_authorized"], [t["state"] for t in journal["transactions"].values()])
+        with _FakeProvider(fixture).installed():
+            with self.assertRaisesRegex(ValidationError, "replay is forbidden"):
+                fixture.run()
 
 
 class AnalysisBindsTheJournalTest(unittest.TestCase):
@@ -548,6 +618,106 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
             for digest in ("a" * 64, "b" * 64)
         }
         self.assertEqual(2, len(hashes))
+        # And the verifier consumes that binding: the real journal verifies
+        # against the manifest it was sealed under and no other.
+        sealed_under = self.fixture.manifest["manifest_sha256"]
+        verify_journal_authority(self.state, observation, frozen_manifest_sha256=sealed_under)
+        with self.assertRaisesRegex(ValidationError, "does not bind this frozen run"):
+            verify_journal_authority(self.state, observation, frozen_manifest_sha256="b" * 64)
+
+    def test_an_authority_too_small_for_the_schedule_is_not_a_paid_run(self) -> None:
+        # The runner refuses an authority below rollouts x max_rollout; a
+        # journal sealed under one (six rollouts of zero usage fit under $2)
+        # therefore cannot have come from run_paid_pair.
+        observation = _observe(ROOT, self.fixture.protocol, self.fixture.runtime)
+        authority = dict(self.state["authority"], total_cost_microusd=usd_to_microusd(2.0))
+        authority["manifest_sha256"] = _canonical_sha256(
+            _authority_manifest(
+                observation,
+                frozen_manifest_sha256=self.fixture.manifest["manifest_sha256"],
+                authorized_cost_microusd=authority["total_cost_microusd"],
+                authorized_metered_tokens=authority["total_metered_tokens"],
+            )
+        )
+        with self.assertRaisesRegex(ValidationError, "cannot cover the complete frozen schedule"):
+            verify_journal_authority(dict(self.state, authority=authority), observation, frozen_manifest_sha256=self.fixture.manifest["manifest_sha256"])
+
+    def test_resume_refuses_a_checkpoint_whose_body_was_edited(self) -> None:
+        # Same sealed digest, checked on the runner's own resume path.
+        def flip(row):
+            row["outcome"]["status"] = "fail"
+            row["judgement"]["trustworthy_success"] = False
+        self._rewrite_candidate(flip)
+        with _FakeProvider(self.fixture).installed():
+            with self.assertRaisesRegex(ValidationError, "checkpoint rollout body does not match the evidence sealed"):
+                self.fixture.run()
+
+    def test_a_rollout_body_edited_after_the_run_is_refused(self) -> None:
+        # Outcome and judgement flipped coherently: validate_rollout accepts
+        # the row, usage and receipt are untouched, only the sealed digest
+        # disagrees.
+        def flip(row):
+            row["outcome"]["status"] = "fail"
+            row["judgement"]["trustworthy_success"] = False
+        self._rewrite_candidate(flip)
+        with self.assertRaisesRegex(ValidationError, "does not match the evidence sealed"):
+            self.fixture.analyze()
+
+    def test_a_receipt_transplanted_from_another_run_of_the_same_freeze_is_refused(self) -> None:
+        # Run B of the same freeze, different usage, into a fresh journal.
+        fixture = self.fixture
+        rows_a = {arm: load_rollouts(fixture.output / f"{arm}.jsonl") for arm in ("baseline", "candidate")}
+        fixture.journal.unlink()
+        shutil.rmtree(fixture.output)
+
+        def pricier(row):
+            row["metrics"]["cost_usd"] = 0.02
+        with _FakeProvider(fixture, mutate_row=pricier).installed():
+            fixture.run()
+        rows_b = {arm: load_rollouts(fixture.output / f"{arm}.jsonl") for arm in ("baseline", "candidate")}
+        # Transplant: A's bodies (with outcomes flipped so they differ from
+        # B's) carrying B's receipts and B's counters, judged against B's
+        # journal. Every receipt matches a committed transaction; only the
+        # sealed body digest tells the two runs apart.
+        for arm in ("baseline", "candidate"):
+            by_key = {(r["task_id"], r["trial"]): r for r in rows_b[arm]}
+            spliced = []
+            for row in rows_a[arm]:
+                twin = by_key[(row["task_id"], row["trial"])]
+                row["metrics"] = twin["metrics"]
+                row["budget_transaction"] = twin["budget_transaction"]
+                row["outcome"]["status"] = "fail"
+                row["judgement"]["trustworthy_success"] = False
+                spliced.append(row)
+            (fixture.output / f"{arm}.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in spliced), encoding="utf-8"
+            )
+        with self.assertRaisesRegex(ValidationError, "does not match the evidence sealed"):
+            fixture.analyze()
+
+    def test_a_receipt_with_foreign_fields_or_a_later_journal_position_is_refused(self) -> None:
+        self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("note", "x"))
+        with self.assertRaisesRegex(ValidationError, "unexpected or missing fields"):
+            self.fixture.analyze()
+        self.setUp()
+        self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("journal_revision", row["budget_transaction"]["commit_revision"] + 1))
+        with self.assertRaisesRegex(ValidationError, "not bound to its commit revision/head"):
+            self.fixture.analyze()
+
+    def test_a_row_the_harness_recorded_with_the_wrong_identity_is_refused(self) -> None:
+        # The body is authentic - the journal sealed it - but its task
+        # fingerprint is not the one this suite produces. Resume would refuse
+        # the checkpoint; analysis applies the same grounded validation.
+        fixture = self.fixture
+        fixture.journal.unlink()
+        shutil.rmtree(fixture.output)
+
+        def wrong_task(row):
+            row["task_fingerprint"] = "0" * 64
+        with _FakeProvider(fixture, mutate_row=wrong_task).installed():
+            fixture.run()
+        with self.assertRaisesRegex(ValidationError, "identity mismatch"):
+            fixture.analyze()
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ if __package__ in {None, ""}:
         validate_checkpoint_payload,
     )
     from scripts.eval.model import ValidationError, parse_rollouts  # type: ignore
+    from scripts.eval.paired_runner import _validate_checkpoint_rows  # type: ignore
     from scripts.eval.plugin_pair_runner import (  # type: ignore
         TOKEN_METRICS,
         _Observation,
@@ -36,6 +37,7 @@ if __package__ in {None, ""}:
         _read_private_json,
         _revision,
         _transaction,
+        rollout_evidence_sha256,
         verify_frozen_manifest,
     )
     from scripts.eval.plugin_release_gate import PluginGateError  # type: ignore
@@ -50,6 +52,7 @@ else:
         validate_checkpoint_payload,
     )
     from .model import ValidationError, parse_rollouts
+    from .paired_runner import _validate_checkpoint_rows
     from .plugin_pair_runner import (
         TOKEN_METRICS,
         _Observation,
@@ -62,6 +65,7 @@ else:
         _read_private_json,
         _revision,
         _transaction,
+        rollout_evidence_sha256,
         verify_frozen_manifest,
     )
     from .plugin_release_gate import PluginGateError
@@ -180,12 +184,21 @@ def verify_journal_authority(
         or authority["provider_identity"] != f"{model['provider']}:{model['id']}"
     ):
         raise ValidationError("budget journal authority names another model")
-    _, _, total_cost, total_tokens = _pair_fields(observation.protocol)
+    rollout_cost, rollout_tokens, total_cost, total_tokens = _pair_fields(observation.protocol)
     if (
         int(authority["total_cost_microusd"]) > usd_to_microusd(total_cost)
         or int(authority["total_metered_tokens"]) > int(total_tokens)
     ):
         raise ValidationError("budget journal authority exceeds the frozen cumulative ceiling")
+    # Mirror of the runner's admission rule: an authority that could not cover
+    # every rollout's maximum reservation is one the runner would have refused,
+    # so a journal claiming it did not come from a paid run of this schedule.
+    rollouts = int(pair["rollouts"])
+    if (
+        int(authority["total_cost_microusd"]) < usd_to_microusd(rollout_cost) * rollouts
+        or int(authority["total_metered_tokens"]) < int(rollout_tokens) * rollouts
+    ):
+        raise ValidationError("budget journal authority cannot cover the complete frozen schedule")
     return BudgetAuthority(**authority)
 
 
@@ -208,9 +221,28 @@ def bind_row_to_journal(
             "paid plugin row names a transaction the budget journal does not contain"
         )
     live = _transaction_receipt_from_state(state, transaction_id)
+    if set(receipt) != set(live):
+        raise ValidationError("paid plugin row budget receipt has unexpected or missing fields")
     immutable = set(live) - {"journal_revision", "journal_head_sha256"}
     if any(receipt.get(key) != live.get(key) for key in immutable):
         raise ValidationError("paid plugin row budget receipt drifted from the journal")
+    # The receipt a row carries is the one taken at commit: its journal
+    # position is the commit's, not an earlier or later revision.
+    if (
+        receipt["journal_revision"] != receipt["commit_revision"]
+        or receipt["journal_head_sha256"] != receipt["commit_head_sha256"]
+    ):
+        raise ValidationError(
+            "paid plugin row budget receipt is not bound to its commit revision/head"
+        )
+    # The journal sealed a digest of the rollout body at commit. A receipt
+    # transplanted onto another body, or a body edited after the run, does
+    # not match it; a transaction committed without one is not this runner's.
+    sealed = state["transactions"][transaction_id].get("evidence_sha256")
+    if sealed is None or sealed != rollout_evidence_sha256(row):
+        raise ValidationError(
+            "paid plugin row body does not match the evidence sealed in the journal"
+        )
     rollout_cost, rollout_tokens, _, _ = _pair_fields(observation.protocol)
     expected = _transaction(
         authority=authority,
@@ -272,12 +304,30 @@ def analyze(
     )
     baseline_payload, baseline = _read_rollouts(baseline_path)
     candidate_payload, candidate = _read_rollouts(candidate_path)
+    pair = protocol["coding_pair"]
+    # The grounded-identity validation resume applies to a checkpoint: every
+    # fingerprint must be the one this suite, wrapper, model and revision
+    # produce - not merely consistent between the two arms.
+    for arm, rows in (("baseline", baseline), ("candidate", candidate)):
+        _validate_checkpoint_rows(
+            rows,
+            variant=arm,
+            suite=observation.suite,
+            repo_root=root,
+            binary=observation.wrappers[arm],
+            trials=int(pair["trials"]),
+            expected_tasks=observation.tasks,
+            model_provider=pair["model"]["provider"],
+            model_id=pair["model"]["id"],
+            harness_revision=_revision(observation.fields),
+            harness_config_id=_config_ids(protocol)[arm],
+            require_runtime_budget=True,
+        )
     expected = _expected_keys(protocol)
     for arm, rows in (("baseline", baseline), ("candidate", candidate)):
         observed = {(str(row["task_id"]), int(row["trial"])) for row in rows}
         if observed != expected or len(rows) != len(expected):
             raise ValidationError(f"{arm} evidence is not the complete frozen pair")
-    pair = protocol["coding_pair"]
     claimed: set[str] = set()
     for arm, rows in (("baseline", baseline), ("candidate", candidate)):
         for row in rows:

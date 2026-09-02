@@ -74,17 +74,53 @@ class InfrastructureRunError(ValidationError):
         )
 
 
-def _runner_env() -> Dict[str, str]:
-    """Remove host treatment knobs before applying the frozen runtime env."""
+# Variables through which the invoking shell changes what a child bash,
+# python or dynamically linked binary executes without any file in the tree
+# changing: startup-file hooks, exported functions, module search paths,
+# loader preloads. Dropped from every child environment the evaluation
+# spawns. PATH stays: the binaries on it are the operator's trust boundary,
+# and a fixed tool path would not survive the self-hosted runners.
+HOST_INJECTION_ENV_KEYS = frozenset(
+    {
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "CDPATH",
+        "GLOBIGNORE",
+        "PERL5OPT",
+        "PERL5LIB",
+        "NODE_OPTIONS",
+        "RUBYOPT",
+    }
+)
+HOST_INJECTION_ENV_PREFIXES = ("BASH_FUNC_", "DYLD_", "LD_", "PYTHON")
+
+
+def hermetic_env(base: Mapping[str, str]) -> Dict[str, str]:
+    """`base` without the shell / interpreter / loader injection vectors."""
     return {
         key: value
-        for key, value in os.environ.items()
-        if not key.startswith("METACODES_")
-        and not key.startswith("TINYKG_")
-        and not key.startswith("E2E_")
-        and not key.startswith("CLAUDE_CODE_")
-        and key != "RG_BIN"
+        for key, value in base.items()
+        if key not in HOST_INJECTION_ENV_KEYS
+        and not key.startswith(HOST_INJECTION_ENV_PREFIXES)
     }
+
+
+def _runner_env() -> Dict[str, str]:
+    """Remove host treatment knobs and injection vectors before applying the
+    frozen runtime env."""
+    return hermetic_env(
+        {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("METACODES_")
+            and not key.startswith("TINYKG_")
+            and not key.startswith("E2E_")
+            and not key.startswith("CLAUDE_CODE_")
+            and key != "RG_BIN"
+        }
+    )
 
 
 def _require_budget(
@@ -585,7 +621,44 @@ def _load_checkpoint(
 ) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
-    rollouts = load_rollouts(path)
+    return _validate_checkpoint_rows(
+        load_rollouts(path),
+        variant=variant,
+        suite=suite,
+        repo_root=repo_root,
+        binary=binary,
+        trials=trials,
+        expected_tasks=expected_tasks,
+        model_provider=model_provider,
+        model_id=model_id,
+        harness_revision=harness_revision,
+        harness_config_id=harness_config_id,
+        require_runtime_budget=require_runtime_budget,
+        treatment_verifier=treatment_verifier,
+    )
+
+
+def _validate_checkpoint_rows(
+    rollouts: List[Dict[str, Any]],
+    *,
+    variant: str,
+    suite: Dict[str, Any],
+    repo_root: Path,
+    binary: Path,
+    trials: int,
+    expected_tasks: Mapping[str, Dict[str, Any]],
+    model_provider: str,
+    model_id: str,
+    harness_revision: str,
+    harness_config_id: str | None = None,
+    require_runtime_budget: bool = False,
+    treatment_verifier: tuple[Path, str] | None = None,
+) -> List[Dict[str, Any]]:
+    """The grounded-identity validation every persisted rollout must pass:
+    unique keys, scoring validity, and every fingerprint equal to what this
+    suite / binary / model / revision would produce. Resume runs it on a
+    checkpoint; the plugin analysis runs it on the evidence it judges, so
+    the two cannot accept different rows."""
     keys = [(item["task_id"], item["trial"]) for item in rollouts]
     duplicates = sorted(key for key, count in Counter(keys).items() if count > 1)
     if duplicates:

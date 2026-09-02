@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.eval.model import ValidationError
+from scripts.eval.paired_runner import _runner_env, hermetic_env
 from scripts.eval.plugin_pair_runner import (
     INVENTORY_IDENTITY,
     _canonical_sha256,
@@ -312,6 +313,57 @@ class PluginPairRunnerTest(unittest.TestCase):
         self.assertNotEqual(os.environ.get("HOME"), inventory["home"])
         self.assertIn("metacodes-plugin-inventory-home-", inventory["home"])
         self.assertFalse(Path(inventory["home"]).exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture required")
+    def test_inventory_does_not_inherit_shell_or_interpreter_injection_vectors(self) -> None:
+        """`BASH_ENV`, exported functions, `PYTHONPATH`, loader preloads: each
+        lets the invoking shell change what the child executes without any
+        file in the tree changing, so none of them reaches the runtime."""
+        injected = {
+            "BASH_ENV": "/tmp/hook.sh",
+            "BASH_FUNC_awk%%": "() { echo pwned; }",
+            "PYTHONPATH": "/tmp/shadow",
+            "DYLD_INSERT_LIBRARIES": "/tmp/x.dylib",
+            "LD_PRELOAD": "/tmp/x.so",
+            "SHELLOPTS": "xtrace",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime.py"
+            runtime.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os\n"
+                "print(json.dumps({"
+                "'schema':'metacodes.plugin-inventory/v1',"
+                "'contract_version':1,'plugins':[],"
+                "'seen':sorted(k for k in os.environ if k in %r)}))\n" % sorted(injected),
+                encoding="utf-8",
+            )
+            os.chmod(runtime, 0o700)
+            with mock.patch.dict(os.environ, injected):
+                inventory = _inventory(
+                    ROOT, ROOT / "scripts/eval/fixtures/plugin_baseline.py", runtime
+                )
+        self.assertEqual([], inventory["seen"])
+
+    def test_child_environments_drop_injection_vectors_and_keep_the_rest(self) -> None:
+        base = {
+            "HOME": "/h", "PATH": "/usr/bin", "LANG": "C", "TERM": "xterm",
+            "BASH_ENV": "/tmp/hook.sh", "ENV": "/tmp/hook.sh", "SHELLOPTS": "xtrace",
+            "BASH_FUNC_ls%%": "() { :; }", "PYTHONPATH": "/x", "PYTHONHOME": "/x",
+            "LD_PRELOAD": "/x.so", "LD_LIBRARY_PATH": "/x", "DYLD_INSERT_LIBRARIES": "/x",
+            "NODE_OPTIONS": "--require /x", "PERL5OPT": "-M/x",
+        }
+        self.assertEqual(
+            {"HOME": "/h", "PATH": "/usr/bin", "LANG": "C", "TERM": "xterm"},
+            hermetic_env(base),
+        )
+        # The rollout side uses the same filter on top of its treatment-knob
+        # stripping.
+        with mock.patch.dict(os.environ, {"BASH_ENV": "/tmp/hook.sh", "METACODES_X": "1", "KEEP_ME": "1"}):
+            env = _runner_env()
+        self.assertNotIn("BASH_ENV", env)
+        self.assertNotIn("METACODES_X", env)
+        self.assertEqual("1", env["KEEP_ME"])
 
     def test_paid_resume_rejects_persisted_invalid_rollout(self) -> None:
         invalid = {

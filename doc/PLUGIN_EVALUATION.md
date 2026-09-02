@@ -340,7 +340,7 @@ tokens，低于用户 US$1,000 总上限。尚未运行外部 WorkBuddy。
 |---|---|---|---|
 | **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头**一次读取**协议字节:运行用的对象与 receipt 携带的哈希出自同一份字节;写 receipt 前要求文件仍是这份字节、这份字节仍通过完整严格校验、git HEAD 未变。它**不能**察觉任何发生在某个输入**最后一次被观测之后**的改动:子进程运行期间被钉输入"改了又改回"(ABA);校验扫描进行中、某文件已被哈希之后才被改动(扫描逐个读 ~130 个文件,不是原子的);以及最后一次读取之后、receipt 返回并持久化之前的单向改动——这些都需要在物化的不可变 checkout 里跑门禁、在那里哈希并封存 receipt,见 #49)、`plugin_pair_runner.build_plan`,以及 freeze、`run_paid_pair` 起点与每次请求前后、`plugin_pair_analysis.analyze` 共用的同一次观测 `_observe`(§7.1)。它们与 `run_gate` 一样经 `validate_protocol_payload`(哈希自己校验过的那份字节)。没有布尔开关,严格是**构造出来的** |
 | **评测器** | `pinned_evaluator_files` | 做测量与判定的代码(gate、runner、analysis、e2e 脚本、门禁阈值)以及 Lean 形式化证据(它们由 CI 单独编译、被评测脚本消费,**不链接进运行时二进制**) | **每次加载**都校验,包括日常测试;**永远不由工具自动 repin**——一个门禁给自己的代码重钉哈希是自证漏洞(c7c2aa9) |
-| **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.root` + `candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件。`candidate.root` 下的文件集合必须**恰好**等于 `candidate.files`(无未钉文件、无缺失、无符号链接):哈希证明钉住的文件还是原样,集合相等证明它们就是全部——否则在被钉 Skill 旁边放一个文件不需要改协议,任何 pin、指纹或清单字段都不会察觉 | 每次加载都校验 |
+| **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.root` + `candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件。`candidate.root` 下的文件集合必须**恰好**等于 `candidate.files`,目录集合恰好等于这些文件蕴含的父目录,无符号链接、无可执行位、无特殊文件:哈希证明钉住的文件还是原样,集合相等证明它们就是全部——否则在被钉 Skill 旁边放一个文件、加一个空目录或 `chmod +x` 都不需要改协议,而运行时把目录名和可执行位哈希进 Skill 身份(`computeContentRevision`),任何 pin、指纹或清单字段都不会察觉 | 每次加载都校验 |
 
 **日常提交不 repin。** 测试与巡检(含 `--validate-only`)用 `load_protocol_structure`:除实现指纹
 相等以外全部照旧 fail-closed;`--validate-only` 打印 pinned / observed 两个值和
@@ -396,6 +396,19 @@ python3 scripts/eval/plugin_pair_runner.py --freeze \
 唯一构造:协议哈希、运行时、wrapper、inventory、revision、冻结清单哈希、授权总额)和每条
 rollout 记录的 `plugin_treatment`。
 
+**证据正文封入日志。** runner 在 commit 之前先挂上 `plugin_treatment`,再对整行(除
+`budget_transaction` 外的一切:outcome、trajectory、judgement、metrics、artifacts、attestation)
+取规范化摘要,以 `evidence_sha256` 封入 committed 事件——它在事件哈希链之内。没有它,
+日志只能证明"这笔钱花在了某个 arm/task/trial 上",证明不了付的是哪份正文:同一冻结的两次
+运行 journal_id、交易 id 集合完全相同,把 B 的 receipt 移植到 A 的行上、或把一行的 outcome
+与 judgement 一起翻转,都过得了 receipt 校验。续跑和 analysis 都要求每行正文的摘要等于日志
+里封的那个;memory benchmark 的 runner 不封该字段,回放对它保持可选。
+
+**预授权失败可回滚。** reserve 之后、`authorize_request` 尚未落盘就失败(信号、异常),
+runner 试图 `abort_pre_request`:日志仍是 `reserved` 则中止落账、续跑不被一笔没花的预留
+挡住;若授权其实已落盘,日志拒绝中止(状态不对或锁内 head 漂移),交易保持
+`request_authorized`——请求可能已被放行,续跑照旧拒绝。
+
 **inventory 哈希与 checkout 位置无关。** 运行时把插件根目录报告为绝对 realpath;冻结的
 `inventory_sha256` 哈希的是 `metacodes.plugin-inventory-identity/v1` 投影:候选插件的
 `source_root` 必须与协议声明的 `candidate.root` realpath 相等,并记录为该仓内相对名;
@@ -405,12 +418,24 @@ inventory 预检在临时 HOME 下、`METACODES_NO_PROBE=1` 执行:`--dump-plugi
 会构造完整 App,在真实 HOME 下会留下 session 目录、读 `~/.metacodes/config.json` 并拉起
 其中的 MCP server、探测模型目录。
 
+**子进程环境去注入向量。** 预检与 rollout(`paired_runner._runner_env`)共用 `hermetic_env`:
+剥掉 `BASH_ENV`/`ENV`/`SHELLOPTS`/`BASHOPTS`/`CDPATH`/`GLOBIGNORE`、导出的 shell 函数
+(`BASH_FUNC_*`)、`PYTHON*`、`LD_*`/`DYLD_*`、`NODE_OPTIONS`/`PERL5OPT`/`PERL5LIB`/`RUBYOPT`。
+`run_e2e.sh` 是非交互 bash,`BASH_ENV` 指向的钩子能重定义它用来拼装 prompt 的 `awk`,在
+不改动树上任何文件的情况下改变候选臂收到的输入。`PATH` 保留:它上面的二进制是操作者的
+信任边界,固定工具路径在自托管 runner 上活不下来。
+
 `analyze` 在读取任何证据之前做同样的清单校验,然后**回放 budget journal**:日志的
 authority 哈希必须等于用日志自记的总额重建的 `_authority_manifest`(即绑定同一冻结清单),
 模型指纹与 provider 一致,总额不超过协议的累计上限;每一行的 `budget_transaction` 必须
-命名日志里存在的交易、除 `journal_revision`/`journal_head_sha256` 外逐字段相等,且交易身份
-(run_id、harness_fingerprint 等)等于本冻结对该 arm/task/trial 应当预留的身份;日志里任何
-已预留/已授权/已提交而没有对应 rollout 的交易都导致拒绝(只有 `aborted_pre_request` 例外)。
+命名日志里存在的交易、键集合与 receipt 投影完全相同、除 `journal_revision`/
+`journal_head_sha256` 外逐字段相等且这两项等于 commit 时的 revision/head,交易身份
+(run_id、harness_fingerprint 等)等于本冻结对该 arm/task/trial 应当预留的身份,正文摘要等于
+日志封入的 `evidence_sha256`;日志里任何已预留/已授权/已提交而没有对应 rollout 的交易都导致
+拒绝(只有 `aborted_pre_request` 例外)。authority 总额除不超累计上限外,还必须**够覆盖**
+`rollouts × max_rollout_*`——runner 拒绝的 authority,analysis 同样不认。每行还要过续跑同款
+的落地身份校验(`_validate_checkpoint_rows`:task/model/harness/grader 指纹必须是本 suite、
+wrapper、model、revision 产出的那些),不是两臂之间互相一致就行。
 receipt 的 `budget_journal_sha256`、`baseline_sha256`、`candidate_sha256` 是**被校验的那份
 字节**的哈希,另携带 `frozen_manifest_sha256`、`implementation_fingerprint` 与
 `path_set_digest`。这里建立的是**一致性**而非签名:日志和清单都不带签名,能证明的是证据、

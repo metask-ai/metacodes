@@ -51,6 +51,7 @@ if __package__ in {None, ""}:
         _require_scoring_rollout,
         _run_once,
         alternating_schedule,
+        hermetic_env,
         scenario_selector,
     )
     from scripts.eval.plugin_release_gate import (  # type: ignore
@@ -79,6 +80,7 @@ else:
         _require_scoring_rollout,
         _run_once,
         alternating_schedule,
+        hermetic_env,
         scenario_selector,
     )
     from .plugin_release_gate import (
@@ -560,13 +562,15 @@ def _inventory(
     probes the model catalog. Executing the pinned runtime is the point of
     this preflight; executing it against the operator's account is not.
     """
-    clean_env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("METACODES_")
-        and not key.startswith("METASK_")
-        and not key.startswith("E2E_")
-    }
+    clean_env = hermetic_env(
+        {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("METACODES_")
+            and not key.startswith("METASK_")
+            and not key.startswith("E2E_")
+        }
+    )
     clean_env["METACODES_PLUGIN_RUNTIME_BINARY"] = str(runtime_binary)
     clean_env["METACODES_NO_PROBE"] = "1"
     with tempfile.TemporaryDirectory(prefix="metacodes-plugin-inventory-home-") as home:
@@ -718,6 +722,17 @@ def _metered_tokens(rollout: Mapping[str, Any]) -> int:
     return sum(int(rollout["metrics"][key]) for key in TOKEN_METRICS)
 
 
+def rollout_evidence_sha256(rollout: Mapping[str, Any]) -> str:
+    """Canonical digest of everything in a rollout except the budget receipt
+    itself - outcome, trajectory, judgement, metrics, artifacts and the
+    treatment attestation. Sealed into the journal's committed event, so a
+    receipt cannot be transplanted onto a rollout with a different body and
+    a body cannot be edited after the run without the journal disagreeing."""
+    return _canonical_sha256(
+        {key: value for key, value in rollout.items() if key != "budget_transaction"}
+    )
+
+
 def _require_scoring_checkpoints(
     collected: Mapping[str, Sequence[dict[str, Any]]],
 ) -> None:
@@ -867,14 +882,17 @@ def run_paid_pair(
                     or receipt.get("actual_metered_tokens") != _metered_tokens(row)
                 ):
                     raise ValidationError("checkpoint usage does not match budget receipt")
+                if journal.transaction_evidence_sha256(transaction_id) != rollout_evidence_sha256(row):
+                    raise ValidationError(
+                        "checkpoint rollout body does not match the evidence sealed in the journal"
+                    )
                 checkpoint_transactions.add(transaction_id)
         _require_no_orphan_budget_transactions(journal, checkpoint_transactions)
 
         remaining = sum(
             1
-            for trial, arm in alternating_schedule(int(pair["trials"]))
-            for task_id in sorted(expected_tasks)
-            if (task_id, trial) not in completed[arm]
+            for entry in observation.schedule
+            if (entry["task_id"], entry["trial"]) not in completed[entry["arm"]]
         )
         committed_cost = sum(
             int(receipt.get("actual_cost_microusd") or 0)
@@ -895,100 +913,112 @@ def run_paid_pair(
 
         runtime_api_key = _load_api_key(provider_auth_file.expanduser().resolve())
         output_dir.mkdir(parents=True, exist_ok=True)
-        for trial, arm in alternating_schedule(int(pair["trials"])):
-            for task_id in sorted(expected_tasks):
-                if (task_id, trial) in completed[arm]:
-                    continue
-                # The bracket around every request is the startup check
-                # itself: the whole manifest against the whole tree. It
-                # cannot see a change made and reverted inside the bracket
-                # (#49); it does see everything that is still different
-                # when the request ends, before its evidence is imported.
-                _require_still_frozen(
-                    root, protocol_path, runtime_binary, manifest, moment="before request"
-                )
-                transaction = _transaction(
-                    authority=budget_authority,
-                    protocol_sha256=protocol_sha256,
-                    task=expected_tasks[task_id],
-                    arm=arm,
-                    trial=trial,
-                    revision=revision,
-                    config_id=config_ids[arm],
-                    wrapper_sha256=wrapper_hashes[arm],
-                    runtime_sha256=runtime_sha256,
-                    inventory_sha256=inventory_hashes[arm],
-                    max_cost_usd=rollout_cost,
-                    max_metered_tokens=rollout_tokens,
-                )
-                reserved = journal.reserve(transaction)
-                transaction_id = str(reserved["transaction_id"])
-                authorization_started = False
-                try:
-                    authorization_started = True
-                    journal.authorize_request(
-                        transaction_id,
-                        expected_revision=int(reserved["journal_revision"]),
-                        expected_head_sha256=str(reserved["journal_head_sha256"]),
-                    )
-                except BaseException:
-                    if not authorization_started:
-                        journal.abort_pre_request(transaction_id)
-                    raise
-                run_dir = _run_once(
-                    root,
-                    wrappers[arm],
-                    arm,
-                    trial,
-                    scenario_selector([task_id]),
-                    model["provider"],
-                    model["id"],
-                    suite_path,
-                    revision,
-                    harness_config_id=config_ids[arm],
-                    timeout_seconds=expected_tasks[task_id]["constraints"]["timeout_seconds"],
-                    max_metered_tokens=rollout_tokens,
-                    max_cost_usd=rollout_cost,
-                    runtime_api_key=runtime_api_key,
-                    runtime_env={
-                        "METACODES_PLUGIN_RUNTIME_BINARY": str(runtime_binary),
-                    },
-                )
-                _require_still_frozen(
-                    root, protocol_path, runtime_binary, manifest, moment="after request"
-                )
-                imported = import_run(suite, root, run_dir)
-                selected = [
-                    row
-                    for row in imported
-                    if row["task_id"] == task_id
-                    and row["trial"] == trial
-                    and row["task_fingerprint_provenance"] == "recorded_at_execution"
-                ]
-                if len(selected) != 1:
-                    raise ValidationError("paid plugin rollout produced ambiguous evidence")
-                row = selected[0]
-                _require_runtime_budget_provenance(
-                    row,
-                    max_metered_tokens=rollout_tokens,
-                    max_cost_usd=rollout_cost,
-                )
-                receipt = journal.commit(
+        for entry in observation.schedule:
+            trial, arm, task_id = int(entry["trial"]), str(entry["arm"]), str(entry["task_id"])
+            if (task_id, trial) in completed[arm]:
+                continue
+            # The bracket around every request is the startup check
+            # itself: the whole manifest against the whole tree. It
+            # cannot see a change made and reverted inside the bracket
+            # (#49); it does see everything that is still different
+            # when the request ends, before its evidence is imported.
+            _require_still_frozen(
+                root, protocol_path, runtime_binary, manifest, moment="before request"
+            )
+            transaction = _transaction(
+                authority=budget_authority,
+                protocol_sha256=protocol_sha256,
+                task=expected_tasks[task_id],
+                arm=arm,
+                trial=trial,
+                revision=revision,
+                config_id=config_ids[arm],
+                wrapper_sha256=wrapper_hashes[arm],
+                runtime_sha256=runtime_sha256,
+                inventory_sha256=inventory_hashes[arm],
+                max_cost_usd=rollout_cost,
+                max_metered_tokens=rollout_tokens,
+            )
+            reserved = journal.reserve(transaction)
+            transaction_id = str(reserved["transaction_id"])
+            try:
+                journal.authorize_request(
                     transaction_id,
-                    actual_cost_microusd=usd_to_microusd_ceiling(row["metrics"]["cost_usd"]),
-                    actual_metered_tokens=_metered_tokens(row),
+                    expected_revision=int(reserved["journal_revision"]),
+                    expected_head_sha256=str(reserved["journal_head_sha256"]),
                 )
-                row["budget_transaction"] = dict(receipt)
-                row["plugin_treatment"] = {
-                    "protocol_sha256": protocol_sha256,
-                    "frozen_manifest_sha256": frozen_manifest_sha256,
-                    "arm": arm,
-                    "inventory_sha256": inventory_hashes[arm],
-                }
-                collected[arm].append(row)
-                completed[arm].add((task_id, trial))
-                write_rollouts(outputs[arm], collected[arm])
-                _require_scoring_rollout(row, variant=arm)
+            except BaseException:
+                # Nothing has been sent. If the authorization never became
+                # durable the journal still says `reserved` and the abort
+                # lands, so a resume is not blocked by a reservation nobody
+                # spent; if it did become durable the journal refuses the
+                # abort (wrong state, or head drift under the lock) and the
+                # transaction stays authorized - the conservative state, a
+                # request may have been admitted.
+                try:
+                    journal.abort_pre_request(transaction_id)
+                except ValidationError:
+                    pass
+                raise
+            run_dir = _run_once(
+                root,
+                wrappers[arm],
+                arm,
+                trial,
+                scenario_selector([task_id]),
+                model["provider"],
+                model["id"],
+                suite_path,
+                revision,
+                harness_config_id=config_ids[arm],
+                timeout_seconds=expected_tasks[task_id]["constraints"]["timeout_seconds"],
+                max_metered_tokens=rollout_tokens,
+                max_cost_usd=rollout_cost,
+                runtime_api_key=runtime_api_key,
+                runtime_env={
+                    "METACODES_PLUGIN_RUNTIME_BINARY": str(runtime_binary),
+                },
+            )
+            _require_still_frozen(
+                root, protocol_path, runtime_binary, manifest, moment="after request"
+            )
+            imported = import_run(suite, root, run_dir)
+            selected = [
+                row
+                for row in imported
+                if row["task_id"] == task_id
+                and row["trial"] == trial
+                and row["task_fingerprint_provenance"] == "recorded_at_execution"
+            ]
+            if len(selected) != 1:
+                raise ValidationError("paid plugin rollout produced ambiguous evidence")
+            row = selected[0]
+            _require_runtime_budget_provenance(
+                row,
+                max_metered_tokens=rollout_tokens,
+                max_cost_usd=rollout_cost,
+            )
+            # The treatment attestation is part of the evidence: attached
+            # before the body is digested, so the digest sealed into the
+            # committed event covers it. The receipt is the only field the
+            # digest excludes.
+            row["plugin_treatment"] = {
+                "protocol_sha256": protocol_sha256,
+                "frozen_manifest_sha256": frozen_manifest_sha256,
+                "arm": arm,
+                "inventory_sha256": inventory_hashes[arm],
+            }
+            receipt = journal.commit(
+                transaction_id,
+                actual_cost_microusd=usd_to_microusd_ceiling(row["metrics"]["cost_usd"]),
+                actual_metered_tokens=_metered_tokens(row),
+                evidence_sha256=rollout_evidence_sha256(row),
+            )
+            row["budget_transaction"] = dict(receipt)
+            collected[arm].append(row)
+            completed[arm].add((task_id, trial))
+            write_rollouts(outputs[arm], collected[arm])
+            _require_scoring_rollout(row, variant=arm)
         return {"baseline": len(collected["baseline"]), "candidate": len(collected["candidate"])}
 
 

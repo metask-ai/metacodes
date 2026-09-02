@@ -474,36 +474,59 @@ class CandidateTreeIsPinnedExactlyTest(unittest.TestCase):
     tree check proves they are the only files. A file added beside a pinned
     Skill needs no protocol edit, so nothing else would notice it."""
 
-    @unittest.skipIf(os.name == "nt", "symlink fixture requires POSIX")
+    PINNED = {"plugin/plugin.json": "x", "plugin/skills/verify/SKILL.md": "y"}
+
+    def _tree(self, root: Path) -> Path:
+        skill = root / "plugin/skills/verify"
+        skill.mkdir(parents=True)
+        (root / "plugin/plugin.json").write_text("{}", encoding="utf-8")
+        (skill / "SKILL.md").write_text("skill", encoding="utf-8")
+        return skill
+
     def test_exactly_the_pinned_files_and_nothing_else(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            skill = root / "plugin/skills/verify"
-            skill.mkdir(parents=True)
-            (root / "plugin/plugin.json").write_text("{}", encoding="utf-8")
-            (skill / "SKILL.md").write_text("skill", encoding="utf-8")
-            pinned = {"plugin/plugin.json": "x", "plugin/skills/verify/SKILL.md": "y"}
-            _require_exact_tree(root, "plugin", pinned, "candidate")
+            skill = self._tree(root)
+            _require_exact_tree(root, "plugin", self.PINNED, "candidate")
             extra = skill / "reference.md"
             extra.write_text("unpinned", encoding="utf-8")
             with self.assertRaisesRegex(PluginGateError, r"unpinned \['plugin/skills/verify/reference.md'\], missing \[\]"):
-                _require_exact_tree(root, "plugin", pinned, "candidate")
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
             extra.unlink()
             (root / "plugin/plugin.json").unlink()
             with self.assertRaisesRegex(PluginGateError, r"unpinned \[\], missing \['plugin/plugin.json'\]"):
-                _require_exact_tree(root, "plugin", pinned, "candidate")
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
             (root / "plugin/plugin.json").write_text("{}", encoding="utf-8")
-            _require_exact_tree(root, "plugin", pinned, "candidate")
+            _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            # Directory names are part of the runtime's Skill identity: an
+            # empty directory the pins do not imply is a different candidate.
+            (skill / "resources").mkdir()
+            with self.assertRaisesRegex(PluginGateError, r"directories its pins do not imply: unpinned \['plugin/skills/verify/resources'\]"):
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            (skill / "resources").rmdir()
+            with self.assertRaisesRegex(PluginGateError, "not a directory"):
+                _require_exact_tree(root, "plugin/plugin.json", self.PINNED, "candidate")
+            with self.assertRaisesRegex(PluginGateError, "unsafe protocol path"):
+                _require_exact_tree(root, "../plugin", self.PINNED, "candidate")
+
+    @unittest.skipIf(os.name == "nt", "symlink and mode-bit fixtures require POSIX")
+    def test_symlinks_and_executable_files_under_the_candidate_root_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = self._tree(root)
             # A symlink is refused even when it points at a pinned file: what
             # the runtime would read is not what the pin describes.
             (skill / "alias.md").symlink_to(skill / "SKILL.md")
             with self.assertRaisesRegex(PluginGateError, "contains a symlink: plugin/skills/verify/alias.md"):
-                _require_exact_tree(root, "plugin", pinned, "candidate")
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
             (skill / "alias.md").unlink()
-            with self.assertRaisesRegex(PluginGateError, "not a directory"):
-                _require_exact_tree(root, "plugin/plugin.json", pinned, "candidate")
-            with self.assertRaisesRegex(PluginGateError, "unsafe protocol path"):
-                _require_exact_tree(root, "../plugin", pinned, "candidate")
+            # The executable bit is hashed into the Skill content revision;
+            # identical bytes with +x are a different candidate.
+            os.chmod(skill / "SKILL.md", 0o755)
+            with self.assertRaisesRegex(PluginGateError, "executable or special file: plugin/skills/verify/SKILL.md"):
+                _require_exact_tree(root, "plugin", self.PINNED, "candidate")
+            os.chmod(skill / "SKILL.md", 0o644)
+            _require_exact_tree(root, "plugin", self.PINNED, "candidate")
 
     def test_every_loader_checks_the_candidate_tree(self) -> None:
         with mock.patch(

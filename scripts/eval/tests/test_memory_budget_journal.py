@@ -135,6 +135,66 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                         committed["transaction_id"],
                     )
 
+    def test_commit_seals_an_optional_evidence_digest_into_the_chain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pilot-budget.json"
+            transaction = self.transaction()
+            evidence = digest("rollout body")
+            with BudgetJournal(path, self.authority()) as journal:
+                authorized = self.authorize(journal, transaction)
+                self.assertIsNone(journal.transaction_evidence_sha256(authorized["transaction_id"]))
+                committed = journal.commit(
+                    authorized["transaction_id"],
+                    actual_cost_microusd=750_000,
+                    actual_metered_tokens=12_345,
+                    evidence_sha256=evidence,
+                )
+                # Not in the receipt projection (persisted receipts keep their
+                # shape), but replayed from the chain.
+                self.assertNotIn("evidence_sha256", committed)
+                self.assertEqual(evidence, journal.transaction_evidence_sha256(committed["transaction_id"]))
+                # Idempotent replay must name the same evidence.
+                journal.commit(
+                    authorized["transaction_id"],
+                    actual_cost_microusd=750_000,
+                    actual_metered_tokens=12_345,
+                    evidence_sha256=evidence,
+                )
+                with self.assertRaisesRegex(ValidationError, "identically"):
+                    journal.commit(
+                        authorized["transaction_id"],
+                        actual_cost_microusd=750_000,
+                        actual_metered_tokens=12_345,
+                        evidence_sha256=digest("another body"),
+                    )
+                payload = journal.checkpoint_payload()
+            state = validate_checkpoint_payload(payload)
+            self.assertEqual(evidence, state["transactions"][committed["transaction_id"]]["evidence_sha256"])
+            with BudgetJournal(path, self.authority()) as reopened:
+                self.assertEqual(evidence, reopened.transaction_evidence_sha256(committed["transaction_id"]))
+            # The digest is under the event hash: editing it breaks the chain.
+            tampered = json.loads(payload)
+            tampered["events"][-1]["evidence_sha256"] = digest("edited")
+            with self.assertRaisesRegex(ValidationError, "does not bind event"):
+                validate_checkpoint_payload(json.dumps(tampered).encode("utf-8"))
+            # And it is only legal on committed events: a reservation carrying
+            # one is a foreign shape, even with a valid event hash.
+            tampered = json.loads(payload)
+            first = tampered["events"][0]
+            self.assertEqual("reserved", first["action"])
+            first["evidence_sha256"] = evidence
+            without = {k: v for k, v in first.items() if k != "event_sha256"}
+            first["event_sha256"] = _canonical_sha256(without)
+            with self.assertRaisesRegex(ValidationError, "events\\[0\\]"):
+                validate_checkpoint_payload(json.dumps(tampered).encode("utf-8"))
+            # A journal committed without one still replays: the field is
+            # optional for the memory-benchmark runner, required by callers
+            # that choose to bind evidence.
+            with BudgetJournal(Path(directory) / "plain.json", self.authority()) as plain:
+                authorized = self.authorize(plain, transaction)
+                plain.commit(authorized["transaction_id"], actual_cost_microusd=1, actual_metered_tokens=1)
+                self.assertIsNone(plain.transaction_evidence_sha256(authorized["transaction_id"]))
+
     def test_abort_is_only_legal_before_authorization(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"

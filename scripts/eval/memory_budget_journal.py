@@ -340,6 +340,14 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
             isinstance(raw_event, dict)
             and raw_event.get("action") == "trial_resume_authorized"
         )
+        # committed 事件可选携带 evidence_sha256(rollout 正文的规范化摘要,
+        # runner 在 commit 时封入,审计端用它识别被移植的 receipt);其他
+        # action 出现该字段一律 fail-closed。
+        evidence_shaped = (
+            isinstance(raw_event, dict)
+            and raw_event.get("action") == "committed"
+            and "evidence_sha256" in raw_event
+        )
         event = _exact_object(
             raw_event,
             where,
@@ -354,7 +362,8 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
                 "recorded_at_unix_ns",
                 "event_sha256",
             )
-            + (("resume",) if resume_shaped else ()),
+            + (("resume",) if resume_shaped else ())
+            + (("evidence_sha256",) if evidence_shaped else ()),
         )
         if _require_integer(event["revision"], f"{where}.revision", minimum=1) != index:
             _fail(f"{where}.revision", "is not contiguous")
@@ -416,6 +425,7 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
                 "commit_head_sha256": None,
                 "actual_cost_microusd": None,
                 "actual_metered_tokens": None,
+                "evidence_sha256": None,
                 "resume_events": [],
             }
         else:
@@ -503,11 +513,15 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
                     _fail(where, "actual cost exceeds transaction maximum")
                 if actual_tokens > identity["max_metered_tokens"]:
                     _fail(where, "actual tokens exceed transaction maximum")
+                evidence = event.get("evidence_sha256")
+                if evidence is not None:
+                    _require_hash(evidence, f"{where}.evidence_sha256")
                 current["state"] = action
                 current["commit_revision"] = index
                 current["commit_head_sha256"] = head
                 current["actual_cost_microusd"] = actual_cost
                 current["actual_metered_tokens"] = actual_tokens
+                current["evidence_sha256"] = evidence
 
         exposure_cost = 0
         exposure_tokens = 0
@@ -807,6 +821,7 @@ class BudgetJournal:
         actual_cost_microusd: int | None = None,
         actual_metered_tokens: int | None = None,
         resume: Mapping[str, Any] | None = None,
+        evidence_sha256: str | None = None,
     ) -> Mapping[str, Any]:
         self._require_open()
         self._reobserve()
@@ -826,6 +841,9 @@ class BudgetJournal:
         if resume is not None:
             # 只在 trial_resume_authorized 事件上携带,其他事件字节形状不变。
             event_without_hash["resume"] = dict(resume)
+        if evidence_sha256 is not None:
+            # 只在 committed 事件上携带;不带它的 commit 字节形状不变。
+            event_without_hash["evidence_sha256"] = evidence_sha256
         event = {
             **event_without_hash,
             "event_sha256": _canonical_sha256(event_without_hash),
@@ -946,14 +964,23 @@ class BudgetJournal:
         *,
         actual_cost_microusd: int,
         actual_metered_tokens: int,
+        evidence_sha256: str | None = None,
     ) -> Mapping[str, Any]:
+        """Settle usage. `evidence_sha256`, when given, is the caller's
+        canonical digest of the rollout this usage paid for; it is sealed
+        into the committed event (and into the hash chain) so an auditor can
+        tell a receipt transplanted onto another rollout - or a rollout body
+        edited after the run - from the one the receipt was taken for."""
         current = self._transaction(transaction_id)
         actual_cost = _require_integer(actual_cost_microusd, "budget commit.actual_cost_microusd")
         actual_tokens = _require_integer(actual_metered_tokens, "budget commit.actual_metered_tokens")
+        if evidence_sha256 is not None:
+            _require_hash(evidence_sha256, "budget commit.evidence_sha256")
         if current["state"] == "committed":
             if (
                 current["actual_cost_microusd"] == actual_cost
                 and current["actual_metered_tokens"] == actual_tokens
+                and current["evidence_sha256"] == evidence_sha256
             ):
                 return self.transaction_receipt(transaction_id)
             _fail("budget transaction", "committed usage may only be replayed identically")
@@ -965,6 +992,7 @@ class BudgetJournal:
             identity=current["identity"],
             actual_cost_microusd=actual_cost,
             actual_metered_tokens=actual_tokens,
+            evidence_sha256=evidence_sha256,
         )
 
     def abort_pre_request(self, transaction_id: str) -> Mapping[str, Any]:
@@ -1001,6 +1029,13 @@ class BudgetJournal:
         self._transaction(transaction_id)
         assert self._state is not None
         return _transaction_receipt_from_state(self._state, transaction_id)
+
+    def transaction_evidence_sha256(self, transaction_id: str) -> str | None:
+        """The rollout digest sealed at commit; None when the transaction is
+        not committed or was committed without one. Kept out of the receipt
+        projection so receipts already persisted in checkpoints keep their
+        byte shape."""
+        return self._transaction(transaction_id).get("evidence_sha256")
 
     def resume_events(self, transaction_id: str) -> Tuple[Mapping[str, Any], ...]:
         """Return the replayed trial-resume authorizations for one transaction.
