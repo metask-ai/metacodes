@@ -65,6 +65,9 @@ take part in SHA-256 contracts), and a few gates are POSIX-only by design and
 skip with a stated reason: the paid budget journal, dir_fd-anchored artifact
 publication, and the anonymous-descriptor memory runtime smoke (see
 `scripts/eval/tests/posix_only.py`). CI runs this leg in the `windows-gates` job.
+To exercise the POSIX-only paths from a Windows box, clone the commit into a
+WSL ext4 home (not `/mnt/...`, where every file reports as executable) and run
+the Python suite there.
 
 Maintainers can audit a candidate binary instead of the bundled one:
 

@@ -151,9 +151,9 @@ jobs:
 
   windows-gates:
     name: Gates (Windows)
-    # The full suite below compiles the whole tree cold on a fresh runner cache
-    # (~15 min warm at -j6 on a 28-core box); the platform gates alone fit in 15.
-    timeout-minutes: 60
+    # Measured on the self-hosted runner with warm caches: full suite step 1:09,
+    # job 1:47. A cold cache compiles the whole tree; 30 matches the `gates` job.
+    timeout-minutes: 30
     # Self-hosted isolation guard; see the `gates` job.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64]
@@ -197,9 +197,9 @@ jobs:
       # the "independent gate" build.zig talked about that no workflow ran, so
       # Windows portability regressions accumulated silently (1 compile error,
       # 8 unit tests, 8 integration shards, 330 Python cases by the time it was
-      # first run). -j6: the default job count is one LLVM codegen per core and
-      # 28 of them exhaust 32 GB, which surfaces as bogus "out of memory" compile
-      # failures rather than a clean signal. --test-timeout 5m: the build runner
+      # first run). -j6: the default job count is one LLVM codegen per core; on a
+      # 28-core/32 GB box that surfaces as bogus "out of memory" compile failures
+      # rather than a clean signal, and the runner finishes in ~1 min anyway. --test-timeout 5m: the build runner
       # watchdog between tests is max(--test-timeout, 60s), same as the AgentCore
       # gate. No Lean step and no METACODES_TEST_REQUIRE_LEAN_SDK here: the
       # kernel-gated tests take their checker from operator-provided
