@@ -326,7 +326,7 @@ test "L2 ⑯: 超过投影上限的真实 Read 图片经 agent_loop 到达 wire 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
 
     // 60000 原始字节 → 80000 base64 字符:高于 TOOL_RESULT_CONTEXT_MAX_BYTES(64 KiB),
     // 不论模型窗口多大,修复前一定被 per-result 投影 spill。Read 只按扩展名定 media type、
@@ -410,7 +410,7 @@ test "L2 ⑰: 第二次请求被 4xx 拒绝时 tool_result 保持未送达——
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const raw = "PNG-ish fixture bytes, size is irrelevant for delivery";
     const path = try std.fmt.allocPrint(a, "{s}/small.png", .{root});
     defer a.free(path);
@@ -464,7 +464,7 @@ test "L2 ⑱: 非 vision 网关模型(glm-5.2)只收到占位文本——含图�
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const raw = "tiny fixture; delivery semantics only";
     const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
     defer a.free(path);
@@ -520,7 +520,7 @@ fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
     defer a.free(path);
     const path_z = try a.dupeZ(u8, path);
@@ -576,7 +576,7 @@ test "L2 ㉑: 运行时方言 profile 说支持图像但序列化器拒绝时—
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
     defer a.free(path);
     const path_z = try a.dupeZ(u8, path);
@@ -690,7 +690,7 @@ test "L2 ㉔: 一等用户图片占掉额度后,新读入的图片结果在投�
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const raw = try a.alloc(u8, 4096);
     defer a.free(raw);
     @memset(raw, 0x42);
@@ -940,6 +940,7 @@ test "L2 ⑨: 同一轮里图像不与文本竞争 turn 预算(文本先被 spil
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
 
     const payload = try a.alloc(u8, OVERSIZE_DATA_BYTES);
     defer a.free(payload);

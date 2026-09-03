@@ -435,8 +435,15 @@ test "L2 AgentDef.memory_scope=project: prompt + tools + permission + sandbox di
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    // resolveDir 末尾再走一次 realpath,返回的是**原生**分隔符路径;而 root 会被归一成
+    // 正斜杠喂给 JSON 工具输入。两者用途不同,各留一份。
+    var native_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    @memcpy(native_root_buf[0..root_len], root_buf[0..root_len]);
+    const native_root = native_root_buf[0..root_len];
+    _ = harness.normalizeSlashes(root_buf[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buf[0..root_len];
-    const expected = try std.fmt.allocPrint(a, "{s}/.metacodes/agent-memory/memory-agent-51d43e883ecfb483fa38290465fe0744", .{root});
+    const sep = std.fs.path.sep_str;
+    const expected = try std.fmt.allocPrint(a, "{s}{s}.metacodes{s}agent-memory{s}memory-agent-51d43e883ecfb483fa38290465fe0744", .{ native_root, sep, sep, sep });
     defer a.free(expected);
 
     const bodies = [_][]const u8{ MEM_PROBE_SSE, END_TURN_SSE };
@@ -470,7 +477,14 @@ test "L2 AgentDef.memory_scope=project: prompt + tools + permission + sandbox di
     const req = srv.lastRequest() orelse return error.NoRequestCaptured;
     const system = req.jsonField("system") orelse return error.SystemFieldMissing;
     const tools = req.jsonField("tools") orelse return error.ToolsFieldMissing;
-    try std.testing.expect(std.mem.indexOf(u8, system, expected) != null);
+    // jsonField 返回的是请求体里的原始 JSON 片段,不做解转义:Windows 路径的反斜杠在
+    // 里面是双写的。把期望值同样编码成 JSON 字符串(去掉首尾引号)再找,POSIX 上无反斜杠,
+    // 编码前后一致,行为不变。
+    var expected_json: std.Io.Writer.Allocating = .init(a);
+    defer expected_json.deinit();
+    try std.json.Stringify.encodeJsonString(expected, .{}, &expected_json.writer);
+    const expected_encoded = expected_json.written()[1 .. expected_json.written().len - 1];
+    try std.testing.expect(std.mem.indexOf(u8, system, expected_encoded) != null);
     try std.testing.expect(std.mem.indexOf(u8, system, "Persistent Agent Memory") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"Read\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"Write\"") != null);

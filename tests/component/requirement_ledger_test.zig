@@ -163,7 +163,7 @@ test "L2 open ledger items nudge a premature final and closure then satisfies" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const create = try createTaskSse(a, "task_1", "first requirement");
     defer a.free(create);
     const close = try toolSse(a, "task_2", "TaskUpdate", "{\"taskId\":\"1\",\"status\":\"completed\"}");
@@ -190,7 +190,7 @@ test "L2 a pure-text session is never prompted or nudged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     var run = try runLedger(a, root, true, false, &.{END_TURN});
     defer run.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), run.requests);
@@ -205,7 +205,7 @@ test "L2 mutations without a ledger get one coverage nudge" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const write_input = try std.fmt.allocPrint(
         a,
         "{{\"file_path\":\"{s}/thing.txt\",\"content\":\"data\\n\"}}",
@@ -229,7 +229,7 @@ test "L2 observe mode records the ledger without prompting or nudging" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const create = try createTaskSse(a, "task_1", "left open");
     defer a.free(create);
     var run = try runLedger(a, root, false, true, &.{ create, END_TURN });

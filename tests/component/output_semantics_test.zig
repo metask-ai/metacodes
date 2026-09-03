@@ -235,7 +235,7 @@ fn runCassetteRouted(
 }
 
 fn tmpRoot(dir: *std.testing.TmpDir, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
-    return buf[0..try dir.dir.realPath(std.testing.io, buf)];
+    return harness.normalizeSlashes(buf[0..try dir.dir.realPath(std.testing.io, buf)]);
 }
 
 test "L2 输出语义:工具调用前的文本是 commentary,end_turn 的文本才是 final" {

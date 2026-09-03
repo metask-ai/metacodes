@@ -322,13 +322,19 @@ test "L2 ontology projection receipt rejects symlink and hardlink aliases" {
     defer a.free(receipt_name);
     const receipt_path = try std.fs.path.join(a, &.{ value.session_dir, receipt_name });
     defer a.free(receipt_path);
-    const hardlink_path = try std.fs.path.join(a, &.{ value.session_dir, "projection-hardlink.json" });
-    defer a.free(hardlink_path);
-    try std.Io.Dir.hardLink(.cwd(), receipt_path, .cwd(), hardlink_path, std.testing.io, .{});
-    try std.testing.expectError(
-        error.InvalidArtifactFile,
-        projection.loadBound(a, value.session_dir, persisted.receipt_id),
-    );
+    // NTFS 本身支持硬链接,但 Zig 0.16 的 std.Io.Dir.hardLink 在 Windows 上直接
+    // return error.OperationUnsupported(std/Io/Threaded.zig dirHardLink)。这是
+    // 标准库缺口,不是被测产品的缺口,所以与下面的 symlink 断言同样按平台跳过,
+    // 而不是让整条用例在 Windows 上红掉。
+    if (@import("builtin").os.tag != .windows) {
+        const hardlink_path = try std.fs.path.join(a, &.{ value.session_dir, "projection-hardlink.json" });
+        defer a.free(hardlink_path);
+        try std.Io.Dir.hardLink(.cwd(), receipt_path, .cwd(), hardlink_path, std.testing.io, .{});
+        try std.testing.expectError(
+            error.InvalidArtifactFile,
+            projection.loadBound(a, value.session_dir, persisted.receipt_id),
+        );
+    }
 
     if (@import("builtin").os.tag != .windows) {
         const symlink_session = try std.fs.path.join(a, &.{ value.root, "symlink-session" });

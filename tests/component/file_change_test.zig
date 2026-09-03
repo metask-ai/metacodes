@@ -219,7 +219,7 @@ fn runCassette(
 }
 
 fn tmpRoot(dir: *std.testing.TmpDir, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
-    return buf[0..try dir.dir.realPath(std.testing.io, buf)];
+    return harness.normalizeSlashes(buf[0..try dir.dir.realPath(std.testing.io, buf)]);
 }
 
 test "L2 文件修改可观测:Write 新建 + Edit 修改,上层拿到实际改动而不解析 tool_result" {

@@ -86,6 +86,7 @@ test "L2 KG: ensureReady 建店 + 版本门通过 + remember/recall 往返" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgtest.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -124,6 +125,7 @@ test "L2 KG: listRecentMemories 按 id 降序枚举最近(替虚词 hack)" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgrecent.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -159,6 +161,7 @@ test "L2 KG governance: scoped recall exposes stable node ids and candidate-only
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgscoped.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -214,6 +217,7 @@ test "L2 KG: typed recall — module/bug/decision 按 schema_type 过滤(本体�
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgonto.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -273,6 +277,7 @@ test "L2 KG: recall 客户端 domain 隔离(别项目记忆不串味)" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgiso.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -314,6 +319,7 @@ test "L2 KG: 项目级 schema 隔离 — 自定义类型跨项目用被 block + 
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgscope.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -353,6 +359,7 @@ test "L2 KG: global scope 记忆跨项目可见" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgglobal.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -603,6 +610,7 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kg-guidance.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -731,6 +739,7 @@ test "L2 KG governance: v3 batch executes every variant and exposes each node bo
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kg-batch-v3.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -785,6 +794,7 @@ test "L2 KG governance: v3 exact-prefixed expansion is audited as seed recovery"
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kg-seed-shape-rewrite-v3.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -846,6 +856,7 @@ test "L2 KG governance: large v3 recall stays complete JSON below projection cap
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kg-bounded-batch-v3.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -929,6 +940,7 @@ test "L2 KG governance: real agent loop batches enumeration recall and host cont
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const project_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kg-enumeration-gate.kg", .{project_dir});
     defer a.free(store);
@@ -1037,6 +1049,7 @@ test "L2 KG governance: malformed GLM seed batch becomes audited exact-only exec
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const project_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kg-malformed-seed-recovery.kg", .{project_dir});
     defer a.free(store);
@@ -1126,6 +1139,7 @@ test "L2 KG governance: KgContext emits evidence, freshness, and supersession si
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kg-context.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -1227,6 +1241,7 @@ test "L2 KG: schema v2 明确 degraded 并给 copy-on-write task-status-v1 迁�
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/legacy-schema.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -1269,6 +1284,7 @@ test "L2 KG migrate: legacy canonical 自动迁移并保留 rollback backup" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/auto-legacy.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -1301,6 +1317,7 @@ test "L2 KG migrate: canonical rename 后崩溃窗口由 backup 恢复且不会 
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/recover-legacy.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
     {
@@ -1334,6 +1351,7 @@ test "L2 KG migrate: TinyKG 发布失败时恢复 legacy 且 session fail closed
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/failed-legacy.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
     {
@@ -1372,6 +1390,7 @@ test "L2 KG: plan 落图 → frontier → 闭合解锁(DAG 驱动全链)" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgplan.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -1495,6 +1514,7 @@ test "L2 KG: 无结构计划 → 全文单 root task(不阻塞,设计降级)" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgflat.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -1517,6 +1537,7 @@ test "L2 KG: DAG 驱动闭环经工具 — TaskList 呈现 frontier + TaskUpdate
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len]; // 用 tmp 目录当 kg_projects_dir
     const store = try std.fmt.allocPrint(a, "{s}/kgloop.kg", .{proj_dir});
     defer a.free(store);
@@ -1593,6 +1614,7 @@ test "L2 KG: failed 是显式终态 — frontier/TaskList 保留失败上下文�
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kgfailed.kg", .{proj_dir});
     defer a.free(store);
@@ -1675,6 +1697,7 @@ test "L2 KG: claim returns bounded packet and fresh process resumes with one lea
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kg-resume-packet.kg", .{proj_dir});
     defer a.free(store);
@@ -1804,6 +1827,7 @@ test "L2 KG: claim packet 失败会释放刚取得的租约" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kg-claim-packet-fail.kg", .{proj_dir});
     defer a.free(store);
@@ -1859,6 +1883,7 @@ test "L2 KG: legacy kg_inbox lease survives fresh-process startup recovery" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kg-legacy-inbox-resume.kg", .{proj_dir});
     defer a.free(store);
@@ -1918,6 +1943,7 @@ test "L2 KG: stale task anchor falls back to legacy root in the same startup" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kg-stale-anchor.kg", .{proj_dir});
     defer a.free(store);
@@ -1961,6 +1987,7 @@ test "L2 KG: 深树全链 — 嵌套子任务/branch 聚合/path/claim 租约/�
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kgdeep.kg", .{proj_dir});
     defer a.free(store);
@@ -2088,6 +2115,7 @@ test "L2 KG: 12b 锚单入口 — TaskList 经 task 锚看全多计划,镜像 to
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store_path = try std.fmt.allocPrint(a, "{s}/kganchor.kg", .{proj_dir});
     defer a.free(store_path);
@@ -2142,6 +2170,7 @@ test "L2 KG: TaskList live frontier 瞬时失败时回退本地 kg 镜像" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store_path = try std.fmt.allocPrint(a, "{s}/kg-list-fallback.kg", .{proj_dir});
     defer a.free(store_path);
@@ -2185,6 +2214,7 @@ test "L2 KG: derived_from 溯源 — 认领计划步骤后 KgRemember 的记忆�
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store_path = try std.fmt.allocPrint(a, "{s}/kgprov.kg", .{proj_dir});
     defer a.free(store_path);
@@ -2249,6 +2279,7 @@ test "L2 KG: TaskCreate write-through — ad-hoc todo 落图 inbox,TaskList 呈�
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kgwt.kg", .{proj_dir});
     defer a.free(store);
@@ -2318,6 +2349,7 @@ test "L2 KG: plan 落图同时建 markdown 文档,render 回人类可读(P3 D3)"
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgmddoc.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -2377,6 +2409,7 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kgauto.kg", .{proj_dir});
     defer a.free(store);
@@ -2570,6 +2603,7 @@ test "L2 KG: 目标导向投影 — 任务闭合经工具写 acts_on/uses/produc
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const proj_dir = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kgproj.kg", .{proj_dir});
     defer a.free(store);
@@ -2674,6 +2708,7 @@ test "L2 KG ontology feedback: successful host execution projects without model 
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const project_dir = pbuf[0..dir_len];
     const store_path = try std.fmt.allocPrint(a, "{s}/kg-execution-feedback.kg", .{project_dir});
     defer a.free(store_path);
@@ -2793,6 +2828,7 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const project_dir = pbuf[0..dir_len];
     const store_path = try std.fmt.allocPrint(a, "{s}/kg-experience-feedback.kg", .{project_dir});
     defer a.free(store_path);
@@ -3034,6 +3070,7 @@ test "L2 KG: ref-edge 重试修复缺失 state 且不降级 confirmed" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kg-ref-retry.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -3066,6 +3103,7 @@ test "L2 KG: 分类纠正入图 — 覆盖不并存 + error_event/fix 留痕(改
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kgcorrect.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -3147,6 +3185,7 @@ test "L2 KG: general-purpose child gets read tools and an isolated KgClient" {
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/kg-child-read.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -3225,6 +3264,7 @@ test "L2 /kg plan fresh-process byte stability: writer process A then root-id-on
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const store = try std.fmt.allocPrint(a, "{s}/plan-bytes.kg", .{pbuf[0..dir_len]});
     defer a.free(store);
 
@@ -3276,6 +3316,7 @@ test "L2 KG v42: 深探针 data 失败 → 隔离重建(字节保全);transient 
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = pbuf[0..dir_len];
     const store = try std.fmt.allocPrint(a, "{s}/kgv42.kg", .{root});
     defer a.free(store);

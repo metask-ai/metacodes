@@ -133,13 +133,14 @@ test "resolveDir maps scopes and sanitizes names" {
 
     const user = (try resolveDir(a, "plugin:reviewer", .user, base, "/repo")).?;
     defer a.free(user);
-    const expected_user = try std.fmt.allocPrint(a, "{s}/.metacodes/agent-memory/plugin-reviewer-7d93a418a742abe5cefae5e0078afe85", .{base});
+    const sep = std.fs.path.sep_str; // realpath 归一成原生分隔符,期望值须同源
+    const expected_user = try std.fmt.allocPrint(a, "{s}{s}.metacodes{s}agent-memory{s}plugin-reviewer-7d93a418a742abe5cefae5e0078afe85", .{ base, sep, sep, sep });
     defer a.free(expected_user);
     try std.testing.expectEqualStrings(expected_user, user);
 
     const local = (try resolveDir(a, "reviewer", .local, "/home/u", base)).?;
     defer a.free(local);
-    const expected_local = try std.fmt.allocPrint(a, "{s}/.metacodes/agent-memory-local/reviewer-2d70999ae1805e4bcef9b4ab3a4b827f", .{base});
+    const expected_local = try std.fmt.allocPrint(a, "{s}{s}.metacodes{s}agent-memory-local{s}reviewer-2d70999ae1805e4bcef9b4ab3a4b827f", .{ base, sep, sep, sep });
     defer a.free(expected_local);
     try std.testing.expectEqualStrings(expected_local, local);
 }

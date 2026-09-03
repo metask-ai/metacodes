@@ -1,5 +1,6 @@
 const std = @import("std");
 const cc = @import("cc");
+const harness = @import("harness");
 
 const candidate_id = [_]u8{'a'} ** 64;
 const project_id = [_]u8{'b'} ** 64;
@@ -15,6 +16,7 @@ const Fixture = struct {
 
 fn rootPath(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     const len = try tmp.dir.realPath(std.testing.io, buffer);
+    _ = harness.normalizeSlashes(buffer[0..len]); // Windows: JSON 字面量里的反斜杠会被当转义
     return buffer[0..len];
 }
 
@@ -347,20 +349,25 @@ test "RuleImpact evidence rejects laundering, identity drift, tamper, symlink, a
         );
     }
 
-    const source = try std.fs.path.join(std.testing.allocator, &.{ fixture.root, "wrong-usage.json" });
-    defer std.testing.allocator.free(source);
-    const linked = try std.fs.path.join(std.testing.allocator, &.{ fixture.root, "usage-hardlink.json" });
-    defer std.testing.allocator.free(linked);
-    try std.Io.Dir.hardLink(.cwd(), source, .cwd(), linked, std.testing.io, .{});
-    try std.testing.expectError(
-        error.InvalidEvidenceFile,
-        cc.rule_impact_evidence.loadUsage(
-            std.testing.allocator,
-            fixture.root,
-            "usage-hardlink.json",
-            wrong_binding,
-        ),
-    );
+    // Zig 0.16 的 std.Io.Dir.hardLink 在 Windows 上直接 return OperationUnsupported
+    // (std/Io/Threaded.zig dirHardLink)。标准库缺口,非产品缺口:与上面的 symlink
+    // 断言同样按平台跳过,而不是让整条用例红掉。
+    if (@import("builtin").os.tag != .windows) {
+        const source = try std.fs.path.join(std.testing.allocator, &.{ fixture.root, "wrong-usage.json" });
+        defer std.testing.allocator.free(source);
+        const linked = try std.fs.path.join(std.testing.allocator, &.{ fixture.root, "usage-hardlink.json" });
+        defer std.testing.allocator.free(linked);
+        try std.Io.Dir.hardLink(.cwd(), source, .cwd(), linked, std.testing.io, .{});
+        try std.testing.expectError(
+            error.InvalidEvidenceFile,
+            cc.rule_impact_evidence.loadUsage(
+                std.testing.allocator,
+                fixture.root,
+                "usage-hardlink.json",
+                wrong_binding,
+            ),
+        );
+    }
 }
 
 test "L2 completed journal receipt invokes fixed Lean RuleImpact governance" {

@@ -2,7 +2,10 @@ const std = @import("std");
 const cc = @import("cc");
 
 pub fn main(init: std.process.Init) !void {
-    var args = init.minimal.args.iterate();
+    // iterateAllocator:Windows 上 `iterate` 是 @compileError(须 allocator 版
+    // 解析 WTF-8 命令行)。与 tests/_harness/replay_server.zig 同一约定。
+    var args = try std.process.Args.iterateAllocator(init.minimal.args, init.gpa);
+    defer args.deinit();
     _ = args.next();
     const url = args.next() orelse return error.MissingUrl;
     const api_key = args.next() orelse return error.MissingApiKey;

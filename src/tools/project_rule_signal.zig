@@ -14,6 +14,7 @@ const protocol = @import("project_rule_gate.zig");
 const project_rule_spec = @import("../core/project_rule_spec.zig");
 const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
+const tt = @import("test_tmp.zig"); // 测试 fixture 路径归一(Windows 反斜杠 vs JSON 转义)
 
 /// The single source of truth for which tools an effect-class rule can see.
 /// A tool belongs here exactly when its primary operation mutates one observed
@@ -223,8 +224,17 @@ fn classifyEffectiveTarget(
             const resolved_slice = std.mem.span(resolved);
             const contained = pathContained(root_resolved, resolved_slice);
             const mode_regular = blk: {
-                const followed = pfs.statMode(path_z.ptr, true) orelse break :blk false;
-                break :blk (followed & 0o170000) == 0o100000;
+                // POSIX:mode 位是权威来源(跟随 symlink)。
+                if (pfs.statMode(path_z.ptr, true)) |followed|
+                    break :blk (followed & 0o170000) == 0o100000;
+                // Windows 没有 POSIX mode 位,statMode 恒返回 null。照旧 break false
+                // 会把**每一个**已存在文件降级成 other_existing,让 Write 传感器在
+                // Windows 上永远报非普通目标,exact-edit 恢复方向随之整体关闭。
+                // `resolved` 已由 realpath 跟随过 symlink / reparse point,所以对它
+                // 做 no-follow 分类等价于"跟随后再判类型"。
+                const resolved_z = ctx.allocator.dupeZ(u8, resolved_slice) catch break :blk false;
+                defer ctx.allocator.free(resolved_z);
+                break :blk pfs.pathKindNoFollow(resolved_z.ptr) == .regular;
             };
             return .{
                 .state = if (mode_regular) .regular_existing else .other_existing,
@@ -315,7 +325,7 @@ test "project rule Write sensor distinguishes new regular and non-regular target
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
-    const root = root_buffer[0..root_len];
+    const root = tt.normalizeSlashes(root_buffer[0..root_len]);
     const existing = try std.fmt.allocPrintSentinel(allocator, "{s}/existing.txt", .{root}, 0);
     defer allocator.free(existing);
     const fd = pfs.open(existing.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);

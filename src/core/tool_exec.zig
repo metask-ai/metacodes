@@ -25,6 +25,7 @@ const file_reference = @import("file_reference.zig");
 const file_change = @import("file_change.zig");
 const tool_catalog = @import("tool_catalog.zig");
 const execution_effect = @import("execution_effect.zig");
+const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 路径归一(Windows 反斜杠 vs JSON 转义)
 
 /// 给任意 allocator 加互斥视图。ArenaAllocator 只隔离自己的链表元数据，它增长时仍会
 /// 调后备 allocator；多个 worker 直接以同一个 session arena 为后备会破坏 arena 状态。
@@ -2070,10 +2071,11 @@ test "tool observation: actual Write dispatch emits UI-independent typed effect 
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = tt.normalizeSlashes(root_buffer[0..root_len]);
     const path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/observed.txt",
-        .{root_buffer[0..root_len]},
+        .{root},
         0,
     );
     defer allocator.free(path);
@@ -2146,10 +2148,11 @@ test "tool observation: finish rejection poisons dispatch after preserving actua
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = tt.normalizeSlashes(root_buffer[0..root_len]);
     const path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/finish-rejected.txt",
-        .{root_buffer[0..root_len]},
+        .{root},
         0,
     );
     defer allocator.free(path);
@@ -2270,10 +2273,11 @@ test "project post gate runs before terminal observation and block preserves act
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = tt.normalizeSlashes(root_buffer[0..root_len]);
     const path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/post-blocked.txt",
-        .{root_buffer[0..root_len]},
+        .{root},
         0,
     );
     defer allocator.free(path);
