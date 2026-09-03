@@ -2041,9 +2041,12 @@ pub fn build(b: *std.Build) void {
         windows_help_cmd.addArg("--help");
         windows_help_cmd.step.dependOn(b.getInstallStep());
         // This gate proves the Windows portability layer and installed CLI can
-        // execute natively. The repository-wide suite remains the independent
-        // `zig build test -Dtarget=x86_64-windows-gnu` gate; do not couple its
-        // unrelated subsystem timing/concurrency failures to this platform gate.
+        // execute natively. The repository-wide suite is a separate gate: the
+        // "Full offline test suite" step of ci.yml`s windows-gates job runs
+        // `zig build test -j6` on the native Windows runner (#53 wired it; before
+        // that no workflow ran it and Windows regressions accumulated silently).
+        // Keep the two decoupled: do not couple the full suite`s unrelated
+        // subsystem timing/concurrency failures to this platform gate.
         windows_gate_step.dependOn(platform_test_step);
         // The LSP subsystem's server lookup is native-platform logic (PATH
         // separator, path joiner, PATHEXT probing), so its suite belongs on the

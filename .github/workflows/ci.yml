@@ -151,7 +151,9 @@ jobs:
 
   windows-gates:
     name: Gates (Windows)
-    timeout-minutes: 15
+    # The full suite below compiles the whole tree cold on a fresh runner cache
+    # (~15 min warm at -j6 on a 28-core box); the platform gates alone fit in 15.
+    timeout-minutes: 60
     # Self-hosted isolation guard; see the `gates` job.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64]
@@ -186,3 +188,19 @@ jobs:
       - name: Verify native bundle and fresh-store contract
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage
+      # The repository-wide suite on the native Windows host. Until #53 this was
+      # the "independent gate" build.zig talked about that no workflow ran, so
+      # Windows portability regressions accumulated silently (1 compile error,
+      # 8 unit tests, 8 integration shards, 330 Python cases by the time it was
+      # first run). -j6: the default job count is one LLVM codegen per core and
+      # 28 of them exhaust 32 GB, which surfaces as bogus "out of memory" compile
+      # failures rather than a clean signal. --test-timeout 5m: the build runner
+      # watchdog between tests is max(--test-timeout, 60s), same as the AgentCore
+      # gate. No Lean step and no METACODES_TEST_REQUIRE_LEAN_SDK here: the
+      # kernel-gated tests take their checker from operator-provided
+      # METACODES_TEST_*_KERNEL_* variables that no job sets, and the runner does
+      # not provision elan; they skip on this leg exactly as documented in
+      # scripts/eval/tests/posix_only.py and the component tests.
+      - name: Full offline test suite
+        shell: cmd
+        run: zig build test -j6 --test-timeout 5m
