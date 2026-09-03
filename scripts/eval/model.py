@@ -75,19 +75,34 @@ def mode_violation(st_mode: int, mask: int) -> bool:
     return POSIX_MODE_BITS and (stat.S_IMODE(st_mode) & mask) != 0
 
 
-def open_nofollow(path: "os.PathLike[str] | str", flags: int, mode: int = 0o600) -> int:
+def open_nofollow(
+    path: "os.PathLike[str] | str",
+    flags: int,
+    mode: int = 0o600,
+    *,
+    dir_fd: "int | None" = None,
+) -> int:
     """``os.open`` that never follows a final-component symlink.
 
     POSIX passes ``O_NOFOLLOW`` to the kernel.  Windows has no such flag, so
     the check is an explicit ``lstat`` before the open; that leaves a small
     TOCTOU window the kernel flag does not have, which is the best the
     standard library offers there.  ``O_BINARY`` is always applied.
+    ``dir_fd`` is forwarded for callers that anchor the open on a directory
+    descriptor (POSIX only; Windows has no dir_fd and never reaches that path).
     """
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    elif os.path.islink(path):
-        raise OSError(errno.ELOOP, "refusing to follow symbolic link", str(path))
-    return os.open(path, flags | O_BINARY, mode)
+    else:
+        try:
+            probe = os.lstat(path) if dir_fd is None else os.lstat(path, dir_fd=dir_fd)
+        except FileNotFoundError:
+            probe = None
+        if probe is not None and stat.S_ISLNK(probe.st_mode):
+            raise OSError(errno.ELOOP, "refusing to follow symbolic link", str(path))
+    if dir_fd is None:
+        return os.open(path, flags | O_BINARY, mode)
+    return os.open(path, flags | O_BINARY, mode, dir_fd=dir_fd)
 
 
 def fsync_directory(path: "os.PathLike[str] | str") -> None:
