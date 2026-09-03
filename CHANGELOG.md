@@ -22,8 +22,9 @@ status, compatibility boundaries, and entry points are defined by
 - MCP tool results decide inline-vs-publish from the caller's
   `result_budget.Budget.per_result_bytes` on both MCP paths — the classic
   `McpClient` and the AgentCore `mcp_result_stream` projector — the same number
-  the native tools have used since #41, instead of private 64KB / 1MB constants
-  that only coincided with it (issue #43). `McpClient.callToolBodyAbortable` /
+  the native tools have used since #41, instead of a private 64KB constant in
+  AgentCore that merely coincided with it, and an unconditional inline of every
+  response below the classic client's 1MB frame limit (issue #43). `McpClient.callToolBodyAbortable` /
   `listResourcesBodyAbortable` / `readResourceBodyAbortable`,
   `mcp_result_stream.project` and `mcp_runtime.Client.callToolBody` take that
   budget as a required parameter; embedders pass `ctx.result_budget` verbatim.

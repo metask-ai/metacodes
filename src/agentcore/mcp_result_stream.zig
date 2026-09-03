@@ -786,7 +786,7 @@ test "stream projector rejects over-ceiling result when publication fails" {
 
     const budget = result_budget.Budget.fromModel(1_000_000);
     try std.testing.expectEqual(result_budget.PER_RESULT_MAX_BYTES, budget.per_result_bytes);
-    const outcome = try project(
+    var outcome = try project(
         allocator,
         &capture,
         root,
@@ -797,6 +797,7 @@ test "stream projector rejects over-ceiling result when publication fails" {
         true,
         true,
     );
+    defer if (outcome == .result) outcome.result.deinit(allocator);
     try std.testing.expect(outcome == .diagnostic);
     try std.testing.expectEqual(DiagnosticCode.resource_limit, outcome.diagnostic.code);
 }
