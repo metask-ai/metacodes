@@ -215,6 +215,24 @@ Spool 在固定内存中增量计算 SHA-256、保存 1152-byte head 与 384-byt
 `<workspace.home|root>/.metacodes/agentcore/sessions/<logical_session_id>`，restore 复用
 同一路径，因此模型收到的恢复指令在 Host-only、MCP 和 process-plugin 会话中都闭合。
 
+### 候选响应边界
+
+`agent_loop.Options.response_observer`（源码级 host 亦可用
+`AgentSession.setResponseObserver`）挂上 `core.response_candidate.Observer`，
+就能观察一条 provider 响应从装配到 Conversation commit 的完整生命周期，并在 commit
+前否决它。四个钩子按序：`begin`（候选打开）、`observe`（每个 canonical 增量：
+text / thinking / reasoning_item / **装配完成的** tool_use，返回 `.reject` 立即停流）、
+`admit`（commit 前最后一问）、`settle`（`committed` 或 `discarded`）。
+
+`begin` 与 `settle` 严格配对——任何路径都恰好 settle 一次——所以 observer 可以把
+`settle` 当作 `begin` 处预留资源的释放点。被否决的候选走与"丢弃的残段"相同的路径：
+可见段以 `discarded` 收尾、不进 Conversation、尚未启动的 tool effect 不会启动，Run 以
+`stop_reason=budget` 结束。observer 为 null 时行为与从前逐字节一致。
+
+这是 AgentCore durable checkpoint 准入所站的边界（`session_budget.RunAdmission`）：
+provider stream 现在边测边放行，超限时记录 outcome 并停流，由该 observer 在 commit 前
+拒绝候选。checkpointability 由否决保证,不再靠扣住字节。
+
 ### Durable execution profile
 
 源码级 `SessionConfig.run_journal` 是 tagged union：`ephemeral`（默认、零 journal

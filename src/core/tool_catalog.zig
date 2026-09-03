@@ -248,6 +248,7 @@ pub const Catalog = struct {
                         .prop_specs = builtin.input_schema.prop_specs,
                         .properties = null,
                         .required = builtin.input_schema.required,
+                        .additional_properties = builtin.input_schema.additional_properties,
                     },
                     .deferred = builtin.deferred,
                 },
@@ -382,6 +383,7 @@ fn cloneInputSchema(allocator: std.mem.Allocator, source: json.InputSchema) std.
         .properties = if (source.properties) |properties| try cloneObject(allocator, properties) else null,
         .prop_specs = if (source.prop_specs) |specs| try clonePropSpecs(allocator, specs) else null,
         .required = if (source.required) |required| try cloneStrings(allocator, required) else null,
+        .additional_properties = source.additional_properties,
     };
 }
 

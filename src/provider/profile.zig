@@ -422,6 +422,32 @@ pub const ProviderProfile = struct {
     /// profile declares no OAuth lifecycle here — Metask's lives in
     /// `core/auth.zig` and keeps its historical path.
     oauth_token_url: ?[]const u8 = null,
+    /// RFC 6749 authorization endpoint, for the loopback-redirect PKCE login
+    /// that obtains the *first* token (issue #33). Null means this profile
+    /// offers no browser flow, and the only entry point is an out-of-band
+    /// token response.
+    oauth_authorize_url: ?[]const u8 = null,
+    /// RFC 8628 device authorization endpoint. Declared separately because a
+    /// headless or SSH session cannot open a browser and a loopback redirect
+    /// has nowhere to land; a provider that supports neither keeps both null.
+    oauth_device_authorization_url: ?[]const u8 = null,
+    /// The registered OAuth client this installation presents. Both the
+    /// interactive grant and the refresh grant send it, so a wrong value
+    /// surfaces as `invalid_client` on the very first exchange rather than as
+    /// a mysterious expiry later. Null means the profile declares none and the
+    /// user must supply one.
+    oauth_client_id: ?[]const u8 = null,
+    /// Space-separated scopes requested at authorization time. Empty omits the
+    /// parameter entirely, which is what a provider that scopes by client
+    /// registration expects.
+    oauth_scope: []const u8 = "",
+
+    /// True when this profile can obtain a first token without the user
+    /// producing a token response by other means.
+    pub fn declaresInteractiveOAuth(self: ProviderProfile) bool {
+        return self.oauth_token_url != null and
+            (self.oauth_authorize_url != null or self.oauth_device_authorization_url != null);
+    }
 
     pub fn matchesName(self: ProviderProfile, name: []const u8) bool {
         if (self.id.eqlText(name)) return true;

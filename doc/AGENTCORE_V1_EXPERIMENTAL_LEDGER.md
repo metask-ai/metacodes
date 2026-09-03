@@ -13,7 +13,7 @@
 > **Revision 6 disposition（2026-08-04）**：A1、A3、A4、B1、B2、B3、C8、E2、
 > E6、E7、E11 已由 Revision 6 canonical seam、public wire 与 conformance tests
 > 关闭；E4 已形成明确的 hard-cut/单代 MCP compatibility window 处置但继续作为
-> 发布治理项；E5、E8、E9、E10 继续作为显式开放债务跟踪。
+> 发布治理项；E5、E8、E10 继续作为显式开放债务跟踪（E9 已由 issue #34 关闭）。
 
 ## A 组：复冻前必须正面解决（评审方点名四项）
 
@@ -128,12 +128,18 @@ revision 内增加语义：
    `agent_loop`、引入 typed prompt outcome，或真实消费方要求模型按 cancelled/unavailable
    采取不同恢复策略。处置必须同时覆盖 CLI/TUI/Web/child 与 AgentCore，未经独立设计批准
    不得借 Revision 6 修改 `src/core/agent_loop.zig`。
-9. **E9 — budgeted Provider stream 的 bounded spool 时序（开放，行为债务）**：为保证超限
-   provider tail 不把 partial response 提交进 Conversation，Revision 6 在 AgentCore facade
-   内有界缓存完整 stream 后再向 shared loop 释放事件。这保持 durable-state invariant，
-   但 AgentCore 消费方观察到的 chunk 时序不同于直接 provider streaming。**Owner**：
-   AgentCore Runtime。**触发条件**：公开异步 Run/低延迟 streaming SLA，或引入能够回滚
-   partial projection 的 transaction seam。当前不得为追求早到 chunk 放松 checkpointability。
+9. **E9 — budgeted Provider stream 的 bounded spool 时序（已关闭，issue #34）**：该债务的
+   根因是 shared Core 未把"candidate Provider response → Conversation commit"暴露成可观测、
+   可否决的语义边界，AgentCore 只能在 facade 内有界缓存完整 stream 作为保守补偿。
+   `src/core/response_candidate.zig` 现在就是那条边界：AgentLoop 按 canonical 增量
+   （text/thinking/reasoning_item/装配完成的 tool_use）通知 observer，observer 可在任一增量
+   或最终 commit 前否决；被否决的 candidate 走与 discarded partial 完全相同的路径——可见段
+   以 `discarded` 收尾、不进 Conversation、不启动尚未开始的 tool effect。
+   `session_budget.StreamWrapper` 因此改为边测边放行，超限时记录 outcome 并停流，
+   `session_budget.RunAdmission` 在 outcome 存在时拒绝 candidate。checkpointability 由否决
+   保证，不再靠扣住字节。L2 证据：`agentcore_abi_test.zig` 的 delayed-frame 测试断言首个
+   content event 与 response 完成之间存在只有增量投递才可能产生的时间差
+   （实测 first=223ms / total=985ms）。
 10. **E10 — durable reservation 可用性标定（开放，参数治理）**：operation reservation 以
     实际 request bytes 加该 operation 的配置 result cap 计算，安全但 cap 过松会提前拒绝长
     Session。默认 cap/soft threshold 需要持续用真实 provider、Host Tool 与 MCP workload

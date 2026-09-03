@@ -1121,13 +1121,34 @@ Modern `tools/list` cache metadata is required; `server/discover` may omit both
 cache fields. Each server TTL starts when that server's discovery completes,
 not when the multi-server refresh began.
 
+A Host tool's `input_schema_json` root accepts `type` (which must be
+`"object"`), `properties`, `required`, and a boolean `additionalProperties`.
+Any other root keyword is `STATUS_INVALID_ARGUMENT` with an `InvalidSchema`
+diagnostic, because AgentCore refuses to accept a constraint it cannot then
+preserve through tool storage, catalog cloning, and Provider request
+construction. A boolean `additionalProperties` is preserved end to end and
+appears in the Provider request; the schema-valued form
+(`"additionalProperties": {...}`) has no internal representation and is
+therefore still rejected rather than silently dropped. Nothing here validates
+tool arguments against the schema: the constraint is declaration forwarded to
+the model provider, which remains the authority on JSON Schema semantics.
+
 Canonical MCP schemas are retained losslessly and dialect-transparently.
 Absent `$schema`, explicit JSON Schema 2020-12, explicit Draft-07, and any
 other string dialect declaration do not by themselves affect Tool
 availability. AgentCore validates bounded JSON structure and the MCP input
 object envelope, then projects the common `type`/`properties`/`required` shape
-to model providers; root `$schema` and non-projected root keywords remain only
-in the canonical record. This is not a claim that AgentCore implements any
+to model providers, plus a boolean root `additionalProperties`; root `$schema`
+and non-projected root keywords remain only in the canonical record. A
+schema-valued `additionalProperties` is one of those non-projected keywords —
+retained canonically, not forwarded, and never a reason a Tool becomes
+unavailable.
+
+Forwarding the boolean form is a deliberate behavior change (issue #35): it was
+previously dropped, so a server that closed its argument object advertised an
+open one to the model. Tools whose schema declares it therefore serialize
+differently than they did before, which invalidates the provider prefix cache
+for those Sessions once. Tools that never declared it are byte-identical. This is not a claim that AgentCore implements any
 complete JSON Schema dialect.
 
 Provider projection must nevertheless be structurally complete. A `$ref` or

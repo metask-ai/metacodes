@@ -12,6 +12,7 @@ test {
     _ = @import("integration/skills_e2e_test.zig");
     _ = @import("integration/agents_e2e_test.zig");
     _ = @import("component/provider_offer_test.zig");
+    _ = @import("component/provider_oauth_login_test.zig");
     _ = @import("component/subagent_model_test.zig");
     _ = @import("component/subagent_agentdef_fields_test.zig");
     _ = @import("component/web_search_test.zig");

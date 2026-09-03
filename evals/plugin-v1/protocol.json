@@ -69,7 +69,7 @@
     "treatment_executable": "scripts/eval/fixtures/plugin_candidate.py",
     "treatment_executable_sha256": "1a80f4f240e80df798521cb4cacd9a59d12d494cbee06468412b4fe751f28a61",
     "single_factor": "one namespaced Skill data package",
-    "implementation_fingerprint": "cfd7ce0cd560e208f08a87f7e2fc7eeff57a6a779a64a96b952b81db2fc655ae",
+    "implementation_fingerprint": "e3ec6fa2b471859eab519176b5f8a0186594a0a6c771224120758e8a5304a857",
     "runtime_binary_sha256": "fd330c2e4c4120a129fb8148091011f014d29d2c496f4a24ffdd8232c5cce054",
     "evaluation_contract_version": 4,
     "model": {
@@ -223,6 +223,7 @@
     "src/tools/task_output.zig",
     "src/tools/web_fetch.zig",
     "src/core/agent_loop.zig",
+    "src/core/response_candidate.zig",
     "src/core/host_injection_meter.zig",
     "src/core/tool_error.zig",
     "src/repl/headless.zig",

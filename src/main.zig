@@ -9,6 +9,7 @@ const app_mod = @import("app.zig");
 const repl = @import("repl/loop.zig");
 const auth = @import("core/auth.zig");
 const api_keys_mod = @import("api/api_keys.zig");
+const oauth_login = @import("api/oauth_login.zig");
 const catalog_mod = @import("api/catalog.zig");
 
 pub const VERSION = @import("version.zig").semver;
@@ -39,6 +40,7 @@ pub const provider_custom = @import("provider/custom_provider.zig");
 pub const provider_oauth = @import("provider/oauth.zig");
 pub const kg_provider_audit = @import("kg/provider_audit.zig");
 pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
+pub const api_oauth_login = @import("api/oauth_login.zig");
 pub const api_catalog_fetch = @import("api/catalog_fetch.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
@@ -65,6 +67,7 @@ pub const compact_summary = @import("core/compact_summary.zig");
 pub const agent_loop = @import("core/agent_loop.zig");
 pub const agent_session = @import("core/agent_session.zig");
 pub const execution_effect = @import("core/execution_effect.zig");
+pub const response_candidate = @import("core/response_candidate.zig");
 pub const run_recovery = @import("core/run_recovery.zig");
 pub const plugin = @import("plugin/root.zig");
 pub const tool_catalog = @import("core/tool_catalog.zig");
@@ -612,6 +615,7 @@ pub fn main(init: std.process.Init) !void {
                 \\Authentication required.
                 \\Use one of:
                 \\  metacodes login --oauth-token-json <token-response.json>
+                \\  metacodes login --provider <id>
                 \\  metacodes login --provider <id> --oauth-token-json <token-response.json>
                 \\  metacodes login --api-key <key>
                 \\  export METASK_API_KEY=...
@@ -810,6 +814,14 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
     // token for one vendor from ever satisfying another.
     var provider_name: ?[]const u8 = null;
     var open_browser = true;
+    // Which grant obtains the first token for a non-Metask provider. Loopback
+    // PKCE is the desktop default; a headless or SSH session has no browser to
+    // open and no loopback address to be redirected to, so it asks for the
+    // device-code flow explicitly.
+    var login_method: oauth_login.Method = .loopback;
+    // The registered OAuth client this installation presents. Not a secret,
+    // but not something the profile can guess either.
+    var client_id: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "status") or std.mem.eql(u8, arg, "--status")) {
             mode = .status;
@@ -827,12 +839,18 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
             };
         } else if (std.mem.eql(u8, arg, "--provider")) {
             provider_name = args.next() orelse {
-                std.debug.print("usage: metacodes login --provider <id> --oauth-token-json <file>\n", .{});
+                std.debug.print("usage: metacodes login --provider <id>\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--no-browser")) {
-            mode = .browser;
             open_browser = false;
+        } else if (std.mem.eql(u8, arg, "--device-code")) {
+            login_method = .device_code;
+        } else if (std.mem.eql(u8, arg, "--client-id")) {
+            client_id = args.next() orelse {
+                std.debug.print("usage: metacodes login --provider <id> --client-id <client>\n", .{});
+                return 2;
+            };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             mode = .help;
         } else {
@@ -844,16 +862,52 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
         }
     }
 
-    if (provider_name) |name| {
-        if (mode != .oauth_json) {
-            std.debug.print(
-                "login --provider currently accepts only --oauth-token-json; " ++
-                    "the interactive flow is Metask-only\n",
-                .{},
-            );
+    // `--client-id` and `--device-code` only mean something for a
+    // provider-scoped login. Accepting them silently for the Metask flow would
+    // run a login the user did not ask for while dropping the argument that
+    // says what they wanted — the same fail-closed rule the unknown-argument
+    // branch above exists for.
+    if (provider_name == null and mode != .help) {
+        if (client_id != null) {
+            std.debug.print("error: --client-id requires --provider <id>\n", .{});
             return 2;
         }
-        return storeProviderOAuthToken(allocator, name, value.?);
+        if (login_method != .loopback) {
+            std.debug.print("error: --device-code requires --provider <id>\n", .{});
+            return 2;
+        }
+    }
+
+    if (provider_name) |name| {
+        switch (mode) {
+            // The non-interactive path stays supported: CI and headless
+            // recovery need a way in that does not involve a browser or a
+            // polling loop, and it is the only path when a token was minted
+            // somewhere else entirely.
+            .oauth_json => return storeProviderOAuthToken(allocator, name, value.?, client_id),
+            .browser => return runProviderOAuthLogin(allocator, init.io, name, .{
+                .method = login_method,
+                .open_browser = open_browser,
+                .client_id = client_id,
+            }),
+            // `--help` is a request for help wherever it appears, not an
+            // argument-combination error.
+            .help => {
+                printLoginHelp();
+                return 0;
+            },
+            .status => {
+                std.debug.print("login status is not provider-scoped yet\n", .{});
+                return 2;
+            },
+            .api_key => {
+                std.debug.print(
+                    "login --provider accepts the interactive flow or --oauth-token-json\n",
+                    .{},
+                );
+                return 2;
+            },
+        }
     }
 
     switch (mode) {
@@ -961,14 +1015,23 @@ fn printLoginHelp() void {
         \\  metacodes login --no-browser
         \\  metacodes login status
         \\  metacodes login --oauth-token-json <token-response.json>
+        \\  metacodes login --provider <id> [--client-id <client>] [--device-code] [--no-browser]
         \\  metacodes login --provider <id> --oauth-token-json <token-response.json>
         \\  metacodes login --api-key <key>
         \\  metacodes logout
         \\
         \\Default login starts a local browser OAuth flow on /auth/callback.
         \\Use --no-browser to print the URL without launching a browser.
-        \\OAuth token JSON must match the Metask token endpoint response:
-        \\access_token, refresh_token, token_type=Bearer, expires_in.
+        \\
+        \\`login --provider <id>` signs in to that provider and stores the token
+        \\in its own OAuth session, never the Metask credential store. It uses a
+        \\loopback-redirect PKCE flow by default; --device-code is the flow for a
+        \\headless or SSH session that cannot open a browser. --client-id supplies
+        \\the registered OAuth client when the profile declares none.
+        \\
+        \\OAuth token JSON must match the token endpoint response:
+        \\access_token, refresh_token, token_type=Bearer, expires_in. It remains
+        \\the non-interactive path for CI and recovery.
         \\Secrets are stored in ~/.metacodes/auth.json with 0600 permissions.
         \\
     , .{});
@@ -1191,6 +1254,7 @@ fn storeProviderOAuthToken(
     allocator: std.mem.Allocator,
     provider_name: []const u8,
     path: []const u8,
+    explicit_client_id: ?[]const u8,
 ) u8 {
     // The same runtime a session builds, so a provider defined in the config —
     // or one that came from a catalog — can be logged into by name.
@@ -1201,13 +1265,6 @@ fn storeProviderOAuthToken(
         std.debug.print("error: unknown provider '{s}'\n", .{provider_name});
         return 2;
     };
-    if (built.oauth_token_url == null) {
-        std.debug.print(
-            "error: provider '{s}' declares no OAuth token endpoint\n",
-            .{built.id.slice()},
-        );
-        return 2;
-    }
 
     const text = readFileArg(allocator, path) catch |err| {
         std.debug.print("error: could not read {s}: {s}\n", .{ path, @errorName(err) });
@@ -1218,30 +1275,194 @@ fn storeProviderOAuthToken(
         allocator.free(text);
     }
 
+    return loginProviderWithTokenResponse(allocator, built, text, explicit_client_id);
+}
+
+/// True when at least one credential kind this profile accepts is an OAuth
+/// kind — which is the only case in which a stored OAuth login is ever
+/// consulted. Credential resolution opens the OAuth session for those kinds
+/// and no others, so a login stored for a profile that accepts none is a
+/// success message followed by silence.
+fn providerServesOAuth(built: *const provider_profile.ProviderProfile) bool {
+    for (built.accepted_credential_kinds) |kind| {
+        if (provider_oauth.servesKind(kind)) return true;
+    }
+    return false;
+}
+
+/// Refuse, with the reason, a provider whose stored login could never be used.
+/// Both login paths ask this before doing anything the user would have to
+/// undo — the token-JSON import before it writes, the interactive flow before
+/// it sends anyone to a browser.
+fn requireOAuthCapableProvider(built: *const provider_profile.ProviderProfile) bool {
+    if (built.oauth_token_url == null) {
+        std.debug.print(
+            "error: provider '{s}' declares no OAuth token endpoint\n",
+            .{built.id.slice()},
+        );
+        return false;
+    }
+    if (!providerServesOAuth(built)) {
+        std.debug.print(
+            "error: provider '{s}' accepts no OAuth credential kind; " ++
+                "a stored login would never be consulted. Declare one under " ++
+                "credential_kinds (e.g. \"openai_oauth\") for a configured provider.\n",
+            .{built.id.slice()},
+        );
+        return false;
+    }
+    return true;
+}
+
+/// Finish a provider login from a token response, the way both entry points
+/// do. Public so the wiring — not just the parts — is testable against a
+/// profile, without a provider host or a home directory.
+///
+/// `explicit_client_id` is what the user passed on the command line; it wins
+/// over what the profile declares, and for a profile that declares none it is
+/// the only way the refresh grant can present the right client. Ignoring it
+/// here while accepting it on the command line is exactly the defect this
+/// function replaced.
+pub fn loginProviderWithTokenResponse(
+    allocator: std.mem.Allocator,
+    built: *const provider_profile.ProviderProfile,
+    token_json: []const u8,
+    explicit_client_id: ?[]const u8,
+) u8 {
+    if (!requireOAuthCapableProvider(built)) return 2;
+    return importProviderTokenResponse(
+        allocator,
+        built.id,
+        token_json,
+        explicit_client_id orelse built.oauth_client_id,
+    );
+}
+
+pub const ProviderLoginOptions = struct {
+    method: oauth_login.Method = .loopback,
+    open_browser: bool = true,
+    /// Overrides the profile's declared client, and supplies one when the
+    /// profile declares none.
+    client_id: ?[]const u8 = null,
+};
+
+/// `metacodes login --provider <id>` — the interactive path (issue #33).
+///
+/// Everything downstream of the first token already worked for any provider:
+/// refresh, single flight, rotated-refresh persistence, turn-boundary refresh.
+/// What was missing was a way to *get* that first token without producing a
+/// token response by other means. This runs the RFC 6749 loopback-PKCE grant
+/// (or the RFC 8628 device grant for a session with no browser) and then hands
+/// the result to exactly the same durable import `--oauth-token-json` uses, so
+/// both entry points converge on identical stored state.
+fn runProviderOAuthLogin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    provider_name: []const u8,
+    options: ProviderLoginOptions,
+) u8 {
+    const host = buildProviderHost(allocator) orelse return 2;
+    defer host.destroy();
+
+    const built = host.registry.find(provider_name) orelse {
+        std.debug.print("error: unknown provider '{s}'\n", .{provider_name});
+        return 2;
+    };
+    if (!requireOAuthCapableProvider(built)) return 2;
+    // Checked above; unwrapped here so the flow gets a plain URL.
+    const token_url = built.oauth_token_url.?;
+    // A profile with no authorization or device endpoint has no interactive
+    // flow to run; say so instead of failing later at a null URL.
+    const endpoint_declared = switch (options.method) {
+        .loopback => built.oauth_authorize_url != null,
+        .device_code => built.oauth_device_authorization_url != null,
+    };
+    if (!endpoint_declared) {
+        std.debug.print(
+            "error: provider '{s}' declares no {s} endpoint; " ++
+                "use `metacodes login --provider {s} --oauth-token-json <file>`\n",
+            .{
+                built.id.slice(),
+                switch (options.method) {
+                    .loopback => "OAuth authorization",
+                    .device_code => "device authorization",
+                },
+                built.id.slice(),
+            },
+        );
+        return 2;
+    }
+    const client_id = options.client_id orelse built.oauth_client_id orelse {
+        std.debug.print(
+            "error: provider '{s}' declares no OAuth client id; " ++
+                "pass --client-id <client>\n" ++
+                "(a provider defined under custom_providers can declare " ++
+                "oauth.client_id instead, and it is then used for refresh too)\n",
+            .{built.id.slice()},
+        );
+        return 2;
+    };
+
+    const token_json = oauth_login.acquireFirstToken(allocator, io, .{
+        .token_url = token_url,
+        .authorize_url = built.oauth_authorize_url,
+        .device_authorization_url = built.oauth_device_authorization_url,
+        .client_id = client_id,
+        .scope = built.oauth_scope,
+    }, .{
+        .method = options.method,
+        .open_browser = options.open_browser,
+        .notify = oauth_login.stderrNotify(),
+    }) catch |err| {
+        std.debug.print("error: OAuth login failed ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    defer {
+        std.crypto.secureZero(u8, token_json);
+        allocator.free(token_json);
+    }
+
+    return importProviderTokenResponse(allocator, built.id, token_json, client_id);
+}
+
+/// The one durable import both provider login paths end in. Keeping it single
+/// is what makes "logged in interactively" and "imported a token response"
+/// indistinguishable to everything downstream.
+fn importProviderTokenResponse(
+    allocator: std.mem.Allocator,
+    provider_id: provider_ids.Slug,
+    token_json: []const u8,
+    client_id: ?[]const u8,
+) u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const outcome = provider_oauth.parseTokenResponse(arena.allocator(), text) catch |err| {
-        std.debug.print("error: {s} is not a token response ({s})\n", .{ path, @errorName(err) });
-        return 2;
+    const outcome = provider_oauth.parseTokenResponse(arena.allocator(), token_json) catch |err| {
+        std.debug.print("error: the token endpoint did not return a token response ({s})\n", .{@errorName(err)});
+        return 1;
     };
     if (outcome.refresh_token == null) {
         std.debug.print("error: the token response carries no refresh_token; it could never be refreshed\n", .{});
-        return 2;
+        return 1;
     }
 
-    var session = provider_oauth.Session.initHome(allocator, built.id) catch |err| {
+    var session = provider_oauth.Session.initHome(allocator, provider_id) catch |err| {
         std.debug.print("error: could not open the OAuth store ({s})\n", .{@errorName(err)});
         return 2;
     };
     defer session.deinit();
-
+    // Recorded before the import so it lands in the same atomic write as the
+    // tokens: a refresh that presents a different client is rejected outright.
+    session.setClientId(client_id) catch |err| {
+        std.debug.print("error: could not record the OAuth client ({s})\n", .{@errorName(err)});
+        return 2;
+    };
     session.importOutcome(outcome, @import("util/time.zig").nowUnix()) catch |err| {
         std.debug.print("error: could not store the token ({s})\n", .{@errorName(err)});
         return 2;
     };
     std.debug.print(
         "Stored an OAuth login for provider '{s}'. No secret was printed.\n",
-        .{built.id.slice()},
+        .{provider_id.slice()},
     );
     return 0;
 }
@@ -1916,6 +2137,7 @@ test {
     _ = &@import("provider/oauth.zig");
     _ = &@import("kg/provider_audit.zig");
     _ = &@import("api/oauth_exchange.zig");
+    _ = &@import("api/oauth_login.zig");
     _ = &@import("api/catalog_fetch.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");

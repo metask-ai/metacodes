@@ -10,6 +10,10 @@
 //! - **状态机**：running → exited | killed | failed
 //!   状态由 waitpid 决定——register 后的 reap 靠 `poll()` 每次查询
 //! - **lifecycle**：App 退出时 killpg 所有 running job（防孤儿）
+//! - **spool retention**：落盘文件由 registry 拥有（issue #37）。`.synchronous`
+//!   job 的输出一旦渲染进 tool result 就立刻 unlink；`.background` job 的输出
+//!   留到 registry teardown——`BashOutput` 在此之前的任何一轮都可能来读它。
+//!   两者都不会活过 `deinit`，命令输出因此不再无限期留在 OS 临时目录里。
 //!
 //! 简化：
 //! - 一期单进程单 registry；不跨 session 恢复
@@ -28,6 +32,20 @@ const shell_mod = @import("shell.zig");
 
 pub const JobStatus = enum { running, exited, killed, failed };
 
+/// Who is still allowed to read this job's spool files.
+///
+/// The distinction is the whole cleanup contract: a synchronous Bash call
+/// owns its spool privately and is done with it the moment the result has
+/// been rendered, while a backgrounded job's spool is the only place its
+/// output lives and `BashOutput` may ask for it at any later turn.
+pub const Retention = enum {
+    /// Reachable by job id: keep the files until registry teardown.
+    background,
+    /// Private to one synchronous call: releasable as soon as its result has
+    /// been rendered.
+    synchronous,
+};
+
 pub const JobEntry = struct {
     id: [12]u8,
     /// 进程句柄（POSIX=pid，Windows=HANDLE）。走可移植 platform/process。
@@ -38,6 +56,11 @@ pub const JobEntry = struct {
     command_preview: []const u8, // owned, 前 N 字符便于 UI 列表
     status: JobStatus = .running,
     exit_code: ?i32 = null,
+    retention: Retention = .background,
+    /// Set once the spool files have been unlinked. The path strings stay
+    /// valid (they are freed at teardown) so an outstanding value snapshot
+    /// never dangles; only the directory entries are gone.
+    spool_released: bool = false,
 
     pub fn idSlice(self: *const JobEntry) []const u8 {
         return self.id[0..];
@@ -95,7 +118,13 @@ pub const JobRegistry = struct {
                 process.reapBlocking(j.proc);
             }
         }
-        for (self.jobs.items) |j| {
+        for (self.jobs.items) |*j| {
+            // The registry owns these files. Freeing the path strings while
+            // leaving the files behind is what let every command's stdout and
+            // stderr accumulate in the OS temp directory indefinitely
+            // (issue #37). Every writer has been reaped above, so nothing can
+            // still be appending to them.
+            unlinkSpool(j);
             self.allocator.free(j.stdout_path);
             self.allocator.free(j.stderr_path);
             self.allocator.free(j.command_preview);
@@ -103,6 +132,27 @@ pub const JobRegistry = struct {
         self.index.deinit();
         self.jobs.deinit(self.allocator);
         self.allocator.free(self.base_dir);
+    }
+
+    /// Drop a completed synchronous job's spool now that its output has been
+    /// rendered into a tool result. Idempotent, and deliberately a no-op for a
+    /// job that is still running or that a consumer can still reach by id —
+    /// the retention boundary is what keeps `BashOutput` working.
+    pub fn releaseSpool(self: *JobRegistry, id: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        const entry = self.getPtrLocked(id) orelse return;
+        if (entry.retention != .synchronous or entry.status == .running) return;
+        unlinkSpool(entry);
+    }
+
+    /// Promote an auto-backgrounded job: its id has just been handed to the
+    /// model, so its spool must survive until teardown.
+    pub fn promoteToBackground(self: *JobRegistry, id: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        const entry = self.getPtrLocked(id) orelse return;
+        entry.retention = .background;
     }
 
     /// 生成新 job id：12 hex = 6 byte，走可移植熵源 `platform/rng.zig`
@@ -123,6 +173,22 @@ pub const JobRegistry = struct {
     /// 立刻返回 job_id，不等待进程结束。
     /// cwd 非 null → 子进程 chdir(borrow:spawn 时消费,不存 JobEntry——生命周期不匹配)。
     pub fn spawnBackground(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry {
+        return self.spawn(command, cwd, .background);
+    }
+
+    /// Same spawn, for output that only one synchronous call will ever read.
+    /// `runAutoBackgroundable` starts here and promotes the job if it later
+    /// hands the id to the model.
+    pub fn spawnSynchronous(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry {
+        return self.spawn(command, cwd, .synchronous);
+    }
+
+    fn spawn(
+        self: *JobRegistry,
+        command: []const u8,
+        cwd: ?[]const u8,
+        retention: Retention,
+    ) !JobEntry {
         const id = try genId();
 
         const stdout_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.out", .{ self.base_dir, id[0..] });
@@ -130,10 +196,15 @@ pub const JobRegistry = struct {
         const stderr_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.err", .{ self.base_dir, id[0..] });
         errdefer self.allocator.free(stderr_path);
 
-        // 预创建空文件（0600）让 reader 能立刻打开
+        // 预创建空文件（0600）让 reader 能立刻打开。
+        // 这两条 errdefer 是 issue #37 的另一半:spawn 在文件创建之后失败
+        // (第二个 open、shell wrap OOM、spawnToFiles、registerEntry) 时,
+        // 只释放路径字符串会把两个空文件永远留在临时目录里。
         const out_fd = createFile(stdout_path) orelse return error.OpenFailed;
+        errdefer unlinkPath(stdout_path);
         defer _ = pfs.close(out_fd);
         const err_fd = createFile(stderr_path) orelse return error.OpenFailed;
+        errdefer unlinkPath(stderr_path);
         defer _ = pfs.close(err_fd);
 
         // 走可移植 platform/process.spawnToFiles(POSIX fork+dup2 / Windows CreateProcessW NO_WINDOW
@@ -166,6 +237,7 @@ pub const JobRegistry = struct {
             .stderr_path = stderr_path,
             .command_preview = preview,
             .status = .running,
+            .retention = retention,
         };
         try self.registerEntry(entry);
         log.info("job", "bg spawn id={s} cmd={s}", .{ id[0..], preview });
@@ -283,6 +355,24 @@ pub const JobRegistry = struct {
     }
 };
 
+/// Unlink one entry's spool files and record that it happened. Failures are
+/// deliberately silent: a missing file is the desired end state, and a
+/// cleanup error must never turn into a failed Bash result.
+fn unlinkSpool(entry: *JobEntry) void {
+    if (entry.spool_released) return;
+    entry.spool_released = true;
+    unlinkPath(entry.stdout_path);
+    unlinkPath(entry.stderr_path);
+}
+
+fn unlinkPath(path: []const u8) void {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= buf.len) return;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    pfs.unlinkPath(@ptrCast(&buf)) catch {};
+}
+
 fn createFile(path: []const u8) ?pfs.Fd {
     var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= buf.len) return null;
@@ -362,6 +452,119 @@ test "activeCount" {
     try std.testing.expect(r.activeCount() == 0);
 }
 
+fn spoolExists(path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&buf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return false;
+    _ = pfs.close(fd);
+    return true;
+}
+
+fn waitUntilExited(r: *JobRegistry, id: []const u8) !void {
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        r.reapExited();
+        if ((r.get(id) orelse return error.JobNotFound).status != .running) return;
+        util_time.sleepMs(10);
+    }
+    return error.JobDidNotExit;
+}
+
+test "a completed synchronous job's spool is released" {
+    // issue #37: with a JobRegistry present, every synchronous Bash execution
+    // spools to files from byte zero. Nothing used to remove them, so ordinary
+    // use grew the OS temp directory without bound and left every command's
+    // output on disk indefinitely.
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+
+    const j = try r.spawnSynchronous("echo spooled", null);
+    try waitUntilExited(&r, j.idSlice());
+    try std.testing.expect(spoolExists(j.stdout_path));
+    try std.testing.expect(spoolExists(j.stderr_path));
+
+    r.releaseSpool(j.idSlice());
+    try std.testing.expect(!spoolExists(j.stdout_path));
+    try std.testing.expect(!spoolExists(j.stderr_path));
+    // Idempotent: a second release (error path plus defer) must not fail.
+    r.releaseSpool(j.idSlice());
+}
+
+test "a running synchronous job keeps its spool" {
+    // Releasing while the child is still writing would unlink the file out
+    // from under it, which is exactly the failure this guard exists to make
+    // impossible on the timeout path.
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+
+    const j = try r.spawnSynchronous("sleep 30", null);
+    r.releaseSpool(j.idSlice());
+    try std.testing.expect(spoolExists(j.stdout_path));
+    try r.kill(j.idSlice());
+}
+
+test "a backgrounded job keeps its spool until registry teardown" {
+    // BashOutput may ask for a backgrounded job's output at any later turn,
+    // so the retention boundary is teardown, not completion.
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    var torn_down = false;
+    defer if (!torn_down) r.deinit();
+
+    const j = try r.spawnBackground("echo background", null);
+    try waitUntilExited(&r, j.idSlice());
+    r.releaseSpool(j.idSlice());
+    try std.testing.expect(spoolExists(j.stdout_path));
+    try std.testing.expect(spoolExists(j.stderr_path));
+
+    // The paths outlive the entry only because this test copies them.
+    const stdout_path = try a.dupe(u8, j.stdout_path);
+    defer a.free(stdout_path);
+    const stderr_path = try a.dupe(u8, j.stderr_path);
+    defer a.free(stderr_path);
+    r.deinit();
+    torn_down = true;
+    try std.testing.expect(!spoolExists(stdout_path));
+    try std.testing.expect(!spoolExists(stderr_path));
+}
+
+test "promotion to background extends a synchronous job's retention" {
+    // The auto-background path hands the job id to the model mid-call; from
+    // that moment the spool is reachable and must stop being releasable.
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+
+    const j = try r.spawnSynchronous("echo promoted", null);
+    r.promoteToBackground(j.idSlice());
+    try waitUntilExited(&r, j.idSlice());
+    r.releaseSpool(j.idSlice());
+    try std.testing.expect(spoolExists(j.stdout_path));
+    try std.testing.expect(spoolExists(j.stderr_path));
+}
+
+test "teardown removes the spool of a job that was still running" {
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    var torn_down = false;
+    defer if (!torn_down) r.deinit();
+
+    const j = try r.spawnBackground("sleep 30", null);
+    const stdout_path = try a.dupe(u8, j.stdout_path);
+    defer a.free(stdout_path);
+    try std.testing.expect(spoolExists(stdout_path));
+    // deinit kills and reaps first, so nothing is still writing when the
+    // directory entry goes away.
+    r.deinit();
+    torn_down = true;
+    try std.testing.expect(!spoolExists(stdout_path));
+}
+
 test "get returns correct entry across many registrations" {
     // 不变量：无论 registry append 了多少次（触发 ArrayList grow），
     // 用保存的 id 查回来的 entry 必须和保存时的 id 一致。
@@ -397,6 +600,10 @@ test "get returns correct entry across many registrations" {
             .command_preview = preview,
             .status = .exited,
             .exit_code = 0,
+            // These entries name no real files. Marking the spool already
+            // released keeps teardown from issuing an unlink for a relative
+            // pathname in whatever directory the test happens to run in.
+            .spool_released = true,
         });
     }
 

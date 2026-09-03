@@ -726,6 +726,7 @@ pub fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
             .prop_specs = t.input_schema.prop_specs,
             .properties = null,
             .required = t.input_schema.required,
+            .additional_properties = t.input_schema.additional_properties,
         },
     };
     var buf: std.ArrayList(u8) = .empty;
@@ -825,6 +826,7 @@ pub fn toToolDefinitionsFull(
                 .prop_specs = prop_specs,
                 .properties = null,
                 .required = tool.input_schema.required,
+                .additional_properties = tool.input_schema.additional_properties,
             },
             .deferred = tool.deferred,
         });

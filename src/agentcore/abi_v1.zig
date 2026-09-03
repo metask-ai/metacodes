@@ -2971,6 +2971,14 @@ const AbiSession = struct {
             return error.InvalidSessionState;
         self.active_budget_controller = &budget_controller;
         defer self.active_budget_controller = null;
+        // The candidate-response boundary is installed with the budgeted
+        // Provider, not instead of it: the Provider measures what a response
+        // costs, and this decides whether an assembled one may become durable
+        // Conversation state (issue #34). Without it the stream would deliver
+        // an oversized response's prefix and the loop would commit it.
+        var run_admission = session_budget.RunAdmission{ .controller = &budget_controller };
+        self.core_session.setResponseObserver(run_admission.observer());
+        defer self.core_session.setResponseObserver(null);
 
         const execution = switch (try self.admitMaterializedSkillBudgeted(
             materializations,
@@ -3058,6 +3066,14 @@ const AbiSession = struct {
             return error.InvalidSessionState;
         self.active_budget_controller = &budget_controller;
         defer self.active_budget_controller = null;
+        // The candidate-response boundary is installed with the budgeted
+        // Provider, not instead of it: the Provider measures what a response
+        // costs, and this decides whether an assembled one may become durable
+        // Conversation state (issue #34). Without it the stream would deliver
+        // an oversized response's prefix and the loop would commit it.
+        var run_admission = session_budget.RunAdmission{ .controller = &budget_controller };
+        self.core_session.setResponseObserver(run_admission.observer());
+        defer self.core_session.setResponseObserver(null);
         const binding: ?*SkillBinding = if (self.skill_binding) |*value| value else null;
         const has_model_skill = if (binding) |value|
             materializations.supportsExactFileModes() and
@@ -4530,7 +4546,8 @@ fn parseSchema(arena: std.mem.Allocator, encoded: []const u8) !core.json.InputSc
     while (fields.next()) |field| {
         if (!std.mem.eql(u8, field.key_ptr.*, "type") and
             !std.mem.eql(u8, field.key_ptr.*, "properties") and
-            !std.mem.eql(u8, field.key_ptr.*, "required"))
+            !std.mem.eql(u8, field.key_ptr.*, "required") and
+            !std.mem.eql(u8, field.key_ptr.*, "additionalProperties"))
             return error.InvalidSchema;
     }
     const type_value = root.object.get("type") orelse return error.InvalidSchema;
@@ -4555,6 +4572,14 @@ fn parseSchema(arena: std.mem.Allocator, encoded: []const u8) !core.json.InputSc
             names[i] = item.string;
         }
         schema.required = names;
+    }
+    // Boolean only. `InputSchema` can carry the boolean form losslessly
+    // (issue #35); the schema-valued form still has no representation, and
+    // accepting it here would reintroduce exactly the silent projection loss
+    // this allowlist exists to prevent.
+    if (root.object.get("additionalProperties")) |additional| {
+        if (additional != .bool) return error.InvalidSchema;
+        schema.additional_properties = additional.bool;
     }
     return schema;
 }
@@ -9609,9 +9634,11 @@ test "Host schema admission rejects ambiguous object contracts" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    // A schema-valued `additionalProperties` has no representation in
+    // `InputSchema`, so it must still fail closed rather than be dropped.
     try std.testing.expectError(
         error.InvalidSchema,
-        parseSchema(a, "{\"type\":\"object\",\"additionalProperties\":false}"),
+        parseSchema(a, "{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}"),
     );
     try std.testing.expectError(
         error.InvalidSchema,
@@ -9625,6 +9652,28 @@ test "Host schema admission rejects ambiguous object contracts" {
         error.DuplicateField,
         parseSchema(a, "{\"type\":\"object\",\"type\":\"object\"}"),
     );
+}
+
+test "Host schema admission preserves a boolean root additionalProperties" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The schema from issue #35, verbatim.
+    const closed = try parseSchema(
+        a,
+        "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}}," ++
+            "\"required\":[\"text\"],\"additionalProperties\":false}",
+    );
+    try std.testing.expectEqual(@as(?bool, false), closed.additional_properties);
+
+    const open = try parseSchema(a, "{\"type\":\"object\",\"additionalProperties\":true}");
+    try std.testing.expectEqual(@as(?bool, true), open.additional_properties);
+
+    // Absent stays absent: a tool that declared nothing must not acquire a
+    // constraint, and its serialized schema must not move.
+    const silent = try parseSchema(a, "{\"type\":\"object\"}");
+    try std.testing.expectEqual(@as(?bool, null), silent.additional_properties);
 }
 
 test "provider-facing tool names use the public intersection grammar" {

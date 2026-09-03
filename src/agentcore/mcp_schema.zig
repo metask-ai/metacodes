@@ -155,6 +155,18 @@ pub fn prepareTool(
         value.object
     else
         null;
+    // Boolean root `additionalProperties` is now representable in the
+    // provider projection (issue #35), so it is forwarded instead of being
+    // silently dropped. The schema-valued form stays canonical-only, like
+    // every other non-projected root keyword: it does not decide Tool
+    // availability and AgentCore does not interpret it locally.
+    const additional_properties: ?bool = if (root.object.get("additionalProperties")) |value|
+        switch (value) {
+            .bool => |flag| flag,
+            else => null,
+        }
+    else
+        null;
     if (properties) |projected|
         if (!validProviderProjectionText(.{ .object = projected }, limits.max_schema_bytes))
             return finishUnavailable(&arena, .invalid_schema, "properties");
@@ -172,6 +184,7 @@ pub fn prepareTool(
                 .type = "object",
                 .properties = properties,
                 .required = required,
+                .additional_properties = additional_properties,
             },
         },
     } };
@@ -350,6 +363,33 @@ test "dialect and semantic keywords do not decide Tool availability" {
     var admission = try prepareTool(std.testing.allocator, "mcp__weather", &tool, .{});
     defer if (admission == .available) admission.available.deinit();
     try std.testing.expect(admission == .available);
+    // Availability is one question; projection is another. A boolean root
+    // `additionalProperties` is now forwarded rather than dropped (issue #35),
+    // so a server that closed its argument object no longer advertises an open
+    // one to the model.
+    try std.testing.expectEqual(
+        @as(?bool, false),
+        admission.available.definition.input_schema.additional_properties,
+    );
+}
+
+test "a schema-valued root additionalProperties stays canonical-only" {
+    // It has no representation in the projected shape, so it is retained in
+    // the canonical record and simply not forwarded — the same rule every
+    // other non-projected root keyword follows. It must not make the Tool
+    // unavailable, because the MCP server remains the authority on semantics.
+    const tool = testTool(
+        "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}," ++
+            "\"additionalProperties\":{\"type\":\"string\"}}",
+        null,
+    );
+    var admission = try prepareTool(std.testing.allocator, "mcp__weather", &tool, .{});
+    defer if (admission == .available) admission.available.deinit();
+    try std.testing.expect(admission == .available);
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        admission.available.definition.input_schema.additional_properties,
+    );
 }
 
 test "provider projection rejects dangling references and incoherent required" {

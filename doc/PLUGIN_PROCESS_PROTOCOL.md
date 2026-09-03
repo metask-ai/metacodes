@@ -151,7 +151,8 @@ response contains one or more tools:
     "input_schema": {
       "type": "object",
       "properties": {"path": {"type": "string"}},
-      "required": ["path"]
+      "required": ["path"],
+      "additionalProperties": false
     }
   }]
 }
@@ -160,6 +161,16 @@ response contains one or more tools:
 Local names, descriptions, tool count, schema depth/property count, required
 references and duplicates are bounded and validated before the immutable
 snapshot is published.
+
+The `input_schema` root accepts `type` (which must be `"object"`),
+`properties`, `required`, and a boolean `additionalProperties`; any other root
+keyword fails the handshake. That set is the one Core can represent and
+propagate to the Provider request unchanged — a boundary that accepted a
+constraint it then dropped would advertise a tool contract the model never
+sees. `"additionalProperties": {...}` has no such representation and is
+therefore refused rather than silently discarded. The authority binding hashes
+the declared schema as written, so adding or removing the keyword is a schema
+change and cannot inherit remembered authority.
 
 ## Call
 

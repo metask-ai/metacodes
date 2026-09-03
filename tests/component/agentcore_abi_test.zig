@@ -8933,3 +8933,373 @@ test "L2 RunState: a Host rejecting the terminal snapshot fails the Run with CAL
         api.session().runText(session, 2, sdk.bytesView("after poison"), &options, &result, &diagnostic),
     );
 }
+
+const SchemaAdvertisementProbe = struct {
+    fn event(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1) callconv(.c) u32 {
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+// Issue #35 L2 evidence: a Host tool that closes its root argument object
+// registers, and the constraint survives all the way into the bytes the
+// Provider receives. Registration alone would not prove anything — the
+// representation gap this closes was precisely one where a boundary could
+// accept a field and then drop it.
+test "L2 a Host tool's root additionalProperties reaches the Provider request" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    const bodies = [_][]const u8{FINAL_SSE};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const base_url = try server.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var probe = SchemaAdvertisementProbe{};
+    var host_tool = std.mem.zeroes(wire.HostToolV1);
+    host_tool.struct_size = @sizeOf(wire.HostToolV1);
+    host_tool.ctx = &probe;
+    host_tool.name = sdk.bytesView("HostEcho");
+    host_tool.description = sdk.bytesView("Echo a value through the Host");
+    // The schema from issue #35, verbatim.
+    host_tool.input_schema_json = sdk.bytesView(
+        "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}}," ++
+            "\"required\":[\"text\"],\"additionalProperties\":false}",
+    );
+    host_tool.execute = Probe.host;
+    host_tool.release_result = Probe.hostRelease;
+    const host_tools = [_]wire.HostToolV1{host_tool};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.host_tools = &host_tools;
+    runtime_config.host_tool_count = host_tools.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    const allowed_tools = [_]wire.BytesViewV1{sdk.bytesView("HostEcho")};
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.allowed_tools = &allowed_tools;
+    host.allowed_tool_count = allowed_tools.len;
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = SchemaAdvertisementProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, 1, sdk.bytesView("advertise the tool"), &options, &result, &diagnostic),
+    );
+
+    const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    const advertised = std.mem.indexOf(u8, body, "HostEcho") orelse return error.ToolNotAdvertised;
+    try std.testing.expect(std.mem.indexOf(u8, body[advertised..], "\"additionalProperties\":false") != null);
+}
+
+// The schema-valued form has no representation in `InputSchema`, so the ABI
+// must keep failing closed rather than accept it and drop it.
+test "L2 a schema-valued root additionalProperties is still refused at registration" {
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var probe = SchemaAdvertisementProbe{};
+    var host_tool = std.mem.zeroes(wire.HostToolV1);
+    host_tool.struct_size = @sizeOf(wire.HostToolV1);
+    host_tool.ctx = &probe;
+    host_tool.name = sdk.bytesView("HostEcho");
+    host_tool.description = sdk.bytesView("Echo a value through the Host");
+    host_tool.input_schema_json = sdk.bytesView(
+        "{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}",
+    );
+    host_tool.execute = Probe.host;
+    host_tool.release_result = Probe.hostRelease;
+    const host_tools = [_]wire.HostToolV1{host_tool};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.host_tools = &host_tools;
+    runtime_config.host_tool_count = host_tools.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime == null);
+}
+
+// Issue #34: with the candidate-response boundary in place, AgentCore no
+// longer withholds a Provider response until it completes. This probe is a
+// clock, and the assertion is a *relative* one: buffering makes the first
+// content event arrive at the same moment as the last, so a gap between them
+// cannot be produced by a slow machine.
+const IncrementalDeliveryProbe = struct {
+    started_ms: i64 = 0,
+    first_text_ms: ?i64 = null,
+    finished_ms: i64 = 0,
+
+    fn event(
+        raw: ?*anyopaque,
+        _: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *IncrementalDeliveryProbe = @ptrCast(@alignCast(
+            raw orelse return wire.EVENT_FATAL,
+        ));
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        if (self.first_text_ms == null and
+            std.mem.indexOf(u8, bytes, "\"text_chunk\"") != null)
+            self.first_text_ms = core.util_time.nowMs() - self.started_ms;
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+test "L2 AgentCore delivers a content event before the Provider response completes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+
+    // The text arrives in the third frame; six further frames keep the
+    // response open for most of a second after that. Under the old bounded
+    // spool the Host saw nothing until the last of them had been written.
+    const DELAYED_SSE =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_slow\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"early\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"-1\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"-2\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"-3\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"-4\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const FRAME_DELAY_MS: u32 = 100;
+    var server = try harness.MockServer.start(DELAYED_SSE, FRAME_DELAY_MS);
+    defer server.stop();
+    const base_url = try server.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var probe = IncrementalDeliveryProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = IncrementalDeliveryProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    probe.started_ms = core.util_time.nowMs();
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, 1, sdk.bytesView("stream slowly"), &options, &result, &diagnostic),
+    );
+    probe.finished_ms = core.util_time.nowMs() - probe.started_ms;
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+
+    const first_text_ms = probe.first_text_ms orelse return error.NoTextEventDelivered;
+    // Six frames still had to be written after the text. Buffering collapses
+    // that gap to nothing, so the margin is what distinguishes the two — not
+    // an absolute latency budget the machine could miss.
+    try std.testing.expect(probe.finished_ms - first_text_ms > 3 * @as(i64, FRAME_DELAY_MS));
+}
+
+// Issue #34: the durable-budget veto, end to end. An over-cap Provider response
+// is now delivered incrementally and *then* refused at the Conversation commit,
+// rather than withheld until it could be judged. Both halves matter: the Host
+// must see the content, and the Session must still refuse to checkpoint it.
+const OverCapProbe = struct {
+    text_events: usize = 0,
+    discarded_segments: usize = 0,
+    committed_segments: usize = 0,
+
+    fn event(
+        raw: ?*anyopaque,
+        _: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *OverCapProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        if (std.mem.indexOf(u8, bytes, "\"text_chunk\"") != null) self.text_events += 1;
+        if (std.mem.indexOf(u8, bytes, "\"output_segment_end\"") != null) {
+            if (std.mem.indexOf(u8, bytes, "\"disposition\":\"discarded\"") != null) {
+                self.discarded_segments += 1;
+            } else if (std.mem.indexOf(u8, bytes, "\"disposition\":\"final\"") != null) {
+                self.committed_segments += 1;
+            }
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+test "L2 an over-cap Provider response is delivered, then refused before Conversation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+
+    // Four text deltas of 400 bytes each against a 512-byte result cap: the
+    // first is admitted, and the response outgrows the cap partway through.
+    const CHUNK = "x" ** 400;
+    const OVER_CAP_SSE =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_big\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" ++ CHUNK ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" ++ CHUNK ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" ++ CHUNK ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var server = try harness.MockServer.start(OVER_CAP_SSE, 0);
+    defer server.stop();
+    const base_url = try server.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    const budget = wire.DurableBudgetProfileV1{
+        .struct_size = @sizeOf(wire.DurableBudgetProfileV1),
+        .reserved0 = 0,
+        .hard_bytes = 1024 * 1024,
+        .soft_bytes = 768 * 1024,
+        .input_cap_bytes = 4096,
+        .provider_request_cap_bytes = 512 * 1024,
+        .provider_result_cap_bytes = 512,
+        .tool_result_cap_bytes = 4096,
+        .mcp_result_cap_bytes = 4096,
+        .audit_reserve_bytes = 4096,
+        .terminal_reserve_bytes = 4096,
+        .reserved = [_]u64{0} ** 4,
+    };
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.durable_budget = &budget;
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var probe = OverCapProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = OverCapProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, 1, sdk.bytesView("answer at length"), &options, &result, &diagnostic),
+    );
+
+    // The durable decision is unchanged: the response is refused and the Run
+    // reports the checkpoint outcome, not a successful end of turn.
+    try std.testing.expectEqual(wire.STOP_CHECKPOINT_RESOURCE_LIMIT, result.stop_reason_code);
+    try std.testing.expectEqual(wire.RUN_CHECKPOINT_RESOURCE_LIMIT, result.checkpoint_outcome_code);
+    // What changed: the Host saw the admitted prefix while it was arriving,
+    // and then saw it withdrawn rather than never hearing about it at all.
+    try std.testing.expect(probe.text_events > 0);
+    try std.testing.expectEqual(@as(usize, 1), probe.discarded_segments);
+    try std.testing.expectEqual(@as(usize, 0), probe.committed_segments);
+}

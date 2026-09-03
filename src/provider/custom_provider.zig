@@ -75,6 +75,12 @@ pub const DefinitionError = error{
     InvalidPrice,
     DuplicateProviderId,
     DuplicateChannelId,
+    /// An `oauth` block on a profile that accepts no OAuth credential kind.
+    /// Credential resolution opens the OAuth session only for kinds
+    /// `oauth.servesKind` recognizes, so such a login would be stored and never
+    /// consulted — `metacodes login` would report success and the session
+    /// would ignore it. Rejected here, where the definition is.
+    OAuthWithoutOAuthCredentialKind,
 };
 
 /// Parsed, validated, and owned. `profiles()` hands out `ProviderProfile`
@@ -168,6 +174,9 @@ fn buildProfile(
         channels[0].id;
 
     const aliases = try parseAliases(arena, value.object.get("aliases"));
+    const oauth = try parseOAuth(arena, value.object.get("oauth"));
+    if (oauth.token_url != null and !acceptsOAuthKind(kinds))
+        return error.OAuthWithoutOAuthCredentialKind;
 
     const built = ProviderProfile{
         .id = id,
@@ -181,12 +190,65 @@ fn buildProfile(
         .auth = auth,
         .default_channel = default_channel,
         .endpoint_policy = policy,
+        .oauth_token_url = oauth.token_url,
+        .oauth_authorize_url = oauth.authorize_url,
+        .oauth_device_authorization_url = oauth.device_authorization_url,
+        .oauth_client_id = oauth.client_id,
+        .oauth_scope = oauth.scope,
     };
     // The same structural validation a built-in profile goes through. Doing it
     // here means a malformed definition fails at parse time rather than at the
     // first request.
     profile_mod.validateProfile(built) catch return error.InvalidDocument;
     return built;
+}
+
+const OAuthDefinition = struct {
+    token_url: ?[]const u8 = null,
+    authorize_url: ?[]const u8 = null,
+    device_authorization_url: ?[]const u8 = null,
+    client_id: ?[]const u8 = null,
+    scope: []const u8 = "",
+};
+
+/// `"oauth": { "token_url", "authorize_url", "device_authorization_url",
+/// "client_id", "scope" }` (issue #33).
+///
+/// A configured provider is exactly the case where the OAuth client belongs in
+/// configuration rather than in the binary: whoever runs the relay or gateway
+/// registered it. Declaring the endpoints here is what makes
+/// `metacodes login --provider <id>` a real flow for it.
+fn parseOAuth(arena: std.mem.Allocator, value: ?std.json.Value) DefinitionError!OAuthDefinition {
+    const object = value orelse return .{};
+    if (object != .object) return error.InvalidDocument;
+    const token_url = try dupeOptional(arena, stringOf(object.object.get("token_url")));
+    const authorize_url = try dupeOptional(arena, stringOf(object.object.get("authorize_url")));
+    const device_url = try dupeOptional(
+        arena,
+        stringOf(object.object.get("device_authorization_url")),
+    );
+    // Without a token endpoint neither grant can be completed and no refresh
+    // can ever run, so an authorization endpoint on its own is a definition
+    // that could only fail later.
+    if (token_url == null and (authorize_url != null or device_url != null))
+        return error.InvalidDocument;
+    return .{
+        .token_url = token_url,
+        .authorize_url = authorize_url,
+        .device_authorization_url = device_url,
+        .client_id = try dupeOptional(arena, stringOf(object.object.get("client_id"))),
+        .scope = try dupe(arena, stringOf(object.object.get("scope")) orelse ""),
+    };
+}
+
+/// The same test credential resolution applies before it will open an OAuth
+/// session for a profile. Asked at parse time so the answer is "this
+/// definition is wrong" rather than a login nothing ever reads.
+fn acceptsOAuthKind(kinds: []const profile_mod.CredentialKind) bool {
+    for (kinds) |kind| {
+        if (@import("oauth.zig").servesKind(kind)) return true;
+    }
+    return false;
 }
 
 fn parseAliases(arena: std.mem.Allocator, value: ?std.json.Value) DefinitionError![]const []const u8 {
@@ -588,6 +650,31 @@ fn optionalDiscount(value: ?std.json.Value) DefinitionError!?u16 {
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "an oauth block requires a credential kind the OAuth session serves" {
+    // Without an OAuth kind the runtime never opens the OAuth session, so a
+    // login stored for this provider would succeed on the command line and be
+    // ignored by every session. A definition that can only mislead fails here.
+    const a = testing.allocator;
+    try testing.expectError(error.OAuthWithoutOAuthCredentialKind, parse(a,
+        \\{"custom_providers":{"relay":{
+        \\  "models":[{"request_model_id":"m","display_name":"M"}],
+        \\  "channels":[{"id":"default","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
+        \\  "oauth":{"token_url":"https://relay.example.com/token","client_id":"relay-cli"}
+        \\}}}
+    ));
+    // Declaring the kind is what makes the block meaningful.
+    var accepted = try parse(a,
+        \\{"custom_providers":{"relay":{
+        \\  "models":[{"request_model_id":"m","display_name":"M"}],
+        \\  "channels":[{"id":"default","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
+        \\  "credential_kinds":["openai_oauth"],
+        \\  "oauth":{"token_url":"https://relay.example.com/token","client_id":"relay-cli"}
+        \\}}}
+    );
+    defer accepted.deinit();
+    try testing.expect(accepted.find("relay") != null);
+}
 
 const RELAY_CONFIG =
     \\{

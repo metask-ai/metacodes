@@ -434,7 +434,8 @@ fn projectInputSchema(allocator: std.mem.Allocator, value: std.json.Value) Error
     while (fields.next()) |field| {
         if (!std.mem.eql(u8, field.key_ptr.*, "type") and
             !std.mem.eql(u8, field.key_ptr.*, "properties") and
-            !std.mem.eql(u8, field.key_ptr.*, "required"))
+            !std.mem.eql(u8, field.key_ptr.*, "required") and
+            !std.mem.eql(u8, field.key_ptr.*, "additionalProperties"))
             return error.InvalidToolDefinition;
     }
     const type_value = value.object.get("type") orelse return error.InvalidToolDefinition;
@@ -465,7 +466,21 @@ fn projectInputSchema(allocator: std.mem.Allocator, value: std.json.Value) Error
         }
         required = names;
     }
-    return .{ .type = "object", .properties = properties, .required = required };
+    // Boolean only, exactly as the AgentCore Host boundary admits it
+    // (issue #35): `InputSchema` can carry that form losslessly, and the
+    // schema-valued form still has no representation. Both boundaries reject
+    // what they cannot preserve rather than accepting and dropping it.
+    var additional_properties: ?bool = null;
+    if (value.object.get("additionalProperties")) |raw| {
+        if (raw != .bool) return error.InvalidToolDefinition;
+        additional_properties = raw.bool;
+    }
+    return .{
+        .type = "object",
+        .properties = properties,
+        .required = required,
+        .additional_properties = additional_properties,
+    };
 }
 
 fn validateSchemaValue(value: std.json.Value, depth: u32, nodes: *usize) Error!void {
@@ -659,6 +674,46 @@ fn formatVersion(allocator: std.mem.Allocator, version: contract.Version) ![]u8 
     if (version.prerelease.len != 0) try out.writer.print("-{s}", .{version.prerelease});
     if (version.build.len != 0) try out.writer.print("+{s}", .{version.build});
     return out.toOwnedSlice();
+}
+
+test "a process tool's root additionalProperties is preserved, boolean only" {
+    // The same representation gap issue #35 reports on the AgentCore Host
+    // boundary reaches Core through this second declaration surface too: a
+    // plugin declaring a closed argument object used to fail to load.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const closed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        a,
+        "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}}," ++
+            "\"required\":[\"text\"],\"additionalProperties\":false}",
+        .{},
+    );
+    const projected = try projectInputSchema(a, closed);
+    try std.testing.expectEqual(@as(?bool, false), projected.additional_properties);
+
+    const silent = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        a,
+        "{\"type\":\"object\"}",
+        .{},
+    );
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        (try projectInputSchema(a, silent)).additional_properties,
+    );
+
+    // Schema-valued has no internal representation; accepting it would drop
+    // the constraint silently, which is the failure mode being fixed.
+    const valued = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        a,
+        "{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}",
+        .{},
+    );
+    try std.testing.expectError(error.InvalidToolDefinition, projectInputSchema(a, valued));
 }
 
 test "Content-Length frame is exact and rejects trailing or oversized bodies" {
