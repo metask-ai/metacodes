@@ -176,6 +176,21 @@ jobs:
         run: |
           echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
           echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
+      # The workspace persists between runs and git treats a CRLF file whose
+      # normalized content matches the index as clean, so `checkout --force`
+      # never repairs line endings some other process rewrote (run 33768501933
+      # failed exactly that way: plugin.json and pinned fixtures hashed as CRLF
+      # while the previous run on the same machine had them as LF). List what is
+      # wrong for the record, rewrite the tree from the index under
+      # .gitattributes, and fail closed if anything still carries CRLF.
+      - name: Normalize line endings of the persistent workspace
+        shell: cmd
+        run: |
+          git config --show-origin --get-all core.autocrlf & echo (core.autocrlf origins above, if any)
+          git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files before normalization above, if any)
+          git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
+          git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
+          exit /b 0
       - name: Native platform modules
         shell: cmd
         env:
@@ -209,3 +224,11 @@ jobs:
       - name: Full offline test suite
         shell: cmd
         run: zig build test -j6 --test-timeout 5m
+      # Evidence for the next line-ending incident: if the suite itself rewrites
+      # tracked files with CRLF, this lists them; the step never fails.
+      - name: Line endings after the suite
+        if: always()
+        shell: cmd
+        run: |
+          git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files after the suite above, if any)
+          exit /b 0
