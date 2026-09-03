@@ -31,7 +31,7 @@
       },
       {
         "suite_id": "metacodes-agentdef-release-v1",
-        "suite_fingerprint": "0cfd05b74cc6c3ce",
+        "suite_fingerprint": "e115b458a8f180e4",
         "task_ids": [
           "40_agentdef_background",
           "41_agentdef_memory",

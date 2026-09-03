@@ -15,6 +15,83 @@ fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const 
     };
 }
 
+fn expectedSizedResourceResult(allocator: std.mem.Allocator, payload_bytes: usize) ![]u8 {
+    const payload = try allocator.alloc(u8, payload_bytes);
+    defer allocator.free(payload);
+    @memset(payload, 's');
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"contents\":[{{\"uri\":\"mock://sized/{d}\",\"mimeType\":\"text/plain\",\"text\":\"{s}\"}}]}}",
+        .{ payload_bytes, payload },
+    );
+}
+
+fn expectSizedResourceBody(payload_bytes: usize, expect_artifact: bool) !void {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
+    const argv = [_]?[*:0]const u8{ mock_path, null };
+    var client = try cc.mcp_client.McpClient.connect(allocator, argv[0..]);
+    defer client.close();
+
+    const server_name = try allocator.dupe(u8, "mock");
+    defer allocator.free(server_name);
+    var entries = [_]cc.mcp_session.McpSessionEntry{.{
+        .name = server_name,
+        .client = &client,
+        .session = cc.mcp_registry_bridge.McpSession.init(allocator, &client),
+    }};
+    defer entries[0].session.deinit();
+    var sessions: []cc.mcp_session.McpSessionEntry = entries[0..];
+    const budget = cc.result_budget.Budget.fromModel(200_000);
+    try std.testing.expectEqual(@as(usize, 25_000), budget.per_result_bytes);
+    var ctx = cc.tools.ToolContext.simple(allocator);
+    ctx.artifact_root = root;
+    ctx.result_budget = budget;
+    ctx.mcp_sessions = &sessions;
+
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"uri\":\"mock://sized/{d}\",\"server\":\"mock\"}}",
+        .{payload_bytes},
+    );
+    defer allocator.free(args);
+    const expected = try expectedSizedResourceResult(allocator, payload_bytes);
+    defer allocator.free(expected);
+    // Both fixtures use five decimal digits in the URI, so exactly 77 bytes
+    // of result JSON surround the requested ASCII payload.
+    try std.testing.expectEqual(payload_bytes + 77, expected.len);
+
+    var read = try cc.tools.dispatch(&ctx, "ReadMcpResourceTool", args);
+    defer read.deinit(allocator);
+    const body = switch (read) {
+        .ok => |*value| value,
+        else => return error.UnexpectedResourceReadOutcome,
+    };
+    if (expect_artifact) {
+        try std.testing.expect(body.* == .artifact);
+        try std.testing.expectEqual(@as(u64, expected.len), body.artifact.stored.bytes);
+        try std.testing.expectEqualStrings(
+            expected[0..body.artifact.preview.head_len],
+            body.artifact.preview.headSlice(),
+        );
+    } else {
+        try std.testing.expect(body.* == .@"inline");
+        try std.testing.expectEqualStrings(expected, body.@"inline".bytes);
+    }
+}
+
+test "MCP budget: resources/read publishes result above caller per-result budget" {
+    try expectSizedResourceBody(30_000 - 77, true);
+}
+
+test "MCP budget: resources/read inlines result at caller per-result budget" {
+    try expectSizedResourceBody(25_000 - 77, false);
+}
+
 test "MCP: full cycle initialize + listTools + callTool echo" {
     const a = std.testing.allocator;
     const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";

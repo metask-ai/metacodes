@@ -143,6 +143,7 @@ pub const McpClient = struct {
         method: []const u8,
         params_json: []const u8,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
         require_content: bool,
     ) !ToolResultBody {
@@ -152,6 +153,7 @@ pub const McpClient = struct {
             method,
             params_json,
             artifact_root,
+            budget,
             abort,
             require_content,
         );
@@ -162,6 +164,7 @@ pub const McpClient = struct {
         method: []const u8,
         params_json: []const u8,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
         require_content: bool,
     ) !ToolResultBody {
@@ -227,7 +230,13 @@ pub const McpClient = struct {
                     return error.McpMalformedResponse;
                 if (!response.isSuccess()) return try self.structuredMcpError(line);
                 const result = response.result_json orelse "null";
-                return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
+                if (result.len <= budget.per_result_bytes)
+                    return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
+                var spool = try artifact_store.Spool.begin(self.allocator, artifact_root);
+                defer spool.deinit();
+                try spool.write(result);
+                const completed = try spool.finish();
+                return ToolResultBody.fromCompletedSpool(completed, .json);
             }
 
             const projected = try result_stream.project(
@@ -237,8 +246,7 @@ pub const McpClient = struct {
                 id,
                 .classic_2025_11_25,
                 .{},
-                // #43's second half will thread the real budget through McpClient.
-                result_budget.Budget.floor,
+                budget,
                 false,
                 require_content,
             );
@@ -315,11 +323,12 @@ pub const McpClient = struct {
         name: []const u8,
         arguments_json: []const u8,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
     ) !ToolResultBody {
         const params = try protocol.callToolParams(self.allocator, name, arguments_json);
         defer self.allocator.free(params);
-        return self.requestBody("tools/call", params, artifact_root, abort, true);
+        return self.requestBody("tools/call", params, artifact_root, budget, abort, true);
     }
 
     /// 列出 server 暴露的 resources（resources/list）。返回原始 JSON-RPC result。
@@ -334,9 +343,10 @@ pub const McpClient = struct {
     pub fn listResourcesBodyAbortable(
         self: *McpClient,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
     ) !ToolResultBody {
-        return self.requestBody("resources/list", protocol.EMPTY_PARAMS, artifact_root, abort, false);
+        return self.requestBody("resources/list", protocol.EMPTY_PARAMS, artifact_root, budget, abort, false);
     }
 
     /// 读取一个 resource（resources/read）。uri 为 resource 标识。
@@ -354,11 +364,12 @@ pub const McpClient = struct {
         self: *McpClient,
         uri: []const u8,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
     ) !ToolResultBody {
         const params = try protocol.readResourceParams(self.allocator, uri);
         defer self.allocator.free(params);
-        return self.requestBody("resources/read", params, artifact_root, abort, false);
+        return self.requestBody("resources/read", params, artifact_root, budget, abort, false);
     }
 };
 
