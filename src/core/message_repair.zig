@@ -384,35 +384,40 @@ pub fn normalizeApiMessages(allocator: std.mem.Allocator, list: *std.ArrayList(t
     try mergeConsecutiveRoles(allocator, list);
 }
 
-/// 收集所有 tool_use id 到 set。调用方 deinit。
-fn collectToolUseIds(allocator: std.mem.Allocator, list: *const std.ArrayList(types.ApiMessage)) !std.StringHashMap(void) {
-    var set = std.StringHashMap(void).init(allocator);
-    errdefer set.deinit();
-    for (list.items) |m| {
-        for (m.content) |c| switch (c) {
-            .tool_use => |tu| try set.put(tu.id, {}),
-            else => {},
-        };
-    }
-    return set;
-}
-
-/// 剥离无对应 tool_use 的孤儿 tool_result block。整条消息 block 全被剥则删除该消息。
+/// 剥离孤儿 tool_result block:**顺序配对**——一个 tool_result 只能答复最近一条 assistant
+/// 消息里的 tool_use(Anthropic/OpenAI 协议都要求结果紧随其调用轮)。不能用全局 id 集合:
+/// OpenAI 兼容端常复用 call_0/call_1 这类短 id,全局集合会让后一轮的同名调用"复活"早已
+/// 成为孤儿的旧结果,把它排到新调用之前 → provider 拒绝或结果错配。整条消息 block 全被剥
+/// 则删除该消息。
 fn stripOrphanToolResults(allocator: std.mem.Allocator, list: *std.ArrayList(types.ApiMessage)) !void {
-    var tu_ids = try collectToolUseIds(allocator, list);
-    defer tu_ids.deinit();
+    // 最近一条 assistant 消息的 tool_use id;遇到下一条 assistant 消息即重置。
+    var outstanding = std.StringHashMap(void).init(allocator);
+    defer outstanding.deinit();
 
     var i: usize = 0;
     while (i < list.items.len) {
         const m = list.items[i];
-        // 该消息有多少孤儿 tool_result?
+        if (m.role == .assistant) {
+            outstanding.clearRetainingCapacity();
+            for (m.content) |c| switch (c) {
+                .tool_use => |tu| try outstanding.put(tu.id, {}),
+                else => {},
+            };
+            i += 1;
+            continue;
+        }
+        // 该消息里哪些 tool_result 合法?id 在本轮未决集合里的首个答复**消费**该 id;
+        // 同一 id 的第二个答复和无对应调用的答复都是孤儿(一个调用只能有一个结果)。
+        const keep_flags = try allocator.alloc(bool, m.content.len);
+        defer allocator.free(keep_flags);
         var orphan: usize = 0;
-        for (m.content) |c| switch (c) {
-            .tool_result => |tr| {
-                if (!tu_ids.contains(tr.tool_use_id)) orphan += 1;
-            },
-            else => {},
-        };
+        for (m.content, 0..) |c, k| {
+            keep_flags[k] = switch (c) {
+                .tool_result => |tr| outstanding.remove(tr.tool_use_id),
+                else => true,
+            };
+            if (!keep_flags[k]) orphan += 1;
+        }
         if (orphan == 0) {
             i += 1;
             continue;
@@ -428,12 +433,8 @@ fn stripOrphanToolResults(allocator: std.mem.Allocator, list: *std.ArrayList(typ
         }
         const new_content = try allocator.alloc(types.ApiContent, keep);
         var idx: usize = 0;
-        for (m.content) |c| {
-            const is_orphan = switch (c) {
-                .tool_result => |tr| !tu_ids.contains(tr.tool_use_id),
-                else => false,
-            };
-            if (is_orphan) continue;
+        for (m.content, 0..) |c, k| {
+            if (!keep_flags[k]) continue;
             new_content[idx] = c;
             idx += 1;
         }
@@ -444,27 +445,30 @@ fn stripOrphanToolResults(allocator: std.mem.Allocator, list: *std.ArrayList(typ
 }
 
 /// 给无对应 tool_result 的 tool_use 补一条占位结果。Anthropic/OpenAI 都要求每个 tool_use 有答复。
+/// 与剥孤儿同一口径**按轮配对**:只有紧跟在该 assistant 消息之后、下一条 assistant 之前的
+/// tool_result 才算答复;后一轮复用同一 id 的结果不算(否则新调用会因"已有同名结果"漏补桩)。
 /// 补桩策略:在含该 tool_use 的 assistant 消息**紧后**插入一条 user 消息,内含所有缺失结果的 stub。
 fn stubMissingToolResults(allocator: std.mem.Allocator, list: *std.ArrayList(types.ApiMessage)) !void {
-    // 收集所有已存在的 tool_result id。
-    var tr_ids = std.StringHashMap(void).init(allocator);
-    defer tr_ids.deinit();
-    for (list.items) |m| {
-        for (m.content) |c| switch (c) {
-            .tool_result => |tr| try tr_ids.put(tr.tool_use_id, {}),
-            else => {},
-        };
-    }
-
     var i: usize = 0;
     while (i < list.items.len) : (i += 1) {
         const m = list.items[i];
+        if (m.role != .assistant) continue;
+        // 本轮已答复的 id:下一条 assistant 消息之前的所有 tool_result。
+        var answered = std.StringHashMap(void).init(allocator);
+        defer answered.deinit();
+        var j = i + 1;
+        while (j < list.items.len and list.items[j].role != .assistant) : (j += 1) {
+            for (list.items[j].content) |c| switch (c) {
+                .tool_result => |tr| try answered.put(tr.tool_use_id, {}),
+                else => {},
+            };
+        }
         // 该 assistant 消息里有哪些 tool_use 缺结果?
         var missing = std.ArrayList([]const u8).empty;
         defer missing.deinit(allocator);
         for (m.content) |c| switch (c) {
             .tool_use => |tu| {
-                if (!tr_ids.contains(tu.id)) try missing.append(allocator, tu.id);
+                if (!answered.contains(tu.id)) try missing.append(allocator, tu.id);
             },
             else => {},
         };
@@ -476,8 +480,7 @@ fn stubMissingToolResults(allocator: std.mem.Allocator, list: *std.ArrayList(typ
         }
         try list.insert(allocator, i + 1, .{ .role = .user, .content = stub_content });
         log.debug("repair", "stubbed {d} missing tool_result(s)", .{missing.items.len});
-        // 标记已补,防重复;跳过刚插入的桩消息。
-        for (missing.items) |id| try tr_ids.put(id, {});
+        // 跳过刚插入的桩消息。
         i += 1;
     }
 }
@@ -495,18 +498,13 @@ fn hasImage(m: types.ApiMessage) bool {
     for (m.content) |c| if (c == .image) return true;
     return false;
 }
-fn hasDocument(m: types.ApiMessage) bool {
-    for (m.content) |c| if (c == .document) return true;
-    return false;
-}
 
 /// 合并相邻同角色消息:新 content = 两者拼接。就地改写(旧数组 free,新数组 owned)。
 /// **provider 安全**:OpenAI/Gemini 的序列化把含 tool_result 的消息当 wire 层 `role:"tool"`/
-/// functionResponse,且遇 tool_result 消息**早返回丢弃同消息内 text/image**。故绝不合并出
-/// "text/image/document + tool_result 混合"消息——若合并后会同时含用户可见内容
-/// (text / image / document)与 tool_result 则跳过。text+text(inject+首 user)、
-/// text+image / text+document(上下文注入+多模态 user)和 tool_result+tool_result
-/// (补桩+真结果)都安全,照合。
+/// functionResponse;同消息 text 现在会在其后补发,但一等 image 块在 tool_result 消息里
+/// 仍是显式错误。故绝不合并出"text/image + tool_result 混合"消息——若合并后会同时含
+/// 用户可见内容(text 或 image)与 tool_result 则跳过(保持 wire 形态稳定)。text+text(inject+首 user)、text+image(上下文注入+多模态 user)
+/// 和 tool_result+tool_result(补桩+真结果)都安全,照合。
 fn mergeConsecutiveRoles(allocator: std.mem.Allocator, list: *std.ArrayList(types.ApiMessage)) !void {
     var i: usize = 0;
     while (i + 1 < list.items.len) {
@@ -517,9 +515,7 @@ fn mergeConsecutiveRoles(allocator: std.mem.Allocator, list: *std.ArrayList(type
             continue;
         }
         // 合并后是否会 text/image 与 tool_result 混合?会则跳过(防序列化丢用户内容)。
-        const combined_has_text = hasText(a) or hasText(b) or
-            hasImage(a) or hasImage(b) or
-            hasDocument(a) or hasDocument(b);
+        const combined_has_text = hasText(a) or hasText(b) or hasImage(a) or hasImage(b);
         const combined_has_tr = hasToolResult(a) or hasToolResult(b);
         if (combined_has_text and combined_has_tr) {
             i += 1;
@@ -731,6 +727,68 @@ test "normalizeApiMessages: 配对齐全时不补桩不剥离(幂等)" {
 
     try normalizeApiMessages(a, &list);
     try testing.expectEqual(@as(usize, 2), list.items.len);
+}
+
+test "normalizeApiMessages: 后轮复用同一 id 不能复活早已成为孤儿的旧结果(顺序配对)" {
+    const a = testing.allocator;
+    var list = std.ArrayList(types.ApiMessage).empty;
+    defer freeList(a, &list);
+    // 旧结果 call_0 的调用轮已被压缩掉;后面一轮 OpenAI 兼容端又发了 call_0。
+    const c0 = try a.alloc(types.ApiContent, 1);
+    c0[0] = .{ .tool_result = .{ .tool_use_id = "call_0", .content = "stale" } };
+    try list.append(a, .{ .role = .user, .content = c0 });
+    const c1 = try a.alloc(types.ApiContent, 1);
+    c1[0] = .{ .tool_use = .{ .id = "call_0", .name = "Read", .input = "{}" } };
+    try list.append(a, .{ .role = .assistant, .content = c1 });
+    const c2 = try a.alloc(types.ApiContent, 1);
+    c2[0] = .{ .tool_result = .{ .tool_use_id = "call_0", .content = "fresh" } };
+    try list.append(a, .{ .role = .user, .content = c2 });
+
+    try normalizeApiMessages(a, &list);
+    // 全局 id 集合会保留 stale(排在调用之前 → provider 拒绝);顺序配对把它剥掉。
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expectEqual(types.MessageRole.assistant, list.items[0].role);
+    try testing.expectEqualStrings("fresh", list.items[1].content[0].tool_result.content);
+}
+
+test "normalizeApiMessages: 同一调用的第二个答复是孤儿(id 被首个答复消费)" {
+    const a = testing.allocator;
+    var list = std.ArrayList(types.ApiMessage).empty;
+    defer freeList(a, &list);
+    const c0 = try a.alloc(types.ApiContent, 1);
+    c0[0] = .{ .tool_use = .{ .id = "x", .name = "Read", .input = "{}" } };
+    try list.append(a, .{ .role = .assistant, .content = c0 });
+    const c1 = try a.alloc(types.ApiContent, 2);
+    c1[0] = .{ .tool_result = .{ .tool_use_id = "x", .content = "first" } };
+    c1[1] = .{ .tool_result = .{ .tool_use_id = "x", .content = "duplicate" } };
+    try list.append(a, .{ .role = .user, .content = c1 });
+
+    try normalizeApiMessages(a, &list);
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expectEqual(@as(usize, 1), list.items[1].content.len);
+    try testing.expectEqualStrings("first", list.items[1].content[0].tool_result.content);
+}
+
+test "normalizeApiMessages: 补桩按轮判定,后轮同 id 的结果不算前轮的答复" {
+    const a = testing.allocator;
+    var list = std.ArrayList(types.ApiMessage).empty;
+    defer freeList(a, &list);
+    const c0 = try a.alloc(types.ApiContent, 1);
+    c0[0] = .{ .tool_use = .{ .id = "call_0", .name = "Read", .input = "{}" } };
+    try list.append(a, .{ .role = .assistant, .content = c0 });
+    const c1 = try a.alloc(types.ApiContent, 1);
+    c1[0] = .{ .tool_use = .{ .id = "call_0", .name = "Grep", .input = "{}" } };
+    try list.append(a, .{ .role = .assistant, .content = c1 });
+    const c2 = try a.alloc(types.ApiContent, 1);
+    c2[0] = .{ .tool_result = .{ .tool_use_id = "call_0", .content = "grep result" } };
+    try list.append(a, .{ .role = .user, .content = c2 });
+
+    try normalizeApiMessages(a, &list);
+    // 第一轮的 call_0 没有答复 → 紧后补桩;第二轮的真结果原样保留。
+    try testing.expectEqual(@as(usize, 4), list.items.len);
+    try testing.expectEqual(types.MessageRole.user, list.items[1].role);
+    try testing.expectEqualStrings(MISSING_RESULT_STUB, list.items[1].content[0].tool_result.content);
+    try testing.expectEqualStrings("grep result", list.items[3].content[0].tool_result.content);
 }
 
 test "normalizeApiMessages: 连续 user 合并" {

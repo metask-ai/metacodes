@@ -773,24 +773,31 @@ def load_json(path: Path) -> Dict[str, Any]:
 
 
 def load_rollouts(path: Path) -> List[Dict[str, Any]]:
-    result = []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ValidationError(f"cannot read rollout JSONL {path}: {exc}") from exc
-    for line_no, line in enumerate(lines, 1):
+    return parse_rollouts(text, str(path))
+
+
+def parse_rollouts(text: str, where: str) -> List[Dict[str, Any]]:
+    """Validate rollout JSONL already in memory. Callers that must hash the
+    exact bytes they judged (a receipt) parse those bytes rather than read
+    the file a second time."""
+    result = []
+    for line_no, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise ValidationError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
+            raise ValidationError(f"{where}:{line_no}: invalid JSON: {exc}") from exc
         if not isinstance(value, dict):
-            raise ValidationError(f"{path}:{line_no}: expected object")
-        validate_rollout(value, f"{path}:{line_no}")
+            raise ValidationError(f"{where}:{line_no}: expected object")
+        validate_rollout(value, f"{where}:{line_no}")
         result.append(value)
     if not result:
-        raise ValidationError(f"{path}: no rollouts")
+        raise ValidationError(f"{where}: no rollouts")
     return result
 
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const types = @import("../types.zig");
 const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
@@ -393,6 +394,13 @@ pub fn imageMediaType(path: []const u8) ?[]const u8 {
         .{ .suffix = ".gif", .mt = "image/gif" },
         .{ .suffix = ".webp", .mt = "image/webp" },
     };
+    // 扩展名表只能映射到方言层接受的 MIME:否则 readImage 产出的结果会被
+    // extractImageResult 判为非图像、当文本投影,图片静默变成预览信封。
+    comptime {
+        for (table) |e| {
+            if (!types.isSupportedImageMediaType(e.mt)) @compileError("Read image extension maps to an unsupported media type: " ++ e.mt);
+        }
+    }
     for (table) |e| {
         if (endsWithIgnoreCase(path, e.suffix)) return e.mt;
     }
@@ -408,9 +416,9 @@ fn endsWithIgnoreCase(s: []const u8, suffix: []const u8) bool {
     return true;
 }
 
-/// 图像读取上限（base64 前的原始字节）。Anthropic 单图 ~5MB 限制，留余量取 3.75MB。
-/// pub:headless --image 入口沿用同一上限(单一真相)。
-pub const MAX_IMAGE_BYTES: usize = 3_750_000;
+/// 图像读取上限（base64 前的原始字节）。定义在 types.MAX_IMAGE_BYTES(单一真相):
+/// headless --image 入口、AgentCore RunInput 图像 part、tool_result 图像判定共用。
+pub const MAX_IMAGE_BYTES: usize = types.MAX_IMAGE_BYTES;
 
 /// 读图像 → base64 → 返回结构化 JSON：{"type":"image","media_type":"...","data":"<b64>"}。
 /// api/request.zig 的 serializeContent 检测到此形态会发成真正的 image content block。

@@ -154,47 +154,9 @@ pub fn main(init: std.process.Init) !void {
     const prompt = "Reply with one short sentence. You may use the Host Echo tool if useful.";
     // Optional multimodal turn: METACODES_IMAGE=<path.png|jpg|jpeg|gif|webp>
     // attaches the image beside the prompt as one ordered text+image user
-    // record, and METACODES_PDF=<path.pdf> attaches a PDF document the same
-    // way. Capability gating stays in core and the two capabilities are
-    // independent: a non-vision model fails with ImageInputUnsupported and a
-    // model without native document input fails with DocumentInputUnsupported,
-    // both before any network I/O. Setting both selects the PDF turn; this
-    // example demonstrates one attachment kind at a time.
-    const result = if (std.c.getenv("METACODES_PDF")) |pdf_env| blk: {
-        const pdf_path = std.mem.span(pdf_env);
-        const raw = std.Io.Dir.cwd().readFileAlloc(
-            init.io,
-            pdf_path,
-            allocator,
-            .limited(mc.pdf.MAX_PDF_BYTES + 1),
-        ) catch |err| {
-            std.debug.print("[example] METACODES_PDF {s}: {s}\n", .{ pdf_path, @errorName(err) });
-            return;
-        };
-        // Admission before encoding: not a PDF, encrypted, or over the byte or
-        // page limit fails here rather than being converted to something else.
-        const pages = mc.pdf.inspect(raw) catch |err| {
-            std.debug.print("[example] METACODES_PDF {s}: {s}\n", .{ pdf_path, mc.pdf.errorCode(err) });
-            return;
-        };
-        const encoder = std.base64.standard.Encoder;
-        const encoded = try allocator.alloc(u8, encoder.calcSize(raw.len));
-        _ = encoder.encode(encoded, raw);
-        break :blk session.runUserParts(
-            1,
-            &.{
-                .{ .text = prompt },
-                .{ .document = .{
-                    .media_type = mc.pdf.MEDIA_TYPE,
-                    .data = encoded,
-                    .title = std.fs.path.basename(pdf_path),
-                    .pages = pages,
-                } },
-            },
-            4,
-            .{ .ctx = &sink_context, .emit = PrintSink.emit },
-        );
-    } else if (std.c.getenv("METACODES_IMAGE")) |image_env| blk: {
+    // record. Capability gating stays in core: a non-vision model fails with
+    // ImageInputUnsupported before any network I/O.
+    const result = if (std.c.getenv("METACODES_IMAGE")) |image_env| blk: {
         const image_path = std.mem.span(image_env);
         const media_type = mc.tool_read.imageMediaType(image_path) orelse {
             std.debug.print("[example] METACODES_IMAGE: unsupported image type: {s}\n", .{image_path});

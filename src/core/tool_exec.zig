@@ -1251,9 +1251,17 @@ pub fn executeSlots(
         i = j;
     }
 
-    // Result persistence is intentionally not an execution concern. The
-    // agent loop lets PostToolUse hooks and UI consume raw results, then makes
-    // one deterministic projection immediately before Conversation append.
+    // Result persistence is intentionally not an execution concern. The agent
+    // loop lets PostToolUse hooks and UI consume the executed result, then
+    // makes one deterministic projection immediately before Conversation
+    // append.
+    //
+    // "The executed result" is not always raw bytes, and saying "raw" here was
+    // misleading: a byte-zero tool whose capture exceeds the per-result budget
+    // publishes at the tool layer, so what hooks observe is that tool's own
+    // bounded envelope with its streaming preview - projection later regrows
+    // the preview to the budget. Inline results and structured errors reach
+    // hooks verbatim; artifact-backed ones do not.
 }
 
 fn observeSuccessfulExecutions(slots: []const Slot, base_ctx: *const ToolContext) void {

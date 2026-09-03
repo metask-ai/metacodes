@@ -68,7 +68,7 @@ metacodes-core 是一个**无 UI、无 CLI** 的 LLM 编码-agent 引擎。它�
 | 模块 | 职责 | 关键导出 |
 |------|------|----------|
 | `agent_loop` | 一个 agent 回合的完整循环:流式请求→收 tool_use→执行→回灌→再循环 | `run()`, `Options`, `RunResult`, `StopReason`, `UsageSink`, `ProgressReporter` |
-| `conversation` / `message` | 对话状态(messages → blocks);压缩/microcompact | `Conversation`, `Message`, `Block`(text/tool_use/tool_result/thinking/image/document/reasoning_item) |
+| `conversation` / `message` | 对话状态(messages → blocks);压缩/microcompact | `Conversation`, `Message`, `Block`(text/tool_use/tool_result/thinking/image/reasoning_item) |
 | `subagent` | 父 agent spawn 子 agent(隔离 Conversation + TaskStore) | `spawnAgent`, `spawnAgentSink`, `SpawnOptions`, `SubagentResult` |
 | `tool_exec` | 工具批量执行(按并发安全分批;每 job 独立 arena + per-worker 值拷贝 ctx) | `executeSlots`, `Slot` |
 | `tools` | 工具注册表 + dispatch(静态 + 动态 Skill/MCP) | `dispatch`, `registry`, `isConcurrencySafe(Input)` |
@@ -293,6 +293,106 @@ emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工
 tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)/ 达 max_turns / abort /
 挂起(`suspended`,见 §5)。`tool_loop` 枚举值保留为 ABI 兼容(无生产者,对齐 codex 无主动熔断)。
 
+### 4.1 工具结果如何进入上下文
+
+本节先给心智模型和数字,后面的段落是每条决定背后的缺陷史。**读顺序:先这里,再往下。**
+
+**从来不是摘要。** 结果级路径全程确定性,不调模型、同输入同字节。会调模型做摘要的只有
+**对话级** auto-compact(付费的 summary 压缩),那是整段历史的事,与单条结果无关。模型能
+看到的结果有四态:
+
+| 形态 | 何时 | 内容 | 可恢复 |
+|---|---|---|---|
+| **原文** | 结果 ≤ 本轮**水位线** | 逐字节原样 | — |
+| **artifact 信封** | 超水位线,且发布成功 | head + tail 摘录 + `artifact_id` + sha256 + 读取指令 | ✅ `ReadArtifact` / `Grep(artifact_id)` |
+| **fallback 信封** | 超水位线,但**发布失败**(会话配额满、存储错误),且捕获完整并 ≤ `PER_RESULT_MAX_BYTES` | head + tail + `storage_error` 如实命名原因,无 `artifact_id` | ❌,但说得出为什么 |
+| **清空桩** | 仅压缩期,且**该结果没有 artifact** | `[tool result cleared to save context]` + 承诺行(`original_bytes` + sha256) | ❌ |
+
+fallback 那一行的限定条件不是修辞:发布失败后要渲染 head/tail 就得把字节拿回内存,
+所以只有完整且 ≤ `PER_RESULT_MAX_BYTES`(64KB)的捕获退得回来。更大的捕获、不完整的
+捕获、以及 OOM,发布失败时仍然上抛成工具错误——那也正是阈值改动之前的行为。
+
+水位线在无 turn 压力时**就是** per-result 预算;兄弟结果多到装不下 `per_turn` 时它会被二分
+压低,那时 ≤ per-result 的结果**也会**被溢出(见下方水位线一节与 T2)。所以判据是水位线,
+不是 per-result——这里最早写成后者,而本仓自己的 T2 就是反例。
+
+信封的实际形状(`renderArtifactEnvelope`):
+
+```json
+{"schema_version":"metacodes.tool-result-projection.v1","projection":"artifact",
+ "artifact_id":"sha256:…","media_type":"text/plain; charset=utf-8",
+ "original_bytes":412903,"sha256":"…","capture_complete":true,"recoverable":true,
+ "preview_encoding":"utf-8","preview_head":"…","preview_tail":"…",
+ "preview_head_bytes":12000,"preview_tail_bytes":12000,"omitted_bytes":388903,
+ "read":{"tool":"ReadArtifact","offset":0,"limit_max":32768}}
+```
+
+头尾都留,不是只留头:日志类输出的信息通常同时在头部(跑了什么)和尾部(怎么失败的)。
+读取指令**内联在信封里**,不指望模型记得工具目录里有 `ReadArtifact`——这一条直接对应
+issue #29 的行为(不知道能取回,就改命令重跑)。
+
+**预算在字节存在之前就生效。** `ToolEntry.result_production` 把生产方式分三类,其中
+`byte_zero_spool`(Glob/Grep/CodeMap/FindSymbol/Bash/两个 MCP 读取/WebFetch)在第一个字节前
+就重定向到内核 Spool,**全量内容从不进内核内存**。所以这不是"先拿到 40MB 再截断"。
+
+**artifact 有两个产生点,但只有一个阈值。** 工具层(`result_spool.finishCaptureAsBody`)在捕获
+完成时决定"这些字节要不要进内存":完整且 ≤ `per_result_bytes` 的抬回 inline,否则直接发布进
+CAS;projection 层在本轮结果就绪后决定"模型该看到多少"。两层分开是信息时序决定的——工具不知道
+兄弟结果,projection 不能把已进内存的字节反物化——但**判定用同一个数**:工具层按值接收
+`ctx.result_budget`,只读 `per_result_bytes`(`result_spool.zig` 内的守卫测试禁止它碰
+`per_turn` 等不属于它的字段,并断言六个调用方逐字传 `ctx.result_budget`)。此前工具层用的是
+常量 64KB(`PER_RESULT_MAX_BYTES` 抄了一遍),在 window < 524,288 的每个模型上留下
+`[per_result, 64KB]` 死区:落入其中的结果先被抬进内存,再被 projection 写回 CAS,同一份字节搬
+两次。统一后无 turn 压力时两层严格一致;有压力时(兄弟结果压低水位线)工具层正确内联的结果仍会
+被 projection 溢出——这不可避免且有界(≤ per_result),`tests/component/inline_threshold_test.zig`
+的 T2 验证这类二次转存零丢失、小结果零牵连、压完恰在预算内。
+
+**两个预算,都是 context window 的纯函数**(`result_budget.perResultBytes`/`perTurnBytes`):
+
+```
+per_result = clamp(window / 8,     8KB, 64KB)     单条结果
+per_turn   = clamp(window * 6 / 5, 16KB, 200KB)   本轮所有结果合计
+```
+
+`6/5` = 4 字节/token × 分给工具结果的 30%。落到实际:
+
+| window | per_result | per_turn |
+|---|---|---|
+| 未知(0) | 8,192 | 16,384 |
+| 128K | 16,000 | 153,600 |
+| 200K | 25,000 | 204,800 |
+| 1M | 65,536(封顶) | 204,800(封顶) |
+
+**一轮的处理顺序**(`result_projection.project`,每轮一次,只作用于本轮新结果):
+
+1. **regrow** — 在更小预算下落成的信封,若现在额度够就读回 artifact 重新内联/扩大 preview。
+   这是唯一会把结果**变大**的一步,所以先按整轮定价(`regrowCeiling`)再执行。
+2. **定 plan** — 标记豁免:图片(按 token 计价,不按字节)、错误、已是信封的、`ReadArtifact`
+   (它自己再溢出就递归了)。
+3. **水位线** — 二分搜出"全轮能装进 `per_turn` 的最大单条上限"。低于水位线的一个字节不动,
+   只削高于它的;**不是逐出最大的那条**。
+4. **溢出** — 全量写进 session CAS,换成信封。`Allowance.cost` 里的 `@min(len, spillCost)` 让
+   "用 ~640 字节脚手架的信封换掉一条 700 字节结果"这种既丢内容又撑大请求的负和交易不可表示。
+
+**历史走另一条路。** projection 只在提交那一刻生效,**从不重投历史**——重写历史字节会让
+provider 的 prompt cache 前缀失效。因此 `/resume` 载入的旧记录、或中途换成小 window 模型,
+只由 `Conversation.truncateLargeToolResults` 这一趟兜底(详见下方"压力阀不得毁掉唯一的恢复能力")。
+
+**provider 只提供一个数字,而这个数字并不可靠。** 整条链路从 provider 拿的就是
+`maxInputTokens`,其余全是它的纯函数。但它有三个来源:`/v1/models` catalog 的
+`max_input_tokens`;各 client 的硬编码默认(OpenAI 128K、Gemini 1M——各持**一个**常量,
+不区分 model,所以这两家的 per-model 解析实际退化成 client 默认);都拿不到就是 0。
+`catalog.nonZero` 把 0 当**未知**而不是"窗口为零"(Anthropic 官方 `/v1/models` 常把
+`max_input_tokens` 返成占位 0),于是退到地板值 8KB/16KB,而不是把所有预算塌成 0。
+subagent 与父共享 Provider、只差 `model_override`,故必须走 `maxInputTokensFor` ——
+见下方"预算按真正会被请求的模型解析"。
+
+**为什么这块牵扯面宽**,一句话版:决定"一条结果值多少字节"要同时满足互不相干的五个约束——
+prompt cache 不许改历史(所以历史必须另开一趟)、图片按 token 计价而文本按字节(所以字节
+记账里必须挖掉图片)、JSON 转义/base64 让"字节"有两种含义(所以有 `Source`/`Encoded` 两个
+单位)、subagent 与父同 Provider 不同 window(所以窗口必须按 override 解析)、以及最后一环
+在模型自己身上(它不知道能恢复就会重跑,而这一环 code review 看不出来,只能靠轨迹审计量)。
+
 **大结果提交协议**:工具统一返回 `ToolResultBody`。旧工具经 `legacy_inline` adapter 仍先产生
 完整 bytes；byte-zero 原生工具和 process plugin 则在产生第一字节前取得 kernel Spool，最终直接
 返回 artifact receipt。`executeSlots`、PostToolUse hook 和 backend 观察该类型的确定性模型投影：
@@ -302,6 +402,22 @@ envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 S
 模型只看到稳定 SHA-256、head/tail 预览和 `ReadArtifact(offset,limit)` 指令。最后的通用字节截断
 仅是失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新
 投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
+图像形态结果（`Read` 读图返回的 `{"type":"image",...}`，`result_projection.isImageResult`）豁免两轮投影：
+vision 路由的方言原生消费它（image block / data URL / inlineData），非 vision 路由收到有界占位文本，
+信封只会把图片变成 base64 预览文本；轮预算按 `IMAGE_RESULT_BUDGET_BYTES`（= `IMAGE_TOKEN_ESTIMATE` × 4
+字节/token）计入，`Stats.projected_bytes` 仍是真实字节数。microcompact 对**未送达**的图片同样豁免：
+送达是 `Message.delivered` 显式水位，只由 agent_loop 在 provider 接受请求并返回流句柄后 `markDelivered` 推进
+（被 HTTP 错误拒绝的请求不算送达；不支持图像输入的模型只收到占位文本，这样的请求不算送达含图消息——
+这个判断由序列化器定案并随 `StreamHandle.image_placeholder_ids`（走占位的 tool_use_id 列表，null = 未知按全占位处理）
+回传、按 `ToolResult.delivered` 逐块记录并随 transcript 持久化，不在 agent_loop 重算；压缩边界之后
+和被规范化器剥掉的孤儿图片则一律标记送达，因为没有后续请求能再携带它们），
+本地追加的 assistant 消息（如 AgentCore 预算终止标记）不算送达，
+transcript resume 恢复持久化的水位（没有该字段的旧记录一律未送达、下一次被接受的请求后自愈）；compact 预览提交时把 live 的水位按索引合并进
+替换集（仅 CAS 路径），在途的送达不会被过期预览覆盖。
+这避免 Read(image) 带并行兄弟时在 provider 看到之前就被 recent-N 阀清掉；已送达的图片照常清，阀对图片密集的
+历史仍有效（未送达的文本沿用历史行为——按数量保留，这是既有的通用问题，不在图像契约内）。图片永不被 `truncateLargeToolResults` 截断。AgentCore 的
+`ToolEnvironment` 不 `promoteInline` 图片，payload cap 按视觉估算记，耐久预算按实际字节记，且
+`settleSuccess` 把仍存活的兄弟预留计入硬预算，结算不能吃掉并行工具已预留的空间。
 
 **读代码给存在性,审计轨迹给频率**:`scripts/audit_trajectories.py` 扫已落盘的
 `transcript.jsonl`,报告各工具的结果大小分布、超预算条数、溢出后**有没有人来取**、以及
@@ -429,7 +545,7 @@ connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt
 --headless-result <result.ndjson> --time-file <time.txt>` 导出；报告只含尺寸、hash、usage、
 恢复/前缀判定和时延，原始 cassette、artifact 与模型文本必须留在隔离本地目录。
 
-### 4.1 Options(全可选,`.{}` 即最简跑)
+### 4.2 Options(全可选,`.{}` 即最简跑)
 
 字段较多,分四类——理解分类比记字段重要:
 
@@ -443,10 +559,10 @@ connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt
   `mcp_sessions` `output_ledger`(§3.2.1) `file_change_journal`(§3.2.2) …
 - **SESSION/身份**:`session: SessionId` `session_id` `project_dir` `cwd_abs` `home_dir`
   `parent_model` `plan_file_path` `artifact_root` …
-- **接口回调/观察(类型安全,见 §4.2)**:`ui_requester` `host_services` `tool_observer`
+- **接口回调/观察(类型安全,见 §4.3)**:`ui_requester` `host_services` `tool_observer`
   `spawn_tick_fn`；usage/progress 由 `CoreEvent`/`EventSink` 投影，不再注入私有 sink。
 
-### 4.2 接口/事件结构(宿主接 core 的类型安全面)
+### 4.3 接口/事件结构(宿主接 core 的类型安全面)
 
 回调接口统一把 context 与函数指针收进类型安全的 value；usage/progress 则走
 `CoreEvent`，不是已经移除的私有 `UsageSink`/`ProgressReporter` 回调:

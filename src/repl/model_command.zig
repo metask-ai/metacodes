@@ -108,7 +108,6 @@ pub fn capabilityLabel(cap: Capability) []const u8 {
         .structured_output => "structured_output",
         .reasoning_content => "reasoning_content",
         .image_input => "image_input",
-        .pdf_input => "pdf_input",
     };
 }
 

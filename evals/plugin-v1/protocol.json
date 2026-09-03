@@ -11,7 +11,9 @@
     "plugin_id": "metacodes.benchmark-coding",
     "plugin_version": "1.2.0",
     "form": "data_package",
-    "capabilities": ["skill_bundle"],
+    "capabilities": [
+      "skill_bundle"
+    ],
     "root": "evals/plugin-v1/coding-plugin",
     "files": {
       "evals/plugin-v1/coding-plugin/.metacodes-plugin/plugin.json": "e91ccc4446c4796a10509dda49af4a6357cb41aa03a3b391e697678e789147e1",
@@ -52,7 +54,11 @@
     "runner": "scripts.eval.paired_runner",
     "suite": "evals/plugin-v1/coding-suite.json",
     "suite_sha256": "936e3e97241239df2ae9034610065cadac8e9ea090bfc35df72eb5eba033c03d",
-    "task_ids": ["00_smoke", "02_html_game", "04_modify_feature"],
+    "task_ids": [
+      "00_smoke",
+      "02_html_game",
+      "04_modify_feature"
+    ],
     "scenario_sha256": {
       "00_smoke": "a5fac2330fa47cf7190423316414b7bb877cc5e687d65f6b4af9137d94b669d7",
       "02_html_game": "48e8610148ae1d3b85e0566eb528b5374b993b43175b962a7503b08e984a0c07",
@@ -63,10 +69,13 @@
     "treatment_executable": "scripts/eval/fixtures/plugin_candidate.py",
     "treatment_executable_sha256": "1a80f4f240e80df798521cb4cacd9a59d12d494cbee06468412b4fe751f28a61",
     "single_factor": "one namespaced Skill data package",
-    "implementation_fingerprint": "45f629d914949aaa9480afae93ad7f1c7ff091d76df0192f0af93edd18451c17",
+    "implementation_fingerprint": "e3ec6fa2b471859eab519176b5f8a0186594a0a6c771224120758e8a5304a857",
     "runtime_binary_sha256": "fd330c2e4c4120a129fb8148091011f014d29d2c496f4a24ffdd8232c5cce054",
     "evaluation_contract_version": 4,
-    "model": {"provider": "anthropic", "id": "glm-5.2"},
+    "model": {
+      "provider": "anthropic",
+      "id": "glm-5.2"
+    },
     "max_output_tokens": 8192,
     "request_input_reserve": {
       "strategy": "max_double_estimate_or_ceil_bytes_div_2_plus_framing",
@@ -113,23 +122,25 @@
     "interpretation": "The 18 paired observations are a development gate. They may reject the plugin candidate but cannot establish a general coding-benchmark advantage or a public leaderboard claim. Promotion still requires the repository release contract and then an external WorkBuddy development cohort."
   },
   "pinned_evaluator_files": {
-    "scripts/eval/paired_runner.py": "6ddaf9f5ea6c34cf75537c5282bab7a85c759676f7c6273200c5074ab7970f59",
+    "scripts/eval/paired_runner.py": "7ec4fbee25c38983b0c7472d0dd978f53e2ac73724c9571b690179fc266d37d9",
     "scripts/eval/analysis.py": "4d93d9fc83a38804dd41e587178fff299cff911b584d9a46dad021c9e9a08516",
     "scripts/eval/e2e_adapter.py": "3ec295e1fd2eef3b1ccf6b0397cd1b3282e92fc9e59ddbbc405af05fb6291dad",
-    "scripts/eval/model.py": "0890e0b5d2366dfd9cdf60f116bf6492bbe0858e3922da1c6242a2eb61771551",
+    "scripts/eval/model.py": "ed3b2ae7aefe693d34229cbd0bf5c2faeb2f09f9fc116a886d5ec5228c3e2934",
     "scripts/eval/statistics.py": "9a3a3dd7784fc1b365e90c6af36743f28cee4ffe39b241f7656e3584949b893e",
     "scripts/eval/experiment.py": "015a2365d5dc8ee3b3663bbda62e709ac0ff325200afaa6a5e055503b6568b4b",
-    "scripts/eval/memory_budget_journal.py": "204182826ac4c389fcfeecba9eb745753e8da31d5105a871ae7245fc13bc22f3",
+    "scripts/eval/memory_budget_journal.py": "beed4ba09e609bcd9f973560ab7614a8c102548f2f98c1f96ea36048707faa88",
     "scripts/eval/memory_agent_runtime_pilot.py": "89eca2ab84dbd625415229b338fe68b8aaea3c4da4141cf2084f5f5bb753c04b",
     "scripts/eval/promotion.py": "65f566244d3880b367a0c9adee858b2160ed63d5b1644ea38202e79a34fb79f3",
     "scripts/eval/treatment_activation.py": "28b976feaf8caab1d03a42d58794b067b9ca892de248e72a2f4ab22eebe769b0",
     "scripts/eval/cli.py": "5646573271b8280dc3ad644ee477c22daa3059f36445686235d166c3e87afb0b",
-    "scripts/eval/plugin_release_gate.py": "729b9755ee52234c676f4cb36619181c9cf1be7eedf0f1a723a75db2f9fb3585",
-    "scripts/eval/plugin_pair_runner.py": "08713fcdc417e7bf81315c6024c3d911192adc407d08c8259dc1f3a4d6ac709b",
-    "scripts/eval/plugin_pair_analysis.py": "7aa81f79d843f52b8de96a1f33f533a18f699bd6205255356187604f604126ff",
+    "scripts/eval/plugin_release_gate.py": "8d2422f05664d4c7c22f8bfbe48eaf341c79ac45158999a3c29f6d85cd6086f4",
+    "scripts/eval/plugin_pair_runner.py": "e1d7aaa6518a48e0137ef83edf308161bb8ae35b9003d403b5100ac18d22e329",
+    "scripts/eval/plugin_pair_analysis.py": "2577c35d64ba2105b4b6060b0e6975ec838a19a099377b6c0da6a6c1e718c885",
     "tests/e2e/run_e2e.sh": "38b21bdc939682e870846cc57731c90b2a114aec285b8df6d8019ba7a59314f3",
     "tests/e2e/lib.sh": "6d7de5cd8fe0e70929b32ea82364a12d16787e690687ab098d6eb8a52383c43a",
-    "evals/gates/default.json": "542ea99c4576cf585bccdd9470a87482b9f308de69cb4f197be7434d466a2faa"
+    "evals/gates/default.json": "542ea99c4576cf585bccdd9470a87482b9f308de69cb4f197be7434d466a2faa",
+    "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean": "9e2c42b1a1d99912f9cf96fb54c83ddcaace2e1f6e2511721d42768a32c739d8",
+    "control-plane/lean/MetaCodesControl/ObligationGate.lean": "c07307865b182cdebc73c72ed007bb6ae0514833b1247b86fcccb770503e426c"
   },
   "implementation_paths": [
     "build.zig",
@@ -223,6 +234,8 @@
     "src/web/session.zig",
     "src/repl/tui/widget/tool_card.zig",
     "sdk/metask/agentcore.h",
+    "sdk/zig/protocol.zig",
+    "sdk/zig/build.zig",
     "sdk/zig/root.zig",
     "sdk/zig/types.zig",
     "sdk/rust/build.rs",
@@ -256,8 +269,6 @@
     "tests/integration/skills_e2e_test.zig",
     "tests/agentcore_artifact_consumer/consumer.c",
     "tests/agentcore_artifact_consumer/main.zig",
-    "tests/agentcore_artifact_consumer/manifest_contract.zig",
-    "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean",
-    "control-plane/lean/MetaCodesControl/ObligationGate.lean"
+    "tests/agentcore_artifact_consumer/manifest_contract.zig"
   ]
 }

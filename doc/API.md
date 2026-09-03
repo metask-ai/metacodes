@@ -155,7 +155,57 @@ keeps `--image`.
 Tool results can also carry an image: the `Read` tool returns
 `{"type":"image","media_type":...,"data":...}` for image files, and every
 protocol family now serializes that form natively instead of passing the raw
-base64 JSON through as tool-result text. Anthropic keeps the base64 `image`
+base64 JSON through as tool-result text. Only the canonical shape counts as
+an image (`dialect.extractImageResult`): one JSON object with exactly those
+three keys in any order, `type` equal to `image`, a media type from
+`types.SUPPORTED_IMAGE_MEDIA_TYPES` (`image/png`, `image/jpeg`, `image/gif`,
+`image/webp`), standard base64 of at most `types.MAX_IMAGE_BYTES` of payload,
+and only whitespace after the closing brace. Standard JSON whitespace between
+tokens does not matter; extra, duplicate or missing keys, JSON escapes (so a
+serializer that writes `image\/png` does not produce an image), or more than
+`types.MAX_IMAGE_RESULT_BYTES` of raw content do.
+Anything else is ordinary text and is bounded by the tool-result projection
+like any other result. A canonical image result is exempt from that
+projection, from microcompact clearing while it has not yet been delivered
+to the provider (delivery is an explicit per-tool_result watermark, persisted in the
+transcript, set by the agent loop once the provider has accepted a request
+for streaming, i.e. a
+stream handle was returned; a request the provider rejects with an HTTP
+error does not deliver, a locally appended assistant message is not
+delivery, a resumed transcript restores the persisted flags (records written
+before this field restore as undelivered until the next accepted request), and a request through a model without image input, which only
+carries the placeholder, does not deliver messages holding an image result —
+that decision is the serializer's own, carried back on the accepted stream
+handle as the tool_use ids whose picture went out as a placeholder
+(`StreamHandle.image_placeholder_ids`; `null` = unknown, treated as all
+placeholders) rather than re-derived, so it always matches the bytes sent
+and a parallel turn's natively-sent siblings are not pinned by one
+placeholder (the flag lives on each tool_result block); messages behind the compact boundary and
+orphan image results the normalizer strips are delivered regardless, since no
+later request can carry them), from `truncateLargeToolResults`, and from the AgentCore
+artifact promotion above the operation's cap (`tool_result_cap_bytes` for
+built-in and host tools, `mcp_result_cap_bytes` for external tools), so the
+picture itself reaches the provider. Two different units apply: context estimation charges one image at
+`types.IMAGE_TOKEN_ESTIMATE` (1,600 tokens); the projection turn budget and
+the AgentCore payload cap charge it at `IMAGE_RESULT_BUDGET_BYTES` (6,400
+budget bytes, four bytes per token). The AgentCore durable budget is charged
+the real bytes. Because images bypass the byte budgets, the bytes they put
+on the wire are capped separately at `types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST`
+(16 MiB, under every wired provider's inline-image request limit): the
+projection spills the largest images of the current turn beyond the cap into
+artifact envelopes, and before each request the agent loop stubs the oldest
+already-delivered image results until the active history fits
+(`agent_loop.Options.image_request_bytes_cap`, also applied as the
+projection's per-turn image cap). The total counts first-class user images
+too (they are never cleared but consume the allowance) and a fresh tool turn
+is projected against what the cap leaves after such non-trimmable images.
+Only results whose persisted watermark says the picture was received
+natively are ever trimmed; when the non-trimmable remainder still exceeds
+the cap the agent loop logs it explicitly and lets the provider decide. On Gemini 3, `image/gif`
+results travel as a sibling `inline_data` part rather than inside the
+multimodal function response, whose `inlineData` accepts only PNG, JPEG and
+WebP. A profile whose cap for that operation kind is below 6,400
+rejects images of that kind with `checkpoint_payload_resource_limit`. Anthropic keeps the base64 `image`
 source block inside the `tool_result` content array (byte-identical to
 before). OpenAI chat/completions sends a short pointer as the tool message
 (tool message content officially accepts only text) and attaches the image in
@@ -263,52 +313,6 @@ will actually name, not the Provider's own. A subagent shares its parent's
 Provider and differs from it only by `model_override`, so sizing a child's
 results — or its auto-compact thresholds — against the parent's window is how a
 200K parent hands a 32K child a history that endpoint rejects.
-
-### PDF document input
-
-A user message can also carry a PDF as first-class content. Core represents it
-as `Block.document {media_type, data, title, pages}`: `data` is the base64
-payload, `media_type` is `application/pdf` (the only admitted type today),
-`title` is a stable host-supplied identity such as a file name — never a local
-path, which would both leak the environment and break the provider cache
-prefix — and `pages` is the counted page total, or null when the page tree
-lives in a compressed object stream and is not determinable without a full
-parser. It is never a guess.
-
-Documents are modelled separately from images because the capability is
-separate. `ModelProfile.supports_pdf_input` (queryable as
-`Capability.pdf_input`) is its own truth: `supports_image_input` being true
-never implies it. The first slice supports exactly one native path — Anthropic
-Claude 3.5 and later, which emit a base64 `document` source block. Every other
-provider/model fails the request with `error.DocumentInputUnsupported` before
-any network I/O. A document is never silently replaced by extracted text, OCR,
-a summary, or page images; any future conversion path has to be explicit about
-its representation and information loss.
-
-Admission runs before encoding and before any provider dispatch
-(`core/pdf.zig`): a payload that is not really a PDF fails with
-`InvalidPdfDocument`, a password-protected one with `EncryptedPdfUnsupported`,
-one over 12 MB raw with `PdfTooLarge`, and one over 100 countable pages with
-`PdfTooManyPages`. Token accounting charges a document by its page count
-(`pdf.estimateTokens`), not by its base64 length, so one attachment cannot
-push a turn past the auto-compaction threshold on byte size alone.
-
-Document blocks round-trip through the JSONL transcript and the AgentCore
-checkpoint (block tag 7), so a restored session resends the original bytes,
-title, and page count with no dependence on the host file still existing or
-being unchanged.
-
-Embedders reach the capability the same three ways as images: source-level
-hosts build `message.UserContentPart{ .document = ... }` slices;
-AgentCore binary consumers submit `RUN_INPUT_PART_DOCUMENT` inside a
-`RUN_INPUT_MULTIMODAL` parts array (ABI revision 16, capability preflight
-status 29); the headless CLI takes `--pdf <path>` (repeatable, order kept).
-The headless block order is prompt text, then each `--image` in command-line
-order, then each `--pdf` in command-line order.
-
-The `Read` tool does **not** read PDFs. It has no extraction or page-rendering
-path and no `pages` parameter, and its description now says so; native PDF
-*input* does not imply local PDF *reading*.
 
 ### Provider reasoning continuity (OpenAI Responses)
 

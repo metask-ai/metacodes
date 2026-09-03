@@ -135,12 +135,12 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
 }
 
 /// Provider 中立的 canonical 请求投影(预算记账/journal 身份/token 估算用)。
-/// 不是真实 provider 请求:图像/文档能力门属于真实发送路径(与 AgentCore 预检),
+/// 不是真实 provider 请求:图像能力门属于真实发送路径(与 AgentCore 预检),
 /// 投影必须对任意 Session model 可计算——否则非 claude 命名的 vision 模型
 /// (如 gpt-*/gemini-*)带图时,记账序列化自己先报 ImageInputUnsupported,
-/// 真实请求反而从未发出。故此处强制放行 image 与 pdf 位,始终按 Anthropic 的
-/// base64 image / document block 形态计字节;text-only 请求字节与
-/// serializeMessagesRequest 完全一致。
+/// 真实请求反而从未发出。故此处强制放行 image 位,始终按 Anthropic base64
+/// image source block 形态计字节;text-only 请求字节与 serializeMessagesRequest
+/// 完全一致。
 pub fn serializeCanonicalRequestProjection(req: MessagesRequest, allocator: std.mem.Allocator) ![]u8 {
     var dialect = dialect_mod.dialectFor(.anthropic, req.model);
     dialect.profileFn = canonicalProjectionProfile;
@@ -154,17 +154,53 @@ fn canonicalProjectionProfile(
 ) @import("dialect.zig").ModelProfile {
     var profile = @import("model_adapter.zig").profileFor(kind, model);
     profile.supports_image_input = true;
-    profile.supports_pdf_input = true;
     return profile;
 }
 
 /// Runtime-scoped variant. The selected Dialect is pinned by the Session's
 /// immutable plugin Snapshot; plugin metadata/generation never enters the
 /// serialized request, preserving provider prefix-cache identity.
+/// 序列化器对图像 tool_result 的**实际**决定:每命中一个规范图像结果 `image_results += 1`;
+/// 走占位分支(方言/profile 不发原生图像块)`image_placeholders += 1` 并记下其 tool_use_id。
+/// 客户端据此填 StreamHandle.image_placeholder_ids——送达水位只认序列化器自己的报告,绝不事后重算能力
+/// (插件方言可以在 profile 声称支持时仍拒绝发图,默认 Dialect 就是这样 fail-closed)。
+pub const SerializationReport = struct {
+    image_results: usize = 0,
+    image_placeholders: usize = 0,
+    /// 走占位分支的每个图像结果的 tool_use_id(借用请求消息里的字节)。客户端把它交给
+    /// 流句柄,送达水位据此只保护**模型没看到图**的那些消息——插件方言可能按 MIME 一部分
+    /// 发原生块、一部分占位,单个布尔表达不了。
+    placeholder_ids: std.ArrayList([]const u8) = .empty,
+
+    pub fn deinit(self: *SerializationReport, allocator: std.mem.Allocator) void {
+        self.placeholder_ids.deinit(allocator);
+    }
+
+    pub fn notePlaceholder(self: *SerializationReport, allocator: std.mem.Allocator, tool_use_id: []const u8) !void {
+        self.image_placeholders += 1;
+        try self.placeholder_ids.append(allocator, tool_use_id);
+    }
+
+    pub fn imagesNative(self: SerializationReport) bool {
+        return self.image_placeholders == 0;
+    }
+};
+
 pub fn serializeMessagesRequestWithDialect(
     req: MessagesRequest,
     allocator: std.mem.Allocator,
     dialect: @import("dialect.zig").Dialect,
+) ![]u8 {
+    var scratch = SerializationReport{};
+    defer scratch.deinit(allocator);
+    return serializeMessagesRequestWithDialectReport(req, allocator, dialect, &scratch);
+}
+
+pub fn serializeMessagesRequestWithDialectReport(
+    req: MessagesRequest,
+    allocator: std.mem.Allocator,
+    dialect: @import("dialect.zig").Dialect,
+    report: *SerializationReport,
 ) ![]u8 {
     var result: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
     errdefer result.deinit(allocator);
@@ -180,7 +216,7 @@ pub fn serializeMessagesRequestWithDialect(
     const profile = dialect.profileFor(.anthropic, req.model);
 
     try result.appendSlice(allocator, ",\"messages\":");
-    try serializeMessages(req.messages, &result, allocator, dialect, profile);
+    try serializeMessages(req.messages, &result, allocator, dialect, profile, report);
 
     const visible_capabilities = @import("dialect.zig").visibleCapabilities(req.tools);
     var system_buf: std.ArrayList(u8) = .empty;
@@ -259,6 +295,7 @@ fn serializeMessages(
     allocator: std.mem.Allocator,
     dialect: @import("dialect.zig").Dialect,
     profile: @import("model_adapter.zig").ModelProfile,
+    report: *SerializationReport,
 ) !void {
     try buf.append(allocator, '[');
     for (messages, 0..) |msg, i| {
@@ -270,7 +307,7 @@ fn serializeMessages(
             .assistant => "assistant",
         }, buf, allocator);
         try buf.appendSlice(allocator, ",\"content\":");
-        try serializeContent(msg.content, buf, allocator, dialect, profile);
+        try serializeContent(msg.content, buf, allocator, dialect, profile, report);
         try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
@@ -282,6 +319,7 @@ fn serializeContent(
     allocator: std.mem.Allocator,
     dialect: @import("dialect.zig").Dialect,
     profile: @import("model_adapter.zig").ModelProfile,
+    report: *SerializationReport,
 ) !void {
     try buf.append(allocator, '[');
     // `first` 而非下标控制逗号:`.reasoning_item` 在本方言里整块跳过(OpenAI
@@ -331,6 +369,7 @@ fn serializeContent(
                 // 非 vision(如经 Anthropic 网关的 GLM 文本模型,方言返 false)发短
                 // 占位文本——绝不把 MB 级 base64(文本或 block 形态)塞给无法看图的模型。
                 if (dialect_mod.extractImageResult(tr.content)) |img| image: {
+                    report.image_results += 1;
                     const mark = buf.items.len;
                     try buf.append(allocator, '[');
                     if (try dialect.serializeImagePart(profile, img, buf, allocator)) {
@@ -338,6 +377,7 @@ fn serializeContent(
                         break :image;
                     }
                     buf.shrinkRetainingCapacity(mark);
+                    try report.notePlaceholder(allocator, tr.tool_use_id);
                     var placeholder: std.ArrayList(u8) = .empty;
                     defer placeholder.deinit(allocator);
                     try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &placeholder, allocator);
@@ -356,14 +396,6 @@ fn serializeContent(
                 // 绝不静默丢图或降级为文本。
                 const emitted = try dialect.serializeImagePart(profile, img, buf, allocator);
                 if (!emitted) return error.ImageInputUnsupported;
-            },
-            .document => |doc| {
-                // 一等文档内容(issue #25):同图像的 fail-closed 契约,但**能力独立**
-                // (supports_pdf_input,不看 supports_image_input)。方言返 false =
-                // 该 (provider, model) 无原生文档输入 → 显式能力错误,绝不静默丢弃、
-                // OCR、抽文本或降级成页面图。
-                const emitted = try dialect.serializeDocumentPart(profile, doc, buf, allocator);
-                if (!emitted) return error.DocumentInputUnsupported;
             },
         }
     }
@@ -1124,26 +1156,30 @@ test "canonical 投影:非 claude 命名的 vision 模型带图可计量,text-on
     const canonical = try serializeCanonicalRequestProjection(.{ .model = "gpt-5.2", .messages = &text_messages }, a);
     defer a.free(canonical);
     try std.testing.expectEqualStrings(plain, canonical);
+}
 
-    // 文档同理(issue #25):真实路径按 supports_pdf_input 守门,记账投影必须
-    // 对任意模型可计算,否则带 PDF 的 Run 会在预算记账里先报能力错误。
-    const document_messages = [_]types.ApiMessage{
-        .{ .role = .user, .content = &[_]types.ApiContent{
-            .{ .document = .{ .media_type = "application/pdf", .data = "JVBE", .title = "r.pdf" } },
-        } },
-    };
-    try std.testing.expectError(
-        error.DocumentInputUnsupported,
-        serializeMessagesRequest(.{ .model = "gpt-5.2", .messages = &document_messages }, a),
-    );
-    const document_projection = try serializeCanonicalRequestProjection(
-        .{ .model = "gpt-5.2", .messages = &document_messages },
-        a,
-    );
-    defer a.free(document_projection);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        document_projection,
-        "{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"JVBE\"},\"title\":\"r.pdf\"}",
-    ) != null);
+test "SerializationReport: fail-closed 方言把图像结果计入占位,内建 vision 方言不计" {
+    const a = std.testing.allocator;
+    const tool_use = [_]types.ApiContent{.{ .tool_use = .{ .id = "t1", .name = "Read", .input = "{}" } }};
+    const tool_result = [_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "t1", .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}" } }};
+    const msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &tool_result } };
+    const req = MessagesRequest{ .model = "claude-sonnet-4-20250514", .max_tokens = 16, .messages = &msgs };
+    // 默认 Dialect:profile 是内建(支持 vision),serializeImagePart 却 fail-closed 返回 false。
+    var closed = SerializationReport{};
+    defer closed.deinit(a);
+    const body_closed = try serializeMessagesRequestWithDialectReport(req, a, .{ .ctx = undefined }, &closed);
+    defer a.free(body_closed);
+    try std.testing.expectEqual(@as(usize, 1), closed.image_results);
+    try std.testing.expectEqual(@as(usize, 1), closed.image_placeholders);
+    try std.testing.expect(!closed.imagesNative());
+    try std.testing.expectEqual(@as(usize, 1), closed.placeholder_ids.items.len);
+    try std.testing.expectEqualStrings("t1", closed.placeholder_ids.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, body_closed, "was read successfully but omitted") != null);
+    var native = SerializationReport{};
+    defer native.deinit(a);
+    const body_native = try serializeMessagesRequestWithDialectReport(req, a, dialect_mod.Resolver.builtin().resolve(.anthropic, req.model), &native);
+    defer a.free(body_native);
+    try std.testing.expectEqual(@as(usize, 1), native.image_results);
+    try std.testing.expectEqual(@as(usize, 0), native.image_placeholders);
+    try std.testing.expect(native.imagesNative());
 }

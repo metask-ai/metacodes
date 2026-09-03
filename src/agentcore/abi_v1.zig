@@ -1379,19 +1379,14 @@ const AbiSession = struct {
                 if (self.run_state_projector.phase == .compacting)
                     changed = self.run_state_projector.setPhase(.generating);
             },
-            .diag_run_end => |value| {
-                if (self.run_state_projector.setPhase(.finalizing)) {
-                    if (!self.emitRunStateSnapshot(session_id, run_id)) return false;
-                }
-                const terminal: public_protocol.RunStatePhase = if (std.mem.eql(u8, value.stop_reason_name, "aborted"))
-                    .aborted
-                else if (std.mem.eql(u8, value.stop_reason_name, "end_turn") or
-                    std.mem.eql(u8, value.stop_reason_name, "max_turns"))
-                    .completed
-                else
-                    .failed;
-                self.run_state_projector.closeForTerminal(terminal);
-                return self.emitRunStateSnapshot(session_id, run_id);
+            .diag_run_end => {
+                // The loop's own stop reason is not final: an abort accepted
+                // from this very `finalizing` callback still rewrites the Run's
+                // result to `aborted` in finishRunLifecycle, and a failure after
+                // the loop poisons it. The terminal snapshot is therefore
+                // published once by `sessionRunInput` from the returned
+                // execution; here the Run only enters `finalizing`.
+                changed = self.run_state_projector.setPhase(.finalizing);
             },
             else => {},
         }
@@ -1408,11 +1403,93 @@ const AbiSession = struct {
         return self.emitRunStateSnapshot(session_id, run_id);
     }
 
-    fn emitPoisonedRunState(self: *AbiSession, run_id: u64) void {
-        if (self.callback_status.load(.acquire) != wire.STATUS_OK) return;
-        if (self.run_state_observation_disabled) return;
-        self.run_state_projector.closeForTerminal(.poisoned);
-        _ = self.emitRunStateSnapshot(self.core_session.session_id, run_id);
+    /// Terminal closure for an admitted Run, published from the **returned**
+    /// execution so it carries the Run's final stop reason: the loop's
+    /// run_done only reaches `finalizing`, because an abort accepted from that
+    /// very callback still rewrites the result to `aborted`. It also covers
+    /// Runs that never ran the loop — the multimodal root record could not be
+    /// built, a Skill was aborted during activation, budget reconciliation
+    /// produced a synthetic completion. While the observation channel stays
+    /// usable, every started Run ends with exactly one terminal snapshot;
+    /// otherwise a Host watching `run_state` sees it stuck in `starting` or
+    /// `finalizing`. (A Host that rejected an earlier snapshot, or a snapshot
+    /// that cannot be built, ends the Run as a callback failure instead — no
+    /// terminal can be delivered then.) Degraded tool-set observation does not
+    /// suppress it (`closeForTerminal` clears the tool set, so the snapshot is
+    /// bounded). Returns false when the Host rejected the snapshot, when it
+    /// could not be built, **or when a callback failure is already
+    /// recorded** — `callback_status` is sticky and keeps the first one,
+    /// whether a rejected snapshot or public event, an unbuildable payload, an
+    /// internal publication step (permission provenance, schema admission), or
+    /// a failed `on_ui_request` exchange: a failure that was swallowed earlier
+    /// must not let this or any later Run report success while its terminal is
+    /// skipped. The caller then fails the Run with the recorded status and
+    /// poisons the facade (ABI rule: a failed Host callback aborts the Run and
+    /// poisons the Session). Returns true without emitting only when the Run
+    /// is already terminal or the projector belongs to a different Run (the
+    /// failure happened before this Run's `starting`).
+    fn emitTerminalRunStateIfOpen(
+        self: *AbiSession,
+        session_id: core.session_id.SessionId,
+        run_id: u64,
+        phase: public_protocol.RunStatePhase,
+    ) bool {
+        if (self.callback_status.load(.acquire) != wire.STATUS_OK) return false;
+        if (self.run_state_projector.run_id != run_id) return true;
+        if (self.run_state_projector.isTerminal()) return true;
+        self.run_state_projector.closeForTerminal(phase);
+        return self.emitRunStateSnapshot(session_id, run_id);
+    }
+
+    /// A callback failure has been recorded (`callback_status` is sticky and
+    /// keeps the first one): the Host rejected a RunState snapshot or a public
+    /// event, a snapshot could not be built, an internal publication step
+    /// (permission provenance, schema admission) failed, or `on_ui_request`
+    /// handling failed — UI transport or decoding, sequence exhaustion,
+    /// permission-memory failures. Whatever the first failure was, the Run
+    /// cannot be reported successful after it: the facade is poisoned and the
+    /// Run fails with the recorded status, the diagnostic naming that cause.
+    fn failOnRecordedCallbackFailure(self: *AbiSession, out_error: ?*wire.OwnedBytesV1) u32 {
+        self.facade_poisoned.store(true, .release);
+        const status = self.callbackFailureStatus();
+        const cause: anyerror = switch (status) {
+            wire.STATUS_OUT_OF_MEMORY => error.OutOfMemory,
+            wire.STATUS_RESOURCE_LIMIT => error.ResourceLimit,
+            wire.STATUS_INTERNAL_ERROR => error.InternalError,
+            else => error.CallbackFailed,
+        };
+        return failError(status, cause, out_error);
+    }
+
+    /// Error reconciliation shared by the three `run_input` kinds. `status` is
+    /// the kind's own mapping of `err`; `core_poisoned` is passed in rather than
+    /// read so the fake facade can exercise every branch. Two outcomes:
+    /// - poisoned: the Core poisoned itself, or post-admission cleanup failed
+    ///   after the Core already returned to idle (`AdmittedCleanupFailed`). The
+    ///   facade is poisoned either way, and the Host's terminal must say
+    ///   `poisoned` — not leave the Run at `finalizing`;
+    /// - failed: a non-poisoning failure after admission.
+    /// A recorded callback failure — the Host rejecting this terminal snapshot,
+    /// or any earlier callback failure the session already latched — supersedes
+    /// the original error (the same precedence the admitted-Run cleanup applies
+    /// to `error.CallbackFailed`).
+    fn reconcileRunFailure(
+        self: *AbiSession,
+        session_id: core.session_id.SessionId,
+        run_id: u64,
+        status: u32,
+        err: anyerror,
+        core_poisoned: bool,
+        out_error: ?*wire.OwnedBytesV1,
+    ) u32 {
+        const phase: public_protocol.RunStatePhase = if (err == error.AdmittedCleanupFailed or core_poisoned)
+            .poisoned
+        else
+            .failed;
+        if (phase == .poisoned) self.facade_poisoned.store(true, .release);
+        if (!self.emitTerminalRunStateIfOpen(session_id, run_id, phase))
+            return self.failOnRecordedCallbackFailure(out_error);
+        return failError(status, err, out_error);
     }
 
     fn emit(raw: *anyopaque, session_id: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
@@ -3830,46 +3907,21 @@ comptime {
     // The wire image cap is exactly the standard base64 encoding of the Read
     // tool's raw-image limit: one image the built-in Read tool can attach is
     // also submittable through RUN_INPUT_MULTIMODAL, and nothing larger is.
-    // The wire document cap is exactly the base64 encoding of Core's raw-PDF
-    // admission limit, taken from the one place that derives it.
-    if (wire.MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1 != core.pdf.MAX_PDF_BASE64_BYTES)
-        @compileError("MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1 must match the Core PDF admission cap");
     if (wire.MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 !=
         std.base64.standard.Encoder.calcSize(core.tool_read.MAX_IMAGE_BYTES))
         @compileError("MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 must match the Read tool image cap");
 }
 
-/// The image media types every wired provider dialect accepts. This is the
-/// same allowlist the built-in Read tool and the headless `--image` entry
-/// derive from file extensions.
+/// The image media types every wired provider dialect accepts, and the
+/// standard-base64 check: both live in `types.zig` so the Read tool, the
+/// headless `--image` entry, this RunInput validation, and the tool_result
+/// image predicate (`dialect.extractImageResult`) share one definition.
 fn isSupportedImageMediaType(media_type: []const u8) bool {
-    const supported = [_][]const u8{
-        "image/png", "image/jpeg", "image/gif", "image/webp",
-    };
-    for (supported) |candidate| {
-        if (std.mem.eql(u8, media_type, candidate)) return true;
-    }
-    return false;
+    return core.types.isSupportedImageMediaType(media_type);
 }
 
-/// Standard base64 with `=` padding and no whitespace: length divisible by
-/// four, alphabet `A-Z a-z 0-9 + /`, at most two `=` and only at the end.
 fn isStandardBase64(data: []const u8) bool {
-    if (data.len == 0 or data.len % 4 != 0) return false;
-    var padding: usize = 0;
-    for (data) |byte| {
-        if (byte == '=') {
-            padding += 1;
-            if (padding > 2) return false;
-            continue;
-        }
-        if (padding != 0) return false;
-        const in_alphabet = (byte >= 'A' and byte <= 'Z') or
-            (byte >= 'a' and byte <= 'z') or
-            (byte >= '0' and byte <= '9') or byte == '+' or byte == '/';
-        if (!in_alphabet) return false;
-    }
-    return true;
+    return core.types.isStandardBase64(data);
 }
 
 /// Wire validation for one RUN_INPUT_MULTIMODAL parts array. Every declared
@@ -3880,7 +3932,6 @@ fn parseMultimodalParts(
     parts_ptr: ?[*]const wire.RunInputPartV1,
     part_count: u64,
     out_has_image: *bool,
-    out_has_document: *bool,
 ) ![]core.message.UserContentPart {
     if (part_count == 0) return error.EmptyMultimodalInput;
     if (part_count > wire.MAX_RUN_INPUT_PARTS_V1) return error.ResourceLimit;
@@ -3899,14 +3950,10 @@ fn parseMultimodalParts(
         if (part.kind_code == wire.RUN_INPUT_PART_IMAGE and
             part.data.len > wire.MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1)
             return error.ResourceLimit;
-        if (part.kind_code == wire.RUN_INPUT_PART_DOCUMENT and
-            part.data.len > wire.MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1)
-            return error.ResourceLimit;
     }
     if (total_payload > wire.MAX_PROMPT_BYTES_V1) return error.ResourceLimit;
     const parsed = try arena.alloc(core.message.UserContentPart, count);
     var has_image = false;
-    var has_document = false;
     for (raw_parts, parsed) |part, *slot| {
         switch (part.kind_code) {
             wire.RUN_INPUT_PART_TEXT => {
@@ -3926,33 +3973,10 @@ fn parseMultimodalParts(
                 has_image = true;
                 slot.* = .{ .image = .{ .media_type = media_type, .data = data } };
             },
-            wire.RUN_INPUT_PART_DOCUMENT => {
-                const media_type = try text(part.media_type);
-                const data = try borrowed(part.data);
-                // `text` is the optional title here rather than a canonical
-                // empty view, so it is validated as UTF-8 instead of rejected.
-                const title = try text(part.text);
-                if (!std.mem.eql(u8, media_type, core.pdf.MEDIA_TYPE))
-                    return error.UnsupportedDocumentMediaType;
-                if (!isStandardBase64(data)) return error.InvalidDocumentBase64;
-                // Admission before admission: a payload that is not really an
-                // unencrypted, in-bounds PDF is rejected here, before the Run
-                // is admitted and before any Provider request. Decoding is
-                // bounded by the cap already enforced above.
-                const pages = try core.pdf.inspectBase64(arena, data);
-                has_document = true;
-                slot.* = .{ .document = .{
-                    .media_type = media_type,
-                    .data = data,
-                    .title = title,
-                    .pages = pages,
-                } };
-            },
             else => return error.UnknownRunInputPartKind,
         }
     }
     out_has_image.* = has_image;
-    out_has_document.* = has_document;
     return parsed;
 }
 
@@ -4033,11 +4057,7 @@ fn statusText(status: u32) []const u8 {
 fn inputErrorStatus(err: anyerror) u32 {
     return if (err == error.OutOfMemory)
         wire.STATUS_OUT_OF_MEMORY
-    else if (err == error.ResourceLimit or
-        // Bounded document caps are resource limits, not malformed input;
-        // everything else the PDF admission rejects (not a PDF, encrypted,
-        // wrong media type, bad base64) is an argument error.
-        err == error.PdfTooLarge or err == error.PdfTooManyPages)
+    else if (err == error.ResourceLimit)
         wire.STATUS_RESOURCE_LIMIT
     else
         wire.STATUS_INVALID_ARGUMENT;
@@ -4183,9 +4203,6 @@ fn runErrorStatus(self: *const AbiSession, err: anyerror) u32 {
         error.CallbackFailed => self.callbackFailureStatus(),
         error.CheckpointBudgetRequired => wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
         error.ImageInputUnsupported => wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
-        error.DocumentInputUnsupported,
-        error.DocumentWithToolResultUnsupported,
-        => wire.STATUS_DOCUMENT_INPUT_UNSUPPORTED,
         else => wire.STATUS_CORE_ERROR,
     };
 }
@@ -6764,16 +6781,16 @@ fn sessionRunInput(
                 prompt,
                 options.max_turns,
             ) catch |err| {
-                const status = runErrorStatus(self, err);
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
-                if (err == error.AdmittedCleanupFailed or
-                    self.core_session.isPoisoned())
-                {
-                    if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
-                    self.facade_poisoned.store(true, .release);
-                }
-                return failError(status, err, out_error);
+                return self.reconcileRunFailure(
+                    self.core_session.session_id,
+                    run_id,
+                    runErrorStatus(self, err),
+                    err,
+                    self.core_session.isPoisoned(),
+                    out_error,
+                );
             };
             break :text_run text_execution;
         },
@@ -6804,16 +6821,16 @@ fn sessionRunInput(
                 arguments,
                 options.max_turns,
             ) catch |err| {
-                const status = skillRunErrorStatus(self, err);
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
-                if (err == error.AdmittedCleanupFailed or
-                    self.core_session.isPoisoned())
-                {
-                    if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
-                    self.facade_poisoned.store(true, .release);
-                }
-                return failError(status, err, out_error);
+                return self.reconcileRunFailure(
+                    self.core_session.session_id,
+                    run_id,
+                    skillRunErrorStatus(self, err),
+                    err,
+                    self.core_session.isPoisoned(),
+                    out_error,
+                );
             };
         },
         wire.RUN_INPUT_MULTIMODAL => multimodal_run: {
@@ -6823,29 +6840,19 @@ fn sessionRunInput(
             var scratch = std.heap.ArenaAllocator.init(allocator);
             defer scratch.deinit();
             var has_image = false;
-            var has_document = false;
             const parts = parseMultimodalParts(
                 scratch.allocator(),
                 input.parts,
                 input.part_count,
                 &has_image,
-                &has_document,
             ) catch |err| return failError(inputErrorStatus(err), err, out_error);
-            // Capability preflight (single truth: ModelProfile.supports_image_input
-            // and .supports_pdf_input, checked independently — vision does not
-            // imply document input). Rejection happens before admission and
-            // before any Provider request, so the Run ID stays reusable and
-            // Conversation is untouched.
+            // Capability preflight (single truth: ModelProfile.supports_image_input).
+            // Rejection happens before admission and before any Provider request,
+            // so the Run ID stays reusable and Conversation is untouched.
             if (has_image and !self.core_session.provider.provider().supports(.image_input))
                 return fail(
                     wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
                     "session model does not support image input",
-                    out_error,
-                );
-            if (has_document and !self.core_session.provider.provider().supports(.pdf_input))
-                return fail(
-                    wire.STATUS_DOCUMENT_INPUT_UNSUPPORTED,
-                    "session model does not support PDF document input",
                     out_error,
                 );
             const multimodal_execution = self.runMultimodalWithBoundSkills(
@@ -6854,16 +6861,16 @@ fn sessionRunInput(
                 parts,
                 options.max_turns,
             ) catch |err| {
-                const status = runErrorStatus(self, err);
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
-                if (err == error.AdmittedCleanupFailed or
-                    self.core_session.isPoisoned())
-                {
-                    if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
-                    self.facade_poisoned.store(true, .release);
-                }
-                return failError(status, err, out_error);
+                return self.reconcileRunFailure(
+                    self.core_session.session_id,
+                    run_id,
+                    runErrorStatus(self, err),
+                    err,
+                    self.core_session.isPoisoned(),
+                    out_error,
+                );
             };
             break :multimodal_run multimodal_execution;
         },
@@ -6873,8 +6880,15 @@ fn sessionRunInput(
     // this fallback for any pre-budget internal fixture path.
     if (self.last_terminal_id != run_id)
         self.recordTerminal(.run, run_id);
+    // The Run's terminal RunState is published from the returned execution —
+    // the loop's run_done only reached `finalizing` — so it carries the final
+    // stop reason, and Runs that never ran the loop (a Skill aborted during
+    // activation, a synthetic completion from budget reconciliation) get their
+    // only terminal here. A Host rejecting it is a callback failure.
     const result = switch (execution) {
         .aborted => {
+            if (!self.emitTerminalRunStateIfOpen(self.core_session.session_id, run_id, .aborted))
+                return self.failOnRecordedCallbackFailure(out_error);
             out.* = .{
                 .struct_size = @sizeOf(wire.RunResultV1),
                 .stop_reason_code = wire.STOP_ABORTED,
@@ -6894,6 +6908,11 @@ fn sessionRunInput(
     };
     defer if (result.suspend_info) |suspend_info| suspend_info.deinit();
     invokeTestEpilogueHook(run_id);
+    if (!self.emitTerminalRunStateIfOpen(
+        self.core_session.session_id,
+        run_id,
+        terminalPhaseForStopReason(result.stop_reason),
+    )) return self.failOnRecordedCallbackFailure(out_error);
     const stop_code = switch (self.budget_state.last_outcome) {
         .budget_exhausted => wire.STOP_CHECKPOINT_BUDGET_EXHAUSTED,
         .resource_limit => wire.STOP_CHECKPOINT_RESOURCE_LIMIT,
@@ -6913,6 +6932,16 @@ fn sessionRunInput(
     };
     writeRunBudgetFields(self, out);
     return wire.STATUS_OK;
+}
+
+/// The terminal RunState phase for a Run's final stop reason. This is the only
+/// such mapping: `observeRunState` no longer closes the projector on run_done.
+fn terminalPhaseForStopReason(stop_reason: core.agent_loop.StopReason) public_protocol.RunStatePhase {
+    return switch (stop_reason) {
+        .aborted => .aborted,
+        .end_turn, .max_turns => .completed,
+        .tool_error, .api_error, .tool_loop, .suspended, .backgrounded, .budget => .failed,
+    };
 }
 
 fn writeRunBudgetFields(self: *const AbiSession, out: *wire.RunResultV1) void {
@@ -7337,7 +7366,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 16), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 15), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 64), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
@@ -9391,6 +9420,213 @@ test "RunState observation capacity does not poison the admitted run" {
     try std.testing.expectEqual(public_protocol.RunStatePhase.retrying, fake.run_state_projector.phase);
     try std.testing.expect(fake.observeRunState(.single, 2, .stream_begin));
     try std.testing.expectEqual(public_protocol.RunStatePhase.generating, fake.run_state_projector.phase);
+}
+
+test "non-poisoning Run failure after `starting` closes RunState as failed; terminal Runs keep their verdict" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+        .run_state_projector = run_state.Projector.init(std.testing.allocator),
+    };
+    defer fake.run_state_projector.deinit();
+
+    // Run 3 published `starting` and then failed before any CoreEvent — the
+    // multimodal root record could not be built after admission.
+    try std.testing.expect(fake.startRunState(.single, 3));
+    try std.testing.expect(fake.emitTerminalRunStateIfOpen(.single, 3, .failed));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.failed, fake.run_state_projector.phase);
+
+    // A Run that already reached its own terminal keeps that verdict.
+    try std.testing.expect(fake.startRunState(.single, 4));
+    fake.run_state_projector.closeForTerminal(.completed);
+    try std.testing.expect(fake.emitTerminalRunStateIfOpen(.single, 4, .failed));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.completed, fake.run_state_projector.phase);
+
+    // A failure before this Run's `starting` leaves the previous Run alone.
+    try std.testing.expect(fake.emitTerminalRunStateIfOpen(.single, 5, .failed));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.completed, fake.run_state_projector.phase);
+    try std.testing.expectEqual(@as(u64, 4), fake.run_state_projector.run_id);
+
+    // A Skill aborted during activation closes as aborted, not failed.
+    try std.testing.expect(fake.startRunState(.single, 6));
+    try std.testing.expect(fake.emitTerminalRunStateIfOpen(.single, 6, .aborted));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.aborted, fake.run_state_projector.phase);
+
+    // Synthetic completions map through the same table as run_done.
+    try std.testing.expectEqual(public_protocol.RunStatePhase.failed, terminalPhaseForStopReason(.api_error));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.completed, terminalPhaseForStopReason(.end_turn));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.completed, terminalPhaseForStopReason(.max_turns));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.aborted, terminalPhaseForStopReason(.aborted));
+}
+
+test "run_done only reaches finalizing; the terminal follows the returned result and survives degraded observation" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+        .run_state_projector = run_state.Projector.init(std.testing.allocator),
+    };
+    defer fake.run_state_projector.deinit();
+
+    try std.testing.expect(fake.startRunState(.single, 8));
+    try std.testing.expect(fake.observeRunState(.single, 8, .{ .diag_run_end = .{
+        .trace_id = [_]u8{0} ** 12,
+        .depth = 0,
+        .turns = 1,
+        .tool_calls = 0,
+        .stop_reason_name = "end_turn",
+    } }));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.finalizing, fake.run_state_projector.phase);
+    try std.testing.expect(!fake.run_state_projector.isTerminal());
+    // An abort accepted from the finalizing callback rewrites the result; the
+    // terminal follows the result, not the loop's own end_turn.
+    try std.testing.expect(fake.emitTerminalRunStateIfOpen(.single, 8, terminalPhaseForStopReason(.aborted)));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.aborted, fake.run_state_projector.phase);
+
+    // Degraded tool-set observation suppresses intermediate snapshots only.
+    try std.testing.expect(fake.startRunState(.single, 9));
+    for (0..run_state.MAX_IN_FLIGHT_TOOLS + 1) |index| {
+        var id_buf: [16]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "tool-{d}", .{index}) catch unreachable;
+        try std.testing.expect(fake.observeRunState(.single, 9, .{ .tool_start = .{
+            .id = id,
+            .name = "Read",
+            .input = "{}",
+        } }));
+    }
+    try std.testing.expect(fake.run_state_observation_disabled);
+    try std.testing.expect(fake.emitTerminalRunStateIfOpen(.single, 9, .completed));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.completed, fake.run_state_projector.phase);
+    try std.testing.expectEqual(@as(usize, 0), fake.run_state_projector.inFlightCount());
+}
+
+const FatalEventCallback = struct {
+    calls: usize = 0,
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *FatalEventCallback = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        self.calls += 1;
+        return wire.EVENT_FATAL;
+    }
+};
+
+test "reconcileRunFailure: cleanup failure after an idle Core still closes as poisoned; a recorded callback failure supersedes the error" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+        .run_state_projector = run_state.Projector.init(std.testing.allocator),
+    };
+    defer fake.run_state_projector.deinit();
+
+    // Post-loop cleanup failure with the Core already idle: the facade is
+    // poisoned, and the Host's terminal says so instead of staying at finalizing.
+    try std.testing.expect(fake.startRunState(.single, 10));
+    try std.testing.expectEqual(
+        wire.STATUS_CORE_ERROR,
+        fake.reconcileRunFailure(.single, 10, wire.STATUS_CORE_ERROR, error.AdmittedCleanupFailed, false, null),
+    );
+    try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, fake.run_state_projector.phase);
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+
+    // A Core-poisoned Run closes as poisoned too; a plain failure closes as failed
+    // and leaves the facade usable.
+    fake.facade_poisoned.store(false, .release);
+    try std.testing.expect(fake.startRunState(.single, 11));
+    _ = fake.reconcileRunFailure(.single, 11, wire.STATUS_CORE_ERROR, error.RunJournalFailed, true, null);
+    try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, fake.run_state_projector.phase);
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+    fake.facade_poisoned.store(false, .release);
+    try std.testing.expect(fake.startRunState(.single, 12));
+    try std.testing.expectEqual(
+        wire.STATUS_OUT_OF_MEMORY,
+        fake.reconcileRunFailure(.single, 12, wire.STATUS_OUT_OF_MEMORY, error.OutOfMemory, false, null),
+    );
+    try std.testing.expectEqual(public_protocol.RunStatePhase.failed, fake.run_state_projector.phase);
+    try std.testing.expect(!fake.facade_poisoned.load(.acquire));
+
+    // An observation channel that already died (an earlier snapshot rejected or
+    // unbuildable; callback_status is sticky) is a rejection, not a no-op: the
+    // Run fails with the recorded status and the facade is poisoned, so no later
+    // Run can report success while its terminal is silently skipped.
+    fake.facade_poisoned.store(false, .release);
+    try std.testing.expect(fake.startRunState(.single, 13));
+    fake.callback_status.store(wire.STATUS_OUT_OF_MEMORY, .release);
+    try std.testing.expectEqual(
+        wire.STATUS_OUT_OF_MEMORY,
+        fake.reconcileRunFailure(.single, 13, wire.STATUS_CORE_ERROR, error.CallbackFailed, false, null),
+    );
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+
+    // Any recorded first failure counts, not only OOM and rejections. The Run
+    // starts on a healthy channel; then an internal publication step (schema
+    // admission) records RESOURCE_LIMIT through the real recorder, mid-Run.
+    // The diagnostic must name that cause, not "CallbackFailed".
+    fake.facade_poisoned.store(false, .release);
+    fake.callback_status.store(wire.STATUS_OK, .release);
+    try std.testing.expect(fake.startRunState(.single, 14));
+    fake.recordCallbackStatus(wire.STATUS_RESOURCE_LIMIT);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        fake.reconcileRunFailure(.single, 14, wire.STATUS_CORE_ERROR, error.CallbackFailed, false, &diagnostic),
+    );
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+    // The status text is documented as unstable; the cause component is the claim.
+    const detail = diagnostic.ptr.?[0..@intCast(diagnostic.len)];
+    try std.testing.expect(std.mem.indexOf(u8, detail, "ResourceLimit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "CallbackFailed") == null);
+}
+
+test "reconcileRunFailure: a Host rejecting the poisoned terminal fails the Run with CALLBACK_FAILED (real Core session)" {
+    // The fatal callback reaches core_session.noteCallbackFailure, so this
+    // fixture needs a real Core session rather than the undefined placeholder.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    var fatal = FatalEventCallback{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &fatal;
+    callbacks.on_event = FatalEventCallback.event;
+    var session = AbiSession{
+        .callbacks = callbacks,
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .run_state_projector = run_state.Projector.init(std.testing.allocator),
+    };
+    defer session.run_state_projector.deinit();
+
+    // Silent begin: no `starting` snapshot reaches the fatal callback first, so
+    // the terminal is the first (and only) snapshot it rejects.
+    session.run_state_projector.begin(21);
+    try std.testing.expectEqual(
+        wire.STATUS_CALLBACK_FAILED,
+        session.reconcileRunFailure(native_session.session_id, 21, wire.STATUS_CORE_ERROR, error.RunJournalFailed, true, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fatal.calls);
+    try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, session.run_state_projector.phase);
+    try std.testing.expect(session.facade_poisoned.load(.acquire));
 }
 
 test "Host schema admission rejects ambiguous object contracts" {

@@ -12,38 +12,128 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
-- PDF documents are first-class user input (issue #25). A user message can
-  carry ordered text, image, and PDF parts; Core models a document as
-  `Block.document {media_type, data, title, pages}` and hands the bytes to the
-  provider's native document format, never to OCR, extracted text, page
-  images, or a summary. Document capability is its own truth
-  (`ModelProfile.supports_pdf_input` / `Capability.pdf_input`) and is checked
-  independently of vision — the first slice supports Anthropic Claude 3.5+
-  natively and fails every other provider/model with
-  `error.DocumentInputUnsupported` before any network I/O. Admission runs
-  before encoding and before dispatch (`core/pdf.zig`): not-a-PDF, encrypted,
-  over 12 MB raw, or over 100 countable pages each fail with their own typed
-  outcome, and an undeterminable page count is reported as unknown rather than
-  guessed. Token accounting charges a document by pages, not base64 length.
-  Documents round-trip through the JSONL transcript and the AgentCore
-  checkpoint (block tag 7), so a restored session resends the original bytes
-  with no dependence on the host file. Reachable from source-level hosts
-  (`message.UserContentPart.document`), from binary consumers
-  (`RUN_INPUT_PART_DOCUMENT`, ABI revision 16, preflight status 29), and from
-  the headless CLI (`--pdf <path>`, repeatable, order kept). The provider-offer
-  vocabulary gains a matching `documents` capability, again separate from
-  `vision`; its comptime coverage guard now binds the real runtime capability
-  enum instead of a hand-copied duplicate, so the next capability added without
-  a mapping is a compile error rather than a silent gap.
-- AgentCore ABI v1 **revision 16** (hard cut over 15): adds
-  `RUN_INPUT_PART_DOCUMENT`, `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1`,
-  status `DOCUMENT_INPUT_UNSUPPORTED` (29), and checkpoint block tag 7.
-  `RunInputPartV1` keeps its 72-byte layout — a document part reuses
-  `media_type`, `data`, and `text` (its title). SDK package version
-  `0.2.0-dev` → `0.3.0-dev`; Rust `raw.rs` regenerated with bindgen 0.72.1.
+- The provider-offer capability vocabulary's comptime coverage guard now binds
+  the real runtime capability enum instead of a hand-copied duplicate, so the
+  next runtime capability added without an offer mapping is a compile error
+  rather than a silent gap.
+
+### Removed
+
+- First-class PDF document input is withdrawn (issue #25). Agent Core carries
+  cross-format, cross-provider, cross-host input modalities; parsing a
+  container format, judging its pages, encryption and structure, and
+  attributing budget from that judgement are not Core's job — and a lexical
+  scan could not answer those questions correctly anyway, which is how it
+  produced three ways to reject a valid document. Removed: the `document`
+  block and its neutral IR, `core/pdf.zig`, `supports_pdf_input` /
+  `Capability.pdf_input`, the dialect document serializer, transcript and
+  checkpoint persistence, `RUN_INPUT_PART_DOCUMENT`, and the headless `--pdf`
+  flag. The `Read` tool description stays corrected: it still does not claim
+  PDF reading or a `pages` parameter.
+  Compatibility: a transcript or checkpoint recorded with a document block is
+  refused explicitly rather than partially read — the transcript loader is now
+  atomic and reports a dedicated error with an actionable message, and the
+  checkpoint decoder reports `UNSUPPORTED` (not `CORRUPT`) for an intact
+  checkpoint carrying the permanently reserved block tag `7`, and only after
+  its digest has been verified. While the observation channel stays usable, the
+  terminal `run_state` snapshot is published exactly once from the Run's final
+  result: a post-admission cleanup failure closes it as `poisoned`, an abort accepted from
+  the `finalizing` callback is reflected as `aborted` (it used to leave a
+  `completed` snapshot beside `STOP_ABORTED`), Runs that never ran the loop — a
+  clean failure, a Skill aborted during activation, a synthetic completion —
+  no longer stay at `starting`, degraded tool-set observation no longer
+  suppresses the closure, and a Host that rejects the terminal snapshot — or
+  any callback failure the Session already recorded — fails the Run with the
+  recorded callback status and poisons the Session instead of being reported a
+  successful Run.
+- AgentCore ABI v1 returns to **revision 15**; `RUN_INPUT_PART_DOCUMENT`,
+  `MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1` and status
+  `DOCUMENT_INPUT_UNSUPPORTED` are gone. No bundle was ever published from a
+  revision-16 tree (the only release, `0.1.0`, is revision 14, has no assets,
+  and no workflow publishes or uploads a bundle), so revision 15 keeps a single meaning and
+  the codes need no tombstone. SDK package version returns to `0.2.0-dev`.
 
 ### Fixed
 
+- AgentCore's request preflight (`canonicalRequestBytes`) charges image tool
+  results as native bytes only when the configured model accepts image
+  input; on a text-only route the estimate is exactly the placeholder request
+  the serializer sends. Previously the full base64 length was added back
+  unconditionally, so a few large image results on deepseek-chat / glm-5.2
+  returned `checkpoint_budget_exhausted` for a request of a few hundred
+  bytes, and repeated it on every later run because those results are
+  non-trimmable.
+- Image results now have a wire-size safety net: they bypass the byte
+  budgets, so five parallel 3.75 MB pictures could produce a request no
+  provider accepts. `types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST` (16 MiB) caps
+  the base64 image bytes per request: the projection spills the largest
+  images of the current turn beyond the cap into artifact envelopes, and the
+  agent loop stubs the oldest already-delivered image results before each
+  request until the history fits (first-class user images count against
+  the allowance and a fresh tool turn is projected against what they leave;
+  the block-level watermark is persisted in the transcript, so a resumed
+  session trims exactly the pictures earlier requests delivered natively and
+  reports explicitly when only non-trimmable images exceed the cap).
+  Gemini 3 function responses embed only
+  PNG/JPEG/WebP; `image/gif` results now go out as a sibling `inline_data`
+  part instead of being rejected. The stream handle reports the exact
+  tool_use ids whose image went out as a placeholder, so a plugin dialect
+  that serializes some MIME types natively and refuses others no longer pins
+  the natively-sent pictures.
+- OpenAI chat/completions and Gemini dropped every text block that shared a
+  message with tool results: the PostToolUse `additionalContext`, the
+  verification checkpoint, the requirement-ledger prompt and similar host
+  text that the agent loop appends to the tool-result user message never
+  reached those providers (Anthropic and the OpenAI Responses protocol were
+  unaffected). The chat serializer now re-sends that text as a user message
+  after the tool messages (or as the last part of the image follow-up
+  message), and Gemini appends it as trailing text parts of the same user
+  content. Covered by serializer tests and by the hook-pipeline component
+  test, which now asserts the context on the wire.
+- The image projection exemption (issue #26, below) is covered end to end by
+  an agent-loop test that reads an 80 KiB-base64 PNG through the real `Read`
+  tool and asserts the image block on the wire, and the same exemption now
+  also holds at the two other layers that rewrite a tool result before
+  serialization: microcompact no longer clears an image
+  result under the recent-N pressure valve (a `Read(image)` with two parallel
+  siblings was cleared before the provider ever saw it), and the AgentCore
+  `ToolEnvironment` no longer promotes an image above `tool_result_cap_bytes`
+  to an artifact (the payload cap is charged at the vision estimate, the
+  durable budget at the real bytes). In exchange the shared predicate
+  `extractImageResult` only accepts the canonical Read shape: allowlisted
+  media type (`image/png|jpeg|gif|webp`), standard base64, at most
+  `MAX_IMAGE_BYTES` of payload, exactly the three keys in any order with only
+  whitespace after the closing brace, so a plugin cannot obtain an unbounded
+  exemption by prefixing arbitrary output with `{"type":"image"`. `result_projection.Stats.projected_bytes` stays a
+  real byte count; the turn-budget decision moved to a new `budget_bytes`.
+  The predicate is structural (any field order, standard JSON whitespace,
+  exactly the three keys, raw content bounded by `MAX_IMAGE_RESULT_BYTES`),
+  so surrounding whitespace cannot smuggle an oversized payload past the
+  budget and a JSON serializer that does not escape `/` still produces an
+  image. Microcompact protects only images that have not yet been delivered
+  to the provider, where delivery is an explicit per-message watermark
+  (`Message.delivered`) advanced by the agent loop once the provider has
+  accepted a request for streaming — and, for messages holding an image
+  result, only when the serializer actually sent native image parts (a
+  non-vision model only received the placeholder; the serializer reports the
+  affected tool_use ids back on `StreamHandle.image_placeholder_ids`, and the
+  flag lives on each tool_result block) — never inferred from a locally
+  appended assistant message; delivered
+  images clear like any result, so the pressure valve keeps working on
+  image-heavy history, and images are never truncated. AgentCore `settleSuccess` now counts live
+  sibling reservations against the hard budget, so an inline image whose
+  durable bytes exceed its own reservation is refused instead of consuming
+  the space a parallel tool had already reserved.
+- Transcript resume no longer treats a failed `read` as end-of-file: `EINTR` (a
+  Ctrl+C or terminal resize during `/resume`) is retried, and any other read error
+  makes `loadTranscript` and the compact-state meta loader fail with `ReadFailed`
+  instead of silently restoring a truncated or empty history. The `/resume`
+  listing keeps skipping a session whose `meta.json` cannot be read. Surfaced by
+  the Codex cross-review on #46.
+- Restoring a persisted compact projection is all-or-nothing: `restoreCompactState`
+  allocates the summary before touching either field, so an allocation failure
+  during resume leaves a genuine full replay rather than an advanced boundary with
+  no summary (and no dangling summary pointer).
 - A KG client that owns no Store can no longer create one (issue #30).
   `KgClient.store_path` was a single `[]const u8` carrying two meanings — a
   real path under the CLI transport, and the marker `"daemon-owned"` under the

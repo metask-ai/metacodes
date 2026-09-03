@@ -201,11 +201,10 @@ pub fn encodedTextMessageBytes(bytes: []const u8) Error!u64 {
     return checkedAdd(14, bytes.len);
 }
 
-/// Exact encoded delta for one user Message built from ordered text/image/
-/// document parts, matching `measureMessage` byte for byte: 1 role byte + 4
-/// count bytes, then per block one tag byte plus 8-byte-length-prefixed
-/// strings (text; media_type then base64 data; or media_type, base64 data and
-/// title followed by a 4-byte page count).
+/// Exact encoded delta for one user Message built from ordered text/image
+/// parts, matching `measureMessage` byte for byte: 1 role byte + 4 count
+/// bytes, then per block one tag byte plus 8-byte-length-prefixed strings
+/// (text, or media_type then base64 data).
 pub fn encodedUserPartsMessageBytes(parts: []const message.UserContentPart) Error!u64 {
     if (parts.len == 0) return error.Corrupt;
     var size: u64 = 1 + 4;
@@ -222,16 +221,6 @@ pub fn encodedUserPartsMessageBytes(parts: []const message.UserContentPart) Erro
                     return error.Corrupt;
                 size = try checkedAdd(try checkedAdd(size, 8), image.media_type.len);
                 size = try checkedAdd(try checkedAdd(size, 8), image.data.len);
-            },
-            .document => |document| {
-                if (!std.unicode.utf8ValidateSlice(document.media_type) or
-                    !std.unicode.utf8ValidateSlice(document.data) or
-                    !std.unicode.utf8ValidateSlice(document.title))
-                    return error.Corrupt;
-                size = try checkedAdd(try checkedAdd(size, 8), document.media_type.len);
-                size = try checkedAdd(try checkedAdd(size, 8), document.data.len);
-                size = try checkedAdd(try checkedAdd(size, 8), document.title.len);
-                size = try checkedAdd(size, 4); // page count
             },
         }
     }
@@ -326,6 +315,11 @@ pub fn decodeFromSource(
     if (extra != 0) return error.Corrupt;
     if (reader.position != parsed.measurement.total_bytes)
         return error.Corrupt;
+    // Every byte has been hashed and the digest verified: the file is intact.
+    // Only now may a withdrawn revision-16 document block (tag 7) turn the
+    // result into "unsupported schema"; any earlier, the same answer could have
+    // masked corruption. The decoded state is released by the errdefer chain.
+    if (reader.withdrawn_blocks != 0) return error.UnsupportedSchema;
 
     return .{
         .allocator = allocator,
@@ -467,18 +461,6 @@ fn measureMessage(item: message.Message, limits: Limits) Error!u64 {
                     return error.Corrupt;
                 size = try addEncodedString(size, image.media_type, limits);
                 size = try addEncodedString(size, image.data, limits);
-            },
-            .document => |document| {
-                // 载荷是 base64(UTF-8 安全),原始文档字节绝不入 envelope。
-                // 页数是准入时数出来的元数据,定长编码(0 = 不可判定)。
-                if (!std.unicode.utf8ValidateSlice(document.media_type) or
-                    !std.unicode.utf8ValidateSlice(document.data) or
-                    !std.unicode.utf8ValidateSlice(document.title))
-                    return error.Corrupt;
-                size = try addEncodedString(size, document.media_type, limits);
-                size = try addEncodedString(size, document.data, limits);
-                size = try addEncodedString(size, document.title, limits);
-                size = try checkedAdd(size, 4);
             },
             .reasoning_item => |reasoning| {
                 // Provider-private continuation JSON (UTF-8 by construction:
@@ -682,6 +664,9 @@ const Reader = struct {
     expected_total: u64 = ABSOLUTE_MAX_CHECKPOINT_BYTES,
     position: u64 = 0,
     hasher: std.crypto.hash.sha2.Sha256,
+    /// Revision-16 document blocks (tag 7) stepped over so far. Their schema
+    /// verdict is delivered by `decodeFromSource` only after the digest verifies.
+    withdrawn_blocks: u64 = 0,
 
     fn init(source: Source, limits: Limits) Reader {
         return .{
@@ -767,13 +752,6 @@ fn writeMessage(writer: *Writer, item: message.Message) Error!void {
             try writeString(writer, image.media_type);
             try writeString(writer, image.data);
         },
-        .document => |document| {
-            try writeInt(writer, u8, 7);
-            try writeString(writer, document.media_type);
-            try writeString(writer, document.data);
-            try writeString(writer, document.title);
-            try writeInt(writer, u32, document.pages orelse 0);
-        },
         .reasoning_item => |reasoning| {
             try writeInt(writer, u8, 6);
             try writeString(writer, reasoning.model);
@@ -834,20 +812,36 @@ fn readMessage(
                 const data = try readString(reader, allocator, messages_end, limits);
                 break :image .{ .image = .{ .media_type = media_type, .data = data } };
             },
-            7 => document: {
-                const media_type = try readString(reader, allocator, messages_end, limits);
-                errdefer allocator.free(media_type);
-                const data = try readString(reader, allocator, messages_end, limits);
-                errdefer allocator.free(data);
-                const title = try readString(reader, allocator, messages_end, limits);
-                errdefer allocator.free(title);
-                const pages = try readInt(reader, u32, messages_end);
-                break :document .{ .document = .{
-                    .media_type = media_type,
-                    .data = data,
-                    .title = title,
-                    .pages = if (pages == 0) null else pages,
-                } };
+            // Tag 7 was revision 16's document block, withdrawn together with
+            // first-class PDF input. A checkpoint carrying it is intact, not
+            // damaged, so it must not report Corrupt — that would send a Host
+            // hunting for storage faults. It is a schema this build no longer
+            // supports, and the tag stays permanently reserved: any build that
+            // ran main between the two revisions could have written one, so
+            // reusing 7 for a different block would silently misread those
+            // files. (The ABI revision number itself could safely return to 15
+            // because no bundle was ever published at 16; a checkpoint on disk
+            // has the wider exposure of the two.)
+            //
+            // The verdict is not delivered here: a damaged file whose bytes
+            // merely happen to read as tag 7 would then report Unsupported and
+            // hide real corruption. The block is decoded exactly as revision 16
+            // decoded it (three length-prefixed UTF-8 strings: media_type, data,
+            // title; then a u32 page count) and discarded, so a malformed block
+            // still reports Corrupt; decoding continues to the digest, and
+            // `decodeFromSource` fails closed with UnsupportedSchema only once
+            // integrity has been verified.
+            7 => withdrawn: {
+                allocator.free(try readString(reader, allocator, messages_end, limits));
+                allocator.free(try readString(reader, allocator, messages_end, limits));
+                allocator.free(try readString(reader, allocator, messages_end, limits));
+                _ = try readInt(reader, u32, messages_end);
+                reader.withdrawn_blocks += 1;
+                // Placeholder keeps `blocks` fully initialized for the cleanup
+                // chain; it is never observable because the decode cannot
+                // succeed once a withdrawn block was seen.
+                break :withdrawn .{ .text = allocator.dupe(u8, "") catch
+                    return error.OutOfMemory };
             },
             6 => reasoning_item: {
                 const model = try readString(reader, allocator, messages_end, limits);
@@ -1296,99 +1290,6 @@ test "checkpoint round-trips image blocks (tag 5, issue #10)" {
     try std.testing.expectEqualStrings("SlBFRw==", restored[2].image.data);
 }
 
-test "checkpoint round-trips document blocks (tag 7, issue #25)" {
-    // Document semantics (MIME, title, counted pages, base64 payload, block
-    // order) survive export/restore, so a restored Run resends the original
-    // bytes without depending on the host file the document came from.
-    const allocator = std.testing.allocator;
-    var conversation = Conversation.init(allocator);
-    defer conversation.deinit();
-    const blocks = try allocator.alloc(message.Block, 2);
-    blocks[0] = .{ .text = try allocator.dupe(u8, "summarize the attached report") };
-    blocks[1] = .{ .document = .{
-        .media_type = try allocator.dupe(u8, "application/pdf"),
-        .data = try allocator.dupe(u8, "JVBERi0xLjcKJSVFT0YK"),
-        .title = try allocator.dupe(u8, "report.pdf"),
-        .pages = 2,
-    } };
-    try conversation.append(.{ .role = .user, .blocks = blocks });
-
-    const id = core.session_id.gen();
-    var sink = TestSink{ .allocator = allocator };
-    defer sink.deinit();
-    const limits = Limits{ .hard_bytes = 1024 * 1024 };
-    _ = try exportToSink(.{
-        .session_id = id,
-        .checkpoint_generation = 1,
-        .last_run_id = 1,
-        .last_compact_id = 0,
-        .terminal_kind = .run,
-        .terminal_id = 1,
-        .model = "claude-sonnet-4",
-        .conversation = &conversation,
-        .policy_generation = 1,
-        .catalog_generation = 1,
-        .authority = .{ .skill = "", .permission = "", .mcp = "" },
-    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
-
-    var source = TestSource{ .bytes = sink.bytes.items, .step = 5 };
-    var decoded = try decodeFromSource(
-        allocator,
-        .{ .ctx = &source, .read_fn = TestSource.read },
-        limits,
-    );
-    defer decoded.deinit();
-    const restored = decoded.conversation.messages.items[0].blocks;
-    try std.testing.expectEqual(@as(usize, 2), restored.len);
-    try std.testing.expectEqualStrings("summarize the attached report", restored[0].text);
-    try std.testing.expectEqualStrings("application/pdf", restored[1].document.media_type);
-    try std.testing.expectEqualStrings("JVBERi0xLjcKJSVFT0YK", restored[1].document.data);
-    try std.testing.expectEqualStrings("report.pdf", restored[1].document.title);
-    try std.testing.expectEqual(@as(?u32, 2), restored[1].document.pages);
-}
-
-test "checkpoint maps an undeterminable page count to null rather than zero pages" {
-    const allocator = std.testing.allocator;
-    var conversation = Conversation.init(allocator);
-    defer conversation.deinit();
-    const blocks = try allocator.alloc(message.Block, 1);
-    blocks[0] = .{ .document = .{
-        .media_type = try allocator.dupe(u8, "application/pdf"),
-        .data = try allocator.dupe(u8, "JVBERi0xLjcKJSVFT0YK"),
-        .title = try allocator.dupe(u8, ""),
-        .pages = null,
-    } };
-    try conversation.append(.{ .role = .user, .blocks = blocks });
-
-    var sink = TestSink{ .allocator = allocator };
-    defer sink.deinit();
-    const limits = Limits{ .hard_bytes = 1024 * 1024 };
-    _ = try exportToSink(.{
-        .session_id = core.session_id.gen(),
-        .checkpoint_generation = 1,
-        .last_run_id = 1,
-        .last_compact_id = 0,
-        .terminal_kind = .run,
-        .terminal_id = 1,
-        .model = "claude-sonnet-4",
-        .conversation = &conversation,
-        .policy_generation = 1,
-        .catalog_generation = 1,
-        .authority = .{ .skill = "", .permission = "", .mcp = "" },
-    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
-
-    var source = TestSource{ .bytes = sink.bytes.items, .step = 7 };
-    var decoded = try decodeFromSource(
-        allocator,
-        .{ .ctx = &source, .read_fn = TestSource.read },
-        limits,
-    );
-    defer decoded.deinit();
-    const restored = decoded.conversation.messages.items[0].blocks;
-    try std.testing.expectEqual(@as(?u32, null), restored[0].document.pages);
-    try std.testing.expectEqualStrings("", restored[0].document.title);
-}
-
 test "checkpoint round-trips reasoning_item blocks (tag 6, issue #23)" {
     // A restored Run must still be able to replay the provider's encrypted
     // reasoning state, so both the owning model and the verbatim item survive.
@@ -1448,14 +1349,6 @@ test "encodedUserPartsMessageBytes 与真实编码字节精确一致(多模态�
     const parts = [_]message.UserContentPart{
         .{ .text = "看这张截图" },
         .{ .image = .{ .media_type = "image/png", .data = "UE5HREFUQQ==" } },
-        // 文档部分同样必须"预留 == 提交":否则一次多模态 Run 可能通过预算准入
-        // 却写不进 checkpoint,留下半准入状态。
-        .{ .document = .{
-            .media_type = "application/pdf",
-            .data = "JVBERi0xLjcK",
-            .title = "report.pdf",
-            .pages = 2,
-        } },
         .{ .text = "以及后记" },
     };
     try conversation.appendUserParts(&parts);
@@ -1484,4 +1377,136 @@ test "encodedUserPartsMessageBytes 与真实编码字节精确一致(多模态�
         try encodedUserPartsMessageBytes(&text_only),
     );
     try std.testing.expectError(error.Corrupt, encodedUserPartsMessageBytes(&.{}));
+}
+
+test "tag 字节损坏成 7 但 digest 不符 → Corrupt(完整性判定先于 schema 判定)" {
+    // 同一份改动在 review 之前会得到 UnsupportedSchema:tag 7 一出现就返回,
+    // 从未走到 digest 校验,于是"文件坏了"被伪装成"schema 不支持"。
+    const allocator = std.testing.allocator;
+    var conversation = Conversation.init(allocator);
+    defer conversation.deinit();
+    const blocks = try allocator.alloc(message.Block, 1);
+    blocks[0] = .{ .text = try allocator.dupe(u8, "placeholder") };
+    try conversation.append(.{ .role = .user, .blocks = blocks });
+
+    var sink = TestSink{ .allocator = allocator };
+    defer sink.deinit();
+    const limits = Limits{ .hard_bytes = 1024 * 1024 };
+    _ = try exportToSink(.{
+        .session_id = core.session_id.gen(),
+        .checkpoint_generation = 1,
+        .last_run_id = 1,
+        .last_compact_id = 0,
+        .terminal_kind = .run,
+        .terminal_id = 1,
+        .model = "claude-sonnet-4",
+        .conversation = &conversation,
+        .policy_generation = 1,
+        .catalog_generation = 1,
+        .authority = .{ .skill = "", .permission = "", .mcp = "" },
+    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
+
+    var patched = try allocator.dupe(u8, sink.bytes.items);
+    defer allocator.free(patched);
+    const needle = "placeholder";
+    const at = std.mem.indexOf(u8, patched, needle) orelse return error.SkipZigTest;
+    patched[at - 9] = 7; // tag byte 在 8 字节长度前缀之前;digest 未重算
+
+    var source = TestSource{ .bytes = patched, .step = 7 };
+    try std.testing.expectError(error.Corrupt, decodeFromSource(
+        allocator,
+        .{ .ctx = &source, .read_fn = TestSource.read },
+        limits,
+    ));
+}
+
+/// 测试用:导出一份两条消息的 checkpoint,把第一条的 48 字节 text block 原地改写成
+/// rev-16 的 tag-7 document 块(media_type "application/pdf" / data "JVBERi0=" /
+/// 5 字节 title / pages=2;编码等长 57 字节,头部尺寸照旧成立),再重算尾部 digest。
+/// 返回 owned 字节;调用方可继续改动后再决定是否重算 digest。
+fn revision16TagSevenFixture(allocator: std.mem.Allocator, title: *const [5]u8) ![]u8 {
+    var conversation = Conversation.init(allocator);
+    defer conversation.deinit();
+    const needle = "p" ** 48;
+    try conversation.appendText(.user, needle);
+    // 第二条消息紧跟在被撤回块之后:块若少读/多读一个字节,这里会先报 Corrupt。
+    try conversation.appendText(.assistant, "after the withdrawn block");
+
+    var sink = TestSink{ .allocator = allocator };
+    defer sink.deinit();
+    const limits = Limits{ .hard_bytes = 1024 * 1024 };
+    _ = try exportToSink(.{
+        .session_id = core.session_id.gen(),
+        .checkpoint_generation = 1,
+        .last_run_id = 1,
+        .last_compact_id = 0,
+        .terminal_kind = .run,
+        .terminal_id = 1,
+        .model = "claude-sonnet-4",
+        .conversation = &conversation,
+        .policy_generation = 1,
+        .catalog_generation = 1,
+        .authority = .{ .skill = "", .permission = "", .mcp = "" },
+    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write });
+
+    const patched = try allocator.dupe(u8, sink.bytes.items);
+    errdefer allocator.free(patched);
+    const at = std.mem.indexOf(u8, patched, needle) orelse return error.FixtureNeedleMissing;
+    var w = at - 9; // tag byte 在 8 字节长度前缀之前
+    patched[w] = 7;
+    w += 1;
+    const fields = [_][]const u8{ "application/pdf", "JVBERi0=", title };
+    for (fields) |field| {
+        std.mem.writeInt(u64, patched[w..][0..8], @intCast(field.len), .little);
+        w += 8;
+        @memcpy(patched[w..][0..field.len], field);
+        w += field.len;
+    }
+    std.mem.writeInt(u32, patched[w..][0..4], 2, .little);
+    w += 4;
+    std.debug.assert(w == at + needle.len); // 等长替换,后续消息未移位
+    rehashFixture(patched);
+    return patched;
+}
+
+/// digest 覆盖尾部 32 字节之前的全部内容(header 起全部 hashed):重算即可让文件在
+/// 完整性上无可挑剔。
+fn rehashFixture(bytes: []u8) void {
+    const body = bytes[0 .. bytes.len - DIGEST_BYTES];
+    std.crypto.hash.sha2.Sha256.hash(body, bytes[bytes.len - DIGEST_BYTES ..][0..DIGEST_BYTES], .{});
+}
+
+fn decodeFixture(allocator: std.mem.Allocator, bytes: []const u8) Error!Decoded {
+    var source = TestSource{ .bytes = bytes, .step = 7 };
+    return decodeFromSource(
+        allocator,
+        .{ .ctx = &source, .read_fn = TestSource.read },
+        .{ .hard_bytes = 1024 * 1024 },
+    );
+}
+
+test "完整的 revision-16 checkpoint(tag 7,digest 正确)→ UnsupportedSchema,跳过后流仍对齐" {
+    const allocator = std.testing.allocator;
+    const fixture = try revision16TagSevenFixture(allocator, "r.pdf");
+    defer allocator.free(fixture);
+    try std.testing.expectError(error.UnsupportedSchema, decodeFixture(allocator, fixture));
+}
+
+test "结构合法的 tag-7 块之后一个字节损坏且未重算 digest → Corrupt(判定确实晚于 digest 校验)" {
+    const allocator = std.testing.allocator;
+    const fixture = try revision16TagSevenFixture(allocator, "r.pdf");
+    defer allocator.free(fixture);
+    // 翻转第二条消息正文的首字节('a'→'b'):仍是合法 UTF-8、结构照旧解析得过,
+    // 只有 digest 不再匹配。若判定在 digest 之前就下,这里会错报 UnsupportedSchema。
+    const later = std.mem.indexOf(u8, fixture, "after the withdrawn block") orelse return error.SkipZigTest;
+    fixture[later] = 'b';
+    try std.testing.expectError(error.Corrupt, decodeFixture(allocator, fixture));
+}
+
+test "tag-7 块内的非法 UTF-8 → Corrupt(与 rev-16 解码器一致,不冒充完整的不支持文件)" {
+    const allocator = std.testing.allocator;
+    // title 第二字节 0xff:rev-16 的 readString 会拒绝它,跳过路径也必须拒绝。
+    const fixture = try revision16TagSevenFixture(allocator, "r\xff.pd");
+    defer allocator.free(fixture);
+    try std.testing.expectError(error.Corrupt, decodeFixture(allocator, fixture));
 }

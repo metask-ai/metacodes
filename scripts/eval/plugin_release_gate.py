@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import time
@@ -92,6 +93,83 @@ def _require_hashes(root: Path, rows: Mapping[str, Any], label: str) -> None:
             )
 
 
+def _require_exact_tree(
+    root: Path,
+    relative: str,
+    pinned: Mapping[str, Any],
+    label: str,
+) -> None:
+    """The directory holds exactly the pinned regular files - nothing added,
+    nothing missing, nothing executable, no symlinks anywhere beneath it -
+    and exactly the directories those files imply.
+
+    ``_require_hashes`` proves the pinned files are what they were; this
+    proves they are all there is. Without it a file dropped next to a pinned
+    Skill needs no protocol edit at all, so no pin, no fingerprint and no
+    frozen-manifest field would notice a candidate that executes differently.
+    Directory names and each file's executable bit go into the runtime's
+    Skill content revision (``computeContentRevision``), so an empty extra
+    directory or a ``chmod +x`` is a different candidate to the runtime even
+    with identical bytes; a data package is read, never run.
+    """
+    path = PurePosixPath(relative)
+    if (
+        not relative
+        or path.is_absolute()
+        or path.as_posix() != relative
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise PluginGateError(f"unsafe protocol path: {relative!r}")
+    cursor = root
+    for part in path.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise PluginGateError(f"protocol path contains a symlink: {relative}")
+    directory = root / path
+    if not directory.is_dir():
+        raise PluginGateError(f"{label} root is not a directory: {relative}")
+    present: set[str] = set()
+    present_dirs: set[str] = set()
+    for current, dirnames, filenames in os.walk(directory, followlinks=False):
+        current_path = Path(current)
+        for name in [*dirnames, *filenames]:
+            entry = current_path / name
+            if entry.is_symlink():
+                raise PluginGateError(
+                    f"{label} root contains a symlink: {entry.relative_to(root).as_posix()}"
+                )
+        for name in dirnames:
+            present_dirs.add((current_path / name).relative_to(root).as_posix())
+        for name in filenames:
+            entry = current_path / name
+            relative_name = entry.relative_to(root).as_posix()
+            mode = entry.lstat().st_mode
+            if not stat.S_ISREG(mode) or mode & 0o111:
+                raise PluginGateError(
+                    f"{label} root contains an executable or special file: {relative_name}"
+                )
+            present.add(relative_name)
+    expected = set(pinned)
+    if present != expected:
+        raise PluginGateError(
+            f"{label} root does not match its pins: "
+            f"unpinned {sorted(present - expected)}, missing {sorted(expected - present)}"
+        )
+    prefix = relative + "/"
+    expected_dirs = {
+        parent.as_posix()
+        for name in expected
+        for parent in PurePosixPath(name).parents
+        if parent.as_posix().startswith(prefix)
+    }
+    if present_dirs != expected_dirs:
+        raise PluginGateError(
+            f"{label} root has directories its pins do not imply: "
+            f"unpinned {sorted(present_dirs - expected_dirs)}, "
+            f"missing {sorted(expected_dirs - present_dirs)}"
+        )
+
+
 def _require_sha256(value: Any, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -137,9 +215,70 @@ def attest_runtime_artifact(
 
 
 def load_protocol(root: Path, path: Path) -> dict[str, Any]:
+    """Load the protocol and fail closed on *every* pin, including the
+    implementation fingerprint against the live tree.
+
+    The path-taking form of ``validate_protocol_payload``. Everything that is
+    about to run, measure or judge - ``run_gate``, ``plugin_pair_runner``
+    (``build_plan``, and ``_observe`` behind freeze / paid run / analysis) -
+    calls ``validate_protocol_payload`` directly, because each must hash the
+    exact bytes it validated. Both are strict by construction rather than by a
+    flag a caller could forget.
+    """
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
+    return validate_protocol_payload(root, raw)
+
+
+def load_protocol_structure(root: Path, path: Path) -> dict[str, Any]:
+    """Load the protocol and validate everything except implementation drift.
+
+    The implementation fingerprint pins ~130 source, test, SDK and doc paths,
+    and is meant to be refreshed only when a release or paid run is *frozen*
+    (see ``refresh_implementation_fingerprint``). Between freezes the pin is
+    stale by design. Routine tests and inspection tools that only need a valid
+    protocol object must therefore not compare it against the moving tree -
+    doing so made every commit that touched a pinned path repin the protocol,
+    which is how 30 consecutive commits on main came to edit this file and why
+    two parallel branches could not auto-merge (each carried a pin correct
+    only for its own tree). Every other check - schema, status, cost
+    authority, candidate, scenario and evaluator hashes - still fails closed.
+
+    Never use this from a path that executes, measures or publishes.
+    """
+    return _load_and_validate(root, path, check_implementation=False)
+
+
+def _load_and_validate(root: Path, path: Path, *, check_implementation: bool) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
+    return _validate_payload(root, raw, check_implementation=check_implementation)
+
+
+def validate_protocol_payload(root: Path, raw: bytes) -> dict[str, Any]:
+    """Strictly validate one exact byte payload - every pin, including the
+    implementation fingerprint against the live tree.
+
+    This is `load_protocol` for callers that already hold the bytes and need
+    the hash of *those* bytes to describe what they validated: the release
+    gate's snapshot. Strict by construction, like `load_protocol`; there is
+    no flag to forget.
+    """
+    return _validate_payload(root, raw, check_implementation=True)
+
+
+def _validate_payload(root: Path, raw: bytes, *, check_implementation: bool) -> dict[str, Any]:
+    """Validate one exact byte payload. Callers that need the payload's hash to
+    describe the same object they validated - the gate's receipt - hash `raw`
+    themselves rather than re-reading the file, so there is no second read
+    for a concurrent writer to slip between."""
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         raise PluginGateError("unsupported plugin evaluation protocol")
@@ -161,6 +300,10 @@ def load_protocol(root: Path, path: Path) -> dict[str, Any]:
     if not isinstance(candidate, dict):
         raise PluginGateError("candidate is missing")
     _require_hashes(root, candidate.get("files"), "candidate files")
+    candidate_root = candidate.get("root")
+    if not isinstance(candidate_root, str):
+        raise PluginGateError("candidate root must be a repository-relative path")
+    _require_exact_tree(root, candidate_root, candidate["files"], "candidate")
 
     pair = value.get("coding_pair")
     if not isinstance(pair, dict):
@@ -190,7 +333,8 @@ def load_protocol(root: Path, path: Path) -> dict[str, Any]:
         raise PluginGateError("coding pair cost authority changed")
     if pair.get("max_cumulative_metered_tokens") != 72_000_000:
         raise PluginGateError("coding pair token authority changed")
-    if pair.get("implementation_fingerprint") != implementation_fingerprint(root, value):
+    _require_sha256(pair.get("implementation_fingerprint"), "coding pair implementation_fingerprint")
+    if check_implementation and pair.get("implementation_fingerprint") != implementation_fingerprint(root, value):
         raise PluginGateError("coding pair implementation fingerprint drifted")
     _require_sha256(
         pair.get("runtime_binary_sha256"),
@@ -325,13 +469,73 @@ def _git_head(path: Path) -> str:
     return completed.stdout.strip()
 
 
+@dataclass(frozen=True)
+class _GateSnapshot:
+    """What a zero-provider receipt describes.
+
+    ``open`` reads the protocol file **once** and returns both the validated
+    object the gate will run with and the hash of the very bytes it was parsed
+    from. An earlier draft loaded the object and then hashed the file in a
+    second read, which let an atomic replacement between the two produce a
+    receipt whose ``protocol_sha256`` named one protocol while the checks had
+    run with another's parameters.
+
+    ``require_unchanged`` is the gate's last act before the receipt exists:
+    the file must still hold the same bytes, those bytes must still pass the
+    full strict validation against the tree (every pin, not only the
+    implementation fingerprint), and the Git HEAD must be the one captured.
+    What this does *not* detect is any mutation after an input's **last
+    observation**: a pinned input changed and restored between the two
+    observations while a subprocess consumed the changed version (ABA); a
+    pinned input changed *during* either validation scan after its bytes were
+    already hashed (the scan reads ~130 files one by one and is not atomic);
+    and any input changed after the final read but before the receipt is
+    returned and persisted. All of these need the subprocesses and the
+    hashing to run inside a materialized checkout of the snapshot, and the
+    receipt to be sealed there (issue #49).
+    """
+
+    protocol_sha256: str
+    git_head: str
+    implementation_fingerprint: str
+
+    @classmethod
+    def open(cls, root: Path, protocol_path: Path) -> tuple[dict[str, Any], "_GateSnapshot"]:
+        try:
+            raw = protocol_path.read_bytes()
+        except OSError as exc:
+            raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
+        protocol = validate_protocol_payload(root, raw)
+        snapshot = cls(
+            protocol_sha256=_sha256_bytes(raw),
+            git_head=_git_head(root),
+            implementation_fingerprint=protocol["coding_pair"]["implementation_fingerprint"],
+        )
+        return protocol, snapshot
+
+    def require_unchanged(self, root: Path, protocol_path: Path) -> None:
+        try:
+            final_raw = protocol_path.read_bytes()
+        except OSError as exc:
+            raise PluginGateError(f"cannot re-read plugin evaluation protocol: {exc}") from exc
+        if _sha256_bytes(final_raw) != self.protocol_sha256:
+            raise PluginGateError("protocol changed while the gate was running")
+        # Same bytes; now the same bytes must still hold against the tree.
+        validate_protocol_payload(root, final_raw)
+        if _git_head(root) != self.git_head:
+            raise PluginGateError("git HEAD moved while the gate was running")
+
+
 def run_gate(
     root: Path,
     protocol_path: Path,
     dsh: Path,
     runtime_binary: Path,
 ) -> dict[str, Any]:
-    protocol = load_protocol(root, protocol_path)
+    # One read: the object the gate runs with and the hash the receipt will
+    # carry come from the same bytes. The receipt is built minutes of
+    # subprocesses later; it must describe this snapshot and nothing else.
+    protocol, snapshot = _GateSnapshot.open(root, protocol_path)
     runtime = attest_runtime_artifact(protocol, runtime_binary)
     expected_dsh = protocol["upstream"]["deepseek_harness_commit"]
     observed_dsh = _git_head(dsh)
@@ -465,15 +669,22 @@ def run_gate(
         missing = sorted(required_checks - observed_checks)
         raise PluginGateError(f"zero-provider receipt is missing required checks: {missing}")
 
+    # Every pin was checked once, before any subprocess ran. Re-run the whole
+    # strict load now - not just the implementation fingerprint: candidate,
+    # scenario and evaluator hashes are pins too - and require the protocol
+    # bytes and the tree identity to be the ones captured at the start, so
+    # the receipt cannot describe a different snapshot than the checks did.
+    snapshot.require_unchanged(root, protocol_path)
+
     overheads = [int(row["static_plugin_p95_overhead_ns"]) for row in benchmark_rows]
     inventories = [int(row["inventory_avg_ns"]) for row in benchmark_rows]
     receipt = {
         "schema": RECEIPT_SCHEMA,
         "quality_evidence": False,
         "provider_requests": 0,
-        "protocol_sha256": _sha256(protocol_path),
-        "metacodes_git_head": _git_head(root),
-        "implementation_fingerprint": implementation_fingerprint(root, protocol),
+        "protocol_sha256": snapshot.protocol_sha256,
+        "metacodes_git_head": snapshot.git_head,
+        "implementation_fingerprint": snapshot.implementation_fingerprint,
         "deepseek_harness_commit": observed_dsh,
         "candidate": {
             "plugin_id": protocol["candidate"]["plugin_id"],
@@ -635,8 +846,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
-        protocol = load_protocol(root, args.protocol.resolve())
         if args.validate_only:
+            # Inspection, not certification. Between freezes the committed pin
+            # is stale by design, so this loads structurally and *reports* the
+            # pin's state instead of failing on it. Exit 0 here says "the
+            # protocol is well-formed and every other pin holds"; it does not
+            # say the tree is frozen - `implementation_pin` does.
+            protocol = load_protocol_structure(root, args.protocol.resolve())
+            pinned = protocol["coding_pair"]["implementation_fingerprint"]
+            observed = implementation_fingerprint(root, protocol)
             print(
                 json.dumps(
                     {
@@ -644,7 +862,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "status": protocol["status"],
                         "quality_evidence": False,
                         "provider_requests": 0,
-                        "implementation_fingerprint": implementation_fingerprint(root, protocol),
+                        "pinned_implementation_fingerprint": pinned,
+                        "observed_implementation_fingerprint": observed,
+                        "implementation_pin": "current" if pinned == observed else "stale",
+                        "freeze_ready": pinned == observed,
                     },
                     sort_keys=True,
                 )

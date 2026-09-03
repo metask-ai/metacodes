@@ -112,14 +112,6 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
                     const head = try std.fmt.allocPrint(allocator, "  {s}❯ [image {s}, {d} bytes base64]{s}", .{ th.dim, img.media_type, img.data.len, th.reset });
                     try lines.append(allocator, head);
                 },
-                .document => |doc| {
-                    // 终端不内联渲文档:显示元信息行(类型 + 标题 + 页数 + base64 字节数)。
-                    const head = if (doc.pages) |n|
-                        try std.fmt.allocPrint(allocator, "  {s}❯ [document {s}{s}{s}, {d} pages, {d} bytes base64]{s}", .{ th.dim, doc.media_type, if (doc.title.len > 0) " " else "", doc.title, n, doc.data.len, th.reset })
-                    else
-                        try std.fmt.allocPrint(allocator, "  {s}❯ [document {s}{s}{s}, {d} bytes base64]{s}", .{ th.dim, doc.media_type, if (doc.title.len > 0) " " else "", doc.title, doc.data.len, th.reset });
-                    try lines.append(allocator, head);
-                },
                 // provider 私有的加密推理续传项:不可读也不是会话内容,transcript
                 // 视图不显示它(显示密文只会污染 Ctrl+O 的"渲染等效"契约)。
                 .reasoning_item => {},

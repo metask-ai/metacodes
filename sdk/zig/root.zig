@@ -110,20 +110,6 @@ pub fn imagePart(media_type: []const u8, base64_data: []const u8) types.RunInput
     };
 }
 
-/// One RUN_INPUT_PART_DOCUMENT element: `application/pdf` plus a standard
-/// base64 payload, with an optional stable title in `text` (a file name, never
-/// a local path). Pass an empty title to leave the document untitled.
-pub fn documentPart(media_type: []const u8, base64_data: []const u8, title: []const u8) types.RunInputPartV1 {
-    return .{
-        .struct_size = @sizeOf(types.RunInputPartV1),
-        .kind_code = types.RUN_INPUT_PART_DOCUMENT,
-        .text = bytesView(title),
-        .media_type = bytesView(media_type),
-        .data = bytesView(base64_data),
-        .reserved = [_]u64{0} ** 2,
-    };
-}
-
 pub fn borrowedBytes(view: types.BytesViewV1) error{InvalidBytesView}![]const u8 {
     const len = std.math.cast(usize, view.len) orelse return error.InvalidBytesView;
     if (len == 0) return "";
@@ -448,7 +434,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 16 SDK rejects Revision 13, Revision 14, and stale reference roots" {
+test "Revision 15 SDK rejects Revision 13, Revision 14, and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -484,7 +470,7 @@ test "Revision 16 SDK rejects Revision 13, Revision 14, and stale reference root
         std.mem.zeroes(StaleReferenceApi);
     stale_reference.struct_size = @sizeOf(StaleReferenceApi);
     stale_reference.abi_version = types.ABI_VERSION_V1;
-    stale_reference.abi_revision = 16;
+    stale_reference.abi_revision = 15;
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(StaleReferenceApi));
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&stale_reference));
 }

@@ -71,9 +71,6 @@ pub const Config = struct {
     /// 构成一条按序 text+images 的 user 消息。多个路径用 `\x00` 分隔拼一串
     /// (同 add_dirs 的 appendNulList 约定)。null = 无图像。
     images: ?[]const u8 = null,
-    /// `--pdf <path>`(headless,可重复):与 images 同形的 `\x00` 分隔路径串。
-    /// 块顺序:prompt 文本 → 各 image → 各 document。null = 未传该 flag。
-    documents: ?[]const u8 = null,
     /// `--json`：headless 下用 NDJSON 事件流输出，便于 CI/脚本消费。
     json_output: bool = false,
     /// `--stream-json`:headless 运行期实时 NDJSON 事件流(text/tool/usage/turn),
@@ -351,12 +348,6 @@ pub const ApiContent = union(enum) {
     /// wire 翻译按 provider 方言(dialect.serializeImagePart);不支持图像输入的
     /// (provider, model) 序列化时必须返回显式能力错误,绝不静默丢弃或降级为文本。
     image: ImageBlock,
-    /// 用户消息中的一等文档内容(issue #25)。当前仅 PDF(application/pdf)。
-    /// **与 image 分开建模**:文档不是图片,能力也不同——`supports_image_input`
-    /// 为真绝不蕴含 `supports_pdf_input`。wire 翻译按 provider 方言
-    /// (dialect.serializeDocumentPart);不支持文档输入的 (provider, model)
-    /// 序列化时返回显式能力错误,绝不静默丢弃、OCR、抽文本或降级成页面图。
-    document: DocumentBlock,
     /// Provider 私有的推理续传状态(issue #23)。目前唯一生产者/消费者是 OpenAI
     /// Responses(`store:false` 下的 `reasoning` item + `encrypted_content`):
     /// 服务端不存响应,推理上下文只能由客户端原样回传。**不是**可读文本——
@@ -381,19 +372,62 @@ pub const ImageBlock = struct {
     data: []const u8,
 };
 
-/// 文档内容块(中立 IR,issue #25)。`data` 是 base64 编码的原始文档字节,
-/// `media_type` 必须与内容一致(当前唯一受理值 `core/pdf.zig` 的 MEDIA_TYPE)。
-/// `title` 是**宿主给的文档身份**(如原始文件名),可为空;它是稳定标识,
-/// 绝不放绝对路径、时间戳或任何每次运行都会变的东西——那会污染 provider 可见
-/// 字节的缓存前缀契约。字节所有权跟随所在 ApiMessage 的借用契约。
-pub const DocumentBlock = struct {
-    media_type: []const u8,
-    data: []const u8,
-    title: []const u8 = "",
-    /// 准入时数出来的页数;null = 页树在压缩对象流里,不完整解析数不出来
-    /// (见 core/pdf.zig)。**不是猜测值**,只用于 token 估算与预算,不上 wire。
-    pages: ?u32 = null,
+/// 图像读取上限(base64 前的原始字节)。Anthropic 单图 ~5MB 限制,留余量取 3.75MB;
+/// Read 工具、headless `--image`、AgentCore RunInput 图像 part 与 tool_result 图像
+/// 判定共用同一上限——超过它的载荷任何已接线 provider 都收不下,不算图像。
+pub const MAX_IMAGE_BYTES: usize = 3_750_000;
+/// MAX_IMAGE_BYTES 经标准 base64(带填充)后的最大字符数。
+pub const MAX_IMAGE_BASE64_BYTES: usize = std.base64.standard.Encoder.calcSize(MAX_IMAGE_BYTES);
+/// 一次请求里所有规范图像结果 base64 字节的上限。图片绕过按字节的投影/轮预算(只按
+/// IMAGE_TOKEN_ESTIMATE 记账),但 wire 有硬上限:Gemini 含内联图片的请求 20 MB,Anthropic
+/// 请求 32 MB;取 16 MiB 给提示词与 JSON 留余量。投影把当前轮超限的图片按最大优先 spill
+/// 成信封;agent_loop 发请求前把活跃历史里最老的**已送达**图片清成 stub。
+pub const MAX_IMAGE_RESULT_BYTES_PER_REQUEST: usize = 16 * 1024 * 1024;
+
+/// 一条规范图像 tool_result 的**原始字节**上限:base64 载荷 + 三个键、引号、MIME 与
+/// 少量 JSON 空白。`extractImageResult` 先按它拒绝,再解析——外围空白可以容忍,但不能
+/// 成为绕过投影预算的免费通道(否则 40 MiB 空白 + 一张小图只记 6400 预算字节)。
+pub const MAX_IMAGE_RESULT_BYTES: usize = MAX_IMAGE_BASE64_BYTES + 512;
+
+/// 所有已接线 provider 方言都接受的图像 MIME。Read 的扩展名表、headless `--image`、
+/// AgentCore RunInput 校验与 tool_result 图像判定都由此推导。
+pub const SUPPORTED_IMAGE_MEDIA_TYPES = [_][]const u8{
+    "image/png", "image/jpeg", "image/gif", "image/webp",
 };
+
+pub fn isSupportedImageMediaType(media_type: []const u8) bool {
+    for (SUPPORTED_IMAGE_MEDIA_TYPES) |candidate| {
+        if (std.mem.eql(u8, media_type, candidate)) return true;
+    }
+    return false;
+}
+
+/// 标准 base64(带 `=` 填充、无空白):长度为 4 的倍数,字母表 `A-Z a-z 0-9 + /`,
+/// 至多两个 `=` 且只在末尾。
+pub fn isStandardBase64(data: []const u8) bool {
+    if (data.len == 0 or data.len % 4 != 0) return false;
+    var padding: usize = 0;
+    for (data) |byte| {
+        if (byte == '=') {
+            padding += 1;
+            if (padding > 2) return false;
+            continue;
+        }
+        if (padding != 0) return false;
+        const in_alphabet = (byte >= 'A' and byte <= 'Z') or
+            (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or byte == '+' or byte == '/';
+        if (!in_alphabet) return false;
+    }
+    return true;
+}
+
+/// 单张输入图像的 token 估算上限。各家 vision 端点把大图缩放到 ~1.1M 像素量级
+/// (Anthropic tokens≈pixels/750 → ~1590;OpenAI high-detail 同量级封顶),不解码
+/// 图像尺寸时取缩放上限做保守高估——auto-compact 阈值宁可早触发,绝不因低估爆窗口。
+/// 放在 IR 层:conversation(估算)、agent_loop(预留)、result_projection(轮预算)
+/// 共用同一口径,且互不依赖。
+pub const IMAGE_TOKEN_ESTIMATE: usize = 1600;
 
 /// 工具调用块
 pub const ToolUseBlock = struct {

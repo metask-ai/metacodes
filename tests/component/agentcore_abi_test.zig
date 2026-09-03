@@ -3955,7 +3955,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 16), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 15), wire.ABI_REVISION);
     try std.testing.expectEqual(
         @as(u32, 8),
         std.mem.readInt(u32, &abi_revision_bytes, .little),
@@ -8565,317 +8565,373 @@ test "L2 Revision 15 multimodal Run reaches OpenAI Responses under a non-Anthrop
     ) != null);
 }
 
-/// Minimal but real PDF: header, two page objects, trailer, `%%EOF`. It passes
-/// Core's admission unchanged and its two pages are countable.
-const TINY_PDF_BYTES =
-    "%PDF-1.7\n" ++
-    "1 0 obj\n<< /Type /Pages /Count 2 /Kids [2 0 R 3 0 R] >>\nendobj\n" ++
-    "2 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj\n" ++
-    "3 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj\n" ++
-    "trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
+/// PR #46 review F2:skill Run 在 activation 期间被 abort 时,以 `SkillExecution.aborted`
+/// **成功返回**,循环从未启动、没有 run_done —— facade 必须自己把已经发出 `starting`
+/// 的 RunState 关成 `aborted`,否则 Host 观测到的 Run 永远停在 `starting`。
+const SkillAbortAtStartingProbe = struct {
+    api: sdk.Api,
+    expected_run_id: u64,
+    abort_status: u32 = std.math.maxInt(u32),
+    saw_starting: bool = false,
+    saw_terminal_aborted: bool = false,
+    saw_other_terminal: bool = false,
+    snapshots_after_terminal: usize = 0,
+    last_seq: u64 = 0,
+    sequence_valid: bool = true,
 
-fn tinyPdfBase64Owned(a: std.mem.Allocator) ![]u8 {
-    const encoder = std.base64.standard.Encoder;
-    const out = try a.alloc(u8, encoder.calcSize(TINY_PDF_BYTES.len));
-    _ = encoder.encode(out, TINY_PDF_BYTES);
-    return out;
-}
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *SkillAbortAtStartingProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .known => |known| switch (known) {
+                .run_state => |state| {
+                    if (state.run_id != self.expected_run_id) return wire.EVENT_CONTINUE;
+                    if (state.transition_seq != self.last_seq + 1) self.sequence_valid = false;
+                    self.last_seq = state.transition_seq;
+                    if (self.saw_terminal_aborted or self.saw_other_terminal) self.snapshots_after_terminal += 1;
+                    switch (state.phase) {
+                        .starting => {
+                            if (self.saw_starting) return wire.EVENT_CONTINUE;
+                            self.saw_starting = true;
+                            // 在 `starting` 快照里就 abort:activation 一结束,skill 路径
+                            // 会命中 isAborted() 直接返回 .aborted,不经过 agent loop。
+                            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+                            self.abort_status = self.api.session().abort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+                            self.api.bufferRelease()(&diagnostic);
+                        },
+                        .aborted => self.saw_terminal_aborted = true,
+                        .completed, .failed, .poisoned => self.saw_other_terminal = true,
+                        else => {},
+                    }
+                },
+                else => {},
+            },
+            .unknown => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
 
-test "L2 Revision 16 multimodal Run carries an ordered document part into the provider request and survives checkpoint restore" {
+test "L2 RunState: a Skill aborted during activation still closes run_state as aborted (PR #46 review F2)" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try rootPath(&tmp, &root_buffer);
-    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    try writeSkillFixture(
+        a,
+        root,
+        "review",
+        "---\nname: Review\ndescription: RunState closure fixture\narguments: [target]\n---\nREVIEW_SKILL_SENTINEL $target",
+    );
+
+    // 不会有任何 provider 请求:abort 在 activation 阶段命中,循环从未启动。
+    const bodies = [_][]const u8{FINAL_SSE};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    const pdf_b64 = try tinyPdfBase64Owned(a);
-    defer a.free(pdf_b64);
 
-    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
-        return error.MissingApi;
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer api.bufferRelease()(&diagnostic);
     var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
     runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
     var runtime: ?*wire.RuntimeHandle = null;
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
-    );
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
     defer if (runtime) |handle| {
         _ = api.runtime().destroy()(handle, &diagnostic);
     };
-    var host = std.mem.zeroes(wire.SessionHostConfigV1);
-    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
-    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
-    host.shell_policy_code = wire.SHELL_DISABLED;
-    host.api_key = sdk.bytesView("test-key");
-    host.base_url = sdk.bytesView(url);
-    host.workspace_root = sdk.bytesView(root);
-    host.workspace_home = sdk.bytesView(root);
-    var create = sessionCreateConfig(&host, "claude-sonnet-4-document-fixture");
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("epoch-1"),
+        .additional_sources = null,
+        .additional_source_count = 0,
+        .reserved = [_]u64{0} ** 1,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    defer if (catalog) |handle| {
+        _ = api.skill().releaseCatalog()(handle, &diagnostic);
+    };
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.skill().resolveCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+    );
+    const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    var decoded = try sdk.decodeSkillCatalog(a, descriptor_bytes);
+    defer decoded.deinit();
+    const grant_views = try a.alloc(wire.BytesViewV1, decoded.value.skills.len);
+    defer a.free(grant_views);
+    for (decoded.value.skills, grant_views) |skill, *grant| grant.* = sdk.bytesView(skill.skill_id);
+    var skill_policy = skillPolicy(grant_views);
+    const ids = try extractCatalogIdentities(a, descriptor_bytes, "review");
+    defer a.free(ids.revision);
+    defer a.free(ids.skill_id);
+
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.skill_catalog = catalog;
+    host_config.skill_policy = &skill_policy;
+    var session_config = sessionCreateConfig(&host_config, "test-model");
+    var probe = SkillAbortAtStartingProbe{ .api = api, .expected_run_id = 1 };
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
-    callbacks.on_event = acceptEvent;
+    callbacks.ctx = &probe;
+    callbacks.on_event = SkillAbortAtStartingProbe.event;
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.session().create()(runtime, &create, &callbacks, &session, &diagnostic),
+        api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic),
     );
     defer if (session) |handle| {
         _ = api.session().destroy()(handle, &diagnostic);
     };
+    try std.testing.expectEqual(wire.STATUS_OK, api.skill().bindPolicy()(session, catalog, &skill_policy, &diagnostic));
 
-    const parts = [_]wire.RunInputPartV1{
-        sdk.textPart("leading-part"),
-        sdk.documentPart("application/pdf", pdf_b64, "report.pdf"),
-        sdk.textPart("trailing-part"),
-    };
+    const encoded_arguments = try sdk.encodeSkillArguments(a, &.{"src/main.zig"});
+    defer a.free(encoded_arguments);
     var options = std.mem.zeroes(wire.RunOptionsV1);
     options.struct_size = @sizeOf(wire.RunOptionsV1);
     options.max_turns = 1;
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.session().runMultimodal(session, 1, &parts, &options, &result, &diagnostic),
-    );
-    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
-    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
-    {
-        const request = server.lastRequest() orelse return error.MissingRequest;
-        const body = request.body();
-        const document_wire = try std.fmt.allocPrint(
-            a,
-            "{{\"type\":\"document\",\"source\":{{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"{s}\"}},\"title\":\"report.pdf\"}}",
-            .{pdf_b64},
-        );
-        defer a.free(document_wire);
-        const leading = std.mem.indexOf(u8, body, "leading-part") orelse return error.MissingTextPart;
-        const document = std.mem.indexOf(u8, body, document_wire) orelse return error.MissingDocumentPart;
-        const trailing = std.mem.indexOf(u8, body, "trailing-part") orelse return error.MissingTextPart;
-        try std.testing.expect(leading < document and document < trailing);
-    }
-
-    var checkpoint = PublicCheckpointBuffer{};
-    defer checkpoint.deinit();
-    var limits = publicCheckpointLimits();
-    var sink = checkpoint.sink();
-    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
-    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
-    export_config.limits = &limits;
-    export_config.sink = &sink;
-    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic),
-    );
-    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
-    session = null;
-
-    var source = checkpoint.source();
-    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
-    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
-    restore_config.host = &host;
-    restore_config.source = &source;
-    restore_config.limits = &limits;
-    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
-    defer api.bufferRelease()(&restore_report);
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.sessionControl().restore()(
-            runtime,
-            &restore_config,
-            &callbacks,
-            &session,
-            &restore_report,
-            &diagnostic,
-        ),
-    );
-
-    var continued = std.mem.zeroes(wire.RunResultV1);
-    try std.testing.expectEqual(
-        wire.STATUS_OK,
-        api.session().runText(
+        api.session().runSkill(
             session,
-            2,
-            sdk.bytesView("continue after restore"),
+            1,
+            sdk.bytesView(ids.skill_id),
+            sdk.bytesView(ids.revision),
+            sdk.bytesView(encoded_arguments),
             &options,
-            &continued,
+            &result,
             &diagnostic,
         ),
     );
-    try std.testing.expectEqual(wire.STOP_END_TURN, continued.stop_reason_code);
-    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
-    {
-        // The restored Conversation resends the original document bytes and
-        // its title: the checkpoint block-tag-7 round trip is observable at
-        // the provider wire, with no dependence on any host file.
-        const request = server.lastRequest() orelse return error.MissingRequest;
-        const body = request.body();
-        try std.testing.expect(std.mem.indexOf(u8, body, pdf_b64) != null);
-        try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"application/pdf\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, body, "\"title\":\"report.pdf\"") != null);
-    }
+    try std.testing.expectEqual(wire.STATUS_OK, probe.abort_status);
+    try std.testing.expectEqual(wire.STOP_ABORTED, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    try std.testing.expect(probe.saw_starting);
+    // 修复前这里挂:没有任何终态快照,Host 看到的 Run 停在 `starting`。
+    try std.testing.expect(probe.saw_terminal_aborted);
+    try std.testing.expect(!probe.saw_other_terminal);
+    try std.testing.expect(probe.sequence_valid);
+    try std.testing.expectEqual(@as(usize, 0), probe.snapshots_after_terminal);
 }
 
-test "L2 Revision 16 document capability preflight is independent of vision and keeps the Run id reusable" {
+/// PR #46 review round 3 (finding 2):Host 在 `finalizing` 快照的回调里 abort,core 会把
+/// 结果改写成 aborted;终态快照必须跟着结果走,而不是循环自己的 end_turn。
+const AbortAtFinalizingProbe = struct {
+    api: sdk.Api,
+    abort_status: u32 = std.math.maxInt(u32),
+    saw_finalizing: bool = false,
+    saw_aborted: bool = false,
+    terminal_count: usize = 0,
+    snapshots_after_terminal: usize = 0,
+    last_seq: u64 = 0,
+    sequence_valid: bool = true,
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *AbortAtFinalizingProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .known => |known| switch (known) {
+                .run_state => |state| {
+                    if (state.transition_seq != self.last_seq + 1) self.sequence_valid = false;
+                    self.last_seq = state.transition_seq;
+                    if (self.terminal_count != 0) self.snapshots_after_terminal += 1;
+                    switch (state.phase) {
+                        .finalizing => {
+                            if (self.saw_finalizing) return wire.EVENT_CONTINUE;
+                            self.saw_finalizing = true;
+                            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+                            self.abort_status = self.api.session().abort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+                            self.api.bufferRelease()(&diagnostic);
+                        },
+                        .aborted => {
+                            self.saw_aborted = true;
+                            self.terminal_count += 1;
+                        },
+                        .completed, .failed, .poisoned => self.terminal_count += 1,
+                        else => {},
+                    }
+                },
+                else => {},
+            },
+            .unknown => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+/// PR #46 review round 3 (finding 1):Host 拒绝**终态**快照 = 回调失败,Run 必须以
+/// CALLBACK_FAILED 失败并毒化 Session,而不是被报成一次成功的 Run。
+const FatalOnTerminalProbe = struct {
+    saw_terminal: bool = false,
+
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *FatalOnTerminalProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .known => |known| switch (known) {
+                .run_state => |state| switch (state.phase) {
+                    .completed, .failed, .aborted, .poisoned => {
+                        self.saw_terminal = true;
+                        return wire.EVENT_FATAL;
+                    },
+                    else => {},
+                },
+                else => {},
+            },
+            .unknown => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+fn createTextRunSession(
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle,
+    url: []const u8,
+    root: []const u8,
+    callbacks: *wire.SessionCallbacksV1,
+    diagnostic: *wire.OwnedBytesV1,
+) !?*wire.SessionHandle {
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("run-state-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    var session_config = sessionCreateConfig(&host_config, "run-state-model");
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, callbacks, &session, diagnostic));
+    return session;
+}
+
+test "L2 RunState: an abort accepted from the finalizing callback yields one terminal snapshot, aborted, matching STOP_ABORTED" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try rootPath(&tmp, &root_buffer);
-    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{FINAL_SSE};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    const pdf_b64 = try tinyPdfBase64Owned(a);
-    defer a.free(pdf_b64);
 
-    // "claude-vision-fixture" has vision under the Anthropic profile but is
-    // not in any family with native document input — exactly the case the
-    // issue calls out: image capability must not imply PDF capability.
-    var fixture = try PublicSessionFixture.init(root, url, "claude-vision-fixture");
-    defer fixture.deinit();
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer {
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
+    }
 
-    const with_document = [_]wire.RunInputPartV1{
-        sdk.textPart("summarize this"),
-        sdk.documentPart("application/pdf", pdf_b64, "report.pdf"),
-    };
-    var result = std.mem.zeroes(wire.RunResultV1);
-    try std.testing.expectEqual(
-        wire.STATUS_DOCUMENT_INPUT_UNSUPPORTED,
-        submitMultimodal(&fixture, 1, &with_document, &result),
-    );
-    fixture.releaseDiagnostic();
-    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    var probe = AbortAtFinalizingProbe{ .api = api };
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = AbortAtFinalizingProbe.event;
+    const session = try createTextRunSession(api, runtime, url, root, &callbacks, &diagnostic);
+    defer {
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
+    }
 
-    // An image part on the same Session is still admitted, and the rejected
-    // Run was never admitted, so the same Run id remains usable.
-    const with_image = [_]wire.RunInputPartV1{
-        sdk.textPart("describe this"),
-        sdk.imagePart("image/png", "UE5HREFUQQ=="),
-    };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        submitMultimodal(&fixture, 1, &with_image, &result),
+        api.session().runText(session, 1, sdk.bytesView("finish normally, then abort late"), &options, &result, &diagnostic),
     );
-    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
-    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expect(probe.saw_finalizing);
+    try std.testing.expectEqual(wire.STATUS_OK, probe.abort_status);
+    // core 把结果改写成 aborted……
+    try std.testing.expectEqual(wire.STOP_ABORTED, result.stop_reason_code);
+    // ……终态快照必须与之一致,且四种终态里恰好只出现这一个(修复前:completed + STOP_ABORTED)。
+    try std.testing.expect(probe.saw_aborted);
+    try std.testing.expectEqual(@as(usize, 1), probe.terminal_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.snapshots_after_terminal);
+    try std.testing.expect(probe.sequence_valid);
 }
 
-test "Revision 16 document wire validation rejects malformed, non-PDF, encrypted and over-cap payloads before admission" {
+test "L2 RunState: a Host rejecting the terminal snapshot fails the Run with CALLBACK_FAILED and poisons the Session" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try rootPath(&tmp, &root_buffer);
-    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var fixture = try PublicSessionFixture.init(root, url, "claude-sonnet-4-document-fixture");
-    defer fixture.deinit();
-    var result = std.mem.zeroes(wire.RunResultV1);
 
-    const encoder = std.base64.standard.Encoder;
-    const not_pdf_raw = "this is plainly not a pdf document at all";
-    const not_pdf = try a.alloc(u8, encoder.calcSize(not_pdf_raw.len));
-    defer a.free(not_pdf);
-    _ = encoder.encode(not_pdf, not_pdf_raw);
-
-    const encrypted_raw = "%PDF-1.7\ntrailer\n<< /Encrypt 9 0 R /Root 1 0 R >>\n%%EOF\n";
-    const encrypted = try a.alloc(u8, encoder.calcSize(encrypted_raw.len));
-    defer a.free(encrypted);
-    _ = encoder.encode(encrypted, encrypted_raw);
-
-    const cases = [_]struct { status: u32, part: wire.RunInputPartV1 }{
-        // Wrong media type: images do not become documents by relabelling.
-        .{ .status = wire.STATUS_INVALID_ARGUMENT, .part = sdk.documentPart("image/png", "UE5HREFUQQ==", "") },
-        // Not standard base64.
-        .{ .status = wire.STATUS_INVALID_ARGUMENT, .part = sdk.documentPart("application/pdf", "!!!!", "") },
-        // Decodes, but is not a PDF.
-        .{ .status = wire.STATUS_INVALID_ARGUMENT, .part = sdk.documentPart("application/pdf", not_pdf, "") },
-        // Password protected: never guessed at, never partially submitted.
-        .{ .status = wire.STATUS_INVALID_ARGUMENT, .part = sdk.documentPart("application/pdf", encrypted, "") },
-    };
-    for (cases) |case| {
-        const parts = [_]wire.RunInputPartV1{case.part};
-        try std.testing.expectEqual(case.status, submitMultimodal(&fixture, 1, &parts, &result));
-        fixture.releaseDiagnostic();
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer {
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
     }
 
-    // Over the payload cap: a bounded resource limit, refused before the
-    // payload pointer is ever dereferenced for decoding.
-    var oversize = sdk.documentPart("application/pdf", "AAAA", "");
-    oversize.data.len = wire.MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1 + 4;
-    const oversize_parts = [_]wire.RunInputPartV1{oversize};
+    var probe = FatalOnTerminalProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = FatalOnTerminalProbe.event;
+    const session = try createTextRunSession(api, runtime, url, root, &callbacks, &diagnostic);
+    defer {
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
+    }
+
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var result: wire.RunResultV1 = undefined;
+    // 修复前:终态快照被拒绝的结果被丢弃,这里返回 STATUS_OK。
     try std.testing.expectEqual(
-        wire.STATUS_RESOURCE_LIMIT,
-        submitMultimodal(&fixture, 1, &oversize_parts, &result),
+        wire.STATUS_CALLBACK_FAILED,
+        api.session().runText(session, 1, sdk.bytesView("reject my terminal"), &options, &result, &diagnostic),
     );
-    fixture.releaseDiagnostic();
-
-    // Nothing reached the provider and the Run id was never consumed.
-    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
-    const pdf_b64 = try tinyPdfBase64Owned(a);
-    defer a.free(pdf_b64);
-    const good = [_]wire.RunInputPartV1{sdk.documentPart("application/pdf", pdf_b64, "report.pdf")};
-    try std.testing.expectEqual(wire.STATUS_OK, submitMultimodal(&fixture, 1, &good, &result));
-    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
-}
-
-test "L2 Revision 16 document root input reserves its durable delta before admission" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try rootPath(&tmp, &root_buffer);
-    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
-    defer server.stop();
-    const url = try server.urlOwned(a);
-    defer a.free(url);
-    var fixture = try PublicSessionFixture.init(root, url, "claude-sonnet-4-document-fixture");
-    defer fixture.deinit();
-
-    // A genuinely well-formed 7 MB PDF (comment padding keeps it valid), so it
-    // clears PDF admission and every wire cap — base64 is 9.3 MB, under both
-    // MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1 and the 16 MiB total. It still
-    // exceeds the default 8 MiB durable input cap, so the exact multimodal
-    // reservation must reject before admission, with no provider request and
-    // no partial durable state.
-    const pad = 7_000_000;
-    var raw: std.ArrayList(u8) = .empty;
-    defer raw.deinit(a);
-    try raw.appendSlice(a, "%PDF-1.7\n1 0 obj\n<< /Type /Page >>\nendobj\n%");
-    try raw.appendNTimes(a, 'x', pad);
-    try raw.appendSlice(a, "\ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
-    // Prove the payload is admissible on its own: the rejection below is the
-    // budget, not a malformed document.
-    _ = try core.pdf.inspect(raw.items);
-
-    const encoder = std.base64.standard.Encoder;
-    const encoded = try a.alloc(u8, encoder.calcSize(raw.items.len));
-    defer a.free(encoded);
-    _ = encoder.encode(encoded, raw.items);
-    try std.testing.expect(encoded.len < wire.MAX_RUN_INPUT_DOCUMENT_DATA_BYTES_V1);
-
-    const parts = [_]wire.RunInputPartV1{sdk.documentPart("application/pdf", encoded, "big.pdf")};
-    var result = std.mem.zeroes(wire.RunResultV1);
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expect(probe.saw_terminal);
+    // 回调失败毒化 Session:后续 Run 一律 INVALID_STATE。
     try std.testing.expectEqual(
-        wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
-        submitMultimodal(&fixture, 1, &parts, &result),
+        wire.STATUS_INVALID_STATE,
+        api.session().runText(session, 2, sdk.bytesView("after poison"), &options, &result, &diagnostic),
     );
-    try std.testing.expectEqual(
-        wire.RUN_CHECKPOINT_BUDGET_REQUIRED,
-        result.checkpoint_outcome_code,
-    );
-    fixture.releaseDiagnostic();
-    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
 }
 
 const SchemaAdvertisementProbe = struct {

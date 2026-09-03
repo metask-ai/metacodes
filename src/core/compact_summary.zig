@@ -76,16 +76,6 @@ pub fn summarizeWithModel(
                 transcript_buf.appendSlice(allocator, img.media_type) catch return null;
                 transcript_buf.appendSlice(allocator, "]") catch return null;
             },
-            .document => |doc| {
-                // 同图像:摘要输入里只留标记 + 宿主给的标题,绝不塞 base64 载荷。
-                transcript_buf.appendSlice(allocator, "[document ") catch return null;
-                transcript_buf.appendSlice(allocator, doc.media_type) catch return null;
-                if (doc.title.len > 0) {
-                    transcript_buf.appendSlice(allocator, " ") catch return null;
-                    transcript_buf.appendSlice(allocator, doc.title) catch return null;
-                }
-                transcript_buf.appendSlice(allocator, "]") catch return null;
-            },
         };
         transcript_buf.append(allocator, '\n') catch return null;
     }
@@ -155,16 +145,6 @@ pub fn summarizeAbortable(
                 // 总结输入的占位标记(被压缩前缀整体替换为摘要,非 model-visible 会话内容)。
                 transcript_buf.appendSlice(allocator, "[image ") catch return null;
                 transcript_buf.appendSlice(allocator, img.media_type) catch return null;
-                transcript_buf.appendSlice(allocator, "]") catch return null;
-            },
-            .document => |doc| {
-                // 同图像:摘要输入里只留标记 + 宿主给的标题,绝不塞 base64 载荷。
-                transcript_buf.appendSlice(allocator, "[document ") catch return null;
-                transcript_buf.appendSlice(allocator, doc.media_type) catch return null;
-                if (doc.title.len > 0) {
-                    transcript_buf.appendSlice(allocator, " ") catch return null;
-                    transcript_buf.appendSlice(allocator, doc.title) catch return null;
-                }
                 transcript_buf.appendSlice(allocator, "]") catch return null;
             },
         };

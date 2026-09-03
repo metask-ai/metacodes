@@ -329,12 +329,14 @@ pub const Client = struct {
     fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!provider_mod.StreamHandle {
         const c = asClient(ctx);
         var sr = try c.sendMessageStreamFull(messages, system, tools, abort, model_override, tool_choice);
+        errdefer sr.deinit();
         sr.user_query = user_query;
         return boxHandle(c.allocator, sr);
     }
     fn pSendStreamRetry(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, max_retries: u32, retry_base_ms: u64, reporter: ?RetryReporter, user_query: []const u8) anyerror!provider_mod.StreamHandle {
         const c = asClient(ctx);
         var sr = try c.sendMessageStreamFullRetry(messages, system, tools, abort, model_override, tool_choice, max_retries, retry_base_ms, reporter);
+        errdefer sr.deinit();
         sr.user_query = user_query;
         return boxHandle(c.allocator, sr);
     }
@@ -557,7 +559,12 @@ pub const Client = struct {
         retry_hint: ?*RetryHint,
     ) !StreamResponse {
         const effective_model = model_override orelse client.modelSnapshot();
-        const req_body = try json_mod.serializeMessagesRequestWithDialect(.{
+        const dialect = client.dialect_resolver.resolve(.anthropic, effective_model);
+        // 图像 tool_result 是发原生块还是占位文本,由序列化器**实际**报告(插件方言可以在
+        // profile 声称支持时仍拒绝发图),随流句柄回传给 agent_loop 的送达水位。
+        var report = json_mod.SerializationReport{};
+        defer report.deinit(client.allocator);
+        const req_body = try json_mod.serializeMessagesRequestWithDialectReport(.{
             .model = effective_model,
             .max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override), // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
             .messages = messages,
@@ -566,14 +573,19 @@ pub const Client = struct {
             .tools = tools,
             .tool_choice = tool_choice,
             .reasoning_effort = client.reasoning_effort,
-        }, client.allocator, client.dialect_resolver.resolve(.anthropic, effective_model));
+        }, client.allocator, dialect, &report);
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
 
         const result = try client.doRequest(req_body, true, abort, retry_hint);
         switch (result) {
             .streaming_response => |r| {
-                return StreamResponse.init(client.allocator, r, abort);
+                var sr = StreamResponse.init(client.allocator, r, abort);
+                // sr owns the accepted response from here: an allocation failure
+                // below must release it instead of leaking the connection.
+                errdefer sr.deinit();
+                sr.image_placeholder_ids = try report.placeholder_ids.toOwnedSlice(client.allocator);
+                return sr;
             },
             .full_body => unreachable,
         }
@@ -947,6 +959,8 @@ pub const StreamResponse = struct {
     done: bool = false,
     /// 本轮用户原始输入(borrowed),透传给 EventIterator 供 web_search 显示真实 query。
     user_query: []const u8 = "",
+    /// 序列化时走占位的图像 tool_result id(owned 切片,元素借用),随 StreamHandle 回传给 agent_loop。
+    image_placeholder_ids: ?[]const []const u8 = null,
     /// 本次流式请求的 request_id，所有下游（stream event、agent loop、工具调用）
     /// 用它把日志串起来。
     id: log.RequestId,
@@ -961,6 +975,7 @@ pub const StreamResponse = struct {
     }
 
     pub fn deinit(self: *StreamResponse) void {
+        if (self.image_placeholder_ids) |ids| self.allocator.free(ids);
         // EventIterator 可能持有未 emit 的 pending_tool(流中途断开时残留),释放它。
         if (self.iter_initialized) self.event_iter.deinit(self.allocator);
         if (self.stream_result.abort_registry) |registry|
@@ -981,6 +996,7 @@ pub const StreamResponse = struct {
         std.debug.assert(!self.iter_initialized);
         return .{
             .ctx = @ptrCast(self),
+            .image_placeholder_ids = self.image_placeholder_ids,
             .nextFn = &hNext,
             .deinitFn = &hDeinit,
             .stopReasonFn = &hStopReason,

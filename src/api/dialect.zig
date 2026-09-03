@@ -24,7 +24,6 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
-const pdf_mod = @import("../core/pdf.zig");
 const model_adapter = @import("model_adapter.zig");
 const openai_dialects = @import("dialects/openai.zig");
 const claude_dialects = @import("dialects/claude.zig");
@@ -325,20 +324,6 @@ pub const Dialect = struct {
         allocator: std.mem.Allocator,
     ) anyerror!bool = defaultSerializeImagePart,
 
-    /// 一等文档内容块的 wire 形态(issue #25,当前仅 PDF)。返回 true=已写入 out;
-    /// false=该 (provider, model) 不支持原生文档输入 → 调用方**必须**报显式能力错误
-    /// (error.DocumentInputUnsupported),绝不静默丢弃或降级成文本/图像。
-    /// - Claude dialect:{"type":"document","source":{"type":"base64",...},"title":..}
-    /// default = 返回 false(fail-closed:未实现原生文档输入的方言一律拒)。
-    /// **与图像分开的能力**:supports_image_input 为真不蕴含 supports_pdf_input。
-    serializeDocumentPartFn: *const fn (
-        ctx: *anyopaque,
-        profile: ModelProfile,
-        document: types.DocumentBlock,
-        out: *std.ArrayList(u8),
-        allocator: std.mem.Allocator,
-    ) anyerror!bool = defaultSerializeDocumentPart,
-
     /// 暴露纯数据 profile 供 UI/agent_loop 快速问能力。单一真相源收口(step 8 后)。
     /// default = 返回 profileFor 的结果。
     profileFn: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
@@ -383,16 +368,6 @@ pub const Dialect = struct {
         if (!p.supports_image_input) return false;
         return try self.serializeImagePartFn(self.ctx, p, image, out, a);
     }
-    pub fn serializeDocumentPart(self: Dialect, p: ModelProfile, document: types.DocumentBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
-        // 能力守门集中在 wrapper(同 serializeImagePart):vendor 覆盖
-        // serializeDocumentPartFn 也绕不开 profile.supports_pdf_input。
-        if (!p.supports_pdf_input) return false;
-        // 类型守门同样放在 wrapper:Core 今天只受理 PDF(core/pdf.zig 的准入是
-        // 唯一入口),一个被贴错标签的载荷不该因为某个方言实现忘了自查就以
-        // document block 上线。方言实现只管 wire 形态。
-        if (!std.mem.eql(u8, document.media_type, pdf_mod.MEDIA_TYPE)) return false;
-        return try self.serializeDocumentPartFn(self.ctx, p, document, out, a);
-    }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
         return self.profileFn(self.ctx, kind, model);
     }
@@ -407,17 +382,82 @@ pub const Dialect = struct {
 
 /// 检测 tool_result content 是否为 Read 工具的图像形态
 /// (`{"type":"image","media_type":..,"data":..}`,见 tools/read.zig readImage)。
-/// 仅当以 `{"type":"image"` 开头且含 media_type + data 字段时返回;否则 null(当文本处理)。
+/// 仅当内容是下述规范形态时返回;否则 null(当文本处理)。
 /// 返回的 slice 借用 content 内部字节(未 unescape)——base64/media_type 无需转义,直接透传。
-/// 三个协议族的 tool_result 序列化共用本检测(单一真相):命中后经
-/// serializeImagePart 发方言原生图像块;不支持图像输入的模型发短占位文本,
-/// **绝不**把含 MB 级 base64 的原始 JSON 当纯文本发给模型。
+/// 三个协议族的 tool_result 序列化、Conversation 投影豁免、microcompact 豁免与
+/// AgentCore 预算包装共用本检测(单一真相):命中后经 serializeImagePart 发方言
+/// 原生图像块;不支持图像输入的模型发短占位文本,**绝不**把含 MB 级 base64 的
+/// 原始 JSON 当纯文本发给模型。
+///
+/// 只认**规范形态**,做结构化解析而非按字段名搜索:恰好一个 JSON 对象,键恰好是
+/// `type`(值 "image")、`media_type`(白名单 MIME)、`data`(标准 base64,≤
+/// types.MAX_IMAGE_BASE64_BYTES),各出现一次、顺序不限、允许标准 JSON 空白,无其它键、
+/// 无转义、对象之后只允许空白。整条内容先按 types.MAX_IMAGE_RESULT_BYTES 封顶,外围
+/// 空白因此有界。任何偏离都返回 null——那样的载荷没有任何 provider 收得下,当普通
+/// 文本走投影/截断才是有界的。
 pub fn extractImageResult(content: []const u8) ?types.ImageBlock {
-    const trimmed = std.mem.trimStart(u8, content, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "{\"type\":\"image\"")) return null;
-    const mt = util_json.extractStringField(trimmed, "media_type") orelse return null;
-    const data = util_json.extractStringField(trimmed, "data") orelse return null;
-    return .{ .media_type = mt, .data = data };
+    if (content.len > types.MAX_IMAGE_RESULT_BYTES) return null;
+    var p = skipJsonWhitespace(content, 0);
+    if (p >= content.len or content[p] != '{') return null;
+    p += 1;
+    var type_seen = false;
+    var media_type: ?[]const u8 = null;
+    var data: ?[]const u8 = null;
+    while (true) {
+        p = skipJsonWhitespace(content, p);
+        const key = readPlainJsonString(content, &p) orelse return null;
+        p = skipJsonWhitespace(content, p);
+        if (p >= content.len or content[p] != ':') return null;
+        p += 1;
+        p = skipJsonWhitespace(content, p);
+        const value = readPlainJsonString(content, &p) orelse return null;
+        if (std.mem.eql(u8, key, "type")) {
+            if (type_seen or !std.mem.eql(u8, value, "image")) return null;
+            type_seen = true;
+        } else if (std.mem.eql(u8, key, "media_type")) {
+            if (media_type != null or !types.isSupportedImageMediaType(value)) return null;
+            media_type = value;
+        } else if (std.mem.eql(u8, key, "data")) {
+            if (data != null or value.len > types.MAX_IMAGE_BASE64_BYTES or !types.isStandardBase64(value)) return null;
+            data = value;
+        } else return null;
+        p = skipJsonWhitespace(content, p);
+        if (p >= content.len) return null;
+        if (content[p] == ',') {
+            p += 1;
+            continue;
+        }
+        if (content[p] == '}') {
+            p += 1;
+            break;
+        }
+        return null;
+    }
+    if (skipJsonWhitespace(content, p) != content.len) return null;
+    if (!type_seen) return null;
+    return .{ .media_type = media_type orelse return null, .data = data orelse return null };
+}
+
+fn skipJsonWhitespace(s: []const u8, start: usize) usize {
+    var i = start;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\n' or s[i] == '\r')) : (i += 1) {}
+    return i;
+}
+
+/// 无转义的 JSON 字符串字面量(规范图像结果的键与三个值都不含转义);成功时 `p`
+/// 移到闭引号之后,返回借用切片。含 `\\` 或控制字符 → null。
+fn readPlainJsonString(s: []const u8, p: *usize) ?[]const u8 {
+    if (p.* >= s.len or s[p.*] != '"') return null;
+    const start = p.* + 1;
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '"') {
+            p.* = i + 1;
+            return s[start..i];
+        }
+        if (s[i] == '\\' or s[i] < 0x20) return null;
+    }
+    return null;
 }
 
 /// tool_result 图像在不支持图像输入的模型上的显式占位文本(绝不发 base64 原文)。
@@ -562,16 +602,6 @@ fn defaultSerializeParallelToolCalls(ctx: *anyopaque, p: ModelProfile, enabled: 
     _ = enabled;
     _ = out;
     _ = a;
-    return false;
-}
-
-fn defaultSerializeDocumentPart(ctx: *anyopaque, p: ModelProfile, document: types.DocumentBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
-    _ = ctx;
-    _ = p;
-    _ = document;
-    _ = out;
-    _ = a;
-    // fail-closed:没有原生文档输入形态的方言一律返回 false,调用方报能力错误。
     return false;
 }
 
@@ -966,6 +996,48 @@ test "extractImageResult: 命中 Read 图像形态,忽略普通文本/JSON" {
     const img = extractImageResult("{\"type\":\"image\",\"media_type\":\"image/gif\",\"data\":\"AAAA\"}").?;
     try std.testing.expectEqualStrings("image/gif", img.media_type);
     try std.testing.expectEqualStrings("AAAA", img.data);
+    // 前后空白容忍(SSE/transcript 回放可能带换行)。
+    const padded = extractImageResult("\n {\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AA==\"}\n").?;
+    try std.testing.expectEqualStrings("AA==", padded.data);
+}
+
+test "extractImageResult: 结构化——顺序/空白不限,但键集合、类型、MIME、base64、尺寸全部严格" {
+    const a = std.testing.allocator;
+    // 顺序无关 + 标准 JSON 空白:插件/适配器用普通序列化器产出的形态也算图像。
+    const reordered = extractImageResult("{ \"data\" : \"AAAA\" ,\n \"media_type\": \"image/png\",\t\"type\":\"image\" }").?;
+    try std.testing.expectEqualStrings("image/png", reordered.media_type);
+    try std.testing.expectEqualStrings("AAAA", reordered.data);
+    // 非白名单 MIME:方言层发出去 provider 会拒收,当文本走投影才有界。
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/svg+xml\",\"data\":\"AAAA\"}") == null);
+    // 非标准 base64 / 空载荷。
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"not base64!!\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"\"}") == null);
+    // 多余键 / 重复键 / 缺键 / 嵌套:一个插件把别的东西挂在对象里,不能混过豁免。
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\",\"extra\":\"x\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\",\"data\":\"BBBB\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"data\":\"AAAA\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"meta\":{\"media_type\":\"image/png\",\"data\":\"AAAA\"}}") == null);
+    // type 必须是 image;值里不允许转义;对象后只允许空白。
+    try std.testing.expect(extractImageResult("{\"type\":\"picture\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image\\/png\",\"data\":\"AAAA\"}") == null);
+    try std.testing.expect(extractImageResult("{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AAAA\"} x") == null);
+    // 超过任何 provider 都收不下的载荷:不是图像;正好在上限内仍是。
+    const oversized = try a.alloc(u8, types.MAX_IMAGE_BASE64_BYTES + 4);
+    defer a.free(oversized);
+    @memset(oversized, 'A');
+    const huge = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{oversized});
+    defer a.free(huge);
+    try std.testing.expect(extractImageResult(huge) == null);
+    const at_limit = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{oversized[0..types.MAX_IMAGE_BASE64_BYTES]});
+    defer a.free(at_limit);
+    try std.testing.expect(extractImageResult(at_limit) != null);
+    // 外围空白有界:一张小图裹在超过 MAX_IMAGE_RESULT_BYTES 的空白里不是图像。
+    const padded = try a.alloc(u8, types.MAX_IMAGE_RESULT_BYTES + 1);
+    defer a.free(padded);
+    @memset(padded, ' ');
+    const tiny = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"AA==\"}";
+    @memcpy(padded[0..tiny.len], tiny);
+    try std.testing.expect(extractImageResult(padded) == null);
 }
 
 test "appendImageOmittedPlaceholder: 纯文本占位含 MIME,不含 base64" {

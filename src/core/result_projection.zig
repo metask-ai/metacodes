@@ -9,6 +9,7 @@
 const std = @import("std");
 const artifact = @import("tool_result_artifact.zig");
 const tool_result = @import("tool_result.zig");
+const types = @import("../types.zig");
 const conversation_mod = @import("conversation.zig");
 const result_budget = @import("result_budget.zig");
 const json_mod = @import("../json.zig");
@@ -32,8 +33,10 @@ const BUDGET_BYTES_PER_TOKEN: usize = 4;
 /// What one image tool result costs this layer's byte budget. A vision block is
 /// billed by the provider at a fixed token price (`IMAGE_TOKEN_ESTIMATE`),
 /// never by its base64 length, so measuring it in bytes would let a single
-/// 3.75 MB screenshot evict every unrelated result in the same turn.
-const IMAGE_ACCOUNTED_BYTES: usize =
+/// 3.75 MB screenshot evict every unrelated result in the same turn. Public
+/// because the AgentCore budget wrapper (`session_budget`) charges its payload
+/// cap for an inline image at the same figure.
+pub const IMAGE_RESULT_BUDGET_BYTES: usize =
     conversation_mod.IMAGE_TOKEN_ESTIMATE * BUDGET_BYTES_PER_TOKEN;
 
 /// Image-shaped tool result (`{"type":"image",...}` from the Read tool).
@@ -49,7 +52,7 @@ fn isImageResult(content: []const u8) bool {
 /// estimate; every other result costs exactly its bytes, so non-image
 /// projection stays byte-identical to the pre-image-carve-out behavior.
 fn accountedBytes(content: []const u8) usize {
-    return if (isImageResult(content)) IMAGE_ACCOUNTED_BYTES else content.len;
+    return if (isImageResult(content)) IMAGE_RESULT_BUDGET_BYTES else content.len;
 }
 
 pub const Item = struct {
@@ -72,6 +75,11 @@ pub const Config = struct {
     /// the caller's job to keep an override inside the budget; only turn
     /// pressure shrinks it afterwards.
     preview_bytes: ?usize = null,
+    /// Aggregate base64 bytes of native image results the turn may keep.
+    /// Images bypass the byte budget above, but providers cap the request
+    /// size (`types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST`); beyond this the
+    /// largest images spill into recoverable envelopes with no preview.
+    per_turn_image_bytes: usize = types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST,
 
     fn previewCap(self: Config) usize {
         return self.preview_bytes orelse
@@ -90,9 +98,15 @@ pub const Stats = struct {
     artifact_bytes: usize = 0,
     artifact_spill_count: usize = 0,
     unrecoverable_fallback_count: usize = 0,
+    /// Results whose *tool* emitted a JSON body (Bash's `bash-result.v2`,
+    /// a bounded `rows/cursor/total` envelope). Projection envelopes are JSON
+    /// too and are deliberately not counted: they are this layer's artifact.
     structured_result_count: usize = 0,
     structured_projection_failures: usize = 0,
     turn_budget_spills: usize = 0,
+    /// Image results spilled because the turn exceeded `per_turn_image_bytes`
+    /// (a wire-size limit, not a budget): the only rule that spills a picture.
+    image_spills: usize = 0,
     /// Image results kept inline that byte-length rules would otherwise have
     /// spilled (over `per_result_bytes`). Logged rather than left silent, so
     /// the carve-out is visible in the same line that reports the spills.
@@ -275,16 +289,50 @@ pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Sta
         } else {
             stats.raw_bytes +|= content.len;
         }
-        const structured = isStructuredJson(content);
+        const structured = toolEmittedStructured(content);
         if (structured) stats.structured_result_count += 1;
         const image = isImageResult(content);
         const exempt = image or
             item.is_error or
             isProjectionEnvelope(content) or
             std.mem.eql(u8, item.tool_name, "ReadArtifact");
-        if (image and content.len > config.budget.per_result_bytes) stats.image_exempt_count += 1;
         if (exempt) fixed_cost +|= accountedBytes(content);
         plan[index] = .{ .exempt = exempt, .structured = structured };
+    }
+
+    // Wire-size cap for the turn's native images (the agent loop passes what
+    // `types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST` leaves after the history's
+    // non-trimmable pictures). Images bypass the byte budget, so this is the
+    // one rule that can spill a picture: largest first (strict > keeps the
+    // ordinal as the deterministic tie-breaker) and with no preview - a base64
+    // preview is noise for the model and would put part of the payload on the
+    // wire anyway; the envelope keeps the artifact id and sha256 for
+    // ReadArtifact recovery. A spilled image is a committed envelope from here
+    // on: still exempt, but priced at its literal length instead of the vision
+    // estimate, so the fixed cost is repriced before the ceiling is resolved.
+    var image_bytes: usize = 0;
+    for (items) |item| {
+        if (isImageResult(item.content.*)) image_bytes +|= item.content.*.len;
+    }
+    while (image_bytes > config.per_turn_image_bytes) {
+        var biggest: ?usize = null;
+        var biggest_len: usize = 0;
+        for (items, 0..) |item, index| {
+            if (!isImageResult(item.content.*)) continue;
+            if (item.content.*.len > biggest_len) {
+                biggest = index;
+                biggest_len = item.content.*.len;
+            }
+        }
+        const index = biggest orelse break;
+        try spillOne(allocator, items[index], plan[index].structured, config, &stats, result_budget.Encoded.of(0), false);
+        fixed_cost = (fixed_cost -| IMAGE_RESULT_BUDGET_BYTES) +| items[index].content.*.len;
+        stats.image_spills += 1;
+        image_bytes -= biggest_len;
+    }
+    for (items) |item| {
+        const content = item.content.*;
+        if (isImageResult(content) and content.len > config.budget.per_result_bytes) stats.image_exempt_count += 1;
     }
 
     // One allowance decision for every result, then one render each. The
@@ -1161,6 +1209,25 @@ fn isInlineUtf8(content: []const u8) bool {
         if (byte < 0x20 and byte != '\n' and byte != '\r' and byte != '\t') return false;
     }
     return true;
+}
+
+/// Whether the **tool** emitted a structured body.
+///
+/// Asking `isStructuredJson` directly gets this wrong in both directions once
+/// the tool layer publishes. A projection envelope is a JSON document, so a
+/// plain-text Grep result wrapped in one counted as structured; excluding every
+/// envelope instead lost the opposite case, a WebFetch JSON body that the tool
+/// layer published - the envelope is the wrapper, and what it wraps is recorded
+/// in its own `media_type`. So: for an envelope, believe its media type; for
+/// anything else, look at the bytes.
+fn toolEmittedStructured(content: []const u8) bool {
+    if (!isProjectionEnvelope(content)) return isStructuredJson(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const media = parsed.value.object.get("media_type") orelse return false;
+    if (media != .string) return false;
+    return std.mem.startsWith(u8, media.string, "application/json");
 }
 
 fn isStructuredJson(content: []const u8) bool {
@@ -2102,4 +2169,40 @@ test "a top-level array is structured too, and is trimmed rather than mangled" {
     try std.testing.expect(isStructuredObject("12345"));
     try std.testing.expect(isStructuredObject("\"a string result\""));
     try std.testing.expect(!isStructuredObject("not json at all, just prose"));
+}
+
+test "per-turn image byte cap spills the largest images into envelopes, keeps the rest native" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var small: []const u8 = try testImageResult(allocator, 2048);
+    defer allocator.free(@constCast(small));
+    var big: []const u8 = try testImageResult(allocator, 8192);
+    var mid: []const u8 = try testImageResult(allocator, 4096);
+    defer allocator.free(@constCast(mid));
+    var items = [_]Item{
+        .{ .tool_name = "Read", .content = &small, .is_error = false },
+        .{ .tool_name = "Read", .content = &big, .is_error = false },
+        .{ .tool_name = "Read", .content = &mid, .is_error = false },
+    };
+    // Cap admits small + mid but not big: exactly the largest one spills.
+    const stats = try project(allocator, &items, .{
+        .session_root = root,
+        .budget = .{ .per_result_bytes = 1 << 20, .per_turn_bytes = 1 << 20 },
+        .per_turn_image_bytes = 8000,
+    });
+    defer allocator.free(@constCast(big));
+    try std.testing.expectEqual(@as(usize, 1), stats.image_spills);
+    try std.testing.expectEqual(@as(usize, 1), stats.artifact_spill_count);
+    try std.testing.expect(isRecoverableEnvelope(big));
+    // No base64 preview of the picture leaks into the envelope.
+    try std.testing.expect(std.mem.indexOf(u8, big, "AAAAAAAA") == null);
+    try std.testing.expect(isImageResult(small));
+    try std.testing.expect(isImageResult(mid));
+    // The spilled image is priced as an envelope from here on, the others at the estimate.
+    try std.testing.expectEqual(2 * IMAGE_RESULT_BUDGET_BYTES + big.len, accountedTotal(&items));
+    try std.testing.expect(!stats.budget_exhausted);
 }

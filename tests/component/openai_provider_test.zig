@@ -344,11 +344,14 @@ test "P0.2: PreToolUse ModifyInput 改写执行输入 + PostToolUse 注入上下
     var render = writer_backend.WriterBackend.initNull();
     const be = render.backend();
 
-    const result = agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a) catch |e| {
-        std.debug.print("hook run failed: {s}\n", .{@errorName(e)});
-        return error.SkipZigTest;
-    };
+    const result = try agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a);
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    // wire 级证据:第二次请求体里,tool 消息之后跟着一条携带 hook 上下文的 user 消息
+    // (此前 chat 序列化器静默丢掉同消息 text,模型从未收到 additionalContext)。
+    const body = srv.lastRequest().?.body();
+    const tool_at = std.mem.indexOf(u8, body, "{\"role\":\"tool\",\"tool_call_id\":\"call_e\"").?;
+    const ctx_at = std.mem.indexOf(u8, body, "{\"role\":\"user\",\"content\":\"[PostToolUse hook]\\npost-check ok\"}").?;
+    try std.testing.expect(tool_at < ctx_at);
 
     var modified_seen = false;
     var post_ctx_seen = false;
