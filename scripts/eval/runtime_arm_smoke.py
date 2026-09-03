@@ -51,6 +51,7 @@ def _headless_protocol_smoke(binary: Path) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         )
         deadline = time.monotonic() + 5
         while not ready.exists() and provider.poll() is None and time.monotonic() < deadline:
@@ -88,6 +89,7 @@ def _headless_protocol_smoke(binary: Path) -> None:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=20,
                 check=False,
             )
@@ -145,6 +147,7 @@ def _workbuddy_tool_policy_smoke(binary: Path, tinykg_binary: Path) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         )
         deadline = time.monotonic() + 5
         while not ready.exists() and provider.poll() is None and time.monotonic() < deadline:
@@ -193,6 +196,7 @@ def _workbuddy_tool_policy_smoke(binary: Path, tinykg_binary: Path) -> None:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    encoding="utf-8",
                     timeout=20,
                     check=False,
                 )
@@ -273,6 +277,7 @@ def _dump(binary: Path, tinykg_binary: Path, arm: str) -> str:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=20,
                 check=False,
             )
@@ -301,6 +306,7 @@ def _version_output_smoke(binary: Path, expected_semver: str) -> None:
         [str(binary), "--version"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=30,
     )
     _require(

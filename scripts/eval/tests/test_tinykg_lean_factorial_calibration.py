@@ -15,6 +15,7 @@ from scripts.eval.memory_budget_journal import (
 )
 from scripts.eval.memory_replay import PRODUCTION_PROVIDER_ID
 from scripts.eval.model import ValidationError, stable_json
+from scripts.eval.tests.posix_only import requires_posix_budget_journal
 
 
 class TinyKgLeanFactorialCalibrationTest(unittest.TestCase):
@@ -163,6 +164,7 @@ class TinyKgLeanFactorialCalibrationTest(unittest.TestCase):
             self.assertFalse(result["projection"]["quality_evidence"])
             self.assertFalse(run_one.call_args.kwargs["quality_evidence_eligible"])
 
+    @requires_posix_budget_journal
     def test_checkpoint_advances_after_every_completed_cell(self) -> None:
         with tempfile.TemporaryDirectory(prefix="factorial-checkpoint-") as temporary:
             root = Path(temporary)
@@ -223,6 +225,7 @@ class TinyKgLeanFactorialCalibrationTest(unittest.TestCase):
             self.assertEqual(4, summary["rollouts"])
             self.assertFalse(summary["quality_evidence"])
 
+    @requires_posix_budget_journal
     def test_historical_receipt_survives_later_commits_but_not_transaction_drift(self) -> None:
         with tempfile.TemporaryDirectory(prefix="factorial-history-") as temporary:
             root = Path(temporary)
@@ -238,6 +241,7 @@ class TinyKgLeanFactorialCalibrationTest(unittest.TestCase):
                 ):
                     executor._assert_historical_budget_receipt(budget, tampered)
 
+    @requires_posix_budget_journal
     def test_completed_resume_does_not_read_credential_or_reexecute(self) -> None:
         with tempfile.TemporaryDirectory(prefix="factorial-resume-") as temporary:
             root = Path(temporary)
@@ -295,6 +299,7 @@ class TinyKgLeanFactorialCalibrationTest(unittest.TestCase):
             execute.assert_not_called()
             self.assertEqual(4, summary["rollouts"])
 
+    @requires_posix_budget_journal
     def test_resume_rejects_uncheckpointed_budget_state_before_credential(self) -> None:
         for authorize in (False, True):
             with self.subTest(authorize=authorize), tempfile.TemporaryDirectory(

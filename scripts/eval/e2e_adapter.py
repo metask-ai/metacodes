@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .model import SCHEMA_VERSION, ValidationError, stable_json
+from .model import SCHEMA_VERSION, ValidationError, stable_json, O_BINARY
 
 
 # Evaluator semantics and native event wire compatibility are separate
@@ -156,6 +156,7 @@ def _execution_input_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, 
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=20,
             ).stdout.strip()
             verified = subprocess.run(
@@ -171,6 +172,7 @@ def _execution_input_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, 
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=20,
             ).stdout.strip()
             listing = subprocess.run(
@@ -305,7 +307,7 @@ def _write_new_private_file(path: Path, payload: bytes) -> None:
     existing path would let a stale file or symlink redirect the evidence stream.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
@@ -467,7 +469,7 @@ def _read_regular_text_capped(
     if before.st_size > max_bytes:
         return None, f"artifact exceeds {max_bytes} byte limit"
 
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:

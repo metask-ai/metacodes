@@ -289,14 +289,14 @@
   "source_contract": {
     "evals/experiments/tinykg-lean-factorial-block-v1-cases.json": "9a563ae27db1c5840339b2bda47c3f535dda06cc05a95be21a32779bc2ed2542",
     "evals/memory/MEMORY_MATURATION_V1.md": "3621d69f26c6e791033a6ba87887942bb620e92ad6103d5b6f2b6c23d7fff582",
-    "scripts/eval/memory_agent_runtime_smoke.py": "b4a3b304de5da8fd52db3eeba654b0a404c2b890a56348806c7b348155ac2be6",
-    "scripts/eval/memory_agent_runtime_pilot.py": "89eca2ab84dbd625415229b338fe68b8aaea3c4da4141cf2084f5f5bb753c04b",
-    "scripts/eval/project_harness_experiment.py": "176b2896adfbd76606a7f1aa140fe1f4540fdd3dcd369636daf98269761cc5ab",
-    "scripts/eval/project_harness_rule_impact_prospective.py": "ce160017a91696e56ed46af663d546f63a9c93401919857bee8c5afffd594094",
-    "scripts/eval/run_project_rule_evolution_mac_pilot.py": "cc824f751529603f8995c7f11351179531c9745ec5bd69b11efb255bebd51f03",
-    "scripts/eval/tinykg_lean_factorial.py": "22053bb1623169be905a45bfff8180a126be50ede9ae53cc17e188732ddbcfa7",
+    "scripts/eval/memory_agent_runtime_smoke.py": "f0900594d9f6ab439f7194934bf801b34edfce14a6edb495fa6975f7a851deb6",
+    "scripts/eval/memory_agent_runtime_pilot.py": "1c83645ba4d0a87e941143ba54924d0521c4e929ad2bf3301cb58ae3e7bb5faa",
+    "scripts/eval/project_harness_experiment.py": "f206d693bd7b21382e58f131ca5bec8b51dccc433eff4f1fff59ae4a07bff3a8",
+    "scripts/eval/project_harness_rule_impact_prospective.py": "d5397e2bb23d4a730ef12ebfba4cd315da69d86d17decad534cf81299872e06b",
+    "scripts/eval/run_project_rule_evolution_mac_pilot.py": "1a89e7c6116f4f43a016e7f1a93a820adf1b4a07514582c1366574ea7fa4019a",
+    "scripts/eval/tinykg_lean_factorial.py": "20a5016dcf44368dfa8c7e667346355cf4ddb780ff2ee994217ee92a425e626f",
     "scripts/eval/tinykg_lean_factorial_block.py": "ed5b6546c8f98f5bbc69c1b715b4ebe4b7a611d3eb4a9ae60abc8f424e0d6043",
-    "scripts/eval/tinykg_lean_factorial_executor.py": "a3ad9957bdd63ee2e5c639369dbf39ba2594b1126cf69733e219c57eb8a5d71d",
+    "scripts/eval/tinykg_lean_factorial_executor.py": "f793cb20071c092c8e58d6f480bcda2e65ca5ad01edd85efc3e9e097b1624e0e",
     "scripts/project_harness_eval_driver.zig": "99ac435b90ebef1a69aa89ff9fbf3e6ba07708cb9829212a2612962eba2d483c"
   },
   "known_gaps": [

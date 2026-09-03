@@ -23,6 +23,7 @@ from scripts.eval.workbuddy.run_w05 import (
     _stable_evidence,
     _wire_json_sha256,
 )
+from scripts.eval.tests.posix_only import POSIX
 
 
 class WorkBuddyW05RunnerTest(unittest.TestCase):
@@ -193,7 +194,8 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
             output = root / "receipt.json"
             _private_new(output, b'{"complete":true}\n')
             self.assertEqual(output.read_bytes(), b'{"complete":true}\n')
-            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            if POSIX:  # permission bits are synthetic on Windows
+                self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             self.assertEqual(list(root.glob(".receipt.json.*.tmp")), [])
             with self.assertRaisesRegex(W05Error, "overwrite"):
                 _private_new(output, b"replacement")
@@ -208,13 +210,13 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
             root = Path(directory)
             os.chmod(root, 0o700)
             evidence = root / "evidence.json"
-            evidence.write_text("{}\n", encoding="utf-8")
+            evidence.write_text("{}\n", encoding="utf-8", newline="\n")
             before = {"evidence": _identity(evidence)}
             self.assertEqual(
                 before["evidence"]["sha256"],
                 hashlib.sha256(b"{}\n").hexdigest(),
             )
-            evidence.write_text('{"changed":true}\n', encoding="utf-8")
+            evidence.write_text('{"changed":true}\n', encoding="utf-8", newline="\n")
             with self.assertRaisesRegex(W05Error, "changed during validation"):
                 _stable_evidence(before, {"evidence": evidence})
 
@@ -242,7 +244,7 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
 
             with mock.patch("scripts.eval.workbuddy.run_w05._git", side_effect=clean_git):
                 _fresh_checkout(root)
-                (root / ".env").write_text("SECRET=x\n", encoding="utf-8")
+                (root / ".env").write_text("SECRET=x\n", encoding="utf-8", newline="\n")
                 with self.assertRaisesRegex(W05Error, "\.env"):
                     _fresh_checkout(root)
 

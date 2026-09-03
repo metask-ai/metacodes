@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 from typing import Any, Dict, Mapping, Sequence
 
+
 if __package__ in {None, ""}:
     import sys
 
@@ -250,7 +251,7 @@ def _project_identity(project: Path) -> str:
 
 def _owned_real_directory(path: Path, where: str) -> None:
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+    if not stat.S_ISDIR(info.st_mode) or (hasattr(os, "getuid") and info.st_uid != os.getuid()):
         raise TemplateError(f"{where} must be an owned real directory")
 
 

@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Tuple
 
-from .model import ValidationError
+from .model import ValidationError, O_BINARY, fsync_directory
 
 if TYPE_CHECKING:
     from .memory_tinykg_local import LocalTinyKg
@@ -91,7 +91,7 @@ def _bounded_utf8(value: str, limit: int) -> Tuple[str, bool]:
 
 def _write_new(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -114,15 +114,11 @@ def _write_new(path: Path, payload: bytes) -> None:
         raise
     finally:
         os.close(fd)
-    directory_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    fsync_directory(path.parent)
 
 
 def _read_regular_file(path: Path, where: str) -> bytes:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -153,7 +149,8 @@ def _replace_regular_file(path: Path, payload: bytes) -> None:
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):  # absent on Windows
+            os.fchmod(fd, 0o600)
         offset = 0
         while offset < len(payload):
             written = os.write(fd, payload[offset:])
@@ -164,11 +161,7 @@ def _replace_regular_file(path: Path, payload: bytes) -> None:
         os.close(fd)
         fd = -1
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(path.parent)
     except BaseException:
         try:
             temporary.unlink()
@@ -525,7 +518,7 @@ def validate_artifacts(
                 stat.S_ISLNK(info.st_mode)
                 or not stat.S_ISREG(info.st_mode)
                 or info.st_nlink != 1
-                or info.st_mode & 0o077
+                or (os.name != "nt" and info.st_mode & 0o077)  # mode bits are synthetic on Windows
             ):
                 _fail(
                     f"{where}.consolidation.{label}",

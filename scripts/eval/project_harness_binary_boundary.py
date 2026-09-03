@@ -26,6 +26,23 @@ import tempfile
 import threading
 from typing import Any, Dict, List, Mapping, Sequence
 
+# Windows portability (see scripts/eval/model.py): os.open text mode must never
+# touch artifacts, directory descriptors cannot be opened, and permission bits
+# are synthetic there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+_POSIX_MODE_BITS = os.name != "nt"
+
+
+def _fsync_directory(path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 if __package__ in {None, ""}:
     import sys
 
@@ -85,7 +102,7 @@ def _write_report(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     raw = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
     fd = os.open(temporary, flags, 0o600)
     try:
         offset = 0
@@ -99,11 +116,7 @@ def _write_report(path: Path, value: Mapping[str, Any]) -> None:
         os.close(fd)
     try:
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _fsync_directory(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -123,6 +136,7 @@ def _canonical_lake(repo: Path, candidate: Path) -> Path:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         timeout=10,
         check=True,
     )

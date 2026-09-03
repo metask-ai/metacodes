@@ -80,7 +80,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const timeout_ms: u64 = if (std.mem.eql(u8, action, "timeout")) 100 else 2_000;
+    // 2_000 ms 是按 POSIX 的瞬时 ECONNREFUSED 调的。Windows 对已关闭的 loopback 端口先重传
+    // SYN 再报拒绝,实测 2.04 s,截止时间会先于拒绝到达,unavailable-* 场景就从
+    // DaemonUnavailable 变成 RequestTimedOut。放宽到 10 s(脚本侧子进程上限 15 s);
+    // "timeout" 场景仍用 100 ms 证明墙钟截止有效。
+    const timeout_ms: u64 = if (std.mem.eql(u8, action, "timeout")) 100 else 10_000;
     const effective_api_key = if (std.mem.eql(u8, action, "unauthorized-write")) "wrong-test-key" else api_key;
     const effective_schema_digest = if (std.mem.eql(u8, action, "schema-drift-across-clone")) "" else schema_digest;
     var transport = try cc.kg_transport.WebTransport.init(init.gpa, .{

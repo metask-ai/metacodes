@@ -32,6 +32,7 @@ from scripts.eval.tests.test_treatment_activation import (
     write_activation_artifacts,
     write_baseline_artifacts,
 )
+from scripts.eval.tests.posix_only import requires_posix_budget_journal
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -450,6 +451,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 self.assertNotIn("METACODES_FORMAL_KERNEL_PATH", row["runtime_env"])
                 self.assertNotIn("METACODES_FORMAL_KERNEL_SHA256", row["runtime_env"])
 
+    @requires_posix_budget_journal
     def test_multi_arm_checkpoints_resume_without_repeating_rollouts(self):
         experiment = copy.deepcopy(self.experiment)
         experiment["budget"]["paid_rollouts_enabled"] = True
@@ -688,6 +690,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 )
             )
 
+    @requires_posix_budget_journal
     def test_multi_arm_rejects_infeasible_remaining_schedule_before_rollout(self):
         experiment = copy.deepcopy(self.experiment)
         with tempfile.TemporaryDirectory() as directory:
@@ -734,6 +737,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     )
             run_once.assert_not_called()
 
+    @requires_posix_budget_journal
     def test_multi_arm_crash_windows_leave_unreplayable_orphans_before_credential(self):
         for crash_stage, expected_calls, expected_state in (
             ("after_request_authorized", 0, "request_authorized"),
@@ -885,6 +889,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 load_key.assert_not_called()
                 rerun.assert_not_called()
 
+    @requires_posix_budget_journal
     def test_multi_arm_checkpoints_runtime_budget_overrun_before_abort(self):
         experiment = copy.deepcopy(self.experiment)
         with tempfile.TemporaryDirectory() as directory:
@@ -975,6 +980,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 [item["code"] for item in checkpoint[0]["attribution"]],
             )
 
+    @requires_posix_budget_journal
     def test_multi_arm_checkpoints_treatment_failure_before_abort(self):
         experiment = copy.deepcopy(self.experiment)
         with tempfile.TemporaryDirectory() as directory:
@@ -1055,6 +1061,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 [item["code"] for item in checkpoint[0]["attribution"]],
             )
 
+    @requires_posix_budget_journal
     def test_multi_arm_does_not_abort_past_failed_treatment_checkpoint(self):
         experiment = copy.deepcopy(self.experiment)
         with tempfile.TemporaryDirectory() as directory:
@@ -1132,6 +1139,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
             )
             self.assertFalse((output_dir / "codex_style.jsonl").exists())
 
+    @requires_posix_budget_journal
     def test_multi_arm_resume_reverifies_treatment_before_network(self):
         experiment = copy.deepcopy(self.experiment)
         with tempfile.TemporaryDirectory() as directory:
@@ -1215,6 +1223,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
             verifier.assert_called_once()
             run_once.assert_not_called()
 
+    @requires_posix_budget_journal
     def test_multi_arm_checkpoints_real_multi_invocation_baseline_receipt(self):
         experiment = copy.deepcopy(self.experiment)
         with tempfile.TemporaryDirectory() as directory:
@@ -1340,6 +1349,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
     @unittest.skipUnless(
         REAL_TINYKG.is_file(), "set METACODES_TEST_TINYKG_BIN"
     )
+    @requires_posix_budget_journal
     def test_multi_arm_attaches_real_tinykg_receipt_before_checkpoint(self):
         experiment = copy.deepcopy(self.experiment)
         with tempfile.TemporaryDirectory() as directory:
@@ -1633,6 +1643,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         tinykg_binary=tinykg,
                     )
 
+    @requires_posix_budget_journal
     def test_multi_arm_rechecks_binary_after_each_rollout(self):
         experiment = copy.deepcopy(self.experiment)
         experiment["budget"]["paid_rollouts_enabled"] = True
@@ -1685,6 +1696,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     )
             imported.assert_not_called()
 
+    @requires_posix_budget_journal
     def test_multi_arm_rechecks_formal_artifact_after_each_rollout(self):
         experiment = copy.deepcopy(self.experiment)
         experiment["budget"]["paid_rollouts_enabled"] = True
@@ -1738,6 +1750,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     )
             imported.assert_not_called()
 
+    @requires_posix_budget_journal
     def test_multi_arm_checkpoints_infrastructure_failure_before_abort(self):
         experiment = copy.deepcopy(self.experiment)
         experiment["budget"]["paid_rollouts_enabled"] = True
@@ -1842,6 +1855,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 "runner_frozen_before_execution",
             )
 
+    @requires_posix_budget_journal
     def test_confirmatory_runner_requires_and_wires_calibration_receipt(self):
         experiment = copy.deepcopy(self.confirmatory_experiment)
         experiment["budget"]["paid_rollouts_enabled"] = True

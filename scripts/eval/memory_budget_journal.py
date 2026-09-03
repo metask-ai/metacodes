@@ -24,7 +24,7 @@ try:
 except ImportError:  # pragma: no cover - production paid runs reject Windows.
     fcntl = None  # type: ignore[assignment]
 
-from .model import ValidationError, stable_json
+from .model import ValidationError, stable_json, O_BINARY, mode_violation
 
 
 JOURNAL_SCHEMA_VERSION = 1
@@ -647,10 +647,10 @@ class BudgetJournal:
             _fail("budget journal parent", "is not a directory")
         if hasattr(os, "geteuid") and parent_info.st_uid != os.geteuid():
             _fail("budget journal parent", "must be owned by the current user")
-        if stat.S_IMODE(parent_info.st_mode) & 0o022:
+        if mode_violation(parent_info.st_mode, 0o022):
             _fail("budget journal parent", "must not be group/world writable")
         self.path = parent / self.path.name
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | O_BINARY
         if hasattr(os, "O_DIRECTORY"):
             flags |= os.O_DIRECTORY
         if hasattr(os, "O_CLOEXEC"):
@@ -667,7 +667,7 @@ class BudgetJournal:
                 _fail("budget journal parent", "changed while opening")
             if hasattr(os, "geteuid") and opened_parent_info.st_uid != os.geteuid():
                 _fail("budget journal parent", "opened directory is not owned by current user")
-            if stat.S_IMODE(opened_parent_info.st_mode) & 0o022:
+            if mode_violation(opened_parent_info.st_mode, 0o022):
                 _fail("budget journal parent", "opened directory is group/world writable")
             self._lock_fd = self._open_lock()
             try:
@@ -705,7 +705,7 @@ class BudgetJournal:
 
     def _open_lock(self) -> int:
         name = self.lock_path.name
-        flags = os.O_RDWR | os.O_CREAT
+        flags = os.O_RDWR | os.O_CREAT | O_BINARY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
@@ -729,7 +729,7 @@ class BudgetJournal:
             _fail(where, "hard links are forbidden")
         if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
             _fail(where, "must be owned by the current user")
-        if stat.S_IMODE(info.st_mode) & 0o077:
+        if mode_violation(info.st_mode, 0o077):
             _fail(where, "permissions must be 0600 or stricter")
         return info
 
@@ -747,7 +747,7 @@ class BudgetJournal:
             _fail("budget journal", "incomplete temporary file requires manual inspection")
 
     def _read_document(self) -> Mapping[str, Any]:
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | O_BINARY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
@@ -792,7 +792,7 @@ class BudgetJournal:
         if len(payload) > MAX_JOURNAL_BYTES:
             _fail("budget journal", "serialized journal exceeds the safety limit")
         name = self.temporary_path.name
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_BINARY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):

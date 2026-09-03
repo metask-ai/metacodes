@@ -20,6 +20,23 @@ from typing import Dict, Iterable, Mapping, Sequence
 
 from . import WORKBUDDY_PINNED_COMMIT
 
+# Windows portability (see scripts/eval/model.py): os.open text mode must never
+# touch artifacts, directory descriptors cannot be opened, and permission bits
+# are synthetic there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+_POSIX_MODE_BITS = os.name != "nt"
+
+
+def _fsync_directory(path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 
 SCHEMA_VERSION = "metacodes-workbuddy-cohorts-v1"
 SALT = "metacodes-workbuddy-2026-08-11-v1"
@@ -132,7 +149,7 @@ def _task_slug(subset: Subset, member: tarfile.TarInfo) -> str | None:
 
 
 def _scan_archive(path: Path, subset: Subset, expected_sha256: str) -> Dict[str, object]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -282,6 +299,7 @@ def _git(repo: Path, *args: str) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as exc:
         raise CohortError(f"git {' '.join(args)} failed for {repo}: {exc}") from exc
@@ -304,7 +322,7 @@ def _write_new(path: Path, payload: bytes) -> None:
     temporary = path.with_name(path.name + ".tmp")
     if temporary.exists() or temporary.is_symlink():
         raise CohortError(f"stale cohort manifest temporary file: {temporary}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
     descriptor = os.open(temporary, flags, 0o600)
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
@@ -312,11 +330,7 @@ def _write_new(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        parent_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        _fsync_directory(path.parent)
     finally:
         os.close(descriptor)
 

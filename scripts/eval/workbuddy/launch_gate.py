@@ -34,7 +34,7 @@ from ..memory_budget_journal import (
     validate_checkpoint_payload,
     usd_to_microusd_ceiling,
 )
-from ..model import ValidationError, stable_json
+from ..model import ValidationError, stable_json, O_BINARY, mode_violation
 from . import WORKBUDDY_PINNED_COMMIT
 from .environment_preflight import (
     EnvironmentPreflightError,
@@ -243,7 +243,7 @@ def _comparison_covariates(
 
 
 def _read_regular(path: Path, *, maximum: int = 16 * 1024 * 1024) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | O_BINARY
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -342,6 +342,7 @@ def _git(repo: Path, *args: str) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as exc:
         raise LaunchError(f"git {' '.join(args)} failed for {repo}: {exc}") from exc
@@ -361,6 +362,7 @@ def _runner_tool(path: Path, version_args: Sequence[str], *, bash: bool = False)
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
             timeout=10,
             # Version banners are localized: a zh_CN host prints
             # "GNU bash，版本 5.3.15", which no English regex can parse and
@@ -1463,7 +1465,7 @@ def _open_private_artifact_parent(path: Path) -> tuple[Path, int]:
             or (info.st_dev, info.st_ino)
             != (parent_link_info.st_dev, parent_link_info.st_ino)
             or (info.st_dev, info.st_ino) != (observed.st_dev, observed.st_ino)
-            or stat.S_IMODE(info.st_mode) & 0o022
+            or mode_violation(info.st_mode, 0o022)
         ):
             raise LaunchError(
                 "paid launch artifact parent must be a stable private directory"
@@ -1510,7 +1512,7 @@ def _write_private_new(
             raise LaunchError(
                 "incomplete paid launch artifact requires manual inspection"
             )
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | O_BINARY
         flags |= getattr(os, "O_CLOEXEC", 0)
         descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
     except BaseException:
@@ -1543,7 +1545,7 @@ def _write_private_new(
         os.fsync(parent_fd)
         final_fd = os.open(
             path.name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            O_BINARY | os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_fd,
         )
         try:
@@ -1551,7 +1553,7 @@ def _write_private_new(
             if (
                 not stat.S_ISREG(final.st_mode)
                 or final.st_nlink != 1
-                or stat.S_IMODE(final.st_mode) & 0o077
+                or mode_violation(final.st_mode, 0o077)
             ):
                 raise LaunchError("published paid launch artifact is not private")
         finally:
@@ -1853,8 +1855,10 @@ def _official_task_identity(
         task
         for task in selected
         if result.get("task_name") == f"workbuddy/{task}"
+        # The runner records POSIX task paths (it runs in a Linux container); compare
+        # spellings, not host Path rendering, or Windows hosts never match.
         and raw_task_path
-        == str(
+        == (
             Path(".workspace/tmp/staged")
             / (
                 (staged_run_ids or {}).get(task)
@@ -1863,7 +1867,7 @@ def _official_task_identity(
             / dataset_root
             / "tasks"
             / task
-        )
+        ).as_posix()
     ]
     checksum = result.get("task_checksum")
     if (

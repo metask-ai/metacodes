@@ -20,6 +20,7 @@ from scripts.eval.memory_budget_journal import (
     validate_checkpoint_payload,
 )
 from scripts.eval.model import ValidationError
+from scripts.eval.tests.posix_only import requires_posix_budget_journal
 
 
 def digest(label: str) -> str:
@@ -83,6 +84,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 total_metered_tokens=1,
             ).validate()
 
+    @requires_posix_budget_journal
     def test_state_machine_crash_exposure_and_commit_idempotence(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"
@@ -136,6 +138,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                         committed["transaction_id"],
                     )
 
+    @requires_posix_budget_journal
     def test_commit_seals_an_optional_evidence_digest_into_the_chain(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"
@@ -196,6 +199,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 plain.commit(authorized["transaction_id"], actual_cost_microusd=1, actual_metered_tokens=1)
                 self.assertIsNone(plain.transaction_evidence_sha256(authorized["transaction_id"]))
 
+    @requires_posix_budget_journal
     def test_refused_abort_of_an_authorized_transaction_is_typed(self):
         # Callers that abort after a failed authorization must be able to
         # tell "correctly refused, the authorization is durable" from "the
@@ -207,6 +211,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                     journal.abort_pre_request(authorized["transaction_id"])
                 self.assertTrue(issubclass(TransactionNotAbortable, ValidationError))
 
+    @requires_posix_budget_journal
     def test_abort_after_an_authorization_that_landed_but_was_not_observed(self):
         # The authorization write reached disk; the exception hit before the
         # in-memory state moved. The abort must recognise its own one-step
@@ -241,6 +246,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                     journal.abort_pre_request(reserved["transaction_id"])
                 self.assertNotIsInstance(caught.exception, TransactionNotAbortable)
 
+    @requires_posix_budget_journal
     def test_abort_is_only_legal_before_authorization(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"
@@ -254,6 +260,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, "cannot be aborted"):
                     journal.abort_pre_request(authorized["transaction_id"])
 
+    @requires_posix_budget_journal
     def test_authorized_run_id_cannot_be_reauthorized_by_harness_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"
@@ -297,6 +304,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                     )
                 self.assertEqual(journal.snapshot(), before)
 
+    @requires_posix_budget_journal
     def test_exposure_limit_is_checked_before_persist(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"
@@ -318,6 +326,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 self.assertEqual(second["state"], "reserved")
                 self.assertEqual(journal.snapshot()["exposure_cost_microusd"], 4_000_000)
 
+    @requires_posix_budget_journal
     def test_revision_cas_and_identity_drift_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"
@@ -340,6 +349,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 with BudgetJournal(path, drifted):
                     pass
 
+    @requires_posix_budget_journal
     def test_lock_is_process_exclusive_and_loser_does_not_mutate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -371,6 +381,7 @@ with BudgetJournal(Path(%r), authority):
                 self.assertIn("another local runner holds it", completed.stderr)
                 self.assertEqual(journal.snapshot(), before)
 
+    @requires_posix_budget_journal
     def test_corrupt_truncated_symlink_hardlink_and_temp_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -410,6 +421,7 @@ with BudgetJournal(Path(%r), authority):
                 with BudgetJournal(incomplete, authority):
                     pass
 
+    @requires_posix_budget_journal
     def test_parent_directory_replacement_between_stat_and_open_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -435,6 +447,7 @@ with BudgetJournal(Path(%r), authority):
             self.assertFalse((trusted / "pilot-budget.json").exists())
             self.assertFalse((replacement / "pilot-budget.json").exists())
 
+    @requires_posix_budget_journal
     def test_fault_before_rename_leaves_manual_stop_after_rename_recovers_new_head(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -475,6 +488,7 @@ with BudgetJournal(Path(%r), authority):
             with BudgetJournal(after_rename, self.authority()) as recovered:
                 self.assertEqual(recovered.snapshot()["transaction_states"], {"reserved": 1})
 
+    @requires_posix_budget_journal
     def test_on_disk_revision_drift_while_locked_is_detected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"
@@ -509,6 +523,7 @@ class TrialResumeAuthorizationTest(MemoryBudgetJournalTest):
             expected_head_sha256=authorized["journal_head_sha256"],
         )
 
+    @requires_posix_budget_journal
     def test_resume_then_commit_replays_and_bounds(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "budget.json"
@@ -531,6 +546,7 @@ class TrialResumeAuthorizationTest(MemoryBudgetJournalTest):
                 self.assertEqual(len(receipts), 1)
                 self.assertEqual(receipts[0]["state"], "committed")
 
+    @requires_posix_budget_journal
     def test_second_resume_refused(self):
         # 预算 = 1 次/事务(2026-08-18 定案):崩溃恢复走 continuation 复用
         # 首个事件;第二个授权只可能是被禁止的 attempt>=3 路径。
@@ -542,6 +558,7 @@ class TrialResumeAuthorizationTest(MemoryBudgetJournalTest):
                 with self.assertRaisesRegex(ValidationError, "resume budget"):
                     self._resume(journal, first, ["task-b"], evidence="e2")
 
+    @requires_posix_budget_journal
     def test_resume_events_accessor_exposes_replayed_authorizations(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "budget.json"
@@ -564,6 +581,7 @@ class TrialResumeAuthorizationTest(MemoryBudgetJournalTest):
                 )
                 self.assertNotIn("resume_events", receipt)
 
+    @requires_posix_budget_journal
     def test_resume_requires_authorized_state_and_bounded_trials(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "budget.json"
@@ -590,6 +608,7 @@ class TrialResumeAuthorizationTest(MemoryBudgetJournalTest):
                 with self.assertRaisesRegex(ValidationError, "payload is invalid"):
                     self._resume(journal, authorized, [])
 
+    @requires_posix_budget_journal
     def test_handcrafted_wrong_attempt_fails_replay(self):
         # Replay-side attack: an event claiming attempt=3 with no prior
         # resume event must fail closed on reload.

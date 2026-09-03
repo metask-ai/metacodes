@@ -49,7 +49,7 @@ if __package__ in {None, ""}:
         load_manifest,
         validate_runtime_artifacts,
     )
-    from scripts.eval.model import ValidationError, stable_json  # type: ignore
+    from scripts.eval.model import O_BINARY, ValidationError, stable_json  # type: ignore
 else:
     from .memory_agent_runtime import (
         PRODUCTION_MODEL_FINGERPRINT,
@@ -72,7 +72,7 @@ else:
         load_manifest,
         validate_runtime_artifacts,
     )
-    from .model import ValidationError, stable_json
+    from .model import O_BINARY, ValidationError, stable_json
 
 
 def _load_api_key(auth_file: Path) -> str:
@@ -82,7 +82,7 @@ def _load_api_key(auth_file: Path) -> str:
             "production pilot rejects METASK_API_KEY because a tool subprocess could inspect "
             "the Python parent's initial environment; use a private auth file"
         )
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -146,6 +146,7 @@ def _probe_tinykg_compatibility(binary: Path, expected_sha256: str) -> Mapping[s
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=30,
                 check=False,
             )

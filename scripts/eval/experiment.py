@@ -184,6 +184,7 @@ def _run_dependency_command(binary: Path, args: Sequence[str], label: str) -> st
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             timeout=DEPENDENCY_PROBE_TIMEOUT_SECONDS,
             check=False,
         )
@@ -326,6 +327,7 @@ def _formal_probe(binary: Path) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             timeout=DEPENDENCY_PROBE_TIMEOUT_SECONDS,
             check=False,
         )

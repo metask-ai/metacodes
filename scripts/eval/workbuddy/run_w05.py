@@ -27,6 +27,7 @@ from .install_overlay import install
 from .mock_provider import MOCK_CREDENTIAL
 from .stage_artifacts import stage
 from .trace import OBSERVATION_FILENAME, TraceError, load_control_metrics
+from ..model import O_BINARY, fsync_directory, mode_violation
 
 
 SCHEMA_VERSION = "metacodes-workbuddy-w05-receipt-v1"
@@ -106,7 +107,7 @@ def _identity(path: Path) -> Dict[str, object]:
     path_before = path.lstat()
     descriptor = os.open(
         path,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        O_BINARY | os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         before = os.fstat(descriptor)
@@ -204,7 +205,7 @@ def _trusted_parent(path: Path) -> Path:
         raise W05Error(f"evidence parent must not be a symlink: {path.parent}")
     parent = path.parent.resolve(strict=True)
     info = parent.stat()
-    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
+    if not stat.S_ISDIR(info.st_mode) or mode_violation(info.st_mode, 0o022):
         raise W05Error(f"evidence parent is not a trusted directory: {parent}")
     if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
         raise W05Error(f"evidence parent is not owned by the current user: {parent}")
@@ -223,21 +224,21 @@ def _private_new(path: Path, payload: bytes) -> None:
     temporary = Path(temporary_raw)
     try:
         try:
-            os.fchmod(descriptor, 0o600)
+            if hasattr(os, "fchmod"):  # absent on Windows
+                os.fchmod(descriptor, 0o600)
             _write_all(descriptor, payload)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
         try:
-            os.link(temporary, parent / path.name, follow_symlinks=False)
+            if os.link in os.supports_follow_symlinks:
+                os.link(temporary, parent / path.name, follow_symlinks=False)
+            else:  # Windows: no follow_symlinks; the temporary is our own regular file
+                os.link(temporary, parent / path.name)
         except FileExistsError as exc:
             raise W05Error(f"refusing to overwrite W0.5 evidence: {path}") from exc
         temporary.unlink()
-        parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        fsync_directory(parent)
     finally:
         try:
             temporary.unlink()
@@ -252,6 +253,7 @@ def _git(repo: Path, *args: str) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
     )
     if completed.returncode != 0:
         raise W05Error(f"git {' '.join(args)} failed: {completed.stderr.strip()}")
@@ -493,6 +495,7 @@ def run_w05(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         )
         try:
             deadline = time.monotonic() + 10

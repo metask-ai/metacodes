@@ -65,6 +65,10 @@ from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
 from scripts.eval.workbuddy.install_overlay import _digest
 from scripts.eval.workbuddy.environment_preflight import prebuild as prebuild_environment
 from scripts.eval.workbuddy.stage_artifacts import stage
+from scripts.eval.tests.posix_only import requires_posix_budget_journal, requires_posix_dir_fd, requires_posix_exec
+# A fixture path that is absolute on every host: POSIX keeps "/fixture", Windows
+# needs a drive letter for Path.is_absolute() (launch manifests reject relative rows).
+FIXTURE = str(Path("/fixture").resolve())
 
 
 def digest(label: str) -> str:
@@ -250,7 +254,7 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
             "artifacts": {"manifest": {"sha256": digest("artifacts")}},
             "environment_preflight": {
                 "receipt": {
-                    "path": "/fixture/environment-preflight.json",
+                    "path": f"{FIXTURE}/environment-preflight.json",
                     "bytes": 1,
                     "sha256": digest("environment-preflight-receipt"),
                 },
@@ -268,7 +272,7 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
             "harness_fingerprint": digest("harness"),
             "host_control_plane": {
                 name: {
-                    "path": f"/fixture/{name}.py",
+                    "path": f"{FIXTURE}/{name}.py",
                     "bytes": 1,
                     "sha256": digest(name),
                 }
@@ -299,18 +303,18 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "harbor_force_build": False,
                 "runner_tools": {
                     "bash": {
-                        "path": "/fixture/bash",
+                        "path": f"{FIXTURE}/bash",
                         "sha256": digest("bash"),
                         "version_sha256": digest("bash-version"),
                     },
                     "uv": {
-                        "path": "/fixture/uv",
+                        "path": f"{FIXTURE}/uv",
                         "sha256": digest("uv"),
                         "version_sha256": digest("uv-version"),
                     },
                 },
                 "runner": [
-                    "/fixture/uv", "run", "--frozen", "/fixture/bash", "scripts/run.sh", "--job",
+                    f"{FIXTURE}/uv", "run", "--frozen", f"{FIXTURE}/bash", "scripts/run.sh", "--job",
                     "metacodes-code-l2",
                 ],
             },
@@ -422,11 +426,11 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
             }
             runner_tools = {
-                "bash": {"path": "/fixture/bash", "bytes": 1, "sha256": digest("bash"), "version_first_line": "bash", "version_sha256": digest("bash-version")},
-                "uv": {"path": "/fixture/uv", "bytes": 1, "sha256": digest("uv"), "version_first_line": "uv", "version_sha256": digest("uv-version")},
+                "bash": {"path": f"{FIXTURE}/bash", "bytes": 1, "sha256": digest("bash"), "version_first_line": "bash", "version_sha256": digest("bash-version")},
+                "uv": {"path": f"{FIXTURE}/uv", "bytes": 1, "sha256": digest("uv"), "version_first_line": "uv", "version_sha256": digest("uv-version")},
             }
             host = {
-                name: {"path": f"/fixture/{name}.py", "bytes": 1, "sha256": digest(name)}
+                name: {"path": f"{FIXTURE}/{name}.py", "bytes": 1, "sha256": digest(name)}
                 for name in HOST_CONTROL_PLANE_MODULES
             }
             overlay = {
@@ -473,8 +477,8 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                     environment_preflight_receipt=preflight,
                     job_config=job_path,
                     model_config=model_path,
-                    runner_bash=Path("/fixture/bash"),
-                    runner_uv=Path("/fixture/uv"),
+                    runner_bash=Path(f"{FIXTURE}/bash"),
+                    runner_uv=Path(f"{FIXTURE}/uv"),
                     provider_identity="provider-l2",
                     total_cost_microusd=1_000_000,
                     total_metered_tokens=100_000,
@@ -602,6 +606,7 @@ raise SystemExit(23)
         os.close(write_fd)
         return read_fd
 
+    @requires_posix_dir_fd
     def test_real_child_provider_observes_authorized_journal_and_receipt_binds_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -650,6 +655,7 @@ raise SystemExit(23)
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
             self.assertNotIn("private-workbuddy-test-key", receipt.read_text())
 
+    @requires_posix_dir_fd
     def test_real_child_provider_503_writes_private_authorized_failure_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -752,6 +758,7 @@ raise SystemExit(23)
                     )
             self.assertEqual(0, retry_provider.requests)
 
+    @requires_posix_dir_fd
     def test_runner_zero_with_invalid_post_run_evidence_writes_failure_receipt(self):
         """Harbor may return zero even when every agent trial failed.
 
@@ -826,6 +833,7 @@ with urllib.request.urlopen(
             with self.assertRaisesRegex(LaunchError, "stage contradicts"):
                 validate_authorized_failure_receipt(contradictory_path)
 
+    @requires_posix_dir_fd
     def test_stale_resume_subset_env_refuses_normal_launch(self):
         # 残留的 resume 子集 export 会让正常付费臂静默跑部分任务,审计
         # fail-closed 时钱已花掉(2026-08-18 对抗审查 F6)——启动前拒绝。
@@ -849,6 +857,7 @@ with urllib.request.urlopen(
                         ],
                     )
 
+    @requires_posix_budget_journal
     def test_offline_failure_recovery_reopens_authorized_without_provider(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -916,6 +925,7 @@ with urllib.request.urlopen(
                     started_ns=started_ns,
                 )
 
+    @requires_posix_dir_fd
     def test_injected_runner_cannot_create_quality_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1190,6 +1200,7 @@ with urllib.request.urlopen(
         self.assertEqual(aggregate["lean"]["checker_bytes_max"], 70)
         self.assertEqual(aggregate["lean"]["kernel_sha256s"], ["1" * 64, "2" * 64])
 
+    @requires_posix_dir_fd
     def test_authorization_crash_consumes_maximum_and_same_run_cannot_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1297,7 +1308,7 @@ with urllib.request.urlopen(
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["cohort"]["manifest"] = {
-                "path": "/fixture/cohort.json",
+                "path": f"{FIXTURE}/cohort.json",
                 "bytes": 1,
                 "sha256": digest("cohort"),
             }
@@ -1373,6 +1384,7 @@ with urllib.request.urlopen(
             finally:
                 os.close(credential_fd)
 
+    @requires_posix_dir_fd
     def test_provider_received_then_crash_has_no_forged_failure_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1411,6 +1423,7 @@ with urllib.request.urlopen(
             transaction = next(iter(state["transactions"].values()))
             self.assertEqual("request_authorized", transaction["state"])
 
+    @requires_posix_dir_fd
     def test_existing_or_linked_receipt_target_fails_before_provider(self):
         for kind in ("regular", "symlink", "hardlink", "temporary"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
@@ -1464,6 +1477,7 @@ with urllib.request.urlopen(
                 self.assertEqual(0, provider.requests)
                 self.assertFalse(journal.exists())
 
+    @requires_posix_dir_fd
     def test_untrusted_receipt_parent_fails_before_provider(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1532,6 +1546,7 @@ with urllib.request.urlopen(
                 self.assertEqual(0, provider.requests)
                 self.assertTrue((root / "alias-receipt.json").is_file())
 
+    @requires_posix_dir_fd
     def test_failure_receipt_ignores_unrelated_new_result_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1640,7 +1655,7 @@ with urllib.request.urlopen(
     def test_host_control_plane_source_drift_fails_closed(self):
         bound = {
             name: {
-                "path": f"/fixture/{name}.py",
+                "path": f"{FIXTURE}/{name}.py",
                 "bytes": 1,
                 "sha256": digest(name),
             }
@@ -1710,12 +1725,12 @@ with urllib.request.urlopen(
             result = {
                 "task_name": f"workbuddy/{task}",
                 "task_id": {
-                    "path": str(
+                    "path": (
                         Path(".workspace/tmp/staged")
                         / run_id
                         / "wb-bench-code-v1.0/tasks"
                         / task
-                    )
+                    ).as_posix()
                 },
                 "source": "tasks",
                 "trial_uri": trial.as_uri(),
@@ -1858,12 +1873,12 @@ with urllib.request.urlopen(
         result = {
             "task_name": f"workbuddy/{task}",
             "task_id": {
-                "path": str(
+                "path": (
                     Path(".workspace/tmp/staged")
                     / run_id
                     / "wb-bench-code-v1.0/tasks"
                     / task
-                )
+                ).as_posix()
             },
             "source": "tasks",
             "trial_uri": trial.resolve().as_uri(),
@@ -2305,6 +2320,7 @@ class RunnerToolLocaleTest(unittest.TestCase):
         path.chmod(0o755)
         return path
 
+    @requires_posix_exec
     def test_localized_bash_banner_is_still_identified(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wb-locale-") as temporary:
             directory = Path(temporary)
@@ -2315,6 +2331,7 @@ class RunnerToolLocaleTest(unittest.TestCase):
         # manifest identity is host-locale independent too.
         self.assertIn("GNU bash, version 5.3.15", str(probed["version_first_line"]))
 
+    @requires_posix_exec
     def test_bash_3_is_still_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wb-locale-old-") as temporary:
             directory = Path(temporary)
@@ -2392,6 +2409,7 @@ class WorkBuddyResumeAuditTest(WorkBuddyPaidLaunchGateL2Test):
     audit offline (no credential, no runner), and commit actual usage.
     """
 
+    @requires_posix_dir_fd
     def test_resume_audit_commits_after_instrument_fix(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2448,6 +2466,7 @@ class WorkBuddyResumeAuditTest(WorkBuddyPaidLaunchGateL2Test):
             self.assertTrue(committed_receipt.is_file())
             self.assertEqual(committed_receipt.stat().st_mode & 0o777, 0o600)
 
+    @requires_posix_dir_fd
     def test_resume_audit_rejects_drifted_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2958,7 +2977,7 @@ class WorkBuddyRipgrepRosterTest(unittest.TestCase):
             observed = _artifact_contract(manifest)
             self.assertIn("ripgrep", observed["executables"])
             self.assertTrue(
-                observed["executables"]["ripgrep"]["path"].endswith("bin/rg")
+                Path(observed["executables"]["ripgrep"]["path"]).as_posix().endswith("bin/rg")
             )
 
     def test_claimed_rg_with_missing_file_fails_closed(self):
@@ -3422,12 +3441,12 @@ class TrialResumeOrchestrationTest(unittest.TestCase):
         result = {
             "task_name": f"workbuddy/{self.TASK}",
             "task_id": {
-                "path": str(
+                "path": (
                     Path(".workspace/tmp/staged")
                     / self.RUN_ID
                     / "wb-bench-code-v1.0/tasks"
                     / self.TASK
-                )
+                ).as_posix()
             },
             "source": "tasks",
             "trial_uri": trial.resolve().as_uri(),
@@ -3543,7 +3562,7 @@ record = {"seq": 1, "request": {"body": {"model": route, "system": "stable",
      "actor_model_identity": "glm-5.2"}) + "\n")
 result = {
     "task_name": "workbuddy/code-task-a",
-    "task_id": {"path": str(Path(".workspace/tmp/staged") / "workbuddy-l2-run-1-a2" / "wb-bench-code-v1.0/tasks" / "code-task-a")},
+    "task_id": {"path": (Path(".workspace/tmp/staged") / "workbuddy-l2-run-1-a2" / "wb-bench-code-v1.0/tasks" / "code-task-a").as_posix()},
     "source": "tasks",
     "trial_uri": trial.resolve().as_uri(),
     "task_checksum": "%s",
@@ -3616,6 +3635,7 @@ result = {
                 runner_argv=runner_argv,
             )
 
+    @requires_posix_budget_journal
     def test_resume_trials_commits_end_to_end(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3655,6 +3675,7 @@ result = {
                 self.assertEqual(len(events), 1)
                 self.assertEqual(events[0]["trials"], (self.TASK,))
 
+    @requires_posix_budget_journal
     def test_resume_trials_runner_crash_then_continuation_succeeds(self):
         # rename 之后 runner 崩溃曾是永久卡死态(2026-08-18 对抗审查 F3):
         # 再入必须复用账本里的授权(不追加第二个事件)并跑通。
@@ -3685,6 +3706,7 @@ result = {
                 )
                 self.assertEqual(len(events), 1)
 
+    @requires_posix_budget_journal
     def test_continuation_after_completed_rerun_skips_runner(self):
         # runner 成功后、commit 前崩溃(2026-08-18 第二轮审查):再入若无
         # 条件重跑会写出第二个干净 attempt-2 目录 → 审计双绑定死局 + 双花
@@ -3719,6 +3741,7 @@ result = {
                 )
                 self.assertEqual(len(events), 1)
 
+    @requires_posix_budget_journal
     def test_failed_attempt2_burns_the_arm(self):
         # attempt-2 自己异常 = attempt>=3,设计禁止;再入必须拒绝而不是
         # 第三次花钱。
@@ -3756,6 +3779,7 @@ result = {
                     [sys.executable, "-c", "raise SystemExit(0)"],
                 )
 
+    @requires_posix_budget_journal
     def test_attempt1_spend_reaches_committed_actuals(self):
         # F4 的钱路端到端:attempt-1 轨迹 $0.004/190 tokens + attempt-2
         # $0.002/19 tokens → 提交额必须是两者之和(2026-08-18 第二轮审查
@@ -3781,6 +3805,7 @@ result = {
             self.assertEqual(row["attempt1_usage"]["metered_tokens"], 190)
             self.assertNotIn("usage_unavailable", row["attempt1_usage"])
 
+    @requires_posix_budget_journal
     def test_no_headroom_refuses_before_any_spend(self):
         # C1:attempt-1 已烧到上限,重跑注定无法 commit——授权前拒绝。
         with tempfile.TemporaryDirectory() as directory:
@@ -3817,6 +3842,7 @@ result = {
                     (),
                 )
 
+    @requires_posix_budget_journal
     def test_stale_partial_attempt2_refuses_with_path(self):
         # [1]:trajectory 有、result 无的半成品目录若不前置拦截,重跑再花
         # 一次钱后审计永久拒绝。
@@ -3836,6 +3862,7 @@ result = {
                     started_ns, [sys.executable, "-c", "raise SystemExit(0)"],
                 )
 
+    @requires_posix_budget_journal
     def test_audit_rejects_rows_not_matching_journal(self):
         # F8 的牙齿:直接调用 resume_post_run_audit 携形状正确但 reason
         # 被改的行——磁盘校验全过,必须死在账本 evidence 绑定上。
@@ -3885,6 +3912,7 @@ result = {
                         resumes=rows,
                     )
 
+    @requires_posix_budget_journal
     def test_audit_refuses_resumed_journal_without_rows(self):
         # [5] 相邻性质:journal 已有 resume 事件时,不带行的审计调用必须
         # fail-closed(收据 checkpoint 漂移拦在最前)。
@@ -3908,6 +3936,7 @@ result = {
                         resumes=None,
                     )
 
+    @requires_posix_budget_journal
     def test_foreign_run_evidence_is_never_touched(self):
         # F7 的牙齿(probe_e):共享 result root 里同名任务、别的 run 的
         # exception trial——resume 必须无视它(不改名、不资格判定)。
@@ -3965,6 +3994,7 @@ result = {
                 ).exists()
             )
 
+    @requires_posix_budget_journal
     def test_clean_trial_is_never_resumable(self):
         # 干净但低分的 trial:exception_info == null → 整个 resume 拒绝。
         with tempfile.TemporaryDirectory() as directory:

@@ -17,6 +17,7 @@ from scripts.eval.memory_budget_journal import (
 )
 from scripts.eval.memory_replay import PRODUCTION_PROVIDER_ID
 from scripts.eval.model import stable_json
+from scripts.eval.tests.posix_only import requires_posix_budget_journal
 
 
 class TinyKgLeanFactorialBlockTest(unittest.TestCase):
@@ -216,6 +217,7 @@ class TinyKgLeanFactorialBlockTest(unittest.TestCase):
             self.assertEqual(16, result["planned_rollouts"])
             self.assertEqual("3", result["tinykg_contract"]["storage_format_version"])
 
+    @requires_posix_budget_journal
     def test_block_checkpoints_each_quality_eligible_rollout(self) -> None:
         with tempfile.TemporaryDirectory(prefix="factorial-block-run-") as temporary:
             root = Path(temporary)
@@ -272,6 +274,7 @@ class TinyKgLeanFactorialBlockTest(unittest.TestCase):
             self.assertEqual(16, summary["rollouts"])
             self.assertTrue(summary["quality_evidence"])
 
+    @requires_posix_budget_journal
     def test_completed_resume_reads_no_credential_and_replays_no_provider(self) -> None:
         with tempfile.TemporaryDirectory(prefix="factorial-block-resume-") as temporary:
             root = Path(temporary)

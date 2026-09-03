@@ -266,6 +266,7 @@ def run(probe: Path, output: Path) -> dict[str, Any]:
             env=env,
             check=False,
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=60,

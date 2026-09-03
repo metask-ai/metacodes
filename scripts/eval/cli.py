@@ -176,6 +176,7 @@ def _write(path: Optional[str], text: str) -> None:
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
+                newline="\n",  # Windows text mode would write CRLF
                 dir=target.parent,
                 prefix=f".{target.name}.",
                 suffix=".tmp",

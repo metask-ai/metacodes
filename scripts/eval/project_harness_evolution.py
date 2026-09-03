@@ -20,6 +20,23 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Mapping, Sequence
 
+# Windows portability (see scripts/eval/model.py): os.open text mode must never
+# touch artifacts, directory descriptors cannot be opened, and permission bits
+# are synthetic there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+_POSIX_MODE_BITS = os.name != "nt"
+
+
+def _fsync_directory(path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 
 MANIFEST_SCHEMA = "metacodes-project-harness-evolution-manifest-v2"
 REPORT_SCHEMA = "metacodes-project-harness-evolution-report-v2"
@@ -56,7 +73,7 @@ def _read_regular(path: Path, maximum: int) -> bytes:
         raise EvolutionError(f"artifact must be a single-link regular file: {path}")
     if before_path.st_size < 0 or before_path.st_size > maximum:
         raise EvolutionError(f"artifact size is invalid: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
     fd = os.open(path, flags)
     try:
         before_fd = os.fstat(fd)
@@ -135,16 +152,12 @@ def _wire_json(value: Any) -> bytes:
 
 
 def _fsync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    _fsync_directory(path)
 
 
 def _write_new(path: Path, value: Any) -> None:
     raw = _stable_json(value) + b"\n"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
     fd = os.open(path, flags, 0o600)
     try:
         offset = 0
@@ -187,6 +200,7 @@ def _git_identity(repo: Path) -> Mapping[str, Any]:
         cwd=repo,
         check=True,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     ).stdout.strip()
@@ -196,6 +210,7 @@ def _git_identity(repo: Path) -> Mapping[str, Any]:
             cwd=repo,
             check=True,
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         ).stdout
@@ -783,7 +798,7 @@ def run_evolution(
         raise EvolutionError("experiment root must be absent or empty")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root_info = root.lstat()
-    if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid():
+    if not stat.S_ISDIR(root_info.st_mode) or (hasattr(os, "getuid") and root_info.st_uid != os.getuid()):
         raise EvolutionError("experiment root must be an owned real directory")
     os.chmod(root, 0o700)
     # Keep the spelling passed to Seatbelt, the native driver, and the

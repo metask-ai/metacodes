@@ -51,6 +51,7 @@ from scripts.eval.workbuddy.trace import (
     transcript_ir,
 )
 from scripts.eval.workbuddy.progress_analysis import analyze_progress
+from scripts.eval.tests.posix_only import POSIX
 
 
 ZERO_COMMIT = "0" * 40
@@ -1870,7 +1871,8 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             self.assertEqual(built["tasks"]["task-a"]["architecture"], "amd64")
             self.assertEqual(built["dataset_staging"]["task_count"], 1)
             self.assertTrue(built["dataset_staging"]["owner_writable"])
-            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            if POSIX:  # permission bits are synthetic on Windows
+                self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
 
             (environment / "Dockerfile").write_text(
                 "FROM busybox\n", encoding="utf-8"
@@ -1958,7 +1960,7 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     EnvironmentPreflightError,
-                    r"not owner-writable.*task-b/task\.toml",
+                    r"not owner-writable.*task-b[/\\]task\.toml",
                 ):
                     prebuild(
                         workbuddy=workbuddy,

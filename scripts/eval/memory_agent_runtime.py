@@ -100,7 +100,7 @@ from .memory_tinykg_local import (
     _tree_digest,
     build_case_batch,
 )
-from .model import ValidationError, stable_json
+from .model import ValidationError, stable_json, O_BINARY, fsync_directory
 
 
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
@@ -381,7 +381,7 @@ def _inside(child: Path, parent: Path, where: str) -> Path:
 
 def _write_new(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -404,17 +404,13 @@ def _write_new(path: Path, payload: bytes) -> None:
         raise
     finally:
         os.close(fd)
-    directory_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    fsync_directory(path.parent)
 
 
 def _private_regular_payload(path: Path, where: str) -> bytes:
     """Read and validate identity through one no-follow descriptor."""
 
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
@@ -457,7 +453,7 @@ def _replace_private_file(path: Path, payload: bytes) -> None:
         _fail("rollout resume checkpoint", "incomplete temporary file requires inspection")
     if path.exists() or path.is_symlink():
         _private_regular_payload(path, "rollout resume checkpoint")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = -1
@@ -476,11 +472,7 @@ def _replace_private_file(path: Path, payload: bytes) -> None:
         os.close(fd)
         fd = -1
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(path.parent)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -586,7 +578,7 @@ def _child_failure_message(returncode: int) -> str:
 
 
 def _read_regular_file(path: Path, where: str) -> bytes:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -2063,6 +2055,7 @@ def _run_production_tinykg_read_probe(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=30,
                 check=False,
             )
@@ -2218,6 +2211,7 @@ test "$(/bin/cat "$4")" = "$3" || exit 15
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             timeout=10,
             check=False,
         )
@@ -2255,6 +2249,7 @@ if /bin/mv "$3" "$4" 2>/dev/null; then exit 20; fi
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=10,
                 check=False,
             )
@@ -3303,7 +3298,7 @@ def run_memory_agent_schedule(
             metadata_path,
             (json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
         )
-        metadata_fd = os.open(metadata_path, os.O_RDONLY)
+        metadata_fd = os.open(metadata_path, O_BINARY | os.O_RDONLY)
         metadata_path.unlink()
         # Keep the inherited event vnode inside the current artifact allowlist;
         # a process-global temp directory would punch an unnecessary write hole.
@@ -3424,6 +3419,7 @@ def run_memory_agent_schedule(
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
+                        encoding="utf-8",
                         timeout=timeout_seconds,
                         check=False,
                         pass_fds=(
@@ -3471,6 +3467,7 @@ def run_memory_agent_schedule(
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
+                        encoding="utf-8",
                         timeout=timeout_seconds,
                         check=False,
                         pass_fds=(metadata_fd, events_file.fileno()),
