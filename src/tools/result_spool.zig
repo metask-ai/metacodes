@@ -115,7 +115,12 @@ fn inlineAfterFailedPublish(
     capture_complete: bool,
     err: anyerror,
 ) !tool_result.ToolResultBody {
-    if (!result_budget.retainInlineAfterFailedPublish(err, capture.bytes, capture_complete))
+    if (!result_budget.retainInlineAfterFailedPublish(
+        err,
+        capture.bytes,
+        capture_complete,
+        result_budget.PER_RESULT_MAX_BYTES,
+    ))
         return err;
     return tool_result.ToolResultBody.initInline(try capture.readRangeAlloc(
         allocator,

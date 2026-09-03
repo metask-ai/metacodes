@@ -17,6 +17,18 @@ status, compatibility boundaries, and entry points are defined by
   next runtime capability added without an offer mapping is a compile error
   rather than a silent gap.
 
+### Changed
+
+- MCP tool results decide inline-vs-publish from the caller's
+  `result_budget.Budget.per_result_bytes` on both MCP paths — the classic
+  `McpClient` and the AgentCore `mcp_result_stream` projector — the same number
+  the native tools have used since #41, instead of private 64KB / 1MB constants
+  that only coincided with it (issue #43). `McpClient.callToolBodyAbortable` /
+  `listResourcesBodyAbortable` / `readResourceBodyAbortable`,
+  `mcp_result_stream.project` and `mcp_runtime.Client.callToolBody` take that
+  budget as a required parameter; embedders pass `ctx.result_budget` verbatim.
+  This is a breaking signature change for library consumers.
+
 ### Removed
 
 - First-class PDF document input is withdrawn (issue #25). Agent Core carries
@@ -55,6 +67,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- A CAS publication failure (a full session quota, for example) no longer turns
+  a bounded MCP result into a tool error. All three publishers — the native
+  spool, the classic `McpClient` and the AgentCore projector — share
+  `result_budget.retainInlineAfterFailedPublish` and keep the bytes inline up to
+  their own materialization ceiling (64KB for the two that would have to read
+  from disk, the 1MB frame limit for the classic client, which already holds
+  the bytes), so the conversation projection renders its bounded head/tail
+  envelope with `storage_error` exactly as it did before the threshold change.
 - AgentCore's request preflight (`canonicalRequestBytes`) charges image tool
   results as native bytes only when the configured model accepts image
   input; on a text-only route the estimate is exactly the placeholder request

@@ -27,6 +27,14 @@ pub const ElicitHandler = struct {
     handleFn: *const fn (ctx: *anyopaque, params_json: []const u8, alloc: std.mem.Allocator) ?[]u8,
 };
 
+/// Frames up to this size are materialized before they are classified: a
+/// server→client control frame (elicitation) has to be answered synchronously,
+/// and only a parsed frame can be told apart from a response. It is also the
+/// ceiling of what this client has ever held inline, which is why the
+/// failed-publication fallback retains results up to it rather than only up to
+/// `result_budget.PER_RESULT_MAX_BYTES`: the bytes are already in memory.
+pub const CONTROL_FRAME_MATERIALIZE_BYTES: usize = 1024 * 1024;
+
 pub const McpClient = struct {
     allocator: std.mem.Allocator,
     transport: StdioTransport,
@@ -135,10 +143,12 @@ pub const McpClient = struct {
     }
 
     /// Typed byte-zero request path used by model-visible MCP tools/resources.
-    /// Frames up to 1 MiB are materialized so server→client control frames can
-    /// be classified and elicitation stays synchronous. A successful result's
-    /// inline-or-publish disposition follows `budget.per_result_bytes`, with a
-    /// bounded inline fallback if publication fails.
+    /// Frames up to `CONTROL_FRAME_MATERIALIZE_BYTES` are materialized so
+    /// server→client control frames can be classified and elicitation stays
+    /// synchronous. A successful result's inline-or-publish disposition follows
+    /// `budget.per_result_bytes`; if publication fails, the bytes already in
+    /// memory are retained inline up to that same limit, which is what this
+    /// path did before the threshold change.
     fn requestBody(
         self: *McpClient,
         method: []const u8,
@@ -191,7 +201,7 @@ pub const McpClient = struct {
             // Server→client requests are intentionally bounded control-plane
             // frames. Materialize only this small class so elicitation keeps
             // its existing synchronous semantics.
-            if (capture.bytes <= 1024 * 1024) {
+            if (capture.bytes <= CONTROL_FRAME_MATERIALIZE_BYTES) {
                 const line = try capture.readRangeAlloc(
                     self.allocator,
                     0,
@@ -235,8 +245,12 @@ pub const McpClient = struct {
                     return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
                 return self.publishJsonResult(artifact_root, result) catch |err| {
                     // Keep a complete bounded result renderable when CAS publication fails.
-                    if (!result_budget.retainInlineAfterFailedPublish(err, result.len, true))
-                        return err;
+                    if (!result_budget.retainInlineAfterFailedPublish(
+                        err,
+                        result.len,
+                        true,
+                        CONTROL_FRAME_MATERIALIZE_BYTES,
+                    )) return err;
                     return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
                 };
             }

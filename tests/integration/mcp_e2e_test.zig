@@ -47,9 +47,11 @@ fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) !voi
     try pfs.setSize(fd, cc.tool_result_artifact.MAX_SESSION_BYTES);
 }
 
+const ExpectedBody = enum { inline_body, artifact, structured_error };
+
 fn expectSizedResourceBody(
     expected_result_bytes: usize,
-    expect_artifact: bool,
+    expected_body: ExpectedBody,
     fill_quota: bool,
 ) !void {
     const allocator = std.testing.allocator;
@@ -99,30 +101,54 @@ fn expectSizedResourceBody(
         .ok => |*value| value,
         else => return error.UnexpectedResourceReadOutcome,
     };
-    if (expect_artifact) {
-        try std.testing.expect(body.* == .artifact);
-        try std.testing.expectEqual(@as(u64, expected.len), body.artifact.stored.bytes);
-        try std.testing.expectEqualStrings(
-            expected[0..body.artifact.preview.head_len],
-            body.artifact.preview.headSlice(),
-        );
-    } else {
-        try std.testing.expect(body.* == .@"inline");
-        try std.testing.expectEqualStrings(expected, body.@"inline".bytes);
+    switch (expected_body) {
+        .artifact => {
+            try std.testing.expect(body.* == .artifact);
+            try std.testing.expectEqual(@as(u64, expected.len), body.artifact.stored.bytes);
+            try std.testing.expectEqualStrings(
+                expected[0..body.artifact.preview.head_len],
+                body.artifact.preview.headSlice(),
+            );
+        },
+        .inline_body => {
+            try std.testing.expect(body.* == .@"inline");
+            try std.testing.expectEqualStrings(expected, body.@"inline".bytes);
+        },
+        .structured_error => {
+            // Above the frame limit the response never enters the ≤1MB branch:
+            // it goes through the projector, whose failed publication is a
+            // `resource_limit` diagnostic that the client returns as a
+            // structured error rather than as bytes.
+            try std.testing.expect(body.* == .structured_error);
+            try std.testing.expect(std.mem.indexOf(u8, body.structured_error.encoded, "resource_limit") != null);
+        },
     }
 }
 
 test "MCP budget: resources/read publishes result above caller per-result budget" {
-    try expectSizedResourceBody(30_000, true, false);
+    try expectSizedResourceBody(30_000, .artifact, false);
 }
 
 test "MCP budget: resources/read inlines result at caller per-result budget" {
-    try expectSizedResourceBody(25_000, false, false);
+    try expectSizedResourceBody(25_000, .inline_body, false);
 }
 
 test "MCP budget: resources/read retains bounded result inline when publication fails" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    try expectSizedResourceBody(30_000, false, true);
+    try expectSizedResourceBody(30_000, .inline_body, true);
+}
+
+test "MCP budget: resources/read retains result inline up to the frame limit when publication fails" {
+    // Between PER_RESULT_MAX_BYTES and the 1MB frame limit the bytes are
+    // already in memory; before the threshold change this band was always
+    // inline, so a full store must not turn it into a tool error now.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try expectSizedResourceBody(120_000, .inline_body, true);
+}
+
+test "MCP budget: resources/read above the frame limit fails closed when publication fails" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try expectSizedResourceBody(1_100_000, .structured_error, true);
 }
 
 test "MCP: full cycle initialize + listTools + callTool echo" {

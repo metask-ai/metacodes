@@ -618,7 +618,12 @@ pub fn project(
         return .{ .diagnostic = Diagnostic.init(.resource_limit) };
     const body = publishRange(allocator, artifact_root, capture, range.start, length_u64) catch |err| {
         // Keep a complete bounded result renderable when CAS publication fails.
-        if (!result_budget.retainInlineAfterFailedPublish(err, length_u64, true)) {
+        if (!result_budget.retainInlineAfterFailedPublish(
+            err,
+            length_u64,
+            true,
+            result_budget.PER_RESULT_MAX_BYTES,
+        )) {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .diagnostic = Diagnostic.init(.resource_limit) };
         }
