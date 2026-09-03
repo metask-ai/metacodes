@@ -23,17 +23,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 # touch artifacts, directory descriptors cannot be opened, and permission bits
 # are synthetic there.
 _O_BINARY = getattr(os, "O_BINARY", 0)
-_POSIX_MODE_BITS = os.name != "nt"
-
-
-def _fsync_directory(path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 

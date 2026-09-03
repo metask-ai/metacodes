@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
-from ..model import stable_json, O_BINARY, fsync_directory, mode_violation
+from ..model import O_BINARY, fsync_directory, mode_violation, open_nofollow, stable_json
 from . import WORKBUDDY_PINNED_COMMIT
 from .stage_artifacts import TARGET_PLATFORM
 
@@ -72,7 +72,7 @@ def _stable_file_identity(info: os.stat_result) -> tuple[int, ...]:
 def _read_regular_observed(
     path: Path, maximum: int = 2 * 1024 * 1024 * 1024
 ) -> tuple[bytes, os.stat_result]:
-    descriptor = os.open(path, O_BINARY | os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = open_nofollow(path, os.O_RDONLY)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:

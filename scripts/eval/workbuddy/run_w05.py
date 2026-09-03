@@ -27,7 +27,7 @@ from .install_overlay import install
 from .mock_provider import MOCK_CREDENTIAL
 from .stage_artifacts import stage
 from .trace import OBSERVATION_FILENAME, TraceError, load_control_metrics
-from ..model import O_BINARY, fsync_directory, mode_violation
+from ..model import fsync_directory, mode_violation, open_nofollow
 
 
 SCHEMA_VERSION = "metacodes-workbuddy-w05-receipt-v1"
@@ -105,9 +105,9 @@ def _identity(path: Path) -> Dict[str, object]:
         raise W05Error(f"evidence must not be a symlink: {path}")
     resolved = path.resolve(strict=True)
     path_before = path.lstat()
-    descriptor = os.open(
+    descriptor = open_nofollow(
         path,
-        O_BINARY | os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
     )
     try:
         before = os.fstat(descriptor)

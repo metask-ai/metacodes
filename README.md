@@ -53,6 +53,19 @@ zig build agentcore:test -Doptimize=ReleaseSafe
 zig build agentcore:gate -Dtarget=<native-target> -Doptimize=ReleaseSafe
 ```
 
+On Windows the same suite runs natively; keep the job count bounded because
+the default is one LLVM codegen per core and the test binaries are large:
+
+```sh
+zig build test -j6
+```
+
+Line endings are pinned to LF by `.gitattributes` (embedded prompt templates
+take part in SHA-256 contracts), and a few gates are POSIX-only by design and
+skip with a stated reason: the paid budget journal, dir_fd-anchored artifact
+publication, and the anonymous-descriptor memory runtime smoke (see
+`scripts/eval/tests/posix_only.py`). CI runs this leg in the `windows-gates` job.
+
 Maintainers can audit a candidate binary instead of the bundled one:
 
 ```sh

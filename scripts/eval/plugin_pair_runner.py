@@ -39,6 +39,7 @@ if __package__ in {None, ""}:
         usd_to_microusd_ceiling,
     )
     from scripts.eval.model import (  # type: ignore
+        open_nofollow,
         O_BINARY,
         ValidationError,
         load_json,
@@ -76,7 +77,7 @@ else:
         usd_to_microusd,
         usd_to_microusd_ceiling,
     )
-    from .model import O_BINARY, ValidationError, load_json, stable_json, validate_suite, write_rollouts
+    from .model import O_BINARY, ValidationError, load_json, stable_json, validate_suite, write_rollouts, open_nofollow
     from .paired_runner import (
         TOKEN_METRICS,
         _load_checkpoint,
@@ -500,11 +501,9 @@ def _write_private_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def _read_private_json(path: Path, label: str) -> dict[str, Any]:
-    flags = os.O_RDONLY | O_BINARY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY
     try:
-        fd = os.open(path, flags)
+        fd = open_nofollow(path, flags)
     except OSError as exc:
         raise ValidationError(f"cannot open {label}: {exc}") from exc
     try:

@@ -49,7 +49,7 @@ if __package__ in {None, ""}:
         load_manifest,
         validate_runtime_artifacts,
     )
-    from scripts.eval.model import O_BINARY, ValidationError, stable_json  # type: ignore
+    from scripts.eval.model import ValidationError, stable_json, open_nofollow  # type: ignore
 else:
     from .memory_agent_runtime import (
         PRODUCTION_MODEL_FINGERPRINT,
@@ -72,7 +72,7 @@ else:
         load_manifest,
         validate_runtime_artifacts,
     )
-    from .model import O_BINARY, ValidationError, stable_json
+    from .model import ValidationError, stable_json, open_nofollow
 
 
 def _load_api_key(auth_file: Path) -> str:
@@ -82,11 +82,9 @@ def _load_api_key(auth_file: Path) -> str:
             "production pilot rejects METASK_API_KEY because a tool subprocess could inspect "
             "the Python parent's initial environment; use a private auth file"
         )
-    flags = os.O_RDONLY | O_BINARY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY
     try:
-        fd = os.open(auth_file, flags)
+        fd = open_nofollow(auth_file, flags)
     except OSError as exc:
         raise ValidationError(f"cannot open production auth file: {exc}") from exc
     try:

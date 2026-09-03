@@ -41,7 +41,7 @@ from .memory_replay import (
     validate_runtime_artifacts,
     validate_runtime_receipt,
 )
-from .model import ValidationError, stable_json, O_BINARY, fsync_directory, mode_violation
+from .model import ValidationError, stable_json, O_BINARY, fsync_directory, mode_violation, open_nofollow
 from .statistics import exact_mcnemar, percentile
 
 
@@ -111,10 +111,8 @@ def _analysis_source_hashes() -> Mapping[str, str]:
 def _private_regular(path: Path, where: str, *, maximum: int = MAX_JSON_BYTES) -> bytes:
     fd = -1
     try:
-        flags = os.O_RDONLY | O_BINARY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags)
+        flags = os.O_RDONLY
+        fd = open_nofollow(path, flags)
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             _fail(where, "expected one non-symlink, non-hardlinked regular file")

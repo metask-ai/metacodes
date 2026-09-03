@@ -34,7 +34,7 @@ from ..memory_budget_journal import (
     validate_checkpoint_payload,
     usd_to_microusd_ceiling,
 )
-from ..model import ValidationError, stable_json, O_BINARY, mode_violation
+from ..model import O_BINARY, ValidationError, mode_violation, open_nofollow, stable_json
 from . import WORKBUDDY_PINNED_COMMIT
 from .environment_preflight import (
     EnvironmentPreflightError,
@@ -243,9 +243,9 @@ def _comparison_covariates(
 
 
 def _read_regular(path: Path, *, maximum: int = 16 * 1024 * 1024) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | O_BINARY
+    flags = os.O_RDONLY
     try:
-        descriptor = os.open(path, flags)
+        descriptor = open_nofollow(path, flags)
     except OSError as exc:
         raise LaunchError(f"cannot open launch input {path}: {exc}") from exc
     try:

@@ -290,13 +290,13 @@
     "evals/experiments/tinykg-lean-factorial-block-v1-cases.json": "9a563ae27db1c5840339b2bda47c3f535dda06cc05a95be21a32779bc2ed2542",
     "evals/memory/MEMORY_MATURATION_V1.md": "3621d69f26c6e791033a6ba87887942bb620e92ad6103d5b6f2b6c23d7fff582",
     "scripts/eval/memory_agent_runtime_smoke.py": "f0900594d9f6ab439f7194934bf801b34edfce14a6edb495fa6975f7a851deb6",
-    "scripts/eval/memory_agent_runtime_pilot.py": "1c83645ba4d0a87e941143ba54924d0521c4e929ad2bf3301cb58ae3e7bb5faa",
-    "scripts/eval/project_harness_experiment.py": "f206d693bd7b21382e58f131ca5bec8b51dccc433eff4f1fff59ae4a07bff3a8",
+    "scripts/eval/memory_agent_runtime_pilot.py": "caff3c557925b164b522c4b3f746e7a5b8526e1a6cfc050c1132f01b60cf1e0c",
+    "scripts/eval/project_harness_experiment.py": "31bea51bdf1a62932318464032bd929b235e52655eaed155b51ae5da0f103ddf",
     "scripts/eval/project_harness_rule_impact_prospective.py": "d5397e2bb23d4a730ef12ebfba4cd315da69d86d17decad534cf81299872e06b",
     "scripts/eval/run_project_rule_evolution_mac_pilot.py": "1a89e7c6116f4f43a016e7f1a93a820adf1b4a07514582c1366574ea7fa4019a",
-    "scripts/eval/tinykg_lean_factorial.py": "20a5016dcf44368dfa8c7e667346355cf4ddb780ff2ee994217ee92a425e626f",
+    "scripts/eval/tinykg_lean_factorial.py": "158df042d42919c3972368096d0de0fa985df46148618249dc8f267224c2bbd2",
     "scripts/eval/tinykg_lean_factorial_block.py": "ed5b6546c8f98f5bbc69c1b715b4ebe4b7a611d3eb4a9ae60abc8f424e0d6043",
-    "scripts/eval/tinykg_lean_factorial_executor.py": "f793cb20071c092c8e58d6f480bcda2e65ca5ad01edd85efc3e9e097b1624e0e",
+    "scripts/eval/tinykg_lean_factorial_executor.py": "847b4cb42c91863a44bce7746a7fdda46e35efa703c70a7c5496cf6390ee3acb",
     "scripts/project_harness_eval_driver.zig": "99ac435b90ebef1a69aa89ff9fbf3e6ba07708cb9829212a2612962eba2d483c"
   },
   "known_gaps": [

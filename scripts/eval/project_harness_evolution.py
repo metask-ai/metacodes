@@ -24,7 +24,6 @@ from typing import Any, Dict, List, Mapping, Sequence
 # touch artifacts, directory descriptors cannot be opened, and permission bits
 # are synthetic there.
 _O_BINARY = getattr(os, "O_BINARY", 0)
-_POSIX_MODE_BITS = os.name != "nt"
 
 
 def _fsync_directory(path) -> None:

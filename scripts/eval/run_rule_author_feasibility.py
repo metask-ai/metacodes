@@ -25,7 +25,7 @@ from scripts.eval.memory_budget_journal import (
     BudgetJournal,
     BudgetTransaction,
 )
-from scripts.eval.model import ValidationError, stable_json, O_BINARY, mode_violation
+from scripts.eval.model import ValidationError, stable_json, O_BINARY, mode_violation, open_nofollow
 
 
 MODEL = "glm-5.2"
@@ -80,13 +80,11 @@ def load_global_api_key() -> bytearray:
     auth_path = Path(
         os.environ.get("METACODES_AUTH_FILE", str(Path.home() / ".metacodes" / "auth.json"))
     ).expanduser()
-    flags = os.O_RDONLY | O_BINARY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     try:
-        fd = os.open(auth_path, flags)
+        fd = open_nofollow(auth_path, flags)
     except OSError as exc:
         raise ValidationError(f"cannot open global credential file: {exc}") from exc
     try:

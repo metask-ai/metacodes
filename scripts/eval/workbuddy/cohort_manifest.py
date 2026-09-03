@@ -19,22 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Mapping, Sequence
 
 from . import WORKBUDDY_PINNED_COMMIT
-
-# Windows portability (see scripts/eval/model.py): os.open text mode must never
-# touch artifacts, directory descriptors cannot be opened, and permission bits
-# are synthetic there.
-_O_BINARY = getattr(os, "O_BINARY", 0)
-_POSIX_MODE_BITS = os.name != "nt"
-
-
-def _fsync_directory(path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+from ..model import O_BINARY, fsync_directory, open_nofollow
 
 
 
@@ -149,9 +134,9 @@ def _task_slug(subset: Subset, member: tarfile.TarInfo) -> str | None:
 
 
 def _scan_archive(path: Path, subset: Subset, expected_sha256: str) -> Dict[str, object]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
+    flags = os.O_RDONLY
     try:
-        descriptor = os.open(path, flags)
+        descriptor = open_nofollow(path, flags)
     except OSError as exc:
         raise CohortError(f"cannot open archive {path}: {exc}") from exc
     try:
@@ -322,7 +307,7 @@ def _write_new(path: Path, payload: bytes) -> None:
     temporary = path.with_name(path.name + ".tmp")
     if temporary.exists() or temporary.is_symlink():
         raise CohortError(f"stale cohort manifest temporary file: {temporary}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | O_BINARY
     descriptor = os.open(temporary, flags, 0o600)
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
@@ -330,7 +315,7 @@ def _write_new(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        fsync_directory(path.parent)
     finally:
         os.close(descriptor)
 

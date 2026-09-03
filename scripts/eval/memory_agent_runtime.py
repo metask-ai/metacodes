@@ -100,7 +100,7 @@ from .memory_tinykg_local import (
     _tree_digest,
     build_case_batch,
 )
-from .model import ValidationError, stable_json, O_BINARY, fsync_directory
+from .model import ValidationError, stable_json, O_BINARY, fsync_directory, open_nofollow
 
 
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
@@ -410,13 +410,11 @@ def _write_new(path: Path, payload: bytes) -> None:
 def _private_regular_payload(path: Path, where: str) -> bytes:
     """Read and validate identity through one no-follow descriptor."""
 
-    flags = os.O_RDONLY | O_BINARY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     try:
-        fd = os.open(path, flags)
+        fd = open_nofollow(path, flags)
     except OSError as exc:
         raise ValidationError(f"{where}: cannot open private file: {exc}") from exc
     try:
@@ -578,11 +576,9 @@ def _child_failure_message(returncode: int) -> str:
 
 
 def _read_regular_file(path: Path, where: str) -> bytes:
-    flags = os.O_RDONLY | O_BINARY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY
     try:
-        fd = os.open(path, flags)
+        fd = open_nofollow(path, flags)
     except OSError as exc:
         raise ValidationError(f"{where}: cannot open regular file: {exc}") from exc
     try:

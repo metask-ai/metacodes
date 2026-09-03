@@ -26,7 +26,7 @@ from .attribution_protocol import (
     load_protocol,
     validate_protocol,
 )
-from .model import ValidationError, stable_json, O_BINARY
+from .model import ValidationError, stable_json, open_nofollow
 from .statistics import exact_mcnemar, mean_confidence_interval_95
 
 
@@ -116,13 +116,11 @@ def _read_regular(path: Path, *, root: Path, label: str, maximum: int) -> bytes:
         resolved.relative_to(resolved_root)
     except (OSError, ValueError) as exc:
         _fail(label, f"escaped evidence root or cannot be inspected: {exc}")
-    flags = os.O_RDONLY | O_BINARY
+    flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(spelled, flags)
+        descriptor = open_nofollow(spelled, flags)
     except OSError as exc:
         _fail(label, f"cannot open without following links: {exc}")
     try:

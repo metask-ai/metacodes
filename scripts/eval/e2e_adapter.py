@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .model import SCHEMA_VERSION, ValidationError, stable_json, O_BINARY
+from .model import SCHEMA_VERSION, ValidationError, stable_json, O_BINARY, open_nofollow
 
 
 # Evaluator semantics and native event wire compatibility are separate
@@ -469,11 +469,9 @@ def _read_regular_text_capped(
     if before.st_size > max_bytes:
         return None, f"artifact exceeds {max_bytes} byte limit"
 
-    flags = os.O_RDONLY | O_BINARY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY
     try:
-        fd = os.open(path, flags)
+        fd = open_nofollow(path, flags)
     except OSError as exc:
         return None, str(exc)
     try:

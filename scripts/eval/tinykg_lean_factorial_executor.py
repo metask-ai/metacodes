@@ -46,7 +46,7 @@ from .memory_budget_journal import (
 )
 from .memory_replay import PRODUCTION_PROVIDER_ID, _artifact_tree_digest
 from .memory_tinykg_local import LocalTinyKg, _store_info
-from .model import ValidationError, stable_json, O_BINARY, fsync_directory, mode_violation
+from .model import ValidationError, stable_json, O_BINARY, fsync_directory, mode_violation, open_nofollow
 from .project_harness_e3_experiment import (
     E3Error,
     _canonical_sha256,
@@ -290,13 +290,11 @@ def _read_regular(path: Path, *, root: Path, where: str) -> bytes:
         resolved.relative_to(root)
     except (OSError, ValueError) as exc:
         _fail(where, f"escaped the run root or cannot be inspected: {exc}")
-    flags = os.O_RDONLY | O_BINARY
+    flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(spelled, flags)
+        descriptor = open_nofollow(spelled, flags)
     except OSError as exc:
         _fail(where, f"cannot open without following links: {exc}")
     try:

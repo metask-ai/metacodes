@@ -18,22 +18,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
 from . import WORKBUDDY_PINNED_COMMIT
-
-# Windows portability (see scripts/eval/model.py): os.open text mode must never
-# touch artifacts, directory descriptors cannot be opened, and permission bits
-# are synthetic there.
-_O_BINARY = getattr(os, "O_BINARY", 0)
-_POSIX_MODE_BITS = os.name != "nt"
-
-
-def _fsync_directory(path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+from ..model import fsync_directory, open_nofollow
 
 
 
@@ -70,9 +55,9 @@ def _sha256(path: Path) -> str:
 
 def _copy_regular(source: Path, target: Path, mode: int) -> Dict[str, object]:
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
+    flags = os.O_RDONLY
     try:
-        descriptor = os.open(source, flags)
+        descriptor = open_nofollow(source, flags)
     except OSError as exc:
         raise StageError(f"cannot open artifact source {source}: {exc}") from exc
     try:
@@ -355,7 +340,7 @@ def stage(
         handle.flush()
         os.fsync(handle.fileno())
     os.chmod(sums_path, 0o644)
-    _fsync_directory(output)
+    fsync_directory(output)
     return manifest
 
 

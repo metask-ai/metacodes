@@ -24,7 +24,7 @@ try:
 except ImportError:  # pragma: no cover - production paid runs reject Windows.
     fcntl = None  # type: ignore[assignment]
 
-from .model import ValidationError, stable_json, O_BINARY, mode_violation
+from .model import ValidationError, stable_json, O_BINARY, mode_violation, open_nofollow
 
 
 JOURNAL_SCHEMA_VERSION = 1
@@ -650,7 +650,7 @@ class BudgetJournal:
         if mode_violation(parent_info.st_mode, 0o022):
             _fail("budget journal parent", "must not be group/world writable")
         self.path = parent / self.path.name
-        flags = os.O_RDONLY | O_BINARY
+        flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             flags |= os.O_DIRECTORY
         if hasattr(os, "O_CLOEXEC"):
@@ -705,13 +705,11 @@ class BudgetJournal:
 
     def _open_lock(self) -> int:
         name = self.lock_path.name
-        flags = os.O_RDWR | os.O_CREAT | O_BINARY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         try:
-            fd = os.open(name, flags, 0o600, dir_fd=self._dir_fd)
+            fd = open_nofollow(name, flags, 0o600, dir_fd=self._dir_fd)
         except OSError as exc:
             raise ValidationError(f"budget journal lock: cannot open: {exc}") from exc
         try:
@@ -747,13 +745,11 @@ class BudgetJournal:
             _fail("budget journal", "incomplete temporary file requires manual inspection")
 
     def _read_document(self) -> Mapping[str, Any]:
-        flags = os.O_RDONLY | O_BINARY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags = os.O_RDONLY
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         try:
-            fd = os.open(self.path.name, flags, dir_fd=self._dir_fd)
+            fd = open_nofollow(self.path.name, flags, dir_fd=self._dir_fd)
         except OSError as exc:
             raise ValidationError(f"budget journal: cannot open: {exc}") from exc
         try:

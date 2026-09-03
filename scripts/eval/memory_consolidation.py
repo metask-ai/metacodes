@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Tuple
 
-from .model import ValidationError, O_BINARY, fsync_directory
+from .model import ValidationError, O_BINARY, fsync_directory, open_nofollow
 
 if TYPE_CHECKING:
     from .memory_tinykg_local import LocalTinyKg
@@ -118,11 +118,9 @@ def _write_new(path: Path, payload: bytes) -> None:
 
 
 def _read_regular_file(path: Path, where: str) -> bytes:
-    flags = os.O_RDONLY | O_BINARY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY
     try:
-        fd = os.open(path, flags)
+        fd = open_nofollow(path, flags)
     except OSError as exc:
         raise ValidationError(f"{where}: cannot open regular file: {exc}") from exc
     try:

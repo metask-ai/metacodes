@@ -472,10 +472,7 @@ class LocalTinyKg:
         return env
 
     def _normalized(self, value: str) -> str:
-        redacted = value.replace(str(self.run_dir), "<RUN_DIR>").replace(str(self.binary), "<TINYKG_BINARY>")
-        # The trace is a host-independent artifact: canonical separators after
-        # redaction (no-op on POSIX, where paths carry no backslashes).
-        return redacted.replace(os.sep, "/") if os.sep != "/" else redacted
+        return value.replace(str(self.run_dir), "<RUN_DIR>").replace(str(self.binary), "<TINYKG_BINARY>")
 
     def command(self, action: str, store: Path, extra: Sequence[str]) -> str:
         if action not in {
@@ -523,7 +520,10 @@ class LocalTinyKg:
         self.commands.append(
             {
                 "action": action,
-                "argv": [self._normalized(item) for item in argv],
+                # argv entries are paths: canonical separators after redaction keep the
+                # trace host-independent (no-op on POSIX). stdout/stderr are hashed as
+                # emitted; rewriting backslashes there would corrupt JSON escapes.
+                "argv": [self._normalized(item).replace(os.sep, "/") for item in argv],
                 "exit_code": completed.returncode,
                 "stdout_sha256": hashlib.sha256(normalized_stdout.encode("utf-8")).hexdigest(),
                 "stderr_sha256": hashlib.sha256(normalized_stderr.encode("utf-8")).hexdigest(),
