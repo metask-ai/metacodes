@@ -159,6 +159,11 @@ jobs:
     runs-on: [self-hosted, Windows, X64]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Same as the `gates` job: the repository-snapshot and grounding
+          # fingerprint tests resolve historical commits with `git rev-parse`,
+          # which a depth-1 checkout cannot (5 errors on the first full run).
+          fetch-depth: 0
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
