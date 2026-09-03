@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
 
 fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const u8) ![]u8 {
@@ -26,12 +27,37 @@ fn expectedSizedResourceResult(allocator: std.mem.Allocator, payload_bytes: usiz
     );
 }
 
-fn expectSizedResourceBody(payload_bytes: usize, expect_artifact: bool) !void {
+fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) !void {
+    const seed = try cc.tool_result_artifact.persist(allocator, root, "seed");
+    _ = seed;
+    const filler = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/tool-results/sha256/quota-fixture.blob",
+        .{root},
+        0,
+    );
+    defer allocator.free(filler);
+    const fd = pfs.open(
+        filler.ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true },
+        0o600,
+    );
+    if (fd < 0) return error.QuotaFixtureOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.setSize(fd, cc.tool_result_artifact.MAX_SESSION_BYTES);
+}
+
+fn expectSizedResourceBody(
+    expected_result_bytes: usize,
+    expect_artifact: bool,
+    fill_quota: bool,
+) !void {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    if (fill_quota) try fillSessionArtifactQuota(allocator, root);
     const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
     const argv = [_]?[*:0]const u8{ mock_path, null };
     var client = try cc.mcp_client.McpClient.connect(allocator, argv[0..]);
@@ -53,6 +79,10 @@ fn expectSizedResourceBody(payload_bytes: usize, expect_artifact: bool) !void {
     ctx.result_budget = budget;
     ctx.mcp_sessions = &sessions;
 
+    const overhead_fixture = try expectedSizedResourceResult(allocator, expected_result_bytes);
+    defer allocator.free(overhead_fixture);
+    const envelope_overhead = overhead_fixture.len - expected_result_bytes;
+    const payload_bytes = expected_result_bytes - envelope_overhead;
     const args = try std.fmt.allocPrint(
         allocator,
         "{{\"uri\":\"mock://sized/{d}\",\"server\":\"mock\"}}",
@@ -61,9 +91,7 @@ fn expectSizedResourceBody(payload_bytes: usize, expect_artifact: bool) !void {
     defer allocator.free(args);
     const expected = try expectedSizedResourceResult(allocator, payload_bytes);
     defer allocator.free(expected);
-    // Both fixtures use five decimal digits in the URI, so exactly 77 bytes
-    // of result JSON surround the requested ASCII payload.
-    try std.testing.expectEqual(payload_bytes + 77, expected.len);
+    try std.testing.expectEqual(expected_result_bytes, expected.len);
 
     var read = try cc.tools.dispatch(&ctx, "ReadMcpResourceTool", args);
     defer read.deinit(allocator);
@@ -85,11 +113,16 @@ fn expectSizedResourceBody(payload_bytes: usize, expect_artifact: bool) !void {
 }
 
 test "MCP budget: resources/read publishes result above caller per-result budget" {
-    try expectSizedResourceBody(30_000 - 77, true);
+    try expectSizedResourceBody(30_000, true, false);
 }
 
 test "MCP budget: resources/read inlines result at caller per-result budget" {
-    try expectSizedResourceBody(25_000 - 77, false);
+    try expectSizedResourceBody(25_000, false, false);
+}
+
+test "MCP budget: resources/read retains bounded result inline when publication fails" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try expectSizedResourceBody(30_000, false, true);
 }
 
 test "MCP: full cycle initialize + listTools + callTool echo" {

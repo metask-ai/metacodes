@@ -108,31 +108,15 @@ fn publish(
     return tool_result.ToolResultBody.fromCompletedSpool(completed, media_type);
 }
 
-/// Publication failed. Hand the bytes back inline when that is possible, so
-/// projection can still render its bounded fallback envelope - head, tail and
-/// `storage_error` - instead of the whole result becoming a tool error.
-///
-/// This is what lowering the inline threshold would otherwise have taken away.
-/// A 40KB Grep result on a 200K window used to stay inline here and meet a
-/// full CAS in `spillOne`, which degrades gracefully; publishing it at this
-/// layer made the same quota failure surface as "Grep failed with
-/// SessionQuotaExceeded" and lose the output entirely.
-///
-/// Three cases still propagate, each matching the behaviour that predates the
-/// threshold change: OOM, which no fallback can help; a capture too large to
-/// materialize - `PER_RESULT_MAX_BYTES` is the ceiling of what was ever inline
-/// here, so re-inlining inside it restores the old degradation without
-/// reintroducing an unbounded read; and an incomplete capture, which has no
-/// complete inline form and always published.
+/// Apply the shared failed-publication policy before materializing the capture.
 fn inlineAfterFailedPublish(
     allocator: std.mem.Allocator,
     capture: *artifact_store.Capture,
     capture_complete: bool,
     err: anyerror,
 ) !tool_result.ToolResultBody {
-    if (err == error.OutOfMemory) return err;
-    if (!capture_complete) return err;
-    if (capture.bytes > result_budget.PER_RESULT_MAX_BYTES) return err;
+    if (!result_budget.retainInlineAfterFailedPublish(err, capture.bytes, capture_complete))
+        return err;
     return tool_result.ToolResultBody.initInline(try capture.readRangeAlloc(
         allocator,
         0,

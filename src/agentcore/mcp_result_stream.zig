@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const artifact_store = @import("../core/tool_result_artifact.zig");
+const pfs = @import("platform").fs;
 const result_budget = @import("../core/result_budget.zig");
 const tool_result = @import("../core/tool_result.zig");
 const tool_error = @import("../core/tool_error.zig");
@@ -458,6 +459,20 @@ fn mapParseError(err: anyerror) Diagnostic {
     });
 }
 
+fn publishRange(
+    allocator: std.mem.Allocator,
+    artifact_root: []const u8,
+    capture: *artifact_store.Capture,
+    start: u64,
+    length: u64,
+) !tool_result.ToolResultBody {
+    var spool = try artifact_store.Spool.begin(allocator, artifact_root);
+    defer spool.deinit();
+    try capture.copyRangeTo(&spool, start, length);
+    const completed = try spool.finish();
+    return tool_result.ToolResultBody.fromCompletedSpool(completed, .json);
+}
+
 pub fn project(
     allocator: std.mem.Allocator,
     capture: *artifact_store.Capture,
@@ -601,20 +616,19 @@ pub fn project(
     }
     if (length_u64 > artifact_store.MAX_ARTIFACT_BYTES)
         return .{ .diagnostic = Diagnostic.init(.resource_limit) };
-    var spool = artifact_store.Spool.begin(allocator, artifact_root) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .diagnostic = Diagnostic.init(.resource_limit) };
+    const body = publishRange(allocator, artifact_root, capture, range.start, length_u64) catch |err| {
+        // Keep a complete bounded result renderable when CAS publication fails.
+        if (!result_budget.retainInlineAfterFailedPublish(err, length_u64, true)) {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .diagnostic = Diagnostic.init(.resource_limit) };
+        }
+        const bytes = capture.readRangeAlloc(allocator, range.start, @intCast(length_u64)) catch |read_err| {
+            if (read_err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .diagnostic = Diagnostic.init(.resource_limit) };
+        };
+        return .{ .result = tool_result.ToolResultBody.initInline(bytes) };
     };
-    defer spool.deinit();
-    capture.copyRangeTo(&spool, range.start, length_u64) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .diagnostic = Diagnostic.init(.resource_limit) };
-    };
-    const completed = spool.finish() catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .diagnostic = Diagnostic.init(.resource_limit) };
-    };
-    return .{ .result = tool_result.ToolResultBody.fromCompletedSpool(completed, .json) };
+    return .{ .result = body };
 }
 
 fn writeSuccessfulResultOfSize(
@@ -639,6 +653,26 @@ fn writeSuccessfulResultOfSize(
     }
     try capture.write(result_suffix);
     try capture.write("}");
+}
+
+fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) !void {
+    const seed = try artifact_store.persist(allocator, root, "seed");
+    _ = seed;
+    const filler = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/tool-results/sha256/quota-fixture.blob",
+        .{root},
+        0,
+    );
+    defer allocator.free(filler);
+    const fd = pfs.open(
+        filler.ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true },
+        0o600,
+    );
+    if (fd < 0) return error.QuotaFixtureOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.setSize(fd, artifact_store.MAX_SESSION_BYTES);
 }
 
 test "stream projector publishes above caller per-result budget" {
@@ -699,6 +733,67 @@ test "stream projector inlines at caller per-result budget" {
     try std.testing.expect(outcome == .result);
     try std.testing.expect(outcome.result == .@"inline");
     try std.testing.expectEqual(@as(usize, 25_000), outcome.result.@"inline".bytes.len);
+}
+
+test "stream projector retains bounded result inline when publication fails" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    try fillSessionArtifactQuota(allocator, root);
+    var capture = try artifact_store.Capture.begin(allocator, root, MAX_RESPONSE_BYTES);
+    defer capture.deinit();
+    try writeSuccessfulResultOfSize(&capture, 30_000);
+    try capture.seal();
+
+    const budget = result_budget.Budget.fromModel(200_000);
+    var outcome = try project(
+        allocator,
+        &capture,
+        root,
+        7,
+        .modern_2026_07_28,
+        .{},
+        budget,
+        true,
+        true,
+    );
+    defer if (outcome == .result) outcome.result.deinit(allocator);
+    try std.testing.expect(outcome == .result);
+    try std.testing.expect(outcome.result == .@"inline");
+    try std.testing.expectEqual(@as(usize, 30_000), outcome.result.@"inline".bytes.len);
+}
+
+test "stream projector rejects over-ceiling result when publication fails" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    try fillSessionArtifactQuota(allocator, root);
+    var capture = try artifact_store.Capture.begin(allocator, root, MAX_RESPONSE_BYTES);
+    defer capture.deinit();
+    try writeSuccessfulResultOfSize(&capture, 96 * 1024);
+    try capture.seal();
+
+    const budget = result_budget.Budget.fromModel(1_000_000);
+    try std.testing.expectEqual(result_budget.PER_RESULT_MAX_BYTES, budget.per_result_bytes);
+    const outcome = try project(
+        allocator,
+        &capture,
+        root,
+        7,
+        .modern_2026_07_28,
+        .{},
+        budget,
+        true,
+        true,
+    );
+    try std.testing.expect(outcome == .diagnostic);
+    try std.testing.expectEqual(DiagnosticCode.resource_limit, outcome.diagnostic.code);
 }
 
 test "stream projector publishes only a large successful result range" {

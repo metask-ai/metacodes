@@ -116,6 +116,18 @@ pub const PER_RESULT_WINDOW_DIVISOR: usize = 8;
 pub const PER_TURN_MIN_BYTES: usize = 16 * 1024;
 pub const PER_TURN_MAX_BYTES: usize = 200 * 1024;
 
+/// Whether bytes remain safe to hand back inline after CAS publication fails.
+/// This preserves the pre-publication degradation path: projection can still
+/// render a bounded head/tail envelope with `storage_error` for any complete
+/// result that could historically be materialized inline. OOM cannot support
+/// a fallback allocation, incomplete captures have no complete inline form,
+/// and `PER_RESULT_MAX_BYTES` remains the materialization ceiling.
+pub fn retainInlineAfterFailedPublish(err: anyerror, bytes: u64, complete: bool) bool {
+    if (err == error.OutOfMemory) return false;
+    if (!complete) return false;
+    return bytes <= PER_RESULT_MAX_BYTES;
+}
+
 pub fn perResultBytes(max_input_tokens: usize) usize {
     const derived = if (max_input_tokens == 0)
         PER_RESULT_MIN_BYTES

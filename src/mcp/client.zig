@@ -135,9 +135,10 @@ pub const McpClient = struct {
     }
 
     /// Typed byte-zero request path used by model-visible MCP tools/resources.
-    /// Small frames preserve the historical inline result bytes. Larger
-    /// frames are captured before parsing and only their successful `result`
-    /// range is published to the Session CAS.
+    /// Frames up to 1 MiB are materialized so server→client control frames can
+    /// be classified and elicitation stays synchronous. A successful result's
+    /// inline-or-publish disposition follows `budget.per_result_bytes`, with a
+    /// bounded inline fallback if publication fails.
     fn requestBody(
         self: *McpClient,
         method: []const u8,
@@ -232,11 +233,12 @@ pub const McpClient = struct {
                 const result = response.result_json orelse "null";
                 if (result.len <= budget.per_result_bytes)
                     return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
-                var spool = try artifact_store.Spool.begin(self.allocator, artifact_root);
-                defer spool.deinit();
-                try spool.write(result);
-                const completed = try spool.finish();
-                return ToolResultBody.fromCompletedSpool(completed, .json);
+                return self.publishJsonResult(artifact_root, result) catch |err| {
+                    // Keep a complete bounded result renderable when CAS publication fails.
+                    if (!result_budget.retainInlineAfterFailedPublish(err, result.len, true))
+                        return err;
+                    return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
+                };
             }
 
             const projected = try result_stream.project(
@@ -258,6 +260,18 @@ pub const McpClient = struct {
                 },
             }
         }
+    }
+
+    fn publishJsonResult(
+        self: *McpClient,
+        artifact_root: []const u8,
+        result: []const u8,
+    ) !ToolResultBody {
+        var spool = try artifact_store.Spool.begin(self.allocator, artifact_root);
+        defer spool.deinit();
+        try spool.write(result);
+        const completed = try spool.finish();
+        return ToolResultBody.fromCompletedSpool(completed, .json);
     }
 
     fn structuredMcpError(self: *McpClient, detail: []const u8) !ToolResultBody {
