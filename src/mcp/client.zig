@@ -16,6 +16,7 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const ToolResultBody = @import("../core/tool_result.zig").ToolResultBody;
 const ToolError = @import("../core/tool_error.zig").ToolError;
+const result_budget = @import("../core/result_budget.zig");
 const result_stream = @import("../agentcore/mcp_result_stream.zig");
 
 /// elicitation 回调:server 在 tool 执行中发 `elicitation/create` 请求用户输入时被调。
@@ -236,6 +237,8 @@ pub const McpClient = struct {
                 id,
                 .classic_2025_11_25,
                 .{},
+                // #43's second half will thread the real budget through McpClient.
+                result_budget.Budget.floor,
                 false,
                 require_content,
             );

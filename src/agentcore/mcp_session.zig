@@ -521,6 +521,7 @@ pub const Environment = struct {
         const outcome = instance.client().callToolBody(
             tool_ctx.allocator,
             tool_ctx.artifact_root,
+            tool_ctx.result_budget,
             entry.tool,
             arguments_json,
             cancellation,
@@ -972,6 +973,100 @@ test "Session MCP view binds identity validates argument envelope and retains ge
     try std.testing.expectEqualStrings(model_name, second.entries[0].model_name);
     try std.testing.expectEqual(@as(u64, 1), first.catalog_generation);
     try std.testing.expectEqual(@as(u64, 2), second.catalog_generation);
+}
+
+test "Session MCP budget drives the streaming projector threshold" {
+    const fixture = @import("mcp_test_support.zig");
+    const Base = struct {
+        fn dispatch(
+            _: *const anyopaque,
+            _: *const core.tool_context.ToolContext,
+            _: []const u8,
+            _: []const u8,
+        ) error{}!core.tools.ToolDispatchOutcome {
+            return .host_fatal;
+        }
+        fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn metadata(_: *const anyopaque, _: []const u8) ?core.tools.ToolMeta {
+            return null;
+        }
+        fn dispatcher() core.tools.ToolDispatcher {
+            return .{
+                .ctx = &unit,
+                .dispatchFn = dispatch,
+                .metadataFn = metadata,
+                .nameAtFn = nameAt,
+            };
+        }
+        const unit: u8 = 0;
+    };
+
+    var server = fixture.Server{ .result_padding_bytes = 30_000 };
+    const binding = [_]u8{0x72} ** 32;
+    const specs = [_]catalog.ServerSpec{.{
+        .binding = binding,
+        .namespace = "budget",
+        .connector = server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-budget-test", .version = "1" },
+    }};
+    var manager = try catalog.Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+    var view = try View.init(std.testing.allocator, snapshot, &.{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather",
+    }}, .fresh);
+    defer view.deinit();
+    var environment = try Environment.init(
+        std.testing.allocator,
+        &view,
+        &.{},
+        Base.dispatcher(),
+        null,
+    );
+    defer environment.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var artifact_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const artifact_root = artifact_root_buffer[0..try tmp.dir.realPath(
+        std.testing.io,
+        &artifact_root_buffer,
+    )];
+    const budget = core.result_budget.Budget.fromModel(200_000);
+    try std.testing.expectEqual(@as(usize, 25_000), budget.per_result_bytes);
+    var tool_context = core.tool_context.ToolContext{
+        .allocator = std.testing.allocator,
+        .artifact_root = artifact_root,
+        .result_budget = budget,
+    };
+
+    {
+        var published = try environment.surface().dispatcher.dispatch(
+            &tool_context,
+            view.entries[0].model_name,
+            "{\"city\":\"Paris\"}",
+        );
+        defer published.deinit(std.testing.allocator);
+        try std.testing.expect(published == .ok);
+        try std.testing.expect(published.ok == .artifact);
+    }
+
+    server.result_padding_bytes = 20_000;
+    var inlined = try environment.surface().dispatcher.dispatch(
+        &tool_context,
+        view.entries[0].model_name,
+        "{\"city\":\"Paris\"}",
+    );
+    defer inlined.deinit(std.testing.allocator);
+    try std.testing.expect(inlined == .ok);
+    try std.testing.expect(inlined.ok == .@"inline");
+    try std.testing.expectEqual(@as(u32, 2), server.calls);
 }
 
 test "MCP expiry excludes new Runs without mutating an admitted Run environment" {

@@ -5,9 +5,14 @@
 //! parser state, rejects malformed/over-budget envelopes, and publishes only
 //! the exact successful `result` value. Remote errors and MCP `isError`
 //! results never enter the content-addressed artifact store.
+//!
+//! The caller hands over its model-derived `result_budget.Budget`. This
+//! projector reads only `per_result_bytes`: turn-level allocation belongs to
+//! the later conversation projection, which can see sibling tool results.
 
 const std = @import("std");
 const artifact_store = @import("../core/tool_result_artifact.zig");
+const result_budget = @import("../core/result_budget.zig");
 const tool_result = @import("../core/tool_result.zig");
 const tool_error = @import("../core/tool_error.zig");
 
@@ -46,7 +51,6 @@ fn ParsedOutcome(comptime T: type) type {
     return union(enum) { value: T, diagnostic: Diagnostic };
 }
 
-pub const MAX_INLINE_RESULT_BYTES: usize = 64 * 1024;
 pub const RESPONSE_OVERHEAD_BYTES: u64 = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: u64 = artifact_store.MAX_ARTIFACT_BYTES +
     RESPONSE_OVERHEAD_BYTES;
@@ -461,6 +465,7 @@ pub fn project(
     expected_id: u64,
     era: Era,
     limits: Limits,
+    budget: result_budget.Budget,
     has_output_schema: bool,
     require_content: bool,
 ) error{OutOfMemory}!Outcome {
@@ -587,7 +592,7 @@ pub fn project(
         };
         return .{ .result = body };
     }
-    if (length_u64 <= MAX_INLINE_RESULT_BYTES) {
+    if (length_u64 <= budget.per_result_bytes) {
         const bytes = capture.readRangeAlloc(allocator, range.start, @intCast(length_u64)) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .diagnostic = Diagnostic.init(.resource_limit) };
@@ -612,6 +617,90 @@ pub fn project(
     return .{ .result = tool_result.ToolResultBody.fromCompletedSpool(completed, .json) };
 }
 
+fn writeSuccessfulResultOfSize(
+    capture: *artifact_store.Capture,
+    result_bytes: usize,
+) !void {
+    const envelope_prefix = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":";
+    const result_prefix = "{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":{\"payload\":\"";
+    const result_suffix = "\"}}";
+    if (result_bytes < result_prefix.len + result_suffix.len)
+        return error.ResultTooSmall;
+
+    try capture.write(envelope_prefix);
+    try capture.write(result_prefix);
+    var block: [4096]u8 = undefined;
+    @memset(&block, 'm');
+    var remaining = result_bytes - result_prefix.len - result_suffix.len;
+    while (remaining != 0) {
+        const count = @min(remaining, block.len);
+        try capture.write(block[0..count]);
+        remaining -= count;
+    }
+    try capture.write(result_suffix);
+    try capture.write("}");
+}
+
+test "stream projector publishes above caller per-result budget" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var capture = try artifact_store.Capture.begin(allocator, root, MAX_RESPONSE_BYTES);
+    defer capture.deinit();
+    try writeSuccessfulResultOfSize(&capture, 30_000);
+    try capture.seal();
+
+    const budget = result_budget.Budget.fromModel(200_000);
+    try std.testing.expectEqual(@as(usize, 25_000), budget.per_result_bytes);
+    var outcome = try project(
+        allocator,
+        &capture,
+        root,
+        7,
+        .modern_2026_07_28,
+        .{},
+        budget,
+        true,
+        true,
+    );
+    defer if (outcome == .result) outcome.result.deinit(allocator);
+    try std.testing.expect(outcome == .result);
+    try std.testing.expect(outcome.result == .artifact);
+    try std.testing.expectEqual(@as(u64, 30_000), outcome.result.artifact.stored.bytes);
+}
+
+test "stream projector inlines at caller per-result budget" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var capture = try artifact_store.Capture.begin(allocator, root, MAX_RESPONSE_BYTES);
+    defer capture.deinit();
+    try writeSuccessfulResultOfSize(&capture, 25_000);
+    try capture.seal();
+
+    const budget = result_budget.Budget.fromModel(200_000);
+    try std.testing.expectEqual(@as(usize, 25_000), budget.per_result_bytes);
+    var outcome = try project(
+        allocator,
+        &capture,
+        root,
+        7,
+        .modern_2026_07_28,
+        .{},
+        budget,
+        true,
+        true,
+    );
+    defer if (outcome == .result) outcome.result.deinit(allocator);
+    try std.testing.expect(outcome == .result);
+    try std.testing.expect(outcome.result == .@"inline");
+    try std.testing.expectEqual(@as(usize, 25_000), outcome.result.@"inline".bytes.len);
+}
+
 test "stream projector publishes only a large successful result range" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -631,7 +720,17 @@ test "stream projector publishes only a large successful result range" {
     }
     try capture.write("\"}}}");
     try capture.seal();
-    var outcome = try project(allocator, &capture, root, 7, .modern_2026_07_28, .{}, true, true);
+    var outcome = try project(
+        allocator,
+        &capture,
+        root,
+        7,
+        .modern_2026_07_28,
+        .{},
+        .{ .per_result_bytes = result_budget.PER_RESULT_MAX_BYTES },
+        true,
+        true,
+    );
     defer if (outcome == .result) outcome.result.deinit(allocator);
     try std.testing.expect(outcome == .result);
     try std.testing.expect(outcome.result == .artifact);
@@ -658,7 +757,17 @@ test "stream projector rejects remote error without publishing it" {
     defer capture.deinit();
     try capture.write("{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"missing\"}}");
     try capture.seal();
-    const outcome = try project(allocator, &capture, root, 3, .classic_2025_11_25, .{}, false, true);
+    const outcome = try project(
+        allocator,
+        &capture,
+        root,
+        3,
+        .classic_2025_11_25,
+        .{},
+        .floor,
+        false,
+        true,
+    );
     try std.testing.expect(outcome == .diagnostic);
     try std.testing.expectEqual(DiagnosticCode.method_not_found, outcome.diagnostic.code);
 }
