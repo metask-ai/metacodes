@@ -3,7 +3,7 @@
 //! 路由到对应 session。**证明点**:N 个 session 各自 App/journal/driver,消息路由隔离、driver 真并发。
 //!
 //! **静态 N(MVP)**:启动即建 N 个 session,**无 dynamic create/destroy/idle-reap**——见
-//! doc/U9_U10_DAEMON_TIER_DESIGN.md §4:resolver 返回 SessionView 是 borrow 快照(裸指针),host 中途
+//! doc/history/U9_U10_DAEMON_TIER_DESIGN.md §4:resolver 返回 SessionView 是 borrow 快照(裸指针),host 中途
 //! destroy 会重现 U10-A 删掉的 borrow-UAF。静态 session 活满 daemon 生命周期 → 无并发销毁 → 安全。
 //!
 //! **每 App 独立 arena + 独立 io_runtime**(设计 §5):

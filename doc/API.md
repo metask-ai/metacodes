@@ -454,40 +454,18 @@ See [LIB_API.md](LIB_API.md) for the dependency/build wiring and
 
 ## AgentCore binary embedding
 
-The source-free bundle contains:
-
-- `sdk/metask/agentcore.h` for C11/C++17;
-- `sdk/zig` typed bindings;
-- `sdk/rust` bindings and build integration;
-- one target-specific static library;
-- the manifest-pinned ripgrep runtime asset (`bin/rg[.exe]`) that `Glob`/`Grep`
-  execute through — deploy it next to the Host executable or via `RG_BIN`;
-- a manifest whose file allow-list, runtime-asset declaration, and SHA-256
-  values are mandatory.
-
-Consumers call only `metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and
-must validate ABI revision 15, the exact 64-byte root, all five mandatory typed
-tables, reserved zeros, function slots, and the schema-1 bundle manifest.
-Runtime/Session, sync run, abort, event/UI callbacks, checkpoint/restore, Host
-streaming tools, MCP streaming, process plugins, and durable journal profiles
-are covered. `SessionHostConfigV1` combines `provider_kind_code`,
-`protocol_kind_code`, `base_url`, and the create/restore model binding. Protocol
-zero preserves each provider's existing default; OpenAI consumers may select
-`OPENAI_PROTOCOL_RESPONSES` explicitly to send Responses `input` requests and
-parse typed Responses SSE. Anthropic and Gemini currently accept only the
-default protocol code. Invalid provider/protocol pairs fail before network I/O,
-and neither URL nor model names select a protocol. `on_event` is the
-per-Session serialized, non-durable Run
-observation stream. Its typed events include authoritative visible-output
-segment boundaries and `commentary` / `final` / `continued` / `partial` /
-`discarded` classifications, plus structured `file_changes` evidence for
-typed file tools, as additive Revision 15 observation tags.
-Independent Completion is deliberately not part of AgentCore: a
-Host owns product-level model calls and exposes only semantically bounded Tools
-when an Agent must invoke one.
-
-The ABI is experimental: there is no compatibility shim between revisions. Pin a
-bundle, not only a semantic version. See [AGENTCORE_BINARY_ABI.md](AGENTCORE_BINARY_ABI.md).
+The source-free bundle is one coordinate root: `sdk/metask/agentcore.h`
+(C11/C++17), the `sdk/zig` and `sdk/rust` bindings, one target-specific static
+library, the manifest-pinned ripgrep runtime asset, and a manifest whose file
+allow-list and SHA-256 values are mandatory. Consumers call only
+`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 15,
+the exact 64-byte root, all five mandatory typed tables, reserved zeros, function
+slots, and the schema-1 bundle manifest. The ABI is experimental, with no
+compatibility shim between revisions: pin a bundle, not only a semantic version.
+What the five tables cover, provider protocol selection, the `on_event`
+observation stream and its visible-output tags, process plugins, Host streaming
+tools, journal profiles, and the Completion boundary are specified once in
+[AGENTCORE_BINARY_ABI.md](AGENTCORE_BINARY_ABI.md) and not repeated here.
 
 ## Tool result contract
 

@@ -1,7 +1,7 @@
 //! Stable, host-neutral contract for what a Run's file-modifying tools
 //! actually changed on disk.
 //!
-//! Requirement: `doc/frommetawork/CORE_FILE_CHANGE_OBSERVABILITY_REQUIREMENT.md`.
+//! Requirement: `doc/history/inbound/CORE_FILE_CHANGE_OBSERVABILITY_REQUIREMENT.md`.
 //!
 //! Two things already existed and neither answers "what changed":
 //!

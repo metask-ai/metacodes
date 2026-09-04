@@ -272,69 +272,26 @@ admission。
 
 ## 3. AgentCore 二进制包
 
-AgentCore 面向不把 metacodes 源码加入构建图的原生 Host：
-
-| Host | 交付物 |
-|---|---|
-| C11 | `<metask/agentcore.h>` + 静态库 |
-| C++17 | 同一 C Header（含 `extern "C"`）+ 静态库 |
-| Zig | `bindings/zig` + 静态库 |
-| Rust | `metask-agentcore-sys` + 静态库 |
-
-消费入口只有：
-
-```c
-/* Returns const void *; cast to const metask_agentcore_api_v1 * after
- * validating version, revision, table size, and capabilities. */
-const void *metask_agentcore_get_api(uint32_t requested_abi);
-```
-
+AgentCore 面向不把 metacodes 源码加入构建图的原生 Host(C11 / C++17 / Zig /
+Rust:同一 C Header + 静态库 + bindings)。消费入口只有
+`metask_agentcore_get_api(uint32_t requested_abi)`。
 当前是实验性的 ABI v1 revision 15。Host 必须同时校验 abi version、精确
-revision、64 字节根表、五张必选 typed 子表、reserved fields 和 manifest hash；
-不存在静默降级或旧 revision shim。五张表按 Runtime、Session、Session Control、
-Skill、MCP 划分，但不是可选能力：discovery 必须一次性验证全部表，消费方只调用
-自己需要的领域。公共边界覆盖同步 run、跨线程 abort、流式事件、typed UI、
-checkpoint/restore、权限规则、MCP 和 Workspace Skill，不再暴露独立 Completion。
-ownership、回调重入、Session poison、并发和持久化语义只以同 revision Header 与
-`AGENTCORE_BINARY_ABI.md` 为准。
-
-revision 15 只有一个 `runtime->create`。其 nullable `plugins` 参数接受显式、绝对
-路径的 `ProcessPluginSourceV1` 数组；null 和空 `RuntimePluginConfigV1` 都表示无额外
-插件。AgentCore 在返回前完成 strict manifest/process 配置、entrypoint SHA-256、
-握手与工具 schema 校验，并复制不可变 Runtime 状态；失败不发布 partial generation。
-同一配置还接受独立的 `HostStreamToolV1` 数组；内核在回调前创建 Session CAS
-spool，Host 只持有同步、借用、只写 sink，不能提交、回滚或保留它。Revision 14
-还要求每个 `McpConnectorV1` 提供 `request_tool_stream`：普通 `request` 只处理有界
-控制帧，`tools/call` 的完整 JSON-RPC 响应从 byte zero 写入内核 capture，经流式
-校验后仅成功 `result` 区间可进入同一 CAS。
-`SessionHostConfigV1.run_journal_mode_code` 另行选择零 I/O 的 ephemeral
-profile，或把 provider/tool intent-result 对写入 Session 目录的 durable profile；
-该数据面不进入 Conversation，因此不会改变 provider-visible bytes 或 prompt cache。
-当前 journal 在崩溃前缀不完整时 fail closed，尚不宣称原地 active-Run resume。
-该表尚不暴露通用 data/static plugin grouping 或 inventory 查询；完整插件清单仍通过
-上节 JSON 协议暴露，reserved 字段不能充当隐式扩展通道。
+revision、64 字节根表、五张必选 typed 子表、reserved fields 和 manifest hash;
+不存在静默降级或旧 revision shim。
+revision 15 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
+工具、MCP 流式响应、journal profile,以及全部 ownership、回调重入、Session
+poison、并发与持久化语义,只以同 revision 的 Header 与
+[`AGENTCORE_BINARY_ABI.md`](AGENTCORE_BINARY_ABI.md)(Contract 一节及其子节)
+为准,本文不再复述。
 
 ## 4. Bundle 与门禁
 
-Bundle 只有一个坐标根，包含 Header、目标静态库、Zig/Rust bindings、README
-与带 SHA-256 白名单的 manifest。消费端拒绝未知/缺失/重复文件、hash 或 target
-不匹配。
-
-```sh
-# 交叉构建并做 source-free C/C++/Zig link check
-zig build agentcore:bundle \
-  -Dtarget=<explicit-target> \
-  -Doptimize=ReleaseSafe
-
-# 在匹配原生 Host 上执行 ABI + C/C++/Zig/Rust 消费 gate
-zig build agentcore:gate \
-  -Dtarget=<native-target> \
-  -Doptimize=ReleaseSafe
-```
-
-Windows 使用 `metask_agentcore.lib`，Linux/macOS 使用
-`libmetask_agentcore.a`。发布状态按 target 记录；cross-build 成功不是原生可用性
-声明。当前准确矩阵见 `AGENTCORE_BINARY_ABI.md`。
+Bundle 只有一个坐标根:Header、目标静态库、Zig/Rust bindings、README 与带
+SHA-256 白名单的 manifest;消费端拒绝未知/缺失/重复文件、hash 或 target 不匹配。
+构建 bundle(`zig build agentcore:bundle`)与原生消费 gate(`zig build
+agentcore:gate`)的命令、库文件名与按 target 的发布状态矩阵,见
+[`sdk/README.md`](../sdk/README.md) 与
+[`AGENTCORE_BINARY_ABI.md`](AGENTCORE_BINARY_ABI.md)(Build and verify 一节)。
 
 ## 5. Host 选择
 

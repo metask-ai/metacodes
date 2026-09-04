@@ -1,6 +1,6 @@
 //! L2: a real `agent_loop.run` classifies its visible output.
 //!
-//! Requirement: `doc/frommetawork/AGENT_OUTPUT_SEMANTICS_ISSUE.md`. The gap it
+//! Requirement: `doc/history/inbound/AGENT_OUTPUT_SEMANTICS_ISSUE.md`. The gap it
 //! records is that a consumer seeing only `text_chunk` + `stream_done` cannot
 //! tell an intermediate note from the answer, cannot join a max-token
 //! continuation back into one result, and cannot tell a rolled-back fragment

@@ -1,6 +1,6 @@
 //! SessionService（U2 S3）— session 状态 mutation 的**唯一中立入口**。
 //!
-//! 设计（doc/U2_SESSIONSERVICE_DESIGN.md）：
+//! 设计（doc/history/U2_SESSIONSERVICE_DESIGN.md）：
 //!   - **只收敛 mutation，不收敛渲染**。exec(verb,args)→CommandOutcome{kind,ok,data}；
 //!     kind 供 U4 派生 config-change 事件，data 是结构化载荷，**渲染归各 UI**（render(buf)
 //!     是共享格式化助手，消除 loop/web 消息重复）。
