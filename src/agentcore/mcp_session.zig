@@ -1054,7 +1054,23 @@ test "Session MCP budget drives the streaming projector threshold" {
         );
         defer published.deinit(std.testing.allocator);
         try std.testing.expect(published == .ok);
-        try std.testing.expect(published.ok == .artifact);
+        // Above the per-result budget the projector seals the result (#73):
+        // the receipt is fixed now, the blob reaches the session CAS only at
+        // the batch commit boundary, so nothing is under the artifact root yet.
+        try std.testing.expect(published.ok == .sealed);
+        try std.testing.expect(published.ok.sealed.media_type == .json);
+        try std.testing.expect(published.ok.sealed.spool.receipt().bytes > budget.per_result_bytes);
+        // The session CAS holds no blob yet (its directory may not even exist;
+        // the sealed spool lives beside it, not in it).
+        if (tmp.dir.openDir(std.testing.io, "tool-results/sha256", .{ .iterate = true })) |cas| {
+            var cas_dir = cas;
+            defer cas_dir.close(std.testing.io);
+            var iterator = cas_dir.iterate();
+            while (try iterator.next(std.testing.io)) |entry| {
+                if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+                return error.BlobPublishedBeforeCommit;
+            }
+        } else |err| try std.testing.expectEqual(error.FileNotFound, err);
     }
 
     server.result_padding_bytes = 20_000;

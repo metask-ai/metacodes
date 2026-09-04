@@ -36,6 +36,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- The Bash tool's spilled stdout/stderr are sealed during execution as attachments
+  of its inline result and published by the batch commit boundary, like every
+  other tool result since #45/#65; a fatal sibling in the same batch leaves no
+  blob, and a channel whose publication fails has its artifact id withdrawn from
+  the JSON (`<channel>_artifact_id: null`, `<channel>_storage_error`,
+  `<channel>_recoverable: false`) instead of dangling. `tool_result.SealedHandles`
+  carries up to two handles per result through `tool_exec` and the prefetch;
+  `artifact_store.sealFileCopy` seals a copy of a foreign private file. Callers
+  without a batch boundary (`!cmd`, embedders) keep the execution-time resolution
+  through `bash.execute`. The MCP projector's above-frame-limit result range
+  (`mcp_result_stream.publishRange`, classic client and AgentCore runtime alike)
+  and the AgentCore durable-budget promotion (`promoteInline`) seal too, so no
+  producer publishes a tool result into the CAS during execution any more; a
+  publication that fails at the boundary for a result above the retention ceiling
+  is the bounded `ArtifactPublishFailed` tool error (#73).
+
 - The paid plugin runner observed and executed the live checkout, so a pinned
   input replaced during a provider request and restored before the after-request
   check went unnoticed (#61, the paid-path form of the #49 gap). `run_paid_pair`,

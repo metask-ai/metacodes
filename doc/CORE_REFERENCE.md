@@ -360,7 +360,7 @@ projection 层在本轮结果就绪后决定"模型该看到多少"。两层分�
 **发布发生在批次提交边界,不在执行期(#45)。** 封存的句柄随渲染好的信封一起走
 (`tool_exec.OneResult.done.sealed` → `Slot.sealed`,流式预取的 `Entry` 同样携带);从封存
 receipt 渲染的信封与发布后渲染的逐字节相同,所以模型看到的字节不因发布时机而变。
-MCP client 超出 frame limit 的结果、host stream 工具的产物,以及声明 `supports_artifact_spool` 的 process plugin 写入的外部 spool(`ExternalSpool.seal`),现在也遵循这一提交边界发布规则(#65);仍在执行期发布的只剩 Bash 的 stdout/stderr spool 导入与 AgentCore 一侧的投影器 / durable budget 提升,见从 #65 拆出的 #73。
+MCP client 超出 frame limit 的结果、host stream 工具的产物,以及声明 `supports_artifact_spool` 的 process plugin 写入的外部 spool(`ExternalSpool.seal`),现在也遵循这一提交边界发布规则(#65)。Bash 的两个通道亦然(#73):结果体仍是内联 JSON,但被截断通道的字节在执行期只**封存**为该内联体的附件(`InlineResult.attachments`,至多 stdout、stderr 两个 `SealedArtifact`,带 `attachment_label`),JSON 里的 `<channel>_artifact_id` 就是封存时已知的 receipt;`publishSealedResults` 在提交边界发布附件,某个附件发布失败时把该通道的 id 从 JSON 里撤回(`withdrawAttachmentFromJson`:`_artifact_id` 置 null、补 `_storage_error`、`_recoverable` 置 false、去掉 `_read` 提示),而不是让模型拿着一个不存在的 blob 的 id。没有批次边界的调用方(`session_service` 的 `!cmd`、嵌入方)走 `bash.execute`,它在执行期就地做同一套解析。MCP 投影器超出 frame limit 的结果区间(`mcp_result_stream.publishRange`,classic client 与 AgentCore MCP runtime 共用)与 AgentCore durable budget 的 `promoteInline` 提升也改为封存(#73):两者的结果都经内核的 `tool_exec` 到达同一个提交边界,不需要 ABI 可见的新边界;至此不再有生产者在执行期把工具结果发布进 CAS。唯一的例外是 `promoteInline` 遇到带附件的内联体(Bash 结果本身超出 AgentCore 的原始上限)时先就地解析附件,因为封存体只携带一个句柄。
 `executeSlots` 无 fatal 地完成就是提交边界:`tool_exec.publishSealedResults` 在这里发布每个
 句柄,发布与为它作证的 Conversation 引用落在同一轮;更早的退出(host 工具 fatal、被拒的
 dispatch 观测)只是释放 slots——`Slot.deinit` 丢弃临时文件,CAS 里不会留下无人引用的 blob。

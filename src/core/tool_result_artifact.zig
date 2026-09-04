@@ -679,6 +679,42 @@ const ImportResult = union(enum) {
     completed: CompletedSpool,
 };
 
+/// Seal a copy of a private file that lives outside the artifact spool
+/// directory (a Bash job's stdout/stderr spool, #73): the bytes are streamed
+/// into a fresh `Spool` and sealed, so the handle owns its own file and the
+/// original may be released by its owner. `expected` is the snapshot the
+/// caller took with `inspectFile`; a copy whose size or digest differs is
+/// refused (`ArtifactSourceChanged`) and leaves nothing behind.
+pub fn sealFileCopy(allocator: std.mem.Allocator, session_root: []const u8, source_path: []const u8, expected: FileSnapshot) !SealedSpool {
+    const source_z = try allocator.dupeZ(u8, source_path);
+    defer allocator.free(source_z);
+    const fd = pfs.open(source_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactSourceOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.makeCloseOnExec(fd);
+    const before = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
+    if (!safeArtifactInfo(before) or before.size != expected.bytes) return error.ArtifactSourceChanged;
+    var spool = try Spool.begin(allocator, session_root);
+    defer spool.deinit();
+    var buffer: [64 * 1024]u8 = undefined;
+    var copied: u64 = 0;
+    while (true) {
+        const count = pfs.readZ(fd, &buffer) catch return error.ArtifactReadFailed;
+        if (count == 0) break;
+        try spool.write(buffer[0..count]);
+        copied += count;
+    }
+    const after = pfs.fileInfo(fd) catch return error.ArtifactSourceChanged;
+    if (!sameFile(before, after) or copied != expected.bytes) return error.ArtifactSourceChanged;
+    var sealed = try spool.seal();
+    if (!std.mem.eql(u8, sealed.snapshot.sha256[0..], expected.sha256[0..])) {
+        sealed.discard();
+        sealed.deinit();
+        return error.ArtifactSourceChanged;
+    }
+    return sealed;
+}
+
 pub fn persist(allocator: std.mem.Allocator, session_root: []const u8, bytes: []const u8) !Receipt {
     var spool = try Spool.begin(allocator, session_root);
     defer spool.deinit();
@@ -1812,6 +1848,53 @@ test "external spool: seal then discard leaves neither a blob nor a private file
     try std.testing.expectError(error.ArtifactSpoolClosed, sealed.publish());
     // The external spool itself is closed too: the file it would unlink is gone.
     try std.testing.expectError(error.ArtifactSpoolClosed, spool.finish());
+}
+
+test "sealFileCopy: a foreign private file becomes a sealed spool with the inspected receipt (#73)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const cas = try artifactDirectory(allocator, root);
+    defer allocator.free(cas);
+    const spool_dir = try spoolDirectory(allocator, root);
+    defer allocator.free(spool_dir);
+    // A job spool outside the artifact directories, as Bash keeps them.
+    const source = try std.fmt.allocPrint(allocator, "{s}/job-1.out", .{root});
+    defer allocator.free(source);
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+    const fd = pfs.open(source_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    if (fd < 0) return error.ArtifactTempOpenFailed;
+    try writeAll(fd, "JOB_HEAD-");
+    const middle = [_]u8{'j'} ** (70 * 1024);
+    try writeAll(fd, &middle);
+    try writeAll(fd, "-JOB_TAIL");
+    try pfs.fsyncChecked(fd);
+    _ = pfs.close(fd);
+    const inspected = try inspectFile(allocator, source);
+
+    var sealed = try sealFileCopy(allocator, root, source, inspected);
+    defer sealed.deinit();
+    try std.testing.expectEqualSlices(u8, inspected.sha256[0..], sealed.receipt().sha256[0..]);
+    try std.testing.expectEqual(inspected.bytes, sealed.receipt().bytes);
+    try std.testing.expectEqual(@as(usize, 0), try testCountDirectory(allocator, cas));
+    try std.testing.expectEqual(@as(usize, 1), try testCountDirectory(allocator, spool_dir));
+    // The source is untouched: its owner releases it on its own terms.
+    try std.testing.expectEqual(inspected.bytes, (try inspectFile(allocator, source)).bytes);
+    const completed = try sealed.publish();
+    try std.testing.expectEqual(@as(usize, 1), try testCountDirectory(allocator, cas));
+    var recovered = try readChunk(allocator, root, completed.receipt.id(), 0, 9);
+    defer recovered.deinit();
+    try std.testing.expectEqualSlices(u8, "JOB_HEAD-", recovered.bytes);
+
+    // A snapshot that no longer describes the file is refused and leaves no temp file.
+    var stale = inspected;
+    stale.sha256[0] = if (stale.sha256[0] == 'a') 'b' else 'a';
+    try std.testing.expectError(error.ArtifactSourceChanged, sealFileCopy(allocator, root, source, stale));
+    try std.testing.expectEqual(@as(usize, 0), try testCountDirectory(allocator, spool_dir));
 }
 
 test "external spool imports only the kernel-created private path" {

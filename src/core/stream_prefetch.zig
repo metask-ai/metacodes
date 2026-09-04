@@ -53,7 +53,7 @@ const Entry = struct {
     file_changes: ?[]file_change.Record = null,
     file_changes_overflow: bool = false,
     file_changes_lost: bool = false,
-    sealed: ?tool_result.SealedArtifact = null,
+    sealed: tool_result.SealedHandles = .{},
     taken: bool = false, // 已被 executeSlots 取走(所有权转移)
     skip: bool = false, // 预取遇 UiPending(并发安全工具不该发生)→ 丢弃,take 返 null 让 executeSlots 重跑
 };
@@ -160,7 +160,7 @@ pub const Prefetch = struct {
         file_changes: ?[]file_change.Record,
         file_changes_overflow: bool,
         file_changes_lost: bool,
-        sealed: ?tool_result.SealedArtifact,
+        sealed: tool_result.SealedHandles,
     } {
         for (self.entries.items) |e| {
             if (e.taken) continue;
@@ -182,7 +182,7 @@ pub const Prefetch = struct {
             const changes = e.file_changes;
             e.file_changes = null;
             const sealed = e.sealed;
-            e.sealed = null;
+            e.sealed = .{};
             return .{
                 .content = content,
                 .file_refs = refs,
@@ -218,8 +218,8 @@ pub const Prefetch = struct {
                 e.file_refs = null;
                 if (e.file_changes) |changes| file_change.freeRecords(self.allocator, changes);
                 e.file_changes = null;
-                if (e.sealed) |*sealed| sealed.spool.deinit();
-                e.sealed = null;
+                e.sealed.deinit();
+                e.sealed = .{};
             }
         }
     }
@@ -334,9 +334,9 @@ test "prefetch carries a sealed handle through take and discards an unclaimed on
     p.start(&ctx, "a", "SealedTool", "{}", .{ .bytes = [_]u8{'0'} ** 12 });
     p.start(&ctx, "b", "SealedTool", "{}", .{ .bytes = [_]u8{'0'} ** 12 });
     const taken = p.take("a") orelse return error.PrefetchMissing;
-    try std.testing.expect(taken.sealed != null);
+    try std.testing.expect(!taken.sealed.isEmpty());
     if (taken.content) |c| a.free(c);
-    var handle = taken.sealed.?;
+    var handle = taken.sealed.items[0].?;
     handle.spool.deinit();
     p.joinAll();
     // "b" was never claimed: joinAll discarded its handle; nothing is left.
