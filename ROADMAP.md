@@ -74,6 +74,17 @@ CI targets self-hosted runners (Linux X64, macOS ARM64, Windows X64).
       runner; `testKernel()` returns null on Windows); the paid budget journal,
       dir_fd-anchored publication and anonymous inherited descriptors are
       POSIX-only and skip with stated reasons (`scripts/eval/tests/posix_only.py`).
+- [x] Shared-runner serialization (#52 suggestion 3): the automatic jobs that
+      land on the same physical runner (`Gates (Windows)` and AgentCore
+      Windows; `Gates (Linux)`/`Gates (macOS)` for symmetry) carry a job-level
+      `concurrency` group keyed by platform and a main/PR bucket, so they queue
+      instead of overlapping (the -j12 AgentCore compile running beside the
+      full suite was the load behind the #51/#52 flakes). Wide test deadlines
+      landed in #54 already; `--test-timeout 5m` is now the watchdog on every
+      leg. `rule-control` is deliberately outside the groups: GitHub cancels
+      the older pending job of a group, which would let a PR push cancel a
+      dispatched two-hour release gate; its fix remains the dedicated runner
+      below.
 - [ ] Release-gate isolation: `rule-control` currently shares the
       `[self-hosted, macOS, ARM64]` label set with pull_request CI jobs;
       before public visibility, give it a dedicated or ephemeral runner so

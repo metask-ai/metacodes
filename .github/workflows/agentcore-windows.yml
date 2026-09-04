@@ -33,6 +33,13 @@ jobs:
     # ci.yml's generic [self-hosted, Windows, X64] pool. Owner: confirm or
     # align the label if the fleet has a single Windows runner.
     runs-on: [self-hosted, Windows, X64, metask-pc]
+    # Shares the Windows box with ci.yml's windows-gates full suite; the
+    # runner-serialization group makes the two queue instead of compiling
+    # at -j12 while the other runs the suite (issue #52 suggestion 3; see
+    # ci.yml `gates` for the bucket semantics).
+    concurrency:
+      group: runner-Windows-X64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}
+      cancel-in-progress: false
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
