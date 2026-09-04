@@ -17,8 +17,8 @@ status, compatibility boundaries, and entry points are defined by
   check went unnoticed (#61, the paid-path form of the #49 gap). `run_paid_pair`,
   `--freeze` and the analysis now read the protocol once, refuse a pinned input
   that is modified in the working tree, materialize Git HEAD into a private
-  directory and observe and execute there; run directories live under the
-  output directory.
+  directory and observe and execute there; each run directory is moved under
+  the output directory before its evidence is imported.
 
 ### Added
 
