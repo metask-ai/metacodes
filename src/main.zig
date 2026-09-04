@@ -474,6 +474,11 @@ pub fn main(init: std.process.Init) !void {
     platform_term.initConsoleUtf8();
     defer platform_term.restoreConsoleCp();
 
+    // The release layout resolves rg beside the executable before PATH (#79);
+    // the library learns the layout here, before anything — `doctor`
+    // included — can resolve it.
+    @import("util/toolchain.zig").setLayout(if (build_options.release_layout) .release else .development);
+
     if (try maybeRunAuthCommand(init, allocator)) |code| {
         std.process.exit(code);
     }

@@ -19,21 +19,33 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         return root
 
     def test_matching_prefix(self):
-        root = self._make(("bin/metacodes", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
         self.assertEqual(check(root), [])
 
+    def test_prefix_without_vendored_ripgrep_is_accepted_only_when_asked(self):
+        root = self._make(("bin/metacodes", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        self.assertIn("missing: bin/rg", check(root))
+        self.assertIn("missing: share/licenses/ripgrep-LICENSE-MIT", check(root))
+        self.assertEqual(check(root, ripgrep=False), [])
+
     def test_extra_and_missing_are_named(self):
-        root = self._make(("bin/metacodes", "vendor/tinykg/tinykg", "extra.txt"))
+        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "extra.txt"))
         findings = check(root)
         self.assertIn("missing: vendor/tinykg/tinykg.provenance.json", findings)
         self.assertIn("unexpected: extra.txt", findings)
 
     def test_windows_names(self):
-        root = self._make(("bin/metacodes.exe", "vendor/tinykg/tinykg.exe", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(("bin/metacodes.exe", "bin/rg.exe", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg.exe", "vendor/tinykg/tinykg.provenance.json"))
         self.assertEqual(check(root), [])
 
+    def test_a_missing_ripgrep_is_named(self):
+        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        self.assertEqual(check(root), [])
+        (root / "bin/rg").unlink()
+        self.assertIn("missing: bin/rg", check(root))
+
     def test_doctor_report_accepts_the_adjacent_matching_tinykg(self):
-        root = self._make(("bin/metacodes", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
         report = {
             "checks": [
                 {"name": "ripgrep", "resolved_path": "/usr/bin/rg", "sha256": "ab", "expected_sha256": None, "match": None, "source": "path"},
@@ -42,8 +54,21 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         }
         self.assertEqual(evaluate_doctor(report, root), [])
 
+    def test_release_doctor_requires_adjacent_ripgrep(self):
+        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        base = {"name": "tinykg", "resolved_path": str(root / "vendor/tinykg/tinykg"), "match": True, "source": "adjacent"}
+        report = {"checks": [{"name": "ripgrep", "resolved_path": str(root / "bin/rg"), "match": True, "source": "adjacent"}, base]}
+        self.assertEqual(evaluate_doctor(report, root, release=True), [])
+        report["checks"][0]["source"] = "path"
+        findings = evaluate_doctor(report, root, release=True)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("expected 'adjacent'", findings[0])
+        # Without --release the same report passes: a development install
+        # resolves rg from PATH first.
+        self.assertEqual(evaluate_doctor(report, root), [])
+
     def test_doctor_report_names_every_deviation(self):
-        root = self._make(("bin/metacodes", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
         report = {
             "checks": [
                 {"name": "tinykg", "resolved_path": "/elsewhere/tinykg", "sha256": "cd", "expected_sha256": "ef", "match": False, "source": "env"},

@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- The default install stages the vendored ripgrep beside the executable as
+  `bin/rg[.exe]` with its MIT notice under `share/licenses/`, and the new
+  `zig build release:stage -Drelease-layout=true` installs the release layout,
+  failing closed for a target without vendored runtime assets (aarch64-linux
+  until #86). Under the release layout the executable resolves rg as `RG_BIN`
+  → its own directory → `PATH` (the development order is unchanged), and
+  `verify_install_prefix.py --release --doctor` proves it on the installed
+  prefix in CI (#79, #47 stage 4, B2).
+
 - `metacodes --version` prints the build identity after its unchanged first
   line, and `--version --json` emits it as one document: commit and dirty
   state, Zig, target, optimize mode, release layout, AgentCore ABI version and

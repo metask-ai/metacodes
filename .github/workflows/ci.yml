@@ -172,6 +172,8 @@ jobs:
         run: python3 scripts/check_doc_links.py
       - name: Default install prefix
         run: zig build --prefix "$RUNNER_TEMP/install-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/install-prefix" --doctor
+      - name: Release layout prefix
+        run: zig build release:stage -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
       - name: Third-party notices check
         if: runner.os == 'Linux'
         run: python3 scripts/gen_third_party_notices.py --check
@@ -258,6 +260,9 @@ jobs:
       - name: Default install prefix
         shell: cmd
         run: zig build --prefix "%RUNNER_TEMP%\install-prefix" && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\install-prefix" --doctor
+      - name: Release layout prefix
+        shell: cmd
+        run: zig build release:stage -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release-prefix" --release --doctor
       - name: Verify install prefix unit tests
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_install_prefix -v

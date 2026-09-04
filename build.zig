@@ -613,6 +613,59 @@ pub fn build(b: *std.Build) void {
         },
     }
 
+    // ── ripgrep for the product install (#79, #47 stage 4) ─────────────────
+    // Glob/Grep need rg at run time. The default install and the release
+    // layout stage the vendored, manifest-pinned binary beside the executable
+    // as bin/rg[.exe] (the script the AgentCore bundle already uses) and ship
+    // its MIT notice under share/licenses. A target without a vendored rg
+    // (aarch64-linux until #86) still builds for development — rg then comes
+    // from PATH — but cannot be released: `release:stage` fails closed rather
+    // than shipping an executable whose Grep cannot run.
+    const ripgrep_bundle = ripgrepBundleInfo(b, target.result);
+    const release_stage_step = b.step(
+        "release:stage",
+        "Install the release layout (bin/metacodes, bin/rg, vendor/tinykg, share/licenses); requires -Drelease-layout=true and fails closed for a target without vendored runtime assets",
+    );
+    release_stage_step.dependOn(b.getInstallStep());
+    if (!release_layout) {
+        release_stage_step.dependOn(&b.addFail(
+            "release:stage requires -Drelease-layout=true so the executable resolves rg beside itself",
+        ).step);
+    }
+    if (staged_tinykg == null) {
+        release_stage_step.dependOn(&b.addFail(
+            "release:stage needs the vendored TinyKG binary for this target (it is disabled or unavailable)",
+        ).step);
+    }
+    const target_family = b.fmt("{s}-{s}", .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) });
+    if (ripgrep_bundle.sha256 != null) {
+        const stage_python = if (@import("builtin").os.tag == .windows) "python" else "python3";
+        const stage_ripgrep = b.addSystemCommand(&.{
+            stage_python,
+            "scripts/stage_ripgrep_binary.py",
+            @tagName(target.result.cpu.arch),
+            @tagName(target.result.os.tag),
+            b.getInstallPath(.bin, ""),
+        });
+        stage_ripgrep.setCwd(b.path("."));
+        const install_ripgrep_license = b.addInstallFileWithDir(
+            b.path("vendor/ripgrep/LICENSE-MIT"),
+            .{ .custom = "share/licenses" },
+            "ripgrep-LICENSE-MIT",
+        );
+        b.getInstallStep().dependOn(&stage_ripgrep.step);
+        b.getInstallStep().dependOn(&install_ripgrep_license.step);
+    } else {
+        std.log.warn(
+            "no vendored ripgrep for {s}: the install carries no bin/rg and Grep/Glob resolve it from PATH (#86)",
+            .{target_family},
+        );
+        release_stage_step.dependOn(&b.addFail(b.fmt(
+            "no vendored ripgrep for {s}; this target is outside the release matrix until #86",
+            .{target_family},
+        )).step);
+    }
+
     const debug_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
