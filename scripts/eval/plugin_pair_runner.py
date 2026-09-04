@@ -451,6 +451,16 @@ def _require_still_frozen(
     not that: a protocol repinned after the freeze - a swapped candidate
     Skill with its hash updated - passes the strict loader, and the rollout
     would still be labelled with this manifest."""
+    # The run never reads the operator's protocol file after the start, but
+    # a rewrite of it mid-run is a reason to stop, exactly as the gate refuses
+    # to write its receipt when the file no longer holds the bytes it ran with
+    # (#49): the bytes on disk must still be the bytes this run was frozen on.
+    try:
+        live = tree.protocol_path.read_bytes()
+    except OSError as exc:
+        raise ValidationError(f"frozen-run manifest drifted: protocol_sha256 ({moment}): {exc}") from exc
+    if live != tree.protocol_raw:
+        raise ValidationError(f"frozen-run manifest drifted: protocol_sha256 ({moment})")
     try:
         verify_frozen_manifest(manifest, _observe(tree, runtime_binary).fields)
     except ValidationError as exc:

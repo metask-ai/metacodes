@@ -393,7 +393,8 @@ OS 补丁也会触发它——重新冻结是一个要看着 diff 做的动作,�
 随后要求 authority 的 `manifest_sha256` 等于校验通过的清单哈希。
 
 **每次 provider 请求前后各做一次同样的整体校验**(`_require_still_frozen`,错误尾缀
-`(before request)` / `(after request)`),而不是只重载磁盘上的协议:一份冻结之后被改写又
+`(before request)` / `(after request)`;它先要求操作者的协议文件仍是开头读取的那份字节——运行从不再读它,
+但它被改写就是停下的理由,与 `run_gate` 写 receipt 前的要求相同),而不是只重载磁盘上的协议:一份冻结之后被改写又
 自洽 repin 的协议(换掉候选 Skill、更新它的哈希)能通过严格加载,却通不过与清单的逐字段
 比对。请求后的校验发生在导入该次证据之前;未通过则该笔交易停留在 `request_authorized`、
 没有 checkpoint,续跑被既有的孤儿交易规则挡住,不会隐式重付。括号内"改了又改回"的变动
