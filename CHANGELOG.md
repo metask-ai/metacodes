@@ -12,6 +12,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- The CLI release unit (#80, #47 stage 5): `zig build release:stage` installs
+  the product files plus `share/licenses/{metacodes-LICENSE, tinykg-LICENSE,
+  THIRD_PARTY_NOTICES.md}` and `share/doc/{README.md, CHANGELOG-<version>.md}`;
+  `release:manifest` writes `manifest.json` (`release/manifest.schema.json`,
+  `release/manifest_contract.zig`, `release/LAYOUT.md`) from git, the vendored
+  manifests and the installed files; `release:check` runs the static checks
+  and `release:verify` also the executable-running ones on the native target
+  (`scripts/verify_release_bundle.py`). A version without a pre-release part is
+  the stable channel and requires a clean tree tagged with the bare `X.Y.Z`;
+  main now carries `0.2.0-dev`, and `--version` reports `0.2.0-dev+<commit12>`
+  exactly as the manifest does. The repository gains its MIT `LICENSE`.
+
 - The default install stages the vendored ripgrep beside the executable as
   `bin/rg[.exe]` with its MIT notice under `share/licenses/`, and the new
   `zig build release:stage -Drelease-layout=true` installs the release layout,

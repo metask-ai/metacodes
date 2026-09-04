@@ -81,3 +81,17 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         self.assertTrue(any("expected 'adjacent'" in finding for finding in findings))
         self.assertTrue(any("expected true" in finding for finding in findings))
         self.assertEqual(evaluate_doctor({"nope": 1}, root), ["doctor: report has no checks array"])
+
+    def test_release_prefix_carries_licences_docs_and_manifest(self):
+        release_files = (
+            "bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "share/licenses/metacodes-LICENSE",
+            "share/licenses/tinykg-LICENSE", "share/licenses/THIRD_PARTY_NOTICES.md", "share/doc/README.md",
+            "share/doc/CHANGELOG-0.2.0-dev.md", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json",
+        )
+        root = self._make(release_files)
+        self.assertEqual(check(root, release=True), [])
+        self.assertIn("unexpected: share/licenses/metacodes-LICENSE", check(root))
+        (root / "manifest.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(check(root, release=True), [])
+        (root / "share/doc/CHANGELOG-0.2.0-dev.md").unlink()
+        self.assertIn("missing: share/doc/CHANGELOG-<version>.md", check(root, release=True))

@@ -153,12 +153,15 @@ fn isLowerHex(value: []const u8, len: usize) bool {
 fn buildInfoOptions(
     b: *std.Build,
     target: std.Target,
+    /// The optimize mode of the module that receives these options — the
+    /// executable's own, not the -Doptimize default (the release app is always
+    /// ReleaseSmall, the debug app always Debug).
     optimize: std.builtin.OptimizeMode,
     release_layout: bool,
     tinykg_input: TinyKgBinaryInput,
+    identity: GitIdentity,
 ) *std.Build.Step.Options {
     const sdk_types = @import("sdk/zig/types.zig");
-    const identity = gitIdentity(b);
     const ripgrep = ripgrepBundleInfo(b, target);
     const tinykg = tinyKgContractInfo(b);
     const options = b.addOptions();
@@ -445,7 +448,11 @@ pub fn build(b: *std.Build) void {
         "release-layout",
         "Record the release runtime layout in the build identity (#47; the layout's asset resolution lands in a later stage)",
     ) orelse false;
-    const build_info = buildInfoOptions(b, target.result, optimize, release_layout, tinykg_input);
+    // One options module per app module, because each reports its own
+    // optimize mode; git is asked once.
+    const build_identity = gitIdentity(b);
+    const build_info = buildInfoOptions(b, target.result, .ReleaseSmall, release_layout, tinykg_input, build_identity);
+    const debug_build_info = buildInfoOptions(b, target.result, .Debug, release_layout, tinykg_input, build_identity);
     const tfilter = b.option([]const u8, "tfilter", "test filter");
     const lib_test_shards = b.option(u8, "lib-test-shards", "Parallel metacodes-core test shards (1-64)") orelse 4;
     if (lib_test_shards == 0 or lib_test_shards > 64) @panic("-Dlib-test-shards must be between 1 and 64");
@@ -655,6 +662,20 @@ pub fn build(b: *std.Build) void {
         );
         b.getInstallStep().dependOn(&stage_ripgrep.step);
         b.getInstallStep().dependOn(&install_ripgrep_license.step);
+        // The release unit also carries its own licence, TinyKG's, the
+        // rendered notices and the operator docs (release/LAYOUT.md, #80);
+        // a development install does not.
+        const release_extras = [_]struct { source: []const u8, dir: []const u8, name: []const u8 }{
+            .{ .source = "LICENSE", .dir = "share/licenses", .name = "metacodes-LICENSE" },
+            .{ .source = "vendor/tinykg/LICENSE", .dir = "share/licenses", .name = "tinykg-LICENSE" },
+            .{ .source = "THIRD_PARTY_NOTICES.md", .dir = "share/licenses", .name = "THIRD_PARTY_NOTICES.md" },
+            .{ .source = "README.md", .dir = "share/doc", .name = "README.md" },
+            .{ .source = "CHANGELOG.md", .dir = "share/doc", .name = b.fmt("CHANGELOG-{s}.md", .{manifest.version}) },
+        };
+        for (release_extras) |extra| {
+            const install_extra = b.addInstallFileWithDir(b.path(extra.source), .{ .custom = extra.dir }, extra.name);
+            release_stage_step.dependOn(&install_extra.step);
+        }
     } else {
         std.log.warn(
             "no vendored ripgrep for {s}: the install carries no bin/rg and Grep/Glob resolve it from PATH (#86)",
@@ -673,7 +694,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, debug_mod);
-    debug_mod.addOptions("build_info", build_info);
+    debug_mod.addOptions("build_info", debug_build_info);
     const debug_exe = b.addExecutable(.{
         .name = "metacodes-debug",
         .root_module = debug_mod,
@@ -700,7 +721,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         addHl(b, m2);
-        m2.addOptions("build_info", build_info);
+        m2.addOptions("build_info", buildInfoOptions(b, target.result, optimize, release_layout, tinykg_input, build_identity));
         break :blk m2;
     };
     const test_harness_mod = b.createModule(.{
@@ -943,6 +964,95 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test, windows_test_prelude).step);
+
+    // ── release:manifest / release:check / release:verify (#80, #47 stage 5) ──
+    // The CLI release unit is the staged prefix sealed with manifest.json
+    // (release/LAYOUT.md). The generator is a host tool beside the AgentCore
+    // one; release/manifest_contract.zig is the reader's side of the contract;
+    // scripts/verify_release_bundle.py runs the fail-closed checks, the
+    // executable-running ones only on the native target.
+    const release_contract_mod = b.createModule(.{
+        .root_source_file = b.path("src/release_contract.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const release_manifest_tool_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/release_manifest.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    release_manifest_tool_mod.addImport("metask_agentcore_types", agentcore_manifest_types_mod);
+    release_manifest_tool_mod.addImport("metacodes_release_contract", release_contract_mod);
+    const release_manifest_tool = b.addExecutable(.{
+        .name = "release-manifest",
+        .root_module = release_manifest_tool_mod,
+    });
+    const release_manifest_tool_test = b.addTest(.{
+        .name = "release-manifest-unit",
+        .root_module = release_manifest_tool_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
+    const manifest_common_test = b.addTest(.{
+        .name = "manifest-common-unit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/manifest_common.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
+    const release_contract_test = b.addTest(.{
+        .name = "release-manifest-contract",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("release/manifest_contract.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
+    const release_test_step = b.step("release:test", "Unit tests of the release manifest generator and contract");
+    release_test_step.dependOn(&addTestRunArtifact(b, release_manifest_tool_test, windows_test_prelude).step);
+    release_test_step.dependOn(&addTestRunArtifact(b, manifest_common_test, windows_test_prelude).step);
+    release_test_step.dependOn(&addTestRunArtifact(b, release_contract_test, windows_test_prelude).step);
+
+    const release_manifest_cmd = b.addRunArtifact(release_manifest_tool);
+    release_manifest_cmd.addArgs(&.{
+        b.install_path,
+        b.fmt("{s}-{s}-{s}", .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag), @tagName(target.result.abi) }),
+        @tagName(target.result.cpu.arch),
+        @tagName(target.result.os.tag),
+        @tagName(target.result.abi),
+        @tagName(release_mod.optimize orelse optimize),
+        if (release_mod.strip orelse false) "true" else "false",
+        manifest.version,
+    });
+    release_manifest_cmd.setCwd(b.path("."));
+    release_manifest_cmd.has_side_effects = true;
+    release_manifest_cmd.step.dependOn(release_stage_step);
+    const release_manifest_step = b.step("release:manifest", "Write manifest.json for the staged release prefix (after release:stage)");
+    release_manifest_step.dependOn(&release_manifest_cmd.step);
+
+    const release_python = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const release_check_cmd = b.addSystemCommand(&.{ release_python, "scripts/verify_release_bundle.py", b.install_path });
+    release_check_cmd.setCwd(b.path("."));
+    release_check_cmd.has_side_effects = true;
+    release_check_cmd.step.dependOn(&release_manifest_cmd.step);
+    const release_check_step = b.step("release:check", "Static release checks: schema, digests, whitelist, licences (any target)");
+    release_check_step.dependOn(&release_check_cmd.step);
+
+    const release_verify_step = b.step("release:verify", "release:check plus the executable-running checks (native target only)");
+    const release_target_is_native = target.result.os.tag == b.graph.host.result.os.tag and
+        target.result.cpu.arch == b.graph.host.result.cpu.arch and
+        target.result.abi == b.graph.host.result.abi;
+    if (release_target_is_native) {
+        const release_verify_cmd = b.addSystemCommand(&.{ release_python, "scripts/verify_release_bundle.py", b.install_path, "--native" });
+        release_verify_cmd.setCwd(b.path("."));
+        release_verify_cmd.has_side_effects = true;
+        release_verify_cmd.step.dependOn(&release_manifest_cmd.step);
+        release_verify_step.dependOn(&release_verify_cmd.step);
+    } else {
+        release_verify_step.dependOn(&b.addFail("use release:check for cross-target validation").step);
+    }
     const agentcore_symbol_gate_mod = b.createModule(.{
         .root_source_file = b.path("scripts/agentcore_symbol_gate.zig"),
         .target = b.graph.host,
@@ -1662,6 +1772,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(release_test_step);
     test_step.dependOn(http_status_gate_step);
     test_step.dependOn(subsystem_boundary_step);
     const tinykg_contract_test_cmd = b.addSystemCommand(&.{

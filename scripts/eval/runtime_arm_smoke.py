@@ -312,6 +312,17 @@ def _run_version(binary: Path, extra: "list[str]") -> "subprocess.CompletedProce
     return completed
 
 
+def _version_line_matches(line: str, expected_semver: str) -> bool:
+    """`metacodes <semver>` exactly; a `-dev` pre-release additionally allows the
+    `+<commit12>` build metadata (`.dirty` appended for a dirty tree) that
+    `--version` and the release manifest append (#80)."""
+    if line == f"metacodes {expected_semver}":
+        return True
+    if "-" not in expected_semver:
+        return False
+    return re.fullmatch(re.escape(f"metacodes {expected_semver}") + r"\+[0-9a-f]{12}(\.dirty)?", line) is not None
+
+
 def _version_output_smoke(binary: Path, expected_semver: str) -> None:
     """`--version` is a documented public surface (doc/API.md): the real binary
     prints exactly `metacodes <semver>` as its first stdout line (the build
@@ -323,9 +334,9 @@ def _version_output_smoke(binary: Path, expected_semver: str) -> None:
     first_line = completed.stdout.split("\n", 1)[0]
     expected = f"metacodes {expected_semver}"
     _require(
-        first_line == expected,
+        _version_line_matches(first_line, expected_semver),
         f"--version first line {first_line!r} != {expected!r} "
-        "(src/version.zig and build.zig.zon must agree)",
+        "(src/version.zig and build.zig.zon must agree; a -dev version may carry +<commit12>[.dirty])",
     )
     _require(
         "\ncommit " in completed.stdout and "\nlayout " in completed.stdout,
@@ -346,7 +357,7 @@ def _version_json_smoke(binary: Path, expected_semver: str, repo_root: Path) -> 
     except json.JSONDecodeError as exc:
         raise SystemExit(f"--version --json stdout is not JSON: {completed.stdout[:200]!r}") from exc
     _require(
-        document.get("name") == "metacodes" and document.get("version") == expected_semver,
+        document.get("name") == "metacodes" and _version_line_matches(f"metacodes {document.get('version')}", expected_semver),
         f"--version --json identity {document.get('name')!r} {document.get('version')!r} != metacodes {expected_semver}",
     )
     abi = re.search(

@@ -24,9 +24,19 @@ from pathlib import Path
 
 ALLOWED_ENTRIES = frozenset(("bin", "bin/metacodes", "bin/metacodes.exe", "vendor", "vendor/tinykg", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.exe", "vendor/tinykg/tinykg.provenance.json"))
 RIPGREP_ENTRIES = frozenset(("share", "share/licenses", "share/licenses/ripgrep-LICENSE-MIT", "bin/rg", "bin/rg.exe"))
+# release:stage adds the unit's own licence, TinyKG's, the notices, the docs and,
+# after release:manifest, manifest.json (release/LAYOUT.md, #80).
+RELEASE_ENTRIES = frozenset((
+    "share/licenses/metacodes-LICENSE",
+    "share/licenses/tinykg-LICENSE",
+    "share/licenses/THIRD_PARTY_NOTICES.md",
+    "share/doc",
+    "share/doc/README.md",
+))
+RELEASE_CHANGELOG_PREFIX = "share/doc/CHANGELOG-"
 
 
-def check(prefix: Path, ripgrep: bool = True) -> list[str]:
+def check(prefix: Path, ripgrep: bool = True, release: bool = False) -> list[str]:
     actual = set()
     if prefix.exists():
         for path in prefix.rglob("*"):
@@ -34,6 +44,12 @@ def check(prefix: Path, ripgrep: bool = True) -> list[str]:
     expected = set(ALLOWED_ENTRIES)
     if ripgrep:
         expected.update(RIPGREP_ENTRIES)
+    if release:
+        expected.update(RELEASE_ENTRIES)
+        changelogs = sorted(p for p in actual if p.startswith(RELEASE_CHANGELOG_PREFIX) and p.endswith(".md"))
+        expected.update(changelogs[:1] or {RELEASE_CHANGELOG_PREFIX + "<version>.md"})
+        if "manifest.json" in actual:
+            expected.add("manifest.json")
     if any(p.endswith(".exe") for p in actual if p.startswith("bin/")):
         expected.remove("bin/metacodes")
     else:
@@ -121,7 +137,7 @@ def main(argv: list[str]) -> int:
         print("usage: verify_install_prefix.py <prefix> [--doctor] [--release] [--no-ripgrep]", file=sys.stderr)
         return 2
     prefix = Path(positional[0])
-    findings = check(prefix, ripgrep)
+    findings = check(prefix, ripgrep, release)
     if doctor and not findings:
         findings.extend(run_doctor(prefix, release))
     for finding in findings:
