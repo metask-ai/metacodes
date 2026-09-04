@@ -14,6 +14,7 @@
 //! file must not reach into Conversation, the projection layer, or a Provider.
 
 const std = @import("std");
+const artifact_store = @import("tool_result_artifact.zig");
 
 /// Two units, kept apart by the type system because every byte-budget defect
 /// this file has had was a confusion between them.
@@ -147,6 +148,19 @@ pub fn perTurnBytes(max_input_tokens: usize) usize {
     return @min(@max(derived / 5, PER_TURN_MIN_BYTES), PER_TURN_MAX_BYTES);
 }
 
+pub const RECOVERY_TURN_DIVISOR: usize = 2;
+
+/// Half the turn budget is reserved for exempt recovery reads. In a 200K
+/// window, 4 full 25,000-byte chunks fit in 102,400; the 5th is deferred
+/// (today 8 fit in projection and the 9th blows the turn).
+pub fn recoveryAllowanceBytes(budget: Budget) usize {
+    return budget.per_turn_bytes / RECOVERY_TURN_DIVISOR;
+}
+
+pub fn recoveryReadCost(budget: Budget) usize {
+    return @max(1, @min(artifact_store.MAX_READ_BYTES, budget.per_result_bytes));
+}
+
 pub const Budget = struct {
     /// Deliberately plain `usize`, not `Encoded`. These are compared almost
     /// exclusively against a committed result's own length - same unit, no
@@ -183,6 +197,16 @@ pub const Budget = struct {
 };
 
 pub const Pair = struct { first: Encoded, second: Encoded };
+
+test "recovery allowance and cost follow turn budget" {
+    const b = Budget.fromModel(200_000);
+    try std.testing.expectEqual(@as(usize, 102_400), recoveryAllowanceBytes(b));
+    try std.testing.expectEqual(@as(usize, 25_000), recoveryReadCost(b));
+    const m = Budget.fromModel(1_000_000);
+    try std.testing.expectEqual(perTurnBytes(1_000_000) / 2, recoveryAllowanceBytes(m));
+    try std.testing.expectEqual(artifact_store.MAX_READ_BYTES, recoveryReadCost(m));
+    try std.testing.expectEqual(@as(usize, PER_TURN_MIN_BYTES / 2), recoveryAllowanceBytes(Budget.floor));
+}
 
 /// Max-min fair split of one payload allowance between two channels.
 ///

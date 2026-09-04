@@ -25,6 +25,8 @@ const file_reference = @import("file_reference.zig");
 const file_change = @import("file_change.zig");
 const tool_catalog = @import("tool_catalog.zig");
 const execution_effect = @import("execution_effect.zig");
+const result_budget = @import("result_budget.zig");
+const read_artifact = @import("../tools/read_artifact.zig");
 const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 路径归一(Windows 反斜杠 vs JSON 转义)
 
 /// 给任意 allocator 加互斥视图。ArenaAllocator 只隔离自己的链表元数据，它增长时仍会
@@ -80,7 +82,7 @@ pub const MAX_TOOL_ERROR_PAYLOAD_BYTES_V1: usize = 1024 * 1024;
 /// 单个 tool 的执行决定 + 结果槽位。
 pub const Slot = struct {
     /// 权限决定:.run=执行,.denied=已被拒(content 已填错误 json,owned)。
-    decision: enum { run, denied },
+    decision: enum { run, denied, deferred },
     name: []const u8, // borrowed(指向 conversation 的 tool_use)
     id: []const u8, // borrowed
     input: []const u8, // borrowed
@@ -140,6 +142,97 @@ pub const Slot = struct {
         return c;
     }
 };
+
+/// What one turn's recovery-read planning decided (#40).
+pub const RecoveryPlan = struct {
+    /// `result_budget.recoveryAllowanceBytes`: half the turn budget.
+    allowance_bytes: usize,
+    /// `result_budget.recoveryReadCost`: what every ReadArtifact call is charged.
+    cost_bytes: usize,
+    /// Cost of the calls that will run; deferred calls are never charged.
+    charged_bytes: usize,
+    deferred_count: usize,
+};
+
+/// Decide, before anything executes, which `ReadArtifact` calls of this turn
+/// run and which are deferred. Slots are walked in order and each running
+/// call is charged its upper bound; once the allowance is spent every later
+/// call is marked `.deferred` (nothing else on the slot is touched). Doing this
+/// in slot order at the upper bound, ahead of any thread, keeps the outcome a
+/// pure function of the request: `ReadArtifact` results are projection-exempt
+/// (spilling one would recurse), so this is the only bound on what they cost,
+/// and provider-visible bytes must not depend on scheduling.
+pub fn planRecoveryAllowance(slots: []Slot, budget: result_budget.Budget) RecoveryPlan {
+    const allowance = result_budget.recoveryAllowanceBytes(budget);
+    const cost = result_budget.recoveryReadCost(budget);
+    var charged: usize = 0;
+    var deferred: usize = 0;
+    for (slots) |*slot| {
+        if (slot.decision != .run or !std.mem.eql(u8, slot.name, "ReadArtifact")) continue;
+        if (charged +| cost <= allowance) charged += cost else {
+            slot.decision = .deferred;
+            deferred += 1;
+        }
+    }
+    return .{ .allowance_bytes = allowance, .cost_bytes = cost, .charged_bytes = charged, .deferred_count = deferred };
+}
+
+/// The bounded body a deferred `ReadArtifact` call receives instead of data:
+/// the call's own artifact id and offset (so the model can resume exactly
+/// there next turn), the allowance, and what the served calls already cost.
+/// The id is untrusted model input and goes through the JSON encoder; every
+/// other field is a number or a fixed string, so the body cannot grow.
+pub fn renderRecoveryDeferral(allocator: std.mem.Allocator, input: []const u8, plan: RecoveryPlan, charged_before: usize) ![]u8 {
+    const req = try read_artifact.describeRequest(allocator, input);
+    defer req.deinit(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"error\":\"recovery_allowance_exhausted\",\"artifact_id\":");
+    if (req.artifact_id) |id| try std.json.Stringify.encodeJsonString(id, .{}, w) else try w.writeAll("null");
+    try w.print(
+        ",\"offset\":{d},\"allowance_bytes\":{d},\"charged_bytes\":{d}," ++
+            "\"hint\":\"the recovery allowance for this turn is spent; call ReadArtifact again from this offset in the next turn\"}}",
+        .{ req.offset, plan.allowance_bytes, charged_before },
+    );
+    return out.toOwnedSlice();
+}
+
+test "recovery planner defers in slot order" {
+    const b = result_budget.Budget{ .per_result_bytes = 25_000, .per_turn_bytes = 204_800 };
+    var slots: [9]Slot = undefined;
+    for (&slots, 0..) |*s, i| s.* = .{ .name = "ReadArtifact", .id = "", .input = "{}", .decision = if (i == 8) .denied else .run };
+    const p = planRecoveryAllowance(&slots, b);
+    try std.testing.expectEqual(@as(usize, 4), p.deferred_count);
+    try std.testing.expectEqual(@as(usize, 100_000), p.charged_bytes);
+    for (slots[0..4]) |s| try std.testing.expectEqual(.run, s.decision);
+    for (slots[4..8]) |s| try std.testing.expectEqual(.deferred, s.decision);
+    try std.testing.expectEqual(.denied, slots[8].decision);
+}
+
+test "renderRecoveryDeferral emits complete JSON" {
+    const a = std.testing.allocator;
+    const plan = RecoveryPlan{ .allowance_bytes = 102400, .cost_bytes = 25000, .charged_bytes = 100000, .deferred_count = 1 };
+    const id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const body = try renderRecoveryDeferral(a, "{\"artifact_id\":\"" ++ id ++ "\",\"offset\":4096}", plan, 100000);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(id, parsed.value.object.get("artifact_id").?.string);
+    try std.testing.expectEqual(@as(i64, 4096), parsed.value.object.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 102400), parsed.value.object.get("allowance_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 100000), parsed.value.object.get("charged_bytes").?.integer);
+}
+
+test "renderRecoveryDeferral escapes artifact id" {
+    const a = std.testing.allocator;
+    const plan = RecoveryPlan{ .allowance_bytes = 1, .cost_bytes = 1, .charged_bytes = 1, .deferred_count = 1 };
+    const body = try renderRecoveryDeferral(a, "{\"artifact_id\":\"a\\\\b\\\"c\"}", plan, 1);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a\\b\"c", parsed.value.object.get("artifact_id").?.string);
+}
 
 /// 一个并发 job 的输入(safe 批用)。
 const Job = struct {
@@ -1218,7 +1311,7 @@ pub fn executeSlots(
     var i: usize = 0;
     while (i < slots.len) {
         // denied(已填错误)或 prefetched(结果已由流式预取填好)→ 跳过,不执行。
-        if (slots[i].decision == .denied or slots[i].prefetched) {
+        if (slots[i].decision == .denied or slots[i].decision == .deferred or slots[i].prefetched) {
             // Prefetch execution is only knowledge-bearing after the main
             // permission path accepts the slot. Denied prefetched work is
             // deliberately invisible to the ledger.
