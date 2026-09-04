@@ -46,6 +46,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- MCP results above the frame limit, host stream tool artifacts and process-plugin
+  external spools (`ExternalSpool.seal`) are sealed during execution and published
+  only at the batch commit boundary, like native tool results since #45: a fatal
+  sibling in the same batch leaves no unreferenced blob in the CAS (#65). Bash's
+  stdout/stderr import and the AgentCore-side producers still publish during
+  execution and are tracked in #73.
+
 - The fingerprint refresh wrote its staging file with `Path.write_text(newline=)`,
   a Python 3.10 call, so every suite whose setUp repins failed on the macOS
   system python3 (3.9); it now uses `open(..., newline="\n")`, and the 82 test

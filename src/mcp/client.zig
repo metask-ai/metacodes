@@ -245,7 +245,7 @@ pub const McpClient = struct {
                 const result = response.result_json orelse "null";
                 if (result.len <= budget.per_result_bytes)
                     return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
-                return self.publishJsonResult(artifact_root, result) catch |err| {
+                return sealJsonResult(self.allocator, artifact_root, result) catch |err| {
                     // Keep a complete bounded result renderable when CAS publication fails.
                     if (!result_budget.retainInlineAfterFailedPublish(
                         err,
@@ -286,18 +286,6 @@ pub const McpClient = struct {
                 },
             }
         }
-    }
-
-    fn publishJsonResult(
-        self: *McpClient,
-        artifact_root: []const u8,
-        result: []const u8,
-    ) !ToolResultBody {
-        var spool = try artifact_store.Spool.begin(self.allocator, artifact_root);
-        defer spool.deinit();
-        try spool.write(result);
-        const completed = try spool.finish();
-        return ToolResultBody.fromCompletedSpool(completed, .json);
     }
 
     fn structuredMcpError(
@@ -442,4 +430,68 @@ test "McpClient: connect to nonexistent command fails clean" {
     } else |err| {
         try testing.expect(err == error.McpServerCrashed or err == error.McpMalformedResponse);
     }
+}
+
+/// An oversized JSON result, sealed but not published: the file is validated
+/// and its receipt fixed, and the agent loop publishes it at the batch commit
+/// boundary (#65). Before #65 this published during the call, so a fatal
+/// sibling in the same batch left an unreferenced blob in the CAS.
+fn sealJsonResult(
+    allocator: std.mem.Allocator,
+    artifact_root: []const u8,
+    result: []const u8,
+) !ToolResultBody {
+    var spool = try artifact_store.Spool.begin(allocator, artifact_root);
+    defer spool.deinit(); // a no-op once `seal` has taken the buffers
+    try spool.write(result);
+    const sealed = try spool.seal();
+    return .{ .sealed = .{
+        .spool = sealed,
+        .media_type = .json,
+        .capture_complete = true,
+    } };
+}
+
+fn testCountDirectory(allocator: std.mem.Allocator, directory: []const u8) !usize {
+    const pdir = @import("platform").dir;
+    const directory_z = try allocator.dupeZ(u8, directory);
+    defer allocator.free(directory_z);
+    var iterator = pdir.open(directory_z.ptr) orelse return 0;
+    defer pdir.close(&iterator);
+    var count: usize = 0;
+    while (pdir.next(&iterator)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        count += 1;
+    }
+    return count;
+}
+
+test "McpClient: an oversized result is sealed, not published, until the batch commits (#65)" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &b);
+    const root = b[0..n];
+    const cas = try std.fmt.allocPrint(a, "{s}/tool-results/sha256", .{root});
+    defer a.free(cas);
+    const result = "{\"rows\":[" ++ ("{\"k\":\"vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv\"}," ** 64) ++ "null]}";
+
+    var body = try sealJsonResult(a, root, result);
+    defer body.deinit(a);
+    try testing.expect(body == .sealed);
+    try testing.expect(body.sealed.media_type == .json);
+    try testing.expectEqual(@as(usize, 0), try testCountDirectory(a, cas));
+    var before = try body.render(a);
+    defer before.deinit(a);
+    var sealed = body.takeSealed().?;
+    defer sealed.spool.deinit();
+    const completed = try sealed.spool.publish();
+    try testing.expectEqual(@as(usize, 1), try testCountDirectory(a, cas));
+    try testing.expectEqual(@as(u64, result.len), completed.receipt.bytes);
+    // The envelope the model saw before publication names the blob that exists after it.
+    try testing.expect(std.mem.indexOf(u8, before.bytes, completed.receipt.id()) != null);
+    var chunk = try artifact_store.readChunk(a, root, completed.receipt.id(), 0, 8);
+    defer chunk.deinit();
+    try testing.expectEqualSlices(u8, result[0..8], chunk.bytes);
 }

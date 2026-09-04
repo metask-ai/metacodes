@@ -569,10 +569,11 @@ pub const Selection = struct {
                 switch (outcome) {
                     .artifact => |media_type| {
                         try stream_state.requireHealthy();
-                        return .{ .ok = tool_result.ToolResultBody.fromCompletedSpool(
-                            try spool.finish(),
-                            media_type,
-                        ) };
+                        return .{ .ok = .{ .sealed = .{
+                            .spool = try spool.seal(),
+                            .media_type = media_type,
+                            .capture_complete = true,
+                        } } };
                     },
                     .failed => |maybe| {
                         const detail = try copyDetail(tool_ctx.allocator, maybe);
@@ -1046,6 +1047,22 @@ test "Host sync boundary rejects invalid UTF-8 and oversized legacy buffers befo
     try std.testing.expectEqual(@as(usize, 1), invalid_failure.releases);
 }
 
+/// Blobs installed under `<root>/tool-results/sha256`, for the tests that pin
+/// when a Host stream result reaches the CAS.
+fn countArtifacts(allocator: std.mem.Allocator, root: []const u8) !usize {
+    const pdir = @import("platform").dir;
+    const directory_z = try std.fmt.allocPrintSentinel(allocator, "{s}/tool-results/sha256", .{root}, 0);
+    defer allocator.free(directory_z);
+    var iterator = pdir.open(directory_z.ptr) orelse return 0;
+    defer pdir.close(&iterator);
+    var count: usize = 0;
+    while (pdir.next(&iterator)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        count += 1;
+    }
+    return count;
+}
+
 test "Host stream entry writes byte zero into CAS and returns no full inline buffer" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1074,15 +1091,23 @@ test "Host stream entry writes byte zero into CAS and returns no full inline buf
     var outcome = try tools.dispatch(&ctx, "HostStream", "{}");
     defer outcome.deinit(allocator);
     try std.testing.expect(outcome == .ok);
-    try std.testing.expect(outcome.ok == .artifact);
-    try std.testing.expectEqual(@as(u64, payload_bytes), outcome.ok.artifact.stored.bytes);
+    try std.testing.expect(outcome.ok == .sealed);
+    // Nothing reached the CAS while the Host streamed (#65): the handle is
+    // sealed, and only its publication, which the loop performs at the batch
+    // commit boundary, installs the blob.
+    try std.testing.expectEqual(@as(usize, 0), try countArtifacts(allocator, root));
+    var sealed = outcome.ok.takeSealed().?;
+    defer sealed.spool.deinit();
+    const completed = try sealed.spool.publish();
+    try std.testing.expectEqual(@as(usize, 1), try countArtifacts(allocator, root));
+    try std.testing.expectEqual(@as(u64, payload_bytes), completed.receipt.bytes);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expect(probe.writes > 1);
     try std.testing.expectEqual(@as(usize, 64 * 1024), probe.max_chunk_bytes);
     var recovered = try artifact_store.readChunk(
         allocator,
         root,
-        outcome.ok.artifact.stored.id(),
+        completed.receipt.id(),
         0,
         32,
     );
@@ -1232,8 +1257,8 @@ test "Host stream equal bytes render cache-stable envelopes across artifact root
     defer first.deinit(allocator);
     var second = try tools.dispatch(&second_ctx, "HostStream", "{}");
     defer second.deinit(allocator);
-    try std.testing.expect(first == .ok and first.ok == .artifact);
-    try std.testing.expect(second == .ok and second.ok == .artifact);
+    try std.testing.expect(first == .ok and first.ok == .sealed);
+    try std.testing.expect(second == .ok and second.ok == .sealed);
     var first_rendered = try first.ok.render(allocator);
     defer first_rendered.deinit(allocator);
     var second_rendered = try second.ok.render(allocator);
