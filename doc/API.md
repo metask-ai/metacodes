@@ -126,7 +126,15 @@ promise: the HTTP endpoint shapes remain pre-1.0.
 ## CLI surface
 
 `metacodes --help` enumerates the current flag set and is the authoritative
-pre-1.0 surface; `metacodes --version` prints `metacodes <semver>`. The flag
+pre-1.0 surface; `metacodes --version` prints `metacodes <semver>` as its first
+line, then the build identity (commit and dirty state, Zig, target and
+optimize mode, AgentCore ABI revision, config schema, the ripgrep and TinyKG
+versions with the digests the vendored manifests pin for the target, layout).
+`metacodes --version --json` prints that identity as one JSON document:
+`{name, version, commit, dirty, zig, target, optimize, release_layout,
+contract: {binary_abi_version, binary_abi_revision, config_schema_version},
+expected_runtime_assets: [{name, version, sha256}]}`, where `sha256` is null
+when the vendored bundle has no artifact for the target. The flag
 surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
 harnesses pass treatment configuration through this surface. Headless

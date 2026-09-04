@@ -10,6 +10,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- `metacodes --version` prints the build identity after its unchanged first
+  line, and `--version --json` emits it as one document: commit and dirty
+  state, Zig, target, optimize mode, release layout, AgentCore ABI version and
+  revision, config schema version, and the ripgrep / TinyKG versions with the
+  digests pinned for the target. `build.zig` fixes every value at configure
+  time from its source (`-Dbuild-commit` names the commit for an exported
+  tree; `-Drelease-layout` records the layout), and the runtime smoke checks
+  the document against `sdk/zig/types.zig` and the vendored manifests with
+  the real binary (#78, #47 stage 3).
+
 ### Changed
 
 - The default `zig build` installs only the release executable and the TinyKG

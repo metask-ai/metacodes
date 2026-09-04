@@ -16,6 +16,8 @@ const oauth_exchange_mod = @import("api/oauth_exchange.zig");
 const catalog_mod = @import("api/catalog.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const provider_ids_mod = @import("provider/ids.zig");
+const version_info = @import("version_info.zig");
+const build_options = @import("build_info");
 
 pub const VERSION = @import("version.zig").semver;
 
@@ -483,7 +485,18 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (config.show_version) {
-        dumpWrite("metacodes " ++ VERSION ++ "\n");
+        // `--json` is the headless output flag; with `--version` it selects the
+        // build identity document (doc/API.md, CLI surface).
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const info = version_info.BuildInfo.fromOptions(build_options);
+        const render: *const fn (*std.Io.Writer, []const u8, version_info.BuildInfo) std.Io.Writer.Error!void =
+            if (config.json_output) version_info.writeJson else version_info.writeText;
+        render(&out.writer, VERSION, info) catch |err| {
+            std.debug.print("error: cannot render --version ({s})\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        dumpWrite(out.written());
         return;
     }
 
@@ -2234,7 +2247,7 @@ fn printHelp() void {
     std.debug.print(
         \\metacodes — embeddable agent core and coding CLI
         \\Usage: metacodes [options]
-        \\  --version             Print version and exit
+        \\  --version             Print version and build identity and exit (--json: one JSON document)
         \\  -p, --print <prompt>  Headless: run one prompt and exit (no REPL)
         \\  -                     Headless: read prompt from stdin
         \\  --json                Headless: emit NDJSON result event
