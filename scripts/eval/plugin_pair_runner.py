@@ -496,7 +496,8 @@ def _write_private_json(path: Path, value: Mapping[str, Any]) -> None:
     commitment, and silently replacing one is how a run ends up bound to a
     manifest nobody looked at."""
     fd = os.open(path, O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    # The manifest is hashed by bytes, so its trailing newline must stay LF on Windows.
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(stable_json(value) + "\n")
 
 

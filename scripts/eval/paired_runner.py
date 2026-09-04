@@ -154,7 +154,7 @@ def interpreter_shim(env: Mapping[str, str]) -> Iterator[Dict[str, str]]:
     with tempfile.TemporaryDirectory(prefix="metacodes-eval-python-") as shim:
         launcher = os.path.join(shim, "python3")
         try:
-            with open(launcher, "w", encoding="utf-8") as handle:
+            with open(launcher, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write("#!/bin/sh\nexec " + _shell_quote(executable) + ' "$@"\n')
             os.chmod(launcher, 0o700)
         except OSError as exc:
