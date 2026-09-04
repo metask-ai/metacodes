@@ -1913,7 +1913,7 @@ test "L2 (#33): a commit that lacks a credential names /login only for an OAuth-
     const picker_host = cc.repl_picker_host;
     const pointer = picker_host.missingCredentialPointer(host, relay_offer orelse return error.RelayOfferMissing) orelse
         return error.PointerMissing;
-    try std.testing.expectEqualStrings("relay", pointer);
+    try std.testing.expectEqualStrings("relay", pointer.slice());
     // A key-only provider has no login to point at; the plain error stands.
     try std.testing.expect(picker_host.missingCredentialPointer(host, keyonly_offer orelse return error.KeyonlyOfferMissing) == null);
 }
