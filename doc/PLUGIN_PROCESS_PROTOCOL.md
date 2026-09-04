@@ -53,8 +53,8 @@ the OS already grants the executable. A future sandbox capability must be a
 separate, measured security boundary.
 
 Loading channels are repeatable CLI `--process-plugin-dir`, source-level Zig
-`AgentRuntime.process_plugins`, and AgentCore ABI revision 13
-`runtime_create_with_plugins`. The AgentCore descriptor requires an absolute
+`AgentRuntime.process_plugins`, and AgentCore ABI revision 15
+`runtime->create(..., plugins, ...)`. The AgentCore descriptor requires an absolute
 root, one explicit layer, at most 64 sources, and zero reserved fields. All
 three channels converge on the same transactional immutable snapshot and
 executor; none is a second AgentLoop.

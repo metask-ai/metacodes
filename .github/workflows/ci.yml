@@ -167,6 +167,11 @@ jobs:
       - name: Documentation link check
         if: runner.os == 'Linux'
         run: python3 scripts/check_doc_links.py
+      - name: Documentation fact check
+        if: runner.os == 'Linux'
+        run: python3 scripts/check_doc_facts.py
+      - name: Documentation fact-check unit tests
+        run: python3 -m unittest scripts.tests.test_check_doc_facts -v
 
   windows-gates:
     name: Gates (Windows)
