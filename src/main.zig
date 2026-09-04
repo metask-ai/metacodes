@@ -10,6 +10,7 @@ const repl = @import("repl/loop.zig");
 const auth = @import("core/auth.zig");
 const api_keys_mod = @import("api/api_keys.zig");
 const oauth_login = @import("api/oauth_login.zig");
+const provider_login = @import("api/provider_login.zig");
 const metask_oauth_mod = @import("api/metask_oauth.zig");
 const oauth_exchange_mod = @import("api/oauth_exchange.zig");
 const catalog_mod = @import("api/catalog.zig");
@@ -47,6 +48,7 @@ pub const provider_metask_ledger = @import("provider/metask_ledger.zig");
 pub const kg_provider_audit = @import("kg/provider_audit.zig");
 pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_oauth_login = @import("api/oauth_login.zig");
+pub const api_provider_login = @import("api/provider_login.zig");
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
 pub const api_catalog_fetch = @import("api/catalog_fetch.zig");
 pub const api_capability = @import("api/capability.zig");
@@ -1422,39 +1424,27 @@ fn storeProviderOAuthToken(
     return loginProviderWithTokenResponse(allocator, built, text, explicit_client_id);
 }
 
-/// True when at least one credential kind this profile accepts is an OAuth
-/// kind — which is the only case in which a stored OAuth login is ever
-/// consulted. Credential resolution opens the OAuth session for those kinds
-/// and no others, so a login stored for a profile that accepts none is a
-/// success message followed by silence.
-fn providerServesOAuth(built: *const provider_profile.ProviderProfile) bool {
-    for (built.accepted_credential_kinds) |kind| {
-        if (provider_oauth.servesKind(kind)) return true;
-    }
-    return false;
-}
-
 /// Refuse, with the reason, a provider whose stored login could never be used.
 /// Both login paths ask this before doing anything the user would have to
 /// undo — the token-JSON import before it writes, the interactive flow before
-/// it sends anyone to a browser.
+/// it sends anyone to a browser. The decision is `provider_login`'s; this
+/// only prints it.
 fn requireOAuthCapableProvider(built: *const provider_profile.ProviderProfile) bool {
-    if (built.oauth_token_url == null) {
-        std.debug.print(
-            "error: provider '{s}' declares no OAuth token endpoint\n",
-            .{built.id.slice()},
-        );
+    provider_login.requireOAuthCapable(built) catch |err| {
+        switch (err) {
+            error.ProviderHasNoTokenEndpoint => std.debug.print(
+                "error: provider '{s}' declares no OAuth token endpoint\n",
+                .{built.id.slice()},
+            ),
+            error.ProviderAcceptsNoOAuthKind => std.debug.print(
+                "error: provider '{s}' accepts no OAuth credential kind; " ++
+                    "a stored login would never be consulted. Declare one under " ++
+                    "credential_kinds (e.g. \"openai_oauth\") for a configured provider.\n",
+                .{built.id.slice()},
+            ),
+        }
         return false;
-    }
-    if (!providerServesOAuth(built)) {
-        std.debug.print(
-            "error: provider '{s}' accepts no OAuth credential kind; " ++
-                "a stored login would never be consulted. Declare one under " ++
-                "credential_kinds (e.g. \"openai_oauth\") for a configured provider.\n",
-            .{built.id.slice()},
-        );
-        return false;
-    }
+    };
     return true;
 }
 
@@ -1578,115 +1568,124 @@ fn runProviderOAuthLogin(
         std.debug.print("error: unknown provider '{s}'\n", .{provider_name});
         return 2;
     };
-    if (!requireOAuthCapableProvider(built)) return 2;
-    // Checked above; unwrapped here so the flow gets a plain URL.
-    const token_url = built.oauth_token_url.?;
-    // A profile with no authorization or device endpoint has no interactive
-    // flow to run; say so instead of failing later at a null URL.
-    const endpoint_declared = switch (options.method) {
-        .loopback => built.oauth_authorize_url != null,
-        .device_code => built.oauth_device_authorization_url != null,
-    };
-    if (!endpoint_declared) {
-        std.debug.print(
-            "error: provider '{s}' declares no {s} endpoint; " ++
-                "use `metacodes login --provider {s} --oauth-token-json <file>`\n",
-            .{
-                built.id.slice(),
-                switch (options.method) {
-                    .loopback => "OAuth authorization",
-                    .device_code => "device authorization",
-                },
-                built.id.slice(),
-            },
-        );
-        return 2;
-    }
-    const client_id = options.client_id orelse built.oauth_client_id orelse {
-        std.debug.print(
-            "error: provider '{s}' declares no OAuth client id; " ++
-                "pass --client-id <client>\n" ++
-                "(a provider defined under custom_providers can declare " ++
-                "oauth.client_id instead, and it is then used for refresh too)\n",
-            .{built.id.slice()},
-        );
-        return 2;
-    };
-
-    const token_json = oauth_login.acquireFirstToken(allocator, io, .{
-        .token_url = token_url,
-        .authorize_url = built.oauth_authorize_url,
-        .device_authorization_url = built.oauth_device_authorization_url,
-        .client_id = client_id,
-        .scope = built.oauth_scope,
-    }, .{
+    // Every refusal is decided in the kernel before anything is contacted;
+    // this only says which one, in the words the CLI has always used.
+    const prepared = provider_login.prepareProfile(built, .{
         .method = options.method,
         .open_browser = options.open_browser,
-        .notify = oauth_login.stderrNotify(),
-    }) catch |err| {
-        std.debug.print("error: OAuth login failed ({s})\n", .{@errorName(err)});
-        return 1;
+        .client_id = options.client_id,
+    }) catch |err| switch (err) {
+        error.ProviderHasNoTokenEndpoint, error.ProviderAcceptsNoOAuthKind => {
+            _ = requireOAuthCapableProvider(built);
+            return 2;
+        },
+        error.FlowUnavailable => {
+            std.debug.print(
+                "error: provider '{s}' declares no {s} endpoint; " ++
+                    "use `metacodes login --provider {s} --oauth-token-json <file>`\n",
+                .{
+                    built.id.slice(),
+                    switch (options.method) {
+                        .loopback => "OAuth authorization",
+                        .device_code => "device authorization",
+                    },
+                    built.id.slice(),
+                },
+            );
+            return 2;
+        },
+        error.ClientIdMissing => {
+            std.debug.print(
+                "error: provider '{s}' declares no OAuth client id; " ++
+                    "pass --client-id <client>\n" ++
+                    "(a provider defined under custom_providers can declare " ++
+                    "oauth.client_id instead, and it is then used for refresh too)\n",
+                .{built.id.slice()},
+            );
+            return 2;
+        },
     };
-    defer {
-        std.crypto.secureZero(u8, token_json);
-        allocator.free(token_json);
-    }
 
-    return importProviderTokenResponse(allocator, built.id, token_json, client_id);
+    var diagnostic: provider_login.ImportDiagnostic = .{};
+    _ = prepared.run(allocator, io, oauth_login.stderrNotify(), &diagnostic) catch |err| switch (err) {
+        error.InvalidTokenResponse,
+        error.MissingRefreshToken,
+        error.MetaskGatewayMissing,
+        error.MetaskGatewayNotOrigin,
+        error.StoreOpenFailed,
+        error.ClientRecordFailed,
+        error.TokenStoreFailed,
+        => |import_err| return reportImportFailure(@errorCast(import_err), diagnostic),
+        else => {
+            std.debug.print("error: OAuth login failed ({s})\n", .{@errorName(err)});
+            return 1;
+        },
+    };
+    std.debug.print(
+        "Stored an OAuth login for provider '{s}'. No secret was printed.\n",
+        .{built.id.slice()},
+    );
+    return 0;
 }
 
-/// The one durable import both provider login paths end in. Keeping it single
-/// is what makes "logged in interactively" and "imported a token response"
-/// indistinguishable to everything downstream.
+/// The one durable import both provider login paths end in
+/// (`provider_login.importTokenResponse`). Keeping it single is what makes
+/// "logged in interactively" and "imported a token response" indistinguishable
+/// to everything downstream; this only reports the outcome.
 fn importProviderTokenResponse(
     allocator: std.mem.Allocator,
     provider_id: provider_ids.Slug,
     token_json: []const u8,
     client_id: ?[]const u8,
 ) u8 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const outcome = provider_oauth.parseTokenResponse(arena.allocator(), token_json) catch |err| {
-        std.debug.print("error: the token endpoint did not return a token response ({s})\n", .{@errorName(err)});
-        return 1;
-    };
-    if (outcome.refresh_token == null) {
-        std.debug.print("error: the token response carries no refresh_token; it could never be refreshed\n", .{});
-        return 1;
-    }
-    if (provider_id.eqlText("metask")) {
-        if (outcome.gateway_url == null or outcome.models_url == null) {
-            std.debug.print("error: the Metask token response must include gateway_url and models_url\n", .{});
-            return 1;
-        }
-        if (!metask_oauth_mod.isGatewayOrigin(outcome.gateway_url.?)) {
-            std.debug.print("error: Metask gateway_url must be an http(s) origin (no /v1 path)\n", .{});
-            return 1;
-        }
-    }
-
-    var session = provider_oauth.Session.initHome(allocator, provider_id) catch |err| {
-        std.debug.print("error: could not open the OAuth store ({s})\n", .{@errorName(err)});
-        return 2;
-    };
-    defer session.deinit();
-    // Recorded before the import so it lands in the same atomic write as the
-    // tokens: a refresh that presents a different client is rejected outright.
-    // Metask's JSON refresh grant is bound to the authorization and expressly
-    // omits client_id; other provider profiles retain their registered client.
-    session.setClientId(if (provider_id.eqlText("metask")) null else client_id) catch |err| {
-        std.debug.print("error: could not record the OAuth client ({s})\n", .{@errorName(err)});
-        return 2;
-    };
-    session.importOutcome(outcome, @import("util/time.zig").nowUnix()) catch |err| {
-        std.debug.print("error: could not store the token ({s})\n", .{@errorName(err)});
-        return 2;
-    };
+    var diagnostic: provider_login.ImportDiagnostic = .{};
+    provider_login.importTokenResponse(allocator, provider_id, token_json, client_id, &diagnostic) catch |err|
+        return reportImportFailure(err, diagnostic);
     std.debug.print(
         "Stored an OAuth login for provider '{s}'. No secret was printed.\n",
         .{provider_id.slice()},
     );
     return 0;
+}
+
+/// The import's refusal in the words the CLI has always used, with the exit
+/// code it has always returned: 1 for a token response that cannot be used,
+/// 2 for a store that could not be written.
+fn reportImportFailure(err: provider_login.ImportError, diagnostic: provider_login.ImportDiagnostic) u8 {
+    switch (err) {
+        error.InvalidTokenResponse => {
+            std.debug.print("error: the token endpoint did not return a token response ({s})\n", .{causeName(diagnostic)});
+            return 1;
+        },
+        error.MissingRefreshToken => {
+            std.debug.print("error: the token response carries no refresh_token; it could never be refreshed\n", .{});
+            return 1;
+        },
+        error.MetaskGatewayMissing => {
+            std.debug.print("error: the Metask token response must include gateway_url and models_url\n", .{});
+            return 1;
+        },
+        error.MetaskGatewayNotOrigin => {
+            std.debug.print("error: Metask gateway_url must be an http(s) origin (no /v1 path)\n", .{});
+            return 1;
+        },
+        error.StoreOpenFailed => {
+            std.debug.print("error: could not open the OAuth store ({s})\n", .{causeName(diagnostic)});
+            return 2;
+        },
+        error.ClientRecordFailed => {
+            std.debug.print("error: could not record the OAuth client ({s})\n", .{causeName(diagnostic)});
+            return 2;
+        },
+        error.TokenStoreFailed => {
+            std.debug.print("error: could not store the token ({s})\n", .{causeName(diagnostic)});
+            return 2;
+        },
+    }
+}
+
+fn causeName(diagnostic: provider_login.ImportDiagnostic) []const u8 {
+    return if (diagnostic.cause) |cause| @errorName(cause) else "unknown";
 }
 
 /// Set once the configuration warning has been shown.

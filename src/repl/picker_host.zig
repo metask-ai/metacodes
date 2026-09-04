@@ -11,6 +11,8 @@ const app_mod = @import("../app.zig");
 const ui_state = @import("tui/ui_state.zig");
 const picker_mod = @import("model_picker.zig");
 const view_mod = @import("model_picker_view.zig");
+const provider_login = @import("../api/provider_login.zig");
+const provider_host_mod = @import("../provider/host.zig");
 
 pub const Key = picker_mod.Key;
 
@@ -74,6 +76,15 @@ pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key) Result {
 
 fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Result {
     const outcome = app.commitModelSelection(commit) catch |err| {
+        // issue #33: the route resolved; what is missing is a credential for
+        // its provider. When the provider can be signed in to, say how.
+        if (err == error.MissingCredentials) {
+            const host = app.providerHost() catch null;
+            if (host) |value| if (missingCredentialPointer(value, commit.offer_id)) |provider| {
+                app.model_picker.setNotice("no credential for {s}; sign in with /login {s}; the previous route is still active", .{ provider, provider });
+                return .redraw;
+            };
+        }
         app.model_picker.setNotice("switch failed ({s}); the previous route is still active", .{@errorName(err)});
         return .redraw;
     };
@@ -109,6 +120,17 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Re
             return .redraw;
         },
     }
+}
+
+/// The provider to name in a `/login` pointer when a commit failed for want of
+/// a credential: the offer's provider, if a login could be stored for it at all
+/// (`provider_login.requireOAuthCapable`). Null means the notice has nothing
+/// better than the error to say.
+pub fn missingCredentialPointer(host: *provider_host_mod.Host, offer_id: ids_mod.OfferId) ?[]const u8 {
+    const offer = host.kernel.catalogSnapshot().find(offer_id) orelse return null;
+    const profile = host.registry.findById(offer.provider_id) orelse return null;
+    provider_login.requireOAuthCapable(profile) catch return null;
+    return profile.id.slice();
 }
 
 fn rejectionText(outcome: @import("../provider/control_plane.zig").ValidationOutcome) []const u8 {

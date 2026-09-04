@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- `/login <provider> [--device-code] [--no-browser] [--client-id <client>]`
+  in the REPL runs the kernel OAuth flow and stores the login where
+  `metacodes login --provider` does. Both entry points share
+  `src/api/provider_login.zig`: `prepareProfile` makes every refusal a typed
+  error before anything is contacted, `Prepared.run` runs the grant and the
+  one durable import. A picker commit that fails for want of a credential on
+  an OAuth-capable provider now names `/login <provider>` (#33; the picker's
+  own credential stage and the built-in OpenAI client id are #67).
+
 - Metask now has a JSON device-code OAuth provider (`login --provider metask`)
   with rotating refresh-token persistence, gateway-derived model routing for
   Anthropic Messages and OpenAI Chat, one-shot replay for pre-stream

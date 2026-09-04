@@ -334,6 +334,9 @@ pub const App = struct {
     // **注:此分区是注释级"地图"(未来真拆分的指引),非编译器 enforced 边界——
     //   加字段时自觉归对区。真拆 struct 时才需 enforcement。**
     conversation: Conversation,
+    /// The I/O runtime the process runs on; shared with every client and the
+    /// kernel flows a command runs inline (`/login`, issue #33).
+    io: std.Io,
     api_client: client_mod.Client,
     /// OpenAI 后端(config.provider_kind==.openai 时非 null)。与 api_client 二选一:
     /// provider() 据 config.provider_kind 选哪个的 .provider()。**core/UI 只见 App.provider()
@@ -498,6 +501,7 @@ pub const App = struct {
                 @import("core/session_id.zig").gen(),
             .conversation = Conversation.init(allocator),
             .file_change_journal = @import("core/file_change.zig").Journal.init(std.heap.c_allocator),
+            .io = io,
             .api_client = client_mod.Client.initWithBaseUrl(allocator, io, api_key, config.model, config.base_url),
             .tool_defs = &.{}, // 占位，下面重建
             .permission_ctx = permission_mod.createContext(config.permission_mode, allocator),

@@ -18,6 +18,7 @@ const ppaths = @import("platform").paths;
 const net = @import("platform").net;
 
 const oauth_login = cc.api_oauth_login;
+const provider_login = cc.api_provider_login;
 const provider_oauth = cc.provider_oauth;
 
 /// Collects what the flow tells the user. Load-bearing, not decoration: the
@@ -486,4 +487,149 @@ test "L2 provider login: a configured provider declares its own OAuth endpoints"
         \\  "oauth":{"authorize_url":"https://relay.invalid/authorize"}
         \\}}}
     ));
+}
+
+const InteractiveRun = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    host: *cc.provider_host.Host,
+    notify: oauth_login.Notify,
+    result: ?(anyerror!provider_login.Outcome) = null,
+
+    fn run(self: *InteractiveRun) void {
+        self.result = provider_login.loginInteractive(self.allocator, self.io, self.host, "relay", .{
+            .method = .loopback,
+            .open_browser = false,
+            .port = 0,
+            .client_id = "explicit-client",
+        }, self.notify);
+    }
+};
+
+fn expectNoLogin(allocator: std.mem.Allocator, comptime id: []const u8) !void {
+    var session = try provider_oauth.Session.initHome(allocator, cc.provider_ids.Slug.lit(id));
+    defer session.deinit();
+    try std.testing.expect(!(try session.load()));
+}
+
+test "loginInteractive persists the login and reports through the notify sink" {
+    // The kernel entry point a front end invokes: the same loopback grant the
+    // CLI runs, ending in the same durable import, with the instructions
+    // delivered through the caller's sink rather than stderr.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const oauth_dir = try a.dupeZ(u8, root_buffer[0..root_len]);
+    defer a.free(oauth_dir);
+    ppaths.setEnv("METACODES_OAUTH_DIR", oauth_dir.ptr);
+    defer ppaths.unsetEnv("METACODES_OAUTH_DIR");
+
+    var token_server = try harness.MockServer.start(
+        \\{"access_token":"relay-access","refresh_token":"relay-refresh","token_type":"Bearer","expires_in":3600}
+    , 0);
+    defer token_server.stop();
+    const definition = try std.fmt.allocPrint(a,
+        \\{{"custom_providers":{{"relay":{{
+        \\  "models":[{{"request_model_id":"m","display_name":"M"}}],
+        \\  "channels":[{{"id":"default","base_url":"https://relay.invalid/v1","protocol":"openai_chat"}}],
+        \\  "credential_kinds":["openai_oauth"],
+        \\  "oauth":{{"token_url":"http://127.0.0.1:{d}/oauth/token","authorize_url":"http://127.0.0.1:1/authorize","client_id":"relay-cli","scope":"offline"}}
+        \\}}}}}}
+    , .{token_server.port});
+    defer a.free(definition);
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+    try host.adoptCustomProviders(definition);
+
+    var instructions = Instructions{ .allocator = a };
+    defer instructions.deinit();
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var run = InteractiveRun{ .allocator = a, .io = io_runtime.io(), .host = host, .notify = instructions.notify() };
+    var thread = try std.Thread.spawn(.{}, InteractiveRun.run, .{&run});
+    if (!instructions.wait()) return error.FlowNeverPublishedInstructions;
+    const port = try instructions.callbackPort();
+    const state = try instructions.stateValue();
+    const query = try std.fmt.allocPrint(a, "code=auth-code-7&state={s}", .{state});
+    defer a.free(query);
+    try deliverCallback(port, query);
+    thread.join();
+
+    const outcome = try (run.result orelse return error.FlowDidNotRun);
+    try std.testing.expect(outcome.client_id_source == .explicit);
+    try std.testing.expect(outcome.provider_id.eqlText("relay"));
+    // The sink, not stderr, carried the authorization URL.
+    try std.testing.expect(std.mem.indexOf(u8, instructions.buffer.items, "http://127.0.0.1:1/authorize") != null);
+    // The explicit client reached the token request, not the declared one.
+    const exchanged = token_server.lastRequest() orelse return error.NoTokenRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, exchanged.body(), "client_id=explicit-client") != null);
+    // The durable import both login paths end in.
+    var reloaded = try provider_oauth.Session.initHome(a, cc.provider_ids.Slug.lit("relay"));
+    defer reloaded.deinit();
+    try std.testing.expect(try reloaded.load());
+    try std.testing.expectEqualStrings("relay-access", reloaded.tokens.?.access_token);
+    try std.testing.expectEqualStrings("explicit-client", reloaded.client_id.?);
+}
+
+test "loginInteractive fails closed with typed errors and persists nothing" {
+    // Every refusal happens before a request is made and before anything is
+    // written, and each has its own error so a front end can say why.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const oauth_dir = try a.dupeZ(u8, root_buffer[0..root_len]);
+    defer a.free(oauth_dir);
+    ppaths.setEnv("METACODES_OAUTH_DIR", oauth_dir.ptr);
+    defer ppaths.unsetEnv("METACODES_OAUTH_DIR");
+
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+    try host.adoptCustomProviders(
+        \\{"custom_providers":{"relay":{
+        \\  "models":[{"request_model_id":"m","display_name":"M"}],
+        \\  "channels":[{"id":"default","base_url":"https://relay.invalid/v1","protocol":"openai_chat"}],
+        \\  "credential_kinds":["openai_oauth"],
+        \\  "oauth":{"token_url":"https://relay.invalid/token","authorize_url":"https://relay.invalid/authorize","client_id":"relay-cli"}
+        \\},"keyonly":{
+        \\  "models":[{"request_model_id":"m","display_name":"M"}],
+        \\  "channels":[{"id":"default","base_url":"https://keyonly.invalid/v1","protocol":"openai_chat"}],
+        \\  "credential_kinds":["api_key"]
+        \\}}}
+    );
+    var quiet = Instructions{ .allocator = a };
+    defer quiet.deinit();
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+    const no_browser: provider_login.Options = .{ .open_browser = false, .port = 0 };
+
+    try std.testing.expectError(error.UnknownProvider, provider_login.loginInteractive(a, io, host, "nope", no_browser, quiet.notify()));
+    try std.testing.expectError(error.ProviderHasNoTokenEndpoint, provider_login.loginInteractive(a, io, host, "keyonly", no_browser, quiet.notify()));
+    try std.testing.expectError(error.FlowUnavailable, provider_login.loginInteractive(a, io, host, "relay", .{ .method = .device_code, .open_browser = false, .port = 0 }, quiet.notify()));
+    // The built-in openai profile declares no client id (an owner decision):
+    // without --client-id the flow must not even start.
+    try std.testing.expectError(error.ClientIdMissing, provider_login.loginInteractive(a, io, host, "openai", no_browser, quiet.notify()));
+    // A profile with a token endpoint but no OAuth credential kind is refused
+    // by the same shared decision the `--oauth-token-json` path uses.
+    const Slug = cc.provider_ids.Slug;
+    const key_only = cc.provider_profile.ProviderProfile{
+        .id = Slug.lit("keyonly2"),
+        .implementation_id = Slug.lit("keyonly2"),
+        .display_name = "Key only",
+        .channels = &.{},
+        .accepted_credential_kinds = &.{.api_key},
+        .oauth_token_url = "https://example.invalid/token",
+    };
+    try std.testing.expectError(error.ProviderAcceptsNoOAuthKind, provider_login.requireOAuthCapable(&key_only));
+
+    // Nothing reached the sink and nothing was persisted.
+    try std.testing.expectEqual(@as(usize, 0), quiet.buffer.items.len);
+    try expectNoLogin(a, "nope");
+    try expectNoLogin(a, "keyonly");
+    try expectNoLogin(a, "relay");
+    try expectNoLogin(a, "openai");
 }

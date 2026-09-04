@@ -1884,3 +1884,36 @@ test "L2: a `--provider` startup route is a resolvable selection before any comm
     try std.testing.expect(profile.id.eqlText("openai"));
     try std.testing.expect(profile.oauth_token_url != null);
 }
+
+test "L2 (#33): a commit that lacks a credential names /login only for an OAuth-capable provider" {
+    // The picker's failure notice is the one place a user who picked a route
+    // without a credential learns there is a way in. The pointer is decided
+    // from the provider profile, not from error text.
+    const a = std.testing.allocator;
+    const host = try cc.provider_host.Host.create(a);
+    defer host.destroy();
+    try host.adoptCustomProviders(
+        \\{"custom_providers":{"relay":{
+        \\  "models":[{"request_model_id":"m","display_name":"M"}],
+        \\  "channels":[{"id":"default","base_url":"https://relay.invalid/v1","protocol":"openai_chat"}],
+        \\  "credential_kinds":["openai_oauth"],
+        \\  "oauth":{"token_url":"https://relay.invalid/token","authorize_url":"https://relay.invalid/authorize","client_id":"relay-cli"}
+        \\},"keyonly":{
+        \\  "models":[{"request_model_id":"m","display_name":"M"}],
+        \\  "channels":[{"id":"default","base_url":"https://keyonly.invalid/v1","protocol":"openai_chat"}],
+        \\  "credential_kinds":["api_key"]
+        \\}}}
+    );
+    var relay_offer: ?cc.provider_ids.OfferId = null;
+    var keyonly_offer: ?cc.provider_ids.OfferId = null;
+    for (host.kernel.catalogSnapshot().items()) |offer| {
+        if (offer.provider_id.eqlText("relay")) relay_offer = offer.offer_id;
+        if (offer.provider_id.eqlText("keyonly")) keyonly_offer = offer.offer_id;
+    }
+    const picker_host = cc.repl_picker_host;
+    const pointer = picker_host.missingCredentialPointer(host, relay_offer orelse return error.RelayOfferMissing) orelse
+        return error.PointerMissing;
+    try std.testing.expectEqualStrings("relay", pointer);
+    // A key-only provider has no login to point at; the plain error stands.
+    try std.testing.expect(picker_host.missingCredentialPointer(host, keyonly_offer orelse return error.KeyonlyOfferMissing) == null);
+}

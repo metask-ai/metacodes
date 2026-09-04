@@ -79,7 +79,9 @@ Interactive surfaces: `Ctrl+O` and `/model` open the route picker (transcript
 viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
 and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
 names a route (`pin`, `float`, `use`, `remove`); `/models` still selects the
-account key.
+account key; `/login <id> [--device-code] [--no-browser] [--client-id <client>]`
+runs the kernel OAuth flow for a provider and stores the login where
+`metacodes login --provider <id>` does (issue #33).
 
 A committed route is broadcast on the UI event stream as `config_changed` →
 `route`, carrying provider, channel, protocol, wire model id, offer id,

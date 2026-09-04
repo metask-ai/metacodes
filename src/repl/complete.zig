@@ -24,6 +24,7 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/history", .desc = "Show input history" },
     .{ .name = "/model", .desc = "Pick a provider, model, and channel (Ctrl+O)" },
     .{ .name = "/models", .desc = "Select the account API key for this session" },
+    .{ .name = "/login", .desc = "Sign in to a provider with OAuth (kernel flow)" },
     .{ .name = "/transcript", .desc = "Browse the conversation (Ctrl+X Ctrl+O)" },
     .{ .name = "/providers", .desc = "List routes; refresh / enable / disable / remove" },
     .{ .name = "/alias", .desc = "Name a route: pin, float, use, remove" },
