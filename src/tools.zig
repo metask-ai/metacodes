@@ -361,7 +361,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ReadMcpResourceTool",
-        .description = "Read a specific MCP resource by URI. Required: uri. Optional: server (hint for which connected server to query first; otherwise tries all). Returns the resource content as JSON.",
+        .description = "Read a specific MCP resource by URI. Required: uri. Optional: server (hint for which connected server to query first; otherwise tries all). Returns the resource content as JSON. Content above the result budget is returned as an artifact envelope rather than inline; local storage failures (for example, a full session quota) are returned as structured errors with category `system_error` instead of `resource_not_found`. A `resource_not_found` response carries `last_err` plus a bounded `last_error_detail` from the last server.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "uri", .type = "string", .description = "The URI of the MCP resource to read" },
             .{ .name = "server", .type = "string", .description = "Optional: hint for which server to query first" },
