@@ -16,6 +16,7 @@ import json
 import math
 import os
 import platform
+import shutil
 import stat
 import subprocess
 import sys
@@ -901,6 +902,19 @@ def run_paid_pair(
         )
 
 
+def _preserve_run_dir(run_dir: Path, output_dir: Path) -> Path:
+    """Move a run directory the harness created inside the materialized tree
+    under ``output_dir/runs``. Refuses to overwrite: two runs with the same
+    name would mean two imports claiming the same evidence."""
+    destination = output_dir / "runs"
+    destination.mkdir(parents=True, exist_ok=True)
+    target = destination / run_dir.name
+    if target.exists():
+        raise ValidationError(f"run directory already preserved: {target}")
+    shutil.move(str(run_dir), str(target))
+    return target
+
+
 def _run_paid_pair_materialized(
     tree: SourceTree,
     *,
@@ -913,8 +927,9 @@ def _run_paid_pair_materialized(
 ) -> dict[str, Any]:
     # `root` is the materialized tree from here on: wrappers, scenarios, the
     # candidate and every re-observation resolve against it, never the live
-    # checkout. Run directories go under the output directory: they are
-    # evidence and must outlive the temporary tree.
+    # checkout. The harness writes each run under that tree; the runner
+    # moves it under the output directory before importing it, because the
+    # evidence must outlive the temporary tree.
     root = tree.root
     observation = _observe(tree, runtime_binary)
     manifest = _read_private_json(
@@ -1135,8 +1150,11 @@ def _run_paid_pair_materialized(
                 runtime_env={
                     "METACODES_PLUGIN_RUNTIME_BINARY": str(runtime_binary),
                 },
-                runs_dir=output_dir / "runs",
             )
+            # The harness wrote the run under the materialized tree; the
+            # evidence has to outlive that tree, so it moves under the
+            # output directory before anything reads it.
+            run_dir = _preserve_run_dir(run_dir, output_dir)
             _require_still_frozen(
                 tree, runtime_binary, manifest, moment="after request"
             )

@@ -797,10 +797,8 @@ def _run_once(
     max_metered_tokens: int | None = None,
     max_cost_usd: float | None = None,
     runtime_api_key: str | None = None,
-    runs_dir: Path | None = None,
 ) -> Path:
-    if runs_dir is None:
-        runs_dir = repo_root / "tests/e2e/runs"
+    runs_dir = repo_root / "tests/e2e/runs"
     before = (
         {path.resolve() for path in runs_dir.iterdir() if path.is_dir()}
         if runs_dir.exists()

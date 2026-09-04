@@ -376,17 +376,21 @@ class _FakeProvider:
         self.tasks = {task["id"]: task for task in suite["tasks"]}
         self.by_selector = {scenario_selector([task_id]): task_id for task_id in self.tasks}
 
-    def run_once(self, repo_root, binary, variant, trial, selector, provider, model_id, suite_path, revision, *, harness_config_id=None, runtime_env=None, allow_invalid_run=False, timeout_seconds=None, max_metered_tokens=None, max_cost_usd=None, runtime_api_key=None, runs_dir=None):
-        token = self.fixture.directory / f"run-{len(self.requests)}"
+    def run_once(self, repo_root, binary, variant, trial, selector, provider, model_id, suite_path, revision, *, harness_config_id=None, runtime_env=None, allow_invalid_run=False, timeout_seconds=None, max_metered_tokens=None, max_cost_usd=None, runtime_api_key=None):
+        # A real directory, as the harness leaves one: the runner moves it
+        # under the output directory before importing, so state is keyed by
+        # its name rather than its path.
+        token = Path(repo_root) / "tests/e2e/runs" / f"run-{len(self.requests)}"
+        token.mkdir(parents=True, exist_ok=True)
         self.requests.append((variant, trial, selector))
-        self._state[token] = (binary, variant, trial, selector, provider, model_id, revision, harness_config_id, max_metered_tokens, max_cost_usd)
+        self._state[token.name] = (binary, variant, trial, selector, provider, model_id, revision, harness_config_id, max_metered_tokens, max_cost_usd)
         if self.during_request is not None:
             self.during_request()
         return token
 
     def import_run(self, suite, repo_root, run_dir):
         self.imports += 1
-        binary, variant, trial, selector, provider, model_id, revision, config_id, max_tokens, max_cost = self._state[run_dir]
+        binary, variant, trial, selector, provider, model_id, revision, config_id, max_tokens, max_cost = self._state[Path(run_dir).name]
         task_id = self.by_selector[selector]
         task = self.tasks[task_id]
         identity = comparison_fingerprints(
@@ -598,25 +602,36 @@ class PaidRunObservesMaterializedHeadTest(unittest.TestCase):
         fake = _FakeProvider(fixture, during_request=change_and_restore)
 
         def recording_run_once(repo_root, binary, *args, **kwargs):
-            seen.append((Path(repo_root), Path(binary), kwargs.get("runs_dir"), Path(binary).read_bytes()))
+            seen.append((Path(repo_root), Path(binary), Path(binary).read_bytes()))
             return fake.run_once(repo_root, binary, *args, **kwargs)
 
+        imported_from = []
+
+        def recording_import_run(suite, repo_root, run_dir):
+            imported_from.append(Path(run_dir))
+            return fake.import_run(suite, repo_root, run_dir)
+
         with mock.patch("scripts.eval.plugin_pair_runner._run_once", side_effect=recording_run_once), mock.patch(
-            "scripts.eval.plugin_pair_runner.import_run", side_effect=fake.import_run
+            "scripts.eval.plugin_pair_runner.import_run", side_effect=recording_import_run
         ), mock.patch("scripts.eval.plugin_pair_runner._load_api_key", return_value="test-only-key"):
             self.assertEqual({"baseline": 3, "candidate": 3}, fixture.run())
         self.assertEqual(6, len(seen))
         self.assertEqual(6, len(rewritten))
-        for repo_root, binary, runs_dir, executed in seen:
+        for repo_root, binary, executed in seen:
             self.assertNotEqual(ROOT.resolve(), repo_root.resolve())
             self.assertIn("metacodes-paid-tree-", str(repo_root))
             self.assertTrue(str(binary).startswith(str(repo_root)), binary)
-            self.assertEqual(fixture.output / "runs", runs_dir)
+        # Evidence outlives the temporary tree: every run directory was moved
+        # under the output directory before it was imported.
+        self.assertEqual(6, len(imported_from))
+        for run_dir in imported_from:
+            self.assertEqual(fixture.output / "runs", run_dir.parent)
+            self.assertTrue(run_dir.is_dir(), run_dir)
         # What the rollouts could execute is HEAD's baseline wrapper, byte for
         # byte, although the live one was different at every request.
         baseline_runs = [row for row in seen if row[1].name == LIVE_PINNED_INPUT.name]
         self.assertEqual(3, len(baseline_runs))
-        for _, _, _, executed in baseline_runs:
+        for _, _, executed in baseline_runs:
             self.assertEqual(head_bytes, executed)
         for live_during_request in rewritten:
             self.assertNotEqual(head_bytes, live_during_request)
