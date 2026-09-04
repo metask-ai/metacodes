@@ -2292,6 +2292,11 @@ const EraseObservingAllocator = struct {
     failed_after_target: bool = false,
     allocations: usize = 0,
     target_ptr: ?[*]u8 = null,
+    /// Allocations whose length matched `target_len`. The observer can only
+    /// key on length, so a test must assert this is exactly one: a second hit
+    /// means some other allocation (a path, a catalog entry) shares the key's
+    /// length and the zeroing verdict would be about the wrong block (#70).
+    target_hits: usize = 0,
     target_freed: bool = false,
     target_was_zero: bool = false,
 
@@ -2312,7 +2317,10 @@ const EraseObservingAllocator = struct {
         }
         self.allocations += 1;
         const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
-        if (len == self.target_len and self.target_ptr == null) self.target_ptr = ptr;
+        if (len == self.target_len) {
+            self.target_hits += 1;
+            if (self.target_ptr == null) self.target_ptr = ptr;
+        }
         return ptr;
     }
 
@@ -2390,7 +2398,8 @@ test "secureClear uses optimizer-resistant zeroing" {
 }
 
 test "AgentSession zeroes the copied API key before normal free" {
-    const key = "normal-destroy-key-with-unique-length-37";
+    // 1009 bytes: a length no path, catalog entry or buffer allocation shares (#70).
+    const key = "normal-destroy-key-" ++ ("k" ** 990);
     var observer = EraseObservingAllocator{ .backing = std.testing.allocator, .target_len = key.len };
     const runtime = try AgentRuntime.create(observer.allocator(), .{ .builtin_tools = &.{} });
     defer runtime.destroy() catch unreachable;
@@ -2405,12 +2414,14 @@ test "AgentSession zeroes the copied API key before normal free" {
         .allowed_tools = &.{},
     });
     try self.destroy();
+    // Exactly one allocation had the key's length: the verdict below is about the copy.
+    try std.testing.expectEqual(@as(usize, 1), observer.target_hits);
     try std.testing.expect(observer.target_freed);
     try std.testing.expect(observer.target_was_zero);
 }
 
 test "AgentSession zeroes the copied API key when later construction fails" {
-    const key = "failed-create-key-with-unique-length-41---";
+    const key = "failed-create-key-" ++ ("k" ** 991); // 1009 bytes, see above (#70)
     // Fail the first allocation after the sensitive copy, independent of how
     // many Workspace/catalog allocations Session construction adds before it.
     var observer = EraseObservingAllocator{
@@ -2430,6 +2441,8 @@ test "AgentSession zeroes the copied API key when later construction fails" {
         .workspace = .{ .root = cwd },
         .allowed_tools = &.{},
     }));
+    // Exactly one allocation had the key's length: the verdict below is about the copy.
+    try std.testing.expectEqual(@as(usize, 1), observer.target_hits);
     try std.testing.expect(observer.target_freed);
     try std.testing.expect(observer.target_was_zero);
 }
