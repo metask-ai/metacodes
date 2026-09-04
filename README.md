@@ -49,9 +49,11 @@ Common gates:
 ```sh
 zig build test
 zig build test:lib -Doptimize=ReleaseSafe
-zig build agentcore:test -Doptimize=ReleaseSafe
-zig build agentcore:gate -Dtarget=<native-target> -Doptimize=ReleaseSafe
 ```
+
+The AgentCore bundle and its native consumption gates (`agentcore:test`,
+`agentcore:bundle`, `agentcore:gate`) are documented once, in
+[sdk/README.md](sdk/README.md).
 
 On Windows the same suite runs natively; keep the job count bounded because
 the default is one LLVM codegen per core and the test binaries are large:

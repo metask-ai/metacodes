@@ -61,6 +61,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- Embedding AgentCore is described once: `doc/LIB_API.md` §3/§4 and the
+  AgentCore section of `doc/API.md` keep a lead-in and the fact-gated
+  sentences and point at `doc/AGENTCORE_BINARY_ABI.md`; `README.md` points at
+  `sdk/README.md` for the bundle and gate commands. Stage 1 of #47.
+
 - Superseded design documents (the revision-14 plugin ABI plan, the MCP
   transport hard-cut, the multi-session refactor, the DeepSeek harness analysis,
   the U2 and U9/U10 designs) and the inbound requirements formerly under
