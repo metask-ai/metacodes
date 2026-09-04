@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -65,6 +66,9 @@ if __package__ in {None, ""}:
         attest_runtime_artifact,
         implementation_fingerprint,
         validate_protocol_payload,
+        require_clean_pinned_inputs,
+        materialize_head,
+        git_head,
     )
 else:
     from .e2e_adapter import import_run
@@ -96,6 +100,9 @@ else:
         attest_runtime_artifact,
         implementation_fingerprint,
         validate_protocol_payload,
+        require_clean_pinned_inputs,
+        materialize_head,
+        git_head,
     )
 
 
@@ -219,12 +226,13 @@ def frozen_run_fields(
     wrapper_hashes: Mapping[str, str],
     inventory_hashes: Mapping[str, str],
     schedule: Sequence[Mapping[str, Any]],
+    head: str | None = None,
 ) -> dict[str, Any]:
     """Everything a paid run is frozen against, as observed *now*."""
     return {
         "schema": FROZEN_RUN_SCHEMA,
         "protocol_sha256": protocol_sha256,
-        "git_head": _git_head(root),
+        "git_head": head if head is not None else _git_head(root),
         "implementation_fingerprint": implementation_fingerprint(root, protocol),
         "path_set_digest": path_set_digest(protocol),
         "runtime_sha256": runtime_sha256,
@@ -243,7 +251,10 @@ def manifest_sha256_of(fields: Mapping[str, Any]) -> str:
 def freeze_run(root: Path, protocol_path: Path, runtime_binary: Path) -> dict[str, Any]:
     """Produce the frozen-run manifest: the pre-registration a user authority
     binds to *before* any provider request. Strict on every pin."""
-    fields = _observe(root, protocol_path, runtime_binary).fields
+    # The manifest can only describe committed bytes: a dirty pinned input is
+    # refused, and what is hashed is HEAD materialized, never the live tree.
+    with materialized_source_tree(root, protocol_path) as tree:
+        fields = _observe(tree, runtime_binary).fields
     return {**fields, "manifest_sha256": manifest_sha256_of(fields)}
 
 
@@ -332,6 +343,47 @@ def _schedule(
 
 
 @dataclass(frozen=True)
+class SourceTree:
+    """What a paid run observes and executes: Git HEAD materialized into a
+    private directory, plus the protocol bytes read once. The live checkout is
+    consulted for HEAD identity only, so change-and-restore of a pinned input
+    between two observations (#61, the paid-path form of the #49 gap) has
+    nothing to act on: nothing reads the live tree after this is built."""
+
+    live_root: Path
+    root: Path
+    protocol_path: Path
+    protocol_raw: bytes
+    head: str
+
+
+@contextmanager
+def materialized_source_tree(live_root: Path, protocol_path: Path):
+    """Read the protocol once, refuse a pinned input that is modified in the
+    working tree (the manifest could otherwise describe uncommitted bytes),
+    and materialize HEAD for the lifetime of the block. Everything happens
+    before the frozen manifest is read and before the user authority is
+    opened, so a materialization failure cannot occur mid-run."""
+    live_root = live_root.resolve()
+    protocol_path = protocol_path.expanduser().resolve()
+    try:
+        raw = protocol_path.read_bytes()
+        structure = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"cannot read plugin evaluation protocol: {exc}") from exc
+    if not isinstance(structure, dict):
+        raise ValidationError("unsupported plugin evaluation protocol")
+    try:
+        require_clean_pinned_inputs(live_root, structure, protocol_path)
+    except PluginGateError as exc:
+        raise ValidationError(str(exc)) from exc
+    head = git_head(live_root)
+    with tempfile.TemporaryDirectory(prefix="metacodes-paid-tree-") as temp:
+        root = materialize_head(live_root, head, Path(temp) / "tree")
+        yield SourceTree(live_root, root, protocol_path, raw, head)
+
+
+@dataclass(frozen=True)
 class _Observation:
     """Everything a paid run is frozen against, as the tree looks *now*, from
     one read of the protocol: the parsed object and the hash the manifest is
@@ -351,12 +403,12 @@ class _Observation:
     fields: dict[str, Any]
 
 
-def _observe(root: Path, protocol_path: Path, runtime_binary: Path) -> _Observation:
+def _observe(tree: SourceTree, runtime_binary: Path) -> _Observation:
     """Strict on every pin. This is the one predicate behind the freeze, the
     start of a paid run, the bracket around every provider request and the
     analysis - the same function everywhere, so there is no weaker second
     definition of "the tree still matches" for a request to slip through."""
-    raw = protocol_path.read_bytes()
+    root, raw = tree.root, tree.protocol_raw
     protocol = validate_protocol_payload(root, raw)
     runtime = attest_runtime_artifact(protocol, runtime_binary)
     wrappers, wrapper_hashes, inventory_hashes = _arm_identities(root, protocol, runtime.path)
@@ -369,6 +421,7 @@ def _observe(root: Path, protocol_path: Path, runtime_binary: Path) -> _Observat
         wrapper_hashes=wrapper_hashes,
         inventory_hashes=inventory_hashes,
         schedule=schedule,
+        head=tree.head,
     )
     return _Observation(
         protocol=protocol,
@@ -387,8 +440,7 @@ def _observe(root: Path, protocol_path: Path, runtime_binary: Path) -> _Observat
 
 
 def _require_still_frozen(
-    root: Path,
-    protocol_path: Path,
+    tree: SourceTree,
     runtime_binary: Path,
     manifest: Mapping[str, Any],
     *,
@@ -400,7 +452,7 @@ def _require_still_frozen(
     Skill with its hash updated - passes the strict loader, and the rollout
     would still be labelled with this manifest."""
     try:
-        verify_frozen_manifest(manifest, _observe(root, protocol_path, runtime_binary).fields)
+        verify_frozen_manifest(manifest, _observe(tree, runtime_binary).fields)
     except ValidationError as exc:
         raise ValidationError(f"{exc} ({moment})") from exc
 
@@ -823,9 +875,38 @@ def run_paid_pair(
     user_authority_file: Path,
     frozen_manifest_file: Path,
 ) -> dict[str, Any]:
-    # Freeze first, authorize second: the manifest the user signed must still
-    # describe this tree before their authority is even opened.
-    observation = _observe(root, protocol_path, runtime_binary)
+    # Materialize first, freeze second, authorize third: the tree the run
+    # observes and executes is fixed before the manifest is read, and the
+    # manifest the user signed must describe it before their authority is
+    # even opened.
+    with materialized_source_tree(root, protocol_path) as tree:
+        return _run_paid_pair_materialized(
+            tree,
+            runtime_binary=runtime_binary,
+            output_dir=output_dir,
+            budget_journal_path=budget_journal_path,
+            provider_auth_file=provider_auth_file,
+            user_authority_file=user_authority_file,
+            frozen_manifest_file=frozen_manifest_file,
+        )
+
+
+def _run_paid_pair_materialized(
+    tree: SourceTree,
+    *,
+    runtime_binary: Path,
+    output_dir: Path,
+    budget_journal_path: Path,
+    provider_auth_file: Path,
+    user_authority_file: Path,
+    frozen_manifest_file: Path,
+) -> dict[str, Any]:
+    # `root` is the materialized tree from here on: wrappers, scenarios, the
+    # candidate and every re-observation resolve against it, never the live
+    # checkout. Run directories go under the output directory: they are
+    # evidence and must outlive the temporary tree.
+    root = tree.root
+    observation = _observe(tree, runtime_binary)
     manifest = _read_private_json(
         frozen_manifest_file.expanduser().resolve(), "frozen-run manifest"
     )
@@ -982,7 +1063,7 @@ def run_paid_pair(
             # (#49); it does see everything that is still different
             # when the request ends, before its evidence is imported.
             _require_still_frozen(
-                root, protocol_path, runtime_binary, manifest, moment="before request"
+                tree, runtime_binary, manifest, moment="before request"
             )
             transaction = _transaction(
                 authority=budget_authority,
@@ -1044,9 +1125,10 @@ def run_paid_pair(
                 runtime_env={
                     "METACODES_PLUGIN_RUNTIME_BINARY": str(runtime_binary),
                 },
+                runs_dir=output_dir / "runs",
             )
             _require_still_frozen(
-                root, protocol_path, runtime_binary, manifest, moment="after request"
+                tree, runtime_binary, manifest, moment="after request"
             )
             imported = import_run(suite, root, run_dir)
             selected = [

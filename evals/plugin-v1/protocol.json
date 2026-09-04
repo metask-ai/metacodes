@@ -122,7 +122,7 @@
     "interpretation": "The 18 paired observations are a development gate. They may reject the plugin candidate but cannot establish a general coding-benchmark advantage or a public leaderboard claim. Promotion still requires the repository release contract and then an external WorkBuddy development cohort."
   },
   "pinned_evaluator_files": {
-    "scripts/eval/paired_runner.py": "ee23692770d2b51ed148b97d63900bd12c5d38fdf0f53c3e86345cb6210c1182",
+    "scripts/eval/paired_runner.py": "35ece23725179fb5711b57430aac7b8e6688adaa7ab4f075b85d961a61865c10",
     "scripts/eval/analysis.py": "4d93d9fc83a38804dd41e587178fff299cff911b584d9a46dad021c9e9a08516",
     "scripts/eval/e2e_adapter.py": "dfaaf78f90cde6b335b7694bcee67d3526368c316aa68c4bc5ef8293d45fd552",
     "scripts/eval/model.py": "657169419417082e55e560c68d71e1e92dea9d73a37cc2619499de34efb10b7c",
@@ -133,9 +133,9 @@
     "scripts/eval/promotion.py": "65f566244d3880b367a0c9adee858b2160ed63d5b1644ea38202e79a34fb79f3",
     "scripts/eval/treatment_activation.py": "28b976feaf8caab1d03a42d58794b067b9ca892de248e72a2f4ab22eebe769b0",
     "scripts/eval/cli.py": "25cc465881dee4f1d6058884ed8fcf0c47d867b541cf2d57ba44aa9e5f8331b1",
-    "scripts/eval/plugin_release_gate.py": "203f4bcd3b3f53ee1fe6ac48a456e737c59327d3e355f7e16b0442f761a50c73",
-    "scripts/eval/plugin_pair_runner.py": "9829de9cbfbe9b0ec5aba7868ce800350fa9a5a47204a9bfa73e0b6418ff59e9",
-    "scripts/eval/plugin_pair_analysis.py": "5dad36d6e5c2465c395cddf81ffcef20586fb124e85173e5df8c159d30ce007a",
+    "scripts/eval/plugin_release_gate.py": "0061a1ddf9176af1ecdd54a4ecfbadab98b730f3f4b517d878e80b0af7e03aac",
+    "scripts/eval/plugin_pair_runner.py": "9c073ccd440486ff1404a806ea4b5a1b49cf4ba07f1764b3d9e31145d903063f",
+    "scripts/eval/plugin_pair_analysis.py": "1cf181442e0c59f5452adfc8aea2c755941f875545b9200ed07589f96606d0f4",
     "tests/e2e/run_e2e.sh": "38b21bdc939682e870846cc57731c90b2a114aec285b8df6d8019ba7a59314f3",
     "tests/e2e/lib.sh": "6d7de5cd8fe0e70929b32ea82364a12d16787e690687ab098d6eb8a52383c43a",
     "evals/gates/default.json": "0e8da44acfefe11c5ff7ede5b11cc5d40a8edfd6660e18891dd2b79151e13559",
