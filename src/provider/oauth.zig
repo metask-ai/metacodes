@@ -20,6 +20,7 @@
 //!   a fake exchange rather than a network.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
 const ids = @import("ids.zig");
@@ -262,7 +263,7 @@ pub const Session = struct {
         now_seconds: i64,
         exchange: Exchange,
     ) OAuthError![]u8 {
-        return self.accessTokenInternal(now_seconds, exchange, false);
+        return self.accessTokenInternal(now_seconds, exchange, false, null);
     }
 
     /// Force one refresh even when the locally recorded expiry is still in the
@@ -274,7 +275,19 @@ pub const Session = struct {
         now_seconds: i64,
         exchange: Exchange,
     ) OAuthError![]u8 {
-        return self.accessTokenInternal(now_seconds, exchange, true);
+        return self.accessTokenInternal(now_seconds, exchange, true, null);
+    }
+
+    /// Refresh only if the token that failed is still the live token. A
+    /// concurrent request may already have rotated it; in that case return a
+    /// copy of the newer token and avoid a second gateway exchange.
+    pub fn refreshIfStale(
+        self: *Session,
+        now_seconds: i64,
+        exchange: Exchange,
+        stale_access_token: []const u8,
+    ) OAuthError![]u8 {
+        return self.accessTokenInternal(now_seconds, exchange, true, stale_access_token);
     }
 
     fn accessTokenInternal(
@@ -282,6 +295,7 @@ pub const Session = struct {
         now_seconds: i64,
         exchange: Exchange,
         force_refresh: bool,
+        stale_access_token: ?[]const u8,
     ) OAuthError![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -289,6 +303,9 @@ pub const Session = struct {
         var must_refresh = force_refresh;
         while (true) {
             const current = self.tokens orelse return error.NoTokens;
+            if (stale_access_token) |stale| if (!std.mem.eql(u8, current.access_token, stale)) {
+                return self.allocator.dupe(u8, current.access_token) catch error.OutOfMemory;
+            };
             if (!must_refresh and !current.isExpiredAt(now_seconds)) {
                 return self.allocator.dupe(u8, current.access_token) catch error.OutOfMemory;
             }
@@ -579,7 +596,11 @@ fn writeAtomicPrivate(allocator: std.mem.Allocator, path: []const u8, bytes: []c
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
-    const fd = pfs.open(temp_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    // Remove a stale temp first, then create exclusively without following a
+    // pre-created symlink. The unlink+EXCL pair ensures the temp path cannot
+    // redirect token bytes to an attacker-chosen target.
+    _ = pfs.unlinkPath(temp_z) catch {};
+    const fd = pfs.open(temp_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     if (fd < 0) return error.PersistFailed;
     var wrote: usize = 0;
     while (wrote < bytes.len) {
@@ -601,6 +622,22 @@ fn writeAtomicPrivate(allocator: std.mem.Allocator, path: []const u8, bytes: []c
         _ = pfs.unlinkPath(temp_z) catch {};
         return error.PersistFailed;
     }
+    // Directory fsync is best effort: the file itself is already fsynced and
+    // renamed, and some filesystems / sandboxes refuse to open or sync a
+    // directory. Failing the rotation here would be worse than a rare lost
+    // rename after power loss.
+    fsyncParentDir(allocator, path) catch {};
+}
+
+fn fsyncParentDir(allocator: std.mem.Allocator, path: []const u8) !void {
+    if (builtin.os.tag == .windows) return;
+    const dir = std.fs.path.dirname(path) orelse ".";
+    const dir_z = try allocator.dupeZ(u8, dir);
+    defer allocator.free(dir_z);
+    const fd = pfs.open(dir_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.fsyncChecked(fd);
 }
 
 fn ensureParent(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -937,6 +974,33 @@ test "concurrent expiry performs exactly one refresh" {
     // had already refreshed — an outcome a broken implementation produces just
     // as happily. Verified by probe: serializing the spawns fails this line.
     try testing.expect(session.waited_count > 0);
+}
+
+test "concurrent stale-token refresh performs exactly one exchange" {
+    const a = testing.allocator;
+    var session = try tempSession(a, "stale-single-flight");
+    defer session.deinit();
+    defer removeSession(&session);
+    try seed(a, &session, 10_000);
+
+    var fake = FakeExchange{ .delay_ms = 60 };
+    const Worker = struct {
+        session: *Session,
+        exchange: Exchange,
+        token: ?[]u8 = null,
+        fn run(self: *@This()) void {
+            self.token = self.session.refreshIfStale(1_000, self.exchange, "access-0") catch null;
+        }
+    };
+    var workers: [2]Worker = .{ .{ .session = &session, .exchange = fake.exchange() }, .{ .session = &session, .exchange = fake.exchange() } };
+    var threads: [2]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| thread.* = try std.Thread.spawn(.{}, Worker.run, .{&workers[index]});
+    for (&threads) |*thread| thread.join();
+    defer for (&workers) |*worker| if (worker.token) |token| a.free(token);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqual(@as(usize, 1), session.exchange_count);
+    try testing.expect(session.waited_count > 0);
+    for (workers) |worker| try testing.expectEqualStrings("access-1", worker.token.?);
 }
 
 test "a rejected refresh reaches every waiter and is not retried as a transport error" {

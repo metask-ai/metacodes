@@ -47,6 +47,8 @@ pub const StreamResult = struct {
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     server_request_id: [256]u8 = undefined,
     server_request_id_len: usize = 0,
+    http_status: u16 = 0,
+    retry_attempt: u32 = 0,
 };
 
 /// 网络瞬态错误判定:服务端关连接(keep-alive 回收/LB 断连)、连接重置、读到 EOF 等。
@@ -247,7 +249,7 @@ pub fn interruptibleSleepMs(total_ms: u64, abort: ?*const AbortSignal) bool {
 
 /// API 客户端
 pub const Client = struct {
-    pub const RefreshFn = *const fn (ctx: *anyopaque) anyerror![]u8;
+    pub const RefreshFn = *const fn (ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8;
     allocator: std.mem.Allocator,
     http_client: http.Client,
     api_key: []const u8,
@@ -285,6 +287,7 @@ pub const Client = struct {
     refresh_ctx: ?*anyopaque = null,
     refresh_fn: ?RefreshFn = null,
     refresh_token_owned: ?[]u8 = null,
+    refresh_token_history: std.ArrayList([]u8) = .empty,
     last_retry_attempt: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8) Client {
@@ -311,6 +314,8 @@ pub const Client = struct {
 
     pub fn deinit(client: *Client) void {
         if (client.refresh_token_owned) |token| secureFree(client.allocator, token);
+        for (client.refresh_token_history.items) |token| secureFree(client.allocator, token);
+        client.refresh_token_history.deinit(client.allocator);
         client.abort_registry.deinit(client.allocator);
         client.http_client.deinit();
         client.catalog.deinit();
@@ -329,8 +334,8 @@ pub const Client = struct {
         client.refresh_fn = callback;
     }
 
-    fn replaceRefreshToken(client: *Client, token: []u8) void {
-        if (client.refresh_token_owned) |old| secureFree(client.allocator, old);
+    fn replaceRefreshToken(client: *Client, token: []u8) !void {
+        if (client.refresh_token_owned) |old| try client.refresh_token_history.append(client.allocator, old);
         client.refresh_token_owned = token;
         client.api_key = token;
     }
@@ -652,21 +657,27 @@ pub const Client = struct {
         retry_hint: ?*RetryHint,
     ) !RequestResult {
         client.last_retry_attempt = 0;
-        const first = client.doRequest(body, streaming, abort, retry_hint) catch |err| {
+        var result = client.doRequest(body, streaming, abort, retry_hint) catch |err| {
             if (err != error.TokenExpired) return err;
             const callback = client.refresh_fn orelse return error.Unauthorized;
             const ctx = client.refresh_ctx orelse return error.Unauthorized;
-            const token = callback(ctx) catch return error.Unauthorized;
-            client.replaceRefreshToken(token);
+            const token = callback(ctx, client.api_key) catch return error.Unauthorized;
+            client.replaceRefreshToken(token) catch {
+                secureFree(client.allocator, token);
+                return error.Unauthorized;
+            };
             client.last_retry_attempt = 1;
             // No event has been delivered: the body is still the exact slice
             // produced by the serializer, so this is a byte-for-byte replay.
-            return client.doRequest(body, streaming, abort, retry_hint) catch |replay_err| {
+            var replay_result = client.doRequest(body, streaming, abort, retry_hint) catch |replay_err| {
                 if (replay_err == error.TokenExpired) return error.Unauthorized;
                 return replay_err;
             };
+            if (streaming) replay_result.streaming_response.retry_attempt = 1;
+            return replay_result;
         };
-        return first;
+        if (streaming) result.streaming_response.retry_attempt = 0;
+        return result;
     }
 
     /// 建连阶段重试包装(对齐 CC withRetry)。仅覆盖 sendMessageStreamFull(建连+收头),
@@ -886,6 +897,7 @@ pub const Client = struct {
                     .abort_registry = if (abort != null) &client.abort_registry else null,
                     .server_request_id = client.server_request_id,
                     .server_request_id_len = client.server_request_id_len,
+                    .http_status = status.code,
                 },
             };
         }
@@ -895,8 +907,6 @@ pub const Client = struct {
         const body_reader = req_ptr.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
         const response_body = body_reader.allocRemaining(client.allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
             log.errId("client", rid, "read body failed: {s}", .{@errorName(err)});
-            req_ptr.deinit();
-            client.allocator.destroy(req_ptr);
             return error.RequestFailed;
         };
         req_ptr.deinit();
@@ -1097,6 +1107,8 @@ pub const StreamResponse = struct {
     /// 本次流式请求的 request_id，所有下游（stream event、agent loop、工具调用）
     /// 用它把日志串起来。
     id: log.RequestId,
+    http_status: u16 = 0,
+    retry_attempt: u32 = 0,
 
     fn init(allocator: std.mem.Allocator, sr: StreamResult, abort: ?*const AbortSignal) StreamResponse {
         return .{
@@ -1104,6 +1116,8 @@ pub const StreamResponse = struct {
             .stream_result = sr,
             .abort = abort,
             .id = sr.id,
+            .http_status = sr.http_status,
+            .retry_attempt = sr.retry_attempt,
         };
     }
 
@@ -1135,6 +1149,8 @@ pub const StreamResponse = struct {
             .stopReasonFn = &hStopReason,
             .requestIdFn = &hRequestId,
             .serverRequestIdFn = &hServerRequestId,
+            .httpStatusFn = &hHttpStatus,
+            .retryAttemptFn = &hRetryAttempt,
         };
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
@@ -1155,6 +1171,12 @@ pub const StreamResponse = struct {
     fn hServerRequestId(ctx: *anyopaque) []const u8 {
         const sr: *StreamResponse = @ptrCast(@alignCast(ctx));
         return sr.stream_result.server_request_id[0..sr.stream_result.server_request_id_len];
+    }
+    fn hHttpStatus(ctx: *anyopaque) u16 {
+        return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).http_status;
+    }
+    fn hRetryAttempt(ctx: *anyopaque) u32 {
+        return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).retry_attempt;
     }
 
     /// drain 完后读 API 报告的 stop_reason(max_tokens 续写判断用)。

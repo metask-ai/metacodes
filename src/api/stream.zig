@@ -809,6 +809,8 @@ pub const StreamHandle = struct {
     /// Provider-assigned request id (for example Metask's
     /// `X-Metask-Request-Id`). Empty when a provider did not return one.
     serverRequestIdFn: *const fn (ctx: *anyopaque) []const u8 = emptyServerRequestId,
+    httpStatusFn: *const fn (ctx: *anyopaque) u16 = emptyHttpStatus,
+    retryAttemptFn: *const fn (ctx: *anyopaque) u32 = emptyRetryAttempt,
 
     pub inline fn next(self: StreamHandle) anyerror!?StreamEvent {
         return self.nextFn(self.ctx);
@@ -825,10 +827,22 @@ pub const StreamHandle = struct {
     pub inline fn serverRequestId(self: StreamHandle) []const u8 {
         return self.serverRequestIdFn(self.ctx);
     }
+    pub inline fn httpStatus(self: StreamHandle) u16 {
+        return self.httpStatusFn(self.ctx);
+    }
+    pub inline fn retryAttempt(self: StreamHandle) u32 {
+        return self.retryAttemptFn(self.ctx);
+    }
 };
 
 fn emptyServerRequestId(_: *anyopaque) []const u8 {
     return "";
+}
+fn emptyHttpStatus(_: *anyopaque) u16 {
+    return 0;
+}
+fn emptyRetryAttempt(_: *anyopaque) u32 {
+    return 0;
 }
 
 /// Provider-neutral connect-retry boundary. Failure is reported immediately,

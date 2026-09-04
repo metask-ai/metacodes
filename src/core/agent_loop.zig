@@ -1529,7 +1529,7 @@ pub fn run(
             // first and can still read the handle's server request id. It is
             // deliberately scoped to this accepted gateway request.
             defer if (opts.metask_ledger_protocol) |protocol| {
-                const report_usage = response_usage.reported and !stream_error;
+                const report_usage = response_usage.reported and !stream_error and !aborted_during_stream;
                 const input_tokens: u64 = if (report_usage) response_usage.input_tokens else 0;
                 const output_tokens: u64 = if (report_usage) response_usage.output_tokens else 0;
                 const cache_read_tokens: u64 = if (report_usage) response_usage.cache_read_tokens else 0;
@@ -1541,9 +1541,9 @@ pub fn run(
                     .model = opts.model_override orelse provider.model(),
                     .local_request_id = stream.requestId().asSlice(),
                     .server_request_id = stream.serverRequestId(),
-                    .http_status = provider.httpStatus(),
+                    .http_status = stream.httpStatus(),
                     .outcome = ledger_outcome,
-                    .retry_attempt = provider.retryAttempt(),
+                    .retry_attempt = stream.retryAttempt(),
                     .input_tokens = input_tokens,
                     .output_tokens = output_tokens,
                     .cache_read_tokens = cache_read_tokens,

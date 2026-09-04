@@ -59,7 +59,7 @@ pub const DEFAULT_OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 pub const DEFAULT_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
 pub const OpenAIClient = struct {
-    pub const RefreshFn = *const fn (ctx: *anyopaque) anyerror![]u8;
+    pub const RefreshFn = *const fn (ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8;
     allocator: std.mem.Allocator,
     api_key: []const u8,
     /// 完整端点 URL 覆盖(可指向 MockServer / 自建中转站)。null = 按 protocol 选官方端点
@@ -86,6 +86,7 @@ pub const OpenAIClient = struct {
     refresh_ctx: ?*anyopaque = null,
     refresh_fn: ?RefreshFn = null,
     refresh_token_owned: ?[]u8 = null,
+    refresh_token_history: std.ArrayList([]u8) = .empty,
     last_retry_attempt: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) OpenAIClient {
@@ -99,6 +100,8 @@ pub const OpenAIClient = struct {
     }
     pub fn deinit(self: *OpenAIClient) void {
         if (self.refresh_token_owned) |token| secureFree(self.allocator, token);
+        for (self.refresh_token_history.items) |token| secureFree(self.allocator, token);
+        self.refresh_token_history.deinit(self.allocator);
         self.abort_registry.deinit(self.allocator);
         self.http_client.deinit();
     }
@@ -112,8 +115,8 @@ pub const OpenAIClient = struct {
         self.refresh_fn = callback;
     }
 
-    fn replaceRefreshToken(self: *OpenAIClient, token: []u8) void {
-        if (self.refresh_token_owned) |old| secureFree(self.allocator, old);
+    fn replaceRefreshToken(self: *OpenAIClient, token: []u8) !void {
+        if (self.refresh_token_owned) |old| try self.refresh_token_history.append(self.allocator, old);
         self.refresh_token_owned = token;
         self.api_key = token;
     }
@@ -245,7 +248,7 @@ pub const OpenAIClient = struct {
         image_placeholder_ids: []const []const u8,
     ) !StreamHandle {
         self.last_retry_attempt = 0;
-        const first = self.doStream(body, abort, dialect, image_placeholder_ids) catch |err| {
+        const first = self.doStream(body, abort, dialect, image_placeholder_ids, 0) catch |err| {
             if (err != error.TokenExpired) return err;
             // The first transport retained the placeholder slice so the
             // replay can use the identical serialized request. If refresh is
@@ -259,13 +262,17 @@ pub const OpenAIClient = struct {
                 self.allocator.free(image_placeholder_ids);
                 return error.RequestFailed;
             };
-            const token = callback(ctx) catch {
+            const token = callback(ctx, self.api_key) catch {
                 self.allocator.free(image_placeholder_ids);
                 return error.RequestFailed;
             };
-            self.replaceRefreshToken(token);
+            self.replaceRefreshToken(token) catch {
+                secureFree(self.allocator, token);
+                self.allocator.free(image_placeholder_ids);
+                return error.RequestFailed;
+            };
             self.last_retry_attempt = 1;
-            return self.doStream(body, abort, dialect, image_placeholder_ids) catch |replay_err| {
+            return self.doStream(body, abort, dialect, image_placeholder_ids, 1) catch |replay_err| {
                 // A second token_expired response also retains the slice;
                 // every other failure has already released it through
                 // doStream's errdefer.
@@ -281,7 +288,7 @@ pub const OpenAIClient = struct {
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
     /// `image_placeholder_ids` 所有权转入本函数:失败路径释放,成功后归 OpenAIStream。
-    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_placeholder_ids: []const []const u8) !StreamHandle {
+    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_placeholder_ids: []const []const u8, retry_attempt: u32) !StreamHandle {
         var preserve_placeholder_ids = false;
         errdefer if (!preserve_placeholder_ids) self.allocator.free(image_placeholder_ids);
         const rid = log.genRequestId();
@@ -370,6 +377,8 @@ pub const OpenAIClient = struct {
             .abort = abort,
             .abort_registry = if (abort != null) &self.abort_registry else null,
             .id = rid,
+            .http_status = status.code,
+            .retry_attempt = retry_attempt,
             .server_request_id = self.server_request_id,
             .server_request_id_len = self.server_request_id_len,
         };
@@ -444,6 +453,8 @@ const OpenAIStream = struct {
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
+    http_status: u16 = 0,
+    retry_attempt: u32 = 0,
     server_request_id: [256]u8 = undefined,
     server_request_id_len: usize = 0,
     /// 序列化时走占位的图像 tool_result id(owned),随 StreamHandle 回传。
@@ -468,7 +479,7 @@ const OpenAIStream = struct {
     reasoning_keys: std.ArrayList([]u8) = .empty,
 
     fn handle(self: *OpenAIStream) StreamHandle {
-        return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid, .serverRequestIdFn = &hServerRid };
+        return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid, .serverRequestIdFn = &hServerRid, .httpStatusFn = &hHttpStatus, .retryAttemptFn = &hRetryAttempt };
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
         return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).next();
@@ -488,6 +499,12 @@ const OpenAIStream = struct {
     fn hServerRid(ctx: *anyopaque) []const u8 {
         const s: *OpenAIStream = @ptrCast(@alignCast(ctx));
         return s.server_request_id[0..s.server_request_id_len];
+    }
+    fn hHttpStatus(ctx: *anyopaque) u16 {
+        return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).http_status;
+    }
+    fn hRetryAttempt(ctx: *anyopaque) u32 {
+        return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).retry_attempt;
     }
 
     fn deinit(self: *OpenAIStream) void {

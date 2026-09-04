@@ -50,6 +50,14 @@ def _authorize(user_code, web_token):
         raise AssertionError(f"device authorize failed: HTTP {e.code}") from None
 
 
+SECRET_RE = re.compile(r"(mrt-[A-Za-z0-9]+|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|sk-[A-Za-z0-9]{20,})")
+
+
+def _redact(line):
+    """登录进程的 stderr 在进入断言消息 / 日志前脱敏:刷新令牌、JWT、长期 key 一律打码。"""
+    return SECRET_RE.sub("***", line)
+
+
 def _device_login(bin_path, home, web_token):
     """跑真正的登录命令;人工确认那一步用网页会话代替。返回登录进程 stderr(已脱敏)。"""
     import queue

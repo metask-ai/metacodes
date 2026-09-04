@@ -538,7 +538,7 @@ pub const App = struct {
         // A Metask login is process-scoped: retain the same Session object
         // used by turn-boundary refresh so a gateway 401 can force-refresh the
         // rotating token without opening a second single-flight domain.
-        if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask")) {
+        if (config.metask_oauth_selected) if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask")) {
             if (provider_ids_mod.Slug.parse("metask")) |provider_id| {
                 app.oauth_session = provider_oauth_mod.Session.initHome(allocator, provider_id) catch null;
                 if (app.oauth_session) |*loaded| {
@@ -715,8 +715,21 @@ pub const App = struct {
         // Fetch it once with the bearer, project limits/capabilities into the
         // provider host, and retain unknown fields as unknown rather than
         // inheriting the historical static inventory.
-        if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask")) metask_catalog: {
-            if (app.oauth_session) |*session| if (session.tokens) |tokens| if (tokens.models_url) |models_url| {
+        if (config.metask_oauth_selected) if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask")) metask_catalog: {
+            if (app.oauth_session) |*session| if (session.tokens) |tokens| {
+                const gateway = if (std.c.getenv("METASK_GATEWAY_URL")) |raw|
+                    std.mem.trimEnd(u8, std.mem.span(raw), "/")
+                else
+                    std.mem.trimEnd(u8, tokens.gateway_url orelse "", "/");
+                if (gateway.len == 0 or !metask_oauth_mod.isGatewayOrigin(gateway)) {
+                    @import("util/log.zig").warn("catalog", "Metask gateway origin unavailable; keeping the compiled route", .{});
+                    break :metask_catalog;
+                }
+                const models_url = std.fmt.allocPrint(app.allocator, "{s}/v1/models", .{gateway}) catch {
+                    @import("util/log.zig").warn("catalog", "Metask catalog URL allocation failed", .{});
+                    break :metask_catalog;
+                };
+                defer app.allocator.free(models_url);
                 const fetched = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
                     .url = models_url,
                     .bearer = app.api_key,
@@ -729,29 +742,14 @@ pub const App = struct {
                     @import("util/log.zig").warn("catalog", "Metask provider host unavailable: {s}", .{@errorName(err)});
                     break :metask_catalog;
                 };
-                // An explicit Metask gateway override wins over the origin
-                // returned by the authorization server. `config.base_url` is
-                // already a protocol endpoint (`.../v1/messages` or
-                // `.../v1/chat/completions`), so it is intentionally not used
-                // as a catalog origin fallback here.
-                const gateway = if (std.c.getenv("METASK_GATEWAY_URL")) |raw|
-                    std.mem.trimEnd(u8, std.mem.span(raw), "/")
-                else
-                    tokens.gateway_url orelse "";
-                if (gateway.len > 0) {
-                    if (!metask_oauth_mod.isGatewayOrigin(gateway)) {
-                        @import("util/log.zig").warn("catalog", "Metask gateway_url is not an origin; keeping the compiled route", .{});
-                        break :metask_catalog;
-                    }
-                    host.ingestMetask(gateway, fetched.body) catch |err| {
-                        @import("util/log.zig").warn("catalog", "Metask model ingestion failed: {s}", .{@errorName(err)});
-                    };
-                    // The route selected before App construction was derived
-                    // from this same gateway origin; re-seed it after the
-                    // dynamic profile replacement so picker/turn-boundary
-                    // state points at the new offer generation.
-                    app.seedStartupSelection(host);
-                }
+                host.ingestMetask(gateway, fetched.body) catch |err| {
+                    @import("util/log.zig").warn("catalog", "Metask model ingestion failed: {s}", .{@errorName(err)});
+                };
+                // The route selected before App construction was derived
+                // from this same gateway origin; re-seed it after the
+                // dynamic profile replacement so picker/turn-boundary
+                // state points at the new offer generation.
+                app.seedStartupSelection(host);
                 app.api_client.catalog.loadFromModelsListJson(fetched.body) catch |err| {
                     @import("util/log.zig").debug("catalog", "Metask client catalog parse failed: {s}", .{@errorName(err)});
                 };
@@ -896,7 +894,7 @@ pub const App = struct {
         return app;
     }
 
-    fn refreshMetaskToken(ctx: *anyopaque) anyerror![]u8 {
+    fn refreshMetaskToken(ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8 {
         const app: *App = @ptrCast(@alignCast(ctx));
         const session = if (app.oauth_session) |*loaded| loaded else return error.NoTokens;
         var site_buf: [1024]u8 = undefined;
@@ -906,7 +904,7 @@ pub const App = struct {
             .io = app.api_client.http_client.io,
             .token_url = token_url,
         };
-        return session.refreshNow(@import("util/time.zig").nowUnix(), exchange.exchange());
+        return session.refreshIfStale(@import("util/time.zig").nowUnix(), exchange.exchange(), stale_access_token);
     }
 
     /// 组装层选 Provider:据 config.provider_kind 返回对应后端的中立 Provider。
@@ -1201,6 +1199,7 @@ pub const App = struct {
         built: *const @import("provider/profile.zig").ProviderProfile,
         now_seconds: i64,
     ) !?[]u8 {
+        if (built.id.eqlText("metask") and !app.config.metask_oauth_selected) return null;
         const token_url = built.oauth_token_url orelse return null;
         var serves = false;
         for (built.accepted_credential_kinds) |kind| {

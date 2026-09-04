@@ -545,8 +545,10 @@ pub fn main(init: std.process.Init) !void {
     // declarative route so the legacy napi endpoint cannot win when a new
     // session exists. An explicit METASK_GATEWAY_URL is the documented local
     // development override and is an origin, never a /v1/messages URL.
+    const metask_legacy_requested = config.api_key != null or
+        (config.auth_precedence == .api_key_first and std.c.getenv("METASK_API_KEY") != null);
     if (config.provider_profile) |profile_name| {
-        if (std.ascii.eqlIgnoreCase(profile_name, "metask") and config.base_url == null) {
+        if (std.ascii.eqlIgnoreCase(profile_name, "metask") and config.base_url == null and !metask_legacy_requested) {
             var gateway_override: ?[]const u8 = null;
             if (std.c.getenv("METASK_GATEWAY_URL")) |raw| {
                 const gateway = std.mem.trimEnd(u8, std.mem.span(raw), "/");
@@ -561,14 +563,13 @@ pub fn main(init: std.process.Init) !void {
             if (metask_session) |*session| {
                 defer session.deinit();
                 if (session.load() catch false) if (session.tokens) |tokens| {
-                    _ = tokens.models_url orelse {
-                        std.debug.print("error: stored Metask session lacks models_url; run `metacodes login --provider metask`\n", .{});
-                        std.process.exit(2);
-                    };
-                    const gateway = gateway_override orelse tokens.gateway_url orelse {
+                    // The catalog URL is derived from the selected gateway;
+                    // models_url is retained only as informational metadata.
+                    const gateway = gateway_override orelse std.mem.trimEnd(u8, tokens.gateway_url orelse "", "/");
+                    if (gateway.len == 0) {
                         std.debug.print("error: stored Metask session lacks gateway_url; run `metacodes login --provider metask`\n", .{});
                         std.process.exit(2);
-                    };
+                    }
                     if (!metask_oauth_mod.isGatewayOrigin(gateway)) {
                         std.debug.print("error: stored Metask gateway_url is invalid; run `metacodes login --provider metask`\n", .{});
                         std.process.exit(2);
@@ -670,9 +671,9 @@ pub fn main(init: std.process.Init) !void {
     // documented `METASK_API_KEY` alias opts into the historical napi route
     // when no session gateway has been selected. `oauth_first` keeps a stored
     // session authoritative even if that ambient alias is present.
-    const metask_legacy_explicit = config.api_key != null or
-        (config.auth_precedence == .api_key_first and std.c.getenv("METASK_API_KEY") != null);
+    const metask_legacy_explicit = metask_legacy_requested;
     var provider_secret: ?[]u8 = null;
+    var metask_oauth_selected = false;
     if (!introspection_only and metask_scope and config.provider_profile != null and
         std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit)
     {
@@ -684,6 +685,7 @@ pub fn main(init: std.process.Init) !void {
             }
             return err;
         };
+        metask_oauth_selected = true;
     } else if (!introspection_only and metask_scope and metask_legacy_explicit) {
         provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
     } else if (!introspection_only and !metask_scope) {
@@ -727,6 +729,7 @@ pub fn main(init: std.process.Init) !void {
         @as([]const u8, credential.bearer_token)
     else
         "";
+    config.metask_oauth_selected = metask_oauth_selected;
 
     // The stored Metask login carries a Metask model and reasoning effort;
     // applying it to another provider's route would silently replace the
