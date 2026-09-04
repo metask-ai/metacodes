@@ -25,6 +25,7 @@ from scripts.eval.memory_query_plan import (
 from scripts.eval.memory_agent_runtime import _query_plan_evaluator_invalid_reason
 from scripts.eval.model import ValidationError
 from scripts.eval.model import stable_json
+from scripts.eval.tests.textio import write_text_lf
 
 
 def call(index, plan, query):
@@ -270,8 +271,10 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
                 "runtime_candidate_file": "failed-validation-runtime-candidate.json",
                 "runtime_candidate_sha256": hashlib.sha256(candidate_raw).hexdigest(),
             }
-            (run / "failed-validation-diagnostic.json").write_text(
-                stable_json(diagnostic) + "\n", encoding="utf-8", newline="\n"
+            write_text_lf(
+                run / "failed-validation-diagnostic.json",
+                stable_json(diagnostic) + "\n",
+                encoding="utf-8",
             )
             with self.assertRaisesRegex(ValidationError, "SHA-256"):
                 _load_failed_candidate(run)
@@ -333,7 +336,7 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
                 "outputs": payloads,
             }
             receipt_path = root / "reanalysis-receipt.json"
-            receipt_path.write_text(stable_json(receipt) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(receipt_path, stable_json(receipt) + "\n", encoding="utf-8")
             os.chmod(receipt_path, 0o600)
             verify_reanalysis_bundle(root)
             unexpected = root / "raw-provider-cassette.json"

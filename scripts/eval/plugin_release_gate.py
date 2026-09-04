@@ -872,7 +872,9 @@ def refresh_implementation_fingerprint(root: Path, protocol_path: Path) -> dict[
         # original protocol untouched instead of a half-refreshed state.
         staged = protocol_path.with_name(protocol_path.name + ".refresh-staging")
         try:
-            staged.write_text(raw.replace(pinned, fresh), encoding="utf-8", newline="\n")  # keep LF on Windows
+            # keep LF on Windows; Path.write_text(newline=) exists only since Python 3.10 (issue #59)
+            with open(staged, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(raw.replace(pinned, fresh))
             load_protocol(root, staged)
             os.replace(staged, protocol_path)
         finally:

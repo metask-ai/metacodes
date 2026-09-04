@@ -24,6 +24,7 @@ from scripts.eval.workbuddy.run_w05 import (
     _wire_json_sha256,
 )
 from scripts.eval.tests.posix_only import POSIX, requires_symlinks
+from scripts.eval.tests.textio import write_text_lf
 
 
 class WorkBuddyW05RunnerTest(unittest.TestCase):
@@ -212,13 +213,13 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
             root = Path(directory)
             os.chmod(root, 0o700)
             evidence = root / "evidence.json"
-            evidence.write_text("{}\n", encoding="utf-8", newline="\n")
+            write_text_lf(evidence, "{}\n", encoding="utf-8")
             before = {"evidence": _identity(evidence)}
             self.assertEqual(
                 before["evidence"]["sha256"],
                 hashlib.sha256(b"{}\n").hexdigest(),
             )
-            evidence.write_text('{"changed":true}\n', encoding="utf-8", newline="\n")
+            write_text_lf(evidence, '{"changed":true}\n', encoding="utf-8")
             with self.assertRaisesRegex(W05Error, "changed during validation"):
                 _stable_evidence(before, {"evidence": evidence})
 
@@ -246,7 +247,7 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
 
             with mock.patch("scripts.eval.workbuddy.run_w05._git", side_effect=clean_git):
                 _fresh_checkout(root)
-                (root / ".env").write_text("SECRET=x\n", encoding="utf-8", newline="\n")
+                write_text_lf(root / ".env", "SECRET=x\n", encoding="utf-8")
                 with self.assertRaisesRegex(W05Error, "\.env"):
                     _fresh_checkout(root)
 

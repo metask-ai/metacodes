@@ -48,6 +48,7 @@ from scripts.eval.memory_replay import (
     PRODUCTION_MODEL_PROVIDER,
     PRODUCTION_PROVIDER_ID,
 )
+from scripts.eval.tests.textio import write_text_lf
 
 
 def _record(sequence: int, event: dict) -> bytes:
@@ -357,9 +358,9 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             for name, content in case["grader"]["expected_files"].items():
-                (workspace / name).write_text(content, encoding="utf-8", newline="\n")
+                write_text_lf(workspace / name, content, encoding="utf-8")
             self.assertTrue(grade_workspace(case, workspace)["passed"])
-            (workspace / "extra.txt").write_text("not allowed", encoding="utf-8", newline="\n")
+            write_text_lf(workspace / "extra.txt", "not allowed", encoding="utf-8")
             result = grade_workspace(case, workspace)
             self.assertFalse(result["passed"])
             self.assertEqual(["extra.txt"], result["extra_files"])
@@ -382,7 +383,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
                 request = run_dir / f"request-{case['id']}-{arm}.json"
                 request.write_bytes(f"frozen-first-request:{case['id']}\n".encode())
                 receipt = run_dir / f"receipt-{sequence:05d}.json"
-                receipt.write_text("{}\n", encoding="utf-8", newline="\n")
+                write_text_lf(receipt, "{}\n", encoding="utf-8")
                 paths.append(receipt)
                 cost = 20 if evolved else 10
                 wall = 150 if evolved else 100
