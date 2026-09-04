@@ -97,6 +97,32 @@ Start at [doc/API.md](doc/API.md). The normative AgentCore ABI contract is
 [doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md); the plugin contracts
 are indexed in [doc/README.md](doc/README.md).
 
+## Metask OAuth
+
+`metacodes login --provider metask` uses Metask's JSON device authorization
+flow. It prints `METASK_VERIFICATION_URI=...` and `METASK_USER_CODE=...` to
+stderr (use `--no-browser` on a headless machine), then stores the access and
+rotating refresh tokens plus gateway/model URLs in
+`$HOME/.metacodes/oauth/metask.json`. Set `METASK_SITE_URL` for a local control
+plane (`http://localhost:3000`); `METASK_GATEWAY_URL` overrides the gateway
+origin for local development. `METACODES_OAUTH_DIR` changes the OAuth store.
+
+Gateway requests use both Anthropic Messages and OpenAI Chat routes. A request
+that receives `401` with `code=token_expired` is refreshed once and replayed;
+`invalid_token`, `invalid_api_key`, and balance errors are never refresh-looped.
+Each request is recorded after completion in
+`$HOME/.metacodes/ledger/metask.ndjson` (override the directory with
+`METACODES_LEDGER_DIR`), and `metacodes ledger metask` prints those JSON lines.
+The ledger uses server-reported token usage only and includes both local and
+`X-Metask-Request-Id` request identifiers.
+Records are schema version 1 NDJSON with unix-millisecond `ts`; failed or
+interrupted responses use zero token counts rather than estimates.
+
+For compatibility, `--api-key` or an explicitly set `METASK_API_KEY` can still
+select the historical `napi.metask-ai.com` API-key route. A stored device-flow
+session supplies its authenticated gateway by default; use `--base-url` or
+`METASK_GATEWAY_URL` when deliberately testing a different gateway.
+
 ## Architecture
 
 ```text

@@ -782,6 +782,8 @@ pub const ApiResponse = struct {
     content: []const u8 = "",
     stop_reason: ?[]const u8 = null,
     tool_calls: []const ToolCallResult = &.{},
+    /// Provider-assigned request id, borrowed from the response metadata.
+    server_request_id: []const u8 = "",
 };
 
 /// 中立的流式响应句柄(type-erased vtable)。Provider.sendStream 返回它——接口里**不出现**
@@ -804,6 +806,9 @@ pub const StreamHandle = struct {
     /// 本次请求的 RequestId(日志串联用)。**契约:每个 provider 实现必须在建连时生成一个有效
     /// RequestId 并经此暴露**——不可返回未初始化值(否则跨 provider 日志串联静默错乱)。
     requestIdFn: *const fn (ctx: *anyopaque) @import("../util/log.zig").RequestId,
+    /// Provider-assigned request id (for example Metask's
+    /// `X-Metask-Request-Id`). Empty when a provider did not return one.
+    serverRequestIdFn: *const fn (ctx: *anyopaque) []const u8 = emptyServerRequestId,
 
     pub inline fn next(self: StreamHandle) anyerror!?StreamEvent {
         return self.nextFn(self.ctx);
@@ -817,7 +822,14 @@ pub const StreamHandle = struct {
     pub inline fn requestId(self: StreamHandle) @import("../util/log.zig").RequestId {
         return self.requestIdFn(self.ctx);
     }
+    pub inline fn serverRequestId(self: StreamHandle) []const u8 {
+        return self.serverRequestIdFn(self.ctx);
+    }
 };
+
+fn emptyServerRequestId(_: *anyopaque) []const u8 {
+    return "";
+}
 
 /// Provider-neutral connect-retry boundary. Failure is reported immediately,
 /// while the next intent is committed only after the delay and immediately

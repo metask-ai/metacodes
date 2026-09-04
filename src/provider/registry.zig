@@ -167,6 +167,21 @@ pub const ProviderRegistry = struct {
         return self.validateAgainstOthers(profile, self.runtimeIndexOf(profile.id));
     }
 
+    /// Validate a catalog-backed replacement, including a built-in profile.
+    /// Providers whose inventory is supplied by their authenticated gateway
+    /// (currently Metask) keep their stable id while replacing only metadata;
+    /// route identity remains the same and the host bumps the catalog revision.
+    pub fn checkReplace(self: *const ProviderRegistry, profile: ProviderProfile) RegisterError!void {
+        var skip: ?usize = null;
+        for (self.profiles.items, 0..) |existing, index| {
+            if (existing.id.eql(profile.id)) {
+                skip = index;
+                break;
+            }
+        }
+        return self.validateAgainstOthers(profile, skip);
+    }
+
     /// Register `profile`, replacing an existing *runtime* registration for the
     /// same id. Requires `checkUpsert` to have passed and capacity to be
     /// reserved, so it cannot fail partway.
@@ -174,6 +189,18 @@ pub const ProviderRegistry = struct {
         if (self.runtimeIndexOf(profile.id)) |index| {
             self.profiles.items[index] = profile;
             return;
+        }
+        self.profiles.appendAssumeCapacity(profile);
+    }
+
+    /// Install a validated catalog-backed profile, replacing either a runtime
+    /// or built-in registration with the same stable provider id.
+    pub fn replaceAssumeCapacity(self: *ProviderRegistry, profile: ProviderProfile) void {
+        for (self.profiles.items, 0..) |existing, index| {
+            if (existing.id.eql(profile.id)) {
+                self.profiles.items[index] = profile;
+                return;
+            }
         }
         self.profiles.appendAssumeCapacity(profile);
     }

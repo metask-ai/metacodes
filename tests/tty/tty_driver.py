@@ -249,13 +249,14 @@ def _drive(key_events, write, cap, set_size, per_key_drain):
 
 def run(bin_path, key_events, term_size=(24, 80), env=None,
         startup_drain=0.8, per_key_drain=0.25, base_url="http://127.0.0.1:1/v1/messages",
-        permission="bypassPermissions", cwd=None):
+        permission="bypassPermissions", cwd=None, extra_args=None):
     """fork pty,设窗口,exec bin,按 key_events 喂键,返回合并原始字节流。
 
     base_url: 默认指死端口(连接立即 refused,probeModels/请求不 hang)——离线渲染测试用。
               打真实模型的 case(test_generating 等)传 base_url=None 用硬编码真端点。
     permission: --permission 模式(默认 bypassPermissions 免弹窗;测权限弹窗传 "default")。
     cwd: 子进程工作目录(默认继承)。测权限弹窗时传隔离临时目录,避免项目 .claude/settings 污染。
+    extra_args: 追加到命令行的参数(如 ["--provider", "metask", "--model", "GLM-5.3-Flash"])。
 
     key_events 元素(字符串):
       "type:文本"        逐 codepoint 写(模拟打字,每字单独 drain → 暴露逐帧 bug)
@@ -273,9 +274,9 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
     try:
         if IS_WINDOWS:
             return _run_windows(bin_path, key_events, (rows, cols), full_env,
-                                permission, base_url, cwd, startup_drain, per_key_drain)
+                                permission, base_url, cwd, startup_drain, per_key_drain, extra_args=extra_args)
         return _run_posix(bin_path, key_events, (rows, cols), full_env,
-                          permission, base_url, cwd, startup_drain, per_key_drain)
+                          permission, base_url, cwd, startup_drain, per_key_drain, extra_args=extra_args)
     finally:
         # ephemeral home 无凭证(live 用例都显式传播种 HOME),删失败无害,尽力而为。
         if ephemeral_home:
@@ -283,7 +284,7 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
 
 
 def _run_posix(bin_path, key_events, term_size, full_env,
-               permission, base_url, cwd, startup_drain, per_key_drain):
+               permission, base_url, cwd, startup_drain, per_key_drain, extra_args=None):
     rows, cols = term_size
     pid, fd = pty.fork()
     if pid == 0:
@@ -293,7 +294,7 @@ def _run_posix(bin_path, key_events, term_size, full_env,
             os.environ.update(full_env)
             if cwd:
                 os.chdir(cwd)
-            argv = [bin_path, "--permission", permission]
+            argv = [bin_path, "--permission", permission] + list(extra_args or [])
             if base_url:
                 # 死端口兜底:即便 NO_PROBE 失效,网络调用也立即 refused 不 hang。
                 argv += ["--base-url", base_url]
@@ -350,7 +351,7 @@ def _run_posix(bin_path, key_events, term_size, full_env,
 
 
 def _run_windows(bin_path, key_events, term_size, full_env,
-                 permission, base_url, cwd, startup_drain, per_key_drain):
+                 permission, base_url, cwd, startup_drain, per_key_drain, extra_args=None):
     """ConPTY 后端。与 POSIX run() 相同的键序列/drain 语义,返回原始字节流(UTF-8)。
 
     走 pywinpty 高层 PtyProcess(argv 列表 + env dict,它负责 which/cmdline/env 块拼装
@@ -361,7 +362,7 @@ def _run_windows(bin_path, key_events, term_size, full_env,
     from winpty.ptyprocess import PtyProcess  # 延迟 import:POSIX 环境无此依赖
 
     rows, cols = term_size
-    argv = [bin_path, "--permission", permission]
+    argv = [bin_path, "--permission", permission] + list(extra_args or [])
     if base_url:
         argv += ["--base-url", base_url]
 

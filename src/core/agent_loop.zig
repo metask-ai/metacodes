@@ -352,6 +352,10 @@ pub const Options = struct {
     /// Session directory that owns recoverable tool-result artifacts. The
     /// artifact envelope never exposes this path to the model.
     artifact_root: []const u8 = "",
+    /// When set to a Metask protocol name, each accepted gateway stream emits
+    /// one billing-ledger record at completion. Null keeps synthetic/providers
+    /// and legacy API-key sessions unchanged.
+    metask_ledger_protocol: ?[]const u8 = null,
     tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
     /// **Run 输出语义账本**(见 core/output_semantics.zig)。挂上后 run() 把每个可见输出段
     /// 连同它的定性(commentary/final/continued/partial/discarded)记进来,并把最终结果
@@ -1425,6 +1429,22 @@ pub fn run(
                 reporter,
                 latestUserText(conversation), // web_search 显示用:用户原话(P1:作请求参数传, 不再 post-set)
             ) catch |err| {
+                if (opts.metask_ledger_protocol) |protocol| {
+                    const failed_record = @import("../provider/metask_ledger.zig").Record{
+                        .ts = @intCast(@divTrunc(util_time.nowWallNs(), 1_000_000)),
+                        .session_id = sess.asSlice(),
+                        .protocol = protocol,
+                        .model = opts.model_override orelse provider.model(),
+                        .local_request_id = provider.requestIdText(),
+                        .server_request_id = provider.serverRequestId(),
+                        .http_status = provider.httpStatus(),
+                        .outcome = if (err == error.Aborted) "client_disconnect" else "failed",
+                        .retry_attempt = provider.retryAttempt(),
+                        .wall_elapsed_ms = elapsedSinceNs(model_request_started_ns),
+                    };
+                    @import("../provider/metask_ledger.zig").append(allocator, failed_record) catch |ledger_err|
+                        log.debug("ledger", "Metask failed-request ledger append failed: {s}", .{@errorName(ledger_err)});
+                }
                 const attempt_outcome: execution_effect.ProviderAttemptOutcome = switch (err) {
                     error.ContextWindowExceeded => .context_window_exceeded,
                     error.Aborted => .aborted,
@@ -1504,6 +1524,35 @@ pub fn run(
             var stream_error = false;
             var stream_context_window_exceeded = false;
             var response_usage = @import("cache_break.zig").ResponseUsage{};
+            var ledger_outcome: []const u8 = "failed";
+            // The defer is declared after stream.deinit above, so it runs
+            // first and can still read the handle's server request id. It is
+            // deliberately scoped to this accepted gateway request.
+            defer if (opts.metask_ledger_protocol) |protocol| {
+                const report_usage = response_usage.reported and !stream_error;
+                const input_tokens: u64 = if (report_usage) response_usage.input_tokens else 0;
+                const output_tokens: u64 = if (report_usage) response_usage.output_tokens else 0;
+                const cache_read_tokens: u64 = if (report_usage) response_usage.cache_read_tokens else 0;
+                const cache_creation_tokens: u64 = if (report_usage) response_usage.cache_write_tokens else 0;
+                const record = @import("../provider/metask_ledger.zig").Record{
+                    .ts = @intCast(@divTrunc(util_time.nowWallNs(), 1_000_000)),
+                    .session_id = sess.asSlice(),
+                    .protocol = protocol,
+                    .model = opts.model_override orelse provider.model(),
+                    .local_request_id = stream.requestId().asSlice(),
+                    .server_request_id = stream.serverRequestId(),
+                    .http_status = provider.httpStatus(),
+                    .outcome = ledger_outcome,
+                    .retry_attempt = provider.retryAttempt(),
+                    .input_tokens = input_tokens,
+                    .output_tokens = output_tokens,
+                    .cache_read_tokens = cache_read_tokens,
+                    .cache_creation_tokens = cache_creation_tokens,
+                    .wall_elapsed_ms = elapsedSinceNs(model_request_started_ns),
+                };
+                @import("../provider/metask_ledger.zig").append(allocator, record) catch |err|
+                    log.debug("ledger", "Metask ledger append failed: {s}", .{@errorName(err)});
+            };
             while (true) {
                 const ev_opt = stream.next() catch |err| switch (err) {
                     error.Aborted => {
@@ -1670,6 +1719,7 @@ pub fn run(
                 .stream_error
             else
                 .succeeded;
+            ledger_outcome = if (aborted_during_stream) "client_disconnect" else if (stream_error) "failed" else "completed";
             if (!retry_ui.finishAttempt(provider_outcome, provider_metering))
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
 

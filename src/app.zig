@@ -114,6 +114,7 @@ const kg_provider_audit = @import("kg/provider_audit.zig");
 const provider_alias_mod = @import("provider/alias.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const oauth_exchange_mod = @import("api/oauth_exchange.zig");
+const metask_oauth_mod = @import("api/metask_oauth.zig");
 const provider_mod = @import("api/provider.zig");
 const request_overrides = @import("api/request_overrides.zig");
 const dialect_mod = @import("api/dialect.zig");
@@ -534,6 +535,25 @@ pub const App = struct {
             app.gemini_client.?.overrides = buildOverridesFromConfig(config);
         }
 
+        // A Metask login is process-scoped: retain the same Session object
+        // used by turn-boundary refresh so a gateway 401 can force-refresh the
+        // rotating token without opening a second single-flight domain.
+        if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask")) {
+            if (provider_ids_mod.Slug.parse("metask")) |provider_id| {
+                app.oauth_session = provider_oauth_mod.Session.initHome(allocator, provider_id) catch null;
+                if (app.oauth_session) |*loaded| {
+                    if (loaded.load() catch false) {
+                        app.oauth_session_provider = provider_id;
+                        app.api_client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
+                        if (app.openai_client) |*client| client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
+                    } else {
+                        loaded.deinit();
+                        app.oauth_session = null;
+                    }
+                }
+            } else |_| {}
+        };
+
         // 启动时先事务化解析 CLI data packages，再由 canonical Runtime 一次性解析
         // enterprise / personal / project / plugin Skill sources。插件失败不降级：用户
         // 显式声明的 package 若不可信或 Host 不支持，启动必须 fail closed。
@@ -691,14 +711,64 @@ pub const App = struct {
         app.model_context.loadOrBundle();
         app.api_client.model_context = &app.model_context;
 
+        // Metask's authenticated catalog is authoritative for this session.
+        // Fetch it once with the bearer, project limits/capabilities into the
+        // provider host, and retain unknown fields as unknown rather than
+        // inheriting the historical static inventory.
+        if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask")) metask_catalog: {
+            if (app.oauth_session) |*session| if (session.tokens) |tokens| if (tokens.models_url) |models_url| {
+                const fetched = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
+                    .url = models_url,
+                    .bearer = app.api_key,
+                }) catch |err| {
+                    @import("util/log.zig").warn("catalog", "Metask /v1/models fetch failed: {s}", .{@errorName(err)});
+                    break :metask_catalog;
+                };
+                defer app.allocator.free(fetched.body);
+                const host = app.providerHost() catch |err| {
+                    @import("util/log.zig").warn("catalog", "Metask provider host unavailable: {s}", .{@errorName(err)});
+                    break :metask_catalog;
+                };
+                // An explicit Metask gateway override wins over the origin
+                // returned by the authorization server. `config.base_url` is
+                // already a protocol endpoint (`.../v1/messages` or
+                // `.../v1/chat/completions`), so it is intentionally not used
+                // as a catalog origin fallback here.
+                const gateway = if (std.c.getenv("METASK_GATEWAY_URL")) |raw|
+                    std.mem.trimEnd(u8, std.mem.span(raw), "/")
+                else
+                    tokens.gateway_url orelse "";
+                if (gateway.len > 0) {
+                    if (!metask_oauth_mod.isGatewayOrigin(gateway)) {
+                        @import("util/log.zig").warn("catalog", "Metask gateway_url is not an origin; keeping the compiled route", .{});
+                        break :metask_catalog;
+                    }
+                    host.ingestMetask(gateway, fetched.body) catch |err| {
+                        @import("util/log.zig").warn("catalog", "Metask model ingestion failed: {s}", .{@errorName(err)});
+                    };
+                    // The route selected before App construction was derived
+                    // from this same gateway origin; re-seed it after the
+                    // dynamic profile replacement so picker/turn-boundary
+                    // state points at the new offer generation.
+                    app.seedStartupSelection(host);
+                }
+                app.api_client.catalog.loadFromModelsListJson(fetched.body) catch |err| {
+                    @import("util/log.zig").debug("catalog", "Metask client catalog parse failed: {s}", .{@errorName(err)});
+                };
+            };
+        };
+
         // 探测 <base_url>/v1/models 取 model catalog（max_tokens）。失败静默，走本地 fallback。
         // METACODES_NO_PROBE=1 跳过：离线/沙箱/TTY 测试下 probeModels 的网络调用会 hang,
         // 跳过让 REPL 立即可用(走本地 model 单价表)。
         // **仅 anthropic 模式 probe**:probeModels 打 Anthropic 的 /v1/models,openai 模式下
         // api_client 是死资源、且其 base_url 指向 Anthropic 端点——probe 它=对错端点发真请求
         // (用真 key),必须跳过。openai 的 context_window 走 OpenAIClient 自己的硬编码值。
+        const metask_session_active =
+            std.ascii.eqlIgnoreCase(config.provider_profile orelse "", "metask") and
+            app.oauth_session != null;
         if (config.provider_kind == .anthropic) {
-            if (std.c.getenv("METACODES_NO_PROBE") == null) {
+            if (std.c.getenv("METACODES_NO_PROBE") == null and !metask_session_active) {
                 app.oauth_token_for_catalog = @import("core/auth.zig").resolveStoredOAuthBearer(allocator) catch null;
                 app.probeApiKeys();
                 app.api_client.probeModels();
@@ -824,6 +894,19 @@ pub const App = struct {
         };
 
         return app;
+    }
+
+    fn refreshMetaskToken(ctx: *anyopaque) anyerror![]u8 {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        const session = if (app.oauth_session) |*loaded| loaded else return error.NoTokens;
+        var site_buf: [1024]u8 = undefined;
+        const token_url = try metask_oauth_mod.tokenUrl(metask_oauth_mod.siteUrl(), &site_buf);
+        var exchange = oauth_exchange_mod.MetaskHttpExchange{
+            .allocator = app.allocator,
+            .io = app.api_client.http_client.io,
+            .token_url = token_url,
+        };
+        return session.refreshNow(@import("util/time.zig").nowUnix(), exchange.exchange());
     }
 
     /// 组装层选 Provider:据 config.provider_kind 返回对应后端的中立 Provider。
@@ -1010,12 +1093,36 @@ pub const App = struct {
     fn seedStartupSelection(app: *App, host: *provider_host_mod.Host) void {
         const rendered = app.config.selected_offer_id orelse return;
         const offer_id = provider_ids_mod.OfferId.parse(rendered) catch return;
-        const found = host.kernel.catalogSnapshot().find(offer_id) orelse return;
-        host.kernel.seedSessionSelection(provider_selection_mod.RuntimeSelection.pinned(
-            found.offer_id,
-            found.offer_revision,
-            .session,
-        ));
+        const snapshot = host.kernel.catalogSnapshot();
+        if (snapshot.find(offer_id)) |found| {
+            host.kernel.seedSessionSelection(provider_selection_mod.RuntimeSelection.pinned(
+                found.offer_id,
+                found.offer_revision,
+                .session,
+            ));
+            return;
+        }
+        // An authenticated Metask catalog replaces the compiled profile, so
+        // its offer ids legitimately change when the server supplies a model
+        // display/limit record. Preserve the startup route by matching the
+        // already-resolved model and wire instead of silently losing the
+        // session selection after ingestion.
+        if (std.ascii.eqlIgnoreCase(app.config.provider_profile orelse "", "metask")) {
+            const protocol = if (app.config.provider_kind == .openai) "openai_chat" else "anthropic_messages";
+            for (snapshot.items()) |*candidate| {
+                if (candidate.provider_id.eqlText("metask") and
+                    std.mem.eql(u8, candidate.request_model_id, app.config.model) and
+                    std.mem.eql(u8, candidate.protocol, protocol))
+                {
+                    host.kernel.replaceSessionSelection(provider_selection_mod.RuntimeSelection.pinned(
+                        candidate.offer_id,
+                        candidate.offer_revision,
+                        .session,
+                    ));
+                    return;
+                }
+            }
+        }
     }
 
     /// Materialize the configured credential pool for the current session.
@@ -1087,8 +1194,7 @@ pub const App = struct {
     /// A live access token for a provider whose profile declares an OAuth
     /// lifecycle, refreshing through the shared single-flight session.
     ///
-    /// Returns null for every profile that declares none — Metask keeps its
-    /// historical `core/auth.zig` path byte for byte, and a provider with no
+    /// Returns null for every profile that declares none. A provider with no
     /// token endpoint has no lifecycle to run.
     pub fn oauthAccessToken(
         app: *App,
@@ -1125,16 +1231,32 @@ pub const App = struct {
         // authorization grant was issued to. The login records it; the profile
         // supplies it when it declares one; the provider id is the historical
         // last resort for a login persisted before either existed.
-        var exchange = oauth_exchange_mod.HttpExchange{
-            .allocator = app.allocator,
-            .io = app.api_client.http_client.io,
-            .endpoint = .{
-                .token_url = token_url,
-                .client_id = session.clientIdFor(built.oauth_client_id),
-            },
-        };
         const before = session.generation;
-        const token = try session.accessToken(now_seconds, exchange.exchange());
+        // Metask's control plane is JSON-only and intentionally rejects the
+        // generic form-encoded RFC 6749 request. Keep this branch here (rather
+        // than relying only on main's startup path) because the picker/turn
+        // boundary can also refresh the process-scoped session.
+        const token = if (built.id.eqlText("metask")) blk: {
+            var site_buf: [1024]u8 = undefined;
+            const metask_token_url = metask_oauth_mod.tokenUrl(metask_oauth_mod.siteUrl(), &site_buf) catch
+                return error.RefreshFailed;
+            var exchange = oauth_exchange_mod.MetaskHttpExchange{
+                .allocator = app.allocator,
+                .io = app.api_client.http_client.io,
+                .token_url = metask_token_url,
+            };
+            break :blk try session.accessToken(now_seconds, exchange.exchange());
+        } else blk: {
+            var exchange = oauth_exchange_mod.HttpExchange{
+                .allocator = app.allocator,
+                .io = app.api_client.http_client.io,
+                .endpoint = .{
+                    .token_url = token_url,
+                    .client_id = session.clientIdFor(built.oauth_client_id),
+                },
+            };
+            break :blk try session.accessToken(now_seconds, exchange.exchange());
+        };
 
         // The session is the only thing that knows this credential's expiry, so
         // it is the only thing that can warn before a turn fails. A refresh
@@ -1834,7 +1956,8 @@ pub const App = struct {
     /// perform one exchange.
     ///
     /// Returns true when the token was replaced. Providers with no OAuth
-    /// lifecycle — Metask, and every API-key profile — are a no-op.
+    /// lifecycle — and API-key-only routes — are a no-op; Metask participates
+    /// through its JSON refresh exchange.
     pub fn refreshRouteCredential(app: *App) !bool {
         // A session that named its provider on the command line and never
         // opened the picker has no host yet — and reading `provider_host`

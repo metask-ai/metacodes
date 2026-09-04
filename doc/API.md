@@ -21,6 +21,44 @@ product surfaces built over the same core protocols.
 
 ## Provider selection surface
 
+### Metask device OAuth and gateway
+
+`metacodes login --provider metask` performs the Metask JSON device flow:
+
+* `POST $METASK_SITE_URL/api/oauth/device/code` (default site
+  `https://metask-ai.com`) with `client_id=metacodes` and the local hostname;
+* polling `POST $METASK_SITE_URL/api/oauth/token` with the device grant until
+  approval; and
+* atomically storing `access_token`, `refresh_token`, `expires_at`,
+  `gateway_url`, `models_url`, and `client_name` in
+  `$HOME/.metacodes/oauth/metask.json` (or `METACODES_OAUTH_DIR`).
+
+The refresh grant sends only `grant_type=refresh_token` and the stored refresh
+token. Metask rotates refresh tokens; persistence happens before the new access
+token is used, and an `invalid_grant` is actionable as “log in again”. The
+gateway origin comes from `gateway_url` or `METASK_GATEWAY_URL` (an origin, not
+`/v1/messages`) and exposes both `/v1/messages` (Anthropic SSE) and
+`/v1/chat/completions` (OpenAI SSE). On a pre-stream `401` whose JSON error code
+is `token_expired`, the identical serialized request is replayed once. Invalid
+tokens, invalid API keys, balance errors, and model-not-found responses are not
+refresh-retried.
+
+Every gateway response captures the case-insensitive `X-Metask-Request-Id`.
+Completed and failed requests are appended as one NDJSON record to
+`$HOME/.metacodes/ledger/metask.ndjson` (or `METACODES_LEDGER_DIR`), with
+server-reported usage only, local/server request ids, HTTP status, retry
+attempt, outcome, and elapsed time. `metacodes ledger metask` prints the file.
+The schema-1 keys are `ts` (unix milliseconds), `session_id`, `provider_id`,
+`protocol`, `model`, `local_request_id`, `server_request_id`, `http_status`,
+`outcome`, `retry_attempt`, `input_tokens`, `output_tokens`,
+`cache_read_tokens`, `cache_creation_tokens`, and `wall_elapsed_ms`; missing
+usage on an error or interrupted stream is recorded as zero.
+
+The historical `METASK_API_KEY`/`--api-key` path remains available only as an
+explicit compatibility choice. It is never inferred in place of a stored
+device-flow gateway; an explicit `--base-url` or `METASK_GATEWAY_URL` can be
+used for deliberate legacy/local testing.
+
 Route selection is provider-owned data, not a model-name convention. See
 [Provider offers and control plane](PROVIDER_OFFER_ARCHITECTURE.md) for the
 normative model; the entry points are:

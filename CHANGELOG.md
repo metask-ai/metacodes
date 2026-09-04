@@ -12,6 +12,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Metask now has a JSON device-code OAuth provider (`login --provider metask`)
+  with rotating refresh-token persistence, gateway-derived model routing for
+  Anthropic Messages and OpenAI Chat, one-shot replay for pre-stream
+  `token_expired` responses, case-insensitive `X-Metask-Request-Id` capture,
+  and the opt-in-path `metacodes ledger metask` NDJSON billing ledger. See
+  `METASK_SITE_URL`, `METASK_GATEWAY_URL`, `METACODES_OAUTH_DIR`, and
+  `METACODES_LEDGER_DIR`.
+
 - The provider-offer capability vocabulary's comptime coverage guard now binds
   the real runtime capability enum instead of a hand-copied duplicate, so the
   next runtime capability added without an offer mapping is a compile error

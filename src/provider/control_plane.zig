@@ -834,6 +834,19 @@ pub const Kernel = struct {
         self.session_selection = seeded;
     }
 
+    /// Replace the boot-time session selection after a catalog-backed provider
+    /// refresh changes offer identities. This is intentionally separate from
+    /// `seedSessionSelection`: ordinary callers must not overwrite a user's
+    /// live selection, while an authenticated Metask inventory has just
+    /// invalidated the compiled offer id that was used during bootstrap.
+    pub fn replaceSessionSelection(self: *Kernel, selection: RuntimeSelection) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var replaced = selection;
+        replaced.scope = .session;
+        self.session_selection = replaced;
+    }
+
     /// Freeze the selection for one turn. A commit during the turn changes the
     /// scope state but not this snapshot, so it takes effect next turn.
     pub fn beginTurn(self: *Kernel) ?RuntimeSelection {
