@@ -1563,12 +1563,16 @@ pub fn build(b: *std.Build) void {
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
     else
         b.addSystemCommand(&.{"scripts/test_coverage_audit.sh"});
+    // The checklist ends with `git diff --check`; the aggregate gate runs it too,
+    // so the one advertised command really is the whole list.
+    const gate_diff_check = b.addSystemCommand(&.{ "git", "diff", "--check" });
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
     gate_pr_step.dependOn(&gate_fmt.step);
     gate_pr_step.dependOn(test_step);
     gate_pr_step.dependOn(core_test_step);
     gate_pr_step.dependOn(&gate_coverage.step);
     gate_pr_step.dependOn(doc_check_step);
+    gate_pr_step.dependOn(&gate_diff_check.step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
