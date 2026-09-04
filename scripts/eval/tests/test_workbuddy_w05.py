@@ -248,7 +248,7 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
             with mock.patch("scripts.eval.workbuddy.run_w05._git", side_effect=clean_git):
                 _fresh_checkout(root)
                 write_text_lf(root / ".env", "SECRET=x\n", encoding="utf-8")
-                with self.assertRaisesRegex(W05Error, "\.env"):
+                with self.assertRaisesRegex(W05Error, r"\.env"):
                     _fresh_checkout(root)
 
             (root / ".env").unlink()
