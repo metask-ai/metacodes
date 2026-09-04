@@ -133,7 +133,7 @@
     "scripts/eval/promotion.py": "65f566244d3880b367a0c9adee858b2160ed63d5b1644ea38202e79a34fb79f3",
     "scripts/eval/treatment_activation.py": "28b976feaf8caab1d03a42d58794b067b9ca892de248e72a2f4ab22eebe769b0",
     "scripts/eval/cli.py": "25cc465881dee4f1d6058884ed8fcf0c47d867b541cf2d57ba44aa9e5f8331b1",
-    "scripts/eval/plugin_release_gate.py": "a883368f6b2b00101fbbde6bbfdac15d6f066842933532670b525d355586d586",
+    "scripts/eval/plugin_release_gate.py": "d2b925595d165e3403d95a5427da7e6340e7893cf47e164f379765fc5dbfbfbe",
     "scripts/eval/plugin_pair_runner.py": "9829de9cbfbe9b0ec5aba7868ce800350fa9a5a47204a9bfa73e0b6418ff59e9",
     "scripts/eval/plugin_pair_analysis.py": "5dad36d6e5c2465c395cddf81ffcef20586fb124e85173e5df8c159d30ce007a",
     "tests/e2e/run_e2e.sh": "38b21bdc939682e870846cc57731c90b2a114aec285b8df6d8019ba7a59314f3",
