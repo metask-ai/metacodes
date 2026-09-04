@@ -1534,6 +1534,10 @@ pub fn build(b: *std.Build) void {
     const doc_check_step = b.step("doc:check", "Check documentation links and facts");
     doc_check_step.dependOn(&doc_check_cmd.step);
     doc_check_step.dependOn(&doc_facts_cmd.step);
+    const notices_cmd = b.addSystemCommand(&.{ if (@import("builtin").os.tag == .windows) "python" else "python3", "scripts/gen_third_party_notices.py", "--check" });
+    const notices_step = b.step("release:notices", "Check generated third-party notices");
+    notices_step.dependOn(&notices_cmd.step);
+    doc_check_step.dependOn(notices_step);
     const doc_facts_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",

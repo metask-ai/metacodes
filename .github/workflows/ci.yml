@@ -170,11 +170,16 @@ jobs:
       - name: Documentation link check
         if: runner.os == 'Linux'
         run: python3 scripts/check_doc_links.py
+      - name: Third-party notices check
+        if: runner.os == 'Linux'
+        run: python3 scripts/gen_third_party_notices.py --check
       - name: Documentation fact check
         if: runner.os == 'Linux'
         run: python3 scripts/check_doc_facts.py
       - name: Documentation fact-check unit tests
         run: python3 -m unittest scripts.tests.test_check_doc_facts -v
+      - name: Third-party notices unit tests
+        run: python3 -m unittest scripts.tests.test_gen_third_party_notices -v
       - name: Gate manifest unit tests
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
       - name: Diff whitespace check

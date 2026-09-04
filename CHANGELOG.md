@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- `THIRD_PARTY_NOTICES.md` is rendered by `scripts/gen_third_party_notices.py`
+  from the dependency manifests (ripgrep, TinyKG, highlight-zig, the Lean
+  toolchain) plus `release/notices.static.md`; `--check` fails with a diff when
+  the committed file is stale, as `zig build release:notices` (part of
+  `doc:check`) and a Linux CI step. The rows now carry the pinned commits and
+  upstream revision. Stage 1 of #47.
+
 - The pre-submit checklist has one source, AGENTS.md "Before submitting":
   `zig build gate:pr` runs it, `CONTRIBUTING.md` and the pull-request template
   point at it instead of repeating it, and `scripts/tests/test_gate_manifest.py`
