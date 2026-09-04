@@ -1048,6 +1048,13 @@ test "BashTool embedding without JobRegistry still spools from byte zero" {
     const artifact_id = parsed.value.object.get("stdout_artifact_id").?.string;
     try std.testing.expect(parsed.value.object.get("stdout_recoverable").?.bool);
     try std.testing.expectEqual(@as(i64, 40_010), parsed.value.object.get("stdout_original_bytes").?.integer);
+    // The spilled channel is a sealed attachment (#73): nothing is in the CAS
+    // until the batch commit boundary publishes it.
+    const cas = try std.fmt.allocPrint(allocator, "{s}/tool-results/sha256", .{root});
+    defer allocator.free(cas);
+    try std.testing.expectEqual(@as(usize, 0), try testCountDirectory(allocator, cas));
+    var handles = body.takeSealedHandles();
+    try testPublishAttachments(&handles);
     var tail = try artifact.readChunk(allocator, root, artifact_id, 39_990, 32);
     defer tail.deinit();
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "EMBED_TAIL") != null);

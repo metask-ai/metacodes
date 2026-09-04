@@ -771,8 +771,45 @@ test "stream projector retains bounded result inline when publication fails" {
     );
     defer if (outcome == .result) outcome.result.deinit(allocator);
     try std.testing.expect(outcome == .result);
-    try std.testing.expect(outcome.result == .@"inline");
-    try std.testing.expectEqual(@as(usize, 30_000), outcome.result.@"inline".bytes.len);
+    // Sealed regardless of the full quota (#73): the failure surfaces at the
+    // batch commit boundary, where the loop's policy keeps a result within the
+    // inline-retention ceiling as bytes.
+    try std.testing.expect(outcome.result == .sealed);
+    var committed = try testCommitSealed(allocator, &outcome.result);
+    defer committed.deinit(allocator);
+    try std.testing.expect(!committed.is_error);
+    try std.testing.expectEqual(@as(usize, 30_000), committed.content.len);
+}
+
+/// What `tool_exec.publishSealedResults` does with a sealed body at the batch
+/// commit boundary; the failure-policy tests drive it directly.
+const TestCommitted = struct {
+    content: []u8,
+    is_error: bool,
+    fn deinit(self: *TestCommitted, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+    }
+};
+
+fn testCommitSealed(allocator: std.mem.Allocator, body: *tool_result.ToolResultBody) !TestCommitted {
+    const tool_exec = @import("../core/tool_exec.zig");
+    var rendered = try body.render(allocator);
+    defer rendered.deinit(allocator);
+    var slots = [_]tool_exec.Slot{.{
+        .decision = .run,
+        .name = "mock__tool",
+        .id = "sid",
+        .input = "{}",
+        .content = try allocator.dupe(u8, rendered.bytes),
+        .sealed = body.takeSealedHandles(),
+    }};
+    errdefer for (&slots) |*slot| slot.deinit(allocator);
+    try tool_exec.publishSealedResults(&slots, allocator, .{ .bytes = [_]u8{'0'} ** 12 });
+    const content = slots[0].content.?;
+    slots[0].content = null;
+    const is_error = slots[0].is_error;
+    for (&slots) |*slot| slot.deinit(allocator);
+    return .{ .content = content, .is_error = is_error };
 }
 
 test "stream projector rejects over-ceiling result when publication fails" {
@@ -802,8 +839,15 @@ test "stream projector rejects over-ceiling result when publication fails" {
         true,
     );
     defer if (outcome == .result) outcome.result.deinit(allocator);
-    try std.testing.expect(outcome == .diagnostic);
-    try std.testing.expectEqual(DiagnosticCode.resource_limit, outcome.diagnostic.code);
+    // Above the ceiling the commit boundary cannot keep the bytes inline: the
+    // slot becomes the bounded ArtifactPublishFailed tool error — fail closed,
+    // as the projector's resource_limit diagnostic was at call time.
+    try std.testing.expect(outcome == .result);
+    try std.testing.expect(outcome.result == .sealed);
+    var committed = try testCommitSealed(allocator, &outcome.result);
+    defer committed.deinit(allocator);
+    try std.testing.expect(committed.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, committed.content, "ArtifactPublishFailed") != null);
 }
 
 test "stream projector publishes only a large successful result range" {
