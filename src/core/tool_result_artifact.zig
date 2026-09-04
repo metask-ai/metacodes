@@ -342,9 +342,7 @@ pub const Spool = struct {
     }
 
     pub fn finish(self: *Spool) !CompletedSpool {
-        var sealed = try self.seal();
-        defer sealed.deinit();
-        return sealed.publish();
+        return self.finishWithMode(.normal);
     }
 
     const PublishMode = enum {
@@ -355,8 +353,27 @@ pub const Spool = struct {
 
     fn finishWithMode(self: *Spool, mode: PublishMode) !CompletedSpool {
         var sealed = try self.seal();
-        defer sealed.deinit();
-        return sealed.publishWithMode(mode);
+        const completed = sealed.publishWithMode(mode) catch |err| {
+            // A failed publication leaves the private file to `Spool.deinit`,
+            // exactly as before the seal/publish split (#45): a caller that
+            // inspects the temp path after a failure still finds it there.
+            self.reclaim(&sealed);
+            return err;
+        };
+        sealed.deinit();
+        self.published = true;
+        return completed;
+    }
+
+    /// Take the buffers back from a sealed handle whose publication failed, so
+    /// this Spool owns the private file again and `deinit` removes it. The
+    /// handle is consumed.
+    fn reclaim(self: *Spool, sealed: *SealedSpool) void {
+        self.session_root = sealed.session_root;
+        self.directory = sealed.directory;
+        self.temp_path = sealed.temp_path;
+        self.transferred = false;
+        sealed.* = undefined;
     }
 
     /// Close and validate the private stream without publishing it. The sealed

@@ -178,12 +178,12 @@ pub const ToolResultBody = union(enum) {
                 break :blk .{ .bytes = result.bytes, .is_error = false };
             },
             .structured_error => |result| blk: {
-                self.* = undefined;
+                self.* = .{ .@"inline" = .{ .bytes = &.{} } };
                 break :blk .{ .bytes = result.encoded, .is_error = true };
             },
             .artifact => |result| blk: {
                 const bytes = try renderArtifactEnvelope(allocator, result);
-                self.* = undefined;
+                self.* = .{ .@"inline" = .{ .bytes = &.{} } };
                 break :blk .{ .bytes = bytes, .is_error = false };
             },
             .sealed => |*result| blk: {
@@ -191,23 +191,23 @@ pub const ToolResultBody = union(enum) {
                     const allowed = result_budget.retainInlineAfterFailedPublish(err, result.spool.receipt().bytes, result.capture_complete, result_budget.PER_RESULT_MAX_BYTES);
                     if (!allowed) {
                         result.spool.deinit();
-                        self.* = undefined;
+                        self.* = .{ .@"inline" = .{ .bytes = &.{} } };
                         return err;
                     }
                     const bytes = result.spool.readAllAlloc(allocator) catch |read_err| {
                         result.spool.deinit();
-                        self.* = undefined;
+                        self.* = .{ .@"inline" = .{ .bytes = &.{} } };
                         return read_err;
                     };
                     result.spool.deinit();
-                    self.* = undefined;
+                    self.* = .{ .@"inline" = .{ .bytes = &.{} } };
                     break :blk .{ .bytes = bytes, .is_error = false };
                 };
                 var receipt = completed.receipt;
                 receipt.capture_complete = result.capture_complete;
                 const bytes = try renderArtifactEnvelope(allocator, .{ .stored = receipt, .preview = completed.preview, .media_type = result.media_type });
                 result.spool.deinit();
-                self.* = undefined;
+                self.* = .{ .@"inline" = .{ .bytes = &.{} } };
                 break :blk .{ .bytes = bytes, .is_error = false };
             },
         };

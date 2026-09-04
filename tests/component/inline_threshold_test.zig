@@ -371,10 +371,10 @@ test "T5 inline threshold: a result that cannot be published degrades to a fallb
     // the shared fallback policy so projection can still say something useful.
     var body = try cc.result_spool.finishCaptureAsBody(a, root, &capture, .text_utf8, true, budget);
     const taken = try body.takeModelBytes(a);
-    defer a.free(taken.bytes);
     try std.testing.expectEqual(size, taken.bytes.len);
-
-    var content = try committed(a, &body);
+    // `takeModelBytes` consumed the body; what the loop would commit is the
+    // retained inline bytes themselves, so they are the projection input.
+    var content: []const u8 = taken.bytes;
     defer a.free(@constCast(content));
     var items = [_]projection.Item{.{ .tool_name = "Grep", .content = &content, .is_error = false }};
     const stats = try projection.project(a, &items, .{ .session_root = root, .budget = budget });
