@@ -170,7 +170,7 @@ pub fn publishSealedResults(slots: []Slot, allocator: std.mem.Allocator, rid: lo
         }
         if (handle.spool.publish()) |_| continue else |err| {
             const bytes = handle.spool.receipt().bytes;
-            const retain = result_budget.retainInlineAfterFailedPublish(err, bytes, handle.capture_complete, result_budget.PER_RESULT_MAX_BYTES);
+            const retain = result_budget.retainInlineAfterFailedPublish(err, bytes, handle.capture_complete, handle.retain_inline_ceiling);
             if (retain) {
                 if (handle.spool.readAllAlloc(allocator)) |inline_bytes| {
                     if (slot.content) |old| allocator.free(old);

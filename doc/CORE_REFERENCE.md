@@ -360,6 +360,7 @@ projection 层在本轮结果就绪后决定"模型该看到多少"。两层分�
 **发布发生在批次提交边界,不在执行期(#45)。** 封存的句柄随渲染好的信封一起走
 (`tool_exec.OneResult.done.sealed` → `Slot.sealed`,流式预取的 `Entry` 同样携带);从封存
 receipt 渲染的信封与发布后渲染的逐字节相同,所以模型看到的字节不因发布时机而变。
+MCP client 超出 frame limit 的结果、host stream 工具的产物,以及声明 `supports_artifact_spool` 的 process plugin 写入的外部 spool(`ExternalSpool.seal`),现在也遵循这一提交边界发布规则(#65);仍在执行期发布的只剩 Bash 的 stdout/stderr spool 导入与 AgentCore 一侧的投影器 / durable budget 提升,见从 #65 拆出的 #73。
 `executeSlots` 无 fatal 地完成就是提交边界:`tool_exec.publishSealedResults` 在这里发布每个
 句柄,发布与为它作证的 Conversation 引用落在同一轮;更早的退出(host 工具 fatal、被拒的
 dispatch 观测)只是释放 slots——`Slot.deinit` 丢弃临时文件,CAS 里不会留下无人引用的 blob。

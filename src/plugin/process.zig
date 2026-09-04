@@ -368,11 +368,13 @@ fn executeTool(
                 return failed(tool_ctx.allocator, "plugin_invalid_media_type")
         else
             .text_utf8;
-        const completed = spool.finish() catch |err| {
+        // Sealed, not published: the loop publishes at the batch commit
+        // boundary, so a fatal sibling in the same batch leaves no blob (#65).
+        const sealed = spool.seal() catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return failed(tool_ctx.allocator, "plugin_artifact_spool_invalid");
         };
-        return .{ .ok = tools.ToolResultBody.fromCompletedSpool(completed, media_type) };
+        return .{ .ok = .{ .sealed = .{ .spool = sealed, .media_type = media_type, .capture_complete = true } } };
     }
     if (std.mem.eql(u8, response.status, "failed")) {
         return .{ .host_failed = if (response.content) |content|

@@ -400,18 +400,29 @@ test "L2 process plugin writes from byte zero into the kernel artifact spool" {
         .{ @tagName(outcome), if (outcome == .host_failed) (outcome.host_failed orelse "") else "" },
     );
     try std.testing.expect(outcome == .ok);
-    try std.testing.expect(outcome.ok == .artifact);
-    try std.testing.expect(outcome.ok.artifact.stored.bytes > 80 * 1024);
+    // #65: the child's spool is sealed during the call and published only at
+    // the batch commit boundary, so nothing is in the CAS yet.
+    try std.testing.expect(outcome.ok == .sealed);
+    const cas_dir = try std.fmt.allocPrint(allocator, "{s}/tool-results/sha256", .{root});
+    defer allocator.free(cas_dir);
+    try std.testing.expectEqual(@as(usize, 0), try cc.tool_exec.testCountEntries(allocator, cas_dir));
     var rendered = try outcome.ok.render(allocator);
     defer rendered.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "ReadArtifact") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "PLUGIN_HEAD-") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "-PLUGIN_TAIL") != null);
+    var sealed = outcome.ok.takeSealed().?;
+    defer sealed.spool.deinit();
+    const completed = try sealed.spool.publish();
+    try std.testing.expect(completed.receipt.bytes > 80 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), try cc.tool_exec.testCountEntries(allocator, cas_dir));
+    // The envelope rendered before publication names the blob that exists after it.
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, completed.receipt.id()) != null);
     var recovered = try cc.tool_result_artifact.readChunk(
         allocator,
         root,
-        outcome.ok.artifact.stored.id(),
-        outcome.ok.artifact.stored.bytes - 32,
+        completed.receipt.id(),
+        completed.receipt.bytes - 32,
         32,
     );
     defer recovered.deinit();

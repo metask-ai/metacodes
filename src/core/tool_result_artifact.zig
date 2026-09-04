@@ -546,6 +546,9 @@ pub const ExternalSpool = struct {
     session_root: []u8,
     path_z: [:0]u8,
     finished: bool = false,
+    /// `seal()` moved the strings and the private file into a `SealedSpool`;
+    /// `deinit` then owns nothing (#65).
+    transferred: bool = false,
 
     pub fn begin(allocator: std.mem.Allocator, session_root: []const u8) !ExternalSpool {
         if (session_root.len == 0) return error.ArtifactRootUnavailable;
@@ -586,6 +589,36 @@ pub const ExternalSpool = struct {
         return self.finishWithMode(.normal);
     }
 
+    /// Validate what the child wrote and hand it over unpublished: the file
+    /// stays in the spool directory (outside the scanned CAS quota) until the
+    /// batch commit boundary publishes or discards it, exactly like
+    /// `Spool.seal` (#65). The digest, size, identity and model-visible
+    /// preview are fixed here, so the envelope rendered before publication is
+    /// the envelope rendered after it.
+    pub fn seal(self: *ExternalSpool) !SealedSpool {
+        if (self.finished) return error.ArtifactSpoolClosed;
+        const snapshot = try inspectFile(self.allocator, self.path());
+        const preview = try previewVerifiedFile(self.allocator, self.path(), snapshot);
+        const fd = pfs.open(self.path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+        if (fd < 0) return error.ArtifactSourceOpenFailed;
+        defer _ = pfs.close(fd);
+        const temp_identity = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
+        if (!safeArtifactInfo(temp_identity) or temp_identity.size != snapshot.bytes)
+            return error.ArtifactSourceChanged;
+        const directory = try spoolDirectory(self.allocator, self.session_root);
+        self.finished = true;
+        self.transferred = true;
+        return .{
+            .allocator = self.allocator,
+            .session_root = self.session_root,
+            .directory = directory,
+            .temp_path = self.path_z,
+            .snapshot = snapshot,
+            .preview = preview,
+            .temp_identity = temp_identity,
+        };
+    }
+
     const FinishMode = enum {
         normal,
         inject_failure_after_publish,
@@ -606,6 +639,10 @@ pub const ExternalSpool = struct {
     }
 
     pub fn deinit(self: *ExternalSpool) void {
+        if (self.transferred) {
+            self.* = undefined;
+            return;
+        }
         if (!self.finished) pfs.unlinkPath(self.path_z.ptr) catch {};
         self.allocator.free(self.path_z);
         self.allocator.free(self.session_root);
@@ -1683,6 +1720,98 @@ test "incremental spool captures from byte zero with fixed head and tail memory"
     var tail = try readChunk(allocator, root, completed.receipt.id(), completed.receipt.bytes - 32, 32);
     defer tail.deinit();
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "TAIL_SENTINEL") != null);
+}
+
+fn testWriteExternal(spool: *const ExternalSpool, head: []const u8, filler: usize, tail: []const u8) !void {
+    const fd = pfs.open(spool.path_z.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactTempOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.makeCloseOnExec(fd);
+    try writeAll(fd, head);
+    var written: usize = 0;
+    const block = [_]u8{'p'} ** 4096;
+    while (written < filler) {
+        const n = @min(block.len, filler - written);
+        try writeAll(fd, block[0..n]);
+        written += n;
+    }
+    try writeAll(fd, tail);
+    try pfs.fsyncChecked(fd);
+}
+
+fn testCountDirectory(allocator: std.mem.Allocator, directory: []const u8) !usize {
+    const directory_z = try allocator.dupeZ(u8, directory);
+    defer allocator.free(directory_z);
+    var iterator = pdir.open(directory_z.ptr) orelse return 0;
+    defer pdir.close(&iterator);
+    var count: usize = 0;
+    while (pdir.next(&iterator)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        count += 1;
+    }
+    return count;
+}
+
+test "external spool: seal publishes nothing, publish installs exactly what finish would (#65)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const cas = try artifactDirectory(allocator, root);
+    defer allocator.free(cas);
+    const spool_dir = try spoolDirectory(allocator, root);
+    defer allocator.free(spool_dir);
+
+    var spool = try ExternalSpool.begin(allocator, root);
+    defer spool.deinit();
+    try testWriteExternal(&spool, "PLUGIN_HEAD-", 70 * 1024, "-PLUGIN_TAIL");
+    var sealed = try spool.seal();
+    defer sealed.deinit();
+    // Sealed: the receipt is already known, the private file still exists,
+    // the CAS holds nothing.
+    const receipt = sealed.receipt();
+    try std.testing.expectEqual(@as(u64, 70 * 1024 + 24), receipt.bytes);
+    try std.testing.expect(std.mem.startsWith(u8, sealed.previewValue().headSlice(), "PLUGIN_HEAD-"));
+    try std.testing.expectEqual(@as(usize, 0), try testCountDirectory(allocator, cas));
+    try std.testing.expectEqual(@as(usize, 1), try testCountDirectory(allocator, spool_dir));
+    // Published: one blob, the same receipt, the private file gone.
+    const completed = try sealed.publish();
+    try std.testing.expectEqualSlices(u8, receipt.id(), completed.receipt.id());
+    try std.testing.expectEqual(@as(usize, 1), try testCountDirectory(allocator, cas));
+    try std.testing.expectEqual(@as(usize, 0), try testCountDirectory(allocator, spool_dir));
+    var recovered = try readChunk(allocator, root, completed.receipt.id(), 0, 12);
+    defer recovered.deinit();
+    try std.testing.expectEqualSlices(u8, "PLUGIN_HEAD-", recovered.bytes);
+    // A second publish is a closed spool, not a second blob.
+    try std.testing.expectError(error.ArtifactSpoolClosed, sealed.publish());
+}
+
+test "external spool: seal then discard leaves neither a blob nor a private file (#65)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const cas = try artifactDirectory(allocator, root);
+    defer allocator.free(cas);
+    const spool_dir = try spoolDirectory(allocator, root);
+    defer allocator.free(spool_dir);
+
+    var spool = try ExternalSpool.begin(allocator, root);
+    defer spool.deinit();
+    try testWriteExternal(&spool, "head", 100, "tail");
+    var sealed = try spool.seal();
+    defer sealed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try testCountDirectory(allocator, spool_dir));
+    sealed.discard();
+    try std.testing.expectEqual(@as(usize, 0), try testCountDirectory(allocator, spool_dir));
+    try std.testing.expectEqual(@as(usize, 0), try testCountDirectory(allocator, cas));
+    try std.testing.expectError(error.ArtifactSpoolClosed, sealed.publish());
+    // The external spool itself is closed too: the file it would unlink is gone.
+    try std.testing.expectError(error.ArtifactSpoolClosed, spool.finish());
 }
 
 test "external spool imports only the kernel-created private path" {

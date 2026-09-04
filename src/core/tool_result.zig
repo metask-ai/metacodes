@@ -41,6 +41,12 @@ pub const SealedArtifact = struct {
     spool: artifact_store.SealedSpool,
     media_type: MediaType,
     capture_complete: bool,
+    /// The largest result the producing tool would have kept inline had its
+    /// publication failed at execution time; the batch commit boundary applies
+    /// the same policy (`result_budget.retainInlineAfterFailedPublish`). Native
+    /// tools keep the per-result ceiling; the MCP client keeps the bytes it
+    /// already materialized up to its frame limit (#65).
+    retain_inline_ceiling: u64 = result_budget.PER_RESULT_MAX_BYTES,
 };
 
 /// A validated, bounded model-visible error. Construction is deliberately
@@ -188,7 +194,7 @@ pub const ToolResultBody = union(enum) {
             },
             .sealed => |*result| blk: {
                 const completed = result.spool.publish() catch |err| {
-                    const allowed = result_budget.retainInlineAfterFailedPublish(err, result.spool.receipt().bytes, result.capture_complete, result_budget.PER_RESULT_MAX_BYTES);
+                    const allowed = result_budget.retainInlineAfterFailedPublish(err, result.spool.receipt().bytes, result.capture_complete, result.retain_inline_ceiling);
                     if (!allowed) {
                         result.spool.deinit();
                         self.* = .{ .@"inline" = .{ .bytes = &.{} } };
