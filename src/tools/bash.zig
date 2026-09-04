@@ -8,6 +8,7 @@ const util_json = @import("../util/json.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const ToolResultBody = @import("context.zig").ToolResultBody;
 const artifact = @import("../core/tool_result_artifact.zig");
+const tool_result = @import("../core/tool_result.zig");
 const ResultMetrics = @import("../core/tool_result_metrics.zig").Metrics;
 const result_budget = @import("../core/result_budget.zig");
 
@@ -155,14 +156,15 @@ fn formatCompletedOutput(
     capture_complete: bool,
     budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
+    attachments: *tool_result.SealedHandles,
 ) ![]u8 {
     const allowance = channelAllowances(budget, encodedDemand(stdout), encodedDemand(stderr));
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"schema_version\":\"metacodes.bash-result.v2\",");
-    try appendMemoryChannel(&aw.writer, allocator, "stdout", stdout, artifact_root, capture_complete, allowance.first, metrics);
+    try appendMemoryChannel(&aw.writer, allocator, "stdout", stdout, artifact_root, capture_complete, allowance.first, metrics, attachments);
     try aw.writer.writeByte(',');
-    try appendMemoryChannel(&aw.writer, allocator, "stderr", stderr, artifact_root, capture_complete, allowance.second, metrics);
+    try appendMemoryChannel(&aw.writer, allocator, "stderr", stderr, artifact_root, capture_complete, allowance.second, metrics, attachments);
     try aw.writer.print(",\"exit_code\":{d}}}", .{exit_code});
     return try aw.toOwnedSlice();
 }
@@ -176,22 +178,75 @@ fn appendMemoryChannel(
     capture_complete: bool,
     allowance: result_budget.Encoded,
     metrics: ?*ResultMetrics,
+    attachments: *tool_result.SealedHandles,
 ) !void {
     const digest = sha256Hex(bytes);
     var preview = try headTailPreview(allocator, bytes, allowance);
     defer preview.deinit();
-    // Publish only when the preview actually elides something. Deciding from
+    // Spill only when the preview actually elides something. Deciding from
     // the preview instead of from a size threshold means a channel that fits
     // the allowance whole is never spilled, and a spill always corresponds to
-    // bytes the model cannot otherwise see.
+    // bytes the model cannot otherwise see. The spill is *sealed*, not
+    // published (#73): the receipt the JSON names is fixed here, the blob is
+    // installed by the batch commit boundary.
     var storage_error: ?[]const u8 = null;
     const stored: ?artifact.Receipt = if (preview.shown_source_bytes < bytes.len) blk: {
-        break :blk artifact.persist(allocator, artifact_root, bytes) catch |err| {
+        break :blk sealBytes(allocator, artifact_root, bytes, label, preview.base64, capture_complete, attachments) catch |err| {
             storage_error = artifact.storageErrorCode(err);
             break :blk null;
         };
     } else null;
     try appendChannel(writer, allocator, label, preview.content, preview.base64, preview.shown_source_bytes, bytes.len, digest, stored, capture_complete, storage_error, metrics);
+}
+
+/// Seal one channel's in-memory bytes as an attachment of the result (#73)
+/// and return the receipt the JSON embeds. The handle joins `attachments`;
+/// the caller's `errdefer attachments.discard()` covers every later failure.
+fn sealBytes(
+    allocator: std.mem.Allocator,
+    artifact_root: []const u8,
+    bytes: []const u8,
+    label: []const u8,
+    base64: bool,
+    capture_complete: bool,
+    attachments: *tool_result.SealedHandles,
+) !artifact.Receipt {
+    var spool = try artifact.Spool.begin(allocator, artifact_root);
+    defer spool.deinit(); // a no-op once `seal` has taken the buffers
+    try spool.write(bytes);
+    var sealed = try spool.seal();
+    errdefer sealed.deinit();
+    const receipt = sealed.receipt();
+    try attachments.append(.{
+        .spool = sealed,
+        .media_type = if (base64) .binary else .text_utf8,
+        .capture_complete = capture_complete,
+        .attachment_label = label,
+    });
+    return receipt;
+}
+
+/// Seal a copy of one channel's job spool file as an attachment (#73); the
+/// job registry keeps releasing its own file as before.
+fn sealFile(
+    allocator: std.mem.Allocator,
+    artifact_root: []const u8,
+    path: []const u8,
+    inspected: artifact.FileSnapshot,
+    label: []const u8,
+    base64: bool,
+    attachments: *tool_result.SealedHandles,
+) !artifact.Receipt {
+    var sealed = try artifact.sealFileCopy(allocator, artifact_root, path, inspected);
+    errdefer sealed.deinit();
+    const receipt = sealed.receipt();
+    try attachments.append(.{
+        .spool = sealed,
+        .media_type = if (base64) .binary else .text_utf8,
+        .capture_complete = true,
+        .attachment_label = label,
+    });
+    return receipt;
 }
 
 fn appendFileChannel(
@@ -202,6 +257,7 @@ fn appendFileChannel(
     artifact_root: []const u8,
     allowance: result_budget.Encoded,
     metrics: ?*ResultMetrics,
+    attachments: *tool_result.SealedHandles,
 ) !void {
     const inspected = artifact.inspectFile(allocator, path) catch |inspect_error| {
         const observed_bytes = artifact.observeFileBytes(allocator, path) catch 0;
@@ -226,7 +282,7 @@ fn appendFileChannel(
     defer preview.deinit();
     var storage_error: ?[]const u8 = null;
     const stored: ?artifact.Receipt = if (preview.shown_source_bytes < inspected.bytes) blk: {
-        break :blk artifact.persistInspectedFile(allocator, artifact_root, path, inspected) catch |err| {
+        break :blk sealFile(allocator, artifact_root, path, inspected, label, preview.base64, attachments) catch |err| {
             storage_error = artifact.storageErrorCode(err);
             break :blk null;
         };
@@ -499,6 +555,7 @@ fn formatCompletedFiles(
     artifact_root: []const u8,
     budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
+    attachments: *tool_result.SealedHandles,
 ) ![]u8 {
     // The split needs real demand: giving each channel a fixed half would
     // forfeit half the allowance to the empty stderr that most commands
@@ -513,14 +570,27 @@ fn formatCompletedFiles(
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"schema_version\":\"metacodes.bash-result.v2\",");
-    try appendFileChannel(&aw.writer, allocator, "stdout", stdout_path, artifact_root, allowance.first, metrics);
+    try appendFileChannel(&aw.writer, allocator, "stdout", stdout_path, artifact_root, allowance.first, metrics, attachments);
     try aw.writer.writeByte(',');
-    try appendFileChannel(&aw.writer, allocator, "stderr", stderr_path, artifact_root, allowance.second, metrics);
+    try appendFileChannel(&aw.writer, allocator, "stderr", stderr_path, artifact_root, allowance.second, metrics, attachments);
     try aw.writer.print(",\"exit_code\":{d}}}", .{exit_code});
     return aw.toOwnedSlice();
 }
 
+/// Execution-time entry for callers without a batch commit boundary (the
+/// `!cmd` shell in `session_service.zig`, embedders): the channel spills are
+/// sealed and then resolved right here — published, or withdrawn from the JSON
+/// when publication fails — so the returned bytes never name a blob that does
+/// not exist. The agent loop uses `executeBody`, which leaves the handles
+/// sealed for `publishSealedResults` (#73).
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    var attachments = tool_result.SealedHandles{};
+    errdefer attachments.discard();
+    const json = try executeInner(ctx, args, &attachments);
+    return tool_result.resolveAttachments(ctx.allocator, json, &attachments);
+}
+
+fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_result.SealedHandles) anyerror![]u8 {
     const allocator = ctx.allocator;
     const command_escaped = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
     if (command_escaped.len == 0) return error.EmptyCommand;
@@ -629,6 +699,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             ctx.project_rule_gate == null,
             ctx.result_budget,
             ctx.tool_result_metrics,
+            attachments,
         );
     }
 
@@ -651,6 +722,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             false,
             ctx.result_budget,
             ctx.tool_result_metrics,
+            attachments,
         );
     }
 
@@ -667,14 +739,19 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(out.stderr);
 
     // 无 JobRegistry 也无 artifact root 的兜底路径:管道捕获后按预算做头尾预览。
-    return try formatCompletedOutput(allocator, out.stdout, out.stderr, out.exit_code, ctx.artifact_root, out.capture_complete, ctx.result_budget, ctx.tool_result_metrics);
+    return try formatCompletedOutput(allocator, out.stdout, out.stderr, out.exit_code, ctx.artifact_root, out.capture_complete, ctx.result_budget, ctx.tool_result_metrics, attachments);
 }
 
 /// Bash already redirects stdout/stderr to JobRegistry files before the child
 /// emits byte zero. Its model-visible completion is bounded JSON containing
-/// per-channel CAS receipts/previews, so the typed boundary remains inline.
+/// per-channel receipts/previews, so the typed boundary remains inline; the
+/// spilled channels travel beside it as sealed attachments and are published
+/// by the batch commit boundary, so a fatal sibling leaves no blob (#73).
 pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
-    return ToolResultBody.initInline(try execute(ctx, args));
+    var attachments = tool_result.SealedHandles{};
+    errdefer attachments.discard();
+    const json = try executeInner(ctx, args, &attachments);
+    return .{ .@"inline" = .{ .bytes = json, .attachments = attachments } };
 }
 
 /// 新路径：总是 spawn 到 job_registry（stdout/stderr 落盘），父端轮询等待。
@@ -692,6 +769,7 @@ fn runAutoBackgroundable(
     allow_auto_background: bool,
     budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
+    attachments: *tool_result.SealedHandles,
 ) ![]u8 {
     // Spooled as private to this call. Every exit below either renders the
     // output and releases the files, or hands the job id to the model and
@@ -716,7 +794,7 @@ fn runAutoBackgroundable(
             // 正常退出：读文件构造完整输出。渲染完成（含 CAS 导入）后 spool 无人
             // 再读——包括非零退出码与渲染失败这两条路径。
             defer registry.releaseSpool(job_id[0..]);
-            return try readJobAsSync(allocator, &j, artifact_root, budget, metrics);
+            return try readJobAsSync(allocator, &j, artifact_root, budget, metrics, attachments);
         }
 
         const elapsed: u64 = @intCast(nowMs() - start);
@@ -736,8 +814,8 @@ fn runAutoBackgroundable(
     }
 }
 
-fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry, artifact_root: []const u8, budget: result_budget.Budget, metrics: ?*ResultMetrics) ![]u8 {
-    return try formatCompletedFiles(allocator, j.stdout_path, j.stderr_path, j.exit_code orelse 0, artifact_root, budget, metrics);
+fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry, artifact_root: []const u8, budget: result_budget.Budget, metrics: ?*ResultMetrics, attachments: *tool_result.SealedHandles) ![]u8 {
+    return try formatCompletedFiles(allocator, j.stdout_path, j.stderr_path, j.exit_code orelse 0, artifact_root, budget, metrics, attachments);
 }
 
 fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
@@ -916,7 +994,10 @@ test "completed job output becomes a bounded recoverable channel artifact" {
     registry.reapExited();
     const job = registry.get(spawned.idSlice()) orelse return error.JobNotFound;
     var metrics = ResultMetrics{};
-    const result = try readJobAsSync(allocator, &job, root, .floor, &metrics);
+    var attachments = tool_result.SealedHandles{};
+    defer attachments.discard();
+    const result = try readJobAsSync(allocator, &job, root, .floor, &metrics, &attachments);
+    try testPublishAttachments(&attachments);
     defer allocator.free(result);
     try std.testing.expect(result.len < 8 * 1024);
     try std.testing.expect(std.mem.indexOf(u8, result, root) == null);
@@ -1092,7 +1173,10 @@ test "over-limit completed spool reports true size without a false commitment" {
     if (stderr_fd < 0) return error.OpenFailed;
     _ = pfs.close(stderr_fd);
 
-    const result = try formatCompletedFiles(allocator, stdout_path, stderr_path, 0, root, .floor, null);
+    var attachments = tool_result.SealedHandles{};
+    defer attachments.discard();
+    const result = try formatCompletedFiles(allocator, stdout_path, stderr_path, 0, root, .floor, null, &attachments);
+    try testPublishAttachments(&attachments);
     defer allocator.free(result);
     try std.testing.expect(result.len < 8 * 1024);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
@@ -1232,7 +1316,9 @@ test "a quote-dense channel is budgeted by encoded size, not source length" {
     defer a.free(noisy);
     @memset(noisy, '"');
     const budget = result_budget.Budget.fromModel(200_000);
-    const envelope = try formatCompletedOutput(a, noisy, "", 0, "", true, budget, null);
+    var envelope_attachments = tool_result.SealedHandles{};
+    defer envelope_attachments.discard();
+    const envelope = try formatCompletedOutput(a, noisy, "", 0, "", true, budget, null, &envelope_attachments);
     defer a.free(envelope);
     try std.testing.expect(envelope.len <= budget.per_result_bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});
@@ -1295,7 +1381,9 @@ test "an ordinary stdout/stderr pair that fits is not cut by the split" {
     const err = try a.alloc(u8, 1000);
     defer a.free(err);
     @memset(err, 'e');
-    const envelope = try formatCompletedOutput(a, out, err, 0, "", true, .floor, null);
+    var envelope_attachments = tool_result.SealedHandles{};
+    defer envelope_attachments.discard();
+    const envelope = try formatCompletedOutput(a, out, err, 0, "", true, .floor, null, &envelope_attachments);
     defer a.free(envelope);
     try std.testing.expect(envelope.len <= result_budget.PER_RESULT_MIN_BYTES);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});
@@ -1319,7 +1407,9 @@ test "the budgeted encoding is the rendered encoding" {
     @memset(noisy, '"');
     noisy[noisy.len / 2] = 0x01;
     const budget = result_budget.Budget.fromModel(200_000);
-    const envelope = try formatCompletedOutput(a, noisy, "", 0, "", true, budget, null);
+    var envelope_attachments = tool_result.SealedHandles{};
+    defer envelope_attachments.discard();
+    const envelope = try formatCompletedOutput(a, noisy, "", 0, "", true, budget, null, &envelope_attachments);
     defer a.free(envelope);
     try std.testing.expect(envelope.len <= budget.per_result_bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});
@@ -1335,7 +1425,9 @@ test "the budgeted encoding is the rendered encoding" {
     const binary = try a.alloc(u8, 64 * 1024);
     defer a.free(binary);
     @memset(binary, 0x01);
-    const binary_envelope = try formatCompletedOutput(a, binary, "", 0, "", true, budget, null);
+    var binary_envelope_attachments = tool_result.SealedHandles{};
+    defer binary_envelope_attachments.discard();
+    const binary_envelope = try formatCompletedOutput(a, binary, "", 0, "", true, budget, null, &binary_envelope_attachments);
     defer a.free(binary_envelope);
     try std.testing.expect(binary_envelope.len <= budget.per_result_bytes);
     var binary_parsed = try std.json.parseFromSlice(std.json.Value, a, binary_envelope, .{});
@@ -1385,4 +1477,106 @@ test "显式 run_in_background 也不交出 staging 路径" {
     try std.testing.expect(parsed.value.object.get("stdout_path") == null);
     try std.testing.expect(parsed.value.object.get("stderr_path") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "/metacodes-jobs/") == null);
+}
+
+// ── #73: the channel spills are sealed attachments of the inline body ────────
+
+/// What the batch commit boundary does for the loop; the tests that read a
+/// blob back call it after rendering.
+fn testPublishAttachments(attachments: *tool_result.SealedHandles) !void {
+    for (attachments.slice()) |*maybe| {
+        if (maybe.*) |*handle| _ = try handle.spool.publish();
+    }
+    attachments.deinit();
+}
+
+fn testCountDirectory(allocator: std.mem.Allocator, directory: []const u8) !usize {
+    const pdir = @import("platform").dir;
+    const directory_z = try allocator.dupeZ(u8, directory);
+    defer allocator.free(directory_z);
+    var iterator = pdir.open(directory_z.ptr) orelse return 0;
+    defer pdir.close(&iterator);
+    var count: usize = 0;
+    while (pdir.next(&iterator)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        count += 1;
+    }
+    return count;
+}
+
+test "executeBody seals a spilled channel as an attachment and publishes nothing until asked (#73)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const cas = try std.fmt.allocPrint(allocator, "{s}/tool-results/sha256", .{root});
+    defer allocator.free(cas);
+    var ctx = ToolContext.simple(allocator);
+    ctx.artifact_root = root;
+    ctx.result_budget = .floor;
+    var body = try executeBody(&ctx, "{\"command\":\"awk 'BEGIN { for(i=0;i<40000;i++) printf \\\"x\\\"; printf \\\"BASH_TAIL\\\" }'\"}");
+    defer body.deinit(allocator);
+    try std.testing.expect(body == .@"inline");
+    try std.testing.expectEqual(@as(u8, 1), body.@"inline".attachments.len);
+    const handle = &body.@"inline".attachments.items[0].?;
+    try std.testing.expectEqualStrings("stdout", handle.attachment_label.?);
+    // The JSON already names the receipt; the CAS holds nothing.
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body.@"inline".bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(handle.spool.receipt().id(), parsed.value.object.get("stdout_artifact_id").?.string);
+    try std.testing.expectEqual(@as(usize, 0), try testCountDirectory(allocator, cas));
+    // The commit boundary publishes; the id in the JSON is the blob.
+    var handles = body.takeSealedHandles();
+    for (handles.slice()) |*maybe| {
+        if (maybe.*) |*h| _ = try h.spool.publish();
+    }
+    const id = try allocator.dupe(u8, parsed.value.object.get("stdout_artifact_id").?.string);
+    defer allocator.free(id);
+    handles.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try testCountDirectory(allocator, cas));
+    var tail = try artifact.readChunk(allocator, root, id, 40_000, 9);
+    defer tail.deinit();
+    try std.testing.expectEqualStrings("BASH_TAIL", tail.bytes);
+    // The body's bytes were not touched by the take.
+    try std.testing.expect(std.mem.indexOf(u8, body.@"inline".bytes, "metacodes.bash-result.v2") != null);
+}
+
+test "withdrawAttachmentFromJson and appendChannel agree on the two id sites (#73)" {
+    // The withdrawal function rewrites two exact substrings; this renders a
+    // real two-channel body and withdraws one channel, so the producer and
+    // the withdrawal cannot drift apart unnoticed.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const big = try allocator.alloc(u8, 40_000);
+    defer allocator.free(big);
+    @memset(big, 'y');
+    var attachments = tool_result.SealedHandles{};
+    defer attachments.discard();
+    const body = try formatCompletedOutput(allocator, big, big, 0, root, true, .floor, null, &attachments);
+    defer allocator.free(body);
+    try std.testing.expectEqual(@as(u8, 2), attachments.len);
+    const stdout_id = try allocator.dupe(u8, attachments.items[0].?.spool.receipt().id());
+    defer allocator.free(stdout_id);
+    const stderr_id = try allocator.dupe(u8, attachments.items[1].?.spool.receipt().id());
+    defer allocator.free(stderr_id);
+    const withdrawn = try tool_result.withdrawAttachmentFromJson(allocator, body, "stderr", stderr_id, "session_quota_exceeded");
+    defer allocator.free(withdrawn);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, withdrawn, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expect(object.get("stderr_artifact_id").? == .null);
+    try std.testing.expectEqualStrings("session_quota_exceeded", object.get("stderr_storage_error").?.string);
+    try std.testing.expect(object.get("stderr_recoverable").?.bool == false);
+    try std.testing.expect(object.get("stderr_read") == null);
+    try std.testing.expectEqualStrings(stdout_id, object.get("stdout_artifact_id").?.string);
+    try std.testing.expect(object.get("stdout_recoverable").?.bool == true);
+    try std.testing.expect(object.get("stdout_read") != null);
 }

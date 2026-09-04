@@ -18,6 +18,9 @@ const pdir = @import("platform").dir;
 /// ceiling `retainInlineAfterFailedPublish` allows when publication fails.
 const SEALED_BYTES: usize = 40_000;
 const TAIL_SENTINEL = "SEALED_TAIL_SENTINEL";
+/// 40,000 bytes of stdout ending in a sentinel: above the preview allowance,
+/// so Bash spills the channel; POSIX only, like the tool's own tests.
+const BASH_ARGS = "{\"command\":\"awk 'BEGIN { for(i=0;i<40000;i++) printf \\\"x\\\"; printf \\\"BASH_TAIL\\\" }'\"}";
 
 const FINAL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"done\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -51,6 +54,10 @@ fn toolCallsSse(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
 const Dispatcher = struct {
     fn dispatch(_: *const anyopaque, ctx: *const cc.tool_context.ToolContext, name: []const u8, _: []const u8) anyerror!cc.tool_context.ToolDispatchOutcome {
         if (std.mem.eql(u8, name, "FatalTool")) return .host_fatal;
+        // The real Bash tool (#73): its inline JSON carries the spilled stdout
+        // as a sealed attachment. The cassette's `{}` input is ignored; the
+        // command is fixed here so the test owns the bytes.
+        if (std.mem.eql(u8, name, "BashTool")) return .{ .ok = try cc.bash.executeBody(ctx, BASH_ARGS) };
         if (!std.mem.eql(u8, name, "SealedTool")) return .{ .host_rejected = null };
         var capture = try cc.tool_result_artifact.Capture.begin(ctx.allocator, ctx.artifact_root, cc.tool_result_artifact.MAX_ARTIFACT_BYTES);
         defer capture.deinit();
@@ -69,6 +76,7 @@ const Dispatcher = struct {
         return switch (index) {
             0 => "SealedTool",
             1 => "FatalTool",
+            2 => "BashTool",
             else => null,
         };
     }
@@ -161,6 +169,7 @@ fn runLoop(allocator: std.mem.Allocator, fixture: *const Fixture, url: []const u
     const definitions = [_]cc.json_mod.ToolDefinition{
         .{ .name = "SealedTool", .description = "returns a large native result", .input_schema = .{} },
         .{ .name = "FatalTool", .description = "a host tool that fails fatally", .input_schema = .{} },
+        .{ .name = "BashTool", .description = "the Bash tool with a fixed large-output command", .input_schema = .{} },
     };
     var dispatcher = Dispatcher{};
     const backend = cc.ui_backend.UiBackend{ .ctx = @ptrCast(&run.sink_state), .emit = Sink.emit, .poll = Sink.poll };
@@ -302,4 +311,111 @@ test "L2 sealed publication: a publication that fails at commit degrades like th
     const tool_result = try onlyToolResult(parsed.value);
     // Not a tool error: the result was retained and projected, not lost.
     try std.testing.expect(!tool_result.is_error);
+}
+
+// ── #73: the Bash tool's spilled channel is an attachment of its inline body ──
+
+fn bashStdoutArtifactId(allocator: std.mem.Allocator, follow_up: []const u8) !?[]u8 {
+    var parsed = try lastUserContent(allocator, follow_up);
+    defer parsed.deinit();
+    const tool_result = try onlyToolResult(parsed.value);
+    var body = try std.json.parseFromSlice(std.json.Value, allocator, tool_result.content, .{});
+    defer body.deinit();
+    const id = body.value.object.get("stdout_artifact_id") orelse return error.MissingStdoutArtifactId;
+    return switch (id) {
+        .string => |value| try allocator.dupe(u8, value),
+        .null => null,
+        else => error.UnexpectedStdoutArtifactId,
+    };
+}
+
+test "L2 sealed publication (#73 Bash): a fatal sibling leaves no blob and no temp file" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init(allocator);
+    defer fixture.deinit(allocator);
+    const calls = try toolCallsSse(allocator, &.{ "BashTool", "FatalTool" });
+    defer allocator.free(calls);
+    const bodies = [_][]const u8{ calls, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    var run: Run = undefined;
+    run.metrics = .{};
+    run.sink_state = 0;
+    const outcome = runLoop(allocator, &fixture, url, &run);
+    defer run.deinit();
+    try std.testing.expectError(error.HostToolFatal, outcome);
+
+    try std.testing.expectEqual(@as(usize, 0), try countEntries(allocator, fixture.cas_dir));
+    try std.testing.expectEqual(@as(usize, 0), try countEntries(allocator, fixture.spool_dir));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
+test "L2 sealed publication (#73 Bash): a batch that commits publishes the blob the JSON names" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init(allocator);
+    defer fixture.deinit(allocator);
+    const calls = try toolCallsSse(allocator, &.{"BashTool"});
+    defer allocator.free(calls);
+    const bodies = [_][]const u8{ calls, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    var run: Run = undefined;
+    run.metrics = .{};
+    run.sink_state = 0;
+    const result = try runLoop(allocator, &fixture, url, &run);
+    defer run.deinit();
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    try std.testing.expectEqual(@as(usize, 1), try countEntries(allocator, fixture.cas_dir));
+    try std.testing.expectEqual(@as(usize, 0), try countEntries(allocator, fixture.spool_dir));
+    const follow_up = (server.requestAt(1) orelse return error.MissingFollowUpRequest).body();
+    const id = (try bashStdoutArtifactId(allocator, follow_up)) orelse return error.StdoutNotSpilled;
+    defer allocator.free(id);
+    var tail = try cc.tool_result_artifact.readChunk(allocator, fixture.root(), id, 40_000, 9);
+    defer tail.deinit();
+    try std.testing.expectEqualStrings("BASH_TAIL", tail.bytes);
+}
+
+test "L2 sealed publication (#73 Bash): a publication that fails at commit withdraws the channel's id" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init(allocator);
+    defer fixture.deinit(allocator);
+    try fillSessionArtifactQuota(allocator, fixture.root());
+    const before = try countEntries(allocator, fixture.cas_dir);
+    const calls = try toolCallsSse(allocator, &.{"BashTool"});
+    defer allocator.free(calls);
+    const bodies = [_][]const u8{ calls, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    var run: Run = undefined;
+    run.metrics = .{};
+    run.sink_state = 0;
+    const result = try runLoop(allocator, &fixture, url, &run);
+    defer run.deinit();
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    try std.testing.expectEqual(before, try countEntries(allocator, fixture.cas_dir));
+    try std.testing.expectEqual(@as(usize, 0), try countEntries(allocator, fixture.spool_dir));
+    const follow_up = (server.requestAt(1) orelse return error.MissingFollowUpRequest).body();
+    // The JSON no longer promises a blob: id withdrawn, the reason named, the
+    // preview kept, and the result is not a tool error.
+    try std.testing.expect((try bashStdoutArtifactId(allocator, follow_up)) == null);
+    var parsed = try lastUserContent(allocator, follow_up);
+    defer parsed.deinit();
+    const tool_result = try onlyToolResult(parsed.value);
+    try std.testing.expect(!tool_result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, tool_result.content, "\"stdout_storage_error\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_result.content, "\"stdout_recoverable\":false") != null);
 }

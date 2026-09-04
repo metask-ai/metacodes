@@ -467,10 +467,13 @@ fn publishRange(
     length: u64,
 ) !tool_result.ToolResultBody {
     var spool = try artifact_store.Spool.begin(allocator, artifact_root);
-    defer spool.deinit();
+    defer spool.deinit(); // a no-op once `seal` has taken the buffers
     try capture.copyRangeTo(&spool, start, length);
-    const completed = try spool.finish();
-    return tool_result.ToolResultBody.fromCompletedSpool(completed, .json);
+    // Sealed, not published (#73): the result range is fixed and its receipt
+    // known here, the blob is installed at the batch commit boundary, so a
+    // fatal sibling in the same batch leaves nothing in the CAS. A publication
+    // that fails there is a bounded tool error, as it was a structured error here.
+    return .{ .sealed = .{ .spool = try spool.seal(), .media_type = .json, .capture_complete = true } };
 }
 
 pub fn project(
@@ -706,8 +709,9 @@ test "stream projector publishes above caller per-result budget" {
     );
     defer if (outcome == .result) outcome.result.deinit(allocator);
     try std.testing.expect(outcome == .result);
-    try std.testing.expect(outcome.result == .artifact);
-    try std.testing.expectEqual(@as(u64, 30_000), outcome.result.artifact.stored.bytes);
+    // Sealed, not published (#73): the receipt is fixed, the blob lands at the batch commit boundary.
+    try std.testing.expect(outcome.result == .sealed);
+    try std.testing.expectEqual(@as(u64, 30_000), outcome.result.sealed.spool.receipt().bytes);
 }
 
 test "stream projector inlines at caller per-result budget" {
@@ -834,12 +838,15 @@ test "stream projector publishes only a large successful result range" {
     );
     defer if (outcome == .result) outcome.result.deinit(allocator);
     try std.testing.expect(outcome == .result);
-    try std.testing.expect(outcome.result == .artifact);
-    try std.testing.expect(outcome.result.artifact.stored.bytes > 96 * 1024);
+    try std.testing.expect(outcome.result == .sealed);
+    try std.testing.expect(outcome.result.sealed.spool.receipt().bytes > 96 * 1024);
+    var published_handle = outcome.result.takeSealed().?;
+    defer published_handle.spool.deinit();
+    const published = try published_handle.spool.publish();
     var first = try artifact_store.readChunk(
         allocator,
         root,
-        outcome.result.artifact.stored.id(),
+        published.receipt.id(),
         0,
         128,
     );

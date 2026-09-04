@@ -98,6 +98,37 @@ fn readResourceBody(
     };
 }
 
+/// What the agent loop does with a sealed body at the batch commit boundary:
+/// the rendered envelope is the slot content, `publishSealedResults` then
+/// publishes the handle or applies the failure policy.
+const Committed = struct {
+    content: []u8,
+    is_error: bool,
+    fn deinit(self: *Committed, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+    }
+};
+
+fn commitSealedBody(allocator: std.mem.Allocator, body: *cc.tools.ToolResultBody) !Committed {
+    var rendered = try body.render(allocator);
+    defer rendered.deinit(allocator);
+    var slots = [_]cc.tool_exec.Slot{.{
+        .decision = .run,
+        .name = "ReadMcpResourceTool",
+        .id = "sid",
+        .input = "{}",
+        .content = try allocator.dupe(u8, rendered.bytes),
+        .sealed = body.takeSealedHandles(),
+    }};
+    errdefer for (&slots) |*slot| slot.deinit(allocator);
+    try cc.tool_exec.publishSealedResults(&slots, allocator, .{ .bytes = [_]u8{'0'} ** 12 });
+    const content = slots[0].content.?;
+    slots[0].content = null;
+    const is_error = slots[0].is_error;
+    for (&slots) |*slot| slot.deinit(allocator);
+    return .{ .content = content, .is_error = is_error };
+}
+
 fn expectSizedResourceBody(
     expected_result_bytes: usize,
     expected_body: ExpectedBody,
@@ -148,37 +179,28 @@ fn expectSizedResourceBody(
                 // boundary. Drive that boundary: with the quota full the
                 // publication fails, and bytes within the client's frame
                 // limit come back inline, exactly as before.
-                var rendered = try body.render(allocator);
-                defer rendered.deinit(allocator);
-                var slots = [_]cc.tool_exec.Slot{.{
-                    .decision = .run,
-                    .name = "ReadMcpResourceTool",
-                    .id = "sid",
-                    .input = "{}",
-                    .content = try allocator.dupe(u8, rendered.bytes),
-                    .sealed = body.takeSealed(),
-                }};
-                defer for (&slots) |*slot| slot.deinit(allocator);
-                try cc.tool_exec.publishSealedResults(&slots, allocator, .{ .bytes = [_]u8{'0'} ** 12 });
-                try std.testing.expect(!slots[0].is_error);
-                try std.testing.expectEqualStrings(expected, slots[0].content.?);
+                var committed = try commitSealedBody(allocator, &body);
+                defer committed.deinit(allocator);
+                try std.testing.expect(!committed.is_error);
+                try std.testing.expectEqualStrings(expected, committed.content);
             } else {
                 try std.testing.expect(body == .@"inline");
                 try std.testing.expectEqualStrings(expected, body.@"inline".bytes);
             }
         },
         .structured_error => {
-            // Above the frame limit the response never enters the ≤1MB branch:
-            // it goes through the projector, whose failed publication is a
-            // `resource_limit` diagnostic that the client returns as a
-            // structured error rather than as bytes.
-            try std.testing.expect(body == .structured_error);
-            try std.testing.expectEqual(
-                @as(?cc.tool_error.Category, .system_error),
-                body.structured_error.category,
-            );
-            try std.testing.expect(std.mem.indexOf(u8, body.structured_error.encoded, "\"category\":\"system_error\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, body.structured_error.encoded, "resource_limit") != null);
+            // Above the frame limit the response goes through the projector,
+            // which seals the result range (#73). With the quota full the
+            // batch commit boundary cannot publish it, and 1.1 MB is above the
+            // inline-retention ceiling, so the slot becomes the bounded
+            // `ArtifactPublishFailed` tool error — fail closed, as the
+            // projector's `resource_limit` structured error was before.
+            try std.testing.expect(body == .sealed);
+            var committed = try commitSealedBody(allocator, &body);
+            defer committed.deinit(allocator);
+            try std.testing.expect(committed.is_error);
+            try std.testing.expect(std.mem.indexOf(u8, committed.content, "ArtifactPublishFailed") != null);
+            try std.testing.expect(std.mem.indexOf(u8, committed.content, "failed at the batch commit boundary") != null);
         },
     }
 }
@@ -474,12 +496,18 @@ test "MCP: CLI stdio captures 17MiB from byte zero and dispatch preserves typed 
     ctx.artifact_root = root;
     var body = try entry.execute(&ctx, "{}");
     defer body.deinit(a);
-    try std.testing.expect(body == .artifact);
-    try std.testing.expect(body.artifact.stored.bytes > 17 * 1024 * 1024);
+    // Above the frame limit the projector seals the result range (#73); the
+    // envelope is rendered below, the blob exists once published.
+    try std.testing.expect(body == .sealed);
+    try std.testing.expect(body.sealed.spool.receipt().bytes > 17 * 1024 * 1024);
+    var large = body.takeSealed().?;
+    defer large.spool.deinit();
+    const large_completed = try large.spool.publish();
+    body = .{ .artifact = .{ .stored = large_completed.receipt, .preview = large_completed.preview, .media_type = .json } };
     var first = try cc.tool_result_artifact.readChunk(
         a,
         root,
-        body.artifact.stored.id(),
+        large_completed.receipt.id(),
         0,
         128,
     );
@@ -557,14 +585,17 @@ test "MCP: static resource tools preserve byte-zero artifact recovery" {
         .ok => |*value| value,
         else => return error.UnexpectedResourceReadOutcome,
     };
-    try std.testing.expect(body.* == .artifact);
-    try std.testing.expect(body.artifact.stored.bytes > 17 * 1024 * 1024);
-    try std.testing.expect(body.artifact.stored.capture_complete);
+    try std.testing.expect(body.* == .sealed);
+    try std.testing.expect(body.sealed.spool.receipt().bytes > 17 * 1024 * 1024);
+    try std.testing.expect(body.sealed.capture_complete);
+    var large = body.takeSealed().?;
+    defer large.spool.deinit();
+    const large_completed = try large.spool.publish();
     var tail = try cc.tool_result_artifact.readChunk(
         a,
         root,
-        body.artifact.stored.id(),
-        body.artifact.stored.bytes - 64,
+        large_completed.receipt.id(),
+        large_completed.receipt.bytes - 64,
         64,
     );
     defer tail.deinit();

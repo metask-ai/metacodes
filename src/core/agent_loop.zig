@@ -2573,10 +2573,7 @@ pub fn run(
             }
             // A deferred slot keeps no sealed handle either (#45); ReadArtifact
             // never seals, so this only guards the invariant.
-            if (s.sealed) |*handle| {
-                handle.spool.deinit();
-                s.sealed = null;
-            }
+            s.sealed.discard();
             // The planner charges only served slots, so this is the amount charged before every deferred slot.
             s.content = try tool_exec_mod.renderRecoveryDeferral(allocator, s.input, recovery_plan, recovery_plan.charged_bytes);
             s.is_error = true;

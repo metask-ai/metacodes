@@ -1881,15 +1881,20 @@ test "oversized inline Tool result is promoted before the AgentCore raw cap" {
     var outcome = try environment.surface().dispatcher.dispatch(&tool_ctx, "HostLarge", "{}");
     defer outcome.deinit(allocator);
     try std.testing.expect(outcome == .ok);
-    try std.testing.expect(outcome.ok == .artifact);
+    // Promoted = sealed (#73): the envelope is model-visible now, the blob
+    // lands when the batch commits. Publish here as the loop would.
+    try std.testing.expect(outcome.ok == .sealed);
     try std.testing.expectEqual(Outcome.none, controller.outcome());
     var rendered = try outcome.ok.render(allocator);
     defer rendered.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "ReadArtifact") != null);
+    var promoted = outcome.ok.takeSealed().?;
+    defer promoted.spool.deinit();
+    const completed = try promoted.spool.publish();
     var recovered = try core.tool_result_artifact.readChunk(
         allocator,
         root,
-        outcome.ok.artifact.stored.id(),
+        completed.receipt.id(),
         0,
         16 * 1024,
     );
@@ -2133,12 +2138,15 @@ test "oversized MCP success is promoted to the shared recoverable artifact plane
     defer outcome.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 1), server.calls);
     try std.testing.expect(outcome == .ok);
-    try std.testing.expect(outcome.ok == .artifact);
+    try std.testing.expect(outcome.ok == .sealed);
     try std.testing.expectEqual(Outcome.none, controller.outcome());
+    var promoted = outcome.ok.takeSealed().?;
+    defer promoted.spool.deinit();
+    const completed = try promoted.spool.publish();
     var recovered = try core.tool_result_artifact.readChunk(
         allocator,
         root,
-        outcome.ok.artifact.stored.id(),
+        completed.receipt.id(),
         0,
         32 * 1024,
     );

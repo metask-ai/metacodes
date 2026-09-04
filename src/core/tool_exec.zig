@@ -92,7 +92,7 @@ pub const Slot = struct {
     content: ?[]u8 = null,
     /// Sealed handle published at the batch commit boundary; deinit discards
     /// it so fatal batches leave no unreferenced CAS artifact (#45).
-    sealed: ?tool_result.SealedArtifact = null,
+    sealed: tool_result.SealedHandles = .{},
     is_error: bool = false,
     /// 执行耗时(ms),runJob 填。供 tool_card 显示真实耗时(0 = 未执行/被拒)。
     elapsed_ms: u64 = 0,
@@ -125,8 +125,7 @@ pub const Slot = struct {
     /// agent_loop 用单个 defer 遍历调用,覆盖**所有**退出路径(正常/挂起/fatal/错误);
     /// 已转移 ownership 的字段(takeContent 置 null)天然跳过。
     pub fn deinit(self: *Slot, allocator: std.mem.Allocator) void {
-        if (self.sealed) |*sealed| sealed.spool.deinit();
-        self.sealed = null;
+        self.sealed.deinit();
         if (self.content) |c| allocator.free(c);
         self.content = null;
         if (self.pending_kind) |k| allocator.free(k);
@@ -163,30 +162,37 @@ pub const Slot = struct {
 /// slot becomes a bounded tool error. The handle is released either way.
 pub fn publishSealedResults(slots: []Slot, allocator: std.mem.Allocator, rid: log.RequestId) !void {
     for (slots) |*slot| {
-        const handle = if (slot.sealed) |*sealed| sealed else continue;
-        defer {
-            handle.spool.deinit();
-            slot.sealed = null;
-        }
-        if (handle.spool.publish()) |_| continue else |err| {
-            const bytes = handle.spool.receipt().bytes;
-            const retain = result_budget.retainInlineAfterFailedPublish(err, bytes, handle.capture_complete, handle.retain_inline_ceiling);
-            if (retain) {
-                if (handle.spool.readAllAlloc(allocator)) |inline_bytes| {
-                    if (slot.content) |old| allocator.free(old);
-                    slot.content = inline_bytes;
-                    slot.is_error = false;
-                    log.warnId("agent", rid, "sealed result of {s} could not be published ({s}); retained inline", .{ slot.name, @errorName(err) });
-                    continue;
-                } else |read_err| {
-                    log.warnId("agent", rid, "sealed result of {s} could not be read back ({s}) after a failed publish ({s})", .{ slot.name, @errorName(read_err), @errorName(err) });
+        if (slot.sealed.isEmpty()) continue;
+        var handles = slot.sealed.take();
+        defer handles.deinit();
+        // A slot carries either the one handle of a `.sealed` body or the
+        // attachments of an inline body (#73); a body is one or the other.
+        if (handles.items[0]) |*handle| if (handle.attachment_label == null) {
+            if (handle.spool.publish()) |_| continue else |err| {
+                const bytes = handle.spool.receipt().bytes;
+                const retain = result_budget.retainInlineAfterFailedPublish(err, bytes, handle.capture_complete, handle.retain_inline_ceiling);
+                if (retain) {
+                    if (handle.spool.readAllAlloc(allocator)) |inline_bytes| {
+                        if (slot.content) |old| allocator.free(old);
+                        slot.content = inline_bytes;
+                        slot.is_error = false;
+                        log.warnId("agent", rid, "sealed result of {s} could not be published ({s}); retained inline", .{ slot.name, @errorName(err) });
+                        continue;
+                    } else |read_err| {
+                        log.warnId("agent", rid, "sealed result of {s} could not be read back ({s}) after a failed publish ({s})", .{ slot.name, @errorName(read_err), @errorName(err) });
+                    }
                 }
+                if (slot.content) |old| allocator.free(old);
+                slot.content = try tool_error.errorToJson("ArtifactPublishFailed", "artifact publication for {s} failed at the batch commit boundary ({s}); the result was not retained, retry the call", .{ slot.name, @errorName(err) }, allocator);
+                slot.is_error = true;
+                log.warnId("agent", rid, "sealed result of {s} could not be published ({s}); reported as a tool error", .{ slot.name, @errorName(err) });
+                continue;
             }
-            if (slot.content) |old| allocator.free(old);
-            slot.content = try tool_error.errorToJson("ArtifactPublishFailed", "artifact publication for {s} failed at the batch commit boundary ({s}); the result was not retained, retry the call", .{ slot.name, @errorName(err) }, allocator);
-            slot.is_error = true;
-            log.warnId("agent", rid, "sealed result of {s} could not be published ({s}); reported as a tool error", .{ slot.name, @errorName(err) });
-        }
+        };
+        // Attachments: publish each; a failure withdraws that channel's id
+        // from the body instead of promising a blob that does not exist.
+        const content = slot.content orelse continue;
+        slot.content = try tool_result.resolveAttachments(allocator, content, &handles);
     }
 }
 
@@ -311,7 +317,7 @@ pub const OneResult = union(enum) {
         /// failed. Travels with the result so a consumer says "incomplete".
         file_changes_overflow: bool = false,
         file_changes_lost: bool = false,
-        sealed: ?tool_result.SealedArtifact = null,
+        sealed: tool_result.SealedHandles = .{},
     },
     /// L3 挂起:工具发起 custom UI(error.UiPending)。kind/payload owned by parent_allocator。
     pending: struct { kind: ?[]u8, payload: ?[]u8, elapsed_ms: u64 },
@@ -331,10 +337,8 @@ pub const OneResult = union(enum) {
         switch (self) {
             .done => |d| {
                 if (d.file_changes) |changes| file_change.freeRecords(allocator, changes);
-                if (d.sealed) |sealed_value| {
-                    var owned = sealed_value;
-                    owned.spool.deinit();
-                }
+                var handles = d.sealed;
+                handles.deinit();
             },
             .host_fatal => |fatal| if (fatal.file_changes) |changes| file_change.freeRecords(allocator, changes),
             .pending => {},
@@ -1031,13 +1035,10 @@ pub fn executeOne(
         .ok => {},
     }
     var rendered = try r.ok.render(job_ctx.allocator);
-    var sealed_result: ?tool_result.SealedArtifact = null;
-    if (r.ok == .sealed) {
-        const handle = r.ok.takeSealed().?;
-        var moved = handle;
-        moved.spool = try moved.spool.adopt(parent_allocator);
-        sealed_result = moved;
-    }
+    // The handles a `.sealed` body or an inline body's attachments carry
+    // escape the dispatch arena with the other `.done` fields (#45, #73).
+    var sealed_result = r.ok.takeSealedHandles();
+    try sealed_result.adopt(parent_allocator);
     defer rendered.deinit(job_ctx.allocator);
     const ok_bytes = rendered.bytes;
     if (!dispatch_observation.finish(
@@ -1672,12 +1673,8 @@ test "executeOne:UnknownTool → 富错误引导(prefetch/executeSlots 共享此
 /// slots next. A failure to re-home discards the handle here, while the view
 /// is still alive, and reports like any other OOM (#45).
 fn rehomeSealed(slot: *Slot, allocator: std.mem.Allocator) error{OutOfMemory}!void {
-    const handle = if (slot.sealed) |*sealed| sealed else return;
-    handle.spool = handle.spool.adopt(allocator) catch {
-        handle.spool.deinit();
-        slot.sealed = null;
-        return error.OutOfMemory;
-    };
+    if (slot.sealed.isEmpty()) return;
+    try slot.sealed.adopt(allocator);
 }
 
 fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator, rid: log.RequestId) error{ HostToolFatal, OutOfMemory }!void {
@@ -2610,7 +2607,7 @@ test "executeOne carries a sealed handle beside the envelope and Slot.deinit dis
     const ctx = tools_mod.ToolContext{ .allocator = a, .artifact_root = root, .tool_dispatcher = SealedToolDispatcher.dispatcher() };
     const r = try executeOne(&ctx, "SealedTool", "{}", "sid", a, .{ .bytes = [_]u8{'0'} ** 12 });
     try std.testing.expect(r == .done);
-    try std.testing.expect(r.done.sealed != null);
+    try std.testing.expect(!r.done.sealed.isEmpty());
     try std.testing.expect(std.mem.startsWith(u8, r.done.content.?, tool_result.ENVELOPE_PREFIX ++ "\"artifact\""));
     try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, cas_dir));
     try std.testing.expectEqual(@as(usize, 1), try testCountEntries(a, spool_dir));
@@ -2648,14 +2645,14 @@ test "publishSealedResults publishes a sealed slot and leaves the envelope untou
 
     try publishSealedResults(&slots, a, .{ .bytes = [_]u8{'0'} ** 12 });
 
-    try std.testing.expect(slots[0].sealed == null);
+    try std.testing.expect(slots[0].sealed.isEmpty());
     try std.testing.expectEqualStrings(envelope, slots[0].content.?);
     try std.testing.expect(!slots[0].is_error);
     try std.testing.expectEqual(@as(usize, 1), try testCountEntries(a, cas_dir));
     try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, spool_dir));
     try std.testing.expectEqualStrings("{\"error\":\"denied\"}", slots[1].content.?);
     try std.testing.expect(slots[1].is_error);
-    try std.testing.expect(slots[1].sealed == null);
+    try std.testing.expect(slots[1].sealed.isEmpty());
 }
 
 test "publishSealedResults resolves a failed publication with the tool layer's inline policy" {
@@ -2677,13 +2674,62 @@ test "publishSealedResults resolves a failed publication with the tool layer's i
         .{ .decision = .run, .name = "SealedTool", .id = "sid", .input = "{}", .content = r.done.content, .sealed = r.done.sealed },
     };
     defer for (&slots) |*s| s.deinit(a);
-    if (slots[0].sealed) |*handle| handle.spool.discard();
+    if (slots[0].sealed.items[0]) |*handle| handle.spool.discard();
 
     try publishSealedResults(&slots, a, .{ .bytes = [_]u8{'0'} ** 12 });
 
-    try std.testing.expect(slots[0].sealed == null);
+    try std.testing.expect(slots[0].sealed.isEmpty());
     try std.testing.expect(slots[0].is_error);
     try std.testing.expect(std.mem.indexOf(u8, slots[0].content.?, "io_error") != null);
     try std.testing.expect(std.mem.indexOf(u8, slots[0].content.?, "failed at the batch commit boundary") != null);
     try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, spool_dir));
+}
+
+test "publishSealedResults publishes an inline body's attachments and withdraws the one that fails (#73)" {
+    const artifact_store = @import("tool_result_artifact.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const cas_dir = try std.fmt.allocPrint(a, "{s}/tool-results/sha256", .{root});
+    defer a.free(cas_dir);
+    const spool_dir = try std.fmt.allocPrint(a, "{s}/tool-results/spool", .{root});
+    defer a.free(spool_dir);
+
+    var handles = tool_result.SealedHandles{};
+    inline for (.{ .{ "stdout", "out-bytes-out-bytes" }, .{ "stderr", "err-bytes" } }) |channel| {
+        var spool = try artifact_store.Spool.begin(a, root);
+        defer spool.deinit();
+        try spool.write(channel[1]);
+        try handles.append(.{ .spool = try spool.seal(), .media_type = .text_utf8, .capture_complete = true, .attachment_label = channel[0] });
+    }
+    const out_id = try a.dupe(u8, handles.items[0].?.spool.receipt().id());
+    defer a.free(out_id);
+    const err_id = try a.dupe(u8, handles.items[1].?.spool.receipt().id());
+    defer a.free(err_id);
+    // The Bash body names both blobs the way `appendChannel` does; the stderr one will not publish.
+    const body = try std.fmt.allocPrint(a, "{{\"stdout_artifact_id\":\"{s}\",\"stdout_recoverable\":true,\"stdout_read\":{{\"tool\":\"ReadArtifact\",\"artifact_id\":\"{s}\",\"offset\":0,\"limit_max\":32768}},\"stderr_artifact_id\":\"{s}\",\"stderr_recoverable\":true,\"stderr_read\":{{\"tool\":\"ReadArtifact\",\"artifact_id\":\"{s}\",\"offset\":0,\"limit_max\":32768}},\"exit_code\":0}}", .{ out_id, out_id, err_id, err_id });
+    handles.items[1].?.spool.discard();
+    var slots = [_]Slot{
+        .{ .decision = .run, .name = "Bash", .id = "sid", .input = "{}", .content = body, .sealed = handles },
+    };
+    defer for (&slots) |*s| s.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, cas_dir));
+
+    try publishSealedResults(&slots, a, .{ .bytes = [_]u8{'0'} ** 12 });
+
+    try std.testing.expect(slots[0].sealed.isEmpty());
+    try std.testing.expect(!slots[0].is_error);
+    try std.testing.expectEqual(@as(usize, 1), try testCountEntries(a, cas_dir));
+    try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, spool_dir));
+    const content = slots[0].content.?;
+    try std.testing.expect(std.mem.indexOf(u8, content, out_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, err_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"stderr_artifact_id\":null,\"stderr_storage_error\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"stderr_recoverable\":false") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, content, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(out_id, parsed.value.object.get("stdout_artifact_id").?.string);
 }
