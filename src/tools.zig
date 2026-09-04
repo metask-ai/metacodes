@@ -352,7 +352,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ListMcpResourcesTool",
-        .description = "List resources exposed by all connected MCP servers. Optional server arg to filter to a single server. Returns aggregated list of {server, uri, name, description, mimeType}.",
+        .description = "List resources exposed by all connected MCP servers. Optional server arg to filter to a single server. Returns aggregated list of {server, uri, name, description, mimeType}. A server whose listing exceeds the result budget appears as {server, resource_list_artifact}, carrying the artifact envelope.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "server", .type = "string", .description = "Optional: filter to a single MCP server name" },
         }, .required = &.{} },

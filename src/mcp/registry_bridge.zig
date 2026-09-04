@@ -148,6 +148,7 @@ fn executeMcpToolBody(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyo
         binding.mcp_tool_name,
         args,
         ctx.artifact_root,
+        ctx.result_budget,
         ctx.abort,
     );
 }
@@ -161,7 +162,7 @@ fn executeListResources(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*an
 fn executeListResourcesBody(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror!ToolResultBody {
     const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
     _ = args;
-    return binding.client.listResourcesBodyAbortable(ctx.artifact_root, ctx.abort);
+    return binding.client.listResourcesBodyAbortable(ctx.artifact_root, ctx.result_budget, ctx.abort);
 }
 
 fn executeReadResource(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
@@ -173,7 +174,7 @@ fn executeReadResource(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*any
 fn executeReadResourceBody(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror!ToolResultBody {
     const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
     const uri = extractStringField(args, "uri") orelse return error.MissingUri;
-    return binding.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.abort);
+    return binding.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort);
 }
 
 // 私有 helpers——和 protocol.zig 同逻辑但只处理 object

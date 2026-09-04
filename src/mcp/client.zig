@@ -16,6 +16,7 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const ToolResultBody = @import("../core/tool_result.zig").ToolResultBody;
 const ToolError = @import("../core/tool_error.zig").ToolError;
+const result_budget = @import("../core/result_budget.zig");
 const result_stream = @import("../agentcore/mcp_result_stream.zig");
 
 /// elicitation 回调:server 在 tool 执行中发 `elicitation/create` 请求用户输入时被调。
@@ -25,6 +26,14 @@ pub const ElicitHandler = struct {
     ctx: *anyopaque,
     handleFn: *const fn (ctx: *anyopaque, params_json: []const u8, alloc: std.mem.Allocator) ?[]u8,
 };
+
+/// Frames up to this size are materialized before they are classified: a
+/// server→client control frame (elicitation) has to be answered synchronously,
+/// and only a parsed frame can be told apart from a response. It is also the
+/// ceiling of what this client has ever held inline, which is why the
+/// failed-publication fallback retains results up to it rather than only up to
+/// `result_budget.PER_RESULT_MAX_BYTES`: the bytes are already in memory.
+pub const CONTROL_FRAME_MATERIALIZE_BYTES: usize = 1024 * 1024;
 
 pub const McpClient = struct {
     allocator: std.mem.Allocator,
@@ -134,14 +143,18 @@ pub const McpClient = struct {
     }
 
     /// Typed byte-zero request path used by model-visible MCP tools/resources.
-    /// Small frames preserve the historical inline result bytes. Larger
-    /// frames are captured before parsing and only their successful `result`
-    /// range is published to the Session CAS.
+    /// Frames up to `CONTROL_FRAME_MATERIALIZE_BYTES` are materialized so
+    /// server→client control frames can be classified and elicitation stays
+    /// synchronous. A successful result's inline-or-publish disposition follows
+    /// `budget.per_result_bytes`; if publication fails, the bytes already in
+    /// memory are retained inline up to that same limit, which is what this
+    /// path did before the threshold change.
     fn requestBody(
         self: *McpClient,
         method: []const u8,
         params_json: []const u8,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
         require_content: bool,
     ) !ToolResultBody {
@@ -151,6 +164,7 @@ pub const McpClient = struct {
             method,
             params_json,
             artifact_root,
+            budget,
             abort,
             require_content,
         );
@@ -161,6 +175,7 @@ pub const McpClient = struct {
         method: []const u8,
         params_json: []const u8,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
         require_content: bool,
     ) !ToolResultBody {
@@ -186,7 +201,7 @@ pub const McpClient = struct {
             // Server→client requests are intentionally bounded control-plane
             // frames. Materialize only this small class so elicitation keeps
             // its existing synchronous semantics.
-            if (capture.bytes <= 1024 * 1024) {
+            if (capture.bytes <= CONTROL_FRAME_MATERIALIZE_BYTES) {
                 const line = try capture.readRangeAlloc(
                     self.allocator,
                     0,
@@ -226,7 +241,18 @@ pub const McpClient = struct {
                     return error.McpMalformedResponse;
                 if (!response.isSuccess()) return try self.structuredMcpError(line);
                 const result = response.result_json orelse "null";
-                return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
+                if (result.len <= budget.per_result_bytes)
+                    return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
+                return self.publishJsonResult(artifact_root, result) catch |err| {
+                    // Keep a complete bounded result renderable when CAS publication fails.
+                    if (!result_budget.retainInlineAfterFailedPublish(
+                        err,
+                        result.len,
+                        true,
+                        CONTROL_FRAME_MATERIALIZE_BYTES,
+                    )) return err;
+                    return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
+                };
             }
 
             const projected = try result_stream.project(
@@ -236,6 +262,7 @@ pub const McpClient = struct {
                 id,
                 .classic_2025_11_25,
                 .{},
+                budget,
                 false,
                 require_content,
             );
@@ -247,6 +274,18 @@ pub const McpClient = struct {
                 },
             }
         }
+    }
+
+    fn publishJsonResult(
+        self: *McpClient,
+        artifact_root: []const u8,
+        result: []const u8,
+    ) !ToolResultBody {
+        var spool = try artifact_store.Spool.begin(self.allocator, artifact_root);
+        defer spool.deinit();
+        try spool.write(result);
+        const completed = try spool.finish();
+        return ToolResultBody.fromCompletedSpool(completed, .json);
     }
 
     fn structuredMcpError(self: *McpClient, detail: []const u8) !ToolResultBody {
@@ -312,11 +351,12 @@ pub const McpClient = struct {
         name: []const u8,
         arguments_json: []const u8,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
     ) !ToolResultBody {
         const params = try protocol.callToolParams(self.allocator, name, arguments_json);
         defer self.allocator.free(params);
-        return self.requestBody("tools/call", params, artifact_root, abort, true);
+        return self.requestBody("tools/call", params, artifact_root, budget, abort, true);
     }
 
     /// 列出 server 暴露的 resources（resources/list）。返回原始 JSON-RPC result。
@@ -331,9 +371,10 @@ pub const McpClient = struct {
     pub fn listResourcesBodyAbortable(
         self: *McpClient,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
     ) !ToolResultBody {
-        return self.requestBody("resources/list", protocol.EMPTY_PARAMS, artifact_root, abort, false);
+        return self.requestBody("resources/list", protocol.EMPTY_PARAMS, artifact_root, budget, abort, false);
     }
 
     /// 读取一个 resource（resources/read）。uri 为 resource 标识。
@@ -351,11 +392,12 @@ pub const McpClient = struct {
         self: *McpClient,
         uri: []const u8,
         artifact_root: []const u8,
+        budget: result_budget.Budget,
         abort: ?*const AbortSignal,
     ) !ToolResultBody {
         const params = try protocol.readResourceParams(self.allocator, uri);
         defer self.allocator.free(params);
-        return self.requestBody("resources/read", params, artifact_root, abort, false);
+        return self.requestBody("resources/read", params, artifact_root, budget, abort, false);
     }
 };
 

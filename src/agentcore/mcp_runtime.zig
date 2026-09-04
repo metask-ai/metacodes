@@ -447,6 +447,7 @@ pub const Client = struct {
         self: *Client,
         result_allocator: std.mem.Allocator,
         artifact_root: []const u8,
+        budget: core.result_budget.Budget,
         tool: *const canonical.Tool,
         arguments_json: []const u8,
         cancellation: Cancellation,
@@ -552,6 +553,7 @@ pub const Client = struct {
                 .max_json_depth = self.limits.max_json_depth,
                 .max_json_nodes = self.limits.max_json_nodes,
             },
+            budget,
             tool.output_schema_json != null,
             true,
         ) catch return .{ .failed = .out_of_memory };

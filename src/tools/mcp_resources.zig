@@ -37,7 +37,7 @@ pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
     var first = true;
     for (sessions.*) |*entry| {
         if (server_filter) |filter| if (!std.mem.eql(u8, filter, entry.name)) continue;
-        var body = entry.client.listResourcesBodyAbortable(ctx.artifact_root, ctx.abort) catch |err| {
+        var body = entry.client.listResourcesBodyAbortable(ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| {
             @import("../util/log.zig").warn("mcp", "list_resources failed for {s}: {s}", .{ entry.name, @errorName(err) });
             continue;
         };
@@ -96,7 +96,7 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
 
     if (server_hint) |hint| {
         for (sessions.*) |*entry| if (std.mem.eql(u8, hint, entry.name)) {
-            return entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.abort) catch |err|
+            return entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err|
                 ToolResultBody.initInline(try std.fmt.allocPrint(
                     allocator,
                     "{{\"error\":\"read_failed\",\"server\":\"{s}\",\"message\":\"{s}\"}}",
@@ -112,7 +112,7 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
 
     var last_error: ?[]const u8 = null;
     for (sessions.*) |*entry| {
-        var body = entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.abort) catch |err| {
+        var body = entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| {
             last_error = @errorName(err);
             continue;
         };

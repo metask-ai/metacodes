@@ -70,6 +70,31 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
             \\{"resources":[{"uri":"mock://large","name":"large fixture","mimeType":"text/plain"}]}
         );
     } else if (std.mem.eql(u8, method, "resources/read")) {
+        const uri = extractStringField(line, "uri") orelse "";
+        const sized_prefix = "mock://sized/";
+        if (std.mem.startsWith(u8, uri, sized_prefix)) {
+            const payload_bytes = std.fmt.parseInt(usize, uri[sized_prefix.len..], 10) catch {
+                try writeError(alloc, id, -32602, "Invalid sized resource URI");
+                return;
+            };
+            var header_buffer: [256]u8 = undefined;
+            const header = try std.fmt.bufPrint(
+                &header_buffer,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"contents\":[{{\"uri\":\"{s}\",\"mimeType\":\"text/plain\",\"text\":\"",
+                .{ id, uri },
+            );
+            try writeStdoutAll(header);
+            var sized_block: [4096]u8 = undefined;
+            @memset(&sized_block, 's');
+            var sized_remaining = payload_bytes;
+            while (sized_remaining != 0) {
+                const count = @min(sized_remaining, sized_block.len);
+                try writeStdoutAll(sized_block[0..count]);
+                sized_remaining -= count;
+            }
+            try writeStdoutAll("\"}]}}\n");
+            return;
+        }
         var header_buffer: [192]u8 = undefined;
         const header = try std.fmt.bufPrint(
             &header_buffer,
