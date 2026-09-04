@@ -282,6 +282,7 @@ pub const Spool = struct {
     fd: pfs.Fd,
     fd_open: bool = true,
     published: bool = false,
+    transferred: bool = false,
     hasher: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
     preview: Preview = .{},
 
@@ -341,7 +342,9 @@ pub const Spool = struct {
     }
 
     pub fn finish(self: *Spool) !CompletedSpool {
-        return self.finishWithMode(.normal);
+        var sealed = try self.seal();
+        defer sealed.deinit();
+        return sealed.publish();
     }
 
     const PublishMode = enum {
@@ -351,6 +354,16 @@ pub const Spool = struct {
     };
 
     fn finishWithMode(self: *Spool, mode: PublishMode) !CompletedSpool {
+        var sealed = try self.seal();
+        defer sealed.deinit();
+        return sealed.publishWithMode(mode);
+    }
+
+    /// Close and validate the private stream without publishing it. The sealed
+    /// file remains in the spool directory (which `directoryBytes` never scans)
+    /// until publication or discard, keeping quota admission atomic with the
+    /// eventual conversation reference (#45).
+    pub fn seal(self: *Spool) !SealedSpool {
         if (!self.fd_open or self.published) return error.ArtifactSpoolClosed;
         try pfs.fsyncChecked(self.fd);
         const temp_identity = pfs.fileInfo(self.fd) catch return error.ArtifactStatFailed;
@@ -363,7 +376,105 @@ pub const Spool = struct {
         self.hasher.final(&digest_bytes);
         const digest = std.fmt.bytesToHex(digest_bytes, .lower);
         const snapshot = FileSnapshot{ .sha256 = digest, .bytes = self.preview.total_bytes };
+        self.transferred = true;
+        return .{
+            .allocator = self.allocator,
+            .session_root = self.session_root,
+            .directory = self.directory,
+            .temp_path = self.temp_path,
+            .snapshot = snapshot,
+            .preview = self.preview,
+            .temp_identity = temp_identity,
+        };
+    }
 
+    pub fn deinit(self: *Spool) void {
+        if (self.transferred) {
+            self.* = undefined;
+            return;
+        }
+        if (self.fd_open) _ = pfs.close(self.fd);
+        if (!self.published) pfs.unlinkPath(self.temp_path.ptr) catch {};
+        self.allocator.free(self.temp_path);
+        self.allocator.free(self.directory);
+        self.allocator.free(self.session_root);
+        self.* = undefined;
+    }
+};
+
+/// A validated, unpublished spool. Its temporary file is outside the scanned
+/// CAS quota; ownership transfers from `Spool` until publish/discard (#45).
+pub const SealedSpool = struct {
+    allocator: std.mem.Allocator,
+    session_root: []u8,
+    directory: []u8,
+    temp_path: [:0]u8,
+    snapshot: FileSnapshot,
+    preview: Preview,
+    temp_identity: pfs.FileInfo,
+    state: enum { sealed, published, discarded } = .sealed,
+
+    pub fn receipt(self: *const SealedSpool) Receipt {
+        return receiptFor(self.snapshot);
+    }
+
+    /// Re-home this sealed handle into `allocator` so it can escape a dispatch
+    /// arena with the other `.done` fields. The source strings are released and
+    /// the source must not be used afterwards; the on-disk temp file is untouched.
+    pub fn adopt(self: *SealedSpool, allocator: std.mem.Allocator) !SealedSpool {
+        const root = try allocator.dupe(u8, self.session_root);
+        errdefer allocator.free(root);
+        const directory = try allocator.dupe(u8, self.directory);
+        errdefer allocator.free(directory);
+        const temp = try allocator.dupeZ(u8, self.temp_path);
+        errdefer allocator.free(temp);
+        const source_allocator = self.allocator;
+        source_allocator.free(self.session_root);
+        source_allocator.free(self.directory);
+        source_allocator.free(self.temp_path);
+        const snapshot = self.snapshot;
+        const preview = self.preview;
+        const temp_identity = self.temp_identity;
+        const state = self.state;
+        self.* = undefined;
+        return .{
+            .allocator = allocator,
+            .session_root = root,
+            .directory = directory,
+            .temp_path = temp,
+            .snapshot = snapshot,
+            .preview = preview,
+            .temp_identity = temp_identity,
+            .state = state,
+        };
+    }
+    pub fn readAllAlloc(self: *const SealedSpool, allocator: std.mem.Allocator) ![]u8 {
+        if (self.state != .sealed) return error.ArtifactSpoolClosed;
+        const path_z = try allocator.dupeZ(u8, self.temp_path);
+        defer allocator.free(path_z);
+        const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+        if (fd < 0) return error.ArtifactSourceOpenFailed;
+        defer _ = pfs.close(fd);
+        const info = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
+        if (!sameFile(info, self.temp_identity) or info.size != self.snapshot.bytes) return error.ArtifactSourceChanged;
+        const out = try allocator.alloc(u8, @intCast(self.snapshot.bytes));
+        errdefer allocator.free(out);
+        var off: usize = 0;
+        while (off < out.len) {
+            const n = pfs.readZ(fd, out[off..]) catch return error.ArtifactReadFailed;
+            if (n == 0) return error.ArtifactSourceChanged;
+            off += n;
+        }
+        return out;
+    }
+    pub fn previewValue(self: *const SealedSpool) Preview {
+        return self.preview;
+    }
+    pub fn publish(self: *SealedSpool) !CompletedSpool {
+        return self.publishWithMode(.normal);
+    }
+    fn publishWithMode(self: *SealedSpool, mode: Spool.PublishMode) !CompletedSpool {
+        if (self.state != .sealed) return error.ArtifactSpoolClosed;
         const artifact_directory = try artifactDirectory(self.allocator, self.session_root);
         defer self.allocator.free(artifact_directory);
         try ensureSecureDirectory(self.allocator, self.session_root, artifact_directory);
@@ -371,15 +482,15 @@ pub const Spool = struct {
         persist_mutex.lock();
         defer persist_mutex.unlock();
 
-        const final_path = try artifactPath(self.allocator, artifact_directory, digest);
+        const final_path = try artifactPath(self.allocator, artifact_directory, self.snapshot.sha256);
         defer self.allocator.free(final_path);
-        if (try verifyExisting(self.allocator, final_path, digest, @intCast(snapshot.bytes))) {
+        if (try verifyExisting(self.allocator, final_path, self.snapshot.sha256, @intCast(self.snapshot.bytes))) {
             pfs.unlinkPath(self.temp_path.ptr) catch return error.ArtifactSpoolCleanupFailed;
             try fsyncDirectory(self.allocator, self.directory);
-            self.published = true;
-            return .{ .receipt = receiptFor(snapshot), .preview = self.preview };
+            self.state = .published;
+            return .{ .receipt = self.receipt(), .preview = self.preview };
         }
-        try reserveQuota(self.allocator, artifact_directory, snapshot.bytes);
+        try reserveQuota(self.allocator, artifact_directory, self.snapshot.bytes);
 
         try publishPreparedFile(
             self.allocator,
@@ -387,18 +498,22 @@ pub const Spool = struct {
             final_path,
             artifact_directory,
             self.directory,
-            snapshot,
-            temp_identity,
+            self.snapshot,
+            self.temp_identity,
             mode,
         );
-        commitQuota(artifact_directory, snapshot.bytes);
-        self.published = true;
-        return .{ .receipt = receiptFor(snapshot), .preview = self.preview };
+        commitQuota(artifact_directory, self.snapshot.bytes);
+        self.state = .published;
+        return .{ .receipt = self.receipt(), .preview = self.preview };
     }
 
-    pub fn deinit(self: *Spool) void {
-        if (self.fd_open) _ = pfs.close(self.fd);
-        if (!self.published) pfs.unlinkPath(self.temp_path.ptr) catch {};
+    pub fn discard(self: *SealedSpool) void {
+        if (self.state != .sealed) return;
+        pfs.unlinkPath(self.temp_path.ptr) catch {};
+        self.state = .discarded;
+    }
+    pub fn deinit(self: *SealedSpool) void {
+        if (self.state == .sealed) pfs.unlinkPath(self.temp_path.ptr) catch {};
         self.allocator.free(self.temp_path);
         self.allocator.free(self.directory);
         self.allocator.free(self.session_root);
@@ -1305,6 +1420,201 @@ test "content-addressed artifact persists, deduplicates, and pages" {
     defer chunk.deinit();
     try std.testing.expectEqualStrings(payload[6..12], chunk.bytes);
     try std.testing.expectEqual(@as(?u64, 12), chunk.next_offset);
+}
+
+/// Test-only: entries in `directory` other than `.`/`..`; a directory that does
+/// not exist counts as empty, which is what "nothing left behind" means.
+fn testCountEntries(allocator: std.mem.Allocator, directory: []const u8) !usize {
+    const directory_z = try allocator.dupeZ(u8, directory);
+    defer allocator.free(directory_z);
+    var iterator = pdir.open(directory_z.ptr) orelse return 0;
+    defer pdir.close(&iterator);
+    var count: usize = 0;
+    while (pdir.next(&iterator)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        count += 1;
+    }
+    return count;
+}
+
+const SealedTestRoot = struct {
+    tmp: std.testing.TmpDir,
+    buffer: [std.fs.max_path_bytes]u8 = undefined,
+    len: usize = 0,
+
+    fn init() !SealedTestRoot {
+        var self = SealedTestRoot{ .tmp = std.testing.tmpDir(.{}) };
+        errdefer self.tmp.cleanup();
+        self.len = try self.tmp.dir.realPath(std.testing.io, &self.buffer);
+        return self;
+    }
+
+    fn root(self: *const SealedTestRoot) []const u8 {
+        return self.buffer[0..self.len];
+    }
+
+    fn expectNothingLeftBehind(self: *const SealedTestRoot, allocator: std.mem.Allocator, expected_blobs: usize) !void {
+        const spool_dir = try spoolDirectory(allocator, self.root());
+        defer allocator.free(spool_dir);
+        const artifact_dir = try artifactDirectory(allocator, self.root());
+        defer allocator.free(artifact_dir);
+        try std.testing.expectEqual(@as(usize, 0), try testCountEntries(allocator, spool_dir));
+        try std.testing.expectEqual(expected_blobs, try testCountEntries(allocator, artifact_dir));
+    }
+
+    fn deinit(self: *SealedTestRoot) void {
+        self.tmp.cleanup();
+    }
+};
+
+test "sealed spool: seal then publish equals finish" {
+    const a = std.testing.allocator;
+    var fixture = try SealedTestRoot.init();
+    defer fixture.deinit();
+    const payload = "sealed-equals-finished";
+
+    var finished = try Spool.begin(a, fixture.root());
+    defer finished.deinit();
+    try finished.write(payload);
+    const via_finish = try finished.finish();
+
+    var spool = try Spool.begin(a, fixture.root());
+    defer spool.deinit();
+    try spool.write(payload);
+    var sealed = try spool.seal();
+    defer sealed.deinit();
+    const via_seal = try sealed.publish();
+
+    try std.testing.expectEqualStrings(via_finish.receipt.id(), via_seal.receipt.id());
+    try std.testing.expectEqual(via_finish.receipt.bytes, via_seal.receipt.bytes);
+    var chunk = try readChunk(a, fixture.root(), via_seal.receipt.id(), 0, payload.len);
+    defer chunk.deinit();
+    try std.testing.expectEqualStrings(payload, chunk.bytes);
+    // Same bytes, same id: one blob, and no private files left in the spool.
+    try fixture.expectNothingLeftBehind(a, 1);
+}
+
+test "sealed spool: seal then discard leaves nothing behind" {
+    const a = std.testing.allocator;
+    var fixture = try SealedTestRoot.init();
+    defer fixture.deinit();
+    var spool = try Spool.begin(a, fixture.root());
+    defer spool.deinit();
+    try spool.write("discarded");
+    var sealed = try spool.seal();
+    defer sealed.deinit();
+    sealed.discard();
+    try fixture.expectNothingLeftBehind(a, 0);
+}
+
+test "sealed spool: deinit without publish discards" {
+    const a = std.testing.allocator;
+    var fixture = try SealedTestRoot.init();
+    defer fixture.deinit();
+    var spool = try Spool.begin(a, fixture.root());
+    defer spool.deinit();
+    try spool.write("dropped on the floor");
+    var sealed = try spool.seal();
+    sealed.deinit();
+    try fixture.expectNothingLeftBehind(a, 0);
+}
+
+test "sealed spool: receipt is known before publication" {
+    const a = std.testing.allocator;
+    var fixture = try SealedTestRoot.init();
+    defer fixture.deinit();
+    const payload = "receipt-before-publish";
+    var spool = try Spool.begin(a, fixture.root());
+    defer spool.deinit();
+    try spool.write(payload);
+    var sealed = try spool.seal();
+    defer sealed.deinit();
+    const before = sealed.receipt();
+    const expected_hex = sha256Hex(payload);
+    try std.testing.expectEqualStrings(ID_PREFIX ++ expected_hex, before.id());
+    try std.testing.expectEqual(@as(u64, payload.len), before.bytes);
+    const published = try sealed.publish();
+    try std.testing.expectEqualStrings(before.id(), published.receipt.id());
+    try std.testing.expectEqual(before.bytes, published.receipt.bytes);
+}
+
+test "sealed spool: identical bytes dedup to one blob" {
+    const a = std.testing.allocator;
+    var fixture = try SealedTestRoot.init();
+    defer fixture.deinit();
+    const payload = "twins";
+    var first = try Spool.begin(a, fixture.root());
+    defer first.deinit();
+    try first.write(payload);
+    var second = try Spool.begin(a, fixture.root());
+    defer second.deinit();
+    try second.write(payload);
+    var first_sealed = try first.seal();
+    defer first_sealed.deinit();
+    var second_sealed = try second.seal();
+    defer second_sealed.deinit();
+    const first_done = try first_sealed.publish();
+    const second_done = try second_sealed.publish();
+    try std.testing.expectEqualStrings(first_done.receipt.id(), second_done.receipt.id());
+    try fixture.expectNothingLeftBehind(a, 1);
+}
+
+test "sealed spool: publish after discard or after publish fails closed" {
+    const a = std.testing.allocator;
+    var fixture = try SealedTestRoot.init();
+    defer fixture.deinit();
+
+    var discarded_source = try Spool.begin(a, fixture.root());
+    defer discarded_source.deinit();
+    try discarded_source.write("discard me");
+    var discarded = try discarded_source.seal();
+    defer discarded.deinit();
+    discarded.discard();
+    try std.testing.expectError(error.ArtifactSpoolClosed, discarded.publish());
+
+    var published_source = try Spool.begin(a, fixture.root());
+    defer published_source.deinit();
+    try published_source.write("publish me once");
+    var published = try published_source.seal();
+    defer published.deinit();
+    _ = try published.publish();
+    try std.testing.expectError(error.ArtifactSpoolClosed, published.publish());
+    try fixture.expectNothingLeftBehind(a, 1);
+}
+
+test "sealed spool: readAllAlloc returns the sealed bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &b);
+    var s = try Spool.begin(std.testing.allocator, b[0..n]);
+    try s.write("sealed-bytes");
+    var sealed = try s.seal();
+    defer sealed.deinit();
+    const bytes = try sealed.readAllAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("sealed-bytes", bytes);
+    sealed.discard();
+    try std.testing.expectError(error.ArtifactSpoolClosed, sealed.readAllAlloc(std.testing.allocator));
+}
+
+test "sealed spool: adopt re-homes the handle into another allocator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &b);
+    var source = try Spool.begin(arena.allocator(), b[0..n]);
+    try source.write("adopted");
+    var sealed = try source.seal();
+    source.deinit();
+    var adopted = try sealed.adopt(std.testing.allocator);
+    defer adopted.deinit();
+    const completed = try adopted.publish();
+    var chunk = try readChunk(std.testing.allocator, b[0..n], completed.receipt.id(), 0, 7);
+    defer chunk.deinit();
+    try std.testing.expectEqualStrings("adopted", chunk.bytes);
 }
 
 test "file import hashes and preserves the complete byte-zero spool" {

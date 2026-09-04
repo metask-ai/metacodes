@@ -336,8 +336,10 @@ issue #29 的行为(不知道能取回,就改命令重跑)。
 就重定向到内核 Spool,**全量内容从不进内核内存**。所以这不是"先拿到 40MB 再截断"。
 
 **artifact 有两个产生点,但只有一个阈值。** 工具层(`result_spool.finishCaptureAsBody`)在捕获
-完成时决定"这些字节要不要进内存":完整且 ≤ `per_result_bytes` 的抬回 inline,否则直接发布进
-CAS;projection 层在本轮结果就绪后决定"模型该看到多少"。两层分开是信息时序决定的——工具不知道
+完成时决定"这些字节要不要进内存":完整且 ≤ `per_result_bytes` 的抬回 inline,否则**封存**
+(`Spool.seal` → `SealedSpool`:私有临时文件留在 spool 目录,receipt 已知,不进 CAS、不计
+quota)并返回 `ToolResultBody.sealed`,由 agent loop 在批次提交边界发布(见下段);
+projection 层在本轮结果就绪后决定"模型该看到多少"。两层分开是信息时序决定的——工具不知道
 兄弟结果,projection 不能把已进内存的字节反物化——但**判定用同一个数**:工具层按值接收
 `ctx.result_budget`,只读 `per_result_bytes`(`result_spool.zig` 内的守卫测试禁止它碰
 `per_turn` 等不属于它的字段,并断言六个调用方逐字传 `ctx.result_budget`)。两个 MCP producer
@@ -354,6 +356,18 @@ CAS;projection 层在本轮结果就绪后决定"模型该看到多少"。两层
 两次。统一后无 turn 压力时两层严格一致;有压力时(兄弟结果压低水位线)工具层正确内联的结果仍会
 被 projection 溢出——这不可避免且有界(≤ per_result),`tests/component/inline_threshold_test.zig`
 的 T2 验证这类二次转存零丢失、小结果零牵连、压完恰在预算内。
+
+**发布发生在批次提交边界,不在执行期(#45)。** 封存的句柄随渲染好的信封一起走
+(`tool_exec.OneResult.done.sealed` → `Slot.sealed`,流式预取的 `Entry` 同样携带);从封存
+receipt 渲染的信封与发布后渲染的逐字节相同,所以模型看到的字节不因发布时机而变。
+`executeSlots` 无 fatal 地完成就是提交边界:`tool_exec.publishSealedResults` 在这里发布每个
+句柄,发布与为它作证的 Conversation 引用落在同一轮;更早的退出(host 工具 fatal、被拒的
+dispatch 观测)只是释放 slots——`Slot.deinit` 丢弃临时文件,CAS 里不会留下无人引用的 blob。
+不能在 fatal 路径上删 blob 的原因没变:CAS 按内容寻址,同一 id 可能已被更早的结果、同批兄弟或
+共用根目录的其它 session 引用。提交边界上发布失败沿用工具层原先在执行期的策略
+(`retainInlineAfterFailedPublish` 允许则退回 inline,否则给出有界的 `ArtifactPublishFailed`
+工具错误)。仍在执行期发布的生产者——MCP 超帧结果、process plugin 的 `ExternalSpool`、Bash
+spool import、host stream 工具、AgentCore 投影器——见 #65。
 
 **两个预算,都是 context window 的纯函数**(`result_budget.perResultBytes`/`perTurnBytes`):
 

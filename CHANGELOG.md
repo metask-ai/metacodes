@@ -27,6 +27,15 @@ status, compatibility boundaries, and entry points are defined by
   next runtime capability added without an offer mapping is a compile error
   rather than a silent gap.
 
+### Fixed
+
+- Restored the invariant that a fatal batch does not persist a completed transient
+  result (#45). Large captures now seal during execution and publish at the batch
+  commit boundary, keeping the envelope reference and CAS publication atomic.
+  Failures use the existing inline fallback policy or a bounded
+  `ArtifactPublishFailed` tool error; other execution-time producers are tracked
+  separately in #65.
+
 ### Changed
 
 - The zero-provider plugin release gate now runs validation, pin hashing, and

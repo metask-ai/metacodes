@@ -61,7 +61,7 @@ pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
                     try output.writer.writeByte('}');
                 }
             },
-            .artifact => {
+            .artifact, .sealed => {
                 var rendered = try body.render(allocator);
                 defer rendered.deinit(allocator);
                 if (!first) try output.writer.writeByte(',');

@@ -2,8 +2,8 @@
 //!
 //! High-output first-party tools write their final representation into a
 //! kernel-private Capture. Small complete results are lifted back to inline;
-//! large or incomplete results are copied into the Session CAS without ever
-//! materializing the whole payload.
+//! large or incomplete results are sealed for publication at the agent-loop
+//! commit boundary (#45), without ever materializing the whole payload.
 //!
 //! "Small" is the projection layer's own per-result budget, handed in by the
 //! caller - never a constant of this file's. There used to be one, 64KB, which
@@ -89,11 +89,11 @@ pub fn finishCaptureAsBody(
         ));
     }
 
-    return publish(allocator, artifact_root, capture, media_type, capture_complete) catch |err|
+    return seal(allocator, artifact_root, capture, media_type, capture_complete) catch |err|
         inlineAfterFailedPublish(allocator, capture, capture_complete, err);
 }
 
-fn publish(
+fn seal(
     allocator: std.mem.Allocator,
     artifact_root: []const u8,
     capture: *artifact_store.Capture,
@@ -103,9 +103,8 @@ fn publish(
     var spool = try artifact_store.Spool.begin(allocator, artifact_root);
     defer spool.deinit();
     try capture.copyRangeTo(&spool, 0, capture.bytes);
-    var completed = try spool.finish();
-    completed.receipt.capture_complete = capture_complete;
-    return tool_result.ToolResultBody.fromCompletedSpool(completed, media_type);
+    const sealed = try spool.seal();
+    return .{ .sealed = .{ .spool = sealed, .media_type = media_type, .capture_complete = capture_complete } };
 }
 
 /// Apply the shared failed-publication policy before materializing the capture.
@@ -159,6 +158,35 @@ test "CaptureWriter streams formatting and preserves small inline result" {
     defer body.deinit(allocator);
     try std.testing.expect(body == .@"inline");
     try std.testing.expectEqualStrings("native-42", body.@"inline".bytes);
+}
+
+test "finishCaptureAsBody seals above the budget and publishes nothing until asked" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &b);
+    const root = b[0..n];
+    const size = result_budget.Budget.floor.per_result_bytes + 1000;
+    var capture = try artifact_store.Capture.begin(a, root, size + 1);
+    defer capture.deinit();
+    const bytes = try a.alloc(u8, size);
+    defer a.free(bytes);
+    @memset(bytes, 'x');
+    try capture.write(bytes);
+    try capture.seal();
+    var body = try finishCaptureAsBody(a, root, &capture, .text_utf8, true, .floor);
+    defer body.deinit(a);
+    try std.testing.expect(body == .sealed);
+    var rendered = try body.render(a);
+    defer rendered.deinit(a);
+    try std.testing.expect(std.mem.startsWith(u8, rendered.bytes, tool_result.ENVELOPE_PREFIX ++ "\"artifact\""));
+    var sealed = body.takeSealed().?;
+    const completed = try sealed.spool.publish();
+    sealed.spool.deinit();
+    var chunk = try artifact_store.readChunk(a, root, completed.receipt.id(), 0, @intCast(size));
+    defer chunk.deinit();
+    try std.testing.expectEqualSlices(u8, bytes, chunk.bytes);
 }
 
 /// `src` with every comment-only line (`//`, `///`, `//!` after leading blanks)

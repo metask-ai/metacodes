@@ -68,6 +68,17 @@ fn captureBodyTyped(
     return cc.result_spool.finishCaptureAsBody(allocator, root, &capture, media_type, true, budget);
 }
 
+fn publishBody(body: *cc.tool_result.ToolResultBody) !void {
+    if (body.* != .sealed) return;
+    var sealed = body.takeSealed().?;
+    const completed = try sealed.spool.publish();
+    var receipt = completed.receipt;
+    receipt.capture_complete = sealed.capture_complete;
+    const media_type = sealed.media_type;
+    sealed.spool.deinit();
+    body.* = .{ .artifact = .{ .stored = receipt, .preview = completed.preview, .media_type = media_type } };
+}
+
 /// The bytes production commits for a body (`tool_exec` renders the same
 /// way), as one owned slice the projection pass may replace.
 fn committed(allocator: std.mem.Allocator, body: *cc.tool_result.ToolResultBody) ![]const u8 {
@@ -110,7 +121,8 @@ test "T1 inline threshold: a result above per_result is published once by the to
 
     var body = try captureBody(a, root, size, 'x', budget);
     defer body.deinit(a);
-    // Tool layer: not lifted into memory.
+    try publishBody(&body);
+    // Tool layer sealed; the commit boundary published it. Not lifted into memory.
     try std.testing.expect(body == .artifact);
 
     const before = artifact.sessionUsage(root);
@@ -247,10 +259,11 @@ test "T3 inline threshold: the seam is per_result_bytes exactly, from both sides
         try std.testing.expectEqual(@as(usize, 0), stats.artifact_spill_count);
         try std.testing.expectEqual(edge, content.len);
     }
-    // One byte over: the tool layer publishes; nothing is materialized.
+    // One byte over: the tool layer seals; the commit boundary publishes.
     {
         var body = try captureBody(a, root, edge + 1, 'f', budget);
         defer body.deinit(a);
+        try publishBody(&body);
         try std.testing.expect(body == .artifact);
     }
     // The same byte count under a larger window stays inline: the seam moves
@@ -271,12 +284,13 @@ test "T4 inline threshold: a tool-layer envelope is not a structured tool result
     const root = try tmpRoot(&tmp, &buf);
     const budget = result_budget.Budget.fromModel(WINDOW);
 
-    // A text result the tool layer published: its envelope is JSON, the
+    // A text result sealed by the tool layer and published at commit: its envelope is JSON, the
     // result is not. Before the fix this counted as structured, and with the
     // tool layer publishing everything above per_result it inflated the
     // metric for every large Grep.
     var text_body = try captureBody(a, root, 40_000, 't', budget);
     defer text_body.deinit(a);
+    try publishBody(&text_body);
     try std.testing.expect(text_body == .artifact);
     var text_content = try committed(a, &text_body);
     defer a.free(@constCast(text_content));
@@ -286,11 +300,12 @@ test "T4 inline threshold: a tool-layer envelope is not a structured tool result
     var json_content: []const u8 = try a.dupe(u8, "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"ok\",\"exit_code\":0}");
     defer a.free(@constCast(json_content));
 
-    // A JSON body the tool layer published: the envelope is the wrapper, and
+    // A JSON body sealed by the tool layer and published at commit: the envelope is the wrapper, and
     // what it wraps is recorded as its media_type. Excluding every envelope
     // outright lost exactly this case - the fix Codex caught in cross-review.
     var json_body = try captureBodyTyped(a, root, 40_000, 'j', budget, .json);
     defer json_body.deinit(a);
+    try publishBody(&json_body);
     try std.testing.expect(json_body == .artifact);
     var published_json = try committed(a, &json_body);
     defer a.free(@constCast(published_json));
@@ -352,12 +367,12 @@ test "T5 inline threshold: a result that cannot be published degrades to a fallb
     try capture.write(payload);
     try capture.seal();
 
-    // Publication now fails at quota admission, and the bytes come back inline
-    // so projection can still say something useful about them.
+    // Commit-boundary publication fails at quota admission; takeModelBytes applies
+    // the shared fallback policy so projection can still say something useful.
     var body = try cc.result_spool.finishCaptureAsBody(a, root, &capture, .text_utf8, true, budget);
-    defer body.deinit(a);
-    try std.testing.expect(body == .@"inline");
-    try std.testing.expectEqual(size, body.@"inline".bytes.len);
+    const taken = try body.takeModelBytes(a);
+    defer a.free(taken.bytes);
+    try std.testing.expectEqual(size, taken.bytes.len);
 
     var content = try committed(a, &body);
     defer a.free(@constCast(content));
