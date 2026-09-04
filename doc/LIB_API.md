@@ -187,6 +187,10 @@ receipt 或 bounded structured error。两种 executor 不能同时存在，也�
 (`payloadAllowance` 扣掉信封开销,`splitPair` 在多通道间做 max-min 公平切分),不要再引入私有常量;
 额度按编码后字节计,`encodedPrefixLen`/`encodedSuffixLen` 负责在 UTF-8 边界上按编码代价下刀。
 嵌入者不提供 Provider 时字段保持 `.floor` 默认(8KiB/16KiB),行为等同历史下限。
+`McpClient.callToolBodyAbortable` / `listResourcesBodyAbortable` / `readResourceBodyAbortable`、
+`mcp_result_stream.project` 与 `mcp_runtime.Client.callToolBody` 现在都把调用方的
+`result_budget.Budget` 列为必填参数,嵌入者须逐字传 `ctx.result_budget`。这是自
+`010e0f9` / `7311295` 起的 breaking signature change。
 
 首方 byte-zero 工具为 `Glob`、`Grep`、`CodeMap`、`FindSymbol`、`Bash`、
 `ListMcpResourcesTool`、`ReadMcpResourceTool` 和 `WebFetch`。Bash 的 JobRegistry、

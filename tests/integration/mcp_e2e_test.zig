@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
 
 fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const u8) ![]u8 {
@@ -13,6 +14,141 @@ fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const 
             return error.UnexpectedDispatchOutcome;
         },
     };
+}
+
+fn expectedSizedResourceResult(allocator: std.mem.Allocator, payload_bytes: usize) ![]u8 {
+    const payload = try allocator.alloc(u8, payload_bytes);
+    defer allocator.free(payload);
+    @memset(payload, 's');
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"contents\":[{{\"uri\":\"mock://sized/{d}\",\"mimeType\":\"text/plain\",\"text\":\"{s}\"}}]}}",
+        .{ payload_bytes, payload },
+    );
+}
+
+fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) !void {
+    const seed = try cc.tool_result_artifact.persist(allocator, root, "seed");
+    _ = seed;
+    const filler = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/tool-results/sha256/quota-fixture.blob",
+        .{root},
+        0,
+    );
+    defer allocator.free(filler);
+    const fd = pfs.open(
+        filler.ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true },
+        0o600,
+    );
+    if (fd < 0) return error.QuotaFixtureOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.setSize(fd, cc.tool_result_artifact.MAX_SESSION_BYTES);
+}
+
+const ExpectedBody = enum { inline_body, artifact, structured_error };
+
+fn expectSizedResourceBody(
+    expected_result_bytes: usize,
+    expected_body: ExpectedBody,
+    fill_quota: bool,
+) !void {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    if (fill_quota) try fillSessionArtifactQuota(allocator, root);
+    const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
+    const argv = [_]?[*:0]const u8{ mock_path, null };
+    var client = try cc.mcp_client.McpClient.connect(allocator, argv[0..]);
+    defer client.close();
+
+    const server_name = try allocator.dupe(u8, "mock");
+    defer allocator.free(server_name);
+    var entries = [_]cc.mcp_session.McpSessionEntry{.{
+        .name = server_name,
+        .client = &client,
+        .session = cc.mcp_registry_bridge.McpSession.init(allocator, &client),
+    }};
+    defer entries[0].session.deinit();
+    var sessions: []cc.mcp_session.McpSessionEntry = entries[0..];
+    const budget = cc.result_budget.Budget.fromModel(200_000);
+    try std.testing.expectEqual(@as(usize, 25_000), budget.per_result_bytes);
+    var ctx = cc.tools.ToolContext.simple(allocator);
+    ctx.artifact_root = root;
+    ctx.result_budget = budget;
+    ctx.mcp_sessions = &sessions;
+
+    const overhead_fixture = try expectedSizedResourceResult(allocator, expected_result_bytes);
+    defer allocator.free(overhead_fixture);
+    const envelope_overhead = overhead_fixture.len - expected_result_bytes;
+    const payload_bytes = expected_result_bytes - envelope_overhead;
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"uri\":\"mock://sized/{d}\",\"server\":\"mock\"}}",
+        .{payload_bytes},
+    );
+    defer allocator.free(args);
+    const expected = try expectedSizedResourceResult(allocator, payload_bytes);
+    defer allocator.free(expected);
+    try std.testing.expectEqual(expected_result_bytes, expected.len);
+
+    var read = try cc.tools.dispatch(&ctx, "ReadMcpResourceTool", args);
+    defer read.deinit(allocator);
+    const body = switch (read) {
+        .ok => |*value| value,
+        else => return error.UnexpectedResourceReadOutcome,
+    };
+    switch (expected_body) {
+        .artifact => {
+            try std.testing.expect(body.* == .artifact);
+            try std.testing.expectEqual(@as(u64, expected.len), body.artifact.stored.bytes);
+            try std.testing.expectEqualStrings(
+                expected[0..body.artifact.preview.head_len],
+                body.artifact.preview.headSlice(),
+            );
+        },
+        .inline_body => {
+            try std.testing.expect(body.* == .@"inline");
+            try std.testing.expectEqualStrings(expected, body.@"inline".bytes);
+        },
+        .structured_error => {
+            // Above the frame limit the response never enters the ≤1MB branch:
+            // it goes through the projector, whose failed publication is a
+            // `resource_limit` diagnostic that the client returns as a
+            // structured error rather than as bytes.
+            try std.testing.expect(body.* == .structured_error);
+            try std.testing.expect(std.mem.indexOf(u8, body.structured_error.encoded, "resource_limit") != null);
+        },
+    }
+}
+
+test "MCP budget: resources/read publishes result above caller per-result budget" {
+    try expectSizedResourceBody(30_000, .artifact, false);
+}
+
+test "MCP budget: resources/read inlines result at caller per-result budget" {
+    try expectSizedResourceBody(25_000, .inline_body, false);
+}
+
+test "MCP budget: resources/read retains bounded result inline when publication fails" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try expectSizedResourceBody(30_000, .inline_body, true);
+}
+
+test "MCP budget: resources/read retains result inline up to the frame limit when publication fails" {
+    // Between PER_RESULT_MAX_BYTES and the 1MB frame limit the bytes are
+    // already in memory; before the threshold change this band was always
+    // inline, so a full store must not turn it into a tool error now.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try expectSizedResourceBody(120_000, .inline_body, true);
+}
+
+test "MCP budget: resources/read above the frame limit fails closed when publication fails" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try expectSizedResourceBody(1_100_000, .structured_error, true);
 }
 
 test "MCP: full cycle initialize + listTools + callTool echo" {

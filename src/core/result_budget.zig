@@ -116,6 +116,22 @@ pub const PER_RESULT_WINDOW_DIVISOR: usize = 8;
 pub const PER_TURN_MIN_BYTES: usize = 16 * 1024;
 pub const PER_TURN_MAX_BYTES: usize = 200 * 1024;
 
+/// Whether bytes remain safe to hand back inline after CAS publication fails.
+/// This preserves the pre-publication degradation path: projection can still
+/// render a bounded head/tail envelope with `storage_error` for any complete
+/// result the publisher could historically hold inline. `ceiling` is exactly
+/// that: the largest result this publisher has ever held inline, so retaining
+/// up to it reintroduces no new materialization. The native spool and the
+/// AgentCore projector pass `PER_RESULT_MAX_BYTES` (they would have to read
+/// the bytes back from disk); the classic MCP client passes the frame limit it
+/// has already materialized. OOM cannot support a fallback allocation and an
+/// incomplete capture has no complete inline form, so neither is retained.
+pub fn retainInlineAfterFailedPublish(err: anyerror, bytes: u64, complete: bool, ceiling: u64) bool {
+    if (err == error.OutOfMemory) return false;
+    if (!complete) return false;
+    return bytes <= ceiling;
+}
+
 pub fn perResultBytes(max_input_tokens: usize) usize {
     const derived = if (max_input_tokens == 0)
         PER_RESULT_MIN_BYTES

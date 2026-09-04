@@ -340,7 +340,15 @@ issue #29 的行为(不知道能取回,就改命令重跑)。
 CAS;projection 层在本轮结果就绪后决定"模型该看到多少"。两层分开是信息时序决定的——工具不知道
 兄弟结果,projection 不能把已进内存的字节反物化——但**判定用同一个数**:工具层按值接收
 `ctx.result_budget`,只读 `per_result_bytes`(`result_spool.zig` 内的守卫测试禁止它碰
-`per_turn` 等不属于它的字段,并断言六个调用方逐字传 `ctx.result_budget`)。此前工具层用的是
+`per_turn` 等不属于它的字段,并断言六个调用方逐字传 `ctx.result_budget`)。两个 MCP producer
+也不另起阈值:classic client 的 `mcp/client.zig` `requestBodyUnlocked` 与 AgentCore 的
+`agentcore/mcp_result_stream.project` 分别把 `ctx.result_budget` / `tool_ctx.result_budget` 原样传下,
+用同一个数做决定。三条发布路径还共用 `result_budget.retainInlineAfterFailedPublish`:非 OOM 的 CAS
+发布失败后,完整且不超过该发布点自己物化上限的结果退回 inline,让 projection 仍能生成带
+`storage_error` 的有界 fallback。上限由各发布点自报:原生 spool 与 AgentCore 投影器是
+`PER_RESULT_MAX_BYTES`(64KB,它们得从盘上读回),classic client 是它本就已物化的 1MB 帧上限
+(`CONTROL_FRAME_MATERIALIZE_BYTES`)——各自恰好等于阈值改动前那条路径内联过的最大值;不完整或
+越过上限的结果仍然失败。此前工具层用的是
 常量 64KB(`PER_RESULT_MAX_BYTES` 抄了一遍),在 window < 524,288 的每个模型上留下
 `[per_result, 64KB]` 死区:落入其中的结果先被抬进内存,再被 projection 写回 CAS,同一份字节搬
 两次。统一后无 turn 压力时两层严格一致;有压力时(兄弟结果压低水位线)工具层正确内联的结果仍会
