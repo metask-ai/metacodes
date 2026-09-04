@@ -448,6 +448,11 @@ pub const CallbackServer = struct {
     sock: net.Socket,
     port: u16,
 
+    /// Bound on each accepted connection's reads and writes: a client that
+    /// connects and then stalls must not pin the wait (and with it Esc in the
+    /// picker's credential stage, #67).
+    pub const CALLBACK_IO_TIMEOUT_MS: u32 = 1000;
+
     pub fn bind(preferred_port: u16) !CallbackServer {
         return bindOnPort(preferred_port) catch |err| switch (err) {
             error.BindFailed => bindOnPort(FALLBACK_LOGIN_PORT) catch bindOnPort(0),
@@ -471,6 +476,10 @@ pub const CallbackServer = struct {
             if (!net.pollReadable(self.sock, 100)) continue;
             const conn_fd = net.acceptConn(self.sock) orelse return error.AcceptFailed;
             defer net.closeSocket(conn_fd);
+            // Bounded IO turns a partial request into a 400 and the loop checks
+            // the signal again instead of blocking in recv.
+            net.setRecvTimeoutMs(conn_fd, CALLBACK_IO_TIMEOUT_MS);
+            net.setSendTimeoutMs(conn_fd, CALLBACK_IO_TIMEOUT_MS);
             const req = readHttpRequest(allocator, conn_fd) catch {
                 sendHttpResponse(conn_fd, 400, "Bad Request", "Bad Request");
                 continue;
@@ -1072,4 +1081,24 @@ test "the loopback wait keeps serving a wrong-state callback and still aborts" {
     const t = try std.Thread.spawn(.{}, Worker.run, .{ server.port, &signal });
     try std.testing.expectError(error.Aborted, server.waitForAuthorizationCode(std.testing.allocator, "s", &signal));
     t.join();
+}
+
+test "the loopback wait is not pinned by a client that connects and stalls" {
+    var server = try CallbackServer.bind(0);
+    defer server.close();
+    var signal = AbortSignal.init();
+    const Worker = struct {
+        fn run(port: u16, s: *AbortSignal) void {
+            const c = net.connectLoopback(port) catch return;
+            defer net.closeSocket(c);
+            // A request line and then silence: no terminator ever arrives.
+            _ = net.send(c, "GET /auth/callback?state=s HTTP/1.1");
+            time.sleepMs(300);
+            s.abort(.user_interrupt);
+            time.sleepMs(CallbackServer.CALLBACK_IO_TIMEOUT_MS + 500);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ server.port, &signal });
+    defer t.join();
+    try std.testing.expectError(error.Aborted, server.waitForAuthorizationCode(std.testing.allocator, "s", &signal));
 }
