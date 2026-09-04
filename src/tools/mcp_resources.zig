@@ -18,7 +18,10 @@ const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const ToolResultBody = @import("context.zig").ToolResultBody;
 const artifact_store = @import("../core/tool_result_artifact.zig");
+const result_budget = @import("../core/result_budget.zig");
 const result_spool = @import("result_spool.zig");
+
+const LAST_ERROR_DETAIL_MAX_BYTES: usize = 512;
 
 pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
     if (ctx.artifact_root.len == 0)
@@ -111,23 +114,70 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
     }
 
     var last_error: ?[]const u8 = null;
+    var last_error_detail: ?[]u8 = null;
+    defer if (last_error_detail) |detail| allocator.free(detail);
     for (sessions.*) |*entry| {
         var body = entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| {
             last_error = @errorName(err);
             continue;
         };
         if (body == .structured_error) {
+            if (body.structured_error.category == .system_error) return body;
+            const detail = duplicateStructuredErrorDetail(
+                allocator,
+                body.structured_error.encoded,
+            ) catch |err| {
+                body.deinit(allocator);
+                return err;
+            };
             body.deinit(allocator);
+            if (last_error_detail) |previous| allocator.free(previous);
+            last_error_detail = detail;
             last_error = "remote_error";
             continue;
         }
         return body;
     }
-    return ToolResultBody.initInline(try std.fmt.allocPrint(
-        allocator,
-        "{{\"error\":\"resource_not_found\",\"uri\":\"{s}\",\"last_err\":\"{s}\"}}",
-        .{ uri, last_error orelse "none" },
-    ));
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"error\":\"resource_not_found\",\"uri\":");
+    try std.json.Stringify.encodeJsonString(uri, .{}, &output.writer);
+    try output.writer.writeAll(",\"last_err\":");
+    try std.json.Stringify.encodeJsonString(last_error orelse "none", .{}, &output.writer);
+    if (last_error_detail) |detail| {
+        try output.writer.writeAll(",\"last_error_detail\":");
+        try std.json.Stringify.encodeJsonString(detail, .{}, &output.writer);
+    }
+    try output.writer.writeByte('}');
+    return ToolResultBody.initInline(try output.toOwnedSlice());
+}
+
+fn duplicateStructuredErrorDetail(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+) error{OutOfMemory}!?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        encoded,
+        .{ .duplicate_field_behavior = .@"error" },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed != .object) return null;
+    const payload = parsed.object.get("error") orelse return null;
+    if (payload != .object) return null;
+    const detail = payload.object.get("detail") orelse return null;
+    if (detail != .string) return null;
+    const bounded_len = result_budget.floorUtf8Boundary(
+        detail.string,
+        LAST_ERROR_DETAIL_MAX_BYTES,
+    );
+    const bounded = detail.string[0..bounded_len];
+    return try allocator.dupe(u8, bounded);
 }
 
 pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -322,4 +372,25 @@ test "read: missing uri errors" {
     var ctx = ToolContext.simple(testing.allocator);
     ctx.mcp_sessions = &sessions;
     try testing.expectError(error.MissingUri, readExecute(&ctx, "{}"));
+}
+
+test "read_resource detail respects UTF-8 boundaries" {
+    const allocator = testing.allocator;
+    const detail = try allocator.alloc(u8, 514);
+    defer allocator.free(detail);
+    @memset(detail[0..511], 'a');
+    detail[511] = 0xe4;
+    detail[512] = 0xb8;
+    detail[513] = 0xad;
+
+    var encoded: std.Io.Writer.Allocating = .init(allocator);
+    defer encoded.deinit();
+    try encoded.writer.writeAll("{\"error\":{\"detail\":");
+    try std.json.Stringify.encodeJsonString(detail, .{}, &encoded.writer);
+    try encoded.writer.writeAll("}}");
+
+    const bounded = try duplicateStructuredErrorDetail(allocator, encoded.written());
+    try testing.expect(bounded != null);
+    defer allocator.free(bounded.?);
+    try testing.expectEqualStrings(detail[0..511], bounded.?);
 }

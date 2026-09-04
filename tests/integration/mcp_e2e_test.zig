@@ -49,11 +49,11 @@ fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) !voi
 
 const ExpectedBody = enum { inline_body, artifact, structured_error };
 
-fn expectSizedResourceBody(
-    expected_result_bytes: usize,
-    expected_body: ExpectedBody,
+fn readResourceBody(
+    uri: []const u8,
+    server_hint: bool,
     fill_quota: bool,
-) !void {
+) !cc.tools.ToolResultBody {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -81,29 +81,49 @@ fn expectSizedResourceBody(
     ctx.result_budget = budget;
     ctx.mcp_sessions = &sessions;
 
+    var args: std.Io.Writer.Allocating = .init(allocator);
+    defer args.deinit();
+    try args.writer.writeAll("{\"uri\":");
+    try std.json.Stringify.encodeJsonString(uri, .{}, &args.writer);
+    if (server_hint) try args.writer.writeAll(",\"server\":\"mock\"");
+    try args.writer.writeByte('}');
+
+    var outcome = try cc.tools.dispatch(&ctx, "ReadMcpResourceTool", args.written());
+    return switch (outcome) {
+        .ok => |body| body,
+        else => {
+            outcome.deinit(allocator);
+            return error.UnexpectedResourceReadOutcome;
+        },
+    };
+}
+
+fn expectSizedResourceBody(
+    expected_result_bytes: usize,
+    expected_body: ExpectedBody,
+    fill_quota: bool,
+    server_hint: bool,
+) !void {
+    const allocator = std.testing.allocator;
     const overhead_fixture = try expectedSizedResourceResult(allocator, expected_result_bytes);
     defer allocator.free(overhead_fixture);
     const envelope_overhead = overhead_fixture.len - expected_result_bytes;
     const payload_bytes = expected_result_bytes - envelope_overhead;
-    const args = try std.fmt.allocPrint(
+    const uri = try std.fmt.allocPrint(
         allocator,
-        "{{\"uri\":\"mock://sized/{d}\",\"server\":\"mock\"}}",
+        "mock://sized/{d}",
         .{payload_bytes},
     );
-    defer allocator.free(args);
+    defer allocator.free(uri);
     const expected = try expectedSizedResourceResult(allocator, payload_bytes);
     defer allocator.free(expected);
     try std.testing.expectEqual(expected_result_bytes, expected.len);
 
-    var read = try cc.tools.dispatch(&ctx, "ReadMcpResourceTool", args);
-    defer read.deinit(allocator);
-    const body = switch (read) {
-        .ok => |*value| value,
-        else => return error.UnexpectedResourceReadOutcome,
-    };
+    var body = try readResourceBody(uri, server_hint, fill_quota);
+    defer body.deinit(allocator);
     switch (expected_body) {
         .artifact => {
-            try std.testing.expect(body.* == .artifact);
+            try std.testing.expect(body == .artifact);
             try std.testing.expectEqual(@as(u64, expected.len), body.artifact.stored.bytes);
             try std.testing.expectEqualStrings(
                 expected[0..body.artifact.preview.head_len],
@@ -111,7 +131,7 @@ fn expectSizedResourceBody(
             );
         },
         .inline_body => {
-            try std.testing.expect(body.* == .@"inline");
+            try std.testing.expect(body == .@"inline");
             try std.testing.expectEqualStrings(expected, body.@"inline".bytes);
         },
         .structured_error => {
@@ -119,23 +139,28 @@ fn expectSizedResourceBody(
             // it goes through the projector, whose failed publication is a
             // `resource_limit` diagnostic that the client returns as a
             // structured error rather than as bytes.
-            try std.testing.expect(body.* == .structured_error);
+            try std.testing.expect(body == .structured_error);
+            try std.testing.expectEqual(
+                @as(?cc.tool_error.Category, .system_error),
+                body.structured_error.category,
+            );
+            try std.testing.expect(std.mem.indexOf(u8, body.structured_error.encoded, "\"category\":\"system_error\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, body.structured_error.encoded, "resource_limit") != null);
         },
     }
 }
 
 test "MCP budget: resources/read publishes result above caller per-result budget" {
-    try expectSizedResourceBody(30_000, .artifact, false);
+    try expectSizedResourceBody(30_000, .artifact, false, true);
 }
 
 test "MCP budget: resources/read inlines result at caller per-result budget" {
-    try expectSizedResourceBody(25_000, .inline_body, false);
+    try expectSizedResourceBody(25_000, .inline_body, false, true);
 }
 
 test "MCP budget: resources/read retains bounded result inline when publication fails" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    try expectSizedResourceBody(30_000, .inline_body, true);
+    try expectSizedResourceBody(30_000, .inline_body, true, true);
 }
 
 test "MCP budget: resources/read retains result inline up to the frame limit when publication fails" {
@@ -143,12 +168,41 @@ test "MCP budget: resources/read retains result inline up to the frame limit whe
     // already in memory; before the threshold change this band was always
     // inline, so a full store must not turn it into a tool error now.
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    try expectSizedResourceBody(120_000, .inline_body, true);
+    try expectSizedResourceBody(120_000, .inline_body, true, true);
 }
 
 test "MCP budget: resources/read above the frame limit fails closed when publication fails" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    try expectSizedResourceBody(1_100_000, .structured_error, true);
+    try expectSizedResourceBody(1_100_000, .structured_error, true, true);
+}
+
+test "MCP unhinted read returns local storage failure" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try expectSizedResourceBody(1_100_000, .structured_error, true, false);
+}
+
+test "MCP unhinted read remote error falls through with detail" {
+    const allocator = std.testing.allocator;
+    var body = try readResourceBody("mock://sized/notanumber", false, false);
+    defer body.deinit(allocator);
+    try std.testing.expect(body == .@"inline");
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body.@"inline".bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const error_value = parsed.value.object.get("error") orelse
+        return error.MissingResourceError;
+    try std.testing.expect(error_value == .string);
+    try std.testing.expectEqualStrings("resource_not_found", error_value.string);
+    const last_err = parsed.value.object.get("last_err") orelse
+        return error.MissingLastResourceError;
+    try std.testing.expect(last_err == .string);
+    try std.testing.expectEqualStrings("remote_error", last_err.string);
+    const detail = parsed.value.object.get("last_error_detail") orelse
+        return error.MissingLastResourceErrorDetail;
+    try std.testing.expect(detail == .string);
+    try std.testing.expect(detail.string.len != 0);
+    try std.testing.expect(std.mem.indexOf(u8, detail.string, "Invalid sized resource URI") != null);
 }
 
 test "MCP: full cycle initialize + listTools + callTool echo" {
