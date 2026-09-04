@@ -205,6 +205,72 @@ test "MCP unhinted read remote error falls through with detail" {
     try std.testing.expect(std.mem.indexOf(u8, detail.string, "Invalid sized resource URI") != null);
 }
 
+test "MCP unhinted read clears stale detail after Zig error" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
+    const argv = [_]?[*:0]const u8{ mock_path, null };
+    var first_client = try cc.mcp_client.McpClient.connect(allocator, argv[0..]);
+    defer first_client.close();
+    var second_client = try cc.mcp_client.McpClient.connect(allocator, argv[0..]);
+    var second_client_closed = false;
+    defer if (!second_client_closed) second_client.close();
+
+    const first_name = try allocator.dupe(u8, "first");
+    defer allocator.free(first_name);
+    const second_name = try allocator.dupe(u8, "second");
+    defer allocator.free(second_name);
+    var entries = [_]cc.mcp_session.McpSessionEntry{
+        .{
+            .name = first_name,
+            .client = &first_client,
+            .session = cc.mcp_registry_bridge.McpSession.init(allocator, &first_client),
+        },
+        .{
+            .name = second_name,
+            .client = &second_client,
+            .session = cc.mcp_registry_bridge.McpSession.init(allocator, &second_client),
+        },
+    };
+    defer entries[0].session.deinit();
+    defer entries[1].session.deinit();
+    second_client.close();
+    second_client_closed = true;
+
+    var sessions: []cc.mcp_session.McpSessionEntry = entries[0..];
+    var ctx = cc.tools.ToolContext.simple(allocator);
+    ctx.artifact_root = root;
+    ctx.mcp_sessions = &sessions;
+    var outcome = try cc.tools.dispatch(
+        &ctx,
+        "ReadMcpResourceTool",
+        "{\"uri\":\"mock://sized/notanumber\"}",
+    );
+    defer outcome.deinit(allocator);
+    const body = switch (outcome) {
+        .ok => |*value| value,
+        else => return error.UnexpectedResourceReadOutcome,
+    };
+    try std.testing.expect(body.* == .@"inline");
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body.@"inline".bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const error_value = parsed.value.object.get("error") orelse
+        return error.MissingResourceError;
+    try std.testing.expect(error_value == .string);
+    try std.testing.expectEqualStrings("resource_not_found", error_value.string);
+    const last_err = parsed.value.object.get("last_err") orelse
+        return error.MissingLastResourceError;
+    try std.testing.expect(last_err == .string);
+    try std.testing.expectEqualStrings("McpServerCrashed", last_err.string);
+    try std.testing.expect(parsed.value.object.get("last_error_detail") == null);
+}
+
 test "MCP: full cycle initialize + listTools + callTool echo" {
     const a = std.testing.allocator;
     const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";

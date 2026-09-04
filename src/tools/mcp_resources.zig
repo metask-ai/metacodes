@@ -118,6 +118,10 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
     defer if (last_error_detail) |detail| allocator.free(detail);
     for (sessions.*) |*entry| {
         var body = entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| {
+            if (last_error_detail) |detail| {
+                allocator.free(detail);
+                last_error_detail = null;
+            }
             last_error = @errorName(err);
             continue;
         };
