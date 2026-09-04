@@ -143,8 +143,25 @@ pub const Slot = struct {
     }
 };
 
-pub const RecoveryPlan = struct { allowance_bytes: usize, cost_bytes: usize, charged_bytes: usize, deferred_count: usize };
+/// What one turn's recovery-read planning decided (#40).
+pub const RecoveryPlan = struct {
+    /// `result_budget.recoveryAllowanceBytes`: half the turn budget.
+    allowance_bytes: usize,
+    /// `result_budget.recoveryReadCost`: what every ReadArtifact call is charged.
+    cost_bytes: usize,
+    /// Cost of the calls that will run; deferred calls are never charged.
+    charged_bytes: usize,
+    deferred_count: usize,
+};
 
+/// Decide, before anything executes, which `ReadArtifact` calls of this turn
+/// run and which are deferred. Slots are walked in order and each running
+/// call is charged its upper bound; once the allowance is spent every later
+/// call is marked `.deferred` (nothing else on the slot is touched). Doing this
+/// in slot order at the upper bound, ahead of any thread, keeps the outcome a
+/// pure function of the request: `ReadArtifact` results are projection-exempt
+/// (spilling one would recurse), so this is the only bound on what they cost,
+/// and provider-visible bytes must not depend on scheduling.
 pub fn planRecoveryAllowance(slots: []Slot, budget: result_budget.Budget) RecoveryPlan {
     const allowance = result_budget.recoveryAllowanceBytes(budget);
     const cost = result_budget.recoveryReadCost(budget);
@@ -160,6 +177,11 @@ pub fn planRecoveryAllowance(slots: []Slot, budget: result_budget.Budget) Recove
     return .{ .allowance_bytes = allowance, .cost_bytes = cost, .charged_bytes = charged, .deferred_count = deferred };
 }
 
+/// The bounded body a deferred `ReadArtifact` call receives instead of data:
+/// the call's own artifact id and offset (so the model can resume exactly
+/// there next turn), the allowance, and what the served calls already cost.
+/// The id is untrusted model input and goes through the JSON encoder; every
+/// other field is a number or a fixed string, so the body cannot grow.
 pub fn renderRecoveryDeferral(allocator: std.mem.Allocator, input: []const u8, plan: RecoveryPlan, charged_before: usize) ![]u8 {
     const req = try read_artifact.describeRequest(allocator, input);
     defer req.deinit(allocator);
@@ -168,12 +190,16 @@ pub fn renderRecoveryDeferral(allocator: std.mem.Allocator, input: []const u8, p
     const w = &out.writer;
     try w.writeAll("{\"error\":\"recovery_allowance_exhausted\",\"artifact_id\":");
     if (req.artifact_id) |id| try std.json.Stringify.encodeJsonString(id, .{}, w) else try w.writeAll("null");
-    try w.print(",\"offset\":{d},\"allowance_bytes\":{d},\"charged_bytes\":{d},\"hint\":\"the recovery allowance for this turn is spent; call ReadArtifact again from this offset in the next turn\"}}", .{ req.offset, plan.allowance_bytes, charged_before });
+    try w.print(
+        ",\"offset\":{d},\"allowance_bytes\":{d},\"charged_bytes\":{d}," ++
+            "\"hint\":\"the recovery allowance for this turn is spent; call ReadArtifact again from this offset in the next turn\"}}",
+        .{ req.offset, plan.allowance_bytes, charged_before },
+    );
     return out.toOwnedSlice();
 }
 
 test "recovery planner defers in slot order" {
-    const b = @import("result_budget.zig").Budget{ .per_result_bytes = 25_000, .per_turn_bytes = 204_800 };
+    const b = result_budget.Budget{ .per_result_bytes = 25_000, .per_turn_bytes = 204_800 };
     var slots: [9]Slot = undefined;
     for (&slots, 0..) |*s, i| s.* = .{ .name = "ReadArtifact", .id = "", .input = "{}", .decision = if (i == 8) .denied else .run };
     const p = planRecoveryAllowance(&slots, b);

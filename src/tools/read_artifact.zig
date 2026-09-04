@@ -14,7 +14,12 @@ const json_util = @import("../util/json.zig");
 /// per-result budget it was derived from.
 const ENVELOPE_OVERHEAD_BYTES: result_budget.Encoded = .of(256);
 
+/// What a `ReadArtifact` call asked for, as far as a caller that will *not*
+/// execute it needs to know: the recovery-allowance deferral (#40) names the
+/// call's own artifact id and offset in its body so the model can resume there.
 pub const Request = struct {
+    /// Unescaped and owned; null when the call named no id (the tool itself
+    /// would have failed with `MissingArtifactId`).
     artifact_id: ?[]u8,
     offset: u64,
     pub fn deinit(self: Request, allocator: std.mem.Allocator) void {
@@ -22,6 +27,10 @@ pub const Request = struct {
     }
 };
 
+/// Never fails on malformed input and never executes anything: a missing or
+/// invalid offset reads as 0 and a missing id as null. The id goes through
+/// `util/json.unescapeString`, so a value that carried JSON escapes comes back
+/// as the string the model sent rather than its escaped spelling.
 pub fn describeRequest(allocator: std.mem.Allocator, args: []const u8) !Request {
     const raw_id = json_util.extractStringField(args, "artifact_id");
     const artifact_id = if (raw_id) |id| try json_util.unescapeString(id, allocator) else null;
