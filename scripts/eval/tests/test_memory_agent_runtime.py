@@ -92,7 +92,7 @@ from scripts.eval.memory_agent_runtime_pilot import (
 )
 from scripts.eval.e2e_adapter import NATIVE_EVENT_SCHEMA_VERSION
 from scripts.eval.model import ValidationError, stable_json
-from scripts.eval.tests.posix_only import POSIX, requires_posix_budget_journal, requires_posix_exec
+from scripts.eval.tests.posix_only import POSIX, requires_posix_budget_journal, requires_posix_exec, requires_symlinks
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -2889,6 +2889,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 os.environ.pop("METASK_API_KEY", None)
                 self.assertEqual(_load_api_key(auth), "private-file-key")
 
+    @requires_symlinks
     def test_tinykg_read_transients_fail_closed_on_unsafe_or_leaked_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3290,6 +3291,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         expected_domain = f"{root.name}-{_xxhash64(resolved.encode()):016x}"[: len(root.name) + 9]
         self.assertEqual(_project_domain(root), expected_domain)
 
+    @requires_symlinks
     def test_markdown_state_copy_rejects_links_and_overlap(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

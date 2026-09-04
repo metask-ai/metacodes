@@ -65,7 +65,7 @@ from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
 from scripts.eval.workbuddy.install_overlay import _digest
 from scripts.eval.workbuddy.environment_preflight import prebuild as prebuild_environment
 from scripts.eval.workbuddy.stage_artifacts import stage
-from scripts.eval.tests.posix_only import requires_posix_budget_journal, requires_posix_dir_fd, requires_posix_exec
+from scripts.eval.tests.posix_only import requires_posix_budget_journal, requires_posix_dir_fd, requires_posix_exec, requires_symlinks
 # A fixture path that is absolute on every host: POSIX keeps "/fixture", Windows
 # needs a drive letter for Path.is_absolute() (launch manifests reject relative rows).
 FIXTURE = str(Path("/fixture").resolve())
@@ -1499,6 +1499,7 @@ with urllib.request.urlopen(
             self.assertEqual(0, provider.requests)
             self.assertFalse(journal.exists())
 
+    @requires_symlinks
     def test_receipt_parent_rejects_direct_symlink_but_allows_system_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

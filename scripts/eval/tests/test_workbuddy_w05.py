@@ -23,7 +23,7 @@ from scripts.eval.workbuddy.run_w05 import (
     _stable_evidence,
     _wire_json_sha256,
 )
-from scripts.eval.tests.posix_only import POSIX
+from scripts.eval.tests.posix_only import POSIX, requires_symlinks
 
 
 class WorkBuddyW05RunnerTest(unittest.TestCase):
@@ -187,6 +187,7 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
         )
         self.assertEqual(environment, {"PATH": "/fixture"})
 
+    @requires_symlinks
     def test_private_publication_is_0600_atomic_and_refuses_existing_or_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -205,6 +206,7 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(W05Error, "overwrite"):
                 _private_new(link, b"replacement")
 
+    @requires_symlinks
     def test_identity_refuses_symlink_hardlink_and_detects_evidence_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -17,9 +17,43 @@ vacuously:
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 
 POSIX = os.name != "nt"
+
+
+def _probe_symlinks() -> bool:
+    root = tempfile.mkdtemp()
+    try:
+        target = os.path.join(root, "target")
+        link = os.path.join(root, "link")
+        with open(target, "w", encoding="utf-8"):
+            pass
+        os.symlink(target, link)
+        return True
+    except (OSError, NotImplementedError):
+        return False
+    finally:
+        try:
+            os.unlink(os.path.join(root, "link"))
+        except OSError:
+            pass
+        try:
+            os.unlink(os.path.join(root, "target"))
+        except OSError:
+            pass
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+
+
+SYMLINKS_SUPPORTED = _probe_symlinks()
+requires_symlinks = unittest.skipUnless(
+    SYMLINKS_SUPPORTED,
+    "symlink creation is not permitted on this host (Windows needs SeCreateSymbolicLinkPrivilege or Developer Mode)",
+)
 
 requires_posix_budget_journal = unittest.skipUnless(
     POSIX,

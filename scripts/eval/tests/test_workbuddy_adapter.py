@@ -51,7 +51,7 @@ from scripts.eval.workbuddy.trace import (
     transcript_ir,
 )
 from scripts.eval.workbuddy.progress_analysis import analyze_progress
-from scripts.eval.tests.posix_only import POSIX
+from scripts.eval.tests.posix_only import POSIX, requires_symlinks
 
 
 ZERO_COMMIT = "0" * 40
@@ -1556,6 +1556,7 @@ class WorkBuddyTraceTest(unittest.TestCase):
                 with self.assertRaises(TraceError):
                     load_control_metrics(transcript, observation)
 
+    @requires_symlinks
     def test_control_metrics_reject_symlink_and_hardlink_observation_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1974,6 +1975,7 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             )
             self.assertFalse((root / "preflight.json").exists())
 
+    @requires_symlinks
     def test_preflight_reobserves_unselected_task_toml_and_rejects_links(self):
         for mutation in ("content", "symlink", "hardlink"):
             with self.subTest(
@@ -2212,6 +2214,7 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
                         inspect_images=True,
                     )
 
+    @requires_symlinks
     def test_preflight_rejects_composite_verifier_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
