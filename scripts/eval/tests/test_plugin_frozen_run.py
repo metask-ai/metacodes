@@ -102,6 +102,16 @@ def _live_fields(protocol_path: Path, runtime: Path) -> dict:
     )
 
 
+class RefreshFingerprintTest(unittest.TestCase):
+    def test_refresh_writes_the_protocol_with_lf_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "protocol.json"
+            shutil.copyfile(PROTOCOL, path)
+            refresh_implementation_fingerprint(ROOT, path)
+            self.assertNotIn(b"\r\n", path.read_bytes())
+            json.loads(path.read_text(encoding="utf-8"))
+
+
 def _write_private(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
     os.chmod(path, 0o600)

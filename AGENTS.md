@@ -40,6 +40,8 @@ python3 scripts/check_doc_links.py
 git diff --check
 ```
 
+The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`).
+
 The native bundled TinyKG is wired into tests by default. Supply
 `-Dtinykg-bin` and `-Dtinykg-sha256` together only to audit an explicit override.
 Do not run paid or provider-backed benchmarks without explicit user authorization,

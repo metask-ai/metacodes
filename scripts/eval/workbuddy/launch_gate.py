@@ -23,7 +23,12 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Sequence
 
-import yaml
+try:
+    import yaml
+except ImportError as error:  # pragma: no cover - environment, not logic
+    raise ImportError(
+        "PyYAML is required here: python3 -m pip install -r requirements-dev.txt"
+    ) from error
 
 from ..memory_budget_journal import (
     BudgetAuthority,

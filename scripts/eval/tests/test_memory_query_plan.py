@@ -19,6 +19,7 @@ from scripts.eval.memory_query_plan import (
 )
 from scripts.eval.memory_agent_runtime import _query_plan_evaluator_invalid_reason
 from scripts.eval.model import ValidationError, stable_json
+from scripts.eval.tests.textio import write_text_lf
 
 
 class MemoryQueryPlanTraceTest(unittest.TestCase):
@@ -382,10 +383,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                     "content": [item[1] for item in observed],
                 },
             ]
-            (root / f"req-{request_index:03d}.json").write_text(
+            write_text_lf(
+                root / f"req-{request_index:03d}.json",
                 stable_json({"messages": messages}) + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
 
     def test_verified_trace_replays_host_gain_and_seen_progression(self):
@@ -411,10 +412,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 [(2, 0), (1, 1)],
             )
             self.assertEqual(trace["calls"][1]["seen_node_count"], 2)
-            (cassette / SIDECAR_NAME).write_text(
+            write_text_lf(
+                cassette / SIDECAR_NAME,
                 stable_json(trace) + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             replayed = load_and_verify_query_plan_sidecar(
                 cassette,
@@ -530,10 +531,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             self.assertEqual(summary["new_hit_count"], 3)
             self.assertEqual(summary["repeated_hit_count"], 1)
 
-            (cassette / SIDECAR_NAME).write_text(
+            write_text_lf(
+                cassette / SIDECAR_NAME,
                 stable_json(trace) + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             self.assertEqual(
                 load_and_verify_query_plan_sidecar(
@@ -591,8 +592,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 schema_version="lexical-query-plan-v3",
             )
             self.assertEqual(call["plan_sha256"], explicit_seed_sha)
-            (cassette / SIDECAR_NAME).write_text(
-                stable_json(trace) + "\n", encoding="utf-8", newline="\n"
+            write_text_lf(
+                cassette / SIDECAR_NAME,
+                stable_json(trace) + "\n",
+                encoding="utf-8",
             )
             self.assertEqual(
                 load_and_verify_query_plan_sidecar(
@@ -709,10 +712,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             result["auto_context"]["context"]["node_id"] = 9
             result["auto_context"]["context"]["graph"]["query"]["root_id"] = 9
             result_item["content"] = stable_json(result)
-            (cassette / "req-001.json").write_text(
+            write_text_lf(
+                cassette / "req-001.json",
                 stable_json(request) + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             tampered = build_query_plan_trace(
                 cassette,
@@ -1426,10 +1429,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             )
             tampered = copy.deepcopy(trace)
             tampered["calls"][0]["new_hit_count"] = 0
-            (cassette / SIDECAR_NAME).write_text(
+            write_text_lf(
+                cassette / SIDECAR_NAME,
                 stable_json(tampered) + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             with self.assertRaisesRegex(ValidationError, "does not match raw provider requests"):
                 load_and_verify_query_plan_sidecar(
@@ -1444,10 +1447,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
     def test_non_tinykg_trace_is_explicitly_not_applicable(self):
         with tempfile.TemporaryDirectory() as directory:
             cassette = Path(directory)
-            (cassette / "req-001.json").write_text(
+            write_text_lf(
+                cassette / "req-001.json",
                 json.dumps({"messages": []}) + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             trace = build_query_plan_trace(
                 cassette,
@@ -1465,10 +1468,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
     def test_verified_host_recall_only_covers_missing_explicit_call(self):
         with tempfile.TemporaryDirectory() as directory:
             cassette = Path(directory)
-            (cassette / "req-001.json").write_text(
+            write_text_lf(
+                cassette / "req-001.json",
                 json.dumps({"messages": []}) + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             trace = build_query_plan_trace(
                 cassette,
@@ -1526,10 +1529,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
     def test_non_tinykg_trace_cannot_claim_host_recall(self):
         with tempfile.TemporaryDirectory() as directory:
             cassette = Path(directory)
-            (cassette / "req-001.json").write_text(
+            write_text_lf(
+                cassette / "req-001.json",
                 json.dumps({"messages": []}) + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             trace = build_query_plan_trace(
                 cassette,
