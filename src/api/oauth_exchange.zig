@@ -14,6 +14,7 @@ const std = @import("std");
 const oauth = @import("../provider/oauth.zig");
 const ids = @import("../provider/ids.zig");
 const http_status = @import("http_status.zig");
+const metask_oauth = @import("metask_oauth.zig");
 
 pub const Slug = ids.Slug;
 
@@ -82,6 +83,47 @@ pub const HttpExchange = struct {
     }
 };
 
+/// Metask's JSON refresh exchange. Unlike RFC 6749 form exchanges this sends
+/// exactly `{grant_type,refresh_token}`; the client id is intentionally absent.
+pub const MetaskHttpExchange = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    token_url: []const u8,
+
+    pub fn exchange(self: *MetaskHttpExchange) oauth.Exchange {
+        return .{ .ctx = @ptrCast(self), .run = run };
+    }
+
+    fn run(ctx: *anyopaque, _: Slug, refresh_token: []const u8, arena: std.mem.Allocator) oauth.OAuthError!oauth.RefreshOutcome {
+        const self: *MetaskHttpExchange = @ptrCast(@alignCast(ctx));
+        const body = metask_oauth.refreshRequestBody(arena, refresh_token) catch
+            return error.OutOfMemory;
+        const uri = std.Uri.parse(self.token_url) catch return error.RefreshFailed;
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+        var request = client.request(.POST, uri, .{ .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "accept", .value = "application/json" },
+        } }) catch return error.RefreshFailed;
+        defer request.deinit();
+        request.sendBodyComplete(body) catch return error.RefreshFailed;
+        var redirect: [4096]u8 = undefined;
+        const response = request.receiveHead(&redirect) catch return error.RefreshFailed;
+        const status = http_status.ResponseStatus.capture(&response);
+        var transfer: [8192]u8 = undefined;
+        const payload = request.reader.bodyReader(&transfer, response.head.transfer_encoding, response.head.content_length)
+            .allocRemaining(arena, std.Io.Limit.limited(256 * 1024)) catch return error.RefreshFailed;
+        if (status.code < 200 or status.code >= 300) return oauth.classifyTokenError(status.code, payload);
+        const outcome = try oauth.parseTokenResponse(arena, payload);
+        // Metask invalidates the presented refresh token and returns a new one
+        // on every successful refresh. Treating an omitted field as "keep the
+        // old token" (the generic RFC-6749 behavior) would persist a dead
+        // token and turn the next refresh into an avoidable re-login.
+        if (outcome.refresh_token == null) return error.MalformedTokenResponse;
+        return outcome;
+    }
+};
+
 fn buildFormBody(
     arena: std.mem.Allocator,
     client_id: []const u8,
@@ -121,4 +163,16 @@ test "the form body encodes a token that contains reserved characters" {
         "grant_type=refresh_token&client_id=app%2Fone&refresh_token=tok%2Ben%2Fwith%3Dchars%26more",
         body,
     );
+}
+
+test "Metask refresh body is JSON and carries no client id" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ex = MetaskHttpExchange{ .allocator = a, .io = undefined, .token_url = "http://localhost/token" };
+    _ = ex;
+    // Keep this assertion transport-free; the exact helper is also exercised
+    // by the production exchange before any socket is opened.
+    const body = @import("metask_oauth.zig").refreshRequestBody(arena.allocator(), "mrt-1") catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, body, "client_id") == null);
 }

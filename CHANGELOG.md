@@ -12,6 +12,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Metask now has a JSON device-code OAuth provider (`login --provider metask`)
+  with rotating refresh-token persistence, gateway-derived model routing for
+  Anthropic Messages and OpenAI Chat, one-shot replay for pre-stream
+  `token_expired` responses, case-insensitive `X-Metask-Request-Id` capture,
+  and the opt-in-path `metacodes ledger metask` NDJSON billing ledger. See
+  `METASK_SITE_URL`, `METASK_GATEWAY_URL`, `METACODES_OAUTH_DIR`, and
+  `METACODES_LEDGER_DIR`.
+
 - `scripts/check_doc_facts.py` with the registry `release/doc_facts.json`: a
   fail-closed documentation fact gate. Each registered fact names one in-tree
   authority (the AgentCore ABI revision in `sdk/zig/types.zig`, the CLI version

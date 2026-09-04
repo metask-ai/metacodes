@@ -171,6 +171,9 @@ pub const Config = struct {
     /// Provider-declared authentication for the resolved route. Null keeps the
     /// historical `authorization: Bearer <key>` transport behaviour.
     auth_scheme: ?@import("provider/credential.zig").AuthScheme = null,
+    /// True only when startup resolved the bearer from the Metask OAuth session;
+    /// explicit legacy API-key mode must not load that session or hydrate it.
+    metask_oauth_selected: bool = false,
     /// OpenAI wire 协议选择(`--openai-protocol` / env METACODES_OPENAI_PROTOCOL)。
     /// 默认 chat_completions;responses 走 /v1/responses(typed SSE 事件流)。
     /// 仅 provider_kind==.openai 时被消费;**显式配置,绝不从 base_url/model 推断**。

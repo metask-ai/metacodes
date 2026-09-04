@@ -84,7 +84,9 @@ const MODELS = [_]profile.ModelEntry{
     claudeEntry("claude-3-5-haiku-20241022", "Claude Haiku 3.5"),
 };
 
-const ROUTES = [_]profile.ProtocolRoute{.{ .protocol = .anthropic_messages }};
+const ROUTES = [_]profile.ProtocolRoute{
+    .{ .protocol = .anthropic_messages },
+};
 
 const CHANNELS = [_]profile.ChannelDescriptor{.{
     .id = Slug.lit("default"),
@@ -110,6 +112,9 @@ pub const PROFILE = profile.ProviderProfile{
     .env_aliases = &ENV_ALIASES,
     .auth = .bearer,
     .default_channel = Slug.lit("default"),
+    .oauth_token_url = "https://metask-ai.com/api/oauth/token",
+    .oauth_device_authorization_url = "https://metask-ai.com/api/oauth/device/code",
+    .oauth_client_id = "metacodes",
 };
 
 test "metask profile keeps the historical endpoint and environment alias" {
@@ -118,6 +123,16 @@ test "metask profile keeps the historical endpoint and environment alias" {
     const url = try CHANNELS[0].endpointFor(PROFILE.endpoint_policy, .anthropic_messages, null, &buffer);
     try std.testing.expectEqualStrings("https://napi.metask-ai.com/v1/messages", url);
     try std.testing.expectEqualStrings("METASK_API_KEY", PROFILE.canonicalEnvAlias(.api_key).?);
+}
+
+test "metask legacy profile keeps the historical messages route" {
+    try profile.validateProfile(PROFILE);
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://napi.metask-ai.com/v1/messages",
+        try CHANNELS[0].endpointFor(PROFILE.endpoint_policy, .anthropic_messages, null, &buffer),
+    );
+    try std.testing.expect(CHANNELS[0].route(.openai_chat) == null);
 }
 
 test "metask model limits come from the shared output-limit table" {

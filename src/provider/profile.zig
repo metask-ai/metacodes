@@ -419,8 +419,7 @@ pub const ProviderProfile = struct {
     classify_error: ClassifyFn = defaultClassifyError,
     quote_hook: ?QuoteFn = null,
     /// RFC 6749 token endpoint for this provider's OAuth kinds. Null means the
-    /// profile declares no OAuth lifecycle here — Metask's lives in
-    /// `core/auth.zig` and keeps its historical path.
+    /// profile declares no OAuth lifecycle here.
     oauth_token_url: ?[]const u8 = null,
     /// RFC 6749 authorization endpoint, for the loopback-redirect PKCE login
     /// that obtains the *first* token (issue #33). Null means this profile

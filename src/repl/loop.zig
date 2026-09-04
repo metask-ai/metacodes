@@ -772,11 +772,21 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 那个;会话跑过期后继续用它就会开始 401——看起来像密钥坏了。单飞在
         // provider/oauth.zig 里,并发 turn 仍只换一次。
         _ = app.refreshRouteCredential() catch |err| blk: {
-            std.debug.print(
-                "\x1b[33mwarning: could not refresh the provider credential ({s}); " ++
-                    "continuing with the current one\x1b[0m\n",
-                .{@errorName(err)},
-            );
+            if (err == error.RefreshRejected and
+                std.ascii.eqlIgnoreCase(app.config.provider_profile orelse "", "metask"))
+            {
+                std.debug.print(
+                    "\x1b[33mwarning: the provider OAuth refresh was rejected; " ++
+                        "run `metacodes login --provider metask` to log in again\x1b[0m\n",
+                    .{},
+                );
+            } else {
+                std.debug.print(
+                    "\x1b[33mwarning: could not refresh the provider credential ({s}); " ++
+                        "continuing with the current one\x1b[0m\n",
+                    .{@errorName(err)},
+                );
+            }
             break :blk false;
         };
 

@@ -10,7 +10,11 @@ const repl = @import("repl/loop.zig");
 const auth = @import("core/auth.zig");
 const api_keys_mod = @import("api/api_keys.zig");
 const oauth_login = @import("api/oauth_login.zig");
+const metask_oauth_mod = @import("api/metask_oauth.zig");
+const oauth_exchange_mod = @import("api/oauth_exchange.zig");
 const catalog_mod = @import("api/catalog.zig");
+const provider_oauth_mod = @import("provider/oauth.zig");
+const provider_ids_mod = @import("provider/ids.zig");
 
 pub const VERSION = @import("version.zig").semver;
 
@@ -38,9 +42,12 @@ pub const provider_host = @import("provider/host.zig");
 pub const provider_alias = @import("provider/alias.zig");
 pub const provider_custom = @import("provider/custom_provider.zig");
 pub const provider_oauth = @import("provider/oauth.zig");
+pub const provider_metask_catalog = @import("provider/metask_catalog.zig");
+pub const provider_metask_ledger = @import("provider/metask_ledger.zig");
 pub const kg_provider_audit = @import("kg/provider_audit.zig");
 pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_oauth_login = @import("api/oauth_login.zig");
+pub const api_metask_oauth = @import("api/metask_oauth.zig");
 pub const api_catalog_fetch = @import("api/catalog_fetch.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
@@ -534,6 +541,45 @@ pub fn main(init: std.process.Init) !void {
     if (config.provider_profile == null) {
         if (std.c.getenv("METACODES_PROVIDER")) |c| config.provider_profile = std.mem.span(c);
     }
+    // A Metask access token carries the gateway origin. Resolve it before the
+    // declarative route so the legacy napi endpoint cannot win when a new
+    // session exists. An explicit METASK_GATEWAY_URL is the documented local
+    // development override and is an origin, never a /v1/messages URL.
+    const metask_legacy_requested = config.api_key != null or
+        (config.auth_precedence == .api_key_first and std.c.getenv("METASK_API_KEY") != null);
+    if (config.provider_profile) |profile_name| {
+        if (std.ascii.eqlIgnoreCase(profile_name, "metask") and config.base_url == null and !metask_legacy_requested) {
+            var gateway_override: ?[]const u8 = null;
+            if (std.c.getenv("METASK_GATEWAY_URL")) |raw| {
+                const gateway = std.mem.trimEnd(u8, std.mem.span(raw), "/");
+                if (!metask_oauth_mod.isGatewayOrigin(gateway)) {
+                    std.debug.print("error: METASK_GATEWAY_URL must be an http(s) gateway origin (no /v1 path)\n", .{});
+                    std.process.exit(2);
+                }
+                gateway_override = gateway;
+                config.base_url = allocator.dupe(u8, gateway) catch null;
+            }
+            var metask_session = provider_oauth_mod.Session.initHome(allocator, provider_ids_mod.Slug.lit("metask")) catch null;
+            if (metask_session) |*session| {
+                defer session.deinit();
+                if (session.load() catch false) if (session.tokens) |tokens| {
+                    // The catalog URL is derived from the selected gateway;
+                    // models_url is retained only as informational metadata.
+                    const gateway = gateway_override orelse std.mem.trimEnd(u8, tokens.gateway_url orelse "", "/");
+                    if (gateway.len == 0) {
+                        std.debug.print("error: stored Metask session lacks gateway_url; run `metacodes login --provider metask`\n", .{});
+                        std.process.exit(2);
+                    }
+                    if (!metask_oauth_mod.isGatewayOrigin(gateway)) {
+                        std.debug.print("error: stored Metask gateway_url is invalid; run `metacodes login --provider metask`\n", .{});
+                        std.process.exit(2);
+                    }
+                    if (gateway_override == null)
+                        config.base_url = allocator.dupe(u8, gateway) catch null;
+                };
+            }
+        }
+    }
     if (config.provider_profile) |profile_name| {
         applyProviderRoute(&config, allocator, profile_name);
     } else if (config.provider_offer != null) {
@@ -555,6 +601,35 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         };
     }
+    // The compiled Metask profile keeps the legacy Messages route so old
+    // model-only selections remain unambiguous. Once the caller explicitly
+    // asks for the OpenAI Chat wire, switch the transport to the authenticated
+    // catalog's chat endpoint; App.init will then construct OpenAIClient and
+    // catalog ingestion below can pin the dynamic OpenAI offer.
+    if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask") and config.openai_protocol_explicit) {
+        if (config.openai_protocol == .responses) {
+            std.debug.print("error: Metask exposes the OpenAI chat/completions route, not Responses API\n", .{});
+            std.process.exit(2);
+        }
+        const current = config.base_url orelse {
+            std.debug.print("error: Metask gateway route has no endpoint; run `metacodes login --provider metask`\n", .{});
+            std.process.exit(2);
+        };
+        const messages_suffix = "/v1/messages";
+        const origin = if (std.mem.endsWith(u8, current, messages_suffix))
+            current[0 .. current.len - messages_suffix.len]
+        else
+            current;
+        const chat_endpoint = allocator.alloc(u8, origin.len + "/v1/chat/completions".len) catch {
+            std.debug.print("error: out of memory while selecting the Metask chat route\n", .{});
+            std.process.exit(2);
+        };
+        @memcpy(chat_endpoint[0..origin.len], origin);
+        @memcpy(chat_endpoint[origin.len..], "/v1/chat/completions");
+        allocator.free(config.base_url.?);
+        config.base_url = chat_endpoint;
+        config.provider_kind = .openai;
+    };
 
     // --- 预置应答队列(Stage 3):--answers-file 优先,METACODES_ANSWERS env 兜底 ---
     if (config.answers_file) |p| {
@@ -591,8 +666,29 @@ pub fn main(init: std.process.Init) !void {
     // own scope. Metask (and every session that names no provider) keeps the
     // historical path unchanged.
     const metask_scope = selectedProfileIsMetask(config);
+    // The device session is the default for the named provider. An API key is
+    // still available as an explicit compatibility path: `--api-key` or the
+    // documented `METASK_API_KEY` alias opts into the historical napi route
+    // when no session gateway has been selected. `oauth_first` keeps a stored
+    // session authoritative even if that ambient alias is present.
+    const metask_legacy_explicit = metask_legacy_requested;
     var provider_secret: ?[]u8 = null;
-    if (!introspection_only and !metask_scope) {
+    var metask_oauth_selected = false;
+    if (!introspection_only and metask_scope and config.provider_profile != null and
+        std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit)
+    {
+        provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| {
+            if (err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession) {
+                std.debug.print("Metask session is unavailable or expired; run `metacodes login --provider metask` to log in again.\n", .{});
+            } else {
+                std.debug.print("Metask OAuth refresh failed: {s}\n", .{@errorName(err)});
+            }
+            return err;
+        };
+        metask_oauth_selected = true;
+    } else if (!introspection_only and metask_scope and metask_legacy_explicit) {
+        provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
+    } else if (!introspection_only and !metask_scope) {
         provider_secret = try resolveProviderScopedSecret(
             allocator,
             config,
@@ -633,6 +729,7 @@ pub fn main(init: std.process.Init) !void {
         @as([]const u8, credential.bearer_token)
     else
         "";
+    config.metask_oauth_selected = metask_oauth_selected;
 
     // The stored Metask login carries a Metask model and reasoning effort;
     // applying it to another provider's route would silently replace the
@@ -782,11 +879,35 @@ fn dumpPluginsAndExit(app: *app_mod.App) noreturn {
     std.process.exit(0);
 }
 
+const LoginMode = enum { browser, help, status, api_key, oauth_json };
+
+fn metaskUsesDeviceFlow(mode: LoginMode) bool {
+    return mode == .browser;
+}
+
 fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u8 {
     var args = argsIter(init);
     defer args.deinit();
     _ = args.next(); // 跳过 argv[0](程序名)
     const cmd = args.next() orelse return null;
+    if (std.mem.eql(u8, cmd, "ledger")) {
+        const provider = args.next() orelse {
+            std.debug.print("usage: metacodes ledger metask\n", .{});
+            return 2;
+        };
+        if (!std.mem.eql(u8, provider, "metask") or args.next() != null) {
+            std.debug.print("usage: metacodes ledger metask\n", .{});
+            return 2;
+        }
+        const bytes = @import("provider/metask_ledger.zig").read(allocator) catch |err| {
+            if (err == error.NotFound) return 0;
+            std.debug.print("error: could not read Metask ledger ({s})\n", .{@errorName(err)});
+            return 1;
+        };
+        defer allocator.free(bytes);
+        dumpWrite(bytes);
+        return 0;
+    }
     if (std.mem.eql(u8, cmd, "logout")) {
         if (args.next()) |extra| {
             std.debug.print("error: unknown logout argument '{s}'\n", .{extra});
@@ -807,7 +928,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
     }
     if (!std.mem.eql(u8, cmd, "login")) return null;
 
-    var mode: enum { browser, help, status, api_key, oauth_json } = .browser;
+    var mode: LoginMode = .browser;
     var value: ?[]const u8 = null;
     // `--provider <id>` stores the token against that provider's own OAuth
     // session instead of the Metask credential store, which is what keeps a
@@ -879,6 +1000,12 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
     }
 
     if (provider_name) |name| {
+        // Metask's control plane uses its JSON device grant by default.  Keep
+        // this special case before the generic profile flow: the latter sends
+        // form-encoded RFC 8628 requests and would violate the Metask contract.
+        if (std.ascii.eqlIgnoreCase(name, "metask") and metaskUsesDeviceFlow(mode)) {
+            return runMetaskDeviceLogin(allocator, init.io, open_browser);
+        }
         switch (mode) {
             // The non-interactive path stays supported: CI and headless
             // recovery need a way in that does not involve a browser or a
@@ -1222,10 +1349,8 @@ fn applyStoredLoginSelection(allocator: std.mem.Allocator, config: *types.Config
 }
 
 /// True when the selected provider profile is Metask (or none was named).
-///
-/// Metask keeps the historical credential path — stored OAuth, stored API key,
-/// and the one-shot runtime descriptor — byte for byte. Every other profile is
-/// resolved in its own scope, so a Metask token can never authenticate it.
+/// Every other named profile is resolved in its own scope, so a Metask token
+/// can never authenticate it.
 pub fn selectedProfileIsMetask(config: types.Config) bool {
     // Naming no provider keeps the historical path.
     if (config.provider_profile == null) return true;
@@ -1236,6 +1361,25 @@ pub fn selectedProfileIsMetask(config: types.Config) bool {
     // cross-provider leak this scoping exists to prevent.
     const resolved = config.resolved_provider_id orelse return false;
     return std.mem.eql(u8, resolved, "metask");
+}
+
+const MetaskSessionError = provider_oauth_mod.OAuthError || error{NoSession};
+
+/// Load and refresh the new Metask session. The returned token is an owned,
+/// scrubbed copy; the Session itself can be closed before App construction.
+fn resolveMetaskBearer(allocator: std.mem.Allocator, io: std.Io) MetaskSessionError![]u8 {
+    var session = try provider_oauth_mod.Session.initHome(allocator, provider_ids_mod.Slug.lit("metask"));
+    defer session.deinit();
+    if (!(try session.load())) return error.NoSession;
+    var site_buf: [1024]u8 = undefined;
+    const token_url = metask_oauth_mod.tokenUrl(metask_oauth_mod.siteUrl(), &site_buf) catch
+        return error.RefreshFailed;
+    var exchange = oauth_exchange_mod.MetaskHttpExchange{
+        .allocator = allocator,
+        .io = io,
+        .token_url = token_url,
+    };
+    return session.accessToken(@import("util/time.zig").nowUnix(), exchange.exchange());
 }
 
 /// Provider-scoped credential resolution (issue #16).
@@ -1346,6 +1490,72 @@ pub const ProviderLoginOptions = struct {
     client_id: ?[]const u8 = null,
 };
 
+fn metaskDeviceNotify(uri: []const u8, code: []const u8) void {
+    // Stable, greppable lines are part of the CLI contract; keep them on
+    // stderr alongside the human-readable instructions.
+    std.debug.print("METASK_VERIFICATION_URI={s}\n", .{uri});
+    std.debug.print("METASK_USER_CODE={s}\n", .{code});
+    std.debug.print("Open {s} and enter the code {s}\n", .{ uri, code });
+}
+
+fn runMetaskDeviceLogin(allocator: std.mem.Allocator, io: std.Io, open_browser: bool) u8 {
+    // Keep the hostname buffer in this function's frame for the whole device
+    // request. HOSTNAME is often unset on macOS and is not authoritative when
+    // inherited from a shell/container, so prefer the kernel-reported name.
+    const HostNameBuffer = if (builtin.os.tag == .windows) [1]u8 else [std.posix.HOST_NAME_MAX]u8;
+    var hostname_buf: HostNameBuffer = undefined;
+    const hostname = if (builtin.os.tag == .windows) "localhost" else blk: {
+        const resolved = std.posix.gethostname(&hostname_buf) catch break :blk "localhost";
+        break :blk if (resolved.len == 0) "localhost" else resolved;
+    };
+    const token_json = metask_oauth_mod.acquireDeviceToken(
+        allocator,
+        io,
+        metask_oauth_mod.siteUrl(),
+        hostname,
+        open_browser,
+        metaskDeviceNotify,
+    ) catch |err| {
+        std.debug.print("error: Metask device login failed ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    defer {
+        std.crypto.secureZero(u8, token_json);
+        allocator.free(token_json);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const outcome = provider_oauth_mod.parseTokenResponse(arena.allocator(), token_json) catch |err| {
+        std.debug.print("error: Metask token response malformed ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    if (outcome.refresh_token == null or outcome.gateway_url == null or outcome.models_url == null) {
+        std.debug.print("error: Metask token response is missing refresh_token or gateway_url/models_url\n", .{});
+        return 1;
+    }
+    if (!metask_oauth_mod.isGatewayOrigin(outcome.gateway_url.?)) {
+        std.debug.print("error: Metask gateway_url must be an http(s) origin (no /v1 path)\n", .{});
+        return 1;
+    }
+    const provider_id = provider_ids_mod.Slug.lit("metask");
+    var session = provider_oauth_mod.Session.initHome(allocator, provider_id) catch |err| {
+        std.debug.print("error: could not open the Metask OAuth store ({s})\n", .{@errorName(err)});
+        return 2;
+    };
+    defer session.deinit();
+    session.setClientId(null) catch |err| {
+        std.debug.print("error: could not initialize the Metask OAuth store ({s})\n", .{@errorName(err)});
+        return 2;
+    };
+    session.importOutcome(outcome, @import("util/time.zig").nowUnix()) catch |err| {
+        std.debug.print("error: could not store the Metask OAuth session ({s})\n", .{@errorName(err)});
+        return 2;
+    };
+    std.debug.print("Stored Metask OAuth session. No secret was printed.\n", .{});
+    return 0;
+}
+
 /// `metacodes login --provider <id>` — the interactive path (issue #33).
 ///
 /// Everything downstream of the first token already worked for any provider:
@@ -1444,6 +1654,16 @@ fn importProviderTokenResponse(
         std.debug.print("error: the token response carries no refresh_token; it could never be refreshed\n", .{});
         return 1;
     }
+    if (provider_id.eqlText("metask")) {
+        if (outcome.gateway_url == null or outcome.models_url == null) {
+            std.debug.print("error: the Metask token response must include gateway_url and models_url\n", .{});
+            return 1;
+        }
+        if (!metask_oauth_mod.isGatewayOrigin(outcome.gateway_url.?)) {
+            std.debug.print("error: Metask gateway_url must be an http(s) origin (no /v1 path)\n", .{});
+            return 1;
+        }
+    }
 
     var session = provider_oauth.Session.initHome(allocator, provider_id) catch |err| {
         std.debug.print("error: could not open the OAuth store ({s})\n", .{@errorName(err)});
@@ -1452,7 +1672,9 @@ fn importProviderTokenResponse(
     defer session.deinit();
     // Recorded before the import so it lands in the same atomic write as the
     // tokens: a refresh that presents a different client is rejected outright.
-    session.setClientId(client_id) catch |err| {
+    // Metask's JSON refresh grant is bound to the authorization and expressly
+    // omits client_id; other provider profiles retain their registered client.
+    session.setClientId(if (provider_id.eqlText("metask")) null else client_id) catch |err| {
         std.debug.print("error: could not record the OAuth client ({s})\n", .{@errorName(err)});
         return 2;
     };
@@ -1590,12 +1812,12 @@ pub fn resolveProviderScopedSecret(
     profile_name: []const u8,
 ) ![]u8 {
     const credential_mod = provider_credential;
-    const provider_ids_mod = provider_ids;
+    const provider_ids_local = provider_ids;
     const host = buildProviderHost(allocator) orelse return error.UnknownProviderProfile;
     defer host.destroy();
     const profile = host.registry.find(profile_name) orelse return error.UnknownProviderProfile;
 
-    var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
+    var reference_buffer: [provider_ids_local.MAX_SLUG_LEN]u8 = undefined;
     const resolved = credential_mod.resolve(.{
         .provider_id = profile.id,
         .accepted_kinds = profile.accepted_credential_kinds,
@@ -2074,6 +2296,14 @@ fn printHelp() void {
 
 test "basic" {
     try std.testing.expect(true);
+}
+
+test "Metask login dispatch uses JSON device flow except token import" {
+    try std.testing.expect(metaskUsesDeviceFlow(.browser));
+    try std.testing.expect(!metaskUsesDeviceFlow(.help));
+    try std.testing.expect(!metaskUsesDeviceFlow(.status));
+    try std.testing.expect(!metaskUsesDeviceFlow(.api_key));
+    try std.testing.expect(!metaskUsesDeviceFlow(.oauth_json));
 }
 
 test {

@@ -20,6 +20,8 @@ const config_doc = @import("config_doc.zig");
 const openrouter = @import("openrouter.zig");
 const offer_mod = @import("offer.zig");
 const profile_mod = @import("profile.zig");
+const metask_profile = @import("profiles/metask.zig");
+const metask_catalog = @import("metask_catalog.zig");
 
 pub const ProviderRegistry = registry_mod.ProviderRegistry;
 pub const OfferCatalog = registry_mod.OfferCatalog;
@@ -214,6 +216,84 @@ pub const Host = struct {
         // notice on its own.
         self.kernel.notePricingUpdated(provider_id);
         self.kernel.noteProviderHealth(provider_id, worst);
+    }
+
+    /// Replace Metask's compiled inventory with the authenticated gateway's
+    /// `/v1/models` document. The gateway origin is kept separate from either
+    /// protocol path; both Anthropic Messages and OpenAI Chat offers are then
+    /// materialized for every returned model.
+    pub fn ingestMetask(self: *Host, gateway_origin: []const u8, models_json: []const u8) IngestError!void {
+        var parsed = metask_catalog.parseModels(self.allocator, models_json) catch return error.InvalidDocument;
+        defer parsed.deinit();
+        if (parsed.models.items.len == 0) return error.InvalidDocument;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
+        const scratch = arena.allocator();
+
+        const models = try scratch.alloc(profile_mod.ModelEntry, parsed.models.items.len);
+        for (parsed.models.items, 0..) |model, i| {
+            var capabilities = offer_mod.CapabilityMatrix{
+                // The provider kernel deliberately has no wall-clock
+                // dependency. The catalog source is known; freshness is
+                // represented by the host's catalog revision rather than an
+                // import of the application time utility.
+                .provenance = offer_mod.Provenance.known(.provider_catalog, null),
+            };
+            capabilities = capabilities.with(.reasoning, model.reasoning);
+            capabilities = capabilities.with(.vision, model.vision);
+            models[i] = .{
+                .request_model_id = try scratch.dupe(u8, model.id),
+                .display_name = try scratch.dupe(u8, model.display_name),
+                .canonical_model_id = null,
+                .limits = .{
+                    .context_window = model.max_input_tokens,
+                    .max_input_tokens = model.max_input_tokens,
+                    .max_output_tokens = model.max_tokens,
+                    .token_counting = .{ .mode = .provider_reported, .unit = .tokens },
+                    .provenance = offer_mod.Provenance.known(.provider_catalog, null),
+                },
+                .capabilities = capabilities,
+                .quote = .unknown,
+            };
+        }
+
+        const channel = try scratch.create(profile_mod.ChannelDescriptor);
+        channel.* = metask_profile.PROFILE.channels[0];
+        channel.base_url = try scratch.dupe(u8, std.mem.trimEnd(u8, gateway_origin, "/"));
+        // The compiled profile intentionally retains only the historical
+        // Messages route so model-only legacy selections stay unambiguous.
+        // An authenticated gateway catalog opts into both wire protocols.
+        const routes = try scratch.alloc(profile_mod.ProtocolRoute, 2);
+        routes[0] = .{ .protocol = .anthropic_messages };
+        routes[1] = .{ .protocol = .openai_chat, .path_suffix = "/v1/chat/completions" };
+        channel.routes = routes;
+        channel.models = models;
+        const channels = try scratch.alloc(profile_mod.ChannelDescriptor, 1);
+        channels[0] = channel.*;
+        const built = profile_mod.ProviderProfile{
+            .id = metask_profile.PROFILE.id,
+            .implementation_id = metask_profile.PROFILE.implementation_id,
+            .display_name = metask_profile.PROFILE.display_name,
+            .aliases = metask_profile.PROFILE.aliases,
+            .channels = channels,
+            .accepted_credential_kinds = metask_profile.PROFILE.accepted_credential_kinds,
+            .env_aliases = metask_profile.PROFILE.env_aliases,
+            .auth = metask_profile.PROFILE.auth,
+            .default_channel = channel.id,
+            .endpoint_policy = metask_profile.PROFILE.endpoint_policy,
+            .oauth_token_url = metask_profile.PROFILE.oauth_token_url,
+            .oauth_device_authorization_url = metask_profile.PROFILE.oauth_device_authorization_url,
+            .oauth_client_id = metask_profile.PROFILE.oauth_client_id,
+        };
+        try self.registry.checkReplace(built);
+        try self.registry.reserve(0);
+        self.registry.replaceAssumeCapacity(built);
+        if (self.catalog_arena) |*previous| previous.deinit();
+        self.catalog_arena = arena;
+        moved = true;
+        self.refresh() catch return error.OutOfMemory;
     }
 
     /// Rebuild the catalog and hand it to the kernel. The previous catalog is
@@ -423,6 +503,19 @@ test "the kernel sees the host's catalog and survives a refresh" {
     for (before.items(), after.items()) |old, new| {
         try std.testing.expect(old.offer_id.eql(new.offer_id));
     }
+}
+
+test "authenticated Metask catalog exposes both protocol routes" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask("http://localhost:9000", "{\"object\":\"list\",\"data\":[{\"id\":\"metask-model\",\"display_name\":\"Gateway Model\",\"max_input_tokens\":32000,\"max_tokens\":2048,\"capabilities\":{\"thinking\":{\"supported\":true},\"image_input\":{\"supported\":false}}}]}");
+    const profile = host.registry.find("metask").?;
+    const channel = profile.channel(Slug.lit("default")).?;
+    try std.testing.expectEqual(@as(usize, 1), channel.models.len);
+    try std.testing.expectEqualStrings("Gateway Model", channel.models[0].display_name);
+    try std.testing.expect(channel.route(.anthropic_messages) != null);
+    try std.testing.expect(channel.route(.openai_chat) != null);
 }
 
 test "two refreshes keep the retired catalog alive for one generation" {
