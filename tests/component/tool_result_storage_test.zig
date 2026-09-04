@@ -596,6 +596,19 @@ test "L2 native WebFetch streams download transform and JSON into one typed arti
     var outcome = try cc.tools.dispatch(&ctx, "WebFetch", args);
     defer outcome.deinit(allocator);
     try std.testing.expect(outcome == .ok);
+    // WebFetch is a byte-zero producer: since #45 it seals during execution
+    // and the blob exists only once the batch commit boundary publishes it.
+    // This test stands in for that boundary by hand.
+    try std.testing.expect(outcome.ok == .sealed);
+    {
+        var sealed = outcome.ok.takeSealed().?;
+        const completed = try sealed.spool.publish();
+        var receipt = completed.receipt;
+        receipt.capture_complete = sealed.capture_complete;
+        const media_type = sealed.media_type;
+        sealed.spool.deinit();
+        outcome.ok = .{ .artifact = .{ .stored = receipt, .preview = completed.preview, .media_type = media_type } };
+    }
     try std.testing.expect(outcome.ok == .artifact);
     try std.testing.expect(outcome.ok.artifact.stored.bytes > 96 * 1024);
     try std.testing.expect(outcome.ok.artifact.stored.capture_complete);

@@ -21,6 +21,7 @@ const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 const file_reference = @import("file_reference.zig");
 const file_change = @import("file_change.zig");
+const tool_result = @import("tool_result.zig");
 
 /// 可流式执行的工具:除 **WebSearch** 外的一切。WebSearch 在其隔离子请求里发子 LLM 请求,
 /// 是重量级付费调用——主 stream 后续还可能取消/改写本轮工具,投机预取的浪费远高于 Read/Grep
@@ -52,6 +53,7 @@ const Entry = struct {
     file_changes: ?[]file_change.Record = null,
     file_changes_overflow: bool = false,
     file_changes_lost: bool = false,
+    sealed: ?tool_result.SealedArtifact = null,
     taken: bool = false, // 已被 executeSlots 取走(所有权转移)
     skip: bool = false, // 预取遇 UiPending(并发安全工具不该发生)→ 丢弃,take 返 null 让 executeSlots 重跑
 };
@@ -91,6 +93,7 @@ fn runJob(job: *Job) void {
             job.entry.file_changes = d.file_changes;
             job.entry.file_changes_overflow = d.file_changes_overflow;
             job.entry.file_changes_lost = d.file_changes_lost;
+            job.entry.sealed = d.sealed;
         },
         // Host 工具不进流式预取(prefetch_safe=false + isStreamable 白名单),此分支
         // 防御性兜底:标 skip 让 executeSlots 正常路径重跑并走完整 fatal 控制流。
@@ -157,6 +160,7 @@ pub const Prefetch = struct {
         file_changes: ?[]file_change.Record,
         file_changes_overflow: bool,
         file_changes_lost: bool,
+        sealed: ?tool_result.SealedArtifact,
     } {
         for (self.entries.items) |e| {
             if (e.taken) continue;
@@ -177,6 +181,8 @@ pub const Prefetch = struct {
             e.file_refs = null;
             const changes = e.file_changes;
             e.file_changes = null;
+            const sealed = e.sealed;
+            e.sealed = null;
             return .{
                 .content = content,
                 .file_refs = refs,
@@ -187,6 +193,7 @@ pub const Prefetch = struct {
                 .file_changes = changes,
                 .file_changes_overflow = e.file_changes_overflow,
                 .file_changes_lost = e.file_changes_lost,
+                .sealed = sealed,
             };
         }
         return null;
@@ -211,6 +218,8 @@ pub const Prefetch = struct {
                 e.file_refs = null;
                 if (e.file_changes) |changes| file_change.freeRecords(self.allocator, changes);
                 e.file_changes = null;
+                if (e.sealed) |*sealed| sealed.spool.deinit();
+                e.sealed = null;
             }
         }
     }
@@ -301,4 +310,36 @@ test "Prefetch:未取走的 entry 由 deinit join+释放(无泄漏,MED-2 abort/d
     p.joinAll(); // 幂等:第二次 no-op
     p.deinit();
     // 到此无泄漏、无未 join 线程即通过(testing.allocator 会在测试末校验)。
+}
+
+test "prefetch carries a sealed handle through take and discards an unclaimed one" {
+    // A speculatively executed tool seals like any other; `take` hands the
+    // handle to the slot, and `joinAll` discards the handle of a result nobody
+    // claimed - so an abandoned prefetch leaves no blob and no temp file (#45).
+    const a = std.testing.allocator;
+    const tool_exec = @import("tool_exec.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const cas_dir = try std.fmt.allocPrint(a, "{s}/tool-results/sha256", .{root});
+    defer a.free(cas_dir);
+    const spool_dir = try std.fmt.allocPrint(a, "{s}/tool-results/spool", .{root});
+    defer a.free(spool_dir);
+
+    var p = Prefetch.init(a);
+    defer p.deinit();
+    const ctx = ToolContext{ .allocator = a, .artifact_root = root, .tool_dispatcher = tool_exec.SealedToolDispatcher.dispatcher() };
+    p.start(&ctx, "a", "SealedTool", "{}", .{ .bytes = [_]u8{'0'} ** 12 });
+    p.start(&ctx, "b", "SealedTool", "{}", .{ .bytes = [_]u8{'0'} ** 12 });
+    const taken = p.take("a") orelse return error.PrefetchMissing;
+    try std.testing.expect(taken.sealed != null);
+    if (taken.content) |c| a.free(c);
+    var handle = taken.sealed.?;
+    handle.spool.deinit();
+    p.joinAll();
+    // "b" was never claimed: joinAll discarded its handle; nothing is left.
+    try std.testing.expectEqual(@as(usize, 0), try tool_exec.testCountEntries(a, spool_dir));
+    try std.testing.expectEqual(@as(usize, 0), try tool_exec.testCountEntries(a, cas_dir));
 }

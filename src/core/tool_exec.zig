@@ -23,9 +23,11 @@ const project_gate_protocol = @import("../tools/project_rule_gate.zig");
 const project_rule_signal = @import("../tools/project_rule_signal.zig");
 const file_reference = @import("file_reference.zig");
 const file_change = @import("file_change.zig");
+const tool_result = @import("tool_result.zig");
+const result_budget = @import("result_budget.zig");
+const tool_error = @import("tool_error.zig");
 const tool_catalog = @import("tool_catalog.zig");
 const execution_effect = @import("execution_effect.zig");
-const result_budget = @import("result_budget.zig");
 const read_artifact = @import("../tools/read_artifact.zig");
 const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 路径归一(Windows 反斜杠 vs JSON 转义)
 
@@ -88,6 +90,9 @@ pub const Slot = struct {
     input: []const u8, // borrowed
     /// 执行后填:成功内容 或 错误内容(均 owned by caller allocator)。
     content: ?[]u8 = null,
+    /// Sealed handle published at the batch commit boundary; deinit discards
+    /// it so fatal batches leave no unreferenced CAS artifact (#45).
+    sealed: ?tool_result.SealedArtifact = null,
     is_error: bool = false,
     /// 执行耗时(ms),runJob 填。供 tool_card 显示真实耗时(0 = 未执行/被拒)。
     elapsed_ms: u64 = 0,
@@ -120,6 +125,8 @@ pub const Slot = struct {
     /// agent_loop 用单个 defer 遍历调用,覆盖**所有**退出路径(正常/挂起/fatal/错误);
     /// 已转移 ownership 的字段(takeContent 置 null)天然跳过。
     pub fn deinit(self: *Slot, allocator: std.mem.Allocator) void {
+        if (self.sealed) |*sealed| sealed.spool.deinit();
+        self.sealed = null;
         if (self.content) |c| allocator.free(c);
         self.content = null;
         if (self.pending_kind) |k| allocator.free(k);
@@ -142,6 +149,46 @@ pub const Slot = struct {
         return c;
     }
 };
+
+/// Publish every sealed result of a batch that completed without a fatal.
+/// This is the one place a native tool's large result enters the CAS: the
+/// publish and the Conversation reference that justifies it happen in the same
+/// turn, so a batch that ended earlier leaves nothing behind (#45). The
+/// content already is the envelope for the sealed receipt, and the envelope
+/// rendered before publication is byte-identical to the one rendered after,
+/// so success changes nothing the model sees. A publication that fails is
+/// resolved per slot with the policy the tool layer used to apply at
+/// execution time: the bytes come back inline when
+/// `result_budget.retainInlineAfterFailedPublish` allows it, otherwise the
+/// slot becomes a bounded tool error. The handle is released either way.
+pub fn publishSealedResults(slots: []Slot, allocator: std.mem.Allocator, rid: log.RequestId) !void {
+    for (slots) |*slot| {
+        const handle = if (slot.sealed) |*sealed| sealed else continue;
+        defer {
+            handle.spool.deinit();
+            slot.sealed = null;
+        }
+        if (handle.spool.publish()) |_| continue else |err| {
+            const bytes = handle.spool.receipt().bytes;
+            const retain = result_budget.retainInlineAfterFailedPublish(err, bytes, handle.capture_complete, result_budget.PER_RESULT_MAX_BYTES);
+            if (retain) {
+                if (handle.spool.readAllAlloc(allocator)) |inline_bytes| {
+                    if (slot.content) |old| allocator.free(old);
+                    slot.content = inline_bytes;
+                    slot.is_error = false;
+                    log.warnId("agent", rid, "sealed result of {s} could not be published ({s}); retained inline", .{ slot.name, @errorName(err) });
+                    continue;
+                } else |read_err| {
+                    log.warnId("agent", rid, "sealed result of {s} could not be read back ({s}) after a failed publish ({s})", .{ slot.name, @errorName(read_err), @errorName(err) });
+                }
+            }
+            if (slot.content) |old| allocator.free(old);
+            slot.content = try tool_error.errorToJson("ArtifactPublishFailed", "artifact publication for {s} failed at the batch commit boundary ({s}); the result was not retained, retry the call", .{ slot.name, @errorName(err) }, allocator);
+            slot.is_error = true;
+            log.warnId("agent", rid, "sealed result of {s} could not be published ({s}); reported as a tool error", .{ slot.name, @errorName(err) });
+        }
+    }
+}
 
 /// What one turn's recovery-read planning decided (#40).
 pub const RecoveryPlan = struct {
@@ -264,6 +311,7 @@ pub const OneResult = union(enum) {
         /// failed. Travels with the result so a consumer says "incomplete".
         file_changes_overflow: bool = false,
         file_changes_lost: bool = false,
+        sealed: ?tool_result.SealedArtifact = null,
     },
     /// L3 挂起:工具发起 custom UI(error.UiPending)。kind/payload owned by parent_allocator。
     pending: struct { kind: ?[]u8, payload: ?[]u8, elapsed_ms: u64 },
@@ -281,7 +329,13 @@ pub const OneResult = union(enum) {
     /// embedders) call it themselves.
     pub fn freeFileChanges(self: OneResult, allocator: std.mem.Allocator) void {
         switch (self) {
-            .done => |d| if (d.file_changes) |changes| file_change.freeRecords(allocator, changes),
+            .done => |d| {
+                if (d.file_changes) |changes| file_change.freeRecords(allocator, changes);
+                if (d.sealed) |sealed_value| {
+                    var owned = sealed_value;
+                    owned.spool.deinit();
+                }
+            },
             .host_fatal => |fatal| if (fatal.file_changes) |changes| file_change.freeRecords(allocator, changes),
             .pending => {},
         }
@@ -810,7 +864,6 @@ pub fn executeOne(
                     .admit_exact_edit => job_ctx.project_edit_mode = .whole_file_exact,
                     .block => |recovery_action| {
                         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
-                        const tool_error = @import("tool_error.zig");
                         const denied = switch (recovery_action) {
                             .none => tool_error.projectRuleBlockedJson(
                                 dispatched_name,
@@ -841,7 +894,6 @@ pub fn executeOne(
             },
             .block => |recovery_action| {
                 const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
-                const tool_error = @import("tool_error.zig");
                 const denied = switch (recovery_action) {
                     .none => tool_error.projectRuleBlockedJson(
                         dispatched_name,
@@ -875,7 +927,7 @@ pub fn executeOne(
         return hostFatalResult(&change_collector);
     }
     defer dispatch_observation.ensureTerminal();
-    const r = (if (job_ctx.project_edit_mode == .whole_file_exact)
+    var r = (if (job_ctx.project_edit_mode == .whole_file_exact)
         tools_mod.dispatchProjectExactEdit(&job_ctx, dispatch_input)
     else
         tools_mod.dispatch(&job_ctx, name, input)) catch |err| {
@@ -902,7 +954,6 @@ pub fn executeOne(
         const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
         if (!dispatch_observation.finish(.tool_error, code, null))
             return hostFatalResult(&change_collector);
-        const tool_error = @import("tool_error.zig");
         // 错误 json 用父 allocator(逃逸 arena)。工具填了 detail 用之,否则通用文案。
         // P0.6:UnknownTool 附可用工具清单(hermes 式引导),弱模型据此自纠而非空转烧 turn。
         const ej = if (err_detail) |d|
@@ -980,6 +1031,13 @@ pub fn executeOne(
         .ok => {},
     }
     var rendered = try r.ok.render(job_ctx.allocator);
+    var sealed_result: ?tool_result.SealedArtifact = null;
+    if (r.ok == .sealed) {
+        const handle = r.ok.takeSealed().?;
+        var moved = handle;
+        moved.spool = try moved.spool.adopt(parent_allocator);
+        sealed_result = moved;
+    }
     defer rendered.deinit(job_ctx.allocator);
     const ok_bytes = rendered.bytes;
     if (!dispatch_observation.finish(
@@ -1041,6 +1099,7 @@ pub fn executeOne(
         .file_changes = change_collector.toOwnedSlice(),
         .file_changes_overflow = change_collector.overflow,
         .file_changes_lost = change_collector.lost,
+        .sealed = sealed_result,
     } };
 }
 
@@ -1227,7 +1286,6 @@ fn hostToolErrorJson(
     maybe_detail: ?[]const u8,
     allocator: std.mem.Allocator,
 ) error{OutOfMemory}![]u8 {
-    const tool_error = @import("tool_error.zig");
     if (maybe_detail) |detail| {
         if (detail.len != 0) {
             if (try tool_error.errorToJsonCapped(code, detail, MAX_TOOL_ERROR_PAYLOAD_BYTES_V1, allocator)) |encoded|
@@ -1261,6 +1319,7 @@ fn runJob(job: *Job) void {
             s.file_changes = d.file_changes;
             s.file_changes_overflow = d.file_changes_overflow;
             s.file_changes_lost = d.file_changes_lost;
+            s.sealed = d.sealed;
         },
         // fatal 不组装 tool_result:slot 不填 content,信号经 Job.fatal 上传。
         .host_fatal => |fatal| {
@@ -1606,6 +1665,21 @@ test "executeOne:UnknownTool → 富错误引导(prefetch/executeSlots 共享此
 
 /// 一批 safe slot 并发执行(每个独立线程,cap MAX_TOOL_CONCURRENCY)。
 /// fatal 语义:当前窗口的 worker **全部 join** 后才检查/返回;fatal 后不启动下一窗口。
+/// A worker adopts its sealed handle into the locked allocator view it was
+/// handed, and that view lives on `runConcurrentBatchWithSpawner`'s frame. Every
+/// handle is therefore re-homed into the caller's allocator before the batch
+/// returns - including on the fatal path, where the agent loop releases the
+/// slots next. A failure to re-home discards the handle here, while the view
+/// is still alive, and reports like any other OOM (#45).
+fn rehomeSealed(slot: *Slot, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    const handle = if (slot.sealed) |*sealed| sealed else return;
+    handle.spool = handle.spool.adopt(allocator) catch {
+        handle.spool.deinit();
+        slot.sealed = null;
+        return error.OutOfMemory;
+    };
+}
+
 fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator, rid: log.RequestId) error{ HostToolFatal, OutOfMemory }!void {
     return runConcurrentBatchWithSpawner(batch, base_ctx, parent_allocator, rid, spawnJob);
 }
@@ -1673,6 +1747,14 @@ fn runConcurrentBatchWithSpawner(
         while (k < launched_end) : (k += 1) {
             if (threads[k]) |thread| thread.join();
         }
+        // Sealed handles must not outlive `worker_allocator`: re-home them into
+        // the caller's allocator before the fatal check releases anything.
+        var rehome_failed = false;
+        for (jobs[started..launched_end]) |*job| {
+            rehomeSealed(job.slot, parent_allocator) catch {
+                rehome_failed = true;
+            };
+        }
         // join 完整个窗口后才检查 fatal——不撕裂在飞 worker;fatal 则不再开下一窗口。
         for (jobs[started..launched_end]) |*job| {
             if (job.fatal) return error.HostToolFatal;
@@ -1680,6 +1762,7 @@ fn runConcurrentBatchWithSpawner(
         for (jobs[started..launched_end]) |*job| {
             if (job.out_of_memory) return error.OutOfMemory;
         }
+        if (rehome_failed) return error.OutOfMemory;
         started = window_end;
     }
 }
@@ -2461,4 +2544,146 @@ test "tool observation: sink rejection blocks before actual dispatcher invocatio
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     try std.testing.expectEqual(@as(usize, 1), capture.starts);
     try std.testing.expectEqual(@as(usize, 0), capture.finishes);
+}
+
+// ── #45: a sealed handle travels beside the envelope until the batch commits ──
+
+/// Test support: entries in `directory` other than `.`/`..`; a directory that
+/// does not exist counts as empty, which is what "nothing left behind" means.
+pub fn testCountEntries(allocator: std.mem.Allocator, directory: []const u8) !usize {
+    const pdir = platform.dir;
+    const directory_z = try allocator.dupeZ(u8, directory);
+    defer allocator.free(directory_z);
+    var iterator = pdir.open(directory_z.ptr) orelse return 0;
+    defer pdir.close(&iterator);
+    var count: usize = 0;
+    while (pdir.next(&iterator)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        count += 1;
+    }
+    return count;
+}
+
+/// Test support: a Host tool that finishes a 9,000-byte capture exactly the
+/// way native tools do, so under the floor budget its body is `.sealed`.
+/// Declared prefetch-safe so the streaming prefetch path can run it too.
+pub const SealedToolDispatcher = struct {
+    fn dispatch(_: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, _: []const u8, _: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
+        const artifact_store = @import("tool_result_artifact.zig");
+        const result_spool = @import("../tools/result_spool.zig");
+        var capture = try artifact_store.Capture.begin(tool_ctx.allocator, tool_ctx.artifact_root, artifact_store.MAX_ARTIFACT_BYTES);
+        defer capture.deinit();
+        const payload = try tool_ctx.allocator.alloc(u8, 9_000);
+        defer tool_ctx.allocator.free(payload);
+        @memset(payload, 'x');
+        try capture.write(payload);
+        try capture.seal();
+        return .{ .ok = try result_spool.finishCaptureAsBody(tool_ctx.allocator, tool_ctx.artifact_root, &capture, .text_utf8, true, .floor) };
+    }
+    fn metadata(_: *const anyopaque, _: []const u8) ?tools_mod.ToolMeta {
+        return .{ .kind = .host, .category = .execute, .replay = .never, .prefetch_safe = true };
+    }
+    fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
+        return if (index == 0) "SealedTool" else null;
+    }
+    pub fn dispatcher() tools_mod.ToolDispatcher {
+        return .{ .ctx = @ptrCast(&sentinel), .dispatchFn = dispatch, .metadataFn = metadata, .nameAtFn = nameAt };
+    }
+    var sentinel: u8 = 0;
+};
+
+test "executeOne carries a sealed handle beside the envelope and Slot.deinit discards it" {
+    // The tool layer seals; nothing reaches the CAS until the batch commits.
+    // A slot released before that - the fatal path - leaves neither a blob
+    // nor a temp file behind.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const cas_dir = try std.fmt.allocPrint(a, "{s}/tool-results/sha256", .{root});
+    defer a.free(cas_dir);
+    const spool_dir = try std.fmt.allocPrint(a, "{s}/tool-results/spool", .{root});
+    defer a.free(spool_dir);
+
+    const ctx = tools_mod.ToolContext{ .allocator = a, .artifact_root = root, .tool_dispatcher = SealedToolDispatcher.dispatcher() };
+    const r = try executeOne(&ctx, "SealedTool", "{}", "sid", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    try std.testing.expect(r == .done);
+    try std.testing.expect(r.done.sealed != null);
+    try std.testing.expect(std.mem.startsWith(u8, r.done.content.?, tool_result.ENVELOPE_PREFIX ++ "\"artifact\""));
+    try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, cas_dir));
+    try std.testing.expectEqual(@as(usize, 1), try testCountEntries(a, spool_dir));
+
+    var slot = Slot{ .decision = .run, .name = "SealedTool", .id = "sid", .input = "{}", .content = r.done.content, .sealed = r.done.sealed };
+    slot.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, spool_dir));
+    try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, cas_dir));
+}
+
+test "publishSealedResults publishes a sealed slot and leaves the envelope untouched" {
+    // The envelope rendered before publication names the same receipt the
+    // publish produces, so committing a batch never rewrites what the model
+    // sees; a slot without a handle passes through untouched.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const cas_dir = try std.fmt.allocPrint(a, "{s}/tool-results/sha256", .{root});
+    defer a.free(cas_dir);
+    const spool_dir = try std.fmt.allocPrint(a, "{s}/tool-results/spool", .{root});
+    defer a.free(spool_dir);
+
+    const ctx = tools_mod.ToolContext{ .allocator = a, .artifact_root = root, .tool_dispatcher = SealedToolDispatcher.dispatcher() };
+    const r = try executeOne(&ctx, "SealedTool", "{}", "sid", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    var slots = [_]Slot{
+        .{ .decision = .run, .name = "SealedTool", .id = "sid", .input = "{}", .content = r.done.content, .sealed = r.done.sealed },
+        .{ .decision = .denied, .name = "Denied", .id = "d", .input = "{}", .content = try a.dupe(u8, "{\"error\":\"denied\"}"), .is_error = true },
+    };
+    defer for (&slots) |*s| s.deinit(a);
+    const envelope = try a.dupe(u8, slots[0].content.?);
+    defer a.free(envelope);
+
+    try publishSealedResults(&slots, a, .{ .bytes = [_]u8{'0'} ** 12 });
+
+    try std.testing.expect(slots[0].sealed == null);
+    try std.testing.expectEqualStrings(envelope, slots[0].content.?);
+    try std.testing.expect(!slots[0].is_error);
+    try std.testing.expectEqual(@as(usize, 1), try testCountEntries(a, cas_dir));
+    try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, spool_dir));
+    try std.testing.expectEqualStrings("{\"error\":\"denied\"}", slots[1].content.?);
+    try std.testing.expect(slots[1].is_error);
+    try std.testing.expect(slots[1].sealed == null);
+}
+
+test "publishSealedResults resolves a failed publication with the tool layer's inline policy" {
+    // A discarded handle cannot publish (`ArtifactSpoolClosed`); that error is
+    // not one the policy retains inline, so the slot becomes a bounded tool
+    // error and the handle is released either way.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const spool_dir = try std.fmt.allocPrint(a, "{s}/tool-results/spool", .{root});
+    defer a.free(spool_dir);
+
+    const ctx = tools_mod.ToolContext{ .allocator = a, .artifact_root = root, .tool_dispatcher = SealedToolDispatcher.dispatcher() };
+    const r = try executeOne(&ctx, "SealedTool", "{}", "sid", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    var slots = [_]Slot{
+        .{ .decision = .run, .name = "SealedTool", .id = "sid", .input = "{}", .content = r.done.content, .sealed = r.done.sealed },
+    };
+    defer for (&slots) |*s| s.deinit(a);
+    if (slots[0].sealed) |*handle| handle.spool.discard();
+
+    try publishSealedResults(&slots, a, .{ .bytes = [_]u8{'0'} ** 12 });
+
+    try std.testing.expect(slots[0].sealed == null);
+    try std.testing.expect(slots[0].is_error);
+    try std.testing.expect(std.mem.indexOf(u8, slots[0].content.?, "io_error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slots[0].content.?, "failed at the batch commit boundary") != null);
+    try std.testing.expectEqual(@as(usize, 0), try testCountEntries(a, spool_dir));
 }

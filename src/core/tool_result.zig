@@ -8,6 +8,7 @@
 const std = @import("std");
 const artifact_store = @import("tool_result_artifact.zig");
 const tool_error = @import("tool_error.zig");
+const result_budget = @import("result_budget.zig");
 
 pub const PROJECTION_SCHEMA = "metacodes.tool-result-projection.v1";
 pub const ENVELOPE_PREFIX = "{\"schema_version\":\"" ++ PROJECTION_SCHEMA ++ "\",\"projection\":";
@@ -35,6 +36,11 @@ pub const ArtifactReceipt = struct {
     stored: artifact_store.Receipt,
     preview: artifact_store.Preview,
     media_type: MediaType,
+};
+pub const SealedArtifact = struct {
+    spool: artifact_store.SealedSpool,
+    media_type: MediaType,
+    capture_complete: bool,
 };
 
 /// A validated, bounded model-visible error. Construction is deliberately
@@ -90,6 +96,7 @@ pub const Taken = struct {
 pub const ToolResultBody = union(enum) {
     @"inline": InlineResult,
     artifact: ArtifactReceipt,
+    sealed: SealedArtifact,
     structured_error: StructuredToolError,
 
     pub fn initInline(bytes: []u8) ToolResultBody {
@@ -112,7 +119,7 @@ pub const ToolResultBody = union(enum) {
     ) !bool {
         const bytes = switch (self.*) {
             .@"inline" => |inline_result| inline_result.bytes,
-            .artifact, .structured_error => return false,
+            .artifact, .sealed, .structured_error => return false,
         };
         var spool = try artifact_store.Spool.begin(allocator, session_root);
         defer spool.deinit();
@@ -144,6 +151,12 @@ pub const ToolResultBody = union(enum) {
                 const encoded = try renderArtifactEnvelope(allocator, result);
                 break :blk .{ .bytes = encoded, .owned = encoded, .is_error = false };
             },
+            .sealed => |result| blk: {
+                var receipt = result.spool.receipt();
+                receipt.capture_complete = result.capture_complete;
+                const encoded = try renderArtifactEnvelope(allocator, .{ .stored = receipt, .preview = result.spool.previewValue(), .media_type = result.media_type });
+                break :blk .{ .bytes = encoded, .owned = encoded, .is_error = false };
+            },
         };
     }
 
@@ -154,21 +167,47 @@ pub const ToolResultBody = union(enum) {
     }
 
     /// Consume the body and return one owned, bounded model-visible slice.
+    /// Sealed bodies publish immediately at this legacy edge and may therefore
+    /// fail with the artifact publication errors formerly returned by the tool layer.
     /// Legacy adapters use this at their outermost compatibility edge; the
     /// typed dispatcher path keeps the union intact.
-    pub fn takeModelBytes(self: *ToolResultBody, allocator: std.mem.Allocator) error{OutOfMemory}!Taken {
+    pub fn takeModelBytes(self: *ToolResultBody, allocator: std.mem.Allocator) !Taken {
         return switch (self.*) {
             .@"inline" => |result| blk: {
-                self.* = undefined;
+                self.* = .{ .@"inline" = .{ .bytes = &.{} } };
                 break :blk .{ .bytes = result.bytes, .is_error = false };
             },
             .structured_error => |result| blk: {
-                self.* = undefined;
+                self.* = .{ .@"inline" = .{ .bytes = &.{} } };
                 break :blk .{ .bytes = result.encoded, .is_error = true };
             },
             .artifact => |result| blk: {
                 const bytes = try renderArtifactEnvelope(allocator, result);
-                self.* = undefined;
+                self.* = .{ .@"inline" = .{ .bytes = &.{} } };
+                break :blk .{ .bytes = bytes, .is_error = false };
+            },
+            .sealed => |*result| blk: {
+                const completed = result.spool.publish() catch |err| {
+                    const allowed = result_budget.retainInlineAfterFailedPublish(err, result.spool.receipt().bytes, result.capture_complete, result_budget.PER_RESULT_MAX_BYTES);
+                    if (!allowed) {
+                        result.spool.deinit();
+                        self.* = .{ .@"inline" = .{ .bytes = &.{} } };
+                        return err;
+                    }
+                    const bytes = result.spool.readAllAlloc(allocator) catch |read_err| {
+                        result.spool.deinit();
+                        self.* = .{ .@"inline" = .{ .bytes = &.{} } };
+                        return read_err;
+                    };
+                    result.spool.deinit();
+                    self.* = .{ .@"inline" = .{ .bytes = &.{} } };
+                    break :blk .{ .bytes = bytes, .is_error = false };
+                };
+                var receipt = completed.receipt;
+                receipt.capture_complete = result.capture_complete;
+                const bytes = try renderArtifactEnvelope(allocator, .{ .stored = receipt, .preview = completed.preview, .media_type = result.media_type });
+                result.spool.deinit();
+                self.* = .{ .@"inline" = .{ .bytes = &.{} } };
                 break :blk .{ .bytes = bytes, .is_error = false };
             },
         };
@@ -178,6 +217,7 @@ pub const ToolResultBody = union(enum) {
         return switch (self.*) {
             .@"inline" => |result| result.bytes.len,
             .artifact => |result| result.stored.bytes,
+            .sealed => |result| result.spool.receipt().bytes,
             .structured_error => |result| result.encoded.len,
         };
     }
@@ -187,8 +227,19 @@ pub const ToolResultBody = union(enum) {
             .@"inline" => |result| allocator.free(result.bytes),
             .structured_error => |result| allocator.free(result.encoded),
             .artifact => {},
+            .sealed => |*result| result.spool.deinit(),
         }
         self.* = undefined;
+    }
+
+    pub fn takeSealed(self: *ToolResultBody) ?SealedArtifact {
+        return switch (self.*) {
+            .sealed => |result| blk: {
+                self.* = .{ .@"inline" = .{ .bytes = &.{} } };
+                break :blk result;
+            },
+            else => null,
+        };
     }
 };
 
@@ -280,6 +331,56 @@ test "ToolResultBody promotes inline bytes to one recoverable artifact envelope"
     try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "ReadArtifact") != null);
 }
 
+test "sealed body renders the same envelope as the published artifact" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &b);
+    const root = b[0..n];
+    const bytes: [3000]u8 = [_]u8{'x'} ** 3000;
+    var s = try artifact_store.Spool.begin(a, root);
+    try s.write(&bytes);
+    const sealed = try s.seal();
+    s.deinit();
+    var body = ToolResultBody{ .sealed = .{ .spool = sealed, .media_type = .text_utf8, .capture_complete = true } };
+    var r1 = try body.render(a);
+    defer r1.deinit(a);
+    body.deinit(a);
+    var s2 = try artifact_store.Spool.begin(a, root);
+    defer s2.deinit();
+    try s2.write(&bytes);
+    var c = try s2.finish();
+    c.receipt.capture_complete = true;
+    var body2 = ToolResultBody.fromCompletedSpool(c, .text_utf8);
+    defer body2.deinit(a);
+    var r2 = try body2.render(a);
+    defer r2.deinit(a);
+    try std.testing.expectEqualStrings(r1.bytes, r2.bytes);
+}
+
+test "takeModelBytes publishes a sealed body" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &b);
+    const root = b[0..n];
+    const bytes: [3000]u8 = [_]u8{'x'} ** 3000;
+    var s = try artifact_store.Spool.begin(a, root);
+    try s.write(&bytes);
+    const sealed = try s.seal();
+    s.deinit();
+    var body = ToolResultBody{ .sealed = .{ .spool = sealed, .media_type = .text_utf8, .capture_complete = true } };
+    const receipt = sealed.receipt();
+    const taken = try body.takeModelBytes(a);
+    defer a.free(taken.bytes);
+    try std.testing.expect(std.mem.startsWith(u8, taken.bytes, ENVELOPE_PREFIX ++ "\"artifact\""));
+    var chunk = try artifact_store.readChunk(a, root, receipt.id(), 0, 3000);
+    defer chunk.deinit();
+    try std.testing.expectEqualSlices(u8, &bytes, chunk.bytes);
+}
+
 test "StructuredToolError rejects invalid and over-budget payloads" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.InvalidStructuredToolError, StructuredToolError.init(allocator, "not-json"));
@@ -312,4 +413,27 @@ test "StructuredToolError maps known categories and ignores unknown categories" 
     );
     defer allocator.free(unknown.encoded);
     try std.testing.expectEqual(@as(?tool_error.Category, null), unknown.category);
+}
+
+test "deinit after takeSealed is a no-op" {
+    // `executeOne` releases the body after moving the handle out, so the
+    // moved-out body must not touch the handle's temp file or leak.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &b);
+    const root = b[0..n];
+    var s = try artifact_store.Spool.begin(a, root);
+    defer s.deinit();
+    try s.write("taken");
+    const sealed = try s.seal();
+    var body = ToolResultBody{ .sealed = .{ .spool = sealed, .media_type = .text_utf8, .capture_complete = true } };
+    var handle = body.takeSealed() orelse return error.NothingTaken;
+    body.deinit(a);
+    // The handle still owns a readable temp file: deinit did not discard it.
+    const bytes = try handle.spool.readAllAlloc(a);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("taken", bytes);
+    handle.spool.deinit();
 }
