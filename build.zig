@@ -1053,6 +1053,45 @@ pub fn build(b: *std.Build) void {
     } else {
         release_verify_step.dependOn(&b.addFail("use release:check for cross-target validation").step);
     }
+
+    // ── release:archive / release:sums (#81, #47 stage 6) ───────────────────
+    // The verified prefix becomes one immutable archive (zip on Windows,
+    // tar.gz elsewhere) plus its .sha256 sidecar; two runs are byte-identical
+    // (scripts/release_archive.py, shared with the AgentCore packager). A
+    // stable version archives only from a clean tree tagged with the bare
+    // X.Y.Z; a pre-release from any commit. Archives never land inside the
+    // bundle root: the default is <build root>/dist (ignored by git).
+    const release_archive_dir = b.option(
+        []const u8,
+        "release-archive-dir",
+        "Output directory for the CLI release archive and SHA256SUMS (default: dist/)",
+    ) orelse b.pathFromRoot("dist");
+    const release_archive_test_cmd = b.addSystemCommand(&.{ release_python, "scripts/release_archive.py", "--self-test" });
+    release_archive_test_cmd.setCwd(b.path("."));
+    const release_archive_cmd = b.addSystemCommand(&.{
+        release_python,
+        "scripts/release_archive.py",
+        "--kind",
+        "cli",
+        b.install_path,
+        release_archive_dir,
+    });
+    release_archive_cmd.setCwd(b.path("."));
+    release_archive_cmd.has_side_effects = true;
+    release_archive_cmd.step.dependOn(&release_archive_test_cmd.step);
+    release_archive_cmd.step.dependOn(if (release_target_is_native) release_verify_step else release_check_step);
+    const release_archive_step = b.step("release:archive", "Create the immutable CLI release archive plus .sha256 (after release:verify, or release:check for a cross target)");
+    release_archive_step.dependOn(&release_archive_cmd.step);
+
+    const release_sums_test_cmd = b.addSystemCommand(&.{ release_python, "scripts/release_sums.py", "--self-test" });
+    release_sums_test_cmd.setCwd(b.path("."));
+    const release_sums_cmd = b.addSystemCommand(&.{ release_python, "scripts/release_sums.py", release_archive_dir, manifest.version });
+    release_sums_cmd.setCwd(b.path("."));
+    release_sums_cmd.has_side_effects = true;
+    release_sums_cmd.step.dependOn(&release_sums_test_cmd.step);
+    release_sums_cmd.step.dependOn(&release_archive_cmd.step);
+    const release_sums_step = b.step("release:sums", "Join the .sha256 sidecars under the archive directory into metacodes-<version>-SHA256SUMS");
+    release_sums_step.dependOn(&release_sums_cmd.step);
     const agentcore_symbol_gate_mod = b.createModule(.{
         .root_source_file = b.path("scripts/agentcore_symbol_gate.zig"),
         .target = b.graph.host,

@@ -176,6 +176,13 @@ jobs:
         run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
       - name: Release bundle verifier self-test
         run: python3 scripts/verify_release_bundle.py --self-test
+      - name: Release archive is reproducible
+        run: |
+          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
+          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" -Drelease-archive-dir="$RUNNER_TEMP/dist-2"
+          cmp "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz
+          zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
+          cat "$RUNNER_TEMP"/dist-1/metacodes-*-SHA256SUMS
       - name: Third-party notices check
         if: runner.os == 'Linux'
         run: python3 scripts/gen_third_party_notices.py --check
@@ -268,6 +275,9 @@ jobs:
       - name: Release bundle verifier self-test
         shell: cmd
         run: python scripts\verify_release_bundle.py --self-test
+      - name: Release archive is reproducible
+        shell: cmd
+        run: zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" -Drelease-archive-dir="%RUNNER_TEMP%\dist-1" && zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" -Drelease-archive-dir="%RUNNER_TEMP%\dist-2" && python scripts\release_sums.py --self-test && for %%F in ("%RUNNER_TEMP%\dist-1\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-2\%%~nxF" > nul && zig build release:sums -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" -Drelease-archive-dir="%RUNNER_TEMP%\dist-1"
       - name: Verify install prefix unit tests
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_install_prefix -v
