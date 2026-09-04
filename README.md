@@ -62,6 +62,11 @@ the default is one LLVM codegen per core and the test binaries are large:
 zig build test -j6
 ```
 
+The Python suites need Python >= 3.9 (the macOS system `python3` suffices) and
+PyYAML: `python3 -m pip install -r requirements-dev.txt`. `zig build test` runs
+`python3` (`python` on Windows) from PATH, and `scripts/tests/test_python_floor.py`
+keeps every script parseable at that floor.
+
 Line endings are pinned to LF by `.gitattributes` (embedded prompt templates
 take part in SHA-256 contracts), and a few gates are POSIX-only by design and
 skip with a stated reason: the paid budget journal, dir_fd-anchored artifact

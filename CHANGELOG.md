@@ -59,6 +59,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- The fingerprint refresh wrote its staging file with `Path.write_text(newline=)`,
+  a Python 3.10 call, so every suite whose setUp repins failed on the macOS
+  system python3 (3.9); it now uses `open(..., newline="\n")`, and the 82 test
+  fixtures that made the same call go through `scripts/eval/tests/textio.py`.
+  The floor (3.9) and PyYAML are declared in `requirements-dev.txt`, an older
+  interpreter or a missing PyYAML fails with a clear message, and
+  `scripts/tests/test_python_floor.py` keeps every script parseable at the floor
+  and free of that call (#59).
+
 - Restored the invariant that a fatal batch does not persist a completed transient
   result (#45). Large captures now seal during execution and publish at the batch
   commit boundary, keeping the envelope reference and CAS publication atomic.

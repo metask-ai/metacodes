@@ -12,7 +12,12 @@ import time
 from pathlib import Path
 from unittest import mock
 
-import yaml
+try:
+    import yaml
+except ImportError as error:  # pragma: no cover - environment, not logic
+    raise ImportError(
+        "PyYAML is required here: python3 -m pip install -r requirements-dev.txt"
+    ) from error
 
 from scripts.eval.memory_budget_journal import (
     BudgetAuthority,

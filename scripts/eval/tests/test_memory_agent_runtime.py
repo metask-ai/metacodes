@@ -93,6 +93,7 @@ from scripts.eval.memory_agent_runtime_pilot import (
 from scripts.eval.e2e_adapter import NATIVE_EVENT_SCHEMA_VERSION
 from scripts.eval.model import ValidationError, stable_json
 from scripts.eval.tests.posix_only import POSIX, requires_posix_budget_journal, requires_posix_exec, requires_symlinks
+from scripts.eval.tests.textio import write_text_lf
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -177,7 +178,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 for path in cassette.glob("req-*.json"):
                     path.unlink()
                 for index, body in enumerate(bodies, 1):
-                    (cassette / f"req-{index:03d}.json").write_text(
+                    write_text_lf(
+                        cassette / f"req-{index:03d}.json",
                         json.dumps(
                             body,
                             ensure_ascii=False,
@@ -186,7 +188,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                         )
                         + "\n",
                         encoding="utf-8",
-                    newline="\n",
                     )
 
             write(normal(), normal(), breaker)
@@ -423,7 +424,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             (cassette / "req-001.json").write_text(
                 stable_json(breaker) + "\n", encoding="utf-8"
             )
-            (cassette / "req-002.json").write_text(
+            write_text_lf(
+                cassette / "req-002.json",
                 stable_json(
                     {
                         "tools": [{"name": allowed[0]}],
@@ -432,7 +434,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 )
                 + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             with self.assertRaisesRegex(ValidationError, "tools: expected an array"):
                 _validate_production_provider_tool_schema(cassette, "test", allowed)
@@ -440,7 +441,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_host_scoped_recall_fallback_is_an_exact_query(self):
         with tempfile.TemporaryDirectory() as directory:
             cassette = Path(directory)
-            (cassette / "req-001.json").write_text(
+            write_text_lf(
+                cassette / "req-001.json",
                 stable_json(
                     {
                         "messages": [
@@ -457,7 +459,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 )
                 + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
 
             observed = _cassette_tool_data(
@@ -506,7 +507,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             cassette = Path(directory)
-            (cassette / "req-001.json").write_text(
+            write_text_lf(
+                cassette / "req-001.json",
                 stable_json(
                     {
                         "messages": [
@@ -534,7 +536,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 )
                 + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             observed = _cassette_tool_data(
                 cassette,
@@ -549,7 +550,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_failed_recall_deduplicates_equivalent_query_variants(self):
         with tempfile.TemporaryDirectory() as directory:
             cassette = Path(directory)
-            (cassette / "req-001.json").write_text(
+            write_text_lf(
+                cassette / "req-001.json",
                 stable_json(
                     {
                         "messages": [
@@ -590,7 +592,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 )
                 + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
 
             observed = _cassette_tool_data(cassette, {}, "fallback query")
@@ -720,7 +721,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             rollout = {"consolidation": receipt, "stop_reason": "end_turn"}
             _validate_consolidation_artifacts(rollout, memory, "test consolidation")
             episode_payload = episode.read_bytes()
-            episode.write_text("tampered episode\n", encoding="utf-8", newline="\n")
+            write_text_lf(episode, "tampered episode\n", encoding="utf-8")
             episode.chmod(0o600)
             with self.assertRaisesRegex(ValidationError, "episode bytes drifted"):
                 _validate_consolidation_artifacts(rollout, memory, "test consolidation")
@@ -741,7 +742,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "- [42] preserve protocol intent\n"
                 "</system-reminder>"
             ).encode("utf-8")
-            (cassette / "req-001.json").write_text(
+            write_text_lf(
+                cassette / "req-001.json",
                 stable_json(
                     {
                         "messages": [
@@ -756,7 +758,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 )
                 + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
             receipt = {
                 "schema_version": "metacodes-scoped-recall-v1",
@@ -2473,7 +2474,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             }
         )
         event_path = root / rollout["artifact_paths"]["native_events"]
-        event_path.write_text(
+        write_text_lf(
+            event_path,
             "".join(
                 stable_json(
                     {
@@ -2488,7 +2490,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 for index, event in enumerate(events)
             ),
             encoding="utf-8",
-        newline="\n",
         )
         rollout["native_events_sha256"] = hashlib.sha256(event_path.read_bytes()).hexdigest()
 
@@ -2529,7 +2530,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             run_dir = root / "run"
             rollout_dir = run_dir / "rollouts" / "00000-example"
             rollout_dir.mkdir(parents=True)
-            (rollout_dir / "result.json").write_text("{}\n", encoding="utf-8", newline="\n")
+            write_text_lf(rollout_dir / "result.json", "{}\n", encoding="utf-8")
             journal_parent = root / "budget"
             journal_parent.mkdir(mode=0o700)
             authority = BudgetAuthority(
@@ -2628,9 +2629,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = root / "manifest.json"
-            manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(manifest_path, stable_json(manifest) + "\n", encoding="utf-8")
             tinykg = root / "fake-tinykg"
-            tinykg.write_text(
+            write_text_lf(
+                tinykg,
                 "#!/bin/sh\n"
                 "case \"$1\" in\n"
                 "  init) mkdir \"$2\" ;;\n"
@@ -2640,11 +2642,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "  *) exit 91 ;;\n"
                 "esac\n",
                 encoding="utf-8",
-            newline="\n",
             )
             tinykg.chmod(0o700)
             auth = root / "auth.json"
-            auth.write_text(stable_json({"api_key": "test-only-secret"}) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(auth, stable_json({"api_key": "test-only-secret"}) + "\n", encoding="utf-8")
             auth.chmod(0o600)
             run_dir = root / "run"
             journal_path = root / "budget" / "journal.json"
@@ -2654,7 +2655,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 owned_run = kwargs["run_dir"]
                 rollout = owned_run / "rollouts" / "00000-real-main-path"
                 rollout.mkdir(parents=True)
-                (rollout / "provider-result.json").write_text("{}\n", encoding="utf-8", newline="\n")
+                write_text_lf(rollout / "provider-result.json", "{}\n", encoding="utf-8")
                 journal = kwargs["budget_journal"]
                 snapshot = journal.snapshot()
                 transaction = BudgetTransaction(
@@ -2731,11 +2732,12 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = root / "manifest.json"
-            manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(manifest_path, stable_json(manifest) + "\n", encoding="utf-8")
             missing_auth = root / "must-not-be-read.json"
             budget_journal = root / "must-not-be-created-budget-journal.json"
             tinykg = root / "fake-tinykg"
-            tinykg.write_text(
+            write_text_lf(
+                tinykg,
                 "#!/bin/sh\n"
                 "case \"$1\" in\n"
                 "  init) mkdir \"$2\" ;;\n"
@@ -2745,7 +2747,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "  *) exit 91 ;;\n"
                 "esac\n",
                 encoding="utf-8",
-            newline="\n",
             )
             tinykg.chmod(0o700)
             output = io.StringIO()
@@ -2790,7 +2791,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = root / "manifest.json"
-            manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(manifest_path, stable_json(manifest) + "\n", encoding="utf-8")
             missing_auth = root / "must-not-be-read.json"
             with self.assertRaisesRegex(ValidationError, "TinyKG compatibility preflight"):
                 production_pilot_main(
@@ -2816,17 +2817,17 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         secret = 'super-secret-"escaped"-key'
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "stdout.ndjson").write_text("safe\n", encoding="utf-8", newline="\n")
+            write_text_lf(root / "stdout.ndjson", "safe\n", encoding="utf-8")
             _assert_production_secret_absent(
                 root,
                 secret,
                 pending_payloads=(("pending receipt", b'{"safe":true}'),),
             )
 
-            (root / "cassette.json").write_text(
+            write_text_lf(
+                root / "cassette.json",
                 json.dumps({"tool_result": secret}),
                 encoding="utf-8",
-            newline="\n",
             )
             with self.assertRaisesRegex(ValidationError, "credential leaked into cassette.json"):
                 _assert_production_secret_absent(root, secret)
@@ -2880,7 +2881,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_production_auth_rejects_parent_environment_and_reads_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
             auth = Path(directory) / "auth.json"
-            auth.write_text('{"api_key":"private-file-key"}\n', encoding="utf-8", newline="\n")
+            write_text_lf(auth, '{"api_key":"private-file-key"}\n', encoding="utf-8")
             auth.chmod(0o600)
             with mock.patch.dict(os.environ, {"METASK_API_KEY": "parent-env-key"}):
                 with self.assertRaisesRegex(ValidationError, "parent's initial environment"):
@@ -2899,13 +2900,13 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
 
             leaked = store / ".tinykg_leases" / "reader.lease"
-            leaked.write_text("unreleased\n", encoding="utf-8", newline="\n")
+            write_text_lf(leaked, "unreleased\n", encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "read lease was not released"):
                 _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
             leaked.unlink()
 
             lock = store / ".tinykg-cli.lock"
-            lock.write_text("unreleased\n", encoding="utf-8", newline="\n")
+            write_text_lf(lock, "unreleased\n", encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "CLI lock was not released"):
                 _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
             lock.unlink()
@@ -2934,8 +2935,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 path.mkdir(parents=True, exist_ok=True)
             host = root / "host-sentinel.txt"
             sibling = root / "run" / "sibling-sentinel.txt"
-            host.write_text("host-secret\n", encoding="utf-8", newline="\n")
-            sibling.write_text("sibling-secret\n", encoding="utf-8", newline="\n")
+            write_text_lf(host, "host-secret\n", encoding="utf-8")
+            write_text_lf(sibling, "sibling-secret\n", encoding="utf-8")
             profile = artifact / "production-seatbelt.sb"
             evidence_path = artifact / "production-seatbelt-probe.json"
             ripgrep = artifact / "sealed-home" / ".metacodes" / "toolchain" / "rg"
@@ -2945,11 +2946,11 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             memory = artifact / "sealed-home" / ".metacodes" / "projects" / "test" / "memory"
             memory.mkdir(parents=True)
             memory_index = memory / "MEMORY.md"
-            memory_index.write_text("- [Procedure](procedure.md) -- durable pattern\n", encoding="utf-8", newline="\n")
+            write_text_lf(memory_index, "- [Procedure](procedure.md) -- durable pattern\n", encoding="utf-8")
             memory_before = hashlib.sha256(memory_index.read_bytes()).hexdigest()
             store_manifest = store / ".tinykg" / "store-manifest.json"
             store_manifest.parent.mkdir()
-            store_manifest.write_text('{"revision":1}\n', encoding="utf-8", newline="\n")
+            write_text_lf(store_manifest, '{"revision":1}\n', encoding="utf-8")
             (store / ".tinykg_leases").mkdir(mode=0o700)
             store_before = hashlib.sha256(store_manifest.read_bytes()).hexdigest()
 
@@ -3037,7 +3038,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             for path in (artifact, workspace, store.parent, child_tmp):
                 path.mkdir(parents=True, exist_ok=True)
             batch = root / "run" / "episode.jsonl"
-            batch.write_text(
+            write_text_lf(
+                batch,
                 stable_json({"version": 1})
                 + "\n"
                 + stable_json(
@@ -3050,7 +3052,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 )
                 + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
 
             def tinykg(action, *arguments):
@@ -3075,8 +3076,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             store_digest_before = _artifact_tree_digest(store)
             host = root / "host-sentinel.txt"
             sibling = root / "run" / "sibling-sentinel.txt"
-            host.write_text("host-secret\n", encoding="utf-8", newline="\n")
-            sibling.write_text("sibling-secret\n", encoding="utf-8", newline="\n")
+            write_text_lf(host, "host-secret\n", encoding="utf-8")
+            write_text_lf(sibling, "sibling-secret\n", encoding="utf-8")
             profile = artifact / "production-seatbelt.sb"
             evidence_path = artifact / "production-seatbelt-probe.json"
             ripgrep = artifact / "sealed-home" / ".metacodes" / "toolchain" / "rg"
@@ -3298,7 +3299,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             source = root / "source"
             source.mkdir()
             outside = root / "outside.md"
-            outside.write_text("outside\n", encoding="utf-8", newline="\n")
+            write_text_lf(outside, "outside\n", encoding="utf-8")
             (source / "escape.md").symlink_to(outside)
             with self.assertRaisesRegex(ValidationError, "symlink is forbidden"):
                 _copy_memory_tree(source, root / "target")
@@ -3308,7 +3309,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             source = root / "source"
             source.mkdir()
             outside = root / "outside.md"
-            outside.write_text("outside\n", encoding="utf-8", newline="\n")
+            write_text_lf(outside, "outside\n", encoding="utf-8")
             os.link(outside, source / "hardlink.md")
             with self.assertRaisesRegex(ValidationError, "hard-linked file is forbidden"):
                 _copy_memory_tree(source, root / "target")
@@ -3409,7 +3410,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ):
                 path = root / paths[path_key]
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"{path_key}:{rollout['sequence']}\n", encoding="utf-8", newline="\n")
+                write_text_lf(path, f"{path_key}:{rollout['sequence']}\n", encoding="utf-8")
                 rollout[hash_key] = hashlib.sha256(path.read_bytes()).hexdigest()
             for path_key, hash_key in (
                 ("cassette", "cassette_sha256"),
@@ -3418,10 +3419,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ):
                 path = root / paths[path_key]
                 path.mkdir(parents=True)
-                (path / "artifact.txt").write_text(
+                write_text_lf(
+                    path / "artifact.txt",
                     f"{path_key}:{rollout['sequence']}\n",
                     encoding="utf-8",
-                newline="\n",
                 )
                 rollout[hash_key] = _artifact_tree_digest(path)
             if paths["store"] is not None:
@@ -3437,7 +3438,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         for source in receipt["runner_sources"]:
             path = root / source["path"]
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"runner-source:{source['module']}\n", encoding="utf-8", newline="\n")
+            write_text_lf(path, f"runner-source:{source['module']}\n", encoding="utf-8")
             source["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
 
         for rollout in receipt["rollouts"]:
@@ -3469,16 +3470,16 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ):
                 path = root / paths[path_key]
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(file_payloads[path_key], encoding="utf-8", newline="\n")
+                write_text_lf(path, file_payloads[path_key], encoding="utf-8")
                 rollout[hash_key] = hashlib.sha256(path.read_bytes()).hexdigest()
 
             for path_key in ("transcript", "workspace"):
                 path = root / paths[path_key]
                 path.mkdir(parents=True, exist_ok=True)
-                (path / "artifact.txt").write_text(
+                write_text_lf(
+                    path / "artifact.txt",
                     f"{path_key}:{sequence}\n",
                     encoding="utf-8",
-                newline="\n",
                 )
 
             cassette = root / paths["cassette"]
@@ -3538,10 +3539,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                             ],
                         },
                     ]
-                (cassette / f"req-{request_id:03d}.json").write_text(
+                write_text_lf(
+                    cassette / f"req-{request_id:03d}.json",
                     stable_json({"messages": messages}) + "\n",
                     encoding="utf-8",
-                newline="\n",
                 )
             rollout["cassette_sha256"] = _artifact_tree_digest(cassette)
 
@@ -3549,10 +3550,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             if backend == "markdown":
                 memory = root / paths["memory_state"]
                 memory.mkdir(parents=True, exist_ok=True)
-                (memory / "memory.md").write_text(
+                write_text_lf(
+                    memory / "memory.md",
                     f"durable-memory:{family_key}:{rollout['trial']}\n",
                     encoding="utf-8",
-                newline="\n",
                 )
                 state_after = _artifact_tree_digest(memory)
                 rollout["memory_state_after"] = state_after
@@ -3562,10 +3563,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             elif backend == "tinykg":
                 store = root / paths["store"]
                 store.mkdir(parents=True, exist_ok=True)
-                (store / "events.bin").write_text(
+                write_text_lf(
+                    store / "events.bin",
                     f"tinykg-state:{family_key}:{rollout['trial']}\n",
                     encoding="utf-8",
-                newline="\n",
                 )
                 raw_after = _artifact_tree_digest(store)
                 state_after = digest(
@@ -3735,10 +3736,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         for module in PRODUCTION_RUNNER_SOURCE_MODULES:
             source_path = root / "runner-sources" / f"{module}.py"
             if not source_path.exists():
-                source_path.write_text(
+                write_text_lf(
+                    source_path,
                     f"production-v7-runner-source:{module}\n",
                     encoding="utf-8",
-                newline="\n",
                 )
             source = sources.get(module, {"module": module, "path": f"runner-sources/{module}.py"})
             source["sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -3831,17 +3832,17 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 }
             else:
                 rollout["scoped_recall"] = None
-            first_request.write_text(stable_json(body) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(first_request, stable_json(body) + "\n", encoding="utf-8")
             for request_path in sorted(cassette.glob("req-*.json")):
                 request_body = json.loads(request_path.read_text(encoding="utf-8"))
                 request_body["model"] = body["model"]
                 request_body["system"] = body["system"]
                 request_body["tools"] = copy.deepcopy(body["tools"])
                 request_body["cache_control"] = {"type": "ephemeral"}
-                request_path.write_text(
+                write_text_lf(
+                    request_path,
                     stable_json(request_body) + "\n",
                     encoding="utf-8",
-                newline="\n",
                 )
             query_plan = build_query_plan_trace(
                 cassette,
@@ -3850,10 +3851,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 memory_backend=rollout["memory_backend"],
                 where=f"test v7 rollout {sequence}",
             )
-            (cassette / SIDECAR_NAME).write_text(
+            write_text_lf(
+                cassette / SIDECAR_NAME,
                 stable_json(query_plan) + "\n",
                 encoding="utf-8",
-            newline="\n",
             )
 
             grader = next(
@@ -3956,7 +3957,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             if memory_root is not None:
                 index_path = memory_root / "MEMORY.md"
                 if case["split"] == "offline" and not index_path.exists():
-                    index_path.write_text("# Durable memory\n", encoding="utf-8", newline="\n")
+                    write_text_lf(index_path, "# Durable memory\n", encoding="utf-8")
                     index_path.chmod(0o600)
                     first = json.loads(first_request.read_text(encoding="utf-8"))
                     first_messages = first.setdefault("messages", [])
@@ -3965,7 +3966,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                     first_messages[0].setdefault("content", []).append(
                         {"type": "text", "text": index_path.read_text(encoding="utf-8")}
                     )
-                    first_request.write_text(stable_json(first) + "\n", encoding="utf-8", newline="\n")
+                    write_text_lf(first_request, stable_json(first) + "\n", encoding="utf-8")
                 markdown_after = _artifact_tree_digest(memory_root)
                 if online:
                     rollout["memory_components_after"]["markdown"] = markdown_after
@@ -4134,10 +4135,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         receipt["arms"] = copy.deepcopy(manifest["execution"]["arms"])
         for source in receipt["runner_sources"]:
             runner = root / source["path"]
-            runner.write_text(
+            write_text_lf(
+                runner,
                 f"production-runner-source:{source['module']}\n",
                 encoding="utf-8",
-            newline="\n",
             )
             source["sha256"] = hashlib.sha256(runner.read_bytes()).hexdigest()
 
@@ -4161,7 +4162,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 rollout["artifact_paths"]["memory_state"] = memory_path
                 memory_root = root / memory_path
                 memory_root.mkdir(parents=True)
-                (memory_root / "MEMORY.md").write_text("# Integrated memory\n", encoding="utf-8", newline="\n")
+                write_text_lf(memory_root / "MEMORY.md", "# Integrated memory\n", encoding="utf-8")
             elif runtime_arm == "claude_style":
                 memory_root = root / rollout["artifact_paths"]["memory_state"]
             else:
@@ -4243,7 +4244,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                     body["messages"][0].setdefault("content", []).append(
                         {"type": "text", "text": expected_index.decode("utf-8")}
                     )
-            first_request.write_text(stable_json(body) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(first_request, stable_json(body) + "\n", encoding="utf-8")
             exposure = _cassette_memory_exposure(
                 cassette,
                 "test production exposure",
@@ -4299,7 +4300,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         receipt["schema_version"] = 5
         journal_module = "memory_budget_journal"
         runner_path = root / "runner-sources" / f"{journal_module}.py"
-        runner_path.write_text("production budget journal source\n", encoding="utf-8", newline="\n")
+        write_text_lf(runner_path, "production budget journal source\n", encoding="utf-8")
         receipt["runner_sources"].append(
             {
                 "module": journal_module,
@@ -4332,10 +4333,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             probe_relative = f"rollouts/{sequence}/production-seatbelt-probe.json"
             profile_path = root / profile_relative
             profile_path.parent.mkdir(parents=True, exist_ok=True)
-            profile_path.write_text(
+            write_text_lf(
+                profile_path,
                 "(version 1)\n(allow default)\n(deny file-read* (subpath \"/\"))\n",
                 encoding="utf-8",
-            newline="\n",
             )
             profile_sha256 = hashlib.sha256(profile_path.read_bytes()).hexdigest()
             probe = {
@@ -4393,7 +4394,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 ),
             }
             probe_path = root / probe_relative
-            probe_path.write_text(stable_json(probe) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(probe_path, stable_json(probe) + "\n", encoding="utf-8")
             rollout["sandbox"] = {
                 "backend": PRODUCTION_SANDBOX_BACKEND,
                 "profile_path": profile_relative,
@@ -4557,13 +4558,13 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             validate_runtime_artifacts(receipt, root)
 
             events = root / receipt["rollouts"][0]["artifact_paths"]["native_events"]
-            events.write_text("tampered\n", encoding="utf-8", newline="\n")
+            write_text_lf(events, "tampered\n", encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "native_events_sha256"):
                 validate_runtime_artifacts(receipt, root)
 
-            events.write_text("native_events:0\n", encoding="utf-8", newline="\n")
+            write_text_lf(events, "native_events:0\n", encoding="utf-8")
             workspace = root / receipt["rollouts"][0]["artifact_paths"]["workspace"]
-            (workspace / "late.lock").write_text("must be hashed\n", encoding="utf-8", newline="\n")
+            write_text_lf(workspace / "late.lock", "must be hashed\n", encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "workspace_sha256"):
                 validate_runtime_artifacts(receipt, root)
 
@@ -4646,7 +4647,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             validate_runtime_artifacts(receipt, root)
 
             runner = root / receipt["runner_sources"][0]["path"]
-            runner.write_text("tampered runner\n", encoding="utf-8", newline="\n")
+            write_text_lf(runner, "tampered runner\n", encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "runtime source mismatch"):
                 validate_runtime_artifacts(receipt, root)
 
@@ -4657,7 +4658,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self._materialize_v3_artifacts(root, manifest, observations, receipt)
             module = "memory_query_plan"
             source_path = root / "runner-sources" / f"{module}.py"
-            source_path.write_text("query-plan analyzer source\n", encoding="utf-8", newline="\n")
+            write_text_lf(source_path, "query-plan analyzer source\n", encoding="utf-8")
             receipt["runner_sources"].append(
                 {
                     "module": module,
@@ -4682,10 +4683,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                     arm=rollout["arm"],
                     memory_backend=rollout["memory_backend"],
                 )
-                (cassette / SIDECAR_NAME).write_text(
+                write_text_lf(
+                    cassette / SIDECAR_NAME,
                     stable_json(trace) + "\n",
                     encoding="utf-8",
-                newline="\n",
                 )
                 rollout["cassette_sha256"] = _artifact_tree_digest(cassette)
             validate_runtime_artifacts(receipt, root)
@@ -4717,7 +4718,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             first_sandbox = receipt["rollouts"][0]["sandbox"]
             profile_path = root / first_sandbox["profile_path"]
             original_profile = profile_path.read_bytes()
-            profile_path.write_text("tampered sandbox profile\n", encoding="utf-8", newline="\n")
+            write_text_lf(profile_path, "tampered sandbox profile\n", encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "sandbox artifact SHA-256 mismatch"):
                 validate_runtime_artifacts(receipt, root)
             profile_path.write_bytes(original_profile)
@@ -4726,7 +4727,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             original_probe = probe_path.read_bytes()
             failed_probe = json.loads(original_probe)
             failed_probe["process_info_denied"] = False
-            probe_path.write_text(stable_json(failed_probe) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(probe_path, stable_json(failed_probe) + "\n", encoding="utf-8")
             failed_probe_receipt = copy.deepcopy(receipt)
             failed_probe_receipt["rollouts"][0]["sandbox"]["probe_sha256"] = hashlib.sha256(
                 probe_path.read_bytes()
@@ -4737,7 +4738,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
 
             forged_tinykg_probe = json.loads(original_probe)
             forged_tinykg_probe["tinykg_store_info_sha256"] = digest("forged-store-info")
-            probe_path.write_text(stable_json(forged_tinykg_probe) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(probe_path, stable_json(forged_tinykg_probe) + "\n", encoding="utf-8")
             forged_tinykg_receipt = copy.deepcopy(receipt)
             forged_tinykg_receipt["rollouts"][0]["sandbox"]["probe_sha256"] = hashlib.sha256(
                 probe_path.read_bytes()
@@ -4787,7 +4788,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 if rollout["memory_backend"] == "markdown"
             )
             memory = root / markdown["artifact_paths"]["memory_state"]
-            (memory / "late.md").write_text("tampered\n", encoding="utf-8", newline="\n")
+            write_text_lf(memory / "late.md", "tampered\n", encoding="utf-8")
             transcript = root / markdown["artifact_paths"]["transcript"]
             markdown["transcript_sha256"] = _artifact_tree_digest(transcript)
             with self.assertRaisesRegex(ValidationError, "memory_state_after"):
@@ -4828,7 +4829,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                     "content": "{}",
                 }
             )
-            request.write_text(stable_json(body) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(request, stable_json(body) + "\n", encoding="utf-8")
             offline["cassette_sha256"] = _artifact_tree_digest(cassette)
             with self.assertRaisesRegex(ValidationError, "memory_write_events"):
                 validate_runtime_artifacts(receipt, root)
@@ -5062,7 +5063,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 / online_tinykg["artifact_paths"]["memory_state"]
                 / online_tinykg["consolidation"]["episode_file"]
             )
-            episode.write_text("tampered\n", encoding="utf-8", newline="\n")
+            write_text_lf(episode, "tampered\n", encoding="utf-8")
             episode.chmod(0o600)
             with self.assertRaisesRegex(
                 ValidationError,
@@ -5215,10 +5216,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             event_rows[0]["event"]["run_started"]["metadata"][
                 "runtime_model_id"
             ] = "forged-model"
-            event_path.write_text(
+            write_text_lf(
+                event_path,
                 "".join(stable_json(row) + "\n" for row in event_rows),
                 encoding="utf-8",
-            newline="\n",
             )
             identity_attack["rollouts"][0]["native_events_sha256"] = hashlib.sha256(
                 event_path.read_bytes()
@@ -5260,7 +5261,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                     },
                 ]
             )
-            request.write_text(stable_json(body) + "\n", encoding="utf-8", newline="\n")
+            write_text_lf(request, stable_json(body) + "\n", encoding="utf-8")
             attacked["rollouts"][0]["cassette_sha256"] = _artifact_tree_digest(cassette)
             with self.assertRaisesRegex(
                 ValidationError,
@@ -5269,7 +5270,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 validate_runtime_artifacts(attacked, root)
 
             runner = root / receipt["runner_sources"][0]["path"]
-            runner.write_text("tampered production runner\n", encoding="utf-8", newline="\n")
+            write_text_lf(runner, "tampered production runner\n", encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "runtime source mismatch"):
                 validate_runtime_artifacts(receipt, root)
 

@@ -47,6 +47,8 @@ asserts every command above has a CI step), so this block is the single source.
 Run the full suite with `-Doptimize=ReleaseSafe` as well when a change touches
 unsafe code or an ABI.
 
+The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`).
+
 The native bundled TinyKG is wired into tests by default. Supply
 `-Dtinykg-bin` and `-Dtinykg-sha256` together only to audit an explicit override.
 Do not run paid or provider-backed benchmarks without explicit user authorization,
