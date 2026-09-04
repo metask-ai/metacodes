@@ -148,12 +148,6 @@ def _stable_json(value: Any) -> bytes:
 def _wire_json(value: Any) -> bytes:
     """Match Zig/Python lifecycle writers, which preserve declared key order."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-
-def _fsync_directory(path: Path) -> None:
-    _fsync_directory(path)
-
-
 def _write_new(path: Path, value: Any) -> None:
     raw = _stable_json(value) + b"\n"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
