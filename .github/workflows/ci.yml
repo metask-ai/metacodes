@@ -259,6 +259,7 @@ jobs:
         shell: cmd
         run: zig build --prefix "%RUNNER_TEMP%\install-prefix" && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\install-prefix"
       - name: Verify install prefix unit tests
+        shell: cmd
         run: python -m unittest scripts.tests.test_verify_install_prefix -v
       # The repository-wide suite on the native Windows host. Until #53 this was
       # the "independent gate" build.zig talked about that no workflow ran, so
