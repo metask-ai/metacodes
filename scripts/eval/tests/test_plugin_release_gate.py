@@ -1,22 +1,24 @@
-from __future__ import annotations
-
 import copy
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import unittest
+import subprocess
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
-from scripts.eval.tests.posix_only import requires_symlinks
+from scripts.eval.tests.posix_only import POSIX, requires_symlinks
+import scripts.eval.plugin_release_gate as gate_module
 
 from scripts.eval.plugin_release_gate import (
     PluginGateError,
     _benchmark_row,
     _median_int,
     _require_exact_tree,
+    _materialize_head,
     attest_runtime_artifact,
     implementation_fingerprint,
     load_protocol,
@@ -56,6 +58,45 @@ def _fresh_protocol(case: unittest.TestCase) -> dict:
     directory = tempfile.TemporaryDirectory()
     case.addCleanup(directory.cleanup)
     return load_protocol(ROOT, _repinned_copy(Path(directory.name)))
+
+
+def _fake_gate_run(protocol_path: Path, mutate_last: callable):
+    """Fake every subprocess the gate shells out to.
+
+    The outputs satisfy the gate's parsers, so a test built on this only
+    exercises the discipline around the subprocesses. ``mutate_last`` runs
+    inside the last one (the candidate inventory), where a change to an input
+    is invisible to a gate that only observes its start and its end.
+    """
+    deterministic = json.loads(protocol_path.read_text(encoding="utf-8"))["deterministic_gate"]
+    plugin_id = json.loads(protocol_path.read_text(encoding="utf-8"))["candidate"]["plugin_id"]
+    benchmark = json.dumps({
+        "schema": "metacodes.plugin-benchmark/v1",
+        "quality_evidence": False,
+        "passed": True,
+        "thresholds": {
+            "max_static_plugin_p95_overhead_ns": deterministic["max_static_plugin_p95_overhead_ns"],
+            "max_inventory_avg_ns": deterministic["max_inventory_avg_ns"],
+        },
+        "static_plugin_p95_overhead_ns": 1,
+        "inventory_avg_ns": 1,
+    })
+    empty = json.dumps({"schema": "metacodes.plugin-inventory/v1", "plugins": []})
+    one = json.dumps({"schema": "metacodes.plugin-inventory/v1", "plugins": [{"id": plugin_id, "capabilities": ["skill_bundle"]}]})
+
+    def fake(root, args, *, env, timeout=600):
+        argv = list(args)
+        if "plugin:bench" in argv:
+            output = benchmark
+        elif argv[0].endswith("plugin_baseline.py"):
+            output = empty
+        elif argv[0].endswith("plugin_candidate.py"):
+            output = one
+            mutate_last()  # the last subprocess of the gate
+        else:
+            output = "ok"
+        return {"argv": argv, "elapsed_ms": 1, "output_sha256": hashlib.sha256(output.encode()).hexdigest(), "output": output}
+    return fake
 
 
 class PluginReleaseGateTest(unittest.TestCase):
@@ -305,35 +346,7 @@ class RunGateSnapshotTest(unittest.TestCase):
         return path, runtime
 
     def _fake_run(self, protocol_path: Path, mutate_last: callable):
-        deterministic = json.loads(protocol_path.read_text(encoding="utf-8"))["deterministic_gate"]
-        plugin_id = json.loads(protocol_path.read_text(encoding="utf-8"))["candidate"]["plugin_id"]
-        benchmark = json.dumps({
-            "schema": "metacodes.plugin-benchmark/v1",
-            "quality_evidence": False,
-            "passed": True,
-            "thresholds": {
-                "max_static_plugin_p95_overhead_ns": deterministic["max_static_plugin_p95_overhead_ns"],
-                "max_inventory_avg_ns": deterministic["max_inventory_avg_ns"],
-            },
-            "static_plugin_p95_overhead_ns": 1,
-            "inventory_avg_ns": 1,
-        })
-        empty = json.dumps({"schema": "metacodes.plugin-inventory/v1", "plugins": []})
-        one = json.dumps({"schema": "metacodes.plugin-inventory/v1", "plugins": [{"id": plugin_id, "capabilities": ["skill_bundle"]}]})
-
-        def fake(root, args, *, env, timeout=600):
-            argv = list(args)
-            if "plugin:bench" in argv:
-                output = benchmark
-            elif argv[0].endswith("plugin_baseline.py"):
-                output = empty
-            elif argv[0].endswith("plugin_candidate.py"):
-                output = one
-                mutate_last()  # the last subprocess of the gate
-            else:
-                output = "ok"
-            return {"argv": argv, "elapsed_ms": 1, "output_sha256": hashlib.sha256(output.encode()).hexdigest(), "output": output}
-        return fake
+        return _fake_gate_run(protocol_path, mutate_last)
 
     def _run_gate(self, protocol_path: Path, runtime: Path, mutate_last: callable, root_heads: list | None = None, before_call: callable = lambda: None):
         expected_dsh = json.loads(protocol_path.read_text(encoding="utf-8"))["upstream"]["deepseek_harness_commit"]
@@ -348,7 +361,9 @@ class RunGateSnapshotTest(unittest.TestCase):
             return real_git_head(ROOT)
 
         with mock.patch("scripts.eval.plugin_release_gate._run", self._fake_run(protocol_path, mutate_last)), \
-             mock.patch("scripts.eval.plugin_release_gate._git_head", fake_git_head):
+             mock.patch("scripts.eval.plugin_release_gate._git_head", fake_git_head), \
+             mock.patch("scripts.eval.plugin_release_gate._materialize_head", return_value=ROOT), \
+             mock.patch("scripts.eval.plugin_release_gate._require_clean_pinned_inputs"):
             before_call()  # test setup above may have read the protocol itself
             return run_gate(ROOT, protocol_path, dsh=Path("/nonexistent-dsh"), runtime_binary=runtime)
 
@@ -410,7 +425,9 @@ class RunGateSnapshotTest(unittest.TestCase):
             # assertRaises and reported as an ERROR, hiding the assertion
             # this test exists for.
             with mock.patch("scripts.eval.plugin_release_gate._run", lambda *a, **k: calls.append(a) or {"argv": [], "elapsed_ms": 0, "output_sha256": "", "output": ""}), \
-                 mock.patch("scripts.eval.plugin_release_gate._git_head", lambda p: expected_dsh):
+                 mock.patch("scripts.eval.plugin_release_gate._git_head", lambda p: expected_dsh), \
+                 mock.patch("scripts.eval.plugin_release_gate._materialize_head", return_value=ROOT), \
+                 mock.patch("scripts.eval.plugin_release_gate._require_clean_pinned_inputs"):
                 with self.assertRaises(PluginGateError) as caught:
                     run_gate(ROOT, path, dsh=Path("/nonexistent-dsh"), runtime_binary=runtime)
             # The key assertion first, so a gate that *did* run subprocesses
@@ -549,5 +566,216 @@ class CandidateTreeIsPinnedExactlyTest(unittest.TestCase):
         self.assertGreaterEqual(len(probe.call_args_list), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class MaterializedCheckoutTest(unittest.TestCase):
+    """The gate consumes a materialized ``git archive HEAD`` checkout, not the live tree.
+
+    Every test builds its own git repository in a temporary directory and
+    never touches the real repository's working tree, so the class stays
+    green on a dirty developer checkout and cannot damage one.
+    """
+
+    DSH = Path("/nonexistent-dsh")
+
+    def _git(self, repo: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def _scratch(self) -> Path:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        return Path(holder.name)
+
+    def _repo(self) -> Path:
+        repo = self._scratch()
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "core.autocrlf", "false")
+        return repo
+
+    def _commit(self, repo: Path, message: str) -> str:
+        self._git(repo, "add", ".")
+        self._git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", message)
+        return gate_module._git_head(repo)
+
+    def _dsh_aware_git_head(self, value: dict):
+        """The real ``_git_head`` for every path but the fake DeepSeek Harness checkout."""
+        expected_dsh = value["upstream"]["deepseek_harness_commit"]
+        real = gate_module._git_head
+
+        def fake(path: Path) -> str:
+            if path == self.DSH:
+                return expected_dsh
+            return real(path)
+
+        return fake
+
+    def test_materialize_head_extracts_the_commit_not_the_working_tree(self) -> None:
+        """Committed bytes only: no working-tree edit, no untracked file, no ``.git``; modes kept."""
+        repo = self._repo()
+        (repo / "a.txt").write_text("A\n", encoding="utf-8")
+        (repo / "dir").mkdir()
+        (repo / "dir/b.txt").write_text("B\n", encoding="utf-8")
+        script = repo / "run.py"
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        os.chmod(script, 0o755)
+        self._commit(repo, "initial")
+        if not POSIX:
+            # Windows cannot express the mode bit on disk; record it in the index.
+            self._git(repo, "update-index", "--chmod=+x", "run.py")
+            self._commit(repo, "mode")
+        head = gate_module._git_head(repo)
+        (repo / "a.txt").write_text("B\n", encoding="utf-8")
+        (repo / "untracked.txt").write_text("x", encoding="utf-8")
+
+        tree = _materialize_head(repo, head, self._scratch() / "tree")
+
+        self.assertEqual("A\n", (tree / "a.txt").read_text(encoding="utf-8"))
+        self.assertTrue((tree / "dir/b.txt").exists())
+        self.assertFalse((tree / "untracked.txt").exists())
+        self.assertFalse((tree / ".git").exists())
+        if POSIX:
+            self.assertTrue((tree / "run.py").stat().st_mode & stat.S_IXUSR)
+
+    @requires_symlinks
+    def test_materialize_head_refuses_a_committed_symlink(self) -> None:
+        """A symlink member fails the materialization closed instead of being followed."""
+        repo = self._repo()
+        (repo / "target").write_text("x", encoding="utf-8")
+        (repo / "link").symlink_to("target")
+        head = self._commit(repo, "link")
+        with self.assertRaisesRegex(PluginGateError, "link"):
+            _materialize_head(repo, head, self._scratch() / "tree")
+
+    def _synthetic(self) -> tuple[Path, Path, Path, dict, str]:
+        """A committed synthetic repository whose protocol pins point into it.
+
+        Derived from the checked-in protocol so every invariant
+        ``_validate_payload`` enforces still holds; only the pin sets are
+        rewritten. Returns ``(repo, protocol_path, runtime_binary, protocol, head)``.
+        """
+        repo = self._repo()
+        value = json.loads(PROTOCOL.read_text(encoding="utf-8"))
+
+        def put(relative: str, data: bytes) -> str:
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            return hashlib.sha256(data).hexdigest()
+
+        value["implementation_paths"] = ["src/impl_a.zig", "src/impl_b.zig"]
+        put("src/impl_a.zig", b"A\n")
+        put("src/impl_b.zig", b"B\n")
+        value["pinned_evaluator_files"] = {"eval.py": put("eval.py", b"eval\n")}
+        value["candidate"]["root"] = "candidate"
+        value["candidate"]["files"] = {
+            "candidate/a.txt": put("candidate/a.txt", b"a\n"),
+            "candidate/b.txt": put("candidate/b.txt", b"b\n"),
+        }
+        pair = value["coding_pair"]
+        pair["suite"] = "suite.py"
+        pair["baseline_executable"] = "base.py"
+        pair["treatment_executable"] = "treat.py"
+        for key in ("suite", "baseline_executable", "treatment_executable"):
+            pair[key + "_sha256"] = put(pair[key], (key + "\n").encode("utf-8"))
+        task = "synthetic"
+        pair["task_ids"] = [task]
+        pair["rollouts"] = pair["trials"] * 2
+        pair["scenario_sha256"] = {task: put(f"tests/e2e/scenarios/{task}.txt", b"task\n")}
+        runtime = self._scratch() / "runtime"
+        runtime.write_bytes(b"runtime")
+        os.chmod(runtime, 0o700)
+        pair["runtime_binary_sha256"] = hashlib.sha256(runtime.read_bytes()).hexdigest()
+        pair["implementation_fingerprint"] = implementation_fingerprint(repo, value)
+        protocol = repo / "evals/plugin-v1/protocol.json"
+        protocol.parent.mkdir(parents=True)
+        protocol.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        head = self._commit(repo, "protocol")
+        return repo, protocol, runtime, value, head
+
+    def test_gate_consumes_the_materialized_tree_and_ignores_change_and_restore_on_the_live_tree(self) -> None:
+        """Subprocesses and pin hashes see the checkout only.
+
+        A change-and-restore of a pinned file on the live tree during the last
+        subprocess is invisible, and so is a live edit that is never restored:
+        the receipt is still produced, which a gate hashing the live tree could
+        not do.
+        """
+        repo, protocol, runtime, value, head = self._synthetic()
+        fake = _fake_gate_run(protocol, lambda: None)
+        calls: list[tuple[Path, list[str]]] = []
+
+        def run(root, args, *, env, timeout=600):
+            calls.append((root, list(args)))
+            result = fake(root, args, env=env, timeout=timeout)
+            if str(args[0]).endswith("plugin_candidate.py"):
+                live = repo / "src/impl_a.zig"
+                committed = live.read_bytes()
+                live.write_bytes(b"ABA")
+                # The tree handed to the subprocess is untouched by the live edit.
+                self.assertEqual(b"A\n", (root / "src/impl_a.zig").read_bytes())
+                live.write_bytes(committed)
+                (repo / "src/impl_b.zig").write_bytes(b"LIVE-MODIFIED\n")
+            return result
+
+        with mock.patch("scripts.eval.plugin_release_gate._run", run), \
+             mock.patch("scripts.eval.plugin_release_gate._git_head", self._dsh_aware_git_head(value)):
+            receipt = run_gate(repo, protocol, self.DSH, runtime)
+
+        self.assertEqual(head, receipt["metacodes_git_head"])
+        self.assertTrue(calls)
+        roots = {root for root, _ in calls}
+        self.assertEqual(1, len(roots))
+        tree_root = roots.pop()
+        self.assertNotEqual(repo, tree_root)
+        self.assertTrue(str(tree_root).startswith(tempfile.gettempdir()))
+        inventory = [
+            args[0]
+            for _, args in calls
+            if str(args[0]).endswith(("plugin_baseline.py", "plugin_candidate.py"))
+        ]
+        self.assertEqual(2, len(inventory))
+        for path in inventory:
+            self.assertTrue(str(path).startswith(str(tree_root)))
+        # The live edit really was in place while the end re-validation ran.
+        self.assertEqual(b"LIVE-MODIFIED\n", (repo / "src/impl_b.zig").read_bytes())
+
+    def test_subprocess_mutating_the_checkout_is_caught_by_the_end_revalidation(self) -> None:
+        """The end re-validation hashes the checkout: a subprocess editing a pinned
+        file there fails the gate, and the live repository stays untouched."""
+        repo, protocol, runtime, value, _ = self._synthetic()
+        fake = _fake_gate_run(protocol, lambda: None)
+
+        def run(root, args, *, env, timeout=600):
+            result = fake(root, args, env=env, timeout=timeout)
+            if str(args[0]).endswith("plugin_candidate.py"):
+                (root / "src/impl_a.zig").write_bytes(b"CHECKOUT-MODIFIED\n")
+            return result
+
+        with mock.patch("scripts.eval.plugin_release_gate._run", run), \
+             mock.patch("scripts.eval.plugin_release_gate._git_head", self._dsh_aware_git_head(value)):
+            with self.assertRaisesRegex(PluginGateError, "fingerprint drifted"):
+                run_gate(repo, protocol, self.DSH, runtime)
+        self.assertEqual(b"A\n", (repo / "src/impl_a.zig").read_bytes())
+
+    def test_dirty_pinned_input_is_refused_before_any_subprocess(self) -> None:
+        """An uncommitted edit to a pinned input is refused up front: the receipt names HEAD."""
+        repo, protocol, runtime, _, _ = self._synthetic()
+        (repo / "src/impl_a.zig").write_text("dirty", encoding="utf-8")
+        calls: list = []
+        with mock.patch("scripts.eval.plugin_release_gate._run", lambda *a, **k: calls.append(a)):
+            with self.assertRaisesRegex(PluginGateError, "modified in the working tree.*src/impl_a.zig"):
+                run_gate(repo, protocol, self.DSH, runtime)
+        self.assertEqual([], calls)
+
+    def test_in_repo_protocol_must_be_tracked_and_clean(self) -> None:
+        """A protocol inside the repository is a pinned input too: modified or untracked, the gate refuses."""
+        repo, protocol, runtime, _, _ = self._synthetic()
+        protocol.write_bytes(protocol.read_bytes() + b"\n")
+        with self.assertRaisesRegex(PluginGateError, "modified in the working tree"):
+            run_gate(repo, protocol, self.DSH, runtime)
+        self._git(repo, "rm", "--cached", "-q", "evals/plugin-v1/protocol.json")
+        with self.assertRaisesRegex(PluginGateError, "is not tracked by Git"):
+            run_gate(repo, protocol, self.DSH, runtime)

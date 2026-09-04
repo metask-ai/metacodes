@@ -19,6 +19,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- The zero-provider plugin release gate now runs validation, pin hashing, and
+  subprocesses from a private `git archive HEAD` materialized checkout;
+  uncommitted pinned-input edits are refused up front and the checkout is
+  revalidated before receipt emission (issue #49).
+
 - MCP tool results decide inline-vs-publish from the caller's
   `result_budget.Budget.per_result_bytes` on both MCP paths — the classic
   `McpClient` and the AgentCore `mcp_result_stream` projector — the same number
