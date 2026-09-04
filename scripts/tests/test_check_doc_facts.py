@@ -92,6 +92,32 @@ class DocFactsTest(unittest.TestCase):
         status, _ = self._main(["--root", str(root), "--facts", str(path)])
         self.assertEqual(1, status)
 
+    def test_an_unreadable_or_malformed_authority_is_a_finding_not_a_crash(self) -> None:
+        """A missing authority file, or JSON that does not parse, ends with a finding and exit 1."""
+        registry = {
+            "schema": SCHEMA,
+            "facts": [
+                {
+                    "id": "x",
+                    "source": {"file": "missing.json", "json": "version"},
+                    "assert_in": [{"file": "doc.md", "regex": r"v = (\d+)"}],
+                }
+            ],
+        }
+        root, path = self._tree("unused", "v = 7\n", registry)
+        findings = check(root, path)
+        self.assertEqual(1, len(findings))
+        self.assertEqual(("missing.json", None, "x"), (findings[0].file, findings[0].line, findings[0].fact_id))
+        self.assertIn("cannot read authority", findings[0].message)
+
+        (root / "missing.json").write_text("{not json", encoding="utf-8")
+        findings = check(root, path)
+        self.assertEqual(1, len(findings))
+        self.assertIn("cannot read authority", findings[0].message)
+        status, output = self._main(["--root", str(root), "--facts", str(path)])
+        self.assertEqual(1, status)
+        self.assertIn("checked 1 facts", output)
+
     def test_registry_shape_is_validated(self) -> None:
         """A regex without a capture group, a missing assert_in and a wrong schema are refused."""
         no_group = _fact("v", r"v = (\d+)")

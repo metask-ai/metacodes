@@ -154,16 +154,32 @@ def check_fact(root: Path, fact: dict) -> list[Finding]:
 
 
 def check(root: Path, facts_path: Path) -> list[Finding]:
-    """All findings for the registry at ``facts_path`` over the tree at ``root``."""
+    """All findings for the registry at ``facts_path`` over the tree at ``root``.
+
+    A registry or authority file that cannot be read or parsed is reported as
+    a finding like any other, so the gate always ends with its summary line and
+    exit status 1 instead of a traceback.
+    """
+    try:
+        registry = facts_path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        registry = str(facts_path)
     try:
         facts = load_facts(facts_path)
-        findings = [finding for fact in facts for finding in check_fact(root, fact)]
     except FactsError as exc:
-        try:
-            registry = facts_path.resolve().relative_to(root.resolve()).as_posix()
-        except ValueError:
-            registry = str(facts_path)
         return [Finding(registry, None, "registry", str(exc))]
+    except (OSError, ValueError) as exc:
+        return [Finding(registry, None, "registry", f"cannot read registry: {exc}")]
+    findings: list[Finding] = []
+    for fact in facts:
+        try:
+            findings.extend(check_fact(root, fact))
+        except FactsError as exc:
+            findings.append(Finding(registry, None, fact["id"], str(exc)))
+        except (OSError, ValueError) as exc:
+            # The authority itself is missing, unreadable or not the JSON it
+            # claims to be: the fact cannot be checked, which is a failure.
+            findings.append(Finding(fact["source"]["file"], None, fact["id"], f"cannot read authority: {exc}"))
     return sorted(findings, key=lambda finding: (finding.file, finding.line or 0, finding.fact_id))
 
 
