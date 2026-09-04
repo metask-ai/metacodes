@@ -20,7 +20,10 @@ status, compatibility boundaries, and entry points are defined by
   time from its source (`-Dbuild-commit` names the commit for an exported
   tree; `-Drelease-layout` records the layout), and the runtime smoke checks
   the document against `sdk/zig/types.zig` and the vendored manifests with
-  the real binary (#78, #47 stage 3).
+  the real binary. `metacodes doctor [--json] [--strict]` reports where ripgrep
+  and TinyKG resolve from and whether their digests match the pinned ones;
+  `verify_install_prefix.py --doctor` runs it on the installed prefix in CI
+  (#78, #47 stage 3).
 
 ### Changed
 

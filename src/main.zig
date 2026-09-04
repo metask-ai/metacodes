@@ -17,6 +17,7 @@ const catalog_mod = @import("api/catalog.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const provider_ids_mod = @import("provider/ids.zig");
 const version_info = @import("version_info.zig");
+const doctor = @import("app/doctor.zig");
 const build_options = @import("build_info");
 
 pub const VERSION = @import("version.zig").semver;
@@ -900,11 +901,49 @@ fn metaskUsesDeviceFlow(mode: LoginMode) bool {
     return mode == .browser;
 }
 
+/// `metacodes doctor [--json] [--strict]` (#78): where ripgrep and TinyKG
+/// resolve from and whether their digests match what this build pinned. Exit 0;
+/// with `--strict`, 1 when a binary is unresolved or mismatched; 2 on an
+/// unknown argument.
+fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
+    var json = false;
+    var strict = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            strict = true;
+        } else {
+            std.debug.print("usage: metacodes doctor [--json] [--strict]\n", .{});
+            return 2;
+        }
+    }
+    var report = doctor.run(allocator, .{
+        .ripgrep_sha256 = build_options.ripgrep_expected_sha256,
+        .tinykg_sha256 = build_options.tinykg_expected_sha256,
+    }) catch |err| {
+        std.debug.print("error: doctor could not resolve the runtime binaries ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    defer report.deinit(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const render: *const fn (*std.Io.Writer, *const doctor.Report) std.Io.Writer.Error!void =
+        if (json) doctor.writeJson else doctor.writeText;
+    render(&out.writer, &report) catch |err| {
+        std.debug.print("error: cannot render the doctor report ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    dumpWrite(out.written());
+    return if (strict and !report.healthy()) 1 else 0;
+}
+
 fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u8 {
     var args = argsIter(init);
     defer args.deinit();
     _ = args.next(); // 跳过 argv[0](程序名)
     const cmd = args.next() orelse return null;
+    if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator);
     if (std.mem.eql(u8, cmd, "ledger")) {
         const provider = args.next() orelse {
             std.debug.print("usage: metacodes ledger metask\n", .{});
@@ -2248,6 +2287,8 @@ fn printHelp() void {
         \\metacodes — embeddable agent core and coding CLI
         \\Usage: metacodes [options]
         \\  --version             Print version and build identity and exit (--json: one JSON document)
+        \\  doctor [--json] [--strict]
+        \\                        Report where ripgrep and TinyKG resolve from and whether they match this build
         \\  -p, --print <prompt>  Headless: run one prompt and exit (no REPL)
         \\  -                     Headless: read prompt from stdin
         \\  --json                Headless: emit NDJSON result event

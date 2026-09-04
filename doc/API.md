@@ -134,7 +134,12 @@ versions with the digests the vendored manifests pin for the target, layout).
 `{name, version, commit, dirty, zig, target, optimize, release_layout,
 contract: {binary_abi_version, binary_abi_revision, config_schema_version},
 expected_runtime_assets: [{name, version, sha256}]}`, where `sha256` is null
-when the vendored bundle has no artifact for the target. The flag
+when the vendored bundle has no artifact for the target. `metacodes doctor
+[--json] [--strict]` reports where ripgrep and TinyKG resolve from (`source`:
+`env`, `config`, `adjacent`, `path`, `fallback`), the SHA-256 of each resolved
+file, the digest this build pinned, and `match`; `--json` emits
+`{checks: [{name, resolved_path, sha256, expected_sha256, match, source}]}` and
+`--strict` exits 1 when a binary is unresolved or mismatched. The flag
 surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
 harnesses pass treatment configuration through this surface. Headless

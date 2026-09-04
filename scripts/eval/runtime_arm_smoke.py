@@ -380,6 +380,52 @@ def _version_json_smoke(binary: Path, expected_semver: str, repo_root: Path) -> 
     )
 
 
+def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
+    """`metacodes doctor --json` (#78) reports the TinyKG binary the environment
+    names — the build artifact has no install tree around it here, so the
+    adjacent layout is checked by `verify_install_prefix.py --doctor` on the
+    installed prefix — with a digest matching the pinned one, and `--strict`
+    agrees with its own report."""
+    env = dict(os.environ)
+    env["METACODES_KG_BIN"] = str(tinykg_binary)
+    completed = subprocess.run(
+        [str(binary), "doctor", "--json"],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    _require(completed.returncode == 0, f"doctor --json exited {completed.returncode}: {completed.stderr[:200]}")
+    try:
+        report = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"doctor --json stdout is not JSON: {completed.stdout[:200]!r}") from exc
+    checks = {check.get("name"): check for check in report.get("checks") or []}
+    _require(set(checks) == {"ripgrep", "tinykg"}, f"doctor checks {sorted(checks)!r}")
+    tinykg = checks["tinykg"]
+    _require(
+        tinykg.get("source") == "env" and Path(str(tinykg.get("resolved_path"))).resolve() == tinykg_binary.resolve(),
+        f"doctor tinykg {tinykg!r} did not come from METACODES_KG_BIN",
+    )
+    _require(tinykg.get("match") is True, f"doctor tinykg digest did not match the pinned one: {tinykg!r}")
+    strict = subprocess.run(
+        [str(binary), "doctor", "--strict"],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    healthy = all(
+        check.get("resolved_path") is not None and check.get("match") in (None, True) for check in checks.values()
+    )
+    _require(
+        strict.returncode == (0 if healthy else 1),
+        f"doctor --strict exited {strict.returncode} for a report that is {'healthy' if healthy else 'unhealthy'}",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
@@ -397,6 +443,7 @@ def main() -> int:
 
     _version_output_smoke(binary, args.expected_version)
     _version_json_smoke(binary, args.expected_version, Path(__file__).resolve().parents[2])
+    _doctor_smoke(binary, tinykg_binary)
 
     dumps = {arm: _dump(binary, tinykg_binary, arm) for arm in ARMS}
     for arm, output in dumps.items():

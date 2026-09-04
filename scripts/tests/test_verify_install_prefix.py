@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.verify_install_prefix import check
+from scripts.verify_install_prefix import check, evaluate_doctor
 
 
 class VerifyInstallPrefixTest(unittest.TestCase):
@@ -31,3 +31,28 @@ class VerifyInstallPrefixTest(unittest.TestCase):
     def test_windows_names(self):
         root = self._make(("bin/metacodes.exe", "vendor/tinykg/tinykg.exe", "vendor/tinykg/tinykg.provenance.json"))
         self.assertEqual(check(root), [])
+
+    def test_doctor_report_accepts_the_adjacent_matching_tinykg(self):
+        root = self._make(("bin/metacodes", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        report = {
+            "checks": [
+                {"name": "ripgrep", "resolved_path": "/usr/bin/rg", "sha256": "ab", "expected_sha256": None, "match": None, "source": "path"},
+                {"name": "tinykg", "resolved_path": str(root / "vendor" / "tinykg" / "tinykg"), "sha256": "cd", "expected_sha256": "cd", "match": True, "source": "adjacent"},
+            ]
+        }
+        self.assertEqual(evaluate_doctor(report, root), [])
+
+    def test_doctor_report_names_every_deviation(self):
+        root = self._make(("bin/metacodes", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        report = {
+            "checks": [
+                {"name": "tinykg", "resolved_path": "/elsewhere/tinykg", "sha256": "cd", "expected_sha256": "ef", "match": False, "source": "env"},
+            ]
+        }
+        findings = evaluate_doctor(report, root)
+        self.assertEqual(len(findings), 4)
+        self.assertTrue(any("no ripgrep check" in finding for finding in findings))
+        self.assertTrue(any("not under" in finding for finding in findings))
+        self.assertTrue(any("expected 'adjacent'" in finding for finding in findings))
+        self.assertTrue(any("expected true" in finding for finding in findings))
+        self.assertEqual(evaluate_doctor({"nope": 1}, root), ["doctor: report has no checks array"])
