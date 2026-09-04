@@ -23,6 +23,7 @@ const provider_ids = @import("../provider/ids.zig");
 const provider_oauth = @import("../provider/oauth.zig");
 const provider_profile = @import("../provider/profile.zig");
 const time = @import("../util/time.zig");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const Method = oauth_login.Method;
 
@@ -34,6 +35,8 @@ pub const Options = struct {
     client_id: ?[]const u8 = null,
     port: u16 = oauth_login.DEFAULT_CALLBACK_PORT,
     timeout_seconds: u32 = 300,
+    /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
+    abort_signal: ?*const AbortSignal = null,
 };
 
 /// A stored login for this profile would never be consulted.
@@ -112,6 +115,7 @@ pub const Prepared = struct {
             .open_browser = self.options.open_browser,
             .port = self.options.port,
             .timeout_seconds = self.options.timeout_seconds,
+            .abort_signal = self.options.abort_signal,
             .notify = notify,
         });
         defer {

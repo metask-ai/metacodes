@@ -24,6 +24,7 @@ const INVALID_SOCKET: SOCKET = ~@as(usize, 0);
 const SOCKET_ERROR: i32 = -1;
 // WSAStartup 只往里写、我们从不读,故用定长对齐字节块(避开 x86/x64 字段序差异)。x64 实际 ~408B。
 const WSADATA = extern struct { data: [512]u8 align(8) = undefined };
+const WSAPOLLFD = extern struct { fd: SOCKET, events: i16, revents: i16 };
 
 // 嵌套 namespace:extern 符号名必须是真实 ws2_32 导出名(recv/send/...),但本文件已有同名
 // 中立 wrapper(pub fn recv/send),故放进 `sys` 隔离,符号名不受 zig 侧标识符影响。
@@ -40,6 +41,7 @@ const sys = struct {
     extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) i32;
     extern "ws2_32" fn setsockopt(s: SOCKET, level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
     extern "ws2_32" fn getsockname(s: SOCKET, addr: *anyopaque, addrlen: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn WSAPoll(fdArray: [*]WSAPOLLFD, fds: u32, timeout: i32) callconv(.winapi) i32;
 };
 
 /// 中立 socket 句柄。POSIX=fd(c_int),Windows=SOCKET(UINT_PTR)。
@@ -151,6 +153,22 @@ pub fn acceptConn(listener: Socket) ?Socket {
         const c = std.c.accept(listener, &caddr, &alen);
         if (c < 0) return null;
         return c;
+    }
+}
+
+/// True when `s` has a pending connection (listening socket) or readable
+/// bytes within `timeout_ms`; false on timeout or error. Lets a blocking
+/// accept loop check an AbortSignal between waits without non-blocking sockets.
+pub fn pollReadable(s: Socket, timeout_ms: u32) bool {
+    if (is_windows) {
+        const POLLRDNORM: i16 = 0x0100; // ws2_32 does not export constants in this std
+        var pfd = WSAPOLLFD{ .fd = s, .events = POLLRDNORM, .revents = 0 };
+        const fds: [*]WSAPOLLFD = @ptrCast(&pfd);
+        return sys.WSAPoll(fds, 1, @intCast(timeout_ms)) > 0 and (pfd.revents & POLLRDNORM) != 0;
+    } else {
+        var pfd = std.c.pollfd{ .fd = s, .events = std.c.POLL.IN, .revents = 0 };
+        const fds: [*]std.c.pollfd = @ptrCast(&pfd);
+        return std.c.poll(fds, 1, @intCast(timeout_ms)) > 0 and (pfd.revents & std.c.POLL.IN) != 0;
     }
 }
 
@@ -343,6 +361,17 @@ test "loopback listen/connect/send/recv roundtrip" {
     const n = recv(conn, &buf);
     try testing.expectEqual(@as(isize, 4), n);
     try testing.expectEqualSlices(u8, msg, buf[0..@intCast(n)]);
+}
+
+test "pollReadable tracks pending loopback connection" {
+    const listener = try listenLoopback(0, 4);
+    defer closeSocket(listener.sock);
+    try testing.expect(!pollReadable(listener.sock, 50));
+    const client = try connectLoopback(listener.port);
+    defer closeSocket(client);
+    try testing.expect(pollReadable(listener.sock, 1000));
+    const conn = acceptConn(listener.sock) orelse return error.AcceptFailed;
+    closeSocket(conn);
 }
 
 test "shutdownSocket wakes a blocked accept before close" {

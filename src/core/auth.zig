@@ -21,6 +21,7 @@ const fs_util = @import("../util/fs.zig");
 const time = @import("../util/time.zig");
 const types = @import("../types.zig");
 const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const METASK_API_KEY_ENV = "METASK_API_KEY";
 pub const RUNTIME_API_KEY_FD_ENV = "METACODES_API_KEY_FD";
@@ -354,7 +355,7 @@ pub fn loginWithBrowser(allocator: std.mem.Allocator, opts: BrowserLoginOptions)
         std.debug.print("Could not open browser automatically: {s}\n", .{@errorName(err)});
     };
 
-    const code = try server.waitForAuthorizationCode(allocator, state);
+    const code = try server.waitForAuthorizationCode(allocator, state, null);
     defer secureFree(allocator, code);
     const token_body = try exchangeAuthorizationCode(allocator, code, redirect_uri, pkce.code_verifier);
     defer secureFree(allocator, token_body);
@@ -464,8 +465,10 @@ pub const CallbackServer = struct {
         net.closeSocket(self.sock);
     }
 
-    pub fn waitForAuthorizationCode(self: *CallbackServer, allocator: std.mem.Allocator, expected_state: []const u8) ![]u8 {
+    pub fn waitForAuthorizationCode(self: *CallbackServer, allocator: std.mem.Allocator, expected_state: []const u8, abort_signal: ?*const AbortSignal) ![]u8 {
         while (true) {
+            if (abort_signal) |signal| if (signal.isAborted()) return error.Aborted;
+            if (!net.pollReadable(self.sock, 100)) continue;
             const conn_fd = net.acceptConn(self.sock) orelse return error.AcceptFailed;
             defer net.closeSocket(conn_fd);
             const req = readHttpRequest(allocator, conn_fd) catch {
@@ -1014,4 +1017,59 @@ test "browser authorize URL omits empty scope" {
     defer a.free(url);
     try std.testing.expect(std.mem.indexOf(u8, url, "scope=") == null);
     try std.testing.expect(std.mem.indexOf(u8, url, "code_challenge=challenge") != null);
+}
+
+test "the loopback wait returns the code a valid callback carries" {
+    const a = std.testing.allocator;
+    var server = try CallbackServer.bind(0);
+    defer server.close();
+    const Worker = struct {
+        fn run(port: u16) void {
+            const c = net.connectLoopback(port) catch return;
+            defer net.closeSocket(c);
+            _ = net.send(c, "GET /auth/callback?state=s&code=abc123 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            var b: [256]u8 = undefined;
+            _ = net.recv(c, &b);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{server.port});
+    const code = try server.waitForAuthorizationCode(a, "s", null);
+    defer secureFree(a, code);
+    try std.testing.expectEqualStrings("abc123", code);
+    t.join();
+}
+
+test "the loopback wait stops when the signal aborts" {
+    var server = try CallbackServer.bind(0);
+    defer server.close();
+    var signal = AbortSignal.init();
+    const Worker = struct {
+        fn run(s: *AbortSignal) void {
+            time.sleepMs(50);
+            s.abort(.user_interrupt);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{&signal});
+    try std.testing.expectError(error.Aborted, server.waitForAuthorizationCode(std.testing.allocator, "s", &signal));
+    t.join();
+}
+
+test "the loopback wait keeps serving a wrong-state callback and still aborts" {
+    var server = try CallbackServer.bind(0);
+    defer server.close();
+    var signal = AbortSignal.init();
+    const Worker = struct {
+        fn run(port: u16, s: *AbortSignal) void {
+            const c = net.connectLoopback(port) catch return;
+            defer net.closeSocket(c);
+            _ = net.send(c, "GET /auth/callback?state=wrong&code=x HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            var b: [256]u8 = undefined;
+            _ = net.recv(c, &b);
+            time.sleepMs(50);
+            s.abort(.user_interrupt);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ server.port, &signal });
+    try std.testing.expectError(error.Aborted, server.waitForAuthorizationCode(std.testing.allocator, "s", &signal));
+    t.join();
 }
