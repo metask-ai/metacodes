@@ -1,0 +1,125 @@
+{
+  "schema": "metacodes.doc-facts/v1",
+  "facts": [
+    {
+      "id": "abi_revision",
+      "source": {
+        "file": "sdk/zig/types.zig",
+        "regex": "pub const ABI_REVISION: u32 = (\\d+);"
+      },
+      "assert_in": [
+        {
+          "file": "sdk/metask/agentcore.h",
+          "regex": "#define METASK_AGENTCORE_ABI_REVISION (\\d+)u"
+        },
+        {
+          "file": "README.md",
+          "regex": "AgentCore C ABI v1 revision (\\d+)"
+        },
+        {
+          "file": "ROADMAP.md",
+          "regex": "verified at revision (\\d+)"
+        },
+        {
+          "file": "sdk/README.md",
+          "regex": "C ABI v1 revision (\\d+)"
+        },
+        {
+          "file": "doc/API.md",
+          "regex": "experimental rev (\\d+)"
+        },
+        {
+          "file": "doc/API.md",
+          "regex": "ABI revision (\\d+)"
+        },
+        {
+          "file": "doc/AGENTCORE_BINARY_ABI.md",
+          "regex": "is \\*\\*ABI v1 revision (\\d+)\\*\\*"
+        },
+        {
+          "file": "doc/AGENTCORE_BINARY_ABI.md",
+          "regex": "abi_revision == (\\d+)"
+        },
+        {
+          "file": "doc/AGENTCORE_BINARY_ABI.md",
+          "regex": "\\| `abi_revision` \\| exactly (\\d+) \\|"
+        },
+        {
+          "file": "doc/LIB_API.md",
+          "regex": "ABI v1 revision (\\d+)"
+        },
+        {
+          "file": "doc/LIB_API.md",
+          "regex": "AgentCore v1 revision (\\d+)"
+        },
+        {
+          "file": "doc/LIB_API.md",
+          "regex": "^revision (\\d+) 只有一个"
+        },
+        {
+          "file": "doc/PLUGIN_ARCHITECTURE.md",
+          "regex": "AgentCore v1 revision (\\d+)"
+        },
+        {
+          "file": "doc/PLUGIN_ARCHITECTURE.md",
+          "regex": "ABI v1 revision (\\d+)"
+        },
+        {
+          "file": "doc/PLUGIN_PROCESS_PROTOCOL.md",
+          "regex": "AgentCore ABI revision (\\d+)"
+        },
+        {
+          "file": "doc/PLUGIN_EVALUATION.md",
+          "regex": "AgentCore v1 revision (\\d+)、CLI"
+        }
+      ]
+    },
+    {
+      "id": "cli_version",
+      "source": {
+        "file": "build.zig.zon",
+        "regex": "\\.version = \"([^\"]+)\""
+      },
+      "assert_in": [
+        {
+          "file": "src/version.zig",
+          "regex": "pub const semver = \"([^\"]+)\";"
+        }
+      ]
+    },
+    {
+      "id": "tinykg_version",
+      "source": {
+        "file": "deps/tinykg.json",
+        "json": "tinykg_version"
+      },
+      "assert_in": [
+        {
+          "file": "doc/TINYKG_INTEGRATION.md",
+          "regex": "TinyKG CLI version ([0-9.]+)"
+        },
+        {
+          "file": "doc/TINYKG_INTEGRATION.md",
+          "regex": "`tinykg ([0-9.]+)` version marker"
+        },
+        {
+          "file": "THIRD_PARTY_NOTICES.md",
+          "regex": "\\| TinyKG ([0-9.]+) \\|"
+        }
+      ]
+    },
+    {
+      "id": "ripgrep_version",
+      "source": {
+        "file": "vendor/ripgrep/manifest.json",
+        "json": "upstream_release"
+      },
+      "assert_in": [
+        {
+          "file": "THIRD_PARTY_NOTICES.md",
+          "regex": "\\| ripgrep ([0-9.]+) \\|"
+        }
+      ]
+    }
+  ]
+}

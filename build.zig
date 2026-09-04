@@ -1523,6 +1523,27 @@ pub fn build(b: *std.Build) void {
     );
     audit_test_step.dependOn(&audit_test_cmd.step);
     test_step.dependOn(&audit_test_cmd.step);
+    const doc_check_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/check_doc_links.py",
+    });
+    const doc_facts_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/check_doc_facts.py",
+    });
+    const doc_check_step = b.step("doc:check", "Check documentation links and facts");
+    doc_check_step.dependOn(&doc_check_cmd.step);
+    doc_check_step.dependOn(&doc_facts_cmd.step);
+    const doc_facts_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_check_doc_facts",
+        "-v",
+    });
+    const doc_facts_test_step = b.step("test:doc-facts", "Test documentation fact checks");
+    doc_facts_test_step.dependOn(&doc_facts_test_cmd.step);
+    test_step.dependOn(&doc_facts_test_cmd.step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
