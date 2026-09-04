@@ -12,9 +12,5 @@ Describe the user-visible result and why this boundary is the right one.
 
 ## Evidence
 
-- [ ] Declaration, wiring, and L2 behavior are all covered
-- [ ] `zig build test:lib -Doptimize=ReleaseSafe`
-- [ ] `zig build test -Doptimize=ReleaseSafe`
-- [ ] `scripts/test_coverage_audit.sh`
-- [ ] No paid/model-backed evaluation was run without explicit authorization
-- [ ] No secrets, personal paths, stores, generated runs, or binaries were added
+- [ ] 已执行 AGENTS.md 提交前清单(粘贴 `zig build gate:pr` 尾部 Build Summary)
+- [ ] 无付费评测 / 无密钥 / 无二进制

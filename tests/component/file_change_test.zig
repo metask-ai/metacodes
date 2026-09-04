@@ -2,7 +2,7 @@
 //! tools actually made — path, kind, outcome, and the change itself — without
 //! reading `tool_result.content`.
 //!
-//! Requirement: `doc/frommetawork/CORE_FILE_CHANGE_OBSERVABILITY_REQUIREMENT.md`.
+//! Requirement: `doc/history/inbound/CORE_FILE_CHANGE_OBSERVABILITY_REQUIREMENT.md`.
 //! Its acceptance criterion is exactly that: "真实 Run 执行后,上层能够获取并展示每个
 //! 文件的实际修改,无需解析 tool_result.content 中的工具私有格式". Every assertion below
 //! is therefore made against the `file_change` contract only; the tests never

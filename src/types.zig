@@ -95,7 +95,7 @@ pub const Config = struct {
     serve_port: ?u16 = null,
     /// **U10-C:`serve --sessions N`**:daemon 宿主的静态 session 数(默认 1=单 session serve)。
     /// >1 → serveMulti(N 个独立 App/journal/driver,WebServer resolver 按 /s/<id>/* 路由)。静态 N,
-    /// 无 dynamic create/destroy(见 doc/U9_U10_DAEMON_TIER_DESIGN.md §4/§5)。
+    /// 无 dynamic create/destroy(见 doc/history/U9_U10_DAEMON_TIER_DESIGN.md §4/§5)。
     serve_sessions: usize = 1,
     /// **U10-B:`serve --uds <path>`**:daemon 附加一条 UDS+NDJSON 本地绑定(gui/语音 UI 首选,与 web
     /// 并存)。非 null 即启用(强制走 serveMulti,即便 N=1)。POSIX only(Windows 走 web)。null=不启用。

@@ -695,6 +695,7 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
 
 ## 7. 已知约束与边界(诚实清单)
 
+- **tree-sitter 已移除**(2026-07-13):不再有对应文档;`doc/TREE_SITTER.md` 已删除,历史见 git。
 - **剩余进程全局态**:`core/answer_queue.zig`(headless 应答兜底)、`core/recorder.zig`
   (record-replay 测试)仍是进程全局。**非多租户路径**——真要并发多租户 IM 服务前,需 session
   化 answer_queue(参考权限模块 M2 的全局态搬迁手法)。其余 session 态已 per-instance。
@@ -741,6 +742,6 @@ zig build example         # 跑 example/ 最小前端(真端点;离线见 LIB_AP
 
 - 第三方 AgentCore 二进制接入:`doc/LIB_API.md`
 - 最小前端示例:`example/main.zig`(`zig build example`)
-- 多 session 设计:metaknow scope metask_business `MULTI_SESSION_REFACTOR`
+- 多 session 设计:`doc/history/MULTI_SESSION_REFACTOR.md`(历史快照;metaknow scope metask_business `MULTI_SESSION_REFACTOR`)
 - 设计文档总入口:metaknow scope `metask_business`(PLAN/SUBAGENT/PERMISSION/TOOLS 等根)
 - 操作命令/API 规范:`doc/API.md`

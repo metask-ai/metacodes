@@ -12,6 +12,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- `THIRD_PARTY_NOTICES.md` is rendered by `scripts/gen_third_party_notices.py`
+  from the dependency manifests (ripgrep, TinyKG, highlight-zig, the Lean
+  toolchain) plus `release/notices.static.md`; `--check` fails with a diff when
+  the committed file is stale, as `zig build release:notices` (part of
+  `doc:check`) and a Linux CI step. The rows now carry the pinned commits and
+  upstream revision. Stage 1 of #47.
+
+- The pre-submit checklist has one source, AGENTS.md "Before submitting":
+  `zig build gate:pr` runs it, `CONTRIBUTING.md` and the pull-request template
+  point at it instead of repeating it, and `scripts/tests/test_gate_manifest.py`
+  asserts that every checklist command has a CI step (CI gained the
+  `git diff --check` step it lacked). Stage 1 of #47.
+
 - `/login <provider> [--device-code] [--no-browser] [--client-id <client>]`
   in the REPL runs the kernel OAuth flow and stores the login where
   `metacodes login --provider` does. Both entry points share
@@ -70,6 +83,18 @@ status, compatibility boundaries, and entry points are defined by
   separately in #65.
 
 ### Changed
+
+- Embedding AgentCore is described once: `doc/LIB_API.md` §3/§4 and the
+  AgentCore section of `doc/API.md` keep a lead-in and the fact-gated
+  sentences and point at `doc/AGENTCORE_BINARY_ABI.md`; `README.md` points at
+  `sdk/README.md` for the bundle and gate commands. Stage 1 of #47.
+
+- Superseded design documents (the revision-14 plugin ABI plan, the MCP
+  transport hard-cut, the multi-session refactor, the DeepSeek harness analysis,
+  the U2 and U9/U10 designs) and the inbound requirements formerly under
+  `doc/frommetawork/` now live under `doc/history/`: records, not contracts,
+  outside `release/doc_facts.json`. `doc/TREE_SITTER.md` is deleted (the feature
+  was removed on 2026-07-13). Stage 1 of #47.
 
 - `ReadArtifact` recovery reads are bounded per turn. Recovery results stay
   exempt from projection (spilling one would recurse), so nothing could trim

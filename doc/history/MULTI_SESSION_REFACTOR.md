@@ -2,7 +2,7 @@
 
 > 历史设计快照。当前源码已经实现 `agent_session.AgentRuntime`、
 > `RuntimeHost` 与 per-Session 生命周期；本文的“当前架构”段落不应当作为现状判断。
-> 现行接口请看 [CORE_REFERENCE](CORE_REFERENCE.md) 和 [LIB_API](LIB_API.md)。
+> 现行接口请看 [CORE_REFERENCE](../CORE_REFERENCE.md) 和 [LIB_API](../LIB_API.md)。
 
 > 目标：把 cc-zig (metacodes-core) 从"单进程单 Session、会话隐含在调用栈"重构为"单进程多 Session、会话显式"，以支撑未来 GUI 产品（一个进程多个并发会话，各有独立 UI 视图）。TUI 行为必须零回归（TUI 是多 Session 架构下"N=1"的特例）。
 

@@ -21,6 +21,9 @@ concurrency:
 jobs:
   gates:
     name: Gates (${{ matrix.os }})
+    # This job's steps are a superset of the AGENTS.md "Before submitting"
+    # checklist; scripts/tests/test_gate_manifest.py asserts that every checklist
+    # command has a step here, so the two cannot drift apart silently.
     timeout-minutes: 30
     # Self-hosted isolation guard: never schedule fork-PR code onto the
     # persistent self-hosted runners. Same-repo PRs, pushes to main, and
@@ -167,13 +170,22 @@ jobs:
       - name: Documentation link check
         if: runner.os == 'Linux'
         run: python3 scripts/check_doc_links.py
+      - name: Third-party notices check
+        if: runner.os == 'Linux'
+        run: python3 scripts/gen_third_party_notices.py --check
       - name: Documentation fact check
         if: runner.os == 'Linux'
         run: python3 scripts/check_doc_facts.py
       - name: Documentation fact-check unit tests
         run: python3 -m unittest scripts.tests.test_check_doc_facts -v
+      - name: Third-party notices unit tests
+        run: python3 -m unittest scripts.tests.test_gen_third_party_notices -v
+      - name: Gate manifest unit tests
+        run: python3 -m unittest scripts.tests.test_gate_manifest -v
       - name: Python floor unit tests
         run: python3 -m unittest scripts.tests.test_python_floor -v
+      - name: Diff whitespace check
+        run: git diff --check
 
   windows-gates:
     name: Gates (Windows)
