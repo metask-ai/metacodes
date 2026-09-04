@@ -38,6 +38,21 @@ jobs:
           - os: macOS
             arch: ARM64
     runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}"]
+    # One physical runner per platform is shared by jobs from different
+    # workflows (AgentCore Windows compiles at -j12 while this job runs the
+    # full suite; issue #52 suggestion 3). GitHub runs at most one job per
+    # concurrency group, so heavy jobs queue behind each other instead of
+    # overlapping on the same box, which is the load that made timing-
+    # sensitive L2 tests flake (#51/#52). GitHub also cancels an *older*
+    # pending job when a newer one joins the group, so pushes to main get
+    # their own bucket: a PR push can never cancel a waiting main run.
+    # rule-control stays outside these groups on purpose: it is dispatch-
+    # only and runs for up to two hours, and that pending-cancel rule would
+    # let a PR push cancel a release gate a maintainer is waiting for; its
+    # isolation is the dedicated-runner item in ROADMAP M1.
+    concurrency:
+      group: runner-${{ matrix.os }}-${{ matrix.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -138,7 +153,11 @@ jobs:
           # so a missing/mislocated ProjectRule.olean is a regression, not an
           # environment gap: fail instead of skip.
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
-        run: zig build test
+        # --test-timeout 5m: the build runner watchdog between tests is
+        # max(--test-timeout, 60s); same value as the Windows leg and the
+        # AgentCore gate, so a wedged test on a loaded runner is reported
+        # instead of eating the job timeout.
+        run: zig build test --test-timeout 5m
       - name: ReleaseSafe core gate
         if: runner.os == 'Linux'
         run: zig build test:lib -Doptimize=ReleaseSafe
@@ -157,6 +176,11 @@ jobs:
     # Self-hosted isolation guard; see the `gates` job.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64]
+    # Same runner-serialization group as AgentCore Windows; see the `gates`
+    # job for the semantics.
+    concurrency:
+      group: runner-Windows-X64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
