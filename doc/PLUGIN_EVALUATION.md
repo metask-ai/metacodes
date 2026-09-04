@@ -338,7 +338,7 @@ tokens，低于用户 US$1,000 总上限。尚未运行外部 WorkBuddy。
 
 | 集合 | 字段 | 钉的是什么 | 谁校验、何时 |
 |---|---|---|---|
-| **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头**一次读取**协议字节:运行用的对象与 receipt 携带的哈希出自同一份字节;随后把捕获的 git HEAD 用 `git archive` 物化到私有临时目录,每一条 pin 都在那棵树里哈希、每个子进程都在那棵树里运行,活树无法触达它——这就是 #49 关掉的"改了又改回"(ABA)缺口;钉住输入在工作树里有未提交修改时开头即拒绝,因为 receipt 记的是 HEAD;写 receipt 前要求协议文件仍是这份字节、这份字节仍对物化树通过完整严格校验(子进程若改了 checkout 会被发现)、活仓库 HEAD 未变。runtime binary 与 DeepSeek Harness checkout 仍是外部输入,分别按哈希与 commit 证明)、`plugin_pair_runner.build_plan`,以及 freeze、`run_paid_pair` 起点与每次请求前后、`plugin_pair_analysis.analyze` 共用的同一次观测 `_observe`(§7.1)。它们与 `run_gate` 一样经 `validate_protocol_payload`(哈希自己校验过的那份字节),但仍观测活树(#61)。没有布尔开关,严格是**构造出来的** |
+| **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头**一次读取**协议字节:运行用的对象与 receipt 携带的哈希出自同一份字节;随后把捕获的 git HEAD 用 `git archive` 物化到私有临时目录,每一条 pin 都在那棵树里哈希、每个子进程都在那棵树里运行,活树无法触达它——这就是 #49 关掉的"改了又改回"(ABA)缺口;钉住输入在工作树里有未提交修改时开头即拒绝,因为 receipt 记的是 HEAD;写 receipt 前要求协议文件仍是这份字节、这份字节仍对物化树通过完整严格校验(子进程若改了 checkout 会被发现)、活仓库 HEAD 未变。runtime binary 与 DeepSeek Harness checkout 仍是外部输入,分别按哈希与 commit 证明)、`plugin_pair_runner.build_plan`,以及 freeze、`run_paid_pair` 起点与每次请求前后、`plugin_pair_analysis.analyze` 共用的同一次观测 `_observe`(§7.1)。它们与 `run_gate` 走同一条路(#61):`materialized_source_tree` 开头**一次读取**协议字节、钉住输入在工作树里有未提交修改即拒绝、把活仓库的 HEAD 用 `git archive` 物化到私有临时目录,freeze、`run_paid_pair` 的起点与每次请求前后、`plugin_pair_analysis.analyze` 全在那棵树里观测,wrapper、场景与候选也在那棵树里执行;活树只提供 HEAD 身份(物化目录不是 git 仓库)。harness 把 run 目录写在那棵树的 `tests/e2e/runs` 下;runner 在导入证据之前把它移到输出目录的 `runs/` 下,证据不随临时树消失。没有布尔开关,严格是**构造出来的** |
 | **评测器** | `pinned_evaluator_files` | 做测量与判定的代码(gate、runner、analysis、e2e 脚本、门禁阈值)以及 Lean 形式化证据(它们由 CI 单独编译、被评测脚本消费,**不链接进运行时二进制**) | **每次加载**都校验,包括日常测试;**永远不由工具自动 repin**——一个门禁给自己的代码重钉哈希是自证漏洞(c7c2aa9) |
 | **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.root` + `candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件。`candidate.root` 下的文件集合必须**恰好**等于 `candidate.files`,目录集合恰好等于这些文件蕴含的父目录,无符号链接、无可执行位、无特殊文件:哈希证明钉住的文件还是原样,集合相等证明它们就是全部——否则在被钉 Skill 旁边放一个文件、加一个空目录或 `chmod +x` 都不需要改协议,而运行时把目录名和可执行位哈希进 Skill 身份(`computeContentRevision`),任何 pin、指纹或清单字段都不会察觉 | 每次加载都校验 |
 
@@ -387,18 +387,19 @@ OS 补丁也会触发它——重新冻结是一个要看着 diff 做的动作,�
 用户 authority 升到 `metacodes.plugin-paid-authority/v2`,在 v1 字段之上**必须**携带
 `manifest_sha256`:用户签的是这份清单,而不只是协议。
 
-`run_paid_pair` 的顺序是**先校验清单、再打开 authority**:对着活树重算每一个字段
-(`_observe`:协议字节只读一次,解析与哈希出自同一份字节),任何一项不等即以
+`run_paid_pair` 的顺序是**先物化、再校验清单、再打开 authority**:对着物化的 HEAD 重算每一个字段
+(`_observe`:协议字节只读一次,解析与哈希出自同一份字节;#61),任何一项不等即以
 `frozen-run manifest drifted: <全部不等字段>` 拒绝,此时 authority 文件根本没有被打开;
 随后要求 authority 的 `manifest_sha256` 等于校验通过的清单哈希。
 
 **每次 provider 请求前后各做一次同样的整体校验**(`_require_still_frozen`,错误尾缀
-`(before request)` / `(after request)`),而不是只重载磁盘上的协议:一份冻结之后被改写又
+`(before request)` / `(after request)`;它先要求操作者的协议文件仍是开头读取的那份字节——运行从不再读它,
+但它被改写就是停下的理由,与 `run_gate` 写 receipt 前的要求相同),而不是只重载磁盘上的协议:一份冻结之后被改写又
 自洽 repin 的协议(换掉候选 Skill、更新它的哈希)能通过严格加载,却通不过与清单的逐字段
 比对。请求后的校验发生在导入该次证据之前;未通过则该笔交易停留在 `request_authorized`、
 没有 checkpoint,续跑被既有的孤儿交易规则挡住,不会隐式重付。括号内"改了又改回"的变动
-在付费路径上仍然看不见:`run_gate` 已改为在物化 checkout 里运行(#49),`run_paid_pair` 的
-前后观测与 rollout 仍消费活树,见 #61。
+在付费路径上也无处下手:与 `run_gate`(#49)一样,`run_paid_pair` 的前后观测与 rollout 都
+消费物化的 HEAD,请求期间对活树的替换与还原不被任何一步读到(#61)。
 
 清单哈希进入预算日志的 `BudgetAuthority`(其 `manifest_sha256` 由 `_authority_manifest`
 唯一构造:协议哈希、运行时、wrapper、inventory、revision、冻结清单哈希、授权总额)和每条

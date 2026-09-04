@@ -992,3 +992,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# Public aliases retained alongside historical private names.
+git_head = _git_head
+materialize_head = _materialize_head
+require_clean_pinned_inputs = _require_clean_pinned_inputs
