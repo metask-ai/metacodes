@@ -847,7 +847,10 @@ test "stream projector rejects over-ceiling result when publication fails" {
     var committed = try testCommitSealed(allocator, &outcome.result);
     defer committed.deinit(allocator);
     try std.testing.expect(committed.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, committed.content, "ArtifactPublishFailed") != null);
+    // `ArtifactPublishFailed` renders as the `io_error` tool error whose detail
+    // names the boundary.
+    try std.testing.expect(std.mem.indexOf(u8, committed.content, "\"io_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, committed.content, "failed at the batch commit boundary") != null);
 }
 
 test "stream projector publishes only a large successful result range" {
