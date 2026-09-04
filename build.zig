@@ -1544,6 +1544,27 @@ pub fn build(b: *std.Build) void {
     const doc_facts_test_step = b.step("test:doc-facts", "Test documentation fact checks");
     doc_facts_test_step.dependOn(&doc_facts_test_cmd.step);
     test_step.dependOn(&doc_facts_test_cmd.step);
+    const gate_manifest_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_gate_manifest",
+        "-v",
+    });
+    const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
+    gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
+    test_step.dependOn(&gate_manifest_test_cmd.step);
+    const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true });
+    const gate_coverage = if (@import("builtin").os.tag == .windows)
+        b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
+    else
+        b.addSystemCommand(&.{"scripts/test_coverage_audit.sh"});
+    const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
+    gate_pr_step.dependOn(&gate_fmt.step);
+    gate_pr_step.dependOn(test_step);
+    gate_pr_step.dependOn(core_test_step);
+    gate_pr_step.dependOn(&gate_coverage.step);
+    gate_pr_step.dependOn(doc_check_step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)

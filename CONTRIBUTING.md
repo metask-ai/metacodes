@@ -13,13 +13,8 @@ evidence-backed changes over broad compatibility promises.
 
 ## Development
 
-Use the Zig version declared in `build.zig.zon` and CI. Build with:
-
-```sh
-zig build
-zig build test:lib
-zig build test
-```
+Use the Zig version declared in `build.zig.zon` and CI; follow the "Before submitting"
+checklist in [AGENTS.md](AGENTS.md), or run `zig build gate:pr`, which runs it.
 
 TinyKG-dependent work uses the native checked-in bundle by default. Follow the
 manual binary contract in [doc/TINYKG_INTEGRATION.md](doc/TINYKG_INTEGRATION.md)
@@ -36,8 +31,6 @@ consumer fixtures in the same pull request as an API change.
 - Add tests for failures and illegal-state rejection, not only the happy path.
 - Note prompt-cache effects explicitly: unchanged, intentionally invalidated, or
   unknown and therefore blocked.
-- Run `git diff --check`, formatting, ReleaseSafe tests proportional to risk, and
-  `scripts/test_coverage_audit.sh`.
 - Do not include credentials, personal absolute paths, generated benchmark runs,
   local stores, or compiled binaries. The reviewed TinyKG assets declared by
   `vendor/tinykg/manifest.json` are the only binary exception.

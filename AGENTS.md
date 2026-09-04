@@ -34,11 +34,18 @@ Before submitting:
 ```sh
 zig fmt --check build.zig src tests
 zig build test:lib -Doptimize=ReleaseSafe
-zig build test -Doptimize=ReleaseSafe
+zig build test
 scripts/test_coverage_audit.sh
 python3 scripts/check_doc_links.py
+python3 scripts/check_doc_facts.py
 git diff --check
 ```
+
+`zig build gate:pr` runs this list. CI runs the same commands (the full suite in
+Debug, the core suite in ReleaseSafe; `scripts/tests/test_gate_manifest.py`
+asserts every command above has a CI step), so this block is the single source.
+Run the full suite with `-Doptimize=ReleaseSafe` as well when a change touches
+unsafe code or an ABI.
 
 The native bundled TinyKG is wired into tests by default. Supply
 `-Dtinykg-bin` and `-Dtinykg-sha256` together only to audit an explicit override.

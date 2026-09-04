@@ -2,6 +2,8 @@
 
 Start here rather than reading design ledgers chronologically.
 
+Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
+
 ## Supported contracts
 
 - [API overview](API.md) — supported entry points, ownership, and compatibility.

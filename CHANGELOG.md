@@ -12,6 +12,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- The pre-submit checklist has one source, AGENTS.md "Before submitting":
+  `zig build gate:pr` runs it, `CONTRIBUTING.md` and the pull-request template
+  point at it instead of repeating it, and `scripts/tests/test_gate_manifest.py`
+  asserts that every checklist command has a CI step (CI gained the
+  `git diff --check` step it lacked). Stage 1 of #47.
+
 - `/login <provider> [--device-code] [--no-browser] [--client-id <client>]`
   in the REPL runs the kernel OAuth flow and stores the login where
   `metacodes login --provider` does. Both entry points share
