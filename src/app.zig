@@ -10,6 +10,7 @@ const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const platform_paths = @import("platform").paths;
 const sync = @import("platform").sync;
+const login_worker = @import("api/login_worker.zig");
 
 /// **U5 B1:slice-safe snapshot 发布缓存(A')**。UAF-critical、运行时会 free+reassign 的 slice
 /// 字段(model/dirs)的 owned dup，mutex 守护。核心不变式：这些 slice 的 free+reassign（driver 侧
@@ -269,6 +270,9 @@ pub const App = struct {
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
     model_picker: model_picker_mod.Picker = undefined,
+    /// The sign-in the picker's credential stage is running (#67); owned
+    /// here because it outlives any one key press.
+    login_worker: ?*login_worker.LoginWorker = null,
     /// Strings a committed offer put into borrowing client fields. Owned here
     /// because `Client.base_url` and `api_key` are borrowed slices that must
     /// outlive every in-flight request.
@@ -966,6 +970,12 @@ pub const App = struct {
             app.allocator.free(tok);
         }
         app.api_key_catalog.deinit();
+        if (app.login_worker) |worker| {
+            worker.cancel();
+            worker.join();
+            app.allocator.destroy(worker);
+            app.login_worker = null;
+        }
         app.model_picker.deinit();
         if (app.oauth_session) |*session| session.deinit();
         if (app.provider_host) |host| host.destroy();

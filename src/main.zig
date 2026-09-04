@@ -52,6 +52,7 @@ pub const kg_provider_audit = @import("kg/provider_audit.zig");
 pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_oauth_login = @import("api/oauth_login.zig");
 pub const api_provider_login = @import("api/provider_login.zig");
+pub const api_login_worker = @import("api/login_worker.zig");
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
 pub const api_catalog_fetch = @import("api/catalog_fetch.zig");
 pub const api_capability = @import("api/capability.zig");

@@ -12,6 +12,7 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+<<<<<<< HEAD
 - `metacodes --version` prints the build identity after its unchanged first
   line, and `--version --json` emits it as one document: commit and dirty
   state, Zig, target, optimize mode, release layout, AgentCore ABI version and
@@ -24,6 +25,15 @@ status, compatibility boundaries, and entry points are defined by
   and TinyKG resolve from and whether their digests match the pinned ones;
   `verify_install_prefix.py --doctor` runs it on the installed prefix in CI
   (#78, #47 stage 3).
+=======
+- The model picker signs in without leaving the overlay (#67): a commit that
+  fails for want of a credential on an OAuth-capable provider runs the kernel
+  login on a worker thread, draws the authorization URL or device code in the
+  picker, cancels on `Esc`, and commits the chosen route once the login lands.
+  The OAuth loopback wait and the device-code poll honour an `AbortSignal`
+  (`platform/net.pollReadable`), so a login abandoned in the TUI no longer
+  blocks until its timeout.
+>>>>>>> a7437443 (picker: sign in without leaving the overlay (#67))
 
 ### Changed
 

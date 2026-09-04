@@ -35,7 +35,10 @@ pub const MAX_FILTER: usize = 64;
 /// truncated for grouping only and never for routing.
 pub const MAX_GROUP_KEY: usize = 128;
 
-pub const Stage = enum { provider, model, offer, options };
+pub const Stage = enum { provider, model, offer, options, credential };
+
+/// What the credential stage can show of the flow's transcript.
+pub const MAX_CREDENTIAL_LINES: usize = 512;
 
 /// What the list is showing right now. `stale` and `failed` are states a client
 /// must be able to render: a picker that silently shows an out-of-date catalog
@@ -75,6 +78,11 @@ pub const Outcome = union(enum) {
     ignored,
     closed,
     commit: Commit,
+    /// The commit needs a credential the provider can be signed in for:
+    /// the host starts that login and the picker shows it (#67).
+    login: Slug,
+    /// Esc in the credential stage: the host aborts the running login.
+    cancel_login,
 };
 
 pub const Key = union(enum) {
@@ -113,6 +121,15 @@ pub const Picker = struct {
     /// the picker so the host never has to keep a matching allocation alive.
     notice_buffer: [160]u8 = undefined,
     notice_len: usize = 0,
+    /// The credential stage (#67): the commit that wanted a credential, the
+    /// provider being signed in to, where Esc returns, and the flow's
+    /// transcript (a bounded copy the host refreshes on its idle tick).
+    pending_commit: ?Commit = null,
+    credential_provider: ?Slug = null,
+    credential_return_stage: Stage = .model,
+    credential_failed: bool = false,
+    credential_lines: [MAX_CREDENTIAL_LINES]u8 = undefined,
+    credential_lines_len: usize = 0,
 
     provider: ?Slug = null,
     group_key_buffer: [MAX_GROUP_KEY]u8 = undefined,
@@ -209,6 +226,65 @@ pub const Picker = struct {
         self.offer_id = null;
         self.controls = .{};
         self.scope = .session;
+        self.pending_commit = null;
+        self.credential_provider = null;
+        self.credential_return_stage = .model;
+        self.credential_failed = false;
+        self.credential_lines_len = 0;
+    }
+
+    /// A commit the host could not perform for want of a credential (#67):
+    /// remember it, and show the sign-in the host starts in place of the list.
+    pub fn enterCredentialStage(self: *Picker, provider: Slug, commit: Commit) Outcome {
+        self.pending_commit = commit;
+        self.credential_provider = provider;
+        self.credential_return_stage = self.stage;
+        self.credential_failed = false;
+        self.credential_lines_len = 0;
+        self.notice_len = 0;
+        self.stage = .credential;
+        self.cursor = 0;
+        self.window_top = 0;
+        return .{ .login = provider };
+    }
+
+    /// The flow's transcript so far (bounded copy). True when it changed, so
+    /// the host redraws only then.
+    pub fn setCredentialLines(self: *Picker, text: []const u8) bool {
+        const len = @min(text.len, self.credential_lines.len);
+        if (len == self.credential_lines_len and std.mem.eql(u8, self.credential_lines[0..len], text[0..len])) return false;
+        @memcpy(self.credential_lines[0..len], text[0..len]);
+        self.credential_lines_len = len;
+        return true;
+    }
+
+    pub fn credentialLines(self: *const Picker) []const u8 {
+        return self.credential_lines[0..self.credential_lines_len];
+    }
+
+    /// The login ended without a credential; the stage stays so the user can
+    /// read why, and Esc returns without a further notice.
+    pub fn credentialFailed(self: *Picker, error_name: []const u8) void {
+        self.credential_failed = true;
+        self.setNotice("sign-in failed ({s}); Esc returns to the route list", .{error_name});
+    }
+
+    /// After the login landed: the commit to retry, with the picker back on
+    /// the stage the user came from.
+    pub fn takePendingCommit(self: *Picker) ?Commit {
+        const commit = self.pending_commit;
+        self.leaveCredentialStage();
+        return commit;
+    }
+
+    fn leaveCredentialStage(self: *Picker) void {
+        self.stage = self.credential_return_stage;
+        self.pending_commit = null;
+        self.credential_provider = null;
+        self.credential_failed = false;
+        self.credential_lines_len = 0;
+        self.cursor = 0;
+        self.window_top = 0;
     }
 
     // ── row construction ────────────────────────────────────────────────────
@@ -223,6 +299,7 @@ pub const Picker = struct {
             .model => self.modelRows(out),
             .offer => self.offerRows(out),
             .options => self.controlRows(out),
+            .credential => out[0..0],
         };
     }
 
@@ -338,6 +415,9 @@ pub const Picker = struct {
     // ── key handling ────────────────────────────────────────────────────────
 
     pub fn onKey(self: *Picker, key: Key) Outcome {
+        // The credential stage has no list to move in and nothing to type:
+        // only Esc, which ends the sign-in.
+        if (self.stage == .credential) return if (key == .escape) self.back() else .ignored;
         var scratch: [MAX_ROWS]Row = undefined;
         const visible = self.rows(&scratch);
         switch (key) {
@@ -454,6 +534,13 @@ pub const Picker = struct {
                 if (self.stage == .model) self.group_key_len = 0;
                 self.offer_id = null;
                 self.controls = .{};
+            },
+            .credential => {
+                // Esc ends the sign-in: the host aborts the worker on
+                // `.cancel_login`; the draft route stays selectable.
+                if (self.credential_failed) self.notice_len = 0 else self.setNotice("sign-in cancelled; the previous route is still active", .{});
+                self.leaveCredentialStage();
+                return .cancel_login;
             },
         }
         self.cursor = 0;
@@ -1041,4 +1128,76 @@ test "the provider stage is searchable by what a provider serves" {
     picker.restart();
     for ("metask") |byte| _ = picker.onKey(.{ .char = byte });
     try testing.expectEqual(@as(usize, 1), picker.rows(&scratch).len);
+}
+
+test "a commit refused for want of a credential enters the credential stage and Esc brings it back" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
+    };
+    try loadFixture(&picker, &offers, null);
+    _ = picker.onKey(.enter); // provider
+    const outcome = picker.onKey(.enter); // one route → commit
+    try testing.expect(outcome == .commit);
+    const came_from = picker.stage;
+
+    const login = picker.enterCredentialStage(Slug.lit("metask"), outcome.commit);
+    try testing.expect(login == .login);
+    try testing.expect(login.login.eqlText("metask"));
+    try testing.expectEqual(Stage.credential, picker.stage);
+    var scratch: [Picker.MAX_ROWS]Row = undefined;
+    try testing.expectEqual(@as(usize, 0), picker.rows(&scratch).len);
+    try testing.expect(picker.onKey(.down) == .ignored);
+    try testing.expect(picker.onKey(.{ .char = 'q' }) == .ignored);
+    try testing.expect(picker.onKey(.enter) == .ignored);
+    try testing.expectEqual(Stage.credential, picker.stage);
+
+    const transcript = "Open this URL to authorize:\nhttps://example.test/authorize?state=s\n";
+    try testing.expect(picker.setCredentialLines(transcript));
+    try testing.expect(!picker.setCredentialLines(transcript));
+    try testing.expectEqualStrings(transcript, picker.credentialLines());
+
+    try testing.expect(picker.onKey(.escape) == .cancel_login);
+    try testing.expectEqual(came_from, picker.stage);
+    try testing.expect(picker.pending_commit == null);
+    try testing.expectEqual(@as(usize, 0), picker.credentialLines().len);
+    try testing.expect(std.mem.indexOf(u8, picker.notice(), "sign-in cancelled") != null);
+}
+
+test "a landed login hands the pending commit back and restores the stage" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
+    };
+    try loadFixture(&picker, &offers, null);
+    _ = picker.onKey(.enter);
+    const outcome = picker.onKey(.enter);
+    const came_from = picker.stage;
+    _ = picker.enterCredentialStage(Slug.lit("metask"), outcome.commit);
+
+    const taken = picker.takePendingCommit() orelse return error.NoPendingCommit;
+    try testing.expect(taken.offer_id.eql(outcome.commit.offer_id));
+    try testing.expectEqual(came_from, picker.stage);
+    try testing.expect(picker.takePendingCommit() == null);
+    try testing.expectEqual(@as(usize, 0), picker.notice_len);
+}
+
+test "a failed sign-in explains itself and Esc then leaves no notice" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
+    };
+    try loadFixture(&picker, &offers, null);
+    _ = picker.onKey(.enter);
+    const outcome = picker.onKey(.enter);
+    _ = picker.enterCredentialStage(Slug.lit("metask"), outcome.commit);
+
+    picker.credentialFailed("ConnectionRefused");
+    try testing.expect(std.mem.indexOf(u8, picker.notice(), "sign-in failed (ConnectionRefused)") != null);
+    try testing.expect(picker.onKey(.escape) == .cancel_login);
+    try testing.expectEqual(@as(usize, 0), picker.notice_len);
+    try testing.expect(!picker.credential_failed);
 }

@@ -59,6 +59,18 @@ pub const PrepareError = CapabilityError || error{
 
 pub const Error = PrepareError || error{UnknownProvider};
 
+pub fn refusalText(err: PrepareError, method: Method) []const u8 {
+    return switch (err) {
+        error.ProviderHasNoTokenEndpoint => "that provider declares no OAuth token endpoint",
+        error.ProviderAcceptsNoOAuthKind => "that provider accepts no OAuth credential kind; a stored login would never be consulted",
+        error.FlowUnavailable => switch (method) {
+            .loopback => "that provider declares no OAuth authorization endpoint",
+            .device_code => "that provider declares no device authorization endpoint",
+        },
+        error.ClientIdMissing => "that provider declares no OAuth client id",
+    };
+}
+
 /// Why the durable import refused a token response. When a step failed rather
 /// than decided, its own error is in the `ImportDiagnostic`.
 pub const ImportError = error{

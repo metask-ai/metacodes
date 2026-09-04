@@ -99,6 +99,7 @@ pub const api_error_class = @import("api/error_class.zig");
 pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
+pub const api_login_worker = @import("api/login_worker.zig"); // picker credential stage: a prepared login on a worker thread (#67)
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
