@@ -61,7 +61,7 @@ tests/e2e/replay_e2e.sh runs/<ts>/02_html_game/cassette scenarios/02_html_game.t
 
 ## 关键设计(2026-05-30 升级)
 
-- **调试基建(Stage 0)**:默认用 `metacodes-debug`(带 error-return-trace);分级日志
+- **调试基建(Stage 0)**:先运行 `zig build dev` 安装 `metacodes-debug`，再使用它(带 error-return-trace);分级日志
   双写——精简 `<场景>.log`(stdout)+ 全量 `<场景>.debug.log`(请求体/SSE 行/工具入参/
   权限决策);REPORT 含失败时间线 + transcript 关联。
 - **环境隔离(Stage 1)**:每场景独立 fake HOME(`<workdir>/.home`),隔离 transcript /

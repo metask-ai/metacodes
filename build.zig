@@ -507,7 +507,6 @@ pub fn build(b: *std.Build) void {
         .root_module = debug_mod,
     });
     const install_debug = b.addInstallArtifact(debug_exe, .{});
-    b.getInstallStep().dependOn(&install_debug.step);
     const dev_step = b.step("dev", "Install only the runnable Debug app (fast edit loop)");
     dev_step.dependOn(&install_debug.step);
     const dev_full_step = b.step("dev:full", "Install the Debug app and selected TinyKG binary");
@@ -553,34 +552,34 @@ pub fn build(b: *std.Build) void {
         .root_module = mock_mcp_mod,
     });
     const install_mock_mcp = b.addInstallArtifact(mock_mcp_exe, .{});
-    b.getInstallStep().dependOn(&install_mock_mcp.step);
 
     // replay_server 二进制(Stage 7):从 cassette 起 mock,供 e2e replay。测试专用。
     // 三端可编:曾经的三个 Windows blocker 已清(socket server→platform/net、
     // args→iterateAllocator、cassette 文件 IO→pfs)。TTY ui_tools 用例依赖它。
-    {
-        const replay_mod = b.createModule(.{
-            .root_source_file = b.path("tests/_harness/replay_server.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        replay_mod.addImport("harness", test_harness_mod); // 共享模块(perf,见上)
-        const replay_cassette_mod = b.createModule(.{
-            .root_source_file = b.path("tests/_harness/cassette.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        addPlatform(b, replay_cassette_mod); // 文件 IO 走 pfs
-        replay_mod.addImport("cassette", replay_cassette_mod);
-        addPlatform(b, replay_mod); // stdout/stderr 走可移植 pfs
-        const replay_exe = b.addExecutable(.{
-            .name = "replay_server",
-            .root_module = replay_mod,
-        });
-        b.installArtifact(replay_exe);
-    }
+    const replay_mod = b.createModule(.{
+        .root_source_file = b.path("tests/_harness/replay_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    replay_mod.addImport("harness", test_harness_mod); // 共享模块(perf,见上)
+    const replay_cassette_mod = b.createModule(.{
+        .root_source_file = b.path("tests/_harness/cassette.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, replay_cassette_mod); // 文件 IO 走 pfs
+    replay_mod.addImport("cassette", replay_cassette_mod);
+    addPlatform(b, replay_mod); // stdout/stderr 走可移植 pfs
+    const replay_exe = b.addExecutable(.{
+        .name = "replay_server",
+        .root_module = replay_mod,
+    });
+    const install_replay = b.addInstallArtifact(replay_exe, .{});
+    const test_harness_step = b.step("test:harness", "Install the test harness binaries: mock_mcp_server and replay_server");
+    test_harness_step.dependOn(&install_mock_mcp.step);
+    test_harness_step.dependOn(&install_replay.step);
 
     // ── metacodes-core 可复用库 module(root=src/lib.zig,UI 图不可达)──────────
     // 供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。
@@ -2068,7 +2067,9 @@ pub fn build(b: *std.Build) void {
         "--bin",    tty_bin,
         "-k",       "e2e_",
     });
-    e2e_tty_cmd.step.dependOn(b.getInstallStep()); // 确保 metacodes-debug + mock_mcp_server 已 build
+    e2e_tty_cmd.step.dependOn(&install_debug.step);
+    e2e_tty_cmd.step.dependOn(&install_mock_mcp.step);
+    e2e_tty_cmd.step.dependOn(&install_replay.step);
     e2e_tty_step.dependOn(&e2e_tty_cmd.step);
 
     const windows_gate_failure = if (!target_was_explicit)
@@ -2114,7 +2115,9 @@ pub fn build(b: *std.Build) void {
             "--bin",  "zig-out/bin/metacodes-debug.exe",
         });
         windows_tty_cmd.setEnvironmentVariable("TTY_SKIP_MODEL", "1");
-        windows_tty_cmd.step.dependOn(b.getInstallStep());
+        windows_tty_cmd.step.dependOn(&install_debug.step);
+        windows_tty_cmd.step.dependOn(&install_mock_mcp.step);
+        windows_tty_cmd.step.dependOn(&install_replay.step);
         if (windows_test_prelude) |prelude| windows_tty_cmd.step.dependOn(&prelude.step);
         windows_tty_step.dependOn(&windows_tty_cmd.step);
     }

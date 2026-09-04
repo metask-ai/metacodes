@@ -10,6 +10,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- The default `zig build` installs only the release executable and the TinyKG
+  bundle (B1, #77): `metacodes-debug` comes from `zig build dev`, and
+  `mock_mcp_server` / `replay_server` from the new `zig build test:harness`;
+  the TTY and e2e steps depend on those installs explicitly.
+  `scripts/verify_install_prefix.py` asserts the exact prefix contents and runs
+  in CI on every platform.
+
 ### Fixed
 
 - The paid plugin runner observed and executed the live checkout, so a pinned
