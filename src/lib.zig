@@ -115,6 +115,10 @@ pub const model_tiers = @import("api/model_tiers.zig"); // provider 内 low/mid/
 pub const json = @import("json.zig");
 pub const types = @import("types.zig");
 pub const config = @import("app/config.zig");
+/// Build identity rendering for --version (#78); build.zig hands the app the values, the library only formats them.
+pub const version_info = @import("version_info.zig");
+/// metacodes doctor (#78): pure resolution report for the runtime binaries.
+pub const doctor = @import("app/doctor.zig");
 
 // ── 工具 ─────────────────────────────────────────────────────────────────
 pub const tools = @import("tools.zig"); // registry + dispatch

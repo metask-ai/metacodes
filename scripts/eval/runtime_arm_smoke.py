@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import subprocess
 import sys
@@ -296,14 +297,9 @@ def _require(condition: bool, message: str) -> None:
         raise SystemExit(message)
 
 
-def _version_output_smoke(binary: Path, expected_semver: str) -> None:
-    """`--version` is a documented public surface (doc/API.md): assert the real
-    binary prints exactly `metacodes <semver>` on stdout and exits 0.  The
-    expected value comes from build.zig.zon via build.zig, so a version bump
-    that misses src/version.zig (or vice versa) fails here instead of
-    shipping a binary that mislabels itself."""
+def _run_version(binary: Path, extra: "list[str]") -> "subprocess.CompletedProcess[str]":
     completed = subprocess.run(
-        [str(binary), "--version"],
+        [str(binary), "--version", *extra],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -311,13 +307,122 @@ def _version_output_smoke(binary: Path, expected_semver: str) -> None:
     )
     _require(
         completed.returncode == 0,
-        f"--version exited {completed.returncode}: {completed.stderr[:200]}",
+        f"--version {' '.join(extra)} exited {completed.returncode}: {completed.stderr[:200]}",
     )
-    expected = f"metacodes {expected_semver}\n"
+    return completed
+
+
+def _version_output_smoke(binary: Path, expected_semver: str) -> None:
+    """`--version` is a documented public surface (doc/API.md): the real binary
+    prints exactly `metacodes <semver>` as its first stdout line (the build
+    identity follows, #78) and exits 0.  The expected value comes from
+    build.zig.zon via build.zig, so a version bump that misses src/version.zig
+    (or vice versa) fails here instead of shipping a binary that mislabels
+    itself."""
+    completed = _run_version(binary, [])
+    first_line = completed.stdout.split("\n", 1)[0]
+    expected = f"metacodes {expected_semver}"
     _require(
-        completed.stdout == expected,
-        f"--version stdout {completed.stdout!r} != {expected!r} "
+        first_line == expected,
+        f"--version first line {first_line!r} != {expected!r} "
         "(src/version.zig and build.zig.zon must agree)",
+    )
+    _require(
+        "\ncommit " in completed.stdout and "\nlayout " in completed.stdout,
+        f"--version lacks the build identity lines: {completed.stdout!r}",
+    )
+
+
+def _version_json_smoke(binary: Path, expected_semver: str, repo_root: Path) -> None:
+    """`--version --json` must describe the sources this checkout builds from
+    (#78): the semver, the AgentCore ABI revision `sdk/zig/types.zig`
+    declares, the TinyKG version `deps/tinykg.json` pins, and the TinyKG
+    digest `vendor/tinykg/manifest.json` pins for the binary's own target.
+    The sources are read here, independently of build.zig, so a baked value
+    that drifts from its source fails on the real binary."""
+    completed = _run_version(binary, ["--json"])
+    try:
+        document = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"--version --json stdout is not JSON: {completed.stdout[:200]!r}") from exc
+    _require(
+        document.get("name") == "metacodes" and document.get("version") == expected_semver,
+        f"--version --json identity {document.get('name')!r} {document.get('version')!r} != metacodes {expected_semver}",
+    )
+    abi = re.search(
+        r"^pub const ABI_REVISION: u32 = (\d+);$",
+        (repo_root / "sdk" / "zig" / "types.zig").read_text(encoding="utf-8"),
+        re.M,
+    )
+    _require(abi is not None, "sdk/zig/types.zig no longer declares ABI_REVISION")
+    contract = document.get("contract") or {}
+    _require(
+        contract.get("binary_abi_version") == 1 and contract.get("binary_abi_revision") == int(abi.group(1)),
+        f"--version --json contract {contract!r} != ABI v1 revision {abi.group(1)}",
+    )
+    _require(isinstance(contract.get("config_schema_version"), int), "contract.config_schema_version is not an integer")
+    assets = {asset.get("name"): asset for asset in document.get("expected_runtime_assets") or []}
+    _require(set(assets) == {"ripgrep", "tinykg"}, f"expected_runtime_assets names {sorted(assets)!r}")
+    tinykg_contract = json.loads((repo_root / "deps" / "tinykg.json").read_text(encoding="utf-8"))
+    _require(
+        assets["tinykg"].get("version") == tinykg_contract["tinykg_version"],
+        f"tinykg version {assets['tinykg'].get('version')!r} != deps/tinykg.json {tinykg_contract['tinykg_version']!r}",
+    )
+    family = "-".join(str(document.get("target", "")).split("-")[:2])
+    manifest = json.loads((repo_root / "vendor" / "tinykg" / "manifest.json").read_text(encoding="utf-8"))
+    pinned = None
+    for artifact in manifest["artifacts"]:
+        if family in artifact["targets"]:
+            pinned = artifact["sha256"]
+    _require(
+        assets["tinykg"].get("sha256") == pinned,
+        f"tinykg sha256 {assets['tinykg'].get('sha256')!r} != manifest value {pinned!r} for {family}",
+    )
+
+
+def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
+    """`metacodes doctor --json` (#78) reports the TinyKG binary the environment
+    names — the build artifact has no install tree around it here, so the
+    adjacent layout is checked by `verify_install_prefix.py --doctor` on the
+    installed prefix — with a digest matching the pinned one, and `--strict`
+    agrees with its own report."""
+    env = dict(os.environ)
+    env["METACODES_KG_BIN"] = str(tinykg_binary)
+    completed = subprocess.run(
+        [str(binary), "doctor", "--json"],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    _require(completed.returncode == 0, f"doctor --json exited {completed.returncode}: {completed.stderr[:200]}")
+    try:
+        report = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"doctor --json stdout is not JSON: {completed.stdout[:200]!r}") from exc
+    checks = {check.get("name"): check for check in report.get("checks") or []}
+    _require(set(checks) == {"ripgrep", "tinykg"}, f"doctor checks {sorted(checks)!r}")
+    tinykg = checks["tinykg"]
+    _require(
+        tinykg.get("source") == "env" and Path(str(tinykg.get("resolved_path"))).resolve() == tinykg_binary.resolve(),
+        f"doctor tinykg {tinykg!r} did not come from METACODES_KG_BIN",
+    )
+    _require(tinykg.get("match") is True, f"doctor tinykg digest did not match the pinned one: {tinykg!r}")
+    strict = subprocess.run(
+        [str(binary), "doctor", "--strict"],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    healthy = all(
+        check.get("resolved_path") is not None and check.get("match") in (None, True) for check in checks.values()
+    )
+    _require(
+        strict.returncode == (0 if healthy else 1),
+        f"doctor --strict exited {strict.returncode} for a report that is {'healthy' if healthy else 'unhealthy'}",
     )
 
 
@@ -337,6 +442,8 @@ def main() -> int:
         _require(path.is_file() and os.access(path, os.X_OK), f"{label} is not executable: {path}")
 
     _version_output_smoke(binary, args.expected_version)
+    _version_json_smoke(binary, args.expected_version, Path(__file__).resolve().parents[2])
+    _doctor_smoke(binary, tinykg_binary)
 
     dumps = {arm: _dump(binary, tinykg_binary, arm) for arm in ARMS}
     for arm, output in dumps.items():

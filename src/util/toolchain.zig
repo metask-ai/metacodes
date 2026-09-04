@@ -40,6 +40,7 @@ const VENDORED_RG: ?[:0]const u8 = switch (builtin.os.tag) {
 };
 
 const VENDORED_FALLBACK = if (VENDORED_RG) |vendored| [_][:0]const u8{vendored} else [_][:0]const u8{};
+// A distinct `vendored` source will arrive with the release layout in a later #47 stage.
 
 const FALLBACK_PATHS = VENDORED_FALLBACK ++ (if (is_windows) [_][:0]const u8{
     // scoop / choco / winget 常见位(用户目录展开在 PATH 搜索兜住,这里放系统级)
@@ -58,7 +59,7 @@ const FALLBACK_PATHS = VENDORED_FALLBACK ++ (if (is_windows) [_][:0]const u8{
 // path_buf[0..need :0] sentinel 位是别的线程的字符 → sentinel mismatch 崩(test:new 后台 Glob 实证)。
 // 修:init_mutex 双检锁串行首次 resolve;缓存后走无锁快路径(cache_done),path_buf 首次后不再写。
 var cache_done = std.atomic.Value(bool).init(false);
-var cached_path: [:0]const u8 = "";
+var cached_resolution: ?RipgrepResolution = null;
 var path_buf: [std.fs.max_path_bytes]u8 = undefined;
 var init_mutex: sync.Mutex = .{};
 
@@ -67,6 +68,9 @@ var init_mutex: sync.Mutex = .{};
 /// 不可构造。串行 test runner 内设置后必须 defer 复位为 null。
 pub var test_ripgrep_override: if (builtin.is_test) ?bool else void =
     if (builtin.is_test) null else {};
+
+pub const RipgrepSource = enum { env, path, adjacent, fallback };
+pub const RipgrepResolution = struct { path: [:0]const u8, source: RipgrepSource };
 
 /// 依赖可用性探测(catalog 准入用):rg 是否可解析。复用 ripgrepPath 的
 /// 进程内缓存,不引入新的解析顺序。
@@ -80,37 +84,39 @@ pub fn ripgrepAvailable() bool {
 
 /// 返回一个可执行的 rg 路径。优先 RG_BIN，其次 PATH，其次 fallback。返回值静态生命周期。
 pub fn ripgrepPath() error{RipgrepNotFound}![:0]const u8 {
+    return (ripgrepResolution() catch return error.RipgrepNotFound).path;
+}
+
+pub fn ripgrepResolution() error{RipgrepNotFound}!RipgrepResolution {
     if (cache_done.load(.acquire)) {
-        if (cached_path.len == 0) return error.RipgrepNotFound;
-        return cached_path;
+        return cached_resolution orelse error.RipgrepNotFound;
     }
     // 首次 init:串行(双检)——否则并发 searchPath 踩共享 path_buf。
     _ = init_mutex.lock();
     defer _ = init_mutex.unlock();
     if (cache_done.load(.acquire)) {
-        if (cached_path.len == 0) return error.RipgrepNotFound;
-        return cached_path;
+        return cached_resolution orelse error.RipgrepNotFound;
     }
     const result = resolve();
-    cached_path = result orelse "";
+    cached_resolution = result;
     cache_done.store(true, .release);
     return result orelse error.RipgrepNotFound;
 }
 
-fn resolve() ?[:0]const u8 {
+fn resolve() ?RipgrepResolution {
     // 1. RG_BIN
     if (std.c.getenv("RG_BIN")) |env_c| {
-        if (pfs.exists(env_c)) return std.mem.span(env_c);
+        if (pfs.exists(env_c)) return .{ .path = std.mem.span(env_c), .source = .env };
     }
     // 2. PATH 逐目录探测
-    if (searchPath()) |p| return p;
+    if (searchPath()) |p| return .{ .path = p, .source = .path };
     // 2.5 可执行文件同目录(split-mount 部署把 rg 和 metacodes 并排装在 bin/;
     // 容器 PATH 不含 mount,靠环境变量协调则是隐式契约——同目录探测让部署
     // 自然成立。WorkBuddy 实证:缺这条时 Grep/Glob 在容器里 100% RipgrepNotFound)。
-    if (nextToExecutable()) |p| return p;
+    if (nextToExecutable()) |p| return .{ .path = p, .source = .adjacent };
     // 3. fallback
     for (FALLBACK_PATHS) |p| {
-        if (pfs.exists(p.ptr)) return p;
+        if (pfs.exists(p.ptr)) return .{ .path = p, .source = .fallback };
     }
     return null;
 }

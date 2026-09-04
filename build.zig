@@ -134,11 +134,122 @@ fn bundledTinyKgForTarget(target: std.Target) ?BundledTinyKg {
 }
 
 fn isLowerSha256(value: []const u8) bool {
-    if (value.len != 64) return false;
+    return isLowerHex(value, 64);
+}
+
+fn isLowerHex(value: []const u8, len: usize) bool {
+    if (value.len != len) return false;
     for (value) |byte| {
         if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
     }
     return true;
+}
+
+/// The build identity `metacodes --version` reports (#78): the `build_info`
+/// module of the two app modules (not of the library module). Every value is
+/// fixed here at configure time from its own source — git, the compiler,
+/// `sdk/zig/types.zig`, the vendored manifests, the selected TinyKG input — so
+/// the executable never reads the repository at run time to describe itself.
+fn buildInfoOptions(
+    b: *std.Build,
+    target: std.Target,
+    optimize: std.builtin.OptimizeMode,
+    release_layout: bool,
+    tinykg_input: TinyKgBinaryInput,
+) *std.Build.Step.Options {
+    const sdk_types = @import("sdk/zig/types.zig");
+    const identity = gitIdentity(b);
+    const ripgrep = ripgrepBundleInfo(b, target);
+    const tinykg = tinyKgContractInfo(b);
+    const options = b.addOptions();
+    options.addOption([]const u8, "commit", identity.commit);
+    options.addOption(bool, "dirty", identity.dirty);
+    options.addOption([]const u8, "zig_version", @import("builtin").zig_version_string);
+    options.addOption([]const u8, "target_triple", b.fmt("{s}-{s}-{s}", .{
+        @tagName(target.cpu.arch),
+        @tagName(target.os.tag),
+        @tagName(target.abi),
+    }));
+    options.addOption([]const u8, "optimize", @tagName(optimize));
+    options.addOption(bool, "release_layout", release_layout);
+    options.addOption(u32, "abi_version", sdk_types.ABI_VERSION_V1);
+    options.addOption(u32, "abi_revision", sdk_types.ABI_REVISION);
+    options.addOption([]const u8, "ripgrep_version", ripgrep.version);
+    options.addOption([]const u8, "ripgrep_revision", ripgrep.revision);
+    options.addOption(?[]const u8, "ripgrep_expected_sha256", ripgrep.sha256);
+    options.addOption([]const u8, "tinykg_version", tinykg.version);
+    options.addOption([]const u8, "tinykg_source_commit", tinykg.source_commit);
+    options.addOption(?[]const u8, "tinykg_expected_sha256", switch (tinykg_input) {
+        .bundled => |input| input.sha256,
+        .explicit => |input| input.sha256,
+        .disabled, .unavailable => null,
+    });
+    return options;
+}
+
+const GitIdentity = struct { commit: []const u8, dirty: bool };
+
+/// `-Dbuild-commit` names the commit when no repository is available (an
+/// exported tree); otherwise git answers for the build root, and a tree
+/// without git reports "unknown" rather than failing the build.
+fn gitIdentity(b: *std.Build) GitIdentity {
+    if (b.option([]const u8, "build-commit", "Commit hash recorded in --version when the tree has no git repository")) |commit| {
+        if (!isLowerHex(commit, 40)) @panic("-Dbuild-commit must be 40 lowercase hex characters");
+        return .{ .commit = commit, .dirty = false };
+    }
+    const root = b.pathFromRoot(".");
+    const commit = gitStdout(b, &.{ "git", "-C", root, "rev-parse", "HEAD" }) orelse
+        return .{ .commit = "unknown", .dirty = false };
+    if (!isLowerHex(commit, 40)) return .{ .commit = "unknown", .dirty = false };
+    const status = gitStdout(b, &.{ "git", "-C", root, "status", "--porcelain", "--untracked-files=no" }) orelse
+        return .{ .commit = commit, .dirty = false };
+    return .{ .commit = commit, .dirty = status.len != 0 };
+}
+
+fn gitStdout(b: *std.Build, argv: []const []const u8) ?[]const u8 {
+    var code: u8 = undefined;
+    const raw = b.runAllowFail(argv, &code, .ignore) catch return null;
+    return std.mem.trim(u8, raw, " \t\r\n");
+}
+
+const RipgrepBundleInfo = struct { version: []const u8, revision: []const u8, sha256: ?[]const u8 };
+
+/// `vendor/ripgrep/manifest.json` names the upstream release and, per target,
+/// the vendored binary's digest; a target without one resolves rg from the
+/// environment and carries no expectation.
+fn ripgrepBundleInfo(b: *std.Build, target: std.Target) RipgrepBundleInfo {
+    const Manifest = struct {
+        artifacts: []const struct { sha256: []const u8, targets: []const []const u8 },
+        upstream_release: []const u8,
+        upstream_revision: []const u8,
+    };
+    const parsed = parseJsonFile(b, Manifest, "vendor/ripgrep/manifest.json");
+    const family = b.fmt("{s}-{s}", .{ @tagName(target.cpu.arch), @tagName(target.os.tag) });
+    var sha256: ?[]const u8 = null;
+    for (parsed.artifacts) |artifact| {
+        for (artifact.targets) |candidate| {
+            if (std.mem.eql(u8, candidate, family)) sha256 = artifact.sha256;
+        }
+    }
+    return .{ .version = parsed.upstream_release, .revision = parsed.upstream_revision, .sha256 = sha256 };
+}
+
+const TinyKgContractInfo = struct { version: []const u8, source_commit: []const u8 };
+
+fn tinyKgContractInfo(b: *std.Build) TinyKgContractInfo {
+    const contract = parseJsonFile(b, struct { tinykg_version: []const u8 }, "deps/tinykg.json");
+    const bundle = parseJsonFile(b, struct { source_commit: []const u8 }, "vendor/tinykg/manifest.json");
+    return .{ .version = contract.tinykg_version, .source_commit = bundle.source_commit };
+}
+
+/// Configure-time read of a repository JSON document into `T`; the strings
+/// stay alive in the build allocator. Unknown fields are ignored so a manifest
+/// can grow without touching the build identity.
+fn parseJsonFile(b: *std.Build, comptime T: type, path: []const u8) T {
+    const bytes = b.build_root.handle.readFileAlloc(b.graph.io, path, b.allocator, .limited(1024 * 1024)) catch |err|
+        std.debug.panic("cannot read {s}: {t}", .{ path, err });
+    return std.json.parseFromSliceLeaky(T, b.allocator, bytes, .{ .ignore_unknown_fields = true }) catch |err|
+        std.debug.panic("invalid {s}: {t}", .{ path, err });
 }
 
 /// TinyKG is an external, manually maintained native artifact. Normal builds
@@ -324,6 +435,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const target_was_explicit = b.user_input_options.contains("target");
     const optimize = b.standardOptimizeOption(.{});
+    // TinyKG source remains outside the Metacodes graph. Normal builds select a
+    // checked-in, manifest-pinned target binary. A maintainer may override it
+    // with an absolute path plus digest. Native staging validates version and a
+    // fresh store; cross staging validates digest, format, arch, and version bytes.
+    const tinykg_input = tinyKgBinaryInput(b, target.result);
+    const release_layout = b.option(
+        bool,
+        "release-layout",
+        "Record the release runtime layout in the build identity (#47; the layout's asset resolution lands in a later stage)",
+    ) orelse false;
+    const build_info = buildInfoOptions(b, target.result, optimize, release_layout, tinykg_input);
     const tfilter = b.option([]const u8, "tfilter", "test filter");
     const lib_test_shards = b.option(u8, "lib-test-shards", "Parallel metacodes-core test shards (1-64)") orelse 4;
     if (lib_test_shards == 0 or lib_test_shards > 64) @panic("-Dlib-test-shards must be between 1 and 64");
@@ -357,6 +479,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, release_mod);
+    release_mod.addOptions("build_info", build_info);
     const exe = b.addExecutable(.{
         .name = "metacodes",
         .root_module = release_mod,
@@ -387,11 +510,6 @@ pub fn build(b: *std.Build) void {
     );
     project_harness_shadow_step.dependOn(&install_project_harness_shadow.step);
 
-    // TinyKG source remains outside the Metacodes graph. Normal builds select a
-    // checked-in, manifest-pinned target binary. A maintainer may override it
-    // with an absolute path plus digest. Native staging validates version and a
-    // fresh store; cross staging validates digest, format, arch, and version bytes.
-    const tinykg_input = tinyKgBinaryInput(b, target.result);
     var staged_tinykg: ?StagedTinyKg = null;
     const tinykg_stage_step = b.step("tinykg:stage", "Validate and install the selected TinyKG binary");
     switch (tinykg_input) {
@@ -502,6 +620,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, debug_mod);
+    debug_mod.addOptions("build_info", build_info);
     const debug_exe = b.addExecutable(.{
         .name = "metacodes-debug",
         .root_module = debug_mod,
@@ -528,6 +647,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         addHl(b, m2);
+        m2.addOptions("build_info", build_info);
         break :blk m2;
     };
     const test_harness_mod = b.createModule(.{
