@@ -15,7 +15,8 @@ const sync = @import("platform").sync;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const ToolResultBody = @import("../core/tool_result.zig").ToolResultBody;
-const ToolError = @import("../core/tool_error.zig").ToolError;
+const tool_error = @import("../core/tool_error.zig");
+const ToolError = tool_error.ToolError;
 const result_budget = @import("../core/result_budget.zig");
 const result_stream = @import("../agentcore/mcp_result_stream.zig");
 
@@ -236,10 +237,11 @@ pub const McpClient = struct {
                     null;
                 if (response_id != null and response_id.? != id) continue;
                 if (obj.get("error") != null)
-                    return try self.structuredMcpError(line);
+                    return try self.structuredMcpError(line, .other, .user_error);
                 const response = protocol.parseResponse(line) catch
                     return error.McpMalformedResponse;
-                if (!response.isSuccess()) return try self.structuredMcpError(line);
+                if (!response.isSuccess())
+                    return try self.structuredMcpError(line, .other, .user_error);
                 const result = response.result_json orelse "null";
                 if (result.len <= budget.per_result_bytes)
                     return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
@@ -270,7 +272,17 @@ pub const McpClient = struct {
                 .result => |body| return body,
                 .diagnostic => |diagnostic| {
                     if (diagnostic.code == .response_id_mismatch) continue;
-                    return try self.structuredMcpError(@tagName(diagnostic.code));
+                    if (diagnostic.code == .resource_limit)
+                        return try self.structuredMcpError(
+                            @tagName(diagnostic.code),
+                            .io_error,
+                            .system_error,
+                        );
+                    return try self.structuredMcpError(
+                        @tagName(diagnostic.code),
+                        .other,
+                        .user_error,
+                    );
                 },
             }
         }
@@ -288,12 +300,17 @@ pub const McpClient = struct {
         return ToolResultBody.fromCompletedSpool(completed, .json);
     }
 
-    fn structuredMcpError(self: *McpClient, detail: []const u8) !ToolResultBody {
+    fn structuredMcpError(
+        self: *McpClient,
+        detail: []const u8,
+        code: tool_error.Code,
+        category: tool_error.Category,
+    ) !ToolResultBody {
         const bounded = detail[0..@min(detail.len, 64 * 1024)];
         const owned = try self.allocator.dupe(u8, bounded);
-        const tool_error = ToolError.init(.other, .user_error, owned, true);
-        defer tool_error.deinit(self.allocator);
-        const encoded = try tool_error.toJson(self.allocator);
+        const structured_error = ToolError.init(code, category, owned, true);
+        defer structured_error.deinit(self.allocator);
+        const encoded = try structured_error.toJson(self.allocator);
         defer self.allocator.free(encoded);
         return ToolResultBody.initStructuredError(self.allocator, encoded);
     }

@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const artifact_store = @import("tool_result_artifact.zig");
+const tool_error = @import("tool_error.zig");
 
 pub const PROJECTION_SCHEMA = "metacodes.tool-result-projection.v1";
 pub const ENVELOPE_PREFIX = "{\"schema_version\":\"" ++ PROJECTION_SCHEMA ++ "\",\"projection\":";
@@ -41,6 +42,7 @@ pub const ArtifactReceipt = struct {
 /// supported API and crowd durable Conversation state.
 pub const StructuredToolError = struct {
     encoded: []u8,
+    category: ?tool_error.Category = null,
 
     pub fn init(allocator: std.mem.Allocator, encoded: []const u8) !StructuredToolError {
         if (encoded.len == 0 or encoded.len > MAX_STRUCTURED_ERROR_BYTES)
@@ -57,7 +59,15 @@ pub const StructuredToolError = struct {
         const payload = parsed.object.get("error") orelse
             return error.InvalidStructuredToolError;
         if (payload != .object) return error.InvalidStructuredToolError;
-        return .{ .encoded = try allocator.dupe(u8, encoded) };
+        var category: ?tool_error.Category = null;
+        if (payload.object.get("category")) |value| {
+            if (value == .string)
+                category = std.meta.stringToEnum(tool_error.Category, value.string);
+        }
+        return .{
+            .encoded = try allocator.dupe(u8, encoded),
+            .category = category,
+        };
     }
 };
 
@@ -282,4 +292,24 @@ test "StructuredToolError rejects invalid and over-budget payloads" {
     defer allocator.free(oversized);
     @memset(oversized, 'x');
     try std.testing.expectError(error.StructuredToolErrorTooLarge, StructuredToolError.init(allocator, oversized));
+}
+
+test "StructuredToolError maps known categories and ignores unknown categories" {
+    const allocator = std.testing.allocator;
+    const system_error = try StructuredToolError.init(
+        allocator,
+        "{\"error\":{\"category\":\"system_error\"}}",
+    );
+    defer allocator.free(system_error.encoded);
+    try std.testing.expectEqual(
+        @as(?tool_error.Category, .system_error),
+        system_error.category,
+    );
+
+    const unknown = try StructuredToolError.init(
+        allocator,
+        "{\"error\":{\"category\":\"future_category\"}}",
+    );
+    defer allocator.free(unknown.encoded);
+    try std.testing.expectEqual(@as(?tool_error.Category, null), unknown.category);
 }

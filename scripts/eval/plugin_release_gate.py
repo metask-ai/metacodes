@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import stat
 import subprocess
 import tempfile
+import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -470,30 +472,101 @@ def _git_head(path: Path) -> str:
     return completed.stdout.strip()
 
 
+def _materialize_head(root: Path, head: str, destination: Path) -> Path:
+    completed = subprocess.run(
+        ["git", "-C", str(root), "archive", "--format=tar", head],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", "replace")
+        raise PluginGateError(f"cannot materialize Git HEAD: {stderr.strip()}")
+    destination.mkdir(parents=True, exist_ok=False)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+            members = archive.getmembers()
+            for member in members:
+                name = member.name
+                path = PurePosixPath(name)
+                if path.is_absolute() or any(part == ".." for part in path.parts):
+                    raise PluginGateError(f"unsafe archive member: {name!r}")
+                if not (member.isdir() or member.isreg()):
+                    raise PluginGateError(f"unsafe archive member type: {name!r}")
+            regular_files = sum(member.isreg() for member in members)
+            if not regular_files:
+                raise PluginGateError("Git archive contains no regular files")
+            if hasattr(tarfile, "data_filter"):
+                archive.extractall(destination, filter=tarfile.data_filter)
+            else:
+                archive.extractall(destination)
+    except (tarfile.TarError, OSError) as exc:
+        raise PluginGateError(f"cannot extract Git archive: {exc}") from exc
+    fixture = destination / "scripts/eval/fixtures/plugin_baseline.py"
+    if os.name != "nt" and fixture.exists() and not (fixture.stat().st_mode & stat.S_IXUSR):
+        raise PluginGateError("materialized plugin_baseline.py is not owner-executable")
+    return destination
+
+
+def _require_clean_pinned_inputs(root: Path, protocol: Mapping[str, Any], protocol_path: Path) -> None:
+    paths: set[str] = set()
+    for item in protocol.get("implementation_paths", []):
+        if isinstance(item, str):
+            paths.add(item)
+    evaluator = protocol.get("pinned_evaluator_files", {})
+    if isinstance(evaluator, Mapping):
+        paths.update(str(item) for item in evaluator if isinstance(item, str))
+    candidate = protocol.get("candidate", {})
+    if isinstance(candidate, Mapping) and isinstance(candidate.get("files"), Mapping):
+        paths.update(str(item) for item in candidate["files"] if isinstance(item, str))
+    pair = protocol.get("coding_pair", {})
+    for key in ("suite", "baseline_executable", "treatment_executable"):
+        if isinstance(pair.get(key), str):
+            paths.add(pair[key])
+    for task in (pair.get("scenario_sha256") or {}):
+        paths.add(f"tests/e2e/scenarios/{task}.txt")
+    try:
+        rel = protocol_path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        rel = None
+    if rel is not None:
+        tracked = subprocess.run(["git", "-C", str(root), "ls-files", "--error-unmatch", "--", rel], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if tracked.returncode != 0:
+            raise PluginGateError(f"protocol path {rel} is not tracked by Git")
+        paths.add(rel)
+    if not paths:
+        return
+    completed = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-z", "--untracked-files=no"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if completed.returncode != 0:
+        raise PluginGateError("cannot inspect pinned inputs")
+    if completed.stdout:
+        fields = completed.stdout.decode("utf-8", "replace").split("\0")
+        changed: set[str] = set()
+        index = 0
+        while index < len(fields) and fields[index]:
+            entry = fields[index]
+            changed.add(entry[3:])
+            if entry[:2].strip() and (entry[:2][0] in "RC" or entry[:2][1] in "RC"):
+                index += 1
+                if index < len(fields) and fields[index]:
+                    changed.add(fields[index])
+            index += 1
+        listed = " ".join(sorted(changed & paths))
+        if not listed:
+            return
+        raise PluginGateError(f"pinned inputs modified in the working tree: {listed}")
+
+
 @dataclass(frozen=True)
 class _GateSnapshot:
     """What a zero-provider receipt describes.
 
-    ``open`` reads the protocol file **once** and returns both the validated
-    object the gate will run with and the hash of the very bytes it was parsed
-    from. An earlier draft loaded the object and then hashed the file in a
-    second read, which let an atomic replacement between the two produce a
-    receipt whose ``protocol_sha256`` named one protocol while the checks had
-    run with another's parameters.
+    ``open`` validates the raw bytes read once by ``run_gate`` against the
+    materialized checkout and records their hash plus the live HEAD captured
+    before materialization. ``require_unchanged`` re-reads the protocol,
+    requires identical bytes, and validates them against the materialized
+    tree; the caller then compares live HEAD. Runtime and DeepSeek Harness
+    remain external inputs attested by hash/commit, and the receipt is written
+    after the final check like any file.
 
-    ``require_unchanged`` is the gate's last act before the receipt exists:
-    the file must still hold the same bytes, those bytes must still pass the
-    full strict validation against the tree (every pin, not only the
-    implementation fingerprint), and the Git HEAD must be the one captured.
-    What this does *not* detect is any mutation after an input's **last
-    observation**: a pinned input changed and restored between the two
-    observations while a subprocess consumed the changed version (ABA); a
-    pinned input changed *during* either validation scan after its bytes were
-    already hashed (the scan reads ~130 files one by one and is not atomic);
-    and any input changed after the final read but before the receipt is
-    returned and persisted. All of these need the subprocesses and the
-    hashing to run inside a materialized checkout of the snapshot, and the
-    receipt to be sealed there (issue #49).
     """
 
     protocol_sha256: str
@@ -501,15 +574,11 @@ class _GateSnapshot:
     implementation_fingerprint: str
 
     @classmethod
-    def open(cls, root: Path, protocol_path: Path) -> tuple[dict[str, Any], "_GateSnapshot"]:
-        try:
-            raw = protocol_path.read_bytes()
-        except OSError as exc:
-            raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
+    def open(cls, root: Path, raw: bytes, head: str) -> tuple[dict[str, Any], "_GateSnapshot"]:
         protocol = validate_protocol_payload(root, raw)
         snapshot = cls(
             protocol_sha256=_sha256_bytes(raw),
-            git_head=_git_head(root),
+            git_head=head,
             implementation_fingerprint=protocol["coding_pair"]["implementation_fingerprint"],
         )
         return protocol, snapshot
@@ -523,8 +592,6 @@ class _GateSnapshot:
             raise PluginGateError("protocol changed while the gate was running")
         # Same bytes; now the same bytes must still hold against the tree.
         validate_protocol_payload(root, final_raw)
-        if _git_head(root) != self.git_head:
-            raise PluginGateError("git HEAD moved while the gate was running")
 
 
 def run_gate(
@@ -533,10 +600,34 @@ def run_gate(
     dsh: Path,
     runtime_binary: Path,
 ) -> dict[str, Any]:
+    head = _git_head(root)
+    try:
+        raw = protocol_path.read_bytes()
+        structure = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PluginGateError(f"cannot read plugin evaluation protocol: {exc}") from exc
+    if not isinstance(structure, dict):
+        raise PluginGateError("unsupported plugin evaluation protocol")
+    # Run this before strict validation so dirty pins get a clear diagnosis.
+    _require_clean_pinned_inputs(root, structure, protocol_path)
+    with tempfile.TemporaryDirectory(prefix="metacodes-plugin-gate-tree-") as temp:
+        tree_root = _materialize_head(root, head, Path(temp) / "tree")
+        protocol, snapshot = _GateSnapshot.open(tree_root, raw, head)
+        return _run_gate_materialized(root, protocol_path, dsh, runtime_binary, tree_root, protocol, snapshot)
+
+
+def _run_gate_materialized(
+    root: Path,
+    protocol_path: Path,
+    dsh: Path,
+    runtime_binary: Path,
+    tree_root: Path,
+    protocol: Mapping[str, Any],
+    snapshot: _GateSnapshot,
+) -> dict[str, Any]:
     # One read: the object the gate runs with and the hash the receipt will
     # carry come from the same bytes. The receipt is built minutes of
     # subprocesses later; it must describe this snapshot and nothing else.
-    protocol, snapshot = _GateSnapshot.open(root, protocol_path)
     runtime = attest_runtime_artifact(protocol, runtime_binary)
     expected_dsh = protocol["upstream"]["deepseek_harness_commit"]
     observed_dsh = _git_head(dsh)
@@ -597,13 +688,13 @@ def run_gate(
         ),
         ("independent_zig_host", ["zig", "build", "example"]),
     ):
-        result = _run(root, argv, env=clean_env)
+        result = _run(tree_root, argv, env=clean_env)
         checks.append({key: value for key, value in result.items() if key != "output"} | {"name": name})
 
     benchmark_rows = []
     for _ in range(protocol["deterministic_gate"]["benchmark_repetitions"]):
         result = _run(
-            root,
+            tree_root,
             ["zig", "build", "plugin:bench", "-Doptimize=ReleaseSafe"],
             env=clean_env,
         )
@@ -617,13 +708,13 @@ def run_gate(
         inventory_env["HOME"] = home
         inventory_env["METACODES_PLUGIN_RUNTIME_BINARY"] = str(runtime.path)
         baseline = _run(
-            root,
-            [str(root / "scripts/eval/fixtures/plugin_baseline.py"), "--dump-plugins"],
+            tree_root,
+            [str(tree_root / "scripts/eval/fixtures/plugin_baseline.py"), "--dump-plugins"],
             env=inventory_env,
         )
         candidate = _run(
-            root,
-            [str(root / "scripts/eval/fixtures/plugin_candidate.py"), "--dump-plugins"],
+            tree_root,
+            [str(tree_root / "scripts/eval/fixtures/plugin_candidate.py"), "--dump-plugins"],
             env=inventory_env,
         )
         runtime = attest_runtime_artifact(protocol, runtime.path)
@@ -675,7 +766,9 @@ def run_gate(
     # scenario and evaluator hashes are pins too - and require the protocol
     # bytes and the tree identity to be the ones captured at the start, so
     # the receipt cannot describe a different snapshot than the checks did.
-    snapshot.require_unchanged(root, protocol_path)
+    snapshot.require_unchanged(tree_root, protocol_path)
+    if _git_head(root) != snapshot.git_head:
+        raise PluginGateError("git HEAD moved while the gate was running")
 
     overheads = [int(row["static_plugin_p95_overhead_ns"]) for row in benchmark_rows]
     inventories = [int(row["inventory_avg_ns"]) for row in benchmark_rows]

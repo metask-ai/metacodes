@@ -58,7 +58,7 @@ DSH 的全部动态 plugin capability、全新 provider transport、UI 插件或
 | 完全保留 metacodes 内核精髓 | 插件支持矩阵不包含 AgentLoop、Permission grant、Lean verifier、TinyKG writer、budget/checkpoint；插件工具仍走 native admission | 已完成并失败关闭 |
 | Lean + TinyKG 形式化/本体 | 候选只能提交 inert evidence；Lean/native verdict、TinyKG provenance/CAS 仍是 kernel-owned | 边界已保留；不是插件可替换服务 |
 | 自我迭代 | candidate → TinyKG → frozen paired eval → Lean/native verdict → CAS → 新 immutable generation | 治理路径与发布机制已具备；自动自批明确禁止 |
-| 嵌入各种软件/场景 | Zig source API、C/C++/Zig/Rust AgentCore v1 revision 13、CLI、Web SSE/HTTP、typed Event/UI seam | 多宿主基础已完成；Host/process/MCP Tool Result 均进入同一 CAS/spool 数据面；静态 service/`RuntimeHost` 尚未扩入 C ABI |
+| 嵌入各种软件/场景 | Zig source API、C/C++/Zig/Rust AgentCore v1 revision 15、CLI、Web SSE/HTTP、typed Event/UI seam | 多宿主基础已完成；Host/process/MCP Tool Result 均进入同一 CAS/spool 数据面；静态 service/`RuntimeHost` 尚未扩入 C ABI |
 | coding 高 benchmark 表现 | `1.2.0` 以同模型/任务/grader/预算完整执行 18 对、36 rollouts | 两臂可信成功率均为 17/18；candidate 因平均成本增加 US$0.0648145 超过 US$0.02 门禁而拒绝，显著 improvement 未建立；外部 WorkBuddy 未运行 |
 
 ## 4. 已通过的确定性门禁
@@ -338,7 +338,7 @@ tokens，低于用户 US$1,000 总上限。尚未运行外部 WorkBuddy。
 
 | 集合 | 字段 | 钉的是什么 | 谁校验、何时 |
 |---|---|---|---|
-| **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头**一次读取**协议字节:运行用的对象与 receipt 携带的哈希出自同一份字节;写 receipt 前要求文件仍是这份字节、这份字节仍通过完整严格校验、git HEAD 未变。它**不能**察觉任何发生在某个输入**最后一次被观测之后**的改动:子进程运行期间被钉输入"改了又改回"(ABA);校验扫描进行中、某文件已被哈希之后才被改动(扫描逐个读 ~130 个文件,不是原子的);以及最后一次读取之后、receipt 返回并持久化之前的单向改动——这些都需要在物化的不可变 checkout 里跑门禁、在那里哈希并封存 receipt,见 #49)、`plugin_pair_runner.build_plan`,以及 freeze、`run_paid_pair` 起点与每次请求前后、`plugin_pair_analysis.analyze` 共用的同一次观测 `_observe`(§7.1)。它们与 `run_gate` 一样经 `validate_protocol_payload`(哈希自己校验过的那份字节)。没有布尔开关,严格是**构造出来的** |
+| **实现** | `implementation_paths` + `coding_pair.implementation_fingerprint` | ~130 条源码/测试/SDK/文档路径的内容摘要,即"这次评测对着哪份实现冻结" | **只在执行、测量、判定时**:`run_gate`(开头**一次读取**协议字节:运行用的对象与 receipt 携带的哈希出自同一份字节;随后把捕获的 git HEAD 用 `git archive` 物化到私有临时目录,每一条 pin 都在那棵树里哈希、每个子进程都在那棵树里运行,活树无法触达它——这就是 #49 关掉的"改了又改回"(ABA)缺口;钉住输入在工作树里有未提交修改时开头即拒绝,因为 receipt 记的是 HEAD;写 receipt 前要求协议文件仍是这份字节、这份字节仍对物化树通过完整严格校验(子进程若改了 checkout 会被发现)、活仓库 HEAD 未变。runtime binary 与 DeepSeek Harness checkout 仍是外部输入,分别按哈希与 commit 证明)、`plugin_pair_runner.build_plan`,以及 freeze、`run_paid_pair` 起点与每次请求前后、`plugin_pair_analysis.analyze` 共用的同一次观测 `_observe`(§7.1)。它们与 `run_gate` 一样经 `validate_protocol_payload`(哈希自己校验过的那份字节),但仍观测活树(#61)。没有布尔开关,严格是**构造出来的** |
 | **评测器** | `pinned_evaluator_files` | 做测量与判定的代码(gate、runner、analysis、e2e 脚本、门禁阈值)以及 Lean 形式化证据(它们由 CI 单独编译、被评测脚本消费,**不链接进运行时二进制**) | **每次加载**都校验,包括日常测试;**永远不由工具自动 repin**——一个门禁给自己的代码重钉哈希是自证漏洞(c7c2aa9) |
 | **场景与候选** | `suite_sha256`、`scenario_sha256`、`candidate.root` + `candidate.files`、`*_executable_sha256` | 评测的定义:任务、场景、被测插件、两个 arm 的可执行文件。`candidate.root` 下的文件集合必须**恰好**等于 `candidate.files`,目录集合恰好等于这些文件蕴含的父目录,无符号链接、无可执行位、无特殊文件:哈希证明钉住的文件还是原样,集合相等证明它们就是全部——否则在被钉 Skill 旁边放一个文件、加一个空目录或 `chmod +x` 都不需要改协议,而运行时把目录名和可执行位哈希进 Skill 身份(`computeContentRevision`),任何 pin、指纹或清单字段都不会察觉 | 每次加载都校验 |
 
@@ -397,7 +397,8 @@ OS 补丁也会触发它——重新冻结是一个要看着 diff 做的动作,�
 自洽 repin 的协议(换掉候选 Skill、更新它的哈希)能通过严格加载,却通不过与清单的逐字段
 比对。请求后的校验发生在导入该次证据之前;未通过则该笔交易停留在 `request_authorized`、
 没有 checkpoint,续跑被既有的孤儿交易规则挡住,不会隐式重付。括号内"改了又改回"的变动
-仍然看不见(#49)。
+在付费路径上仍然看不见:`run_gate` 已改为在物化 checkout 里运行(#49),`run_paid_pair` 的
+前后观测与 rollout 仍消费活树,见 #61。
 
 清单哈希进入预算日志的 `BudgetAuthority`(其 `manifest_sha256` 由 `_authority_manifest`
 唯一构造:协议哈希、运行时、wrapper、inventory、revision、冻结清单哈希、授权总额)和每条

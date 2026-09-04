@@ -148,7 +148,7 @@ Freeze the surfaces hosts depend on. Preconditions are already written down:
       then pass the reference-closure audit and the real-consumer gate
       ([doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md)).
 - [ ] Re-verify the full supported-target matrix at the frozen revision
-      (currently only `aarch64-macos` is fully verified at revision 13).
+      (currently only `aarch64-macos` is fully verified at revision 15).
 - [ ] Plugin manifest/process-protocol v1 freeze with negative-test coverage.
 - [ ] CLI: versioned `--version`/`--help` surface and changelog discipline for
       flag changes.

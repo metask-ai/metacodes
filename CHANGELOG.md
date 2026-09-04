@@ -20,12 +20,27 @@ status, compatibility boundaries, and entry points are defined by
   `METASK_SITE_URL`, `METASK_GATEWAY_URL`, `METACODES_OAUTH_DIR`, and
   `METACODES_LEDGER_DIR`.
 
+- `scripts/check_doc_facts.py` with the registry `release/doc_facts.json`: a
+  fail-closed documentation fact gate. Each registered fact names one in-tree
+  authority (the AgentCore ABI revision in `sdk/zig/types.zig`, the CLI version
+  in `build.zig.zon`, the TinyKG and ripgrep versions in their manifests) and
+  the documents that state it; every match must equal the authority, and a
+  pattern that no longer matches anything fails as a detached sensor rather
+  than switching the check off. Runs in CI and as `zig build doc:check`. The
+  README, ROADMAP and plugin documents that still said ABI revision 13 or 14
+  now state the declared revision, and the two `## 0.1.0` headings below are
+  merged into one. (#47, stage 0)
 - The provider-offer capability vocabulary's comptime coverage guard now binds
   the real runtime capability enum instead of a hand-copied duplicate, so the
   next runtime capability added without an offer mapping is a compile error
   rather than a silent gap.
 
 ### Changed
+
+- The zero-provider plugin release gate now runs validation, pin hashing, and
+  subprocesses from a private `git archive HEAD` materialized checkout;
+  uncommitted pinned-input edits are refused up front and the checkout is
+  revalidated before receipt emission (issue #49).
 
 - MCP tool results decide inline-vs-publish from the caller's
   `result_budget.Budget.per_result_bytes` on both MCP paths — the classic
@@ -76,6 +91,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Unhinted `ReadMcpResourceTool` no longer reports a local MCP storage failure
+  (`resource_limit` on a full session quota) as `resource_not_found`: the MCP
+  client classifies it as `system_error` and the read loop returns it instead
+  of trying other servers. Remote errors still fall through to
+  `resource_not_found`, which now carries the last server's error detail
+  (issue #56).
 - A CAS publication failure (a full session quota, for example) no longer turns
   a bounded MCP result into a tool error. All three publishers — the native
   spool, the classic `McpClient` and the AgentCore projector — share
@@ -658,6 +679,9 @@ status, compatibility boundaries, and entry points are defined by
   `*PRIVATE_KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`), so
   echoed child environments do not carry those variables into uploaded
   artifacts.
+- Prepared the extracted history for removal of a legacy hard-coded provider token
+  before any remote publication. Public visibility remains blocked on an
+  independent full-history scan and owner-selected project license.
 
 ### Added
 
@@ -786,6 +810,18 @@ status, compatibility boundaries, and entry points are defined by
   `METACODES_TEST_REQUIRE_LEAN_SDK=1`, which turns that skip into a failure so
   an olean path drift cannot become a permanent silent skip; the guard path
   itself is imported from `project_harness_evolution.SDK_OLEAN_RELATIVE`.
+- Extracted `metacodes` as a history-preserving standalone repository whose
+  primary branch is `main`.
+- Replaced vendored TinyKG source compilation with a manually maintained native
+  binary contract: explicit absolute path, operator-observed SHA-256, exact CLI
+  version, fresh-store format/schema probe, atomic staging, and deterministic
+  provenance receipt.
+- Removed ambient TinyKG discovery from runtime and tests. TinyKG-dependent gates
+  now fail closed or skip explicitly when no attested binary is injected.
+- Added public API, contribution, security, governance, support, third-party, and
+  open-source readiness documentation.
+- Removed generated evaluation-run artifacts from the published source tree;
+  local copies remain ignored and recoverable from the pre-extraction history.
 
 ### Fixed
 
@@ -872,29 +908,6 @@ status, compatibility boundaries, and entry points are defined by
   escaped bytes, so `\n`/`\t`/`\uXXXX` rendered as literals. Both paths (and
   streamed tool-call `arguments`) now share one unescaping extractor in
   `util/json.zig`.
-
-## 0.1.0 — standalone extraction and embedding boundary
-
-### Changed
-
-- Extracted `metacodes` as a history-preserving standalone repository whose
-  primary branch is `main`.
-- Replaced vendored TinyKG source compilation with a manually maintained native
-  binary contract: explicit absolute path, operator-observed SHA-256, exact CLI
-  version, fresh-store format/schema probe, atomic staging, and deterministic
-  provenance receipt.
-- Removed ambient TinyKG discovery from runtime and tests. TinyKG-dependent gates
-  now fail closed or skip explicitly when no attested binary is injected.
-- Added public API, contribution, security, governance, support, third-party, and
-  open-source readiness documentation.
-- Removed generated evaluation-run artifacts from the published source tree;
-  local copies remain ignored and recoverable from the pre-extraction history.
-
-### Security
-
-- Prepared the extracted history for removal of a legacy hard-coded provider token
-  before any remote publication. Public visibility remains blocked on an
-  independent full-history scan and owner-selected project license.
 
 ## Historical — Stage 3 parity (2026-05-29, cc-zig line)
 

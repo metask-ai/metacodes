@@ -346,7 +346,7 @@ Conversation, and `ReadArtifact` recovery.
 | Immutable Runtime replacement | yes | source-level `RuntimeHost`; transactional stage/publish, failed-stage preservation, old/new Session generation pinning and last-Session effect cleanup have one provider-facing L2 |
 | Provider dialect contribution | yes for Zig Runtime | `provider_dialect`; static-trusted, Snapshot-scoped longest-prefix resolver below existing transports, typed request-visible capability + request/profile/response adaptation, duplicate-key rejection and cache-stable equivalent replacement L2 |
 | Skill/Agent package directories | yes | implemented through repeatable `--plugin-dir`; both are namespaced and reach one App/provider-request L2 |
-| Process Host tools | yes | implemented through explicit `--process-plugin-dir`, Zig `RuntimeConfig.process_plugins`, and AgentCore v1 revision 13 `runtime_create_with_plugins`; hash-pinned, namespaced, exact-handshake, native `execute` permission/authority binding, abort/timeout/cap/reap L2; CLI `DynRegistry` preserves typed artifacts |
+| Process Host tools | yes | implemented through explicit `--process-plugin-dir`, Zig `RuntimeConfig.process_plugins`, and AgentCore v1 revision 15 `runtime->create(..., plugins, ...)`; hash-pinned, namespaced, exact-handshake, native `execute` permission/authority binding, abort/timeout/cap/reap L2; CLI `DynRegistry` preserves typed artifacts |
 | Static Host tools | yes | implemented through AgentRuntime; namespaced, attributed and guarded by the native permission pipeline |
 | Provider transport contribution | semantic boundary yes | descriptor activation rejected; embedding Hosts use the existing borrowed Provider override vtable |
 | Advisory policy/hook | synchronous ceiling yes | static descriptor activates monotonic `ToolExecutionPolicy`; it can hide/deny but never grant or rewrite; process/input-rewrite/around/post variants remain fail closed |
@@ -370,8 +370,8 @@ static plugin, replaces the first-party core profile from minimal to coding,
 and inventories both generations before optionally running a stateful
 `AgentSession`. The exact core capability/Host support matrix is
 `doc/CORE_PLUGIN_HOTSWAP.md`. The
-source-free AgentCore C/C++/Zig/Rust bundle is ABI v1 revision 13. Its explicit
-`runtime_create_with_plugins` constructor loads strict process packages and
+source-free AgentCore C/C++/Zig/Rust bundle is ABI v1 revision 15. Its explicit
+`runtime->create(..., plugins, ...)` constructor loads strict process packages and
 binds their executable/package/schema digest into native Permission and
 checkpoint identity. The original `runtime_create` remains the no-process path
 with an unchanged 96-byte `RuntimeConfigV1`. Revision 13 additionally exposes a
