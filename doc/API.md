@@ -507,6 +507,12 @@ streaming. Conversation receives deterministic inline bytes or an artifact
 envelope; `ReadArtifact` restores bounded slices. UI and post-tool observation can
 consume the original result without changing model-visible projection.
 
+Results above `per_result_bytes` are sealed during execution and published at the
+batch commit boundary. The sealed receipt renders a byte-identical artifact envelope;
+publication failure uses `retainInlineAfterFailedPublish`, falling back to inline bytes
+when allowed or a bounded `ArtifactPublishFailed` tool error otherwise. Other producers
+that still publish during execution are tracked in #65.
+
 ## Prompt-cache contract
 
 For equivalent effective configuration, one provider request must be a byte prefix

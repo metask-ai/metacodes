@@ -2548,6 +2548,7 @@ pub fn run(
             if (s.decision != .run) continue;
             if (prefetch.take(s.id)) |pf| {
                 s.content = pf.content;
+                s.sealed = pf.sealed;
                 s.file_refs = pf.file_refs;
                 s.file_changes = pf.file_changes;
                 s.file_changes_overflow = pf.file_changes_overflow;
@@ -2570,6 +2571,12 @@ pub fn run(
                 s.content = null;
                 s.prefetched = false;
             }
+            // A deferred slot keeps no sealed handle either (#45); ReadArtifact
+            // never seals, so this only guards the invariant.
+            if (s.sealed) |*handle| {
+                handle.spool.deinit();
+                s.sealed = null;
+            }
             // The planner charges only served slots, so this is the amount charged before every deferred slot.
             s.content = try tool_exec_mod.renderRecoveryDeferral(allocator, s.input, recovery_plan, recovery_plan.charged_bytes);
             s.is_error = true;
@@ -2588,6 +2595,9 @@ pub fn run(
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
         try exec_outcome;
+        // Execution completed without a fatal host result: this is the batch
+        // commit boundary, so sealed artifacts and their references commit together.
+        try tool_exec.publishSealedResults(slots.items, allocator, rid);
         // 成功条件义务 2.0:结果侧回填 met——只有执行成功(!is_error 且
         // exit_code=0,bash.zig 序列化以 `"exit_code":N}` 收尾)才算履约。
         if (opts.obligations) |obligation_runtime| {

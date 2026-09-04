@@ -121,6 +121,8 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "Timeout", .code = .timeout, .category = .system_error, .recoverable = true },
     .{ .name = "Aborted", .code = .aborted, .category = .system_error, .recoverable = false },
     .{ .name = "SpawnError", .code = .spawn_failed, .category = .system_error, .recoverable = true },
+    // A sealed result could not be published at the batch commit boundary (#45): a storage problem, not the tool's fault; retrying the call may succeed.
+    .{ .name = "ArtifactPublishFailed", .code = .io_error, .category = .system_error, .recoverable = true },
     .{ .name = "PathTraversal", .code = .path_traversal, .category = .safety, .recoverable = false },
     .{ .name = "DangerousCommand", .code = .dangerous_command, .category = .safety, .recoverable = false },
     .{ .name = "PermissionDenied", .code = .permission_denied, .category = .safety, .recoverable = false },
