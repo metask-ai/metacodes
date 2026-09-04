@@ -47,6 +47,7 @@ from scripts.eval.plugin_pair_runner import (
     _authority_manifest,
     _canonical_sha256,
     _observe,
+    materialized_source_tree,
     build_plan,
     freeze_run,
     frozen_run_fields,
@@ -770,7 +771,8 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
 
     @requires_posix_budget_journal
     def test_the_journal_authority_is_a_function_of_the_frozen_manifest(self) -> None:
-        observation = _observe(ROOT, self.fixture.protocol, self.fixture.runtime)
+        with materialized_source_tree(ROOT, self.fixture.protocol) as tree:
+            observation = _observe(tree, self.fixture.runtime)
         hashes = {
             _canonical_sha256(
                 _authority_manifest(
@@ -795,7 +797,8 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         # The runner refuses an authority below rollouts x max_rollout; a
         # journal sealed under one (six rollouts of zero usage fit under $2)
         # therefore cannot have come from run_paid_pair.
-        observation = _observe(ROOT, self.fixture.protocol, self.fixture.runtime)
+        with materialized_source_tree(ROOT, self.fixture.protocol) as tree:
+            observation = _observe(tree, self.fixture.runtime)
         authority = dict(self.state["authority"], total_cost_microusd=usd_to_microusd(2.0))
         authority["manifest_sha256"] = _canonical_sha256(
             _authority_manifest(
