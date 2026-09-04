@@ -68,6 +68,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Unhinted `ReadMcpResourceTool` no longer reports a local MCP storage failure
+  (`resource_limit` on a full session quota) as `resource_not_found`: the MCP
+  client classifies it as `system_error` and the read loop returns it instead
+  of trying other servers. Remote errors still fall through to
+  `resource_not_found`, which now carries the last server's error detail
+  (issue #56).
 - A CAS publication failure (a full session quota, for example) no longer turns
   a bounded MCP result into a tool error. All three publishers — the native
   spool, the classic `McpClient` and the AgentCore projector — share
