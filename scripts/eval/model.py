@@ -85,9 +85,12 @@ def open_nofollow(
     """``os.open`` that never follows a final-component symlink.
 
     POSIX passes ``O_NOFOLLOW`` to the kernel.  Windows has no such flag, so
-    the check is an explicit ``lstat`` before the open; that leaves a small
-    TOCTOU window the kernel flag does not have, which is the best the
-    standard library offers there.  ``O_BINARY`` is always applied.
+    the check uses a pre-open ``lstat`` fast path followed by open-then-verify.
+    The descriptor is bound to the file that was opened, so a swap after the
+    verification cannot redirect it.  The remaining difference from the
+    kernel flag is only that a symlink present exactly at open time is detected
+    after the fact and refused instead of failing the open.  ``O_BINARY`` is
+    always applied.
     ``dir_fd`` is forwarded for callers that anchor the open on a directory
     descriptor (POSIX only; Windows has no dir_fd and never reaches that path).
     """
@@ -100,6 +103,22 @@ def open_nofollow(
             probe = None
         if probe is not None and stat.S_ISLNK(probe.st_mode):
             raise OSError(errno.ELOOP, "refusing to follow symbolic link", str(path))
+        if dir_fd is None:
+            fd = os.open(path, flags | O_BINARY, mode)
+        else:
+            fd = os.open(path, flags | O_BINARY, mode, dir_fd=dir_fd)
+        try:
+            info = os.fstat(fd)
+            try:
+                after = os.lstat(path) if dir_fd is None else os.lstat(path, dir_fd=dir_fd)
+            except FileNotFoundError:
+                raise OSError(errno.ELOOP, "refusing to follow symbolic link", str(path))
+            if stat.S_ISLNK(after.st_mode) or (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+                raise OSError(errno.ELOOP, "refusing to follow symbolic link", str(path))
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
     if dir_fd is None:
         return os.open(path, flags | O_BINARY, mode)
     return os.open(path, flags | O_BINARY, mode, dir_fd=dir_fd)
