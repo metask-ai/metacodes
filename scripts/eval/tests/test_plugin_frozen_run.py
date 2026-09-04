@@ -624,8 +624,11 @@ class PaidRunObservesMaterializedHeadTest(unittest.TestCase):
         # Evidence outlives the temporary tree: every run directory was moved
         # under the output directory before it was imported.
         self.assertEqual(6, len(imported_from))
+        # Compared resolved: on macOS the temporary directory is reached through
+        # the /var -> /private/var symlink, and the runner resolves the output
+        # directory it is handed.
         for run_dir in imported_from:
-            self.assertEqual(fixture.output / "runs", run_dir.parent)
+            self.assertEqual((fixture.output / "runs").resolve(), run_dir.parent.resolve())
             self.assertTrue(run_dir.is_dir(), run_dir)
         # What the rollouts could execute is HEAD's baseline wrapper, byte for
         # byte, although the live one was different at every request.
