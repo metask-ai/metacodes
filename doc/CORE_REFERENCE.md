@@ -477,6 +477,15 @@ per_result_bytes)` 限界——同样按**编码后**字节,并扣掉自身信�
 (或 base64)进 `data` 的,按源字节限界会让引号密集内容渲染成预算的两倍,即"给超预算结果
 的恢复,比结果本身更超预算"。余量走 `next_offset`,一个字节都不丢。
 
+豁免仍然保留,但成本按 turn 限界(#40):agent loop 在执行前按 slot 顺序为每个 `ReadArtifact`
+调用计入其上界 `result_budget.recoveryReadCost`(= `min(MAX_READ_BYTES, per_result_bytes)`),
+超过 `recoveryAllowanceBytes`(= `per_turn_bytes / 2`)的调用一律 deferred:不执行,结果是有界的
+`{"error":"recovery_allowance_exhausted","artifact_id":…,"offset":…,"allowance_bytes":…,
+"charged_bytes":…,"hint":…}`(`is_error`),并发出 source 为 `recovery_allowance` 的
+`policy_decision` 事件。200K 窗口服务 4 个完整 chunk、第 5 个 deferred,而过去 9 个并行读会
+超出整个 turn 预算且投影无从裁剪。决策在任何线程运行之前按 slot 顺序、按上界完成,因此哪个
+调用被 deferred 不依赖调度时序,provider-visible bytes 始终是请求的纯函数。
+
 **压力阀不得毁掉唯一的恢复能力**:`microcompact` 的 clear 趟明确跳过带 recoverable
 artifact 的结果(那是被省略字节的唯一取回途径),`truncateLargeToolResults` 必须守同一条
 承诺——它的通用头尾截断是**文本**操作,套到信封上会切出不可解析的 JSON,artifact_id /

@@ -2511,6 +2511,29 @@ pub fn run(
         }
         // Host 工具 fatal → 直接上抛:不组装 tool_result(errdefer 释放 result_blocks,
         // slot payload 由上方 defer 回收),AgentSession.runLoop 捕获后 poisonRun。
+        const recovery_plan = tool_exec_mod.planRecoveryAllowance(slots.items, base_ctx.result_budget);
+        const deferred_recovery: usize = recovery_plan.deferred_count;
+        for (slots.items) |*s| {
+            if (s.decision != .deferred) continue;
+            if (s.prefetched) {
+                if (s.content) |c| allocator.free(c);
+                s.content = null;
+                s.prefetched = false;
+            }
+            // The planner charges only served slots, so this is the amount charged before every deferred slot.
+            s.content = try tool_exec_mod.renderRecoveryDeferral(allocator, s.input, recovery_plan, recovery_plan.charged_bytes);
+            s.is_error = true;
+            backend.emitEvent(sess, .{ .policy_decision = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .id = s.id,
+                .tool = s.name,
+                .decision = "deferred",
+                .source = "recovery_allowance",
+                .allowed = false,
+            } });
+        }
+        if (deferred_recovery > 0) log.info("agent", "recovery allowance: charged={d} allowance={d} deferred={d}", .{ recovery_plan.charged_bytes, recovery_plan.allowance_bytes, deferred_recovery });
         const exec_outcome = tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);

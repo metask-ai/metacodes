@@ -290,6 +290,22 @@ filename output is suppressed, `files_with_matches` — whose entire output woul
 be that path — is rejected for artifact searches, and the child's stderr is
 scrubbed of it before it can reach a tool error.
 
+`ReadArtifact` remains exempt from result projection, but its recovery cost is
+bounded per turn. Before the batch executes, the agent loop walks the turn's
+tool calls in slot order and charges each `ReadArtifact` call its upper bound,
+`result_budget.recoveryReadCost` (`min(MAX_READ_BYTES, per_result_bytes)`).
+Every call past `recoveryAllowanceBytes` (`per_turn_bytes / 2`) is deferred: it
+does not run, and its result is the bounded body
+`{"error":"recovery_allowance_exhausted","artifact_id":<id or null>,"offset":<n>,
+"allowance_bytes":<allowance>,"charged_bytes":<charged before this call>,
+"hint":<resume from this offset next turn>}` with `is_error` set, plus a
+`policy_decision` event whose source is `recovery_allowance`. On a 200K window
+four full chunks are served and the fifth is deferred, where nine used to
+exceed the turn budget with nothing projection could trim. The decision is made
+in slot order at the upper bound before any thread runs, so which call is
+deferred never depends on scheduling and provider-visible bytes stay a pure
+function of the request.
+
 No staging path is model-visible from Bash at all - not on a completed
 channel, not in the auto-backgrounded snapshot, and not on the explicit
 `run_in_background` response. All three handed one back for `Read` until they

@@ -19,6 +19,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- `ReadArtifact` recovery reads are bounded per turn. Recovery results stay
+  exempt from projection (spilling one would recurse), so nothing could trim
+  them: nine parallel reads on a 200K window cost 225,000 bytes against a
+  204,800-byte turn and squeezed every sibling to its minimum. The agent loop
+  now charges each `ReadArtifact` call its upper bound
+  (`result_budget.recoveryReadCost`) in slot order before execution and defers
+  every call past half the turn budget (`recoveryAllowanceBytes`): a deferred
+  call gets a bounded `recovery_allowance_exhausted` body carrying its
+  artifact id and offset instead of data, and a `policy_decision` event with
+  source `recovery_allowance`. Slot order at the upper bound keeps the
+  decision independent of thread timing, so provider-visible bytes do not
+  depend on scheduling. (#40)
+
 - The zero-provider plugin release gate now runs validation, pin hashing, and
   subprocesses from a private `git archive HEAD` materialized checkout;
   uncommitted pinned-input edits are refused up front and the checkout is
