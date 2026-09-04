@@ -637,6 +637,18 @@ by several routes is reported with their offer ids instead of guessed, and an
 offer id is accepted verbatim. Names the catalog does not declare fall through
 to the historical path, which still serves proxies and server-catalog models.
 
+`/login <provider> [--device-code] [--no-browser] [--client-id <client>]` is
+the TUI's OAuth setup path (issue #33). It is the kernel flow the CLI runs —
+`api/provider_login.zig` decides whether a login can start and typed-refuses
+when it cannot, `api/oauth_login.zig` runs the grant — with the REPL's
+transcript as the notify sink, and it ends in the same durable import, so a
+login made here and one made from the shell are indistinguishable afterwards.
+The flow blocks the REPL until it completes or times out, as `metacodes login`
+blocks the terminal; Metask keeps its own JSON device grant on the CLI. A picker
+commit that fails for want of a credential on an OAuth-capable provider names
+`/login <provider>` in its notice. The picker's own credential stage — signing
+in without leaving the overlay — is not built (see "Not implemented yet").
+
 ## Module map
 
 | File | Responsibility |
@@ -662,6 +674,7 @@ to the historical path, which still serves proxies and server-catalog models.
 | `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
 | `src/api/oauth_login.zig` | the interactive first-token grants (PKCE, device) |
+| `src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33) |
 | `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
 | `src/repl/model_picker.zig` | picker state machine (pure) |
 | `src/repl/model_picker_view.zig` | picker rendering |
@@ -688,17 +701,18 @@ from a profile, and `../app.zig` from the picker.
 Listed rather than left silent. Each is a decision with a reason, not an
 omission — and none of them is an acceptance criterion of the issue.
 
-- **Picker OAuth setup, and a default OpenAI client (issue #33, remaining).**
-  `metacodes login --provider <id>` is the interactive entry point, and the
-  flow lives in the kernel layer (`api/oauth_login.zig`) so a front end invokes
-  it rather than reimplementing it. The picker's credential stage itself is not
-  implemented yet — the `/models` handler says so — so there is nothing to wire
-  an OAuth setup path into; when that stage lands it should call the kernel
-  flow with a TUI `Notify` sink. Separately, the built-in `openai` profile
-  declares no `oauth_client_id`: the client an installation presents is a
-  registration decision, not something to guess in a profile, so
-  `metacodes login --provider openai` needs `--client-id` until the
-  maintainers settle one. #33 stays open on exactly those two points.
+- **The picker's credential stage, and a default OpenAI client (issue #33,
+  remaining; tracked as #67).** `/login <provider>` and `metacodes login
+  --provider <id>` are two entry points to one kernel flow
+  (`api/provider_login.zig` decides, `api/oauth_login.zig` runs), and a picker
+  commit that fails for want of a credential on an OAuth-capable provider names
+  `/login`. What is not built is a credential *stage* inside the picker —
+  signing in without leaving the overlay — which needs a run that does not
+  block the render loop, a way to cancel it, and a picker-owned `Notify` sink.
+  Separately, the built-in `openai` profile declares no `oauth_client_id`: the
+  client an installation presents is a registration decision for the
+  maintainers, not something to guess in a profile, so both entry points need
+  `--client-id` for `openai` until one is settled.
 - **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
   signed adapter reference, which needs review and signing infrastructure. The
   declarative schema covers relays, gateways, and self-hosted servers, which

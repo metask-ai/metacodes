@@ -13,6 +13,8 @@ const platform_signal = @import("platform").signal;
 const platform_term = @import("platform").terminal;
 const posix = std.posix;
 const app_mod = @import("../app.zig");
+const provider_login = @import("../api/provider_login.zig");
+const oauth_login_mod = @import("../api/oauth_login.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;
 const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
@@ -183,6 +185,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /skills          List installed skills
                 \\  /history         Show recent commands
                 \\  /model [name]    Show or switch the active model
+                \\  /login <id>      Sign in to a provider with OAuth (flags: /login)
                 \\  /mode [name]     Cycle or set permission mode (default|accept-edits|plan|auto|dont-ask|bypass)
                 \\  /effort [level]  Show or set reasoning effort (none|minimal|low|medium|high|xhigh)
                 \\  /resume [id]     List recent sessions, or resume one by id
@@ -434,6 +437,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         // issue #16:transcript 查看器从 Ctrl+O 移到 Ctrl+X Ctrl+O,`/transcript`
         // 是等价的可发现入口——绑定变了,可达性不能变。
+        // issue #33:`/login <provider>` 调内核 OAuth 流程(loopback PKCE 或设备码),
+        // 登录落到 `metacodes login --provider` 写的同一个 store。流程期间 REPL 阻塞,
+        // 与 CLI 阻塞终端一样。
+        if (std.mem.eql(u8, trimmed, "/login") or std.mem.startsWith(u8, trimmed, "/login ")) {
+            const rest = std.mem.trim(u8, trimmed[6..], " \t");
+            try handleLogin(app, allocator, rest);
+            continue;
+        }
         // issue #16:`/providers` 列出当前所有路由;`/providers refresh` 重新拉取
         // 配置里声明的 provider catalog(失败保留旧 catalog——陈旧目录远好过空目录)。
         if (std.mem.eql(u8, trimmed, "/providers") or std.mem.startsWith(u8, trimmed, "/providers ")) {
@@ -2323,6 +2334,108 @@ fn reportAliasAmbiguity(app: *app_mod.App, store: *const @import("../provider/co
     }
 }
 
+// ── `/login <provider>` (issue #33) ──────────────────────────────────────────
+
+fn printLoginUsage() void {
+    std.debug.print(
+        \\usage: /login <provider> [--device-code] [--no-browser] [--client-id <client>]
+        \\  Runs the provider's OAuth flow — loopback PKCE, or the device-code grant
+        \\  with --device-code — and stores the login where `metacodes login
+        \\  --provider <id>` stores it. The REPL waits until the flow finishes or
+        \\  times out (5 minutes). Metask signs in from the shell:
+        \\  `metacodes login --provider metask`.
+        \\
+    , .{});
+}
+
+/// The kernel decides every refusal (`provider_login.prepareProfile`); this
+/// only says which one, in the REPL's own words.
+fn loginRefusalText(err: provider_login.PrepareError, method: provider_login.Method) []const u8 {
+    return switch (err) {
+        error.ProviderHasNoTokenEndpoint => "that provider declares no OAuth token endpoint",
+        error.ProviderAcceptsNoOAuthKind => "that provider accepts no OAuth credential kind; a stored login would never be consulted",
+        error.FlowUnavailable => switch (method) {
+            .loopback => "that provider declares no OAuth authorization endpoint; try --device-code, or import a token with `metacodes login --provider <id> --oauth-token-json <file>`",
+            .device_code => "that provider declares no device authorization endpoint; try without --device-code, or import a token with `metacodes login --provider <id> --oauth-token-json <file>`",
+        },
+        error.ClientIdMissing => "that provider declares no OAuth client id; pass --client-id <client> (a provider under custom_providers can declare oauth.client_id)",
+    };
+}
+
+const LoginArgs = struct { provider: []const u8, options: provider_login.Options };
+const LoginParse = union(enum) { usage, unknown: []const u8, ok: LoginArgs };
+
+/// `/login` takes the CLI's flags with the CLI's rule: an argument it does not
+/// know refuses the whole command rather than starting a flow the user did not
+/// ask for.
+fn parseLoginArgs(rest: []const u8) LoginParse {
+    var provider_name: ?[]const u8 = null;
+    var options: provider_login.Options = .{};
+    var parts = std.mem.tokenizeAny(u8, rest, " \t");
+    while (parts.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--device-code")) {
+            options.method = .device_code;
+        } else if (std.mem.eql(u8, arg, "--no-browser")) {
+            options.open_browser = false;
+        } else if (std.mem.eql(u8, arg, "--client-id")) {
+            options.client_id = parts.next() orelse return .usage;
+        } else if (arg[0] == '-' or provider_name != null) {
+            return .{ .unknown = arg };
+        } else {
+            provider_name = arg;
+        }
+    }
+    const provider = provider_name orelse return .usage;
+    return .{ .ok = .{ .provider = provider, .options = options } };
+}
+
+fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    const args = switch (parseLoginArgs(rest)) {
+        .usage => return printLoginUsage(),
+        .unknown => |arg| {
+            std.debug.print("\x1b[31munknown /login argument '{s}'\x1b[0m\n", .{arg});
+            return printLoginUsage();
+        },
+        .ok => |value| value,
+    };
+    const name = args.provider;
+    const options = args.options;
+    if (std.ascii.eqlIgnoreCase(name, "metask")) {
+        // Metask's control plane uses its own JSON device grant, which the CLI
+        // runs; the generic RFC 8628 flow would violate that contract.
+        std.debug.print("Metask signs in from the shell: run `metacodes login --provider metask` (add --no-browser for a device code), then /providers refresh.\n", .{});
+        return;
+    }
+    const host = app.providerHost() catch |err| {
+        std.debug.print("\x1b[31mprovider registry unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    const built = host.registry.find(name) orelse {
+        std.debug.print("\x1b[31munknown provider '{s}'\x1b[0m\n", .{name});
+        return;
+    };
+    const prepared = provider_login.prepareProfile(built, options) catch |err| {
+        std.debug.print("\x1b[31m{s}\x1b[0m\n", .{loginRefusalText(err, options.method)});
+        return;
+    };
+    std.debug.print("Signing in to '{s}'; the REPL waits for the flow to finish.\n", .{built.id.slice()});
+    var diagnostic: provider_login.ImportDiagnostic = .{};
+    const outcome = prepared.run(allocator, app.io, oauth_login_mod.stderrNotify(), &diagnostic) catch |err| {
+        if (diagnostic.cause) |cause| {
+            std.debug.print("\x1b[31mlogin failed: {s} ({s})\x1b[0m\n", .{ @errorName(err), @errorName(cause) });
+        } else {
+            std.debug.print("\x1b[31mlogin failed: {s}\x1b[0m\n", .{@errorName(err)});
+        }
+        return;
+    };
+    std.debug.print("Signed in to '{s}' (OAuth); pick a route with /model.\n", .{outcome.provider_id.slice()});
+    // A route on this provider may have been unusable for want of a
+    // credential; the picker catalog is rebuilt so it reflects the login.
+    app.refreshModelPicker() catch |err| {
+        std.debug.print("\x1b[33mthe model picker did not refresh ({s}); /providers refresh will\x1b[0m\n", .{@errorName(err)});
+    };
+}
+
 fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     if (std.mem.eql(u8, rest, "refresh")) {
         const refreshed = app.refreshProviderCatalogs() catch |err| {
@@ -4117,6 +4230,23 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     }
 
     std.debug.print("Resumed session ({d} messages). Continue by sending a message.\n", .{app.conversation.len()});
+}
+
+test "/login parses the CLI's flags and fails closed on an argument it does not know" {
+    const parsed = parseLoginArgs("relay --device-code --no-browser --client-id abc");
+    try std.testing.expect(parsed == .ok);
+    try std.testing.expectEqualStrings("relay", parsed.ok.provider);
+    try std.testing.expect(parsed.ok.options.method == .device_code);
+    try std.testing.expect(!parsed.ok.options.open_browser);
+    try std.testing.expectEqualStrings("abc", parsed.ok.options.client_id.?);
+    // Flags may precede the name; a second bare word is refused, as is a typo.
+    try std.testing.expect(parseLoginArgs("--no-browser relay") == .ok);
+    try std.testing.expect(parseLoginArgs("relay extra") == .unknown);
+    try std.testing.expect(parseLoginArgs("") == .usage);
+    try std.testing.expect(parseLoginArgs("relay --client-id") == .usage);
+    const typo = parseLoginArgs("relay --device-cod");
+    try std.testing.expect(typo == .unknown);
+    try std.testing.expectEqualStrings("--device-cod", typo.unknown);
 }
 
 test "/loop gate: requires active goal, no queued input, non-plan mode, non-aborted run" {
