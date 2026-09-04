@@ -445,11 +445,17 @@ fn sealJsonResult(
     defer spool.deinit(); // a no-op once `seal` has taken the buffers
     try spool.write(result);
     const sealed = try spool.seal();
-    return .{ .sealed = .{
-        .spool = sealed,
-        .media_type = .json,
-        .capture_complete = true,
-    } };
+    return .{
+        .sealed = .{
+            .spool = sealed,
+            .media_type = .json,
+            .capture_complete = true,
+            // The bytes were materialized in memory up to the frame limit, so a
+            // failed publication at the commit boundary keeps them inline exactly
+            // as the execution-time policy did.
+            .retain_inline_ceiling = CONTROL_FRAME_MATERIALIZE_BYTES,
+        },
+    };
 }
 
 fn testCountDirectory(allocator: std.mem.Allocator, directory: []const u8) !usize {

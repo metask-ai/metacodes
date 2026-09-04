@@ -49,16 +49,16 @@ fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) !voi
 
 const ExpectedBody = enum { inline_body, artifact, structured_error };
 
+/// The caller owns `root` (a temporary session root): since #65 a result above
+/// the per-result budget comes back *sealed*, with its private file under that
+/// root, so the root has to outlive the call for the assertions to publish it.
 fn readResourceBody(
+    root: []const u8,
     uri: []const u8,
     server_hint: bool,
     fill_quota: bool,
 ) !cc.tools.ToolResultBody {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
     if (fill_quota) try fillSessionArtifactQuota(allocator, root);
     const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
     const argv = [_]?[*:0]const u8{ mock_path, null };
@@ -119,7 +119,11 @@ fn expectSizedResourceBody(
     defer allocator.free(expected);
     try std.testing.expectEqual(expected_result_bytes, expected.len);
 
-    var body = try readResourceBody(uri, server_hint, fill_quota);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var body = try readResourceBody(root, uri, server_hint, fill_quota);
     defer body.deinit(allocator);
     switch (expected_body) {
         .artifact => {
@@ -137,8 +141,31 @@ fn expectSizedResourceBody(
             );
         },
         .inline_body => {
-            try std.testing.expect(body == .@"inline");
-            try std.testing.expectEqualStrings(expected, body.@"inline".bytes);
+            if (body == .sealed) {
+                // Above the per-result budget the client seals (#65); the
+                // inline-retention policy it used to apply when publication
+                // failed during the call now runs at the batch commit
+                // boundary. Drive that boundary: with the quota full the
+                // publication fails, and bytes within the client's frame
+                // limit come back inline, exactly as before.
+                var rendered = try body.render(allocator);
+                defer rendered.deinit(allocator);
+                var slots = [_]cc.tool_exec.Slot{.{
+                    .decision = .run,
+                    .name = "ReadMcpResourceTool",
+                    .id = "sid",
+                    .input = "{}",
+                    .content = try allocator.dupe(u8, rendered.bytes),
+                    .sealed = body.takeSealed(),
+                }};
+                defer for (&slots) |*slot| slot.deinit(allocator);
+                try cc.tool_exec.publishSealedResults(&slots, allocator, .{ .bytes = [_]u8{'0'} ** 12 });
+                try std.testing.expect(!slots[0].is_error);
+                try std.testing.expectEqualStrings(expected, slots[0].content.?);
+            } else {
+                try std.testing.expect(body == .@"inline");
+                try std.testing.expectEqualStrings(expected, body.@"inline".bytes);
+            }
         },
         .structured_error => {
             // Above the frame limit the response never enters the ≤1MB branch:
@@ -189,7 +216,11 @@ test "MCP unhinted read returns local storage failure" {
 
 test "MCP unhinted read remote error falls through with detail" {
     const allocator = std.testing.allocator;
-    var body = try readResourceBody("mock://sized/notanumber", false, false);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var body = try readResourceBody(root, "mock://sized/notanumber", false, false);
     defer body.deinit(allocator);
     try std.testing.expect(body == .@"inline");
 
