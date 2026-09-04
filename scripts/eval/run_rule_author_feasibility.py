@@ -25,7 +25,7 @@ from scripts.eval.memory_budget_journal import (
     BudgetJournal,
     BudgetTransaction,
 )
-from scripts.eval.model import ValidationError, stable_json
+from scripts.eval.model import ValidationError, stable_json, O_BINARY, mode_violation, open_nofollow
 
 
 MODEL = "glm-5.2"
@@ -69,7 +69,7 @@ def secure_parent(path: Path) -> Path:
     info = path.lstat()
     if (
         not stat.S_ISDIR(info.st_mode)
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or mode_violation(info.st_mode, 0o077)
         or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
     ):
         raise ValidationError(f"artifact parent must be a private 0700 directory: {path}")
@@ -81,12 +81,10 @@ def load_global_api_key() -> bytearray:
         os.environ.get("METACODES_AUTH_FILE", str(Path.home() / ".metacodes" / "auth.json"))
     ).expanduser()
     flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     try:
-        fd = os.open(auth_path, flags)
+        fd = open_nofollow(auth_path, flags)
     except OSError as exc:
         raise ValidationError(f"cannot open global credential file: {exc}") from exc
     try:
@@ -94,7 +92,7 @@ def load_global_api_key() -> bytearray:
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) & 0o077
+            or mode_violation(info.st_mode, 0o077)
             or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
             or info.st_size <= 0
             or info.st_size > 64 * 1024
@@ -222,7 +220,7 @@ def child_error_code(stderr: str) -> str | None:
 
 def private_write(path: Path, value: Mapping[str, Any]) -> None:
     payload = (stable_json(value) + "\n").encode("utf-8")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(path, O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         offset = 0
         while offset < len(payload):
@@ -343,6 +341,7 @@ def main() -> int:
                 pass_fds=(read_fd,),
                 check=False,
                 text=True,
+                encoding="utf-8",
                 timeout=300,
             )
         finally:

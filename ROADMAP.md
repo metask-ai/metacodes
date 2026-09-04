@@ -62,6 +62,18 @@ CI targets self-hosted runners (Linux X64, macOS ARM64, Windows X64).
       that is runner availability (queueing), not workflow cost. Keep it
       there — heavyweight gates (`rule-control`, AgentCore Windows) stay in
       their own workflows.
+- [x] Windows leg runs the repository-wide suite (#53, PR #54). Until then the
+      `windows-gates` job only ran the platform modules and bundle checks; the
+      full `zig build test` had no Windows CI at all and portability
+      regressions accumulated silently (1 compile error, 8 unit tests, 8
+      integration shards, 330 Python cases when first run). Measured on the
+      self-hosted Windows runner with warm caches: full-suite step 1:09
+      (`zig build test -j6 --test-timeout 5m`), job total 1:47 — inside the
+      ~15 min budget, so it stays in the default job rather than a separate
+      workflow. Kernel-gated tests skip on this leg by design (no elan on the
+      runner; `testKernel()` returns null on Windows); the paid budget journal,
+      dir_fd-anchored publication and anonymous inherited descriptors are
+      POSIX-only and skip with stated reasons (`scripts/eval/tests/posix_only.py`).
 - [ ] Release-gate isolation: `rule-control` currently shares the
       `[self-hosted, macOS, ARM64]` label set with pull_request CI jobs;
       before public visibility, give it a dedicated or ephemeral runner so

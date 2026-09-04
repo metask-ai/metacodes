@@ -119,6 +119,7 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/l2-observed.txt",
@@ -256,6 +257,7 @@ test "L2 builtin replay declaration reaches durable dispatch intent" {
     });
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/read-replay.txt",

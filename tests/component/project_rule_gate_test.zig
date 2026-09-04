@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cc = @import("cc");
 const pfs = @import("platform").fs;
+const harness = @import("harness");
 
 const GovernedGateProbe = struct {
     pre_calls: usize = 0,
@@ -297,6 +298,7 @@ test "L2 Lean-selected source-CAS rewrites existing Write through one host-synth
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/auto-source-\"cas\".txt",
@@ -388,6 +390,7 @@ test "L2 malformed Write cannot be normalized by source-CAS lowering" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/malformed-source-cas.txt",
@@ -491,6 +494,7 @@ test "L2 host synthesis rejects non-UTF8 source without starting a dispatch" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/binary-source.bin",
@@ -559,6 +563,7 @@ test "L2 execution policy can reject synthesized Edit with zero file effect" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/policy-denied.txt",
@@ -624,6 +629,7 @@ test "L2 rejected auto-recovery dispatch start cancels inflight authorization" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const path = try std.fmt.allocPrint(allocator, "{s}/auto-start-rejected.txt", .{root});
     defer allocator.free(path);
@@ -680,6 +686,7 @@ test "L2 source drift between synthesis selection and recovery pre starts no dis
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/auto-pre-race.txt",
@@ -749,6 +756,7 @@ test "L2 source drift after recovery admission is reobserved without overwrite" 
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/auto-dispatch-race.txt",
@@ -817,6 +825,7 @@ test "L2 admitted new-file Write cannot truncate a target created after observat
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/raced.txt",
@@ -867,6 +876,7 @@ test "L2 Lean-admitted exact Edit refuses a source changed before native dispatc
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/exact-race.txt",
@@ -980,6 +990,7 @@ test "L2 exact recovery preserves content CAS across the blocked Write and later
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/between-turns-race.txt",
@@ -1072,6 +1083,7 @@ test "L2 exact recovery can fill an existing empty file without ordinary empty-n
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/empty.txt",
@@ -1157,6 +1169,7 @@ test "L2 malformed unrelated Edit remains a tool error while an exact obligation
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/pending.txt",
@@ -1236,6 +1249,7 @@ test "L2 rejected dispatch start cancels exact recovery inflight state" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/start-rejected.txt",
@@ -1738,6 +1752,7 @@ test "L2 promoted Lean deny rule blocks the real dispatcher before side effects"
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -2077,6 +2092,7 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -2426,6 +2442,7 @@ test "L2 shadow project rule records Lean blocks without changing real dispatch"
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -2550,6 +2567,7 @@ test "L2 active project rules fail closed before dispatch on artifact or kernel 
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -2702,6 +2720,7 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const session_dir = try std.fmt.allocPrint(allocator, "{s}/session", .{root});
     defer allocator.free(session_dir);
@@ -2833,6 +2852,7 @@ test "L2 extending an active bundle reattests the prior promotion before mutatio
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -3133,6 +3153,7 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -3324,6 +3345,7 @@ test "L2 exact recovery obligation capacity fails closed before a new target" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
 
     var active = try syntheticOrderedRecoveryActive(allocator, true, config);
@@ -3393,6 +3415,7 @@ test "L2 multi-rule recovery follows the first blocking Lean verdict only" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/existing.txt",
@@ -3469,6 +3492,7 @@ fn runBatchRuntimeFixture(rule_count: usize) !BatchRuntimeStats {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -3589,6 +3613,7 @@ test "L2 target mismatch skips checker while retaining auditable dispatch filter
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -3684,6 +3709,7 @@ test "L2 exact recovery retains source and Edit rules while pruning unrelated to
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -3779,6 +3805,7 @@ test "L2 repeated identical signals retain distinct physical checker calls" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -3884,6 +3911,7 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -3965,6 +3993,7 @@ test "L2 exact recovery checker fault fails closed before Edit side effects" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const checker_path = try std.fmt.allocPrint(
         allocator,
@@ -4059,6 +4088,7 @@ test "L2 same-cardinality batch binding drift has no durable verdict and no disp
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -4134,6 +4164,7 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);
@@ -4389,6 +4420,7 @@ test "L2 an Edit that rewrites an existing file under Write-only rules reports a
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/coverage-gap-target.txt",
@@ -4470,6 +4502,7 @@ test "L2 a covered dispatch and a harmless uncovered dispatch report no coverage
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const fresh_path = try std.fmt.allocPrint(
         allocator,
         "{s}/coverage-gap-fresh.txt",
@@ -4607,6 +4640,7 @@ test "L2 effect-class rule reaches the checker for Edit and is pruned for Bash" 
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/effect-class-target.txt",
@@ -4744,6 +4778,7 @@ test "L2 verify-only rule admits an oversized new-file Write and reports the ove
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/oversized-deliverable.json",
@@ -4854,6 +4889,7 @@ test "dispatch_started 记录真实 within_root(根外 false/根内 true)" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
     defer allocator.free(evidence_dir);

@@ -1600,16 +1600,26 @@ pub fn build(b: *std.Build) void {
             // real agent-loop/tool/runtime boundary.  Run all three adapters
             // against the native binary and hash-pinned local TinyKG with a
             // deterministic loopback provider (paid=0, external network=0).
-            const memory_runtime_smoke = b.addSystemCommand(&.{
-                eval_python_exe,
-                "scripts/eval/memory_agent_runtime_smoke.py",
-                "--binary",
-            });
-            memory_runtime_smoke.addArtifactArg(exe);
-            memory_runtime_smoke.addArg("--tinykg-binary");
-            memory_runtime_smoke.addFileArg(tinykg.artifact);
-            eval_test_step.dependOn(&memory_runtime_smoke.step);
-            test_step.dependOn(&memory_runtime_smoke.step);
+            // The native rollout hands the runtime its metadata as an anonymous
+            // inherited descriptor: open, unlink, pass the fd number through
+            // METACODES_EVAL_METADATA_FD via pass_fds (memory_agent_runtime.py,
+            // evaluation_backend.zig). Windows has no pass_fds, refuses to unlink
+            // an open file (sharing violation), and the runtime parses a POSIX fd
+            // number, so the smoke is POSIX-only until that hand-off gets a
+            // Windows handle design (the Python suite marks the same mechanism
+            // "anonymous inherited descriptor requires POSIX").
+            if (@import("builtin").os.tag != .windows) {
+                const memory_runtime_smoke = b.addSystemCommand(&.{
+                    eval_python_exe,
+                    "scripts/eval/memory_agent_runtime_smoke.py",
+                    "--binary",
+                });
+                memory_runtime_smoke.addArtifactArg(exe);
+                memory_runtime_smoke.addArg("--tinykg-binary");
+                memory_runtime_smoke.addFileArg(tinykg.artifact);
+                eval_test_step.dependOn(&memory_runtime_smoke.step);
+                test_step.dependOn(&memory_runtime_smoke.step);
+            }
         }
     }
 
@@ -2031,9 +2041,12 @@ pub fn build(b: *std.Build) void {
         windows_help_cmd.addArg("--help");
         windows_help_cmd.step.dependOn(b.getInstallStep());
         // This gate proves the Windows portability layer and installed CLI can
-        // execute natively. The repository-wide suite remains the independent
-        // `zig build test -Dtarget=x86_64-windows-gnu` gate; do not couple its
-        // unrelated subsystem timing/concurrency failures to this platform gate.
+        // execute natively. The repository-wide suite is a separate gate: the
+        // "Full offline test suite" step of ci.yml's windows-gates job runs
+        // `zig build test -j6` on the native Windows runner (#53 wired it; before
+        // that no workflow ran it and Windows regressions accumulated silently).
+        // Keep the two decoupled: do not couple the full suite's unrelated
+        // subsystem timing/concurrency failures to this platform gate.
         windows_gate_step.dependOn(platform_test_step);
         // The LSP subsystem's server lookup is native-platform logic (PATH
         // separator, path joiner, PATHEXT probing), so its suite belongs on the

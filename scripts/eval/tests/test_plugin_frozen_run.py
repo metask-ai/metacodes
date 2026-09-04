@@ -63,6 +63,7 @@ from scripts.eval.plugin_release_gate import (
     load_protocol,
     refresh_implementation_fingerprint,
 )
+from scripts.eval.tests.posix_only import POSIX, requires_posix_budget_journal
 
 ROOT = Path(__file__).resolve().parents[3]
 PROTOCOL = ROOT / "evals/plugin-v1/protocol.json"
@@ -267,7 +268,8 @@ class FreezeCliTest(unittest.TestCase):
             out = Path(directory) / "frozen.json"
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(0, main(["--freeze", "--protocol", str(path), "--runtime-binary", str(runtime), "--frozen-manifest", str(out)]))
-            self.assertEqual(0o600, stat.S_IMODE(out.stat().st_mode))
+            if POSIX:  # permission bits are synthetic on Windows
+                self.assertEqual(0o600, stat.S_IMODE(out.stat().st_mode))
             written = json.loads(out.read_text(encoding="utf-8"))
             self.assertEqual(manifest_sha256_of(written), written["manifest_sha256"])
             with self.assertRaises(SystemExit):
@@ -435,6 +437,7 @@ class PaidRunStaysFrozenTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.fixture = _PaidFixture(Path(self._tmp.name))
 
+    @requires_posix_budget_journal
     def test_a_complete_pair_is_bound_to_the_manifest_end_to_end(self) -> None:
         fixture = self.fixture
         fake = _FakeProvider(fixture)
@@ -468,6 +471,7 @@ class PaidRunStaysFrozenTest(unittest.TestCase):
         self.assertEqual(3, receipt["pair_count"])
         self.assertEqual(6, receipt["provider_requests_upper_bound"])
 
+    @requires_posix_budget_journal
     def test_a_protocol_rewritten_during_a_request_is_refused_before_its_evidence_is_imported(self) -> None:
         fixture = self.fixture
         fake = _FakeProvider(fixture, during_request=fixture.rewrite_protocol)
@@ -480,6 +484,7 @@ class PaidRunStaysFrozenTest(unittest.TestCase):
         self.assertEqual(["request_authorized"], [t["state"] for t in journal["transactions"].values()])
         self.assertFalse((fixture.output / "baseline.jsonl").exists())
 
+    @requires_posix_budget_journal
     def test_a_protocol_rewritten_between_requests_is_refused_before_the_next_request(self) -> None:
         fixture = self.fixture
         fake = _FakeProvider(fixture)
@@ -519,6 +524,7 @@ class PreAuthorizationFailureTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.fixture = _PaidFixture(Path(self._tmp.name))
 
+    @requires_posix_budget_journal
     def test_a_failure_before_the_authorization_is_durable_aborts_the_reservation(self) -> None:
         fixture = self.fixture
         with mock.patch.object(BudgetJournal, "authorize_request", side_effect=RuntimeError("lost before the write")):
@@ -533,6 +539,7 @@ class PreAuthorizationFailureTest(unittest.TestCase):
             self.assertEqual({"baseline": 3, "candidate": 3}, fixture.run())
         self.assertEqual(6, len(fake.requests))
 
+    @requires_posix_budget_journal
     def test_a_failure_after_the_authorization_is_durable_keeps_it_and_blocks_resume(self) -> None:
         fixture = self.fixture
         real = BudgetJournal.authorize_request
@@ -551,6 +558,7 @@ class PreAuthorizationFailureTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "replay is forbidden"):
                 fixture.run()
 
+    @requires_posix_budget_journal
     def test_an_abort_that_cannot_be_recorded_is_reported_not_swallowed(self) -> None:
         # The authorization never became durable *and* the abort could not
         # be persisted (storage failure): the reservation is stranded on
@@ -597,10 +605,12 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         mutate(rows[0])
         path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
+    @requires_posix_budget_journal
     def test_an_unrelated_readable_file_is_not_a_budget_journal(self) -> None:
         with self.assertRaisesRegex(ValidationError, "budget journal"):
             self.fixture.analyze(budget_journal_path=self.fixture.protocol)
 
+    @requires_posix_budget_journal
     def test_a_journal_sealed_without_this_frozen_manifest_is_refused(self) -> None:
         foreign = self.fixture.directory / "foreign-budget.jsonl"
         authority = dict(self.state["authority"], manifest_sha256="c" * 64)
@@ -609,16 +619,19 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "does not bind this frozen run"):
             self.fixture.analyze(budget_journal_path=foreign)
 
+    @requires_posix_budget_journal
     def test_a_row_naming_an_unknown_transaction_is_refused(self) -> None:
         self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("transaction_id", "0" * 64))
         with self.assertRaisesRegex(ValidationError, "the budget journal does not contain"):
             self.fixture.analyze()
 
+    @requires_posix_budget_journal
     def test_a_receipt_that_drifted_from_the_journal_is_refused(self) -> None:
         self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("identity_sha256", "0" * 64))
         with self.assertRaisesRegex(ValidationError, "drifted from the journal"):
             self.fixture.analyze()
 
+    @requires_posix_budget_journal
     def test_an_authorized_transaction_without_a_rollout_is_refused(self) -> None:
         authority = self.state["authority"]
         extra = BudgetTransaction(
@@ -640,6 +653,7 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "without a matching rollout"):
             self.fixture.analyze()
 
+    @requires_posix_budget_journal
     def test_the_journal_authority_is_a_function_of_the_frozen_manifest(self) -> None:
         observation = _observe(ROOT, self.fixture.protocol, self.fixture.runtime)
         hashes = {
@@ -661,6 +675,7 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "does not bind this frozen run"):
             verify_journal_authority(self.state, observation, frozen_manifest_sha256="b" * 64)
 
+    @requires_posix_budget_journal
     def test_an_authority_too_small_for_the_schedule_is_not_a_paid_run(self) -> None:
         # The runner refuses an authority below rollouts x max_rollout; a
         # journal sealed under one (six rollouts of zero usage fit under $2)
@@ -678,6 +693,7 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "cannot cover the complete frozen schedule"):
             verify_journal_authority(dict(self.state, authority=authority), observation, frozen_manifest_sha256=self.fixture.manifest["manifest_sha256"])
 
+    @requires_posix_budget_journal
     def test_resume_refuses_a_checkpoint_whose_body_was_edited(self) -> None:
         # Same sealed digest, checked on the runner's own resume path.
         def flip(row):
@@ -688,6 +704,7 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "checkpoint rollout body does not match the evidence sealed"):
                 self.fixture.run()
 
+    @requires_posix_budget_journal
     def test_a_rollout_body_edited_after_the_run_is_refused(self) -> None:
         # Outcome and judgement flipped coherently: validate_rollout accepts
         # the row, usage and receipt are untouched, only the sealed digest
@@ -699,6 +716,7 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "does not match the evidence sealed"):
             self.fixture.analyze()
 
+    @requires_posix_budget_journal
     def test_a_receipt_transplanted_from_another_run_of_the_same_freeze_is_refused(self) -> None:
         # Run B of the same freeze, different usage, into a fresh journal.
         fixture = self.fixture
@@ -731,6 +749,7 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "does not match the evidence sealed"):
             fixture.analyze()
 
+    @requires_posix_budget_journal
     def test_a_receipt_with_foreign_fields_or_a_later_journal_position_is_refused(self) -> None:
         self._rewrite_candidate(lambda row: row["budget_transaction"].__setitem__("note", "x"))
         with self.assertRaisesRegex(ValidationError, "unexpected or missing fields"):
@@ -740,6 +759,7 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "not bound to its commit revision/head"):
             self.fixture.analyze()
 
+    @requires_posix_budget_journal
     def test_resume_applies_the_same_receipt_binding_as_analysis(self) -> None:
         # A receipt with a foreign field, or one pointing at another journal
         # position, is refused on resume exactly as in analysis: the two
@@ -754,6 +774,7 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "not bound to its commit revision/head"):
                 self.fixture.run()
 
+    @requires_posix_budget_journal
     def test_a_row_the_harness_recorded_with_the_wrong_identity_is_refused(self) -> None:
         # The body is authentic - the journal sealed it - but its task
         # fingerprint is not the one this suite produces. Resume would refuse

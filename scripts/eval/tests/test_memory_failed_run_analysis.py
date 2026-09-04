@@ -271,7 +271,7 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
                 "runtime_candidate_sha256": hashlib.sha256(candidate_raw).hexdigest(),
             }
             (run / "failed-validation-diagnostic.json").write_text(
-                stable_json(diagnostic) + "\n"
+                stable_json(diagnostic) + "\n", encoding="utf-8", newline="\n"
             )
             with self.assertRaisesRegex(ValidationError, "SHA-256"):
                 _load_failed_candidate(run)
@@ -333,7 +333,7 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
                 "outputs": payloads,
             }
             receipt_path = root / "reanalysis-receipt.json"
-            receipt_path.write_text(stable_json(receipt) + "\n")
+            receipt_path.write_text(stable_json(receipt) + "\n", encoding="utf-8", newline="\n")
             os.chmod(receipt_path, 0o600)
             verify_reanalysis_bundle(root)
             unexpected = root / "raw-provider-cassette.json"

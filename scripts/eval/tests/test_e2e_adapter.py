@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from scripts.eval.tests.posix_only import requires_symlinks
 from pathlib import Path
 
 from scripts.eval.e2e_adapter import (
@@ -482,6 +483,7 @@ class E2EAdapterTest(unittest.TestCase):
             self.assertFalse(prompt_only["passed"])
             self.assertTrue(assistant["passed"])
 
+    @requires_symlinks
     def test_workspace_grader_rejects_symlinks_and_traversal(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -559,6 +561,7 @@ class E2EAdapterTest(unittest.TestCase):
             self.assertTrue(excludes["passed"])
             self.assertIn("casefold", contains["detail"])
 
+    @requires_symlinks
     def test_native_trace_reader_rejects_links_special_files_and_oversize(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

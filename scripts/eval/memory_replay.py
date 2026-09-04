@@ -42,7 +42,7 @@ from .memory_query_plan import (
     load_and_verify_query_plan_sidecar,
     summarize_query_plan_traces,
 )
-from .model import ValidationError, stable_json
+from .model import ValidationError, stable_json, POSIX_MODE_BITS
 
 
 REPLAY_SCHEMA_VERSION = 1
@@ -3242,7 +3242,7 @@ def validate_runtime_artifacts(
             directory=False,
         )
         snapshot_info = snapshot.lstat()
-        if stat.S_IMODE(snapshot_info.st_mode) != 0o500:
+        if POSIX_MODE_BITS and stat.S_IMODE(snapshot_info.st_mode) != 0o500:
             _fail(
                 f"{where}.ripgrep_snapshot_path",
                 "snapshot permissions must remain 0500",

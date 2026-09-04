@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
+from scripts.eval.tests.posix_only import requires_symlinks
 
 from scripts.eval.plugin_release_gate import (
     PluginGateError,
@@ -196,6 +197,7 @@ class PluginReleaseGateTest(unittest.TestCase):
         with self.assertRaises(PluginGateError):
             _benchmark_row(json.dumps(row), protocol["deterministic_gate"])
 
+    @requires_symlinks
     def test_symlinked_pinned_file_is_rejected(self) -> None:
         # The symlink is a *candidate* file named by the protocol, not the
         # protocol path itself - that was never symlink-checked.

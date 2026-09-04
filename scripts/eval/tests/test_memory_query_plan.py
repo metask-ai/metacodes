@@ -385,6 +385,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             (root / f"req-{request_index:03d}.json").write_text(
                 stable_json({"messages": messages}) + "\n",
                 encoding="utf-8",
+            newline="\n",
             )
 
     def test_verified_trace_replays_host_gain_and_seen_progression(self):
@@ -413,6 +414,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             (cassette / SIDECAR_NAME).write_text(
                 stable_json(trace) + "\n",
                 encoding="utf-8",
+            newline="\n",
             )
             replayed = load_and_verify_query_plan_sidecar(
                 cassette,
@@ -531,6 +533,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             (cassette / SIDECAR_NAME).write_text(
                 stable_json(trace) + "\n",
                 encoding="utf-8",
+            newline="\n",
             )
             self.assertEqual(
                 load_and_verify_query_plan_sidecar(
@@ -589,7 +592,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             )
             self.assertEqual(call["plan_sha256"], explicit_seed_sha)
             (cassette / SIDECAR_NAME).write_text(
-                stable_json(trace) + "\n", encoding="utf-8"
+                stable_json(trace) + "\n", encoding="utf-8", newline="\n"
             )
             self.assertEqual(
                 load_and_verify_query_plan_sidecar(
@@ -709,6 +712,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             (cassette / "req-001.json").write_text(
                 stable_json(request) + "\n",
                 encoding="utf-8",
+            newline="\n",
             )
             tampered = build_query_plan_trace(
                 cassette,
@@ -1425,6 +1429,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             (cassette / SIDECAR_NAME).write_text(
                 stable_json(tampered) + "\n",
                 encoding="utf-8",
+            newline="\n",
             )
             with self.assertRaisesRegex(ValidationError, "does not match raw provider requests"):
                 load_and_verify_query_plan_sidecar(
@@ -1442,6 +1447,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             (cassette / "req-001.json").write_text(
                 json.dumps({"messages": []}) + "\n",
                 encoding="utf-8",
+            newline="\n",
             )
             trace = build_query_plan_trace(
                 cassette,
@@ -1462,6 +1468,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             (cassette / "req-001.json").write_text(
                 json.dumps({"messages": []}) + "\n",
                 encoding="utf-8",
+            newline="\n",
             )
             trace = build_query_plan_trace(
                 cassette,
@@ -1522,6 +1529,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             (cassette / "req-001.json").write_text(
                 json.dumps({"messages": []}) + "\n",
                 encoding="utf-8",
+            newline="\n",
             )
             trace = build_query_plan_trace(
                 cassette,

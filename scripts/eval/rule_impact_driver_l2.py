@@ -29,6 +29,7 @@ def run_checked(argv: list[str], timeout: float = 60.0) -> subprocess.CompletedP
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=timeout,
     )
     if completed.returncode != 0:
@@ -69,6 +70,7 @@ def invoke_driver_fails(
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=60.0,
     )
     if completed.returncode == 0:

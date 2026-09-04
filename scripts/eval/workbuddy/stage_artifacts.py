@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
 from . import WORKBUDDY_PINNED_COMMIT
+from ..model import fsync_directory, open_nofollow
+
 
 
 SCHEMA_VERSION = "metacodes-workbuddy-split-mount-v1"
@@ -53,9 +55,9 @@ def _sha256(path: Path) -> str:
 
 def _copy_regular(source: Path, target: Path, mode: int) -> Dict[str, object]:
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY
     try:
-        descriptor = os.open(source, flags)
+        descriptor = open_nofollow(source, flags)
     except OSError as exc:
         raise StageError(f"cannot open artifact source {source}: {exc}") from exc
     try:
@@ -338,11 +340,7 @@ def stage(
         handle.flush()
         os.fsync(handle.fileno())
     os.chmod(sums_path, 0o644)
-    directory_fd = os.open(output, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    fsync_directory(output)
     return manifest
 
 

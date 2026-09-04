@@ -39,6 +39,8 @@ if __package__ in {None, ""}:
         usd_to_microusd_ceiling,
     )
     from scripts.eval.model import (  # type: ignore
+        open_nofollow,
+        O_BINARY,
         ValidationError,
         load_json,
         stable_json,
@@ -75,7 +77,7 @@ else:
         usd_to_microusd,
         usd_to_microusd_ceiling,
     )
-    from .model import ValidationError, load_json, stable_json, validate_suite, write_rollouts
+    from .model import O_BINARY, ValidationError, load_json, stable_json, validate_suite, write_rollouts, open_nofollow
     from .paired_runner import (
         TOKEN_METRICS,
         _load_checkpoint,
@@ -127,6 +129,7 @@ def _git_head(root: Path) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     if result.returncode != 0:
@@ -492,17 +495,16 @@ def _write_private_json(path: Path, value: Mapping[str, Any]) -> None:
     """Create `path` 0600, refusing to overwrite: a frozen manifest is a
     commitment, and silently replacing one is how a run ends up bound to a
     manifest nobody looked at."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    fd = os.open(path, O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    # The manifest is hashed by bytes, so its trailing newline must stay LF on Windows.
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(stable_json(value) + "\n")
 
 
 def _read_private_json(path: Path, label: str) -> dict[str, Any]:
     flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, flags)
+        fd = open_nofollow(path, flags)
     except OSError as exc:
         raise ValidationError(f"cannot open {label}: {exc}") from exc
     try:
@@ -620,6 +622,7 @@ def _inventory(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
             check=False,
             timeout=60,
         )

@@ -46,7 +46,7 @@ from .memory_budget_journal import (
 )
 from .memory_replay import PRODUCTION_PROVIDER_ID, _artifact_tree_digest
 from .memory_tinykg_local import LocalTinyKg, _store_info
-from .model import ValidationError, stable_json
+from .model import ValidationError, stable_json, O_BINARY, fsync_directory, mode_violation, open_nofollow
 from .project_harness_e3_experiment import (
     E3Error,
     _canonical_sha256,
@@ -293,10 +293,8 @@ def _read_regular(path: Path, *, root: Path, where: str) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(spelled, flags)
+        descriptor = open_nofollow(spelled, flags)
     except OSError as exc:
         _fail(where, f"cannot open without following links: {exc}")
     try:
@@ -681,7 +679,7 @@ def build_projection(
 
 def _write_private(path: Path, payload: bytes) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = os.open(path, O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         view = memoryview(payload)
         while view:
@@ -692,11 +690,7 @@ def _write_private(path: Path, payload: bytes) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    fsync_directory(path.parent)
 
 
 def persist_projection(
@@ -1322,7 +1316,7 @@ def _validate_private_path_if_present(path: Path, where: str) -> None:
         or not stat.S_ISREG(info.st_mode)
         or info.st_nlink != 1
         or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or mode_violation(info.st_mode, 0o077)
     ):
         _fail(where, "must be an owned single-link private regular file")
 
@@ -1551,7 +1545,7 @@ def _prepare_calibration(
             stat.S_ISLNK(run_info.st_mode)
             or not stat.S_ISDIR(run_info.st_mode)
             or (hasattr(os, "geteuid") and run_info.st_uid != os.geteuid())
-            or stat.S_IMODE(run_info.st_mode) & 0o077
+            or mode_violation(run_info.st_mode, 0o077)
         ):
             _fail("factorial calibration", "resume requires an owned private real directory")
     elif run_dir.exists() or run_dir.is_symlink():
@@ -1586,7 +1580,7 @@ def _prepare_calibration(
     if (
         not stat.S_ISDIR(parent_info.st_mode)
         or (hasattr(os, "geteuid") and parent_info.st_uid != os.geteuid())
-        or stat.S_IMODE(parent_info.st_mode) & 0o022
+        or mode_violation(parent_info.st_mode, 0o022)
     ):
         _fail("factorial calibration budget", "parent directory is not private and owned")
     budget_candidate = budget_parent / budget_candidate.name

@@ -326,7 +326,7 @@ test "L2 回归: subagent 单轮多 TaskCreate 不熔断,正常完成(治 tasks=
 
     var done = false;
     var i: usize = 0;
-    while (i < 500) : (i += 1) { // 最多 ~5s
+    while (i < 2000) : (i += 1) { // 最多 ~20s;上限只约束失败路径
         const r = try cc.task_output_tool.execute(&ctx, query);
         defer a.free(r);
         if (std.mem.indexOf(u8, r, "\"status\":\"done\"") != null) {

@@ -15,6 +15,7 @@ from scripts.eval.memory_tinykg_local import (
     run_local_tinykg_smoke,
 )
 from scripts.eval.model import ValidationError
+from scripts.eval.tests.posix_only import requires_posix_exec
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -349,6 +350,7 @@ class LocalTinyKgNativeTest(unittest.TestCase):
 
 
 class LocalTinyKgFailClosedTest(unittest.TestCase):
+    @requires_posix_exec
     def test_read_only_store_mutation_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from scripts.eval.tests.posix_only import requires_symlinks
 
 from scripts.eval.project_harness_e3_templates import (
     TemplateError,
@@ -26,6 +27,7 @@ class ProjectHarnessE3TemplatesTest(unittest.TestCase):
         ).hexdigest()
         self.assertEqual(expected, _project_identity(path))
 
+    @requires_symlinks
     def test_tree_digest_rejects_links(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
-from ..model import stable_json
+from ..model import O_BINARY, fsync_directory, mode_violation, open_nofollow, stable_json
 from . import WORKBUDDY_PINNED_COMMIT
 from .stage_artifacts import TARGET_PLATFORM
 
@@ -52,6 +52,10 @@ def _canonical_sha256(value: object) -> str:
 
 
 def _stable_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    # On Windows os.stat reports creation time as st_ctime while os.fstat reports the
+    # change time, so the field cannot pin identity across the two calls there.
+    if os.name == "nt":
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns)
     return (
         info.st_dev,
         info.st_ino,
@@ -68,7 +72,7 @@ def _stable_file_identity(info: os.stat_result) -> tuple[int, ...]:
 def _read_regular_observed(
     path: Path, maximum: int = 2 * 1024 * 1024 * 1024
 ) -> tuple[bytes, os.stat_result]:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = open_nofollow(path, os.O_RDONLY)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -148,7 +152,7 @@ def _private_new_parent(path: Path) -> Path:
     info = parent.stat()
     if (
         not stat.S_ISDIR(info.st_mode)
-        or stat.S_IMODE(info.st_mode) & 0o022
+        or mode_violation(info.st_mode, 0o022)
         or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
     ):
         raise EnvironmentPreflightError(
@@ -170,7 +174,7 @@ def _write_private_new(path: Path, payload: bytes) -> None:
     temporary = parent / (path.name + ".tmp")
     descriptor = os.open(
         temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
     try:
@@ -184,11 +188,7 @@ def _write_private_new(path: Path, payload: bytes) -> None:
     finally:
         os.close(descriptor)
     os.replace(temporary, parent / path.name)
-    parent_descriptor = os.open(parent, os.O_RDONLY)
-    try:
-        os.fsync(parent_descriptor)
-    finally:
-        os.close(parent_descriptor)
+    fsync_directory(parent)
 
 
 def _run(
@@ -202,6 +202,7 @@ def _run(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             timeout=timeout,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:

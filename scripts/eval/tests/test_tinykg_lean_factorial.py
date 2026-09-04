@@ -17,6 +17,7 @@ from scripts.eval.tinykg_lean_factorial import (
     dry_run_plan,
     load_receipts,
 )
+from scripts.eval.tests.posix_only import requires_posix_mode_bits
 
 
 CASES = ("factor-a", "factor-b", "factor-c", "factor-d")
@@ -226,6 +227,7 @@ class TinyKgLeanFactorialTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "no real checker call"):
             build_report(rows, CASES)
 
+    @requires_posix_mode_bits
     def test_smoke_rows_and_unsafe_receipt_files_cannot_claim_quality(self) -> None:
         unauthenticated = build_report(self.rows(), CASES)
         self.assertFalse(unauthenticated["quality_evidence"])

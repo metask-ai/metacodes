@@ -14,6 +14,24 @@ const std = @import("std");
 const net = @import("platform").net;
 const psync = @import("platform").sync;
 
+/// 把路径里的反斜杠原地改成正斜杠,返回同一 slice。
+///
+/// L2 组件测试普遍用 `tmpDir` + `realPath` 取 fixture 根,再把它插进 JSON 工具输入的
+/// 字符串字面量:`{"file_path":"<root>/x.txt", ...}`。realPath 在 Windows 上返回原生
+/// 反斜杠路径(`D:\prj\...\tmp\abc`),其中 `\t`、`\p` 会被 JSON 解析成
+/// 转义序列,file_path 于是指向一个不存在的路径:工具报 MissingFileChange、
+/// FileTargetState 落到 unavailable,断言全线崩。
+///
+/// Windows 的文件 API 同样接受正斜杠,所以在取根处归一一次,下游每个插值点都不必各自
+/// 转义。POSIX 上路径本就没有反斜杠,这个函数是**空操作**——它只改变 Windows 行为。
+/// 同一条纪律见 src/tools/test_tmp.zig 对 TEMP 的处理。
+pub fn normalizeSlashes(s: []u8) []const u8 {
+    for (s) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return s;
+}
+
 pub const MockServer = struct {
     pub const MAX_CAPTURED_REQUESTS: usize = 32;
     // Component tests exercise bounded 30KB tool previews across several

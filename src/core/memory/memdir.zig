@@ -102,9 +102,12 @@ pub fn canonicalAutoMemPath(allocator: std.mem.Allocator, memdir_abs: []const u8
 
     // 严格前缀 + 分隔符边界:canon == mem_canon(写 memdir 本身,罕见)或 canon 以 "mem_canon/" 开头。
     if (std.mem.eql(u8, canon, mem_canon)) return canon;
+    // 分隔符用 isSep 判:realpath 在 Windows 上返回反斜杠,写死 '/' 会让已存在文件的
+    // canonical 路径永远过不了边界检查——memdir 内的每次 Edit 都失去豁免,autosync 也
+    // 跟着失效。src/agents/memory.zig 的 isWithin 用的就是 isSep,同一条纪律。
     if (canon.len > mem_canon.len and
         std.mem.startsWith(u8, canon, mem_canon) and
-        canon[mem_canon.len] == '/')
+        std.fs.path.isSep(canon[mem_canon.len]))
     {
         return canon;
     }

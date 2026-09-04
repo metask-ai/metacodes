@@ -99,10 +99,17 @@ test "L2 WebSearch 独立 provider 让混合批并发且 Read 不被隔离" {
                 self.web_overlap.store(true, .release);
             }
             // A provider factory makes all four slots one safe batch. Wait for
-            // the whole batch so the assertion is scheduler-deterministic.
-            for (0..100_000) |_| {
-                if (self.active.load(.acquire) == 4) break;
-                std.Thread.yield() catch {};
+            // the whole batch so the assertion is scheduler-deterministic. The
+            // wait is wall-clock bounded, not iteration bounded: 100k yields
+            // elapse in milliseconds when nothing else is runnable (Windows
+            // SwitchToThread returns at once), and on a loaded runner (CI ran
+            // the AgentCore gate on the same box) the fourth slot's thread was
+            // not scheduled yet, so the peak read 3. A batch that genuinely
+            // never runs concurrently still fails: it never reaches 4 and the
+            // deadline expires.
+            const deadline = cc.util_time.nowMs() + 5_000;
+            while (self.active.load(.acquire) != 4 and cc.util_time.nowMs() < deadline) {
+                cc.util_time.sleepMs(1);
             }
             if (is_web) self.web_active.store(false, .release);
             _ = self.active.fetchSub(1, .acq_rel);

@@ -509,6 +509,7 @@ class LocalTinyKg:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=self.timeout_seconds,
                 check=False,
             )
@@ -519,7 +520,10 @@ class LocalTinyKg:
         self.commands.append(
             {
                 "action": action,
-                "argv": [self._normalized(item) for item in argv],
+                # argv entries are paths: canonical separators after redaction keep the
+                # trace host-independent (no-op on POSIX). stdout/stderr are hashed as
+                # emitted; rewriting backslashes there would corrupt JSON escapes.
+                "argv": [self._normalized(item).replace(os.sep, "/") for item in argv],
                 "exit_code": completed.returncode,
                 "stdout_sha256": hashlib.sha256(normalized_stdout.encode("utf-8")).hexdigest(),
                 "stderr_sha256": hashlib.sha256(normalized_stderr.encode("utf-8")).hexdigest(),

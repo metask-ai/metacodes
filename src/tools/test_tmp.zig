@@ -43,6 +43,19 @@ pub fn dir(buf: []u8) [:0]const u8 {
     return std.fmt.bufPrintZ(buf, "{s}/cc-zig-test-{d}", .{ tmp, pid }) catch unreachable;
 }
 
+/// 反斜杠 → 正斜杠(原地改写,返回同一 slice)。
+///
+/// 用 `std.testing.tmpDir` + `realPath` 取 fixture 根的测试拿到的是原生路径,Windows 上
+/// 含反斜杠。照原样插进 JSON 字符串字面量时,\t / \p 会被当成 JSON 转义序列,解析
+/// 出来的 file_path 被破坏 → 写入失败或 stat 落空。Windows API 同样接受正斜杠,所以归一
+/// 后既能嵌 JSON 也照常访问文件——与本模块 `path()` 对 TEMP 的处理是同一条纪律。
+pub fn normalizeSlashes(s: []u8) []const u8 {
+    for (s) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return s;
+}
+
 /// 反斜杠 → 正斜杠(拷进 out,返回 slice)。
 fn fwd(out: []u8, s: []const u8) []const u8 {
     const n = @min(s.len, out.len);

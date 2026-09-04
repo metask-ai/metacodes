@@ -6749,9 +6749,12 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
         }
 
         fn wait(self: *@This()) !void {
-            for (0..1_000_000) |_| {
+            // Wall-clock bound (10 s of 1 ms sleeps), not a yield count: a million
+            // yields elapse in well under a second when nothing else is runnable,
+            // which turns a loaded runner into a spurious EpilogueHookTimeout.
+            for (0..10_000) |_| {
                 if (self.entered.load(.acquire)) return;
-                std.Thread.yield() catch {};
+                sync.sleepMs(1);
             }
             return error.EpilogueHookTimeout;
         }

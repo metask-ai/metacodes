@@ -27,6 +27,10 @@ from scripts.eval.workbuddy.paired_analysis import (
     build_report,
 )
 from scripts.eval.workbuddy import paired_analysis
+from scripts.eval.tests.posix_only import requires_posix_budget_journal
+# A fixture path that is absolute on every host: POSIX keeps "/fixture", Windows
+# needs a drive letter for Path.is_absolute() (launch manifests reject relative rows).
+FIXTURE = str(Path("/fixture").resolve())
 
 
 def digest(label: str) -> str:
@@ -90,7 +94,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             "environment_preflight": {
                 "target_platform": "linux/amd64",
                 "content_sha256": digest("preflight"),
-                "receipt": {"path": "/fixture/preflight", "bytes": 1, "sha256": digest("p")},
+                "receipt": {"path": f"{FIXTURE}/preflight", "bytes": 1, "sha256": digest("p")},
             },
             "job": {"slug": f"job-{arm}", "config": {"sha256": digest(arm)}},
             "model": {
@@ -103,7 +107,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             "harness_fingerprint": digest(f"harness-{arm}"),
             "host_control_plane": {
                 name: {
-                    "path": f"/fixture/{name}.py",
+                    "path": f"{FIXTURE}/{name}.py",
                     "bytes": 1,
                     "sha256": digest(name),
                 }
@@ -133,10 +137,10 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 "environment_preflight_required": True,
                 "harbor_force_build": False,
                 "runner_tools": {
-                    "bash": {"path": "/fixture/bash", "sha256": digest("bash"), "version_sha256": digest("bv")},
-                    "uv": {"path": "/fixture/uv", "sha256": digest("uv"), "version_sha256": digest("uvv")},
+                    "bash": {"path": f"{FIXTURE}/bash", "sha256": digest("bash"), "version_sha256": digest("bv")},
+                    "uv": {"path": f"{FIXTURE}/uv", "sha256": digest("uv"), "version_sha256": digest("uvv")},
                 },
-                "runner": ["/fixture/uv", "run", "--frozen", "/fixture/bash", "scripts/run.sh", "--job", f"job-{arm}"],
+                "runner": [f"{FIXTURE}/uv", "run", "--frozen", f"{FIXTURE}/bash", "scripts/run.sh", "--job", f"job-{arm}"],
             },
             "dry_run": {
                 "network_requests": 0,
@@ -351,6 +355,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
         tr, trv, tj = self._receipt(root, "treatment", tmv, study=study)
         return bm, br, bj, tm, tr, tj, bmv, brv, tmv, trv
 
+    @requires_posix_budget_journal
     def test_replaced_trial_result_artifact_fails_closed(self):
         # The committed reward is bound to the trial artifact by content
         # hash; replacing (or deleting) the artifact after commit orphans
@@ -384,6 +389,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     treatment_journal_path=tj,
                 )
 
+    @requires_posix_budget_journal
     def test_resumed_arm_report_disclosure_and_revision_binding(self):
         # resumed 收据:披露块 + revision-gap + 花费恒等式(计分和 +
         # attempt-1)全链通过,报告并排披露两臂 resumed 清单。
@@ -408,6 +414,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 report["arms"]["treatment"]["resumed_trials"], []
             )
 
+    @requires_posix_budget_journal
     def test_hidden_resumes_disclosure_fails_revision_binding(self):
         # 藏匿:journal 里有 resume 事件(commit_revision=4),收据剥掉
         # resumes 块 → revision-gap 必须抓到(2026-08-18 对抗审查 J3)。
@@ -438,6 +445,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     treatment_journal_path=tj,
                 )
 
+    @requires_posix_budget_journal
     def test_tampered_resumes_content_fails_journal_binding(self):
         # 计数对、内容错(2026-08-18 第二轮审查 C2):把披露块的任务名换成
         # 另一个 selected 任务,revision-gap 仍满足——必须由账本
@@ -466,6 +474,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     treatment_journal_path=tj,
                 )
 
+    @requires_posix_budget_journal
     def test_fabricated_resumes_disclosure_fails_revision_binding(self):
         # 伪造:journal 无 resume 事件(commit_revision=3),收据硬塞
         # resumes 块 → 同一 gap 算式反向抓到。
@@ -495,6 +504,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     treatment_journal_path=tj,
                 )
 
+    @requires_posix_budget_journal
     def test_absorbed_hidden_resume_fails_closed(self):
         # 完整再平衡的藏匿(2026-08-18 第二轮审查 [3]/probe_d):剥掉披露
         # 块并把 attempt-1 花费吸收进 usage 与 task 行,让花费恒等式全部
@@ -562,6 +572,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             self._write(receipt_path, value)
         return bm, br, bj, tm, tr, tj
 
+    @requires_posix_budget_journal
     def test_dated_cache_prefix_drift_needs_flag_and_is_disclosed(self):
         # 跨 UTC 午夜的日期行漂移(pov2-r2 实例):无 flag 拒绝;有 flag 时
         # 从真实工件验证"仅日期行不同"后接受并披露。
@@ -583,6 +594,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 report["cache_prefix_dated_drift_tasks"], ["task-a"]
             )
 
+    @requires_posix_budget_journal
     def test_dated_cache_prefix_flag_refuses_non_date_differences(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -614,6 +626,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     accept_dated_cache_prefix=["task-a"],
                 )
 
+    @requires_posix_budget_journal
     def test_dated_cache_prefix_stale_flag_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -629,6 +642,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     accept_dated_cache_prefix=["task-a"],
                 )
 
+    @requires_posix_budget_journal
     def test_results_root_override_survives_checkout_relocation(self):
         # The manifest pins the checkout's absolute path; after archival the
         # same receipts must stay analyzable via --results-root (global
@@ -661,6 +675,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             )
             self.assertEqual(report["mean_reward_delta"], 0.5)
 
+    @requires_posix_budget_journal
     def test_report_binds_equal_cache_prefix_and_quality_cost_time_deltas(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -684,6 +699,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             self.assertIn("observed paired difference", report["claim_boundary"])
             self.assertNotIn("assignment effect", report["claim_boundary"])
 
+    @requires_posix_budget_journal
     def test_checkpoint_report_requires_single_actuation_and_reports_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -714,6 +730,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 progress["time_after_first_successful_verification_ms_delta"],
             )
 
+    @requires_posix_budget_journal
     def test_checkpoint_report_fails_closed_on_treatment_lean_cache_or_progress_drift(self):
         mutations = (
             (
@@ -779,6 +796,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                         treatment_journal_path=tj,
                     )
 
+    @requires_posix_budget_journal
     def test_covariate_cache_reward_and_budget_drift_fail_closed(self):
         mutations = (
             ("covariate", lambda tm, tr: tm["comparison"].update({"covariates_sha256": digest("other")})),
@@ -811,6 +829,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                         treatment_journal_path=tj,
                     )
 
+    @requires_posix_budget_journal
     def test_run_transaction_and_journal_reuse_fail_closed(self):
         for name, mutate in (
             (
@@ -863,6 +882,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                         treatment_journal_path=tj,
                     )
 
+    @requires_posix_budget_journal
     def test_per_task_cost_delta_is_already_in_microusd(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -880,6 +900,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             )
             self.assertEqual(1_000, report["tasks"]["task-a"]["cost_microusd_delta"])
 
+    @requires_posix_budget_journal
     def test_tampered_budget_journal_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -897,6 +918,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     treatment_journal_path=tj,
                 )
 
+    @requires_posix_budget_journal
     def test_receipt_cannot_elevate_unregistered_quality_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -920,6 +942,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     treatment_journal_path=tj,
                 )
 
+    @requires_posix_budget_journal
     def test_report_identities_use_the_same_bytes_that_were_validated(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

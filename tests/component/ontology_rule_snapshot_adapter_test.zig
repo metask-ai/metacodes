@@ -265,6 +265,7 @@ fn localFixture(
     root_buffer: []u8,
 ) !LocalFixture {
     const root_len = try tmp.dir.realPath(std.testing.io, root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const sid = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
     const session_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, sid.asSlice() });
@@ -625,6 +626,7 @@ test "L2 real TinyKG scratch store snapshot binds through prepare persist and ru
     defer local.deinit(a);
     var store_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &store_buf);
+    _ = harness.normalizeSlashes(store_buf[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = store_buf[0..root_len];
     const store = try std.fmt.allocPrint(a, "{s}/scratch.kg", .{root});
     defer a.free(store);
@@ -768,6 +770,7 @@ test "L2 KgClient requires exactly one LF of CLI framing and rejects any other s
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const canonical = try sourceSnapshot(a);
     defer a.free(canonical);
@@ -978,6 +981,7 @@ const EvolutionFixture = struct {
 
 fn evolutionFixture(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, root_buffer: []u8) !EvolutionFixture {
     const root_len = try tmp.dir.realPath(std.testing.io, root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const project_root = try std.fmt.allocPrint(allocator, "{s}/project", .{root});
     errdefer allocator.free(project_root);

@@ -218,6 +218,7 @@ def _run_fd_auth_seatbelt_smoke(root: Path, metacodes: Path) -> None:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=20,
                 check=False,
                 pass_fds=(credential_read_fd,),
@@ -304,6 +305,7 @@ def _run_fd_auth_https_environment_regression(root: Path, metacodes: Path) -> No
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             timeout=20,
             check=False,
             pass_fds=(credential_read_fd,),
@@ -410,6 +412,7 @@ def _run_adapter(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=15,
                 check=False,
             )
