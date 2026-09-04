@@ -20,6 +20,7 @@ import os
 import platform
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -374,7 +375,7 @@ class _FakeProvider:
         self.tasks = {task["id"]: task for task in suite["tasks"]}
         self.by_selector = {scenario_selector([task_id]): task_id for task_id in self.tasks}
 
-    def run_once(self, repo_root, binary, variant, trial, selector, provider, model_id, suite_path, revision, *, harness_config_id=None, runtime_env=None, allow_invalid_run=False, timeout_seconds=None, max_metered_tokens=None, max_cost_usd=None, runtime_api_key=None):
+    def run_once(self, repo_root, binary, variant, trial, selector, provider, model_id, suite_path, revision, *, harness_config_id=None, runtime_env=None, allow_invalid_run=False, timeout_seconds=None, max_metered_tokens=None, max_cost_usd=None, runtime_api_key=None, runs_dir=None):
         token = self.fixture.directory / f"run-{len(self.requests)}"
         self.requests.append((variant, trial, selector))
         self._state[token] = (binary, variant, trial, selector, provider, model_id, revision, harness_config_id, max_metered_tokens, max_cost_usd)
@@ -515,6 +516,110 @@ class PaidRunStaysFrozenTest(unittest.TestCase):
         journal = validate_checkpoint_payload(fixture.journal.read_bytes())
         self.assertEqual(["committed"], [t["state"] for t in journal["transactions"].values()])
         self.assertEqual(1, len(load_rollouts(fixture.output / "baseline.jsonl")))
+
+
+# The paid runner observes and executes Git HEAD materialized into a private
+# directory (#61, the paid-path form of the #49 gap). These tests edit a pinned
+# input of the LIVE checkout and restore it, which is exactly the sequence the
+# change closes; each restores the original bytes in `finally` and refuses to
+# run when the developer already has that file modified.
+LIVE_PINNED_INPUT = ROOT / "scripts/eval/fixtures/plugin_baseline.py"
+
+
+@contextlib.contextmanager
+def _live_pinned_input_rewritten(new_tail: bytes):
+    status = subprocess.run(
+        ["git", "-C", str(ROOT), "status", "--porcelain", "--", str(LIVE_PINNED_INPUT.relative_to(ROOT))],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if status.returncode != 0 or status.stdout.strip():
+        raise unittest.SkipTest("the live baseline wrapper is already modified; not clobbering it")
+    original = LIVE_PINNED_INPUT.read_bytes()
+    try:
+        with open(LIVE_PINNED_INPUT, "wb") as handle:
+            handle.write(original + new_tail)
+        yield original
+    finally:
+        with open(LIVE_PINNED_INPUT, "wb") as handle:
+            handle.write(original)
+
+
+class PaidRunObservesMaterializedHeadTest(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch(
+            "scripts.eval.plugin_pair_runner._verify_arm_inventory",
+            lambda root, protocol, arm, executable, runtime: "inventory-" + arm,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.temporary = Path(self._tmp.name)
+
+    def test_freeze_refuses_a_modified_pinned_input(self) -> None:
+        protocol_path, runtime = _frozen_fixture(self.temporary)
+        with _live_pinned_input_rewritten(b"\n# uncommitted\n"):
+            with self.assertRaisesRegex(ValidationError, "pinned inputs modified in the working tree"):
+                freeze_run(ROOT, protocol_path, runtime)
+
+    def test_a_paid_run_refuses_a_modified_pinned_input_before_opening_the_authority(self) -> None:
+        fixture = _PaidFixture(self.temporary)
+        opened = []
+        real_open = os.open
+
+        def spy_open(path, *args, **kwargs):
+            if str(path) == str(fixture.authority):
+                opened.append(path)
+            return real_open(path, *args, **kwargs)
+
+        with _live_pinned_input_rewritten(b"\n# uncommitted\n"), mock.patch(
+            "scripts.eval.plugin_pair_runner.os.open", spy_open
+        ):
+            with self.assertRaisesRegex(ValidationError, "pinned inputs modified in the working tree"):
+                fixture.run()
+        self.assertEqual([], opened)
+        self.assertFalse(fixture.output.exists())
+        self.assertFalse(fixture.journal.exists())
+
+    @requires_posix_budget_journal
+    def test_a_paid_run_executes_the_materialized_tree_not_the_live_one(self) -> None:
+        fixture = _PaidFixture(self.temporary)
+        head_bytes = LIVE_PINNED_INPUT.read_bytes()
+        seen = []
+        rewritten = []
+
+        def change_and_restore():
+            # The ABA sequence between the before/after observations: the live
+            # wrapper is replaced and restored while the request is in flight.
+            with _live_pinned_input_rewritten(b"\n# replaced during the request\n"):
+                rewritten.append(LIVE_PINNED_INPUT.read_bytes())
+
+        fake = _FakeProvider(fixture, during_request=change_and_restore)
+
+        def recording_run_once(repo_root, binary, *args, **kwargs):
+            seen.append((Path(repo_root), Path(binary), kwargs.get("runs_dir"), Path(binary).read_bytes()))
+            return fake.run_once(repo_root, binary, *args, **kwargs)
+
+        with mock.patch("scripts.eval.plugin_pair_runner._run_once", side_effect=recording_run_once), mock.patch(
+            "scripts.eval.plugin_pair_runner.import_run", side_effect=fake.import_run
+        ), mock.patch("scripts.eval.plugin_pair_runner._load_api_key", return_value="test-only-key"):
+            self.assertEqual({"baseline": 3, "candidate": 3}, fixture.run())
+        self.assertEqual(6, len(seen))
+        self.assertEqual(6, len(rewritten))
+        for repo_root, binary, runs_dir, executed in seen:
+            self.assertNotEqual(ROOT.resolve(), repo_root.resolve())
+            self.assertIn("metacodes-paid-tree-", str(repo_root))
+            self.assertTrue(str(binary).startswith(str(repo_root)), binary)
+            self.assertEqual(fixture.output / "runs", runs_dir)
+        # What the rollouts could execute is HEAD's baseline wrapper, byte for
+        # byte, although the live one was different at every request.
+        baseline_runs = [row for row in seen if row[1].name == LIVE_PINNED_INPUT.name]
+        self.assertEqual(3, len(baseline_runs))
+        for _, _, _, executed in baseline_runs:
+            self.assertEqual(head_bytes, executed)
+        for live_during_request in rewritten:
+            self.assertNotEqual(head_bytes, live_during_request)
+        self.assertEqual(head_bytes, LIVE_PINNED_INPUT.read_bytes())
 
 
 class PreAuthorizationFailureTest(unittest.TestCase):
