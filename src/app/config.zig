@@ -31,8 +31,9 @@ pub const FileConfig = struct {
 };
 
 /// Schema version of `~/.metacodes/config.json` this build reads and writes
-/// (doc/API.md); `--version --json` reports it as `contract.config_schema_version`.
-pub const SCHEMA_VERSION: u32 = 1;
+/// (doc/API.md); `--version --json` reports it as `contract.config_schema_version`
+/// and the release manifest carries the same number (`src/release_contract.zig`).
+pub const SCHEMA_VERSION: u32 = @import("../release_contract.zig").CONFIG_SCHEMA_VERSION;
 
 /// 从 ~/.metacodes/config.json 加载。文件不存在返回全默认（null 字段）。
 pub fn loadFromHome(allocator: std.mem.Allocator) !FileConfig {

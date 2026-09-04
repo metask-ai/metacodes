@@ -1,8 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const abi_types = @import("metask_agentcore_types");
-
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const common = @import("manifest_common.zig");
 
 const FileEntry = struct {
     path: []const u8,
@@ -70,10 +69,7 @@ const Manifest = struct {
     files: []const FileEntry,
 };
 
-const SourceIdentity = struct {
-    commit: []const u8,
-    dirty: bool,
-};
+const SourceIdentity = common.SourceIdentity;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -97,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
         return error.EmptyMetadata;
     const strip = parseBool(strip_text) orelse return error.InvalidBoolean;
 
-    const source = try sourceIdentity(allocator, init.io);
+    const source = try common.sourceIdentity(allocator, init.io, "AgentCore manifest");
     const sdk_version_bytes = try std.Io.Dir.cwd().readFileAlloc(
         init.io,
         "sdk/VERSION",
@@ -107,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
     const sdk_version = std.mem.trim(u8, sdk_version_bytes, " \r\n\t");
     const version = try packageVersion(allocator, sdk_version, source);
     if (version.len > 32) return error.PackageVersionTooLong;
-    const target_id = try packageTargetId(allocator, architecture, os, abi);
+    const target_id = try common.packageTargetId(allocator, architecture, os, abi);
     const rust_target = try rustTarget(architecture, os, abi);
     const no_link_inputs = [_][]const u8{};
     const windows_libraries = [_][]const u8{ "advapi32", "crypt32" };
@@ -132,11 +128,11 @@ pub fn main(init: std.process.Init) !void {
     const cargo = try renderCargoToml(allocator, version);
     const cargo_lock = try renderCargoLock(allocator, version);
     const rust_link_config = try renderRustLinkConfig(allocator, rust_target, system_libraries, system_frameworks);
-    try writeBundleFile(allocator, init.io, bundle_root, "README.md", readme);
-    try writeBundleFile(allocator, init.io, bundle_root, "bindings/zig/build.zig.zon", zon);
-    try writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/Cargo.toml", cargo);
-    try writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/Cargo.lock", cargo_lock);
-    try writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/link.cfg", rust_link_config);
+    try common.writeBundleFile(allocator, init.io, bundle_root, "README.md", readme);
+    try common.writeBundleFile(allocator, init.io, bundle_root, "bindings/zig/build.zig.zon", zon);
+    try common.writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/Cargo.toml", cargo);
+    try common.writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/Cargo.lock", cargo_lock);
+    try common.writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/link.cfg", rust_link_config);
 
     const library_rel = try std.fmt.allocPrint(allocator, "lib/{s}", .{library_file});
     const relative_paths = [_][]const u8{
@@ -163,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
     var files: [relative_paths.len]FileEntry = undefined;
     for (relative_paths, 0..) |relative_path, index| {
         const installed_path = try std.fs.path.join(allocator, &.{ bundle_root, relative_path });
-        digests[index] = std.fmt.bytesToHex(try fileSha256(init.io, installed_path), .lower);
+        digests[index] = std.fmt.bytesToHex(try common.fileSha256(init.io, installed_path), .lower);
         files[index] = .{ .path = relative_path, .sha256 = &digests[index] };
     }
 
@@ -205,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
     const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 });
     const json_with_newline = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
     const manifest_path = try std.fs.path.join(allocator, &.{ bundle_root, "manifest.json" });
-    try writeAtomic(init.io, manifest_path, json_with_newline);
+    try common.writeAtomic(init.io, manifest_path, json_with_newline);
 }
 
 fn usage() error{InvalidArguments} {
@@ -254,13 +250,6 @@ fn packageVersion(allocator: std.mem.Allocator, sdk_version: []const u8, source:
         std.fmt.allocPrint(allocator, "{s}+{s}.dirty", .{ sdk_version, commit_short })
     else
         std.fmt.allocPrint(allocator, "{s}+{s}", .{ sdk_version, commit_short });
-}
-
-fn packageTargetId(allocator: std.mem.Allocator, architecture: []const u8, os: []const u8, abi: []const u8) ![]const u8 {
-    return if (std.mem.eql(u8, os, "macos"))
-        std.fmt.allocPrint(allocator, "{s}-macos", .{architecture})
-    else
-        std.fmt.allocPrint(allocator, "{s}-{s}-{s}", .{ architecture, os, abi });
 }
 
 fn rustTarget(architecture: []const u8, os: []const u8, abi: []const u8) ![]const u8 {
@@ -381,67 +370,6 @@ fn renderRustLinkConfig(
     for (system_frameworks) |framework|
         try output.writer.print("framework={s}\n", .{framework});
     return output.toOwnedSlice();
-}
-
-fn writeBundleFile(allocator: std.mem.Allocator, io: std.Io, bundle_root: []const u8, relative_path: []const u8, bytes: []const u8) !void {
-    const path = try std.fs.path.join(allocator, &.{ bundle_root, relative_path });
-    try writeAtomic(io, path, bytes);
-}
-
-fn fileSha256(io: std.Io, path: []const u8) ![32]u8 {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    var hash = Sha256.init(.{});
-    var buffer: [64 * 1024]u8 = undefined;
-    var offset: u64 = 0;
-    while (true) {
-        const count = try file.readPositional(io, &.{&buffer}, offset);
-        if (count == 0) break;
-        hash.update(buffer[0..count]);
-        offset += count;
-    }
-    var digest: [32]u8 = undefined;
-    hash.final(&digest);
-    return digest;
-}
-
-fn sourceIdentity(allocator: std.mem.Allocator, io: std.Io) !SourceIdentity {
-    const commit_output = try runGit(allocator, io, &.{ "git", "rev-parse", "HEAD" });
-    const commit = std.mem.trim(u8, commit_output, " \r\n\t");
-    if (commit.len != 40 or !isLowerHex(commit)) return error.InvalidGitCommit;
-    const status = try runGit(allocator, io, &.{
-        "git", "status", "--porcelain=v1", "-z", "--untracked-files=normal", "--", ".",
-    });
-    return .{ .commit = commit, .dirty = status.len != 0 };
-}
-
-fn runGit(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]const u8 {
-    const result = try std.process.run(allocator, io, .{
-        .argv = argv,
-        .stdout_limit = .limited(512 * 1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    switch (result.term) {
-        .exited => |code| if (code == 0) return result.stdout,
-        else => {},
-    }
-    std.debug.print("AgentCore manifest: git command failed: {s}\n", .{result.stderr});
-    return error.GitCommandFailed;
-}
-
-fn writeAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
-    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
-        .replace = true,
-        .make_path = true,
-    });
-    defer atomic_file.deinit(io);
-    try atomic_file.file.writeStreamingAll(io, bytes);
-    try atomic_file.replace(io);
-}
-
-fn isLowerHex(bytes: []const u8) bool {
-    for (bytes) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
-    return true;
 }
 
 test "ripgrep pin parses the vendor manifest identity and rejects empty fields" {

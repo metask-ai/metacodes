@@ -104,10 +104,26 @@ pub const Document = struct {
     }
 };
 
+pub const MAX_VERSION_LEN: usize = 96;
+
+/// The version the executable reports and the release manifest records
+/// (#80): the semver as declared for a release, or, for a `-dev`
+/// pre-release, the semver plus `+<commit12>` build metadata (`.dirty`
+/// appended when the tree was dirty) — the same rule
+/// `scripts/release_manifest.zig` applies, so `--version --json` is a strict
+/// subset of `manifest.json`.
+pub fn fullVersion(buffer: *[MAX_VERSION_LEN]u8, semver: []const u8, info: BuildInfo) []const u8 {
+    const parsed = std.SemanticVersion.parse(semver) catch return semver;
+    if (parsed.pre == null or parsed.build != null or info.commit.len < 12) return semver;
+    const suffix: []const u8 = if (info.dirty) ".dirty" else "";
+    return std.fmt.bufPrint(buffer, "{s}+{s}{s}", .{ semver, info.commit[0..12], suffix }) catch semver;
+}
+
 /// Human-readable identity. The first line is the documented `metacodes
-/// <semver>` and must not change; every later line is `<key> <value...>`.
+/// <version>` and must not change shape; every later line is `<key> <value...>`.
 pub fn writeText(w: *std.Io.Writer, semver: []const u8, info: BuildInfo) std.Io.Writer.Error!void {
-    try w.print("metacodes {s}\n", .{semver});
+    var version_buffer: [MAX_VERSION_LEN]u8 = undefined;
+    try w.print("metacodes {s}\n", .{fullVersion(&version_buffer, semver, info)});
     try w.print("commit {s}{s}\n", .{ info.commit, if (info.dirty) " (dirty)" else "" });
     try w.print("zig {s}\n", .{info.zig});
     try w.print("target {s} {s}\n", .{ info.target, info.optimize });
@@ -128,7 +144,8 @@ fn writeAssetLine(w: *std.Io.Writer, name: []const u8, version: []const u8, revi
 
 /// The JSON document, one line, newline-terminated.
 pub fn writeJson(w: *std.Io.Writer, semver: []const u8, info: BuildInfo) std.Io.Writer.Error!void {
-    try std.json.Stringify.value(Document.init(semver, info), .{}, w);
+    var version_buffer: [MAX_VERSION_LEN]u8 = undefined;
+    try std.json.Stringify.value(Document.init(fullVersion(&version_buffer, semver, info), info), .{}, w);
     try w.writeByte('\n');
 }
 
@@ -193,4 +210,21 @@ test "version json has the documented shape" {
         "5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba",
         assets[1].object.get("sha256").?.string,
     );
+}
+
+test "a dev pre-release reports the commit as build metadata; a release version stays bare" {
+    var buffer: [MAX_VERSION_LEN]u8 = undefined;
+    try std.testing.expectEqualStrings("0.2.0-dev+0123456789ab.dirty", fullVersion(&buffer, "0.2.0-dev", test_info));
+    var clean = test_info;
+    clean.dirty = false;
+    try std.testing.expectEqualStrings("0.2.0-dev+0123456789ab", fullVersion(&buffer, "0.2.0-dev", clean));
+    try std.testing.expectEqualStrings("0.2.0", fullVersion(&buffer, "0.2.0", test_info));
+    var unknown = test_info;
+    unknown.commit = "unknown";
+    try std.testing.expectEqualStrings("0.2.0-dev", fullVersion(&buffer, "0.2.0-dev", unknown));
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeText(&out.writer, "0.2.0-dev", clean);
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "metacodes 0.2.0-dev+0123456789ab\n"));
 }
