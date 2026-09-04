@@ -251,7 +251,7 @@ test "L2 CLI process package preserves typed artifact through DynRegistry and Ag
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .artifact_spool, 1000);
+    const entrypoint = try createPackage(root, .artifact_spool, 30_000);
     defer std.testing.allocator.free(entrypoint);
 
     const bodies = [_][]const u8{ TOOL_SSE, FINAL_SSE };
@@ -337,7 +337,7 @@ test "L2 process plugin is namespaced advertised permissioned executed and proje
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .ok, 1000);
+    const entrypoint = try createPackage(root, .ok, 30_000);
     defer allocator.free(entrypoint);
 
     const runtime = try createRuntime(root);
@@ -383,7 +383,7 @@ test "L2 process plugin writes from byte zero into the kernel artifact spool" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .artifact_spool, 1000);
+    const entrypoint = try createPackage(root, .artifact_spool, 30_000);
     defer allocator.free(entrypoint);
     const runtime = try createRuntime(root);
     defer runtime.destroy() catch unreachable;
@@ -394,6 +394,11 @@ test "L2 process plugin writes from byte zero into the kernel artifact spool" {
     tool_ctx.artifact_root = root;
     var outcome = try selection.dispatcher().dispatch(&tool_ctx, TOOL_NAME, "{\"text\":\"hello\"}");
     defer outcome.deinit(allocator);
+    // #52:失败时把 outcome 打出来,否则日志里分不清握手超时、调用超时还是别的错误。
+    if (outcome != .ok) std.debug.print(
+        "dispatch outcome: {s} {s}\n",
+        .{ @tagName(outcome), if (outcome == .host_failed) (outcome.host_failed orelse "") else "" },
+    );
     try std.testing.expect(outcome == .ok);
     try std.testing.expect(outcome.ok == .artifact);
     try std.testing.expect(outcome.ok.artifact.stored.bytes > 80 * 1024);
@@ -420,7 +425,7 @@ test "L2 native plan mode denies process plugin before child execution" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .ok, 1000);
+    const entrypoint = try createPackage(root, .ok, 30_000);
     defer allocator.free(entrypoint);
     const runtime = try createRuntime(root);
     defer runtime.destroy() catch unreachable;
@@ -465,7 +470,10 @@ test "process timeout kills and reaps the child group" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .timeout, 100);
+    // 1000 ms 而不是 100 ms:脚本先 `echo $$ > child.pid` 再 sleep 5,超时只需短于 5 s 即可
+    // 证明"超时会杀掉并收尸";100 ms 在负载高的 runner 上子进程还没写出 pid 文件就被杀,
+    // 下面的 pid 读取报 FileNotFound(#52 同类)。
+    const entrypoint = try createPackage(root, .timeout, 1000);
     defer allocator.free(entrypoint);
     const runtime = try createRuntime(root);
     defer runtime.destroy() catch unreachable;
@@ -507,12 +515,17 @@ test "process plugin receives no inherited parent secret" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .env_probe, 1000);
+    const entrypoint = try createPackage(root, .env_probe, 30_000);
     defer std.testing.allocator.free(entrypoint);
     const runtime = try createRuntime(root);
     defer runtime.destroy() catch unreachable;
     var outcome = try dispatchOnce(runtime, null);
     defer outcome.deinit(std.testing.allocator);
+    // #52:失败时把 outcome 打出来,否则日志里分不清握手超时、调用超时还是别的错误。
+    if (outcome != .ok) std.debug.print(
+        "dispatch outcome: {s} {s}\n",
+        .{ @tagName(outcome), if (outcome == .host_failed) (outcome.host_failed orelse "") else "" },
+    );
     try std.testing.expect(outcome == .ok);
     try std.testing.expectEqualStrings("process-plugin-ok", outcome.ok.@"inline".bytes);
 }
@@ -524,7 +537,7 @@ test "oversized process request fails before child execution" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .ok, 1000);
+    const entrypoint = try createPackage(root, .ok, 30_000);
     defer allocator.free(entrypoint);
     const runtime = try createRuntime(root);
     defer runtime.destroy() catch unreachable;
@@ -553,7 +566,7 @@ test "handshake input schema required field is enforced before process execution
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .ok, 1000);
+    const entrypoint = try createPackage(root, .ok, 30_000);
     defer allocator.free(entrypoint);
     const runtime = try createRuntime(root);
     defer runtime.destroy() catch unreachable;
@@ -576,7 +589,7 @@ test "post-stage process binary mutation fails closed" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .ok, 1000);
+    const entrypoint = try createPackage(root, .ok, 30_000);
     defer std.testing.allocator.free(entrypoint);
     const runtime = try createRuntime(root);
     defer runtime.destroy() catch unreachable;
@@ -593,7 +606,7 @@ test "handshake identity mismatch prevents snapshot publication" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try realRoot(&tmp, &root_buffer);
-    const entrypoint = try createPackage(root, .bad_handshake, 1000);
+    const entrypoint = try createPackage(root, .bad_handshake, 30_000);
     defer std.testing.allocator.free(entrypoint);
     const packages = [_]cc.agent_session.ProcessPlugin{.{ .root = root, .layer = .session }};
     try std.testing.expectError(

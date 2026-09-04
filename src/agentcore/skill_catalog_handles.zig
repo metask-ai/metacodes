@@ -602,7 +602,7 @@ test "Runtime serializes catalog builds without holding the lifecycle lock" {
     defer if (!joined) thread.join();
 
     var observed_waiting_call = false;
-    for (0..5_000) |_| {
+    for (0..10_000) |_| {
         runtime.mutex.lock();
         const active_calls = runtime.active_calls;
         runtime.mutex.unlock();

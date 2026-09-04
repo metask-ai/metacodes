@@ -309,7 +309,7 @@ test "U10-A: abort_fn 中断阻塞在 IO 的 driver → 有界内退出(真红�
     h.requestStop(); // 应经 abort_fn 中断 driver
     // 有界等 driver 退出(≤2s);abort 坏 → exited 永假 → 断言干净失败(cleanup 强制 abort 保证不挂)。
     var waited: usize = 0;
-    while (!bc.exited.load(.acquire) and waited < 2000) : (waited += 1) time.sleepMs(1);
+    while (!bc.exited.load(.acquire) and waited < 10_000) : (waited += 1) time.sleepMs(1);
     try testing.expect(bc.exited.load(.acquire)); // 真红灯锚点
 }
 

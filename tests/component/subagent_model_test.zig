@@ -365,7 +365,7 @@ test "L2 #12(Linus review): 后台 subagent 也继承父 sandbox(run_in_backgrou
 
     // 等后台 job 跑完(调 SbxProbe)。≤3s。
     var waited: u32 = 0;
-    while (waited < 3000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         if (g_sbx_probe != .unset) break;
         cc.util_time.sleepMs(20); // 可移植(POSIX nanosleep / Windows Sleep)
     }

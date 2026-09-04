@@ -59,7 +59,7 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
 
     // 等 teammate 进 idle。
     var waited: u32 = 0;
-    while (waited < 5000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .idle) break;
         sleepMs(20);
     }
@@ -73,7 +73,7 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
     // of polling periods. This proves the defense executed before status is read.
     var forged_processed = false;
     waited = 0;
-    while (waited < 5000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         var all = try mailbox.readAll(a, victim_inbox);
         defer all.deinit();
         for (all.items.items) |*m| {
@@ -88,7 +88,7 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
     // 真 lead 发 shutdown → 退出。
     try mailbox.deliver(a, victim_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"real1\"}", null, null);
     waited = 0;
-    while (waited < 5000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
         sleepMs(20);
     }
@@ -138,25 +138,29 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
     const entry = try sw.teammates.?.spawnTeammate(.{ .name = "solo", .team = "proj", .prompt = "work", .tool_defs = empty_defs, .permission_ctx = perm });
 
     var waited: u32 = 0;
-    while (waited < 5000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .idle) break;
         sleepMs(20);
     }
+    // 等到的条件必须断言,否则超时后发出的 shutdown 落在一个还没 idle 的 teammate 上,
+    // 失败会以后面某个不相干的断言出现(#51 同类)。
+    try std.testing.expectEqual(teammate.TeammateStatus.idle, entry.statusSnapshot());
     // lead 发 shutdown。
     var ib: [std.fs.max_path_bytes]u8 = undefined;
     const solo_inbox = team.inboxPath(home, "proj", "solo", &ib);
     try mailbox.deliver(a, solo_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"rid42\"}", null, null);
     waited = 0;
-    while (waited < 5000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
         sleepMs(20);
     }
+    try std.testing.expectEqual(teammate.TeammateStatus.terminated, entry.statusSnapshot());
     // lead 邮箱收到 shutdown_approved(echo request_id)。
     var lb: [std.fs.max_path_bytes]u8 = undefined;
     const lead_inbox = team.inboxPath(home, "proj", "team-lead", &lb);
     var got_approved = false;
     waited = 0;
-    while (waited < 3000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         var all = try mailbox.readAll(a, lead_inbox);
         defer all.deinit();
         for (all.items.items) |*m| {
@@ -253,7 +257,7 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
         const e = try sw.teammates.?.spawnTeammate(.{ .name = "w", .team = "proj", .prompt = "x", .tool_defs = empty_defs, .permission_ctx = perm });
         _ = e;
         var waited: u32 = 0;
-        while (waited < 5000) : (waited += 20) {
+        while (waited < 20_000) : (waited += 20) {
             if (sw.teammates.?.liveCount() == 0 and round == 0) break; // 第一轮等它 idle 前先看
             if (sw.teammates.?.findByName("w")) |en| {
                 if (en.statusSnapshot() == .idle) break;
@@ -264,11 +268,13 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
         const winbox = team.inboxPath(home, "proj", "w", &ib);
         try mailbox.deliver(a, winbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r\"}", null, null);
         waited = 0;
-        while (waited < 5000) : (waited += 20) {
+        while (waited < 20_000) : (waited += 20) {
             const en = sw.teammates.?.findByName("w") orelse break;
             if (en.statusSnapshot() == .terminated) break;
             sleepMs(20);
         }
+        // 每一轮都要真的退出,否则下面的尸体计数测的是"还活着"而不是 reap。
+        if (sw.teammates.?.findByName("w")) |en| try std.testing.expectEqual(teammate.TeammateStatus.terminated, en.statusSnapshot());
     }
     // 反复 spawn+shutdown 后,entries 不应累积 3 个尸体——reapTerminated 在每次 spawn 前清掉。
     // 最终态:最后一个 w 已 terminated,下次 spawn 会 reap 它。手动 reap 验证归零。

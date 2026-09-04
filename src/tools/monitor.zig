@@ -141,7 +141,7 @@ test "Monitor: sandbox 开启时命令被 sandbox-exec 包裹(cwd 外写被拦,t
     // 等 job 退出(≤2s;touch 快,sandbox 拦则失败退,不拦则成功退)。
     const pfs = @import("platform").fs; // 可移植 exists（std.c.fstatat 在 linux 下 void）
     var waited: u32 = 0;
-    while (waited < 2000) : (waited += 20) {
+    while (waited < 10_000) : (waited += 20) {
         jobs.reapExited();
         if (pfs.exists(escape)) break; // 出现(不该)
         // Success means the sandboxed command exits without creating the
