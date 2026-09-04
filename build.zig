@@ -1825,6 +1825,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/subagent_agentdef_fields_test.zig",
         "tests/component/agent_session_tools_test.zig",
         "tests/component/sealed_publication_test.zig",
+        "tests/component/recovery_allowance_test.zig",
         "tests/component/agent_session_host_tools_test.zig",
         "tests/component/plugin_runtime_test.zig",
         "tests/component/plugin_process_test.zig",

@@ -456,6 +456,10 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .additional_dirs = app.additionalDirs(),
         .home_dir = app.homeDir(),
         .artifact_root = app.sessionDir() orelse "",
+        .metask_ledger_protocol = if (std.ascii.eqlIgnoreCase(app.config.provider_profile orelse "", "metask"))
+            if (app.config.provider_kind == .openai) "openai_chat" else "anthropic_messages"
+        else
+            null,
         .tool_result_metrics = &app.tool_result_metrics,
         .file_change_journal = &app.file_change_journal,
         .plan_file_path = app.plan_file_path,

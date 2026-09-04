@@ -1,8 +1,7 @@
 //! Provider-scoped OAuth lifecycle (issue #16, delivery slice P1).
 //!
-//! Metask's OAuth lives in `core/auth.zig` and stays there, byte for byte. This
-//! is the same lifecycle for *any* provider that declares an OAuth credential
-//! kind — OpenAI and Codex first — kept in the provider subsystem so it is
+//! This is the lifecycle for *any* provider that declares an OAuth credential
+//! kind — Metask, OpenAI, and Codex — kept in the provider subsystem so it is
 //! reachable from provider-scoped credential resolution and so a token for one
 //! vendor can never satisfy another.
 //!
@@ -21,6 +20,7 @@
 //!   a fake exchange rather than a network.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
 const ids = @import("ids.zig");
@@ -54,6 +54,10 @@ pub const TokenSet = struct {
     token_type: []u8,
     scope: ?[]u8 = null,
     account_id: ?[]u8 = null,
+    /// Metask session metadata. Optional for backward-compatible stores.
+    gateway_url: ?[]u8 = null,
+    models_url: ?[]u8 = null,
+    client_name: ?[]u8 = null,
 
     pub fn deinit(self: *TokenSet, allocator: std.mem.Allocator) void {
         secureFree(allocator, self.access_token);
@@ -61,6 +65,9 @@ pub const TokenSet = struct {
         allocator.free(self.token_type);
         if (self.scope) |value| allocator.free(value);
         if (self.account_id) |value| allocator.free(value);
+        if (self.gateway_url) |value| allocator.free(value);
+        if (self.models_url) |value| allocator.free(value);
+        if (self.client_name) |value| allocator.free(value);
         self.* = undefined;
     }
 
@@ -79,6 +86,9 @@ pub const RefreshOutcome = struct {
     expires_in_seconds: i64,
     token_type: []const u8 = "Bearer",
     scope: ?[]const u8 = null,
+    gateway_url: ?[]const u8 = null,
+    models_url: ?[]const u8 = null,
+    client_name: ?[]const u8 = null,
 };
 
 /// Caller-supplied token exchange. Returning an error must not leave partial
@@ -222,7 +232,7 @@ pub const Session = struct {
     /// before saving would lose the login entirely.
     pub fn importOutcome(self: *Session, outcome: RefreshOutcome, now_seconds: i64) OAuthError!void {
         const refresh = outcome.refresh_token orelse return error.MalformedTokenResponse;
-        var tokens = try own(self.allocator, outcome, refresh, now_seconds);
+        var tokens = try own(self.allocator, outcome, refresh, now_seconds, null);
         errdefer tokens.deinit(self.allocator);
         try self.persist(tokens);
         self.adopt(tokens);
@@ -253,12 +263,50 @@ pub const Session = struct {
         now_seconds: i64,
         exchange: Exchange,
     ) OAuthError![]u8 {
+        return self.accessTokenInternal(now_seconds, exchange, false, null);
+    }
+
+    /// Force one refresh even when the locally recorded expiry is still in the
+    /// future. Gateway `token_expired` responses are authoritative and may
+    /// arrive before a client clock notices expiry; this preserves the same
+    /// single-flight and atomic rotation guarantees as accessToken().
+    pub fn refreshNow(
+        self: *Session,
+        now_seconds: i64,
+        exchange: Exchange,
+    ) OAuthError![]u8 {
+        return self.accessTokenInternal(now_seconds, exchange, true, null);
+    }
+
+    /// Refresh only if the token that failed is still the live token. A
+    /// concurrent request may already have rotated it; in that case return a
+    /// copy of the newer token and avoid a second gateway exchange.
+    pub fn refreshIfStale(
+        self: *Session,
+        now_seconds: i64,
+        exchange: Exchange,
+        stale_access_token: []const u8,
+    ) OAuthError![]u8 {
+        return self.accessTokenInternal(now_seconds, exchange, true, stale_access_token);
+    }
+
+    fn accessTokenInternal(
+        self: *Session,
+        now_seconds: i64,
+        exchange: Exchange,
+        force_refresh: bool,
+        stale_access_token: ?[]const u8,
+    ) OAuthError![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        var must_refresh = force_refresh;
         while (true) {
             const current = self.tokens orelse return error.NoTokens;
-            if (!current.isExpiredAt(now_seconds)) {
+            if (stale_access_token) |stale| if (!std.mem.eql(u8, current.access_token, stale)) {
+                return self.allocator.dupe(u8, current.access_token) catch error.OutOfMemory;
+            };
+            if (!must_refresh and !current.isExpiredAt(now_seconds)) {
                 return self.allocator.dupe(u8, current.access_token) catch error.OutOfMemory;
             }
             if (self.refreshing) {
@@ -275,6 +323,7 @@ pub const Session = struct {
                 // A *later* call still retries: only this cohort shares the
                 // result.
                 if (self.last_error) |err| return err;
+                must_refresh = false;
                 // Success, or a spurious wake: the loop re-checks. A fresh
                 // token returns above; a still-running refresh waits again.
                 continue;
@@ -325,7 +374,7 @@ pub const Session = struct {
         defer arena.deinit();
         const outcome = try exchange.run(exchange.ctx, self.provider_id, refresh_token, arena.allocator());
 
-        var replacement = try own(self.allocator, outcome, refresh_token, now_seconds);
+        var replacement = try own(self.allocator, outcome, refresh_token, now_seconds, self.tokens);
         errdefer replacement.deinit(self.allocator);
 
         // Persist *before* the new tokens become the live ones. A provider that
@@ -355,6 +404,7 @@ fn own(
     outcome: RefreshOutcome,
     previous_refresh: []const u8,
     now_seconds: i64,
+    previous: ?TokenSet,
 ) OAuthError!TokenSet {
     if (outcome.access_token.len == 0) return error.MalformedTokenResponse;
     if (outcome.expires_in_seconds <= 0) return error.MalformedTokenResponse;
@@ -377,13 +427,30 @@ fn own(
     else
         null;
 
+    const gateway_url = try ownOptional(allocator, outcome.gateway_url orelse if (previous) |p| p.gateway_url else null);
+    errdefer if (gateway_url) |value| allocator.free(value);
+    const models_url = try ownOptional(allocator, outcome.models_url orelse if (previous) |p| p.models_url else null);
+    errdefer if (models_url) |value| allocator.free(value);
+    const client_name = try ownOptional(allocator, outcome.client_name orelse if (previous) |p| p.client_name else null);
+    errdefer if (client_name) |value| allocator.free(value);
+
     return .{
         .access_token = access,
         .refresh_token = refresh,
         .expires_at = now_seconds + outcome.expires_in_seconds,
         .token_type = token_type,
         .scope = scope,
+        .gateway_url = gateway_url,
+        .models_url = models_url,
+        .client_name = client_name,
     };
+}
+
+fn ownOptional(allocator: std.mem.Allocator, value: ?[]const u8) OAuthError!?[]u8 {
+    return if (value) |text| blk: {
+        if (text.len == 0) break :blk null;
+        break :blk allocator.dupe(u8, text) catch return error.OutOfMemory;
+    } else null;
 }
 
 // ── wire parsing ─────────────────────────────────────────────────────────────
@@ -407,6 +474,9 @@ pub fn parseTokenResponse(arena: std.mem.Allocator, body: []const u8) OAuthError
         .expires_in_seconds = expires,
         .token_type = stringOf(root.object.get("token_type")) orelse "Bearer",
         .scope = stringOf(root.object.get("scope")),
+        .gateway_url = stringOf(root.object.get("gateway_url")),
+        .models_url = stringOf(root.object.get("models_url")),
+        .client_name = stringOf(root.object.get("client_name")),
     };
 }
 
@@ -447,6 +517,18 @@ fn renderStored(
         try out.appendSlice(allocator, ",\"client_id\":");
         try writeJsonString(allocator, out, value);
     }
+    if (tokens.gateway_url) |value| {
+        try out.appendSlice(allocator, ",\"gateway_url\":");
+        try writeJsonString(allocator, out, value);
+    }
+    if (tokens.models_url) |value| {
+        try out.appendSlice(allocator, ",\"models_url\":");
+        try writeJsonString(allocator, out, value);
+    }
+    if (tokens.client_name) |value| {
+        try out.appendSlice(allocator, ",\"client_name\":");
+        try writeJsonString(allocator, out, value);
+    }
     try out.append(allocator, '}');
 }
 
@@ -482,12 +564,21 @@ fn parseStored(allocator: std.mem.Allocator, text: []const u8) OAuthError!Stored
         (allocator.dupe(u8, value) catch return error.OutOfMemory)
     else
         null;
+    const gateway_owned = try ownOptional(allocator, stringOf(root.object.get("gateway_url")));
+    errdefer if (gateway_owned) |value| allocator.free(value);
+    const models_owned = try ownOptional(allocator, stringOf(root.object.get("models_url")));
+    errdefer if (models_owned) |value| allocator.free(value);
+    const client_name_owned = try ownOptional(allocator, stringOf(root.object.get("client_name")));
+    errdefer if (client_name_owned) |value| allocator.free(value);
     return .{
         .tokens = .{
             .access_token = access_owned,
             .refresh_token = refresh_owned,
             .expires_at = expires,
             .token_type = type_owned,
+            .gateway_url = gateway_owned,
+            .models_url = models_owned,
+            .client_name = client_name_owned,
         },
         .client_id = client_owned,
     };
@@ -505,7 +596,11 @@ fn writeAtomicPrivate(allocator: std.mem.Allocator, path: []const u8, bytes: []c
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
-    const fd = pfs.open(temp_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    // Remove a stale temp first, then create exclusively without following a
+    // pre-created symlink. The unlink+EXCL pair ensures the temp path cannot
+    // redirect token bytes to an attacker-chosen target.
+    _ = pfs.unlinkPath(temp_z) catch {};
+    const fd = pfs.open(temp_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     if (fd < 0) return error.PersistFailed;
     var wrote: usize = 0;
     while (wrote < bytes.len) {
@@ -527,6 +622,22 @@ fn writeAtomicPrivate(allocator: std.mem.Allocator, path: []const u8, bytes: []c
         _ = pfs.unlinkPath(temp_z) catch {};
         return error.PersistFailed;
     }
+    // Directory fsync is best effort: the file itself is already fsynced and
+    // renamed, and some filesystems / sandboxes refuse to open or sync a
+    // directory. Failing the rotation here would be worse than a rare lost
+    // rename after power loss.
+    fsyncParentDir(allocator, path) catch {};
+}
+
+fn fsyncParentDir(allocator: std.mem.Allocator, path: []const u8) !void {
+    if (builtin.os.tag == .windows) return;
+    const dir = std.fs.path.dirname(path) orelse ".";
+    const dir_z = try allocator.dupeZ(u8, dir);
+    defer allocator.free(dir_z);
+    const fd = pfs.open(dir_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.fsyncChecked(fd);
 }
 
 fn ensureParent(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -589,10 +700,10 @@ fn secureFree(allocator: std.mem.Allocator, bytes: []u8) void {
     allocator.free(bytes);
 }
 
-/// Credential kinds this lifecycle serves. Metask keeps its historical path.
+/// Credential kinds this lifecycle serves.
 pub fn servesKind(kind: profile_mod.CredentialKind) bool {
     return switch (kind) {
-        .openai_oauth, .openai_codex_oauth => true,
+        .metask_oauth, .openai_oauth, .openai_codex_oauth => true,
         else => false,
     };
 }
@@ -783,6 +894,37 @@ test "rotated tokens are persisted atomically and survive a reload" {
     try testing.expectEqual(@as(i64, 1_000 + 3600), reloaded.tokens.?.expires_at);
 }
 
+test "Metask gateway metadata survives initial import and rotated refresh" {
+    const a = testing.allocator;
+    var session = try tempSession(a, "metask-metadata");
+    session.provider_id = Slug.lit("metask");
+    const path = try a.dupe(u8, session.path);
+    defer a.free(path);
+    defer removePath(path);
+    try session.importOutcome(.{
+        .access_token = "at-0",
+        .refresh_token = "mrt-0",
+        .expires_in_seconds = 3600,
+        .gateway_url = "http://localhost:9000",
+        .models_url = "http://localhost:9000/v1/models",
+        .client_name = "MetaCode on host",
+    }, 100);
+    try testing.expectEqualStrings("http://localhost:9000", session.tokens.?.gateway_url.?);
+    session.tokens.?.expires_at = 0;
+    var fake = FakeExchange{};
+    const token = try session.accessToken(1_000, fake.exchange());
+    a.free(token);
+    session.deinit();
+
+    var reloaded = try Session.init(a, Slug.lit("metask"), path);
+    defer reloaded.deinit();
+    try testing.expect(try reloaded.load());
+    try testing.expectEqualStrings("http://localhost:9000", reloaded.tokens.?.gateway_url.?);
+    try testing.expectEqualStrings("http://localhost:9000/v1/models", reloaded.tokens.?.models_url.?);
+    try testing.expectEqualStrings("MetaCode on host", reloaded.tokens.?.client_name.?);
+    try testing.expectEqualStrings("refresh-1", reloaded.tokens.?.refresh_token);
+}
+
 test "concurrent expiry performs exactly one refresh" {
     const a = testing.allocator;
     var session = try tempSession(a, "single-flight");
@@ -832,6 +974,33 @@ test "concurrent expiry performs exactly one refresh" {
     // had already refreshed — an outcome a broken implementation produces just
     // as happily. Verified by probe: serializing the spawns fails this line.
     try testing.expect(session.waited_count > 0);
+}
+
+test "concurrent stale-token refresh performs exactly one exchange" {
+    const a = testing.allocator;
+    var session = try tempSession(a, "stale-single-flight");
+    defer session.deinit();
+    defer removeSession(&session);
+    try seed(a, &session, 10_000);
+
+    var fake = FakeExchange{ .delay_ms = 60 };
+    const Worker = struct {
+        session: *Session,
+        exchange: Exchange,
+        token: ?[]u8 = null,
+        fn run(self: *@This()) void {
+            self.token = self.session.refreshIfStale(1_000, self.exchange, "access-0") catch null;
+        }
+    };
+    var workers: [2]Worker = .{ .{ .session = &session, .exchange = fake.exchange() }, .{ .session = &session, .exchange = fake.exchange() } };
+    var threads: [2]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| thread.* = try std.Thread.spawn(.{}, Worker.run, .{&workers[index]});
+    for (&threads) |*thread| thread.join();
+    defer for (&workers) |*worker| if (worker.token) |token| a.free(token);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqual(@as(usize, 1), session.exchange_count);
+    try testing.expect(session.waited_count > 0);
+    for (workers) |worker| try testing.expectEqualStrings("access-1", worker.token.?);
 }
 
 test "a rejected refresh reaches every waiter and is not retried as a transport error" {
@@ -912,8 +1081,7 @@ test "the token endpoint's wire shape parses, and invalid_grant is terminal" {
 test "the lifecycle serves the OAuth kinds and leaves Metask on its own path" {
     try testing.expect(servesKind(.openai_oauth));
     try testing.expect(servesKind(.openai_codex_oauth));
-    // Metask's OAuth stays in core/auth.zig, byte for byte.
-    try testing.expect(!servesKind(.metask_oauth));
+    try testing.expect(servesKind(.metask_oauth));
     try testing.expect(!servesKind(.api_key));
 }
 

@@ -27,6 +27,7 @@ const RequestResult = union(enum) {
     full_body: struct {
         body: []u8,
         id: log.RequestId,
+        server_request_id: []const u8 = "",
     },
     streaming_response: StreamResult,
 };
@@ -44,6 +45,10 @@ pub const StreamResult = struct {
     transfer_buf: [8192]u8,
     id: log.RequestId,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
+    server_request_id: [256]u8 = undefined,
+    server_request_id_len: usize = 0,
+    http_status: u16 = 0,
+    retry_attempt: u32 = 0,
 };
 
 /// 网络瞬态错误判定:服务端关连接(keep-alive 回收/LB 断连)、连接重置、读到 EOF 等。
@@ -244,6 +249,7 @@ pub fn interruptibleSleepMs(total_ms: u64, abort: ?*const AbortSignal) bool {
 
 /// API 客户端
 pub const Client = struct {
+    pub const RefreshFn = *const fn (ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8;
     allocator: std.mem.Allocator,
     http_client: http.Client,
     api_key: []const u8,
@@ -272,6 +278,17 @@ pub const Client = struct {
     dialect_resolver: dialect_mod.Resolver = .{},
     abort_registry: provider_mod.RequestAbortRegistry = .{},
     request_setup_failure_injector: ?*RequestSetupFailureInjector = null,
+    last_request_id: log.RequestId = .{ .bytes = .{0} ** 12 },
+    last_http_status: u16 = 0,
+    /// Last gateway request id; overwritten at each response head. Borrowed
+    /// metadata is copied so error responses are observable as well.
+    server_request_id: [256]u8 = undefined,
+    server_request_id_len: usize = 0,
+    refresh_ctx: ?*anyopaque = null,
+    refresh_fn: ?RefreshFn = null,
+    refresh_token_owned: ?[]u8 = null,
+    refresh_token_history: std.ArrayList([]u8) = .empty,
+    last_retry_attempt: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8) Client {
         return initWithBaseUrl(allocator, io, api_key, model, null);
@@ -296,9 +313,31 @@ pub const Client = struct {
     }
 
     pub fn deinit(client: *Client) void {
+        if (client.refresh_token_owned) |token| secureFree(client.allocator, token);
+        for (client.refresh_token_history.items) |token| secureFree(client.allocator, token);
+        client.refresh_token_history.deinit(client.allocator);
         client.abort_registry.deinit(client.allocator);
         client.http_client.deinit();
         client.catalog.deinit();
+    }
+
+    pub fn serverRequestId(client: *const Client) []const u8 {
+        return client.server_request_id[0..client.server_request_id_len];
+    }
+
+    /// Install the provider's single-flight refresh seam. The callback must
+    /// return an owned access token; the client owns it until replaced or
+    /// deinit. Keeping this seam at the transport boundary means replay uses
+    /// the exact request bytes that already passed serialization.
+    pub fn setRefreshCallback(client: *Client, ctx: *anyopaque, callback: RefreshFn) void {
+        client.refresh_ctx = ctx;
+        client.refresh_fn = callback;
+    }
+
+    fn replaceRefreshToken(client: *Client, token: []u8) !void {
+        if (client.refresh_token_owned) |old| try client.refresh_token_history.append(client.allocator, old);
+        client.refresh_token_owned = token;
+        client.api_key = token;
     }
 
     // ── P0:Provider vtable 包装(AnthropicProvider = Client 的 thunk)─────────
@@ -321,6 +360,10 @@ pub const Client = struct {
             // Anthropic 不支持方言字段覆盖(Claude 无 prompt_cache_key/parallel_tool_calls/response_format 方言字段);
             // requestOverridesFn 走 default(返全 null),setRequestOverridesFn 留 null(setter 调用返 error)
             .supportsFn = &pSupports,
+            .requestIdTextFn = &pRequestIdText,
+            .serverRequestIdFn = &pServerRequestId,
+            .httpStatusFn = &pHttpStatus,
+            .retryAttemptFn = &pRetryAttempt,
         };
     }
     fn pModel(ctx: *anyopaque) []const u8 {
@@ -378,6 +421,18 @@ pub const Client = struct {
         // P2:走 capability 表(单一真相源),按当前 model 真判, 不再恒 true stub。
         const capability = @import("api/capability.zig");
         return capability.supports(.anthropic, asClient(ctx).model, cap);
+    }
+    fn pRequestIdText(ctx: *anyopaque) []const u8 {
+        return asClient(ctx).last_request_id.asSlice();
+    }
+    fn pServerRequestId(ctx: *anyopaque) []const u8 {
+        return asClient(ctx).serverRequestId();
+    }
+    fn pHttpStatus(ctx: *anyopaque) u16 {
+        return asClient(ctx).last_http_status;
+    }
+    fn pRetryAttempt(ctx: *anyopaque) u32 {
+        return asClient(ctx).last_retry_attempt;
     }
     inline fn asClient(ctx: *anyopaque) *Client {
         return @ptrCast(@alignCast(ctx));
@@ -462,6 +517,7 @@ pub const Client = struct {
         var redirect_buf: [4096]u8 = undefined;
         const http_response = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
         const status = ResponseStatus.capture(&http_response);
+        client.last_http_status = status.code;
         connection_lease.release();
         if (!status.isOk()) return error.HttpError;
 
@@ -499,12 +555,14 @@ pub const Client = struct {
         }, client.allocator, client.dialect_resolver.resolve(.anthropic, effective_model));
         defer client.allocator.free(req_body);
 
-        const result = try client.doRequest(req_body, false, null, null);
+        const result = try client.doRequestWithAuthReplay(req_body, false, null, null);
         switch (result) {
             .full_body => |fb| {
                 defer client.allocator.free(fb.body);
                 log.debugId("client", fb.id, "response body ({d} bytes):\n{s}", .{ fb.body.len, fb.body });
-                return try parseApiResponse(fb.body, client.allocator);
+                var response = try parseApiResponse(fb.body, client.allocator);
+                response.server_request_id = fb.server_request_id;
+                return response;
             },
             .streaming_response => unreachable,
         }
@@ -577,7 +635,7 @@ pub const Client = struct {
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
 
-        const result = try client.doRequest(req_body, true, abort, retry_hint);
+        const result = try client.doRequestWithAuthReplay(req_body, true, abort, retry_hint);
         switch (result) {
             .streaming_response => |r| {
                 var sr = StreamResponse.init(client.allocator, r, abort);
@@ -589,6 +647,37 @@ pub const Client = struct {
             },
             .full_body => unreachable,
         }
+    }
+
+    fn doRequestWithAuthReplay(
+        client: *Client,
+        body: []const u8,
+        streaming: bool,
+        abort: ?*const AbortSignal,
+        retry_hint: ?*RetryHint,
+    ) !RequestResult {
+        client.last_retry_attempt = 0;
+        var result = client.doRequest(body, streaming, abort, retry_hint) catch |err| {
+            if (err != error.TokenExpired) return err;
+            const callback = client.refresh_fn orelse return error.Unauthorized;
+            const ctx = client.refresh_ctx orelse return error.Unauthorized;
+            const token = callback(ctx, client.api_key) catch return error.Unauthorized;
+            client.replaceRefreshToken(token) catch {
+                secureFree(client.allocator, token);
+                return error.Unauthorized;
+            };
+            client.last_retry_attempt = 1;
+            // No event has been delivered: the body is still the exact slice
+            // produced by the serializer, so this is a byte-for-byte replay.
+            var replay_result = client.doRequest(body, streaming, abort, retry_hint) catch |replay_err| {
+                if (replay_err == error.TokenExpired) return error.Unauthorized;
+                return replay_err;
+            };
+            if (streaming) replay_result.streaming_response.retry_attempt = 1;
+            return replay_result;
+        };
+        if (streaming) result.streaming_response.retry_attempt = 0;
+        return result;
     }
 
     /// 建连阶段重试包装(对齐 CC withRetry)。仅覆盖 sendMessageStreamFull(建连+收头),
@@ -664,6 +753,7 @@ pub const Client = struct {
         retry_hint: ?*RetryHint,
     ) !RequestResult {
         const rid = log.genRequestId();
+        client.last_request_id = rid;
         const t_start = timestampMs();
 
         // 凭据及其任何片段都不得进入日志/eval artifact。
@@ -768,6 +858,9 @@ pub const Client = struct {
             return error.RequestFailed;
         };
         const status = ResponseStatus.capture(&http_response);
+        client.last_http_status = status.code;
+        const server_request_id_len = copyMetaskRequestId(&client.server_request_id, http_response.head.bytes);
+        client.server_request_id_len = server_request_id_len;
         // DNS/TCP/TLS + request-head phase is complete; active streaming must not consume a slot.
         connection_lease.release();
 
@@ -802,6 +895,9 @@ pub const Client = struct {
                     .transfer_buf = undefined,
                     .id = rid,
                     .abort_registry = if (abort != null) &client.abort_registry else null,
+                    .server_request_id = client.server_request_id,
+                    .server_request_id_len = client.server_request_id_len,
+                    .http_status = status.code,
                 },
             };
         }
@@ -811,20 +907,34 @@ pub const Client = struct {
         const body_reader = req_ptr.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
         const response_body = body_reader.allocRemaining(client.allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
             log.errId("client", rid, "read body failed: {s}", .{@errorName(err)});
-            req_ptr.deinit();
-            client.allocator.destroy(req_ptr);
             return error.RequestFailed;
         };
         req_ptr.deinit();
         client.allocator.destroy(req_ptr);
         log.infoId("client", rid, "response complete bytes={d} total_ms={d}", .{ response_body.len, timestampMs() - t_start });
-        return RequestResult{ .full_body = .{ .body = response_body, .id = rid } };
+        return RequestResult{ .full_body = .{ .body = response_body, .id = rid, .server_request_id = client.serverRequestId() } };
     }
 };
 
 fn shutdownRequest(raw: *anyopaque) void {
     const request: *http.Client.Request = @ptrCast(@alignCast(raw));
     provider_mod.abortHttpRequest(request);
+}
+
+/// `std.http` preserves unknown response headers in Head.bytes but only
+/// promotes a small standard subset to fields.  Scan the raw head so Metask's
+/// vendor request id is captured case-insensitively on every response.
+fn copyMetaskRequestId(dst: *[256]u8, raw_head: []const u8) usize {
+    var lines = std.mem.splitSequence(u8, raw_head, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "x-metask-request-id")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        const n = @min(value.len, dst.len);
+        @memcpy(dst[0..n], value[0..n]);
+        return n;
+    }
+    return 0;
 }
 
 fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
@@ -853,6 +963,7 @@ const HttpDisposition = union(enum) {
 };
 
 const HttpFailureError = error{
+    TokenExpired,
     Unauthorized,
     RateLimited,
     ServerError,
@@ -880,7 +991,7 @@ fn classifyHttpStatus(status_code: u16) HttpDisposition {
 /// failure category forces this function to make an explicit error decision.
 fn resolveHttpFailure(failure: HttpFailure, body: ErrorBodyInfo) HttpFailureError {
     return switch (failure) {
-        .unauthorized => error.Unauthorized,
+        .unauthorized => if (body.token_expired) error.TokenExpired else error.Unauthorized,
         .rate_limited => error.RateLimited,
         .server_error => error.ServerError,
         .bad_gateway => error.BadGateway,
@@ -912,11 +1023,37 @@ fn logErrorBody(
         status.code, status.name, preview,
     });
     last_error.recordHttp(status.code, preview);
-    return .{ .context_window_exceeded = error_class.isContextWindowExceeded(preview) };
+    return .{
+        .context_window_exceeded = error_class.isContextWindowExceeded(preview),
+        .token_expired = status.code == 401 and containsMetaskTokenExpired(preview),
+    };
+}
+
+fn containsMetaskTokenExpired(body: []const u8) bool {
+    // The gateway's error envelope is JSON and the code is authoritative. A
+    // message may mention the words `token_expired` while carrying a different
+    // code (for example invalid_token), so only an actual `code` field can
+    // trigger the replay.
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, body, from, "\"code\"")) |key_pos| {
+        var i = key_pos + "\"code\"".len;
+        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+        if (i >= body.len or body[i] != ':') {
+            from = i;
+            continue;
+        }
+        i += 1;
+        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+        const value = "\"token_expired\"";
+        if (i + value.len <= body.len and std.mem.eql(u8, body[i .. i + value.len], value)) return true;
+        from = i + 1;
+    }
+    return false;
 }
 
 const ErrorBodyInfo = struct {
     context_window_exceeded: bool = false,
+    token_expired: bool = false,
 };
 
 test "HTTP status classification is total and preserves provider semantics" {
@@ -939,6 +1076,12 @@ test "HTTP status classification is total and preserves provider semantics" {
     try std.testing.expectEqual(error.Unauthorized, resolveHttpFailure(.unauthorized, .{ .context_window_exceeded = true }));
     try std.testing.expectEqual(error.ContextWindowExceeded, resolveHttpFailure(.generic, .{ .context_window_exceeded = true }));
     try std.testing.expectEqual(error.HttpError, resolveHttpFailure(.generic, .{}));
+}
+
+test "Metask request id capture is case-insensitive and trims the value" {
+    var out: [256]u8 = undefined;
+    const n = copyMetaskRequestId(&out, "HTTP/1.1 401 Unauthorized\r\nx-MeTaSk-ReQuEsT-iD:  req-abc  \r\n\r\n");
+    try std.testing.expectEqualStrings("req-abc", out[0..n]);
 }
 
 /// API 响应（非流式）
@@ -964,6 +1107,8 @@ pub const StreamResponse = struct {
     /// 本次流式请求的 request_id，所有下游（stream event、agent loop、工具调用）
     /// 用它把日志串起来。
     id: log.RequestId,
+    http_status: u16 = 0,
+    retry_attempt: u32 = 0,
 
     fn init(allocator: std.mem.Allocator, sr: StreamResult, abort: ?*const AbortSignal) StreamResponse {
         return .{
@@ -971,6 +1116,8 @@ pub const StreamResponse = struct {
             .stream_result = sr,
             .abort = abort,
             .id = sr.id,
+            .http_status = sr.http_status,
+            .retry_attempt = sr.retry_attempt,
         };
     }
 
@@ -1001,6 +1148,9 @@ pub const StreamResponse = struct {
             .deinitFn = &hDeinit,
             .stopReasonFn = &hStopReason,
             .requestIdFn = &hRequestId,
+            .serverRequestIdFn = &hServerRequestId,
+            .httpStatusFn = &hHttpStatus,
+            .retryAttemptFn = &hRetryAttempt,
         };
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
@@ -1017,6 +1167,16 @@ pub const StreamResponse = struct {
     }
     fn hRequestId(ctx: *anyopaque) log.RequestId {
         return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).id;
+    }
+    fn hServerRequestId(ctx: *anyopaque) []const u8 {
+        const sr: *StreamResponse = @ptrCast(@alignCast(ctx));
+        return sr.stream_result.server_request_id[0..sr.stream_result.server_request_id_len];
+    }
+    fn hHttpStatus(ctx: *anyopaque) u16 {
+        return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).http_status;
+    }
+    fn hRetryAttempt(ctx: *anyopaque) u32 {
+        return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).retry_attempt;
     }
 
     /// drain 完后读 API 报告的 stop_reason(max_tokens 续写判断用)。

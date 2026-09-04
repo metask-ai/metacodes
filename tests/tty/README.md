@@ -51,6 +51,7 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
 | T11 退出清理 | 无残留边框、show cursor、Goodbye |
 | T12 resize 自适应 | SIGWINCH → 框自动变宽(不按键) |
 | T13 提交回显 | 提交后用户输入留在 scrollback(❯ 行) |
+| e2e_metask_device(真模型) | Metask 设备码登录(程序化确认)→ 经网关请求真实模型 → 本地账本每请求带 X-Metask-Request-Id → `scripts/metask_reconcile.py` 与网关 /v1/usage 对账零差异;需 METASK_WEB_SESSION_TOKEN、METASK_SITE_URL、METASK_MODELS |
 
 ## 已发现并修复的 bug
 - **输入框跳动**(T07):回顶用 `prev_rows`(总行数)而非 `cursor_row`(光标实际行)→ 逐帧上漂。

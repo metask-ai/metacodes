@@ -21,6 +21,44 @@ product surfaces built over the same core protocols.
 
 ## Provider selection surface
 
+### Metask device OAuth and gateway
+
+`metacodes login --provider metask` performs the Metask JSON device flow:
+
+* `POST $METASK_SITE_URL/api/oauth/device/code` (default site
+  `https://metask-ai.com`) with `client_id=metacodes` and the local hostname;
+* polling `POST $METASK_SITE_URL/api/oauth/token` with the device grant until
+  approval; and
+* atomically storing `access_token`, `refresh_token`, `expires_at`,
+  `gateway_url`, `models_url`, and `client_name` in
+  `$HOME/.metacodes/oauth/metask.json` (or `METACODES_OAUTH_DIR`).
+
+The refresh grant sends only `grant_type=refresh_token` and the stored refresh
+token. Metask rotates refresh tokens; persistence happens before the new access
+token is used, and an `invalid_grant` is actionable as “log in again”. The
+gateway origin comes from `gateway_url` or `METASK_GATEWAY_URL` (an origin, not
+`/v1/messages`) and exposes both `/v1/messages` (Anthropic SSE) and
+`/v1/chat/completions` (OpenAI SSE). On a pre-stream `401` whose JSON error code
+is `token_expired`, the identical serialized request is replayed once. Invalid
+tokens, invalid API keys, balance errors, and model-not-found responses are not
+refresh-retried.
+
+Every gateway response captures the case-insensitive `X-Metask-Request-Id`.
+Completed and failed requests are appended as one NDJSON record to
+`$HOME/.metacodes/ledger/metask.ndjson` (or `METACODES_LEDGER_DIR`), with
+server-reported usage only, local/server request ids, HTTP status, retry
+attempt, outcome, and elapsed time. `metacodes ledger metask` prints the file.
+The schema-1 keys are `ts` (unix milliseconds), `session_id`, `provider_id`,
+`protocol`, `model`, `local_request_id`, `server_request_id`, `http_status`,
+`outcome`, `retry_attempt`, `input_tokens`, `output_tokens`,
+`cache_read_tokens`, `cache_creation_tokens`, and `wall_elapsed_ms`; missing
+usage on an error or interrupted stream is recorded as zero.
+
+The historical `METASK_API_KEY`/`--api-key` path remains available only as an
+explicit compatibility choice. It is never inferred in place of a stored
+device-flow gateway; an explicit `--base-url` or `METASK_GATEWAY_URL` can be
+used for deliberate legacy/local testing.
+
 Route selection is provider-owned data, not a model-name convention. See
 [Provider offers and control plane](PROVIDER_OFFER_ARCHITECTURE.md) for the
 normative model; the entry points are:
@@ -289,6 +327,22 @@ question about the content; `Grep` therefore accepts `artifact_id` in place of
 filename output is suppressed, `files_with_matches` — whose entire output would
 be that path — is rejected for artifact searches, and the child's stderr is
 scrubbed of it before it can reach a tool error.
+
+`ReadArtifact` remains exempt from result projection, but its recovery cost is
+bounded per turn. Before the batch executes, the agent loop walks the turn's
+tool calls in slot order and charges each `ReadArtifact` call its upper bound,
+`result_budget.recoveryReadCost` (`min(MAX_READ_BYTES, per_result_bytes)`).
+Every call past `recoveryAllowanceBytes` (`per_turn_bytes / 2`) is deferred: it
+does not run, and its result is the bounded body
+`{"error":"recovery_allowance_exhausted","artifact_id":<id or null>,"offset":<n>,
+"allowance_bytes":<allowance>,"charged_bytes":<charged before this call>,
+"hint":<resume from this offset next turn>}` with `is_error` set, plus a
+`policy_decision` event whose source is `recovery_allowance`. On a 200K window
+four full chunks are served and the fifth is deferred, where nine used to
+exceed the turn budget with nothing projection could trim. The decision is made
+in slot order at the upper bound before any thread runs, so which call is
+deferred never depends on scheduling and provider-visible bytes stay a pure
+function of the request.
 
 No staging path is model-visible from Bash at all - not on a completed
 channel, not in the auto-backgrounded snapshot, and not on the explicit

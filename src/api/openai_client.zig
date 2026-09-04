@@ -59,6 +59,7 @@ pub const DEFAULT_OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 pub const DEFAULT_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
 pub const OpenAIClient = struct {
+    pub const RefreshFn = *const fn (ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8;
     allocator: std.mem.Allocator,
     api_key: []const u8,
     /// 完整端点 URL 覆盖(可指向 MockServer / 自建中转站)。null = 按 protocol 选官方端点
@@ -78,6 +79,15 @@ pub const OpenAIClient = struct {
     /// Null keeps the historical `authorization: Bearer <key>` bytes exactly.
     auth_scheme: ?auth_header_mod.AuthScheme = null,
     dialect_resolver: dialect_mod.Resolver = .{},
+    server_request_id: [256]u8 = undefined,
+    server_request_id_len: usize = 0,
+    last_request_id: log.RequestId = .{ .bytes = .{0} ** 12 },
+    last_http_status: u16 = 0,
+    refresh_ctx: ?*anyopaque = null,
+    refresh_fn: ?RefreshFn = null,
+    refresh_token_owned: ?[]u8 = null,
+    refresh_token_history: std.ArrayList([]u8) = .empty,
+    last_retry_attempt: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) OpenAIClient {
         return .{
@@ -89,8 +99,26 @@ pub const OpenAIClient = struct {
         };
     }
     pub fn deinit(self: *OpenAIClient) void {
+        if (self.refresh_token_owned) |token| secureFree(self.allocator, token);
+        for (self.refresh_token_history.items) |token| secureFree(self.allocator, token);
+        self.refresh_token_history.deinit(self.allocator);
         self.abort_registry.deinit(self.allocator);
         self.http_client.deinit();
+    }
+
+    pub fn serverRequestId(self: *const OpenAIClient) []const u8 {
+        return self.server_request_id[0..self.server_request_id_len];
+    }
+
+    pub fn setRefreshCallback(self: *OpenAIClient, ctx: *anyopaque, callback: RefreshFn) void {
+        self.refresh_ctx = ctx;
+        self.refresh_fn = callback;
+    }
+
+    fn replaceRefreshToken(self: *OpenAIClient, token: []u8) !void {
+        if (self.refresh_token_owned) |old| try self.refresh_token_history.append(self.allocator, old);
+        self.refresh_token_owned = token;
+        self.api_key = token;
     }
 
     /// 本次请求的实际端点:显式 base_url 优先,否则按 protocol 选官方端点。
@@ -117,6 +145,10 @@ pub const OpenAIClient = struct {
             .requestOverridesFn = &pRequestOverrides,
             .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
+            .requestIdTextFn = &pRequestIdText,
+            .serverRequestIdFn = &pServerRequestId,
+            .httpStatusFn = &pHttpStatus,
+            .retryAttemptFn = &pRetryAttempt,
         };
     }
     inline fn cast(ctx: *anyopaque) *OpenAIClient {
@@ -153,6 +185,18 @@ pub const OpenAIClient = struct {
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         return capability.supports(.openai, cast(ctx).model, cap);
+    }
+    fn pRequestIdText(ctx: *anyopaque) []const u8 {
+        return cast(ctx).last_request_id.asSlice();
+    }
+    fn pServerRequestId(ctx: *anyopaque) []const u8 {
+        return cast(ctx).serverRequestId();
+    }
+    fn pHttpStatus(ctx: *anyopaque) u16 {
+        return cast(ctx).last_http_status;
+    }
+    fn pRetryAttempt(ctx: *anyopaque) u32 {
+        return cast(ctx).last_retry_attempt;
     }
     fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!provider_mod.ApiResponse {
         // P3 MVP:非流式不实现(compact summary 在 OpenAI 路径下退回纯丢老消息)。诚实返回空。
@@ -193,14 +237,62 @@ pub const OpenAIClient = struct {
         };
         defer self.allocator.free(body);
         const placeholder_ids = try report.placeholder_ids.toOwnedSlice(self.allocator);
-        return self.doStream(body, abort, dialect, placeholder_ids);
+        return self.doStreamWithAuthReplay(body, abort, dialect, placeholder_ids);
+    }
+
+    fn doStreamWithAuthReplay(
+        self: *OpenAIClient,
+        body: []const u8,
+        abort: ?*const AbortSignal,
+        dialect: dialect_mod.Dialect,
+        image_placeholder_ids: []const []const u8,
+    ) !StreamHandle {
+        self.last_retry_attempt = 0;
+        const first = self.doStream(body, abort, dialect, image_placeholder_ids, 0) catch |err| {
+            if (err != error.TokenExpired) return err;
+            // The first transport retained the placeholder slice so the
+            // replay can use the identical serialized request. If refresh is
+            // unavailable, this call owns the only remaining copy and must
+            // release it here.
+            const callback = self.refresh_fn orelse {
+                self.allocator.free(image_placeholder_ids);
+                return error.RequestFailed;
+            };
+            const ctx = self.refresh_ctx orelse {
+                self.allocator.free(image_placeholder_ids);
+                return error.RequestFailed;
+            };
+            const token = callback(ctx, self.api_key) catch {
+                self.allocator.free(image_placeholder_ids);
+                return error.RequestFailed;
+            };
+            self.replaceRefreshToken(token) catch {
+                secureFree(self.allocator, token);
+                self.allocator.free(image_placeholder_ids);
+                return error.RequestFailed;
+            };
+            self.last_retry_attempt = 1;
+            return self.doStream(body, abort, dialect, image_placeholder_ids, 1) catch |replay_err| {
+                // A second token_expired response also retains the slice;
+                // every other failure has already released it through
+                // doStream's errdefer.
+                if (replay_err == error.TokenExpired) {
+                    self.allocator.free(image_placeholder_ids);
+                    return error.RequestFailed;
+                }
+                return replay_err;
+            };
+        };
+        return first;
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
     /// `image_placeholder_ids` 所有权转入本函数:失败路径释放,成功后归 OpenAIStream。
-    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_placeholder_ids: []const []const u8) !StreamHandle {
-        errdefer self.allocator.free(image_placeholder_ids);
+    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_placeholder_ids: []const []const u8, retry_attempt: u32) !StreamHandle {
+        var preserve_placeholder_ids = false;
+        errdefer if (!preserve_placeholder_ids) self.allocator.free(image_placeholder_ids);
         const rid = log.genRequestId();
+        self.last_request_id = rid;
         log.infoId(
             "openai",
             rid,
@@ -253,9 +345,23 @@ pub const OpenAIClient = struct {
             return err;
         };
         const status = ResponseStatus.capture(&response);
+        self.last_http_status = status.code;
+        self.server_request_id_len = copyMetaskRequestId(&self.server_request_id, response.head.bytes);
         connection_lease.release();
         if (!status.isOk()) {
-            log.errId("openai", rid, "HTTP {d} {s}", .{ status.code, status.name });
+            var err_body: [4096]u8 = undefined;
+            const body_reader = req_ptr.reader.bodyReader(
+                err_body[0..],
+                response.head.transfer_encoding,
+                response.head.content_length,
+            );
+            const n = body_reader.readSliceShort(err_body[0..]) catch 0;
+            const preview = err_body[0..@min(n, err_body.len)];
+            log.errId("openai", rid, "HTTP {d} {s}: body={s}", .{ status.code, status.name, preview });
+            if (status.code == 401 and containsMetaskTokenExpired(preview)) {
+                preserve_placeholder_ids = true;
+                return error.TokenExpired;
+            }
             return error.RequestFailed;
         }
 
@@ -271,6 +377,10 @@ pub const OpenAIClient = struct {
             .abort = abort,
             .abort_registry = if (abort != null) &self.abort_registry else null,
             .id = rid,
+            .http_status = status.code,
+            .retry_attempt = retry_attempt,
+            .server_request_id = self.server_request_id,
+            .server_request_id_len = self.server_request_id_len,
         };
         return heap.handle();
     }
@@ -279,6 +389,46 @@ pub const OpenAIClient = struct {
 fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
     @memset(buf, 0);
     allocator.free(buf);
+}
+
+fn copyMetaskRequestId(dst: *[256]u8, raw_head: []const u8) usize {
+    var lines = std.mem.splitSequence(u8, raw_head, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "x-metask-request-id")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        const n = @min(value.len, dst.len);
+        @memcpy(dst[0..n], value[0..n]);
+        return n;
+    }
+    return 0;
+}
+
+fn containsMetaskTokenExpired(body: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, body, from, "\"code\"")) |key_pos| {
+        var i = key_pos + "\"code\"".len;
+        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+        if (i >= body.len or body[i] != ':') {
+            from = i;
+            continue;
+        }
+        i += 1;
+        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+        const value = "\"token_expired\"";
+        if (i + value.len <= body.len and std.mem.eql(u8, body[i .. i + value.len], value)) return true;
+        from = i + 1;
+    }
+    return false;
+}
+
+test "OpenAI transport captures Metask request id and recognizes only token_expired" {
+    var out: [256]u8 = undefined;
+    const n = copyMetaskRequestId(&out, "x-METASK-request-id:req-openai\r\n");
+    try std.testing.expectEqualStrings("req-openai", out[0..n]);
+    try std.testing.expect(containsMetaskTokenExpired("{\"error\":{\"code\": \"token_expired\"}}"));
+    try std.testing.expect(!containsMetaskTokenExpired("{\"error\":{\"code\": \"invalid_token\"}}"));
+    try std.testing.expect(!containsMetaskTokenExpired("{\"error\":{\"code\": \"invalid_token\",\"message\":\"token_expired\"}}"));
 }
 
 /// OpenAI 流式响应:持 Response + transfer buffer + 逐行 SSE 解析状态。包成中立 StreamHandle。
@@ -303,6 +453,10 @@ const OpenAIStream = struct {
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
+    http_status: u16 = 0,
+    retry_attempt: u32 = 0,
+    server_request_id: [256]u8 = undefined,
+    server_request_id_len: usize = 0,
     /// 序列化时走占位的图像 tool_result id(owned),随 StreamHandle 回传。
     image_placeholder_ids: []const []const u8 = &.{},
     done: bool = false,
@@ -325,7 +479,7 @@ const OpenAIStream = struct {
     reasoning_keys: std.ArrayList([]u8) = .empty,
 
     fn handle(self: *OpenAIStream) StreamHandle {
-        return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
+        return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid, .serverRequestIdFn = &hServerRid, .httpStatusFn = &hHttpStatus, .retryAttemptFn = &hRetryAttempt };
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
         return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).next();
@@ -341,6 +495,16 @@ const OpenAIStream = struct {
     }
     fn hRid(ctx: *anyopaque) log.RequestId {
         return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).id;
+    }
+    fn hServerRid(ctx: *anyopaque) []const u8 {
+        const s: *OpenAIStream = @ptrCast(@alignCast(ctx));
+        return s.server_request_id[0..s.server_request_id_len];
+    }
+    fn hHttpStatus(ctx: *anyopaque) u16 {
+        return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).http_status;
+    }
+    fn hRetryAttempt(ctx: *anyopaque) u32 {
+        return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).retry_attempt;
     }
 
     fn deinit(self: *OpenAIStream) void {

@@ -223,6 +223,12 @@ pub const Provider = struct {
 
     /// 能力查询(P2 真接表;P0 实现可恒按 Anthropic 能力答)。
     supportsFn: *const fn (ctx: *anyopaque, cap: Capability) bool,
+    /// Last transport identifiers, available even when a request failed before
+    /// a StreamHandle could be returned (used by the Metask ledger).
+    requestIdTextFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
+    serverRequestIdFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
+    httpStatusFn: ?*const fn (ctx: *anyopaque) u16 = null,
+    retryAttemptFn: ?*const fn (ctx: *anyopaque) u32 = null,
 
     // ── 便利转发 ──────────────────────────────────────────────────────────
     pub inline fn model(self: Provider) []const u8 {
@@ -284,6 +290,22 @@ pub const Provider = struct {
     }
     pub inline fn supports(self: Provider, cap: Capability) bool {
         return self.supportsFn(self.ctx, cap);
+    }
+    pub inline fn requestIdText(self: Provider) []const u8 {
+        const f = self.requestIdTextFn orelse return "";
+        return f(self.ctx);
+    }
+    pub inline fn serverRequestId(self: Provider) []const u8 {
+        const f = self.serverRequestIdFn orelse return "";
+        return f(self.ctx);
+    }
+    pub inline fn httpStatus(self: Provider) u16 {
+        const f = self.httpStatusFn orelse return 0;
+        return f(self.ctx);
+    }
+    pub inline fn retryAttempt(self: Provider) u32 {
+        const f = self.retryAttemptFn orelse return 0;
+        return f(self.ctx);
     }
 };
 

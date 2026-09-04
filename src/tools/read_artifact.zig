@@ -5,6 +5,7 @@ const ToolContext = @import("context.zig").ToolContext;
 const common = @import("common.zig");
 const artifact = @import("../core/tool_result_artifact.zig");
 const result_budget = @import("../core/result_budget.zig");
+const json_util = @import("../util/json.zig");
 
 /// Fixed JSON scaffolding of one recovery envelope: schema version, artifact
 /// id, the four byte counters, the truncation flag, the encoding and the field
@@ -12,6 +13,30 @@ const result_budget = @import("../core/result_budget.zig");
 /// against the remaining allowance cannot push the rendered envelope past the
 /// per-result budget it was derived from.
 const ENVELOPE_OVERHEAD_BYTES: result_budget.Encoded = .of(256);
+
+/// What a `ReadArtifact` call asked for, as far as a caller that will *not*
+/// execute it needs to know: the recovery-allowance deferral (#40) names the
+/// call's own artifact id and offset in its body so the model can resume there.
+pub const Request = struct {
+    /// Unescaped and owned; null when the call named no id (the tool itself
+    /// would have failed with `MissingArtifactId`).
+    artifact_id: ?[]u8,
+    offset: u64,
+    pub fn deinit(self: Request, allocator: std.mem.Allocator) void {
+        if (self.artifact_id) |id| allocator.free(id);
+    }
+};
+
+/// Never fails on malformed input and never executes anything: a missing or
+/// invalid offset reads as 0 and a missing id as null. The id goes through
+/// `util/json.unescapeString`, so a value that carried JSON escapes comes back
+/// as the string the model sent rather than its escaped spelling.
+pub fn describeRequest(allocator: std.mem.Allocator, args: []const u8) !Request {
+    const raw_id = json_util.extractStringField(args, "artifact_id");
+    const artifact_id = if (raw_id) |id| try json_util.unescapeString(id, allocator) else null;
+    const offset = (parseOptionalU64(args, "offset") catch null) orelse 0;
+    return .{ .artifact_id = artifact_id, .offset = offset };
+}
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const artifact_id = common.extractJsonArg(args, "artifact_id") orelse return error.MissingArtifactId;
@@ -28,7 +53,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // bounds how many *source* bytes to pull off disk - an encoded byte never
     // costs less than its source byte, so the encoded budget is a safe upper
     // bound for it. `render_budget` is what the rendered envelope may cost.
-    const budget_cap = @max(1, @min(artifact.MAX_READ_BYTES, ctx.result_budget.per_result_bytes));
+    const budget_cap = result_budget.recoveryReadCost(ctx.result_budget);
     const read_limit = result_budget.Source.of(budget_cap);
     const render_budget = result_budget.Encoded.of(budget_cap).minus(ENVELOPE_OVERHEAD_BYTES);
     const requested_limit = (try parseOptionalU64(args, "limit")) orelse read_limit.raw();
@@ -84,6 +109,20 @@ fn parseOptionalU64(args: []const u8, key: []const u8) !?u64 {
     const value = parsed.value.object.get(key) orelse return null;
     if (value != .integer or value.integer < 0) return error.InvalidArtifactArgs;
     return @intCast(value.integer);
+}
+
+test "describeRequest parses present, missing, and malformed fields" {
+    const allocator = std.testing.allocator;
+    const a = try describeRequest(allocator, "{\"artifact_id\":\"sha256:x\",\"offset\":4096}");
+    defer a.deinit(allocator);
+    try std.testing.expectEqualStrings("sha256:x", a.artifact_id.?);
+    try std.testing.expectEqual(@as(u64, 4096), a.offset);
+    const missing = try describeRequest(allocator, "{}");
+    defer missing.deinit(allocator);
+    try std.testing.expect(missing.artifact_id == null);
+    const malformed = try describeRequest(allocator, "{\"offset\":-1}");
+    defer malformed.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 0), malformed.offset);
 }
 
 test "ReadArtifact returns bounded stable envelope" {
