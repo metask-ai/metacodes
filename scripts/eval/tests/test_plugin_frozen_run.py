@@ -20,6 +20,7 @@ import os
 import platform
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -46,6 +47,7 @@ from scripts.eval.plugin_pair_runner import (
     _authority_manifest,
     _canonical_sha256,
     _observe,
+    materialized_source_tree,
     build_plan,
     freeze_run,
     frozen_run_fields,
@@ -375,16 +377,20 @@ class _FakeProvider:
         self.by_selector = {scenario_selector([task_id]): task_id for task_id in self.tasks}
 
     def run_once(self, repo_root, binary, variant, trial, selector, provider, model_id, suite_path, revision, *, harness_config_id=None, runtime_env=None, allow_invalid_run=False, timeout_seconds=None, max_metered_tokens=None, max_cost_usd=None, runtime_api_key=None):
-        token = self.fixture.directory / f"run-{len(self.requests)}"
+        # A real directory, as the harness leaves one: the runner moves it
+        # under the output directory before importing, so state is keyed by
+        # its name rather than its path.
+        token = Path(repo_root) / "tests/e2e/runs" / f"run-{len(self.requests)}"
+        token.mkdir(parents=True, exist_ok=True)
         self.requests.append((variant, trial, selector))
-        self._state[token] = (binary, variant, trial, selector, provider, model_id, revision, harness_config_id, max_metered_tokens, max_cost_usd)
+        self._state[token.name] = (binary, variant, trial, selector, provider, model_id, revision, harness_config_id, max_metered_tokens, max_cost_usd)
         if self.during_request is not None:
             self.during_request()
         return token
 
     def import_run(self, suite, repo_root, run_dir):
         self.imports += 1
-        binary, variant, trial, selector, provider, model_id, revision, config_id, max_tokens, max_cost = self._state[run_dir]
+        binary, variant, trial, selector, provider, model_id, revision, config_id, max_tokens, max_cost = self._state[Path(run_dir).name]
         task_id = self.by_selector[selector]
         task = self.tasks[task_id]
         identity = comparison_fingerprints(
@@ -515,6 +521,121 @@ class PaidRunStaysFrozenTest(unittest.TestCase):
         journal = validate_checkpoint_payload(fixture.journal.read_bytes())
         self.assertEqual(["committed"], [t["state"] for t in journal["transactions"].values()])
         self.assertEqual(1, len(load_rollouts(fixture.output / "baseline.jsonl")))
+
+
+# The paid runner observes and executes Git HEAD materialized into a private
+# directory (#61, the paid-path form of the #49 gap). These tests edit a pinned
+# input of the LIVE checkout and restore it, which is exactly the sequence the
+# change closes; each restores the original bytes in `finally` and refuses to
+# run when the developer already has that file modified.
+LIVE_PINNED_INPUT = ROOT / "scripts/eval/fixtures/plugin_baseline.py"
+
+
+@contextlib.contextmanager
+def _live_pinned_input_rewritten(new_tail: bytes):
+    status = subprocess.run(
+        ["git", "-C", str(ROOT), "status", "--porcelain", "--", str(LIVE_PINNED_INPUT.relative_to(ROOT))],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if status.returncode != 0 or status.stdout.strip():
+        raise unittest.SkipTest("the live baseline wrapper is already modified; not clobbering it")
+    original = LIVE_PINNED_INPUT.read_bytes()
+    try:
+        with open(LIVE_PINNED_INPUT, "wb") as handle:
+            handle.write(original + new_tail)
+        yield original
+    finally:
+        with open(LIVE_PINNED_INPUT, "wb") as handle:
+            handle.write(original)
+
+
+class PaidRunObservesMaterializedHeadTest(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch(
+            "scripts.eval.plugin_pair_runner._verify_arm_inventory",
+            lambda root, protocol, arm, executable, runtime: "inventory-" + arm,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.temporary = Path(self._tmp.name)
+
+    def test_freeze_refuses_a_modified_pinned_input(self) -> None:
+        protocol_path, runtime = _frozen_fixture(self.temporary)
+        with _live_pinned_input_rewritten(b"\n# uncommitted\n"):
+            with self.assertRaisesRegex(ValidationError, "pinned inputs modified in the working tree"):
+                freeze_run(ROOT, protocol_path, runtime)
+
+    def test_a_paid_run_refuses_a_modified_pinned_input_before_opening_the_authority(self) -> None:
+        fixture = _PaidFixture(self.temporary)
+        opened = []
+        real_open = os.open
+
+        def spy_open(path, *args, **kwargs):
+            if str(path) == str(fixture.authority):
+                opened.append(path)
+            return real_open(path, *args, **kwargs)
+
+        with _live_pinned_input_rewritten(b"\n# uncommitted\n"), mock.patch(
+            "scripts.eval.plugin_pair_runner.os.open", spy_open
+        ):
+            with self.assertRaisesRegex(ValidationError, "pinned inputs modified in the working tree"):
+                fixture.run()
+        self.assertEqual([], opened)
+        self.assertFalse(fixture.output.exists())
+        self.assertFalse(fixture.journal.exists())
+
+    @requires_posix_budget_journal
+    def test_a_paid_run_executes_the_materialized_tree_not_the_live_one(self) -> None:
+        fixture = _PaidFixture(self.temporary)
+        head_bytes = LIVE_PINNED_INPUT.read_bytes()
+        seen = []
+        rewritten = []
+
+        def change_and_restore():
+            # The ABA sequence between the before/after observations: the live
+            # wrapper is replaced and restored while the request is in flight.
+            with _live_pinned_input_rewritten(b"\n# replaced during the request\n"):
+                rewritten.append(LIVE_PINNED_INPUT.read_bytes())
+
+        fake = _FakeProvider(fixture, during_request=change_and_restore)
+
+        def recording_run_once(repo_root, binary, *args, **kwargs):
+            seen.append((Path(repo_root), Path(binary), Path(binary).read_bytes()))
+            return fake.run_once(repo_root, binary, *args, **kwargs)
+
+        imported_from = []
+
+        def recording_import_run(suite, repo_root, run_dir):
+            imported_from.append(Path(run_dir))
+            return fake.import_run(suite, repo_root, run_dir)
+
+        with mock.patch("scripts.eval.plugin_pair_runner._run_once", side_effect=recording_run_once), mock.patch(
+            "scripts.eval.plugin_pair_runner.import_run", side_effect=recording_import_run
+        ), mock.patch("scripts.eval.plugin_pair_runner._load_api_key", return_value="test-only-key"):
+            self.assertEqual({"baseline": 3, "candidate": 3}, fixture.run())
+        self.assertEqual(6, len(seen))
+        self.assertEqual(6, len(rewritten))
+        for repo_root, binary, executed in seen:
+            self.assertNotEqual(ROOT.resolve(), repo_root.resolve())
+            self.assertIn("metacodes-paid-tree-", str(repo_root))
+            self.assertTrue(str(binary).startswith(str(repo_root)), binary)
+        # Evidence outlives the temporary tree: every run directory was moved
+        # under the output directory before it was imported.
+        self.assertEqual(6, len(imported_from))
+        for run_dir in imported_from:
+            self.assertEqual(fixture.output / "runs", run_dir.parent)
+            self.assertTrue(run_dir.is_dir(), run_dir)
+        # What the rollouts could execute is HEAD's baseline wrapper, byte for
+        # byte, although the live one was different at every request.
+        baseline_runs = [row for row in seen if row[1].name == LIVE_PINNED_INPUT.name]
+        self.assertEqual(3, len(baseline_runs))
+        for _, _, executed in baseline_runs:
+            self.assertEqual(head_bytes, executed)
+        for live_during_request in rewritten:
+            self.assertNotEqual(head_bytes, live_during_request)
+        self.assertEqual(head_bytes, LIVE_PINNED_INPUT.read_bytes())
 
 
 class PreAuthorizationFailureTest(unittest.TestCase):
@@ -665,7 +786,8 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
 
     @requires_posix_budget_journal
     def test_the_journal_authority_is_a_function_of_the_frozen_manifest(self) -> None:
-        observation = _observe(ROOT, self.fixture.protocol, self.fixture.runtime)
+        with materialized_source_tree(ROOT, self.fixture.protocol) as tree:
+            observation = _observe(tree, self.fixture.runtime)
         hashes = {
             _canonical_sha256(
                 _authority_manifest(
@@ -690,7 +812,8 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         # The runner refuses an authority below rollouts x max_rollout; a
         # journal sealed under one (six rollouts of zero usage fit under $2)
         # therefore cannot have come from run_paid_pair.
-        observation = _observe(ROOT, self.fixture.protocol, self.fixture.runtime)
+        with materialized_source_tree(ROOT, self.fixture.protocol) as tree:
+            observation = _observe(tree, self.fixture.runtime)
         authority = dict(self.state["authority"], total_cost_microusd=usd_to_microusd(2.0))
         authority["manifest_sha256"] = _canonical_sha256(
             _authority_manifest(

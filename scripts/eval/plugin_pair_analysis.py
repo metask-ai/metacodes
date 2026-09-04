@@ -33,6 +33,7 @@ if __package__ in {None, ""}:
         _config_ids,
         _metered_tokens,
         _observe,
+        materialized_source_tree,
         _pair_fields,
         _read_private_json,
         _require_receipt_bound,
@@ -62,6 +63,7 @@ else:
         _config_ids,
         _metered_tokens,
         _observe,
+        materialized_source_tree,
         _pair_fields,
         _read_private_json,
         _require_receipt_bound,
@@ -275,126 +277,131 @@ def analyze(
     # The evidence is judged against the same frozen manifest the run was
     # authorized under, re-verified against the tree as it is now - before
     # the journal, before any rollout is read.
-    observation = _observe(root, protocol_path, runtime_binary)
-    frozen_manifest_sha256 = verify_frozen_manifest(
-        _read_private_json(frozen_manifest_file.expanduser().resolve(), "frozen-run manifest"),
-        observation.fields,
-    )
-    protocol = observation.protocol
-    protocol_sha256 = observation.protocol_sha256
-    journal_payload, journal = _read_journal(budget_journal_path)
-    authority = verify_journal_authority(
-        journal, observation, frozen_manifest_sha256=frozen_manifest_sha256
-    )
-    baseline_payload, baseline = _read_rollouts(baseline_path)
-    candidate_payload, candidate = _read_rollouts(candidate_path)
-    pair = protocol["coding_pair"]
-    # The grounded-identity validation resume applies to a checkpoint: every
-    # fingerprint must be the one this suite, wrapper, model and revision
-    # produce - not merely consistent between the two arms.
-    for arm, rows in (("baseline", baseline), ("candidate", candidate)):
-        _validate_checkpoint_rows(
-            rows,
-            variant=arm,
-            suite=observation.suite,
-            repo_root=root,
-            binary=observation.wrappers[arm],
-            trials=int(pair["trials"]),
-            expected_tasks=observation.tasks,
-            model_provider=pair["model"]["provider"],
-            model_id=pair["model"]["id"],
-            harness_revision=_revision(observation.fields),
-            harness_config_id=_config_ids(protocol)[arm],
-            require_runtime_budget=True,
+    # The analysis observes the same materialized HEAD the paid run did, so
+    # a pinned input restored to its frozen bytes after the fact is not what
+    # is hashed here either (#61).
+    with materialized_source_tree(root, protocol_path) as tree:
+        root = tree.root
+        observation = _observe(tree, runtime_binary)
+        frozen_manifest_sha256 = verify_frozen_manifest(
+            _read_private_json(frozen_manifest_file.expanduser().resolve(), "frozen-run manifest"),
+            observation.fields,
         )
-    expected = _expected_keys(protocol)
-    for arm, rows in (("baseline", baseline), ("candidate", candidate)):
-        observed = {(str(row["task_id"]), int(row["trial"])) for row in rows}
-        if observed != expected or len(rows) != len(expected):
-            raise ValidationError(f"{arm} evidence is not the complete frozen pair")
-    claimed: set[str] = set()
-    for arm, rows in (("baseline", baseline), ("candidate", candidate)):
-        for row in rows:
-            validate_paid_row(
-                row,
-                protocol=protocol,
-                protocol_sha256=protocol_sha256,
-                frozen_manifest_sha256=frozen_manifest_sha256,
-                arm=arm,
-                inventory_sha256=observation.inventory_hashes[arm],
+        protocol = observation.protocol
+        protocol_sha256 = observation.protocol_sha256
+        journal_payload, journal = _read_journal(budget_journal_path)
+        authority = verify_journal_authority(
+            journal, observation, frozen_manifest_sha256=frozen_manifest_sha256
+        )
+        baseline_payload, baseline = _read_rollouts(baseline_path)
+        candidate_payload, candidate = _read_rollouts(candidate_path)
+        pair = protocol["coding_pair"]
+        # The grounded-identity validation resume applies to a checkpoint: every
+        # fingerprint must be the one this suite, wrapper, model and revision
+        # produce - not merely consistent between the two arms.
+        for arm, rows in (("baseline", baseline), ("candidate", candidate)):
+            _validate_checkpoint_rows(
+                rows,
+                variant=arm,
+                suite=observation.suite,
+                repo_root=root,
+                binary=observation.wrappers[arm],
+                trials=int(pair["trials"]),
+                expected_tasks=observation.tasks,
+                model_provider=pair["model"]["provider"],
+                model_id=pair["model"]["id"],
+                harness_revision=_revision(observation.fields),
+                harness_config_id=_config_ids(protocol)[arm],
+                require_runtime_budget=True,
             )
-            transaction_id = bind_row_to_journal(row, journal, observation, authority, arm=arm)
-            if transaction_id in claimed:
-                raise ValidationError("two paid plugin rows claim the same budget transaction")
-            claimed.add(transaction_id)
-    _require_no_orphan_transactions(journal, claimed)
+        expected = _expected_keys(protocol)
+        for arm, rows in (("baseline", baseline), ("candidate", candidate)):
+            observed = {(str(row["task_id"]), int(row["trial"])) for row in rows}
+            if observed != expected or len(rows) != len(expected):
+                raise ValidationError(f"{arm} evidence is not the complete frozen pair")
+        claimed: set[str] = set()
+        for arm, rows in (("baseline", baseline), ("candidate", candidate)):
+            for row in rows:
+                validate_paid_row(
+                    row,
+                    protocol=protocol,
+                    protocol_sha256=protocol_sha256,
+                    frozen_manifest_sha256=frozen_manifest_sha256,
+                    arm=arm,
+                    inventory_sha256=observation.inventory_hashes[arm],
+                )
+                transaction_id = bind_row_to_journal(row, journal, observation, authority, arm=arm)
+                if transaction_id in claimed:
+                    raise ValidationError("two paid plugin rows claim the same budget transaction")
+                claimed.add(transaction_id)
+        _require_no_orphan_transactions(journal, claimed)
 
-    thresholds = pair["release_thresholds"]
-    judgement = gate(
-        candidate,
-        baseline=baseline,
-        max_invalid_rate=float(thresholds["max_invalid_rate"]),
-        min_trustworthy_success=float(
-            thresholds["min_treatment_trustworthy_success"]
-        ),
-        max_policy_violations=int(thresholds["max_policy_violations"]),
-        max_success_regression=float(thresholds["max_success_rate_regression"]),
-        max_cost_increase_usd=float(thresholds["max_mean_cost_increase_usd"]),
-        max_latency_increase_ms=float(
-            thresholds["max_mean_latency_increase_ms"]
-        ),
-        max_model_tool_error_increase=float(
-            thresholds["max_mean_model_tool_error_increase"]
-        ),
-        min_latency_attribution_coverage=1.0,
-        factor="harness",
-    )
-    comparison = judgement["comparison"]
-    assert comparison is not None
-    local_improvement = (
-        judgement["passed"]
-        and comparison["success_rate_delta"] > 0
-        and comparison["mcnemar_exact_p"] <= 0.05
-    )
-    total_cost = sum(
-        float(row["metrics"]["cost_usd"])
-        for row in [*baseline, *candidate]
-    )
-    total_tokens = sum(_metered_tokens(row) for row in [*baseline, *candidate])
-    if (
-        total_cost > float(pair["max_cumulative_cost_usd"])
-        or total_tokens > int(pair["max_cumulative_metered_tokens"])
-    ):
-        raise ValidationError("paid plugin evidence exceeds the frozen cumulative authority")
-    receipt: dict[str, Any] = {
-        "schema": RECEIPT_SCHEMA,
-        "quality_evidence": True,
-        "protocol_sha256": protocol_sha256,
-        "frozen_manifest_sha256": frozen_manifest_sha256,
-        "implementation_fingerprint": observation.fields["implementation_fingerprint"],
-        "path_set_digest": observation.fields["path_set_digest"],
-        "baseline_sha256": _sha256_bytes(baseline_payload),
-        "candidate_sha256": _sha256_bytes(candidate_payload),
-        "budget_journal_sha256": _sha256_bytes(journal_payload),
-        "pair_count": len(expected),
-        "provider_requests_upper_bound": int(pair["rollouts"]),
-        "observed_cost_usd": total_cost,
-        "observed_metered_tokens": total_tokens,
-        "kernel_controls": protocol["kernel_controls"],
-        "gate": judgement,
-        "release_status": (
-            "development_gate_passed" if judgement["passed"] else "candidate_rejected"
-        ),
-        "local_paired_improvement": (
-            "supported" if local_improvement else "not_established"
-        ),
-        "public_benchmark_claim": "not_permitted",
-        "interpretation": pair["interpretation"],
-    }
-    receipt["content_sha256"] = hashlib.sha256(
-        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return receipt
+        thresholds = pair["release_thresholds"]
+        judgement = gate(
+            candidate,
+            baseline=baseline,
+            max_invalid_rate=float(thresholds["max_invalid_rate"]),
+            min_trustworthy_success=float(
+                thresholds["min_treatment_trustworthy_success"]
+            ),
+            max_policy_violations=int(thresholds["max_policy_violations"]),
+            max_success_regression=float(thresholds["max_success_rate_regression"]),
+            max_cost_increase_usd=float(thresholds["max_mean_cost_increase_usd"]),
+            max_latency_increase_ms=float(
+                thresholds["max_mean_latency_increase_ms"]
+            ),
+            max_model_tool_error_increase=float(
+                thresholds["max_mean_model_tool_error_increase"]
+            ),
+            min_latency_attribution_coverage=1.0,
+            factor="harness",
+        )
+        comparison = judgement["comparison"]
+        assert comparison is not None
+        local_improvement = (
+            judgement["passed"]
+            and comparison["success_rate_delta"] > 0
+            and comparison["mcnemar_exact_p"] <= 0.05
+        )
+        total_cost = sum(
+            float(row["metrics"]["cost_usd"])
+            for row in [*baseline, *candidate]
+        )
+        total_tokens = sum(_metered_tokens(row) for row in [*baseline, *candidate])
+        if (
+            total_cost > float(pair["max_cumulative_cost_usd"])
+            or total_tokens > int(pair["max_cumulative_metered_tokens"])
+        ):
+            raise ValidationError("paid plugin evidence exceeds the frozen cumulative authority")
+        receipt: dict[str, Any] = {
+            "schema": RECEIPT_SCHEMA,
+            "quality_evidence": True,
+            "protocol_sha256": protocol_sha256,
+            "frozen_manifest_sha256": frozen_manifest_sha256,
+            "implementation_fingerprint": observation.fields["implementation_fingerprint"],
+            "path_set_digest": observation.fields["path_set_digest"],
+            "baseline_sha256": _sha256_bytes(baseline_payload),
+            "candidate_sha256": _sha256_bytes(candidate_payload),
+            "budget_journal_sha256": _sha256_bytes(journal_payload),
+            "pair_count": len(expected),
+            "provider_requests_upper_bound": int(pair["rollouts"]),
+            "observed_cost_usd": total_cost,
+            "observed_metered_tokens": total_tokens,
+            "kernel_controls": protocol["kernel_controls"],
+            "gate": judgement,
+            "release_status": (
+                "development_gate_passed" if judgement["passed"] else "candidate_rejected"
+            ),
+            "local_paired_improvement": (
+                "supported" if local_improvement else "not_established"
+            ),
+            "public_benchmark_claim": "not_permitted",
+            "interpretation": pair["interpretation"],
+        }
+        receipt["content_sha256"] = hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return receipt
 
 
 def _write_new(path: Path, value: Mapping[str, Any]) -> None:
