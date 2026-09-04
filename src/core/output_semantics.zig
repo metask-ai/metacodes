@@ -1,6 +1,6 @@
 //! Semantic classification of an agent Run's visible output.
 //!
-//! Requirement: `doc/frommetawork/AGENT_OUTPUT_SEMANTICS_ISSUE.md`.
+//! Requirement: `doc/history/inbound/AGENT_OUTPUT_SEMANTICS_ISSUE.md`.
 //!
 //! The provider stream can only say "text arrived". Whether that text is an
 //! intermediate note the model wrote before calling a tool, the completed

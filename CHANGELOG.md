@@ -61,6 +61,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- Superseded design documents (the revision-14 plugin ABI plan, the MCP
+  transport hard-cut, the multi-session refactor, the DeepSeek harness analysis,
+  the U2 and U9/U10 designs) and the inbound requirements formerly under
+  `doc/frommetawork/` now live under `doc/history/`: records, not contracts,
+  outside `release/doc_facts.json`. `doc/TREE_SITTER.md` is deleted (the feature
+  was removed on 2026-07-13). Stage 1 of #47.
+
 - `ReadArtifact` recovery reads are bounded per turn. Recovery results stay
   exempt from projection (spilling one would recurse), so nothing could trim
   them: nine parallel reads on a 200K window cost 225,000 bytes against a

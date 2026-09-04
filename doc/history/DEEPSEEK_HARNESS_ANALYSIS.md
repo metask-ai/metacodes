@@ -1,8 +1,8 @@
 # DeepSeek Harness 源码分析与 metacodes 取舍
 
 > 历史设计分析（非当前状态契约）。其中的阶段编号、能力矩阵和“当前”描述来自
-> 早期提取时点；请以 [API 总览](API.md)、[LIB_API](LIB_API.md)、
-> [AgentCore ABI](AGENTCORE_BINARY_ABI.md) 和源码为准。
+> 早期提取时点；请以 [API 总览](../API.md)、[LIB_API](../LIB_API.md)、
+> [AgentCore ABI](../AGENTCORE_BINARY_ABI.md) 和源码为准。
 
 ## 1. 固定样本与验证
 

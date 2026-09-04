@@ -72,7 +72,7 @@ pub const Deps = struct {
     /// waitSinceFrom 最多 15s**。故 resolver **必须保证:被解析的 session 活过所有在飞请求**,即 host
     /// 绝不可在某连接持其指针时被 destroy。**MVP 满足此约束靠 session 静态**(fixed-N at startup,无
     /// per-session destroy);引入 dynamic destroy / idle-reap 前**必须**先把签名改成 refcount handle /
-    /// lock-hold(见 doc/U9_U10_DAEMON_TIER_DESIGN.md §4)。否则 = 重现 U10-A 删掉的 borrow-UAF。
+    /// lock-hold(见 doc/history/U9_U10_DAEMON_TIER_DESIGN.md §4)。否则 = 重现 U10-A 删掉的 borrow-UAF。
     resolver: ?*const fn (ctx: *anyopaque, id: []const u8) ?SessionView = null,
     resolver_ctx: *anyopaque = undefined,
     /// **U10-C:`GET /` 落地页覆盖**。非 null → `GET /` 调它取 HTML(caller-allocated,route 用完 free);
