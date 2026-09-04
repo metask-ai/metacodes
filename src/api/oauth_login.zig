@@ -28,6 +28,7 @@ const std = @import("std");
 const auth = @import("../core/auth.zig");
 const http_status = @import("http_status.zig");
 const util_time = @import("../util/time.zig");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 /// Distinct from Metask's 1455/1457 so a provider login started while a Metask
 /// login is waiting does not steal its callback.
@@ -95,6 +96,8 @@ pub const Options = struct {
     /// Test seam: a fixed `state` makes the redirect reproducible without
     /// weakening the production path, which always generates one.
     force_state: ?[]const u8 = null,
+    /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
+    abort_signal: ?*const AbortSignal = null,
 };
 
 pub const Error = error{
@@ -180,7 +183,7 @@ fn acquireByLoopback(
         }
     };
 
-    const code = try server.waitForAuthorizationCode(allocator, state);
+    const code = try server.waitForAuthorizationCode(allocator, state, options.abort_signal);
     defer auth.secureFree(allocator, code);
 
     var body: std.Io.Writer.Allocating = .init(allocator);
@@ -247,7 +250,11 @@ fn acquireByDeviceCode(
     );
 
     while (util_time.nowUnix() - started < budget) {
-        util_time.sleepMs(@as(u64, interval) * 1000);
+        var waited_ms: u32 = 0;
+        while (waited_ms < interval * 1000) : (waited_ms += 100) {
+            if (options.abort_signal) |signal| if (signal.isAborted()) return error.Aborted;
+            util_time.sleepMs(100);
+        }
         var poll: std.Io.Writer.Allocating = .init(allocator);
         defer poll.deinit();
         try auth.appendFormField(

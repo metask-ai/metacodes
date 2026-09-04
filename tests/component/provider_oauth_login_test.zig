@@ -62,29 +62,33 @@ const Instructions = struct {
 
     /// Pull the loopback port out of the redirect the authorize URL carries.
     fn callbackPort(self: *const Instructions) !u16 {
-        const marker = "http%3A%2F%2Flocalhost%3A";
-        const at = std.mem.indexOf(u8, self.buffer.items, marker) orelse
-            return error.NoRedirectInInstructions;
-        var cursor = at + marker.len;
-        var port: u32 = 0;
-        while (cursor < self.buffer.items.len and std.ascii.isDigit(self.buffer.items[cursor])) : (cursor += 1) {
-            port = port * 10 + (self.buffer.items[cursor] - '0');
-        }
-        return std.math.cast(u16, port) orelse error.NoRedirectInInstructions;
+        return callbackPortIn(self.buffer.items);
     }
 
     fn stateValue(self: *const Instructions) ![]const u8 {
-        const marker = "&state=";
-        const at = std.mem.indexOf(u8, self.buffer.items, marker) orelse return error.NoStateInInstructions;
-        const start = at + marker.len;
-        var end = start;
-        while (end < self.buffer.items.len and
-            self.buffer.items[end] != '&' and
-            self.buffer.items[end] != '\n') : (end += 1)
-        {}
-        return self.buffer.items[start..end];
+        return stateValueIn(self.buffer.items);
     }
 };
+
+fn callbackPortIn(text: []const u8) !u16 {
+    const marker = "http%3A%2F%2Flocalhost%3A";
+    const at = std.mem.indexOf(u8, text, marker) orelse return error.NoRedirectInInstructions;
+    var cursor = at + marker.len;
+    var port: u32 = 0;
+    while (cursor < text.len and std.ascii.isDigit(text[cursor])) : (cursor += 1) {
+        port = port * 10 + (text[cursor] - '0');
+    }
+    return std.math.cast(u16, port) orelse error.NoRedirectInInstructions;
+}
+
+fn stateValueIn(text: []const u8) ![]const u8 {
+    const marker = "&state=";
+    const at = std.mem.indexOf(u8, text, marker) orelse return error.NoStateInInstructions;
+    const start = at + marker.len;
+    var end = start;
+    while (end < text.len and text[end] != '&' and text[end] != '\n') : (end += 1) {}
+    return text[start..end];
+}
 
 /// Drive the redirect the authorization server would perform.
 fn deliverCallback(port: u16, query: []const u8) !void {
@@ -632,4 +636,142 @@ test "loginInteractive fails closed with typed errors and persists nothing" {
     try expectNoLogin(a, "keyonly");
     try expectNoLogin(a, "relay");
     try expectNoLogin(a, "openai");
+}
+
+/// The picker's credential stage runs the login through `LoginWorker` (#67);
+/// spin until the worker's transcript satisfies `predicate` or the bound runs out.
+fn awaitWorker(worker: *cc.api_login_worker.LoginWorker, comptime predicate: fn (*cc.api_login_worker.LoginWorker) bool) bool {
+    var spins: usize = 0;
+    while (spins < 1_000) : (spins += 1) {
+        if (predicate(worker)) return true;
+        cc.util_time.sleepMs(10);
+    }
+    return false;
+}
+
+fn workerNamesState(worker: *cc.api_login_worker.LoginWorker) bool {
+    var buffer: [cc.api_login_worker.TRANSCRIPT_CAPACITY]u8 = undefined;
+    return std.mem.indexOf(u8, worker.copyTranscript(&buffer), "&state=") != null;
+}
+
+fn workerSettled(worker: *cc.api_login_worker.LoginWorker) bool {
+    return worker.isSettled();
+}
+
+test "L2 picker credential stage: the login worker lands a loopback grant as a durable login, and a cancelled one stores nothing" {
+    const a = std.testing.allocator;
+
+    var token_server = try harness.MockServer.start(
+        \\{"access_token":"picker-access","refresh_token":"picker-refresh","token_type":"Bearer","expires_in":3600}
+    , 0);
+    defer token_server.stop();
+    const token_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/oauth/token", .{token_server.port});
+    defer a.free(token_url);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const oauth_dir = try a.dupeZ(u8, root_buffer[0..root_len]);
+    defer a.free(oauth_dir);
+    ppaths.setEnv("METACODES_OAUTH_DIR", oauth_dir.ptr);
+    defer ppaths.unsetEnv("METACODES_OAUTH_DIR");
+
+    const Slug = cc.provider_ids.Slug;
+    const profile = cc.provider_profile.ProviderProfile{
+        .id = Slug.lit("picker-oauth"),
+        .implementation_id = Slug.lit("picker-oauth"),
+        .display_name = "Picker OAuth",
+        .channels = &.{},
+        .accepted_credential_kinds = &.{.openai_oauth},
+        .oauth_token_url = token_url,
+        .oauth_authorize_url = "http://127.0.0.1:1/authorize",
+    };
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+
+    // What picker_host does on MissingCredentials: prepare (typed refusals
+    // happen here), then run on the worker. No browser; kernel-chosen port.
+    const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client" });
+    var worker = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), prepared);
+    try worker.start();
+    defer worker.join();
+
+    // The transcript the picker draws is what the user acts on; the test acts
+    // as the browser that follows it.
+    if (!awaitWorker(&worker, workerNamesState)) return error.WorkerNeverPublishedInstructions;
+    var transcript: [cc.api_login_worker.TRANSCRIPT_CAPACITY]u8 = undefined;
+    const text = worker.copyTranscript(&transcript);
+    const port = try callbackPortIn(text);
+    const state = try stateValueIn(text);
+    const query = try std.fmt.allocPrint(a, "code=picker-code&state={s}", .{state});
+    defer a.free(query);
+    try deliverCallback(port, query);
+
+    if (!awaitWorker(&worker, workerSettled)) return error.WorkerNeverSettled;
+    try std.testing.expectEqual(cc.api_login_worker.State.succeeded, worker.currentState());
+    try std.testing.expect(token_server.requestCount() == 1);
+
+    // The whole point: the login is durable and carries the client, so the
+    // retried commit finds a credential and later refreshes present it.
+    var reloaded = try provider_oauth.Session.initHome(a, profile.id);
+    defer reloaded.deinit();
+    try std.testing.expect(try reloaded.load());
+    try std.testing.expectEqualStrings("picker-access", reloaded.tokens.?.access_token);
+    try std.testing.expectEqualStrings("picker-client", reloaded.client_id.?);
+
+    // Esc: the worker is cancelled through the signal and nothing is stored.
+    const cancelled_profile = cc.provider_profile.ProviderProfile{
+        .id = Slug.lit("picker-oauth-esc"),
+        .implementation_id = Slug.lit("picker-oauth-esc"),
+        .display_name = "Picker OAuth (cancelled)",
+        .channels = &.{},
+        .accepted_credential_kinds = &.{.openai_oauth},
+        .oauth_token_url = token_url,
+        .oauth_authorize_url = "http://127.0.0.1:1/authorize",
+    };
+    const cancelled_prepared = try provider_login.prepareProfile(&cancelled_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client" });
+    var cancelled = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), cancelled_prepared);
+    try cancelled.start();
+    defer cancelled.join();
+    if (!awaitWorker(&cancelled, workerNamesState)) return error.WorkerNeverPublishedInstructions;
+    cancelled.cancel();
+    if (!awaitWorker(&cancelled, workerSettled)) return error.WorkerNeverSettled;
+    try std.testing.expectEqual(cc.api_login_worker.State.cancelled, cancelled.currentState());
+    try std.testing.expect(token_server.requestCount() == 1);
+    var absent = try provider_oauth.Session.initHome(a, cancelled_profile.id);
+    defer absent.deinit();
+    try std.testing.expect(!(try absent.load()));
+
+    // A token endpoint that answers garbage: the worker settles `failed`
+    // with the import's typed error, which the picker shows, and nothing
+    // is stored.
+    var garbage_server = try harness.MockServer.start("not a token response", 0);
+    defer garbage_server.stop();
+    const garbage_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/oauth/token", .{garbage_server.port});
+    defer a.free(garbage_url);
+    const failing_profile = cc.provider_profile.ProviderProfile{
+        .id = Slug.lit("picker-oauth-bad"),
+        .implementation_id = Slug.lit("picker-oauth-bad"),
+        .display_name = "Picker OAuth (bad token endpoint)",
+        .channels = &.{},
+        .accepted_credential_kinds = &.{.openai_oauth},
+        .oauth_token_url = garbage_url,
+        .oauth_authorize_url = "http://127.0.0.1:1/authorize",
+    };
+    const failing_prepared = try provider_login.prepareProfile(&failing_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client" });
+    var failing = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), failing_prepared);
+    try failing.start();
+    defer failing.join();
+    if (!awaitWorker(&failing, workerNamesState)) return error.WorkerNeverPublishedInstructions;
+    const failing_text = failing.copyTranscript(&transcript);
+    const failing_query = try std.fmt.allocPrint(a, "code=picker-code&state={s}", .{try stateValueIn(failing_text)});
+    defer a.free(failing_query);
+    try deliverCallback(try callbackPortIn(failing_text), failing_query);
+    if (!awaitWorker(&failing, workerSettled)) return error.WorkerNeverSettled;
+    try std.testing.expectEqual(cc.api_login_worker.State.failed, failing.currentState());
+    try std.testing.expectEqualStrings("InvalidTokenResponse", failing.failureName());
+    var not_stored = try provider_oauth.Session.initHome(a, failing_profile.id);
+    defer not_stored.deinit();
+    try std.testing.expect(!(try not_stored.load()));
 }

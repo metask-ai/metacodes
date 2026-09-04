@@ -643,11 +643,24 @@ the TUI's OAuth setup path (issue #33). It is the kernel flow the CLI runs —
 when it cannot, `api/oauth_login.zig` runs the grant — with the REPL's
 transcript as the notify sink, and it ends in the same durable import, so a
 login made here and one made from the shell are indistinguishable afterwards.
-The flow blocks the REPL until it completes or times out, as `metacodes login`
-blocks the terminal; Metask keeps its own JSON device grant on the CLI. A picker
-commit that fails for want of a credential on an OAuth-capable provider names
-`/login <provider>` in its notice. The picker's own credential stage — signing
-in without leaving the overlay — is not built (see "Not implemented yet").
+`/login` blocks the REPL until the flow completes, as `metacodes login` blocks
+the terminal; Metask keeps its own JSON device grant on the CLI. The loopback
+wait polls its socket (`platform/net.pollReadable`) and checks an
+`AbortSignal` every 100 ms, and the device-code poll sleeps in the same
+slices, so either flow can be cancelled from another thread (#67).
+
+The picker has a credential stage (#67). A commit that fails with
+`MissingCredentials` on an OAuth-capable provider does not leave the overlay:
+`picker_host` prepares the same kernel login (`prepareProfile`, so every
+refusal — no token endpoint, no client id — is the typed one `/login` gives)
+and runs it on a worker thread (`api/login_worker.zig`), whose `Notify` sink is
+a bounded buffer the picker draws in place of the route list: the URL to
+open, or the device code. The TUI's 100 ms input tick polls the worker; `Esc`
+aborts the flow through the signal and returns to the stage the user came
+from; a landed login refreshes the catalog and retries the pending commit, so
+the route the user chose is the one that becomes active. The state machine
+stays pure (`Stage.credential`, `Outcome.login` / `Outcome.cancel_login`); the
+thread, the network and `App` live in the host and the worker.
 
 ## Module map
 
@@ -675,6 +688,7 @@ in without leaving the overlay — is not built (see "Not implemented yet").
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
 | `src/api/oauth_login.zig` | the interactive first-token grants (PKCE, device) |
 | `src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33) |
+| `src/api/login_worker.zig` | a prepared login on a worker thread: `AbortSignal` cancellation, bounded `Notify` transcript, atomic state (#67) |
 | `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
 | `src/repl/model_picker.zig` | picker state machine (pure) |
 | `src/repl/model_picker_view.zig` | picker rendering |
@@ -701,18 +715,13 @@ from a profile, and `../app.zig` from the picker.
 Listed rather than left silent. Each is a decision with a reason, not an
 omission — and none of them is an acceptance criterion of the issue.
 
-- **The picker's credential stage, and a default OpenAI client (issue #33,
-  remaining; tracked as #67).** `/login <provider>` and `metacodes login
-  --provider <id>` are two entry points to one kernel flow
-  (`api/provider_login.zig` decides, `api/oauth_login.zig` runs), and a picker
-  commit that fails for want of a credential on an OAuth-capable provider names
-  `/login`. What is not built is a credential *stage* inside the picker —
-  signing in without leaving the overlay — which needs a run that does not
-  block the render loop, a way to cancel it, and a picker-owned `Notify` sink.
-  Separately, the built-in `openai` profile declares no `oauth_client_id`: the
-  client an installation presents is a registration decision for the
-  maintainers, not something to guess in a profile, so both entry points need
-  `--client-id` for `openai` until one is settled.
+- **A default OpenAI client (tracked as #87).** The built-in `openai` profile
+  declares no `oauth_client_id`: the client an installation presents is a
+  registration decision for the maintainers — redirect URI, device-code scope,
+  who owns the registration — not something to guess in a profile, so `/login
+  openai`, `metacodes login --provider openai` and the picker's credential
+  stage all require `--client-id` (or `custom_providers.<id>.oauth.client_id`)
+  until one is settled.
 - **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
   signed adapter reference, which needs review and signing infrastructure. The
   declarative schema covers relays, gateways, and self-hosted servers, which
