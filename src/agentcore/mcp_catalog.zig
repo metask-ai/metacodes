@@ -1459,7 +1459,7 @@ test "describe does not wait for an in-flight Connector handshake" {
     defer if (!refresh_joined) refresh_thread.join();
 
     var observed_blocked_handshake = false;
-    for (0..1_000) |_| {
+    for (0..10_000) |_| {
         fake.block_mutex.lock();
         observed_blocked_handshake = fake.open_waiting;
         fake.block_mutex.unlock();

@@ -151,12 +151,19 @@ jobs:
 
   windows-gates:
     name: Gates (Windows)
-    timeout-minutes: 15
+    # Measured on the self-hosted runner with warm caches: full suite step 1:09,
+    # job 1:47. A cold cache compiles the whole tree; 30 matches the `gates` job.
+    timeout-minutes: 30
     # Self-hosted isolation guard; see the `gates` job.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Same as the `gates` job: the repository-snapshot and grounding
+          # fingerprint tests resolve historical commits with `git rev-parse`,
+          # which a depth-1 checkout cannot (5 errors on the first full run).
+          fetch-depth: 0
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
@@ -169,6 +176,21 @@ jobs:
         run: |
           echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
           echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
+      # The workspace persists between runs and git treats a CRLF file whose
+      # normalized content matches the index as clean, so `checkout --force`
+      # never repairs line endings some other process rewrote (run 33768501933
+      # failed exactly that way: plugin.json and pinned fixtures hashed as CRLF
+      # while the previous run on the same machine had them as LF). List what is
+      # wrong for the record, rewrite the tree from the index under
+      # .gitattributes, and fail closed if anything still carries CRLF.
+      - name: Normalize line endings of the persistent workspace
+        shell: cmd
+        run: |
+          git config --show-origin --get-all core.autocrlf & echo (core.autocrlf origins above, if any)
+          git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files before normalization above, if any)
+          git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
+          git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
+          exit /b 0
       - name: Native platform modules
         shell: cmd
         env:
@@ -186,3 +208,27 @@ jobs:
       - name: Verify native bundle and fresh-store contract
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage
+      # The repository-wide suite on the native Windows host. Until #53 this was
+      # the "independent gate" build.zig talked about that no workflow ran, so
+      # Windows portability regressions accumulated silently (1 compile error,
+      # 8 unit tests, 8 integration shards, 330 Python cases by the time it was
+      # first run). -j6: the default job count is one LLVM codegen per core; on a
+      # 28-core/32 GB box that surfaces as bogus "out of memory" compile failures
+      # rather than a clean signal, and the runner finishes in ~1 min anyway. --test-timeout 5m: the build runner
+      # watchdog between tests is max(--test-timeout, 60s), same as the AgentCore
+      # gate. No Lean step and no METACODES_TEST_REQUIRE_LEAN_SDK here: the
+      # kernel-gated tests take their checker from operator-provided
+      # METACODES_TEST_*_KERNEL_* variables that no job sets, and the runner does
+      # not provision elan; they skip on this leg exactly as documented in
+      # scripts/eval/tests/posix_only.py and the component tests.
+      - name: Full offline test suite
+        shell: cmd
+        run: zig build test -j6 --test-timeout 5m
+      # Evidence for the next line-ending incident: if the suite itself rewrites
+      # tracked files with CRLF, this lists them; the step never fails.
+      - name: Line endings after the suite
+        if: always()
+        shell: cmd
+        run: |
+          git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files after the suite above, if any)
+          exit /b 0

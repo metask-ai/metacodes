@@ -54,7 +54,8 @@ pub const SwarmContext = struct {
     dialect_resolver: dialect_mod.Resolver = .builtin(),
 
     /// 非阻塞 reap:对进程外 teammate waitpid(WNOHANG),已退出的收尸+removeWorktree+摘除记录。
-    /// 返回仍存活的数量。POSIX only(Windows 列表恒空)。
+    /// 返回仍存活的数量。POSIX only(Windows 上没有 waitpid,直接报 0;列表本身未必为空,
+    /// 注入 spawn_fn 时照样会登记——释放由 terminateProcessTeammates 负责)。
     pub fn reapDeadProcessTeammates(self: *SwarmContext) usize {
         if (@import("builtin").os.tag == .windows) return 0;
         var i: usize = 0;
@@ -83,8 +84,20 @@ pub const SwarmContext = struct {
     /// 终止全部进程外 teammate:SIGTERM → 宽限期 poll waitpid(WNOHANG)→ 顽固 SIGKILL → 阻塞收尸
     /// → removeWorktree。**必须先等死再删 worktree**:teammate 可能还在写,强删是竞态(旧 bug)。
     pub fn terminateProcessTeammates(self: *SwarmContext, grace_ms: u64) void {
-        if (@import("builtin").os.tag == .windows) return;
         if (self.process_teammates.items.len == 0) return;
+        if (@import("builtin").os.tag == .windows) {
+            // 没有 fork/kill/waitpid 可做,但记录里的 owned 字符串仍是本 context 的:
+            // spawnTeammateProcess 接受任意 spawn_fn(测试注入 mock),登记成功后条目
+            // 就存在。裸 return 会让 name/worktree_path/repo 全部泄漏——deinit 只释放
+            // 列表本身。这里只跳过 POSIX 的信号、收尸与 worktree 删除,释放照做。
+            for (self.process_teammates.items) |*pt| {
+                self.allocator.free(pt.name);
+                self.allocator.free(pt.worktree_path);
+                self.allocator.free(pt.repo);
+            }
+            self.process_teammates.clearRetainingCapacity();
+            return;
+        }
         const time = @import("../util/time.zig");
         for (self.process_teammates.items) |*pt| _ = std.c.kill(@intCast(pt.pid), std.c.SIG.TERM);
         var waited: u64 = 0;

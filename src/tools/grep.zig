@@ -881,16 +881,23 @@ test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发(需 zl
     const a = std.testing.allocator;
     // Y2 砍 tree-sitter 后:FindSymbol 走 LSP documentSymbol,搭车需 ctx.lsp + git workspace + zls。
     const lsp_servers = @import("../lsp/servers.zig");
+    // LSP 的 pathToUri 是 POSIX 形状(src/lsp/client.zig pathToUri 与 src/lsp/lsp.zig 的
+    // Windows 支持表均标注未支持):Windows 上它把盘符路径原样拼在 file:// 后面,既没有
+    // 规范要求的第三个斜杠,冒号也不做百分号编码,反斜杠更不转正斜杠,zls 拒收,
+    // documentSymbol 永远拿不到 → 搭车不触发。这是记录在案的子系统缺口,不是本用例的
+    // 断言错了,所以按平台跳过而不是红掉。
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
     if (lsp_servers.which("zls", &zbuf) == null) return error.SkipZigTest; // 未装 zls → skip
 
     // per-pid 唯一目录 + fake .git 过 workspace gate。
     var dbuf: [256]u8 = undefined;
     const dir = tt.path(&dbuf, "grep-hitch");
-    _ = std.c.mkdir(dir.ptr, 0o755);
+    // std.c.mkdir 是 POSIX 形状(mode 参数);Windows 上用可移植的 mkdirParents。
+    @import("../util/fs.zig").mkdirParents(dir) catch {};
     var gbuf: [320]u8 = undefined;
     const gdir = std.fmt.bufPrintZ(&gbuf, "{s}/.git", .{dir}) catch unreachable;
-    _ = std.c.mkdir(gdir.ptr, 0o755);
+    @import("../util/fs.zig").mkdirParents(gdir) catch {};
     var fbuf: [320]u8 = undefined;
     const fpath = std.fmt.bufPrintZ(&fbuf, "{s}/sample.zig", .{dir}) catch unreachable;
     defer _ = std.c.unlink(fpath.ptr);

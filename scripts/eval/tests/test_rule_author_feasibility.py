@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from scripts.eval.run_rule_author_feasibility import child_error_code
+from scripts.eval.tests.posix_only import requires_posix_budget_journal
 
 
 REPO = Path(__file__).resolve().parents[3]
@@ -97,6 +98,7 @@ class RuleAuthorFeasibilityRunnerTest(unittest.TestCase):
             self.assertFalse((root / "artifacts").exists())
             self.assertFalse(json.loads(completed.stdout)["execute_paid"])
 
+    @requires_posix_budget_journal
     def test_child_observes_durable_authorization_before_commit(self) -> None:
         result = json.dumps(
             {
@@ -135,6 +137,7 @@ class RuleAuthorFeasibilityRunnerTest(unittest.TestCase):
             self.assertTrue(summary_path.is_file())
             self.assertEqual(stat.S_IMODE(summary_path.stat().st_mode), 0o600)
 
+    @requires_posix_budget_journal
     def test_malformed_child_result_remains_authorized_and_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

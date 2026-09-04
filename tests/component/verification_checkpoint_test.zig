@@ -6,6 +6,16 @@ const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
 
+/// 让 fixture 脚本可执行。
+///
+/// Windows 上 `_chmod` 只切换只读位,`#!/bin/sh` 脚本照样跑不起来,原来的
+/// `chmod != 0` 守卫因此不触发:脚本静默不执行,断言退化成假绿(断言"没出现某
+/// 文本"的用例会无条件通过)。所以在那里直接跳过,让结果诚实。
+fn makeExecutable(path_z: [:0]const u8) !void {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+}
+
 const END_TURN =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"done\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
@@ -57,7 +67,7 @@ fn successfulTestCommand(
     });
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    try makeExecutable(path_z);
     return allocator.dupe(u8, path);
 }
 
@@ -159,8 +169,8 @@ test "L2 post-mutation green test injects one checkpoint without first-request d
     defer treatment_tmp.cleanup();
     var control_buf: [std.fs.max_path_bytes]u8 = undefined;
     var treatment_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const control_root = control_buf[0..try control_tmp.dir.realPath(std.testing.io, &control_buf)];
-    const treatment_root = treatment_buf[0..try treatment_tmp.dir.realPath(std.testing.io, &treatment_buf)];
+    const control_root = harness.normalizeSlashes(control_buf[0..try control_tmp.dir.realPath(std.testing.io, &control_buf)]);
+    const treatment_root = harness.normalizeSlashes(treatment_buf[0..try treatment_tmp.dir.realPath(std.testing.io, &treatment_buf)]);
 
     const control_command = try successfulTestCommand(a, control_root);
     defer a.free(control_command);
@@ -181,7 +191,7 @@ test "L2 checkpoint recognizes pytest stderr redirect before display-only tail" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const pytest_path = try std.fmt.allocPrint(a, "{s}/pytest", .{root});
     defer a.free(pytest_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
@@ -190,7 +200,7 @@ test "L2 checkpoint recognizes pytest stderr redirect before display-only tail" 
     });
     const pytest_z = try a.dupeZ(u8, pytest_path);
     defer a.free(pytest_z);
-    if (std.c.chmod(pytest_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    try makeExecutable(pytest_z);
     const command = try std.fmt.allocPrint(a, "{s} 2>&1 | tail -20", .{pytest_path});
     defer a.free(command);
 
@@ -204,7 +214,7 @@ test "L2 display-only tail cannot turn a failed pytest summary into progress" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const pytest_path = try std.fmt.allocPrint(a, "{s}/pytest", .{root});
     defer a.free(pytest_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
@@ -213,7 +223,7 @@ test "L2 display-only tail cannot turn a failed pytest summary into progress" {
     });
     const pytest_z = try a.dupeZ(u8, pytest_path);
     defer a.free(pytest_z);
-    if (std.c.chmod(pytest_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    try makeExecutable(pytest_z);
     const command = try std.fmt.allocPrint(a, "{s} 2>&1 | tail -20", .{pytest_path});
     defer a.free(command);
 
@@ -230,8 +240,8 @@ test "L2 failed or ordinary Bash does not trigger checkpoint" {
     defer ordinary_tmp.cleanup();
     var failed_buf: [std.fs.max_path_bytes]u8 = undefined;
     var ordinary_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const failed_root = failed_buf[0..try failed_tmp.dir.realPath(std.testing.io, &failed_buf)];
-    const ordinary_root = ordinary_buf[0..try ordinary_tmp.dir.realPath(std.testing.io, &ordinary_buf)];
+    const failed_root = harness.normalizeSlashes(failed_buf[0..try failed_tmp.dir.realPath(std.testing.io, &failed_buf)]);
+    const ordinary_root = harness.normalizeSlashes(ordinary_buf[0..try ordinary_tmp.dir.realPath(std.testing.io, &ordinary_buf)]);
     var failed = try runScenario(a, failed_root, true, "python3 -m pytest /definitely/missing", false);
     defer failed.deinit(a);
     var ordinary = try runScenario(a, ordinary_root, true, "git status", false);
@@ -245,7 +255,7 @@ test "L2 checkpoint is steering not a hard stop; a later justified Edit executes
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const command = try successfulTestCommand(a, root);
     defer a.free(command);
     var run = try runScenario(a, root, true, command, true);

@@ -1,2 +1,18 @@
+# 工作区行尾一律 LF,不看开发者的 core.autocrlf。
+#
+# 动机不是风格统一。`@embedFile` 把模板按**字节**嵌进二进制,而 rule_author 的
+# prompt SHA-256 是缓存键与历史收据的契约(src/core/rule_author.zig)。在
+# core.autocrlf=true 的 Windows checkout 上模板带 CRLF,摘要随之漂移:
+#   期望 9e6affe7ae9548a90f9d52fc537956f334e3730828b80d512cc2f8ba8b063514
+#   实得 4750cbbccdf6f6bc2d147f7c611f9029bfb49a9a6a3315a29a77d7295c9a9336
+# 同一风险覆盖每一个 @embedFile 的文本资产(.md/.toml/.html/.zig),以及必须
+# 保持 LF 才能执行的 scripts/*.sh。把行尾的决定权收回仓库自身。
+* text=auto eol=lf
+
+# 二进制:别让 text=auto 的启发式猜错,更别做行尾转换。
+*.exe -text
+*.zlib -text
+vendor/tinykg/bin/* -text -diff
+vendor/ripgrep/bin/* -text -diff
+
 sdk/rust/src/raw.rs text eol=lf
-vendor/tinykg/bin/* -diff

@@ -279,7 +279,7 @@ test "L2 SW3: TeamCreate 建共享 root + teammate 线程自领跑起来(端到�
     // 等 teammate 自领(claimed_by 出现在 frontier)。SELF_CLAIM_POLL_MS=2500,给足时间。
     var claimed = false;
     var waited: u32 = 0;
-    while (waited < 12000) : (waited += 100) {
+    while (waited < 30_000) : (waited += 100) {
         const rows = kg.frontier(root, 50) catch {
             sleepMs(100);
             continue;
@@ -304,10 +304,14 @@ test "L2 SW3: TeamCreate 建共享 root + teammate 线程自领跑起来(端到�
     const winbox = team.inboxPath(home, "proj", "worker", &ib);
     try cc.swarm_mailbox.deliver(a, winbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r1\"}", null, null);
     waited = 0;
-    while (waited < 6000) : (waited += 50) {
+    while (waited < 30_000) : (waited += 50) {
         if (sw.teammates.?.liveCount() == 0) break;
         sleepMs(50);
     }
+    // #51:先断言"退出了",再断言"退出时释放了租约"。上限落空后直接读 frontier 会把
+    // "没退出"(runner 负载,环境问题)和"退出但没释放"(releaseHeldTasks 的 bug)混成
+    // 同一个 stuck==true。上限只约束失败路径,放宽不拖慢通过的运行。
+    try std.testing.expectEqual(@as(usize, 0), sw.teammates.?.liveCount());
     // 退出后:worker 领的任务租约已释放(claimed_by=null 或已闭合出 frontier)。
     // 只要没有"claimed_by 仍是 worker 但任务还 open"的卡死叶子即可。
     const rows2 = try kg.frontier(root, 50);

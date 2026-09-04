@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from scripts.eval.tests.posix_only import requires_symlinks
 from pathlib import Path
 from unittest import mock
 
@@ -214,6 +215,7 @@ class PluginPairRunnerTest(unittest.TestCase):
                     max_metered_tokens=30000000,
                 )
 
+    @requires_symlinks
     def test_paid_inventory_identity_is_location_independent(self) -> None:
         """The runtime reports the plugin root as an absolute realpath. The
         frozen inventory hash must not depend on where the checkout lives -

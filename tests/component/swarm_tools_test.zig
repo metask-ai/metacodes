@@ -124,7 +124,7 @@ test "L2 SW2 端到端: TeamCreate → Task spawn teammate → SendMessage → p
     // C+D: 等 teammate 第一轮跑完 → lead 邮箱有 idle 通知 → pollLeadInbox 拉成 status。
     var pulled_status = false;
     var waited: u32 = 0;
-    while (waited < 8000) : (waited += 30) {
+    while (waited < 20_000) : (waited += 30) {
         if (try swtools.pollLeadInbox(a, &sw)) |pulled| {
             defer a.free(pulled);
             if (std.mem.indexOf(u8, pulled, "<teammate-status from=\"worker\"") != null) {
@@ -147,7 +147,7 @@ test "L2 SW2 端到端: TeamCreate → Task spawn teammate → SendMessage → p
     const worker_inbox = team.inboxPath(home, "proj", "worker", &inbox_buf);
     var consumed = false;
     waited = 0;
-    while (waited < 8000) : (waited += 30) {
+    while (waited < 20_000) : (waited += 30) {
         var unread = try mailbox.readUnread(a, worker_inbox);
         defer unread.deinit();
         if (unread.items.items.len == 0) {
@@ -166,10 +166,12 @@ test "L2 SW2 端到端: TeamCreate → Task spawn teammate → SendMessage → p
     a.free(rsd);
     // 等 teammate 退出(liveCount → 0)。
     waited = 0;
-    while (waited < 5000) : (waited += 30) {
+    while (waited < 20_000) : (waited += 30) {
         if (sw.teammates.?.liveCount() == 0) break;
         sleepMs(30);
     }
+    // TeamDelete 对活着的 teammate 会拒绝;先断言退出,让"没退出"和"删不掉"是两个失败。
+    try std.testing.expectEqual(@as(usize, 0), sw.teammates.?.liveCount());
     const rdel = try cc.swarm_tools.executeTeamDelete(&ctx, "{}");
     defer a.free(rdel);
     try std.testing.expect(std.mem.indexOf(u8, rdel, "\"status\":\"deleted\"") != null);
@@ -239,7 +241,7 @@ test "L2 SW2 F1/F2: teammate SendMessage 回 lead 送达 lead 邮箱" {
     const lead_inbox = team.inboxPath(home, "proj", "team-lead", &inbox_buf);
     var got = false;
     var waited: u32 = 0;
-    while (waited < 10000) : (waited += 30) {
+    while (waited < 20_000) : (waited += 30) {
         var all = try mailbox.readAll(a, lead_inbox);
         defer all.deinit();
         for (all.items.items) |*m| {
@@ -257,7 +259,7 @@ test "L2 SW2 F1/F2: teammate SendMessage 回 lead 送达 lead 邮箱" {
     // 收尾:shutdown 让 teammate 退出,便于 sw.deinit join。
     _ = try cc.swarm_tools.executeSendMessage(&ctx, "{\"to\":\"solver\",\"message\":\"{\\\"type\\\":\\\"shutdown_request\\\",\\\"request_id\\\":\\\"r1\\\"}\",\"summary\":\"stop\"}");
     waited = 0;
-    while (waited < 5000) : (waited += 30) {
+    while (waited < 20_000) : (waited += 30) {
         if (sw.teammates.?.liveCount() == 0) break;
         sleepMs(30);
     }

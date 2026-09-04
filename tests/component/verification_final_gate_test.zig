@@ -8,6 +8,16 @@ const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
 
+/// 让 fixture 脚本可执行。
+///
+/// Windows 上 `_chmod` 只切换只读位,`#!/bin/sh` 脚本照样跑不起来,原来的
+/// `chmod != 0` 守卫因此不触发:脚本静默不执行,断言退化成假绿(断言"没出现某
+/// 文本"的用例会无条件通过)。所以在那里直接跳过,让结果诚实。
+fn makeExecutable(path_z: [:0]const u8) !void {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+}
+
 const END_TURN =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"done\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
@@ -94,7 +104,7 @@ fn greenCommand(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     });
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    try makeExecutable(path_z);
     return allocator.dupe(u8, path);
 }
 
@@ -186,7 +196,7 @@ test "L2 unverified mutation nudges once and a green run then satisfies the obli
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const command = try greenCommand(a, root);
     defer a.free(command);
     const write = try writeSse(a, root);
@@ -210,7 +220,7 @@ test "L2 a verified session finishes with zero nudges" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const command = try greenCommand(a, root);
     defer a.free(command);
     const write = try writeSse(a, root);
@@ -231,7 +241,7 @@ test "L2 exhausted nudges finish honestly with obligation_unmet recorded" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const write = try writeSse(a, root);
     defer a.free(write);
     // The model refuses to verify: write, then three premature finals.
@@ -249,7 +259,7 @@ test "L2 disabled gate never nudges and never records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const write = try writeSse(a, root);
     defer a.free(write);
     var run = try runGate(a, root, false, &.{ write, END_TURN });
@@ -264,7 +274,7 @@ test "L2 observe-only records the outcome and never touches the conversation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const write = try writeSse(a, root);
     defer a.free(write);
     var server = try harness.MockServer.startCassette(&.{ write, END_TURN }, 0);
@@ -328,7 +338,7 @@ test "L2 a mid-stream provider failure retries the same turn instead of dying" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const write = try writeSse(a, root);
     defer a.free(write);
     // Response #1 (index 1) is cut mid-body; the retry replays it complete.
@@ -378,7 +388,7 @@ test "L2 zero-retry default preserves the api_error surface" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const write = try writeSse(a, root);
     defer a.free(write);
     var server = try harness.MockServer.startCassetteMidStreamCut(
@@ -431,7 +441,7 @@ fn probeCommand(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     });
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    try makeExecutable(path_z);
     return allocator.dupe(u8, path);
 }
 
@@ -448,7 +458,7 @@ fn redCommand(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     });
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    try makeExecutable(path_z);
     return allocator.dupe(u8, path);
 }
 
@@ -457,7 +467,7 @@ test "L2 tier-2 validating re-observation satisfies the gate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const probe = try probeCommand(a, root);
     defer a.free(probe);
     const write = try writeSse(a, root);
@@ -481,7 +491,7 @@ test "L2 known-failing state selects the honest-report nudge variant" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const red = try redCommand(a, root);
     defer a.free(red);
     const write = try writeSse(a, root);
@@ -505,7 +515,7 @@ test "L2 churn after a verified state injects one freshness caution and counts t
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const command = try greenCommand(a, root);
     defer a.free(command);
     const write = try writeSse(a, root);
@@ -565,7 +575,7 @@ test "L2 a test-file edit after a failed verification emits a hot weakening cand
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const tests_dir = try std.fmt.allocPrint(a, "{s}/tests", .{root});
     defer a.free(tests_dir);
     try cc.util_fs.mkdirParents(tests_dir);
@@ -647,7 +657,7 @@ test "L2 a green rerun after closure counts as redundant and closure tier is rec
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const command = try greenCommand(a, root);
     defer a.free(command);
     const write = try writeSse(a, root);

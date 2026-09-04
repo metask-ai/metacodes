@@ -41,7 +41,7 @@ from .memory_replay import (
     validate_runtime_artifacts,
     validate_runtime_receipt,
 )
-from .model import ValidationError, stable_json
+from .model import ValidationError, stable_json, O_BINARY, fsync_directory, mode_violation, open_nofollow
 from .statistics import exact_mcnemar, percentile
 
 
@@ -112,9 +112,7 @@ def _private_regular(path: Path, where: str, *, maximum: int = MAX_JSON_BYTES) -
     fd = -1
     try:
         flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags)
+        fd = open_nofollow(path, flags)
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             _fail(where, "expected one non-symlink, non-hardlinked regular file")
@@ -203,7 +201,7 @@ def _prepare_output_directory(path: Path, run_dir: Path) -> Path:
             _fail("reanalysis output parent", "expected a directory")
         if hasattr(os, "geteuid") and parent_info.st_uid != os.geteuid():
             _fail("reanalysis output parent", "must be owned by the current user")
-        if stat.S_IMODE(parent_info.st_mode) & 0o022:
+        if mode_violation(parent_info.st_mode, 0o022):
             _fail("reanalysis output parent", "must not be group/world writable")
         resolved.mkdir(mode=0o700)
     except ValidationError:
@@ -214,7 +212,7 @@ def _prepare_output_directory(path: Path, run_dir: Path) -> Path:
 
 
 def _write_private(path: Path, payload: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = -1
@@ -236,11 +234,7 @@ def _write_private(path: Path, payload: bytes) -> None:
 
 
 def _sync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    fsync_directory(path)
 
 
 def verify_reanalysis_bundle(output_dir: Path) -> Mapping[str, Any]:
@@ -251,7 +245,7 @@ def verify_reanalysis_bundle(output_dir: Path) -> Mapping[str, Any]:
         raise ValidationError(f"reanalysis bundle: cannot open directory: {exc}") from exc
     if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
         _fail("reanalysis bundle", "expected a non-symlink directory")
-    if stat.S_IMODE(root_info.st_mode) & 0o077:
+    if mode_violation(root_info.st_mode, 0o077):
         _fail("reanalysis bundle", "directory permissions must be 0700 or stricter")
     try:
         observed_files = frozenset(path.name for path in root.iterdir())
@@ -263,7 +257,7 @@ def verify_reanalysis_bundle(output_dir: Path) -> Mapping[str, Any]:
             "file set differs from the analysis-only allowlist",
         )
     receipt = _canonical_json(root / "reanalysis-receipt.json", "reanalysis receipt")
-    if stat.S_IMODE((root / "reanalysis-receipt.json").stat().st_mode) & 0o077:
+    if mode_violation((root / "reanalysis-receipt.json").stat().st_mode, 0o077):
         _fail("reanalysis receipt", "permissions must be 0600 or stricter")
     if set(receipt) != {
         "schema_version",
@@ -323,7 +317,7 @@ def verify_reanalysis_bundle(output_dir: Path) -> Mapping[str, Any]:
     for field, name in OUTPUT_DIGEST_FILES.items():
         path = root / name
         payload = _private_regular(path, f"reanalysis output {name}")
-        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+        if mode_violation(path.stat().st_mode, 0o077):
             _fail(f"reanalysis output {name}", "permissions must be 0600 or stricter")
         if _sha256_bytes(payload) != outputs[field]:
             _fail(f"reanalysis output {name}", "SHA-256 does not match receipt")

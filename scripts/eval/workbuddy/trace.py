@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from ..model import open_nofollow
+
+
 
 MAX_TRACE_BYTES = 64 * 1024 * 1024
 LEGACY_CONTROL_METRICS_SCHEMA = "metacodes-workbuddy-control-metrics-v1"
@@ -193,9 +196,9 @@ def project_state_hash(project_root: str) -> str:
 
 
 def _read_regular_bytes(path: Path, *, limit: int = MAX_TRACE_BYTES) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY
     try:
-        descriptor = os.open(path, flags)
+        descriptor = open_nofollow(path, flags)  # emulates O_NOFOLLOW on Windows
     except OSError as exc:
         raise TraceError(f"cannot open trace file {path}: {exc}") from exc
     try:

@@ -19,6 +19,12 @@ import sys
 import tempfile
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
+# Windows portability (see scripts/eval/model.py): os.open text mode must never
+# touch artifacts, directory descriptors cannot be opened, and permission bits
+# are synthetic there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
 
 MANIFEST_SCHEMA = "metacodes-project-harness-calibration-manifest-v1"
 REPORT_SCHEMA = "metacodes-project-harness-calibration-report-v1"
@@ -63,7 +69,7 @@ def _read_regular(path: Path, maximum: int) -> bytes:
         raise CalibrationError(f"artifact must be a single-link regular file: {path}")
     if before_path.st_size <= 0 or before_path.st_size > maximum:
         raise CalibrationError(f"artifact size is invalid: {path}")
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | _O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags)
@@ -131,7 +137,7 @@ def _stable_json(value: Any) -> bytes:
 def _write_new(path: Path, value: Any) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     raw = _stable_json(value) + b"\n"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
@@ -166,6 +172,7 @@ def _git_identity(repo: Path) -> Mapping[str, Any]:
         cwd=repo,
         check=True,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     ).stdout.strip()
@@ -175,6 +182,7 @@ def _git_identity(repo: Path) -> Mapping[str, Any]:
             cwd=repo,
             check=True,
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         ).stdout

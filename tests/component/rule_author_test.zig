@@ -323,6 +323,7 @@ test "L2 rule author: admitted no-tools provider call persists a receipt-bound c
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const binding = try completedFailureRun(root);
     var prepared = try prepareFailurePacket(a, root, binding, TEST_MODEL);
@@ -424,6 +425,7 @@ test "L2 ontology projection drives isolated v2 rule author without actor contex
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const session_dir = try std.fmt.allocPrint(a, "{s}/0123456789abcdef01234567", .{root});
     defer a.free(session_dir);
@@ -515,6 +517,7 @@ test "L2 governed rule author preserves actor independence and lifecycle reopens
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const session_dir = try std.fmt.allocPrint(a, "{s}/0123456789abcdef01234567", .{root});
     defer a.free(session_dir);
@@ -745,6 +748,7 @@ test "L2 ontology drift after prepare blocks v2 author before provider request" 
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const session_dir = try std.fmt.allocPrint(a, "{s}/0123456789abcdef01234567", .{root});
     defer a.free(session_dir);
@@ -790,6 +794,7 @@ test "L2 ontology authority identity mismatch fails before provider request" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const session_dir = try std.fmt.allocPrint(a, "{s}/0123456789abcdef01234567", .{root});
     defer a.free(session_dir);
@@ -843,13 +848,18 @@ test "L2 ontology authority identity mismatch fails before provider request" {
     defer a.free(receipt_name);
     const receipt_path = try std.fs.path.join(a, &.{ session_dir, receipt_name });
     defer a.free(receipt_path);
-    const hardlink_path = try std.fs.path.join(a, &.{ session_dir, "projection-author-hardlink.json" });
-    defer a.free(hardlink_path);
-    try std.Io.Dir.hardLink(.cwd(), receipt_path, .cwd(), hardlink_path, std.testing.io, .{});
-    try std.testing.expectError(
-        error.InvalidArtifactFile,
-        prepareFailurePacketV2(a, session_dir, binding, ontology.authority),
-    );
+    // Zig 0.16 的 std.Io.Dir.hardLink 在 Windows 上直接 return OperationUnsupported
+    // (std/Io/Threaded.zig dirHardLink)。标准库缺口,非产品缺口:与上面的 symlink
+    // 断言同样按平台跳过,而不是让整条用例红掉。
+    if (@import("builtin").os.tag != .windows) {
+        const hardlink_path = try std.fs.path.join(a, &.{ session_dir, "projection-author-hardlink.json" });
+        defer a.free(hardlink_path);
+        try std.Io.Dir.hardLink(.cwd(), receipt_path, .cwd(), hardlink_path, std.testing.io, .{});
+        try std.testing.expectError(
+            error.InvalidArtifactFile,
+            prepareFailurePacketV2(a, session_dir, binding, ontology.authority),
+        );
+    }
     try std.testing.expectEqual(@as(usize, 0), server.requestCount());
 }
 
@@ -859,6 +869,7 @@ test "L2 rule author: permit packet provider and model drift fail before network
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const binding = try completedFailureRun(root);
     var prepared = try prepareFailurePacket(a, root, binding, TEST_MODEL);
@@ -934,6 +945,7 @@ test "L2 rule author: malformed response and tool events fail closed" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const binding = try completedFailureRun(root);
     var prepared = try prepareFailurePacket(a, root, binding, TEST_MODEL);
@@ -992,6 +1004,7 @@ test "L2 rule author: oversized provider text is rejected" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buffer[0..root_len];
     const binding = try completedFailureRun(root);
     var prepared = try prepareFailurePacket(a, root, binding, TEST_MODEL);

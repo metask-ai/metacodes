@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from scripts.eval.tests.posix_only import requires_symlinks
 
 from scripts.eval.model import ValidationError, validate_treatment_activation_receipt
 from scripts.eval.treatment_activation import (
@@ -524,6 +525,7 @@ class TreatmentActivationTest(unittest.TestCase):
                     workspace, "tinykg", self.binary, self.binary_sha256
                 )
 
+    @requires_symlinks
     def test_store_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

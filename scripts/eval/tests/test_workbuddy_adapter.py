@@ -51,6 +51,7 @@ from scripts.eval.workbuddy.trace import (
     transcript_ir,
 )
 from scripts.eval.workbuddy.progress_analysis import analyze_progress
+from scripts.eval.tests.posix_only import POSIX, requires_symlinks
 
 
 ZERO_COMMIT = "0" * 40
@@ -1555,6 +1556,7 @@ class WorkBuddyTraceTest(unittest.TestCase):
                 with self.assertRaises(TraceError):
                     load_control_metrics(transcript, observation)
 
+    @requires_symlinks
     def test_control_metrics_reject_symlink_and_hardlink_observation_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1870,7 +1872,8 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             self.assertEqual(built["tasks"]["task-a"]["architecture"], "amd64")
             self.assertEqual(built["dataset_staging"]["task_count"], 1)
             self.assertTrue(built["dataset_staging"]["owner_writable"])
-            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            if POSIX:  # permission bits are synthetic on Windows
+                self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
 
             (environment / "Dockerfile").write_text(
                 "FROM busybox\n", encoding="utf-8"
@@ -1958,7 +1961,7 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     EnvironmentPreflightError,
-                    r"not owner-writable.*task-b/task\.toml",
+                    r"not owner-writable.*task-b[/\\]task\.toml",
                 ):
                     prebuild(
                         workbuddy=workbuddy,
@@ -1972,6 +1975,7 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             )
             self.assertFalse((root / "preflight.json").exists())
 
+    @requires_symlinks
     def test_preflight_reobserves_unselected_task_toml_and_rejects_links(self):
         for mutation in ("content", "symlink", "hardlink"):
             with self.subTest(
@@ -2210,6 +2214,7 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
                         inspect_images=True,
                     )
 
+    @requires_symlinks
     def test_preflight_rejects_composite_verifier_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

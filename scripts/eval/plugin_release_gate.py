@@ -462,6 +462,7 @@ def _git_head(path: Path) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     if completed.returncode != 0:
@@ -716,7 +717,7 @@ def run_gate(
 
 def _write_new(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as handle:
+    with path.open("x", encoding="utf-8", newline="\n") as handle:
         json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
         handle.flush()
@@ -778,7 +779,7 @@ def refresh_implementation_fingerprint(root: Path, protocol_path: Path) -> dict[
         # original protocol untouched instead of a half-refreshed state.
         staged = protocol_path.with_name(protocol_path.name + ".refresh-staging")
         try:
-            staged.write_text(raw.replace(pinned, fresh), encoding="utf-8")
+            staged.write_text(raw.replace(pinned, fresh), encoding="utf-8", newline="\n")  # keep LF on Windows
             load_protocol(root, staged)
             os.replace(staged, protocol_path)
         finally:

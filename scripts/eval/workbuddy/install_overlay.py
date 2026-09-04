@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 from . import WORKBUDDY_PINNED_COMMIT
+from ..model import open_nofollow
+
 
 
 class OverlayError(ValueError):
@@ -484,6 +486,7 @@ def _run(repo: Path, *args: str) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         ).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
         raise OverlayError(f"git {' '.join(args)} failed: {exc}") from exc
@@ -696,7 +699,7 @@ def _write_expected(target: Path, content: bytes, *, replace_owned: bool = False
 
 def _read_single_link_regular(path: Path, *, maximum: int = 32 * 1024 * 1024) -> bytes:
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = open_nofollow(path, os.O_RDONLY)
     except OSError as exc:
         raise OverlayError(f"cannot open overlay file {path}: {exc}") from exc
     try:

@@ -1251,6 +1251,7 @@ def _kernel_runtime_dependencies(binary: Path) -> List[Mapping[str, str]]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             timeout=10,
             check=False,
         )

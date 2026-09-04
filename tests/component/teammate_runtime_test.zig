@@ -141,7 +141,7 @@ test "L2 teammate 全链: spawn→idle→消息续跑→shutdown 优雅退出" {
     // D: shutdown_request → 线程优雅退出。
     try mailbox.deliver(a, bob_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r1\"}", null, null);
     var waited: u32 = 0;
-    while (waited < 5000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
         sleepMs(20);
     }
@@ -220,7 +220,7 @@ test "L2 teammate 失败必达 lead: 401 快速失败 → idleReason=failed + fa
     const lead_inbox = team.inboxPath(home, "proj", "team-lead", &pbuf);
     var found = false;
     var waited: u32 = 0;
-    while (waited < 15000) : (waited += 20) {
+    while (waited < 30_000) : (waited += 20) {
         var all = try mailbox.readAll(a, lead_inbox);
         defer all.deinit();
         for (all.items.items) |*m| {
@@ -275,7 +275,7 @@ test "L2 teammate 软截断不洗白: max_turns → needs_continuation + stopRea
     const lead_inbox = team.inboxPath(home, "proj", "team-lead", &pbuf);
     var found = false;
     var waited: u32 = 0;
-    while (waited < 8000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         var all = try mailbox.readAll(a, lead_inbox);
         defer all.deinit();
         for (all.items.items) |*m| {
@@ -332,7 +332,7 @@ test "L2 teammate 协议消息不吞: task_assignment 留未读,teammate 保持 
     // shutdown:只标读 shutdown,task_assignment 仍未读。
     try mailbox.deliver(a, hal_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r9\"}", null, null);
     var waited: u32 = 0;
-    while (waited < 5000) : (waited += 20) {
+    while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
         sleepMs(20);
     }
@@ -393,7 +393,7 @@ test "L2 teammate MAX_TEAMMATES 上限强制执行 + working 期 is_active=true"
     const cfg_path = team.configPath(home, "proj", &cfgbuf);
     var seen_active = false;
     var waited: u32 = 0;
-    while (waited < 3000) : (waited += 50) {
+    while (waited < 20_000) : (waited += 50) {
         var tf = team.load(a, cfg_path) orelse {
             sleepMs(50);
             continue;

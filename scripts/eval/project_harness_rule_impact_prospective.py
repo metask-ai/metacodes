@@ -590,6 +590,7 @@ def _run_driver_request(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         timeout=60,
         check=False,
         env=env,

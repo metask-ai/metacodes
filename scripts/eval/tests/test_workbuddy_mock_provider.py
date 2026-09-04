@@ -16,6 +16,7 @@ from scripts.eval.workbuddy.mock_provider import (
     _control_plane_sse,
     _private_new,
 )
+from scripts.eval.tests.posix_only import POSIX
 
 
 class WorkBuddyMockProviderTest(unittest.TestCase):
@@ -160,7 +161,8 @@ class WorkBuddyMockProviderTest(unittest.TestCase):
                 _private_new(output, b"complete-payload")
 
             self.assertEqual(output.read_bytes(), b"complete-payload")
-            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            if POSIX:  # permission bits are synthetic on Windows
+                self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             with self.assertRaisesRegex(ValueError, "overwrite"):
                 _private_new(output, b"replacement")
 

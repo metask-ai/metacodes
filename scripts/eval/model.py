@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional
@@ -43,6 +45,99 @@ CHECK_TYPES = frozenset(
 
 class ValidationError(ValueError):
     """The evaluation artifact is structurally invalid."""
+
+
+# ---------------------------------------------------------------------------
+# Host portability (Windows).
+#
+# The control plane opens artifacts with ``os.open`` so it can pin identity
+# with ``fstat`` and refuse symlinks with ``O_NOFOLLOW``.  On Windows the CRT
+# defaults ``os.open`` to *text* mode: reads fold CRLF and stop at Ctrl-Z,
+# writes turn LF into CRLF, so a 12-byte artifact reads back as 4 bytes and an
+# 8-byte receipt lands as 9.  Every ``os.open`` in this package must therefore
+# carry ``O_BINARY`` (0 elsewhere).  ``O_NOFOLLOW`` and directory descriptors
+# do not exist there either; the helpers below keep the POSIX contract intact
+# and degrade explicitly rather than by accident.
+# ---------------------------------------------------------------------------
+
+O_BINARY = getattr(os, "O_BINARY", 0)
+
+# Windows synthesizes st_mode from FAT-style attributes (directories 0o777,
+# files 0o666), so permission bits carry no ownership meaning there.  The
+# existing convention in this package gates mode-bit checks on this flag; the
+# paid budget journal separately refuses Windows outright.
+POSIX_MODE_BITS = os.name != "nt"
+
+
+def mode_violation(st_mode: int, mask: int) -> bool:
+    """True when ``st_mode`` has any permission bit in ``mask`` on a host whose
+    mode bits are authoritative.  Always False on Windows."""
+    return POSIX_MODE_BITS and (stat.S_IMODE(st_mode) & mask) != 0
+
+
+def open_nofollow(
+    path: "os.PathLike[str] | str",
+    flags: int,
+    mode: int = 0o600,
+    *,
+    dir_fd: "int | None" = None,
+) -> int:
+    """``os.open`` that never follows a final-component symlink.
+
+    POSIX passes ``O_NOFOLLOW`` to the kernel.  Windows has no such flag, so
+    the check uses a pre-open ``lstat`` fast path followed by open-then-verify.
+    The descriptor is bound to the file that was opened, so a swap after the
+    verification cannot redirect it.  The remaining difference from the
+    kernel flag is only that a symlink present exactly at open time is detected
+    after the fact and refused instead of failing the open.  ``O_BINARY`` is
+    always applied.
+    ``dir_fd`` is forwarded for callers that anchor the open on a directory
+    descriptor (POSIX only; Windows has no dir_fd and never reaches that path).
+    """
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    else:
+        try:
+            probe = os.lstat(path) if dir_fd is None else os.lstat(path, dir_fd=dir_fd)
+        except FileNotFoundError:
+            probe = None
+        if probe is not None and stat.S_ISLNK(probe.st_mode):
+            raise OSError(errno.ELOOP, "refusing to follow symbolic link", str(path))
+        if dir_fd is None:
+            fd = os.open(path, flags | O_BINARY, mode)
+        else:
+            fd = os.open(path, flags | O_BINARY, mode, dir_fd=dir_fd)
+        try:
+            info = os.fstat(fd)
+            try:
+                after = os.lstat(path) if dir_fd is None else os.lstat(path, dir_fd=dir_fd)
+            except FileNotFoundError:
+                raise OSError(errno.ELOOP, "refusing to follow symbolic link", str(path))
+            if stat.S_ISLNK(after.st_mode) or (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+                raise OSError(errno.ELOOP, "refusing to follow symbolic link", str(path))
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+    if dir_fd is None:
+        return os.open(path, flags | O_BINARY, mode)
+    return os.open(path, flags | O_BINARY, mode, dir_fd=dir_fd)
+
+
+def fsync_directory(path: "os.PathLike[str] | str") -> None:
+    """Flush a directory entry after a rename/create (POSIX durability idiom).
+
+    Windows cannot open a directory with ``os.open`` (it needs
+    FILE_FLAG_BACKUP_SEMANTICS) and NTFS metadata is journaled, so the call is
+    a documented no-op there instead of a PermissionError.
+    """
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def safe_posix_relative_path(value: Any, where: str) -> PurePosixPath:
@@ -812,6 +907,7 @@ def write_rollouts(path: Path, rollouts: Iterable[Dict[str, Any]]) -> None:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
+            newline="\n",  # Windows text mode would write CRLF and drift every byte hash
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",

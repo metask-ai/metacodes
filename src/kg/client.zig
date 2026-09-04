@@ -3125,7 +3125,10 @@ test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
         .env_bin = "",
     });
     defer rel.deinit();
-    try testing.expectEqualStrings("/home/u/relative/store.kg", rel.store.fsPath().?);
+    // absoluteStorePath 走原生 std.fs.path.join;期望值同源拼,别写死正斜杠。
+    const expected_rel = try std.fs.path.join(a, &.{ "/home/u", "relative/store.kg" });
+    defer a.free(expected_rel);
+    try testing.expectEqualStrings(expected_rel, rel.store.fsPath().?);
     try testing.expect(std.fs.path.isAbsolute(rel.store.fsPath().?));
 
     // 绝对路径原样保留。

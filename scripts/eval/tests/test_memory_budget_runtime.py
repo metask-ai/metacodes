@@ -42,6 +42,7 @@ from scripts.eval.memory_replay import (
     validate_runtime_receipt,
 )
 from scripts.eval.model import ValidationError, stable_json
+from scripts.eval.tests.posix_only import requires_posix_budget_journal
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -696,6 +697,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             self.assertTrue((rollouts[0] / "stdout.ndjson").is_file())
             self.assertTrue((rollouts[0] / "stderr.log").is_file())
 
+    @requires_posix_budget_journal
     def test_second_pilot_runner_loses_lock_before_credential_or_network(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -758,6 +760,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             self.assertFalse(invoked.exists())
             self.assertFalse((root / "loser-run").exists())
 
+    @requires_posix_budget_journal
     def test_resume_checkpoint_failure_precedes_credential_loading(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

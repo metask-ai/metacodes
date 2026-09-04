@@ -19,6 +19,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
 
+# Windows portability (see scripts/eval/model.py): os.open text mode must never
+# touch artifacts, directory descriptors cannot be opened, and permission bits
+# are synthetic there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+_POSIX_MODE_BITS = os.name != "nt"
+
+
+def _fsync_directory(path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 
 SCHEMA_VERSION = "metacodes-workbuddy-mock-provider-v2"
 MOCK_CREDENTIAL = "metacodes-workbuddy-mock-only"
@@ -51,7 +68,7 @@ def _write_all(descriptor: int, payload: bytes) -> None:
 def _private_new(path: Path, payload: bytes) -> None:
     parent = path.parent.resolve(strict=True)
     info = parent.stat()
-    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
+    if not stat.S_ISDIR(info.st_mode) or (_POSIX_MODE_BITS and stat.S_IMODE(info.st_mode) & 0o022):
         raise ValueError("mock-provider artifact parent must be private")
     if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
         raise ValueError("mock-provider artifact parent must be owned by the current user")
@@ -59,7 +76,7 @@ def _private_new(path: Path, payload: bytes) -> None:
         raise ValueError(f"refusing to overwrite mock-provider artifact: {path}")
     descriptor = os.open(
         parent / path.name,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        _O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
     try:
@@ -67,11 +84,7 @@ def _private_new(path: Path, payload: bytes) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    parent_descriptor = os.open(parent, os.O_RDONLY)
-    try:
-        os.fsync(parent_descriptor)
-    finally:
-        os.close(parent_descriptor)
+    _fsync_directory(parent)
 
 
 def _events_sse(events: list[dict[str, Any]]) -> bytes:

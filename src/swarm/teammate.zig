@@ -1153,6 +1153,9 @@ fn teammateThreadMain(input: *TeammateInput) void {
             &be,
             a,
         ) catch |err| {
+            // 先放租约再翻 failed:failed 同样让 liveCount() 不再计入本 teammate,
+            // lead 据此重派或收尸时租约必须已经不在 KG 里(理由同下方 terminated 路径)。
+            releaseHeldTasks(e, kg_ptr); // 释放持有租约(PM F4/Linus M1:防卡 TTL)
             e.lockPublic();
             e.status = .failed;
             e.err_name = @errorName(err);
@@ -1162,7 +1165,6 @@ fn teammateThreadMain(input: *TeammateInput) void {
             // 失败必须到达 lead 邮箱(PM F1:静默失败 = roster 里躺着一个与健康 idle
             // 无法区分的尸体;cc 同款发 idleReason:'failed'+failureReason)。
             sendIdleNotification(a, e, "failed", null, @errorName(err));
-            releaseHeldTasks(e, kg_ptr); // 释放持有租约(PM F4/Linus M1:防卡 TTL)
             input.cleanup();
             return;
         };
@@ -1198,9 +1200,13 @@ fn teammateThreadMain(input: *TeammateInput) void {
         conv.appendText(.user, next) catch break;
     }
 
+    // 先释放租约,再翻 terminated。liveCount() 按 working/idle 计数,lead 一看到
+    // "人没了"就可能重派或收尸;若此时租约还在 KG 里,它读到的是一个已退出 teammate
+    // 卡着的叶子(#51 的 "退出但没释放"正是这个顺序造成的竞争,不是 releaseHeldTasks
+    // 没生效)。terminated 必须蕴含 "持有的租约已经放掉"。
+    releaseHeldTasks(e, kg_ptr); // 退出前释放持有租约(PM F4/Linus M1:abort/shutdown 不卡 TTL)
     e.setStatus(.terminated);
     setMemberActiveBestEffort(a, e.config_path, e.name, false);
-    releaseHeldTasks(e, kg_ptr); // 退出前释放持有租约(PM F4/Linus M1:abort/shutdown 不卡 TTL)
     input.cleanup();
 }
 

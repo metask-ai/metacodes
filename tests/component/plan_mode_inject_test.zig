@@ -114,6 +114,7 @@ test "L2 headless bypass enters and exits plan before real Write" {
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    _ = harness.normalizeSlashes(root_buf[0..root_len]); // Windows: JSON 字面量里的反斜杠会被当转义
     const root = root_buf[0..root_len];
     const output_path = try std.fmt.allocPrint(a, "{s}/plan-exit-write.txt", .{root});
     defer a.free(output_path);

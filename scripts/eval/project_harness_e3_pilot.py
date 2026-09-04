@@ -69,7 +69,7 @@ if __package__ in {None, ""}:
         _cassette_memory_exposure,
         _cassette_scoped_recall_injections,
     )
-    from scripts.eval.model import stable_json  # type: ignore
+    from scripts.eval.model import O_BINARY, stable_json  # type: ignore
     from scripts.eval.project_harness_e3_experiment import (  # type: ignore
         ANALYSIS_PLAN,
         ARMS,
@@ -137,7 +137,7 @@ else:
         _cassette_memory_exposure,
         _cassette_scoped_recall_injections,
     )
-    from .model import stable_json
+    from .model import O_BINARY, stable_json
     from .project_harness_e3_experiment import (
         ANALYSIS_PLAN,
         ARMS,
@@ -715,7 +715,7 @@ def _run_one(
         ),
     )
     _write_new(metadata_path, (stable_json(metadata) + "\n").encode("utf-8"))
-    metadata_fd = os.open(metadata_path, os.O_RDONLY)
+    metadata_fd = os.open(metadata_path, O_BINARY | os.O_RDONLY)
     metadata_path.unlink()
     events_file = tempfile.TemporaryFile(dir=artifact_dir)
     env = _production_environment(os.environ)
@@ -821,6 +821,7 @@ def _run_one(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             timeout=timeout_seconds,
             check=False,
             pass_fds=(metadata_fd, events_file.fileno(), credential_read_fd),
