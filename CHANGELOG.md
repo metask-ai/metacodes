@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- `zig build release:archive` writes the immutable CLI release archive
+  (`metacodes-<version>-<target-id>.tar.gz` / `.zip` plus `.sha256`) from the
+  verified prefix, byte-identical across runs (fixed gzip name and mtime, no
+  owners or timestamps in members); `release:sums` joins the sidecars into
+  `metacodes-<version>-SHA256SUMS`. The archive core moved from
+  `package_agentcore.py` to `scripts/release_archive.py --kind agentcore|cli`;
+  a stable version archives only from a clean tree tagged with the bare
+  `X.Y.Z`, a pre-release from any commit, and the SDK keeps its historical
+  refusal text (#81, #47 stage 6).
+
 - The CLI release unit (#80, #47 stage 5): `zig build release:stage` installs
   the product files plus `share/licenses/{metacodes-LICENSE, tinykg-LICENSE,
   THIRD_PARTY_NOTICES.md}` and `share/doc/{README.md, CHANGELOG-<version>.md}`;

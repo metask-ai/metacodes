@@ -52,6 +52,28 @@ write otherwise. A version with a pre-release part (`0.2.0-dev`) is the **pre**
 channel: `version` gains `+<commit12>` as build metadata, `tag` is null, and a
 missing `share/licenses/metacodes-LICENSE` is a warning rather than an error.
 
+## Archives
+
+`zig build release:archive` (after `release:verify`, or `release:check` for a
+cross target) writes `metacodes-<version>-<target-id>.tar.gz` (`.zip` on
+Windows) plus `<archive>.sha256` into `-Drelease-archive-dir` (default `dist/`,
+never inside the prefix). The archive holds exactly the manifest's files plus
+`manifest.json` under a `metacodes-<version>-<target-id>/` root; members carry
+no owner, group, timestamp or host name, so two runs over the same prefix are
+byte-identical — CI compares them, and re-running `release:archive` into a
+directory that already holds the archive succeeds only when the bytes are the
+same (it never replaces an archive). `zig build release:sums` joins every
+`.sha256` under the archive directory into `metacodes-<version>-SHA256SUMS`
+(`sha256sum -c` format), re-verifying each sidecar against its archive first.
+
+The channel gate applies at archive time too (#47 Q1/Q3): a stable version
+archives only from a clean tree whose HEAD carries the bare `X.Y.Z` tag; a
+pre-release (`0.x.y-dev+<commit12>`) archives from any commit but is published
+only through `workflow_dispatch`, never attached to a Release automatically.
+The AgentCore SDK packager (`scripts/package_agentcore.py`) shares the same
+core (`scripts/release_archive.py --kind agentcore`) and keeps its historical
+refusal of untagged stable versions.
+
 ## What is deliberately not in the unit
 
 Debug executables, the test harness servers, evaluation shadows, the AgentCore

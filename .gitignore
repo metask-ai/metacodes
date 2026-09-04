@@ -2,6 +2,8 @@
 .zig-cache/
 .lake/
 zig-out/
+# release archives (zig build release:archive / release:sums)
+dist/
 *.zig.zon
 !build.zig.zon
 .DS_Store
