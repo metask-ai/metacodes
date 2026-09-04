@@ -123,11 +123,17 @@ fn expectSizedResourceBody(
     defer body.deinit(allocator);
     switch (expected_body) {
         .artifact => {
-            try std.testing.expect(body == .artifact);
-            try std.testing.expectEqual(@as(u64, expected.len), body.artifact.stored.bytes);
+            // Above the per-result budget and below the frame limit the
+            // client seals the result during the call; the agent loop
+            // publishes it at the batch commit boundary (#65). The receipt
+            // and the model-visible preview are fixed at seal time.
+            try std.testing.expect(body == .sealed);
+            try std.testing.expect(body.sealed.media_type == .json);
+            try std.testing.expectEqual(@as(u64, expected.len), body.sealed.spool.receipt().bytes);
+            const preview = body.sealed.spool.previewValue();
             try std.testing.expectEqualStrings(
-                expected[0..body.artifact.preview.head_len],
-                body.artifact.preview.headSlice(),
+                expected[0..preview.head_len],
+                preview.headSlice(),
             );
         },
         .inline_body => {
