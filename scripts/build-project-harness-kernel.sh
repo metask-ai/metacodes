@@ -106,7 +106,7 @@ request_bindings="\"expected_checker_version\":\"metacodes-project-harness-kerne
 effect_bindings=${request_bindings/\"target_kind\":\"tool\",\"target\":\"Write\",\"target_scope\":\"existing_file\",\"deny_target\":true/\"target_kind\":\"effect_class\",\"target\":\"existing_file_rewrite\",\"target_scope\":\"all\",\"deny_target\":false}
 effect_bindings=${effect_bindings/\"effect_requirement\":\"none\"/\"effect_requirement\":\"file_mutation_v1_reobserved\"}
 prefix="${request_prefix}\"operation\":\"pre_decision\",${request_bindings}\"payload\":{\"pre\":{"
-deny_request="${prefix}\"tool\":\"Write\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":true,\"file_mutating\":true}}}"
+deny_request="${prefix}\"tool\":\"Write\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":true,\"file_mutating\":true,\"within_root\":true}}}"
 admit_request=${deny_request/\"regular_existing\"/\"missing\"}
 # The doubly-reproduced false-intervention shape must admit under a
 # verify-only rule: oversized input on a missing target is the author's
@@ -114,7 +114,7 @@ admit_request=${deny_request/\"regular_existing\"/\"missing\"}
 overflow_bindings=${request_bindings/\"target_scope\":\"existing_file\",\"deny_target\":true/\"target_scope\":\"all\",\"deny_target\":false}
 overflow_bindings=${overflow_bindings/\"effect_requirement\":\"none\"/\"effect_requirement\":\"file_mutation_v1_reobserved\"}
 overflow_prefix="${request_prefix}\"operation\":\"pre_decision\",${overflow_bindings}\"payload\":{\"pre\":{"
-overflow_request="${overflow_prefix}\"tool\":\"Write\",\"input_bytes\":14892,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"missing\",\"exact_recovery_material_ready\":false,\"file_mutating\":true}}}"
+overflow_request="${overflow_prefix}\"tool\":\"Write\",\"input_bytes\":14892,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"missing\",\"exact_recovery_material_ready\":false,\"file_mutating\":true,\"within_root\":true}}}"
 overflow_verdict=$(printf '%s' "$overflow_request" | "$output")
 [[ "$overflow_verdict" == *'"decision":"admit"'* ]] || {
   echo "build-project-harness-kernel: verify-only bounds-overflow smoke failed" >&2
@@ -126,11 +126,11 @@ admit_verdict=$(printf '%s' "$admit_request" | "$output")
 # regular file is inside scope (pre admits: verify-only rule), and the post
 # obligation demands a reobserved mutation.
 effect_pre_prefix="${request_prefix}\"operation\":\"pre_decision\",${effect_bindings}\"payload\":{\"pre\":{"
-effect_pre_edit="${effect_pre_prefix}\"tool\":\"Edit\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":false,\"file_mutating\":true}}}"
+effect_pre_edit="${effect_pre_prefix}\"tool\":\"Edit\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":false,\"file_mutating\":true,\"within_root\":true}}}"
 effect_pre_bash=${effect_pre_edit/\"tool\":\"Edit\"/\"tool\":\"Bash\"}
 effect_pre_bash=${effect_pre_bash/\"file_mutating\":true/\"file_mutating\":false}
 effect_post_prefix="${request_prefix}\"operation\":\"post_decision\",${effect_bindings}\"payload\":{\"post\":{\"pre\":{"
-effect_post_unobserved="${effect_post_prefix}\"tool\":\"Edit\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":false,\"file_mutating\":true},\"succeeded\":true,\"effect_valid\":true,\"has_file_mutation_v1\":true,\"post_reobserved\":false}}}"
+effect_post_unobserved="${effect_post_prefix}\"tool\":\"Edit\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":false,\"file_mutating\":true,\"within_root\":true},\"succeeded\":true,\"effect_valid\":true,\"has_file_mutation_v1\":true,\"post_reobserved\":false}}}"
 effect_pre_edit_verdict=$(printf '%s' "$effect_pre_edit" | "$output")
 effect_pre_bash_verdict=$(printf '%s' "$effect_pre_bash" | "$output")
 effect_post_unobserved_verdict=$(printf '%s' "$effect_post_unobserved" | "$output")
@@ -138,6 +138,23 @@ effect_post_unobserved_verdict=$(printf '%s' "$effect_post_unobserved" | "$outpu
   "$effect_pre_bash_verdict" == *'"decision":"admit"'* &&
   "$effect_post_unobserved_verdict" == *'"decision":"block"'* ]] || {
   echo "build-project-harness-kernel: effect-class smoke failed" >&2
+  exit 1
+}
+# Containment is judged before the observed state (ProjectRule.preDecision):
+# an effective target outside the project root never admits, neither under
+# the effect-class rule nor under a tool rule scoped to existing files, even
+# when the same signal with within_root=true admits (effect_pre_edit,
+# admit_request). The kernel reads within_root after file_mutating; a pre
+# signal without it is rejected before any decision is made.
+effect_pre_escape=${effect_pre_edit/\"within_root\":true/\"within_root\":false}
+admit_escape=${admit_request/\"within_root\":true/\"within_root\":false}
+effect_pre_escape_verdict=$(printf '%s' "$effect_pre_escape" | "$output")
+admit_escape_verdict=$(printf '%s' "$admit_escape" | "$output")
+[[ "$effect_pre_escape_verdict" == *'"decision":"block"'* &&
+  "$effect_pre_escape_verdict" == *'"rule_precondition_blocked"'* &&
+  "$admit_escape_verdict" == *'"decision":"block"'* &&
+  "$admit_escape_verdict" == *'"rule_precondition_blocked"'* ]] || {
+  echo "build-project-harness-kernel: within_root escape smoke failed" >&2
   exit 1
 }
 [[ "$deny_verdict" == *'"decision":"block"'* &&

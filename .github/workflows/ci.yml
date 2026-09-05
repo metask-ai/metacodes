@@ -107,6 +107,17 @@ jobs:
             fi
           fi
           (cd control-plane/lean && lake build)
+          # The project-harness kernel is linked and smoked by its build
+          # script, not by `lake build`: the smoke requests are hand-written
+          # canonical JSON that the strict Lean parser must accept field for
+          # field, and nothing else exercises that pairing. They drifted from
+          # the kernel for three weeks (within_root, 33cf238) because no job
+          # ran the script on any platform. Runs before the cache save so the
+          # executable objects persist with the rest of .lake; the output goes
+          # outside the workspace so no test can pick up a kernel that the
+          # suite did not stage itself. One line: test_gate_manifest.py
+          # shlex-splits every line of this block on its own.
+          LAKE="$(command -v lake)" bash scripts/build-project-harness-kernel.sh "$RUNNER_TEMP/metacodes-project-kernel"
           mkdir -p "$HOME/.cache/metacodes-lean/lake"
           if command -v rsync >/dev/null 2>&1; then
             rsync -a --delete control-plane/lean/.lake/ "$HOME/.cache/metacodes-lean/lake/"
