@@ -59,8 +59,10 @@ jobs:
     # and the Windows unit tests tripped the build runner's one-minute
     # no-response watchdog under that load; ci.yml records the same contention
     # as the cause of its timing flakes. The price is the pending-cancel rule
-    # ci.yml describes: a push to the same lane while a dry-run job is still
-    # queued cancels that job, loudly, and the maintainer re-dispatches. The
+    # ci.yml describes, in both directions: a push to the same lane while a
+    # dry-run job is still queued cancels that job, and a dispatch while a CI
+    # job is still queued in the lane cancels that CI job. Both are loud;
+    # dispatch when the lane is idle, or rerun whatever was cancelled. The
     # dedicated pool serializes only with itself.
     concurrency:
       group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-{0}-{1}-{2}', matrix.os, matrix.arch, github.ref == 'refs/heads/main' && 'main' || 'pr') || format('release-runner-{0}-{1}', matrix.os, matrix.arch) }}
@@ -100,8 +102,11 @@ jobs:
           fi
       - name: Vendored runtime assets are attested
         run: python3 scripts/verify_tinykg_binary.py && python3 scripts/verify_ripgrep_binary.py
+      # Same test watchdog as ci.yml: the build runner's one-minute default
+      # is what the Windows dry runs tripped (a few I/O-bound unit tests sit
+      # near a minute on that box).
       - name: Full suite in release configuration
-        run: zig build test -Doptimize=ReleaseSafe
+        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Stage, manifest and verify the release unit
         run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release"
       - name: Installed prefix matches the release layout
@@ -175,7 +180,7 @@ jobs:
         run: python scripts\verify_tinykg_binary.py && python scripts\verify_ripgrep_binary.py
       - name: Full suite in release configuration
         shell: cmd
-        run: zig build test -Doptimize=ReleaseSafe -j6
+        run: zig build test -Doptimize=ReleaseSafe -j6 --test-timeout 5m
       - name: Stage, manifest and verify the release unit
         shell: cmd
         run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release"
