@@ -767,7 +767,8 @@ pub const App = struct {
                 app.api_client.catalog.loadFromModelsListJson(fetched.body) catch |err| {
                     @import("util/log.zig").debug("catalog", "Metask client catalog parse failed: {s}", .{@errorName(err)});
                 };
-                try app.refreshChildCatalogSnapshots();
+                // No snapshot refresh here: the registry and swarm do not exist yet; their
+                // first snapshot is taken from the fully loaded catalog at registry init below.
             };
         };
 
@@ -786,7 +787,6 @@ pub const App = struct {
                 app.oauth_token_for_catalog = @import("core/auth.zig").resolveStoredOAuthBearer(allocator) catch null;
                 app.probeApiKeys();
                 app.api_client.probeModels();
-                try app.refreshChildCatalogSnapshots();
             } else {
                 @import("util/log.zig").debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
             }
@@ -1656,7 +1656,10 @@ pub const App = struct {
             .max_tokens_override = app.config.max_tokens,
         };
         if (app.agent_jobs) |*jobs| try jobs.setLimits(source);
-        if (app.swarm) |*swarm| if (swarm.teammates) |*teammates| try teammates.setLimits(source);
+        // `app.swarm` is a plain field (undefined until App init assigns it), so this must only
+        // run after init: the sole startup catalog loads happen before registry/swarm exist and
+        // are covered by the initial setLimits at registry creation.
+        if (app.swarm.teammates) |*teammates| try teammates.setLimits(source);
     }
 
     /// **U3 单一真理源写侧 seam**:把 model 同步到全部值镜像。抽成独立函数(不依赖 io/App
