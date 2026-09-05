@@ -111,7 +111,7 @@ pub fn renderOutcome(allocator: std.mem.Allocator, input: OutcomeInput) ![]u8 {
     return renderCanonical(allocator, OutcomeArtifact{
         .project_sha256 = &input.binding.project_sha256,
         .issuer_sha256 = &input.binding.issuer_sha256,
-        .observation = wireRun(input.binding),
+        .observation = wireRun(&input.binding),
         .outcome_source = input.outcome_source,
         .task_success = input.task_success,
         .trustworthy_success = input.trustworthy_success,
@@ -133,7 +133,7 @@ pub fn renderUsage(allocator: std.mem.Allocator, input: UsageInput) ![]u8 {
     return renderCanonical(allocator, UsageArtifact{
         .project_sha256 = &input.binding.project_sha256,
         .issuer_sha256 = &input.binding.issuer_sha256,
-        .observation = wireRun(input.binding),
+        .observation = wireRun(&input.binding),
         .provider_requests = input.provider_requests,
         .input_tokens = input.input_tokens,
         .output_tokens = input.output_tokens,
@@ -231,7 +231,10 @@ pub fn validateEvidenceName(name: []const u8) !void {
         return error.InvalidEvidenceName;
 }
 
-fn wireRun(binding: Binding) WireRun {
+/// The wire view borrows from the caller-owned binding; by value the slices
+/// would point into a parameter copy that dies with this frame (ReleaseSafe
+/// reused it and the evidence came out corrupt).
+fn wireRun(binding: *const Binding) WireRun {
     return .{
         .session_id = binding.observation.session_id.asSlice(),
         .run_id = binding.observation.run_id.asSlice(),
