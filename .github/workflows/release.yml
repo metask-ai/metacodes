@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Ref to release: the bare X.Y.Z tag (stable) or a branch/commit whose version is 0.x.y-dev (pre)"
+        description: "Ref to release: the bare X.Y.Z tag (stable) or a branch / full 40-hex commit SHA whose version is 0.x.y-dev (pre); actions/checkout rejects short SHAs"
         required: true
         type: string
       dry_run:
@@ -49,14 +49,18 @@ jobs:
             arch: ARM64
             zig_target: aarch64-macos
     runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON(format('["self-hosted","{0}","{1}"]', matrix.os, matrix.arch)) || fromJSON(format('["self-hosted","metacodes-release","{0}","{1}"]', matrix.os, matrix.arch)) }}
-    # One physical runner per platform: a dry run on the CI pool joins the
-    # CI workflow's own runner group so it never overlaps a PR job on the same
-    # box (the second dry run did, and the Windows unit tests tripped the build
-    # runner's one-minute no-response watchdog under that load; ci.yml records
-    # the same contention as the cause of its timing flakes). The dedicated
-    # pool serializes only with itself.
+    # One physical runner per platform: a dry run on the CI pool joins the CI
+    # workflow's runner group for the lane of its own ref (main dispatches join
+    # the main lane, same expression as ci.yml), so it never overlaps the CI
+    # job that a merge just started on the same box. The second dry run did,
+    # and the Windows unit tests tripped the build runner's one-minute
+    # no-response watchdog under that load; ci.yml records the same contention
+    # as the cause of its timing flakes. The price is the pending-cancel rule
+    # ci.yml describes: a push to the same lane while a dry-run job is still
+    # queued cancels that job, loudly, and the maintainer re-dispatches. The
+    # dedicated pool serializes only with itself.
     concurrency:
-      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-{0}-{1}-pr', matrix.os, matrix.arch) || format('release-runner-{0}-{1}', matrix.os, matrix.arch) }}
+      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-{0}-{1}-{2}', matrix.os, matrix.arch, github.ref == 'refs/heads/main' && 'main' || 'pr') || format('release-runner-{0}-{1}', matrix.os, matrix.arch) }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -128,7 +132,7 @@ jobs:
     runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON('["self-hosted","Windows","X64"]') || fromJSON('["self-hosted","metacodes-release","Windows","X64"]') }}
     # Same runner-serialization rule as the POSIX jobs.
     concurrency:
-      group: ${{ inputs.runner_pool == 'pr-pool' && 'runner-Windows-X64-pr' || 'release-runner-Windows-X64' }}
+      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-Windows-X64-{0}', github.ref == 'refs/heads/main' && 'main' || 'pr') || 'release-runner-Windows-X64' }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
