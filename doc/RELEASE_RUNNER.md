@@ -22,6 +22,7 @@ three.
 | Count | one runner per platform; the workflow's matrix has one job per platform |
 | Registration | repository-level runner group `metacodes-release`, restricted to the `Release` workflow (GitHub → Settings → Actions → Runner groups → "Selected workflows") |
 | Account | a dedicated unprivileged OS user; no access to developer home directories or PR-pool workspaces |
+| Egress | HTTPS to `github.com`, `api.github.com`, `objects.githubusercontent.com` and the Actions artifact service (`*.actions.githubusercontent.com`, `*.blob.core.windows.net`): the build jobs upload the archives with `actions/upload-artifact` and `publish` downloads them. Verify with one dry run before registering the runner; the CI pool's Linux runner resets that upload today (`ECONNRESET`, run 33939121801), which is why dry runs tolerate a failed upload |
 | Toolchain | Zig 0.16.0 installed by `mlugg/setup-zig` in the job, exactly as CI does; Python ≥ 3.9 from the OS; `git`; `gh`; a Rust stable toolchain (`cargo`) and `bindgen` 0.72.1 for the AgentCore gate's link probe and bindings-regen check — the workflow's toolchain inventory fails a release job that lacks them |
 | Network | outbound only to GitHub (checkout, `setup-zig` download, artifact upload). Nothing in `zig build` downloads: ripgrep and TinyKG are vendored and hash-checked (`verify_ripgrep_binary.py`, `verify_tinykg_binary.py`) |
 
