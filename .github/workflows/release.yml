@@ -52,9 +52,10 @@ jobs:
             zig_target: aarch64-macos
     runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON(format('["self-hosted","{0}","{1}"]', matrix.os, matrix.arch)) || fromJSON(format('["self-hosted","metacodes-release","{0}","{1}"]', matrix.os, matrix.arch)) }}
     # One physical runner per platform: a dry run on the CI pool joins the CI
-    # workflow's runner group for the lane of its own ref (main dispatches join
-    # the main lane, same expression as ci.yml), so it never overlaps the CI
-    # job that a merge just started on the same box. The second dry run did,
+    # workflow's runner group for the lane of the ref it was dispatched from
+    # (github.ref, normally main; the tag input is a ref to build, not a lane;
+    # same expression as ci.yml), so it never overlaps the CI job that a merge
+    # just started on the same box. The second dry run did,
     # and the Windows unit tests tripped the build runner's one-minute
     # no-response watchdog under that load; ci.yml records the same contention
     # as the cause of its timing flakes. The price is the pending-cancel rule

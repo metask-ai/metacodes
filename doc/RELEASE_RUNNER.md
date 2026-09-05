@@ -58,7 +58,9 @@ Until the runners are registered, `release.yml` is `workflow_dispatch` only and
 the `runner_pool: pr-pool` input lets a maintainer dry-run the workflow on the CI
 machines (`dry_run: true`, no publish; `tag` takes a branch name or a full
 40-hex commit SHA, since `actions/checkout` rejects short SHAs). A pr-pool dry
-run joins the CI runner lane of its ref, so it queues behind the CI job a merge
+run joins the CI runner lane of the branch it was dispatched from (`github.ref`,
+normally main; the `tag` input picks what to build, not the lane), so it queues
+behind the CI job a merge
 just started instead of sharing the box with it, and a push to that lane while
 the dry-run job is still queued cancels it (re-dispatch). Once the three
 runners report online:
