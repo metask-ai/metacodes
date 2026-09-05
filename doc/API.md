@@ -81,7 +81,9 @@ and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
 names a route (`pin`, `float`, `use`, `remove`); `/models` still selects the
 account key; `/login <id> [--device-code] [--no-browser] [--client-id <client>]`
 runs the kernel OAuth flow for a provider and stores the login where
-`metacodes login --provider <id>` does (issue #33). Choosing a route whose
+`metacodes login --provider <id>` does (issue #33); `--client-id` is needed
+only when neither the profile nor `providers.<id>.oauth_client_id` in
+`~/.metacodes/config.json` names the installation's registered client (#87). Choosing a route whose
 OAuth-capable provider has no credential signs in inside the picker: the
 authorization URL or device code is drawn in the overlay, `Esc` cancels the
 flow, and the chosen route is committed once the login lands (issue #67).

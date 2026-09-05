@@ -2411,7 +2411,7 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         std.debug.print("\x1b[31munknown provider '{s}'\x1b[0m\n", .{name});
         return;
     };
-    const prepared = provider_login.prepareProfile(built, options) catch |err| {
+    const prepared = provider_login.prepareProfileWith(built, options, host.oauthClientIdFor(built.id)) catch |err| {
         std.debug.print("\x1b[31m{s}\x1b[0m\n", .{provider_login.refusalText(err, options.method)});
         return;
     };

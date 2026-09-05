@@ -1628,11 +1628,11 @@ fn runProviderOAuthLogin(
     };
     // Every refusal is decided in the kernel before anything is contacted;
     // this only says which one, in the words the CLI has always used.
-    const prepared = provider_login.prepareProfile(built, .{
+    const prepared = provider_login.prepareProfileWith(built, .{
         .method = options.method,
         .open_browser = options.open_browser,
         .client_id = options.client_id,
-    }) catch |err| switch (err) {
+    }, host.oauthClientIdFor(built.id)) catch |err| switch (err) {
         error.ProviderHasNoTokenEndpoint, error.ProviderAcceptsNoOAuthKind => {
             _ = requireOAuthCapableProvider(built);
             return 2;
@@ -1655,10 +1655,11 @@ fn runProviderOAuthLogin(
         error.ClientIdMissing => {
             std.debug.print(
                 "error: provider '{s}' declares no OAuth client id; " ++
-                    "pass --client-id <client>\n" ++
+                    "pass --client-id <client> or set providers.{s}.oauth_client_id " ++
+                    "in ~/.metacodes/config.json\n" ++
                     "(a provider defined under custom_providers can declare " ++
-                    "oauth.client_id instead, and it is then used for refresh too)\n",
-                .{built.id.slice()},
+                    "oauth.client_id instead; every one of these is used for refresh too)\n",
+                .{ built.id.slice(), built.id.slice() },
             );
             return 2;
         },
