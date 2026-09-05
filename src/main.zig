@@ -1479,7 +1479,7 @@ fn storeProviderOAuthToken(
         allocator.free(text);
     }
 
-    return loginProviderWithTokenResponse(allocator, built, text, explicit_client_id);
+    return loginProviderWithTokenResponse(allocator, built, text, explicit_client_id, host.oauthClientIdFor(built.id));
 }
 
 /// Refuse, with the reason, a provider whose stored login could never be used.
@@ -1510,23 +1510,27 @@ fn requireOAuthCapableProvider(built: *const provider_profile.ProviderProfile) b
 /// do. Public so the wiring — not just the parts — is testable against a
 /// profile, without a provider host or a home directory.
 ///
-/// `explicit_client_id` is what the user passed on the command line; it wins
-/// over what the profile declares, and for a profile that declares none it is
-/// the only way the refresh grant can present the right client. Ignoring it
-/// here while accepting it on the command line is exactly the defect this
-/// function replaced.
+/// `explicit_client_id` is what the user passed on the command line and
+/// `configured_client_id` what the installation declared under
+/// `providers.<id>.oauth_client_id` (#87); the precedence is the one
+/// `provider_login.prepareProfileWith` applies to the interactive grant —
+/// explicit, then configured, then the profile's declaration — so an imported
+/// login records the same client an interactive one would, and the refresh
+/// grant presents the right one. Ignoring a client here while accepting it
+/// elsewhere is exactly the defect this function replaced.
 pub fn loginProviderWithTokenResponse(
     allocator: std.mem.Allocator,
     built: *const provider_profile.ProviderProfile,
     token_json: []const u8,
     explicit_client_id: ?[]const u8,
+    configured_client_id: ?[]const u8,
 ) u8 {
     if (!requireOAuthCapableProvider(built)) return 2;
     return importProviderTokenResponse(
         allocator,
         built.id,
         token_json,
-        explicit_client_id orelse built.oauth_client_id,
+        explicit_client_id orelse configured_client_id orelse built.oauth_client_id,
     );
 }
 
