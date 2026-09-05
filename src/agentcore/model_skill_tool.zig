@@ -514,14 +514,21 @@ pub const Environment = struct {
                 .host_session_ctx = host_ctx,
             } else null;
 
+        // Child scope is transient (session_budget.DurableScope): the child's
+        // Conversation is discarded, and its final text becomes this tool's
+        // result, which the parent's ToolEnvironment already charges as
+        // durable. Charging the child's transcript here as well double-counted
+        // bytes the checkpoint never stores.
         var budget_provider: ?session_budget.BudgetedProvider = if (self.budget_controller) |controller| .{
             .allocator = self.allocator,
             .controller = controller,
             .base = self.session.provider.provider(),
+            .scope = .transient,
         } else null;
         var budget_tools: ?session_budget.ToolEnvironment = if (self.budget_controller) |controller| .{
             .controller = controller,
             .base = child_environment.surface(),
+            .scope = .transient,
         } else null;
         const child_surface = if (budget_tools) |*tools|
             tools.surface()

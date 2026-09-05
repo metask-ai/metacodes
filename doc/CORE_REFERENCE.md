@@ -441,6 +441,10 @@ transcript resume 恢复持久化的水位（没有该字段的旧记录一律�
 历史仍有效（未送达的文本沿用历史行为——按数量保留，这是既有的通用问题，不在图像契约内）。图片永不被 `truncateLargeToolResults` 截断。AgentCore 的
 `ToolEnvironment` 不 `promoteInline` 图片，payload cap 按视觉估算记，耐久预算按实际字节记，且
 `settleSuccess` 把仍存活的兄弟预留计入硬预算，结算不能吃掉并行工具已预留的空间。
+子 agent（Task / fork / 模型调用的 Skill）的 `BudgetedProvider` 与 `ToolEnvironment` 以
+`DurableScope.transient` 结算：在途仍预留请求与 payload cap、超限仍是 resource limit，但不累加
+`estimated_usage_bytes`——子对话在返回时即被丢弃，只有最终文本会进入 Session（fork 根路径由
+`Controller.commitDurable` 一次性计入；model-tool 路径由父 `ToolEnvironment` 按工具结果计入）。
 
 **读代码给存在性,审计轨迹给频率**:`scripts/audit_trajectories.py` 扫已落盘的
 `transcript.jsonl`,报告各工具的结果大小分布、超预算条数、溢出后**有没有人来取**、以及

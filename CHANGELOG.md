@@ -103,6 +103,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- AgentCore child agents (Task / fork / model-invoked Skill) no longer exhaust
+  the Session durable budget with bytes the checkpoint never stores. The child
+  ran on the parent's `BudgetedProvider` and a `ToolEnvironment` bound to the
+  parent's `Controller`, and every child assistant increment and tool result
+  settled as durable — yet the child's Conversation is discarded when it
+  returns and only its final text re-enters the Session. A subagent-heavy Run
+  therefore reached `budget_exhausted` (hosts render it as a budget stop, the
+  Task result carries `checkpoint_budget_exhausted`) while the real checkpoint
+  was far below `hard_bytes`; reported on a GLM-5.2 session whose subagents
+  were verbose enough to trip it. `session_budget.DurableScope` now separates
+  the two: a `.transient` operation still reserves its request and payload cap
+  while in flight and an oversized child result is still a resource limit, but
+  settle adds nothing to `estimated_usage_bytes`. The fork-root final text is
+  charged once through `Controller.commitDurable` before `runIsolated` appends
+  it (a commit that does not fit withholds the text and ends the Run
+  `.budget`); the model-tool child's final text is already charged as the
+  parent's tool result.
+
 - Headless `--stream-json` and `--json` NDJSON lines are always valid UTF-8.
   The stream backend and the `result` line encoded strings with
   `std.json.Stringify.encodeJsonString`, which passes bytes 0x80–0xFF through
