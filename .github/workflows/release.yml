@@ -49,8 +49,14 @@ jobs:
             arch: ARM64
             zig_target: aarch64-macos
     runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON(format('["self-hosted","{0}","{1}"]', matrix.os, matrix.arch)) || fromJSON(format('["self-hosted","metacodes-release","{0}","{1}"]', matrix.os, matrix.arch)) }}
+    # One physical runner per platform: a dry run on the CI pool joins the
+    # CI workflow's own runner group so it never overlaps a PR job on the same
+    # box (the second dry run did, and the Windows unit tests tripped the build
+    # runner's one-minute no-response watchdog under that load; ci.yml records
+    # the same contention as the cause of its timing flakes). The dedicated
+    # pool serializes only with itself.
     concurrency:
-      group: release-runner-${{ inputs.runner_pool }}-${{ matrix.os }}-${{ matrix.arch }}
+      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-{0}-{1}-pr', matrix.os, matrix.arch) || format('release-runner-{0}-{1}', matrix.os, matrix.arch) }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -120,8 +126,9 @@ jobs:
     timeout-minutes: 90
     if: inputs.runner_pool == 'metacodes-release' || inputs.dry_run
     runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON('["self-hosted","Windows","X64"]') || fromJSON('["self-hosted","metacodes-release","Windows","X64"]') }}
+    # Same runner-serialization rule as the POSIX jobs.
     concurrency:
-      group: release-runner-${{ inputs.runner_pool }}-Windows-X64
+      group: ${{ inputs.runner_pool == 'pr-pool' && 'runner-Windows-X64-pr' || 'release-runner-Windows-X64' }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
