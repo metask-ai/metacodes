@@ -10,6 +10,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- Vendored ripgrep moves from 14.1.1 to 15.2.0 (#86): the four existing
+  targets are replaced by the upstream 15.2.0 release binaries and
+  `rg-linux-aarch64` (upstream's `aarch64-unknown-linux-musl`, static-pie,
+  first published in 15.x) joins `vendor/ripgrep/manifest.json`, so
+  `aarch64-linux` satisfies the `elf-static` contract that #79 fails closed
+  on. Glob/Grep pass only `--files`, `--no-messages`, `--glob`, `--type`,
+  `--no-filename` and `--multiline-dotall`; the 15.x notes change none of
+  them. Every asset digest was checked against the GitHub Releases API.
+
 ### Added
 
 - `.github/workflows/release.yml` (#82, #47 stage 7): `workflow_dispatch` with

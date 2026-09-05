@@ -123,9 +123,10 @@ jobs:
         run: |
           zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
           cmp "$RUNNER_TEMP"/dist/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-again/metacodes-*.tar.gz
-      # aarch64-linux stays outside the release matrix until a vendored musl
-      # ripgrep exists (#86); `release:check -Dtarget=aarch64-linux-musl` is
-      # expected to refuse, so it is not run here.
+      # aarch64-linux has a vendored musl ripgrep since #86; ci.yml proves the
+      # cross-staged unit with `release:check -Dtarget=aarch64-linux-musl`.
+      # Building it here as a cross-compiled release unit is a matrix change
+      # for a later issue: it needs a runner-independent verify path.
       # A dry run rehearses the build, not the runner's egress: an upload that
       # fails there is reported as a step failure but does not decide the
       # rehearsal (the CI pool's Linux runner has never uploaded an artifact;

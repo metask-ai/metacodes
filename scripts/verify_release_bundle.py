@@ -347,8 +347,8 @@ def _fixture(root: Path) -> dict:
         "components": [
             {"role": "primary_executable", "name": "metacodes", "path": "bin/metacodes", "sha256": digests["bin/metacodes"], "version": "0.1.0"},
             {
-                "role": "runtime_asset", "name": "ripgrep", "path": "bin/rg", "sha256": digests["bin/rg"], "version": "14.1.1",
-                "revision": "4649aa9700", "upstream": "https://github.com/BurntSushi/ripgrep", "license": "MIT OR Unlicense",
+                "role": "runtime_asset", "name": "ripgrep", "path": "bin/rg", "sha256": digests["bin/rg"], "version": "15.2.0",
+                "revision": "e89fff89ac", "upstream": "https://github.com/BurntSushi/ripgrep", "license": "MIT OR Unlicense",
                 "license_path": "share/licenses/ripgrep-LICENSE-MIT", "purpose": "Glob/Grep execution dependency",
             },
             {

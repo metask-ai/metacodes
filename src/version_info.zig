@@ -158,8 +158,8 @@ const test_info: BuildInfo = .{
     .release_layout = true,
     .abi_version = 1,
     .abi_revision = 15,
-    .ripgrep_version = "14.1.1",
-    .ripgrep_revision = "4649aa9700",
+    .ripgrep_version = "15.2.0",
+    .ripgrep_revision = "e89fff89ac",
     .ripgrep_sha256 = null,
     .tinykg_version = "0.2.0",
     .tinykg_commit = "a0544788aeadb3b92c69e539834be54850792285",
@@ -175,7 +175,7 @@ test "version text keeps the documented first line and names every source" {
     try std.testing.expect(std.mem.indexOf(u8, text, "\ncommit 0123456789abcdef0123456789abcdef01234567 (dirty)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\ntarget x86_64-linux-gnu ReleaseSafe\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\nagentcore-abi v1 revision 15\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\nripgrep 14.1.1 (4649aa9700) not bundled for this target\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\nripgrep 15.2.0 (e89fff89ac) not bundled for this target\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "expected sha256 5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "\nlayout release\n"));
 }

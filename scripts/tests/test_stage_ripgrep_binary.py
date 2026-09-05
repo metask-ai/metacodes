@@ -62,7 +62,7 @@ class RipgrepBundleStageTest(unittest.TestCase):
             "bundle_schema": "metacodes.ripgrep-bundle/v1",
             "license": "MIT OR Unlicense",
             "source_repository": "https://example.invalid/ripgrep",
-            "upstream_release": "14.1.1",
+            "upstream_release": "15.2.0",
             "upstream_revision": "deadbeef00",
         }
         (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")

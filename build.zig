@@ -625,7 +625,8 @@ pub fn build(b: *std.Build) void {
     // layout stage the vendored, manifest-pinned binary beside the executable
     // as bin/rg[.exe] (the script the AgentCore bundle already uses) and ship
     // its MIT notice under share/licenses. A target without a vendored rg
-    // (aarch64-linux until #86) still builds for development — rg then comes
+    // (none of the release targets since #86; a new target until its binary
+    // is vendored) still builds for development — rg then comes
     // from PATH — but cannot be released: `release:stage` fails closed rather
     // than shipping an executable whose Grep cannot run.
     const ripgrep_bundle = ripgrepBundleInfo(b, target.result);
