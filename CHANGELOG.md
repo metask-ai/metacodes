@@ -84,6 +84,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `scripts/eval/tests/test_plugin_release_gate.py` did not import on the macOS
+  system python3 (3.9): a `list | None` parameter annotation is evaluated at
+  definition time (`type.__or__` is Python 3.10) in a module that does not
+  defer annotations, so the eval-suite discovery in `zig build test` died at
+  collection while CI's newer interpreter never saw it. The module now opens
+  with `from __future__ import annotations` like the rest of scripts/, and
+  `scripts/tests/test_python_floor.py` reports every PEP 604 union in an
+  annotation of a module without that import, and every `X | None` outside an
+  annotation (a type alias, an `isinstance` argument), which the import does
+  not defer.
+
 - The Bash tool's spilled stdout/stderr are sealed during execution as attachments
   of its inline result and published by the batch commit boundary, like every
   other tool result since #45/#65; a fatal sibling in the same batch leaves no
