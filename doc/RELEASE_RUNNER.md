@@ -61,8 +61,11 @@ machines (`dry_run: true`, no publish; `tag` takes a branch name or a full
 run joins the CI runner lane of the branch it was dispatched from (`github.ref`,
 normally main; the `tag` input picks what to build, not the lane), so it queues
 behind the CI job a merge
-just started instead of sharing the box with it, and a push to that lane while
-the dry-run job is still queued cancels it (re-dispatch). Once the three
+just started instead of sharing the box with it. GitHub cancels the older
+*queued* job when a newer one joins a group, in both directions: a push to that
+lane cancels a still-queued dry-run job (re-dispatch), and a dispatch cancels a
+still-queued CI job in that lane (rerun it). Dispatch when `gh run list` shows
+the lane idle. Once the three
 runners report online:
 
 1. Remove the `pr-pool` choice from the workflow input.
