@@ -10,6 +10,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- Child agents could inherit a provider default instead of the lead's current
+  effort: the parent logged `none` while a GLM-5.2 child logged `default` and
+  consequently enabled thinking. Child resolution now follows AgentDef
+  `effort`, explicit Task model-tier effort, inherited parent effort when the
+  model is unchanged, then the selected model's default; this also preserves
+  an explicit `.none`.
+- Per-call providers could fall back to unrelated hard-coded limits. The
+  provider factory now passes `ModelLimitsSource`: registries own immutable
+  catalog snapshots and App refreshes them after catalog changes, avoiding
+  worker races with `/model` rebuilds and probes. OpenAI/Gemini resolve input
+  windows through ModelContext; their output limit and `--max-tokens` semantics
+  remain unchanged (the override applies only to Anthropic).
+- Model routing, capability, pricing, catalog, and context-window matching is
+  now ASCII case-insensitive through `model_name.zig`; the model string sent
+  on the wire remains unchanged. The GLM-5.2 note also records that the
+  2026-07 historical 262144 window became 1048576 on 2026-09-05 (1,001,205
+  input tokens succeeded; 1,101,379 was rejected).
+
 ### Changed
 
 - Vendored ripgrep moves from 14.1.1 to 15.2.0 (#86): the four existing

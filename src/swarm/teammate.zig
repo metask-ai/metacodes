@@ -302,6 +302,8 @@ pub const TeammateRegistry = struct {
     /// bearer 字节。由 `SwarmContext` 在 spawn 时注入。
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
     dialect_resolver: dialect_mod.Resolver = .builtin(),
+    limits: ?@import("../api/model_limits.zig").ModelLimitsSource = null,
+    catalog_snapshot: ?@import("../api/catalog.zig").Catalog = null,
     home: []u8,
 
     pub fn init(
@@ -360,6 +362,35 @@ pub const TeammateRegistry = struct {
     }
     fn listUnlock(self: *TeammateRegistry) void {
         _ = self.list_mutex.unlock();
+    }
+
+    /// Publish an owned catalog snapshot; worker teammates never read App's mutable catalog.
+    pub fn setLimits(self: *TeammateRegistry, source: @import("../api/model_limits.zig").ModelLimitsSource) !void {
+        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
+        if (source.catalog) |catalog| snapshot = try catalog.clone(self.allocator);
+        self.listLock();
+        defer self.listUnlock();
+        if (self.catalog_snapshot) |*old| old.deinit();
+        self.catalog_snapshot = snapshot;
+        self.limits = source;
+        self.limits.?.catalog = null;
+    }
+
+    fn makeProvider(self: *TeammateRegistry, model: []const u8) !pf.OwnedProvider {
+        self.listLock();
+        defer self.listUnlock();
+        var limits = self.limits;
+        if (limits) |*value| value.catalog = if (self.catalog_snapshot) |*catalog| catalog else null;
+        return pf.makeProviderWithOptions(
+            std.heap.c_allocator,
+            self.provider_kind,
+            self.api_key,
+            model,
+            self.base_url,
+            self.openai_protocol,
+            self.dialect_resolver,
+            .{ .auth_scheme = self.auth_scheme, .limits = limits },
+        );
     }
 
     pub fn findByName(self: *TeammateRegistry, name_sanitized: []const u8) ?*TeammateEntry {
@@ -596,18 +627,7 @@ pub const TeammateRegistry = struct {
         try mailbox.ensureInbox(lead_inbox_path);
 
         // 4) 专属 provider(c_allocator:线程安全 + 与 agent_loop 事件所有权一致)。
-        var owned = try pf.makeProviderWithOptions(
-            std.heap.c_allocator,
-            self.provider_kind,
-            self.api_key,
-            p.model_override orelse self.model,
-            self.base_url,
-            self.openai_protocol,
-            self.dialect_resolver,
-            // issue #16:继承 lead 的 auth scheme。少了它,teammate 会把正确的
-            // 密钥发到错误的头上——对 `x-api-key` 类 provider 就是 401。
-            .{ .auth_scheme = self.auth_scheme },
-        );
+        var owned = try self.makeProvider(p.model_override orelse self.model);
         errdefer if (!committed) owned.deinit();
 
         // 5) dupe 输入。
@@ -723,6 +743,7 @@ pub const TeammateRegistry = struct {
 
     /// abort 全部 → join 全部 → free(deinit 铁律)。
     pub fn deinit(self: *TeammateRegistry) void {
+        if (self.catalog_snapshot) |*catalog| catalog.deinit();
         self.listLock();
         const items = self.entries.items;
         for (items) |e| e.abort.abort(.user_ctrl_c);

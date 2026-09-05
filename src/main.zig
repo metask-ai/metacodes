@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_name = @import("api/model_name.zig");
 const builtin = @import("builtin");
 const platform_term = @import("platform").terminal;
 const pfs = @import("platform").fs;
@@ -436,13 +437,13 @@ fn applyStartupOutcome(
 }
 
 pub fn inferProviderKind(model: []const u8) types.ProviderKind {
-    if (std.mem.startsWith(u8, model, "gpt") or
-        std.mem.startsWith(u8, model, "o1") or
-        std.mem.startsWith(u8, model, "o3"))
+    if (model_name.startsWithIgnoreCase(model, "gpt") or
+        model_name.startsWithIgnoreCase(model, "o1") or
+        model_name.startsWithIgnoreCase(model, "o3"))
     {
         return .openai;
     }
-    if (std.mem.startsWith(u8, model, "gemini")) return .gemini;
+    if (model_name.startsWithIgnoreCase(model, "gemini")) return .gemini;
     return .anthropic;
 }
 

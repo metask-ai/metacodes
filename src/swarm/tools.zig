@@ -16,9 +16,28 @@ const SwarmContext = @import("context.zig").SwarmContext;
 const team_mod = @import("team.zig");
 const mailbox = @import("mailbox.zig");
 const teammate_mod = @import("teammate.zig");
+const model_tiers_mod = @import("../api/model_tiers.zig");
+const types_mod = @import("../types.zig");
 const util_json = @import("../util/json.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
+
+/// Team spawn uses the same Codex-compatible precedence as Task subagents.
+pub fn resolveTeammateEffort(
+    def_effort: ?types_mod.ReasoningEffort,
+    selection: model_tiers_mod.Resolved,
+    lead_effort: ?types_mod.ReasoningEffort,
+) ?types_mod.ReasoningEffort {
+    return model_tiers_mod.resolveChildEffort(def_effort, selection, lead_effort);
+}
+
+test "teammate effort inherits lead only when the member keeps its model" {
+    try std.testing.expectEqual(
+        types_mod.ReasoningEffort.none,
+        resolveTeammateEffort(null, .{ .model = null, .effort = null }, .none).?,
+    );
+    try std.testing.expect(resolveTeammateEffort(null, .{ .model = "other", .effort = null }, .high) == null);
+}
 
 /// 有 team 活跃时追加到 system prompt(agent_loop 每轮注入,gated on swarm.hasTeam)。
 /// 纪律核心:普通助手文本对 teammate/lead 互相不可见,一切协作必须走 SendMessage。
@@ -106,6 +125,7 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
         sw.home,
         sw.dialect_resolver,
     );
+    if (sw.limits) |limits| try sw.teammates.?.setLimits(limits);
     // issue #16:auth scheme 随 lead 已解析的路由走。少了它,teammate 会把正确
     // 的密钥发到错误的头上。
     sw.teammates.?.auth_scheme = sw.auth_scheme;

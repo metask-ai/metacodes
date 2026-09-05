@@ -1215,7 +1215,7 @@ pub const AgentSession = struct {
             self.base_url,
             self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = self.auth_scheme },
+            .{ .auth_scheme = self.auth_scheme, .limits = null },
         );
     }
 
@@ -1306,7 +1306,7 @@ pub const AgentSession = struct {
             base_url,
             config.openai_protocol,
             runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = config.auth_scheme },
+            .{ .auth_scheme = config.auth_scheme, .limits = null },
         );
         errdefer owned_provider.deinit();
 

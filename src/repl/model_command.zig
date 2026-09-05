@@ -4,6 +4,7 @@
 //! REPL layer is responsible for rendering and mutating App state.
 
 const std = @import("std");
+const model_name = @import("../api/model_name.zig");
 const types = @import("../types.zig");
 const catalog_mod = @import("../api/catalog.zig");
 const capability_mod = @import("../api/capability.zig");
@@ -112,9 +113,9 @@ pub fn capabilityLabel(cap: Capability) []const u8 {
 }
 
 pub fn providerForModel(model: []const u8) ?types.ProviderKind {
-    if (std.mem.startsWith(u8, model, "claude-")) return .anthropic;
-    if (std.mem.startsWith(u8, model, "gpt") or std.mem.startsWith(u8, model, "o1") or std.mem.startsWith(u8, model, "o3")) return .openai;
-    if (std.mem.startsWith(u8, model, "gemini")) return .gemini;
+    if (model_name.startsWithIgnoreCase(model, "claude-")) return .anthropic;
+    if (model_name.startsWithIgnoreCase(model, "gpt") or model_name.startsWithIgnoreCase(model, "o1") or model_name.startsWithIgnoreCase(model, "o3")) return .openai;
+    if (model_name.startsWithIgnoreCase(model, "gemini")) return .gemini;
     return null;
 }
 
@@ -160,12 +161,12 @@ fn appendIfMissing(allocator: std.mem.Allocator, out: *std.ArrayList(Candidate),
 }
 
 pub fn groupForModel(model: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, model, "opus") != null) return "opus";
-    if (std.mem.indexOf(u8, model, "sonnet") != null) return "sonnet";
-    if (std.mem.indexOf(u8, model, "haiku") != null) return "haiku";
-    if (std.mem.startsWith(u8, model, "gpt") or std.mem.startsWith(u8, model, "o1") or std.mem.startsWith(u8, model, "o3")) return "openai";
-    if (std.mem.startsWith(u8, model, "gemini")) return "gemini";
-    if (std.mem.startsWith(u8, model, "claude-")) return "claude";
+    if (model_name.containsIgnoreCase(model, "opus")) return "opus";
+    if (model_name.containsIgnoreCase(model, "sonnet")) return "sonnet";
+    if (model_name.containsIgnoreCase(model, "haiku")) return "haiku";
+    if (model_name.startsWithIgnoreCase(model, "gpt") or model_name.startsWithIgnoreCase(model, "o1") or model_name.startsWithIgnoreCase(model, "o3")) return "openai";
+    if (model_name.startsWithIgnoreCase(model, "gemini")) return "gemini";
+    if (model_name.startsWithIgnoreCase(model, "claude-")) return "claude";
     return "other";
 }
 
@@ -200,14 +201,14 @@ pub fn supports(provider: types.ProviderKind, model: []const u8, cap: Capability
 
 pub fn isKnownCandidate(candidates: []const Candidate, model: []const u8) bool {
     for (candidates) |c| {
-        if (std.mem.eql(u8, c.id, model)) return true;
+        if (model_name.eqlIgnoreCase(c.id, model)) return true;
     }
     return false;
 }
 
 pub fn canUseInCurrentProvider(current_provider: types.ProviderKind, candidates: []const Candidate, model: []const u8) bool {
     for (candidates) |c| {
-        if (std.mem.eql(u8, c.id, model)) return c.provider == current_provider;
+        if (model_name.eqlIgnoreCase(c.id, model)) return c.provider == current_provider;
     }
     const inferred = providerForModel(model) orelse return false;
     return inferred == current_provider;

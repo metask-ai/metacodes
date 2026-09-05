@@ -5,6 +5,7 @@
 //! retain their Runtime and therefore their exact plugin generation.
 
 const std = @import("std");
+const model_name = @import("../api/model_name.zig");
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
 const contract = @import("contract.zig");
@@ -517,7 +518,7 @@ pub const Snapshot = struct {
         const self: *const Snapshot = @ptrCast(@alignCast(raw));
         var best: ?*const ProviderDialectBinding = null;
         for (self.provider_dialects) |*binding| {
-            if (binding.provider_kind != kind or !std.mem.startsWith(u8, model, binding.model_prefix)) continue;
+            if (binding.provider_kind != kind or !model_name.startsWithIgnoreCase(model, binding.model_prefix)) continue;
             if (best == null or binding.model_prefix.len > best.?.model_prefix.len) best = binding;
         }
         return if (best) |binding| binding.dialect else dialect_mod.dialectFor(kind, model);

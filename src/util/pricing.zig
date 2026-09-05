@@ -3,6 +3,7 @@
 //! 参考：https://www.anthropic.com/pricing （2026-04 snapshot）
 
 const std = @import("std");
+const model_name = @import("../api/model_name.zig");
 
 pub const Rates = struct {
     /// 每百万 input token USD
@@ -30,9 +31,9 @@ pub const GLM_52_GUARDRAIL_PROVENANCE = "metacodes_glm-5.2_conservative_sonnet4_
 
 /// 按 model 名称（子串匹配）返回单价。未匹配到 → DEFAULT_RATES。
 pub fn rateFor(model: []const u8) Rates {
-    if (std.mem.eql(u8, model, "glm-5.2")) return GLM_52_GUARDRAIL_RATES;
+    if (model_name.eqlIgnoreCase(model, "glm-5.2")) return GLM_52_GUARDRAIL_RATES;
     // opus 系列
-    if (std.mem.indexOf(u8, model, "opus") != null) {
+    if (model_name.containsIgnoreCase(model, "opus")) {
         return .{
             .input_per_mtok = 15.0,
             .output_per_mtok = 75.0,
@@ -41,7 +42,7 @@ pub fn rateFor(model: []const u8) Rates {
         };
     }
     // haiku 系列
-    if (std.mem.indexOf(u8, model, "haiku") != null) {
+    if (model_name.containsIgnoreCase(model, "haiku")) {
         return .{
             .input_per_mtok = 1.0,
             .output_per_mtok = 5.0,
@@ -54,7 +55,7 @@ pub fn rateFor(model: []const u8) Rates {
 }
 
 pub fn provenanceFor(model: []const u8) []const u8 {
-    if (std.mem.eql(u8, model, "glm-5.2")) return GLM_52_GUARDRAIL_PROVENANCE;
+    if (model_name.eqlIgnoreCase(model, "glm-5.2")) return GLM_52_GUARDRAIL_PROVENANCE;
     return "metacodes_builtin_2026-04_with_fallback";
 }
 

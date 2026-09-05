@@ -10,6 +10,7 @@
 //! 未知模型 → DEFAULT_MAX_TOKENS (32000) / DEFAULT_UPPER_LIMIT (64000)。
 
 const std = @import("std");
+const model_name = @import("../api/model_name.zig");
 
 pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
 pub const DEFAULT_UPPER_LIMIT: u32 = 64_000;
@@ -46,7 +47,7 @@ const TABLE = [_]ModelEntry{
 /// 查模型限额。未知模型返 DEFAULT。
 pub fn limitsFor(model: []const u8) ModelLimits {
     for (TABLE) |e| {
-        if (std.mem.startsWith(u8, model, e.prefix)) return e.limits;
+        if (model_name.startsWithIgnoreCase(model, e.prefix)) return e.limits;
     }
     return .{ .default = DEFAULT_MAX_TOKENS, .upper = DEFAULT_UPPER_LIMIT };
 }

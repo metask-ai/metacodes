@@ -358,6 +358,8 @@ pub const AgentJobRegistry = struct {
     /// Borrowed from the App/Runtime immutable plugin Snapshot. App drains all
     /// jobs before destroying that Snapshot.
     dialect_resolver: dialect_mod.Resolver = .builtin(),
+    limits: ?@import("../api/model_limits.zig").ModelLimitsSource = null,
+    catalog_snapshot: ?@import("../api/catalog.zig").Catalog = null,
     seq: u32 = 0,
 
     pub fn init(
@@ -414,6 +416,18 @@ pub const AgentJobRegistry = struct {
         const old = self.model;
         self.model = model_owned;
         self.allocator.free(old);
+    }
+
+    /// Publish an owned catalog snapshot. Workers never inspect App's mutable catalog.
+    pub fn setLimits(self: *AgentJobRegistry, source: @import("../api/model_limits.zig").ModelLimitsSource) !void {
+        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
+        if (source.catalog) |catalog| snapshot = try catalog.clone(self.allocator);
+        self.listLock();
+        defer self.listUnlock();
+        if (self.catalog_snapshot) |*old| old.deinit();
+        self.catalog_snapshot = snapshot;
+        self.limits = source;
+        self.limits.?.catalog = null;
     }
 
     /// Update the API key used for subsequently spawned agent jobs.
@@ -562,7 +576,7 @@ pub const AgentJobRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
-            .{ .auth_scheme = self.auth_scheme },
+            .{ .auth_scheme = self.auth_scheme, .limits = self.limits },
         );
         errdefer if (!committed) owned.deinit();
 
@@ -916,6 +930,10 @@ pub const AgentJobRegistry = struct {
         // TaskBatch 并发 worker),且主线程造它时可能与 App 的 io_runtime worker 线程并发。App 的
         // gpa(self.allocator)非线程安全并发访问会损坏(假 OOM/unreachable → SIGABRT,真机实测)。
         // 故用 c_allocator(malloc,线程安全)隔离。OwnedProvider 自带此 allocator,deinit 也用它,一致。
+        self.listLock();
+        defer self.listUnlock();
+        var limits = self.limits;
+        if (limits) |*value| value.catalog = if (self.catalog_snapshot) |*catalog| catalog else null;
         return pf.makeProviderWithOptions(
             std.heap.c_allocator,
             self.provider_kind,
@@ -924,7 +942,7 @@ pub const AgentJobRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
-            .{ .auth_scheme = self.auth_scheme },
+            .{ .auth_scheme = self.auth_scheme, .limits = limits },
         );
     }
 
@@ -1041,6 +1059,7 @@ pub const AgentJobRegistry = struct {
 
     /// abort 全部 running → join 全部线程 → free。drain 循环覆盖迟注册的嵌套 job。
     pub fn deinit(self: *AgentJobRegistry) void {
+        if (self.catalog_snapshot) |*catalog| catalog.deinit();
         // drain:反复 abort + join,直到没有未 join 的线程。
         while (true) {
             // 快照当前 entries(持锁拷指针,join 时不持锁避免与线程注册死锁)
@@ -1410,4 +1429,31 @@ test "issue #16: a failed setRoute leaves the previous route completely intact" 
     try std.testing.expectEqualStrings("old-key", reg.api_key);
     try std.testing.expectEqualStrings("https://old.invalid", reg.base_url.?);
     try std.testing.expectEqual(types_mod.ProviderKind.anthropic, reg.provider_kind);
+}
+
+test "AgentJobRegistry provider inherits and defaults its model limits" {
+    const a = std.testing.allocator;
+    var catalog = @import("../api/catalog.zig").Catalog.init(a);
+    defer catalog.deinit();
+    try catalog.loadFromModelsListJson("{\"data\":[{\"id\":\"GLM-5.2\",\"max_tokens\":64000,\"max_input_tokens\":1048576}]} ");
+    var reg = try AgentJobRegistry.init(a, "test-key", null, "GLM-5.2", .anthropic);
+    defer reg.deinit();
+    try reg.setLimits(.{ .catalog = &catalog });
+    catalog.deinit();
+    catalog = @import("../api/catalog.zig").Catalog.init(a);
+    try catalog.loadFromModelsListJson("{\"data\":[{\"id\":\"GLM-5.2\",\"max_tokens\":1111,\"max_input_tokens\":2222}]} ");
+    var inherited = try reg.makeProvider();
+    defer inherited.deinit();
+    try std.testing.expectEqual(@as(u32, 64000), inherited.provider().maxTokensFor("glm-5.2"));
+    try std.testing.expectEqual(@as(u32, 1048576), inherited.provider().maxInputTokensFor("GLM-5.2"));
+    try reg.setLimits(.{ .catalog = &catalog });
+    var refreshed = try reg.makeProvider();
+    defer refreshed.deinit();
+    try std.testing.expectEqual(@as(u32, 1111), refreshed.provider().maxTokensFor("GLM-5.2"));
+    try std.testing.expectEqual(@as(u32, 2222), refreshed.provider().maxInputTokensFor("GLM-5.2"));
+    try reg.setLimits(.{});
+    var fallback = try reg.makeProvider();
+    defer fallback.deinit();
+    try std.testing.expectEqual(@as(u32, 32000), fallback.provider().maxTokensFor("GLM-5.2"));
+    try std.testing.expectEqual(@as(u32, 200000), fallback.provider().maxInputTokensFor("GLM-5.2"));
 }

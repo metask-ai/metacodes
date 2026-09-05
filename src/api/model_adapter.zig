@@ -21,6 +21,7 @@
 //! 调研来源:各厂商 chat_template.jinja / OpenAPI spec / 官方文档(2025-08 快照)。
 
 const std = @import("std");
+const model_name = @import("model_name.zig");
 
 /// thinking 控制模式:决定 reasoning_effort 如何翻译到 wire 格式。
 pub const ThinkingMode = enum {
@@ -279,7 +280,7 @@ fn openaiNativeVision(model: []const u8) bool {
 /// o 系推理模型名以 "oN" 开头且后随边界(结尾/'-'/'.'):o1、o3-pro、o4-mini-2025 命中;
 /// marco-o1、skywork-o1、olmo-4 等不命中。
 fn oSeriesPrefix(model: []const u8, prefix: []const u8) bool {
-    if (!std.mem.startsWith(u8, model, prefix)) return false;
+    if (!model_name.startsWithIgnoreCase(model, prefix)) return false;
     if (model.len == prefix.len) return true;
     return model[prefix.len] == '-' or model[prefix.len] == '.';
 }
@@ -348,7 +349,7 @@ pub fn minimaxM3ThinkingType(effort: ?@import("../types.zig").ReasoningEffort) [
 }
 
 pub fn hasSubstr(haystack: []const u8, needle: []const u8) bool {
-    return std.mem.indexOf(u8, haystack, needle) != null;
+    return model_name.containsIgnoreCase(haystack, needle);
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────────

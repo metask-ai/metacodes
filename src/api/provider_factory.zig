@@ -17,6 +17,7 @@ const provider_mod = @import("provider.zig");
 const types = @import("../types.zig");
 const dialect_mod = @import("dialect.zig");
 const auth_header_mod = @import("auth_header.zig");
+const limits_mod = @import("model_limits.zig");
 
 /// 三选一具体 client。tagged union(ProviderKind)→ "kind 说 X 但字段 null" 的非法态
 /// 编译期不可表示(遵 CLAUDE.md "Make Illegal States Unrepresentable")。
@@ -103,6 +104,7 @@ pub fn makeProvider(
 /// child agents authenticate the same way the parent does.
 pub const Options = struct {
     auth_scheme: ?auth_header_mod.AuthScheme = null,
+    limits: ?limits_mod.ModelLimitsSource = null,
 };
 
 /// Runtime-scoped provider construction. The resolver is a borrowed immutable
@@ -143,23 +145,40 @@ pub fn makeProviderWithOptions(
     const owned: OwnedClient = switch (kind) {
         .anthropic => blk: {
             const c = try a.create(client_mod.Client);
+            errdefer {
+                c.deinit();
+                a.destroy(c);
+            }
             c.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), api_key, model, base_url);
             c.dialect_resolver = dialect_resolver;
             c.auth_scheme = options.auth_scheme;
+            if (options.limits) |limits| {
+                if (limits.catalog) |catalog| c.catalog = try catalog.clone(a);
+                c.model_context = limits.model_context;
+                c.max_tokens_override = limits.max_tokens_override;
+            }
             break :blk .{ .anthropic = c };
         },
         .openai => blk: {
             const c = try a.create(openai_mod.OpenAIClient);
+            // No fallible work follows this allocation, so no errdefer is needed.
             c.* = openai_mod.OpenAIClient.init(a, io_rt.io(), api_key, model, base_url);
             c.protocol = openai_protocol;
             c.dialect_resolver = dialect_resolver;
             c.auth_scheme = options.auth_scheme;
+            if (options.limits) |limits| {
+                c.model_context = limits.model_context;
+            }
             break :blk .{ .openai = c };
         },
         .gemini => blk: {
             const c = try a.create(gemini_mod.GeminiClient);
+            // No fallible work follows this allocation, so no errdefer is needed.
             c.* = gemini_mod.GeminiClient.init(a, io_rt.io(), api_key, model, base_url);
             c.dialect_resolver = dialect_resolver;
+            if (options.limits) |limits| {
+                c.model_context = limits.model_context;
+            }
             break :blk .{ .gemini = c };
         },
     };
@@ -182,4 +201,38 @@ test "makeProvider:三 kind 各造对应 client + provider() 出中立 vtable" {
             try std.testing.expect(op.anthropicClient() == null);
         }
     }
+}
+
+test "provider factory limits inherit and defaults remain provider specific" {
+    const a = std.testing.allocator;
+    var catalog = @import("catalog.zig").Catalog.init(a);
+    defer catalog.deinit();
+    try catalog.loadFromModelsListJson("{\"data\":[{\"id\":\"GLM-5.2\",\"max_tokens\":64000,\"max_input_tokens\":1048576}]} ");
+    var context = @import("../app/model_context.zig").ModelContext.init(a);
+    defer context.deinit();
+    context.parse("[models]\n\"gpt-5\" = 400000\n");
+
+    const limits = limits_mod.ModelLimitsSource{ .catalog = &catalog, .model_context = &context };
+    var anthropic = try makeProviderWithOptions(a, .anthropic, "test-key", "GLM-5.2", null, .chat_completions, .builtin(), .{ .limits = limits });
+    defer anthropic.deinit();
+    try std.testing.expectEqual(@as(u32, 64000), anthropic.provider().maxTokensFor("glm-5.2"));
+    try std.testing.expectEqual(@as(u32, 1048576), anthropic.provider().maxInputTokensFor("GLM-5.2"));
+
+    var openai = try makeProviderWithOptions(a, .openai, "test-key", "gpt-5", null, .chat_completions, .builtin(), .{ .limits = limits });
+    defer openai.deinit();
+    try std.testing.expectEqual(@as(u32, 400000), openai.provider().maxInputTokensFor("GPT-5-mini"));
+    try std.testing.expectEqual(@as(u32, 4096), openai.provider().maxTokensFor("gpt-5"));
+
+    var overridden = try makeProviderWithOptions(a, .anthropic, "test-key", "GLM-5.2", null, .chat_completions, .builtin(), .{ .limits = .{ .catalog = &catalog, .max_tokens_override = 1234 } });
+    defer overridden.deinit();
+    try std.testing.expectEqual(@as(u32, 1234), overridden.provider().maxTokensFor("GLM-5.2"));
+
+    var anthropic_default = try makeProvider(a, .anthropic, "test-key", "unknown", null);
+    defer anthropic_default.deinit();
+    try std.testing.expectEqual(@as(u32, 200000), anthropic_default.provider().maxInputTokensFor("unknown"));
+    try std.testing.expectEqual(@as(u32, 32000), anthropic_default.provider().maxTokensFor("unknown"));
+    var openai_default = try makeProvider(a, .openai, "test-key", "unknown", null);
+    defer openai_default.deinit();
+    try std.testing.expectEqual(@as(u32, 128000), openai_default.provider().maxInputTokensFor("unknown"));
+    try std.testing.expectEqual(@as(u32, 4096), openai_default.provider().maxTokensFor("unknown"));
 }

@@ -445,6 +445,9 @@ transcript resume 恢复持久化的水位（没有该字段的旧记录一律�
 `DurableScope.transient` 结算：在途仍预留请求与 payload cap、超限仍是 resource limit，但不累加
 `estimated_usage_bytes`——子对话在返回时即被丢弃，只有最终文本会进入 Session（fork 根路径由
 `Controller.commitDurable` 一次性计入；model-tool 路径由父 `ToolEnvironment` 按工具结果计入）。
+Task/subagent 的 reasoning effort 解析顺序与 Codex 子代理对齐：AgentDef `effort` > Task `model`
+档位带出的 effort > 未换模型时继承父当前 effort（`/effort` 修改立即生效） > 换模型且未指定
+effort 时使用该模型默认值。
 
 **读代码给存在性,审计轨迹给频率**:`scripts/audit_trajectories.py` 扫已落盘的
 `transcript.jsonl`,报告各工具的结果大小分布、超预算条数、溢出后**有没有人来取**、以及
@@ -530,8 +533,12 @@ random id,所以后台命令跨 run 仍不逐字节一致。它不能简单换�
 **文件标识**与**模型可见句柄**分开,属于 JobRegistry 所有权议题(与 spool 清理同源)。删掉
 路径把暴露面收窄到每条后台命令一个短不透明 token,并且不再泄露宿主临时目录,但没有做完。
 
-**预算按真正会被请求的模型解析**:subagent 与父**共享 Provider**,只靠 `model_override`
-区分。`Provider.maxInputTokensFor(model_override)` / `maxTokensFor` 因此成为**所有**窗口/输出
+**预算按真正会被请求的模型解析**：subagent 的 per-call provider 通过
+`ModelLimitsSource` 由 App 在父 catalog 变化后主动发布到 registry；registry 持有 owned catalog
+快照（避免 `/model` 切换 deinit/rebuild 或并发 probe 造成 worker UAF），并借用 App 生命周期内
+只读的 ModelContext 与 max-tokens override；子仍按
+`model_override` 解析 `Provider.maxInputTokensFor(model_override)` / `maxTokensFor`，因此它们
+成为**所有**窗口/输出
 派生量的唯一入口——per-result 预算、turn 预算、auto-compact 阈值、请求估算体、request gate
 的准入、agentcore 的预算预留,一处都不能落。答不了 per-model 的 provider 回退到自身窗口
 (即历史行为)。拿父窗口给子算,就是把 200K 的历史发给 32K 端点。
