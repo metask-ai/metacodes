@@ -99,6 +99,7 @@ pub const api_error_class = @import("api/error_class.zig");
 pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
+pub const api_login_worker = @import("api/login_worker.zig"); // picker credential stage: a prepared login on a worker thread (#67)
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
@@ -115,6 +116,10 @@ pub const model_tiers = @import("api/model_tiers.zig"); // provider 内 low/mid/
 pub const json = @import("json.zig");
 pub const types = @import("types.zig");
 pub const config = @import("app/config.zig");
+/// Build identity rendering for --version (#78); build.zig hands the app the values, the library only formats them.
+pub const version_info = @import("version_info.zig");
+/// metacodes doctor (#78): pure resolution report for the runtime binaries.
+pub const doctor = @import("app/doctor.zig");
 
 // ── 工具 ─────────────────────────────────────────────────────────────────
 pub const tools = @import("tools.zig"); // registry + dispatch

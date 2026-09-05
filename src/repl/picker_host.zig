@@ -13,6 +13,7 @@ const picker_mod = @import("model_picker.zig");
 const view_mod = @import("model_picker_view.zig");
 const provider_login = @import("../api/provider_login.zig");
 const provider_host_mod = @import("../provider/host.zig");
+const login_worker_mod = @import("../api/login_worker.zig");
 
 pub const Key = picker_mod.Key;
 
@@ -36,6 +37,9 @@ pub fn open(app: *app_mod.App, ui: *ui_state.UiState) void {
 }
 
 pub fn close(app: *app_mod.App, ui: *ui_state.UiState) void {
+    // A picker that closes mid sign-in must not leave a thread waiting on
+    // a socket.
+    cancelLogin(app);
     ui.picker_open = false;
     app.model_picker.clearNotice();
 }
@@ -71,7 +75,88 @@ pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key) Result {
             return .redraw;
         },
         .commit => |commit| return apply(app, ui, commit),
+        // Only `enterCredentialStage` produces `.login`, never a key.
+        .login => unreachable,
+        .cancel_login => {
+            cancelLogin(app);
+            return .redraw;
+        },
     }
+}
+
+/// Called from the input loops' idle tick while the picker is open (#67):
+/// moves the worker's transcript into the picker and settles a finished
+/// login. A landed login refreshes the catalog and retries the pending commit,
+/// so the route the user chose is the one that becomes active.
+pub fn poll(app: *app_mod.App, ui: *ui_state.UiState) Result {
+    const worker = app.login_worker orelse return .ignored;
+    var transcript: [login_worker_mod.TRANSCRIPT_CAPACITY]u8 = undefined;
+    const changed = app.model_picker.setCredentialLines(worker.copyTranscript(&transcript));
+    switch (worker.currentState()) {
+        .idle => return .ignored,
+        .running => return if (changed) .redraw else .ignored,
+        .failed => {
+            app.model_picker.credentialFailed(worker.failureName());
+            finishLogin(app);
+            return .redraw;
+        },
+        .cancelled => {
+            finishLogin(app);
+            return .redraw;
+        },
+        .succeeded => {
+            finishLogin(app);
+            // The catalog is rebuilt so the route's credential is seen, then
+            // the commit the user asked for goes through the normal path.
+            app.refreshModelPicker() catch app.model_picker.markFailed();
+            if (app.model_picker.takePendingCommit()) |commit| return apply(app, ui, commit);
+            return .redraw;
+        },
+    }
+}
+
+/// A commit refused for want of a credential on an OAuth-capable provider
+/// becomes a sign-in inside the picker (#67): the kernel prepares the same
+/// login `/login` runs (so every refusal is the typed one), a worker thread
+/// runs it, and the picker enters its credential stage with the commit
+/// pending. Returns false when nothing was started and no notice was set.
+fn startLogin(app: *app_mod.App, commit: picker_mod.Commit) bool {
+    const host = app.providerHost() catch return false;
+    const provider = missingCredentialPointer(host, commit.offer_id) orelse return false;
+    const profile = host.registry.findById(provider) orelse return false;
+    const prepared = provider_login.prepareProfile(profile, .{}) catch |err| {
+        app.model_picker.setNotice("no credential for {s}, and /login {s} cannot start: {s}; the previous route is still active", .{
+            provider.slice(),
+            provider.slice(),
+            provider_login.refusalText(err, .loopback),
+        });
+        return true;
+    };
+    const worker = app.allocator.create(login_worker_mod.LoginWorker) catch return false;
+    worker.* = login_worker_mod.LoginWorker.init(app.allocator, app.io, prepared);
+    worker.start() catch {
+        app.allocator.destroy(worker);
+        return false;
+    };
+    app.login_worker = worker;
+    switch (app.model_picker.enterCredentialStage(provider, commit)) {
+        .login => {},
+        else => unreachable,
+    }
+    return true;
+}
+
+fn finishLogin(app: *app_mod.App) void {
+    const worker = app.login_worker orelse return;
+    worker.join();
+    app.allocator.destroy(worker);
+    app.login_worker = null;
+}
+
+fn cancelLogin(app: *app_mod.App) void {
+    const worker = app.login_worker orelse return;
+    worker.cancel();
+    finishLogin(app);
 }
 
 fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Result {
@@ -79,9 +164,10 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Re
         // issue #33: the route resolved; what is missing is a credential for
         // its provider. When the provider can be signed in to, say how.
         if (err == error.MissingCredentials) {
+            if (startLogin(app, commit)) return .redraw;
             const host = app.providerHost() catch null;
             if (host) |value| if (missingCredentialPointer(value, commit.offer_id)) |provider| {
-                app.model_picker.setNotice("no credential for {s}; sign in with /login {s}; the previous route is still active", .{ provider, provider });
+                app.model_picker.setNotice("no credential for {s}; sign in with /login {s}; the previous route is still active", .{ provider.slice(), provider.slice() });
                 return .redraw;
             };
         }
@@ -122,15 +208,15 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Re
     }
 }
 
-/// The provider to name in a `/login` pointer when a commit failed for want of
-/// a credential: the offer's provider, if a login could be stored for it at all
+/// The provider a commit that failed for want of a credential can be signed
+/// in to: the offer's provider, if a login could be stored for it at all
 /// (`provider_login.requireOAuthCapable`). Null means the notice has nothing
 /// better than the error to say.
-pub fn missingCredentialPointer(host: *provider_host_mod.Host, offer_id: ids_mod.OfferId) ?[]const u8 {
+pub fn missingCredentialPointer(host: *provider_host_mod.Host, offer_id: ids_mod.OfferId) ?picker_mod.Slug {
     const offer = host.kernel.catalogSnapshot().find(offer_id) orelse return null;
     const profile = host.registry.findById(offer.provider_id) orelse return null;
     provider_login.requireOAuthCapable(profile) catch return null;
-    return profile.id.slice();
+    return profile.id;
 }
 
 fn rejectionText(outcome: @import("../provider/control_plane.zig").ValidationOutcome) []const u8 {

@@ -10,7 +10,95 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- `.github/workflows/release.yml` (#82, #47 stage 7): `workflow_dispatch` with
+  `tag`, `dry_run` and `runner_pool`; one job per platform on the dedicated
+  `metacodes-release` runner label (the CI pool only for dry runs) running the
+  attested-asset checks, the ReleaseSafe suite, `release:verify`,
+  `agentcore:gate`, both archives and a byte-for-byte reproducibility check;
+  a `publish` job — the only one with `contents: write` — joins the checksums
+  and creates a *draft* GitHub Release with `--verify-tag`. The tag trigger
+  stays off until the runners exist; `doc/RELEASE_RUNNER.md` is their design.
+
+- `zig build release:archive` writes the immutable CLI release archive
+  (`metacodes-<version>-<target-id>.tar.gz` / `.zip` plus `.sha256`) from the
+  verified prefix, byte-identical across runs (fixed gzip name and mtime, no
+  owners or timestamps in members); `release:sums` joins the sidecars into
+  `metacodes-<version>-SHA256SUMS`. The archive core moved from
+  `package_agentcore.py` to `scripts/release_archive.py --kind agentcore|cli`;
+  a stable version archives only from a clean tree tagged with the bare
+  `X.Y.Z`, a pre-release from any commit, and the SDK keeps its historical
+  refusal text (#81, #47 stage 6).
+
+- The CLI release unit (#80, #47 stage 5): `zig build release:stage` installs
+  the product files plus `share/licenses/{metacodes-LICENSE, tinykg-LICENSE,
+  THIRD_PARTY_NOTICES.md}` and `share/doc/{README.md, CHANGELOG-<version>.md}`;
+  `release:manifest` writes `manifest.json` (`release/manifest.schema.json`,
+  `release/manifest_contract.zig`, `release/LAYOUT.md`) from git, the vendored
+  manifests and the installed files; `release:check` runs the static checks
+  and `release:verify` also the executable-running ones on the native target
+  (`scripts/verify_release_bundle.py`). A version without a pre-release part is
+  the stable channel and requires a clean tree tagged with the bare `X.Y.Z`;
+  main now carries `0.2.0-dev`, and `--version` reports `0.2.0-dev+<commit12>`
+  exactly as the manifest does. The repository gains its MIT `LICENSE`.
+
+- The default install stages the vendored ripgrep beside the executable as
+  `bin/rg[.exe]` with its MIT notice under `share/licenses/`, and the new
+  `zig build release:stage -Drelease-layout=true` installs the release layout,
+  failing closed for a target without vendored runtime assets (aarch64-linux
+  until #86). Under the release layout the executable resolves rg as `RG_BIN`
+  → its own directory → `PATH` (the development order is unchanged), and
+  `verify_install_prefix.py --release --doctor` proves it on the installed
+  prefix in CI (#79, #47 stage 4, B2).
+
+- `metacodes --version` prints the build identity after its unchanged first
+  line, and `--version --json` emits it as one document: commit and dirty
+  state, Zig, target, optimize mode, release layout, AgentCore ABI version and
+  revision, config schema version, and the ripgrep / TinyKG versions with the
+  digests pinned for the target. `build.zig` fixes every value at configure
+  time from its source (`-Dbuild-commit` names the commit for an exported
+  tree; `-Drelease-layout` records the layout), and the runtime smoke checks
+  the document against `sdk/zig/types.zig` and the vendored manifests with
+  the real binary. `metacodes doctor [--json] [--strict]` reports where ripgrep
+  and TinyKG resolve from and whether their digests match the pinned ones;
+  `verify_install_prefix.py --doctor` runs it on the installed prefix in CI
+  (#78, #47 stage 3).
+
+- The model picker signs in without leaving the overlay (#67): a commit that
+  fails for want of a credential on an OAuth-capable provider runs the kernel
+  login on a worker thread, draws the authorization URL or device code in the
+  picker, cancels on `Esc`, and commits the chosen route once the login lands.
+  The OAuth loopback wait and the device-code poll honour an `AbortSignal`
+  (`platform/net.pollReadable`), so a login abandoned in the TUI no longer
+  blocks until its timeout.
+
+### Changed
+
+- The default `zig build` installs only the release executable and the TinyKG
+  bundle (B1, #77): `metacodes-debug` comes from `zig build dev`, and
+  `mock_mcp_server` / `replay_server` from the new `zig build test:harness`;
+  the TTY and e2e steps depend on those installs explicitly.
+  `scripts/verify_install_prefix.py` asserts the exact prefix contents and runs
+  in CI on every platform.
+
 ### Fixed
+
+- The Bash tool's spilled stdout/stderr are sealed during execution as attachments
+  of its inline result and published by the batch commit boundary, like every
+  other tool result since #45/#65; a fatal sibling in the same batch leaves no
+  blob, and a channel whose publication fails has its artifact id withdrawn from
+  the JSON (`<channel>_artifact_id: null`, `<channel>_storage_error`,
+  `<channel>_recoverable: false`) instead of dangling. `tool_result.SealedHandles`
+  carries up to two handles per result through `tool_exec` and the prefetch;
+  `artifact_store.sealFileCopy` seals a copy of a foreign private file. Callers
+  without a batch boundary (`!cmd`, embedders) keep the execution-time resolution
+  through `bash.execute`. The MCP projector's above-frame-limit result range
+  (`mcp_result_stream.publishRange`, classic client and AgentCore runtime alike)
+  and the AgentCore durable-budget promotion (`promoteInline`) seal too, so no
+  producer publishes a tool result into the CAS during execution any more; a
+  publication that fails at the boundary for a result above the retention ceiling
+  is the bounded `ArtifactPublishFailed` tool error (#73).
 
 - `scripts/build-project-harness-kernel.sh` failed its first smoke on every
   platform (`invalid project harness request: expected ,`, exit 64): the

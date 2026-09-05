@@ -30,6 +30,7 @@ pub const MediaType = enum {
 
 pub const InlineResult = struct {
     bytes: []u8,
+    attachments: SealedHandles = .{},
 };
 
 pub const ArtifactReceipt = struct {
@@ -47,6 +48,73 @@ pub const SealedArtifact = struct {
     /// tools keep the per-result ceiling; the MCP client keeps the bytes it
     /// already materialized up to its frame limit (#65).
     retain_inline_ceiling: u64 = result_budget.PER_RESULT_MAX_BYTES,
+    /// Set when this handle is an *attachment* of an inline body rather than
+    /// the body itself (#73): the Bash result JSON embeds one artifact id per
+    /// channel under this label ("stdout", "stderr"). A failed publication
+    /// withdraws that id from the JSON instead of leaving a dangling promise.
+    attachment_label: ?[]const u8 = null,
+};
+/// The most handles one tool result carries: a `.sealed` body has one, a
+/// Bash inline body has one attachment per channel (stdout, stderr).
+pub const MAX_SEALED_HANDLES: usize = 2;
+
+/// The sealed handles one tool result carries to the batch commit boundary
+/// (#73): either the single handle of a `.sealed` body, or the attachments of
+/// an inline body. Fixed capacity, no allocation; the handles own their
+/// private spool files until `discard`/`deinit`.
+pub const SealedHandles = struct {
+    items: [MAX_SEALED_HANDLES]?SealedArtifact = .{ null, null },
+    len: u8 = 0,
+
+    pub fn isEmpty(self: *const SealedHandles) bool {
+        return self.len == 0;
+    }
+
+    pub fn append(self: *SealedHandles, handle: SealedArtifact) error{TooManySealedHandles}!void {
+        if (self.len >= MAX_SEALED_HANDLES) return error.TooManySealedHandles;
+        self.items[self.len] = handle;
+        self.len += 1;
+    }
+
+    /// Move the handles out; `self` is left empty.
+    pub fn take(self: *SealedHandles) SealedHandles {
+        const out = self.*;
+        self.* = .{};
+        return out;
+    }
+
+    pub fn slice(self: *SealedHandles) []?SealedArtifact {
+        return self.items[0..self.len];
+    }
+
+    /// Unlink every still-sealed private file and release the handles.
+    pub fn discard(self: *SealedHandles) void {
+        for (self.slice()) |*maybe| {
+            if (maybe.*) |*handle| handle.spool.discard();
+        }
+        self.deinit();
+    }
+
+    /// Release the handles; a still-sealed file is unlinked by `SealedSpool.deinit`.
+    pub fn deinit(self: *SealedHandles) void {
+        for (self.slice()) |*maybe| {
+            if (maybe.*) |*handle| handle.spool.deinit();
+        }
+        self.* = .{};
+    }
+
+    /// Re-home every handle into `allocator` (see `SealedSpool.adopt`). On
+    /// failure the handles are discarded and nothing dangles.
+    pub fn adopt(self: *SealedHandles, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+        for (self.slice()) |*maybe| {
+            if (maybe.*) |*handle| {
+                handle.spool = handle.spool.adopt(allocator) catch {
+                    self.discard();
+                    return error.OutOfMemory;
+                };
+            }
+        }
+    }
 };
 
 /// A validated, bounded model-visible error. Construction is deliberately
@@ -116,28 +184,35 @@ pub const ToolResultBody = union(enum) {
         return .{ .structured_error = try StructuredToolError.init(allocator, encoded) };
     }
 
-    /// Promote a completed legacy inline result into the Session CAS. The
-    /// union changes tag only after fsync + verified publication succeeds.
+    /// Promote an oversized inline result into the artifact plane: the bytes
+    /// are sealed as a `.sealed` body whose envelope the model sees, and the
+    /// batch commit boundary publishes the blob (#73; before that this
+    /// published during the call). The union changes tag only after the seal
+    /// succeeds, so a failure leaves the inline body untouched. An inline body
+    /// that carries attachments resolves them first — its bytes embed their
+    /// ids, and a sealed body holds no second handle — which is the one place
+    /// an attachment still publishes at execution time.
     pub fn promoteInline(
         self: *ToolResultBody,
         allocator: std.mem.Allocator,
         session_root: []const u8,
     ) !bool {
         const bytes = switch (self.*) {
-            .@"inline" => |inline_result| inline_result.bytes,
+            .@"inline" => |*inline_result| blk: {
+                if (!inline_result.attachments.isEmpty()) {
+                    inline_result.bytes = try resolveAttachments(allocator, inline_result.bytes, &inline_result.attachments);
+                }
+                break :blk inline_result.bytes;
+            },
             .artifact, .sealed, .structured_error => return false,
         };
         var spool = try artifact_store.Spool.begin(allocator, session_root);
-        defer spool.deinit();
+        defer spool.deinit(); // a no-op once `seal` has taken the buffers
         try spool.write(bytes);
-        const completed = try spool.finish();
+        const sealed = try spool.seal();
         const media_type = detectMediaType(bytes);
         allocator.free(bytes);
-        self.* = .{ .artifact = .{
-            .stored = completed.receipt,
-            .preview = completed.preview,
-            .media_type = media_type,
-        } };
+        self.* = .{ .sealed = .{ .spool = sealed, .media_type = media_type, .capture_complete = true } };
         return true;
     }
 
@@ -180,8 +255,10 @@ pub const ToolResultBody = union(enum) {
     pub fn takeModelBytes(self: *ToolResultBody, allocator: std.mem.Allocator) !Taken {
         return switch (self.*) {
             .@"inline" => |result| blk: {
+                var handles = result.attachments;
+                const bytes = try resolveAttachments(allocator, result.bytes, &handles);
                 self.* = .{ .@"inline" = .{ .bytes = &.{} } };
-                break :blk .{ .bytes = result.bytes, .is_error = false };
+                break :blk .{ .bytes = bytes, .is_error = false };
             },
             .structured_error => |result| blk: {
                 self.* = .{ .@"inline" = .{ .bytes = &.{} } };
@@ -230,7 +307,11 @@ pub const ToolResultBody = union(enum) {
 
     pub fn deinit(self: *ToolResultBody, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .@"inline" => |result| allocator.free(result.bytes),
+            .@"inline" => |result| {
+                allocator.free(result.bytes);
+                var handles = result.attachments;
+                handles.discard();
+            },
             .structured_error => |result| allocator.free(result.encoded),
             .artifact => {},
             .sealed => |*result| result.spool.deinit(),
@@ -247,7 +328,85 @@ pub const ToolResultBody = union(enum) {
             else => null,
         };
     }
+    pub fn takeSealedHandles(self: *ToolResultBody) SealedHandles {
+        return switch (self.*) {
+            .sealed => |result| blk: {
+                var h = SealedHandles{};
+                h.append(result) catch unreachable;
+                self.* = .{ .@"inline" = .{ .bytes = &.{} } };
+                break :blk h;
+            },
+            // The bytes stay with the body; only the handles move.
+            .@"inline" => |*result| result.attachments.take(),
+            else => .{},
+        };
+    }
 };
+
+/// Replace the first occurrence of `needle` in `haystack`; a copy of the
+/// input when it does not occur.
+fn replaceOnce(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) error{OutOfMemory}![]u8 {
+    const pos = std.mem.indexOf(u8, haystack, needle) orelse return allocator.dupe(u8, haystack);
+    const out = try allocator.alloc(u8, haystack.len - needle.len + replacement.len);
+    @memcpy(out[0..pos], haystack[0..pos]);
+    @memcpy(out[pos..][0..replacement.len], replacement);
+    @memcpy(out[pos + replacement.len ..], haystack[pos + needle.len ..]);
+    return out;
+}
+
+/// Withdraw one channel's artifact from a `metacodes.bash-result.v2` body whose
+/// publication failed at the commit boundary (#73). Two exact substrings are
+/// rewritten, both emitted by `bash.zig`'s `appendChannel` (a test there pins
+/// the two producers together): `"<label>_artifact_id":"<id>"` becomes
+/// `"<label>_artifact_id":null,"<label>_storage_error":"<code>"`, and the
+/// recovery hint `,"<label>_recoverable":true,"<label>_read":{...}` becomes
+/// `,"<label>_recoverable":false`. Either substring being absent leaves that
+/// part unchanged; the result is always a fresh allocation.
+pub fn withdrawAttachmentFromJson(
+    allocator: std.mem.Allocator,
+    json: []const u8,
+    label: []const u8,
+    artifact_id: []const u8,
+    storage_error: []const u8,
+) error{OutOfMemory}![]u8 {
+    const id_needle = try std.fmt.allocPrint(allocator, "\"{s}_artifact_id\":\"{s}\"", .{ label, artifact_id });
+    defer allocator.free(id_needle);
+    const id_replacement = try std.fmt.allocPrint(allocator, "\"{s}_artifact_id\":null,\"{s}_storage_error\":\"{s}\"", .{ label, label, storage_error });
+    defer allocator.free(id_replacement);
+    const hint_needle = try std.fmt.allocPrint(
+        allocator,
+        ",\"{s}_recoverable\":true,\"{s}_read\":{{\"tool\":\"ReadArtifact\",\"artifact_id\":\"{s}\",\"offset\":0,\"limit_max\":32768}}",
+        .{ label, label, artifact_id },
+    );
+    defer allocator.free(hint_needle);
+    const hint_replacement = try std.fmt.allocPrint(allocator, ",\"{s}_recoverable\":false", .{label});
+    defer allocator.free(hint_replacement);
+
+    const first = try replaceOnce(allocator, json, id_needle, id_replacement);
+    defer allocator.free(first);
+    return replaceOnce(allocator, first, hint_needle, hint_replacement);
+}
+
+/// Publish the attachments of an inline body at the commit boundary (#73).
+/// `bytes` is the rendered body (owned by the caller); when a publication
+/// fails the corresponding id is withdrawn from it and the rewritten bytes are
+/// returned (the input is freed); otherwise `bytes` is returned as is. The
+/// handles are released either way. Handles that are not attachments
+/// (`attachment_label == null`) are left to the caller.
+pub fn resolveAttachments(allocator: std.mem.Allocator, bytes: []u8, handles: *SealedHandles) error{OutOfMemory}![]u8 {
+    var out = bytes;
+    for (handles.slice()) |*maybe| {
+        const handle = if (maybe.*) |*value| value else continue;
+        const label = handle.attachment_label orelse continue;
+        if (handle.spool.publish()) |_| continue else |err| {
+            const rewritten = try withdrawAttachmentFromJson(allocator, out, label, handle.spool.receipt().id(), artifact_store.storageErrorCode(err));
+            allocator.free(out);
+            out = rewritten;
+        }
+    }
+    handles.deinit();
+    return out;
+}
 
 pub fn renderArtifactEnvelope(allocator: std.mem.Allocator, result: ArtifactReceipt) error{OutOfMemory}![]u8 {
     return renderArtifactEnvelopeFallible(allocator, result) catch error.OutOfMemory;
@@ -330,7 +489,9 @@ test "ToolResultBody promotes inline bytes to one recoverable artifact envelope"
     var body = ToolResultBody.initInline(try allocator.dupe(u8, "head-streamed-body-tail"));
     defer body.deinit(allocator);
     try std.testing.expect(try body.promoteInline(allocator, root));
-    try std.testing.expect(body == .artifact);
+    // Promoted = sealed (#73): the envelope is renderable now, the blob lands
+    // when the batch commits.
+    try std.testing.expect(body == .sealed);
     var rendered = try body.render(allocator);
     defer rendered.deinit(allocator);
     try std.testing.expect(std.mem.startsWith(u8, rendered.bytes, ENVELOPE_PREFIX ++ "\"artifact\""));
@@ -442,4 +603,89 @@ test "deinit after takeSealed is a no-op" {
     defer a.free(bytes);
     try std.testing.expectEqualStrings("taken", bytes);
     handle.spool.deinit();
+}
+
+// ── #73: attachments of an inline body ───────────────────────────────────────
+
+fn testSealedAttachment(allocator: std.mem.Allocator, root: []const u8, label: []const u8, payload: []const u8) !SealedArtifact {
+    var spool = try artifact_store.Spool.begin(allocator, root);
+    defer spool.deinit();
+    try spool.write(payload);
+    return .{ .spool = try spool.seal(), .media_type = .text_utf8, .capture_complete = true, .attachment_label = label };
+}
+
+test "withdrawAttachmentFromJson rewrites both id sites of one channel and nothing else" {
+    const a = std.testing.allocator;
+    const id = "sha256:" ++ ("a" ** 64);
+    const body = "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"x\",\"stdout_artifact_id\":\"" ++ id ++
+        "\",\"stdout_recoverable\":true,\"stdout_read\":{\"tool\":\"ReadArtifact\",\"artifact_id\":\"" ++ id ++
+        "\",\"offset\":0,\"limit_max\":32768},\"stderr\":\"\",\"stderr_artifact_id\":null,\"stderr_recoverable\":true,\"exit_code\":0}";
+    const out = try withdrawAttachmentFromJson(a, body, "stdout", id, "session_quota_exceeded");
+    defer a.free(out);
+    try std.testing.expectEqualStrings(
+        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"x\",\"stdout_artifact_id\":null,\"stdout_storage_error\":\"session_quota_exceeded\"" ++
+            ",\"stdout_recoverable\":false,\"stderr\":\"\",\"stderr_artifact_id\":null,\"stderr_recoverable\":true,\"exit_code\":0}",
+        out,
+    );
+    // Still JSON after the surgery.
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("stdout_artifact_id").? == .null);
+    // A body without that channel's id is copied unchanged.
+    const untouched = try withdrawAttachmentFromJson(a, "{\"stderr_artifact_id\":null}", "stdout", id, "x");
+    defer a.free(untouched);
+    try std.testing.expectEqualStrings("{\"stderr_artifact_id\":null}", untouched);
+}
+
+test "SealedHandles holds two attachments, refuses a third, and takeSealedHandles empties the body" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &b);
+    const root = b[0..n];
+    var body = ToolResultBody.initInline(try a.dupe(u8, "{}"));
+    defer body.deinit(a);
+    try body.@"inline".attachments.append(try testSealedAttachment(a, root, "stdout", "out-bytes"));
+    try body.@"inline".attachments.append(try testSealedAttachment(a, root, "stderr", "err-bytes"));
+    var third = try testSealedAttachment(a, root, "extra", "x");
+    defer third.spool.deinit();
+    try std.testing.expectError(error.TooManySealedHandles, body.@"inline".attachments.append(third));
+    third.spool.discard();
+    var handles = body.takeSealedHandles();
+    defer handles.discard();
+    try std.testing.expectEqual(@as(u8, 2), handles.len);
+    try std.testing.expect(body.@"inline".attachments.isEmpty());
+    try std.testing.expectEqualStrings("stdout", handles.items[0].?.attachment_label.?);
+    // The body's own bytes survive the take; only the handles moved.
+    try std.testing.expectEqualStrings("{}", body.@"inline".bytes);
+}
+
+test "resolveAttachments publishes what it can and withdraws what it cannot" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &b);
+    const root = b[0..n];
+    var handles = SealedHandles{};
+    try handles.append(try testSealedAttachment(a, root, "stdout", "out-bytes"));
+    try handles.append(try testSealedAttachment(a, root, "stderr", "err-bytes"));
+    const out_id = try a.dupe(u8, handles.items[0].?.spool.receipt().id());
+    defer a.free(out_id);
+    const err_id = try a.dupe(u8, handles.items[1].?.spool.receipt().id());
+    defer a.free(err_id);
+    // A discarded handle cannot publish: that is the failure the loop meets at the commit boundary.
+    handles.items[1].?.spool.discard();
+    const body = try std.fmt.allocPrint(a, "{{\"stdout_artifact_id\":\"{s}\",\"stdout_recoverable\":true,\"stdout_read\":{{\"tool\":\"ReadArtifact\",\"artifact_id\":\"{s}\",\"offset\":0,\"limit_max\":32768}},\"stderr_artifact_id\":\"{s}\",\"stderr_recoverable\":true,\"stderr_read\":{{\"tool\":\"ReadArtifact\",\"artifact_id\":\"{s}\",\"offset\":0,\"limit_max\":32768}}}}", .{ out_id, out_id, err_id, err_id });
+    const resolved = try resolveAttachments(a, body, &handles);
+    defer a.free(resolved);
+    try std.testing.expect(handles.isEmpty());
+    try std.testing.expect(std.mem.indexOf(u8, resolved, out_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, err_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"stderr_artifact_id\":null,\"stderr_storage_error\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"stderr_recoverable\":false") != null);
+    var chunk = try artifact_store.readChunk(a, root, out_id, 0, 9);
+    defer chunk.deinit();
+    try std.testing.expectEqualStrings("out-bytes", chunk.bytes);
 }

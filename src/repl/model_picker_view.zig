@@ -24,6 +24,8 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
     var rows: u16 = 0;
     rows += header(picker, w, th);
 
+    if (picker.stage == .credential) return rows + credentialBody(picker, w, th, cols);
+
     var scratch: [Picker.MAX_ROWS]Row = undefined;
     const visible = picker.rows(&scratch);
     if (visible.len == 0) {
@@ -67,8 +69,10 @@ fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
         .model => "Model",
         .offer => "Channel / offer",
         .options => "Options",
+        .credential => "sign in",
     };
     w.print("  {s}{s}{s}", .{ th.accent, title, th.reset }) catch {};
+    if (picker.stage == .credential) if (picker.credential_provider) |p| w.print(" to {s}", .{p.slice()}) catch {};
     if (picker.filter_len > 0) {
         w.print(" {s}/{s}{s}", .{ th.dim, picker.filter(), th.reset }) catch {};
     }
@@ -269,6 +273,51 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
     ) catch {};
     newline(w);
     return 2;
+}
+
+/// The sign-in transcript in place of the list (#67): the flow's lines — the
+/// URL to open, a device code — wrapped to the width so a URL stays readable,
+/// oldest dropped when they do not fit the window, then how to leave.
+fn credentialBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
+    const width = @max(cols -| 2, 8);
+    const budget = @max(picker.page_rows, 1);
+    const text = picker.credentialLines();
+    var total: usize = 0;
+    var count_it = std.mem.splitScalar(u8, text, '\n');
+    while (count_it.next()) |line_text| total += wrappedCount(line_text.len, width);
+    var skip = if (total > budget) total - budget else 0;
+
+    var rows: u16 = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line_text| {
+        var start: usize = 0;
+        while (true) {
+            const end = @min(start + width, line_text.len);
+            if (skip > 0) {
+                skip -= 1;
+            } else {
+                line(w);
+                w.print("  {s}", .{line_text[start..end]}) catch {};
+                newline(w);
+                rows += 1;
+            }
+            if (end >= line_text.len) break;
+            start = end;
+        }
+    }
+    line(w);
+    if (picker.credential_failed) {
+        w.print("  {s}{s}{s}", .{ th.warn, picker.notice(), th.reset }) catch {};
+    } else {
+        w.print("  {s}Esc cancels the sign-in{s}", .{ th.dim, th.reset }) catch {};
+    }
+    newline(w);
+    return rows + 1;
+}
+
+fn wrappedCount(len: usize, width: usize) usize {
+    if (len == 0) return 1;
+    return (len + width - 1) / width;
 }
 
 fn line(w: *std.Io.Writer) void {
@@ -519,4 +568,31 @@ test "an option row shows the vocabulary and marks an unsettable control" {
     try testing.expect(std.mem.indexOf(u8, text, "higher cost and latency") != null);
     // A control the picker cannot set must say so rather than look broken.
     try testing.expect(std.mem.indexOf(u8, text, "(not settable here)") != null);
+}
+
+test "the credential stage draws the sign-in transcript, wrapped, and the Esc hint" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var offers = [_]control_plane.OfferSummary{richOffer()};
+    try seed(&picker, &offers, null);
+    picker.page_rows = 6;
+    _ = picker.onKey(.enter); // provider
+    const outcome = picker.onKey(.enter); // one route → commit
+    try testing.expect(outcome == .commit);
+    _ = picker.enterCredentialStage(ids.Slug.lit("zai"), outcome.commit);
+    _ = picker.setCredentialLines("Open this URL to authorize:\nhttps://example.test/authorize?client_id=c&state=s0123456789abcdef&code_challenge=xyz\n");
+
+    var buffer: [8192]u8 = undefined;
+    const text = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "sign in") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Open this URL to authorize:") != null);
+    // The URL is longer than the width `draw` renders at; every character of
+    // it must still be on screen, split across lines rather than cut.
+    try testing.expect(std.mem.indexOf(u8, text, "code_challenge=xyz") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Esc cancels the sign-in") != null);
+
+    picker.credentialFailed("ConnectionRefused");
+    const failed_text = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, failed_text, "sign-in failed (ConnectionRefused)") != null);
+    try testing.expect(std.mem.indexOf(u8, failed_text, "Esc cancels the sign-in") == null);
 }

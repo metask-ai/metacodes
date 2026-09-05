@@ -542,13 +542,24 @@ pub const KgClient = struct {
     /// 算成错误的 zig-out/vendor 位置→ 与 staged artifact 分离 → 静默
     /// 落到会漂移的 dev 树 → "dev degraded"。新版:selfExeDirPath 真实定位(不依赖 argv[0])
     /// + 向上逐级搜(兼容 zig-out/bin 与 <prefix>/bin 布局)+ dev 兜底改 opt-in(默认绝不静默落 dev)。
-    fn resolveBinPath(allocator: std.mem.Allocator, opts: ResolveOptions) !?[]u8 {
+    pub const BinarySource = enum { env, config, adjacent };
+    pub const ResolvedBinary = struct {
+        path: []u8,
+        source: BinarySource,
+
+        pub fn deinit(self: *ResolvedBinary, allocator: std.mem.Allocator) void {
+            allocator.free(self.path);
+        }
+    };
+
+    /// Pure: stats candidate paths only; never creates a Store, never contacts a daemon (#30 lesson).
+    pub fn resolveTinykgBinary(allocator: std.mem.Allocator, opts: ResolveOptions) !?ResolvedBinary {
         if (opts.env_bin orelse envGet("METACODES_KG_BIN")) |v| {
-            if (v.len > 0 and isExecutable(v)) return try allocator.dupe(u8, v);
+            if (v.len > 0 and isExecutable(v)) return .{ .path = try allocator.dupe(u8, v), .source = .env };
             if (v.len > 0) return null; // 显式指定但不可用 → 不静默回落,degraded 明示
         }
         if (opts.config_bin) |v| {
-            if (v.len > 0 and isExecutable(v)) return try allocator.dupe(u8, v);
+            if (v.len > 0 and isExecutable(v)) return .{ .path = try allocator.dupe(u8, v), .source = .config };
             if (v.len > 0) return null;
         }
         // staged:真实 exe 目录(opts.exe_dir 为测试注入覆盖;否则 OS 级 selfExeDir)
@@ -556,8 +567,14 @@ pub const KgClient = struct {
         var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
         const exe_dir: ?[]const u8 = opts.exe_dir orelse selfExeDir(&exe_buf);
         if (exe_dir) |dir| {
-            if (try findStagedAdjacent(allocator, dir)) |p| return p;
+            if (try findStagedAdjacent(allocator, dir)) |p| return .{ .path = p, .source = .adjacent };
         }
+        return null;
+    }
+
+    fn resolveBinPath(allocator: std.mem.Allocator, opts: ResolveOptions) !?[]u8 {
+        var resolved = try resolveTinykgBinary(allocator, opts);
+        if (resolved) |*value| return value.path;
         return null;
     }
 
@@ -3112,6 +3129,80 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
     var c3 = try KgClient.init(a, .{ .home = "/home/u", .domain = "p", .env_store = "", .env_bin = "" });
     defer c3.deinit();
     try testing.expectEqualStrings("/home/u/.metacodes/kg/store.kg", c3.store.fsPath().?);
+}
+
+test "resolveTinykgBinary: env and config sources, from an executable it did not create" {
+    const a = std.testing.allocator;
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = @import("platform").paths.selfExePath(&exe_buf) orelse return error.SkipZigTest;
+
+    var from_env = (try KgClient.resolveTinykgBinary(a, .{ .home = "", .domain = "", .env_bin = exe })).?;
+    defer from_env.deinit(a);
+    try std.testing.expectEqual(KgClient.BinarySource.env, from_env.source);
+    try std.testing.expectEqualStrings(exe, from_env.path);
+
+    var from_config = (try KgClient.resolveTinykgBinary(a, .{ .home = "", .domain = "", .env_bin = "", .config_bin = exe })).?;
+    defer from_config.deinit(a);
+    try std.testing.expectEqual(KgClient.BinarySource.config, from_config.source);
+    try std.testing.expectEqualStrings(exe, from_config.path);
+}
+
+test "resolveTinykgBinary: an explicit but unusable env binary does not fall through to config" {
+    const a = std.testing.allocator;
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = @import("platform").paths.selfExePath(&exe_buf) orelse return error.SkipZigTest;
+    const result = try KgClient.resolveTinykgBinary(a, .{
+        .home = "",
+        .domain = "",
+        .env_bin = "/definitely/missing/tinykg",
+        .config_bin = exe,
+    });
+    try std.testing.expect(result == null);
+}
+
+test "resolveTinykgBinary: the adjacent install layout resolves from the executable directory without side effects" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    try tmp.dir.createDirPath(std.testing.io, "vendor/tinykg");
+    try tmp.dir.createDirPath(std.testing.io, "bin");
+    const bin_name = if (@import("builtin").os.tag == .windows) "tinykg.exe" else "tinykg";
+    const staged = try std.fmt.allocPrint(a, "{s}/vendor/tinykg/{s}", .{ root, bin_name });
+    defer a.free(staged);
+    {
+        // Created executable (0o755 on POSIX; Windows treats existence as executable).
+        const staged_z = try a.dupeZ(u8, staged);
+        defer a.free(staged_z);
+        const fd = pfs.open(staged_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o755));
+        try std.testing.expect(fd >= 0);
+        _ = pfs.close(fd);
+    }
+    const exe_dir = try std.fmt.allocPrint(a, "{s}/bin", .{root});
+    defer a.free(exe_dir);
+    const before = try testCountEntries(a, root);
+
+    var found = (try KgClient.resolveTinykgBinary(a, .{ .home = root, .domain = "d", .env_bin = "", .exe_dir = exe_dir })).?;
+    defer found.deinit(a);
+    try std.testing.expectEqual(KgClient.BinarySource.adjacent, found.source);
+    try std.testing.expectEqualStrings(staged, found.path);
+    // Pure resolution: nothing appeared under the prefix (no Store, no marker).
+    try std.testing.expectEqual(before, try testCountEntries(a, root));
+}
+
+fn testCountEntries(allocator: std.mem.Allocator, directory: []const u8) !usize {
+    const pdir = @import("platform").dir;
+    const directory_z = try allocator.dupeZ(u8, directory);
+    defer allocator.free(directory_z);
+    var iterator = pdir.open(directory_z.ptr) orelse return error.OpenFailed;
+    defer pdir.close(&iterator);
+    var count: usize = 0;
+    while (pdir.next(&iterator)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        count += 1;
+    }
+    return count;
 }
 
 test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {

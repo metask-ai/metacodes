@@ -1,0 +1,155 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/metask-ai/metacodes/release/manifest.schema.json",
+  "title": "metacodes-cli release manifest",
+  "description": "manifest.json at the root of a metacodes CLI release unit (#47 stage 5). Written by scripts/release_manifest.zig, validated by release/manifest_contract.zig and scripts/verify_release_bundle.py; release/LAYOUT.md describes the tree.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "vendor", "name", "release", "source", "toolchain", "target", "build", "contract", "components", "compatibility", "files"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "vendor": { "const": "metask" },
+    "name": { "const": "metacodes-cli" },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "channel"],
+      "properties": {
+        "version": { "type": "string", "description": "SemVer; stable is the bare X.Y.Z, pre carries a pre-release part and +<commit12>[.dirty] build metadata" },
+        "channel": { "enum": ["stable", "pre"] },
+        "tag": { "type": ["string", "null"], "description": "the bare X.Y.Z git tag; present on the stable channel, absent or null on pre" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "dirty"],
+      "properties": {
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "dirty": { "type": "boolean" }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["zig_version"],
+      "properties": { "zig_version": { "type": "string" } }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "architecture", "os", "abi", "zig_target"],
+      "properties": {
+        "id": { "type": "string", "description": "<arch>-macos on macOS, else <arch>-<os>-<abi>" },
+        "architecture": { "enum": ["aarch64", "x86_64"] },
+        "os": { "enum": ["linux", "macos", "windows"] },
+        "abi": { "type": "string" },
+        "zig_target": { "type": "string" }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["optimize", "strip"],
+      "properties": {
+        "optimize": { "enum": ["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"] },
+        "strip": { "type": "boolean" }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cli_surface_version", "binary_abi_status", "binary_abi_version", "binary_abi_revision", "config_schema_version"],
+      "properties": {
+        "cli_surface_version": { "type": "integer", "minimum": 1 },
+        "binary_abi_status": { "const": "experimental" },
+        "binary_abi_version": { "type": "integer", "minimum": 1 },
+        "binary_abi_revision": { "type": "integer", "minimum": 1 },
+        "config_schema_version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "components": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "name", "path", "sha256", "version"],
+        "properties": {
+          "role": { "enum": ["primary_executable", "runtime_asset"] },
+          "name": { "enum": ["metacodes", "ripgrep", "tinykg"] },
+          "path": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "version": { "type": "string" },
+          "revision": { "type": "string" },
+          "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+          "upstream": { "type": "string", "format": "uri" },
+          "license": { "type": "string" },
+          "license_path": { "type": "string" },
+          "provenance_path": { "type": "string" },
+          "compat": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["storage_format_version", "store_schema_version"],
+            "properties": {
+              "storage_format_version": { "type": "string" },
+              "store_schema_version": { "type": "string" }
+            }
+          },
+          "purpose": { "type": "string" }
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requires", "fails_without", "degraded_without"],
+      "properties": {
+        "requires": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["component", "cli_version", "storage_format_version", "store_schema_version"],
+            "properties": {
+              "component": { "type": "string" },
+              "cli_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.x$" },
+              "storage_format_version": { "type": "string" },
+              "store_schema_version": { "type": "string" }
+            }
+          }
+        },
+        "fails_without": { "$ref": "#/definitions/effects" },
+        "degraded_without": { "$ref": "#/definitions/effects" }
+      }
+    },
+    "files": {
+      "type": "array",
+      "description": "exactly the files of the unit, manifest.json excluded, sorted by path",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string", "pattern": "^(bin|share|vendor)/" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "effects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["component", "effect"],
+        "properties": {
+          "component": { "type": "string" },
+          "effect": { "type": "string" }
+        }
+      }
+    }
+  }
+}

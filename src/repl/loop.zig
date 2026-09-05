@@ -1251,6 +1251,17 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                         }
                     }
                 }
+                // The picker's sign-in runs on a worker thread (#67); the idle
+                // tick is where its transcript reaches the overlay.
+                if (region.ui.picker_open) switch (picker_host.poll(app, &region.ui)) {
+                    .committed => {
+                        region.clear();
+                        std.debug.print("{s}\n", .{picker_host.lastNotice(app)});
+                        redraw(&region, &editor, app);
+                    },
+                    .redraw => redraw(&region, &editor, app),
+                    .ignored => {},
+                };
                 continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
             }
             if (rc > 0) break; // 有字节可读
@@ -2348,20 +2359,6 @@ fn printLoginUsage() void {
     , .{});
 }
 
-/// The kernel decides every refusal (`provider_login.prepareProfile`); this
-/// only says which one, in the REPL's own words.
-fn loginRefusalText(err: provider_login.PrepareError, method: provider_login.Method) []const u8 {
-    return switch (err) {
-        error.ProviderHasNoTokenEndpoint => "that provider declares no OAuth token endpoint",
-        error.ProviderAcceptsNoOAuthKind => "that provider accepts no OAuth credential kind; a stored login would never be consulted",
-        error.FlowUnavailable => switch (method) {
-            .loopback => "that provider declares no OAuth authorization endpoint; try --device-code, or import a token with `metacodes login --provider <id> --oauth-token-json <file>`",
-            .device_code => "that provider declares no device authorization endpoint; try without --device-code, or import a token with `metacodes login --provider <id> --oauth-token-json <file>`",
-        },
-        error.ClientIdMissing => "that provider declares no OAuth client id; pass --client-id <client> (a provider under custom_providers can declare oauth.client_id)",
-    };
-}
-
 const LoginArgs = struct { provider: []const u8, options: provider_login.Options };
 const LoginParse = union(enum) { usage, unknown: []const u8, ok: LoginArgs };
 
@@ -2415,7 +2412,7 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         return;
     };
     const prepared = provider_login.prepareProfile(built, options) catch |err| {
-        std.debug.print("\x1b[31m{s}\x1b[0m\n", .{loginRefusalText(err, options.method)});
+        std.debug.print("\x1b[31m{s}\x1b[0m\n", .{provider_login.refusalText(err, options.method)});
         return;
     };
     std.debug.print("Signing in to '{s}'; the REPL waits for the flow to finish.\n", .{built.id.slice()});

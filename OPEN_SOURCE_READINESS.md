@@ -43,9 +43,18 @@ The repository is prepared for review but is **not approved for public visibilit
       approval to "Require approval for all outside collaborators", and either
       move public-facing CI to GitHub-hosted or ephemeral runners or record an
       explicit owner decision that persistent runners may execute contributor
-      PR code. Give the `rule-control` release gate a runner label separate
-      from the PR pool.
-- [ ] Tag an immutable pre-release and publish its checksums/SBOM/provenance.
+      PR code. Register the dedicated `metacodes-release` runners described in
+      `doc/RELEASE_RUNNER.md` (one per platform, a runner group restricted to
+      the `Release` workflow) so release builds and the `rule-control` gate
+      never share a machine with the PR pool; until they exist,
+      `.github/workflows/release.yml` runs only as a dry run.
+- [ ] Tag an immutable pre-release and publish its checksums: run
+      `.github/workflows/release.yml` (`workflow_dispatch`, `dry_run: false`)
+      on the dedicated runners for a `0.x.y-dev` commit, verify one unpacked
+      archive per platform with `scripts/verify_release_bundle.py --native`,
+      then publish the draft it created (archives, `.sha256` sidecars and
+      `metacodes-<version>-SHA256SUMS`). SBOM/provenance attestations remain
+      a separate item.
 
 Removing this warning or making the repository public requires all blocking owner
 decisions, not merely a green build.

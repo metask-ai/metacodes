@@ -203,8 +203,11 @@ MCP stdio、大型 WebFetch/curl、ripgrep 与代码索引输出都在子进程/
 `ripgrep`，`Glob`/`Grep` 声明之）。catalog 准入按声明探测可用性：解析不到 `rg`
 时 Runtime 创建返回 `error.ToolDependencyUnavailable`，而不是把工具广告给
 Provider 后在首次调用时报 `RipgrepNotFound`。嵌入宿主可用
-`util_toolchain.ripgrepPath()` 预探测（解析顺序：`RG_BIN` → `PATH` → 宿主可执行
-文件同目录 → 常见安装位），据此决定是否在工具集中包含 `Glob`/`Grep`。
+`util_toolchain.ripgrepPath()` 预探测（开发布局解析顺序：`RG_BIN` → `PATH` → 宿主可执行
+文件同目录 → 常见安装位；`util_toolchain.setLayout(.release)` 之后为 `RG_BIN` →
+宿主可执行文件同目录 → `PATH`,不再查询固定位置——metacodes 可执行文件按
+`-Drelease-layout` 在启动时设定,嵌入宿主自行决定,#79），据此决定是否在工具集中包含
+`Glob`/`Grep`。
 
 Spool 在固定内存中增量计算 SHA-256、保存 1152-byte head 与 384-byte rolling tail，
 并以 no-replace 原语原子发布到 Session 级 CAS；POSIX hard-link 发布会在 receipt

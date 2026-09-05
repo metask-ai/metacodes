@@ -10,7 +10,8 @@
 
 ```bash
 # 先编译,再跑(独立 runner,不经 zig build —— PTY 在 build-runner 下时序不稳)
-zig build
+zig build dev
+zig build test:harness  # e2e cases that need mock_mcp_server/replay_server
 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug
 # 单跑某用例 + dump:
 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v

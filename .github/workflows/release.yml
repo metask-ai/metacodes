@@ -1,0 +1,179 @@
+name: Release
+
+# The release pipeline (#82, #47 stage 7). Dispatch-only until the dedicated
+# `metacodes-release` runners exist (doc/RELEASE_RUNNER.md, owner decision
+# Q4): a bare `X.Y.Z` tag is the stable channel, a `0.x.y-dev` commit the pre
+# channel (#47 Q1/Q3), and neither is published without a human pressing the
+# button on the draft this workflow leaves behind.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Ref to release: the bare X.Y.Z tag (stable) or a branch/commit whose version is 0.x.y-dev (pre)"
+        required: true
+        type: string
+      dry_run:
+        description: "Build, verify, archive and upload artifacts, but do not create the draft release"
+        required: true
+        type: boolean
+        default: true
+      runner_pool:
+        description: "metacodes-release = the dedicated runners; pr-pool = the CI runners (dry runs only, until the dedicated pool exists)"
+        required: true
+        type: choice
+        options: [metacodes-release, pr-pool]
+        default: metacodes-release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-posix:
+    name: Release (${{ matrix.os }})
+    timeout-minutes: 90
+    # A dry run may borrow the CI machines; a real release runs only on the
+    # dedicated pool, which no PR job can reach.
+    if: inputs.runner_pool == 'metacodes-release' || inputs.dry_run
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: Linux
+            arch: X64
+            zig_target: x86_64-linux-gnu
+          - os: macOS
+            arch: ARM64
+            zig_target: aarch64-macos
+    runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON(format('["self-hosted","{0}","{1}"]', matrix.os, matrix.arch)) || fromJSON(format('["self-hosted","metacodes-release","{0}","{1}"]', matrix.os, matrix.arch)) }}
+    concurrency:
+      group: release-runner-${{ inputs.runner_pool }}-${{ matrix.os }}-${{ matrix.arch }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Point Zig caches at persistent per-runner storage
+        shell: bash
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
+      - name: Vendored runtime assets are attested
+        run: python3 scripts/verify_tinykg_binary.py && python3 scripts/verify_ripgrep_binary.py
+      - name: Full suite in release configuration
+        run: zig build test -Doptimize=ReleaseSafe
+      - name: Stage, manifest and verify the release unit
+        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release"
+      - name: Installed prefix matches the release layout
+        run: python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release" --release --doctor
+      - name: AgentCore gate for the native target
+        run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+      - name: Archives (CLI unit and AgentCore SDK)
+        run: |
+          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist"
+          zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
+      - name: Archives are reproducible
+        run: |
+          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
+          cmp "$RUNNER_TEMP"/dist/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-again/metacodes-*.tar.gz
+      # aarch64-linux stays outside the release matrix until a vendored musl
+      # ripgrep exists (#86); `release:check -Dtarget=aarch64-linux-musl` is
+      # expected to refuse, so it is not run here.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: archives-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Release (Windows)
+    timeout-minutes: 90
+    if: inputs.runner_pool == 'metacodes-release' || inputs.dry_run
+    runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON('["self-hosted","Windows","X64"]') || fromJSON('["self-hosted","metacodes-release","Windows","X64"]') }}
+    concurrency:
+      group: release-runner-${{ inputs.runner_pool }}-Windows-X64
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      # cmd throughout: the Windows runner is not guaranteed to provide bash.
+      - name: Point Zig caches at persistent per-runner storage
+        shell: cmd
+        run: |
+          echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
+          echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
+      - name: Vendored runtime assets are attested
+        shell: cmd
+        run: python scripts\verify_tinykg_binary.py && python scripts\verify_ripgrep_binary.py
+      - name: Full suite in release configuration
+        shell: cmd
+        run: zig build test -Doptimize=ReleaseSafe -j6
+      - name: Stage, manifest and verify the release unit
+        shell: cmd
+        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release"
+      - name: Installed prefix matches the release layout
+        shell: cmd
+        run: python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release" --release --doctor
+      - name: AgentCore gate for the native target
+        shell: cmd
+        run: zig build agentcore:gate -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
+      - name: Archives (CLI unit and AgentCore SDK)
+        shell: cmd
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist" && zig build agentcore:archive -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -Dagentcore-archive-dir="%RUNNER_TEMP%\dist"
+      - name: Archives are reproducible
+        shell: cmd
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: archives-Windows-X64
+          path: ${{ runner.temp }}\dist\*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Draft release
+    needs: [build-posix, build-windows]
+    if: ${{ !inputs.dry_run && inputs.runner_pool == 'metacodes-release' }}
+    timeout-minutes: 20
+    runs-on: [self-hosted, metacodes-release, Linux, X64]
+    # The only job that can write to the repository, and only through the
+    # ephemeral token, and only to create a *draft*.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+      - name: SHA256SUMS over every archive
+        run: python3 scripts/release_sums.py "$RUNNER_TEMP/dist" "${{ inputs.tag }}"
+      - name: Create the draft release (a human publishes it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" --draft --verify-tag \
+            --title "metacodes ${{ inputs.tag }}" \
+            --notes "Draft created by the Release workflow. Verify an unpacked archive with scripts/verify_release_bundle.py --native before publishing." \
+            "$RUNNER_TEMP"/dist/*
