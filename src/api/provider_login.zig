@@ -67,7 +67,7 @@ pub fn refusalText(err: PrepareError, method: Method) []const u8 {
             .loopback => "that provider declares no OAuth authorization endpoint",
             .device_code => "that provider declares no device authorization endpoint",
         },
-        error.ClientIdMissing => "that provider declares no OAuth client id",
+        error.ClientIdMissing => "that provider declares no OAuth client id; pass --client-id or set providers.<id>.oauth_client_id in ~/.metacodes/config.json",
     };
 }
 
@@ -89,7 +89,10 @@ pub const ImportDiagnostic = struct {
     cause: ?anyerror = null,
 };
 
-pub const ClientIdSource = enum { explicit, declared };
+/// Which client the grant presented, in order of precedence: the caller's
+/// `--client-id`, the installation's `providers.<id>.oauth_client_id`, or the
+/// profile's own declaration.
+pub const ClientIdSource = enum { explicit, configured, declared };
 
 pub const Outcome = struct {
     provider_id: provider_ids.Slug,
@@ -152,8 +155,22 @@ pub fn requireOAuthCapable(profile: *const provider_profile.ProviderProfile) Cap
 }
 
 /// Every decision the interactive login makes before it starts, for a profile
-/// the caller already resolved.
+/// the caller already resolved and no installation-configured client; the
+/// host-aware entry points use `prepareProfileWith`.
 pub fn prepareProfile(profile: *const provider_profile.ProviderProfile, options: Options) PrepareError!Prepared {
+    return prepareProfileWith(profile, options, null);
+}
+
+/// `prepareProfile` with the client the installation configured for this
+/// profile (`Host.oauthClientIdFor`, #87). Precedence: the caller's explicit
+/// client, then the configured one, then the profile's declaration — the
+/// configured client is the installation's own registration, so it stands in
+/// for a declaration and overrides one, exactly as `--client-id` does.
+pub fn prepareProfileWith(
+    profile: *const provider_profile.ProviderProfile,
+    options: Options,
+    configured: ?[]const u8,
+) PrepareError!Prepared {
     try requireOAuthCapable(profile);
     // A profile with no authorization or device endpoint has no interactive
     // flow to run; say so instead of failing later at a null URL.
@@ -162,11 +179,18 @@ pub fn prepareProfile(profile: *const provider_profile.ProviderProfile, options:
         .device_code => profile.oauth_device_authorization_url != null,
     };
     if (!endpoint_declared) return error.FlowUnavailable;
-    const client_id = options.client_id orelse profile.oauth_client_id orelse return error.ClientIdMissing;
+    const source: ClientIdSource = if (options.client_id != null)
+        .explicit
+    else if (configured != null)
+        .configured
+    else
+        .declared;
+    const client_id = options.client_id orelse configured orelse profile.oauth_client_id orelse
+        return error.ClientIdMissing;
     return .{
         .profile = profile,
         .client_id = client_id,
-        .client_id_source = if (options.client_id != null) .explicit else .declared,
+        .client_id_source = source,
         .options = options,
     };
 }
@@ -174,7 +198,7 @@ pub fn prepareProfile(profile: *const provider_profile.ProviderProfile, options:
 /// `prepareProfile` for a provider named the way the user names it.
 pub fn prepare(host: *provider_host.Host, provider_name: []const u8, options: Options) Error!Prepared {
     const profile = host.registry.find(provider_name) orelse return error.UnknownProvider;
-    return prepareProfile(profile, options);
+    return prepareProfileWith(profile, options, host.oauthClientIdFor(profile.id));
 }
 
 /// `prepare` then `run`, for a caller that reports a failure by its error name.
@@ -224,4 +248,35 @@ pub fn importTokenResponse(
 fn failed(diagnostic: ?*ImportDiagnostic, cause: anyerror, err: ImportError) ImportError {
     if (diagnostic) |out| out.cause = cause;
     return err;
+}
+
+test "the client id precedence is explicit, then configured, then declared" {
+    const kinds = [_]provider_profile.CredentialKind{.openai_oauth};
+    var undeclared = provider_profile.ProviderProfile{
+        .id = provider_ids.Slug.lit("undeclared"),
+        .implementation_id = provider_ids.Slug.lit("undeclared"),
+        .display_name = "Undeclared",
+        .channels = &.{},
+        .accepted_credential_kinds = &kinds,
+        .oauth_token_url = "https://auth.example.com/token",
+        .oauth_authorize_url = "https://auth.example.com/authorize",
+    };
+    // No declaration, nothing configured, nothing explicit: refused.
+    try std.testing.expectError(error.ClientIdMissing, prepareProfileWith(&undeclared, .{}, null));
+    // The installation's client stands in for the missing declaration.
+    const configured = try prepareProfileWith(&undeclared, .{}, "app_installation");
+    try std.testing.expectEqual(ClientIdSource.configured, configured.client_id_source);
+    try std.testing.expectEqualStrings("app_installation", configured.client_id);
+    // An explicit client wins over the configured one.
+    const explicit = try prepareProfileWith(&undeclared, .{ .client_id = "cli-client" }, "app_installation");
+    try std.testing.expectEqual(ClientIdSource.explicit, explicit.client_id_source);
+    try std.testing.expectEqualStrings("cli-client", explicit.client_id);
+    // The configured client overrides a declaration, like --client-id does.
+    undeclared.oauth_client_id = "declared-client";
+    const overridden = try prepareProfileWith(&undeclared, .{}, "app_installation");
+    try std.testing.expectEqual(ClientIdSource.configured, overridden.client_id_source);
+    try std.testing.expectEqualStrings("app_installation", overridden.client_id);
+    const declared = try prepareProfileWith(&undeclared, .{}, null);
+    try std.testing.expectEqual(ClientIdSource.declared, declared.client_id_source);
+    try std.testing.expectEqualStrings("declared-client", declared.client_id);
 }

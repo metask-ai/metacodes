@@ -23,6 +23,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- `providers.<id>.oauth_client_id` in `~/.metacodes/config.json` (#87): the
+  OAuth client an installation registered for a built-in profile that declares
+  none. `metacodes login --provider <id>`, `/login <id>` and the picker's
+  credential stage present it without `--client-id`; precedence is
+  `--client-id`, then the configured client, then the profile's declaration,
+  and the winner is recorded with the login as before. Built-in profiles keep
+  declaring none.
+
 - `.github/workflows/release.yml` (#82, #47 stage 7): `workflow_dispatch` with
   `tag`, `dry_run` and `runner_pool`; one job per platform on the dedicated
   `metacodes-release` runner label (the CI pool only for dry runs) running the

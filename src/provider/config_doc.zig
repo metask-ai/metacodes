@@ -41,6 +41,9 @@ pub const UrlText = controls_mod.Bounded(256);
 pub const ProtocolText = controls_mod.Bounded(48);
 pub const AliasName = controls_mod.Bounded(48);
 pub const OperationId = controls_mod.Bounded(64);
+/// An OAuth client id as a registrar issues it; 128 covers every provider
+/// seen so far with room to spare.
+pub const ClientIdText = controls_mod.Bounded(128);
 
 pub const MAX_PROTOCOL_DEFAULTS: usize = 4;
 
@@ -114,6 +117,11 @@ pub const ProviderEntry = struct {
     channels: ChannelList = .{},
     protocol_defaults: ProtocolList = .{},
     base_url: ?UrlText = null,
+    /// The OAuth client this installation registered for a profile that
+    /// declares none (#87). It is presented at login and recorded with the
+    /// login like every other client id, so refresh keeps working even if
+    /// this key is later removed.
+    oauth_client_id: ?ClientIdText = null,
     /// Credential pool for this provider. Several accounts, each a distinct
     /// route identity, because the credential participates in the offer id.
     credentials: CredentialList = .{},
@@ -315,6 +323,10 @@ pub const Document = struct {
             if (entry.base_url) |url| {
                 try out.appendSlice(arena, ",\"base_url\":");
                 try writeJsonString(arena, &out, url.slice());
+            }
+            if (entry.oauth_client_id) |client| {
+                try out.appendSlice(arena, ",\"oauth_client_id\":");
+                try writeJsonString(arena, &out, client.slice());
             }
             if (entry.channels.len > 0) {
                 try out.appendSlice(arena, ",\"channels\":");
@@ -671,6 +683,9 @@ fn parseProvider(key: []const u8, value: std.json.Value) DocumentError!ProviderE
     if (stringOf(value.object.get("base_url"))) |text| {
         entry.base_url = try UrlText.parse(text);
     }
+    if (stringOf(value.object.get("oauth_client_id"))) |text| {
+        entry.oauth_client_id = try ClientIdText.parse(text);
+    }
     if (value.object.get("channels")) |list| {
         if (list != .array) return error.InvalidDocument;
         for (list.array.items) |item| {
@@ -969,6 +984,30 @@ test "several providers coexist and disabling one preserves the others" {
     try std.testing.expect(!again.provider(Slug.lit("openai")).?.enabled);
     try std.testing.expect(again.provider(Slug.lit("openai")).?.credential_ref.?.eqlText("cred-openai-oauth"));
     try std.testing.expect(again.provider(Slug.lit("metask")).?.enabled);
+}
+
+test "an installation's OAuth client id for a built-in profile round-trips" {
+    const a = std.testing.allocator;
+    var document = Document.init(a);
+    defer document.deinit();
+    try document.upsertProvider(.{
+        .id = Slug.lit("openai"),
+        .oauth_client_id = try ClientIdText.parse("app_example_client"),
+    });
+    try document.upsertProvider(.{ .id = Slug.lit("metask") });
+
+    const text = try document.merge("{}");
+    defer a.free(text);
+    // The merged document names the key; the reload below checks its value,
+    // so this stays true whatever whitespace the merge emits.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"oauth_client_id\"") != null);
+
+    var reloaded = try parse(a, text);
+    defer reloaded.deinit();
+    try std.testing.expect(reloaded.provider(Slug.lit("openai")).?.oauth_client_id.?.eqlText("app_example_client"));
+    // Absent stays absent: a profile without a configured client keeps the
+    // fail-closed refusal.
+    try std.testing.expect(reloaded.provider(Slug.lit("metask")).?.oauth_client_id == null);
 }
 
 test "the control plane never clobbers another writer's keys" {

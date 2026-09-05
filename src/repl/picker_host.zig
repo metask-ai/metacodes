@@ -124,7 +124,7 @@ fn startLogin(app: *app_mod.App, commit: picker_mod.Commit) bool {
     const host = app.providerHost() catch return false;
     const provider = missingCredentialPointer(host, commit.offer_id) orelse return false;
     const profile = host.registry.findById(provider) orelse return false;
-    const prepared = provider_login.prepareProfile(profile, .{}) catch |err| {
+    const prepared = provider_login.prepareProfileWith(profile, .{}, host.oauthClientIdFor(provider)) catch |err| {
         app.model_picker.setNotice("no credential for {s}, and /login {s} cannot start: {s}; the previous route is still active", .{
             provider.slice(),
             provider.slice(),
