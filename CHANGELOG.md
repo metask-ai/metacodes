@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- `.github/workflows/release.yml` (#82, #47 stage 7): `workflow_dispatch` with
+  `tag`, `dry_run` and `runner_pool`; one job per platform on the dedicated
+  `metacodes-release` runner label (the CI pool only for dry runs) running the
+  attested-asset checks, the ReleaseSafe suite, `release:verify`,
+  `agentcore:gate`, both archives and a byte-for-byte reproducibility check;
+  a `publish` job — the only one with `contents: write` — joins the checksums
+  and creates a *draft* GitHub Release with `--verify-tag`. The tag trigger
+  stays off until the runners exist; `doc/RELEASE_RUNNER.md` is their design.
+
 - `zig build release:archive` writes the immutable CLI release archive
   (`metacodes-<version>-<target-id>.tar.gz` / `.zip` plus `.sha256`) from the
   verified prefix, byte-identical across runs (fixed gzip name and mtime, no

@@ -74,6 +74,17 @@ The AgentCore SDK packager (`scripts/package_agentcore.py`) shares the same
 core (`scripts/release_archive.py --kind agentcore`) and keeps its historical
 refusal of untagged stable versions.
 
+## Publishing
+
+`.github/workflows/release.yml` runs the whole chain per platform on the
+`metacodes-release` runners (`doc/RELEASE_RUNNER.md`) and leaves a *draft*
+GitHub Release holding every archive, its `.sha256`, and
+`metacodes-<version>-SHA256SUMS`; a maintainer publishes it after verifying an
+unpacked archive on a clean machine with `scripts/verify_release_bundle.py
+--native`. Pre-releases are dispatched by hand and never auto-attached (#47
+Q3); the stable tag trigger is enabled only once the dedicated runners exist
+(Q4).
+
 ## What is deliberately not in the unit
 
 Debug executables, the test harness servers, evaluation shadows, the AgentCore
