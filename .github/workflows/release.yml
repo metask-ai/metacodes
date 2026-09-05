@@ -49,8 +49,14 @@ jobs:
             arch: ARM64
             zig_target: aarch64-macos
     runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON(format('["self-hosted","{0}","{1}"]', matrix.os, matrix.arch)) || fromJSON(format('["self-hosted","metacodes-release","{0}","{1}"]', matrix.os, matrix.arch)) }}
+    # One physical runner per platform: a dry run on the CI pool joins the
+    # CI workflow's own runner group so it never overlaps a PR job on the same
+    # box (the second dry run did, and the Windows unit tests tripped the build
+    # runner's one-minute no-response watchdog under that load; ci.yml records
+    # the same contention as the cause of its timing flakes). The dedicated
+    # pool serializes only with itself.
     concurrency:
-      group: release-runner-${{ inputs.runner_pool }}-${{ matrix.os }}-${{ matrix.arch }}
+      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-{0}-{1}-pr', matrix.os, matrix.arch) || format('release-runner-{0}-{1}', matrix.os, matrix.arch) }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -67,6 +73,24 @@ jobs:
         run: |
           echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
           echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
+      # The AgentCore gate needs cargo (Rust link probe) and bindgen (bindings
+      # regen gate). The dedicated pool must have them (doc/RELEASE_RUNNER.md);
+      # a dry run on the CI pool may lack them and then skips the AgentCore
+      # steps with a warning rather than failing the whole rehearsal.
+      - name: Toolchain inventory
+        id: tools
+        shell: bash
+        run: |
+          have=true
+          command -v cargo >/dev/null 2>&1 || have=false
+          command -v bindgen >/dev/null 2>&1 || have=false
+          echo "agentcore=$have" >> "$GITHUB_OUTPUT"
+          if [ "$have" != true ]; then
+            if [ "${{ inputs.runner_pool }}" = "metacodes-release" ]; then
+              echo "::error::cargo and bindgen are required on metacodes-release runners (doc/RELEASE_RUNNER.md)"; exit 1
+            fi
+            echo "::warning::cargo/bindgen missing on this dry-run runner; AgentCore gate and archive are skipped"
+          fi
       - name: Vendored runtime assets are attested
         run: python3 scripts/verify_tinykg_binary.py && python3 scripts/verify_ripgrep_binary.py
       - name: Full suite in release configuration
@@ -76,11 +100,13 @@ jobs:
       - name: Installed prefix matches the release layout
         run: python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release" --release --doctor
       - name: AgentCore gate for the native target
+        if: steps.tools.outputs.agentcore == 'true'
         run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
-      - name: Archives (CLI unit and AgentCore SDK)
-        run: |
-          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist"
-          zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
+      - name: Archive (CLI unit)
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist"
+      - name: Archive (AgentCore SDK)
+        if: steps.tools.outputs.agentcore == 'true'
+        run: zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
       - name: Archives are reproducible
         run: |
           zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
@@ -100,8 +126,9 @@ jobs:
     timeout-minutes: 90
     if: inputs.runner_pool == 'metacodes-release' || inputs.dry_run
     runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON('["self-hosted","Windows","X64"]') || fromJSON('["self-hosted","metacodes-release","Windows","X64"]') }}
+    # Same runner-serialization rule as the POSIX jobs.
     concurrency:
-      group: release-runner-${{ inputs.runner_pool }}-Windows-X64
+      group: ${{ inputs.runner_pool == 'pr-pool' && 'runner-Windows-X64-pr' || 'release-runner-Windows-X64' }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -119,6 +146,17 @@ jobs:
         run: |
           echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
           echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
+      - name: Toolchain inventory
+        id: tools
+        shell: cmd
+        run: |
+          set HAVE=true
+          where cargo >nul 2>nul || set HAVE=false
+          where bindgen >nul 2>nul || set HAVE=false
+          echo agentcore=%HAVE%>>"%GITHUB_OUTPUT%"
+          if "%HAVE%"=="true" exit /b 0
+          if "${{ inputs.runner_pool }}"=="metacodes-release" ( echo ::error::cargo and bindgen are required on metacodes-release runners ^(doc/RELEASE_RUNNER.md^) & exit /b 1 )
+          echo ::warning::cargo/bindgen missing on this dry-run runner; AgentCore gate and archive are skipped
       - name: Vendored runtime assets are attested
         shell: cmd
         run: python scripts\verify_tinykg_binary.py && python scripts\verify_ripgrep_binary.py
@@ -132,11 +170,16 @@ jobs:
         shell: cmd
         run: python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release" --release --doctor
       - name: AgentCore gate for the native target
+        if: steps.tools.outputs.agentcore == 'true'
         shell: cmd
         run: zig build agentcore:gate -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
-      - name: Archives (CLI unit and AgentCore SDK)
+      - name: Archive (CLI unit)
         shell: cmd
-        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist" && zig build agentcore:archive -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -Dagentcore-archive-dir="%RUNNER_TEMP%\dist"
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist"
+      - name: Archive (AgentCore SDK)
+        if: steps.tools.outputs.agentcore == 'true'
+        shell: cmd
+        run: zig build agentcore:archive -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -Dagentcore-archive-dir="%RUNNER_TEMP%\dist"
       - name: Archives are reproducible
         shell: cmd
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
