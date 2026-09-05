@@ -32,6 +32,13 @@ _PREPARE_JOB_PATH = Path("src/workbuddy_bench/runner/prepare_job.py")
 _AGENT_PATH = Path("src/workbuddy_bench/agents/metacodes_agent.py")
 _TRACE_PATH = Path("src/workbuddy_bench/agents/_metacodes_trace.py")
 _KEY_FD_PATH = Path("src/workbuddy_bench/proxy/_metacodes_key_fd.py")
+_MODEL_PATH = Path("src/workbuddy_bench/_metacodes_model.py")
+# trace.py imports the shared eval model module relatively (scripts/eval/model.py).
+# Inside the WorkBuddy package that relative name would resolve to
+# workbuddy_bench.model, which does not exist, so the overlay ships model.py as a
+# private sibling module and repoints the import when it materializes the copy.
+_TRACE_MODEL_IMPORT_OLD = b"from ..model import open_nofollow\n"
+_TRACE_MODEL_IMPORT_NEW = b"from .._metacodes_model import open_nofollow\n"
 _PROXY_CONFIG_PATH = Path("src/workbuddy_bench/proxy/config.py")
 _PROXY_LOGGER_PATH = Path("src/workbuddy_bench/proxy/interceptors/logger.py")
 _PROXY_PIPELINE_PATH = Path("src/workbuddy_bench/proxy/pipeline.py")
@@ -642,9 +649,14 @@ def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
 def _overlay_sources() -> List[Tuple[Path, bytes]]:
     root = Path(__file__).resolve().parent
     overlay = root / "overlay"
+    trace = (root / "trace.py").read_bytes()
+    if trace.count(_TRACE_MODEL_IMPORT_OLD) != 1:
+        raise OverlayError("WorkBuddy trace model-import anchor drifted")
+    trace = trace.replace(_TRACE_MODEL_IMPORT_OLD, _TRACE_MODEL_IMPORT_NEW, 1)
     rows: List[Tuple[Path, bytes]] = [
-        (_TRACE_PATH, (root / "trace.py").read_bytes()),
+        (_TRACE_PATH, trace),
         (_KEY_FD_PATH, (root / "key_fd.py").read_bytes()),
+        (_MODEL_PATH, (root.parent / "model.py").read_bytes()),
     ]
     for source in sorted(overlay.rglob("*")):
         if source.is_file():
