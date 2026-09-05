@@ -235,10 +235,18 @@ def _read_regular_bytes(path: Path, *, limit: int = MAX_TRACE_BYTES) -> bytes:
 
 
 def _read_regular_file(path: Path, *, limit: int = MAX_TRACE_BYTES) -> str:
-    try:
-        return _read_regular_bytes(path, limit=limit).decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise TraceError(f"cannot read trace file {path}: {exc}") from exc
+    # This is the read `load_trace_ir` uses for both the output stream and the
+    # transcript. A tool result echoed into the transcript can carry raw
+    # non-UTF-8 bytes — e.g. a Read of a generated .pptx/.pdf (office-sealed
+    # 2026-09-05, byte 0xbb) — and --stream-json can split a multi-byte
+    # character across two text events (byte 0x93 mid-file). A strict decode
+    # raised TraceError, which the adapter's populate_context_post_run turns
+    # into a RuntimeError that aborts the whole harbor cohort — and this read
+    # runs first, before load_control_metrics. Decode tolerantly with U+FFFD:
+    # the JSON envelope and the result/usage/tool fields are ASCII, so
+    # replacement never disturbs parsing, and byte-exact evidence binding is
+    # done by callers over the raw bytes.
+    return _read_regular_bytes(path, limit=limit).decode("utf-8", errors="replace")
 
 
 def _sha256(payload: bytes) -> str:
@@ -1596,11 +1604,17 @@ def load_control_metrics(
 
     transcript_bytes = _read_regular_bytes(transcript_path)
     observation_bytes = _read_regular_bytes(observation_path)
-    try:
-        transcript_text = transcript_bytes.decode("utf-8", errors="strict")
-        observation_text = observation_bytes.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise TraceError(f"control evidence is not UTF-8: {exc}") from exc
+    # Tool results echoed into the transcript/observation journals can carry raw
+    # non-UTF-8 bytes (e.g. a task that reads back a generated .pptx/.pdf —
+    # html-report-quadrant-ppt, office-sealed 2026-09-05, byte 0xbb). A strict
+    # decode here raised TraceError, which populate_context_post_run turned into
+    # a RuntimeError that aborted the whole harbor cohort (17/30 graded). Decode
+    # tolerantly with U+FFFD, matching _read_regular_file: the control-metric
+    # scans key off ASCII journal markers and NDJSON structure, which
+    # replacement never disturbs, and the integrity hashes below are taken over
+    # the raw bytes regardless.
+    transcript_text = transcript_bytes.decode("utf-8", errors="replace")
+    observation_text = observation_bytes.decode("utf-8", errors="replace")
     transcript = _json_lines_from_text(transcript_text, transcript_path, allow_prose=False)
     observations = _json_lines_from_text(
         observation_text, observation_path, allow_prose=False
