@@ -147,8 +147,15 @@ surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
-NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`. Flag
-removals or semantic changes require a changelog entry.
+NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`. Every
+NDJSON line is valid UTF-8: string fields go through the repository's JSON
+encoder, which replaces bytes that are not valid UTF-8 (binary tool output,
+such as a PDF read with `Read`) with U+FFFD while `content_bytes` and
+`input_bytes` keep counting the raw payload; a `text`/`thinking` delta cut
+inside a multi-byte character is held back and rejoined with the next delta of
+the same kind, and a character the block ends without completing is emitted
+as one U+FFFD line rather than dropped. Flag removals or semantic changes
+require a changelog entry.
 
 ### Model tiers
 

@@ -95,6 +95,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Headless `--stream-json` and `--json` NDJSON lines are always valid UTF-8.
+  The stream backend and the `result` line encoded strings with
+  `std.json.Stringify.encodeJsonString`, which passes bytes 0x80–0xFF through
+  untouched, so a `tool_result` carrying binary tool output (a ReportLab PDF's
+  `%\x93\x8c\x8b\x9e` marker read with `Read`, observed on the 2026-09-05
+  WorkBuddy office cohort) reached stdout as raw bytes and a strict UTF-8
+  consumer rejected the whole file. Every string field now goes through the
+  repository's canonical encoder (`util/json.zig`, invalid bytes → U+FFFD;
+  `content_bytes`/`input_bytes` still count the raw payload), a `text` or
+  `thinking` delta cut inside a multi-byte character is held back and rejoined
+  losslessly with the next delta of the same kind, and a character the block
+  ends without completing is emitted as one explicit U+FFFD line.
+
 - The Bash tool's spilled stdout/stderr are sealed during execution as attachments
   of its inline result and published by the batch commit boundary, like every
   other tool result since #45/#65; a fatal sibling in the same batch leaves no
