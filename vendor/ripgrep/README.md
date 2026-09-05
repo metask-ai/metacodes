@@ -1,7 +1,7 @@
 # vendored ripgrep(manifest-pinned 跨平台二进制)
 
 - 上游:https://github.com/BurntSushi/ripgrep
-- 版本:14.1.1 (rev 4649aa9700)(`rg --version` 可验)
+- 版本:15.2.0 (rev e89fff89ac)(`rg --version` 可验)
 - 许可:双许可 MIT OR Unlicense,见同目录 `LICENSE-MIT`(再分发所需)。
 - 清单:`manifest.json`(`metacodes.ripgrep-bundle/v1`)按 target 钉每个二进制的
   SHA-256;`scripts/verify_ripgrep_binary.py` 做 fail-closed 校验(哈希、格式
@@ -9,14 +9,15 @@
 
 ## 二进制来源(全部为上游官方 release 资产,未修改)
 
-| bin/ 文件 | 上游资产(release 14.1.1) | 资产 SHA256 |
+| bin/ 文件 | 上游资产(release 15.2.0) | 资产 SHA256 |
 |---|---|---|
-| `rg-macos-aarch64` | `ripgrep-14.1.1-aarch64-apple-darwin.tar.gz` | `24ad76777745fbff131c8fbc466742b011f925bfa4fffa2ded6def23b5b937be` |
-| `rg-macos-x86_64` | `ripgrep-14.1.1-x86_64-apple-darwin.tar.gz` | `fc87e78f7cb3fea12d69072e7ef3b21509754717b746368fd40d88963630e2b3` |
-| `rg-linux-x86_64` | `ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz`(static-pie) | `4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e` |
-| `rg-windows-x86_64.exe` | `ripgrep-14.1.1-x86_64-pc-windows-msvc.zip` | (rg.exe SHA256 见 manifest) |
+| `rg-macos-aarch64` | `ripgrep-15.2.0-aarch64-apple-darwin.tar.gz` | `3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4` |
+| `rg-macos-x86_64` | `ripgrep-15.2.0-x86_64-apple-darwin.tar.gz` | `af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1` |
+| `rg-linux-x86_64` | `ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz`(static-pie) | `33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c` |
+| `rg-linux-aarch64` | `ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz`(static-pie,15.x 起上游才提供 aarch64 musl,#86) | `800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915` |
+| `rg-windows-x86_64.exe` | `ripgrep-15.2.0-x86_64-pc-windows-msvc.zip` | `71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5`(rg.exe 本体 SHA256 见 manifest) |
 
-资产 SHA256 逐一对照上游 release 的 `.sha256` 伴随文件核验后落库;二进制本体的
+资产 SHA256 逐一对照上游 release 的 `.sha256` 伴随文件与 GitHub Releases API 公布的 digest 核验后落库;二进制本体的
 SHA-256 钉在 `manifest.json`。
 
 上游没有 aarch64-windows 二进制:manifest 显式把 `rg-windows-x86_64.exe` 声明给
