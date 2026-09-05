@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `scripts/build-project-harness-kernel.sh` failed its first smoke on every
+  platform (`invalid project harness request: expected ,`, exit 64): the
+  kernel has read `within_root` after `file_mutating` in every pre-decision
+  signal since 33cf238 (2026-08-17), the script's hand-written canonical
+  requests never gained the field, and no CI job ran the script. The smoke
+  requests now carry `within_root`, two escape probes assert that a target
+  outside the project root blocks under both the effect-class rule and the
+  existing-file scope, and the `gates` job builds and smokes the kernel on
+  Linux and macOS right after `lake build`.
+
 - The paid plugin runner observed and executed the live checkout, so a pinned
   input replaced during a provider request and restored before the after-request
   check went unnoticed (#61, the paid-path form of the #49 gap). `run_paid_pair`,
