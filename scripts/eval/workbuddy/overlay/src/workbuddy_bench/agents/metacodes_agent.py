@@ -1002,34 +1002,83 @@ class MetacodesAgent(BaseInstalledAgent):
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         try:
-            trace = load_trace_ir(
-                self.logs_dir / _OUTPUT_FILENAME,
-                self.logs_dir / _TRANSCRIPT_FILENAME,
-            )
-            control_metrics = load_control_metrics(
-                self.logs_dir / _TRANSCRIPT_FILENAME,
-                self.logs_dir / OBSERVATION_FILENAME,
-            )
-            # Runtime receipt for the enforced arm, symmetric with the
-            # disabled arm's exit-88 bundle-absence postcheck: the binary
-            # derives the project-rules directory from its own XxHash64 of
-            # the cwd and silently runs bare-rules when the lookup misses
-            # (harness review 2026-08-17 finding #2 — the treatment dose
-            # would drop to zero with no error anywhere). A dispatching
-            # enforced run whose journal carries zero rule_filter events
-            # means the bundle was never loaded; fail the trial loudly.
-            if self._project_control_mode == "enforced":
-                runtime = control_metrics.get("tool_runtime") or {}
-                lean = control_metrics.get("lean") or {}
-                if runtime.get("dispatch_started", 0) > 0 and not lean.get(
-                    "rule_filter_events", 0
-                ):
-                    raise RuntimeError(
-                        "enforced project control produced no rule_filter "
-                        "events across a dispatching run: the rule bundle "
-                        "was staged but never loaded by the binary"
-                    )
-            trace["control_metrics"] = control_metrics
+            try:
+                trace = load_trace_ir(
+                    self.logs_dir / _OUTPUT_FILENAME,
+                    self.logs_dir / _TRANSCRIPT_FILENAME,
+                )
+            except TraceError as exc:
+                # A killed or timed-out agent (harbor SIGTERM -> exit 143, or an
+                # OOM kill) is torn down before it can emit its single terminal
+                # `result` event, so the NDJSON stream carries zero results.
+                # That is a legitimately failed trial worth zero reward, not a
+                # harness fault. Raising here propagates out of harbor's
+                # per-trial exception-recovery path (_recover_outputs runs
+                # inside the trial's own `except`) and cancels every sibling in
+                # the TaskGroup — observed 2026-09-05 on kunshan security-sealed
+                # where a single exit-143 trial aborted the whole 24-task cohort
+                # after only 3 were graded. Tolerate *exactly* the no-result
+                # case as a degenerate zero trajectory; every other trace defect
+                # (malformed JSON, more than one result, bad field types) must
+                # still fail loudly.
+                if "result event, found 0" not in str(exc):
+                    raise
+                trace = {
+                    "result": {
+                        "stop_reason": "killed_no_result",
+                        "turns": 0,
+                        "tool_calls": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_usd": 0.0,
+                        "text": "",
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                    # Trajectory requires >= 1 step; emit a single marker step so
+                    # the degenerate trajectory validates. transcript_ir row shape.
+                    "steps": [
+                        {
+                            "step_id": 1,
+                            "source": "agent",
+                            "message": (
+                                "metacodes agent was terminated before emitting "
+                                "a result event (timeout / SIGTERM / OOM); this "
+                                "trial is recorded as a failed zero-reward run."
+                            ),
+                            "reasoning_content": None,
+                            "tool_calls": [],
+                            "observations": [],
+                            "extra": {"killed_no_result": True},
+                        }
+                    ],
+                    "control_metrics": {"killed_no_result": True},
+                }
+            if "control_metrics" not in trace:
+                control_metrics = load_control_metrics(
+                    self.logs_dir / _TRANSCRIPT_FILENAME,
+                    self.logs_dir / OBSERVATION_FILENAME,
+                )
+                # Runtime receipt for the enforced arm, symmetric with the
+                # disabled arm's exit-88 bundle-absence postcheck: the binary
+                # derives the project-rules directory from its own XxHash64 of
+                # the cwd and silently runs bare-rules when the lookup misses
+                # (harness review 2026-08-17 finding #2 — the treatment dose
+                # would drop to zero with no error anywhere). A dispatching
+                # enforced run whose journal carries zero rule_filter events
+                # means the bundle was never loaded; fail the trial loudly.
+                if self._project_control_mode == "enforced":
+                    runtime = control_metrics.get("tool_runtime") or {}
+                    lean = control_metrics.get("lean") or {}
+                    if runtime.get("dispatch_started", 0) > 0 and not lean.get(
+                        "rule_filter_events", 0
+                    ):
+                        raise RuntimeError(
+                            "enforced project control produced no rule_filter "
+                            "events across a dispatching run: the rule bundle "
+                            "was staged but never loaded by the binary"
+                        )
+                trace["control_metrics"] = control_metrics
             trajectory = self._build_trajectory(trace)
         except (OSError, TraceError, ValueError) as exc:
             raise RuntimeError(f"cannot build metacodes ATIF trajectory: {exc}") from exc
