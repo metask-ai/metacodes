@@ -203,6 +203,13 @@ pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+/// writeJsonString 去引号版(writer 侧):只写转义后的字符串内容,调用方自己拼引号——
+/// 一个 JSON 字符串值要分几段写出时用(stream-json 把跨增量拼回的字符与本增量正文接进
+/// 同一个 "text" 值)。转义/替换语义与 serializeStringContents 逐字节一致。
+pub fn writeJsonStringContents(w: *std.Io.Writer, s: []const u8) !void {
+    try encodeStringInner(s, w);
+}
+
 /// 序列化浮点数为 JSON number,追加到 buf。
 /// 用 std.fmt 整数+小数形式,避免科学计数法(JSON number 接受但厂商兼容性差)。
 pub fn serializeNumber(v: anytype, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -437,6 +444,25 @@ test "serializeString replaces invalid utf8 with U+FFFD" {
     // 孤立 continuation + 截断的 3 字节序列开头 + 合法字节
     try serializeString("a\x80b\xe4\xbdok", &buf, std.testing.allocator);
     try std.testing.expectEqualStrings("\"a\u{FFFD}b\u{FFFD}\u{FFFD}ok\"", buf.items);
+}
+
+test "writeJsonStringContents matches serializeStringContents output (no quotes)" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(std.testing.allocator);
+    const input = "mix\x00\"quote\"\\slash 中文\x80tail\xe5\x88";
+    try serializeStringContents(input, &buf, std.testing.allocator);
+
+    var wbuf: [256]u8 = undefined;
+    var fw = std.Io.Writer.fixed(&wbuf);
+    try writeJsonStringContents(&fw, input);
+    try std.testing.expectEqualStrings(buf.items, fw.buffered());
+    // 去引号:首字节就是正文;补上引号后是 std.json 接受的合法字符串,非法字节已成 U+FFFD。
+    try std.testing.expect(fw.buffered()[0] == 'm');
+    const quoted = try std.fmt.allocPrint(std.testing.allocator, "\"{s}\"", .{fw.buffered()});
+    defer std.testing.allocator.free(quoted);
+    const parsed = try std.json.parseFromSlice([]const u8, std.testing.allocator, quoted, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("mix\x00\"quote\"\\slash 中文\u{FFFD}tail\u{FFFD}\u{FFFD}", parsed.value);
 }
 
 test "writeJsonString matches serializeString output" {

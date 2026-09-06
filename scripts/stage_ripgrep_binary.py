@@ -32,6 +32,7 @@ TARGET_CONTRACTS = {
     "aarch64-macos": ("mach-o", "aarch64"),
     "x86_64-macos": ("mach-o", "x86_64"),
     "x86_64-linux": ("elf-static", "x86_64"),
+    "aarch64-linux": ("elf-static", "aarch64"),
     "x86_64-windows": ("pe", "x86_64"),
     # Upstream publishes no aarch64-windows binary; Windows-on-ARM runs the
     # x86_64 executable through the OS's built-in x64 emulation. The vendor

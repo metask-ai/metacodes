@@ -1019,9 +1019,9 @@ fn teammateThreadMain(input: *TeammateInput) void {
 
     if (input.reasoning_effort_override) |effort| {
         input.owned.provider().setReasoningEffort(effort) catch {
+            setMemberActiveBestEffort(a, e.config_path, e.name, false); // 先落盘再翻状态(#100)
             e.setStatus(.failed);
             sendIdleNotification(a, e, "failed", null, "AgentEffortUnsupportedProvider");
-            setMemberActiveBestEffort(a, e.config_path, e.name, false);
             input.cleanup();
             return;
         };
@@ -1031,9 +1031,9 @@ fn teammateThreadMain(input: *TeammateInput) void {
     var conv = Conversation.init(a);
     defer conv.deinit();
     conv.appendText(.user, input.prompt) catch {
+        setMemberActiveBestEffort(a, e.config_path, e.name, false); // 先落盘再翻状态(#100)
         e.setStatus(.failed);
         sendIdleNotification(a, e, "failed", null, "OutOfMemory");
-        setMemberActiveBestEffort(a, e.config_path, e.name, false);
         input.cleanup();
         return;
     };
@@ -1156,11 +1156,11 @@ fn teammateThreadMain(input: *TeammateInput) void {
             // 先放租约再翻 failed:failed 同样让 liveCount() 不再计入本 teammate,
             // lead 据此重派或收尸时租约必须已经不在 KG 里(理由同下方 terminated 路径)。
             releaseHeldTasks(e, kg_ptr); // 释放持有租约(PM F4/Linus M1:防卡 TTL)
+            setMemberActiveBestEffort(a, e.config_path, e.name, false); // 先落盘再翻状态(#100)
             e.lockPublic();
             e.status = .failed;
             e.err_name = @errorName(err);
             e.unlockPublic();
-            setMemberActiveBestEffort(a, e.config_path, e.name, false);
             log.warn("swarm", "teammate {s} run failed: {s}", .{ e.agent_id, @errorName(err) });
             // 失败必须到达 lead 邮箱(PM F1:静默失败 = roster 里躺着一个与健康 idle
             // 无法区分的尸体;cc 同款发 idleReason:'failed'+failureReason)。
@@ -1184,8 +1184,9 @@ fn teammateThreadMain(input: *TeammateInput) void {
         // idle:翻牌 + 通知 lead。**软截断不得洗成 available**(Linus MED-1):end_turn
         // 才是"干完可接新活";max_turns/tool_loop/budget 等是"没干完",发 needs_continuation
         // + stopReason 让 lead 决定续跑/改派,而非误以为完工。
-        e.setStatus(.idle);
+        // 与 terminated 同序(#100):先落盘 isActive=false,再翻 idle,再通知。
         setMemberActiveBestEffort(a, e.config_path, e.name, false);
+        e.setStatus(.idle);
         switch (result.stop_reason) {
             .end_turn => sendIdleNotification(a, e, "available", null, null),
             // api_error 是失败不是截断(401/429/5xx 重试耗尽后正常返回此 reason,非 Zig error)。
@@ -1200,13 +1201,16 @@ fn teammateThreadMain(input: *TeammateInput) void {
         conv.appendText(.user, next) catch break;
     }
 
-    // 先释放租约,再翻 terminated。liveCount() 按 working/idle 计数,lead 一看到
+    // 先释放租约、先落盘,最后才翻 terminated。liveCount() 按 working/idle 计数,lead 一看到
     // "人没了"就可能重派或收尸;若此时租约还在 KG 里,它读到的是一个已退出 teammate
     // 卡着的叶子(#51 的 "退出但没释放"正是这个顺序造成的竞争,不是 releaseHeldTasks
-    // 没生效)。terminated 必须蕴含 "持有的租约已经放掉"。
+    // 没生效)。config.json 同理(#100):观察到 terminated 的读者会紧接着 load config,
+    // 若 isActive=false 还在写,Windows 上 renameReplace 的替换窗口会让它读到 null。
+    // terminated 必须蕴含 "持有的租约已经放掉" 且 "config.json 的 isActive=false 已落盘"
+    // (best-effort:写失败也不再重试,但此后不会再有写)。
     releaseHeldTasks(e, kg_ptr); // 退出前释放持有租约(PM F4/Linus M1:abort/shutdown 不卡 TTL)
-    e.setStatus(.terminated);
     setMemberActiveBestEffort(a, e.config_path, e.name, false);
+    e.setStatus(.terminated);
     input.cleanup();
 }
 

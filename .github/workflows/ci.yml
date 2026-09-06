@@ -149,9 +149,14 @@ jobs:
           python3 scripts/verify_tinykg_binary.py
           python3 scripts/verify_ripgrep_binary.py
           zig build tinykg:stage
+      # Both vendored runtime assets stage for aarch64-linux, and the static
+      # release checks accept the cross-built unit (#86): the target's rg is
+      # the upstream aarch64 musl binary, first published with ripgrep 15.x.
       - name: Verify Linux arm64 cross-stage contract
         if: runner.os == 'Linux'
-        run: zig build tinykg:stage -Dtarget=aarch64-linux-musl
+        run: |
+          zig build tinykg:stage -Dtarget=aarch64-linux-musl
+          zig build release:check -Dtarget=aarch64-linux-musl -Drelease-layout=true --prefix "$RUNNER_TEMP/release-aarch64-linux"
       - name: Native platform modules
         shell: bash
         env:

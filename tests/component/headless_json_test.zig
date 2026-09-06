@@ -83,3 +83,22 @@ test "L2 headless breaker fallback:跳过只有 tool_use 的尾消息" {
     defer a.free(text);
     try std.testing.expectEqualStrings("work completed before breaker", text);
 }
+
+test "L2 headless --json: text 含非法 UTF-8(二进制工具输出混入)→ result 行严格可解码,坏字节成 U+FFFD" {
+    const a = std.testing.allocator;
+    const usage = UsageTotals{};
+    const result = RunResult{ .stop_reason = .end_turn, .turns = 1, .tool_calls = 1 };
+    // 2026-09-05 WorkBuddy 现场:Read 一个 ReportLab PDF,第二行的二进制标记 %\x93\x8c\x8b\x9e 原样
+    // 进了 stdout,trace.py 的 strict decode 把整个 cohort 判废。结尾再补半个"判"(E5 88)当被截断的字符。
+    const dirty = "%PDF-1.3\n%\x93\x8c\x8b\x9e ReportLab Generated PDF\n结论:\xe5\x88";
+    const line = try headless.buildResultLine(a, dirty, "final", null, result, &usage, "m");
+    defer a.free(line);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+    // std.json 的 Scanner 校验字符串内 UTF-8:能 parse 即严格可解码。
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "%PDF-1.3\n%\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD} ReportLab Generated PDF\n结论:\u{FFFD}\u{FFFD}",
+        parsed.value.object.get("text").?.string,
+    );
+}

@@ -10,7 +10,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- Vendored ripgrep moves from 14.1.1 to 15.2.0 (#86): the four existing
+  targets are replaced by the upstream 15.2.0 release binaries and
+  `rg-linux-aarch64` (upstream's `aarch64-unknown-linux-musl`, static-pie,
+  first published in 15.x) joins `vendor/ripgrep/manifest.json`, so
+  `aarch64-linux` satisfies the `elf-static` contract that #79 fails closed
+  on. Glob/Grep pass only `--files`, `--no-messages`, `--glob`, `--type`,
+  `--no-filename` and `--multiline-dotall`; the 15.x notes change none of
+  them. Every asset digest was checked against the GitHub Releases API.
+
 ### Added
+
+- `providers.<id>.oauth_client_id` in `~/.metacodes/config.json` (#87): the
+  OAuth client an installation registered for a built-in profile that declares
+  none. `metacodes login --provider <id>`, `/login <id>` and the picker's
+  credential stage present it without `--client-id`; precedence is
+  `--client-id`, then the configured client, then the profile's declaration,
+  and the winner is recorded with the login as before. Built-in profiles keep
+  declaring none.
 
 - `.github/workflows/release.yml` (#82, #47 stage 7): `workflow_dispatch` with
   `tag`, `dry_run` and `runner_pool`; one job per platform on the dedicated
@@ -94,6 +113,19 @@ status, compatibility boundaries, and entry points are defined by
   annotation of a module without that import, and every `X | None` outside an
   annotation (a type alias, an `isinstance` argument), which the import does
   not defer.
+
+- Headless `--stream-json` and `--json` NDJSON lines are always valid UTF-8.
+  The stream backend and the `result` line encoded strings with
+  `std.json.Stringify.encodeJsonString`, which passes bytes 0x80–0xFF through
+  untouched, so a `tool_result` carrying binary tool output (a ReportLab PDF's
+  `%\x93\x8c\x8b\x9e` marker read with `Read`, observed on the 2026-09-05
+  WorkBuddy office cohort) reached stdout as raw bytes and a strict UTF-8
+  consumer rejected the whole file. Every string field now goes through the
+  repository's canonical encoder (`util/json.zig`, invalid bytes → U+FFFD;
+  `content_bytes`/`input_bytes` still count the raw payload), a `text` or
+  `thinking` delta cut inside a multi-byte character is held back and rejoined
+  losslessly with the next delta of the same kind, and a character the block
+  ends without completing is emitted as one explicit U+FFFD line.
 
 - The Bash tool's spilled stdout/stderr are sealed during execution as attachments
   of its inline result and published by the batch commit boundary, like every
