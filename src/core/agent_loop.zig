@@ -43,7 +43,7 @@ const ui_event = @import("protocol/ui_event.zig");
 const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
 
-pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget };
+pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget, max_tokens_exhausted };
 
 /// Event capture is independent of execution depth. The default preserves the
 /// existing CLI/UI card behavior. Both AgentCore modes emit the complete raw
@@ -2011,6 +2011,18 @@ pub fn run(
         if (has_tool_use) output_channel.close(.commentary, assistant_text.items);
 
         if (!has_tool_use) {
+            if (turn_stop_reason == .max_tokens and
+                continuations >= MAX_CONTINUATIONS and
+                assistant_text.items.len == 0)
+            {
+                // The provider exhausted the continuation budget without
+                // producing answer text or a tool call. Preserve the
+                // distinction from a normal completion so callers can surface
+                // the truncated, empty run instead of treating it as success.
+                output_channel.close(.partial, assistant_text.items);
+                log.warnId("agent", rid, "max_tokens continuation budget exhausted without actionable output", .{});
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_tokens_exhausted, .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
             // Some Anthropic-compatible gateways accept but ignore a forced
             // tool_choice. `required_first` is stronger than a prompt hint:
             // one bounded, provider-neutral repair keeps the model from
@@ -5441,6 +5453,8 @@ test "StopReason has aborted and max_turns" {
     try std.testing.expect(r == .aborted);
     const r2: StopReason = .max_turns;
     try std.testing.expect(r2 == .max_turns);
+    const r3: StopReason = .max_tokens_exhausted;
+    try std.testing.expect(r3 == .max_tokens_exhausted);
 }
 
 test "auto-compact 阈值用 input context window 而非 output max_tokens(防回归真机 bug)" {
@@ -5804,6 +5818,126 @@ const CandidateSegments = struct {
     }
 };
 
+/// Provider fixture for the continuation-budget boundary. Every response is
+/// cut off with no content, with an optional tool call on the final response.
+const MaxTokensFake = struct {
+    allocator: std.mem.Allocator,
+    include_final_tool: bool = false,
+    sends: u32 = 0,
+    stream_step: u8 = 0,
+    rid: log.RequestId = undefined,
+
+    fn state(ctx: *anyopaque) *MaxTokensFake {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn next(ctx: *anyopaque) anyerror!?api_stream.StreamEvent {
+        const self = state(ctx);
+        defer self.stream_step += 1;
+        if (self.include_final_tool and self.sends == 4 and self.stream_step == 0) {
+            return .{ .tool_use_start = .{
+                .id = try self.allocator.dupe(u8, "tu_final"),
+                .name = try self.allocator.dupe(u8, "DefinitelyUnknown"),
+                .input_json = try self.allocator.dupe(u8, "{}"),
+            } };
+        }
+        return null;
+    }
+
+    fn streamDeinit(_: *anyopaque) void {}
+
+    fn stop(_: *anyopaque) api_stream.StopReason {
+        return .max_tokens;
+    }
+
+    fn requestId(ctx: *anyopaque) log.RequestId {
+        return state(ctx).rid;
+    }
+
+    fn sendStreamRetry(
+        ctx: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const json_mod.ToolDefinition,
+        _: ?*const AbortSignal,
+        _: ?[]const u8,
+        _: ?json_mod.ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?provider_mod.RetryReporter,
+        _: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        const self = state(ctx);
+        self.sends += 1;
+        self.stream_step = 0;
+        self.rid = log.genRequestId();
+        return .{
+            .ctx = ctx,
+            .nextFn = next,
+            .deinitFn = streamDeinit,
+            .stopReasonFn = stop,
+            .requestIdFn = requestId,
+        };
+    }
+
+    fn sendStream(
+        ctx: *anyopaque,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const json_mod.ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?json_mod.ToolChoice,
+        user_query: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        return sendStreamRetry(ctx, messages, system, tools, abort, model_override, tool_choice, 0, 0, null, user_query);
+    }
+
+    fn send(
+        _: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const json_mod.ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!provider_mod.ApiResponse {
+        return error.UnexpectedTestCall;
+    }
+
+    fn model(_: *anyopaque) []const u8 {
+        return "max-tokens-fake";
+    }
+
+    fn maxTokens(_: *anyopaque) u32 {
+        return 16_384;
+    }
+
+    fn maxInputTokens(_: *anyopaque) u32 {
+        return 200_000;
+    }
+
+    fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
+    }
+
+    fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+        return false;
+    }
+
+    fn provider(self: *MaxTokensFake) provider_mod.Provider {
+        return .{
+            .ctx = @ptrCast(self),
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+};
+
 const CandidateRun = struct {
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -5885,6 +6019,64 @@ test "a candidate observation reaches the boundary before the response completes
     try std.testing.expectEqualStrings("first-tail", segments.text.items);
     try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
     try std.testing.expectEqual(output_semantics.Disposition.final, segments.dispositions.items[0]);
+}
+
+test "max_tokens_exhausted with no actionable output is an explicit terminal stop" {
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = MaxTokensFake{ .allocator = a };
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(
+        &conversation,
+        fake.provider(),
+        &.{},
+        &perm,
+        .{ .max_turns = 4, .colorize = false },
+        &backend,
+        a,
+    );
+
+    try std.testing.expectEqual(StopReason.max_tokens_exhausted, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 4), fake.sends);
+    try std.testing.expectEqual(@as(u32, 4), result.turns);
+    try std.testing.expectEqual(@as(usize, 4), conversation.len());
+    try std.testing.expectEqual(@as(usize, 4), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.partial, segments.dispositions.items[3]);
+}
+
+test "max_tokens_exhausted preserves a complete tool_use instead of failing" {
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = MaxTokensFake{ .allocator = a, .include_final_tool = true };
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(
+        &conversation,
+        fake.provider(),
+        &.{},
+        &perm,
+        .{ .max_turns = 4, .colorize = false },
+        &backend,
+        a,
+    );
+
+    try std.testing.expectEqual(StopReason.max_turns, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 4), fake.sends);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+    try std.testing.expect(result.stop_reason != .max_tokens_exhausted);
 }
 
 test "a stream error settles the candidate as discarded and commits nothing" {
