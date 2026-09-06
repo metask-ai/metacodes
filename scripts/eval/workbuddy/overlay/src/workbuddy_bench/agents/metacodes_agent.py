@@ -503,6 +503,33 @@ class MetacodesAgent(BaseInstalledAgent):
             ),
         )
         await ensure_agent_user(self, environment)
+        run_user = getattr(environment, "default_user", None)
+        task_workdir = getattr(
+            getattr(environment, "task_env_config", None), "workdir", None
+        )
+        if run_user not in (None, "", "root", 0, "0"):
+            escaped_user = shlex.quote(str(run_user))
+            escaped_workdir = shlex.quote(str(task_workdir)) if task_workdir else '""'
+            # Repair only the task workdir.  The explicit protected-path cases
+            # keep a malformed task declaration from making verifier/grading
+            # state writable; the command is best effort by design.
+            await self.exec_as_root(
+                environment,
+                command=(
+                    f"(target={escaped_workdir}; "
+                    'if [ -z "$target" ]; then target="$(pwd)"; fi; '
+                    "case \"$target\" in "
+                    "/|//|//*|/tests|/tests/*|/logs/verifier|/logs/verifier/*|"
+                    "*/verifier|*/verifier/*|*/grading|*/grading/*) ;; "
+                    "*/..|*/../*|*/.|*/./*) ;; "
+                    '/*) if [ -d "$target" ] && [ ! -L "$target" ]; then '
+                    f"chown {escaped_user} \"$target\" && chmod u+rwx \"$target\"; "
+                    "fi ;; esac) || true"
+                ),
+                # A configured workdir may be absent.  Run from / so that the
+                # fail-soft repair cannot fail before its guarded body runs.
+                cwd="/" if task_workdir else None,
+            )
 
     def _collect_outcomes(self):
         """已完成 trial 的 verifier 结局(本 run 的兄弟 trial + 声明的

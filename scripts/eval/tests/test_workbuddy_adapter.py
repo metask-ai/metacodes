@@ -2999,6 +2999,27 @@ asyncio.run(main())
         self.assertIn('"artifacts_verified": True', source)
         self.assertIn('"runtime_active_bundle_absent": (', source)
 
+    def test_adapter_repairs_only_the_task_workdir_for_the_non_root_agent(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        install = source[source.index("    async def install("):source.index(
+            "    def _collect_outcomes", source.index("    async def install(")
+        )]
+        repair = install[install.index("await ensure_agent_user"):]
+        self.assertIn('getattr(environment, "default_user", None)', repair)
+        self.assertIn('getattr(environment, "task_env_config", None)', repair)
+        self.assertIn('target="$(pwd)"', repair)
+        self.assertIn("chown", repair)
+        self.assertIn("chmod u+rwx", repair)
+        self.assertIn("|| true", repair)
+        self.assertIn("/tests|/tests/*", repair)
+        self.assertIn("/logs/verifier|/logs/verifier/*", repair)
+        self.assertIn("*/verifier|*/verifier/*", repair)
+        self.assertIn("*/grading|*/grading/*", repair)
+        self.assertNotIn("chown -R", repair)
+
     def test_paid_code_probe_is_frozen_to_first_code_dev_task(self):
         root = Path(__file__).parents[1] / "workbuddy"
         overlay = root / "overlay"
