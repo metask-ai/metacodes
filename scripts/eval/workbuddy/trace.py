@@ -235,10 +235,13 @@ def _read_regular_bytes(path: Path, *, limit: int = MAX_TRACE_BYTES) -> bytes:
 
 
 def _read_regular_file(path: Path, *, limit: int = MAX_TRACE_BYTES) -> str:
-    try:
-        return _read_regular_bytes(path, limit=limit).decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise TraceError(f"cannot read trace file {path}: {exc}") from exc
+    # metacodes' --stream-json can split a multi-byte character across two
+    # streamed text events (observed 2026-09-05: byte 0x93 mid-file), which
+    # makes the raw file invalid UTF-8 even though every line is otherwise
+    # well-formed JSON.  Decoding with replacement keeps the terminal result
+    # event, usage and tool events readable; hashes are always taken over the
+    # raw bytes, so evidence binding is unaffected.
+    return _read_regular_bytes(path, limit=limit).decode("utf-8", errors="replace")
 
 
 def _sha256(payload: bytes) -> str:
@@ -918,7 +921,14 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                     if _task_list_has_kg_status(result["content"]):
                         tinykg["task_tinykg_status_results"] += 1
                     continue
-                payload = _result_object(result["content"], name)
+                try:
+                    payload = _result_object(result["content"], name)
+                except TraceError:
+                    # metacodes' Task* tools can answer with plain text (observed
+                    # 2026-09-05: a successful TaskUpdate whose result was not JSON).
+                    # The call is already counted above; only the kg_status detail
+                    # is unavailable, which must not abort the whole trial.
+                    continue
                 kg_status = payload.get("kg_status")
                 if kg_status is None and name == "TaskCreate":
                     task = payload.get("task")
@@ -1596,11 +1606,17 @@ def load_control_metrics(
 
     transcript_bytes = _read_regular_bytes(transcript_path)
     observation_bytes = _read_regular_bytes(observation_path)
-    try:
-        transcript_text = transcript_bytes.decode("utf-8", errors="strict")
-        observation_text = observation_bytes.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise TraceError(f"control evidence is not UTF-8: {exc}") from exc
+    # Tool results echoed into the transcript/observation journals can carry raw
+    # non-UTF-8 bytes (e.g. a task that reads back a generated .pptx/.pdf —
+    # html-report-quadrant-ppt, office-sealed 2026-09-05, byte 0xbb). A strict
+    # decode here raised TraceError, which populate_context_post_run turned into
+    # a RuntimeError that aborted the whole harbor cohort (17/30 graded). Decode
+    # tolerantly with U+FFFD, exactly as _read_regular_file already does for the
+    # output stream: the control-metric scans key off ASCII journal markers and
+    # NDJSON structure, which replacement never disturbs, and the integrity
+    # hashes below are taken over the raw bytes regardless.
+    transcript_text = transcript_bytes.decode("utf-8", errors="replace")
+    observation_text = observation_bytes.decode("utf-8", errors="replace")
     transcript = _json_lines_from_text(transcript_text, transcript_path, allow_prose=False)
     observations = _json_lines_from_text(
         observation_text, observation_path, allow_prose=False

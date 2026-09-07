@@ -75,6 +75,23 @@ _CONTINUITY_LEDGER = "ledger.jsonl"
 _MAX_CONTINUITY_TAR_BYTES = 64 * 1024 * 1024
 
 
+
+def _fresh_run_home(logs_dir: Path, step_key: str = "") -> str:
+    """Return the deterministic private HOME for one WorkBuddy step.
+
+    In multi-step tasks harbor reuses the SAME agent object and logs_dir for
+    every step (per-step outputs are archived under steps/<name>/ only AFTER
+    the step finishes), so logs_dir alone does not distinguish step 1 from
+    step 2 and the shared HOME would trip the fresh-HOME guard on step 2+.
+    The rendered instruction differs per step, so it is folded in to make the
+    path unique per step while staying deterministic for a given step.
+    """
+
+    step_hash = hashlib.sha256(
+        (str(logs_dir) + "\x00" + step_key).encode("utf-8")
+    ).hexdigest()
+    return f"/tmp/metacodes-workbuddy-home-{step_hash}"
+
 def _continuity_root(logs_dir: Path) -> Path:
     """Arm-level store home: <jobs_dir>/kg-store-continuity.
 
@@ -305,6 +322,44 @@ def _read_continuity_ledger(path: Path) -> list:
         if line.strip():
             rows.append(json.loads(line))
     return rows
+
+
+_PROXY_PROVIDER_ID = "workbuddy-proxy"
+
+
+def _proxy_provider_config(proxy_url: str, model_name: str) -> str:
+    """User-defined provider document that routes the actor at the job proxy.
+
+    ``custom_providers`` in ``~/.metacodes/config.json`` goes through the same
+    registry validation as a built-in profile.  The only difference from the
+    ``anthropic`` profile is the endpoint policy, which names the plaintext
+    hop to the audited WorkBuddy host proxy explicitly instead of relying on
+    the loopback exemption; the channel base URL is the proxy root and the
+    anthropic_messages wire appends ``/v1/messages``.
+    """
+    root = str(proxy_url or "").strip().rstrip("/")
+    if not root.startswith(("http://", "https://")):
+        raise ValueError("metacodes local_proxy connection has no http(s) proxy_url")
+    if "@" in root.split("//", 1)[1].split("/", 1)[0]:
+        raise ValueError("metacodes local_proxy proxy_url must not carry userinfo")
+    document = {
+        "schema_version": 1,
+        "custom_providers": {
+            _PROXY_PROVIDER_ID: {
+                "display_name": "WorkBuddy job proxy",
+                "auth": {"kind": "api_key_header", "header": "x-api-key"},
+                "env_aliases": [
+                    {"name": "METACODES_ROUTE_TOKEN", "kind": "api_key", "canonical": True}
+                ],
+                "endpoint_policy": {"require_tls": False},
+                "channels": [
+                    {"id": "proxy", "base_url": root, "protocol": "anthropic_messages"}
+                ],
+                "models": [{"request_model_id": model_name}],
+            }
+        },
+    }
+    return json.dumps(document, sort_keys=True, separators=(",", ":"))
 
 
 class MetacodesAgent(BaseInstalledAgent):
@@ -674,10 +729,17 @@ class MetacodesAgent(BaseInstalledAgent):
             # Route authority only.  The real provider credential never crosses
             # the host proxy boundary.
             "METACODES_ROUTE_TOKEN": route,
-            "METACODES_PROVIDER": "anthropic",
-            "METACODES_BASE_URL": escaped_proxy,
+            # The job proxy is plain HTTP on a non-loopback name
+            # (host.docker.internal).  Since the provider endpoint policy
+            # (2026-09-01) a built-in profile refuses that, so the trial
+            # declares a user-defined provider whose only channel *is* the
+            # audited local proxy and whose policy states the plaintext hop
+            # explicitly.  The route token still arrives over the anonymous
+            # descriptor; nothing else about the request changes.
+            "METACODES_PROVIDER": _PROXY_PROVIDER_ID,
             "METACODES_NO_PROBE": "1",
         }
+        provider_config = _proxy_provider_config(self._proxy_url, self.model_name)
 
         mount = self._mount_path.rstrip("/")
         output_path = f"/logs/agent/{_OUTPUT_FILENAME}"
@@ -885,7 +947,7 @@ class MetacodesAgent(BaseInstalledAgent):
                 "outcome_feedback": self._outcome_feedback,
                 "continuity_seed_sha256": self._continuity_seed_sha256,
                 "store_import_sha256": store_import_sha,
-                "credential_delivery": "anonymous-fd-route-token",
+                "credential_delivery": "env-route-token",
                 "transport_model_is_route": True,
                 "actor_model_identity": self._model_display_name,
                 "verification_checkpoint": self._verification_checkpoint,
@@ -939,11 +1001,14 @@ class MetacodesAgent(BaseInstalledAgent):
         # Bash is intentional: WorkBuddy's installed-agent contract already
         # uses shell commands, and anonymous-FD handoff plus PIPESTATUS need a
         # real shell.  No credential value is interpolated into this command.
+        run_home = _fresh_run_home(self.logs_dir, step_key=instruction)
         command = (
             "set -uo pipefail; umask 077; "
-            'run_home="/tmp/metacodes-workbuddy-home"; '
+            f'run_home="{run_home}"; '
             'test ! -e "$run_home" || { echo "fresh HOME already exists" >&2; exit 70; }; '
             'mkdir -p "$run_home" || exit 70; export HOME="$run_home"; '
+            'mkdir -p "$HOME/.metacodes" || exit 70; '
+            f"printf '%s' {shlex.quote(provider_config)} > \"$HOME/.metacodes/config.json\" || exit 70; "
             "unset METACODES_PROJECT_KERNEL_PATH METACODES_PROJECT_KERNEL_SHA256; "
             f"{project_setup}"
             "export METACODES_KG_TRANSPORT=cli-exclusive; "
@@ -977,8 +1042,12 @@ class MetacodesAgent(BaseInstalledAgent):
             f"printf '%s\\n' {shlex.quote(runtime_contract)} > "
             f"{shlex.quote(runtime_contract_path)} || exit 86; "
             f"chmod 0600 {shlex.quote(runtime_contract_path)} || exit 87; "
-            'exec 9<<<"$METACODES_ROUTE_TOKEN"; unset METACODES_ROUTE_TOKEN; '
-            "export METACODES_API_KEY_FD=9; "
+            # The route token stays in the environment: it is the credential
+            # the user-defined provider declares (env alias METACODES_ROUTE_TOKEN),
+            # and the registry credential path (resolveProviderScopedSecret)
+            # consults CLI/env material only - the anonymous-descriptor hand-off
+            # exists on the legacy Metask path alone.  The token is per-trial
+            # route authority for the host proxy, never the provider secret.
             # --stream-json: live per-event NDJSON on stdout (text/tool/usage/
             # turn) so watchers can tail metacodes-output.jsonl mid-run and
             # kill a doomed trial early instead of waiting for the terminal
@@ -1029,34 +1098,86 @@ class MetacodesAgent(BaseInstalledAgent):
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         try:
-            trace = load_trace_ir(
-                self.logs_dir / _OUTPUT_FILENAME,
-                self.logs_dir / _TRANSCRIPT_FILENAME,
-            )
-            control_metrics = load_control_metrics(
-                self.logs_dir / _TRANSCRIPT_FILENAME,
-                self.logs_dir / OBSERVATION_FILENAME,
-            )
-            # Runtime receipt for the enforced arm, symmetric with the
-            # disabled arm's exit-88 bundle-absence postcheck: the binary
-            # derives the project-rules directory from its own XxHash64 of
-            # the cwd and silently runs bare-rules when the lookup misses
-            # (harness review 2026-08-17 finding #2 — the treatment dose
-            # would drop to zero with no error anywhere). A dispatching
-            # enforced run whose journal carries zero rule_filter events
-            # means the bundle was never loaded; fail the trial loudly.
-            if self._project_control_mode == "enforced":
-                runtime = control_metrics.get("tool_runtime") or {}
-                lean = control_metrics.get("lean") or {}
-                if runtime.get("dispatch_started", 0) > 0 and not lean.get(
-                    "rule_filter_events", 0
+            try:
+                trace = load_trace_ir(
+                    self.logs_dir / _OUTPUT_FILENAME,
+                    self.logs_dir / _TRANSCRIPT_FILENAME,
+                )
+            except (TraceError, FileNotFoundError) as exc:
+                # A killed or timed-out agent (harbor SIGTERM -> exit 143, or an
+                # OOM kill) is torn down before it can emit its single terminal
+                # `result` event, so the NDJSON stream carries zero results.
+                # That is a legitimately failed trial worth zero reward, not a
+                # harness fault. Raising here propagates out of harbor's
+                # per-trial exception-recovery path (_recover_outputs runs
+                # inside the trial's own `except`) and cancels every sibling in
+                # the TaskGroup — observed 2026-09-05 on kunshan security-sealed
+                # where a single exit-143 trial aborted the whole 24-task cohort
+                # after only 3 were graded. Tolerate *exactly* the no-result
+                # case as a degenerate zero trajectory; every other trace defect
+                # (malformed JSON, more than one result, bad field types) must
+                # still fail loudly.
+                if (
+                    isinstance(exc, TraceError)
+                    and "result event, found 0" not in str(exc)
                 ):
-                    raise RuntimeError(
-                        "enforced project control produced no rule_filter "
-                        "events across a dispatching run: the rule bundle "
-                        "was staged but never loaded by the binary"
-                    )
-            trace["control_metrics"] = control_metrics
+                    raise
+                trace = {
+                    "result": {
+                        "stop_reason": "killed_no_result",
+                        "turns": 0,
+                        "tool_calls": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_usd": 0.0,
+                        "text": "",
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                    # Trajectory requires >= 1 step; emit a single marker step so
+                    # the degenerate trajectory validates. transcript_ir row shape.
+                    "steps": [
+                        {
+                            "step_id": 1,
+                            "source": "agent",
+                            "message": (
+                                "metacodes agent was terminated before emitting "
+                                "a result event (timeout / SIGTERM / OOM); this "
+                                "trial is recorded as a failed zero-reward run."
+                            ),
+                            "reasoning_content": None,
+                            "tool_calls": [],
+                            "observations": [],
+                            "extra": {"killed_no_result": True},
+                        }
+                    ],
+                    "control_metrics": {"killed_no_result": True},
+                }
+            if "control_metrics" not in trace:
+                control_metrics = load_control_metrics(
+                    self.logs_dir / _TRANSCRIPT_FILENAME,
+                    self.logs_dir / OBSERVATION_FILENAME,
+                )
+                # Runtime receipt for the enforced arm, symmetric with the
+                # disabled arm's exit-88 bundle-absence postcheck: the binary
+                # derives the project-rules directory from its own XxHash64 of
+                # the cwd and silently runs bare-rules when the lookup misses
+                # (harness review 2026-08-17 finding #2 — the treatment dose
+                # would drop to zero with no error anywhere). A dispatching
+                # enforced run whose journal carries zero rule_filter events
+                # means the bundle was never loaded; fail the trial loudly.
+                if self._project_control_mode == "enforced":
+                    runtime = control_metrics.get("tool_runtime") or {}
+                    lean = control_metrics.get("lean") or {}
+                    if runtime.get("dispatch_started", 0) > 0 and not lean.get(
+                        "rule_filter_events", 0
+                    ):
+                        raise RuntimeError(
+                            "enforced project control produced no rule_filter "
+                            "events across a dispatching run: the rule bundle "
+                            "was staged but never loaded by the binary"
+                        )
+                trace["control_metrics"] = control_metrics
             trajectory = self._build_trajectory(trace)
         except (OSError, TraceError, ValueError) as exc:
             raise RuntimeError(f"cannot build metacodes ATIF trajectory: {exc}") from exc
