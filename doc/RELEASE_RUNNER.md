@@ -22,6 +22,7 @@ three.
 | Count | one runner per platform; the workflow's matrix has one job per platform |
 | Registration | repository-level runner group `metacodes-release`, restricted to the `Release` workflow (GitHub → Settings → Actions → Runner groups → "Selected workflows") |
 | Account | a dedicated unprivileged OS user; no access to developer home directories or PR-pool workspaces |
+| Egress | HTTPS to `github.com`, `api.github.com`, `objects.githubusercontent.com` and the Actions artifact service (`*.actions.githubusercontent.com`, `*.blob.core.windows.net`): the build jobs upload the archives with `actions/upload-artifact` and `publish` downloads them. Verify with one dry run before registering the runner; the CI pool's Linux runner resets that upload today (`ECONNRESET`, run 33939121801), which is why dry runs tolerate a failed upload |
 | Toolchain | Zig 0.16.0 installed by `mlugg/setup-zig` in the job, exactly as CI does; Python ≥ 3.9 from the OS; `git`; `gh`; a Rust stable toolchain (`cargo`) and `bindgen` 0.72.1 for the AgentCore gate's link probe and bindings-regen check — the workflow's toolchain inventory fails a release job that lacks them |
 | Network | outbound only to GitHub (checkout, `setup-zig` download, artifact upload). Nothing in `zig build` downloads: ripgrep and TinyKG are vendored and hash-checked (`verify_ripgrep_binary.py`, `verify_tinykg_binary.py`) |
 
@@ -55,7 +56,17 @@ The PR pool keeps its labels; nothing here changes `ci.yml`.
 
 Until the runners are registered, `release.yml` is `workflow_dispatch` only and
 the `runner_pool: pr-pool` input lets a maintainer dry-run the workflow on the CI
-machines (`dry_run: true`, no publish). Once the three runners report online:
+machines (`dry_run: true`, no publish; `tag` takes a branch name or a full
+40-hex commit SHA, since `actions/checkout` rejects short SHAs). A pr-pool dry
+run joins the CI runner lane of the branch it was dispatched from (`github.ref`,
+normally main; the `tag` input picks what to build, not the lane), so it queues
+behind the CI job a merge
+just started instead of sharing the box with it. GitHub cancels the older
+*queued* job when a newer one joins a group, in both directions: a push to that
+lane cancels a still-queued dry-run job (re-dispatch), and a dispatch cancels a
+still-queued CI job in that lane (rerun it). Dispatch when `gh run list` shows
+the lane idle. Once the three
+runners report online:
 
 1. Remove the `pr-pool` choice from the workflow input.
 2. Add `on: push: tags: ["[0-9]+.[0-9]+.[0-9]+"]` so a bare `X.Y.Z` tag builds

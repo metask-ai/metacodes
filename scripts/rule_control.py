@@ -3865,7 +3865,7 @@ def observe_daemon_transport(repo: Path) -> Observation:
         )),
         "end_to_end_wall_clock_deadline": all(marker in policy + deadline + sources["probe"] + sources["runtime"] for marker in (
             "std.Io.Select(PostRace)", "deadlineTask", "remainingTimeoutMs", "Error.RequestTimedOut",
-            '"wall_clock_timeout=observed', "time.monotonic() - started < 1.0",
+            '"wall_clock_timeout=observed', "time.monotonic() - started < 5.0", "time.sleep(5.0)",
         )),
         "bounded_backpressure_and_unavailability": all(marker in parse + sources["probe"] + sources["runtime"] for marker in (
             "DaemonQueueFull", "Error.Backpressure", "Error.DaemonUnavailable",

@@ -342,11 +342,19 @@ The refresh grant must present the same client the authorization grant was
 issued to, so a client that lives only in configuration would break the login
 the moment that configuration moved. A profile may declare one
 (`oauth_client_id`); a configured provider declares it under
-`custom_providers.<id>.oauth`; `--client-id` supplies one for a profile that
-declares none. Built-in profiles deliberately declare no client id: the client
-an installation presents is registered by whoever runs it, and shipping a
+`custom_providers.<id>.oauth`; an installation declares the client it
+registered for a built-in profile under `providers.<id>.oauth_client_id` in
+`~/.metacodes/config.json` (#87), and `--client-id` supplies one for a single
+login. Precedence is `--client-id`, then the configured client, then the
+profile's declaration; whichever wins is the one recorded with the login.
+Built-in profiles deliberately declare no client id: the client an
+installation presents is registered by whoever runs it, and shipping a
 guessed one would point every user's first exchange at a client that is not
-theirs.
+theirs. That is the resolution of #87: the built-in `openai` profile stays
+undeclared, the installation configures its own registration once, and
+`/login openai`, `metacodes login --provider openai` and the picker's
+credential stage then need no `--client-id`. A metask-registered default, if
+one is ever wanted, is a one-line profile constant behind the same precedence.
 
 A profile that declares neither an authorization nor a device endpoint has no
 interactive flow, and says so at the entry point instead of failing later at a
@@ -715,13 +723,6 @@ from a profile, and `../app.zig` from the picker.
 Listed rather than left silent. Each is a decision with a reason, not an
 omission — and none of them is an acceptance criterion of the issue.
 
-- **A default OpenAI client (tracked as #87).** The built-in `openai` profile
-  declares no `oauth_client_id`: the client an installation presents is a
-  registration decision for the maintainers — redirect URI, device-code scope,
-  who owns the registration — not something to guess in a profile, so `/login
-  openai`, `metacodes login --provider openai` and the picker's credential
-  stage all require `--client-id` (or `custom_providers.<id>.oauth.client_id`)
-  until one is settled.
 - **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
   signed adapter reference, which needs review and signing infrastructure. The
   declarative schema covers relays, gateways, and self-hosted servers, which

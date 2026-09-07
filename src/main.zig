@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_name = @import("api/model_name.zig");
 const builtin = @import("builtin");
 const platform_term = @import("platform").terminal;
 const pfs = @import("platform").fs;
@@ -436,13 +437,13 @@ fn applyStartupOutcome(
 }
 
 pub fn inferProviderKind(model: []const u8) types.ProviderKind {
-    if (std.mem.startsWith(u8, model, "gpt") or
-        std.mem.startsWith(u8, model, "o1") or
-        std.mem.startsWith(u8, model, "o3"))
+    if (model_name.startsWithIgnoreCase(model, "gpt") or
+        model_name.startsWithIgnoreCase(model, "o1") or
+        model_name.startsWithIgnoreCase(model, "o3"))
     {
         return .openai;
     }
-    if (std.mem.startsWith(u8, model, "gemini")) return .gemini;
+    if (model_name.startsWithIgnoreCase(model, "gemini")) return .gemini;
     return .anthropic;
 }
 
@@ -1479,7 +1480,7 @@ fn storeProviderOAuthToken(
         allocator.free(text);
     }
 
-    return loginProviderWithTokenResponse(allocator, built, text, explicit_client_id);
+    return loginProviderWithTokenResponse(allocator, built, text, explicit_client_id, host.oauthClientIdFor(built.id));
 }
 
 /// Refuse, with the reason, a provider whose stored login could never be used.
@@ -1510,23 +1511,27 @@ fn requireOAuthCapableProvider(built: *const provider_profile.ProviderProfile) b
 /// do. Public so the wiring — not just the parts — is testable against a
 /// profile, without a provider host or a home directory.
 ///
-/// `explicit_client_id` is what the user passed on the command line; it wins
-/// over what the profile declares, and for a profile that declares none it is
-/// the only way the refresh grant can present the right client. Ignoring it
-/// here while accepting it on the command line is exactly the defect this
-/// function replaced.
+/// `explicit_client_id` is what the user passed on the command line and
+/// `configured_client_id` what the installation declared under
+/// `providers.<id>.oauth_client_id` (#87); the precedence is the one
+/// `provider_login.prepareProfileWith` applies to the interactive grant —
+/// explicit, then configured, then the profile's declaration — so an imported
+/// login records the same client an interactive one would, and the refresh
+/// grant presents the right one. Ignoring a client here while accepting it
+/// elsewhere is exactly the defect this function replaced.
 pub fn loginProviderWithTokenResponse(
     allocator: std.mem.Allocator,
     built: *const provider_profile.ProviderProfile,
     token_json: []const u8,
     explicit_client_id: ?[]const u8,
+    configured_client_id: ?[]const u8,
 ) u8 {
     if (!requireOAuthCapableProvider(built)) return 2;
     return importProviderTokenResponse(
         allocator,
         built.id,
         token_json,
-        explicit_client_id orelse built.oauth_client_id,
+        explicit_client_id orelse configured_client_id orelse built.oauth_client_id,
     );
 }
 
@@ -1628,11 +1633,11 @@ fn runProviderOAuthLogin(
     };
     // Every refusal is decided in the kernel before anything is contacted;
     // this only says which one, in the words the CLI has always used.
-    const prepared = provider_login.prepareProfile(built, .{
+    const prepared = provider_login.prepareProfileWith(built, .{
         .method = options.method,
         .open_browser = options.open_browser,
         .client_id = options.client_id,
-    }) catch |err| switch (err) {
+    }, host.oauthClientIdFor(built.id)) catch |err| switch (err) {
         error.ProviderHasNoTokenEndpoint, error.ProviderAcceptsNoOAuthKind => {
             _ = requireOAuthCapableProvider(built);
             return 2;
@@ -1655,10 +1660,11 @@ fn runProviderOAuthLogin(
         error.ClientIdMissing => {
             std.debug.print(
                 "error: provider '{s}' declares no OAuth client id; " ++
-                    "pass --client-id <client>\n" ++
+                    "pass --client-id <client> or set providers.{s}.oauth_client_id " ++
+                    "in ~/.metacodes/config.json\n" ++
                     "(a provider defined under custom_providers can declare " ++
-                    "oauth.client_id instead, and it is then used for refresh too)\n",
-                .{built.id.slice()},
+                    "oauth.client_id instead; every one of these is used for refresh too)\n",
+                .{ built.id.slice(), built.id.slice() },
             );
             return 2;
         },

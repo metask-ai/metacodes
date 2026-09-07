@@ -22,6 +22,7 @@ const subagent = @import("../core/subagent.zig");
 const util_json = @import("../util/json.zig");
 const filter_mod = @import("../agents/filter.zig");
 const model_tiers_mod = @import("../api/model_tiers.zig");
+const swarm_tools = @import("../swarm/tools.zig");
 
 /// 最深嵌套层数。parent=0,孙=2;>= 这个值就拒绝 spawn。
 /// 嵌套 subagent 是允许的(子 agent 也能调 Task),但深度有限保护栈。
@@ -228,6 +229,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (def_opt) |d| d.model else null,
     );
     const model_override = model_selection.model;
+    const parent_provider = ctx.provider orelse api_client.?.provider();
+    const child_effort = swarm_tools.resolveTeammateEffort(
+        if (def_opt) |d| d.effort else null,
+        model_selection,
+        parent_provider.reasoningEffort(),
+    );
 
     // subagent system prompt:def + 环境 + CLAUDE.md/git(Explore/Plan 跳过) + skills preload
     const preload_mod = @import("../agents/preload.zig");
@@ -304,7 +311,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .agent_type = subagent_type_raw,
             .model_override = model_override,
             .model_tiers = ctx.model_tiers,
-            .reasoning_effort_override = (if (def_opt) |d| d.effort else null) orelse model_selection.effort,
+            .reasoning_effort_override = child_effort,
             .perm_override = perm_override,
             .project_dir = effective_project_dir,
             .cwd = effective_cwd,
@@ -357,7 +364,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .max_turns = max_turns,
             .model_override = model_override,
             .model_tiers = ctx.model_tiers,
-            .reasoning_effort_override = (if (def_opt) |d| d.effort else null) orelse model_selection.effort,
+            .reasoning_effort_override = child_effort,
             .overrides_override = if (def_opt) |d| d.overrides else null,
             .perm_override = perm_override,
             .project_dir = effective_project_dir,
@@ -489,7 +496,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .permission_mode_override = perm_override,
             .model_override = model_override,
             .model_tiers = ctx.model_tiers,
-            .reasoning_effort_override = (if (def_opt) |d| d.effort else null) orelse model_selection.effort,
+            .reasoning_effort_override = child_effort,
             .overrides_override = if (def_opt) |d| d.overrides else null,
             .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
             .project_dir = effective_project_dir,

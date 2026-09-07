@@ -25,6 +25,7 @@ const tool_context_mod = @import("../tools/context.zig");
 const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend = @import("../core/writer_backend.zig");
 const stream_json_mod = @import("stream_json_backend.zig");
+const util_json = @import("../util/json.zig");
 
 /// Headless callers can make tool availability part of their frozen runtime
 /// contract with `--disallowed-tools`. The ordinary permission settings still
@@ -336,10 +337,15 @@ pub fn run(
         effective_be,
         allocator,
     ) catch |err| {
+        // --stream-json:run 报错提前返回没走到 diag_run_end 收口,悬挂的半个字符也要落地(U+FFFD)。
+        if (app.config.stream_json) sjb.flush();
         if (run_control) |control| try control.finishRun(@errorName(err));
         std.debug.print("error: {s}\n", .{@errorName(err)});
         return 1;
     };
+    // --stream-json:正常路径 diag_run_end 已触发同一收口;这里幂等兜底,保证 result 行
+    // 之前时间线已封口,不留半个字符悬在内存里。
+    if (app.config.stream_json) sjb.flush();
     if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
 
     // v41 机制遥测:run 末把义务运行时状态折叠成 ontology 行(host 观测,
@@ -844,9 +850,11 @@ pub fn buildResultLine(
         usage.cache_creation_input_tokens,
         cost,
     });
-    try std.json.Stringify.encodeJsonString(final_text, .{}, &aw.writer);
+    // 规范编码器(util/json.zig):非法 UTF-8 字节 → U+FFFD。std.json 的 encodeJsonString 默认
+    // 原样透传 0x80..0xFF,二进制工具输出混进最终文本会让整行无法严格解码。
+    try util_json.writeJsonString(&aw.writer, final_text);
     try aw.writer.writeAll(",\"text_kind\":");
-    try std.json.Stringify.encodeJsonString(text_kind, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, text_kind);
     if (changes) |journal| {
         const file_change = @import("../core/file_change.zig");
         const records = journal.acquire();

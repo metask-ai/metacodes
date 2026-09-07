@@ -24,6 +24,7 @@ const json_mod = @import("../json.zig");
 const model_fallback = @import("../util/model.zig");
 const log = @import("../util/log.zig");
 const types = @import("../types.zig");
+const model_name = @import("model_name.zig");
 
 pub const Catalog = struct {
     allocator: std.mem.Allocator,
@@ -49,6 +50,17 @@ pub const Catalog = struct {
 
     pub fn init(allocator: std.mem.Allocator) Catalog {
         return .{ .allocator = allocator, .entries = .empty };
+    }
+
+    pub fn clone(self: *const Catalog, allocator: std.mem.Allocator) !Catalog {
+        var copy = Catalog.init(allocator);
+        errdefer copy.deinit();
+        for (self.entries.items) |entry| {
+            const id = try allocator.dupe(u8, entry.model_id);
+            errdefer allocator.free(id);
+            try copy.entries.append(allocator, .{ .model_id = id, .max_tokens = entry.max_tokens, .max_input_tokens = entry.max_input_tokens, .reasoning_mask = entry.reasoning_mask });
+        }
+        return copy;
     }
 
     pub fn deinit(self: *Catalog) void {
@@ -118,7 +130,7 @@ pub const Catalog = struct {
             return v;
         }
         for (self.entries.items) |e| {
-            if (std.mem.eql(u8, e.model_id, model)) {
+            if (model_name.eqlIgnoreCase(e.model_id, model)) {
                 if (e.max_tokens) |v| return v;
                 break; // 命中 entry 但后端没给 max_tokens → 走 fallback
             }
@@ -131,7 +143,7 @@ pub const Catalog = struct {
     /// 注意:这是 **input 上限**,与 maxTokensFor(output 上限)是两回事——auto-compact 该用本函数。
     pub fn maxInputTokensFor(self: *const Catalog, model: []const u8) u32 {
         for (self.entries.items) |e| {
-            if (std.mem.eql(u8, e.model_id, model)) {
+            if (model_name.eqlIgnoreCase(e.model_id, model)) {
                 if (e.max_input_tokens) |v| return v;
                 break; // 命中 entry 但后端没给 max_input_tokens → 走默认
             }
@@ -141,11 +153,22 @@ pub const Catalog = struct {
 
     pub fn reasoningMaskFor(self: *const Catalog, model: []const u8) u8 {
         for (self.entries.items) |e| {
-            if (std.mem.eql(u8, e.model_id, model)) return e.reasoning_mask;
+            if (model_name.eqlIgnoreCase(e.model_id, model)) return e.reasoning_mask;
         }
         return 0;
     }
 };
+
+test "Catalog.clone deep-copies model identifiers" {
+    var original = Catalog.init(std.testing.allocator);
+    defer original.deinit();
+    try original.loadFromModelsListJson("{\"data\":[{\"id\":\"GLM-5.2\",\"max_tokens\":64000,\"max_input_tokens\":1048576}]} ");
+    var copy = try original.clone(std.testing.allocator);
+    defer copy.deinit();
+    original.entries.items[0].model_id[0] = 'X';
+    try std.testing.expectEqualStrings("GLM-5.2", copy.entries.items[0].model_id);
+    try std.testing.expectEqual(@as(u32, 64000), copy.maxTokensFor("glm-5.2", null));
+}
 
 pub fn reasoningBit(effort: types.ReasoningEffort) u8 {
     return switch (effort) {

@@ -30,6 +30,9 @@ pub const Slug = ids.Slug;
 
 pub const HostError = error{OutOfMemory} || registry_mod.RegisterError;
 
+/// One `providers.<id>.oauth_client_id` entry as the host keeps it (#87).
+pub const ConfiguredClientId = struct { provider_id: Slug, client_id: []const u8 };
+
 pub const Host = struct {
     allocator: std.mem.Allocator,
     registry: ProviderRegistry,
@@ -58,6 +61,13 @@ pub const Host = struct {
     /// `/providers refresh` used to do.
     config_bindings: std.ArrayList(registry_mod.CredentialBinding) = .empty,
     config_exclusions: std.ArrayList(Slug) = .empty,
+    /// `providers.<id>.oauth_client_id` (#87): the client an installation
+    /// registered for a profile that declares none. The strings live in
+    /// `config_client_arena`, which only the host's end frees: a login that
+    /// is presenting one of them may still be in flight when the
+    /// configuration is applied again, so a swap appends rather than frees.
+    config_client_ids: std.ArrayList(ConfiguredClientId) = .empty,
+    config_client_arena: ?std.heap.ArenaAllocator = null,
     kernel: Kernel,
 
     pub fn create(allocator: std.mem.Allocator) HostError!*Host {
@@ -96,6 +106,8 @@ pub const Host = struct {
         if (self.catalog_arena) |*arena| arena.deinit();
         self.config_bindings.deinit(allocator);
         self.config_exclusions.deinit(allocator);
+        self.config_client_ids.deinit(allocator);
+        if (self.config_client_arena) |*arena| arena.deinit();
         allocator.destroy(self);
     }
 
@@ -422,6 +434,21 @@ pub const Host = struct {
             if (entry.enabled) continue;
             disabled.append(self.allocator, entry.id) catch return error.OutOfMemory;
         }
+        // The installation's OAuth clients (#87). Copied into the arena the
+        // host keeps for them: a `Prepared` login holds the slice for the
+        // whole grant, so the previous strings must outlive this swap.
+        var client_ids: std.ArrayList(ConfiguredClientId) = .empty;
+        errdefer if (!moved) client_ids.deinit(self.allocator);
+        for (document.providers.items) |entry| {
+            const configured = entry.oauth_client_id orelse continue;
+            if (self.config_client_arena == null) {
+                self.config_client_arena = std.heap.ArenaAllocator.init(self.allocator);
+            }
+            const owned = self.config_client_arena.?.allocator().dupe(u8, configured.slice()) catch
+                return error.OutOfMemory;
+            client_ids.append(self.allocator, .{ .provider_id = entry.id, .client_id = owned }) catch
+                return error.OutOfMemory;
+        }
 
         // The new configuration is *swapped in*, and the old lists are kept
         // until the rebuild succeeds: a failed rebuild would otherwise leave
@@ -432,22 +459,39 @@ pub const Host = struct {
         // then would leave the previous exclusions in force.
         const previous_bindings = self.config_bindings;
         const previous_exclusions = self.config_exclusions;
+        const previous_client_ids = self.config_client_ids;
         moved = true;
         self.config_bindings = bindings;
         self.config_exclusions = disabled;
+        self.config_client_ids = client_ids;
         errdefer {
             self.config_bindings.deinit(self.allocator);
             self.config_exclusions.deinit(self.allocator);
+            self.config_client_ids.deinit(self.allocator);
             self.config_bindings = previous_bindings;
             self.config_exclusions = previous_exclusions;
+            self.config_client_ids = previous_client_ids;
         }
 
         try self.rebuild();
 
         var retired_bindings = previous_bindings;
         var retired_exclusions = previous_exclusions;
+        var retired_client_ids = previous_client_ids;
         retired_bindings.deinit(self.allocator);
         retired_exclusions.deinit(self.allocator);
+        retired_client_ids.deinit(self.allocator);
+    }
+
+    /// The OAuth client the installation configured for `id`
+    /// (`providers.<id>.oauth_client_id`), or null when it relies on the
+    /// profile's own declaration or on `--client-id`. The slice stays valid
+    /// for the host's lifetime (see `config_client_arena`).
+    pub fn oauthClientIdFor(self: *const Host, id: Slug) ?[]const u8 {
+        for (self.config_client_ids.items) |entry| {
+            if (entry.provider_id.eql(id)) return entry.client_id;
+        }
+        return null;
     }
 
     /// Record the first reason a startup stage did not apply. The first is the
@@ -751,6 +795,33 @@ test "two accounts on one provider are two selectable routes" {
     try std.testing.expect(work > 0);
     try std.testing.expectEqual(work, personal);
     try std.testing.expect(host.kernel.catalogSnapshot().items().len > before);
+}
+
+test "the installation's OAuth client id is looked up per provider and follows the configuration" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try std.testing.expect(host.oauthClientIdFor(Slug.lit("openai")) == null);
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    try document.upsertProvider(.{
+        .id = Slug.lit("openai"),
+        .oauth_client_id = try config_doc.ClientIdText.parse("app_example_client"),
+    });
+    try host.applyProviderConfiguration(&document);
+    const configured = host.oauthClientIdFor(Slug.lit("openai")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("app_example_client", configured);
+    try std.testing.expect(host.oauthClientIdFor(Slug.lit("metask")) == null);
+
+    // Removing the key removes the lookup; the string a login in flight may
+    // still hold stays readable until the host goes away.
+    var without = config_doc.Document.init(a);
+    defer without.deinit();
+    try without.upsertProvider(.{ .id = Slug.lit("openai") });
+    try host.applyProviderConfiguration(&without);
+    try std.testing.expect(host.oauthClientIdFor(Slug.lit("openai")) == null);
+    try std.testing.expectEqualStrings("app_example_client", configured);
 }
 
 test "a provider with no configured pool keeps exactly its previous offers" {

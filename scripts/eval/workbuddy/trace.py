@@ -235,12 +235,17 @@ def _read_regular_bytes(path: Path, *, limit: int = MAX_TRACE_BYTES) -> bytes:
 
 
 def _read_regular_file(path: Path, *, limit: int = MAX_TRACE_BYTES) -> str:
-    # metacodes' --stream-json can split a multi-byte character across two
-    # streamed text events (observed 2026-09-05: byte 0x93 mid-file), which
-    # makes the raw file invalid UTF-8 even though every line is otherwise
-    # well-formed JSON.  Decoding with replacement keeps the terminal result
-    # event, usage and tool events readable; hashes are always taken over the
-    # raw bytes, so evidence binding is unaffected.
+    # This is the read `load_trace_ir` uses for both the output stream and the
+    # transcript. A tool result echoed into the transcript can carry raw
+    # non-UTF-8 bytes — e.g. a Read of a generated .pptx/.pdf (office-sealed
+    # 2026-09-05, byte 0xbb) — and --stream-json can split a multi-byte
+    # character across two text events (byte 0x93 mid-file). A strict decode
+    # raised TraceError, which the adapter's populate_context_post_run turns
+    # into a RuntimeError that aborts the whole harbor cohort — and this read
+    # runs first, before load_control_metrics. Decode tolerantly with U+FFFD:
+    # the JSON envelope and the result/usage/tool fields are ASCII, so
+    # replacement never disturbs parsing, and byte-exact evidence binding is
+    # done by callers over the raw bytes.
     return _read_regular_bytes(path, limit=limit).decode("utf-8", errors="replace")
 
 
@@ -1611,10 +1616,10 @@ def load_control_metrics(
     # html-report-quadrant-ppt, office-sealed 2026-09-05, byte 0xbb). A strict
     # decode here raised TraceError, which populate_context_post_run turned into
     # a RuntimeError that aborted the whole harbor cohort (17/30 graded). Decode
-    # tolerantly with U+FFFD, exactly as _read_regular_file already does for the
-    # output stream: the control-metric scans key off ASCII journal markers and
-    # NDJSON structure, which replacement never disturbs, and the integrity
-    # hashes below are taken over the raw bytes regardless.
+    # tolerantly with U+FFFD, matching _read_regular_file: the control-metric
+    # scans key off ASCII journal markers and NDJSON structure, which
+    # replacement never disturbs, and the integrity hashes below are taken over
+    # the raw bytes regardless.
     transcript_text = transcript_bytes.decode("utf-8", errors="replace")
     observation_text = observation_bytes.decode("utf-8", errors="replace")
     transcript = _json_lines_from_text(transcript_text, transcript_path, allow_prose=False)

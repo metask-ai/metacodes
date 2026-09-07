@@ -23,6 +23,7 @@
 //! provider prefix cache。Snapshot 固定生命周期，但不会替不可信 callback 伪造确定性。
 
 const std = @import("std");
+const model_name = @import("model_name.zig");
 const types = @import("../types.zig");
 const model_adapter = @import("model_adapter.zig");
 const openai_dialects = @import("dialects/openai.zig");
@@ -666,7 +667,7 @@ pub const DialectRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.entries.items) |e| {
-            if (e.kind == kind and std.mem.startsWith(u8, model, e.model_prefix)) return e.dialect;
+            if (e.kind == kind and model_name.startsWithIgnoreCase(model, e.model_prefix)) return e.dialect;
         }
         return null;
     }

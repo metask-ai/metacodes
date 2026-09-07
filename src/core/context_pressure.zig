@@ -37,10 +37,14 @@ pub const ContextPressure = struct {
     ) ContextPressure {
         // 输出预留必须按实际请求的 max_tokens **全额**预留(下限 20K 作余量):
         // 服务端普遍校验 input + max_tokens ≤ context window(Anthropic "prompt is
-        // too long";glm-5.2/metask 实测 2026-07-06:198758 input + 64000 completion
-        // > 262144 直接 400)。旧公式 @min(max_output, 20K) 只留 20K,glm-5.2
-        // (窗口 262144,max_tokens 64000)算出 auto 阈值 229144 **高于**真实输入
-        // 上限 198144 → 压缩永远来不及,长会话必撞 400 ——"auto compact 失效"主因。
+        // 服务端普遍校验 input + max_tokens ≤ context window（Anthropic 报 "prompt is
+        // too long"；glm-5.2/metask 在 2026-07-06 曾实测 198758 input + 64000 completion
+        // 直接 400，说明当时窗口为 262144）。2026-09-05 同一线路实测 /v1/models 报
+        // max_input_tokens=1048576、max_tokens=64000；1,001,205 input tokens 请求成功，
+        // 1,101,379 tokens 返回 400 "longer than the model's context length (1048576 tokens)"。
+        // 公式与具体窗口无关。旧公式 @min(max_output, 20K) 只留 20K，glm-5.2
+        // （窗口 262144、max_tokens 64000）算出 auto 阈值 229144 高于真实输入上限
+        // 198144，压缩永远来不及，长会话必撞 400——这是 "auto compact 失效" 的主因。
         const output_reserve = @max(max_output_tokens, OUTPUT_RESERVE_TOKENS);
         const effective = raw_context_window -| output_reserve;
         const formula_auto = effective -| AUTOCOMPACT_BUFFER_TOKENS;
@@ -88,9 +92,10 @@ test "ContextPressure reserves full max_output_tokens" {
     try std.testing.expectEqual(@as(usize, 180_000), small_out.effective_context_window);
 }
 
-test "ContextPressure glm-5.2 metask 实测参数:auto 阈值必须低于服务端输入上限" {
-    // 2026-07-06 实测:窗口 262144,max_tokens 64000,服务端强制 in+completion ≤ 262144
-    // → 真实输入上限 198144。阈值必须全部低于它,否则 compact 永远来不及。
+test "ContextPressure glm-5.2 metask historical July parameters" {
+    // 参数为 2026-07 历史值：2026-07-06 窗口 262144、max_tokens 64000，服务端强制
+    // in+completion ≤ 262144，因而真实 input 上限为 198144；阈值必须低于它。
+    // 2026-09-05 的当前实测为 1048576，但公式对任一窗口都成立。
     const p = ContextPressure.fromModel(262_144, 64_000, null, 0);
     const real_input_cap: usize = 262_144 - 64_000;
     try std.testing.expectEqual(@as(usize, 185_144), p.auto_compact_threshold);

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -56,6 +57,7 @@ from scripts.eval.workbuddy.trace import (
     anthropic_messages_endpoint,
     final_result,
     load_control_metrics,
+    load_trace_ir,
     project_state_hash,
     read_json_lines,
     transcript_ir,
@@ -207,12 +209,122 @@ class WorkBuddyTraceTest(unittest.TestCase):
         ]
         self.assertEqual(final_result(stream_events)["stop_reason"], row["stop_reason"])
 
-    def test_trace_rejects_non_utf8_instead_of_replacing_evidence(self):
+    def test_trace_reads_non_utf8_tolerantly_but_still_rejects_malformed_json(self):
+        # metacodes' transcript writer (src/core/transcript.zig) echoes a
+        # tool_result's content through std.json.Stringify with default options,
+        # which pass raw 0x80..0xFF through verbatim; a Read of a generated
+        # .pptx/.pdf therefore lands raw non-UTF-8 bytes in the transcript. #109
+        # fixed the --stream-json/--json *output* encoder but not the transcript
+        # writer, and load_trace_ir reads the transcript through read_json_lines
+        # *before* load_control_metrics, so a strict decode aborts the whole
+        # harbor cohort. Decode tolerantly with U+FFFD -- but only the byte
+        # decode is relaxed: a structurally malformed line must still fail
+        # closed, and callers bind evidence over the raw bytes.
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "trace.jsonl"
-            path.write_bytes(b'{"type":"result","text":"\xff"}\n')
+            root = Path(directory)
+            tolerant = root / "trace.jsonl"
+            tolerant.write_bytes(b'{"type":"result","text":"pdf \xbb marker"}\n')
+            rows = read_json_lines(tolerant)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["type"], "result")
+            self.assertEqual(rows[0]["text"], "pdf � marker")
+            malformed = root / "malformed.jsonl"
+            malformed.write_bytes(b'{"type":"result",\xbb not json}\n')
             with self.assertRaises(TraceError):
-                read_json_lines(path)
+                read_json_lines(malformed)
+
+    def test_load_trace_ir_tolerates_non_utf8_transcript(self):
+        # load_trace_ir reads the transcript through read_json_lines *before*
+        # populate_context_post_run reaches load_control_metrics, so a non-UTF-8
+        # transcript (a .pptx/.pdf read back into a tool result) aborts the whole
+        # cohort here first unless this read is tolerant.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "metacodes-output.jsonl"
+            transcript = root / "metacodes-transcript.jsonl"
+            output.write_bytes(
+                b'{"type":"result","stop_reason":"end_turn","turns":1,'
+                b'"tool_calls":0,"input_tokens":1,"output_tokens":1,'
+                b'"cost_usd":0.0,"text":"ok"}\n'
+            )
+            transcript.write_bytes(
+                b'{"role":"user","blocks":[{"type":"text",'
+                b'"text":"open the \xbb deck"}]}\n'
+            )
+            trace = load_trace_ir(output, transcript)
+        self.assertEqual(trace["result"]["stop_reason"], "end_turn")
+        self.assertEqual(len(trace["steps"]), 1)
+        self.assertEqual(trace["steps"][0]["source"], "user")
+
+    def test_control_metrics_tolerate_non_utf8_control_evidence(self):
+        # office-sealed 2026-09-05 (html-report-quadrant-ppt, byte 0xbb): a task
+        # read a generated .pptx back into a tool result, so raw non-UTF-8 bytes
+        # reached the transcript journal. load_control_metrics decoded both
+        # journals with errors="strict", raised "control evidence is not UTF-8",
+        # and populate_context_post_run turned that into a RuntimeError that
+        # aborted the whole harbor cohort at 17/30. Both decodes must be tolerant
+        # and succeed; the source hashes are taken over the raw bytes, so U+FFFD
+        # replacement never disturbs evidence binding.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            transcript.write_bytes(
+                b'{"role":"assistant","blocks":[{"type":"tool_use",'
+                b'"id":"r","name":"Read","input":{"file_path":"deck.pptx"}}]}\n'
+                b'{"role":"user","blocks":[{"type":"tool_result",'
+                b'"tool_use_id":"r","content":"PK \xbb pptx","is_error":false}]}\n'
+            )
+            # Also exercise the observation-journal decode path: a raw 0xbb in
+            # the hash-only, consistency-checked session id (identical in every
+            # row) decodes to a consistent U+FFFD.
+            observation.write_bytes(
+                "".join(
+                    json.dumps(row, sort_keys=True) + "\n" for row in self._journal()
+                )
+                .encode("utf-8")
+                .replace(b"session-control-l2", b"session-control-l\xbb2")
+            )
+            metrics = load_control_metrics(transcript, observation)
+            # Bind evidence over the raw bytes while the fixtures still exist.
+            transcript_digest = hashlib.sha256(transcript.read_bytes()).hexdigest()
+            observation_digest = hashlib.sha256(observation.read_bytes()).hexdigest()
+        self.assertEqual(metrics["schema_version"], CONTROL_METRICS_SCHEMA)
+        self.assertEqual(metrics["source"]["observation_journal_records"], 2)
+        self.assertEqual(metrics["tool_runtime"]["transcript_tool_calls"], 1)
+        self.assertEqual(metrics["tool_runtime"]["transcript_tool_results"], 1)
+        self.assertEqual(metrics["source"]["transcript_sha256"], transcript_digest)
+        self.assertEqual(
+            metrics["source"]["observation_journal_sha256"], observation_digest
+        )
+
+    def test_truncated_output_stream_raises_the_no_result_sentinel_the_adapter_keys_on(self):
+        # A killed/timed-out agent (harbor SIGTERM -> exit 143, OOM) is torn
+        # down before it emits its single terminal `result` event, so
+        # load_trace_ir -> final_result raises. The adapter's
+        # populate_context_post_run tolerates *exactly* this case by substring
+        # matching the message, so the "result event, found 0" wording is a
+        # contract: if it drifts, the adapter re-raises and one killed trial
+        # again cancels every sibling in the harbor TaskGroup.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "metacodes-output.jsonl"
+            transcript = root / "metacodes-transcript.jsonl"
+            # Realistic truncation: live stream events, no terminal result.
+            self._write_jsonl(
+                output,
+                [
+                    {"type": "turn_begin", "turn": 1},
+                    {"type": "text", "text": "starting"},
+                ],
+            )
+            self._write_jsonl(
+                transcript,
+                [{"role": "user", "blocks": [{"type": "text", "text": "task"}]}],
+            )
+            with self.assertRaises(TraceError) as caught:
+                load_trace_ir(output, transcript)
+        self.assertIn("result event, found 0", str(caught.exception))
 
     def test_control_metrics_accept_complete_no_tool_run_and_bind_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2277,6 +2389,146 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             self.assertFalse(any("buildx" in call for call in calls))
 
 
+def _materialize_pinned_upstream(repo: Path) -> None:
+    """Commit a stand-in for the pinned WorkBuddy checkout.
+
+    It carries exactly the upstream anchor text the installer patches plus the
+    package skeleton the shipped modules are copied into, so the real installer
+    can run end to end in a temporary directory without the Tencent clone.
+    """
+    fixtures = {
+        Path("src/workbuddy_bench/__init__.py"): "",
+        Path("src/workbuddy_bench/agents/__init__.py"): "",
+        Path("src/workbuddy_bench/proxy/__init__.py"): "",
+        Path("src/workbuddy_bench/proxy/interceptors/__init__.py"): "",
+        Path("src/workbuddy_bench/runner/__init__.py"): "",
+        overlay_installer._ADAPTER_PATH:
+            overlay_installer._ADAPTER_ANCHOR,
+        overlay_installer._RESOLVER_PATH: (
+            overlay_installer._DISPATCH_OLD
+            + overlay_installer._GENERIC_ANCHOR
+            + overlay_installer._MODEL_ROUTE_OLD
+            + overlay_installer._RESOLVER_MOUNT_OLD
+            + overlay_installer._RESUME_SUBSET_OLD
+        ),
+        overlay_installer._PREPARE_JOB_PATH:
+            (
+                overlay_installer._PREPARE_AGENT_IDENTITY_OLD
+                + overlay_installer._PREPARE_MOUNT_OLD
+            ),
+        overlay_installer._PROXY_CONFIG_PATH: (
+            overlay_installer._PROXY_IMPORT_ANCHOR
+            + overlay_installer._PROXY_KEY_OLD
+        ),
+        overlay_installer._PROXY_LOGGER_PATH: (
+            overlay_installer._PROXY_LOGGER_INIT_OLD
+            + overlay_installer._PROXY_LOGGER_REQUEST_OLD
+            + overlay_installer._PROXY_LOGGER_DISCARD_OLD
+            + overlay_installer._PROXY_LOGGER_SEQ_OLD
+            + overlay_installer._PROXY_LOGGER_RECORD_SEQ_OLD
+        ),
+        overlay_installer._PROXY_PIPELINE_PATH: (
+            overlay_installer._PROXY_PIPELINE_A2O_SIGNATURE_OLD
+            + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_SIGNATURE_OLD
+            + overlay_installer._PROXY_PIPELINE_A2O_SENDER_OLD
+            + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_SENDER_OLD
+            + overlay_installer._PROXY_PIPELINE_SUBSTREAM_CALLS_OLD
+            + overlay_installer._PROXY_PIPELINE_A2O_START_OLD
+            + overlay_installer._PROXY_PIPELINE_A2O_EVENTS_OLD
+            + overlay_installer._PROXY_PIPELINE_A2O_FINISH_OLD
+            + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_OLD
+            + overlay_installer._PROXY_PIPELINE_REWRITE_OLD
+            + overlay_installer._PROXY_PIPELINE_REWRITE_TAIL_OLD
+            + overlay_installer._PROXY_PIPELINE_STREAM_STATE_OLD
+            + overlay_installer._PROXY_PIPELINE_STREAM_LOOP_OLD
+            + overlay_installer._PROXY_PIPELINE_FINALLY_OLD
+        ),
+    }
+    # Bytes, not text: the installer compares the file on disk with the HEAD
+    # blob byte-for-byte before patching.  A text-mode write on Windows lands
+    # CRLF while Git for Windows (core.autocrlf=true) commits LF, and the
+    # installer then refuses the fixture as "modified independently".  The
+    # pinned checkout is LF on every host, so the fixture is too, and the
+    # repository-local setting keeps the installer's own git calls from
+    # renormalizing behind it.
+    for relative, content in fixtures.items():
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content.encode("utf-8"))
+    for args in (
+        ("init", "-q"),
+        ("config", "core.autocrlf", "false"),
+        ("add", "."),
+        (
+            "-c", "user.name=metacodes-test",
+            "-c", "user.email=metacodes-test@example.invalid",
+            "commit", "-qm", "fixture",
+        ),
+    ):
+        subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+
+def _install_overlay_into(repo: Path) -> dict:
+    """Run the real installer against a materialized fixture checkout.
+
+    Only the two identity probes the fixture cannot satisfy (pinned HEAD and
+    the Tencent origin) are answered for it; diff, ls-files and show run for
+    real so the dirty-path and upstream-patch logic is exercised.
+    """
+    real_run = overlay_installer._run
+
+    def run(target, *args):
+        if args == ("rev-parse", "HEAD"):
+            return WORKBUDDY_PINNED_COMMIT + "\n"
+        if args == ("remote", "get-url", "origin"):
+            return "https://github.com/Tencent/WorkBuddy-Bench.git\n"
+        return real_run(target, *args)
+
+    with mock.patch.object(overlay_installer, "_run", side_effect=run):
+        return overlay_installer.install(repo)
+
+
+# Imports the shipped private modules the way Harbor does: as members of the
+# workbuddy_bench package, in a fresh isolated interpreter whose only extra
+# sys.path entry is the checkout's src/.  Nothing from this repository is
+# importable there, so a copied module that still reaches for a metacodes
+# sibling fails exactly as it does inside a trial.
+_INSTALLED_OVERLAY_IMPORT_PROBE = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import workbuddy_bench._metacodes_model as model
+import workbuddy_bench.agents._metacodes_trace as trace
+import workbuddy_bench.proxy._metacodes_key_fd as key_fd
+print(json.dumps({
+    "modules": [module.__name__ for module in (model, trace, key_fd)],
+    "trace_file": trace.__file__,
+    "trace_uses_shipped_open_nofollow": trace.open_nofollow is model.open_nofollow,
+}))
+'''
+
+
+def _probe_installed_overlay_imports(repo: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _INSTALLED_OVERLAY_IMPORT_PROBE,
+            str(repo / "src"),
+        ],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+
+
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
     def test_workbuddy_headless_policy_hides_interactive_plan_without_disabling_tinykg(self):
         overlay = Path(__file__).parents[1] / "workbuddy/overlay"
@@ -2384,6 +2636,90 @@ with tempfile.TemporaryDirectory() as directory:
     assert context.n_cache_tokens == 80
     assert context.n_output_tokens == 30
     assert context.cost_usd == 0.01
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_installed_adapter_tolerates_killed_agent_missing_result_event(self):
+        # A killed or timed-out trial (harbor SIGTERM -> exit 143, OOM) is torn
+        # down before it emits its single terminal `result` event. load_trace_ir
+        # then raises "found 0"; populate_context_post_run must record a
+        # degenerate failed zero-reward trajectory that *validates against the
+        # real harbor Trajectory/Step/FinalMetrics models* instead of raising,
+        # because a raise here propagates through harbor's TaskGroup and cancels
+        # every sibling trial (kunshan security-sealed, 2026-09-05, died at
+        # 3/24). This is the model-validation the pure-Python suite cannot do.
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        installed_agent = checkout / "src/workbuddy_bench/agents/metacodes_agent.py"
+        if "killed_no_result" not in installed_agent.read_text(encoding="utf-8"):
+            self.skipTest(
+                "installed overlay predates the killed-agent tolerance; "
+                "reinstall the overlay to activate this gate"
+            )
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import json, tempfile
+from pathlib import Path
+from harbor.models.agent.context import AgentContext
+from workbuddy_bench.agents._metacodes_trace import (
+    OBSERVATION_JOURNAL_SCHEMA, OBSERVATION_FILENAME,
+)
+from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
+
+def write_jsonl(path, rows):
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+with tempfile.TemporaryDirectory() as directory:
+    logs = Path(directory) / "trial" / "agent"
+    logs.mkdir(parents=True)
+    # Truncated output: live stream events, no terminal `result` event.
+    write_jsonl(logs / "metacodes-output.jsonl", [
+        {"type": "turn_begin", "turn": 1},
+        {"type": "text", "text": "starting"},
+    ])
+    write_jsonl(logs / "metacodes-transcript.jsonl", [
+        {"role": "user", "blocks": [{"type": "text", "text": "task"}]},
+    ])
+    write_jsonl(logs / OBSERVATION_FILENAME, [
+        {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 0,
+         "monotonic_elapsed_ns": 0, "session_id": "s-l2", "run_id": "r-l2",
+         "event": {"run_started": {}}},
+        {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 1,
+         "monotonic_elapsed_ns": 1, "session_id": "s-l2", "run_id": "r-l2",
+         "event": {"run_finished": {}}},
+    ])
+    agent = MetacodesAgent(
+        logs, model_name="route-l2", model_params={},
+        METACODES_MODEL_DISPLAY_NAME="glm-5.2",
+        connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
+    )
+    context = AgentContext()
+    # Must not raise: a raise here cancels every sibling trial in the cohort.
+    agent.populate_context_post_run(context)
+    trajectory = json.loads((logs / "trajectory.json").read_text(encoding="utf-8"))
+    # Degenerate single-step zero trajectory that validated against the real
+    # harbor models (the to_json_dict write would have raised otherwise).
+    assert len(trajectory["steps"]) == 1, trajectory["steps"]
+    extra = trajectory["final_metrics"]["extra"]
+    assert extra["metacodes_stop_reason"] == "killed_no_result", extra
+    assert extra["control_metrics"] == {"killed_no_result": True}, extra
+    # Recorded as a failed zero-reward run; it never reaches the verifier.
+    assert context.n_input_tokens == 0
+    assert context.n_output_tokens == 0
+    assert context.cost_usd == 0
 '''
         env = dict(os.environ)
         env["PYTHONPATH"] = str(checkout / "src")
@@ -2764,68 +3100,7 @@ assert failed, "enforced run without rule_filter events must fail loudly"
     def test_overlay_patches_resolve_and_prepare_with_one_mount_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            fixtures = {
-                overlay_installer._ADAPTER_PATH:
-                    overlay_installer._ADAPTER_ANCHOR,
-                overlay_installer._RESOLVER_PATH: (
-                    overlay_installer._DISPATCH_OLD
-                    + overlay_installer._GENERIC_ANCHOR
-                    + overlay_installer._MODEL_ROUTE_OLD
-                    + overlay_installer._RESOLVER_MOUNT_OLD
-                    + overlay_installer._RESUME_SUBSET_OLD
-                ),
-                overlay_installer._PREPARE_JOB_PATH:
-                    (
-                        overlay_installer._PREPARE_AGENT_IDENTITY_OLD
-                        + overlay_installer._PREPARE_MOUNT_OLD
-                    ),
-                overlay_installer._PROXY_CONFIG_PATH: (
-                    overlay_installer._PROXY_IMPORT_ANCHOR
-                    + overlay_installer._PROXY_KEY_OLD
-                ),
-                overlay_installer._PROXY_LOGGER_PATH: (
-                    overlay_installer._PROXY_LOGGER_INIT_OLD
-                    + overlay_installer._PROXY_LOGGER_REQUEST_OLD
-                    + overlay_installer._PROXY_LOGGER_DISCARD_OLD
-                    + overlay_installer._PROXY_LOGGER_SEQ_OLD
-                    + overlay_installer._PROXY_LOGGER_RECORD_SEQ_OLD
-                ),
-                overlay_installer._PROXY_PIPELINE_PATH: (
-                    overlay_installer._PROXY_PIPELINE_A2O_SIGNATURE_OLD
-                    + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_SIGNATURE_OLD
-                    + overlay_installer._PROXY_PIPELINE_A2O_SENDER_OLD
-                    + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_SENDER_OLD
-                    + overlay_installer._PROXY_PIPELINE_SUBSTREAM_CALLS_OLD
-                    + overlay_installer._PROXY_PIPELINE_A2O_START_OLD
-                    + overlay_installer._PROXY_PIPELINE_A2O_EVENTS_OLD
-                    + overlay_installer._PROXY_PIPELINE_A2O_FINISH_OLD
-                    + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_OLD
-                    + overlay_installer._PROXY_PIPELINE_REWRITE_OLD
-                    + overlay_installer._PROXY_PIPELINE_REWRITE_TAIL_OLD
-                    + overlay_installer._PROXY_PIPELINE_STREAM_STATE_OLD
-                    + overlay_installer._PROXY_PIPELINE_STREAM_LOOP_OLD
-                    + overlay_installer._PROXY_PIPELINE_FINALLY_OLD
-                ),
-            }
-            for relative, content in fixtures.items():
-                path = repo / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
-            for args in (
-                ("init", "-q"),
-                ("add", "."),
-                (
-                    "-c", "user.name=metacodes-test",
-                    "-c", "user.email=metacodes-test@example.invalid",
-                    "commit", "-qm", "fixture",
-                ),
-            ):
-                subprocess.run(
-                    ["git", "-C", str(repo), *args],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
+            _materialize_pinned_upstream(repo)
             patched = overlay_installer._patched_upstream(repo)
             resolver = patched[overlay_installer._RESOLVER_PATH].decode("utf-8")
             prepare = patched[overlay_installer._PREPARE_JOB_PATH].decode("utf-8")
@@ -2848,6 +3123,91 @@ assert failed, "enforced run without rule_filter events must fail loudly"
             self.assertNotIn(overlay_installer._MODEL_ROUTE_OLD, resolver)
             self.assertNotIn(overlay_installer._PREPARE_MOUNT_OLD, prepare)
             self.assertNotIn(overlay_installer._PREPARE_AGENT_IDENTITY_OLD, prepare)
+
+    def test_installed_overlay_modules_import_from_materialized_checkout(self):
+        # Regression: since 94dd15d trace.py imports ``..model``.  Copied
+        # byte-for-byte into workbuddy_bench.agents that resolved to the
+        # non-existent workbuddy_bench.model and every Harbor trial died at
+        # agent import.  The installer must ship model.py beside the package
+        # and repoint the copy; this proves it by importing the installed
+        # modules from a materialized checkout, not by reading the sources.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            _materialize_pinned_upstream(repo)
+            manifest = _install_overlay_into(repo)
+            self.assertEqual(
+                {
+                    path
+                    for path in manifest["installed_paths"]
+                    if Path(path).name.startswith("_metacodes_")
+                },
+                {
+                    overlay_installer._MODEL_PATH.as_posix(),
+                    overlay_installer._TRACE_PATH.as_posix(),
+                    overlay_installer._KEY_FD_PATH.as_posix(),
+                },
+            )
+            self.assertEqual(
+                (repo / overlay_installer._MODEL_PATH).read_bytes(),
+                (Path(__file__).parents[1] / "model.py").read_bytes(),
+            )
+            installed_trace = (repo / overlay_installer._TRACE_PATH).read_bytes()
+            self.assertNotIn(overlay_installer._TRACE_MODEL_IMPORT_OLD, installed_trace)
+            self.assertEqual(
+                installed_trace.count(overlay_installer._TRACE_MODEL_IMPORT_NEW), 1
+            )
+            self.assertEqual(
+                overlay_installer.validate_installed_overlay(repo)["overlay_sha256"],
+                manifest["overlay_sha256"],
+            )
+
+            probe = _probe_installed_overlay_imports(repo)
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            observed = json.loads(probe.stdout)
+            self.assertEqual(
+                observed["modules"],
+                [
+                    "workbuddy_bench._metacodes_model",
+                    "workbuddy_bench.agents._metacodes_trace",
+                    "workbuddy_bench.proxy._metacodes_key_fd",
+                ],
+            )
+            self.assertEqual(
+                Path(observed["trace_file"]).resolve(),
+                (repo / overlay_installer._TRACE_PATH).resolve(),
+            )
+            self.assertTrue(observed["trace_uses_shipped_open_nofollow"])
+
+    def test_unrewritten_trace_copy_fails_to_import_inside_workbuddy_package(self):
+        # The probe above has to be able to fail.  Replay the pre-fix installer
+        # (a verbatim copy of trace.py) and require the exact failure the
+        # Linux trials reported, so a future byte-copy regression is caught by
+        # the positive test rather than passing vacuously.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            _materialize_pinned_upstream(repo)
+            with mock.patch.object(
+                overlay_installer,
+                "_TRACE_MODEL_IMPORT_NEW",
+                overlay_installer._TRACE_MODEL_IMPORT_OLD,
+            ):
+                _install_overlay_into(repo)
+            probe = _probe_installed_overlay_imports(repo)
+            self.assertNotEqual(probe.returncode, 0)
+            self.assertIn("No module named 'workbuddy_bench.model'", probe.stderr)
+
+    def test_overlay_sources_fail_closed_when_trace_model_import_anchor_drifts(self):
+        # If trace.py stops importing ``..model`` on that exact line, the
+        # installer must refuse rather than ship whatever the new import is.
+        with mock.patch.object(
+            overlay_installer,
+            "_TRACE_MODEL_IMPORT_OLD",
+            b"from ..model import open_nofollow, fsync_directory\n",
+        ):
+            with self.assertRaisesRegex(
+                overlay_installer.OverlayError, "model-import anchor drifted"
+            ):
+                overlay_installer._overlay_sources()
 
     def test_adapter_passes_stable_backend_identity_separately_from_route(self):
         source = (

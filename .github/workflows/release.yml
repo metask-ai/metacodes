@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Ref to release: the bare X.Y.Z tag (stable) or a branch/commit whose version is 0.x.y-dev (pre)"
+        description: "Ref to release: the bare X.Y.Z tag (stable) or a branch / full 40-hex commit SHA whose version is 0.x.y-dev (pre); actions/checkout rejects short SHAs"
         required: true
         type: string
       dry_run:
@@ -39,7 +39,9 @@ jobs:
     # dedicated pool, which no PR job can reach.
     if: inputs.runner_pool == 'metacodes-release' || inputs.dry_run
     strategy:
-      fail-fast: true
+      # Every platform reports its own verdict: a rehearsal needs all three,
+      # and the publish job already waits for all of them.
+      fail-fast: false
       matrix:
         include:
           - os: Linux
@@ -49,14 +51,21 @@ jobs:
             arch: ARM64
             zig_target: aarch64-macos
     runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON(format('["self-hosted","{0}","{1}"]', matrix.os, matrix.arch)) || fromJSON(format('["self-hosted","metacodes-release","{0}","{1}"]', matrix.os, matrix.arch)) }}
-    # One physical runner per platform: a dry run on the CI pool joins the
-    # CI workflow's own runner group so it never overlaps a PR job on the same
-    # box (the second dry run did, and the Windows unit tests tripped the build
-    # runner's one-minute no-response watchdog under that load; ci.yml records
-    # the same contention as the cause of its timing flakes). The dedicated
-    # pool serializes only with itself.
+    # One physical runner per platform: a dry run on the CI pool joins the CI
+    # workflow's runner group for the lane of the ref it was dispatched from
+    # (github.ref, normally main; the tag input is a ref to build, not a lane;
+    # same expression as ci.yml), so it never overlaps the CI job that a merge
+    # just started on the same box. The second dry run did,
+    # and the Windows unit tests tripped the build runner's one-minute
+    # no-response watchdog under that load; ci.yml records the same contention
+    # as the cause of its timing flakes. The price is the pending-cancel rule
+    # ci.yml describes, in both directions: a push to the same lane while a
+    # dry-run job is still queued cancels that job, and a dispatch while a CI
+    # job is still queued in the lane cancels that CI job. Both are loud;
+    # dispatch when the lane is idle, or rerun whatever was cancelled. The
+    # dedicated pool serializes only with itself.
     concurrency:
-      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-{0}-{1}-pr', matrix.os, matrix.arch) || format('release-runner-{0}-{1}', matrix.os, matrix.arch) }}
+      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-{0}-{1}-{2}', matrix.os, matrix.arch, github.ref == 'refs/heads/main' && 'main' || 'pr') || format('release-runner-{0}-{1}', matrix.os, matrix.arch) }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -93,8 +102,11 @@ jobs:
           fi
       - name: Vendored runtime assets are attested
         run: python3 scripts/verify_tinykg_binary.py && python3 scripts/verify_ripgrep_binary.py
+      # Same test watchdog as ci.yml: the build runner's one-minute default
+      # is what the Windows dry runs tripped (a few I/O-bound unit tests sit
+      # near a minute on that box).
       - name: Full suite in release configuration
-        run: zig build test -Doptimize=ReleaseSafe
+        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Stage, manifest and verify the release unit
         run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release"
       - name: Installed prefix matches the release layout
@@ -111,10 +123,17 @@ jobs:
         run: |
           zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
           cmp "$RUNNER_TEMP"/dist/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-again/metacodes-*.tar.gz
-      # aarch64-linux stays outside the release matrix until a vendored musl
-      # ripgrep exists (#86); `release:check -Dtarget=aarch64-linux-musl` is
-      # expected to refuse, so it is not run here.
+      # aarch64-linux has a vendored musl ripgrep since #86; ci.yml proves the
+      # cross-staged unit with `release:check -Dtarget=aarch64-linux-musl`.
+      # Building it here as a cross-compiled release unit is a matrix change
+      # for a later issue: it needs a runner-independent verify path.
+      # A dry run rehearses the build, not the runner's egress: an upload that
+      # fails there is reported as a step failure but does not decide the
+      # rehearsal (the CI pool's Linux runner has never uploaded an artifact;
+      # doc/RELEASE_RUNNER.md lists the endpoints a release runner must reach).
+      # A real release keeps the upload fatal: publish needs the archives.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        continue-on-error: ${{ inputs.dry_run }}
         with:
           name: archives-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/dist/*
@@ -128,7 +147,7 @@ jobs:
     runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON('["self-hosted","Windows","X64"]') || fromJSON('["self-hosted","metacodes-release","Windows","X64"]') }}
     # Same runner-serialization rule as the POSIX jobs.
     concurrency:
-      group: ${{ inputs.runner_pool == 'pr-pool' && 'runner-Windows-X64-pr' || 'release-runner-Windows-X64' }}
+      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-Windows-X64-{0}', github.ref == 'refs/heads/main' && 'main' || 'pr') || 'release-runner-Windows-X64' }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -162,7 +181,7 @@ jobs:
         run: python scripts\verify_tinykg_binary.py && python scripts\verify_ripgrep_binary.py
       - name: Full suite in release configuration
         shell: cmd
-        run: zig build test -Doptimize=ReleaseSafe -j6
+        run: zig build test -Doptimize=ReleaseSafe -j6 --test-timeout 5m
       - name: Stage, manifest and verify the release unit
         shell: cmd
         run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release"
@@ -183,7 +202,9 @@ jobs:
       - name: Archives are reproducible
         shell: cmd
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
+      # Same dry-run rule as the POSIX upload.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        continue-on-error: ${{ inputs.dry_run }}
         with:
           name: archives-Windows-X64
           path: ${{ runner.temp }}\dist\*

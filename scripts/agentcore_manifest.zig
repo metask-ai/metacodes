@@ -378,10 +378,10 @@ test "ripgrep pin parses the vendor manifest identity and rejects empty fields" 
     const pin = try parseRipgrepPin(arena.allocator(),
         \\{"artifacts":[],"bundle_schema":"metacodes.ripgrep-bundle/v1",
         \\ "license":"MIT OR Unlicense","source_repository":"https://github.com/BurntSushi/ripgrep",
-        \\ "upstream_release":"14.1.1","upstream_revision":"4649aa9700"}
+        \\ "upstream_release":"15.2.0","upstream_revision":"e89fff89ac"}
     );
-    try std.testing.expectEqualStrings("14.1.1", pin.upstream_release);
-    try std.testing.expectEqualStrings("4649aa9700", pin.upstream_revision);
+    try std.testing.expectEqualStrings("15.2.0", pin.upstream_release);
+    try std.testing.expectEqualStrings("e89fff89ac", pin.upstream_revision);
     try std.testing.expectError(error.InvalidRipgrepPin, parseRipgrepPin(
         arena.allocator(),
         \\{"license":"","source_repository":"x","upstream_release":"y","upstream_revision":"z"}

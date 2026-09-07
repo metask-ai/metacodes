@@ -285,6 +285,27 @@ pub const OperationKind = enum(u8) {
     mcp,
 };
 
+/// Whether the bytes an operation produces become Session durable state.
+///
+/// The Controller's `estimated_usage_bytes` predicts the next checkpoint. A
+/// root Run's assistant increments and tool results land in the Session
+/// Conversation, so every settle grows the estimate. A child agent (Task /
+/// fork / model-invoked Skill) runs on a Conversation that is discarded when
+/// it returns: only its final text re-enters the Session — as the parent's
+/// tool result, which the parent's ToolEnvironment charges, or through
+/// `Controller.commitDurable` on the fork-root path. Charging the child's whole
+/// transcript as durable inflated the estimate by bytes the checkpoint never
+/// stores, and a subagent-heavy Run then hit `budget_exhausted` (surfaced by
+/// hosts as a budget stop) long before the real checkpoint was anywhere near
+/// `hard_bytes`.
+pub const DurableScope = enum(u8) {
+    /// Results become Conversation state; settle charges the durable estimate.
+    session,
+    /// Results are consumed by a discarded child Conversation; settle enforces
+    /// the payload cap and releases the in-flight reservation, nothing more.
+    transient,
+};
+
 pub const Controller = struct {
     allocator: std.mem.Allocator,
     profile: Profile,
@@ -503,6 +524,43 @@ pub const Controller = struct {
         self.markOutcomeLocked(.budget_exhausted, required);
     }
 
+    /// Charge bytes that enter the Session Conversation outside an operation
+    /// reservation: the fork-root child's final text, which `runIsolated`
+    /// appends as an assistant message after the transient child returns.
+    /// Same requirement convention as `settleSuccess` (usage + live sibling
+    /// reservations + terminal reserve must fit under `hard_bytes`); failure
+    /// marks `budget_exhausted` so the Run terminates through the ordinary
+    /// marker path instead of committing text the checkpoint cannot hold.
+    pub fn commitDurable(self: *Controller, durable_delta_bytes: u64) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.outcome_value != .none) return error.BudgetExhausted;
+        const with_audit = checkedAdd(
+            durable_delta_bytes,
+            self.profile.audit_reserve_bytes,
+        ) catch {
+            self.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return error.ResourceLimit;
+        };
+        const next = checkedAdd(self.estimated_usage_bytes, with_audit) catch {
+            self.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return error.ResourceLimit;
+        };
+        var required = checkedAdd(next, self.reserved_bytes) catch {
+            self.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return error.ResourceLimit;
+        };
+        required = checkedAdd(required, self.profile.terminal_reserve_bytes) catch {
+            self.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return error.ResourceLimit;
+        };
+        if (required > self.profile.hard_bytes) {
+            self.markOutcomeLocked(.budget_exhausted, required);
+            return error.BudgetExhausted;
+        }
+        self.estimated_usage_bytes = next;
+    }
+
     fn markOutcomeLocked(
         self: *Controller,
         next_outcome: Outcome,
@@ -614,6 +672,34 @@ pub const Reservation = struct {
         self.controller.estimated_usage_bytes = next;
     }
 
+    /// `DurableScope.transient` settle: the payload cap still binds (an
+    /// oversized child result is a resource limit exactly like a root one) and
+    /// the in-flight reservation is returned, but nothing is added to the
+    /// durable estimate because these bytes never reach the checkpoint.
+    pub fn settleTransient(self: *Reservation, payload_bytes: u64) Error!void {
+        if (!self.active) return;
+        self.controller.mutex.lock();
+        defer self.controller.mutex.unlock();
+        self.removeReservedLocked();
+        if (payload_bytes > self.payload_cap_bytes) {
+            self.controller.markOutcomeLocked(.resource_limit, payload_bytes);
+            return error.ResourceLimit;
+        }
+    }
+
+    /// Dispatch on scope so both decorators settle through one seam.
+    pub fn settle(
+        self: *Reservation,
+        scope: DurableScope,
+        payload_bytes: u64,
+        durable_delta_bytes: u64,
+    ) Error!void {
+        return switch (scope) {
+            .session => self.settleSuccess(payload_bytes, durable_delta_bytes),
+            .transient => self.settleTransient(payload_bytes),
+        };
+    }
+
     pub fn failResourceLimit(self: *Reservation, required: u64) void {
         if (!self.active) return;
         self.controller.mutex.lock();
@@ -640,6 +726,8 @@ pub const Reservation = struct {
 pub const ToolEnvironment = struct {
     controller: *Controller,
     base: core.agent_session.RunToolSurface,
+    /// `.transient` for a child agent's tool surface (see `DurableScope`).
+    scope: DurableScope = .session,
 
     pub fn surface(self: *const ToolEnvironment) core.agent_session.RunToolSurface {
         return .{
@@ -742,7 +830,7 @@ pub const ToolEnvironment = struct {
         const durable_bytes: u64 = if (inline_image) outcome.ok.rawBytes() else payload_bytes;
         const durable_delta = checkedAdd(durable_bytes, 32) catch
             std.math.maxInt(u64);
-        reservation.settleSuccess(payload_bytes, durable_delta) catch {
+        reservation.settle(self.scope, payload_bytes, durable_delta) catch {
             outcome.deinit(tool_ctx.allocator);
             outcome_live = false;
             return boundedToolOutcome(tool_ctx.allocator, RESOURCE_LIMIT_MARKER);
@@ -775,6 +863,8 @@ pub const BudgetedProvider = struct {
     allocator: std.mem.Allocator,
     controller: *Controller,
     base: core.api_provider.Provider,
+    /// `.transient` for the Provider a child agent runs on (see `DurableScope`).
+    scope: DurableScope = .session,
 
     pub fn provider(self: *BudgetedProvider) core.api_provider.Provider {
         return .{
@@ -899,7 +989,7 @@ pub const BudgetedProvider = struct {
             reservation.failResourceLimit(std.math.maxInt(u64));
             return error.CheckpointPayloadTooLarge;
         };
-        reservation.settleSuccess(measured.payload, measured.durable) catch {
+        reservation.settle(self.scope, measured.payload, measured.durable) catch {
             deinitApiResponse(self.allocator, response);
             return error.CheckpointPayloadTooLarge;
         };
@@ -949,6 +1039,7 @@ pub const BudgetedProvider = struct {
             .controller = self.controller,
             .base = base_stream,
             .reservation = reservation,
+            .scope = self.scope,
         };
         return wrapper.handle();
     }
@@ -994,6 +1085,7 @@ const StreamWrapper = struct {
     controller: *Controller,
     base: core.api_provider.StreamHandle,
     reservation: Reservation,
+    scope: DurableScope,
     payload_bytes: u64 = 0,
     durable_delta_bytes: u64 = 0,
     /// The reservation has been settled or released; `deinit` must not do it
@@ -1059,7 +1151,8 @@ const StreamWrapper = struct {
         if (self.settled) return;
         self.settled = true;
         switch (mode) {
-            .settle => self.reservation.settleSuccess(
+            .settle => self.reservation.settle(
+                self.scope,
                 self.payload_bytes,
                 self.durable_delta_bytes,
             ) catch {},
@@ -2216,4 +2309,167 @@ test "canonicalRequestBytes: 纯文本路由的图片工具结果按占位符计
     try std.testing.expectEqual(placeholder_only, text_route);
     // 原生收图的路由:整条图片结果的 JSON 长度加回。
     try std.testing.expectEqual(text_route + image_result.len, vision_route);
+}
+
+test "transient scope: child Provider stream reserves and caps but never charges the durable estimate" {
+    const a = std.testing.allocator;
+    var profile = smallTestProfile();
+    profile.provider_result_cap_bytes = 64;
+    const admitted = try preflight(profile, 1000, &.{"x"});
+
+    // Positive side: a root (session) stream grows the estimate by text + envelope + audit.
+    {
+        var controller = Controller.init(a, profile, admitted);
+        var base = TestProvider{ .allocator = a, .payload_bytes = 30 };
+        var decorated = BudgetedProvider{
+            .allocator = a,
+            .controller = &controller,
+            .base = base.provider(),
+        };
+        var stream = try decorated.provider().sendStream(&.{}, null, null, null, null, null, "");
+        defer stream.deinit();
+        while (try stream.next()) |event| deinitStreamEvent(a, event);
+        try std.testing.expectEqual(
+            admitted.projected_usage_bytes + 30 + 14 + profile.audit_reserve_bytes,
+            controller.estimated_usage_bytes,
+        );
+        try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+        try std.testing.expectEqual(Outcome.none, controller.outcome());
+    }
+
+    // Negative side: the same stream in transient scope leaves the estimate untouched,
+    // still performs exactly one Provider call, and returns its reservation.
+    {
+        var controller = Controller.init(a, profile, admitted);
+        var base = TestProvider{ .allocator = a, .payload_bytes = 30 };
+        var decorated = BudgetedProvider{
+            .allocator = a,
+            .controller = &controller,
+            .base = base.provider(),
+            .scope = .transient,
+        };
+        var stream = try decorated.provider().sendStream(&.{}, null, null, null, null, null, "");
+        defer stream.deinit();
+        var events: u32 = 0;
+        while (try stream.next()) |event| {
+            events += 1;
+            deinitStreamEvent(a, event);
+        }
+        try std.testing.expectEqual(@as(u32, 1), events);
+        try std.testing.expectEqual(@as(u32, 1), base.calls);
+        try std.testing.expectEqual(admitted.projected_usage_bytes, controller.estimated_usage_bytes);
+        try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+        try std.testing.expectEqual(Outcome.none, controller.outcome());
+    }
+
+    // The payload cap binds in transient scope exactly as it does for a root stream.
+    {
+        var controller = Controller.init(a, profile, admitted);
+        var base = TestProvider{ .allocator = a, .payload_bytes = 65 };
+        var decorated = BudgetedProvider{
+            .allocator = a,
+            .controller = &controller,
+            .base = base.provider(),
+            .scope = .transient,
+        };
+        var stream = try decorated.provider().sendStream(&.{}, null, null, null, null, null, "");
+        defer stream.deinit();
+        try std.testing.expectEqual(@as(?core.api_stream.StreamEvent, null), try stream.next());
+        try std.testing.expectEqual(Outcome.resource_limit, controller.outcome());
+        try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+    }
+}
+
+test "transient scope: child Tool results are capped but never charged the durable estimate" {
+    const a = std.testing.allocator;
+    const profile = smallTestProfile();
+    const admitted: @TypeOf(try preflight(profile, 1000, &.{"x"})) = .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 1000,
+        .minimum_required_bytes = 1000,
+    };
+    const tool_ctx = core.tool_context.ToolContext{ .allocator = a };
+
+    // Positive side: session scope charges payload + tool_result envelope + audit.
+    {
+        var controller = Controller.init(a, profile, admitted);
+        var base = TestDispatcher{ .payload_bytes = 40 };
+        var tools = ToolEnvironment{
+            .controller = &controller,
+            .base = .{ .definitions = &.{}, .dispatcher = base.dispatcher() },
+        };
+        var out = try tools.surface().dispatcher.dispatch(&tool_ctx, "Read", "{}");
+        defer out.deinit(a);
+        try std.testing.expect(out == .ok);
+        try std.testing.expectEqual(
+            @as(u64, 1000 + 40 + 32) + profile.audit_reserve_bytes,
+            controller.estimated_usage_bytes,
+        );
+        try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+    }
+
+    // Negative side: transient scope dispatches once, returns the result, charges nothing.
+    {
+        var controller = Controller.init(a, profile, admitted);
+        var base = TestDispatcher{ .payload_bytes = 40 };
+        var tools = ToolEnvironment{
+            .controller = &controller,
+            .base = .{ .definitions = &.{}, .dispatcher = base.dispatcher() },
+            .scope = .transient,
+        };
+        var out = try tools.surface().dispatcher.dispatch(&tool_ctx, "Read", "{}");
+        defer out.deinit(a);
+        try std.testing.expect(out == .ok);
+        try std.testing.expectEqual(@as(u32, 1), base.calls);
+        try std.testing.expectEqual(@as(u64, 1000), controller.estimated_usage_bytes);
+        try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+        try std.testing.expectEqual(Outcome.none, controller.outcome());
+    }
+
+    // An oversized child result is still a resource limit, not a silently admitted payload.
+    {
+        var limited_profile = profile;
+        limited_profile.tool_result_cap_bytes = 16;
+        var controller = Controller.init(a, limited_profile, admitted);
+        var base = TestDispatcher{ .payload_bytes = 17 };
+        var tools = ToolEnvironment{
+            .controller = &controller,
+            .base = .{ .definitions = &.{}, .dispatcher = base.dispatcher() },
+            .scope = .transient,
+        };
+        var out = try tools.surface().dispatcher.dispatch(&tool_ctx, "Read", "{}");
+        defer out.deinit(a);
+        try std.testing.expectEqual(Outcome.resource_limit, controller.outcome());
+        try std.testing.expectEqualStrings(RESOURCE_LIMIT_MARKER, out.host_failed.?);
+        try std.testing.expectEqual(@as(u64, 1000), controller.estimated_usage_bytes);
+    }
+}
+
+test "commitDurable charges the fork root final text once and fails closed at the hard budget" {
+    const a = std.testing.allocator;
+    const profile = smallTestProfile(); // hard 4096, audit 64, terminal 128
+    var controller = Controller.init(a, profile, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 1000,
+        .minimum_required_bytes = 1000,
+    });
+
+    // Positive: the text lands in the estimate with the audit reserve, no outcome.
+    try controller.commitDurable(100);
+    try std.testing.expectEqual(@as(u64, 1000 + 100 + 64), controller.estimated_usage_bytes);
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+
+    // Boundary: 1164 + 2740 + 64 + terminal 128 == 4096 fits exactly …
+    try controller.commitDurable(2740);
+    try std.testing.expectEqual(@as(u64, 1164 + 2740 + 64), controller.estimated_usage_bytes);
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+
+    // … and one more byte is refused, recorded as budget_exhausted, estimate unchanged.
+    try std.testing.expectError(error.BudgetExhausted, controller.commitDurable(1));
+    try std.testing.expectEqual(Outcome.budget_exhausted, controller.outcome());
+    try std.testing.expectEqual(@as(u64, 1164 + 2740 + 64), controller.estimated_usage_bytes);
+    try std.testing.expectEqual(@as(u64, 3968 + 1 + 64 + 128), controller.requiredBytes());
+
+    // Once an outcome stands nothing further is admitted, even a zero-length commit.
+    try std.testing.expectError(error.BudgetExhausted, controller.commitDurable(0));
 }

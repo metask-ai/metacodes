@@ -10,7 +10,46 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- Child agents could inherit a provider default instead of the lead's current
+  effort: the parent logged `none` while a GLM-5.2 child logged `default` and
+  consequently enabled thinking. Child resolution now follows AgentDef
+  `effort`, explicit Task model-tier effort, inherited parent effort when the
+  model is unchanged, then the selected model's default; this also preserves
+  an explicit `.none`.
+- Per-call providers could fall back to unrelated hard-coded limits. The
+  provider factory now passes `ModelLimitsSource`: registries own immutable
+  catalog snapshots and App refreshes them after catalog changes, avoiding
+  worker races with `/model` rebuilds and probes. OpenAI/Gemini resolve input
+  windows through ModelContext; their output limit and `--max-tokens` semantics
+  remain unchanged (the override applies only to Anthropic).
+- Model routing, capability, pricing, catalog, and context-window matching is
+  now ASCII case-insensitive through `model_name.zig`; the model string sent
+  on the wire remains unchanged. The GLM-5.2 note also records that the
+  2026-07 historical 262144 window became 1048576 on 2026-09-05 (1,001,205
+  input tokens succeeded; 1,101,379 was rejected).
+
+### Changed
+
+- Vendored ripgrep moves from 14.1.1 to 15.2.0 (#86): the four existing
+  targets are replaced by the upstream 15.2.0 release binaries and
+  `rg-linux-aarch64` (upstream's `aarch64-unknown-linux-musl`, static-pie,
+  first published in 15.x) joins `vendor/ripgrep/manifest.json`, so
+  `aarch64-linux` satisfies the `elf-static` contract that #79 fails closed
+  on. Glob/Grep pass only `--files`, `--no-messages`, `--glob`, `--type`,
+  `--no-filename` and `--multiline-dotall`; the 15.x notes change none of
+  them. Every asset digest was checked against the GitHub Releases API.
+
 ### Added
+
+- `providers.<id>.oauth_client_id` in `~/.metacodes/config.json` (#87): the
+  OAuth client an installation registered for a built-in profile that declares
+  none. `metacodes login --provider <id>`, `/login <id>` and the picker's
+  credential stage present it without `--client-id`; precedence is
+  `--client-id`, then the configured client, then the profile's declaration,
+  and the winner is recorded with the login as before. Built-in profiles keep
+  declaring none.
 
 - `.github/workflows/release.yml` (#82, #47 stage 7): `workflow_dispatch` with
   `tag`, `dry_run` and `runner_pool`; one job per platform on the dedicated
@@ -83,6 +122,48 @@ status, compatibility boundaries, and entry points are defined by
   in CI on every platform.
 
 ### Fixed
+
+- AgentCore child agents (Task / fork / model-invoked Skill) no longer exhaust
+  the Session durable budget with bytes the checkpoint never stores. The child
+  ran on the parent's `BudgetedProvider` and a `ToolEnvironment` bound to the
+  parent's `Controller`, and every child assistant increment and tool result
+  settled as durable — yet the child's Conversation is discarded when it
+  returns and only its final text re-enters the Session. A subagent-heavy Run
+  therefore reached `budget_exhausted` (hosts render it as a budget stop, the
+  Task result carries `checkpoint_budget_exhausted`) while the real checkpoint
+  was far below `hard_bytes`; reported on a GLM-5.2 session whose subagents
+  were verbose enough to trip it. `session_budget.DurableScope` now separates
+  the two: a `.transient` operation still reserves its request and payload cap
+  while in flight and an oversized child result is still a resource limit, but
+  settle adds nothing to `estimated_usage_bytes`. The fork-root final text is
+  charged once through `Controller.commitDurable` before `runIsolated` appends
+  it (a commit that does not fit withholds the text and ends the Run
+  `.budget`); the model-tool child's final text is already charged as the
+  parent's tool result.
+
+- `scripts/eval/tests/test_plugin_release_gate.py` did not import on the macOS
+  system python3 (3.9): a `list | None` parameter annotation is evaluated at
+  definition time (`type.__or__` is Python 3.10) in a module that does not
+  defer annotations, so the eval-suite discovery in `zig build test` died at
+  collection while CI's newer interpreter never saw it. The module now opens
+  with `from __future__ import annotations` like the rest of scripts/, and
+  `scripts/tests/test_python_floor.py` reports every PEP 604 union in an
+  annotation of a module without that import, and every `X | None` outside an
+  annotation (a type alias, an `isinstance` argument), which the import does
+  not defer.
+
+- Headless `--stream-json` and `--json` NDJSON lines are always valid UTF-8.
+  The stream backend and the `result` line encoded strings with
+  `std.json.Stringify.encodeJsonString`, which passes bytes 0x80–0xFF through
+  untouched, so a `tool_result` carrying binary tool output (a ReportLab PDF's
+  `%\x93\x8c\x8b\x9e` marker read with `Read`, observed on the 2026-09-05
+  WorkBuddy office cohort) reached stdout as raw bytes and a strict UTF-8
+  consumer rejected the whole file. Every string field now goes through the
+  repository's canonical encoder (`util/json.zig`, invalid bytes → U+FFFD;
+  `content_bytes`/`input_bytes` still count the raw payload), a `text` or
+  `thinking` delta cut inside a multi-byte character is held back and rejoined
+  losslessly with the next delta of the same kind, and a character the block
+  ends without completing is emitted as one explicit U+FFFD line.
 
 - The Bash tool's spilled stdout/stderr are sealed during execution as attachments
   of its inline result and published by the batch commit boundary, like every

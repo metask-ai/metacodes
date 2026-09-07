@@ -71,7 +71,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if command == "slow":
-            time.sleep(1.0)
+            # The stall the "timeout" scenario must NOT wait out: the probe's
+            # 100 ms client deadline has to return long before this. Keep it
+            # equal to the end-to-end bound asserted in main() (#105).
+            time.sleep(5.0)
         if command in {"stats", "add-node"} and self.server.mode == "backpressure":  # type: ignore[attr-defined]
             response = self.response(body, False, -3, "", "tinykgd: error: DaemonQueueFull\n", "none")
             return self.send_json(response)
@@ -282,9 +285,15 @@ def main() -> int:
         # would advance this by two or mark the receipt replayed.
         assert ACTOR.generation == 4
         server.mode = "normal"  # type: ignore[attr-defined]
+        # Proof that the client deadline (100 ms) fired instead of waiting out
+        # the server's "slow" stall: the whole probe process (spawn, connect,
+        # timeout, exit) returns before that stall would have ended. Stall and
+        # bound are both 5 s (Handler.do_POST) so process-spawn jitter on a
+        # loaded shared CI runner cannot fake a failure; at 1 s it did (#105).
+        # scripts/rule_control.py pins both literals as declared evidence.
         started = time.monotonic()
         assert "wall_clock_timeout=observed" in run_probe(args.probe, url, "timeout")
-        assert time.monotonic() - started < 1.0
+        assert time.monotonic() - started < 5.0
         server.shutdown()
         server.server_close()
         assert "unavailable_read=observed" in run_probe(args.probe, url, "unavailable-read")
