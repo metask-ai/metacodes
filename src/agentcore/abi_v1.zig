@@ -4300,7 +4300,7 @@ fn stopReason(self: *AbiSession, reason: core.agent_loop.StopReason) error{Unsup
         .tool_error => wire.STOP_TOOL_ERROR,
         .api_error => wire.STOP_API_ERROR,
         .tool_loop => wire.STOP_TOOL_LOOP,
-        .suspended, .backgrounded, .budget => {
+        .suspended, .backgrounded, .budget, .max_tokens_exhausted => {
             // The stateful Run has already committed Conversation changes.
             // Returning an error while leaving the facade reusable would make
             // a Host retry ambiguous and could repeat side effects.
@@ -6968,7 +6968,7 @@ fn terminalPhaseForStopReason(stop_reason: core.agent_loop.StopReason) public_pr
     return switch (stop_reason) {
         .aborted => .aborted,
         .end_turn, .max_turns => .completed,
-        .tool_error, .api_error, .tool_loop, .suspended, .backgrounded, .budget => .failed,
+        .tool_error, .api_error, .tool_loop, .suspended, .backgrounded, .budget, .max_tokens_exhausted => .failed,
     };
 }
 
