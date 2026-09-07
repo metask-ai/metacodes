@@ -117,7 +117,7 @@ pub const Catalog = struct {
     pub fn maxTokensFor(self: *const Catalog, model: []const u8, user_override: ?u32) u32 {
         if (user_override) |v| {
             for (self.entries.items) |e| {
-                if (!std.mem.eql(u8, e.model_id, model)) continue;
+                if (!model_name.eqlIgnoreCase(e.model_id, model)) continue;
                 if (e.max_tokens) |catalog_value| {
                     if (@as(u64, v) * 2 < @as(u64, catalog_value) and
                         @constCast(&self.narrow_override_warning_emitted).cmpxchgStrong(false, true, .acq_rel, .acquire) == null)
