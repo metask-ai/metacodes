@@ -52,6 +52,7 @@ pub const SwarmContext = struct {
     /// Immutable App/Runtime-scoped resolver; in-process teammates drain before
     /// the owning plugin Snapshot is destroyed.
     dialect_resolver: dialect_mod.Resolver = .builtin(),
+    limits: ?@import("../api/model_limits.zig").ModelLimitsSource = null,
 
     /// 非阻塞 reap:对进程外 teammate waitpid(WNOHANG),已退出的收尸+removeWorktree+摘除记录。
     /// 返回仍存活的数量。POSIX only(Windows 上没有 waitpid,直接报 0;列表本身未必为空,

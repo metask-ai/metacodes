@@ -10,6 +10,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- Child agents could inherit a provider default instead of the lead's current
+  effort: the parent logged `none` while a GLM-5.2 child logged `default` and
+  consequently enabled thinking. Child resolution now follows AgentDef
+  `effort`, explicit Task model-tier effort, inherited parent effort when the
+  model is unchanged, then the selected model's default; this also preserves
+  an explicit `.none`.
+- Per-call providers could fall back to unrelated hard-coded limits. The
+  provider factory now passes `ModelLimitsSource`: registries own immutable
+  catalog snapshots and App refreshes them after catalog changes, avoiding
+  worker races with `/model` rebuilds and probes. OpenAI/Gemini resolve input
+  windows through ModelContext; their output limit and `--max-tokens` semantics
+  remain unchanged (the override applies only to Anthropic).
+- Model routing, capability, pricing, catalog, and context-window matching is
+  now ASCII case-insensitive through `model_name.zig`; the model string sent
+  on the wire remains unchanged. The GLM-5.2 note also records that the
+  2026-07 historical 262144 window became 1048576 on 2026-09-05 (1,001,205
+  input tokens succeeded; 1,101,379 was rejected).
+
 ### Changed
 
 - Vendored ripgrep moves from 14.1.1 to 15.2.0 (#86): the four existing
@@ -102,6 +122,24 @@ status, compatibility boundaries, and entry points are defined by
   in CI on every platform.
 
 ### Fixed
+
+- AgentCore child agents (Task / fork / model-invoked Skill) no longer exhaust
+  the Session durable budget with bytes the checkpoint never stores. The child
+  ran on the parent's `BudgetedProvider` and a `ToolEnvironment` bound to the
+  parent's `Controller`, and every child assistant increment and tool result
+  settled as durable — yet the child's Conversation is discarded when it
+  returns and only its final text re-enters the Session. A subagent-heavy Run
+  therefore reached `budget_exhausted` (hosts render it as a budget stop, the
+  Task result carries `checkpoint_budget_exhausted`) while the real checkpoint
+  was far below `hard_bytes`; reported on a GLM-5.2 session whose subagents
+  were verbose enough to trip it. `session_budget.DurableScope` now separates
+  the two: a `.transient` operation still reserves its request and payload cap
+  while in flight and an oversized child result is still a resource limit, but
+  settle adds nothing to `estimated_usage_bytes`. The fork-root final text is
+  charged once through `Controller.commitDurable` before `runIsolated` appends
+  it (a commit that does not fit withholds the text and ends the Run
+  `.budget`); the model-tool child's final text is already charged as the
+  parent's tool result.
 
 - `scripts/eval/tests/test_plugin_release_gate.py` did not import on the macOS
   system python3 (3.9): a `list | None` parameter annotation is evaluated at

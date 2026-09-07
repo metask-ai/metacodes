@@ -18,7 +18,7 @@
 //!     遇非 200(含 429/500)直接 error.RequestFailed,无重试。Anthropic 路径有 withRetry,此处没有。
 //!   - **非流式 pSend**:返回 error.NotImplemented → auto-compact summary 在 OpenAI 路径退化成
 //!     纯丢老消息(compact_summary.summarize catch 兜底,不崩)。
-//!   - **max_tokens/context_window**:硬编码 4096/128000,未按 model 区分(o1 实际 200k 等)。
+//!   - **max_tokens/context_window**:output 保持原生 4096 默认(序列化器不发送该字段,所以不接 `--max-tokens` override,否则本地预算与服务端脱节);context window 按 ModelContext 解析,未命中以 128000 兜底。
 //!   - **keep_alive=false**(每请求新连接):牺牲连接池(省 TLS 握手)换稳定性;流式池化收益小。
 //!   - thinking/o1-reasoning、prompt cache、completion(非 chat)。
 //!
@@ -49,6 +49,7 @@ const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
 const auth_header_mod = @import("auth_header.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const model_context_mod = @import("../app/model_context.zig");
 
 const StreamEvent = api_stream.StreamEvent;
 const StreamHandle = api_stream.StreamHandle;
@@ -70,6 +71,7 @@ pub const OpenAIClient = struct {
     abort_registry: provider_mod.RequestAbortRegistry = .{},
     max_tokens: u32 = 4096,
     context_window: u32 = 128_000,
+    model_context: ?*const model_context_mod.ModelContext = null,
     reasoning_effort: ?types.ReasoningEffort = null,
     /// OpenAI wire 协议(显式配置,组装层从 config.openai_protocol 塞;绝不从 URL 推断)。
     protocol: types.OpenAIProtocol = .chat_completions,
@@ -140,6 +142,8 @@ pub const OpenAIClient = struct {
             .cancelFn = &pCancel,
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
+            .maxTokensForFn = &pMaxTokensFor,
+            .maxInputTokensForFn = &pMaxInputTokensFor,
             .reasoningEffortFn = &pReasoningEffort,
             .setReasoningEffortFn = &pSetReasoningEffort,
             .requestOverridesFn = &pRequestOverrides,
@@ -172,10 +176,22 @@ pub const OpenAIClient = struct {
         if (o.reasoning_effort) |e| cast(ctx).reasoning_effort = e;
     }
     fn pMaxTokens(ctx: *anyopaque) u32 {
-        return cast(ctx).max_tokens;
+        const self = cast(ctx);
+        return pMaxTokensFor(ctx, self.model);
     }
     fn pMaxInputTokens(ctx: *anyopaque) u32 {
-        return cast(ctx).context_window;
+        const self = cast(ctx);
+        return pMaxInputTokensFor(ctx, self.model);
+    }
+    fn pMaxTokensFor(ctx: *anyopaque, model: []const u8) u32 {
+        const self = cast(ctx);
+        _ = model; // OpenAI does not serialize max_tokens; an override would desync local budgeting.
+        return self.max_tokens;
+    }
+    fn pMaxInputTokensFor(ctx: *anyopaque, model: []const u8) u32 {
+        const self = cast(ctx);
+        if (self.model_context) |mc| if (mc.windowFor(model)) |w| return w;
+        return self.context_window;
     }
     fn pReasoningEffort(ctx: *anyopaque) ?types.ReasoningEffort {
         return cast(ctx).reasoning_effort;

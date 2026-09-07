@@ -10,6 +10,7 @@
 //! 当前单 Anthropic provider 全支持, 门控未激活但表已就位)。
 
 const std = @import("std");
+const model_name = @import("model_name.zig");
 const Capability = @import("provider.zig").Capability;
 const model_adapter = @import("model_adapter.zig");
 
@@ -100,7 +101,7 @@ fn isClaude4(model: []const u8) bool {
     return hasSubstr(model, "claude-opus-4") or hasSubstr(model, "claude-sonnet-4") or hasSubstr(model, "claude-haiku-4");
 }
 fn hasSubstr(haystack: []const u8, needle: []const u8) bool {
-    return std.mem.indexOf(u8, haystack, needle) != null;
+    return model_name.containsIgnoreCase(haystack, needle);
 }
 
 // ── 测试:能力矩阵是单一真相源(断言关键格子)──────────────────────────────────

@@ -718,6 +718,12 @@ pub const App = struct {
         // precedence 高于 probe → auto-compact 阈值优先用此表(offline 可靠 + 用户可编辑)。
         app.model_context.loadOrBundle();
         app.api_client.model_context = &app.model_context;
+        if (app.openai_client) |*client| {
+            client.model_context = &app.model_context;
+        }
+        if (app.gemini_client) |*client| {
+            client.model_context = &app.model_context;
+        }
 
         // Metask's authenticated catalog is authoritative for this session.
         // Fetch it once with the bearer, project limits/capabilities into the
@@ -761,6 +767,8 @@ pub const App = struct {
                 app.api_client.catalog.loadFromModelsListJson(fetched.body) catch |err| {
                     @import("util/log.zig").debug("catalog", "Metask client catalog parse failed: {s}", .{@errorName(err)});
                 };
+                // No snapshot refresh here: the registry and swarm do not exist yet; their
+                // first snapshot is taken from the fully loaded catalog at registry init below.
             };
         };
 
@@ -769,7 +777,8 @@ pub const App = struct {
         // 跳过让 REPL 立即可用(走本地 model 单价表)。
         // **仅 anthropic 模式 probe**:probeModels 打 Anthropic 的 /v1/models,openai 模式下
         // api_client 是死资源、且其 base_url 指向 Anthropic 端点——probe 它=对错端点发真请求
-        // (用真 key),必须跳过。openai 的 context_window 走 OpenAIClient 自己的硬编码值。
+        // (用真 key),必须跳过。OpenAI/Gemini 的 context window 走 ModelContext，未命中时
+        // 才退回各 client 的硬编码默认值。
         const metask_session_active =
             std.ascii.eqlIgnoreCase(config.provider_profile orelse "", "metask") and
             app.oauth_session != null;
@@ -825,10 +834,18 @@ pub const App = struct {
         // Background jobs allocate and free from worker threads.  The session
         // arena is not thread-safe; keep the registry and all job-owned state
         // on c_allocator (the provider/agent_loop allocator must match too).
+        // registry/swarm receive an owned snapshot here and are refreshed after every parent
+        // catalog mutation; workers never read &app.api_client.catalog concurrently.
+        const model_limits = @import("api/model_limits.zig").ModelLimitsSource{
+            .catalog = &app.api_client.catalog,
+            .model_context = &app.model_context,
+            .max_tokens_override = config.max_tokens,
+        };
         app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.initWithDialectResolver(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind, app.config.openai_protocol, app_dialect_resolver) catch |err| blk: {
             @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
+        if (app.agent_jobs) |*jobs| try jobs.setLimits(model_limits);
         // Child agents authenticate the way the parent's resolved route does.
         if (app.agent_jobs) |*jobs| jobs.auth_scheme = config.auth_scheme;
 
@@ -844,6 +861,7 @@ pub const App = struct {
             .openai_protocol = app.config.openai_protocol,
             .auth_scheme = app.config.auth_scheme,
             .dialect_resolver = app_dialect_resolver,
+            .limits = model_limits,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
         };
 
@@ -1626,7 +1644,22 @@ pub const App = struct {
         app.api_client.catalog.deinit();
         app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
         app.api_client.probeModels();
+        try app.refreshChildCatalogSnapshots();
         app.models_picker_key_index = idx;
+    }
+
+    /// Refresh worker-owned catalog snapshots after the mutable parent catalog changes.
+    fn refreshChildCatalogSnapshots(app: *App) !void {
+        const source = @import("api/model_limits.zig").ModelLimitsSource{
+            .catalog = &app.api_client.catalog,
+            .model_context = &app.model_context,
+            .max_tokens_override = app.config.max_tokens,
+        };
+        if (app.agent_jobs) |*jobs| try jobs.setLimits(source);
+        // `app.swarm` is a plain field (undefined until App init assigns it), so this must only
+        // run after init: the sole startup catalog loads happen before registry/swarm exist and
+        // are covered by the initial setLimits at registry creation.
+        if (app.swarm.teammates) |*teammates| try teammates.setLimits(source);
     }
 
     /// **U3 单一真理源写侧 seam**:把 model 同步到全部值镜像。抽成独立函数(不依赖 io/App

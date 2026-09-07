@@ -9,6 +9,7 @@
 //! 需要 runtime 读 cwd / platform / model。
 
 const std = @import("std");
+const model_name = @import("../api/model_name.zig");
 const util_fs = @import("../util/fs.zig");
 const kg_retrieval = @import("../kg/retrieval_protocol.zig");
 const kg_tasks = @import("../kg/task_protocol.zig");
@@ -134,15 +135,15 @@ const OUTPUT_EFFICIENCY_SECTION =
 // 动态：# Environment （对应 TS computeSimpleEnvInfo）
 // ============================================================================
 
-fn getKnowledgeCutoff(model: []const u8) ?[]const u8 {
+pub fn getKnowledgeCutoff(model: []const u8) ?[]const u8 {
     // 对应 TS getKnowledgeCutoff() 的分支，用 substring 匹配。
-    if (std.mem.indexOf(u8, model, "claude-sonnet-4-6") != null) return "August 2025";
-    if (std.mem.indexOf(u8, model, "claude-opus-4-7") != null) return "January 2026";
-    if (std.mem.indexOf(u8, model, "claude-opus-4-6") != null) return "May 2025";
-    if (std.mem.indexOf(u8, model, "claude-opus-4-5") != null) return "May 2025";
-    if (std.mem.indexOf(u8, model, "claude-haiku-4") != null) return "February 2025";
-    if (std.mem.indexOf(u8, model, "claude-opus-4") != null or
-        std.mem.indexOf(u8, model, "claude-sonnet-4") != null) return "January 2025";
+    if (model_name.containsIgnoreCase(model, "claude-sonnet-4-6")) return "August 2025";
+    if (model_name.containsIgnoreCase(model, "claude-opus-4-7")) return "January 2026";
+    if (model_name.containsIgnoreCase(model, "claude-opus-4-6")) return "May 2025";
+    if (model_name.containsIgnoreCase(model, "claude-opus-4-5")) return "May 2025";
+    if (model_name.containsIgnoreCase(model, "claude-haiku-4")) return "February 2025";
+    if (model_name.containsIgnoreCase(model, "claude-opus-4") or
+        model_name.containsIgnoreCase(model, "claude-sonnet-4")) return "January 2025";
     return null;
 }
 

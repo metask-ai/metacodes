@@ -101,6 +101,22 @@ pub const Resolved = struct {
     effort: ?types.ReasoningEffort,
 };
 
+/// Resolve child effort in Codex order: definition, explicit tier selection,
+/// inherited parent effort for the same model, then provider default.
+pub fn resolveChildEffort(def_effort: ?types.ReasoningEffort, selection: Resolved, parent_effort: ?types.ReasoningEffort) ?types.ReasoningEffort {
+    if (def_effort) |effort| return effort;
+    if (selection.effort) |effort| return effort;
+    if (selection.model == null) return parent_effort;
+    return null;
+}
+
+test "resolveChildEffort covers all precedence branches" {
+    try std.testing.expectEqual(types.ReasoningEffort.low, resolveChildEffort(.low, .{ .model = "child", .effort = .high }, .none).?);
+    try std.testing.expectEqual(types.ReasoningEffort.medium, resolveChildEffort(null, .{ .model = "child", .effort = .medium }, .high).?);
+    try std.testing.expectEqual(types.ReasoningEffort.none, resolveChildEffort(null, .{ .model = null, .effort = null }, .none).?);
+    try std.testing.expect(resolveChildEffort(null, .{ .model = "other", .effort = null }, .high) == null);
+}
+
 pub fn resolveName(tiers: ?*const ProviderTiers, name: []const u8) Resolved {
     if (Tier.parse(name)) |tier| {
         const spec = (tiers orelse return .{ .model = null, .effort = null }).spec(tier);

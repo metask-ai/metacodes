@@ -10,6 +10,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const log = @import("../util/log.zig");
+const model_name = @import("../api/model_name.zig");
 
 const BUNDLED = @embedFile("model_context_default.toml");
 
@@ -103,7 +104,7 @@ pub const ModelContext = struct {
     }
 
     /// 极简 TOML 解析:`# 注释` / 空行 / `[section]`(只认 [models]) / `"key" = 12345`。
-    fn parse(self: *ModelContext, source: []const u8) void {
+    pub fn parse(self: *ModelContext, source: []const u8) void {
         var in_models = false;
         var it = std.mem.splitScalar(u8, source, '\n');
         while (it.next()) |raw| {
@@ -132,13 +133,13 @@ pub const ModelContext = struct {
     pub fn windowFor(self: *const ModelContext, model: []const u8) ?u32 {
         // exact 优先。
         for (self.entries.items) |e| {
-            if (std.mem.eql(u8, e.key, model)) return e.window;
+            if (model_name.eqlIgnoreCase(e.key, model)) return e.window;
         }
         // substring:model 含 key;多个命中取最长 key(最具体)。
         var best: ?u32 = null;
         var best_len: usize = 0;
         for (self.entries.items) |e| {
-            if (std.mem.indexOf(u8, model, e.key) != null and e.key.len > best_len) {
+            if (model_name.containsIgnoreCase(model, e.key) and e.key.len > best_len) {
                 best = e.window;
                 best_len = e.key.len;
             }

@@ -3718,11 +3718,23 @@ const ForkExecutorContext = struct {
                 .definitions = self.session.tools.definitions,
                 .dispatcher = self.session.tools.dispatcher(),
             };
+        // The child runs on its own Conversation, discarded when it returns;
+        // its tool results and assistant increments never reach the Session
+        // checkpoint, so they reserve and cap but do not grow the durable
+        // estimate (session_budget.DurableScope). Only the final text below is
+        // durable, charged once through commitDurable.
         var budget_tools = session_budget.ToolEnvironment{
             .controller = self.budget_controller,
             .base = inner_surface,
+            .scope = .transient,
         };
         const child_surface = budget_tools.surface();
+        var child_provider = session_budget.BudgetedProvider{
+            .allocator = self.budget_provider.allocator,
+            .controller = self.budget_controller,
+            .base = self.budget_provider.base,
+            .scope = .transient,
+        };
         const execution_policy = if (environment) |*env|
             env.executionPolicy()
         else if (mcp_environment) |*mcp_env|
@@ -3747,7 +3759,7 @@ const ForkExecutorContext = struct {
 
         const child = core.subagent.spawnAgentSink(
             output_allocator,
-            self.budget_provider.provider(),
+            child_provider.provider(),
             self.session.provider.anthropicClient(),
             child_surface.definitions,
             permission_lease.permissionContext(),
@@ -3792,6 +3804,22 @@ const ForkExecutorContext = struct {
         };
         defer child.deinit();
         try projector.appendFinalText(out_final_text);
+        // runIsolated appends this text to the Session Conversation as an
+        // assistant message. That is the one durable byte range a transient
+        // child leaves behind; the envelope constant mirrors the stream
+        // measurement of a text increment. A commit that does not fit marks
+        // budget_exhausted and the text is withheld, so the Run ends through
+        // the same terminal-marker path as a rejected root candidate.
+        if (out_final_text.items.len != 0) {
+            self.budget_controller.commitDurable(out_final_text.items.len + 14) catch {
+                out_final_text.clearRetainingCapacity();
+                return .{
+                    .stop_reason = .budget,
+                    .turns = child.turns,
+                    .tool_calls = child.tool_calls,
+                };
+            };
+        }
         if (environment) |*env| {
             try env.deinit();
             environment_live = false;

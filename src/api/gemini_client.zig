@@ -28,7 +28,7 @@
 //!     inline_data part,issue #10;图像 **tool_result**(Read 工具)也已做——Gemini 3 系发
 //!     官方 multimodal functionResponse,旧世代发同级 inline_data part,见
 //!     serializeGeminiContent;图像输出/其它媒体仍未做。)
-//!   - **max_tokens/context_window**:硬编码,未按 model 区分(Gemini 1.5 Pro 2M 等)。
+//!   - **max_tokens/context_window**:output 保持原生 8192 默认(序列化器不发送 max_output_tokens,所以不接 `--max-tokens` override);context window 按 ModelContext 解析,未命中以 1M 兜底。
 //!
 //! 取舍登记:keep_alive=false(每请求新连接)——牺牲真后端连接池(省 TLS 握手)换稳定性;
 //! 流式请求被长流独占,池化收益本就小,且当前 per-job client 用法几乎不复用连接。
@@ -48,6 +48,7 @@ const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const model_context_mod = @import("../app/model_context.zig");
 
 const StreamEvent = api_stream.StreamEvent;
 const StreamHandle = api_stream.StreamHandle;
@@ -81,6 +82,7 @@ pub const GeminiClient = struct {
     http_client: http.Client,
     abort_registry: provider_mod.RequestAbortRegistry = .{},
     max_tokens: u32 = 8192,
+    model_context: ?*const model_context_mod.ModelContext = null,
     context_window: u32 = 1_048_576, // Gemini 1.5/2.x 默认 1M(保守;未按 model 区分)
     /// thinking 控制(effort 档位)。null = 自适应(Gemini 2.5 默认开 thinking,无需显式)。
     /// 非null → serializeGeminiRequest 经 GeminiDialect.serializeThinking 翻成
@@ -154,6 +156,8 @@ pub const GeminiClient = struct {
             .cancelFn = &pCancel,
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
+            .maxTokensForFn = &pMaxTokensFor,
+            .maxInputTokensForFn = &pMaxInputTokensFor,
             .reasoningEffortFn = &pReasoningEffort,
             .requestOverridesFn = &pRequestOverrides,
             .setRequestOverridesFn = &pSetRequestOverrides,
@@ -178,10 +182,22 @@ pub const GeminiClient = struct {
         if (o.reasoning_effort) |e| cast(ctx).reasoning_effort = e;
     }
     fn pMaxTokens(ctx: *anyopaque) u32 {
-        return cast(ctx).max_tokens;
+        const self = cast(ctx);
+        return pMaxTokensFor(ctx, self.model);
     }
     fn pMaxInputTokens(ctx: *anyopaque) u32 {
-        return cast(ctx).context_window;
+        const self = cast(ctx);
+        return pMaxInputTokensFor(ctx, self.model);
+    }
+    fn pMaxTokensFor(ctx: *anyopaque, model: []const u8) u32 {
+        const self = cast(ctx);
+        _ = model; // Gemini does not serialize max_output_tokens; an override would desync local budgeting.
+        return self.max_tokens;
+    }
+    fn pMaxInputTokensFor(ctx: *anyopaque, model: []const u8) u32 {
+        const self = cast(ctx);
+        if (self.model_context) |mc| if (mc.windowFor(model)) |w| return w;
+        return self.context_window;
     }
     fn pReasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
         return null;
