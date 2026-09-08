@@ -1770,6 +1770,49 @@ with urllib.request.urlopen(
             with self.assertRaisesRegex(LaunchError, "identity is incomplete"):
                 _official_task_identity(trajectory, manifest, [task], route)
 
+    def test_official_task_identity_accepts_security_codebuddy_namespace(self):
+        # The security dataset (wb-bench-sec-v1.0) namespaces tasks as
+        # "codebuddy/<task>" while code/office/web use "workbuddy/<task>". The
+        # gate must bind either spelling, or every security trial is rejected as
+        # "identity is incomplete or drifted" and no security cohort can commit.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            trial = root / "order-of-validation-2fa-bypass-h__random"
+            trajectory = trial / "agent/trajectory.json"
+            trajectory.parent.mkdir(parents=True)
+            trajectory.write_text("{}\n", encoding="utf-8")
+            task = "order-of-validation-2fa-bypass-hard-multistep"
+            run_id = "workbuddy-sec-codebuddy-l2"
+            route = run_id + "--metacodes-glm52"
+            result = {
+                "task_name": f"codebuddy/{task}",
+                "task_id": {
+                    "path": (
+                        Path(".workspace/tmp/staged")
+                        / run_id
+                        / "wb-bench-sec-v1.0/tasks"
+                        / task
+                    ).as_posix()
+                },
+                "source": "tasks",
+                "trial_uri": trial.as_uri(),
+                "task_checksum": digest("task-checksum"),
+                "exception_info": None,
+                "agent_info": {"name": "metacodes", "model_info": {"name": route}},
+            }
+            (trial / "result.json").write_text(
+                json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            manifest = {
+                "run_id": run_id,
+                "cohort": {"dataset": "datasets/wb-bench-sec-v1.0/tasks"},
+            }
+            observed, result_path, loaded = _official_task_identity(
+                trajectory, manifest, [task], route
+            )
+            self.assertEqual(task, observed)
+            self.assertEqual(trial / "result.json", result_path)
+
     def _official_usage_fixture(self, root: Path, reward: object) -> dict:
         workbuddy = root / "workbuddy"
         run_id = "workbuddy-official-reward-l2"

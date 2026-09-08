@@ -1830,6 +1830,26 @@ def _aggregate_control_metrics(rows: Mapping[str, Mapping[str, Any]]) -> Dict[st
     return totals
 
 
+# WorkBuddy datasets namespace Harbor task names as "<namespace>/<task>".
+# code/office/web (wb-bench-{code,office,web}-v1.0) use "workbuddy/"; the security
+# dataset (wb-bench-sec-v1.0) uses "codebuddy/". The namespace label is not a trust
+# boundary — provenance is bound by the staged task path, task_checksum and
+# trial_uri checked alongside every use below — so accept either known spelling
+# instead of hardcoding one, which silently rejected every security trial.
+_TASK_NAMESPACES = ("workbuddy/", "codebuddy/")
+
+
+def _bare_task_name(task_name: object) -> str | None:
+    """Return the bare task for a namespaced Harbor ``task_name`` (either known
+    WorkBuddy namespace), or ``None`` when it is not a namespaced string."""
+    if not isinstance(task_name, str):
+        return None
+    for namespace in _TASK_NAMESPACES:
+        if task_name.startswith(namespace):
+            return task_name[len(namespace):] or None
+    return None
+
+
 def _official_task_identity(
     trajectory_path: Path,
     manifest: Mapping[str, Any],
@@ -1859,7 +1879,7 @@ def _official_task_identity(
     matches = [
         task
         for task in selected
-        if result.get("task_name") == f"workbuddy/{task}"
+        if _bare_task_name(result.get("task_name")) == task
         # The runner records POSIX task paths (it runs in a Linux container); compare
         # spellings, not host Path rendering, or Windows hosts never match.
         and raw_task_path
@@ -2964,11 +2984,7 @@ def _official_failure_roots(
             task_id = result.get("task_id")
             agent = result.get("agent_info")
             model = agent.get("model_info") if isinstance(agent, dict) else None
-            task = (
-                task_name.removeprefix("workbuddy/")
-                if isinstance(task_name, str)
-                else None
-            )
+            task = _bare_task_name(task_name)
             task_path = task_id.get("path") if isinstance(task_id, dict) else None
             expected_task_path = str(
                 Path(".workspace/tmp/staged")
@@ -4137,10 +4153,9 @@ def resume_trials(
         对抗审查 F7)。归属靠 staged 路径(内嵌 instance id)+ trial_uri,
         不靠时间;attempt-2 的 staging 是 <run_id>-a2,因此重跑自身的失败
         永远不会被再次判为可 resume(attempt≥3 设计禁止)。"""
-        task_name = str(result.get("task_name") or "")
-        if not task_name.startswith("workbuddy/"):
+        task = _bare_task_name(result.get("task_name"))
+        if task is None:
             return None
-        task = task_name.removeprefix("workbuddy/")
         task_id = result.get("task_id") or {}
         raw_path = task_id.get("path") if isinstance(task_id, dict) else None
         if raw_path != str(
