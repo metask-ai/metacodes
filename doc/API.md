@@ -202,10 +202,12 @@ form (`Dialect.serializeImagePart`): Anthropic emits a base64 `image` source
 block, OpenAI-compatible endpoints emit an `image_url` data URL content part
 (the Responses protocol emits `input_image`), and Gemini emits an
 `inline_data` part. Capability is per-model data
-(`ModelProfile.supports_image_input`, queryable as `Capability.image_input`):
-a model without vision fails the request with `error.ImageInputUnsupported`
-before any network I/O — images are never silently dropped, OCR'd, or
-replaced with placeholder text. Image blocks round-trip through the JSONL
+(`ModelProfile.supports_image_input`, queryable as `Capability.image_input`)
+keyed by the model family rather than the wire protocol, so a vision model
+reached through a compatible gateway of another protocol keeps its
+capability: a model without vision fails the request with
+`error.ImageInputUnsupported` before any network I/O — images are never
+silently dropped, OCR'd, or replaced with placeholder text. Image blocks round-trip through the JSONL
 transcript and the AgentCore checkpoint (block tag 5), so restored sessions
 resend the original bytes.
 

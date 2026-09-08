@@ -141,4 +141,8 @@ test "image_input 能力矩阵转发 ModelProfile(单一真相)" {
     try std.testing.expect(supports(.gemini, "gemini-2.5-flash", .image_input));
     try std.testing.expect(!supports(.openai, "deepseek-chat", .image_input));
     try std.testing.expect(!supports(.other, "mystery", .image_input));
+    // issue #112:Anthropic Messages 兼容路由上的非 Claude vision 模型不被本地拒绝;
+    // 同路由上的文本模型仍 false。
+    try std.testing.expect(supports(.anthropic, "gpt-5.6-sol", .image_input));
+    try std.testing.expect(!supports(.anthropic, "glm-5.2", .image_input));
 }

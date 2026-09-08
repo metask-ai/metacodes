@@ -155,12 +155,10 @@ fn anthropicProfile(model: []const u8) ModelProfile {
         .thinking_mode = .anthropic_adaptive,
         .effort_levels = .full,
         .returns_reasoning_content = false, // Claude 用 content[] 里的 thinking block,非平级字段
-        // Vision 自 Claude 3 起(claude-1/2/instant 是纯文本代);经 Anthropic 兼容
-        // 网关的第三方文本模型(如 glm-5)同样不支持。按已验证家族守门,其余保守 false。
-        .supports_image_input = hasSubstr(model, "claude") and
-            !hasSubstr(model, "claude-instant") and
-            !hasSubstr(model, "claude-1") and
-            !hasSubstr(model, "claude-2"),
+        // provider_kind=anthropic 只说明 wire 是 Anthropic Messages 格式,不说明后端是
+        // Claude:兼容网关同样以此格式暴露 gpt-*/gemini-* 等模型(issue #112)。vision 按
+        // 模型家族判定(与 openai 路由同一张表),经网关的第三方文本模型(如 glm-5)保守 false。
+        .supports_image_input = visionFamily(model),
     };
     // Claude 4.x 保留 thinking(preserved thinking)
     if (hasSubstr(model, "claude-opus-4") or hasSubstr(model, "claude-sonnet-4") or hasSubstr(model, "claude-haiku-4")) {
@@ -223,7 +221,7 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .effort_levels = .none_, // Qwen3 无 effort 档位,只开关
             .returns_reasoning_content = true,
             // Qwen3 文本模型无 vision;VL 变体(qwen3-vl-*)走 OpenAI image_url 格式。
-            .supports_image_input = hasSubstr(model, "vl"),
+            .supports_image_input = qwenVision(model),
         };
     }
     // MiniMax M3(三态 thinking;可关)
@@ -253,14 +251,38 @@ fn openaiProfile(model: []const u8) ModelProfile {
         };
     }
     // OpenAI 原生(GPT-4o/o1/o3/GPT-5)。注意本分支同时是**所有未匹配模型名的
-    // catch-all**(vLLM/自部署/新厂商)——vision 只对已验证 OpenAI 家族开 true,
-    // 未知模型保持保守 false(fail-closed:本地显式能力错误优于远端 400/静默忽略)。
+    // catch-all**(vLLM/自部署/新厂商/经 OpenAI 兼容网关的 Claude、Gemini)——vision 只对
+    // 已验证家族开 true,未知模型保持保守 false(fail-closed:本地显式能力错误优于远端
+    // 400/静默忽略)。
     return .{
         .thinking_mode = .openai_effort,
         .effort_levels = .full,
         .returns_reasoning_content = false, // OpenAI 不暴露 reasoning content
-        .supports_image_input = openaiNativeVision(model),
+        .supports_image_input = visionFamily(model),
     };
+}
+
+/// 已验证 vision 模型家族,**按模型名判定、与 wire 协议无关**:同一个模型不论经
+/// Anthropic Messages 还是 OpenAI 兼容路由,能力结论一致(issue #112:gpt-5.6-sol 经
+/// Anthropic 兼容端点曾因名字不含 claude 被本地拒绝,请求从未发出)。
+/// 覆盖 Claude 3+、OpenAI 原生 vision 系、Gemini 全系、Qwen VL;其余一律 false——
+/// 这是序列化守门的 fail-closed 面,新家族须验证后再加,不按路由放宽。
+fn visionFamily(model: []const u8) bool {
+    return claudeVision(model) or openaiNativeVision(model) or
+        hasSubstr(model, "gemini") or qwenVision(model);
+}
+
+/// Claude vision 自 Claude 3 起;claude-1/claude-2/claude-instant 是纯文本代。
+fn claudeVision(model: []const u8) bool {
+    return hasSubstr(model, "claude") and
+        !hasSubstr(model, "claude-instant") and
+        !hasSubstr(model, "claude-1") and
+        !hasSubstr(model, "claude-2");
+}
+
+/// Qwen 文本模型无 vision;VL 变体(qwen3-vl-*/qwen-3-vl-*)支持。
+fn qwenVision(model: []const u8) bool {
+    return (hasSubstr(model, "qwen3") or hasSubstr(model, "qwen-3")) and hasSubstr(model, "vl");
 }
 
 /// OpenAI 原生已验证 vision 家族:GPT-4o/4.1/4.5/GPT-5/ChatGPT 全系、gpt-4-turbo/
@@ -524,6 +546,34 @@ test "profileFor: vision 能力矩阵(issue #10)" {
     try std.testing.expect(!profileFor(.openai, "minimax-m3").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "mistral-large").supports_image_input);
     try std.testing.expect(!profileFor(.other, "mystery").supports_image_input);
+}
+
+test "profileFor: vision 按模型家族判定,与 wire 协议无关(issue #112)" {
+    // Anthropic Messages 兼容网关暴露的非 Claude vision 模型:不因名字不含 claude 被本地拒绝。
+    try std.testing.expect(profileFor(.anthropic, "gpt-5.6-sol").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "GPT-5.6-Sol").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "gpt-4o").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "o3").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "gemini-2.5-pro").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "qwen3-vl-235b").supports_image_input);
+    // 同一模型经两条路由结论一致。
+    try std.testing.expectEqual(
+        profileFor(.openai, "gpt-5.6-sol").supports_image_input,
+        profileFor(.anthropic, "gpt-5.6-sol").supports_image_input,
+    );
+    try std.testing.expect(profileFor(.openai, "claude-sonnet-4-20250514").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "claude-2.1").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "gemini-2.5-flash").supports_image_input);
+    // Anthropic 路由上的文本模型/未知名字仍 fail-closed:守门面没有因路由放宽。
+    try std.testing.expect(!profileFor(.anthropic, "glm-5.2").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "deepseek-chat").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "o3-mini").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "marco-o1").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "qwen3-235b").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "llama-3.3-70b").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "test-model").supports_image_input);
+    // 家族表只关心 vision 位:Anthropic 路由上 gpt-* 的其余 profile 仍是 Anthropic 方言的。
+    try std.testing.expect(profileFor(.anthropic, "gpt-5.6-sol").thinking_mode == .anthropic_adaptive);
 }
 
 test "profileFor: multimodal functionResponse 仅 Gemini 3 系 true" {

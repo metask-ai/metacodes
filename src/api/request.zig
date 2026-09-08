@@ -136,11 +136,11 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
 
 /// Provider 中立的 canonical 请求投影(预算记账/journal 身份/token 估算用)。
 /// 不是真实 provider 请求:图像能力门属于真实发送路径(与 AgentCore 预检),
-/// 投影必须对任意 Session model 可计算——否则非 claude 命名的 vision 模型
-/// (如 gpt-*/gemini-*)带图时,记账序列化自己先报 ImageInputUnsupported,
-/// 真实请求反而从未发出。故此处强制放行 image 位,始终按 Anthropic base64
-/// image source block 形态计字节;text-only 请求字节与 serializeMessagesRequest
-/// 完全一致。
+/// 投影必须对任意 Session model 可计算——内建家族表之外的模型(插件方言自行
+/// 声明 vision、或文本模型带图等着预检报错)若在记账序列化里先报
+/// ImageInputUnsupported,预算 admission 就替 provider 拒绝了请求。故此处强制
+/// 放行 image 位,始终按 Anthropic base64 image source block 形态计字节;
+/// text-only 请求字节与 serializeMessagesRequest 完全一致。
 pub fn serializeCanonicalRequestProjection(req: MessagesRequest, allocator: std.mem.Allocator) ![]u8 {
     var dialect = dialect_mod.dialectFor(.anthropic, req.model);
     dialect.profileFn = canonicalProjectionProfile;
@@ -940,6 +940,25 @@ test "serializeMessagesRequest: 不支持 vision 的模型带 image → 显式�
     );
 }
 
+test "serializeMessagesRequest: Anthropic 兼容路由上的非 Claude vision 模型带 image 正常序列化(issue #112)" {
+    // provider_kind=anthropic 只决定 wire 格式;gpt-5.6-sol 是已验证 vision 家族,
+    // 图像按 Anthropic base64 image source block 发出,不因名字不含 claude 报能力错误。
+    const contents = [_]types.ApiContent{
+        .{ .text = "what color?" },
+        .{ .image = .{ .media_type = "image/png", .data = "QUJD" } },
+    };
+    const msg = types.ApiMessage{ .role = .user, .content = &contents };
+    const req = MessagesRequest{ .model = "gpt-5.6-sol", .messages = &.{msg} };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-5.6-sol\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        body,
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}}",
+    ) != null);
+}
+
 test "serializeMessagesRequest escapes special chars in text" {
     const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "line1\nline2\"quoted\"" }} };
     const req = MessagesRequest{ .model = "m", .messages = &.{msg} };
@@ -1120,7 +1139,7 @@ test "serializeInputSchema: prop_specs 支持 array items 与 enum" {
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"enum\":[\"a\",\"b\"]") != null);
 }
 
-test "canonical 投影:非 claude 命名的 vision 模型带图可计量,text-only 与普通序列化字节一致" {
+test "canonical 投影:守门拒绝的模型带图仍可计量,text-only 与普通序列化字节一致" {
     const a = std.testing.allocator;
     const image_messages = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{
@@ -1128,17 +1147,17 @@ test "canonical 投影:非 claude 命名的 vision 模型带图可计量,text-on
             .{ .image = .{ .media_type = "image/png", .data = "UE5H" } },
         } },
     };
-    // 普通(真实请求)序列化按 Anthropic 能力守门:gpt-5.2 无 "claude" → 显式能力错误。
+    // 普通(真实请求)序列化按能力守门:deepseek-chat 不在 vision 家族表 → 显式能力错误。
     try std.testing.expectError(
         error.ImageInputUnsupported,
         serializeMessagesRequest(
-            .{ .model = "gpt-5.2", .messages = &image_messages },
+            .{ .model = "deepseek-chat", .messages = &image_messages },
             a,
         ),
     );
     // canonical 投影是记账/身份用的 provider 中立形态:必须对任意模型可计算。
     const projected = try serializeCanonicalRequestProjection(
-        .{ .model = "gpt-5.2", .messages = &image_messages },
+        .{ .model = "deepseek-chat", .messages = &image_messages },
         a,
     );
     defer a.free(projected);

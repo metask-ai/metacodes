@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Image input was rejected locally (`image_input_unsupported`, status 28, no
+  HTTP request) for non-Claude vision models reached through an Anthropic
+  Messages-compatible endpoint, because the Anthropic profile only granted
+  vision to names containing `claude` (#112). `provider_kind: anthropic`
+  selects the wire format, not the model family: vision is now decided by one
+  route-independent family table (Claude 3+, OpenAI GPT-4o/4.1/4.5/5 and
+  o-series, Gemini, Qwen VL) shared by the Anthropic and OpenAI-compatible
+  profiles, so `gpt-5.6-sol` gets the same answer on both routes and the image
+  goes out as an Anthropic base64 `image` source block. Text models and
+  unknown names on either route still fail closed before any network I/O.
 - Child agents could inherit a provider default instead of the lead's current
   effort: the parent logged `none` while a GLM-5.2 child logged `default` and
   consequently enabled thinking. Child resolution now follows AgentDef
