@@ -439,6 +439,24 @@ pub fn buildFull(
     kg_ready: bool,
     cwd: []const u8,
 ) ![]u8 {
+    return buildFullWithDefs(allocator, model, skills, agents, enabled_tool_names, memdir_abs, kg_ready, cwd, null);
+}
+
+/// `buildFull` + 运行时工具定义:`tool_defs` 里 deferred 的**动态**工具(MCP `<server>__<tool>`、
+/// 插件工具)也列进 `# Deferred tools`。静态注册表之外的 deferred 工具只有这一条被模型发现的
+/// 路径——它们不在 API tools 数组里,ToolSearch 的关键字匹配又是 AND 语义,模型不知道名字就
+/// 只能瞎猜。null = 只列静态 deferred(纯单测/无动态工具的宿主)。
+pub fn buildFullWithDefs(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    skills: ?*const @import("../skills/skill.zig").SkillSet,
+    agents: ?*const @import("../agents/set.zig").AgentSet,
+    enabled_tool_names: ?[]const []const u8,
+    memdir_abs: []const u8,
+    kg_ready: bool,
+    cwd: []const u8,
+    tool_defs: ?[]const @import("../json.zig").ToolDefinition,
+) ![]u8 {
     const env_section = try buildEnvSection(allocator, model, cwd);
     defer allocator.free(env_section);
 
@@ -473,7 +491,7 @@ pub fn buildFull(
     };
     defer allocator.free(using_tools_section);
 
-    const deferred_section = try buildDeferredToolsSection(allocator, enabled_tool_names, kg_ready);
+    const deferred_section = try buildDeferredToolsSection(allocator, enabled_tool_names, kg_ready, tool_defs);
     defer allocator.free(deferred_section);
 
     const kg_section = try buildKnowledgeGraphSection(allocator, enabled_tool_names, kg_ready);
@@ -506,6 +524,7 @@ fn buildDeferredToolsSection(
     allocator: std.mem.Allocator,
     enabled_tool_names: ?[]const []const u8,
     kg_ready: bool,
+    tool_defs: ?[]const @import("../json.zig").ToolDefinition,
 ) ![]u8 {
     const tools = @import("../tools.zig");
     var buf: std.ArrayList(u8) = .empty;
@@ -514,28 +533,64 @@ fn buildDeferredToolsSection(
     for (tools.registry) |*t| {
         if (!t.deferred) continue;
         if (t.tinykg_gated and !kg_ready) continue;
-        if (enabled_tool_names) |names| {
-            var enabled = false;
-            for (names) |name| {
-                if (std.mem.eql(u8, name, t.name)) {
-                    enabled = true;
-                    break;
-                }
-            }
-            if (!enabled) continue;
+        if (!toolNameEnabled(enabled_tool_names, t.name)) continue;
+        try appendDeferredLine(allocator, &buf, &any, t.name, t.description);
+    }
+    // 动态 deferred 工具(MCP/插件):不在静态注册表里,按运行时定义列名。描述压成单行
+    // 并截短——MCP server 的描述常常是整段文档,提示词只需要"这是什么"够模型选。
+    if (tool_defs) |defs| {
+        for (defs) |def| {
+            if (!def.deferred) continue;
+            if (tools.getTool(def.name) != null) continue; // 静态条目上面已列
+            if (!toolNameEnabled(enabled_tool_names, def.name)) continue;
+            const summary = try deferredDescriptionSummary(allocator, def.description);
+            defer allocator.free(summary);
+            try appendDeferredLine(allocator, &buf, &any, def.name, summary);
         }
-        if (!any) {
-            try buf.appendSlice(allocator,
-                \\# Deferred tools
-                \\The tools below are available but their parameter schemas are not loaded yet, so you cannot call them directly. To use one, first call ToolSearch with `select:<name>` (or keywords) to fetch its schema; after that it is callable like any other tool.
-                \\
-            );
-            any = true;
-        }
-        try buf.print(allocator, "\n- {s} — {s}", .{ t.name, t.description });
     }
     if (!any) return try allocator.dupe(u8, "");
     return try buf.toOwnedSlice(allocator);
+}
+
+fn appendDeferredLine(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), any: *bool, name: []const u8, description: []const u8) !void {
+    if (!any.*) {
+        try buf.appendSlice(allocator,
+            \\# Deferred tools
+            \\The tools below are available but their parameter schemas are not loaded yet, so you cannot call them directly. To use one, first call ToolSearch with `select:<name>` (or keywords) to fetch its schema; after that it is callable like any other tool.
+            \\
+        );
+        any.* = true;
+    }
+    try buf.print(allocator, "\n- {s} — {s}", .{ name, description });
+}
+
+/// 动态工具描述的提示词投影:折成单行、UTF-8 边界上截到 `DEFERRED_SUMMARY_MAX_BYTES`。
+/// 行内不能出现换行——`projectDeferredToolsForExecution` 按行解析这一段。
+pub const DEFERRED_SUMMARY_MAX_BYTES: usize = 120;
+
+fn deferredDescriptionSummary(allocator: std.mem.Allocator, description: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var last_space = true; // 吞掉开头空白
+    for (description) |c| {
+        const ws = c == '\n' or c == '\r' or c == '\t' or c == ' ';
+        if (ws) {
+            if (!last_space) try out.append(allocator, ' ');
+            last_space = true;
+        } else {
+            try out.append(allocator, c);
+            last_space = false;
+        }
+    }
+    while (out.items.len > 0 and out.items[out.items.len - 1] == ' ') out.items.len -= 1;
+    if (out.items.len > DEFERRED_SUMMARY_MAX_BYTES) {
+        var cut = DEFERRED_SUMMARY_MAX_BYTES;
+        while (cut > 0 and (out.items[cut] & 0xC0) == 0x80) cut -= 1;
+        out.items.len = cut;
+        try out.appendSlice(allocator, "…");
+    }
+    if (out.items.len == 0) try out.appendSlice(allocator, "(no description)");
+    return try out.toOwnedSlice(allocator);
 }
 
 /// Keep the ordinary tool-usage guidance in an already-built system prompt
@@ -1063,4 +1118,68 @@ test "buildUsingToolsSection gates CodeMap + FindSymbol guidance on tool presenc
         try testing.expect(std.mem.indexOf(u8, s, "use CodeMap") != null);
         try testing.expect(std.mem.indexOf(u8, s, "FindSymbol") != null);
     }
+}
+
+test "deferred section lists dynamic (MCP) deferred tools with a single-line summary; static entries are not duplicated" {
+    const a = std.testing.allocator;
+    const defs = [_]@import("../json.zig").ToolDefinition{
+        .{ .name = "knowforge__search", .description = "Search the knowledge base.\n\nSecond paragraph that goes on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on.", .input_schema = .{}, .deferred = true, .mcp_server = "knowforge" },
+        .{ .name = "knowforge__overview", .description = "  库概览——中文描述也要在 UTF-8 边界上截断,不能切出半个字。这里放足够长的文字保证超过一百二十字节的上限以触发截断逻辑。", .input_schema = .{}, .deferred = true, .mcp_server = "knowforge" },
+        .{ .name = "skill__helper", .description = "resident skill tool", .input_schema = .{}, .deferred = false },
+        // 与静态注册表同名的动态定义(唯一的静态 deferred 是 TinyKG 门控的 FormalAuditTask):
+        // 静态循环已列,动态循环必须跳过,否则重复。
+        .{ .name = "FormalAuditTask", .description = "static deferred already listed by the registry", .input_schema = .{}, .deferred = true },
+    };
+    const names = [_][]const u8{ "Read", "ToolSearch", "FormalAuditTask", "knowforge__search", "knowforge__overview", "skill__helper" };
+    const prompt = try buildFullWithDefs(a, "glm-5.2", null, null, &names, "", true, "/tmp", &defs);
+    defer a.free(prompt);
+    const start = std.mem.indexOf(u8, prompt, "# Deferred tools") orelse return error.TestExpectedSection;
+    const section_end = std.mem.indexOfPos(u8, prompt, start + 1, "\n\n# ") orelse prompt.len;
+    const section = prompt[start..section_end];
+    try std.testing.expect(std.mem.indexOf(u8, section, "\n- knowforge__search — Search the knowledge base. Second paragraph") != null);
+    try std.testing.expect(std.mem.indexOf(u8, section, "\n- knowforge__overview — 库概览——中文描述") != null);
+    // 常驻(非 deferred)动态工具不进本段。
+    try std.testing.expect(std.mem.indexOf(u8, section, "skill__helper") == null);
+    // 静态 deferred 只出现一次。
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, section, "\n- FormalAuditTask "));
+    // 每条一行,描述被截短且以 … 收尾,且是合法 UTF-8。
+    var lines = std.mem.splitScalar(u8, section, '\n');
+    var seen: usize = 0;
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "- knowforge__")) continue;
+        seen += 1;
+        try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+        try std.testing.expect(std.mem.endsWith(u8, line, "…"));
+        try std.testing.expect(line.len < "- knowforge__overview — ".len + DEFERRED_SUMMARY_MAX_BYTES + "…".len + 1);
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    // 名字不在 enabled 集里的动态工具不列。
+    const fewer = [_][]const u8{ "Read", "ToolSearch", "knowforge__search" };
+    const narrowed = try buildFullWithDefs(a, "glm-5.2", null, null, &fewer, "", true, "/tmp", &defs);
+    defer a.free(narrowed);
+    try std.testing.expect(std.mem.indexOf(u8, narrowed, "knowforge__search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrowed, "knowforge__overview") == null);
+    // 投影(执行策略裁剪)能按行解析动态条目:只保留 catalog 里 deferred 的名字。
+    const catalog = [_]@import("../json.zig").ToolDefinition{
+        .{ .name = "ToolSearch", .description = "activate", .input_schema = .{} },
+        .{ .name = "knowforge__search", .description = "x", .input_schema = .{}, .deferred = true },
+    };
+    const projected = (try projectDeferredToolsForExecution(a, prompt, &catalog, &catalog)) orelse return error.TestExpectedProjection;
+    defer a.free(projected);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "- knowforge__search — ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "knowforge__overview") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "- FormalAuditTask ") == null);
+}
+
+test "deferredDescriptionSummary: empty and whitespace-only descriptions get a placeholder" {
+    const a = std.testing.allocator;
+    const empty = try deferredDescriptionSummary(a, "");
+    defer a.free(empty);
+    try std.testing.expectEqualStrings("(no description)", empty);
+    const blank = try deferredDescriptionSummary(a, " \n\t ");
+    defer a.free(blank);
+    try std.testing.expectEqualStrings("(no description)", blank);
+    const short = try deferredDescriptionSummary(a, "  a\n b  ");
+    defer a.free(short);
+    try std.testing.expectEqualStrings("a b", short);
 }

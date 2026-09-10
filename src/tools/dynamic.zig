@@ -160,6 +160,32 @@ pub const DynRegistry = struct {
         return self.registerImpl(name, description, required_fields, .{ .result_body = execute }, ctx_ptr, true, server_name);
     }
 
+    /// MCP 工具带完整 inputSchema 注册:名字/描述/required 拷贝,`input_schema` 的嵌套
+    /// 存储**借用**(由 McpSession 的 schema_arena 持有,随 session 存亡)。deferred 强制
+    /// true(MCP 工具经 ToolSearch 激活),mcp_server 标记来源供 AgentDef.mcpServers 过滤。
+    pub fn registerMcpDefinitionBody(
+        self: *DynRegistry,
+        definition: json.ToolDefinition,
+        execute: DynExecuteBodyFn,
+        ctx_ptr: ?*anyopaque,
+        server_name: []const u8,
+    ) !void {
+        if (server_name.len == 0) return error.InvalidMcpServerName;
+        if (definition.server_type != null or !std.mem.eql(u8, definition.input_schema.type, "object"))
+            return error.InvalidDynamicDefinition;
+        try self.registerImpl(
+            definition.name,
+            definition.description,
+            definition.input_schema.required orelse &.{},
+            .{ .result_body = execute },
+            ctx_ptr,
+            true,
+            server_name,
+        );
+        const entry = &self.entries.items[self.entries.items.len - 1];
+        entry.borrowed_input_schema = definition.input_schema;
+    }
+
     /// Register a definition owned by an immutable plugin snapshot. Strings
     /// used for lookup/display are still copied; nested schema storage remains
     /// borrowed so arbitrary JSON Schema can be advertised without a lossy

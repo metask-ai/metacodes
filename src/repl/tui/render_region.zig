@@ -685,12 +685,15 @@ pub const RenderRegion = struct {
         w.writeAll("\r\n") catch {};
         rows += 1;
 
+        // 标签用这条路由自己的词汇:目录只声明 max 的(Metask 网关 / GLM)顶档显示 max,
+        // 不是内部枚举名 xhigh——用户选的是 provider 的档位。
+        const vocabulary = if (model_idx < entries.len) entries[model_idx].effort_vocabulary else .neutral;
         const selected_idx = @min(self.ui.slash_sel, efforts.len - 1);
         for (efforts, 0..) |effort, i| {
             const selected = i == selected_idx;
             const color = if (selected) th.accent else th.dim;
             w.writeAll(ansi.clear.line) catch {};
-            w.print("  {s}{s} {s}{s}", .{ color, if (selected) ">" else " ", effort.name(), th.reset }) catch {};
+            w.print("  {s}{s} {s}{s}", .{ color, if (selected) ">" else " ", @import("../../api/catalog.zig").effortLabel(vocabulary, effort), th.reset }) catch {};
             w.writeAll("\r\n") catch {};
             rows += 1;
         }
