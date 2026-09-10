@@ -29,9 +29,19 @@ const Claude = struct {
         // effort=null 时省略(让 Anthropic 端用默认)。
         if (effort) |e| if (e.active()) {
             try out.appendSlice(a, ",\"output_config\":{\"effort\":");
-            try util_json.serializeString(e.name(), out, a);
+            try util_json.serializeString(anthropicEffortName(e), out, a);
             try out.append(a, '}');
             try out.appendSlice(a, ",\"thinking\":{\"type\":\"adaptive\"}");
+        };
+    }
+
+    /// Anthropic Messages `output_config.effort` 的词汇是 low / medium / high / **max**。
+    /// 中立枚举的顶档 `.xhigh` 是 OpenAI 的叫法,原样发过去不是 Anthropic 认的值;Metask
+    /// 网关的目录对 glm-5.3-flash 也只声明 high/max。其余档位各家叫法一致,原样透传。
+    fn anthropicEffortName(e: ReasoningEffort) []const u8 {
+        return switch (e) {
+            .xhigh => "max",
+            else => e.name(),
         };
     }
 
@@ -129,6 +139,25 @@ test "claudeDialectFor: effort=high 发 thinking adaptive + output_config" {
     try d.serializeThinking(.{}, .high, &out, a);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"adaptive\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"output_config\":{\"effort\":\"high\"}") != null);
+}
+
+test "claudeDialectFor: effort=xhigh 在 Anthropic wire 上是 max(Claude 与经网关的 GLM 同)" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "claude-opus-4-6", "glm-5.3-flash" }) |model| {
+        const d = claudeDialectFor(model);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try d.serializeThinking(.{}, .xhigh, &out, allocator);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "\"output_config\":{\"effort\":\"max\"}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "xhigh") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"adaptive\"}") != null);
+    }
+    // 其它档位原样。
+    const d = claudeDialectFor("claude-opus-4-6");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try d.serializeThinking(.{}, .medium, &out, allocator);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"output_config\":{\"effort\":\"medium\"}") != null);
 }
 
 test "claudeDialectFor: effort=null 不发 thinking wire" {

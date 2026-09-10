@@ -1327,6 +1327,10 @@ pub fn run(
             .plan_file_path = opts.plan_file_path,
             .agents = opts.agents,
             .parent_model = opts.parent_model,
+            // 本 run 真会命名的模型及其收图能力——Read 的图片门控按 model_override 判,
+            // 子 agent 不拿父模型的能力当自己的(与 result_budget 同一派生规则)。
+            .active_model = opts.model_override orelse provider.model(),
+            .image_input_supported = provider.supportsForModel(.image_input, opts.model_override),
             .model_tiers = opts.model_tiers,
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,
@@ -2497,6 +2501,10 @@ pub fn run(
             .last_proposed_plan = if (proposed_plan_buf) |p| p else "",
             .agents = opts.agents,
             .parent_model = opts.parent_model,
+            // 本 run 真会命名的模型及其收图能力——Read 的图片门控按 model_override 判,
+            // 子 agent 不拿父模型的能力当自己的(与 result_budget 同一派生规则)。
+            .active_model = opts.model_override orelse provider.model(),
+            .image_input_supported = provider.supportsForModel(.image_input, opts.model_override),
             .model_tiers = opts.model_tiers,
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,

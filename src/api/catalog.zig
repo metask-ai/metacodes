@@ -26,6 +26,20 @@ const log = @import("../util/log.zig");
 const types = @import("../types.zig");
 const model_name = @import("model_name.zig");
 
+/// 顶档(内部 `.xhigh`)在某条路由上的叫法。neutral = 目录没说、或用 OpenAI 词汇 xhigh。
+pub const EffortVocabulary = enum { neutral, max };
+
+/// 给人看的档位标签:顶档按路由词汇,其余档位各家叫法一致。
+pub fn effortLabel(vocabulary: EffortVocabulary, effort: types.ReasoningEffort) []const u8 {
+    return switch (effort) {
+        .xhigh => switch (vocabulary) {
+            .max => "max",
+            .neutral => effort.name(),
+        },
+        else => effort.name(),
+    };
+}
+
 pub const Catalog = struct {
     allocator: std.mem.Allocator,
     /// model_id → {max_tokens, max_input_tokens}。entry 里的 string 由 allocator 拥有。
@@ -42,6 +56,16 @@ pub const Catalog = struct {
         max_tokens: ?u32, // 单次请求可生成的 output tokens 上限
         max_input_tokens: ?u32, // context window（input 上限）
         reasoning_mask: u8 = 0,
+        /// `capabilities.image_input.supported`:后端对**这条路由上这个模型**是否收图的
+        /// 声明。null = 后端没说(走 model_adapter 的家族表);true/false = 后端说了算——
+        /// 目录是路由的事实,家族表只是离线兜底(issue #112:同一个模型名在不同路由上
+        /// 能力不同,名字猜不出来)。
+        image_input: ?bool = null,
+        /// 目录声明顶档用的词汇:`capabilities.effort` 里有 "max" 而没有 "xhigh" → 这条路由把
+        /// 最高档叫 max(Anthropic 官方 / Metask 网关 / GLM / Kimi / DeepSeek 的叫法)。内部
+        /// 枚举仍是中立的 `.xhigh`,只有给人看的标签跟着目录走——用户在 picker 里看到的
+        /// 必须是 provider 自己的词。
+        effort_vocabulary: EffortVocabulary = .neutral,
 
         pub fn supportsReasoning(self: Entry, effort: types.ReasoningEffort) bool {
             return (self.reasoning_mask & reasoningBit(effort)) != 0;
@@ -58,7 +82,7 @@ pub const Catalog = struct {
         for (self.entries.items) |entry| {
             const id = try allocator.dupe(u8, entry.model_id);
             errdefer allocator.free(id);
-            try copy.entries.append(allocator, .{ .model_id = id, .max_tokens = entry.max_tokens, .max_input_tokens = entry.max_input_tokens, .reasoning_mask = entry.reasoning_mask });
+            try copy.entries.append(allocator, .{ .model_id = id, .max_tokens = entry.max_tokens, .max_input_tokens = entry.max_input_tokens, .reasoning_mask = entry.reasoning_mask, .image_input = entry.image_input, .effort_vocabulary = entry.effort_vocabulary });
         }
         return copy;
     }
@@ -97,6 +121,8 @@ pub const Catalog = struct {
             const mt = nonZero(extractUintField(obj, "max_tokens"));
             const mit = nonZero(extractUintField(obj, "max_input_tokens"));
             const reasoning_mask = extractReasoningMask(obj);
+            const effort_vocabulary = extractEffortVocabulary(obj);
+            const image_input = extractImageInput(obj);
 
             const id_owned = try self.allocator.dupe(u8, id);
             errdefer self.allocator.free(id_owned);
@@ -105,8 +131,10 @@ pub const Catalog = struct {
                 .max_tokens = mt,
                 .max_input_tokens = mit,
                 .reasoning_mask = reasoning_mask,
+                .image_input = image_input,
+                .effort_vocabulary = effort_vocabulary,
             });
-            log.debug("catalog", "model {s}: max_tokens={?d} max_input_tokens={?d}", .{ id, mt, mit });
+            log.debug("catalog", "model {s}: max_tokens={?d} max_input_tokens={?d} image_input={?}", .{ id, mt, mit, image_input });
         }
         log.info("catalog", "loaded {d} model entries from /v1/models", .{self.entries.items.len});
     }
@@ -156,6 +184,34 @@ pub const Catalog = struct {
             if (model_name.eqlIgnoreCase(e.model_id, model)) return e.reasoning_mask;
         }
         return 0;
+    }
+
+    /// `model` 在这条路由上的档位标签(顶档按目录词汇);目录里没有这个模型 → 中立名。
+    pub fn effortLabelFor(self: *const Catalog, model: []const u8, effort: types.ReasoningEffort) []const u8 {
+        for (self.entries.items) |e| {
+            if (model_name.eqlIgnoreCase(e.model_id, model)) return effortLabel(e.effort_vocabulary, effort);
+        }
+        return effort.name();
+    }
+
+    /// 后端目录对 `model` 的 image_input 声明。null = 目录里没有这个模型、或有但没声明
+    /// → 调用方回退家族表(model_adapter.profileFor)。命中 true/false 时目录说了算。
+    pub fn imageInputFor(self: *const Catalog, model: []const u8) ?bool {
+        for (self.entries.items) |e| {
+            if (model_name.eqlIgnoreCase(e.model_id, model)) return e.image_input;
+        }
+        return null;
+    }
+
+    /// 目录里声明 `image_input.supported=true` 的模型名(借用 catalog 内存,调用方不释放)。
+    /// 供 Read 图片门控在报错时告诉模型"这条路由上谁能看图"。
+    pub fn visionModels(self: *const Catalog, allocator: std.mem.Allocator) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.entries.items) |e| {
+            if (e.image_input == true) try out.append(allocator, e.model_id);
+        }
+        return try out.toOwnedSlice(allocator);
     }
 };
 
@@ -215,6 +271,27 @@ fn extractReasoningMask(obj: []const u8) u8 {
     if (capSupported(effort, "max")) mask |= reasoningBit(.xhigh);
     if (capSupported(effort, "xhigh")) mask |= reasoningBit(.xhigh);
     return mask;
+}
+
+/// 目录顶档词汇:声明了 xhigh → neutral(OpenAI 叫法);只声明 max → max;都没有 → neutral。
+fn extractEffortVocabulary(obj: []const u8) EffortVocabulary {
+    const caps = findObjectField(obj, "capabilities") orelse return .neutral;
+    const effort = findObjectField(caps, "effort") orelse return .neutral;
+    if (capSupported(effort, "xhigh")) return .neutral;
+    if (capSupported(effort, "max")) return .max;
+    return .neutral;
+}
+
+/// `capabilities.image_input.supported` 三态:缺 capabilities / 缺 image_input / 缺
+/// supported → null;true/false 按字面。只认布尔字面量,别的形状一律当"没说"。
+fn extractImageInput(obj: []const u8) ?bool {
+    const caps = findObjectField(obj, "capabilities") orelse return null;
+    const image_input = findObjectField(caps, "image_input") orelse return null;
+    const value_start = findFieldValueStart(image_input, "supported") orelse return null;
+    const rest = image_input[value_start..];
+    if (std.mem.startsWith(u8, rest, "true")) return true;
+    if (std.mem.startsWith(u8, rest, "false")) return false;
+    return null;
 }
 
 fn capSupported(effort_obj: []const u8, name: []const u8) bool {
@@ -493,6 +570,63 @@ test "Catalog: max_input_tokens=0 占位值不被当成有效 context window" {
     try testing.expect(c.entries.items[0].max_input_tokens == null); // 0 归一成 null
     try testing.expect(c.entries.items[0].max_tokens == null);
     try testing.expect(c.maxInputTokensFor("m") == 200_000); // 走默认而非 0
+}
+
+test "Catalog: image_input 三态——目录声明 true/false 按字面,缺失为 null" {
+    var c = Catalog.init(testing.allocator);
+    defer c.deinit();
+    try c.loadFromModelsListJson(
+        \\{"data":[
+        \\ {"id":"GLM-5.2","max_input_tokens":1048576,"capabilities":{"thinking":{"supported":true},"image_input":{"supported":false}}},
+        \\ {"id":"glm-5.3-flash","capabilities":{"image_input":{"supported": true}}},
+        \\ {"id":"mystery","capabilities":{"thinking":{"supported":true}}},
+        \\ {"id":"bare"},
+        \\ {"id":"odd","capabilities":{"image_input":{"supported":"yes"}}}
+        \\]}
+    );
+    try std.testing.expectEqual(@as(?bool, false), c.imageInputFor("glm-5.2"));
+    try std.testing.expectEqual(@as(?bool, true), c.imageInputFor("GLM-5.3-FLASH"));
+    try std.testing.expectEqual(@as(?bool, null), c.imageInputFor("mystery"));
+    try std.testing.expectEqual(@as(?bool, null), c.imageInputFor("bare"));
+    try std.testing.expectEqual(@as(?bool, null), c.imageInputFor("odd"));
+    try std.testing.expectEqual(@as(?bool, null), c.imageInputFor("not-in-catalog"));
+    const vision = try c.visionModels(testing.allocator);
+    defer testing.allocator.free(vision);
+    try std.testing.expectEqual(@as(usize, 1), vision.len);
+    try std.testing.expectEqualStrings("glm-5.3-flash", vision[0]);
+    // clone 保留三态
+    var copy = try c.clone(testing.allocator);
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(?bool, true), copy.imageInputFor("glm-5.3-flash"));
+    try std.testing.expectEqual(@as(?bool, false), copy.imageInputFor("GLM-5.2"));
+}
+
+test "Catalog: 顶档标签跟目录词汇——只声明 max 的路由标 max,声明 xhigh / 未声明的标 xhigh" {
+    var c = Catalog.init(testing.allocator);
+    defer c.deinit();
+    // Metask 网关真实形状(glm-5.3-flash):effort 里 high/max 支持,low/medium 不支持。
+    try c.loadFromModelsListJson(
+        \\{"data":[
+        \\ {"id":"glm-5.3-flash","capabilities":{"effort":{"high": {"supported": true}, "low": {"supported": false}, "max": {"supported": true}, "medium": {"supported": false}, "supported": true}}},
+        \\ {"id":"gpt-5.2","capabilities":{"effort":{"high":{"supported":true},"xhigh":{"supported":true},"max":{"supported":true}}}},
+        \\ {"id":"plain"}
+        \\]}
+    );
+    try std.testing.expectEqualStrings("max", c.effortLabelFor("GLM-5.3-Flash", .xhigh));
+    try std.testing.expectEqualStrings("high", c.effortLabelFor("glm-5.3-flash", .high));
+    try std.testing.expectEqualStrings("xhigh", c.effortLabelFor("gpt-5.2", .xhigh));
+    try std.testing.expectEqualStrings("xhigh", c.effortLabelFor("plain", .xhigh));
+    try std.testing.expectEqualStrings("xhigh", c.effortLabelFor("not-in-catalog", .xhigh));
+    // 档位集合本身不变:max 与 xhigh 都是同一个顶档位,low/medium 未支持不进 mask。
+    try std.testing.expect(c.entries.items[0].supportsReasoning(.xhigh));
+    try std.testing.expect(c.entries.items[0].supportsReasoning(.high));
+    try std.testing.expect(!c.entries.items[0].supportsReasoning(.low));
+    try std.testing.expect(!c.entries.items[0].supportsReasoning(.medium));
+    var copy = try c.clone(testing.allocator);
+    defer copy.deinit();
+    try std.testing.expectEqualStrings("max", copy.effortLabelFor("glm-5.3-flash", .xhigh));
+    try std.testing.expectEqualStrings("xhigh", effortLabel(.neutral, .xhigh));
+    try std.testing.expectEqualStrings("medium", effortLabel(.max, .medium));
 }
 
 test "Catalog: empty/invalid json no crash" {

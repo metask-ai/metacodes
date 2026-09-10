@@ -493,6 +493,14 @@ pub const ToolContext = struct {
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 父 model(供 subagent model 字段 `inherit` 解析)。
     parent_model: []const u8 = "",
+    /// 本 run 请求真会命名的模型(`model_override orelse provider.model()`)。只用于
+    /// 对模型说话(错误 detail 里点名),不参与路由。空 = 未知(纯单测)。
+    active_model: []const u8 = "",
+    /// `active_model` 能否收图(provider.supportsForModel(.image_input, override))。
+    /// Read 读到图片文件时据此**执行期**门控:false → 不读盘不编码,直接返回
+    /// capability_unsupported 并交代替代路径;null = 宿主没告知(纯单测/旧宿主)→ 不门控,
+    /// 图片照旧进 tool_result,由序列化层按方言发原生块或占位文本。
+    image_input_supported: ?bool = null,
     /// 当前 provider 的模型档位表(low/mid/high → {model, effort};App 启动时按
     /// provider_kind 从 ~/.metacodes/config.json 选定)。null = 未配置:档位名
     /// 一律 inherit 父模型,绝不回退硬编码模型 ID。

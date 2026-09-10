@@ -426,7 +426,11 @@ envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 S
 仅是失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新
 投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
 图像形态结果（`Read` 读图返回的 `{"type":"image",...}`，`result_projection.isImageResult`）豁免两轮投影：
-vision 路由的方言原生消费它（image block / data URL / inlineData），非 vision 路由收到有界占位文本，
+vision 路由的方言原生消费它（image block / data URL / inlineData），非 vision 路由收到有界占位文本
+（能力真相 = provider `/v1/models` 目录的 `image_input` 声明覆盖 `model_adapter.knownVisionFamily` 家族表，
+见 `Client.dialectFor`；`Read` 在执行期按 `ToolContext.image_input_supported` 先门控——活动模型收不了图就
+返回 `capability_unsupported` 错误并点名目录里能看图的模型，图片根本不进历史；占位文本只剩给读后换模型 /
+fail-closed 方言这类序列化期才发现的情况），
 信封只会把图片变成 base64 预览文本；轮预算按 `IMAGE_RESULT_BUDGET_BYTES`（= `IMAGE_TOKEN_ESTIMATE` × 4
 字节/token）计入，`Stats.projected_bytes` 仍是真实字节数。microcompact 对**未送达**的图片同样豁免：
 送达是 `Message.delivered` 显式水位，只由 agent_loop 在 provider 接受请求并返回流句柄后 `markDelivered` 推进

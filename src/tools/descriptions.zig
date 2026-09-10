@@ -31,7 +31,7 @@ const READ_DESC =
     \\- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
     \\- When you already know which part of the file you need, only read that part. This can be important for larger files.
     \\- Results are returned using cat -n format, with line numbers starting at 1
-    \\- This tool allows MetaCode to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as MetaCode is a multimodal LLM.
+    \\- This tool reads images (PNG, JPG, GIF, WEBP). When the active model supports image input the image is presented visually. When it does not, the call fails with error code capability_unsupported and the detail names which models on this route can view images; do not retry the same Read, pick another approach (switch model, or extract text/metadata with a script).
     \\- This tool cannot read PDF files. It has no PDF extraction or page-rendering path and no pages parameter; reading a .pdf here yields its raw bytes, not its contents.
     \\- Jupyter notebooks (.ipynb files) are read as their raw JSON, not as rendered cells; use NotebookEdit to modify a cell.
     \\- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.

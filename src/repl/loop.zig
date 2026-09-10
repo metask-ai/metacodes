@@ -2108,7 +2108,7 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             switch (picker_host.useSelector(app, resolved)) {
                 .switched => {
                     std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
-                    if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{effort.name()});
+                    if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{app.api_client.catalog.effortLabelFor(app.activeModel(), effort)});
                     std.debug.print(" (max_output={d})\n", .{app.provider().maxTokens()});
                     return;
                 },
@@ -2675,7 +2675,7 @@ fn switchModel(
     }
 
     std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
-    if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{effort.name()});
+    if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{app.api_client.catalog.effortLabelFor(app.activeModel(), effort)});
     std.debug.print(" (max_output={d})\n", .{app.provider().maxTokens()});
 }
 

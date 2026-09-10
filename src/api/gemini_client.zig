@@ -162,6 +162,7 @@ pub const GeminiClient = struct {
             .requestOverridesFn = &pRequestOverrides,
             .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
+            .supportsForModelFn = &pSupportsForModel,
         };
     }
     inline fn cast(ctx: *anyopaque) *GeminiClient {
@@ -204,6 +205,10 @@ pub const GeminiClient = struct {
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         return capability.supports(.gemini, cast(ctx).model, cap);
+    }
+    fn pSupportsForModel(ctx: *anyopaque, cap: provider_mod.Capability, model: []const u8) bool {
+        _ = ctx;
+        return capability.supports(.gemini, model, cap);
     }
     fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!provider_mod.ApiResponse {
         _ = ctx;

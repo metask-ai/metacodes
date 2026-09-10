@@ -1128,14 +1128,25 @@ test "canonical 投影:非 claude 命名的 vision 模型带图可计量,text-on
             .{ .image = .{ .media_type = "image/png", .data = "UE5H" } },
         } },
     };
-    // 普通(真实请求)序列化按 Anthropic 能力守门:gpt-5.2 无 "claude" → 显式能力错误。
+    // 普通(真实请求)序列化按**模型家族**守门(issue #112):gpt-5.2 是已知 vision 家族,
+    // 经 Anthropic 兼容路由照样发原生 image block;glm-5.2 是文本家族 → 显式能力错误。
+    const real = try serializeMessagesRequest(.{ .model = "gpt-5.2", .messages = &image_messages }, a);
+    defer a.free(real);
+    try std.testing.expect(std.mem.indexOf(u8, real, "{\"type\":\"image\",\"source\":{\"type\":\"base64\"") != null);
     try std.testing.expectError(
         error.ImageInputUnsupported,
         serializeMessagesRequest(
-            .{ .model = "gpt-5.2", .messages = &image_messages },
+            .{ .model = "glm-5.2", .messages = &image_messages },
             a,
         ),
     );
+    // canonical 投影对文本家族同样可计量(记账/身份用,不问能力)。
+    const projected_text_family = try serializeCanonicalRequestProjection(
+        .{ .model = "glm-5.2", .messages = &image_messages },
+        a,
+    );
+    defer a.free(projected_text_family);
+    try std.testing.expect(std.mem.indexOf(u8, projected_text_family, "\"type\":\"image\",\"source\"") != null);
     // canonical 投影是记账/身份用的 provider 中立形态:必须对任意模型可计算。
     const projected = try serializeCanonicalRequestProjection(
         .{ .model = "gpt-5.2", .messages = &image_messages },
