@@ -1850,6 +1850,21 @@ def _bare_task_name(task_name: object) -> str | None:
     return None
 
 
+def _trial_dir_for_trajectory(trajectory_path: Path) -> Path:
+    """Resolve the Harbor trial directory that owns a trajectory.
+
+    Single-step layout is ``<trial>/agent/trajectory.json``; multi-step layout is
+    ``<trial>/steps/<step>/agent/trajectory.json`` (Harbor's MultiStepTrial
+    archives one trajectory per step). The audit binds provenance through the
+    trial's ``result.json`` at the trial root, so it must climb there in BOTH
+    shapes — the single-step ``parent.parent`` points at ``steps/<step>`` (which
+    has no ``result.json``) for a multi-step trajectory."""
+    parents = trajectory_path.parents
+    if len(parents) >= 4 and parents[2].name == "steps":
+        return parents[3].resolve()
+    return parents[1].resolve()
+
+
 def _official_task_identity(
     trajectory_path: Path,
     manifest: Mapping[str, Any],
@@ -1865,7 +1880,7 @@ def _official_task_identity(
     sibling result carries the canonical task name, staged task path, source,
     model route, checksum and trial URI; require all of them to agree.
     """
-    trial_dir = trajectory_path.parent.parent.resolve()
+    trial_dir = _trial_dir_for_trajectory(trajectory_path)
     result_path = trial_dir / "result.json"
     result = _json(result_path)
     task_id = result.get("task_id") or {}
@@ -2125,8 +2140,11 @@ def _expected_verification_checkpoint(
 
 
 def _validate_trial_project_control(
-    trial_dir: Path, manifest: Mapping[str, Any]
+    trial_dir: Path, agent_dir: Path, manifest: Mapping[str, Any]
 ) -> None:
+    # config.json is trial-level in both layouts; the per-agent runtime contract
+    # is written next to each trajectory (``<trial>/agent`` single-step,
+    # ``<trial>/steps/<step>/agent`` multi-step), so it is read from ``agent_dir``.
     expected = _expected_project_control(manifest)
     config = _json(trial_dir / "config.json")
     agent = config.get("agent")
@@ -2150,7 +2168,7 @@ def _validate_trial_project_control(
     _validate_outcome_feedback_kwargs(
         agent.get("kwargs"), manifest, label="official WorkBuddy trial"
     )
-    runtime = _json(trial_dir / "agent/metacodes-runtime-contract.json")
+    runtime = _json(agent_dir / "metacodes-runtime-contract.json")
     backend_model_name = str(manifest.get("model", {}).get("backend_model_name") or "")
     if (
         runtime.get("transport_model_is_route") is not True
@@ -2313,9 +2331,15 @@ def _collect_usage(
         and path.stat().st_mtime_ns >= started_ns
         and ".tainted-a1" not in str(path)
     ] if result_root.exists() else []
-    if len(trajectories) != len(selected):
+    # Each selected task emits one trajectory per step (single-step: one;
+    # multi-step: one per step), so require at least one per task; exact per-task
+    # coverage (no missing, no extra tasks) is enforced by the set() check after
+    # Pass 1 below.
+    if len(trajectories) < len(selected):
         raise LaunchError(
-            f"expected {len(selected)} new WorkBuddy trajectories, observed {len(trajectories)}"
+            f"expected at least {len(selected)} new WorkBuddy trajectories "
+            f"(one per selected task, more for multi-step tasks), "
+            f"observed {len(trajectories)}"
         )
     rows: Dict[str, object] = {}
     control_rows: Dict[str, Mapping[str, Any]] = {}
@@ -2390,7 +2414,18 @@ def _collect_usage(
             raise LaunchError(
                 f"staged project rules active pointer is unreadable: {exc}"
             ) from exc
+    # ---- Pass 1: validate each STEP trajectory, grouped by task ------------
+    # A single-step task has one trajectory (<trial>/agent/trajectory.json); a
+    # multi-step task (Harbor MultiStepTrial) has one per step under
+    # <trial>/steps/<step>/agent/. Per-step evidence (identity, project control,
+    # control/progress metrics, kernel/bundle, cost/tokens) is validated here.
+    # The provider request audit is per TASK — requests.jsonl is trial-level and
+    # spans every step — so it runs in Pass 2 against the SUM of per-step turns.
+    by_task: Dict[str, list[Dict[str, Any]]] = {}
+    task_trial: Dict[str, Dict[str, Any]] = {}
     for trajectory_path in sorted(trajectories):
+        trial_dir = _trial_dir_for_trajectory(trajectory_path)
+        agent_dir = trajectory_path.parent
         trial_result_path: Path | None = None
         trial_result: Dict[str, Any] | None = None
         if official_runner:
@@ -2402,16 +2437,33 @@ def _collect_usage(
                 staged_run_ids=resumed_staged_run_ids,
                 route_overrides=resumed_route_overrides,
             )
-            _validate_trial_project_control(trajectory_path.parent.parent, manifest)
+            _validate_trial_project_control(trial_dir, agent_dir, manifest)
         else:
             task = _task_for_path(trajectory_path, selected)
-        if task is None or task in rows:
+        if task is None:
             raise LaunchError(f"cannot uniquely bind trajectory to selected task: {trajectory_path}")
+        # Every step of a task must bind to the SAME trial (root + authoritative
+        # result); a step trajectory that resolves elsewhere is a cross-instance
+        # contamination attempt.
+        bound = task_trial.get(task)
+        if bound is None:
+            task_trial[task] = {
+                "trial_dir": trial_dir,
+                "trial_result_path": trial_result_path,
+                "trial_result": trial_result,
+            }
+        elif (
+            bound["trial_dir"] != trial_dir
+            or bound["trial_result_path"] != trial_result_path
+        ):
+            raise LaunchError(
+                f"task {task} bound to two different trials: {trajectory_path}"
+            )
         trajectory = _json(trajectory_path)
         final = trajectory.get("final_metrics") or {}
         extra = final.get("extra") or {}
-        transcript_path = trajectory_path.parent / "metacodes-transcript.jsonl"
-        observation_path = trajectory_path.parent / OBSERVATION_FILENAME
+        transcript_path = agent_dir / "metacodes-transcript.jsonl"
+        observation_path = agent_dir / OBSERVATION_FILENAME
         try:
             control_metrics = _validate_control_metrics(
                 extra.get("control_metrics"),
@@ -2433,19 +2485,12 @@ def _collect_usage(
         observed_kernels = set(lean_metrics.get("kernel_sha256s") or [])
         observed_bundles = set(lean_metrics.get("bundle_sha256s") or [])
         if observed_kernels or observed_bundles:
-            # 自演化 treatment:临时规则束是自改的(哨兵 revision + 内容
-            # 寻址 sha,随 trial 演化),束 sha 恒等检查按声明放行——但
-            # kernel 身份永远必须恰等于 staged(裁决者不可自改)。束的
-            # 审计轨迹在连续性链导出的 store(provisional_rule 节点)里。
-            # 收紧(2026-08-18 发射前审查):首 trial(store_import 为
-            # null,连续性链尚未开始)不可能有临时规则,束轴不放行——
-            # 首 trial 出现非 staged 束 = 真漂移。
             self_evolution_declared = (
                 _expected_self_evolution(manifest) is True
             )
             if self_evolution_declared:
                 first_trial_contract = _json(
-                    trajectory_path.parent / "metacodes-runtime-contract.json"
+                    agent_dir / "metacodes-runtime-contract.json"
                 )
                 if first_trial_contract.get("store_import_sha256") is None:
                     self_evolution_declared = False
@@ -2490,13 +2535,65 @@ def _collect_usage(
             or completion < 0
         ):
             raise LaunchError(f"trajectory has invalid token usage: {trajectory_path}")
-        request_log = trajectory_path.parent / "requests.jsonl"
+        cache_read = final.get("total_cached_tokens", 0)
+        cache_create = extra.get("cache_creation_input_tokens", 0)
+        if cache_read is None:
+            cache_read = 0
+        if cache_create is None:
+            cache_create = 0
+        if (
+            not isinstance(cache_read, int)
+            or isinstance(cache_read, bool)
+            or cache_read < 0
+            or not isinstance(cache_create, int)
+            or isinstance(cache_create, bool)
+            or cache_create < 0
+        ):
+            raise LaunchError(f"trajectory has invalid cache token usage: {trajectory_path}")
+        websearch_dispatches = sum(
+            1
+            for step in trajectory.get("steps") or []
+            for call in (step.get("tool_calls") or [] if isinstance(step, Mapping) else [])
+            if isinstance(call, Mapping) and call.get("function_name") == "WebSearch"
+        )
+        by_task.setdefault(task, []).append(
+            {
+                "trajectory_path": trajectory_path,
+                "trajectory_sha256": _identity(trajectory_path)["sha256"],
+                "control_metrics": control_metrics,
+                "progress_metrics": progress_metrics,
+                "cost": float(cost),
+                "prompt": prompt,
+                "completion": completion,
+                "cache_read": cache_read,
+                "cache_create": cache_create,
+                "metered": prompt + completion + cache_read + cache_create,
+                "metacodes_turns": extra.get("metacodes_turns"),
+                "websearch_dispatches": websearch_dispatches,
+                "transcript_sha256": control_metrics["source"]["transcript_sha256"],
+                "observation_journal_sha256": control_metrics["source"][
+                    "observation_journal_sha256"
+                ],
+            }
+        )
+    if set(by_task) != set(selected):
+        raise LaunchError("WorkBuddy result set differs from frozen task selection")
+
+    # ---- Pass 2: per-task provider request audit (trial-level requests.jsonl)
+    # + usage aggregation across the task's steps + one authoritative reward --
+    for task in sorted(by_task):
+        steps = by_task[task]
+        bound = task_trial[task]
+        trial_dir = bound["trial_dir"]
+        trial_result_path = bound["trial_result_path"]
+        trial_result = bound["trial_result"]
+        request_log = trial_dir / "agent" / "requests.jsonl"
         request_lines = [
             line for line in _read_regular(request_log, maximum=MAX_REQUEST_LOG_BYTES).splitlines()
             if line.strip()
         ]
         if not request_lines:
-            raise LaunchError(f"trajectory has no provider request audit: {trajectory_path}")
+            raise LaunchError(f"trajectory has no provider request audit: {request_log}")
         try:
             request_records = [
                 json.loads(line.decode("utf-8")) for line in request_lines
@@ -2506,23 +2603,24 @@ def _collect_usage(
             first_record = request_records[0]
             first_body = dict(first_record["request"]["body"])
         except (UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise LaunchError(f"invalid first request audit for {trajectory_path}: {exc}") from exc
+            raise LaunchError(f"invalid first request audit for {request_log}: {exc}") from exc
         if manifest.get("schema_version") == SCHEMA_VERSION:
             sequences = [record.get("seq") for record in request_records]
-            metacodes_turns = extra.get("metacodes_turns")
-            # Provider traffic is a three-way ledger. Beside agent-loop turns
-            # (full tools array) the runtime issues two kinds of ISOLATED
-            # sub-requests that are real, audited traffic but NOT turns:
-            #  - WebSearch: a single message carrying exactly one tool named
-            #    "web_search" (the shape that keeps server-tool entries out of
-            #    the main tools array);
-            #  - auto-compact summarization (compact_summary.zig): a provider
-            #    call with NO tools at all.
-            # Each gets its own column instead of silently breaking the turn
-            # equation.  Known open gap, kept loud: subagent (Task-spawned)
-            # provider requests would likewise fall outside `metacodes_turns`;
-            # the cohort disables those tools, and this audit fails closed —
-            # not miscounts — if one ever appears.
+            # A multi-step task's turns span all its steps; the trial-level
+            # request log carries the whole task's traffic, so the turn equation
+            # reconciles successful turn responses against the SUM of per-step
+            # turns. Each step must independently declare a positive turn count.
+            step_turns = [step["metacodes_turns"] for step in steps]
+            if any(
+                not isinstance(turns, int) or isinstance(turns, bool) or turns <= 0
+                for turns in step_turns
+            ):
+                raise LaunchError(
+                    f"provider request audit is incomplete or out of order: {request_log}"
+                )
+            metacodes_turns = sum(step_turns)
+            websearch_dispatches = sum(step["websearch_dispatches"] for step in steps)
+
             def _request_kind(record: Mapping[str, Any]) -> str:
                 tools = record.get("tools")
                 if (
@@ -2533,19 +2631,9 @@ def _collect_usage(
                 ):
                     return "websearch"
                 if not tools:
-                    # A turn request always carries the full tool array; the
-                    # only tool-less provider call is the compact summary.  A
-                    # hypothetical tool-less agent loop would drive
-                    # successful turns to zero and fail the equation loudly.
                     return "compact"
                 return "turn"
 
-            websearch_dispatches = sum(
-                1
-                for step in trajectory.get("steps") or []
-                for call in (step.get("tool_calls") or [] if isinstance(step, Mapping) else [])
-                if isinstance(call, Mapping) and call.get("function_name") == "WebSearch"
-            )
             tallies = {
                 "turn": [0, 0],
                 "websearch": [0, 0],
@@ -2562,14 +2650,6 @@ def _collect_usage(
             successful_responses, failed_attempts = tallies["turn"]
             websearch_successes, websearch_failures = tallies["websearch"]
             compact_successes, compact_failures = tallies["compact"]
-            # Retry budgets mirror the emitters exactly: turns retry up to
-            # MAX_STREAM_TURN_RETRIES(=2) in headless; WebSearch hardcodes
-            # WEB_SEARCH_MAX_RETRIES=3 (src/tools/web_search.zig — change
-            # either side only in lockstep); compaction issues one attempt
-            # per trigger, at most one trigger per turn. Accounting stays
-            # exact: successful turn responses must equal the committed
-            # turns, sub-request successes are bounded by their observed
-            # causes, and ordering/uniqueness never relax.
             if (
                 any(
                     not isinstance(sequence, int) or isinstance(sequence, bool)
@@ -2577,8 +2657,6 @@ def _collect_usage(
                 )
                 or sequences != sorted(sequences)
                 or len(set(sequences)) != len(sequences)
-                or not isinstance(metacodes_turns, int)
-                or isinstance(metacodes_turns, bool)
                 or metacodes_turns <= 0
                 or successful_responses != metacodes_turns
                 or failed_attempts > 2 * metacodes_turns
@@ -2588,36 +2666,39 @@ def _collect_usage(
                 or compact_failures > metacodes_turns
             ):
                 raise LaunchError(
-                    f"provider request audit is incomplete or out of order: {trajectory_path}"
+                    f"provider request audit is incomplete or out of order: {request_log}"
                 )
             if task in resumed_tasks:
                 resumed_request_sequences.extend(sequences)
             else:
                 request_sequences.extend(sequences)
         prefix_hash = _cacheable_first_request_sha256(first_body)
-        cache_read = final.get("total_cached_tokens", 0)
-        cache_create = extra.get("cache_creation_input_tokens", 0)
-        if cache_read is None:
-            cache_read = 0
-        if cache_create is None:
-            cache_create = 0
-        if (
-            not isinstance(cache_read, int)
-            or isinstance(cache_read, bool)
-            or cache_read < 0
-            or not isinstance(cache_create, int)
-            or isinstance(cache_create, bool)
-            or cache_create < 0
-        ):
-            raise LaunchError(f"trajectory has invalid cache token usage: {trajectory_path}")
-        metered_tokens = prompt + completion + cache_read + cache_create
-        total_cost += float(cost)
-        total_tokens += metered_tokens
-        total_cache_read += cache_read
-        total_cache_create += cache_create
+        agg_prompt = sum(step["prompt"] for step in steps)
+        agg_completion = sum(step["completion"] for step in steps)
+        agg_cache_read = sum(step["cache_read"] for step in steps)
+        agg_cache_create = sum(step["cache_create"] for step in steps)
+        agg_metered = sum(step["metered"] for step in steps)
+        agg_cost = sum(step["cost"] for step in steps)
+        total_cost += agg_cost
+        total_tokens += agg_metered
+        total_cache_read += agg_cache_read
+        total_cache_create += agg_cache_create
         total_requests += len(request_records)
+        first = steps[0]
+        # Disclose every audited byte: the scalar *_sha256 keys carry the first
+        # step's trajectory + the trial-level request log + the trial result;
+        # later steps' trajectory/transcript/observation bytes go in step_audit.
+        step_audit: list[str] = []
+        for step in steps[1:]:
+            step_audit.extend(
+                [
+                    step["trajectory_sha256"],
+                    step["transcript_sha256"],
+                    step["observation_journal_sha256"],
+                ]
+            )
         rows[task] = {
-            "trajectory_sha256": _identity(trajectory_path)["sha256"],
+            "trajectory_sha256": first["trajectory_sha256"],
             # The request audit was already read above under the explicit 64 MiB
             # bound.  Reuse that same safety contract for its identity; falling
             # back to _identity's 16 MiB default would reject a complete long
@@ -2627,16 +2708,18 @@ def _collect_usage(
             )["sha256"],
             "provider_requests": len(request_records),
             "cacheable_first_request_sha256": prefix_hash,
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "metered_tokens": metered_tokens,
-            "cache_read_input_tokens": cache_read,
-            "cache_creation_input_tokens": cache_create,
-            "cost_usd": float(cost),
-            "control_metrics": control_metrics,
-            "progress_metrics": progress_metrics,
+            "prompt_tokens": agg_prompt,
+            "completion_tokens": agg_completion,
+            "metered_tokens": agg_metered,
+            "cache_read_input_tokens": agg_cache_read,
+            "cache_creation_input_tokens": agg_cache_create,
+            "cost_usd": agg_cost,
+            "control_metrics": first["control_metrics"],
+            "progress_metrics": first["progress_metrics"],
         }
-        control_rows[task] = control_metrics
+        if step_audit:
+            rows[task]["step_audit_sha256s"] = step_audit
+        control_rows[task] = first["control_metrics"]
         if trial_result_path is not None and trial_result is not None:
             verifier_result = trial_result.get("verifier_result")
             rewards = (
@@ -2666,6 +2749,7 @@ def _collect_usage(
                     "full_pass": reward == 1.0,
                 }
             )
+
     if set(rows) != set(selected):
         raise LaunchError("WorkBuddy result set differs from frozen task selection")
     if resumes is None:
@@ -3890,6 +3974,9 @@ def resume_post_run_audit(
             value = source.get(key)
             if isinstance(value, str):
                 audited_shas.setdefault(value, f"{task}:{key}")
+        for value in row.get("step_audit_sha256s") or []:
+            if isinstance(value, str):
+                audited_shas.setdefault(value, f"{task}:step")
     late_frozen = [
         {"sha256": sha, "pinned_by": pin}
         for sha, pin in sorted(audited_shas.items())
@@ -4316,11 +4403,11 @@ def resume_trials(
                 continue
             if trajectory_path.stat().st_mtime_ns < started_ns:
                 continue
-            sibling_result = trajectory_path.parent.parent / "result.json"
+            sibling_result = _trial_dir_for_trajectory(trajectory_path) / "result.json"
             try:
                 _json(sibling_result)
             except LaunchError:
-                stale_partials.append(str(trajectory_path.parent.parent))
+                stale_partials.append(str(_trial_dir_for_trajectory(trajectory_path)))
     if stale_partials:
         raise LaunchError(
             "stale partial trial directories (trajectory without a valid "
