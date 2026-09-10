@@ -105,6 +105,9 @@ pub fn makeProvider(
 pub const Options = struct {
     auth_scheme: ?auth_header_mod.AuthScheme = null,
     limits: ?limits_mod.ModelLimitsSource = null,
+    /// 流空闲上限(毫秒;见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS)。null = 各 client 自己
+    /// 从 env/默认取;测试用小值让"对端沉默"在秒级可复现。
+    stream_idle_timeout_ms: ?u64 = null,
 };
 
 /// Runtime-scoped provider construction. The resolver is a borrowed immutable
@@ -152,6 +155,7 @@ pub fn makeProviderWithOptions(
             c.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), api_key, model, base_url);
             c.dialect_resolver = dialect_resolver;
             c.auth_scheme = options.auth_scheme;
+            if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.limits) |limits| {
                 if (limits.catalog) |catalog| c.catalog = try catalog.clone(a);
                 c.model_context = limits.model_context;
@@ -166,6 +170,7 @@ pub fn makeProviderWithOptions(
             c.protocol = openai_protocol;
             c.dialect_resolver = dialect_resolver;
             c.auth_scheme = options.auth_scheme;
+            if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.limits) |limits| {
                 c.model_context = limits.model_context;
             }
@@ -176,6 +181,7 @@ pub fn makeProviderWithOptions(
             // No fallible work follows this allocation, so no errdefer is needed.
             c.* = gemini_mod.GeminiClient.init(a, io_rt.io(), api_key, model, base_url);
             c.dialect_resolver = dialect_resolver;
+            if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.limits) |limits| {
                 c.model_context = limits.model_context;
             }

@@ -145,6 +145,9 @@ pub const TuiBackend = struct {
     /// I 锁,会无谓扩大临界区);input_thread 仅主线程 start 写 / stop 读清(无 watcher 读)。
     input_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     input_thread: ?std.Thread = null,
+    /// 本轮已对在飞请求调过 provider.cancel(SIGINT 桥:handler 只能置原子标志,watcher 的
+    /// 100ms tick 看到标志后代它 shutdown 连接;只做一次)。startInput 复位。
+    cancel_sent: bool = false,
 
     /// 本轮 spinner 是否已喂工具(从 tool_start 自决喂第一个普通工具;clear_current_tool 重置)。
     /// agent_loop 不再预算"喂哪个工具"——backend 据 tool_card 分类自决,层泄漏修复。
@@ -284,6 +287,10 @@ pub const TuiBackend = struct {
                 // 结束助手文本行(幂等):半行补 \n,已在行首 no-op。
                 // 旧版无条件 writeGenText("\n") 在文本已以 \n 结尾时多吐空行 → 多批次 tool 卡间冒空行。
                 self.region.endScrollLine();
+                // 每个 provider 回合结束就把新消息刷进 transcript(以前只在整个用户轮结束后刷:
+                // 一次 40 分钟的冻结 + 强杀丢掉了 17 个回合的上下文)。emitEvent 在主线程,
+                // 与 conversation 同线程,读它是安全的。
+                if (self.input_ctx.snapshot().app) |app| app.persistTranscript();
             },
             .ui_request_pending => {
                 // TUI 是同步前端(走阻塞 requestUi,恒 .answered,从不挂起)→ 此事件不会发给它,no-op。
@@ -372,7 +379,17 @@ pub const TuiBackend = struct {
         std.debug.assert(self.input_thread == null);
         self.input_ctx.set(fd, app, allocator); // 持 I 锁写;spawn 的 release 另给初值可见性
         self.input_stop.store(false, .release);
+        self.cancel_sent = false;
         self.input_thread = try std.Thread.spawn(.{}, watcherMain, .{self});
+    }
+
+    /// SIGINT 桥:abort 标志已置但连接还没被 shutdown → 代 handler 调 provider.cancel(一次)。
+    fn cancelInFlightIfAborted(self: *TuiBackend, app: *app_mod.App) void {
+        if (self.cancel_sent) return;
+        const ab = self.input_abort orelse return;
+        if (!ab.isAborted()) return;
+        app.provider().cancel(ab);
+        self.cancel_sent = true;
     }
 
     /// 停止并 join 输入线程(loop.zig 在 agent_loop.run 返回后调,成功/错误路径都要)。
@@ -527,6 +544,9 @@ pub const TuiBackend = struct {
                 if (parser.flushEsc()) |k| {
                     self.handleKey(snap, k, &editor);
                 } else {
+                    // Ctrl+C 走 SIGINT handler,只能置原子标志;标志只在流事件之间被检查,
+                    // 卡在 readv 里的读醒不了。这里代它 shutdown 在飞连接(一次)。
+                    self.cancelInFlightIfAborted(app);
                     self.region.tickSpinner(app);
                     // The picker's sign-in runs on a worker thread (#67);
                     // this tick moves its transcript into the overlay and
@@ -556,7 +576,10 @@ pub const TuiBackend = struct {
                 // 读 stdin 同见 EOF → 走既有 Ctrl+D 退出路径。
                 dead_reads += 1;
                 if (dead_reads >= 8) {
-                    if (self.input_abort) |ab| ab.abort(.user_ctrl_c);
+                    if (self.input_abort) |ab| {
+                        ab.abort(.user_ctrl_c);
+                        app.provider().cancel(ab);
+                    }
                     if (app.agent_jobs) |*reg| _ = reg.abortAllRunning();
                     return;
                 }
@@ -682,7 +705,12 @@ pub const TuiBackend = struct {
                     if (self.queue) |qq| _ = qq.push(v);
                 }
                 ed.clear();
-                if (self.input_abort) |ab| ab.abort(.user_ctrl_c);
+                if (self.input_abort) |ab| {
+                    ab.abort(.user_ctrl_c);
+                    // 标志之外还要真的 shutdown 连接:对端沉默时主线程卡在 readv,标志永远没人看。
+                    app.provider().cancel(ab);
+                    self.cancel_sent = true;
+                }
                 // 多 agent:esc 还要 abort 所有 running agent job——前台 Task 的 subagent 走 app.abort
                 // 已被打断,但**后台/嵌套** agent job 持自己的 entry.abort,app.abort 不触达,否则 esc 后
                 // 它们继续跑(用户实测 bug:启动多 agent 后 esc 不终止)。非阻塞 abort,不 join。

@@ -43,6 +43,7 @@ const json_mod = @import("../json.zig");
 const util_json = @import("../util/json.zig");
 const api_stream = @import("stream.zig");
 const provider_mod = @import("provider.zig");
+const client_mod = @import("../client.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
@@ -81,6 +82,8 @@ pub const GeminiClient = struct {
     model: []const u8,
     http_client: http.Client,
     abort_registry: provider_mod.RequestAbortRegistry = .{},
+    /// 见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
+    stream_idle_timeout_ms: u64 = client_mod.DEFAULT_STREAM_IDLE_TIMEOUT_MS,
     max_tokens: u32 = 8192,
     model_context: ?*const model_context_mod.ModelContext = null,
     context_window: u32 = 1_048_576, // Gemini 1.5/2.x 默认 1M(保守;未按 model 区分)
@@ -103,6 +106,7 @@ pub const GeminiClient = struct {
             .base_url = base_url orelse DEFAULT_GEMINI_BASE,
             .model = model,
             .http_client = http.Client{ .allocator = allocator, .io = io },
+            .stream_idle_timeout_ms = client_mod.streamIdleTimeoutMsFromEnv(),
         };
     }
     pub fn deinit(self: *GeminiClient) void {
@@ -291,21 +295,25 @@ pub const GeminiClient = struct {
             if (registered) self.abort_registry.unregister(req_ptr);
             req_ptr.deinit();
         }
-        if (abort) |signal| {
-            try self.abort_registry.register(
-                self.allocator,
-                signal,
-                req_ptr,
-                shutdownRequest,
-            );
-            registered = true;
-        }
+        // 总是登记:abort 路由(有 signal 时)+ 空闲监视(见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS)。
+        try self.abort_registry.registerMonitored(
+            self.allocator,
+            abort,
+            req_ptr,
+            shutdownRequest,
+            self.stream_idle_timeout_ms,
+        );
+        registered = true;
         req_ptr.transfer_encoding = .{ .content_length = body.len };
         req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
             log.errId("gemini", rid, "send body failed: {s}", .{@errorName(err)});
             return error.RequestFailed;
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
+            if (self.abort_registry.stalledIdleMs(req_ptr)) |idle| {
+                log.warnId("gemini", rid, "no response head for {d}ms (idle limit {d}ms): connection shut down, will retry", .{ idle, self.stream_idle_timeout_ms });
+                return error.TransientNetwork;
+            }
             log.errId("gemini", rid, "receiveHead failed: {s}", .{@errorName(err)});
             return err;
         };
@@ -327,7 +335,7 @@ pub const GeminiClient = struct {
             .request = req_ptr,
             .response = response,
             .abort = abort,
-            .abort_registry = if (abort != null) &self.abort_registry else null,
+            .abort_registry = &self.abort_registry,
             .id = rid,
         };
         return heap.handle();
@@ -403,7 +411,15 @@ const GeminiStream = struct {
         const r = self.reader.?;
         while (true) {
             if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
-            const line_opt = try r.takeDelimiter('\n');
+            const line_opt = r.takeDelimiter('\n') catch |err| {
+                self.done = true;
+                if (self.abort_registry) |registry| if (registry.stalledIdleMs(self.request)) |idle| {
+                    log.warnId("gemini", self.id, "no bytes for {d}ms: stream stalled, connection shut down", .{idle});
+                    return error.StreamStalled;
+                };
+                return err;
+            };
+            if (self.abort_registry) |registry| registry.touch(self.request);
             const line = line_opt orelse {
                 self.done = true;
                 // 流尽:若还有 pending usage(末 chunk 只含内容+usage,内容已 emit),吐它。

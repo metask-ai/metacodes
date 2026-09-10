@@ -722,6 +722,15 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
 - **输出粒度**:`text_chunk` 按 token 流。语音要整句、IM 要整条(限流)、LED 要终态——backend 可
   缓冲当前段到 `output_segment_end`，再按 disposition 决定展示、合并或丢弃；`stream_done` 不是
   输出终态。
+- **流存活性靠客户端自己保证**(2026-09-10 起):对端"连接活着、字节不来"时,std.http 的读没有
+  超时,abort 标志只在事件之间被检查,卡在 `readv` 里的线程谁也叫不醒——一次真实故障让 TaskBatch
+  的 join 和整个 TUI 冻了 40 分钟。现在每个在飞请求都登记进 `RequestAbortRegistry` 并带空闲上限
+  (`METACODES_STREAM_IDLE_TIMEOUT_MS`,默认 120s):监视线程超时 shutdown 连接,收头阶段归为
+  TransientNetwork 重试,正文阶段以 `StreamStalled` 结束本轮(`stop_reason=api_error`);TaskBatch
+  看门狗、TUI 的 Esc/Ctrl+C、`abortAllRunning` 现在都真的调 `provider.cancel`。仍然成立的边界:
+  正文阶段的 stall 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
+  不会 detach 卡死的 worker;TUI 每个 provider 回合结束就刷 transcript,但一个回合内的内容仍只在
+  内存里。
 - **permission 门不可挂起**:权限确认是 `executeSlots` 前的同步门,异步挂起暂不覆盖(out of scope)。
 - **文件修改契约只覆盖类型化文件工具**(Write/Edit/NotebookEdit/ApplyPatch,§3.2.2)。`Bash` 或
   任意终端命令改动文件系统**不会**产生 `file_changes`——要覆盖它需要文件系统级观测,不在本契约内。

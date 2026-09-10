@@ -22,6 +22,7 @@ const api_stream = @import("stream.zig");
 const request_overrides = @import("request_overrides.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const sync = @import("platform").sync;
+const log = @import("../util/log.zig");
 
 pub const StreamHandle = api_stream.StreamHandle;
 pub const ApiResponse = api_stream.ApiResponse;
@@ -32,16 +33,38 @@ pub const RetryReporter = api_stream.RetryReporter;
 /// unregister before destroying it. `cancel` runs the transport's shutdown
 /// hook under the same lock, closing the lifetime race without knowing HTTP
 /// details in this neutral module.
+///
+/// **Liveness (2026-09-10)**: a request registered with `idle_limit_ms > 0` is
+/// also watched by a monitor thread. When no byte has arrived for that long the
+/// monitor runs the same shutdown hook, so a read that is blocked in the kernel
+/// returns instead of waiting forever — a TUI session froze for 40 minutes on a
+/// gateway connection that stayed ESTABLISHED and silent; nothing else (abort
+/// flag, watchdog, Ctrl+C) can wake a thread that sits in `readv`. The
+/// transport reads `stalledIdleMs` afterwards to report `StreamStalled` rather
+/// than a generic connection error, and refreshes `touch` on every event.
 pub const RequestAbortRegistry = struct {
     const ShutdownFn = *const fn (ctx: *anyopaque) void;
     const Slot = struct {
-        signal: *const AbortSignal,
+        /// Null = not cancellable through an AbortSignal (liveness-only slot).
+        signal: ?*const AbortSignal,
         ctx: *anyopaque,
         shutdown_fn: ShutdownFn,
+        /// 0 = no liveness monitoring for this request.
+        idle_limit_ms: u64 = 0,
+        last_activity_ms: u64 = 0,
+        /// Set once the monitor shut the request down for inactivity: how long
+        /// it had been silent. Read by the transport to name the failure.
+        stalled_after_ms: ?u64 = null,
     };
+
+    /// Monitor wake-up interval; also bounds how late a stall is detected.
+    pub const MONITOR_TICK_MS: u64 = 250;
 
     mutex: sync.Mutex = .{},
     slots: std.ArrayList(Slot) = .empty,
+    monitor: ?std.Thread = null,
+    monitor_stop: bool = false,
+    monitor_cond: sync.Condition = .{},
 
     pub fn register(
         self: *RequestAbortRegistry,
@@ -50,16 +73,41 @@ pub const RequestAbortRegistry = struct {
         ctx: *anyopaque,
         shutdown_fn: ShutdownFn,
     ) error{OutOfMemory}!void {
+        return self.registerMonitored(allocator, signal, ctx, shutdown_fn, 0);
+    }
+
+    /// Register an in-flight request. `signal` null = no abort routing;
+    /// `idle_limit_ms` > 0 = the monitor shuts the request down after that much
+    /// silence (call `touch` whenever bytes arrive).
+    pub fn registerMonitored(
+        self: *RequestAbortRegistry,
+        allocator: std.mem.Allocator,
+        signal: ?*const AbortSignal,
+        ctx: *anyopaque,
+        shutdown_fn: ShutdownFn,
+        idle_limit_ms: u64,
+    ) error{OutOfMemory}!void {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.slots.append(allocator, .{
             .signal = signal,
             .ctx = ctx,
             .shutdown_fn = shutdown_fn,
+            .idle_limit_ms = idle_limit_ms,
+            .last_activity_ms = monotonicMs(),
         });
         // Close the race where abort was accepted just before the transport
         // published its request in this registry.
-        if (signal.isAborted()) shutdown_fn(ctx);
+        if (signal) |s| if (s.isAborted()) shutdown_fn(ctx);
+        if (idle_limit_ms > 0 and self.monitor == null) {
+            self.monitor_stop = false;
+            self.monitor = std.Thread.spawn(.{}, monitorMain, .{self}) catch |err| blk: {
+                // No monitor = no liveness guarantee for this process; say so
+                // once rather than pretending the limit is enforced.
+                log.warn("client", "stream liveness monitor unavailable ({s}); idle limit {d}ms will not be enforced", .{ @errorName(err), idle_limit_ms });
+                break :blk null;
+            };
+        }
     }
 
     pub fn unregister(self: *RequestAbortRegistry, ctx: *anyopaque) void {
@@ -81,16 +129,84 @@ pub const RequestAbortRegistry = struct {
         }
     }
 
+    /// Bytes arrived for `ctx`: restart its idle clock. Cheap (one uncontended
+    /// lock); called per stream event.
+    pub fn touch(self: *RequestAbortRegistry, ctx: *anyopaque) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.slots.items) |*active| {
+            if (active.ctx == ctx) {
+                active.last_activity_ms = monotonicMs();
+                return;
+            }
+        }
+    }
+
+    /// Shut down every monitored request that has been silent past its limit.
+    /// Returns how many were shut down this pass. Idempotent per request: a
+    /// stalled slot is never shut down twice.
+    pub fn reapStalled(self: *RequestAbortRegistry, now_ms: u64) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var reaped: usize = 0;
+        for (self.slots.items) |*active| {
+            if (active.idle_limit_ms == 0 or active.stalled_after_ms != null) continue;
+            const idle = now_ms -| active.last_activity_ms;
+            if (idle < active.idle_limit_ms) continue;
+            active.stalled_after_ms = idle;
+            log.warn("client", "stream idle for {d}ms (limit {d}ms): shutting down the connection so the blocked read returns", .{ idle, active.idle_limit_ms });
+            active.shutdown_fn(active.ctx);
+            reaped += 1;
+        }
+        return reaped;
+    }
+
+    /// How long `ctx` had been silent when the monitor shut it down; null =
+    /// not stalled (any read error then has another cause).
+    pub fn stalledIdleMs(self: *RequestAbortRegistry, ctx: *anyopaque) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.slots.items) |active| {
+            if (active.ctx == ctx) return active.stalled_after_ms;
+        }
+        return null;
+    }
+
+    fn monitorMain(self: *RequestAbortRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.monitor_stop) {
+            // timedWait releases the mutex while sleeping and re-acquires it;
+            // deinit signals the condition so a stop never waits a full tick.
+            _ = self.monitor_cond.timedWait(&self.mutex, MONITOR_TICK_MS * std.time.ns_per_ms);
+            if (self.monitor_stop) break;
+            self.mutex.unlock();
+            _ = self.reapStalled(monotonicMs());
+            self.mutex.lock();
+        }
+    }
+
     pub fn deinit(
         self: *RequestAbortRegistry,
         allocator: std.mem.Allocator,
     ) void {
+        self.mutex.lock();
+        self.monitor_stop = true;
+        self.monitor_cond.broadcast();
+        const monitor = self.monitor;
+        self.monitor = null;
+        self.mutex.unlock();
+        if (monitor) |thread| thread.join();
         self.mutex.lock();
         defer self.mutex.unlock();
         std.debug.assert(self.slots.items.len == 0);
         self.slots.deinit(allocator);
     }
 };
+
+fn monotonicMs() u64 {
+    return @intCast(@max(@import("../util/time.zig").nowMs(), 0));
+}
 
 /// provider+model 的能力查询(P2 落 capability 表;P0 先留枚举 + 占位)。
 /// Interrupt a std.http request without taking ownership of its connection.
@@ -341,6 +457,70 @@ fn defaultRequestOverrides(_: *anyopaque) request_overrides.RequestOverrides {
 test "Capability enum + StreamHandle 可表达" {
     try std.testing.expect(Capability.web_search != Capability.prompt_cache);
     try std.testing.expect(@sizeOf(Provider) > 0);
+}
+
+const LivenessProbe = struct {
+    shutdowns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    fn shutdown(ctx: *anyopaque) void {
+        const self: *LivenessProbe = @ptrCast(@alignCast(ctx));
+        _ = self.shutdowns.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "RequestAbortRegistry: reapStalled shuts a silent request down once, touch restarts the clock, limit 0 never stalls" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(a);
+    var watched = LivenessProbe{};
+    var unwatched = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&watched), LivenessProbe.shutdown, 1_000);
+    try registry.registerMonitored(a, null, @ptrCast(&unwatched), LivenessProbe.shutdown, 0);
+    defer registry.unregister(@ptrCast(&watched));
+    defer registry.unregister(@ptrCast(&unwatched));
+    // Measure from the slot's own clock: registering spawns the monitor thread,
+    // which can take more than a millisecond, so "now" is not the registration time.
+    const registered_at = registry.slots.items[0].last_activity_ms;
+    // Below the limit: nothing happens.
+    try std.testing.expectEqual(@as(usize, 0), registry.reapStalled(registered_at + 999));
+    try std.testing.expect(registry.stalledIdleMs(@ptrCast(&watched)) == null);
+    // Activity restarts the idle clock.
+    registry.touch(@ptrCast(&watched));
+    const touched_at = registry.slots.items[0].last_activity_ms;
+    try std.testing.expect(touched_at >= registered_at);
+    try std.testing.expectEqual(@as(usize, 0), registry.reapStalled(touched_at + 999));
+    // Past the limit: shut down exactly once, stall recorded, unmonitored slot untouched.
+    try std.testing.expectEqual(@as(usize, 1), registry.reapStalled(touched_at + 1_000));
+    try std.testing.expectEqual(@as(usize, 0), registry.reapStalled(touched_at + 5_000));
+    try std.testing.expectEqual(@as(u32, 1), watched.shutdowns.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), unwatched.shutdowns.load(.acquire));
+    try std.testing.expect(registry.stalledIdleMs(@ptrCast(&watched)).? >= 1_000);
+    try std.testing.expect(registry.stalledIdleMs(@ptrCast(&unwatched)) == null);
+    // A liveness-only slot is not cancellable through any signal.
+    var signal = AbortSignal.init();
+    signal.abort(.user_ctrl_c);
+    registry.cancel(&signal);
+    try std.testing.expectEqual(@as(u32, 1), watched.shutdowns.load(.acquire));
+}
+
+test "RequestAbortRegistry: the monitor thread reaps a stalled request on its own and stops promptly on deinit" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    var probe = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&probe), LivenessProbe.shutdown, 50);
+    try std.testing.expect(registry.monitor != null);
+    // Wait for the monitor (250ms tick) rather than calling reapStalled by hand.
+    var waited_ms: u64 = 0;
+    while (probe.shutdowns.load(.acquire) == 0 and waited_ms < 5_000) : (waited_ms += 20) {
+        @import("../util/time.zig").sleepMs(20);
+    }
+    try std.testing.expectEqual(@as(u32, 1), probe.shutdowns.load(.acquire));
+    try std.testing.expect(registry.stalledIdleMs(@ptrCast(&probe)).? >= 50);
+    registry.unregister(@ptrCast(&probe));
+    const before = monotonicMs();
+    registry.deinit(a);
+    // deinit signals the monitor instead of waiting out a full tick (generous bound: a loaded
+    // CI box, not a tick multiple, is what this must survive).
+    try std.testing.expect(monotonicMs() - before < 2_000);
 }
 
 test "RequestAbortRegistry closes pre-registration abort race" {

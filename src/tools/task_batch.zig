@@ -22,8 +22,10 @@
 //!    ReadArtifact 完整恢复，所以 Conversation 不再丢正文，但生成期峰值仍是 O(聚合结果)。未做
 //!    per-item byte-zero spool/summary 模式(P1 待办)。
 //!  - **output_schema 强制**:codex 每 worker 结果按 JSON Schema 校验;本实现不校验(schema 无此字段)。
-//!  - **per-item deadline 只在 turn 边界生效**:client 无 socket read timeout,watchdog 的 abort 打不断
-//!    卡在单次网络读里的子 agent(需 client 层 SO_RCVTIMEO,P2.4-adjacent)。串行(headless)路径无 watchdog。
+//!  - 串行(headless)路径无 watchdog;并发路径的 watchdog 在 deadline / 父 abort 时**同时调
+//!    provider.cancel**(shutdown 连接,让卡在单次网络读里的子 agent 立即返回),client 层另有
+//!    空闲监视(RequestAbortRegistry idle limit)兜住对端沉默——2026-09-10 前两者都没有,一个
+//!    ESTABLISHED 却不再发字节的连接让整批 join 永远等下去。
 //!  - **id_column 去重 / report 工具回填 / SQLite 持久化 / CSV I/O / 崩溃恢复**:故意不移植(与既有
 //!    AgentJobRegistry 重复,内存内批处理不需要)。
 
@@ -59,6 +61,8 @@ const BatchJob = struct {
     owned: ?@import("../api/provider_factory.zig").OwnedProvider = null,
     /// per-item abort:watchdog 据 deadline / 父 abort 触发(worker 传给 spawnAgentSink)。
     abort_sig: AbortSignal = AbortSignal.init(),
+    /// watchdog 已对本 job 调过 provider.cancel(只调一次;shutdown 幂等但别刷日志)。
+    cancel_sent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     started_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // 0=未启动;watchdog 读
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // worker 结束置;watchdog 读
     // 输出(runBatchJob 写):
@@ -88,9 +92,8 @@ fn runBatchJob(job: *BatchJob) void {
 }
 
 /// per-item deadline watchdog:监控每个已启动未完成 job,超 MAX_ITEM_SECONDS 或父 abort → 触发
-/// 该 job 的 abort_sig(agent_loop 在 turn 边界检查 → 停)。所有 job done 即退出。
-/// **局限(已登记差距)**:client 无 socket read timeout,故 abort 无法打断卡在**单次网络读**里的
-/// 子 agent(只能在 turn 之间生效)。真 mid-read stall 需 client 层 SO_RCVTIMEO(P2.4-adjacent)。
+/// 该 job 的 abort_sig(agent_loop 在 turn 边界检查 → 停)**并 cancel 它在飞的请求**(注册表
+/// shutdown 连接 → 卡在单次网络读里的线程立即返回,不必等下一个事件)。所有 job done 即退出。
 const Watchdog = struct {
     jobs: []BatchJob,
     parent_abort: ?*const AbortSignal,
@@ -122,6 +125,11 @@ fn watchdogMain(wd: *Watchdog) void {
                 const why: @import("../util/abort.zig").Reason =
                     if (parent_aborted) (if (wd.parent_abort) |pa| pa.reason() else .timeout) else .timeout;
                 j.abort_sig.abort(why);
+                // 置标志只在事件之间被看到;卡在 readv 里的线程要靠 shutdown 连接叫醒。
+                // owned 由主线程造、join 后才 deinit,worker 未 done 时它一定活着。
+                if (!j.cancel_sent.swap(true, .acq_rel)) {
+                    if (j.owned) |*o| o.provider().cancel(&j.abort_sig);
+                }
             }
         }
         if (all_done) break;

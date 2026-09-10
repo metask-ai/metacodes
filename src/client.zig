@@ -90,6 +90,7 @@ pub fn isRetriableError(err: anyerror) bool {
     if (isTransientNetworkError(err)) return true;
     return switch (err) {
         error.TransientNetwork,
+        error.StreamStalled,
         error.RateLimited,
         error.ServerError,
         error.BadGateway,
@@ -229,6 +230,18 @@ pub fn defaultMaxRetries() u32 {
 
 pub const RETRY_BASE_MS: u64 = 500;
 
+/// 流式/收头阶段的**空闲上限**:这么久没收到任何字节,注册表的监视线程 shutdown 该连接,阻塞在
+/// 内核里的读立即返回——收头阶段归为 TransientNetwork 走重试,正文阶段报 StreamStalled 结束本轮。
+/// 之前没有这一层:一个 ESTABLISHED 但对端沉默的连接能让子 agent 线程永远卡在 readv,
+/// 看门狗/Ctrl+C 的 abort 标志只在事件之间被检查,整个 TUI 冻死 40 分钟。0 = 关闭。
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
+
+/// `METACODES_STREAM_IDLE_TIMEOUT_MS` 覆盖默认空闲上限(毫秒;0 关闭;非法值用默认)。
+pub fn streamIdleTimeoutMsFromEnv() u64 {
+    const raw = std.c.getenv("METACODES_STREAM_IDLE_TIMEOUT_MS") orelse return DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+    return std.fmt.parseInt(u64, std.mem.span(raw), 10) catch DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+}
+
 /// 重试 UI 上报回调(agent_loop 注入,把 attempt/max/delay 渲染成 "Retrying in Ns…")。
 /// state 类型擦除(指向 stdout_writer 等);headless 传 null。
 pub const RetryReporter = api_stream.RetryReporter;
@@ -277,6 +290,8 @@ pub const Client = struct {
     /// use the built-in resolver; AgentRuntime injects its Snapshot resolver.
     dialect_resolver: dialect_mod.Resolver = .{},
     abort_registry: provider_mod.RequestAbortRegistry = .{},
+    /// 见 DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
+    stream_idle_timeout_ms: u64 = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
     request_setup_failure_injector: ?*RequestSetupFailureInjector = null,
     last_request_id: log.RequestId = .{ .bytes = .{0} ** 12 },
     last_http_status: u16 = 0,
@@ -309,6 +324,7 @@ pub const Client = struct {
             .model = model,
             .base_url = base_url_override orelse ANTHROPIC_API_URL,
             .catalog = Catalog.init(allocator),
+            .stream_idle_timeout_ms = streamIdleTimeoutMsFromEnv(),
         };
     }
 
@@ -851,14 +867,16 @@ pub const Client = struct {
         };
         // errdefer 销毁顺序：先 req.deinit()（释放连接/缓冲），再 destroy 槽位。
         errdefer req_ptr.deinit();
-        if (abort) |signal|
-            try client.abort_registry.register(
-                client.allocator,
-                signal,
-                req_ptr,
-                shutdownRequest,
-            );
-        errdefer if (abort != null) client.abort_registry.unregister(req_ptr);
+        // 总是登记:abort 路由(有 signal 时)+ 空闲监视(idle limit > 0 时)。收头阶段的等待也
+        // 由同一只表计时——请求发出后对端一个字节都不回同样是 stall。
+        try client.abort_registry.registerMonitored(
+            client.allocator,
+            abort,
+            req_ptr,
+            shutdownRequest,
+            client.stream_idle_timeout_ms,
+        );
+        errdefer client.abort_registry.unregister(req_ptr);
 
         // 发送 body
         req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
@@ -874,6 +892,12 @@ pub const Client = struct {
         // 读取响应头
         var redirect_buf: [4096]u8 = undefined;
         const http_response = req_ptr.receiveHead(&redirect_buf) catch |err| {
+            if (client.abort_registry.stalledIdleMs(req_ptr)) |idle| {
+                // 监视线程因沉默 shutdown 了连接:请求没有副作用(还没收到响应头),按瞬态错误重试。
+                log.warnId("client", rid, "no response head for {d}ms (idle limit {d}ms): connection shut down, will retry", .{ idle, client.stream_idle_timeout_ms });
+                last_error.recordNamed("响应头空闲超时", "StreamStalled");
+                return error.TransientNetwork;
+            }
             log.errId("client", rid, "receiveHead failed: {s}", .{@errorName(err)});
             // 网络瞬态错误(服务端关连接等)上抛区分性 error,让重试层识别;非瞬态塌缩 RequestFailed。
             if (isTransientNetworkError(err)) {
@@ -920,7 +944,7 @@ pub const Client = struct {
                     .response = http_response,
                     .transfer_buf = undefined,
                     .id = rid,
-                    .abort_registry = if (abort != null) &client.abort_registry else null,
+                    .abort_registry = &client.abort_registry,
                     .server_request_id = client.server_request_id,
                     .server_request_id_len = client.server_request_id_len,
                     .http_status = status.code,
@@ -932,6 +956,10 @@ pub const Client = struct {
         var transfer_buf: [8192]u8 = undefined;
         const body_reader = req_ptr.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
         const response_body = body_reader.allocRemaining(client.allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
+            if (client.abort_registry.stalledIdleMs(req_ptr)) |idle| {
+                log.warnId("client", rid, "response body idle for {d}ms (idle limit {d}ms): connection shut down", .{ idle, client.stream_idle_timeout_ms });
+                return error.StreamStalled;
+            }
             log.errId("client", rid, "read body failed: {s}", .{@errorName(err)});
             return error.RequestFailed;
         };
@@ -1233,6 +1261,17 @@ pub const StreamResponse = struct {
                 log.warnId("stream", self.id, "aborted during event read", .{});
                 return error.Aborted;
             },
+            error.ReadFailed => {
+                // 监视线程因沉默 shutdown 了连接 → 读失败的真因是 stall,不是网络。
+                if (self.stream_result.abort_registry) |registry| {
+                    if (registry.stalledIdleMs(self.stream_result.request)) |idle| {
+                        log.warnId("stream", self.id, "no bytes for {d}ms: stream stalled, connection shut down", .{idle});
+                        return error.StreamStalled;
+                    }
+                }
+                log.warnId("stream", self.id, "event_iter.next failed: {s}", .{@errorName(err)});
+                return error.RequestFailed;
+            },
             error.ApiErrorEvent => {
                 // SSE `event: error` 帧:API 主动报错(overloaded/invalid_request 等)。
                 // 上抛**区分性** error,不塌缩成 RequestFailed,让 agent_loop/测试能识别。
@@ -1248,6 +1287,8 @@ pub const StreamResponse = struct {
                 return error.RequestFailed;
             },
         };
+        // 每个事件都是活着的证据:重置空闲时钟(思考阶段一样有 thinking_delta 流过)。
+        if (self.stream_result.abort_registry) |registry| registry.touch(self.stream_result.request);
         const ev = ev_opt orelse {
             self.done = true;
             return null;

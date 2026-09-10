@@ -70,6 +70,15 @@ pub const MockServer = struct {
     midstream_cut_index: ?usize = null,
     /// serveLoop 为当前连接算好的"本响应要截断"标记。
     current_response_cut: bool = false,
+    /// 沉默模式:该 0-based 响应序号读完请求后**保持连接打开但不再发任何字节**,直到 stop()。
+    /// `silent_prefix_bytes` = 0 → 连响应头都不发(收头阶段 stall);> 0 → 发响应头 + 正文前
+    /// 这么多字节后沉默(正文阶段 stall)。模拟对端"连接活着、字节不来"的网关/代理故障——
+    /// 与 flaky(断连)、midstream_cut(截断后断连)相互独立:那两种服务端会关连接,这种不会。
+    silent_index: ?usize = null,
+    silent_prefix_bytes: usize = 0,
+    /// 在飞的沉默连接持有线程数:每条沉默连接由独立线程握着(accept 循环不能被它堵住,否则
+    /// 客户端重试的下一条连接永远等不到服务);stop() 等它们归零再释放 self。
+    silent_holders: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// flaky 模式:前 N 个连接读完请求后直接 close 不写响应(模拟服务端建连阶段断连,
     /// 客户端 receiveHead 拿到 ConnectionClosing/EOF)。serveLoop 每断一次递减,归 0 后正常服务。
     flaky_close_remaining: usize = 0,
@@ -171,6 +180,18 @@ pub const MockServer = struct {
         return self;
     }
 
+    /// cassette 多轮 + 指定响应序号沉默(见 silent_index 字段注释)。
+    pub fn startCassetteSilent(
+        bodies: []const []const u8,
+        silent_index: usize,
+        silent_prefix_bytes: usize,
+    ) !*MockServer {
+        const self = try startCassette(bodies, 0);
+        self.silent_index = silent_index;
+        self.silent_prefix_bytes = silent_prefix_bytes;
+        return self;
+    }
+
     pub fn startFlaky(body: []const u8, close_first_n: usize) !*MockServer {
         const listener = try net.listenLoopback(0, 16);
         errdefer net.closeSocket(listener.sock);
@@ -204,6 +225,8 @@ pub const MockServer = struct {
         }
         net.closeSocket(self.listen_sock);
         self.thread.join();
+        // 沉默连接的持有线程看到 closing 后自行退出;等归零再释放 self(它们还在读 self.closing)。
+        while (self.silent_holders.load(.acquire) != 0) psync.sleepMs(5);
         for (self.captured_requests[0..self.captured_count]) |maybe_raw| {
             if (maybe_raw) |raw| std.heap.page_allocator.free(raw);
         }
@@ -324,9 +347,44 @@ pub const MockServer = struct {
                 continue;
             }
 
+            // 沉默:交给持有线程(发 prefix 后什么都不做,连接一直开着到 stop()),accept 循环继续。
+            if (self.silent_index) |silent| if (response_index == silent) {
+                _ = self.silent_holders.fetchAdd(1, .acq_rel);
+                const holder = std.Thread.spawn(.{}, holdSilent, .{ conn, self }) catch {
+                    _ = self.silent_holders.fetchSub(1, .acq_rel);
+                    net.closeSocket(conn);
+                    continue;
+                };
+                holder.detach();
+                continue;
+            };
+
             sendResponse(conn, self);
             net.closeSocket(conn);
         }
+    }
+
+    /// 沉默模式的连接处理(独立线程):可选地发响应头 + 正文前 prefix 字节,然后保持连接直到
+    /// stop()。客户端那边应由自己的空闲监视把连接 shutdown;这里绝不主动关(那是另一种故障)。
+    fn holdSilent(conn: net.Socket, self: *MockServer) void {
+        defer {
+            net.closeSocket(conn);
+            _ = self.silent_holders.fetchSub(1, .acq_rel);
+        }
+        if (self.silent_prefix_bytes > 0) {
+            const header =
+                "HTTP/1.1 200 OK\r\n" ++
+                "content-type: text/event-stream\r\n" ++
+                "cache-control: no-cache\r\n" ++
+                "transfer-encoding: chunked\r\n" ++
+                "connection: close\r\n";
+            sendAll(conn, header);
+            sendAll(conn, self.extra_response_headers);
+            sendAll(conn, "\r\n");
+            const prefix = self.body[0..@min(self.silent_prefix_bytes, self.body.len)];
+            if (prefix.len > 0) writeChunk(conn, prefix);
+        }
+        while (!self.closing.load(.acquire)) psync.sleepMs(20);
     }
 
     fn captureRequest(self: *MockServer, raw: []const u8) void {
