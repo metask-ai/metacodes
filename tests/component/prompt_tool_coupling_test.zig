@@ -467,3 +467,115 @@ test "L2 e2e: execution policy hides deferred tools from schema and system promp
     try std.testing.expect(std.mem.indexOf(u8, request_system, "# Deferred tools") == null);
     try std.testing.expect(std.mem.indexOf(u8, request_system, "FormalAuditTask") == null);
 }
+
+// ── 动态(MCP)deferred 工具的可发现性:提示词列名 → ToolSearch select → 下一请求进 tools ──
+
+fn toolSearchSse(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_search\",\"name\":\"ToolSearch\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"query\\\":\\\"{s}\\\"}}\"}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+        "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+        "data: {{\"type\":\"message_stop\"}}\n\n", .{query});
+}
+
+/// 生产 App.activateTool 的最小镜像:dupe 名字记入激活集(ToolSearch 传进来的 name 借用
+/// 工具参数内存,工具返回后就失效)。
+const Activation = struct {
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMap(void),
+
+    fn activate(state: *anyopaque, name: []const u8) anyerror!void {
+        const self: *Activation = @ptrCast(@alignCast(state));
+        if (self.map.contains(name)) return;
+        const key = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(key);
+        try self.map.put(key, {});
+    }
+
+    fn deinit(self: *Activation) void {
+        var it = self.map.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.map.deinit();
+    }
+};
+
+test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;ToolSearch select 激活后下一请求进 tools" {
+    const a = std.testing.allocator;
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    const long_desc = "Search a KnowForge knowledge base by keyword.\n\n" ++ ("Returns fragments with their source file names and scores. " ** 12);
+    try dyn.register("knowforge__search", long_desc, &.{}, deferredProbe, null, true);
+    try dyn.register("knowforge__overview", "Knowledge base overview.", &.{}, deferredProbe, null, true);
+
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var pc = cc.tools.PromptContext{};
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), &dyn, &pc);
+    const names = try defs_arena.allocator().alloc([]const u8, defs.len);
+    for (defs, 0..) |d, i| names[i] = d.name;
+    try std.testing.expect(findDef(defs, "knowforge__search").?.deferred);
+
+    const system = try cc.system_prompt.buildFullWithDefs(a, "claude-sonnet-4-20250514", null, null, names, "", false, "/tmp", defs);
+    defer a.free(system);
+    try std.testing.expect(std.mem.indexOf(u8, system, "# Deferred tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__search — Search a KnowForge knowledge base by keyword. Returns fragments") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__overview — Knowledge base overview.") != null);
+
+    const search_sse = try toolSearchSse(a, "select:knowforge__search");
+    defer a.free(search_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ search_sse, MINIMAL_END_TURN_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var activated = std.StringHashMap(void).init(a);
+    var activation = Activation{ .allocator = a, .map = &activated };
+    defer activation.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "search the knowledge base for onboarding docs");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    var wb = cc.writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .system_prompt = system,
+        .activated_tools = &activated,
+        .dyn_registry = &dyn,
+        .host_services = .{ .ctx = @ptrCast(&activation), .activateToolFn = &Activation.activate },
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+
+    // 第一请求:MCP 工具只在 system 的 Deferred 段里,不在 tools 数组里;ToolSearch 在。
+    const first = srv.requestAt(0) orelse return error.NoRequestCaptured;
+    const first_tools = first.jsonField("tools") orelse return error.ToolsFieldMissing;
+    const first_system = first.jsonField("system") orelse return error.SystemFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, first_tools, "\"name\":\"ToolSearch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_tools, "knowforge__search") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "# Deferred tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "- knowforge__search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "- knowforge__overview") != null);
+
+    // ToolSearch 的结果把 schema 给了模型,激活集记下了名字。
+    try std.testing.expect(activated.contains("knowforge__search"));
+    try std.testing.expect(!activated.contains("knowforge__overview"));
+    const tool_result_msg = conv.messages.items[2];
+    try std.testing.expect(tool_result_msg.blocks[0] == .tool_result);
+    try std.testing.expect(std.mem.indexOf(u8, tool_result_msg.blocks[0].tool_result.content, "\"name\":\"knowforge__search\"") != null);
+
+    // 第二请求:被激活的 MCP 工具进 tools 数组;未激活的同伴仍只在 Deferred 段。
+    const second = srv.requestAt(1) orelse return error.NoRequestCaptured;
+    const second_tools = second.jsonField("tools") orelse return error.ToolsFieldMissing;
+    const second_system = second.jsonField("system") orelse return error.SystemFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, second_tools, "\"name\":\"knowforge__search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_tools, "knowforge__overview") == null);
+    try std.testing.expect(std.mem.indexOf(u8, second_system, "- knowforge__overview") != null);
+}

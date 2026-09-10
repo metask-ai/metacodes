@@ -223,6 +223,14 @@ pub const Provider = struct {
 
     /// 能力查询(P2 真接表;P0 实现可恒按 Anthropic 能力答)。
     supportsFn: *const fn (ctx: *anyopaque, cap: Capability) bool,
+    /// 同一问题针对**某个具体模型**——subagent 的 `model_override` 指向的不是本
+    /// provider 自己的模型时,它的能力(尤其 image_input)要按它真要发往的模型答,
+    /// 不是按父模型答。可选:答不了的 provider 保持返回自己的答案,与 maxTokensForFn
+    /// 同一约定。
+    supportsForModelFn: ?*const fn (ctx: *anyopaque, cap: Capability, model: []const u8) bool = null,
+    /// 本路由目录里声明能收图的模型名(借用 provider 内存;调用方只释放外层 slice)。
+    /// 可选:没有目录的 provider 不实现,调用方视为"不知道",不编造候选。
+    visionModelsFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const []const u8 = null,
     /// Last transport identifiers, available even when a request failed before
     /// a StreamHandle could be returned (used by the Metask ledger).
     requestIdTextFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
@@ -290,6 +298,19 @@ pub const Provider = struct {
     }
     pub inline fn supports(self: Provider, cap: Capability) bool {
         return self.supportsFn(self.ctx, cap);
+    }
+    /// 能力查询,按请求真会命名的模型答:`model_override` 为 null 时等价 `supports`。
+    /// 与 `maxInputTokensFor` 同一形状——每一处按 override 派生的判断都要问这个,
+    /// 否则子 agent 的图片门控会拿父模型的能力当自己的。
+    pub inline fn supportsForModel(self: Provider, cap: Capability, model_override: ?[]const u8) bool {
+        const name = model_override orelse return self.supports(cap);
+        const resolve = self.supportsForModelFn orelse return self.supports(cap);
+        return resolve(self.ctx, cap, name);
+    }
+    /// 目录声明能收图的模型名;provider 没有目录 → 空 slice(不是错误)。
+    pub inline fn visionModels(self: Provider, allocator: std.mem.Allocator) anyerror![]const []const u8 {
+        const f = self.visionModelsFn orelse return try allocator.alloc([]const u8, 0);
+        return f(self.ctx, allocator);
     }
     pub inline fn requestIdText(self: Provider) []const u8 {
         const f = self.requestIdTextFn orelse return "";

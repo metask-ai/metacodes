@@ -360,6 +360,8 @@ pub const Client = struct {
             // Anthropic 不支持方言字段覆盖(Claude 无 prompt_cache_key/parallel_tool_calls/response_format 方言字段);
             // requestOverridesFn 走 default(返全 null),setRequestOverridesFn 留 null(setter 调用返 error)
             .supportsFn = &pSupports,
+            .supportsForModelFn = &pSupportsForModel,
+            .visionModelsFn = &pVisionModels,
             .requestIdTextFn = &pRequestIdText,
             .serverRequestIdFn = &pServerRequestId,
             .httpStatusFn = &pHttpStatus,
@@ -419,8 +421,32 @@ pub const Client = struct {
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         // P2:走 capability 表(单一真相源),按当前 model 真判, 不再恒 true stub。
+        return asClient(ctx).supportsForModel(cap, asClient(ctx).model);
+    }
+    fn pSupportsForModel(ctx: *anyopaque, cap: provider_mod.Capability, model: []const u8) bool {
+        return asClient(ctx).supportsForModel(cap, model);
+    }
+    fn pVisionModels(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const []const u8 {
+        return asClient(ctx).catalog.visionModels(allocator);
+    }
+
+    /// 本 client 发往 `model` 时用的方言:注册表/插件解析出的 Dialect,再叠上目录对
+    /// image_input 的声明。**序列化守门与能力查询的唯一出口**——两条 send 路径和
+    /// `supportsForModel` 都从这里拿 profile,目录真相不可能只影响其中一边。
+    pub fn dialectFor(client: *const Client, model: []const u8) dialect_mod.Dialect {
+        var dialect = client.dialect_resolver.resolve(.anthropic, model);
+        dialect.image_input_override = client.catalog.imageInputFor(model);
+        return dialect;
+    }
+
+    /// provider+model 能力,image_input 经 `dialectFor` 走目录覆盖后的 profile;其余能力
+    /// 走 capability 表。
+    pub fn supportsForModel(client: *const Client, cap: provider_mod.Capability, model: []const u8) bool {
         const capability = @import("api/capability.zig");
-        return capability.supports(.anthropic, asClient(ctx).model, cap);
+        return switch (cap) {
+            .image_input => client.dialectFor(model).profileFor(.anthropic, model).supports_image_input,
+            else => capability.supports(.anthropic, model, cap),
+        };
     }
     fn pRequestIdText(ctx: *anyopaque) []const u8 {
         return asClient(ctx).last_request_id.asSlice();
@@ -552,7 +578,7 @@ pub const Client = struct {
             .stream = false,
             .tools = tools,
             .reasoning_effort = client.reasoning_effort,
-        }, client.allocator, client.dialect_resolver.resolve(.anthropic, effective_model));
+        }, client.allocator, client.dialectFor(effective_model));
         defer client.allocator.free(req_body);
 
         const result = try client.doRequestWithAuthReplay(req_body, false, null, null);
@@ -617,7 +643,7 @@ pub const Client = struct {
         retry_hint: ?*RetryHint,
     ) !StreamResponse {
         const effective_model = model_override orelse client.modelSnapshot();
-        const dialect = client.dialect_resolver.resolve(.anthropic, effective_model);
+        const dialect = client.dialectFor(effective_model);
         // 图像 tool_result 是发原生块还是占位文本,由序列化器**实际**报告(插件方言可以在
         // profile 声称支持时仍拒绝发图),随流句柄回传给 agent_loop 的送达水位。
         var report = json_mod.SerializationReport{};

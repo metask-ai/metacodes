@@ -149,6 +149,7 @@ pub const OpenAIClient = struct {
             .requestOverridesFn = &pRequestOverrides,
             .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
+            .supportsForModelFn = &pSupportsForModel,
             .requestIdTextFn = &pRequestIdText,
             .serverRequestIdFn = &pServerRequestId,
             .httpStatusFn = &pHttpStatus,
@@ -201,6 +202,10 @@ pub const OpenAIClient = struct {
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         return capability.supports(.openai, cast(ctx).model, cap);
+    }
+    fn pSupportsForModel(ctx: *anyopaque, cap: provider_mod.Capability, model: []const u8) bool {
+        _ = ctx;
+        return capability.supports(.openai, model, cap);
     }
     fn pRequestIdText(ctx: *anyopaque) []const u8 {
         return cast(ctx).last_request_id.asSlice();

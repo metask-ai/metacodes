@@ -431,6 +431,14 @@ fn readImage(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []cons
         if (s.size > MAX_IMAGE_BYTES) return error.ImageTooLarge;
     }
 
+    // 执行期能力门控(宿主按 model_override 算好塞进 ctx):活动模型收不了图就不读盘、
+    // 不 base64、不往 transcript 塞几十 KB——直接把"为什么不行、谁行、怎么办"告诉模型。
+    // 文件存在性/大小检查在前:文件不存在时 file_not_found 比能力错误更准。
+    if (ctx.image_input_supported == false) {
+        try rejectImageForTextModel(allocator, ctx, media_type, if (st) |s| s.size else null);
+        unreachable;
+    }
+
     const raw = try common.readAllFromFd(fd, allocator);
     defer allocator.free(raw);
     if (raw.len > MAX_IMAGE_BYTES) return error.ImageTooLarge;
@@ -457,6 +465,40 @@ fn readImage(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []cons
     return try out.toOwnedSlice();
 }
 
+/// 非 vision 活动模型读图:返回 error.ImageInputUnsupported(tool_error 映射为
+/// capability_unsupported / recoverable),detail 点名活动模型、本路由目录里能看图的模型、
+/// 以及不看图的替代路径。候选来自 provider 的目录(`Provider.visionModels`),没有目录
+/// 就如实说"本路由没有模型声明 image_input",绝不编造模型名。
+fn rejectImageForTextModel(allocator: std.mem.Allocator, ctx: *const ToolContext, media_type: []const u8, size: ?u64) !noreturn {
+    const vision_owned: ?[]const []const u8 = if (ctx.provider) |p| (p.visionModels(allocator) catch null) else null;
+    defer if (vision_owned) |v| allocator.free(v);
+    const vision: []const []const u8 = vision_owned orelse &.{};
+
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(allocator);
+    const max_listed: usize = 8;
+    for (vision, 0..) |name, i| {
+        if (i >= max_listed) {
+            try names.print(allocator, ", … ({d} more)", .{vision.len - max_listed});
+            break;
+        }
+        if (i > 0) try names.appendSlice(allocator, ", ");
+        try names.appendSlice(allocator, name);
+    }
+
+    var size_text: std.ArrayList(u8) = .empty;
+    defer size_text.deinit(allocator);
+    if (size) |n| try size_text.print(allocator, ", {d} bytes", .{n});
+
+    const model_label: []const u8 = if (ctx.active_model.len > 0) ctx.active_model else "the active model";
+    if (names.items.len > 0) {
+        common.setErrorDetail(ctx.error_detail, allocator, "Image file exists ({s}{s}) but model \"{s}\" cannot receive images on this route (image_input=false). Models on this route that declare image input: {s}. Switch with /model <id> and read the file again, or extract what you need without viewing it (OCR / metadata / dimensions via a script). Do not retry this Read with the same model.", .{ media_type, size_text.items, model_label, names.items });
+    } else {
+        common.setErrorDetail(ctx.error_detail, allocator, "Image file exists ({s}{s}) but model \"{s}\" cannot receive images on this route (image_input=false), and no model on this route declares image input. Extract what you need without viewing it (OCR / metadata / dimensions via a script), or ask the user to switch to a vision-capable provider. Do not retry this Read with the same model.", .{ media_type, size_text.items, model_label });
+    }
+    return error.ImageInputUnsupported;
+}
+
 test "imageMediaType detects extensions" {
     try std.testing.expectEqualStrings("image/png", imageMediaType("/x/y.png").?);
     try std.testing.expectEqualStrings("image/jpeg", imageMediaType("a.JPG").?);
@@ -474,6 +516,45 @@ test "rejectDevicePath blocks devices" {
 test "ReadTool device path blocked via execute" {
     const ctx = testCtx();
     try std.testing.expectError(error.DevicePathBlocked, execute(&ctx, "{\"file_path\":\"/dev/zero\"}"));
+}
+
+test "ReadTool image: 活动模型不收图 → capability 错误,不读盘不编码,detail 点名替代路径" {
+    const a = std.testing.allocator;
+    const path = "/tmp/cc-zig-read-img-gate-test.png";
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    try std.testing.expect(fd >= 0);
+    _ = pfs.write(fd, &[_]u8{ 0x89, 0x50, 0x4E, 0x47 });
+    _ = pfs.close(fd);
+    defer pfs.unlinkPath(path) catch {};
+
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    var rs = read_state.ReadState.init(a);
+    defer rs.deinit();
+    const ctx = ToolContext{
+        .allocator = a,
+        .read_state = &rs,
+        .error_detail = &detail,
+        .active_model = "GLM-5.2",
+        .image_input_supported = false,
+    };
+    try std.testing.expectError(error.ImageInputUnsupported, execute(&ctx, "{\"file_path\":\"" ++ path ++ "\"}"));
+    const d = detail orelse return error.TestExpectedDetail;
+    try std.testing.expect(std.mem.indexOf(u8, d, "\"GLM-5.2\" cannot receive images") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "image/png, 4 bytes") != null);
+    // 没有 provider 目录 → 如实说没有候选,不编造模型名。
+    try std.testing.expect(std.mem.indexOf(u8, d, "no model on this route declares image input") != null);
+    // 门控在读盘之前:read_state 没有记录这次读取。
+    try std.testing.expect(rs.get(path) == null);
+
+    // 文件不存在时优先报 file_not_found(能力错误不遮蔽更准的原因)。
+    try std.testing.expectError(error.FileNotFound, execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-img-gate-missing.png\"}"));
+
+    // null(宿主没告知)与 true 都不门控。
+    const ungated = ToolContext{ .allocator = a, .read_state = &rs, .active_model = "x" };
+    const r = try execute(&ungated, "{\"file_path\":\"" ++ path ++ "\"}");
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"type\":\"image\"") != null);
 }
 
 test "ReadTool image returns structured json" {

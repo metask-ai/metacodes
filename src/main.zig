@@ -1270,7 +1270,7 @@ fn runModelSelectionForStoredApiKey(allocator: std.mem.Allocator, io: std.Io, st
     const efforts = reasoningOptionsForMask(model.reasoning_mask, &effort_buf);
     std.debug.print("\nSelect reasoning effort:\n", .{});
     for (efforts, 0..) |effort, i| {
-        std.debug.print("  {d}. {s}\n", .{ i + 1, effort.name() });
+        std.debug.print("  {d}. {s}\n", .{ i + 1, catalog_mod.effortLabel(model.effort_vocabulary, effort) });
     }
     const effort_idx = try promptChoice(allocator, efforts.len);
     stored.reasoning_effort = efforts[effort_idx];
@@ -2309,7 +2309,7 @@ fn printHelp() void {
         \\  --resume-response <j> Resume a suspended session with a late tool response (@file to read from a file)
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
         \\  --model-display-name <name>  Stable actor-visible model identity
-        \\  --reasoning-effort <e> none|minimal|low|medium|high|xhigh
+        \\  --reasoning-effort <e> none|minimal|low|medium|high|xhigh (alias: max, the Anthropic-route name of the top level)
         \\  --temperature <f>    Override sampling temperature (dialect-gated fields)
         \\  --top-p <f>          Override nucleus sampling top_p
         \\  --prompt-cache-key <k>  Kimi K2.6 cache hint (gated by dialect capability)

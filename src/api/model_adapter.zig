@@ -155,12 +155,11 @@ fn anthropicProfile(model: []const u8) ModelProfile {
         .thinking_mode = .anthropic_adaptive,
         .effort_levels = .full,
         .returns_reasoning_content = false, // Claude 用 content[] 里的 thinking block,非平级字段
-        // Vision 自 Claude 3 起(claude-1/2/instant 是纯文本代);经 Anthropic 兼容
-        // 网关的第三方文本模型(如 glm-5)同样不支持。按已验证家族守门,其余保守 false。
-        .supports_image_input = hasSubstr(model, "claude") and
-            !hasSubstr(model, "claude-instant") and
-            !hasSubstr(model, "claude-1") and
-            !hasSubstr(model, "claude-2"),
+        // Vision 按**模型家族**判,与 wire 格式无关(issue #112):Anthropic 兼容网关
+        // 后面挂的可以是 gpt-5.x / gemini / qwen-vl,名字认得出的家族照常放行;
+        // 认不出的(glm-5.x 之类)保守 false——真相由 /v1/models 目录的 image_input
+        // 声明覆盖(Dialect.image_input_override),不在这里赌远端 400。
+        .supports_image_input = knownVisionFamily(model),
     };
     // Claude 4.x 保留 thinking(preserved thinking)
     if (hasSubstr(model, "claude-opus-4") or hasSubstr(model, "claude-sonnet-4") or hasSubstr(model, "claude-haiku-4")) {
@@ -185,6 +184,9 @@ fn openaiProfile(model: []const u8) ModelProfile {
             // GLM coding-plan 端点默认保留 thinking;标准 API 端点默认清除。
             // harness 无法从 model 名区分端点,保守取 false(保留)——coding agent 场景更常见。
             .preserved_thinking_default = false,
+            // GLM 文本系(glm-5.x/glm-4-plus)无 vision;视觉变体是 glm-4v / glm-4.1v / glm-4.5v
+            // 这种"版本号以 v 收尾"的名字。glm-5.3-flash 这类新号名字看不出来,靠目录声明。
+            .supports_image_input = glmVisionVariant(model),
         };
     }
     // Kimi K3(总是开 thinking,顶层 reasoning_effort,不发 thinking body,省略 temp/top_p/n)
@@ -259,8 +261,39 @@ fn openaiProfile(model: []const u8) ModelProfile {
         .thinking_mode = .openai_effort,
         .effort_levels = .full,
         .returns_reasoning_content = false, // OpenAI 不暴露 reasoning content
-        .supports_image_input = openaiNativeVision(model),
+        .supports_image_input = knownVisionFamily(model),
     };
+}
+
+/// 已验证的 vision **家族**——与调用它的 wire 格式无关(同一个模型经 Anthropic 兼容
+/// 网关或 OpenAI 兼容端点,能不能看图是模型的事,不是协议的事;issue #112)。
+/// 认不出的名字一律 false(fail-closed):本地显式能力错误优于远端 400 / 静默忽略。
+/// 目录(`/v1/models` 的 image_input 声明)有话说时覆盖本表,见 dialect.Dialect.image_input_override。
+pub fn knownVisionFamily(model: []const u8) bool {
+    // Claude 3 起原生多模态;claude-1/2/instant 是纯文本代。
+    if (hasSubstr(model, "claude")) {
+        return !hasSubstr(model, "claude-instant") and
+            !hasSubstr(model, "claude-1") and
+            !hasSubstr(model, "claude-2");
+    }
+    if (openaiNativeVision(model)) return true;
+    // Gemini 全系原生多模态。
+    if (hasSubstr(model, "gemini")) return true;
+    // Qwen VL 变体(qwen2.5-vl / qwen3-vl)。
+    if (hasSubstr(model, "qwen") and hasSubstr(model, "vl")) return true;
+    return glmVisionVariant(model);
+}
+
+/// GLM 视觉变体:`glm-` 后的版本段以 `v` 收尾——glm-4v、glm-4.1v-thinking、glm-4.5v、
+/// glm-4.6v-flash 命中;glm-4-plus / glm-4-flash / glm-5.2 / glm-5.3-flash 不命中
+/// (它们的版本段是 "4" / "5.2" / "5.3")。
+fn glmVisionVariant(model: []const u8) bool {
+    const at = std.ascii.indexOfIgnoreCase(model, "glm-") orelse return false;
+    const rest = model[at + "glm-".len ..];
+    const seg_end = std.mem.indexOfScalar(u8, rest, '-') orelse rest.len;
+    const segment = rest[0..seg_end];
+    if (segment.len < 2) return false;
+    return segment[segment.len - 1] == 'v' or segment[segment.len - 1] == 'V';
 }
 
 /// OpenAI 原生已验证 vision 家族:GPT-4o/4.1/4.5/GPT-5/ChatGPT 全系、gpt-4-turbo/
@@ -494,6 +527,22 @@ test "profileFor: other 保守默认" {
     try std.testing.expect(!p.returns_reasoning_content);
 }
 
+test "profileFor: vision 家族判定与 wire 格式无关(issue #112)" {
+    // 同一个名字,Anthropic 兼容路由和 OpenAI 兼容路由给同一个答案。
+    try std.testing.expect(profileFor(.anthropic, "gpt-5.6-sol").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "gpt-5.6-sol").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "gemini-2.5-pro").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "qwen3-vl-235b").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "glm-4.5v").supports_image_input);
+    // 文本家族 / 认不出的名字在两条路由上都 fail-closed。
+    try std.testing.expect(!profileFor(.anthropic, "glm-5.2").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "glm-5.3-flash").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "deepseek-chat").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "marco-o1").supports_image_input);
+    try std.testing.expect(!profileFor(.anthropic, "claude-2.1").supports_image_input);
+    try std.testing.expect(!knownVisionFamily("llama-3.3-70b"));
+}
+
 test "profileFor: vision 能力矩阵(issue #10)" {
     // 已验证 vision 家族 true;文本模型/未验证家族/未知模型名保守 false(fail-closed)。
     try std.testing.expect(profileFor(.anthropic, "claude-sonnet-4-20250514").supports_image_input);
@@ -519,6 +568,11 @@ test "profileFor: vision 能力矩阵(issue #10)" {
     try std.testing.expect(profileFor(.openai, "qwen3-vl-235b").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "qwen3-235b").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "glm-5.2").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "glm-5.3-flash").supports_image_input); // 名字看不出,靠目录
+    try std.testing.expect(!profileFor(.openai, "glm-4-plus").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "glm-4v").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "glm-4.5v").supports_image_input);
+    try std.testing.expect(profileFor(.openai, "GLM-4.6V-Flash").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "deepseek-chat").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "kimi-k3").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "minimax-m3").supports_image_input);
