@@ -1,3 +1,8 @@
+import asyncio
+import importlib
+import importlib.util
+import sys
+import types
 import ast
 import hashlib
 import io
@@ -2885,20 +2890,212 @@ assert failed, "enforced run without rule_filter events must fail loudly"
             source,
         )
 
-    def test_adapter_uses_complete_messages_endpoint_so_proxy_rewrites_model(self):
+    def test_adapter_command_uses_distinct_fresh_home_per_step(self):
+        # Load the overlay adapter with narrow test doubles for WorkBuddy's
+        # runtime types so this L2 check exercises the command actually built
+        # by MetacodesAgent, even when a pinned WorkBuddy checkout is absent.
+        module_names = (
+            "harbor",
+            "harbor.agents",
+            "harbor.agents.installed",
+            "harbor.environments",
+            "harbor.models",
+            "harbor.models.agent",
+            "harbor.models.trajectories",
+            "workbuddy_bench",
+            "workbuddy_bench.agents",
+        )
+        modules = {name: types.ModuleType(name) for name in module_names}
+
+        class BaseInstalledAgent:
+            def __init__(self, logs_dir, *_args, **_kwargs):
+                self.logs_dir = logs_dir
+
+        modules["harbor.agents.installed.base"] = types.ModuleType(
+            "harbor.agents.installed.base"
+        )
+        modules["harbor.agents.installed.base"].BaseInstalledAgent = BaseInstalledAgent
+        modules["harbor.environments.base"] = types.ModuleType(
+            "harbor.environments.base"
+        )
+        modules["harbor.environments.base"].BaseEnvironment = type(
+            "BaseEnvironment", (), {}
+        )
+        modules["harbor.models.agent.context"] = types.ModuleType(
+            "harbor.models.agent.context"
+        )
+        modules["harbor.models.agent.context"].AgentContext = type(
+            "AgentContext", (), {}
+        )
+        for name, class_name in (
+            ("agent", "Agent"),
+            ("final_metrics", "FinalMetrics"),
+            ("observation", "Observation"),
+            ("observation_result", "ObservationResult"),
+            ("step", "Step"),
+            ("tool_call", "ToolCall"),
+            ("trajectory", "Trajectory"),
+        ):
+            modules[f"harbor.models.trajectories.{name}"] = types.ModuleType(
+                f"harbor.models.trajectories.{name}"
+            )
+            setattr(
+                modules[f"harbor.models.trajectories.{name}"],
+                class_name,
+                type(class_name, (), {}),
+            )
+        modules["workbuddy_bench.agents._agent_user"] = types.ModuleType(
+            "workbuddy_bench.agents._agent_user"
+        )
+        modules["workbuddy_bench.agents._agent_user"].ensure_agent_user = lambda *args, **kwargs: None
+        trace_module = types.ModuleType("workbuddy_bench.agents._metacodes_trace")
+        trace_module.OBSERVATION_FILENAME = "tool-observations.jsonl"
+        trace_module.TraceError = type("TraceError", (Exception,), {})
+        trace_module.anthropic_messages_endpoint = lambda url: url + "/v1/messages"
+        trace_module.load_control_metrics = lambda *_args: {}
+        trace_module.load_trace_ir = lambda *_args: {}
+        trace_module.project_state_hash = lambda *_args: "project-hash"
+        modules["workbuddy_bench.agents._metacodes_trace"] = trace_module
+
+        adapter_path = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        )
+        with mock.patch.dict(sys.modules, modules, clear=False):
+            spec = importlib.util.spec_from_file_location(
+                "workbuddy_bench.agents.metacodes_agent_l2", adapter_path
+            )
+            adapter = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(adapter)
+
+            async def capture_command(logs_dir, instruction="instruction"):
+                agent = adapter.MetacodesAgent.__new__(adapter.MetacodesAgent)
+                agent.logs_dir = logs_dir
+                agent.model_name = "route-l2"
+                agent._model_display_name = "model-l2"
+                agent._model_params = {}
+                agent._mount_path = "/opt/metacodes"
+                agent._disabled_tools = "Agent"
+                agent._proxy_url = "http://127.0.0.1:1"
+                agent._session_id = ""
+                agent._max_output_tokens = None
+                agent._verification_checkpoint = False
+                agent._verification_final_gate = False
+                agent._verification_final_observe = False
+                agent._requirement_ledger = False
+                agent._requirement_ledger_observe = False
+                agent._project_kernel_relative = None
+                agent._project_rules_relative = None
+                agent._project_control_mode = "absent"
+                agent._memory_accumulation = False
+                agent._self_evolution = False
+                agent._outcome_feedback = False
+                agent._continuity_seed_sha256 = None
+                agent._context_window = None
+                agent._context_compact_pct = None
+                captured = {}
+                agent.render_instruction = lambda instruction: instruction
+
+                async def fake_exec(_environment, command, **_kwargs):
+                    captured["command"] = command
+
+                agent.exec_as_agent = fake_exec
+                await agent.run(instruction, object(), None)
+                return captured["command"]
+
+            with tempfile.TemporaryDirectory() as directory:
+                first_logs = Path(directory) / "trial" / "steps" / "find-vuln" / "agent"
+                second_logs = Path(directory) / "trial" / "steps" / "poc-verify" / "agent"
+                first_logs.mkdir(parents=True)
+                second_logs.mkdir(parents=True)
+                # Real multi-step shape: harbor reuses the SAME logs_dir for both
+                # steps; only the rendered instruction differs.  Both must yield
+                # a DIFFERENT, deterministic HOME so step 2 does not trip the
+                # fresh-HOME guard.
+                commands = [
+                    asyncio.run(capture_command(first_logs, "audit for the vulnerability")),
+                    asyncio.run(capture_command(first_logs, "write the proof of concept")),
+                ]
+                det_command = asyncio.run(
+                    capture_command(first_logs, "audit for the vulnerability")
+                )
+
+                missing_logs = Path(directory) / "trial" / "steps" / "setup-failed" / "agent"
+                missing_logs.mkdir(parents=True)
+                missing_agent = adapter.MetacodesAgent.__new__(adapter.MetacodesAgent)
+                missing_agent.logs_dir = missing_logs
+                missing_agent._project_control_mode = "absent"
+                captured_trace = {}
+
+                def missing_trace(*_args):
+                    raise FileNotFoundError("metacodes-output.jsonl")
+
+                class MarkerTrajectory:
+                    final_metrics = None
+
+                    def to_json_dict(self):
+                        return {"marker": "killed-no-result"}
+
+                def build_marker_trajectory(trace):
+                    captured_trace["trace"] = trace
+                    return MarkerTrajectory()
+
+                adapter.load_trace_ir = missing_trace
+                missing_agent._build_trajectory = build_marker_trajectory
+                missing_agent.populate_context_post_run(types.SimpleNamespace())
+                missing_trajectory = json.loads(
+                    (missing_logs / "trajectory.json").read_text(encoding="utf-8")
+                )
+
+        homes = [re.search(r'run_home="([^"]+)";', command).group(1) for command in commands]
+        self.assertNotEqual(homes[0], homes[1])
+        self.assertTrue(all(home.startswith("/tmp/") for home in homes))
+        det_home = re.search(r'run_home="([^"]+)";', det_command).group(1)
+        # Same logs_dir + different instruction -> different HOME (the multi-step fix).
+        self.assertNotEqual(homes[0], homes[1])
+        # Deterministic for a given (logs_dir, instruction).
+        self.assertEqual(homes[0], det_home)
+        for home in homes:
+            self.assertTrue(home.startswith("/tmp/metacodes-workbuddy-home-"))
+        for command in commands:
+            # The fresh-HOME guard must survive per step: it is what proves the
+            # HOME was created empty for this step (not reused from a prior one).
+            self.assertIn(
+                'test ! -e "$run_home" || { echo "fresh HOME already exists" >&2; exit 70; };',
+                command,
+            )
+            self.assertIn(
+                'mkdir -p "$run_home" || exit 70; export HOME="$run_home";',
+                command,
+            )
+            self.assertIn("umask 077;", command)
+            self.assertIn('"fresh_home":true', command)
+        self.assertEqual(
+            captured_trace["trace"]["result"]["stop_reason"],
+            "killed_no_result",
+        )
+        self.assertEqual(
+            missing_trajectory,
+            {"marker": "killed-no-result"},
+        )
+
+    def test_adapter_routes_through_custom_provider_not_base_url(self):
+        # Since metacodes EndpointPolicy defaults to require_tls=True, a plaintext
+        # --base-url override to the WorkBuddy job proxy is rejected
+        # (InsecureEndpoint).  The adapter therefore writes a `workbuddy-proxy`
+        # custom_provider (endpoint_policy.require_tls=False, route-token via env
+        # alias) and selects it with METACODES_PROVIDER, instead of injecting
+        # METACODES_BASE_URL.  Guard that contract so a regression back to the
+        # base-url path is caught.
         source = (
             Path(__file__).parents[1]
             / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
         ).read_text(encoding="utf-8")
-        self.assertIn(
-            "escaped_proxy = anthropic_messages_endpoint(self._proxy_url)",
-            source,
-        )
-        self.assertIn('"METACODES_BASE_URL": escaped_proxy', source)
-        self.assertLess(
-            source.index("escaped_proxy = anthropic_messages_endpoint(self._proxy_url)"),
-            source.index('"METACODES_BASE_URL": escaped_proxy'),
-        )
+        self.assertIn('"custom_providers": {', source)
+        self.assertIn('"METACODES_PROVIDER": _PROXY_PROVIDER_ID', source)
+        self.assertIn('anthropic_messages_endpoint(self._proxy_url)', source)
+        # The plaintext base-url override must NOT be reintroduced.
+        self.assertNotIn('"METACODES_BASE_URL": escaped_proxy', source)
 
     def test_overlay_patches_resolve_and_prepare_with_one_mount_contract(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3358,6 +3555,27 @@ asyncio.run(main())
         )
         self.assertIn('"artifacts_verified": True', source)
         self.assertIn('"runtime_active_bundle_absent": (', source)
+
+    def test_adapter_repairs_only_the_task_workdir_for_the_non_root_agent(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        install = source[source.index("    async def install("):source.index(
+            "    def _collect_outcomes", source.index("    async def install(")
+        )]
+        repair = install[install.index("await ensure_agent_user"):]
+        self.assertIn('getattr(environment, "default_user", None)', repair)
+        self.assertIn('getattr(environment, "task_env_config", None)', repair)
+        self.assertIn('target="$(pwd)"', repair)
+        self.assertIn("chown", repair)
+        self.assertIn("chmod u+rwx", repair)
+        self.assertIn("|| true", repair)
+        self.assertIn("/tests|/tests/*", repair)
+        self.assertIn("/logs/verifier|/logs/verifier/*", repair)
+        self.assertIn("*/verifier|*/verifier/*", repair)
+        self.assertIn("*/grading|*/grading/*", repair)
+        self.assertNotIn("chown -R", repair)
 
     def test_paid_code_probe_is_frozen_to_first_code_dev_task(self):
         root = Path(__file__).parents[1] / "workbuddy"
