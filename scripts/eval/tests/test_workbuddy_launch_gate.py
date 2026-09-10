@@ -1770,6 +1770,49 @@ with urllib.request.urlopen(
             with self.assertRaisesRegex(LaunchError, "identity is incomplete"):
                 _official_task_identity(trajectory, manifest, [task], route)
 
+    def test_official_task_identity_accepts_security_codebuddy_namespace(self):
+        # The security dataset (wb-bench-sec-v1.0) namespaces tasks as
+        # "codebuddy/<task>" while code/office/web use "workbuddy/<task>". The
+        # gate must bind either spelling, or every security trial is rejected as
+        # "identity is incomplete or drifted" and no security cohort can commit.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            trial = root / "order-of-validation-2fa-bypass-h__random"
+            trajectory = trial / "agent/trajectory.json"
+            trajectory.parent.mkdir(parents=True)
+            trajectory.write_text("{}\n", encoding="utf-8")
+            task = "order-of-validation-2fa-bypass-hard-multistep"
+            run_id = "workbuddy-sec-codebuddy-l2"
+            route = run_id + "--metacodes-glm52"
+            result = {
+                "task_name": f"codebuddy/{task}",
+                "task_id": {
+                    "path": (
+                        Path(".workspace/tmp/staged")
+                        / run_id
+                        / "wb-bench-sec-v1.0/tasks"
+                        / task
+                    ).as_posix()
+                },
+                "source": "tasks",
+                "trial_uri": trial.as_uri(),
+                "task_checksum": digest("task-checksum"),
+                "exception_info": None,
+                "agent_info": {"name": "metacodes", "model_info": {"name": route}},
+            }
+            (trial / "result.json").write_text(
+                json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            manifest = {
+                "run_id": run_id,
+                "cohort": {"dataset": "datasets/wb-bench-sec-v1.0/tasks"},
+            }
+            observed, result_path, loaded = _official_task_identity(
+                trajectory, manifest, [task], route
+            )
+            self.assertEqual(task, observed)
+            self.assertEqual(trial / "result.json", result_path)
+
     def _official_usage_fixture(self, root: Path, reward: object) -> dict:
         workbuddy = root / "workbuddy"
         run_id = "workbuddy-official-reward-l2"
@@ -1960,6 +2003,102 @@ with urllib.request.urlopen(
             },
             "artifacts": {},
         }
+
+    def _official_multistep_usage_fixture(
+        self, root: Path, reward: object, step_turns=(1, 1)
+    ) -> dict:
+        """Reshape the single-step fixture into a Harbor multi-step trial.
+
+        Per-step artifacts (trajectory/transcript/observation/runtime-contract)
+        move under steps/<step>/agent with distinct per-step tokens+cost+turns;
+        requests.jsonl stays trial-level at <trial>/agent (spans all steps).
+        """
+        manifest = self._official_usage_fixture(root, reward)
+        workbuddy = Path(manifest["workbuddy"]["checkout"])
+        agent = next(workbuddy.rglob("agent/trajectory.json")).parent
+        trial = agent.parent
+        per_step = [
+            "trajectory.json",
+            "metacodes-transcript.jsonl",
+            OBSERVATION_FILENAME,
+            "metacodes-runtime-contract.json",
+        ]
+        for i, turns in enumerate(step_turns, start=1):
+            sd = trial / "steps" / f"step-{i}" / "agent"
+            sd.mkdir(parents=True)
+            for name in per_step:
+                shutil.copy(agent / name, sd / name)
+            tp = sd / "trajectory.json"
+            traj = json.loads(tp.read_text(encoding="utf-8"))
+            fm = traj["final_metrics"]
+            fm["total_prompt_tokens"] = 10 * i
+            fm["total_completion_tokens"] = 2 * i
+            fm["total_cached_tokens"] = 3 * i
+            fm["total_cost_usd"] = 0.001 * i
+            fm["extra"]["cache_creation_input_tokens"] = 4 * i
+            fm["extra"]["metacodes_turns"] = turns
+            tp.write_text(json.dumps(traj) + "\n", encoding="utf-8")
+        # trial/agent keeps only the trial-level requests.jsonl
+        for name in per_step:
+            (agent / name).unlink()
+        return manifest
+
+    def test_official_collect_usage_aggregates_multistep_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_multistep_usage_fixture(
+                Path(directory), 1.0, step_turns=(1, 1)
+            )
+            usage = _collect_usage(manifest, started_ns=0, official_runner=True)
+            task = usage["tasks"]["code-task-a"]
+            # step-1 metered = 10+2+3+4 = 19; step-2 = 20+4+6+8 = 38
+            self.assertEqual(19 + 38, task["metered_tokens"])
+            self.assertEqual(10 + 20, task["prompt_tokens"])
+            self.assertEqual(2 + 4, task["completion_tokens"])
+            self.assertAlmostEqual(0.001 + 0.002, task["cost_usd"])
+            # requests.jsonl is trial-level and counted ONCE, not per step
+            self.assertEqual(1, task["provider_requests"])
+            self.assertEqual(1, usage["provider_requests"])
+            # reward is trial-level and counted once
+            self.assertEqual(1.0, task["verifier_reward"])
+            self.assertTrue(task["full_pass"])
+            self.assertEqual(1.0, usage["quality"]["mean_verifier_reward"])
+            self.assertEqual(1, usage["control_metrics"]["tasks"])
+            # the later step's audited bytes are disclosed
+            self.assertIn("step_audit_sha256s", task)
+            self.assertTrue(task["step_audit_sha256s"])
+
+    def test_v3_multistep_request_audit_reconciles_summed_turns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_multistep_usage_fixture(
+                Path(directory), 1.0, step_turns=(1, 2)
+            )
+            manifest["schema_version"] = SCHEMA_VERSION
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            trial = next(
+                workbuddy.rglob("steps/*/agent/trajectory.json")
+            ).parents[3]
+            req = trial / "agent" / "requests.jsonl"
+            template = json.loads(req.read_text(encoding="utf-8").splitlines()[0])
+
+            def _write(seqs):
+                lines = []
+                for seq in seqs:
+                    r = json.loads(json.dumps(template))
+                    r.update({"seq": seq, "response": {"status": 200}, "error": None})
+                    lines.append(json.dumps(r))
+                req.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            # 3 successful turn responses == sum of per-step turns (1 + 2)
+            _write([1, 2, 3])
+            usage = _collect_usage(manifest, started_ns=0, official_runner=True)
+            self.assertEqual(3, usage["tasks"]["code-task-a"]["provider_requests"])
+            self.assertEqual(3, usage["provider_requests"])
+            # 2 successful turns != summed turns 3 -> the audit fails closed
+            _write([1, 2])
+            with self.assertRaisesRegex(
+                LaunchError, "provider request audit is incomplete or out of order"
+            ):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
 
     def test_official_collect_usage_reads_authoritative_reward_and_rejects_bad_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2218,7 +2357,7 @@ with urllib.request.urlopen(
                 + "\n",
                 encoding="utf-8",
             )
-            _validate_trial_project_control(trial, manifest)
+            _validate_trial_project_control(trial, trial / "agent", manifest)
 
             runtime_job.write_text(
                 yaml.safe_dump({"agents": [{"kwargs": {}}]}),
@@ -2291,7 +2430,7 @@ with urllib.request.urlopen(
                 + "\n",
                 encoding="utf-8",
             )
-            _validate_trial_project_control(trial, manifest)
+            _validate_trial_project_control(trial, trial / "agent", manifest)
             forged = json.loads(
                 (trial / "agent/metacodes-runtime-contract.json").read_text()
             )
@@ -2300,7 +2439,7 @@ with urllib.request.urlopen(
                 json.dumps(forged) + "\n", encoding="utf-8"
             )
             with self.assertRaisesRegex(LaunchError, "runtime project control drifted"):
-                _validate_trial_project_control(trial, manifest)
+                _validate_trial_project_control(trial, trial / "agent", manifest)
 
 
 if __name__ == "__main__":
@@ -2736,7 +2875,7 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
             contract_path.write_text(
                 json.dumps(contract) + "\n", encoding="utf-8"
             )
-            _validate_trial_project_control(trial, manifest)
+            _validate_trial_project_control(trial, trial / "agent", manifest)
             # 契约侧漂移:声明 true、运行时 false → 拒绝。
             drifted = dict(contract)
             drifted["self_evolution"] = False
@@ -2746,7 +2885,7 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 LaunchError, "self-evolution treatment drifted"
             ):
-                _validate_trial_project_control(trial, manifest)
+                _validate_trial_project_control(trial, trial / "agent", manifest)
             contract_path.write_text(
                 json.dumps(contract) + "\n", encoding="utf-8"
             )
@@ -2759,7 +2898,7 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 LaunchError, "unexpectedly enables self evolution"
             ):
-                _validate_trial_project_control(trial, undeclared)
+                _validate_trial_project_control(trial, trial / "agent", undeclared)
 
     def test_self_evolution_never_waives_kernel_staging(self):
         # 自演化放行的只是"束可自改";kernel 身份必须仍来自 staged 工件。

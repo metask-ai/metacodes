@@ -44,6 +44,10 @@ pub const Catalog = struct {
     allocator: std.mem.Allocator,
     /// model_id → {max_tokens, max_input_tokens}。entry 里的 string 由 allocator 拥有。
     entries: std.ArrayList(Entry),
+    /// Each materially narrow user override is warned once per catalog. The
+    /// atomic keeps the read-only lookup API safe when providers share a
+    /// catalog across worker threads.
+    narrow_override_warning_emitted: std.atomic.Value(bool) = .init(false),
 
     pub const Entry = struct {
         model_id: []u8,
@@ -139,7 +143,20 @@ pub const Catalog = struct {
     /// user_override != null → 直接用用户 CLI 值
     /// 否则查 catalog（命中且字段非 null）；缺失 → 查本地 fallback 表；全没中 → 默认
     pub fn maxTokensFor(self: *const Catalog, model: []const u8, user_override: ?u32) u32 {
-        if (user_override) |v| return v;
+        if (user_override) |v| {
+            for (self.entries.items) |e| {
+                if (!model_name.eqlIgnoreCase(e.model_id, model)) continue;
+                if (e.max_tokens) |catalog_value| {
+                    if (@as(u64, v) * 2 < @as(u64, catalog_value) and
+                        @constCast(&self.narrow_override_warning_emitted).cmpxchgStrong(false, true, .acq_rel, .acquire) == null)
+                    {
+                        log.warn("catalog", "max_tokens override {d} is materially below catalog value {d} for model {s}", .{ v, catalog_value, model });
+                    }
+                }
+                break;
+            }
+            return v;
+        }
         for (self.entries.items) |e| {
             if (model_name.eqlIgnoreCase(e.model_id, model)) {
                 if (e.max_tokens) |v| return v;
@@ -432,6 +449,30 @@ test "Catalog: user override beats catalog" {
     defer c.deinit();
     try c.loadFromModelsListJson("{\"data\":[{\"id\":\"x\",\"max_tokens\":1000}]}");
     try testing.expect(c.maxTokensFor("x", 500) == 500);
+}
+
+test "Catalog: materially narrow user override warns once and still wins" {
+    var c = Catalog.init(testing.allocator);
+    defer c.deinit();
+    try c.loadFromModelsListJson("{\"data\":[{\"id\":\"x\",\"max_tokens\":1000}]}");
+
+    try testing.expectEqual(@as(u32, 400), c.maxTokensFor("x", 400));
+    try testing.expect(c.narrow_override_warning_emitted.load(.acquire));
+    try testing.expectEqual(@as(u32, 400), c.maxTokensFor("x", 400));
+}
+
+test "Catalog: 非显著偏低的 override 不告警(负例,防条件恒真)" {
+    var c = Catalog.init(testing.allocator);
+    defer c.deinit();
+    try c.loadFromModelsListJson("{\"data\":[{\"id\":\"x\",\"max_tokens\":1000}]}");
+
+    // 600*2 >= 1000 → 不算 materially below,不应告警。
+    try testing.expectEqual(@as(u32, 600), c.maxTokensFor("x", 600));
+    try testing.expect(!c.narrow_override_warning_emitted.load(.acquire));
+
+    // catalog 没有该 model 的 max_tokens 时,也不应告警。
+    try testing.expectEqual(@as(u32, 1), c.maxTokensFor("unknown-model", 1));
+    try testing.expect(!c.narrow_override_warning_emitted.load(.acquire));
 }
 
 test "Catalog: 端到端——后端只返回 max_input_tokens=1M 时 auto-compact 阈值放大到 800K(非 160K)" {

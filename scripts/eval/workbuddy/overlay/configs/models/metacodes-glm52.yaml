@@ -6,5 +6,5 @@ model:
   context_window: 200000
   max_concurrent: 1
   params:
-    max_output_tokens: 16384
+    max_output_tokens: 32768
     temperature: 0.0

@@ -164,7 +164,7 @@ fn recordResult(job: *BatchJob, r: subagent.SubagentResult) void {
 /// (别用 `==` 漏网——哪天给 batch subagent 接上 requester,suspended 不能被谎报成 completed)。
 fn isFailureStop(sr: @import("../core/agent_loop.zig").StopReason) bool {
     return switch (sr) {
-        .api_error, .aborted, .tool_error, .suspended => true, // 出错/中断/挂起未完成 → 失败
+        .api_error, .aborted, .tool_error, .suspended, .max_tokens_exhausted => true, // 出错/中断/挂起/续写耗尽未完成 → 失败
         .end_turn, .max_turns, .tool_loop, .backgrounded, .budget => false, // 跑到终止,有产出 → 完成
     };
 }
@@ -543,12 +543,13 @@ test "shouldAbortJob: deadline / 父 abort / 未启动 判定(watchdog 核心逻
     try testing.expect(!shouldAbortJob(1_000_000, 1_300_000, false, deadline));
 }
 
-test "isFailureStop: exhaustive 覆盖 StopReason 9 变体" {
+test "isFailureStop: exhaustive 覆盖 StopReason 10 变体" {
     const SR = @import("../core/agent_loop.zig").StopReason;
     try testing.expect(isFailureStop(.api_error));
     try testing.expect(isFailureStop(.aborted));
     try testing.expect(isFailureStop(.tool_error));
     try testing.expect(isFailureStop(.suspended));
+    try testing.expect(isFailureStop(.max_tokens_exhausted));
     try testing.expect(!isFailureStop(.end_turn));
     try testing.expect(!isFailureStop(.max_turns));
     try testing.expect(!isFailureStop(.tool_loop));
