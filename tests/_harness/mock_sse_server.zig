@@ -33,6 +33,12 @@ pub fn normalizeSlashes(s: []u8) []const u8 {
 }
 
 pub const MockServer = struct {
+    const DelayedBurst = struct {
+        index: usize,
+        prefix_bytes: usize,
+        delay_ms: u32,
+    };
+
     pub const MAX_CAPTURED_REQUESTS: usize = 32;
     // Component tests exercise bounded 30KB tool previews across several
     // turns. 64KB truncated the third HTTP request mid-body, making the mock
@@ -76,6 +82,8 @@ pub const MockServer = struct {
     /// 与 flaky(断连)、midstream_cut(截断后断连)相互独立:那两种服务端会关连接,这种不会。
     silent_index: ?usize = null,
     silent_prefix_bytes: usize = 0,
+    /// 指定响应发完 prefix 后零字节等待,再正常发完余下正文。
+    delayed_burst: ?DelayedBurst = null,
     /// 在飞的沉默连接持有线程数:每条沉默连接由独立线程握着(accept 循环不能被它堵住,否则
     /// 客户端重试的下一条连接永远等不到服务);stop() 等它们归零再释放 self。
     silent_holders: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -189,6 +197,22 @@ pub const MockServer = struct {
         const self = try startCassette(bodies, 0);
         self.silent_index = silent_index;
         self.silent_prefix_bytes = silent_prefix_bytes;
+        return self;
+    }
+
+    /// cassette 多轮 + 指定响应先发 prefix,保持连接沉默 delay_ms 后突发剩余正文。
+    pub fn startCassetteDelayedBurst(
+        bodies: []const []const u8,
+        delay_index: usize,
+        delay_prefix_bytes: usize,
+        delay_ms: u32,
+    ) !*MockServer {
+        const self = try startCassette(bodies, 0);
+        self.delayed_burst = .{
+            .index = delay_index,
+            .prefix_bytes = delay_prefix_bytes,
+            .delay_ms = delay_ms,
+        };
         return self;
     }
 
@@ -359,6 +383,12 @@ pub const MockServer = struct {
                 continue;
             };
 
+            if (self.delayed_burst) |delay| if (response_index == delay.index) {
+                sendResponseWithDelay(conn, self, delay);
+                net.closeSocket(conn);
+                continue;
+            };
+
             sendResponse(conn, self);
             net.closeSocket(conn);
         }
@@ -435,6 +465,10 @@ pub const MockServer = struct {
     }
 
     fn sendResponse(conn: net.Socket, self: *MockServer) void {
+        sendResponseWithDelay(conn, self, null);
+    }
+
+    fn sendResponseWithDelay(conn: net.Socket, self: *MockServer, delayed_burst: ?DelayedBurst) void {
         // 非 200:发纯 body(application/json,Content-Length),不走 chunked SSE。
         // 让客户端的 HTTP 错误分支(logErrorBody)能读到 body。
         if (std.mem.indexOf(u8, self.status_line, "200") == null) {
@@ -472,6 +506,18 @@ pub const MockServer = struct {
         else
             self.body;
         var cursor: usize = 0;
+        if (delayed_burst) |delay| {
+            cursor = @min(delay.prefix_bytes, effective_body.len);
+            if (cursor > 0) writeChunk(conn, effective_body[0..cursor]);
+            var remaining_ms = delay.delay_ms;
+            // 不发 ping/comment/终止 chunk;每 ≤20ms 检查停机,stop() 不必等完整 delay。
+            while (!self.closing.load(.acquire) and remaining_ms > 0) {
+                const slice_ms = @min(remaining_ms, 20);
+                psync.sleepMs(slice_ms);
+                remaining_ms -= slice_ms;
+            }
+            if (self.closing.load(.acquire)) return;
+        }
         while (cursor < effective_body.len) {
             const end = std.mem.indexOfPos(u8, effective_body, cursor, "\n\n") orelse effective_body.len;
             const chunk_end = @min(end + 2, effective_body.len);

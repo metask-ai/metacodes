@@ -20,6 +20,7 @@
 //!   ⑥ 只有 ping 的保活 → 算活着,本轮正常 end_turn;
 //!   ⑦ 收头阶段用严上限,正文阶段用另一个(更大的)上限:两者独立生效;
 //!   ⑧ 非流式(auto-compact 那条路)正文 stall 同样点名而不是塌缩成 RequestFailed。
+//!   ⑨ napi 网关先发短文本,零字节沉默超过收头上限但未达正文上限,再突发完整 tool_use → 正常收齐。
 
 const std = @import("std");
 const harness = @import("harness");
@@ -376,4 +377,74 @@ test "L2 liveness ⑧: 非流式请求正文阶段沉默 → StreamStalled 并�
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     const detail = takeLastError(&buf) orelse return error.TestExpectedLastError;
     try std.testing.expect(std.mem.startsWith(u8, detail, "正文空闲超时: "));
+}
+
+test "L2 liveness ⑨: 短文本后零字节沉默超过收头上限,正文上限内突发完整 tool_use → 正常收齐不报 stall" {
+    const a = std.testing.allocator;
+    const delay_ms: u32 = 1_500;
+    const body_ms: u64 = 6_000;
+    // napi 网关实测形状:先发短文本,工具生成期间不发任何字节,完整参数只在一条长 SSE 行里到达。
+    const content = "0123456789abcdef" ** 128;
+    const input_json = "{\"file_path\":\"/tmp/burst.txt\",\"content\":\"" ++ content ++ "\"}";
+    const prefix =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"开始撰写\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+    const body = prefix ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_burst\",\"name\":\"Write\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"/tmp/burst.txt\\\",\\\"content\\\":\\\"" ++ content ++ "\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1024}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var srv = try harness.MockServer.startCassetteDelayedBurst(&[_][]const u8{body}, 0, prefix.len, delay_ms);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = mkClient(a, io_rt.io(), url, 300, body_ms);
+    defer client.deinit();
+    clearLastError();
+    // 失败时保留具体错误及 TUI 现场,便于区分正文 stall 与其它链路失败。
+    errdefer |err| {
+        var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+        std.debug.print("run test L2 liveness ⑨: expected normal stream, got {t}; last_error={s}\n", .{
+            err, takeLastError(&buf) orelse "<null>",
+        });
+    }
+
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    const t0 = cc.util_time.nowMs();
+    var handle = try client.provider().sendStream(empty, null, null, null, null, null, "");
+    defer handle.deinit();
+    var text_received = false;
+    var tool_uses: usize = 0;
+    var done = false;
+    while (try handle.next()) |ev| switch (ev) {
+        .text => |t| {
+            defer a.free(t);
+            try std.testing.expectEqualStrings("开始撰写", t);
+            text_received = true;
+        },
+        .thinking => |t| a.free(t),
+        .tool_use_start => |tu| {
+            defer a.free(tu.id);
+            defer a.free(tu.name);
+            defer a.free(tu.input_json);
+            tool_uses += 1;
+            try std.testing.expectEqualStrings("Write", tu.name);
+            try std.testing.expectEqualStrings(input_json, tu.input_json);
+        },
+        .done => done = true,
+        else => {},
+    };
+    const elapsed = cc.util_time.nowMs() - t0;
+    try std.testing.expect(text_received);
+    try std.testing.expectEqual(@as(usize, 1), tool_uses);
+    try std.testing.expect(done);
+    // 只断言下界:沉默确实发生在网络上,不限制加载较重的 CI 的总耗时。
+    try std.testing.expect(elapsed >= @as(i64, delay_ms));
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    try std.testing.expect(takeLastError(&buf) == null);
 }
