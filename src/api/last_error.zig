@@ -11,8 +11,11 @@
 //! 读侧:repl/loop .api_error 分支 take() 消费——读后清空,旧错不跨轮陈述。
 //! headless 不需要:log.errId 直接落 stderr,现场本来可见。
 //!
+//! 写侧还有:client.reportHeadStall / reportBodyStall(空闲监视 shutdown 连接,2026-09-11 起
+//!       正文阶段 stall 也记,TUI 打"正文空闲超时: N ms 内无任何字节(上限 M ms)…")。
+//!
 //! 已知缺口(记录缺失时 UI 回退通用文案,不会错报):
-//! - mid-stream 读错误(200 后半途断连,ReadFailed 类)不经此处,现场只在日志;
+//! - mid-stream 读错误(200 后半途断连,ReadFailed 类,**非** stall)不经此处,现场只在日志;
 //! - 进程级单例:并发 subagent 的错误可能相互覆盖——此摘要是"进程最近一次 API 错误",
 //!   不保证归属某个具体 run。
 //!

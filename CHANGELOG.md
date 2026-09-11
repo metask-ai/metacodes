@@ -12,6 +12,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Stream liveness killed legitimate long tool calls: the idle clock was reset
+  per parsed event, so a tool call's `input_json_delta` frames, SSE pings and
+  unknown events counted as silence, and the flat 120 s limit also applied to
+  the body phase, where a gateway may generate an entire 20-40 KB tool call
+  before writing a byte of it (a 126 s call died as `StreamStalled` although
+  bytes arrived every second). All three transports now reset the clock on
+  every transport read (`LivenessReader`), the request switches from the strict
+  head-phase limit (`METACODES_STREAM_IDLE_TIMEOUT_MS`) to a body-phase limit
+  scaled by `max_tokens` (`METACODES_STREAM_BODY_IDLE_TIMEOUT_MS`, default
+  `clamp(max_tokens × 100 ms, 10 min, 1 h)`) once the response head is
+  accepted, and a body-phase stall records the idle time and limit so the TUI
+  prints `正文空闲超时: N ms 内无任何字节(上限 M ms)` instead of the generic
+  "重试耗尽 / 后端错误 / 上下文超限" guess.
 - Child agents could inherit a provider default instead of the lead's current
   effort: the parent logged `none` while a GLM-5.2 child logged `default` and
   consequently enabled thinking. Child resolution now follows AgentDef

@@ -724,10 +724,18 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
   输出终态。
 - **流存活性靠客户端自己保证**(2026-09-10 起):对端"连接活着、字节不来"时,std.http 的读没有
   超时,abort 标志只在事件之间被检查,卡在 `readv` 里的线程谁也叫不醒——一次真实故障让 TaskBatch
-  的 join 和整个 TUI 冻了 40 分钟。现在每个在飞请求都登记进 `RequestAbortRegistry` 并带空闲上限
-  (`METACODES_STREAM_IDLE_TIMEOUT_MS`,默认 120s):监视线程超时 shutdown 连接,收头阶段归为
-  TransientNetwork 重试,正文阶段以 `StreamStalled` 结束本轮(`stop_reason=api_error`);TaskBatch
-  看门狗、TUI 的 Esc/Ctrl+C、`abortAllRunning` 现在都真的调 `provider.cancel`。仍然成立的边界:
+  的 join 和整个 TUI 冻了 40 分钟。现在每个在飞请求都登记进 `RequestAbortRegistry` 并带空闲上限:
+  监视线程超时 shutdown 连接,收头阶段归为 TransientNetwork 重试,正文阶段以 `StreamStalled` 结束
+  本轮(`stop_reason=api_error`);TaskBatch 看门狗、TUI 的 Esc/Ctrl+C、`abortAllRunning` 现在都真的
+  调 `provider.cancel`。**两个阶段、两个上限、按字节计**(2026-09-11 起):收头阶段用严上限
+  (`METACODES_STREAM_IDLE_TIMEOUT_MS`,默认 120s);响应头一到就切到正文阶段上限
+  (`METACODES_STREAM_BODY_IDLE_TIMEOUT_MS`,默认按 max_tokens 放大:clamp(max_tokens × 100ms,
+  10min, 1h))——napi 这类网关把整个 tool_use 参数攒成一条 `input_json_delta`,生成期间零字节、
+  无 ping,一个 20-40KB 的 Write/Bash 调用就是 120-200s 的真实线路沉默,平的 120s 会**确定性**杀掉
+  合法长工具调用。空闲时钟由 `LivenessReader` 在传输层每次读到字节时重置,不再按解析出的语义事件
+  重置(旧法把被 `continue` 掉的 input_json_delta / ping / unknown 事件全算成沉默:126s 的合法工具
+  调用曾在字节每秒都在到的情况下被判 stall)。正文 stall 经 `client.reportBodyStall` 写 last_error,
+  TUI 打"正文空闲超时: N ms 内无任何字节(上限 M ms)"而不是猜谜文案。仍然成立的边界:
   正文阶段的 stall 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
   不会 detach 卡死的 worker;TUI 每个 provider 回合结束就刷 transcript,但一个回合内的内容仍只在
   内存里。
