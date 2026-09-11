@@ -44,6 +44,7 @@ const util_json = @import("../util/json.zig");
 const api_stream = @import("stream.zig");
 const provider_mod = @import("provider.zig");
 const client_mod = @import("../client.zig");
+const liveness_reader = @import("liveness_reader.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
@@ -70,8 +71,10 @@ pub const OpenAIClient = struct {
     model: []const u8,
     http_client: http.Client,
     abort_registry: provider_mod.RequestAbortRegistry = .{},
-    /// 见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
+    /// 收头阶段空闲上限,见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
     stream_idle_timeout_ms: u64 = client_mod.DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    /// 正文阶段空闲上限的平覆盖;null = 按 max_tokens 自动(client.zig bodyIdleLimitMs)。
+    stream_body_idle_timeout_ms: ?u64 = null,
     max_tokens: u32 = 4096,
     context_window: u32 = 128_000,
     model_context: ?*const model_context_mod.ModelContext = null,
@@ -102,6 +105,7 @@ pub const OpenAIClient = struct {
             .model = model,
             .http_client = http.Client{ .allocator = allocator, .io = io },
             .stream_idle_timeout_ms = client_mod.streamIdleTimeoutMsFromEnv(),
+            .stream_body_idle_timeout_ms = client_mod.streamBodyIdleTimeoutMsFromEnv(),
         };
     }
     pub fn deinit(self: *OpenAIClient) void {
@@ -366,8 +370,8 @@ pub const OpenAIClient = struct {
             return error.RequestFailed;
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
-            if (self.abort_registry.stalledIdleMs(req_ptr)) |idle| {
-                log.warnId("openai", rid, "no response head for {d}ms (idle limit {d}ms): connection shut down, will retry", .{ idle, self.stream_idle_timeout_ms });
+            if (self.abort_registry.stalled(req_ptr)) |stall| {
+                client_mod.reportHeadStall("openai", rid, stall);
                 return error.TransientNetwork;
             }
             log.errId("openai", rid, "receiveHead failed: {s}", .{@errorName(err)});
@@ -393,6 +397,8 @@ pub const OpenAIClient = struct {
             }
             return error.RequestFailed;
         }
+        // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
+        self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens));
 
         const heap = try self.allocator.create(OpenAIStream);
         heap.* = .{
@@ -479,6 +485,9 @@ const OpenAIStream = struct {
     /// 复用同一 ArrayList,每次清空再用;deinit 时释放。
     line_overflow: std.ArrayList(u8) = .empty,
     reader: ?*std.Io.Reader = null,
+    /// 字节级活性适配器(见 liveness_reader.zig):首次 next 时包在 body reader 外;heap 分配,地址稳定。
+    liveness: liveness_reader.LivenessReader = undefined,
+    liveness_buf: [8192]u8 = undefined,
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
@@ -605,6 +614,12 @@ const OpenAIStream = struct {
         }
     }
 
+    /// 注册表对这条请求的 stall 判定(null = 没被监视线程 shutdown 过,读错误另有原因)。
+    fn stalledVerdict(self: *OpenAIStream) ?provider_mod.RequestAbortRegistry.Stall {
+        const registry = self.abort_registry orelse return null;
+        return registry.stalled(self.request);
+    }
+
     /// 读下一个中立事件。逐行读 SSE,翻译 OpenAI chunk → StreamEvent。
     fn next(self: *OpenAIStream) anyerror!?StreamEvent {
         // 先把已排队的 flush 事件(并行 tool_use_start)逐个吐出。
@@ -621,7 +636,12 @@ const OpenAIStream = struct {
         }
         if (self.done) return null;
         if (self.reader == null) {
-            self.reader = self.response.reader(&self.transfer_buf);
+            const raw = self.response.reader(&self.transfer_buf);
+            // 字节级续命:每次 recv 到字节就 touch——tool_calls 参数增量 chunk 不再是"沉默"。
+            self.reader = if (self.abort_registry) |registry| blk: {
+                self.liveness = liveness_reader.LivenessReader.init(raw, registry, self.request, &self.liveness_buf);
+                break :blk &self.liveness.interface;
+            } else raw;
         }
         const r = self.reader.?;
         while (true) {
@@ -631,15 +651,19 @@ const OpenAIStream = struct {
                 // 读取/上限失败可能把传输层留在一行中间;置终态,防调用方再 next()
                 // 把行尾当新 SSE 帧解析(对齐 stream.zig next 的 fail-terminal 契约)。
                 self.done = true;
-                if (self.abort_registry) |registry| if (registry.stalledIdleMs(self.request)) |idle| {
-                    log.warnId("openai", self.id, "no bytes for {d}ms: stream stalled, connection shut down", .{idle});
+                if (self.stalledVerdict()) |stall| {
+                    client_mod.reportBodyStall("openai", self.id, stall);
                     return error.StreamStalled;
-                };
+                }
                 return err;
             };
-            if (self.abort_registry) |registry| registry.touch(self.request);
             const line = line_opt orelse {
                 self.done = true;
+                // EOF 而无 [DONE]:连接若是被监视线程 shutdown 的,这是 stall 而非正常收尾。
+                if (self.stalledVerdict()) |stall| {
+                    client_mod.reportBodyStall("openai", self.id, stall);
+                    return error.StreamStalled;
+                }
                 return self.finishFlush();
             };
             const trimmed = std.mem.trim(u8, line, " \r\n");

@@ -11,6 +11,7 @@ const last_error = @import("api/last_error.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
 const AbortSignal = @import("util/abort.zig").AbortSignal;
 const provider_mod = @import("api/provider.zig");
+const liveness_reader = @import("api/liveness_reader.zig");
 const sync = @import("platform").sync;
 const rng = @import("platform").rng;
 const connection_gate = @import("api/connection_gate.zig");
@@ -230,16 +231,80 @@ pub fn defaultMaxRetries() u32 {
 
 pub const RETRY_BASE_MS: u64 = 500;
 
-/// 流式/收头阶段的**空闲上限**:这么久没收到任何字节,注册表的监视线程 shutdown 该连接,阻塞在
-/// 内核里的读立即返回——收头阶段归为 TransientNetwork 走重试,正文阶段报 StreamStalled 结束本轮。
+/// **收头阶段**的空闲上限:请求发出后这么久对端一个字节都不回,注册表的监视线程 shutdown 该连接,
+/// 阻塞在内核里的读立即返回,归为 TransientNetwork 走重试(请求尚无副作用)。
 /// 之前没有这一层:一个 ESTABLISHED 但对端沉默的连接能让子 agent 线程永远卡在 readv,
-/// 看门狗/Ctrl+C 的 abort 标志只在事件之间被检查,整个 TUI 冻死 40 分钟。0 = 关闭。
+/// 看门狗/Ctrl+C 的 abort 标志只在事件之间被检查,整个 TUI 冻死 40 分钟。0 = 整个活性监视关闭。
+///
+/// 响应头一到就切到**正文阶段**上限(`bodyIdleLimitMs`)——两个阶段的"合理沉默"量级不同:
+/// 收头阶段沉默 = 网关根本没接活;正文阶段沉默 = 网关可能正在生成一整个工具调用
+/// (napi 网关把 tool_use 参数攒成**一条** input_json_delta,生成期间零字节、无 ping;
+/// 一个 20-40KB 的 Write/Bash 调用 = 120-200 秒真实的线路沉默)。用 120s 的平上限判正文,
+/// 合法的长工具调用会被**确定性**杀掉(2026-09-11 实录:126.4s 后 StreamStalled)。
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 
-/// `METACODES_STREAM_IDLE_TIMEOUT_MS` 覆盖默认空闲上限(毫秒;0 关闭;非法值用默认)。
+/// 正文阶段空闲上限的下限(10 分钟):再小的 max_tokens 也至少容忍这么久的生成沉默。
+pub const DEFAULT_STREAM_BODY_IDLE_FLOOR_MS: u64 = 600_000;
+/// 正文阶段按 max_tokens 放大的预算:每个可能生成的 token 给 100ms(= 10 tok/s,比实测
+/// glm-5.3-flash 经网关 ~50 tok/s 慢 5 倍的"活着但慢"下界)。
+pub const STREAM_BODY_IDLE_MS_PER_TOKEN: u64 = 100;
+/// 正文阶段空闲上限的封顶(1 小时):零字节超过一小时的连接,中间设备早已把流丢了,
+/// 再等也是空等;用户随时能 Ctrl+C(真 cancel)。
+pub const STREAM_BODY_IDLE_CAP_MS: u64 = 3_600_000;
+
+/// `METACODES_STREAM_IDLE_TIMEOUT_MS` 覆盖收头阶段默认空闲上限(毫秒;0 关闭;非法值用默认)。
 pub fn streamIdleTimeoutMsFromEnv() u64 {
     const raw = std.c.getenv("METACODES_STREAM_IDLE_TIMEOUT_MS") orelse return DEFAULT_STREAM_IDLE_TIMEOUT_MS;
     return std.fmt.parseInt(u64, std.mem.span(raw), 10) catch DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+}
+
+/// `METACODES_STREAM_BODY_IDLE_TIMEOUT_MS`:正文阶段的**平**上限覆盖(毫秒;0 = 正文阶段不监视)。
+/// 未设/非法 = null = 按 max_tokens 自动(`bodyIdleLimitMs`)。
+pub fn streamBodyIdleTimeoutMsFromEnv() ?u64 {
+    const raw = std.c.getenv("METACODES_STREAM_BODY_IDLE_TIMEOUT_MS") orelse return null;
+    return std.fmt.parseInt(u64, std.mem.span(raw), 10) catch null;
+}
+
+/// 正文阶段空闲上限:显式覆盖 > 收头上限为 0(整体关闭)→ 0 > clamp(max_tokens × 100ms, 10min, 1h)。
+/// 按 max_tokens 放大是因为正文沉默的上界就是"一次生成能有多长";下限/封顶见各常量注释。
+pub fn bodyIdleLimitMs(override: ?u64, head_limit_ms: u64, max_tokens: u32) u64 {
+    if (override) |flat| return flat;
+    if (head_limit_ms == 0) return 0;
+    const scaled = @as(u64, max_tokens) * STREAM_BODY_IDLE_MS_PER_TOKEN;
+    return @min(@max(scaled, DEFAULT_STREAM_BODY_IDLE_FLOOR_MS), STREAM_BODY_IDLE_CAP_MS);
+}
+
+test "bodyIdleLimitMs: override wins, head 0 disables, otherwise max_tokens scaling clamped to [floor, cap]" {
+    try std.testing.expectEqual(@as(u64, 400), bodyIdleLimitMs(400, DEFAULT_STREAM_IDLE_TIMEOUT_MS, 8192));
+    try std.testing.expectEqual(@as(u64, 0), bodyIdleLimitMs(0, DEFAULT_STREAM_IDLE_TIMEOUT_MS, 8192));
+    try std.testing.expectEqual(@as(u64, 0), bodyIdleLimitMs(null, 0, 8192));
+    // 8192 tokens × 100ms = 819.2s > floor.
+    try std.testing.expectEqual(@as(u64, 819_200), bodyIdleLimitMs(null, DEFAULT_STREAM_IDLE_TIMEOUT_MS, 8192));
+    // Small max_tokens never drops below the floor.
+    try std.testing.expectEqual(DEFAULT_STREAM_BODY_IDLE_FLOOR_MS, bodyIdleLimitMs(null, DEFAULT_STREAM_IDLE_TIMEOUT_MS, 1024));
+    // Huge max_tokens is capped.
+    try std.testing.expectEqual(STREAM_BODY_IDLE_CAP_MS, bodyIdleLimitMs(null, DEFAULT_STREAM_IDLE_TIMEOUT_MS, 131072));
+    // The body limit is always at least as permissive as the documented floor for the TUI default.
+    try std.testing.expect(bodyIdleLimitMs(null, DEFAULT_STREAM_IDLE_TIMEOUT_MS, 1) >= DEFAULT_STREAM_IDLE_TIMEOUT_MS);
+}
+
+/// 收头阶段 stall 的统一交代:日志 + last_error 现场(重试成功后被 HTTP 200 清掉;
+/// 重试耗尽时 TUI 打印"响应头空闲超时: …"而不是猜谜文案)。三个 provider client 共用。
+pub fn reportHeadStall(comptime module: []const u8, rid: log.RequestId, stall: provider_mod.RequestAbortRegistry.Stall) void {
+    log.warnId(module, rid, "no response head for {d}ms (head idle limit {d}ms): connection shut down, will retry", .{ stall.idle_ms, stall.limit_ms });
+    var buf: [128]u8 = undefined;
+    const detail = std.fmt.bufPrint(&buf, "{d} ms 内无响应头(上限 {d} ms),连接已由客户端关闭", .{ stall.idle_ms, stall.limit_ms }) catch "StreamStalled";
+    last_error.recordNamed("响应头空闲超时", detail);
+}
+
+/// 正文阶段 stall 的统一交代:日志 + last_error 现场。此前 mid-stream 的 StreamStalled 不写
+/// last_error,TUI 只能打"重试耗尽 / 后端错误 / 上下文超限"三选一的猜谜文案——排障靠翻
+/// 观测日志才知道是空闲超时。三个 provider client 共用。
+pub fn reportBodyStall(comptime module: []const u8, rid: log.RequestId, stall: provider_mod.RequestAbortRegistry.Stall) void {
+    log.warnId(module, rid, "no bytes for {d}ms (body idle limit {d}ms): stream stalled, connection shut down", .{ stall.idle_ms, stall.limit_ms });
+    var buf: [128]u8 = undefined;
+    const detail = std.fmt.bufPrint(&buf, "{d} ms 内无任何字节(上限 {d} ms),连接已由客户端关闭", .{ stall.idle_ms, stall.limit_ms }) catch "StreamStalled";
+    last_error.recordNamed("正文空闲超时", detail);
 }
 
 /// 重试 UI 上报回调(agent_loop 注入,把 attempt/max/delay 渲染成 "Retrying in Ns…")。
@@ -290,8 +355,10 @@ pub const Client = struct {
     /// use the built-in resolver; AgentRuntime injects its Snapshot resolver.
     dialect_resolver: dialect_mod.Resolver = .{},
     abort_registry: provider_mod.RequestAbortRegistry = .{},
-    /// 见 DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
+    /// 收头阶段空闲上限,见 DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
     stream_idle_timeout_ms: u64 = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    /// 正文阶段空闲上限的平覆盖;null = 按 max_tokens 自动(bodyIdleLimitMs)。init 时从 env 取。
+    stream_body_idle_timeout_ms: ?u64 = null,
     request_setup_failure_injector: ?*RequestSetupFailureInjector = null,
     last_request_id: log.RequestId = .{ .bytes = .{0} ** 12 },
     last_http_status: u16 = 0,
@@ -325,6 +392,7 @@ pub const Client = struct {
             .base_url = base_url_override orelse ANTHROPIC_API_URL,
             .catalog = Catalog.init(allocator),
             .stream_idle_timeout_ms = streamIdleTimeoutMsFromEnv(),
+            .stream_body_idle_timeout_ms = streamBodyIdleTimeoutMsFromEnv(),
         };
     }
 
@@ -586,9 +654,10 @@ pub const Client = struct {
         model_override: ?[]const u8,
     ) !ApiResponse {
         const effective_model = model_override orelse client.modelSnapshot();
+        const max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override); // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
         const req_body = try json_mod.serializeMessagesRequestWithDialect(.{
             .model = effective_model,
-            .max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override), // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
+            .max_tokens = max_tokens,
             .messages = messages,
             .system = system,
             .stream = false,
@@ -597,7 +666,7 @@ pub const Client = struct {
         }, client.allocator, client.dialectFor(effective_model));
         defer client.allocator.free(req_body);
 
-        const result = try client.doRequestWithAuthReplay(req_body, false, null, null);
+        const result = try client.doRequestWithAuthReplay(req_body, false, null, null, max_tokens);
         switch (result) {
             .full_body => |fb| {
                 defer client.allocator.free(fb.body);
@@ -664,9 +733,10 @@ pub const Client = struct {
         // profile 声称支持时仍拒绝发图),随流句柄回传给 agent_loop 的送达水位。
         var report = json_mod.SerializationReport{};
         defer report.deinit(client.allocator);
+        const max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override); // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
         const req_body = try json_mod.serializeMessagesRequestWithDialectReport(.{
             .model = effective_model,
-            .max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override), // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
+            .max_tokens = max_tokens,
             .messages = messages,
             .system = system,
             .stream = true,
@@ -677,7 +747,7 @@ pub const Client = struct {
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
 
-        const result = try client.doRequestWithAuthReplay(req_body, true, abort, retry_hint);
+        const result = try client.doRequestWithAuthReplay(req_body, true, abort, retry_hint, max_tokens);
         switch (result) {
             .streaming_response => |r| {
                 var sr = StreamResponse.init(client.allocator, r, abort);
@@ -697,9 +767,10 @@ pub const Client = struct {
         streaming: bool,
         abort: ?*const AbortSignal,
         retry_hint: ?*RetryHint,
+        max_tokens: u32,
     ) !RequestResult {
         client.last_retry_attempt = 0;
-        var result = client.doRequest(body, streaming, abort, retry_hint) catch |err| {
+        var result = client.doRequest(body, streaming, abort, retry_hint, max_tokens) catch |err| {
             if (err != error.TokenExpired) return err;
             const callback = client.refresh_fn orelse return error.Unauthorized;
             const ctx = client.refresh_ctx orelse return error.Unauthorized;
@@ -711,7 +782,7 @@ pub const Client = struct {
             client.last_retry_attempt = 1;
             // No event has been delivered: the body is still the exact slice
             // produced by the serializer, so this is a byte-for-byte replay.
-            var replay_result = client.doRequest(body, streaming, abort, retry_hint) catch |replay_err| {
+            var replay_result = client.doRequest(body, streaming, abort, retry_hint, max_tokens) catch |replay_err| {
                 if (replay_err == error.TokenExpired) return error.Unauthorized;
                 return replay_err;
             };
@@ -787,12 +858,14 @@ pub const Client = struct {
         }
     }
 
+    /// `max_tokens` = 本请求实际发送的输出预算,只用于推正文阶段空闲上限(bodyIdleLimitMs)。
     fn doRequest(
         client: *Client,
         body: []const u8,
         streaming: bool,
         abort: ?*const AbortSignal,
         retry_hint: ?*RetryHint,
+        max_tokens: u32,
     ) !RequestResult {
         const rid = log.genRequestId();
         client.last_request_id = rid;
@@ -892,10 +965,9 @@ pub const Client = struct {
         // 读取响应头
         var redirect_buf: [4096]u8 = undefined;
         const http_response = req_ptr.receiveHead(&redirect_buf) catch |err| {
-            if (client.abort_registry.stalledIdleMs(req_ptr)) |idle| {
+            if (client.abort_registry.stalled(req_ptr)) |stall| {
                 // 监视线程因沉默 shutdown 了连接:请求没有副作用(还没收到响应头),按瞬态错误重试。
-                log.warnId("client", rid, "no response head for {d}ms (idle limit {d}ms): connection shut down, will retry", .{ idle, client.stream_idle_timeout_ms });
-                last_error.recordNamed("响应头空闲超时", "StreamStalled");
+                reportHeadStall("client", rid, stall);
                 return error.TransientNetwork;
             }
             log.errId("client", rid, "receiveHead failed: {s}", .{@errorName(err)});
@@ -934,6 +1006,11 @@ pub const Client = struct {
                 return resolveHttpFailure(failure, body_info);
             },
         }
+        // 响应头已接受 → 正文阶段:切到按 max_tokens 放大的上限(见 bodyIdleLimitMs)。收头阶段的
+        // 严上限从此不再适用于这条连接;字节级续命由 LivenessReader 负责。
+        const body_idle_limit_ms = bodyIdleLimitMs(client.stream_body_idle_timeout_ms, client.stream_idle_timeout_ms, max_tokens);
+        client.abort_registry.setIdleLimit(req_ptr, body_idle_limit_ms);
+        log.debugId("client", rid, "body idle limit {d}ms (head limit {d}ms, max_tokens {d})", .{ body_idle_limit_ms, client.stream_idle_timeout_ms, max_tokens });
 
         if (streaming) {
             // 所有权转给调用方：StreamResult.request 拥有 req_ptr，StreamResponse.deinit
@@ -954,10 +1031,13 @@ pub const Client = struct {
 
         // 非流式：读取完整 body；结束后立即 deinit+destroy req_ptr（不再返回）
         var transfer_buf: [8192]u8 = undefined;
-        const body_reader = req_ptr.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
-        const response_body = body_reader.allocRemaining(client.allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
-            if (client.abort_registry.stalledIdleMs(req_ptr)) |idle| {
-                log.warnId("client", rid, "response body idle for {d}ms (idle limit {d}ms): connection shut down", .{ idle, client.stream_idle_timeout_ms });
+        const raw_body_reader = req_ptr.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
+        // 字节级续命(同流式路径):大 body 分多次 recv 到达,每次都是活着的证据。
+        var liveness_buf: [8192]u8 = undefined;
+        var liveness = liveness_reader.LivenessReader.init(raw_body_reader, &client.abort_registry, req_ptr, &liveness_buf);
+        const response_body = liveness.interface.allocRemaining(client.allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
+            if (client.abort_registry.stalled(req_ptr)) |stall| {
+                reportBodyStall("client", rid, stall);
                 return error.StreamStalled;
             }
             log.errId("client", rid, "read body failed: {s}", .{@errorName(err)});
@@ -1152,6 +1232,10 @@ pub const StreamResponse = struct {
     stream_result: StreamResult,
     event_iter: api_stream.EventIterator = undefined,
     iter_initialized: bool = false,
+    /// 字节级活性适配器(见 api/liveness_reader.zig):包在 http body reader 外面,每次传输层
+    /// 读到字节就给注册表 touch。首次 next 时初始化,之后 self 不可移动(内含 buffer 指针)。
+    liveness: liveness_reader.LivenessReader = undefined,
+    liveness_buf: [8192]u8 = undefined,
     abort: ?*const AbortSignal = null,
     done: bool = false,
     /// 本轮用户原始输入(borrowed),透传给 EventIterator 供 web_search 显示真实 query。
@@ -1240,13 +1324,25 @@ pub const StreamResponse = struct {
         return self.event_iter.last_stop_reason;
     }
 
+    /// 注册表对这条请求的 stall 判定(null = 没被监视线程 shutdown 过,读错误另有原因)。
+    fn stalledVerdict(self: *StreamResponse) ?provider_mod.RequestAbortRegistry.Stall {
+        const registry = self.stream_result.abort_registry orelse return null;
+        return registry.stalled(self.stream_result.request);
+    }
+
     /// 读下一个事件。首次调用时懒初始化 EventIterator——Response.reader 的返回是一个
     /// 指向 self.stream_result 内部字段的指针，必须在 self 稳定后才能取地址。
     pub fn next(self: *StreamResponse) !?StreamEvent {
         if (self.done) return null;
 
         if (!self.iter_initialized) {
-            const reader = self.stream_result.response.reader(&self.stream_result.transfer_buf);
+            const raw_reader = self.stream_result.response.reader(&self.stream_result.transfer_buf);
+            // 字节级续命:每次 recv 到字节就 touch——tool_use 参数的 input_json_delta 串、ping、
+            // unknown 事件都不再是"沉默"。无注册表(纯测试构造)时直接用裸 reader。
+            const reader = if (self.stream_result.abort_registry) |registry| blk: {
+                self.liveness = liveness_reader.LivenessReader.init(raw_reader, registry, self.stream_result.request, &self.liveness_buf);
+                break :blk &self.liveness.interface;
+            } else raw_reader;
             self.event_iter = if (self.abort) |a|
                 api_stream.EventIterator.initWithAbort(reader, a)
             else
@@ -1263,11 +1359,9 @@ pub const StreamResponse = struct {
             },
             error.ReadFailed => {
                 // 监视线程因沉默 shutdown 了连接 → 读失败的真因是 stall,不是网络。
-                if (self.stream_result.abort_registry) |registry| {
-                    if (registry.stalledIdleMs(self.stream_result.request)) |idle| {
-                        log.warnId("stream", self.id, "no bytes for {d}ms: stream stalled, connection shut down", .{idle});
-                        return error.StreamStalled;
-                    }
+                if (self.stalledVerdict()) |stall| {
+                    reportBodyStall("stream", self.id, stall);
+                    return error.StreamStalled;
                 }
                 log.warnId("stream", self.id, "event_iter.next failed: {s}", .{@errorName(err)});
                 return error.RequestFailed;
@@ -1287,10 +1381,16 @@ pub const StreamResponse = struct {
                 return error.RequestFailed;
             },
         };
-        // 每个事件都是活着的证据:重置空闲时钟(思考阶段一样有 thinking_delta 流过)。
-        if (self.stream_result.abort_registry) |registry| registry.touch(self.stream_result.request);
+        // 空闲时钟不在这里续:活性证据是字节(LivenessReader),不是解析出的事件——按事件续命
+        // 会把 tool_use 参数流(全是 continue 掉的 input_json_delta)当成沉默。
         const ev = ev_opt orelse {
             self.done = true;
+            // EOF 而无 message_stop:若连接是被监视线程 shutdown 的(非 chunked 编码下读到的是
+            // 干净 EOF 而不是 ReadFailed),这仍是 stall,不能装成正常收尾。
+            if (self.stalledVerdict()) |stall| {
+                reportBodyStall("stream", self.id, stall);
+                return error.StreamStalled;
+            }
             return null;
         };
         return switch (ev) {

@@ -364,8 +364,10 @@ pub const AgentJobRegistry = struct {
     dialect_resolver: dialect_mod.Resolver = .builtin(),
     limits: ?@import("../api/model_limits.zig").ModelLimitsSource = null,
     catalog_snapshot: ?@import("../api/catalog.zig").Catalog = null,
-    /// per-job provider 的流空闲上限;null = env/默认(见 provider_factory.Options)。测试注入小值。
+    /// per-job provider 的收头阶段流空闲上限;null = env/默认(见 provider_factory.Options)。测试注入小值。
     stream_idle_timeout_ms: ?u64 = null,
+    /// per-job provider 的正文阶段流空闲上限平覆盖;null = env/按 max_tokens 自动。测试注入小值。
+    stream_body_idle_timeout_ms: ?u64 = null,
     seq: u32 = 0,
 
     pub fn init(
@@ -582,7 +584,7 @@ pub const AgentJobRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
-            .{ .auth_scheme = self.auth_scheme, .limits = self.limits, .stream_idle_timeout_ms = self.stream_idle_timeout_ms },
+            .{ .auth_scheme = self.auth_scheme, .limits = self.limits, .stream_idle_timeout_ms = self.stream_idle_timeout_ms, .stream_body_idle_timeout_ms = self.stream_body_idle_timeout_ms },
         );
         errdefer if (!committed) owned.deinit();
 
@@ -952,7 +954,7 @@ pub const AgentJobRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
-            .{ .auth_scheme = self.auth_scheme, .limits = limits, .stream_idle_timeout_ms = self.stream_idle_timeout_ms },
+            .{ .auth_scheme = self.auth_scheme, .limits = limits, .stream_idle_timeout_ms = self.stream_idle_timeout_ms, .stream_body_idle_timeout_ms = self.stream_body_idle_timeout_ms },
         );
     }
 

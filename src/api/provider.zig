@@ -40,8 +40,18 @@ pub const RetryReporter = api_stream.RetryReporter;
 /// returns instead of waiting forever — a TUI session froze for 40 minutes on a
 /// gateway connection that stayed ESTABLISHED and silent; nothing else (abort
 /// flag, watchdog, Ctrl+C) can wake a thread that sits in `readv`. The
-/// transport reads `stalledIdleMs` afterwards to report `StreamStalled` rather
-/// than a generic connection error, and refreshes `touch` on every event.
+/// transport reads `stalled` afterwards to report `StreamStalled` rather than
+/// a generic connection error.
+///
+/// **Two phases, two limits (2026-09-11)**: the clock is refreshed by
+/// `LivenessReader` on every transport read — bytes are the evidence of life,
+/// not parsed events. A tool call's `input_json_delta` frames, SSE pings and
+/// unknown events used to leave the clock untouched, so a legitimate 126 s
+/// tool call died as "stalled" although bytes arrived every second. The
+/// request is registered with the strict head-phase limit; once the response
+/// head is accepted the transport switches the slot to the body-phase limit
+/// with `setIdleLimit` (larger: a gateway may generate a whole tool call
+/// before writing a single byte of it).
 pub const RequestAbortRegistry = struct {
     const ShutdownFn = *const fn (ctx: *anyopaque) void;
     const Slot = struct {
@@ -59,6 +69,14 @@ pub const RequestAbortRegistry = struct {
 
     /// Monitor wake-up interval; also bounds how late a stall is detected.
     pub const MONITOR_TICK_MS: u64 = 250;
+
+    /// What the monitor recorded when it shut a silent request down: how long
+    /// the request had been silent and which limit was in force at the time
+    /// (head- or body-phase). The transport names the failure with both.
+    pub const Stall = struct {
+        idle_ms: u64,
+        limit_ms: u64,
+    };
 
     mutex: sync.Mutex = .{},
     slots: std.ArrayList(Slot) = .empty,
@@ -99,14 +117,35 @@ pub const RequestAbortRegistry = struct {
         // Close the race where abort was accepted just before the transport
         // published its request in this registry.
         if (signal) |s| if (s.isAborted()) shutdown_fn(ctx);
-        if (idle_limit_ms > 0 and self.monitor == null) {
-            self.monitor_stop = false;
-            self.monitor = std.Thread.spawn(.{}, monitorMain, .{self}) catch |err| blk: {
-                // No monitor = no liveness guarantee for this process; say so
-                // once rather than pretending the limit is enforced.
-                log.warn("client", "stream liveness monitor unavailable ({s}); idle limit {d}ms will not be enforced", .{ @errorName(err), idle_limit_ms });
-                break :blk null;
-            };
+        self.ensureMonitorLocked(idle_limit_ms);
+    }
+
+    /// Spawn the monitor thread on first monitored registration. Caller holds
+    /// the mutex. A limit of 0 never needs a monitor.
+    fn ensureMonitorLocked(self: *RequestAbortRegistry, idle_limit_ms: u64) void {
+        if (idle_limit_ms == 0 or self.monitor != null) return;
+        self.monitor_stop = false;
+        self.monitor = std.Thread.spawn(.{}, monitorMain, .{self}) catch |err| blk: {
+            // No monitor = no liveness guarantee for this process; say so
+            // once rather than pretending the limit is enforced.
+            log.warn("client", "stream liveness monitor unavailable ({s}); idle limit {d}ms will not be enforced", .{ @errorName(err), idle_limit_ms });
+            break :blk null;
+        };
+    }
+
+    /// Phase switch: the response head has been accepted, so from now on the
+    /// request is judged against `limit_ms` (0 = stop monitoring it). The
+    /// clock restarts here as well — the head itself was activity. A slot
+    /// the monitor has already shut down keeps its verdict.
+    pub fn setIdleLimit(self: *RequestAbortRegistry, ctx: *anyopaque, limit_ms: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.slots.items) |*active| {
+            if (active.ctx != ctx) continue;
+            active.idle_limit_ms = limit_ms;
+            active.last_activity_ms = monotonicMs();
+            self.ensureMonitorLocked(limit_ms);
+            return;
         }
     }
 
@@ -130,7 +169,7 @@ pub const RequestAbortRegistry = struct {
     }
 
     /// Bytes arrived for `ctx`: restart its idle clock. Cheap (one uncontended
-    /// lock); called per stream event.
+    /// lock); called per transport read (`LivenessReader`), i.e. per `recv`.
     pub fn touch(self: *RequestAbortRegistry, ctx: *anyopaque) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -164,10 +203,18 @@ pub const RequestAbortRegistry = struct {
     /// How long `ctx` had been silent when the monitor shut it down; null =
     /// not stalled (any read error then has another cause).
     pub fn stalledIdleMs(self: *RequestAbortRegistry, ctx: *anyopaque) ?u64 {
+        return (self.stalled(ctx) orelse return null).idle_ms;
+    }
+
+    /// The monitor's verdict for `ctx` with the limit that was in force; null =
+    /// not stalled (any read error then has another cause).
+    pub fn stalled(self: *RequestAbortRegistry, ctx: *anyopaque) ?Stall {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.slots.items) |active| {
-            if (active.ctx == ctx) return active.stalled_after_ms;
+            if (active.ctx != ctx) continue;
+            const idle = active.stalled_after_ms orelse return null;
+            return .{ .idle_ms = idle, .limit_ms = active.idle_limit_ms };
         }
         return null;
     }
@@ -495,11 +542,66 @@ test "RequestAbortRegistry: reapStalled shuts a silent request down once, touch 
     try std.testing.expectEqual(@as(u32, 0), unwatched.shutdowns.load(.acquire));
     try std.testing.expect(registry.stalledIdleMs(@ptrCast(&watched)).? >= 1_000);
     try std.testing.expect(registry.stalledIdleMs(@ptrCast(&unwatched)) == null);
+    const verdict = registry.stalled(@ptrCast(&watched)).?;
+    try std.testing.expect(verdict.idle_ms >= 1_000);
+    try std.testing.expectEqual(@as(u64, 1_000), verdict.limit_ms);
+    try std.testing.expect(registry.stalled(@ptrCast(&unwatched)) == null);
     // A liveness-only slot is not cancellable through any signal.
     var signal = AbortSignal.init();
     signal.abort(.user_ctrl_c);
     registry.cancel(&signal);
     try std.testing.expectEqual(@as(u32, 1), watched.shutdowns.load(.acquire));
+}
+
+test "RequestAbortRegistry: setIdleLimit switches the slot to the body-phase limit, restarts the clock, and 0 stops monitoring" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(a);
+    var probe = LivenessProbe{};
+    // Registered under the strict head-phase limit.
+    try registry.registerMonitored(a, null, @ptrCast(&probe), LivenessProbe.shutdown, 1_000);
+    defer registry.unregister(@ptrCast(&probe));
+    const registered_at = registry.slots.items[0].last_activity_ms;
+    // Head accepted: the body phase is judged against a larger limit. The old
+    // limit no longer applies even though more than 1s of "silence" elapsed.
+    registry.setIdleLimit(@ptrCast(&probe), 5_000);
+    const switched_at = registry.slots.items[0].last_activity_ms;
+    try std.testing.expect(switched_at >= registered_at);
+    try std.testing.expectEqual(@as(u64, 5_000), registry.slots.items[0].idle_limit_ms);
+    try std.testing.expectEqual(@as(usize, 0), registry.reapStalled(switched_at + 4_999));
+    try std.testing.expect(registry.stalled(@ptrCast(&probe)) == null);
+    try std.testing.expectEqual(@as(usize, 1), registry.reapStalled(switched_at + 5_000));
+    const verdict = registry.stalled(@ptrCast(&probe)).?;
+    try std.testing.expectEqual(@as(u64, 5_000), verdict.limit_ms);
+    try std.testing.expect(verdict.idle_ms >= 5_000);
+    try std.testing.expectEqual(@as(u32, 1), probe.shutdowns.load(.acquire));
+
+    // A limit of 0 takes a fresh slot out of monitoring entirely.
+    var quiet = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&quiet), LivenessProbe.shutdown, 1_000);
+    defer registry.unregister(@ptrCast(&quiet));
+    registry.setIdleLimit(@ptrCast(&quiet), 0);
+    const quiet_at = registry.slots.items[1].last_activity_ms;
+    try std.testing.expectEqual(@as(usize, 0), registry.reapStalled(quiet_at + 1_000_000));
+    try std.testing.expect(registry.stalled(@ptrCast(&quiet)) == null);
+    try std.testing.expectEqual(@as(u32, 0), quiet.shutdowns.load(.acquire));
+}
+
+test "RequestAbortRegistry: setIdleLimit on a slot registered without monitoring spawns the monitor" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(a);
+    var probe = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&probe), LivenessProbe.shutdown, 0);
+    defer registry.unregister(@ptrCast(&probe));
+    try std.testing.expect(registry.monitor == null);
+    registry.setIdleLimit(@ptrCast(&probe), 50);
+    try std.testing.expect(registry.monitor != null);
+    var waited: u64 = 0;
+    while (registry.stalled(@ptrCast(&probe)) == null and waited < 5_000) : (waited += 10) {
+        @import("../util/time.zig").sleepMs(10);
+    }
+    try std.testing.expect(registry.stalled(@ptrCast(&probe)).?.idle_ms >= 50);
 }
 
 test "RequestAbortRegistry: the monitor thread reaps a stalled request on its own and stops promptly on deinit" {
