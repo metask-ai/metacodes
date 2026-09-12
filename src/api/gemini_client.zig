@@ -43,6 +43,8 @@ const json_mod = @import("../json.zig");
 const util_json = @import("../util/json.zig");
 const api_stream = @import("stream.zig");
 const provider_mod = @import("provider.zig");
+const client_mod = @import("../client.zig");
+const liveness_reader = @import("liveness_reader.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
@@ -81,6 +83,10 @@ pub const GeminiClient = struct {
     model: []const u8,
     http_client: http.Client,
     abort_registry: provider_mod.RequestAbortRegistry = .{},
+    /// 收头阶段空闲上限,见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
+    stream_idle_timeout_ms: u64 = client_mod.DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    /// 正文阶段空闲上限的平覆盖;null = 按 max_tokens 自动(client.zig bodyIdleLimitMs)。
+    stream_body_idle_timeout_ms: ?u64 = null,
     max_tokens: u32 = 8192,
     model_context: ?*const model_context_mod.ModelContext = null,
     context_window: u32 = 1_048_576, // Gemini 1.5/2.x 默认 1M(保守;未按 model 区分)
@@ -103,6 +109,8 @@ pub const GeminiClient = struct {
             .base_url = base_url orelse DEFAULT_GEMINI_BASE,
             .model = model,
             .http_client = http.Client{ .allocator = allocator, .io = io },
+            .stream_idle_timeout_ms = client_mod.streamIdleTimeoutMsFromEnv(),
+            .stream_body_idle_timeout_ms = client_mod.streamBodyIdleTimeoutMsFromEnv(),
         };
     }
     pub fn deinit(self: *GeminiClient) void {
@@ -162,6 +170,7 @@ pub const GeminiClient = struct {
             .requestOverridesFn = &pRequestOverrides,
             .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
+            .supportsForModelFn = &pSupportsForModel,
         };
     }
     inline fn cast(ctx: *anyopaque) *GeminiClient {
@@ -204,6 +213,10 @@ pub const GeminiClient = struct {
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         return capability.supports(.gemini, cast(ctx).model, cap);
+    }
+    fn pSupportsForModel(ctx: *anyopaque, cap: provider_mod.Capability, model: []const u8) bool {
+        _ = ctx;
+        return capability.supports(.gemini, model, cap);
     }
     fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!provider_mod.ApiResponse {
         _ = ctx;
@@ -286,21 +299,25 @@ pub const GeminiClient = struct {
             if (registered) self.abort_registry.unregister(req_ptr);
             req_ptr.deinit();
         }
-        if (abort) |signal| {
-            try self.abort_registry.register(
-                self.allocator,
-                signal,
-                req_ptr,
-                shutdownRequest,
-            );
-            registered = true;
-        }
+        // 总是登记:abort 路由(有 signal 时)+ 空闲监视(见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS)。
+        try self.abort_registry.registerMonitored(
+            self.allocator,
+            abort,
+            req_ptr,
+            shutdownRequest,
+            self.stream_idle_timeout_ms,
+        );
+        registered = true;
         req_ptr.transfer_encoding = .{ .content_length = body.len };
         req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
             log.errId("gemini", rid, "send body failed: {s}", .{@errorName(err)});
             return error.RequestFailed;
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
+            if (self.abort_registry.stalled(req_ptr)) |stall| {
+                client_mod.reportHeadStall("gemini", rid, stall);
+                return error.TransientNetwork;
+            }
             log.errId("gemini", rid, "receiveHead failed: {s}", .{@errorName(err)});
             return err;
         };
@@ -310,6 +327,8 @@ pub const GeminiClient = struct {
             log.errId("gemini", rid, "HTTP {d} {s}", .{ status.code, status.name });
             return error.RequestFailed;
         }
+        // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
+        self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens));
         // receiveHead 成功后,req_ptr.* 是个开着连接的完整 Request。到 heap 转移所有权之前若出错
         // (create(GeminiStream) OOM),必须 deinit 它(否则泄漏 socket fd + 连接状态,非纯字节)。
         // errdefer LIFO:此 deinit 先跑、顶部 destroy 后跑 = 正确的 deinit()→destroy() 顺序。
@@ -322,7 +341,7 @@ pub const GeminiClient = struct {
             .request = req_ptr,
             .response = response,
             .abort = abort,
-            .abort_registry = if (abort != null) &self.abort_registry else null,
+            .abort_registry = &self.abort_registry,
             .id = rid,
         };
         return heap.handle();
@@ -336,6 +355,9 @@ const GeminiStream = struct {
     response: http.Client.Response,
     transfer_buf: [8192]u8 = undefined,
     reader: ?*std.Io.Reader = null,
+    /// 字节级活性适配器(见 liveness_reader.zig):首次 next 时包在 body reader 外;heap 分配,地址稳定。
+    liveness: liveness_reader.LivenessReader = undefined,
+    liveness_buf: [8192]u8 = undefined,
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
@@ -381,6 +403,12 @@ const GeminiStream = struct {
         self.allocator.destroy(self.request);
     }
 
+    /// 注册表对这条请求的 stall 判定(null = 没被监视线程 shutdown 过,读错误另有原因)。
+    fn stalledVerdict(self: *GeminiStream) ?provider_mod.RequestAbortRegistry.Stall {
+        const registry = self.abort_registry orelse return null;
+        return registry.stalled(self.request);
+    }
+
     fn next(self: *GeminiStream) anyerror!?StreamEvent {
         // 并行 functionCall 队列优先 drain(一个 chunk 多个 functionCall 的其余)。
         if (self.fc_pos < self.fc_queue.items.len) {
@@ -394,13 +422,32 @@ const GeminiStream = struct {
             return StreamEvent{ .usage = u };
         }
         if (self.done) return null;
-        if (self.reader == null) self.reader = self.response.reader(&self.transfer_buf);
+        if (self.reader == null) {
+            const raw = self.response.reader(&self.transfer_buf);
+            // 字节级续命:每次 recv 到字节就 touch(见 liveness_reader.zig)。
+            self.reader = if (self.abort_registry) |registry| blk: {
+                self.liveness = liveness_reader.LivenessReader.init(raw, registry, self.request, &self.liveness_buf);
+                break :blk &self.liveness.interface;
+            } else raw;
+        }
         const r = self.reader.?;
         while (true) {
             if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
-            const line_opt = try r.takeDelimiter('\n');
+            const line_opt = r.takeDelimiter('\n') catch |err| {
+                self.done = true;
+                if (self.stalledVerdict()) |stall| {
+                    client_mod.reportBodyStall("gemini", self.id, stall);
+                    return error.StreamStalled;
+                }
+                return err;
+            };
             const line = line_opt orelse {
                 self.done = true;
+                // EOF:连接若是被监视线程 shutdown 的,这是 stall 而非正常收尾。
+                if (self.stalledVerdict()) |stall| {
+                    client_mod.reportBodyStall("gemini", self.id, stall);
+                    return error.StreamStalled;
+                }
                 // 流尽:若还有 pending usage(末 chunk 只含内容+usage,内容已 emit),吐它。
                 if (self.pending_usage) |u| {
                     self.pending_usage = null;

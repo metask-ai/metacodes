@@ -926,7 +926,14 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                     if _task_list_has_kg_status(result["content"]):
                         tinykg["task_tinykg_status_results"] += 1
                     continue
-                payload = _result_object(result["content"], name)
+                try:
+                    payload = _result_object(result["content"], name)
+                except TraceError:
+                    # metacodes' Task* tools can answer with plain text (observed
+                    # 2026-09-05: a successful TaskUpdate whose result was not JSON).
+                    # The call is already counted above; only the kg_status detail
+                    # is unavailable, which must not abort the whole trial.
+                    continue
                 kg_status = payload.get("kg_status")
                 if kg_status is None and name == "TaskCreate":
                     task = payload.get("task")

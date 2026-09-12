@@ -892,7 +892,7 @@ pub const App = struct {
         // 环境段 cwd 用进程 cwd(CLI 语义);Session 库消费方用 workspace.root(见 agent_session)。
         const cli_cwd = @import("util/fs.zig").getCwd(allocator) catch "";
         defer if (cli_cwd.len > 0) allocator.free(cli_cwd);
-        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model_display_name orelse app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cli_cwd) catch |err| blk: {
+        app.system_prompt = system_prompt_mod.buildFullWithDefs(allocator, app.config.model_display_name orelse app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cli_cwd, app.tool_defs) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };
@@ -1711,7 +1711,7 @@ pub const App = struct {
         // The startup display identity is bound to the startup transport route.
         // An explicit /model switch selects a new real model and must not keep
         // advertising the old backend identity.
-        const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), sw_cwd) catch null;
+        const new_system_prompt = sp_mod.buildFullWithDefs(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), sw_cwd, app.tool_defs) catch null;
 
         // U3:先同步全部 model 值镜像(seam,不含 config.model=启动快照/system_prompt=派生重建/
         // usage anchor=作废重建),**再** free 旧 model_switch_owned。

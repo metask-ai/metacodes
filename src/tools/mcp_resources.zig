@@ -17,18 +17,51 @@ const std = @import("std");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const ToolResultBody = @import("context.zig").ToolResultBody;
+const McpSessionEntry = @import("../core/mcp_session.zig").McpSessionEntry;
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const result_budget = @import("../core/result_budget.zig");
 const result_spool = @import("result_spool.zig");
 
 const LAST_ERROR_DETAIL_MAX_BYTES: usize = 512;
 
+const NO_MCP_SESSIONS_DETAIL = "No MCP servers are connected in this session. Declare servers in ~/.metacodes/config.json under \"mcp_servers\" (see /mcp) and restart; their tools then register as <server>__<tool> and are listed under \"# Deferred tools\".";
+
+/// 本 session 连接的 MCP session 列表。宿主没接 MCP(null)或一个 server 都没连(空)都是
+/// `NoMcpSessions`——空数组 `{"resources":[]}` 会让模型以为"server 在,只是没资源",
+/// 然后去猜工具名(实测:模型把 mecode/Claude Code 的 mcp_server.py 进程当成本 session 的)。
+fn connectedSessions(ctx: *const ToolContext) ![]McpSessionEntry {
+    const sessions = ctx.mcp_sessions orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, NO_MCP_SESSIONS_DETAIL, .{});
+        return error.NoMcpSessions;
+    };
+    if (sessions.len == 0) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, NO_MCP_SESSIONS_DETAIL, .{});
+        return error.NoMcpSessions;
+    }
+    return sessions.*;
+}
+
+/// `server` 过滤值必须是已连接的 server 名;否则报 McpServerNotFound 并列出已连接的名字。
+fn requireServer(ctx: *const ToolContext, sessions: []McpSessionEntry, filter: ?[]const u8) !void {
+    const wanted = filter orelse return;
+    for (sessions) |*entry| if (std.mem.eql(u8, wanted, entry.name)) return;
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(ctx.allocator);
+    for (sessions, 0..) |*entry, i| {
+        if (i > 0) try names.appendSlice(ctx.allocator, ", ");
+        try names.appendSlice(ctx.allocator, entry.name);
+    }
+    common.setErrorDetail(ctx.error_detail, ctx.allocator, "MCP server \"{s}\" is not connected in this session. Connected servers: {s}. Omit \"server\" to list resources across all of them.", .{ wanted, names.items });
+    return error.McpServerNotFound;
+}
+
 pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
     if (ctx.artifact_root.len == 0)
         return ToolResultBody.initInline(try listExecute(ctx, args));
     const allocator = ctx.allocator;
-    const sessions = ctx.mcp_sessions orelse return error.NoMcpSessions;
+    const sessions = try connectedSessions(ctx);
     const server_filter = common.extractJsonArg(args, "server");
+    try requireServer(ctx, sessions, server_filter);
     var capture = try artifact_store.Capture.begin(
         allocator,
         ctx.artifact_root,
@@ -38,7 +71,7 @@ pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
     var output = result_spool.CaptureWriter.init(&capture);
     try output.writer.writeAll("{\"resources\":[");
     var first = true;
-    for (sessions.*) |*entry| {
+    for (sessions) |*entry| {
         if (server_filter) |filter| if (!std.mem.eql(u8, filter, entry.name)) continue;
         var body = entry.client.listResourcesBodyAbortable(ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| {
             @import("../util/log.zig").warn("mcp", "list_resources failed for {s}: {s}", .{ entry.name, @errorName(err) });
@@ -186,15 +219,16 @@ fn duplicateStructuredErrorDetail(
 
 pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const a = ctx.allocator;
-    const sessions = ctx.mcp_sessions orelse return error.NoMcpSessions;
+    const sessions = try connectedSessions(ctx);
     const server_filter = common.extractJsonArg(args, "server");
+    try requireServer(ctx, sessions, server_filter);
 
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     try out.writer.writeAll("{\"resources\":[");
 
     var first = true;
-    for (sessions.*) |*entry| {
+    for (sessions) |*entry| {
         if (server_filter) |sf| {
             if (!std.mem.eql(u8, sf, entry.name)) continue;
         }
@@ -369,6 +403,27 @@ test "ArrayIter: iterates objects" {
 test "list: missing mcp_sessions errors" {
     const ctx = ToolContext.simple(testing.allocator);
     try testing.expectError(error.NoMcpSessions, listExecute(&ctx, "{}"));
+}
+
+test "list: zero connected servers is NoMcpSessions with a config hint, not an empty resources array" {
+    const a = testing.allocator;
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    var empty: []McpSessionEntry = &.{};
+    const ctx = ToolContext{ .allocator = a, .mcp_sessions = &empty, .error_detail = &detail };
+    try testing.expectError(error.NoMcpSessions, listExecute(&ctx, "{}"));
+    try testing.expect(std.mem.indexOf(u8, detail.?, "mcp_servers") != null);
+    a.free(detail.?);
+    detail = null;
+    // 带 server 过滤同样先报"没连"——不是 server_not_found,更不是空数组。
+    try testing.expectError(error.NoMcpSessions, listExecute(&ctx, "{\"server\":\"knowforge\"}"));
+    try testing.expect(detail != null);
+    // artifact 路径(有 artifact_root)同一行为。
+    a.free(detail.?);
+    detail = null;
+    const body_ctx = ToolContext{ .allocator = a, .mcp_sessions = &empty, .error_detail = &detail, .artifact_root = "/tmp" };
+    try testing.expectError(error.NoMcpSessions, listExecuteBody(&body_ctx, "{\"server\":\"knowforge\"}"));
+    try testing.expect(detail != null);
 }
 
 test "read: missing uri errors" {

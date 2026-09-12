@@ -67,7 +67,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     if (matched.items.len == 0) {
-        setDetail(ctx, allocator, "No deferred tool matched query \"{s}\". Deferred tools are listed by name in the system prompt; use select:<exact_name> to fetch one.", .{query});
+        // 落空时把现在真能激活的 deferred 名单直接给模型:比"去 system prompt 找"有用——
+        // 动态(MCP)工具的名字模型未必记得,关键字匹配又是 AND 语义,一次猜错就该有出路。
+        const available = try availableDeferredNames(ctx, allocator);
+        defer allocator.free(available);
+        if (available.len > 0) {
+            setDetail(ctx, allocator, "No deferred tool matched query \"{s}\". Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{ query, available });
+        } else {
+            setDetail(ctx, allocator, "No deferred tool matched query \"{s}\": no deferred tools are registered in this session (no MCP server or plugin tool is connected). Use the tools already in your tool list.", .{query});
+        }
         return error.NoToolMatch;
     }
 
@@ -83,10 +91,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const schema: []u8 = tools.toolSchemaJson(allocator, name) catch blk: {
             const dr = ctx.dyn_registry orelse return error.UnknownTool;
             const e = dr.find(name) orelse return error.UnknownTool;
+            // 有借用的完整 schema(MCP inputSchema / 插件定义)就给模型完整参数;
+            // 只有 required 名单的旧式注册才退化成空 properties。
             const def = json_mod.ToolDefinition{
                 .name = e.name,
                 .description = e.description,
-                .input_schema = .{ .type = "object", .properties = null, .required = e.required_fields },
+                .input_schema = e.borrowed_input_schema orelse .{ .type = "object", .properties = null, .required = e.required_fields },
             };
             var b: std.ArrayList(u8) = .empty;
             errdefer b.deinit(allocator);
@@ -100,20 +110,52 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try out.toOwnedSlice();
 }
 
-/// query 的每个空白分词都要在 name+description(小写)里出现才算命中(AND 语义,对齐 cc)。
+/// 本 session 当前可激活的 deferred 工具名(静态 deferred 受执行策略/TinyKG 门控;动态
+/// deferred = MCP/插件)。逗号分隔,超过 `MAX_LISTED_NAMES` 个只给前面的加计数。owned。
+pub const MAX_LISTED_NAMES: usize = 40;
+
+fn availableDeferredNames(ctx: *const ToolContext, allocator: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var count: usize = 0;
+    var omitted: usize = 0;
+    for (tools.registry) |*t| {
+        if (!t.deferred) continue;
+        if (t.tinykg_gated and ctx.kg == null) continue;
+        if (ctx.execution_policy) |policy| if (!policy.allowsTool(t.name)) continue;
+        try appendName(allocator, &out, t.name, &count, &omitted);
+    }
+    if (ctx.dyn_registry) |dr| {
+        for (dr.entries.items) |*e| {
+            if (!e.deferred) continue;
+            if (ctx.execution_policy) |policy| if (!policy.allowsTool(e.name)) continue;
+            try appendName(allocator, &out, e.name, &count, &omitted);
+        }
+    }
+    if (omitted > 0) try out.print(allocator, ", … ({d} more)", .{omitted});
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendName(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, count: *usize, omitted: *usize) !void {
+    if (count.* >= MAX_LISTED_NAMES) {
+        omitted.* += 1;
+        return;
+    }
+    if (count.* > 0) try out.appendSlice(allocator, ", ");
+    try out.appendSlice(allocator, name);
+    count.* += 1;
+}
+
+/// query 的每个空白分词都要在 name 或 description 里出现(忽略大小写)才算命中(AND 语义,
+/// 对齐 cc)。不经定长栈缓冲:MCP server 的描述动辄上 KB,旧实现 512 字节的 bufPrint 一
+/// 溢出就整条返回 false——描述越详尽的工具越搜不到。
 fn matchesKeywords(query: []const u8, name: []const u8, description: []const u8) bool {
-    var buf: [512]u8 = undefined;
-    const hay = std.fmt.bufPrint(&buf, "{s} {s}", .{ name, description }) catch return false;
-    var lower_buf: [512]u8 = undefined;
-    const hay_lower = std.ascii.lowerString(lower_buf[0..hay.len], hay);
     var it = std.mem.tokenizeAny(u8, query, " \t,");
     var any = false;
     while (it.next()) |tok| {
         any = true;
-        var tb: [64]u8 = undefined;
-        if (tok.len > tb.len) return false;
-        const tl = std.ascii.lowerString(tb[0..tok.len], tok);
-        if (std.mem.indexOf(u8, hay_lower, tl) == null) return false;
+        if (std.ascii.indexOfIgnoreCase(name, tok) == null and
+            std.ascii.indexOfIgnoreCase(description, tok) == null) return false;
     }
     return any;
 }
@@ -137,6 +179,10 @@ fn testActivate(state: *anyopaque, name: []const u8) anyerror!void {
 
 fn dynExec(_: *const ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8 {
     return testing.allocator.dupe(u8, "ok");
+}
+
+fn dynExecBody(_: *const ToolContext, _: []const u8, _: ?*anyopaque) anyerror!@import("context.zig").ToolResultBody {
+    return @import("context.zig").ToolResultBody.initInline(try testing.allocator.dupe(u8, "ok"));
 }
 
 test "ToolSearch: select 静态工具返回 schema + 激活" {
@@ -188,6 +234,81 @@ test "ToolSearch: 无匹配 → NoToolMatch + detail" {
     try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"select:NoSuchToolXYZ\"}"));
     try testing.expect(detail != null);
     if (detail) |d| a.free(d);
+}
+
+test "ToolSearch: 落空时 detail 列出当前可激活的 deferred 工具名(含 MCP)" {
+    const a = testing.allocator;
+    var dyn = DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("knowforge__search", "Search the knowledge base", &.{}, dynExec, null, true);
+    try dyn.register("knowforge__overview", "Knowledge base overview", &.{}, dynExec, null, true);
+    try dyn.register("skill__resident", "resident tool, not deferred", &.{}, dynExec, null, false);
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    const ctx = ToolContext{ .allocator = a, .dyn_registry = &dyn, .error_detail = &detail };
+    // AND 语义:一个工具名里不可能同时含 list_knowledge_bases 和 overview → 落空。
+    try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"knowforge list_knowledge_bases overview\"}"));
+    const d = detail orelse return error.TestExpectedDetail;
+    try testing.expect(std.mem.indexOf(u8, d, "knowforge__search") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "knowforge__overview") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "skill__resident") == null);
+    try testing.expect(std.mem.indexOf(u8, d, "select:<exact_name>") != null);
+    // 静态 deferred 受同样的门控:唯一的静态 deferred(FormalAuditTask)是 TinyKG 门控,
+    // 本 ctx 没有 kg → 不列(列了模型也激活不了)。
+    try testing.expect(std.mem.indexOf(u8, d, "FormalAuditTask") == null);
+}
+
+test "ToolSearch: select MCP 工具时 <function> 块带完整 inputSchema(properties/required)" {
+    const a = testing.allocator;
+    test_activated = .empty;
+    defer test_activated.deinit(a);
+    var dyn = DynRegistry.init(a);
+    defer dyn.deinit();
+    var inner: std.json.ObjectMap = .empty;
+    defer inner.deinit(a);
+    try inner.put(a, "type", .{ .string = "string" });
+    var props: std.json.ObjectMap = .empty;
+    defer props.deinit(a);
+    try props.put(a, "query", .{ .object = inner });
+    const required = [_][]const u8{"query"};
+    try dyn.registerMcpDefinitionBody(.{
+        .name = "knowforge__search",
+        .description = "Search a knowledge base",
+        .input_schema = .{ .type = "object", .properties = props, .required = &required },
+        .deferred = true,
+        .mcp_server = "knowforge",
+    }, dynExecBody, null, "knowforge");
+    var dummy: u8 = 0;
+    const ctx = ToolContext{
+        .allocator = a,
+        .dyn_registry = &dyn,
+        .host_services = .{ .ctx = @ptrCast(&dummy), .activateToolFn = &testActivate },
+    };
+    const out = try execute(&ctx, "{\"query\":\"select:knowforge__search\"}");
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"query\":{\"type\":\"string\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"required\":[\"query\"]") != null);
+    try testing.expectEqualStrings("knowforge__search", test_activated.items[0]);
+}
+
+test "ToolSearch: 长描述(>512B)的 MCP 工具关键字仍可命中" {
+    const a = testing.allocator;
+    test_activated = .empty;
+    defer test_activated.deinit(a);
+    var dyn = DynRegistry.init(a);
+    defer dyn.deinit();
+    const long_desc = "Search fragments in a knowledge base by keyword. " ++ ("Lorem ipsum dolor sit amet, consectetur adipiscing elit. " ** 12) ++ " Returns matching fragments with source file names.";
+    comptime std.debug.assert(long_desc.len > 512);
+    try dyn.register("knowforge__search", long_desc, &.{}, dynExec, null, true);
+    var dummy: u8 = 0;
+    const ctx = ToolContext{
+        .allocator = a,
+        .dyn_registry = &dyn,
+        .host_services = .{ .ctx = @ptrCast(&dummy), .activateToolFn = &testActivate },
+    };
+    const out = try execute(&ctx, "{\"query\":\"KNOWFORGE fragments\"}");
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "knowforge__search") != null);
 }
 
 test "ToolSearch: 关键字不命中常驻内置工具(它们非 deferred)" {

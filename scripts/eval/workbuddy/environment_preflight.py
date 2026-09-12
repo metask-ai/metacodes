@@ -29,6 +29,10 @@ from .stage_artifacts import TARGET_PLATFORM
 SCHEMA_VERSION = "metacodes-workbuddy-environment-preflight-v3"
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,191}$")
 DEFAULT_HARNESS_IMAGE = "workbuddy-bench/harness/metacodes:0.1.0"
+# Image builds get a much longer budget than the other subprocesses: several
+# official security task images download a ~400 MB Ghidra release from GitHub
+# inside a RUN step, which takes well over an hour from CN hosts.
+BUILD_TIMEOUT_SECONDS = 4 * 3600
 MAX_DATASET_TASKS = 4096
 MAX_TASK_TOML_BYTES = 1024 * 1024
 MAX_DATASET_TASK_TOML_BYTES = 128 * 1024 * 1024
@@ -423,7 +427,9 @@ def _dataset_execution_identity(dataset_path: Path) -> Dict[str, object]:
             f"invalid WorkBuddy dataset contract: {dataset_toml}"
         ) from exc
     verifier: Dict[str, str] = {}
+    scoring: Dict[str, str] = {}
     identity_keys = {"schema", "engine", "plugin"}
+    scoring_keys = {"scorer"}
     section = ""
     for raw in text.splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -433,10 +439,18 @@ def _dataset_execution_identity(dataset_path: Path) -> Dict[str, object]:
         if header is not None:
             section = header.group(1)
             continue
-        if section != "verifier":
+        if section == "verifier":
+            target, keys = verifier, identity_keys
+        elif section == "scoring":
+            # wb-bench-sec-v1.0 declares no dataset-level verifier engine; its
+            # ``[scoring] scorer = "task-native"`` says every task ships its
+            # own tests/ scorer (bound per task below).  Read it with the same
+            # dependency-free extractor so the receipt still pins the choice.
+            target, keys = scoring, scoring_keys
+        else:
             continue
         assignment = re.match(r"([A-Za-z0-9_-]+)\s*=", line)
-        if assignment is None or assignment.group(1) not in identity_keys:
+        if assignment is None or assignment.group(1) not in keys:
             # The runner owns the complete TOML parser.  This dependency-free
             # host gate extracts only the fields that select executable verifier
             # behavior; unrelated numeric/list settings must not be rejected.
@@ -444,21 +458,25 @@ def _dataset_execution_identity(dataset_path: Path) -> Dict[str, object]:
         match = re.fullmatch(
             r"([A-Za-z0-9_-]+)\s*=\s*([\"'])([^\"']*)\2", line
         )
-        if match is None or match.group(1) in verifier:
+        if match is None or match.group(1) in target:
             raise EnvironmentPreflightError(
                 f"invalid WorkBuddy verifier contract: {dataset_toml}"
             )
-        verifier[match.group(1)] = match.group(3)
-    if not verifier:
+        target[match.group(1)] = match.group(3)
+    if not verifier and not scoring.get("scorer"):
         raise EnvironmentPreflightError(
             f"official WorkBuddy dataset has no verifier contract: {dataset_toml}"
         )
-    schema = verifier.get("schema")
-    engine = verifier.get("engine")
-    if not isinstance(schema, str) or not schema or not isinstance(engine, str) or not engine:
-        raise EnvironmentPreflightError(
-            f"WorkBuddy dataset verifier contract is incomplete: {dataset_toml}"
-        )
+    if verifier:
+        schema = verifier.get("schema")
+        engine = verifier.get("engine")
+        if not isinstance(schema, str) or not schema or not isinstance(engine, str) or not engine:
+            raise EnvironmentPreflightError(
+                f"WorkBuddy dataset verifier contract is incomplete: {dataset_toml}"
+            )
+    else:
+        schema = None
+        engine = scoring["scorer"]
 
     shared_identity: Dict[str, object] | None = None
     if engine == COMPOSITE_VERIFIER_ENGINE:
@@ -570,18 +588,41 @@ def _dataset_execution_identity(dataset_path: Path) -> Dict[str, object]:
             "content_sha256": _canonical_sha256(rows),
         }
 
+    dataset_toml_identity: Dict[str, object] = {
+        "path": str(dataset_toml.resolve(strict=True)),
+        "bytes": len(payload),
+        "sha256": _sha256_bytes(payload),
+        "schema": schema,
+        "engine": engine,
+    }
+    if scoring.get("scorer"):
+        # Only task-native datasets carry the key, so receipts of composite
+        # datasets keep their exact pre-existing shape.
+        dataset_toml_identity["scorer"] = scoring["scorer"]
     return {
         "dataset_root": str(dataset_root.resolve(strict=True)),
         "contract": "dataset-verifier",
-        "dataset_toml": {
-            "path": str(dataset_toml.resolve(strict=True)),
-            "bytes": len(payload),
-            "sha256": _sha256_bytes(payload),
-            "schema": schema,
-            "engine": engine,
-        },
+        "dataset_toml": dataset_toml_identity,
         "shared_verifier": shared_identity,
     }
+
+
+def _proxy_build_args() -> list[str]:
+    """Predefined proxy build-args for ``docker buildx build``.
+
+    BuildKit does not forward the client's proxy environment into RUN steps
+    (verified: an image built with http_proxy set in the caller's environment
+    saw an empty variable), so the host's build-time proxy - used on CN hosts
+    to reach an apt mirror - has to be passed explicitly.  The predefined
+    proxy arguments need no ARG declaration and are excluded from image
+    history, so the pinned image identity does not change.
+    """
+    args: list[str] = []
+    for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
+        value = os.environ.get(name)
+        if value:
+            args += ["--build-arg", f"{name}={value}"]
+    return args
 
 
 def prebuild(
@@ -620,9 +661,11 @@ def prebuild(
             "--load",
             "--tag",
             harness_image,
+            *_proxy_build_args(),
             str(harness_context),
         ],
         cwd=checkout,
+        timeout=BUILD_TIMEOUT_SECONDS,
     )
     if _tree_identity(harness_context) != harness_identity:
         raise EnvironmentPreflightError(
@@ -648,9 +691,11 @@ def prebuild(
                 "--load",
                 "--tag",
                 tag,
+                *_proxy_build_args(),
                 str(environment),
             ],
             cwd=checkout,
+            timeout=BUILD_TIMEOUT_SECONDS,
         )
         if _tree_identity(environment) != identity:
             raise EnvironmentPreflightError(

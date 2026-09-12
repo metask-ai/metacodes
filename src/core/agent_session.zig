@@ -1925,7 +1925,7 @@ pub const AgentSession = struct {
         const sp_names = try self.allocator.alloc([]const u8, tool_definitions.len);
         defer self.allocator.free(sp_names);
         for (tool_definitions, 0..) |d, i| sp_names[i] = d.name;
-        const system_prompt = sp_mod.buildFull(
+        const system_prompt = sp_mod.buildFullWithDefs(
             self.allocator,
             self.model,
             null,
@@ -1934,6 +1934,7 @@ pub const AgentSession = struct {
             "",
             false,
             self.workspace.root,
+            tool_definitions,
         ) catch null;
         defer if (system_prompt) |sp| self.allocator.free(sp);
 

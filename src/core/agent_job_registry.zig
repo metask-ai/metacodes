@@ -76,6 +76,10 @@ pub const JobEntry = struct {
     err_name: ?[]const u8 = null, // @errorName 静态字符串,不 own
     thread: ?std.Thread = null,
     abort: AbortSignal = undefined,
+    /// worker 线程在发第一个请求前登记的 provider 视图(借用 worker 栈上的 OwnedProvider);
+    /// abortAllRunning 据此 cancel 在飞请求(shutdown 连接叫醒卡住的读)。worker 退出前
+    /// 在 entry 锁内清空,cancel 与清空串行,不会指向已 deinit 的 client。
+    cancel_provider: ?@import("../api/provider.zig").Provider = null,
     allocator: std.mem.Allocator,
     started_ms: util_time.Millis = 0,
     desc_preview: []u8 = &.{}, // owned
@@ -360,6 +364,10 @@ pub const AgentJobRegistry = struct {
     dialect_resolver: dialect_mod.Resolver = .builtin(),
     limits: ?@import("../api/model_limits.zig").ModelLimitsSource = null,
     catalog_snapshot: ?@import("../api/catalog.zig").Catalog = null,
+    /// per-job provider 的收头阶段流空闲上限;null = env/默认(见 provider_factory.Options)。测试注入小值。
+    stream_idle_timeout_ms: ?u64 = null,
+    /// per-job provider 的正文阶段流空闲上限平覆盖;null = env/按 max_tokens 自动。测试注入小值。
+    stream_body_idle_timeout_ms: ?u64 = null,
     seq: u32 = 0,
 
     pub fn init(
@@ -576,7 +584,7 @@ pub const AgentJobRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
-            .{ .auth_scheme = self.auth_scheme, .limits = self.limits },
+            .{ .auth_scheme = self.auth_scheme, .limits = self.limits, .stream_idle_timeout_ms = self.stream_idle_timeout_ms, .stream_body_idle_timeout_ms = self.stream_body_idle_timeout_ms },
         );
         errdefer if (!committed) owned.deinit();
 
@@ -916,6 +924,10 @@ pub const AgentJobRegistry = struct {
             e.unlock();
             if (running) {
                 e.abort.abort(.user_ctrl_c);
+                // 标志只在事件之间被检查;真的把连接 shutdown 才能叫醒卡在 readv 里的 worker。
+                e.lock();
+                if (e.cancel_provider) |p| p.cancel(&e.abort);
+                e.unlock();
                 n += 1;
             }
         }
@@ -942,7 +954,7 @@ pub const AgentJobRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
-            .{ .auth_scheme = self.auth_scheme, .limits = limits },
+            .{ .auth_scheme = self.auth_scheme, .limits = limits, .stream_idle_timeout_ms = self.stream_idle_timeout_ms, .stream_body_idle_timeout_ms = self.stream_body_idle_timeout_ms },
         );
     }
 
@@ -1152,6 +1164,16 @@ fn jobThreadMain(input: *JobInput) void {
         .prebuilt_conversation = input.prebuilt_conversation,
     };
     input.prebuilt_conversation = null;
+
+    e.lock();
+    e.cancel_provider = input.owned.provider();
+    e.unlock();
+    // worker 结束(无论成败)都先撤下 cancel 视图,再由 input.cleanup() deinit owned。
+    defer {
+        e.lock();
+        e.cancel_provider = null;
+        e.unlock();
+    }
 
     const result = subagent.spawnAgentSink(
         input.allocator,

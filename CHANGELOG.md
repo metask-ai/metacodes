@@ -16,12 +16,30 @@ status, compatibility boundaries, and entry points are defined by
   HTTP request) for non-Claude vision models reached through an Anthropic
   Messages-compatible endpoint, because the Anthropic profile only granted
   vision to names containing `claude` (#112). `provider_kind: anthropic`
-  selects the wire format, not the model family: vision is now decided by one
-  route-independent family table (Claude 3+, OpenAI GPT-4o/4.1/4.5/5 and
-  o-series, Gemini, Qwen VL) shared by the Anthropic and OpenAI-compatible
-  profiles, so `gpt-5.6-sol` gets the same answer on both routes and the image
-  goes out as an Anthropic base64 `image` source block. Text models and
-  unknown names on either route still fail closed before any network I/O.
+  selects the wire format, not the model family: vision is now resolved in
+  two layers — the catalog's per-model `image_input` declaration wins when it
+  names the model, otherwise one route-independent family table
+  (`model_adapter.knownVisionFamily`: Claude 3+, OpenAI GPT-4o/4.1/4.5/5 and
+  o-series, Gemini, Qwen VL, GLM-V) shared by the Anthropic and
+  OpenAI-compatible profiles — so `gpt-5.6-sol` gets the same answer on both
+  routes and the image goes out as an Anthropic base64 `image` source block.
+  Text models and unknown names on either route still fail closed before any
+  network I/O. The AgentCore ABI suite now proves the positive path end to
+  end: a multimodal Run on the Anthropic route for `gpt-5.6-sol` is admitted
+  and the provider receives exactly one request carrying the image bytes.
+- Stream liveness killed legitimate long tool calls: the idle clock was reset
+  per parsed event, so a tool call's `input_json_delta` frames, SSE pings and
+  unknown events counted as silence, and the flat 120 s limit also applied to
+  the body phase, where a gateway may generate an entire 20-40 KB tool call
+  before writing a byte of it (a 126 s call died as `StreamStalled` although
+  bytes arrived every second). All three transports now reset the clock on
+  every transport read (`LivenessReader`), the request switches from the strict
+  head-phase limit (`METACODES_STREAM_IDLE_TIMEOUT_MS`) to a body-phase limit
+  scaled by `max_tokens` (`METACODES_STREAM_BODY_IDLE_TIMEOUT_MS`, default
+  `clamp(max_tokens × 100 ms, 10 min, 1 h)`) once the response head is
+  accepted, and a body-phase stall records the idle time and limit so the TUI
+  prints `正文空闲超时: N ms 内无任何字节(上限 M ms)` instead of the generic
+  "重试耗尽 / 后端错误 / 上下文超限" guess.
 - Child agents could inherit a provider default instead of the lead's current
   effort: the parent logged `none` while a GLM-5.2 child logged `default` and
   consequently enabled thinking. Child resolution now follows AgentDef

@@ -329,6 +329,13 @@ pub const Dialect = struct {
     /// default = 返回 profileFor 的结果。
     profileFn: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
 
+    /// 运行时目录对 image_input 的声明(`/v1/models` capabilities.image_input.supported)。
+    /// null = 目录没说,profile 的家族表说了算;true/false = 目录覆盖家族表——目录描述的
+    /// 是**这条路由上这个模型**的真实能力,家族表只是离线兜底(issue #112:同名模型在
+    /// 不同路由上能力不同,名字猜不出来)。由持有目录的 client 在 resolve 之后填入;
+    /// `profileFor` 是唯一的读取点,序列化守门(serializeImagePart)与能力查询自然同源。
+    image_input_override: ?bool = null,
+
     /// 便利转发:inline 调对应方法(免调用方写 `dialect.serializeThinkingFn(dialect.ctx, ...)`)。
     pub fn serializeThinking(self: Dialect, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
         try self.serializeThinkingFn(self.ctx, p, effort, out, a);
@@ -370,7 +377,9 @@ pub const Dialect = struct {
         return try self.serializeImagePartFn(self.ctx, p, image, out, a);
     }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
-        return self.profileFn(self.ctx, kind, model);
+        var profile = self.profileFn(self.ctx, kind, model);
+        if (self.image_input_override) |declared| profile.supports_image_input = declared;
+        return profile;
     }
 
     /// 返回一个填好 ctx 的副本(供 const dialect 声明在运行时填 ctx)。
@@ -1050,4 +1059,26 @@ test "appendImageOmittedPlaceholder: 纯文本占位含 MIME,不含 base64" {
         "[image (image/png) was read successfully but omitted: this model does not support image input]",
         out.items,
     );
+}
+
+test "Dialect.image_input_override: 目录声明覆盖家族表,null 保持家族表" {
+    // 家族表认不出 glm-5.3-flash → false;目录说 true → 序列化守门放行。
+    var d = dialectFor(.anthropic, "glm-5.3-flash");
+    try std.testing.expect(!d.profileFor(.anthropic, "glm-5.3-flash").supports_image_input);
+    d.image_input_override = true;
+    try std.testing.expect(d.profileFor(.anthropic, "glm-5.3-flash").supports_image_input);
+    // 反向:家族表说 Claude 能看图,目录说这条路由不收 → 目录赢。
+    var c = dialectFor(.anthropic, "claude-sonnet-4-20250514");
+    try std.testing.expect(c.profileFor(.anthropic, "claude-sonnet-4-20250514").supports_image_input);
+    c.image_input_override = false;
+    try std.testing.expect(!c.profileFor(.anthropic, "claude-sonnet-4-20250514").supports_image_input);
+    // 守门 wrapper 读的是同一个 profile:override=false 时 serializeImagePart 返 false 且不写字节。
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const img = types.ImageBlock{ .media_type = "image/png", .data = "AAAA" };
+    try std.testing.expect(!try c.serializeImagePart(c.profileFor(.anthropic, "claude-sonnet-4-20250514"), img, &out, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    c.image_input_override = null;
+    try std.testing.expect(try c.serializeImagePart(c.profileFor(.anthropic, "claude-sonnet-4-20250514"), img, &out, std.testing.allocator));
+    try std.testing.expect(out.items.len > 0);
 }

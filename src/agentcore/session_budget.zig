@@ -1005,7 +1005,8 @@ pub const BudgetedProvider = struct {
         model_override: ?[]const u8,
     ) anyerror!Reservation {
         // 路由能否原生收图决定图片工具结果在 wire 上是 base64 还是占位符(见
-        // request.zig 的序列化);按配置模型判定,model_override 跨能力类别时估算偏保守。
+        // request.zig 的序列化);按请求真会命名的模型判定(model_override 优先),
+        // 与旁边的 max_tokens 同一派生规则。
         const request_bytes = try canonicalRequestBytes(
             self.allocator,
             model_override orelse self.base.model(),
@@ -1017,7 +1018,7 @@ pub const BudgetedProvider = struct {
             system,
             tools,
             tool_choice,
-            self.base.supports(.image_input),
+            self.base.supportsForModel(.image_input, model_override),
         );
         return self.controller.beginOperation(.provider, request_bytes) catch
             return error.CheckpointBudgetExhausted;

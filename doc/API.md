@@ -70,8 +70,10 @@ normative model; the entry points are:
 | `--offer <offer-id>` | pin one exact reproducible route |
 | `--base-url <url>` | validated against the selected profile and route policy before any request URL is built |
 | `--check-providers` | validate the configuration and print every route it produces, then exit; no credential is resolved and no request URL is built |
+| `METACODES_STREAM_IDLE_TIMEOUT_MS` | stream liveness, **head phase**: a request whose connection stays open but delivers no byte before the response head for this long (default 120000; 0 disables liveness monitoring entirely) is shut down by the client's monitor and retried as a transient network error. Nothing in a blocked socket read notices an abort flag; this is what turns a silent gateway or proxy into a bounded failure instead of a frozen session. Liveness is measured in bytes at the transport read, not in parsed events: a tool call's `input_json_delta` frames, SSE pings and unknown events all keep the connection alive |
+| `METACODES_STREAM_BODY_IDLE_TIMEOUT_MS` | stream liveness, **body phase** (response head accepted): unset = automatic, `clamp(max_tokens × 100 ms, 600000, 3600000)` — a gateway may generate an entire tool call before writing a byte of it, so the tolerated silence scales with the response the request allows; an explicit value is a flat limit in ms; 0 disables body-phase monitoring. Past the limit the client shuts the connection down, the turn ends with `StreamStalled` and the TUI reports `正文空闲超时: <idle> ms 内无任何字节(上限 <limit> ms)` instead of the generic failure text. A body-phase stall is never retried automatically (the streamed prefix cannot be pretended away) |
 | `metacodes login --provider <id> --oauth-token-json <file>` | import an OAuth token into that provider's own store; refresh, single flight, and rotated-refresh persistence then run themselves |
-| `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `recent_operation_ids`; written atomically, other keys preserved |
+| `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `recent_operation_ids`; written atomically, other keys preserved. The same file declares MCP servers: `"mcp_servers":[{"name":"<id>","command":["<exe>","<arg>",...]}]` — each connected server's tools register as deferred `<id>__<tool>` (listed under the prompt's `# Deferred tools`, activated with `ToolSearch select:<id>__<tool>`), `/mcp` shows what is connected, and `ListMcpResourcesTool` fails with `capability_unsupported` when nothing is |
 | `<session_dir>/runtime-selection.json` | `session_selection`; a session-scoped choice never reaches `config.json` |
 | `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
 
@@ -184,8 +186,14 @@ dialect translates it to its own wire format and level count (OpenAI
 `reasoning.effort` full scale; GLM `reasoning_effort` pass-through; Kimi
 K2.6/K3 three levels; DeepSeek two levels; MiniMax M3 three states
 `disabled|adaptive|enabled` with M2.x always-on; Anthropic adaptive thinking
-plus `output_config.effort`). Explicit `effort:` in an agent definition wins
-over the tier's effort. The built-in `Explore` agent pins the `low` tier.
+plus `output_config.effort`, whose vocabulary is `low|medium|high|max` — the
+canonical top level `xhigh` is sent as `max` on every Anthropic-compatible
+route, including GLM behind the Metask gateway). The picker and the `/model`
+status line label that top level with the route's own word: a catalog whose
+`capabilities.effort` declares `max` shows `max`, one that declares `xhigh`
+(or nothing) shows `xhigh`; `--reasoning-effort max` is accepted as an alias.
+Explicit `effort:` in an agent definition wins over the tier's effort. The
+built-in `Explore` agent pins the `low` tier.
 
 ### Multimodal image input
 
@@ -202,12 +210,18 @@ form (`Dialect.serializeImagePart`): Anthropic emits a base64 `image` source
 block, OpenAI-compatible endpoints emit an `image_url` data URL content part
 (the Responses protocol emits `input_image`), and Gemini emits an
 `inline_data` part. Capability is per-model data
-(`ModelProfile.supports_image_input`, queryable as `Capability.image_input`)
-keyed by the model family rather than the wire protocol, so a vision model
-reached through a compatible gateway of another protocol keeps its
-capability: a model without vision fails the request with
-`error.ImageInputUnsupported` before any network I/O — images are never
-silently dropped, OCR'd, or replaced with placeholder text. Image blocks round-trip through the JSONL
+(`ModelProfile.supports_image_input`, queryable as `Capability.image_input`):
+a model without vision fails the request with `error.ImageInputUnsupported`
+before any network I/O — images are never silently dropped, OCR'd, or
+replaced with placeholder text. The truth has two layers, resolved in
+`Client.dialectFor`: the provider's `/v1/models` catalog
+(`capabilities.image_input.supported`, parsed into `api/catalog.zig`
+`Entry.image_input` and applied as `Dialect.image_input_override`) wins
+whenever it declares the model; otherwise `model_adapter.knownVisionFamily`
+decides from the model *family* regardless of wire protocol (a `gpt-5.x`,
+`gemini-*`, `qwen*-vl` or `glm-4.Nv` name is vision on an Anthropic-compatible
+route too, issue #112), and unknown names fail closed. `Provider.supportsForModel`
+answers the same question for a subagent's `model_override`. Image blocks round-trip through the JSONL
 transcript and the AgentCore checkpoint (block tag 5), so restored sessions
 resend the original bytes.
 
@@ -285,11 +299,20 @@ multimodal function response (`functionResponse.parts[].inlineData`,
 receive the image as a sibling `inline_data` part in the same user turn after
 all `functionResponse` parts.
 
-Unlike first-class user images (which fail the request up front), a tool
-result arrives after the tool already ran mid-conversation, so a model
-without vision gets a short explicit placeholder text — `[image (<MIME>) was
-read successfully but omitted: this model does not support image input]` —
-never the multi-megabyte base64 payload and never a silently wedged session.
+The `Read` tool is gated at execution time: the agent loop passes the run's
+effective model and `supportsForModel(.image_input, model_override)` into
+`ToolContext` (`active_model`, `image_input_supported`), and reading an image
+for a model that cannot receive one returns a structured tool error (code
+`capability_unsupported`, recoverable) whose detail names the model, the
+models on the route whose catalog entry declares image input
+(`Provider.visionModels`), and the non-visual alternatives — nothing is read,
+encoded, or written to the transcript. When a host does not populate the gate
+(`image_input_supported == null`) the image still enters history as before,
+and a serializer that finds an image result it cannot send (a model switch
+after the read, a fail-closed dialect) emits the short explicit placeholder
+`[image (<MIME>) was read successfully but omitted: this model does not
+support image input]` — never the multi-megabyte base64 payload and never a
+silently wedged session.
 
 Prompt-cache note: a text-only conversation serializes byte-identically to
 builds without this feature (OpenAI `content` stays a plain string unless the

@@ -833,6 +833,9 @@ pub fn buildResultLine(
         .suspended => "suspended",
         .backgrounded => "backgrounded", // headless 不会转后台,但 switch 须穷尽
         .budget => "budget",
+        // 被 token 上限截断且续写预算耗尽、该轮无可用产出(见 agent_loop
+        // MAX_CONTINUATIONS):一个显式的失败终态,不能当作 end_turn。
+        .max_tokens_exhausted => "max_tokens_exhausted",
     };
     const cost = usage.costUsd(model);
 

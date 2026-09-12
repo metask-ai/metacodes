@@ -31,6 +31,9 @@ pub const Code = enum {
     string_not_found,
     no_op_edit,
     required_first_pending,
+    /// 当前 (provider, model) 没有这项能力(如非 vision 模型读图、本 session 没连 MCP)。
+    /// 换模型/接上依赖后同一调用可能成功,所以它不是 invalid_args,也不是 safety。
+    capability_unsupported,
     other,
 
     pub fn name(self: Code) []const u8 {
@@ -52,6 +55,7 @@ pub const Code = enum {
             .string_not_found => "string_not_found",
             .no_op_edit => "no_op_edit",
             .required_first_pending => "required_first_pending",
+            .capability_unsupported => "capability_unsupported",
             .other => "other",
         };
     }
@@ -145,6 +149,12 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "OldLinesNotFound", .code = .string_not_found, .category = .user_error, .recoverable = true },
     .{ .name = "NoOpEdit", .code = .no_op_edit, .category = .user_error, .recoverable = true },
     .{ .name = "RequiredFirstPending", .code = .required_first_pending, .category = .user_error, .recoverable = true },
+    // 图片读取:非 vision 模型的门控(换模型即可成功 → recoverable);超限是输入问题。
+    .{ .name = "ImageInputUnsupported", .code = .capability_unsupported, .category = .system_error, .recoverable = true },
+    .{ .name = "ImageTooLarge", .code = .invalid_args, .category = .user_error, .recoverable = true },
+    // MCP:本 session 一个 server 都没连 → 换参数无用;server 名不存在 → 换名可成功。
+    .{ .name = "NoMcpSessions", .code = .capability_unsupported, .category = .system_error, .recoverable = false },
+    .{ .name = "McpServerNotFound", .code = .invalid_args, .category = .user_error, .recoverable = true },
     // invalid_args 的 error 名字比较多（MissingPath/EmptyPath/InvalidOffset 等），
     // 先列 code=invalid_args 的部分，查询时用 hasAny 辅助而非表中枚举全部
 };
@@ -399,6 +409,27 @@ test "fromErrorName maps common errors" {
     try std.testing.expect(e6.code == .permission_denied);
     try std.testing.expect(e6.category == .safety);
     try std.testing.expect(!e6.recoverable);
+}
+
+test "fromErrorName maps image and MCP capability errors" {
+    const a = std.testing.allocator;
+    const img = fromErrorName("ImageInputUnsupported", try a.dupe(u8, "d"));
+    defer img.deinit(a);
+    try std.testing.expectEqual(Code.capability_unsupported, img.code);
+    try std.testing.expectEqual(Category.system_error, img.category);
+    try std.testing.expect(img.recoverable);
+    try std.testing.expectEqualStrings("capability_unsupported", img.code.name());
+    const big = fromErrorName("ImageTooLarge", try a.dupe(u8, "d"));
+    defer big.deinit(a);
+    try std.testing.expectEqual(Code.invalid_args, big.code);
+    const none = fromErrorName("NoMcpSessions", try a.dupe(u8, "d"));
+    defer none.deinit(a);
+    try std.testing.expectEqual(Code.capability_unsupported, none.code);
+    try std.testing.expect(!none.recoverable);
+    const missing = fromErrorName("McpServerNotFound", try a.dupe(u8, "d"));
+    defer missing.deinit(a);
+    try std.testing.expectEqual(Code.invalid_args, missing.code);
+    try std.testing.expect(missing.recoverable);
 }
 
 test "errorToJson oneliner" {

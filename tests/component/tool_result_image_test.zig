@@ -459,64 +459,40 @@ test "L2 ⑰: 第二次请求被 4xx 拒绝时 tool_result 保持未送达——
     try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
 }
 
-test "L2 ⑱: 非 vision 网关模型(glm-5.2)只收到占位文本——含图消息不算送达,文本消息照常送达" {
+test "L2 ⑱: 非 vision 网关模型(glm-5.2)Read 图片被执行期门控——wire 上是 capability_unsupported 错误(非占位/非图片),transcript 无 base64,错误结果照常送达" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
-    const raw = "tiny fixture; delivery semantics only";
-    const path = try std.fmt.allocPrint(a, "{s}/pic.png", .{root});
-    defer a.free(path);
-    const path_z = try a.dupeZ(u8, path);
-    defer a.free(path_z);
-    try writeFixture(path_z, raw);
-
-    const tool_sse = try readToolSse(a, path);
-    defer a.free(tool_sse);
-    var srv = try harness.MockServer.startCassette(&[_][]const u8{ tool_sse, ANTHROPIC_OK_SSE }, 0);
-    defer srv.stop();
-    const url = try srv.urlOwned(a);
-    defer a.free(url);
-
-    var io_rt = std.Io.Threaded.init(a, .{});
-    defer io_rt.deinit();
-    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "glm-5.2", url);
-    defer client.deinit();
-    try std.testing.expect(!client.provider().supports(.image_input));
-    var conv = cc.conversation.Conversation.init(a);
-    defer conv.deinit();
-    try conv.appendText(.user, "look at pic.png");
-    var perm = cc.permission.createContext(.bypass_permissions, a);
-    perm.no_interactive_prompt = true;
-    const defs = try cc.tools.toToolDefinitions(a);
-    defer a.free(defs);
-    var render = cc.writer_backend.WriterBackend.initNull();
-    const be = render.backend();
-    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
-        .max_turns = 3,
-        .cwd_abs = root,
-        .home_dir = root,
-        .artifact_root = root,
-        .auto_compact_threshold = std.math.maxInt(usize),
-    }, &be, a);
-    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
-
-    // wire 上是占位文本,不是图片。
-    const body = srv.lastRequest().?.body();
-    try std.testing.expect(std.mem.indexOf(u8, body, "was read successfully but omitted: this model does not support image input") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\",\"source\"") == null);
-    // 第二次请求被接受:首条 user 消息与 tool_use 消息送达;含图的 tool_result 消息保持未送达。
-    const items = conv.messages.items;
-    try std.testing.expectEqual(@as(usize, 4), items.len);
-    try std.testing.expect(items[0].delivered);
-    try std.testing.expect(items[1].delivered);
-    try std.testing.expect(items[2].blocks[0] == .tool_result and !items[2].delivered);
-    try std.testing.expect(!items[3].delivered);
+    const r = try runReadImageCase(a, "glm-5.2", null, null);
+    defer r.deinit(a);
+    try std.testing.expect(r.gated);
+    try std.testing.expect(!r.image_on_wire);
+    try std.testing.expect(!r.placeholder_on_wire);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "cannot receive images on this route") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"is_error\":true") != null);
+    // 没有目录 → 如实说本路由没有模型声明 image_input,不编造候选。
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "no model on this route declares image input") != null);
+    // 门控在读盘前:tool_result 是文本错误,不含图片 JSON,所以它是普通送达。
+    try std.testing.expect(r.result_is_error);
+    try std.testing.expect(!r.result_has_image_json);
+    try std.testing.expect(r.delivered);
 }
 
-/// 跑一次"Read 图片 → 回复"的两轮会话,返回 (第二次请求体含图像块?, tool_result 消息已送达?)。
-fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?[]const u8) !struct { image_on_wire: bool, delivered: bool } {
+/// 一次"Read 图片 → 回复"的两轮会话(Anthropic 路由)。`catalog_json` 非 null 时先灌进
+/// client 目录(模拟启动时 `/v1/models` 探测的结果)。返回第二次请求体的副本与判定位。
+const ReadImageOutcome = struct {
+    body: []u8,
+    image_on_wire: bool,
+    placeholder_on_wire: bool,
+    gated: bool,
+    delivered: bool,
+    result_is_error: bool,
+    result_has_image_json: bool,
+
+    fn deinit(self: ReadImageOutcome, a: std.mem.Allocator) void {
+        a.free(self.body);
+    }
+};
+
+fn runReadImageCase(a: std.mem.Allocator, base_model: []const u8, override: ?[]const u8, catalog_json: ?[]const u8) !ReadImageOutcome {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -525,7 +501,7 @@ fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?
     defer a.free(path);
     const path_z = try a.dupeZ(u8, path);
     defer a.free(path_z);
-    try writeFixture(path_z, "override fixture");
+    try writeFixture(path_z, "tiny fixture; delivery semantics only");
 
     const tool_sse = try readToolSse(a, path);
     defer a.free(tool_sse);
@@ -537,6 +513,7 @@ fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", base_model, url);
     defer client.deinit();
+    if (catalog_json) |json| try client.catalog.loadFromModelsListJson(json);
     var conv = cc.conversation.Conversation.init(a);
     defer conv.deinit();
     try conv.appendText(.user, "look at pic.png");
@@ -558,11 +535,26 @@ fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?
     const body = srv.lastRequest().?.body();
     const items = conv.messages.items;
     try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expect(items[0].delivered and items[1].delivered);
     try std.testing.expect(items[2].blocks[0] == .tool_result);
+    try std.testing.expect(!items[3].delivered);
+    const tr = items[2].blocks[0].tool_result;
     return .{
+        .body = try a.dupe(u8, body),
         .image_on_wire = std.mem.indexOf(u8, body, "{\"type\":\"image\",\"source\":{\"type\":\"base64\"") != null,
+        .placeholder_on_wire = std.mem.indexOf(u8, body, "was read successfully but omitted: this model does not support image input") != null,
+        .gated = std.mem.indexOf(u8, body, "capability_unsupported") != null,
         .delivered = items[2].delivered,
+        .result_is_error = tr.is_error,
+        .result_has_image_json = std.mem.indexOf(u8, tr.content, "\"type\":\"image\"") != null,
     };
+}
+
+/// 跑一次"Read 图片 → 回复"的两轮会话,返回 (第二次请求体含图像块?, 被执行期门控?, tool_result 消息已送达?)。
+fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?[]const u8) !struct { image_on_wire: bool, gated: bool, delivered: bool } {
+    const r = try runReadImageCase(a, base_model, override, null);
+    defer r.deinit(a);
+    return .{ .image_on_wire = r.image_on_wire, .gated = r.gated, .delivered = r.delivered };
 }
 
 /// 与 dialect.zig 默认 Dialect 相同的 fail-closed 方言:profile 声称支持图像,serializeImagePart
@@ -800,18 +792,76 @@ test "L2 ㉓: transcript resume 后(送达标记随 transcript 持久化)请求�
     try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[2].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
 }
 
-test "L2 ⑲: model_override 决定送达——基础模型非 vision、override 为 vision 时图片上 wire 且送达" {
+test "L2 ⑲: model_override 决定门控与送达——基础模型非 vision、override 为 vision 时 Read 放行,图片上 wire 且送达" {
     const a = std.testing.allocator;
     const r = try runOverrideDelivery(a, "glm-5.2", "claude-sonnet-4-20250514");
+    try std.testing.expect(!r.gated);
     try std.testing.expect(r.image_on_wire);
     try std.testing.expect(r.delivered);
 }
 
-test "L2 ⑳: model_override 决定送达——基础模型 vision、override 非 vision 时只发占位且不送达" {
+test "L2 ⑳: model_override 决定门控——基础模型 vision、override 非 vision 时 Read 按 override 的能力被门控,wire 上无图无占位" {
     const a = std.testing.allocator;
     const r = try runOverrideDelivery(a, "claude-sonnet-4-20250514", "glm-5.2");
+    try std.testing.expect(r.gated);
     try std.testing.expect(!r.image_on_wire);
-    try std.testing.expect(!r.delivered);
+    // 错误结果是文本,照常送达(占位路径才是"含图消息不算送达")。
+    try std.testing.expect(r.delivered);
+}
+
+test "L2 ㉕: 目录声明 image_input=true 的非 Claude 名(glm-5.3-flash)经 Anthropic 路由——家族表不认识它,目录说了算:原生 image block 上 wire 且送达" {
+    const a = std.testing.allocator;
+    const catalog = "{\"data\":[{\"id\":\"GLM-5.3-Flash\",\"max_input_tokens\":200000,\"capabilities\":{\"thinking\":{\"supported\":true},\"image_input\":{\"supported\":true}}}]}";
+    // 没有目录时家族表 fail-closed(会被门控)。
+    const without = try runReadImageCase(a, "glm-5.3-flash", null, null);
+    defer without.deinit(a);
+    try std.testing.expect(without.gated);
+    try std.testing.expect(!without.image_on_wire);
+    // 目录声明 supported=true(模型名大小写与目录不同也命中)→ 门控放行、序列化发原生块。
+    const with = try runReadImageCase(a, "glm-5.3-flash", null, catalog);
+    defer with.deinit(a);
+    try std.testing.expect(!with.gated);
+    try std.testing.expect(with.image_on_wire);
+    try std.testing.expect(!with.placeholder_on_wire);
+    try std.testing.expect(with.delivered);
+    try std.testing.expect(with.result_has_image_json);
+}
+
+test "L2 ㉖: 目录声明 image_input=false 覆盖家族表——Claude 名在这条路由上收不了图,Read 被门控,wire 上无图无占位" {
+    const a = std.testing.allocator;
+    const catalog = "{\"data\":[{\"id\":\"claude-sonnet-4-20250514\",\"capabilities\":{\"image_input\":{\"supported\":false}}}]}";
+    const r = try runReadImageCase(a, "claude-sonnet-4-20250514", null, catalog);
+    defer r.deinit(a);
+    try std.testing.expect(r.gated);
+    try std.testing.expect(!r.image_on_wire);
+    try std.testing.expect(!r.placeholder_on_wire);
+    try std.testing.expect(r.delivered);
+}
+
+test "L2 ㉗: 非 vision 活动模型读图——错误 detail 点名活动模型,并列出目录里声明能看图的模型" {
+    const a = std.testing.allocator;
+    const catalog = "{\"data\":[" ++
+        "{\"id\":\"GLM-5.2\",\"capabilities\":{\"image_input\":{\"supported\":false}}}," ++
+        "{\"id\":\"glm-5.3-flash\",\"capabilities\":{\"image_input\":{\"supported\":true}}}," ++
+        "{\"id\":\"claude-sonnet-4-6\",\"capabilities\":{\"image_input\":{\"supported\":true}}}," ++
+        "{\"id\":\"deepseek-chat\",\"capabilities\":{\"image_input\":{\"supported\":false}}}]}";
+    const r = try runReadImageCase(a, "GLM-5.2", null, catalog);
+    defer r.deinit(a);
+    try std.testing.expect(r.gated);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "GLM-5.2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "glm-5.3-flash, claude-sonnet-4-6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "deepseek-chat") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "Switch with /model <id>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "no model on this route declares image input") == null);
+}
+
+test "L2 ㉘(issue #112): 非 Claude 的已知 vision 家族(gpt-5.6-sol)经 Anthropic 兼容路由——不再因名字不含 claude 被拒,image block 上 wire" {
+    const a = std.testing.allocator;
+    const r = try runReadImageCase(a, "gpt-5.6-sol", null, null);
+    defer r.deinit(a);
+    try std.testing.expect(!r.gated);
+    try std.testing.expect(r.image_on_wire);
+    try std.testing.expect(r.delivered);
 }
 
 test "L2 ⑦: 超阈值图像经真实投影后仍以 Anthropic 原生 image block 到达 wire" {
