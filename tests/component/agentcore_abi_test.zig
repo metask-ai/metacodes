@@ -8387,6 +8387,45 @@ test "L2 Revision 15 image capability preflight rejects before any Provider requ
     try std.testing.expectEqual(@as(usize, 1), server.requestCount());
 }
 
+test "L2 Revision 15 image preflight admits a non-Claude vision model on the Anthropic Messages route (issue #112)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // provider_kind=anthropic only selects the Anthropic Messages wire format;
+    // gpt-5.6-sol is a verified vision family, so the preflight must not reject
+    // it for lacking "claude" in its name (issue #112).
+    var fixture = try PublicSessionFixture.init(root, url, "gpt-5.6-sol");
+    defer fixture.deinit();
+
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", "UE5HREFUQQ=="),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        submitMultimodal(&fixture, 1, &with_image, &result),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+
+    // The image reaches the provider in the Anthropic base64 image source form,
+    // not dropped, OCR'd, or downgraded to text.
+    const request = server.lastRequest() orelse return error.MissingRequest;
+    const body = request.body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-5.6-sol\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") != null);
+}
+
 test "Revision 15 multimodal wire validation bounds every length before payload access" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

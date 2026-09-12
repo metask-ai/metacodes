@@ -12,6 +12,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Image input was rejected locally (`image_input_unsupported`, status 28, no
+  HTTP request) for non-Claude vision models reached through an Anthropic
+  Messages-compatible endpoint, because the Anthropic profile only granted
+  vision to names containing `claude` (#112). `provider_kind: anthropic`
+  selects the wire format, not the model family: vision is now resolved in
+  two layers — the catalog's per-model `image_input` declaration wins when it
+  names the model, otherwise one route-independent family table
+  (`model_adapter.knownVisionFamily`: Claude 3+, OpenAI GPT-4o/4.1/4.5/5 and
+  o-series, Gemini, Qwen VL, GLM-V) shared by the Anthropic and
+  OpenAI-compatible profiles — so `gpt-5.6-sol` gets the same answer on both
+  routes and the image goes out as an Anthropic base64 `image` source block.
+  Text models and unknown names on either route still fail closed before any
+  network I/O. The AgentCore ABI suite now proves the positive path end to
+  end: a multimodal Run on the Anthropic route for `gpt-5.6-sol` is admitted
+  and the provider receives exactly one request carrying the image bytes.
 - Stream liveness killed legitimate long tool calls: the idle clock was reset
   per parsed event, so a tool call's `input_json_delta` frames, SSE pings and
   unknown events counted as silence, and the flat 120 s limit also applied to
