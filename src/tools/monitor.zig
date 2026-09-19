@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const common = @import("common.zig");
+const util_json = @import("../util/json.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -26,7 +27,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // Reject before sandbox profile creation or process spawn.
     if (ctx.project_rule_gate != null)
         return error.ProjectRulesRequireSynchronousExecution;
-    const command = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
+    const command_escaped = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
+    const command = try util_json.unescapeString(command_escaped, ctx.allocator);
+    defer ctx.allocator.free(command);
     if (command.len == 0) return error.EmptyCommand;
     const description = common.extractJsonArg(args, "description") orelse "background monitor";
 
@@ -112,6 +115,44 @@ test "Monitor: launches background job and returns job_id" {
     var pfd = [_]std.posix.pollfd{};
     _ = std.posix.poll(&pfd, 200) catch {};
     jobs.reapExited();
+}
+
+test "Monitor: unescapes command before spawning and captures separate stdout lines" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
+    const pfs = @import("platform").fs;
+    var jobs = try JobRegistry.init(a);
+    defer jobs.deinit();
+    var ctx = ToolContext.simple(a);
+    ctx.jobs = &jobs;
+
+    const out = try execute(&ctx, "{\"command\":\"echo \\\"x\\\" 2\\u003e/dev/null; echo \\\"y\\\"\",\"description\":\"t\"}");
+    defer a.free(out);
+    const job_id = common.extractJsonArg(out, "job_id") orelse return error.MissingJobId;
+    var waited: usize = 0;
+    while (waited < 2_000) : (waited += 20) {
+        jobs.reapExited();
+        if ((jobs.get(job_id) orelse return error.JobNotFound).status != .running) break;
+        var ts = std.c.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&ts, &rem);
+    }
+    jobs.reapExited();
+    const job = jobs.get(job_id) orelse return error.JobNotFound;
+    try testing.expect(job.status != .running);
+
+    const stdout_fd = try pfs.openZ(job.stdout_path, .{ .ACCMODE = .RDONLY }, 0);
+    defer _ = pfs.close(stdout_fd);
+    const stdout = try common.readAllFromFd(stdout_fd, a);
+    defer a.free(stdout);
+    const stderr_fd = try pfs.openZ(job.stderr_path, .{ .ACCMODE = .RDONLY }, 0);
+    defer _ = pfs.close(stderr_fd);
+    const stderr = try common.readAllFromFd(stderr_fd, a);
+    defer a.free(stderr);
+
+    try testing.expectEqualStrings("x\ny\n", stdout);
+    try testing.expectEqualStrings("", stderr);
 }
 
 test "Monitor: sandbox 开启时命令被 sandbox-exec 包裹(cwd 外写被拦,task#12 Linus review)" {
