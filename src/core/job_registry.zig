@@ -382,6 +382,41 @@ pub const JobRegistry = struct {
         return false;
     }
 
+    /// Value snapshot for the in-core wait spinner: how many notify-eligible jobs
+    /// of this owner are still running and the first one's id/preview. Taken under
+    /// the lock so no pointer into `jobs.items` escapes (2026-09-19 wait design).
+    pub const PendingNotifySummary = struct {
+        count: u32 = 0,
+        first_id: [12]u8 = .{'0'} ** 12,
+        first_preview: [40]u8 = undefined,
+        first_preview_len: u8 = 0,
+
+        pub fn preview(self: *const PendingNotifySummary) []const u8 {
+            return self.first_preview[0..self.first_preview_len];
+        }
+    };
+
+    pub fn pendingNotifySummary(self: *JobRegistry, owner: SessionId) PendingNotifySummary {
+        self.lock();
+        defer self.unlock();
+        self.reapExitedLocked();
+        var out: PendingNotifySummary = .{};
+        for (self.jobs.items) |entry| {
+            if (!entry.notify_on_exit or entry.status != .running) continue;
+            if (!std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
+            if (out.count == 0) {
+                out.first_id = entry.id;
+                var n: usize = @min(entry.command_preview.len, out.first_preview.len);
+                // 不切坏 UTF-8:回退到字符边界(continuation byte 0b10xxxxxx)。
+                while (n > 0 and n < entry.command_preview.len and (entry.command_preview[n] & 0b1100_0000) == 0b1000_0000) : (n -= 1) {}
+                @memcpy(out.first_preview[0..n], entry.command_preview[0..n]);
+                out.first_preview_len = @intCast(n);
+            }
+            out.count += 1;
+        }
+        return out;
+    }
+
     pub fn takeUnannouncedExits(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator) ![]JobExitEvent {
         self.lock();
         defer self.unlock();

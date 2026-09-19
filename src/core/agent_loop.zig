@@ -221,6 +221,23 @@ pub const RunResult = struct {
     suspend_info: ?SuspendInfo = null,
 };
 
+/// Probe supplied by an interactive host so a queued user message can end the
+/// background-job wait without consuming the still-pending exit event.
+pub const PendingInputProbe = struct {
+    ctx: *anyopaque,
+    hasPendingFn: *const fn (*anyopaque) bool,
+
+    pub fn hasPending(self: PendingInputProbe) bool {
+        return self.hasPendingFn(self.ctx);
+    }
+};
+
+pub const JobWaitOptions = struct {
+    max_wakeups: u32 = 20,
+    timeout_ms: ?u64 = null,
+    poll_slice_ms: u64 = 200,
+};
+
 pub const Options = struct {
     /// **唯一兜底 backstop**(对齐 codex:无主动熔断,只靠 max_turns + 用户中断)。
     /// 轮数不度量任何真实风险,只防真失控。长任务靠 pre-sampling auto-compact 压缩续接。
@@ -294,6 +311,11 @@ pub const Options = struct {
     /// Optional turn-boundary exit delivery. Null keeps existing embedders
     /// unchanged; ownership is the spawning tool context's agent identity.
     job_notifications: ?*@import("job_registry.zig").JobRegistry = null,
+    /// Interactive input ends the in-core wait while leaving exits for the next
+    /// turn boundary; this prevents the 2026-09-19 polling incident from
+    /// competing with a user's already queued message.
+    pending_input: ?PendingInputProbe = null,
+    job_wait: JobWaitOptions = .{},
     /// 后台 subagent 作业注册表（Task run_in_background + TaskOutput + TaskStop agent_ 分流用）
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
     /// Swarm 会话状态（TeamCreate/TeamDelete/SendMessage + Task name+team_name spawn）。
@@ -809,6 +831,7 @@ pub fn run(
     const trace_id = log.genRequestId().bytes;
     const depth = opts.agent_depth;
     var turns: u32 = 0;
+    var job_wakeups: u32 = 0;
     var verification_progress = verification_progress_mod.State{};
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
@@ -892,7 +915,7 @@ pub fn run(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    while (turns < opts.max_turns +| kg_coverage_borrowed_turns) : (turns += 1) {
+    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
@@ -917,7 +940,7 @@ pub fn run(
         // 2026-09-19 polling incident: deliver metadata at the boundary so
         // the model need not poll, while keeping child bytes behind BashOutput
         // and preserving owner/duplicate/role invariants.
-        if (turns > 0) if (opts.job_notifications) |registry| {
+        if (opts.job_notifications) |registry| {
             notification_delivery: {
                 const owner = opts.agent_ident orelse opts.session;
                 const events = registry.takeUnannouncedExits(owner, allocator) catch |err| {
@@ -953,7 +976,7 @@ pub fn run(
                     log.info("agent", "job notification delivered ids={s} turn={d}", .{ ids.items, turns + 1 });
                 }
             }
-        };
+        }
 
         // 进度事件:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具
         // (JobEntry 后端据空名跳过工具更新,对齐 cc 持续显示最近动作)。
@@ -2259,6 +2282,83 @@ pub fn run(
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
             backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+
+            // A background job can be the only remaining work after the model
+            // says it will wait. Keep this in core so every host gets the same
+            // owner-scoped, metadata-only channel and no frontend needs an idle
+            // polling loop. User input and abort always win without consuming
+            // the event; that preserves the next turn's boundary delivery.
+            if (opts.job_notifications) |registry| wait_for_jobs: {
+                const owner = opts.agent_ident orelse opts.session;
+                const pending = registry.pendingNotifySummary(owner);
+                if (pending.count == 0) break :wait_for_jobs;
+                if (job_wakeups >= opts.job_wait.max_wakeups) {
+                    // Backstop against unattended self-continuation (hazard: turn storms).
+                    log.info("agent", "job wait cap reached turn={d} wakeups={d} max_wakeups={d}", .{ turns + 1, job_wakeups, opts.job_wait.max_wakeups });
+                    break :wait_for_jobs;
+                }
+                // Spinner label: reuse set_current_tool (no new CoreEvent variants, ABI freeze).
+                // The buffer lives on this frame until the deferred clear_current_tool.
+                var label_buf: [160]u8 = undefined;
+                const label: []const u8 = if (pending.count == 1)
+                    std.fmt.bufPrint(&label_buf, "waiting for background job {s} ({s}) · Ctrl+C to stop waiting", .{ pending.first_id[0..], pending.preview() }) catch "waiting for background job · Ctrl+C to stop waiting"
+                else
+                    std.fmt.bufPrint(&label_buf, "waiting for {d} background jobs · Ctrl+C to stop waiting", .{pending.count}) catch "waiting for background jobs · Ctrl+C to stop waiting";
+                backend.emitEvent(sess, .{ .set_current_tool = .{ .name = label } });
+                defer backend.emitEvent(sess, .clear_current_tool);
+                log.info("agent", "job wait begin turn={d} pending={d} first={s}", .{ turns + 1, pending.count, pending.first_id[0..] });
+                const wait_started_ms = util_time.nowMs();
+                while (true) {
+                    // Escape hatch 1: abort. The answer given before the wait was complete,
+                    // so it stays the final segment.
+                    if (opts.abort) |a| if (a.isAborted()) {
+                        output_channel.close(.final, assistant_text.items);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                    };
+                    // Escape hatch 2: queued user input wins; the exit stays unannounced and
+                    // rides with that message through the next run's boundary drain.
+                    if (opts.pending_input) |probe| if (probe.hasPending()) {
+                        log.info("agent", "job wait ended: user input pending turn={d}", .{turns + 1});
+                        break;
+                    };
+                    // Escape hatch 3: bounded wait (headless sets it; TUI leaves it open).
+                    if (opts.job_wait.timeout_ms) |limit| {
+                        const now = util_time.nowMs();
+                        const elapsed: u64 = if (now >= wait_started_ms) @intCast(now - wait_started_ms) else 0;
+                        if (elapsed >= limit) {
+                            log.info("agent", "job wait timeout reached turn={d} elapsed_ms={d}", .{ turns + 1, elapsed });
+                            break;
+                        }
+                    }
+                    const events = registry.takeUnannouncedExits(owner, allocator) catch |err| {
+                        log.warn("agent", "job wait notification skipped: {s}", .{@errorName(err)});
+                        break;
+                    };
+                    if (events.len > 0) {
+                        defer @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                        const text = job_notification_mod.render(allocator, events) catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break;
+                        };
+                        defer allocator.free(text);
+                        // Persist first. Only a delivered notification turns the earlier text into
+                        // commentary; on failure the segment stays open for the .final close below,
+                        // so it is never closed twice.
+                        conversation.appendText(.user, text) catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break;
+                        };
+                        output_channel.close(.commentary, assistant_text.items);
+                        job_wakeups += 1;
+                        log.info("agent", "job notification delivered after wait id={s} turn={d} wakeups={d}", .{ events[0].id[0..], turns + 1, job_wakeups });
+                        continue :outer_turn;
+                    }
+                    @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                    // Jobs ended but were already observed via BashOutput/KillShell: nothing to say.
+                    if (!registry.hasPendingNotifyJobs(owner)) break;
+                    if (opts.job_wait.poll_slice_ms > 0) util_time.sleepMs(opts.job_wait.poll_slice_ms);
+                }
+            }
             // 自然 end_turn 且无任何主机异议 → 这一段(连同同 group 的续写段)就是最终结果。
             output_channel.close(.final, assistant_text.items);
             // Stop hook:顶层 agent 自然结束 → 触发(记忆提取挂载点)。

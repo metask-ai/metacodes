@@ -27,6 +27,9 @@ const writer_backend = @import("../core/writer_backend.zig");
 const stream_json_mod = @import("stream_json_backend.zig");
 const util_json = @import("../util/json.zig");
 
+/// A headless invocation must not wait forever on a child that never exits.
+pub const HEADLESS_JOB_WAIT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
 /// Headless callers can make tool availability part of their frozen runtime
 /// contract with `--disallowed-tools`. The ordinary permission settings still
 /// enforce every rule at dispatch; this narrower ceiling additionally removes
@@ -516,6 +519,8 @@ fn buildOptions(
         .read_state = &app.read_state,
         .lsp = app.lsp_service, // Y2:headless 也接 LSP 诊断
         .jobs = if (app.jobs) |*j| j else null,
+        .job_notifications = if (app.jobs) |*j| j else null,
+        .job_wait = .{ .timeout_ms = HEADLESS_JOB_WAIT_TIMEOUT_MS },
         .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
         .swarm = &app.swarm, // SW7:headless 也接 swarm
         .plan_prev_mode = &app.plan_prev_mode,

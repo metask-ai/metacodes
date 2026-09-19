@@ -51,6 +51,11 @@ const model_command = @import("model_command.zig");
 const session_service = @import("../session_service.zig");
 const skill_cli_adapter = @import("../skills/cli_adapter.zig");
 
+fn hasPendingRunInput(ctx: *anyopaque) bool {
+    const queue: *msg_queue_mod.MsgQueue = @ptrCast(@alignCast(ctx));
+    return queue.len() > 0;
+}
+
 /// 把 CoreEvent 的字节写到 std.debug.print(stderr)——非 TTY 交互 / cron / skill 等场景。
 /// 对齐旧 DebugWriter.print 行为。
 fn debugSink(_: *anyopaque, bytes: []const u8) void {
@@ -767,6 +772,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // U11:App 可导出字段统一走 canonical buildRunOptions(五处前端装配漂移的收敛点);
         // 宿主专属字段(eval gate/policy、run_control 三件套、预算、UI requester、心跳)在此补。
         var run_opts = session_service.buildRunOptions(app, scoped_recall);
+        run_opts.pending_input = .{ .ctx = @ptrCast(&msg_queue), .hasPendingFn = &hasPendingRunInput };
         // 宿主契约:主 REPL 是唯一消化 .backgrounded(下方尾声)并复位 flag 的宿主,
         // 故 background_request 在此接——canonical 不带(见 buildRunOptions 注)。
         run_opts.background_request = &app.background_request;

@@ -871,7 +871,7 @@ fn formatAutoBackgroundedAndRemember(
     try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stderr\":");
     try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. BashOutput waits for new lines or exit, so no sleep loop is needed; use this job_id to read incrementally.\"}");
+    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. You will be notified automatically when it exits; do not poll or sleep-wait. Use BashOutput with this job_id to read its output (it waits for new lines if the job is still running).\"}");
     return try aw.toOwnedSlice();
 }
 
