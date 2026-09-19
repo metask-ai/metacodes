@@ -186,7 +186,7 @@ const Args = struct {
 };
 
 pub fn execute(ctx: *const ToolContext, args_json: []const u8) anyerror![]u8 {
-    return switch (runtime.loadConfigFromEnv()) {
+    return switch (runtime.loadConfig()) {
         .configured => |config| executeWithConfig(ctx, args_json, config, null),
         .missing => renderPreflight(ctx, args_json, .config_missing, null),
         .invalid => renderPreflight(ctx, args_json, .config_invalid, null),

@@ -5,6 +5,9 @@ It owns a fixed agent loop, deterministic provider projection, permission and
 sandbox enforcement, durable tool-result artifacts, Lean-backed governance, and
 optional TinyKG memory/task coordination. Hosts can extend tools, provider
 dialects, UI, MCP, and process plugins without replacing those kernel boundaries.
+The Lean governance kernels ship under `libexec/metacodes/` beside `bin/`; runtime
+resolution checks the environment-variable pair first, then the adjacent file with
+its compiled-in digest, and `metacodes doctor` reports both kernels.
 
 > Repository status: pre-publication, pre-1.0 (version declared in
 > `build.zig.zon`). The history has been extracted from the original monorepo,

@@ -413,7 +413,10 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
     except json.JSONDecodeError as exc:
         raise SystemExit(f"doctor --json stdout is not JSON: {completed.stdout[:200]!r}") from exc
     checks = {check.get("name"): check for check in report.get("checks") or []}
-    _require(set(checks) == {"ripgrep", "tinykg"}, f"doctor checks {sorted(checks)!r}")
+    _require(
+        set(checks) == {"ripgrep", "tinykg", "formal_kernel", "project_kernel"},
+        f"doctor checks {sorted(checks)!r}",
+    )
     tinykg = checks["tinykg"]
     _require(
         tinykg.get("source") == "env" and Path(str(tinykg.get("resolved_path"))).resolve() == tinykg_binary.resolve(),
@@ -428,9 +431,18 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
         encoding="utf-8",
         timeout=60,
     )
-    healthy = all(
-        check.get("resolved_path") is not None and check.get("match") in (None, True) for check in checks.values()
-    )
+    def check_healthy(name: str, check: dict) -> bool:
+        if name in {"formal_kernel", "project_kernel"}:
+            if check.get("resolved_path") is None and check.get("expected_sha256") is None:
+                return True
+            return (
+                check.get("resolved_path") is not None
+                and check.get("match") in (None, True)
+                and check.get("provenance") is True
+            )
+        return check.get("resolved_path") is not None and check.get("match") in (None, True)
+
+    healthy = all(check_healthy(name, check) for name, check in checks.items())
     _require(
         strict.returncode == (0 if healthy else 1),
         f"doctor --strict exited {strict.returncode} for a report that is {'healthy' if healthy else 'unhealthy'}",

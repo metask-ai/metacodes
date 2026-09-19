@@ -909,8 +909,8 @@ fn metaskUsesDeviceFlow(mode: LoginMode) bool {
     return mode == .browser;
 }
 
-/// `metacodes doctor [--json] [--strict]` (#78): where ripgrep and TinyKG
-/// resolve from and whether their digests match what this build pinned. Exit 0;
+/// `metacodes doctor [--json] [--strict]` (#78): where ripgrep, TinyKG, and the
+/// Lean kernels resolve from and whether their digests match what this build pinned. Exit 0;
 /// with `--strict`, 1 when a binary is unresolved or mismatched; 2 on an
 /// unknown argument.
 fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
@@ -929,6 +929,8 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 
     var report = doctor.run(allocator, .{
         .ripgrep_sha256 = build_options.ripgrep_expected_sha256,
         .tinykg_sha256 = build_options.tinykg_expected_sha256,
+        .formal_kernel_sha256 = build_options.formal_kernel_expected_sha256,
+        .project_kernel_sha256 = build_options.project_kernel_expected_sha256,
     }) catch |err| {
         std.debug.print("error: doctor could not resolve the runtime binaries ({s})\n", .{@errorName(err)});
         return 1;
