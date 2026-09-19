@@ -52,6 +52,11 @@ pub const Result = struct {
     }
 };
 
+/// `supported == false` means the daemon exposes no `/api/ready` (404/405/501):
+/// an actor that already answered `store-info` is then treated as ready rather
+/// than degraded, so older StoreActors and the contract mock keep working.
+pub const Readiness = struct { ok: bool = false, ready: bool = false, degraded: bool = false, supported: bool = true };
+
 pub const Options = struct {
     io: std.Io,
     url: []const u8,
@@ -250,6 +255,48 @@ pub const WebTransport = struct {
         return self.runWithRequestId(command, args, mutates, request_id);
     }
 
+    /// Bounded authenticated server health probe. It deliberately parses only
+    /// the three readiness booleans so daemon additions remain harmless.
+    pub fn ready(self: *WebTransport) Error!Readiness {
+        self.request_mu.lockUncancelable(self.http_client.io);
+        defer self.request_mu.unlock(self.http_client.io);
+        const base_len = self.run_url.len - "/api/run".len;
+        const url = std.fmt.allocPrint(self.allocator, "{s}/api/ready", .{self.run_url[0..base_len]}) catch return Error.OutOfMemory;
+        defer self.allocator.free(url);
+        var results: [2]ReadyRace = undefined;
+        var race = std.Io.Select(ReadyRace).init(self.http_client.io, &results);
+        errdefer race.cancelDiscard();
+        race.concurrent(.response, readyTask, .{ self, url }) catch return Error.RequestFailed;
+        race.concurrent(.deadline, deadlineTask, .{ self.http_client.io, @as(u64, 2_000) }) catch return Error.RequestFailed;
+        const first = race.await() catch return Error.RequestFailed;
+        const bytes_opt = switch (first) {
+            .response => |response| blk: {
+                race.cancelDiscard();
+                break :blk response catch |err| return err;
+            },
+            .deadline => |deadline| {
+                deadline catch return Error.RequestFailed;
+                while (race.cancel()) |late| switch (late) {
+                    .response => |response| if (response) |owned_opt| {
+                        if (owned_opt) |owned| self.allocator.free(owned);
+                    } else |_| {},
+                    .deadline => {},
+                };
+                return Error.RequestTimedOut;
+            },
+        };
+        const bytes = bytes_opt orelse return .{ .ok = true, .ready = true, .degraded = false, .supported = false };
+        defer self.allocator.free(bytes);
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch return Error.InvalidResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return Error.InvalidResponse;
+        return .{
+            .ok = boolean(parsed.value.object.get("ok")),
+            .ready = boolean(parsed.value.object.get("ready")),
+            .degraded = boolean(parsed.value.object.get("degraded")),
+        };
+    }
+
     /// Execute exactly one semantic request identity. This method never
     /// retries a write. Once a result becomes ambiguous, this client family is
     /// intentionally poisoned for writes; a fresh process must first recover
@@ -379,6 +426,47 @@ pub const WebTransport = struct {
         response: Error!Result,
         deadline: std.Io.Cancelable!void,
     };
+
+    const ReadyRace = union(enum) {
+        response: Error!?[]u8,
+        deadline: std.Io.Cancelable!void,
+    };
+
+    fn readyTask(self: *WebTransport, url: []const u8) Error!?[]u8 {
+        const uri = std.Uri.parse(url) catch return Error.InvalidUrl;
+        var req = self.http_client.request(.GET, uri, .{
+            .keep_alive = false,
+            .extra_headers = &.{.{ .name = "x-api-key", .value = self.api_key }},
+        }) catch return Error.RequestFailed;
+        defer req.deinit();
+        // A bodiless request still has to be written out; without this the
+        // probe waited for a reply to a GET that never left the client.
+        req.sendBodiless() catch return Error.RequestFailed;
+        var redirect_buffer: [4096]u8 = undefined;
+        const head = req.receiveHead(&redirect_buffer) catch return Error.RequestFailed;
+        const status = ResponseStatus.capture(&head);
+        var transfer_buffer: [8192]u8 = undefined;
+        const reader = req.reader.bodyReader(&transfer_buffer, head.head.transfer_encoding, head.head.content_length);
+        const bytes = reader.allocRemaining(self.allocator, std.Io.Limit.limited(64 * 1024)) catch return Error.ResponseTooLarge;
+        if (status.code == 401 or status.code == 403) {
+            self.allocator.free(bytes);
+            return Error.AuthenticationFailed;
+        }
+        if (status.code == 503) {
+            self.allocator.free(bytes);
+            return Error.DaemonUnavailable;
+        }
+        if (status.code == 404 or status.code == 405 or status.code == 501) {
+            // No readiness endpoint on this actor: not a health verdict.
+            self.allocator.free(bytes);
+            return null;
+        }
+        if (!status.isOk()) {
+            self.allocator.free(bytes);
+            return Error.InvalidResponse;
+        }
+        return bytes;
+    }
 
     /// `std.http.Client.request` does not expose an end-to-end timeout in Zig
     /// 0.16. Race the complete POST (connect, send, response head and body)

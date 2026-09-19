@@ -131,6 +131,36 @@ Automatic staged lookup is limited to `<prefix>/bin` and
 `<prefix>/eval/bin` executable layouts. It never walks arbitrary ancestors in
 search of a `vendor/` directory.
 
+When the runtime is degraded, the diagnosis is retained with a kind and a
+fixed repair hint:
+
+| Kind | Hint |
+|---|---|
+| `unconfigured` | write `~/.metacodes/kg/daemon.json` (0600) or set the KG URL/key/build-id variables |
+| `config_unsafe` | make the file regular, non-symlink, under 64 KB, and mode 0600 |
+| `config_invalid` | fix the URL, API key, and expected build-id JSON |
+| `daemon_unreachable` | start tinykgd/tinykg-web at the configured URL |
+| `auth_failed` | match the daemon's `TINYKG_WEB_API_KEY` |
+| `pin_mismatch` | use the running daemon's catalog build/schema values |
+| `store_contract_mismatch` | migrate storage and schema to 3/3 |
+| `server_degraded` | inspect the daemon's degraded-store logs |
+| `cli_bin_missing` | set `METACODES_KG_BIN` or install the staged bundle |
+| `cli_store_failed` | inspect the reason for disk, permission, or store corruption |
+
+A daemon without `/api/ready` (404/405/501) is treated as ready once `store-info`
+succeeded; only an explicit `degraded`/`ready:false` answer yields `server_degraded`.
+Degraded sessions re-probe from the KG tools after 5 seconds, doubling to a
+5 minute cap; `/kg` probes immediately. A root client whose diagnosis is
+`unconfigured`, `config_unsafe` or `config_invalid` re-reads `daemon.json` (or
+the environment) on that probe, so a configuration repaired mid-session takes
+effect without a restart. Subagent and teammate clones never re-read
+configuration: a transport rebuilt inside a clone would carry a private write
+fence, and the ambiguous-commit poison must stay shared across the in-process
+client family. Clones created after the root re-read inherit its binding. The
+state appears in the startup line, `/kg`, and `metacodes doctor`, whose `kg`
+object names the configuration source (`METACODES_KG_CONFIG`, `env` for the
+`METACODES_KG_*` triple, or the default `daemon.json` path).
+
 ## Ownership and prompt-cache boundary
 
 Metacodes owns proposals, policy/Lean admission, re-observation, transactions,

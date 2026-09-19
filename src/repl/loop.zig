@@ -2808,11 +2808,12 @@ pub fn parseGoalCommand(rest_raw: []const u8) GoalCommand {
 /// 无参=状态;`mem`=最近记忆;`forget <id>`=删除(投毒自救);`export`=导出 markdown。
 fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     const kg = if (app.kg) |*k| k else {
-        std.debug.print("KG 未配置。配置 authenticated tinykgd，或为隔离 CLI 模式设置 METACODES_KG_BIN；见 doc/TINYKG_INTEGRATION.md。\n", .{});
+        std.debug.print("KG 已降级:unconfigured\n原因:KG 未配置\n修法:{s}\n", .{@import("../kg/client.zig").KgClient.hintFor(.unconfigured)});
         return;
     };
-    if (!kg.ready) {
-        std.debug.print("KG 已降级:{s}\n", .{kg.degradedMessage()});
+    // An explicit status request probes now; the backoff only paces the tools.
+    if (!kg.retryReadyNow()) {
+        std.debug.print("KG 已降级:{s}\n原因:{s}\n修法:{s}\n", .{ @tagName(kg.degradedKind() orelse .unconfigured), kg.degradedMessage(), kg.degradedHint() });
         return;
     }
     const arg = std.mem.trim(u8, rest, " \t");
@@ -3900,6 +3901,12 @@ fn printStartupBanner(app: *const app_mod.App) void {
     // 内容行:模型 + cwd。
     printBannerLine(th, inner, app.activeModel());
     printBannerLine(th, inner, app.cwdAbs());
+    if (app.kg == null or !(app.kg.?.ready)) {
+        const kind = if (app.kg) |*kg| @tagName(kg.degradedKind() orelse .unconfigured) else "unconfigured";
+        var kg_line: [128]u8 = undefined;
+        const text = std.fmt.bufPrint(&kg_line, "KG unavailable: {s} · metacodes doctor", .{kind}) catch "KG unavailable: unconfigured · metacodes doctor";
+        printBannerLine(th, inner, text);
+    }
 
     // 底边框。
     std.debug.print("{s}{s}", .{ th.accent, th.box_bl });

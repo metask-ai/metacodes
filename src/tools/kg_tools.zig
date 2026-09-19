@@ -25,17 +25,23 @@ fn requireKg(ctx: *const ToolContext) ?*kg_mod.KgClient {
 /// 返回正常 content,模型读到说明即止,不触发同错熔断)。
 fn degradedResult(allocator: std.mem.Allocator, kg: ?*kg_mod.KgClient) ![]u8 {
     const msg = if (kg) |k| k.degradedMessage() else "KG 未配置(缺 tinykg 二进制)";
+    const kind = if (kg) |k| @tagName(k.degradedKind() orelse .unconfigured) else "unconfigured";
+    const hint = if (kg) |k| k.degradedHint() else kg_mod.KgClient.hintFor(.unconfigured);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"kg_unavailable\":true,\"reason\":");
     try appendJsonString(&out, allocator, msg);
+    try out.appendSlice(allocator, ",\"kind\":");
+    try appendJsonString(&out, allocator, kind);
+    try out.appendSlice(allocator, ",\"hint\":");
+    try appendJsonString(&out, allocator, hint);
     try out.appendSlice(allocator, "}");
     return out.toOwnedSlice(allocator);
 }
 
 pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const kg = requireKg(ctx) orelse return degradedResult(ctx.allocator, null);
-    if (!kg.ready) return degradedResult(ctx.allocator, kg);
+    if (!kg.retryReadyIfDue()) return degradedResult(ctx.allocator, kg);
     kg.setAbort(ctx.abort); // M1:ESC 可中断 spawn
 
     const text = util_json.extractStringField(args, "text") orelse {
@@ -124,7 +130,7 @@ fn activeKgTaskId(ctx: *const ToolContext) ?u64 {
 
 pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const kg = requireKg(ctx) orelse return degradedResult(ctx.allocator, null);
-    if (!kg.ready) return degradedResult(ctx.allocator, kg);
+    if (!kg.retryReadyIfDue()) return degradedResult(ctx.allocator, kg);
     kg.setAbort(ctx.abort); // M1:ESC 可中断 spawn
 
     var parsed_args = std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{}) catch |err| switch (err) {
@@ -772,7 +778,7 @@ const ContextObservation = struct {
 
 fn executeContextObserved(ctx: *const ToolContext, args: []const u8) anyerror!ContextObservation {
     const kg = requireKg(ctx) orelse return .{ .result = try degradedResult(ctx.allocator, null) };
-    if (!kg.ready) return .{ .result = try degradedResult(ctx.allocator, kg) };
+    if (!kg.retryReadyIfDue()) return .{ .result = try degradedResult(ctx.allocator, kg) };
     kg.setAbort(ctx.abort);
 
     var parsed_args = std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{}) catch |err| switch (err) {

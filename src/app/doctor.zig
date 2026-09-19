@@ -81,9 +81,11 @@ pub const Expectations = struct {
 pub const Report = struct {
     /// `[0]` ripgrep, `[1]` TinyKG, `[2]` formal kernel, `[3]` project kernel.
     checks: [4]Check,
+    kg: ?KgDiagnosis = null,
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
         for (&self.checks) |*check| check.deinit(allocator);
+        if (self.kg) |diagnosis| diagnosis.deinit(allocator);
     }
 
     /// Every binary resolved, and every one with an expectation matches it.
@@ -98,6 +100,20 @@ pub const Report = struct {
             if (is_kernel and check.provenance != true) return false;
         }
         return true;
+    }
+};
+
+pub const KgDiagnosis = struct {
+    state: []u8,
+    transport: []u8,
+    config: []u8,
+    hint: []u8,
+
+    pub fn deinit(self: KgDiagnosis, allocator: std.mem.Allocator) void {
+        allocator.free(self.state);
+        allocator.free(self.transport);
+        allocator.free(self.config);
+        allocator.free(self.hint);
     }
 };
 
@@ -141,7 +157,7 @@ pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
     const project = resolveKernel(.project, expected.project_kernel_sha256, expected.exe_path_override, &project_override_buf);
     checks[3] = try Check.init(allocator, "project_kernel", project, expected.project_kernel_sha256);
     checks[3].provenance = try kernelProvenance(allocator, checks[3].resolved_path, checks[3].sha256);
-    return .{ .checks = checks };
+    return .{ .checks = checks, .kg = null };
 }
 
 fn resolveKernel(name: toolchain.KernelName, expected: ?[]const u8, exe_override: ?[]const u8, override_buf: []u8) ?Resolved {
@@ -227,6 +243,7 @@ pub fn writeText(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
             if (check.provenance) |valid| (if (valid) "true" else "false") else "n/a",
         });
     }
+    if (report.kg) |kg| try w.print("tinykg_daemon {s} transport={s} config={s} hint={s}\n", .{ kg.state, kg.transport, kg.config, kg.hint });
 }
 
 /// The `doctor --json` document: `{"checks":[{name, resolved_path, sha256,
@@ -253,7 +270,11 @@ pub fn writeJson(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
             .provenance = check.provenance,
         };
     }
-    try std.json.Stringify.value(.{ .checks = entries }, .{}, w);
+    if (report.kg) |kg| {
+        try std.json.Stringify.value(.{ .checks = entries, .kg = .{ .state = kg.state, .transport = kg.transport, .config = kg.config, .hint = kg.hint } }, .{}, w);
+    } else {
+        try std.json.Stringify.value(.{ .checks = entries }, .{}, w);
+    }
     try w.writeByte('\n');
 }
 
