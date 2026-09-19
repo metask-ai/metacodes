@@ -68,7 +68,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     return try std.fmt.allocPrint(
         ctx.allocator,
-        "{{\"job_id\":\"{s}\",\"status\":\"running\",\"description\":\"{s}\",\"hint\":\"Use BashOutput(job_id) to read streamed lines; KillShell(job_id) to stop.\"}}",
+        "{{\"job_id\":\"{s}\",\"status\":\"running\",\"description\":\"{s}\",\"hint\":\"Use BashOutput(job_id) to wait for new lines or exit and read them; no sleep loop is needed. KillShell(job_id) to stop.\"}}",
         .{ entry.id[0..], description },
     );
 }

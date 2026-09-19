@@ -193,3 +193,15 @@ test "L2 守卫: BashOutput max_bytes 的 schema 描述与预算实现不分叉"
         try std.testing.expect(std.mem.indexOf(u8, desc, text) != null);
     }
 }
+
+test "L2 守卫: BashOutput wait_ms 的 schema 描述绑定等待常量" {
+    const desc = propDescription("BashOutput", "wait_ms") orelse
+        return error.BashOutputWaitMsSpecMissing;
+    var default_buf: [32]u8 = undefined;
+    var max_buf: [32]u8 = undefined;
+    const default_text = try std.fmt.bufPrint(&default_buf, "default {d} ms", .{cc.tools_bash_output.DEFAULT_WAIT_MS});
+    const max_text = try std.fmt.bufPrint(&max_buf, "maximum {d} ms", .{cc.tools_bash_output.MAX_WAIT_MS});
+    try std.testing.expect(std.mem.indexOf(u8, desc, default_text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "0 for an immediate snapshot") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, max_text) != null);
+}

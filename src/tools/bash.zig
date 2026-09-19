@@ -114,15 +114,9 @@ const ChannelPreview = struct {
 /// 切点回退到不超过上限的最近 UTF-8 字符边界 + 最近换行(不切坏多字节/半行)。
 /// 返回 owned slice(调用方 free);未超限时返回原文 dupe。
 fn truncateHead(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    if (s.len <= MAX_OUTPUT_BYTES) return try allocator.dupe(u8, s);
+    const cut = truncateHeadSourceBytes(s);
+    if (cut == s.len) return try allocator.dupe(u8, s);
 
-    // 1. 先定到 MAX_OUTPUT_BYTES,回退到 UTF-8 字符边界(continuation byte 0b10xxxxxx)。
-    var cut = MAX_OUTPUT_BYTES;
-    while (cut > 0 and (s[cut] & 0b1100_0000) == 0b1000_0000) : (cut -= 1) {}
-    // 2. 再回退到最近换行(让截断落在行边界,输出更整齐);若该行很长找不到则就用 cut。
-    if (std.mem.lastIndexOfScalar(u8, s[0..cut], '\n')) |nl| {
-        if (nl + 1 >= MAX_OUTPUT_BYTES / 2) cut = nl + 1; // 仅当不会砍掉过多时才退到换行
-    }
     // 统计被砍掉的行数(剩余部分的 \n 数 + 1 行尾)。
     var dropped_lines: usize = 0;
     for (s[cut..]) |c| {
@@ -135,6 +129,21 @@ fn truncateHead(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     try out.writer.writeAll(s[0..cut]);
     try out.writer.print("\n... [{d} lines truncated] ...\n", .{dropped_lines});
     return try out.toOwnedSlice();
+}
+
+/// Number of source bytes represented by the visible head. The formatted
+/// preview also contains an omission marker, so its length is not a safe
+/// cursor for BashOutput to resume from.
+fn truncateHeadSourceBytes(s: []const u8) usize {
+    if (s.len <= MAX_OUTPUT_BYTES) return s.len;
+    // 1. 先定到 MAX_OUTPUT_BYTES,回退到 UTF-8 字符边界(continuation byte 0b10xxxxxx)。
+    var cut = MAX_OUTPUT_BYTES;
+    while (cut > 0 and (s[cut] & 0b1100_0000) == 0b1000_0000) : (cut -= 1) {}
+    // 2. 再回退到最近换行(让截断落在行边界,输出更整齐);若该行很长找不到则就用 cut。
+    if (std.mem.lastIndexOfScalar(u8, s[0..cut], '\n')) |nl| {
+        if (nl + 1 >= MAX_OUTPUT_BYTES / 2) cut = nl + 1; // 仅当不会砍掉过多时才退到换行
+    }
+    return cut;
 }
 
 fn sha256Hex(bytes: []const u8) [64]u8 {
@@ -809,7 +818,7 @@ fn runAutoBackgroundable(
             // 此刻 job id 进入模型可见结果，BashOutput 随后任何一轮都可能凭它来读
             // → 转为 background 保留期。
             registry.promoteToBackground(job_id[0..]);
-            return try formatAutoBackgrounded(allocator, &j);
+            return try formatAutoBackgroundedAndRemember(allocator, &j, registry);
         }
     }
 }
@@ -819,6 +828,14 @@ fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_re
 }
 
 fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
+    return formatAutoBackgroundedAndRemember(allocator, j, null);
+}
+
+fn formatAutoBackgroundedAndRemember(
+    allocator: std.mem.Allocator,
+    j: *const @import("../core/job_registry.zig").JobEntry,
+    registry: ?*@import("../core/job_registry.zig").JobRegistry,
+) ![]u8 {
     const out_bytes = readWholeFile(j.stdout_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
     defer allocator.free(out_bytes);
     const err_bytes = readWholeFile(j.stderr_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
@@ -828,6 +845,15 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
     defer allocator.free(out_trunc);
     const err_trunc = try truncateHead(allocator, err_bytes);
     defer allocator.free(err_trunc);
+
+    // The auto-background result already exposed these head bytes. Remember
+    // exactly the shown prefix so the first BashOutput call starts after it;
+    // truncateHead's length is the authority, never the full spool size.
+    if (registry) |r| r.updateReadCursors(
+        j.idSlice(),
+        truncateHeadSourceBytes(out_bytes),
+        truncateHeadSourceBytes(err_bytes),
+    );
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -842,7 +868,7 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
     try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stderr\":");
     try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. Poll it with BashOutput using this job_id; stdout_since_byte/stderr_since_byte read incrementally so a long job does not re-send what you already have.\"}");
+    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. BashOutput waits for new lines or exit, so no sleep loop is needed; use this job_id to read incrementally.\"}");
     return try aw.toOwnedSlice();
 }
 
