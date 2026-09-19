@@ -55,6 +55,7 @@ test {
     _ = @import("component/rule_impact_governance_test.zig");
     _ = @import("component/rule_impact_operational_observation_test.zig");
     _ = @import("component/tool_result_storage_test.zig");
+    _ = @import("component/bash_output_wait_test.zig");
     _ = @import("component/sealed_publication_test.zig");
     _ = @import("component/inline_threshold_test.zig");
     _ = @import("component/cache_break_test.zig");

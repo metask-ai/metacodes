@@ -57,6 +57,11 @@ pub const JobEntry = struct {
     status: JobStatus = .running,
     exit_code: ?i32 = null,
     retention: Retention = .background,
+    /// BashOutput's implicit read positions. These are registry state rather
+    /// than fields on a caller snapshot so repeated polls resume where the
+    /// previous result stopped.
+    stdout_read_offset: u64 = 0,
+    stderr_read_offset: u64 = 0,
     /// Set once the spool files have been unlinked. The path strings stay
     /// valid (they are freed at teardown) so an outstanding value snapshot
     /// never dangles; only the directory entries are gone.
@@ -301,6 +306,17 @@ pub const JobRegistry = struct {
         self.lock();
         defer self.unlock();
         return if (self.getPtrLocked(id)) |p| p.* else null;
+    }
+
+    /// Advance BashOutput's remembered cursors under the registry mutex.
+    /// `null` leaves that channel unchanged; the value is the next offset
+    /// reported by a successful read, including a truncated read.
+    pub fn updateReadCursors(self: *JobRegistry, id: []const u8, stdout_next: ?u64, stderr_next: ?u64) void {
+        self.lock();
+        defer self.unlock();
+        const entry = self.getPtrLocked(id) orelse return;
+        if (stdout_next) |next| entry.stdout_read_offset = next;
+        if (stderr_next) |next| entry.stderr_read_offset = next;
     }
 
     /// 持锁内部版:返回内部指针供 kill 就地改 status/exit_code。**调用方必须持锁**且不得

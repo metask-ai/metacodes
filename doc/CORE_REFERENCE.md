@@ -584,7 +584,7 @@ JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次�
 path + 随机 id,两条都踩)。恢复面只有内容寻址的 `<channel>_artifact_id`(配 `Grep(artifact_id)`
 就地搜索);捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时就是**真的不可恢复**,由
 `<channel>_storage_error` 如实命名原因,而不是靠一条违约的句柄把它装成可恢复。后台作业则用
-稳定的 `job_id` + `BashOutput`(`*_next_offset` 是续读游标)。MCP stdio、AgentCore MCP
+稳定的 `job_id` + `BashOutput`(`*_next_offset` 是续读游标;无新请求字节时默认等待 30 秒直到新输出或退出,`wait_ms=0` 为快照)。MCP stdio、AgentCore MCP
 connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt/`ReadArtifact`
 恢复面。
 
