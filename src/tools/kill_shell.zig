@@ -13,6 +13,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const registry = ctx.jobs orelse return error.JobsNotAvailable;
 
     try registry.kill(job_id);
+    registry.markExitObserved(job_id);
     const job = registry.get(job_id) orelse return error.JobNotFound;
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -40,4 +41,21 @@ test "KillShell on running job" {
     const result = try execute(&ctx, args);
     defer a.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"status\":\"killed\"") != null);
+}
+
+test "KillShell observed job is never announced" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("../core/session_id.zig").gen();
+    const j = try r.spawnBackgroundOwned("sleep 30", null, owner);
+    var args_buf: [128]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
+    const ctx = ToolContext{ .allocator = a, .jobs = &r, .agent_ident = owner };
+    const result = try execute(&ctx, args);
+    defer a.free(result);
+    const events = try r.takeUnannouncedExits(owner, a);
+    defer @import("../core/job_registry.zig").freeJobExitEvents(a, events);
+    try std.testing.expectEqual(@as(usize, 0), events.len);
 }

@@ -428,6 +428,7 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .edit_hl_cache = &app.edit_hl_cache,
         .lsp = app.lsp_service,
         .jobs = if (app.jobs) |*j| j else null,
+        .job_notifications = if (app.jobs) |*j| j else null,
         .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
         .swarm = &app.swarm,
         .plan_prev_mode = &app.plan_prev_mode,

@@ -234,6 +234,7 @@ pub fn spawnAgentSink(
             .ui_requester = opts.ui_requester,
             .read_state = opts.read_state,
             .jobs = opts.jobs,
+            .job_notifications = opts.jobs,
             .agent_jobs = opts.agent_jobs,
             .project_dir = opts.project_dir,
             .session_id = opts.session.asSlice(),

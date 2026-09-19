@@ -65,13 +65,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 启动后台 job(已 sandbox 包裹)
     const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-    const entry = jobs.spawnBackground(eff_command, cwd_opt) catch |err| {
+    const entry = jobs.spawnBackgroundOwned(eff_command, cwd_opt, ctx.agent_ident) catch |err| {
         return try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"spawn_failed\",\"message\":\"{s}\"}}", .{@errorName(err)});
     };
 
     return try std.fmt.allocPrint(
         ctx.allocator,
-        "{{\"job_id\":\"{s}\",\"status\":\"running\",\"description\":\"{s}\",\"hint\":\"Use BashOutput(job_id) to wait for new lines or exit and read them; no sleep loop is needed. KillShell(job_id) to stop.\"}}",
+        "{{\"job_id\":\"{s}\",\"status\":\"running\",\"description\":\"{s}\",\"hint\":\"Its exit is announced to you automatically. Use BashOutput(job_id) to read streamed lines (it waits for new lines if none are unread); KillShell(job_id) to stop.\"}}",
         .{ entry.id[0..], description },
     );
 }

@@ -588,6 +588,8 @@ path + 随机 id,两条都踩)。恢复面只有内容寻址的 `<channel>_artif
 connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt/`ReadArtifact`
 恢复面。
 
+后台作业退出通过 core 的第二输入通道送回会话：通知是 metadata-only 的 user 消息（只含 job id、状态、退出码、耗时和各通道未读字节，避免把任意进程输出从 tool_result 提升成 user-role 提示注入），按 owner 隔离且每个退出最多通知一次。它在 turn boundary 投递，也会在自然 end_turn 时按 `job_wait` 等待并继续运行；`job_wait.max_wakeups` 默认 20，`timeout_ms` 默认 null（headless 设为 30 分钟），`poll_slice_ms` 默认 200，`pending_input` 探针、abort、超时和 wakeup cap 都会结束等待而把事件留给下一轮边界。
+
 真实 rollout 的非敏感证据用 `scripts/eval/tool_result_projection_eval.py <cassette>
 --headless-result <result.ndjson> --time-file <time.txt>` 导出；报告只含尺寸、hash、usage、
 恢复/前缀判定和时延，原始 cassette、artifact 与模型文本必须留在隔离本地目录。
