@@ -65,7 +65,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 启动后台 job(已 sandbox 包裹)
     const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-    const entry = jobs.spawnBackground(eff_command, cwd_opt) catch |err| {
+    const entry = jobs.spawnBackgroundOwned(eff_command, cwd_opt, ctx.agent_ident) catch |err| {
         return try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"spawn_failed\",\"message\":\"{s}\"}}", .{@errorName(err)});
     };
 

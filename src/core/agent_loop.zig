@@ -42,6 +42,7 @@ const ui_backend = @import("protocol/ui_backend.zig");
 const ui_event = @import("protocol/ui_event.zig");
 const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
+const job_notification_mod = @import("job_notification.zig");
 
 pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget, max_tokens_exhausted };
 
@@ -290,6 +291,9 @@ pub const Options = struct {
     auto_compact_keep_recent: usize = 10,
     /// Bash 后台作业注册表（给 ToolContext 用，工具侧 Bash/BashOutput/KillShell 用）
     jobs: ?*@import("job_registry.zig").JobRegistry = null,
+    /// Optional turn-boundary exit delivery. Null keeps existing embedders
+    /// unchanged; ownership is the spawning tool context's agent identity.
+    job_notifications: ?*@import("job_registry.zig").JobRegistry = null,
     /// 后台 subagent 作业注册表（Task run_in_background + TaskOutput + TaskStop agent_ 分流用）
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
     /// Swarm 会话状态（TeamCreate/TeamDelete/SendMessage + Task name+team_name spawn）。
@@ -908,6 +912,47 @@ pub fn run(
         if (opts.background_request) |bg| if (bg.load(.acquire)) {
             log.info("agent", "background requested before turn {d} → backgrounding", .{turns + 1});
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
+        };
+
+        // 2026-09-19 polling incident: deliver metadata at the boundary so
+        // the model need not poll, while keeping child bytes behind BashOutput
+        // and preserving owner/duplicate/role invariants.
+        if (turns > 0) if (opts.job_notifications) |registry| {
+            notification_delivery: {
+                const owner = opts.agent_ident orelse opts.session;
+                const events = registry.takeUnannouncedExits(owner, allocator) catch |err| {
+                    log.warn("agent", "job notification skipped: {s}", .{@errorName(err)});
+                    break :notification_delivery;
+                };
+                defer @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                if (events.len > 0) {
+                    // Build every fallible piece before appending the user message;
+                    // notification delivery is best-effort and must not fail a run.
+                    var ids = std.ArrayList(u8).empty;
+                    defer ids.deinit(allocator);
+                    for (events, 0..) |event, index| {
+                        if (index != 0) ids.append(allocator, ',') catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break :notification_delivery;
+                        };
+                        ids.appendSlice(allocator, event.id[0..]) catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break :notification_delivery;
+                        };
+                    }
+                    if (ids.items.len == 0) break :notification_delivery;
+                    const text = job_notification_mod.render(allocator, events) catch |err| {
+                        log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                        break :notification_delivery;
+                    };
+                    defer allocator.free(text);
+                    conversation.appendText(.user, text) catch |err| {
+                        log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                        break :notification_delivery;
+                    };
+                    log.info("agent", "job notification delivered ids={s} turn={d}", .{ ids.items, turns + 1 });
+                }
+            }
         };
 
         // 进度事件:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具

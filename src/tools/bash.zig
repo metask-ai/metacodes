@@ -666,7 +666,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
                 // 后台:profile 文件不能删(进程还在跑),detach
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-                const j = try registry.spawnBackground(command, cwd_opt);
+                const j = try registry.spawnBackgroundOwned(command, cwd_opt, ctx.agent_ident);
                 // Same rule as the auto-backgrounded snapshot: the spool is a
                 // staging path and never model-visible. BashOutput polls by
                 // job_id and reads incrementally.
@@ -709,6 +709,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.result_budget,
             ctx.tool_result_metrics,
             attachments,
+            ctx.agent_ident,
         );
     }
 
@@ -732,6 +733,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.result_budget,
             ctx.tool_result_metrics,
             attachments,
+            ctx.agent_ident,
         );
     }
 
@@ -779,11 +781,12 @@ fn runAutoBackgroundable(
     budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
     attachments: *tool_result.SealedHandles,
+    owner: @import("../core/session_id.zig").SessionId,
 ) ![]u8 {
     // Spooled as private to this call. Every exit below either renders the
     // output and releases the files, or hands the job id to the model and
     // promotes the job so its spool survives for `BashOutput` (issue #37).
-    const j_entry = try registry.spawnSynchronous(command, cwd);
+    const j_entry = try registry.spawnSynchronousOwned(command, cwd, owner);
     const job_id = j_entry.id; // 值拷贝，不持指针（registry 可能扩容移动）
 
     const effective_budget = if (allow_auto_background) @min(timeout_ms, AUTO_BACKGROUND_MS) else timeout_ms;

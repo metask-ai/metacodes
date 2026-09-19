@@ -106,4 +106,5 @@ test {
     _ = @import("component/overrides_test.zig");
     _ = @import("component/ontology_rule_projection_test.zig");
     _ = @import("component/ontology_rule_snapshot_adapter_test.zig");
+    _ = @import("component/job_notification_test.zig");
 }

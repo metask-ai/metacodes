@@ -195,6 +195,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (want_stdout) stdout_next_offset else null,
         if (want_stderr) stderr_next_offset else null,
     );
+    if (job.status != .running) registry.markExitObserved(job_id);
     return out;
 }
 
@@ -356,6 +357,24 @@ test "BashOutput returns stdout after exit" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"status\":\"exited\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_total_bytes\":6") != null); // "hello\n"
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_truncated\":false") != null);
+}
+
+test "BashOutput observed exit is not announced" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("../core/session_id.zig").gen();
+    const j = try r.spawnBackgroundOwned("printf done", null, owner);
+    try waitForExit(&r, j.idSlice());
+    const ctx = ToolContext{ .allocator = a, .jobs = &r, .agent_ident = owner };
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
+    defer a.free(args);
+    const result = try execute(&ctx, args);
+    defer a.free(result);
+    const events = try r.takeUnannouncedExits(owner, a);
+    defer @import("../core/job_registry.zig").freeJobExitEvents(a, events);
+    try std.testing.expectEqual(@as(usize, 0), events.len);
 }
 
 test "BashOutput since_byte skips prefix" {

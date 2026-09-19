@@ -29,6 +29,7 @@ const util_fs = @import("../util/fs.zig");
 const util_time = @import("../util/time.zig");
 const ppaths = @import("platform").paths;
 const shell_mod = @import("shell.zig");
+const SessionId = @import("session_id.zig").SessionId;
 
 pub const JobStatus = enum { running, exited, killed, failed };
 
@@ -54,6 +55,15 @@ pub const JobEntry = struct {
     stdout_path: []const u8, // owned
     stderr_path: []const u8, // owned
     command_preview: []const u8, // owned, 前 N 字符便于 UI 列表
+    /// Exit ownership is the spawning agent identity; main/subagent jobs must
+    /// never cross conversation boundaries (2026-09-19 event-channel hazard).
+    owner: SessionId = SessionId.single,
+    /// These flags make announcement delivery at-most-once and suppress stale
+    /// exits already observed through BashOutput/KillShell.
+    notify_on_exit: bool = false,
+    exit_announced: bool = false,
+    exit_observed: bool = false,
+    ended_ms: ?util_time.Millis = null,
     status: JobStatus = .running,
     exit_code: ?i32 = null,
     retention: Retention = .background,
@@ -71,6 +81,29 @@ pub const JobEntry = struct {
         return self.id[0..];
     }
 };
+
+/// Metadata-only exit record: child output and spool paths never cross into
+/// the user-role notification, avoiding prompt-injection elevation.
+pub const JobExitEvent = struct {
+    id: [12]u8,
+    status: JobStatus,
+    exit_code: ?i32,
+    started_ms: util_time.Millis,
+    ended_ms: ?util_time.Millis,
+    command_preview: []u8,
+    stdout_unread: u64,
+    stderr_unread: u64,
+
+    pub fn deinit(self: *JobExitEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.command_preview);
+        self.command_preview = &.{};
+    }
+};
+
+pub fn freeJobExitEvents(allocator: std.mem.Allocator, events: []JobExitEvent) void {
+    for (events) |*event| event.deinit(allocator);
+    allocator.free(events);
+}
 
 pub const JobRegistry = struct {
     allocator: std.mem.Allocator,
@@ -158,6 +191,7 @@ pub const JobRegistry = struct {
         defer self.unlock();
         const entry = self.getPtrLocked(id) orelse return;
         entry.retention = .background;
+        entry.notify_on_exit = true;
     }
 
     /// 生成新 job id：12 hex = 6 byte，走可移植熵源 `platform/rng.zig`
@@ -178,14 +212,22 @@ pub const JobRegistry = struct {
     /// 立刻返回 job_id，不等待进程结束。
     /// cwd 非 null → 子进程 chdir(borrow:spawn 时消费,不存 JobEntry——生命周期不匹配)。
     pub fn spawnBackground(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry {
-        return self.spawn(command, cwd, .background);
+        return self.spawnBackgroundOwned(command, cwd, SessionId.single);
+    }
+
+    pub fn spawnBackgroundOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry {
+        return self.spawn(command, cwd, .background, owner, true);
     }
 
     /// Same spawn, for output that only one synchronous call will ever read.
     /// `runAutoBackgroundable` starts here and promotes the job if it later
     /// hands the id to the model.
     pub fn spawnSynchronous(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry {
-        return self.spawn(command, cwd, .synchronous);
+        return self.spawnSynchronousOwned(command, cwd, SessionId.single);
+    }
+
+    pub fn spawnSynchronousOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry {
+        return self.spawn(command, cwd, .synchronous, owner, false);
     }
 
     fn spawn(
@@ -193,6 +235,8 @@ pub const JobRegistry = struct {
         command: []const u8,
         cwd: ?[]const u8,
         retention: Retention,
+        owner: SessionId,
+        notify_on_exit: bool,
     ) !JobEntry {
         const id = try genId();
 
@@ -241,6 +285,8 @@ pub const JobRegistry = struct {
             .stdout_path = stdout_path,
             .stderr_path = stderr_path,
             .command_preview = preview,
+            .owner = owner,
+            .notify_on_exit = notify_on_exit,
             .status = .running,
             .retention = retention,
         };
@@ -292,6 +338,7 @@ pub const JobRegistry = struct {
                 .exited => |code| {
                     j.exit_code = code;
                     j.status = if (code < 0) .killed else .exited; // 负=被信号杀(posixExitCode)
+                    j.ended_ms = util_time.nowMs();
                     log.info("job", "bg exit id={s} code={d} status={s}", .{ j.id[0..], code, @tagName(j.status) });
                 },
             }
@@ -317,6 +364,61 @@ pub const JobRegistry = struct {
         const entry = self.getPtrLocked(id) orelse return;
         if (stdout_next) |next| entry.stdout_read_offset = next;
         if (stderr_next) |next| entry.stderr_read_offset = next;
+    }
+
+    pub fn markExitObserved(self: *JobRegistry, id: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        if (self.getPtrLocked(id)) |entry| entry.exit_observed = true;
+    }
+
+    pub fn hasPendingNotifyJobs(self: *JobRegistry, owner: SessionId) bool {
+        self.lock();
+        defer self.unlock();
+        self.reapExitedLocked();
+        for (self.jobs.items) |entry| {
+            if (entry.notify_on_exit and entry.status == .running and std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) return true;
+        }
+        return false;
+    }
+
+    pub fn takeUnannouncedExits(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator) ![]JobExitEvent {
+        self.lock();
+        defer self.unlock();
+        self.reapExitedLocked();
+        var events = std.ArrayList(JobExitEvent).empty;
+        errdefer {
+            for (events.items) |*event| event.deinit(allocator);
+            events.deinit(allocator);
+        }
+        for (self.jobs.items) |*entry| {
+            if (!entry.notify_on_exit or entry.status == .running or entry.exit_announced or entry.exit_observed) continue;
+            if (!std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
+            const command_preview = try allocator.dupe(u8, entry.command_preview);
+            errdefer allocator.free(command_preview);
+            const stdout_size = spoolFileSize(entry.stdout_path) catch 0;
+            const stderr_size = spoolFileSize(entry.stderr_path) catch 0;
+            try events.append(allocator, .{
+                .id = entry.id,
+                .status = entry.status,
+                .exit_code = if (entry.status == .exited) entry.exit_code else null,
+                .started_ms = entry.started_ms,
+                .ended_ms = entry.ended_ms,
+                .command_preview = command_preview,
+                .stdout_unread = stdout_size -| entry.stdout_read_offset,
+                .stderr_unread = stderr_size -| entry.stderr_read_offset,
+            });
+        }
+        const owned = try events.toOwnedSlice(allocator);
+        // Commit the at-most-once markers only after the complete owned slice
+        // exists. An OOM must leave every exit retryable rather than losing the
+        // earlier entries collected before the failing append.
+        for (self.jobs.items) |*entry| {
+            if (entry.notify_on_exit and entry.status != .running and !entry.exit_announced and !entry.exit_observed and
+                std.mem.eql(u8, &entry.owner.bytes, &owner.bytes))
+                entry.exit_announced = true;
+        }
+        return owned;
     }
 
     /// 持锁内部版:返回内部指针供 kill 就地改 status/exit_code。**调用方必须持锁**且不得
@@ -355,6 +457,7 @@ pub const JobRegistry = struct {
             if (jp.status == .running) {
                 jp.status = .killed;
                 jp.exit_code = -9; // SIGKILL 语义
+                jp.ended_ms = util_time.nowMs();
             }
         }
         self.unlock();
@@ -397,6 +500,19 @@ fn createFile(path: []const u8) ?pfs.Fd {
     const fd = pfs.open(@ptrCast(&buf), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return null;
     return fd;
+}
+
+fn spoolFileSize(path: []const u8) !u64 {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= buf.len) return error.PathTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&buf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    const total = pfs.lseek(fd, 0, .end);
+    if (total < 0) return error.SeekFailed;
+    return @intCast(total);
 }
 
 fn exitCode(status: c_int) i32 {
@@ -630,4 +746,42 @@ test "get returns correct entry across many registrations" {
         const found = r.get(saved_ids[i][0..]) orelse return error.IdLost;
         try std.testing.expectEqualSlices(u8, &saved_ids[i], &found.id);
     }
+}
+
+test "JobRegistry owned exit is announced once" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const j = try r.spawnBackgroundOwned("printf notify", null, owner);
+    try waitUntilExited(&r, j.idSlice());
+    var events = try r.takeUnannouncedExits(owner, a);
+    defer freeJobExitEvents(a, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualSlices(u8, j.idSlice(), &events[0].id);
+    try std.testing.expectEqual(@as(u64, 6), events[0].stdout_unread);
+    const second = try r.takeUnannouncedExits(owner, a);
+    defer freeJobExitEvents(a, second);
+    try std.testing.expectEqual(@as(usize, 0), second.len);
+}
+
+test "JobRegistry owner and observed exit suppress notification" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const other = @import("session_id.zig").gen();
+    const j = try r.spawnBackgroundOwned("true", null, owner);
+    try std.testing.expect(r.hasPendingNotifyJobs(owner));
+    try waitUntilExited(&r, j.idSlice());
+    try std.testing.expect(!r.hasPendingNotifyJobs(owner));
+    const wrong = try r.takeUnannouncedExits(other, a);
+    defer freeJobExitEvents(a, wrong);
+    try std.testing.expectEqual(@as(usize, 0), wrong.len);
+    r.markExitObserved(j.idSlice());
+    const observed = try r.takeUnannouncedExits(owner, a);
+    defer freeJobExitEvents(a, observed);
+    try std.testing.expectEqual(@as(usize, 0), observed.len);
 }

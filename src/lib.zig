@@ -67,6 +67,7 @@ pub const read_state = @import("core/read_state.zig");
 pub const edit_hl_cache = @import("core/edit_hl_cache.zig");
 pub const task_store = @import("core/task_store.zig");
 pub const job_registry = @import("core/job_registry.zig");
+pub const job_notification = @import("core/job_notification.zig");
 pub const agent_job_registry = @import("core/agent_job_registry.zig");
 pub const cron_registry = @import("core/cron_registry.zig");
 pub const cache_break = @import("core/cache_break.zig");
