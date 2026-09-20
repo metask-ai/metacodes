@@ -118,6 +118,13 @@ pub const FileInfo = struct {
     /// matching size/content alone cannot detect a same-byte final-path swap.
     device: u64,
     inode: u64,
+    /// Owner. Zero on Windows, where the concept does not map; callers that
+    /// need ownership there must use a Windows-specific check instead of
+    /// trusting this field.
+    uid: u32,
+    /// True for a directory. `is_regular` answers the common case; a caller
+    /// that hands a pathname to another process has to know the difference.
+    is_dir: bool,
 };
 
 /// 对已打开 fd 做类型与大小检查。安全敏感读取必须先 open(O_NOFOLLOW)，再 fstat fd，
@@ -133,6 +140,8 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .mode = @intCast(st.st_mode),
             .device = @intCast(st.st_dev),
             .inode = @intCast(st.st_ino),
+            .uid = 0,
+            .is_dir = (@as(u32, st.st_mode) & S_IFMT) == S_IFDIR,
         };
     }
     if (builtin.os.tag == .linux) {
@@ -148,6 +157,8 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .mode = stx.mode,
             .device = (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor),
             .inode = stx.ino,
+            .uid = stx.uid,
+            .is_dir = (@as(u32, stx.mode) & S_IFMT) == S_IFDIR,
         };
     }
     var st: std.c.Stat = undefined;
@@ -159,6 +170,8 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
         .mode = @intCast(st.mode),
         .device = @intCast(st.dev),
         .inode = @intCast(st.ino),
+        .uid = @intCast(st.uid),
+        .is_dir = (@as(u32, @intCast(st.mode)) & S_IFMT) == S_IFDIR,
     };
 }
 

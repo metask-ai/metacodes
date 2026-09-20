@@ -306,17 +306,23 @@ pub const Supervisor = struct {
             .session_id = session_id,
             .timeout_ms = timeoutOf(root),
         }) catch |err| {
-            // Refused here, before the child saw anything: that is the client's
-            // request being too large, not the daemon failing to answer.
-            if (err == bridge_mod.Error.RequestTooLarge) {
-                self.sendError(conn, 413, "the encoded request exceeds the TinyKG request limit");
-                return;
-            }
-            self.reportDaemonFailure(conn, err);
+            self.reportBridgeError(conn, err);
             return;
         };
         defer response.deinit();
         self.sendEnvelope(conn, allocator, request_id, session_id, &response);
+    }
+
+    /// One place decides what a bridge failure means to the client, so a new
+    /// endpoint cannot report a locally refused request as the daemon dying.
+    fn reportBridgeError(self: *Supervisor, conn: net.Socket, err: anyerror) void {
+        if (err == bridge_mod.Error.RequestTooLarge) {
+            // Refused before the child saw a byte: the client's request is too
+            // large, and the daemon is fine.
+            self.sendError(conn, 413, "the encoded request exceeds the TinyKG request limit");
+            return;
+        }
+        self.reportDaemonFailure(conn, err);
     }
 
     /// Any failure after the request reached the child desynchronizes the pipe
@@ -388,7 +394,7 @@ pub const Supervisor = struct {
             .content_digest = digest_buffer[0..],
             .timeout_ms = timeoutOf(root),
         }) catch |err| {
-            self.reportDaemonFailure(conn, err);
+            self.reportBridgeError(conn, err);
             return;
         };
         defer response.deinit();
@@ -410,8 +416,7 @@ pub const Supervisor = struct {
         markdown: []const u8,
     ) ![]const u8 {
         const dir = try std.fmt.allocPrint(allocator, "{s}.import", .{self.options.store_path});
-        try @import("../../util/fs.zig").mkdirParents(dir);
-        restrictDirectory(allocator, dir);
+        try ensurePrivateDirectory(allocator, dir);
 
         var suffix: [8]u8 = undefined;
         if (!@import("platform").rng.randomBytes(&suffix)) return error.StageFailed;
@@ -727,14 +732,38 @@ fn infoField(stdout: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Best effort: the directory may predate this build with looser bits, and a
-/// failure here is not a reason to refuse an import that is otherwise safe
-/// because of the exclusive temporary above.
-fn restrictDirectory(allocator: std.mem.Allocator, path: []const u8) void {
-    if (@import("builtin").os.tag == .windows) return;
-    const path_z = allocator.dupeZ(u8, path) catch return;
+/// The staging directory must be private before anything is written into it,
+/// and the check has to be a refusal rather than a repair.
+///
+/// The engine opens the staged file by pathname after we rename it there, so
+/// between our rename and its open anyone who can write in that directory can
+/// swap the file for a symlink and have the daemon follow it. No amount of care
+/// with our own file closes that window; only a directory nobody else can write
+/// does. A best-effort `chmod` was worse than nothing here: it also followed a
+/// directory symlink, so a planted link could redirect both the tightening and
+/// the staging itself.
+fn ensurePrivateDirectory(allocator: std.mem.Allocator, path: []const u8) !void {
+    const util_fs = @import("../../util/fs.zig");
+    const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    _ = std.c.chmod(path_z.ptr, 0o700);
+    const existed = pfs.exists(path_z.ptr);
+    util_fs.mkdirParents(path) catch return error.StagingDirectoryUnusable;
+    // Tightened only when this process created it. Repairing a directory that
+    // was already there would silently accept a shared one — and would follow a
+    // planted directory symlink while doing it.
+    if (!existed and @import("builtin").os.tag != .windows) {
+        if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.StagingDirectoryUnusable;
+    }
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.StagingDirectoryUnusable;
+    defer _ = pfs.close(fd);
+    const info = pfs.fileInfo(fd) catch return error.StagingDirectoryUnusable;
+    if (!info.is_dir) return error.StagingDirectoryUnusable;
+    if (@import("builtin").os.tag == .windows) return;
+    if (info.uid != std.c.geteuid()) return error.StagingDirectoryUnusable;
+    // No group or world write: those are exactly the bits that would let
+    // someone else replace the staged file after the rename.
+    if ((info.mode & 0o022) != 0) return error.StagingDirectoryUnusable;
 }
 
 fn removeFile(path: []const u8) void {
@@ -792,6 +821,39 @@ test "KgdServer: informational fields are read by exact key" {
     try testing.expectEqualStrings("/tmp/x", infoField(stdout, "db").?);
     try testing.expect(infoField(stdout, "version") == null);
     try testing.expect(infoField(stdout, "nodes_total") == null);
+}
+
+test "KgdServer: staging refuses a directory other people can write" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+
+    // Created fresh: private, and usable.
+    const fresh = try std.fmt.allocPrint(a, "{s}/fresh.import", .{root});
+    defer a.free(fresh);
+    try ensurePrivateDirectory(a, fresh);
+
+    // Group- and world-writable: the daemon opens the staged file by name
+    // after we rename it, so anyone who can write here can swap it for a
+    // symlink in between. Refuse rather than stage.
+    const shared = try std.fmt.allocPrintSentinel(a, "{s}/shared.import", .{root}, 0);
+    defer a.free(shared);
+    try @import("../../util/fs.zig").mkdirParents(std.mem.span(shared.ptr));
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(shared.ptr, 0o777));
+    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, std.mem.span(shared.ptr)));
+
+    // A symlink standing in for the directory: following it would stage into
+    // someone else's directory, and the old code would have chmod'ed it too.
+    const target = try std.fmt.allocPrintSentinel(a, "{s}/elsewhere", .{root}, 0);
+    defer a.free(target);
+    try @import("../../util/fs.zig").mkdirParents(std.mem.span(target.ptr));
+    const linked = try std.fmt.allocPrintSentinel(a, "{s}/linked.import", .{root}, 0);
+    defer a.free(linked);
+    try testing.expectEqual(@as(c_int, 0), std.c.symlink(target.ptr, linked.ptr));
+    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, std.mem.span(linked.ptr)));
 }
 
 test "KgdServer: a timeout outside the daemon's range falls back to the default" {
