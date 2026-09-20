@@ -86,7 +86,7 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
     try std.testing.expectEqual(teammate.TeammateStatus.idle, entry.statusSnapshot()); // 仍活着
 
     // 真 lead 发 shutdown → 退出。
-    try mailbox.deliver(a, victim_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"real1\"}", null, null);
+    try mailbox.deliverWithIdentity(a, victim_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"real1\"}", null, null, sw.session.asSlice(), sw.session.asSlice());
     waited = 0;
     while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
@@ -148,7 +148,7 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
     // lead 发 shutdown。
     var ib: [std.fs.max_path_bytes]u8 = undefined;
     const solo_inbox = team.inboxPath(home, "proj", "solo", &ib);
-    try mailbox.deliver(a, solo_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"rid42\"}", null, null);
+    try mailbox.deliverWithIdentity(a, solo_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"rid42\"}", null, null, sw.session.asSlice(), sw.session.asSlice());
     // The approval must carry the persisted generation identity.  Read it
     // here to mirror the real teammate response and make the test fail if
     // spawn stops recording a lease.
@@ -312,7 +312,7 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
         }
         var ib: [std.fs.max_path_bytes]u8 = undefined;
         const winbox = team.inboxPath(home, "proj", "w", &ib);
-        try mailbox.deliver(a, winbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r\"}", null, null);
+        try mailbox.deliverWithIdentity(a, winbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r\"}", null, null, sw.session.asSlice(), sw.session.asSlice());
         waited = 0;
         while (waited < 20_000) : (waited += 20) {
             const en = sw.teammates.?.findByName("w") orelse break;

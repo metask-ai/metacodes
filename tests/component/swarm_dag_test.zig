@@ -302,7 +302,7 @@ test "L2 SW3: TeamCreate 建共享 root + teammate 线程自领跑起来(端到�
     // → 该任务回到无主(claimed_by=null),可被别人重领。
     var ib: [std.fs.max_path_bytes]u8 = undefined;
     const winbox = team.inboxPath(home, "proj", "worker", &ib);
-    try cc.swarm_mailbox.deliver(a, winbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r1\"}", null, null);
+    try cc.swarm_mailbox.deliverWithIdentity(a, winbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r1\"}", null, null, sw.session.asSlice(), sw.session.asSlice());
     waited = 0;
     while (waited < 30_000) : (waited += 50) {
         if (sw.teammates.?.liveCount() == 0) break;

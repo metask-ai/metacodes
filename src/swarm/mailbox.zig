@@ -39,6 +39,10 @@ pub const Message = struct {
     read: bool = false,
     color: ?[]const u8 = null,
     summary: ?[]const u8 = null,
+    /// Durable sender identity. Legacy mailbox entries omit these fields and
+    /// must fail closed at consumers that route plain messages.
+    session_id: ?[]const u8 = null,
+    lease_id: ?[]const u8 = null,
     /// 运行时字段(不序列化):该消息在文件数组里的下标。投递只 append、只有主人标读/重写
     /// → 下标在主人视角稳定,可用于 markReadAt 选择性标读(只标真正消费掉的,协议消息留着
     /// 给 SW3/SW4 的消费者;Linus SW1 MED-2)。
@@ -111,6 +115,8 @@ fn freeMessage(a: std.mem.Allocator, m: *Message) void {
     a.free(m.timestamp);
     if (m.color) |c| a.free(c);
     if (m.summary) |s| a.free(s);
+    if (m.session_id) |s| a.free(s);
+    if (m.lease_id) |l| a.free(l);
 }
 
 // ============================================================================
@@ -147,6 +153,23 @@ pub const MAILBOX_MAX_MESSAGES: usize = 500;
 pub const MAILBOX_HARD_MAX: usize = 5000;
 
 pub fn deliver(allocator: std.mem.Allocator, path: []const u8, from: []const u8, text: []const u8, color: ?[]const u8, summary: ?[]const u8) !void {
+    return deliverWithIdentity(allocator, path, from, text, color, summary, null, null);
+}
+
+/// Deliver a message with the sender's durable session + per-spawn lease.
+/// The legacy `deliver` wrapper intentionally omits identity for fixtures and
+/// old files; routing consumers reject those messages when they are plain.
+pub fn deliverWithIdentity(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    from: []const u8,
+    text: []const u8,
+    color: ?[]const u8,
+    summary: ?[]const u8,
+    session_id: ?[]const u8,
+    lease_id: ?[]const u8,
+) !void {
+    if ((session_id == null) != (lease_id == null)) return error.InvalidIdentity;
     try ensureInbox(path);
     var lock = try file_lock.acquire(path, .{});
     defer lock.release();
@@ -158,15 +181,38 @@ pub fn deliver(allocator: std.mem.Allocator, path: []const u8, from: []const u8,
     dropOldestIfOverHardCap(allocator, &list, MAILBOX_HARD_MAX, path);
     var ts_buf: [40]u8 = undefined;
     const ts = formatIso8601(@divTrunc(util_time.nowWallNs(), 1_000_000), &ts_buf);
+    var from_owned = try allocator.dupe(u8, from);
+    errdefer allocator.free(from_owned);
+    var text_owned = try allocator.dupe(u8, text);
+    errdefer allocator.free(text_owned);
+    var timestamp_owned = try allocator.dupe(u8, ts);
+    errdefer allocator.free(timestamp_owned);
+    var color_owned: ?[]u8 = if (color) |c| try allocator.dupe(u8, c) else null;
+    errdefer if (color_owned) |c| allocator.free(c);
+    var summary_owned: ?[]u8 = if (summary) |s| try allocator.dupe(u8, s) else null;
+    errdefer if (summary_owned) |s| allocator.free(s);
+    var session_owned: ?[]u8 = if (session_id) |s| try allocator.dupe(u8, s) else null;
+    errdefer if (session_owned) |s| allocator.free(s);
+    var lease_owned: ?[]u8 = if (lease_id) |l| try allocator.dupe(u8, l) else null;
+    errdefer if (lease_owned) |l| allocator.free(l);
     try list.items.append(allocator, .{
-        .from = try allocator.dupe(u8, from),
-        .text = try allocator.dupe(u8, text),
-        .timestamp = try allocator.dupe(u8, ts),
+        .from = from_owned,
+        .text = text_owned,
+        .timestamp = timestamp_owned,
         .read = false,
-        .color = if (color) |c| try allocator.dupe(u8, c) else null,
-        .summary = if (summary) |s| try allocator.dupe(u8, s) else null,
+        .color = color_owned,
+        .summary = summary_owned,
+        .session_id = session_owned,
+        .lease_id = lease_owned,
         .file_index = list.items.items.len,
     });
+    from_owned = &.{};
+    text_owned = &.{};
+    timestamp_owned = &.{};
+    color_owned = null;
+    summary_owned = null;
+    session_owned = null;
+    lease_owned = null;
     try writeAllUnlocked(allocator, path, &list);
 }
 
@@ -224,6 +270,10 @@ pub fn readUnread(allocator: std.mem.Allocator, path: []const u8) !MessageList {
         errdefer if (color) |c| allocator.free(c);
         var summary: ?[]u8 = if (m.summary) |s| try allocator.dupe(u8, s) else null;
         errdefer if (summary) |s| allocator.free(s);
+        var session_id: ?[]u8 = if (m.session_id) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (session_id) |s| allocator.free(s);
+        var lease_id: ?[]u8 = if (m.lease_id) |l| try allocator.dupe(u8, l) else null;
+        errdefer if (lease_id) |l| allocator.free(l);
         try out.items.append(allocator, .{
             .from = from,
             .text = text,
@@ -231,6 +281,8 @@ pub fn readUnread(allocator: std.mem.Allocator, path: []const u8) !MessageList {
             .read = false,
             .color = color,
             .summary = summary,
+            .session_id = session_id,
+            .lease_id = lease_id,
             .file_index = m.file_index,
         });
         from = &.{};
@@ -238,6 +290,8 @@ pub fn readUnread(allocator: std.mem.Allocator, path: []const u8) !MessageList {
         timestamp = &.{};
         color = null;
         summary = null;
+        session_id = null;
+        lease_id = null;
     }
     return out;
 }
@@ -257,7 +311,7 @@ pub fn markReadAt(allocator: std.mem.Allocator, path: []const u8, consumed: []co
         // 快路径:序数直取 + 身份校验。
         if (c.file_index < list.items.items.len) {
             const m = &list.items.items[c.file_index];
-            if (std.mem.eql(u8, m.from, c.from) and std.mem.eql(u8, m.timestamp, c.timestamp) and std.mem.eql(u8, m.text, c.text)) {
+            if (sameIdentity(m, c) and std.mem.eql(u8, m.from, c.from) and std.mem.eql(u8, m.timestamp, c.timestamp) and std.mem.eql(u8, m.text, c.text)) {
                 m.read = true;
                 continue;
             }
@@ -265,7 +319,7 @@ pub fn markReadAt(allocator: std.mem.Allocator, path: []const u8, consumed: []co
         // 回退:身份线性搜(文件被并发修复/压缩过的罕见情形)。
         for (list.items.items) |*m| {
             if (m.read) continue;
-            if (std.mem.eql(u8, m.from, c.from) and std.mem.eql(u8, m.timestamp, c.timestamp) and std.mem.eql(u8, m.text, c.text)) {
+            if (sameIdentity(m, c) and std.mem.eql(u8, m.from, c.from) and std.mem.eql(u8, m.timestamp, c.timestamp) and std.mem.eql(u8, m.text, c.text)) {
                 m.read = true;
                 break;
             }
@@ -325,6 +379,10 @@ fn readAllUnlocked(allocator: std.mem.Allocator, path: []const u8) !MessageList 
         errdefer if (c_owned) |c| allocator.free(c);
         var s_owned: ?[]const u8 = if (strField(o, "summary")) |s| try allocator.dupe(u8, s) else null;
         errdefer if (s_owned) |s| allocator.free(s);
+        var session_owned: ?[]const u8 = if (strField(o, "session_id")) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (session_owned) |s| allocator.free(s);
+        var lease_owned: ?[]const u8 = if (strField(o, "lease_id")) |l| try allocator.dupe(u8, l) else null;
+        errdefer if (lease_owned) |l| allocator.free(l);
         try out.items.append(allocator, .{
             .from = f_owned,
             .text = t_owned,
@@ -332,6 +390,8 @@ fn readAllUnlocked(allocator: std.mem.Allocator, path: []const u8) !MessageList 
             .read = boolField(o, "read") orelse false,
             .color = c_owned,
             .summary = s_owned,
+            .session_id = session_owned,
+            .lease_id = lease_owned,
             // 解析序数(非原始数组下标):写侧只落有效消息且保序,故序数在主人视角稳定。
             .file_index = out.items.items.len,
         });
@@ -342,6 +402,8 @@ fn readAllUnlocked(allocator: std.mem.Allocator, path: []const u8) !MessageList 
         ts_owned = &.{};
         c_owned = null;
         s_owned = null;
+        session_owned = null;
+        lease_owned = null;
     }
     return out;
 }
@@ -367,6 +429,14 @@ fn writeAllUnlocked(allocator: std.mem.Allocator, path: []const u8, list: *const
         if (m.summary) |s| {
             try out.appendSlice(allocator, ",\"summary\":");
             try util_json.serializeString(s, &out, allocator);
+        }
+        if (m.session_id) |s| {
+            try out.appendSlice(allocator, ",\"session_id\":");
+            try util_json.serializeString(s, &out, allocator);
+        }
+        if (m.lease_id) |l| {
+            try out.appendSlice(allocator, ",\"lease_id\":");
+            try util_json.serializeString(l, &out, allocator);
         }
         try out.append(allocator, '}');
     }
@@ -477,6 +547,16 @@ fn boolField(o: std.json.ObjectMap, key: []const u8) ?bool {
         .bool => |b| b,
         else => null,
     };
+}
+
+fn sameIdentity(left: *const Message, right: *const Message) bool {
+    return optionalStringEqual(left.session_id, right.session_id) and
+        optionalStringEqual(left.lease_id, right.lease_id);
+}
+
+fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left) |value| return right != null and std.mem.eql(u8, value, right.?);
+    return right == null;
 }
 
 // ============================================================================

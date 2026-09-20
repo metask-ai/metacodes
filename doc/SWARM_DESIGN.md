@@ -28,7 +28,7 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
   `leaseId`；恢复、轮换 session、删除后重建同名成员或启动进程外 teammate 时都以父 session
   和 lease 双重校验。缺少字段的旧配置按不属于当前 session 处理并拒绝操作。
 - **file_lock**(`src/util/file_lock.zig`):`<path>.lock` O_EXCL 哨兵 + **原子 rename 两阶段抢占**(防双持有)+ mtime 兜底陈旧检测。
-- **mailbox**:锁内读-改-写;消息 `{from,text,timestamp,read,color?,summary?}`;`classify` 真顶层 JSON parse 认协议类型(非 substring,防误判);`markReadAt` 选择性标读(协议消息留给消费者);软顶 500(裁最旧已读)+ 硬顶 5000(丢最旧未读 + log.warn)。
+- **mailbox**:锁内读-改-写;消息 `{from,text,timestamp,read,color?,summary?,session_id?,lease_id?}`。生产 SendMessage、idle 和 shutdown 回执都写入发送者的父 session 与 spawn lease；lead、线程 teammate、进程 teammate 消费普通消息时按当前 TeamFile 成员身份校验，缺少或过期身份的旧消息消费后丢弃，防同名替换后的延迟消息注入。`classify` 真顶层 JSON parse 认协议类型(非 substring,防误判);`markReadAt` 选择性标读(协议消息留给消费者);软顶 500(裁最旧已读)+ 硬顶 5000(丢最旧未读 + log.warn)。
 - **updateTeam**:一切 team 变更的唯一锁内 RMW 入口(防丢更新)。
 
 ## 2. 进程内 teammate 运行时(SW1)

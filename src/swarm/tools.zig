@@ -266,7 +266,17 @@ pub fn executeSendMessage(ctx: *const ToolContext, args: []const u8) anyerror![]
     }
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
     const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, to_s, &inbox_buf);
-    try mailbox.deliver(ctx.allocator, inbox, sw.self_name, message, null, summary);
+    const sender_lease = sw.senderLease();
+    try mailbox.deliverWithIdentity(
+        ctx.allocator,
+        inbox,
+        sw.self_name,
+        message,
+        null,
+        summary,
+        sw.session.asSlice(),
+        sender_lease.asSlice(),
+    );
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
     errdefer out.deinit();
     try out.writer.writeAll("{\"to\":");
@@ -305,7 +315,17 @@ fn broadcast(ctx: *const ToolContext, sw: *SwarmContext, message: []const u8, su
         }
         var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
         const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, m.name, &inbox_buf);
-        mailbox.deliver(ctx.allocator, inbox, sw.self_name, message, null, summary) catch |e| {
+        const sender_lease = sw.senderLease();
+        mailbox.deliverWithIdentity(
+            ctx.allocator,
+            inbox,
+            sw.self_name,
+            message,
+            null,
+            summary,
+            sw.session.asSlice(),
+            sender_lease.asSlice(),
+        ) catch |e| {
             log.warn("swarm", "broadcast to {s} failed: {s}", .{ m.name, @errorName(e) });
             continue;
         };
@@ -315,7 +335,17 @@ fn broadcast(ctx: *const ToolContext, sw: *SwarmContext, message: []const u8, su
     if (!std.mem.eql(u8, sw.self_name, team_mod.TEAM_LEAD_NAME)) {
         var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
         const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, team_mod.TEAM_LEAD_NAME, &inbox_buf);
-        mailbox.deliver(ctx.allocator, inbox, sw.self_name, message, null, summary) catch {};
+        const sender_lease = sw.senderLease();
+        mailbox.deliverWithIdentity(
+            ctx.allocator,
+            inbox,
+            sw.self_name,
+            message,
+            null,
+            summary,
+            sw.session.asSlice(),
+            sender_lease.asSlice(),
+        ) catch {};
         n += 1;
     }
     return n;
@@ -351,6 +381,13 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
         const kind = mailbox.classify(allocator, m.text);
         switch (kind) {
             .plain => {
+                // Plain messages are routed work products too. Reject old
+                // mailbox entries and delayed same-name senders unless their
+                // persisted session+lease still names the current member.
+                if (!plainMessageMatchesCurrentMember(allocator, sw, m)) {
+                    consumed.append(allocator, m.*) catch {};
+                    continue;
+                }
                 const wire = mailbox.formatForModel(allocator, m) catch continue;
                 defer allocator.free(wire);
                 if (out.items.len > 0) out.appendSlice(allocator, "\n\n") catch {};
@@ -392,8 +429,13 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
                 // Process teammates have no in-process registry. A matching
                 // tracked record means the child is still running because
                 // exited records were reaped at the start of this poll.
-                var process_alive = false;
+                const envelope_session = m.session_id orelse continue;
+                const envelope_lease = m.lease_id orelse continue;
+                const approval_session = util_json.extractStringField(m.text, "session_id") orelse continue;
                 const approval_lease_raw = util_json.extractStringField(m.text, "lease_id") orelse continue;
+                if (!std.mem.eql(u8, envelope_session, approval_session) or
+                    !std.mem.eql(u8, envelope_lease, approval_lease_raw)) continue;
+                var process_alive = false;
                 for (sw.process_teammates.items) |*process_member| {
                     if (std.mem.eql(u8, process_member.name, m.from) and
                         std.mem.eql(u8, process_member.session.asSlice(), sw.session.asSlice()) and
@@ -410,7 +452,6 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
                 // missing or malformed identity is left unread for the
                 // owner of the old protocol to handle rather than deleting
                 // by name alone.
-                const approval_session = util_json.extractStringField(m.text, "session_id") orelse continue;
                 const approval_lease = util_json.extractStringField(m.text, "lease_id") orelse continue;
                 const session_id_mod = @import("../core/session_id.zig");
                 if (session_id_mod.SessionId.fromSlice(approval_session) == null or
@@ -445,6 +486,10 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
 fn idleNotificationMatchesCurrentMember(allocator: std.mem.Allocator, sw: *const SwarmContext, m: *const mailbox.Message) bool {
     const raw_session = util_json.extractStringField(m.text, "session_id") orelse return false;
     const raw_lease = util_json.extractStringField(m.text, "lease_id") orelse return false;
+    const envelope_session = m.session_id orelse return false;
+    const envelope_lease = m.lease_id orelse return false;
+    if (!std.mem.eql(u8, raw_session, envelope_session) or
+        !std.mem.eql(u8, raw_lease, envelope_lease)) return false;
     const session = @import("../core/session_id.zig").SessionId.fromSlice(raw_session) orelse return false;
     const lease = @import("../core/session_id.zig").SessionId.fromSlice(raw_lease) orelse return false;
     if (!std.mem.eql(u8, session.asSlice(), sw.session.asSlice())) return false;
@@ -455,6 +500,36 @@ fn idleNotificationMatchesCurrentMember(allocator: std.mem.Allocator, sw: *const
     const cfg = sw.configPath(&cfg_buf);
     var tf = team_mod.load(allocator, cfg) orelse return false;
     defer tf.deinit();
+    if (std.mem.eql(u8, name, team_mod.TEAM_LEAD_NAME)) {
+        const lead_session = tf.lead_session_id orelse return false;
+        return std.mem.eql(u8, lead_session, session.asSlice()) and
+            std.mem.eql(u8, lease.asSlice(), session.asSlice());
+    }
+    const member = tf.findMember(name) orelse return false;
+    const member_session = member.session_id orelse return false;
+    const member_lease = member.lease_id orelse return false;
+    return std.mem.eql(u8, member_session, session.asSlice()) and
+        std.mem.eql(u8, member_lease, lease.asSlice());
+}
+
+fn plainMessageMatchesCurrentMember(allocator: std.mem.Allocator, sw: *const SwarmContext, m: *const mailbox.Message) bool {
+    const raw_session = m.session_id orelse return false;
+    const raw_lease = m.lease_id orelse return false;
+    const session = @import("../core/session_id.zig").SessionId.fromSlice(raw_session) orelse return false;
+    const lease = @import("../core/session_id.zig").SessionId.fromSlice(raw_lease) orelse return false;
+    if (!std.mem.eql(u8, session.asSlice(), sw.session.asSlice())) return false;
+
+    var name_buf: [64]u8 = undefined;
+    const name = team_mod.sanitizeAgentName(m.from, &name_buf);
+    var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cfg = sw.configPath(&cfg_buf);
+    var tf = team_mod.load(allocator, cfg) orelse return false;
+    defer tf.deinit();
+    if (std.mem.eql(u8, name, team_mod.TEAM_LEAD_NAME)) {
+        const lead_session = tf.lead_session_id orelse return false;
+        return std.mem.eql(u8, lead_session, session.asSlice()) and
+            std.mem.eql(u8, lease.asSlice(), session.asSlice());
+    }
     const member = tf.findMember(name) orelse return false;
     const member_session = member.session_id orelse return false;
     const member_lease = member.lease_id orelse return false;
@@ -644,14 +719,43 @@ test "pollLeadInbox: plain + idle_notification 消费,协议回执留未读" {
 
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
     const lead_inbox = team_mod.inboxPath(home, "proj", "team-lead", &inbox_buf);
-    try mailbox.deliver(a, lead_inbox, "bob", "here is my result", "blue", "result");
+    try mailbox.deliverWithIdentity(
+        a,
+        lead_inbox,
+        "bob",
+        "here is my result",
+        "blue",
+        "result",
+        sw.session.asSlice(),
+        lease.asSlice(),
+    );
+    const stale_lease = @import("../core/session_id.zig").gen();
+    try mailbox.deliverWithIdentity(
+        a,
+        lead_inbox,
+        "bob",
+        "stale replacement result",
+        null,
+        null,
+        sw.session.asSlice(),
+        stale_lease.asSlice(),
+    );
     const idle = try std.fmt.allocPrint(
         a,
         "{{\"type\":\"idle_notification\",\"from\":\"bob\",\"session_id\":\"{s}\",\"lease_id\":\"{s}\",\"idleReason\":\"failed\",\"stopReason\":\"<stop>\",\"failureReason\":\"<boom>\"}}",
         .{ sw.session.asSlice(), lease.asSlice() },
     );
     defer a.free(idle);
-    try mailbox.deliver(a, lead_inbox, "bob", idle, null, null);
+    try mailbox.deliverWithIdentity(
+        a,
+        lead_inbox,
+        "bob",
+        idle,
+        null,
+        null,
+        sw.session.asSlice(),
+        lease.asSlice(),
+    );
     // A legacy notification without the durable identity is consumed but
     // must not affect the visible roster.
     try mailbox.deliver(a, lead_inbox, "bob", "{\"type\":\"idle_notification\",\"from\":\"bob\",\"idleReason\":\"available\"}", null, null);
@@ -661,6 +765,7 @@ test "pollLeadInbox: plain + idle_notification 消费,协议回执留未读" {
     const pulled = (try pollLeadInbox(a, &sw)) orelse return error.NothingPulled;
     defer a.free(pulled);
     try testing.expect(std.mem.indexOf(u8, pulled, "here is my result") != null);
+    try testing.expect(std.mem.indexOf(u8, pulled, "stale replacement result") == null);
     try testing.expect(std.mem.indexOf(u8, pulled, "state=\"failed\"") != null);
     try testing.expect(std.mem.indexOf(u8, pulled, "boom") != null);
     try testing.expect(std.mem.indexOf(u8, pulled, "stopReason=\"&lt;stop&gt;\"") != null);

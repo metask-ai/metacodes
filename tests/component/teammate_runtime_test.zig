@@ -127,7 +127,7 @@ test "L2 teammate 全链: spawn→idle→消息续跑→shutdown 优雅退出" {
     // C: 投 plain 消息 → 第二轮跑 → 第二条 idle notification + 输出含 TURN2 + 消息标已读。
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
     const bob_inbox = team.inboxPath(home, "proj", "bob", &inbox_buf);
-    try mailbox.deliver(a, bob_inbox, "team-lead", "continue with step 2", null, null);
+    try mailbox.deliverWithIdentity(a, bob_inbox, "team-lead", "continue with step 2", null, null, entry.session.asSlice(), entry.session.asSlice());
     try waitIdleCount(a, home, 2, 5000);
     {
         entry.lockPublic();
@@ -140,7 +140,7 @@ test "L2 teammate 全链: spawn→idle→消息续跑→shutdown 优雅退出" {
     }
 
     // D: shutdown_request → 线程优雅退出。
-    try mailbox.deliver(a, bob_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r1\"}", null, null);
+    try mailbox.deliverWithIdentity(a, bob_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r1\"}", null, null, entry.session.asSlice(), entry.session.asSlice());
     var waited: u32 = 0;
     while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
@@ -331,7 +331,7 @@ test "L2 teammate 协议消息不吞: task_assignment 留未读,teammate 保持 
         try std.testing.expectEqual(@as(usize, 1), unread.items.items.len); // 留给 SW3 消费者
     }
     // shutdown:只标读 shutdown,task_assignment 仍未读。
-    try mailbox.deliver(a, hal_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r9\"}", null, null);
+    try mailbox.deliverWithIdentity(a, hal_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r9\"}", null, null, entry.session.asSlice(), entry.session.asSlice());
     var waited: u32 = 0;
     while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;

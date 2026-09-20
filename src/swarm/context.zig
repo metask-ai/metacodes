@@ -26,6 +26,10 @@ pub const SwarmContext = struct {
     /// Session that owns this team roster; resume must not address a prior
     /// session's teammates by name.
     session: SessionId = SessionId.single,
+    /// Per-spawn sender lease for teammate mail. Lead messages use the lead
+    /// session as their stable lease; production teammates set this to the
+    /// persisted member lease before entering the tool loop.
+    lease: SessionId = SessionId.single,
     /// HOME(teams 目录根 `{home}/.metacodes/teams`)。空 = swarm 不可用。
     home: []const u8 = "",
     /// 调用者身份(lead="team-lead";teammate=自己 sanitized 名)。
@@ -210,6 +214,10 @@ pub const SwarmContext = struct {
 
     pub fn hasTeamForSession(self: *const SwarmContext, session: SessionId) bool {
         return self.hasTeam() and std.mem.eql(u8, self.session.asSlice(), session.asSlice());
+    }
+
+    pub fn senderLease(self: *const SwarmContext) SessionId {
+        return if (self.is_lead) self.session else self.lease;
     }
 
     /// config.json 路径(当前 team;无 team → "")。写进 buf。

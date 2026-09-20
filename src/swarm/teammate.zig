@@ -1070,7 +1070,16 @@ fn sendIdleNotification(a: std.mem.Allocator, e: *TeammateEntry, reason: []const
     out.writer.writeByte('}') catch return;
     const body = out.toOwnedSlice() catch return;
     defer a.free(body);
-    mailbox.deliver(a, e.lead_inbox_path, e.name, body, if (e.color.len > 0) e.color else null, null) catch |err| {
+    mailbox.deliverWithIdentity(
+        a,
+        e.lead_inbox_path,
+        e.name,
+        body,
+        if (e.color.len > 0) e.color else null,
+        null,
+        e.session.asSlice(),
+        e.agent_ident.asSlice(),
+    ) catch |err| {
         log.warn("swarm", "idle notification delivery failed for {s}: {s}", .{ e.agent_id, @errorName(err) });
     };
 }
@@ -1103,7 +1112,16 @@ fn sendShutdownApproved(a: std.mem.Allocator, e: *TeammateEntry, request_text: [
     out.writer.writeByte('}') catch return;
     const body = out.toOwnedSlice() catch return;
     defer a.free(body);
-    mailbox.deliver(a, e.lead_inbox_path, e.name, body, if (e.color.len > 0) e.color else null, null) catch {};
+    mailbox.deliverWithIdentity(
+        a,
+        e.lead_inbox_path,
+        e.name,
+        body,
+        if (e.color.len > 0) e.color else null,
+        null,
+        e.session.asSlice(),
+        e.agent_ident.asSlice(),
+    ) catch {};
 }
 
 /// idle-wait:轮询自己邮箱直到有下一轮 prompt 或退出信号。
@@ -1131,7 +1149,9 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
             // lead 发 shutdown 不得终止别人(对齐 cc "plan/mode 响应仅认 from==team-lead")。
             for (unread.items.items) |*m| {
                 if (mailbox.classify(a, m.text) != .shutdown_request) continue;
-                if (!std.mem.eql(u8, m.from, team_mod.TEAM_LEAD_NAME)) {
+                if (!std.mem.eql(u8, m.from, team_mod.TEAM_LEAD_NAME) or
+                    !leadMessageMatchesCurrentSession(e, m))
+                {
                     // 非 lead 发的 shutdown:标读丢弃 + 记日志(不终止)。
                     const bad = [1]mailbox.Message{m.*};
                     mailbox.markReadAt(a, e.inbox_path, &bad) catch {};
@@ -1150,8 +1170,8 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
             defer out.deinit(a);
             var consumed: std.ArrayList(mailbox.Message) = .empty;
             defer consumed.deinit(a); // 元素借 unread 的内存,不 free
-            appendPlainFrom(a, &out, &unread, team_mod.TEAM_LEAD_NAME, true, &consumed);
-            appendPlainFrom(a, &out, &unread, team_mod.TEAM_LEAD_NAME, false, &consumed);
+            appendPlainFrom(a, e, &out, &unread, team_mod.TEAM_LEAD_NAME, true, &consumed);
+            appendPlainFrom(a, e, &out, &unread, team_mod.TEAM_LEAD_NAME, false, &consumed);
 
             // **只标读真正消费的 plain**(Linus MED-2/PM F4):协议消息(task_assignment/
             // plan_approval_response…)留在未读,SW3/SW4 的消费者接手;绝不 mark-all 吞掉。
@@ -1247,6 +1267,7 @@ pub fn tryClaimFrontierTask(a: std.mem.Allocator, kg: *@import("../kg/client.zig
 /// 协议消息跳过(由 waitForMail 统一记日志)。
 fn appendPlainFrom(
     a: std.mem.Allocator,
+    e: *TeammateEntry,
     out: *std.ArrayList(u8),
     unread: *mailbox.MessageList,
     lead_name: []const u8,
@@ -1257,12 +1278,51 @@ fn appendPlainFrom(
         const is_lead = std.mem.eql(u8, m.from, lead_name);
         if (is_lead != match_lead) continue;
         if (mailbox.classify(a, m.text) != .plain) continue;
+        // A plain message is actionable work. Legacy entries without the
+        // envelope identity, or a delayed same-name sender after a resume,
+        // must be consumed and discarded instead of reaching the teammate.
+        if (!plainMessageMatchesCurrentMember(a, e, m)) {
+            consumed.append(a, m.*) catch {};
+            continue;
+        }
         const wire = mailbox.formatForModel(a, m) catch continue;
         defer a.free(wire);
         if (out.items.len > 0) out.appendSlice(a, "\n\n") catch {};
         out.appendSlice(a, wire) catch {};
         consumed.append(a, m.*) catch {};
     }
+}
+
+fn plainMessageMatchesCurrentMember(a: std.mem.Allocator, e: *const TeammateEntry, m: *const mailbox.Message) bool {
+    const raw_session = m.session_id orelse return false;
+    const raw_lease = m.lease_id orelse return false;
+    const session = session_id_mod.SessionId.fromSlice(raw_session) orelse return false;
+    const lease = session_id_mod.SessionId.fromSlice(raw_lease) orelse return false;
+    if (!std.mem.eql(u8, session.asSlice(), e.session.asSlice())) return false;
+
+    var name_buf: [64]u8 = undefined;
+    const sender = team_mod.sanitizeAgentName(m.from, &name_buf);
+    if (std.mem.eql(u8, sender, team_mod.TEAM_LEAD_NAME)) {
+        // Lead messages use the lead session as both session and lease.
+        return std.mem.eql(u8, lease.asSlice(), session.asSlice());
+    }
+
+    var tf = team_mod.load(a, e.config_path) orelse return false;
+    defer tf.deinit();
+    const member = tf.findMember(sender) orelse return false;
+    const member_session = member.session_id orelse return false;
+    const member_lease = member.lease_id orelse return false;
+    return std.mem.eql(u8, member_session, session.asSlice()) and
+        std.mem.eql(u8, member_lease, lease.asSlice());
+}
+
+fn leadMessageMatchesCurrentSession(e: *const TeammateEntry, m: *const mailbox.Message) bool {
+    const raw_session = m.session_id orelse return false;
+    const raw_lease = m.lease_id orelse return false;
+    const session = session_id_mod.SessionId.fromSlice(raw_session) orelse return false;
+    const lease = session_id_mod.SessionId.fromSlice(raw_lease) orelse return false;
+    return std.mem.eql(u8, session.asSlice(), e.session.asSlice()) and
+        std.mem.eql(u8, lease.asSlice(), e.session.asSlice());
 }
 
 /// teammate 线程主函数:多轮持久对话 + idle-wait 循环。
@@ -1347,6 +1407,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
     var teammate_sw = @import("context.zig").SwarmContext{
         .allocator = a,
         .session = input.session,
+        .lease = e.agent_ident,
         .home = input.home,
         .self_name = e.name,
         .is_lead = false,

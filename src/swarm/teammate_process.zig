@@ -164,6 +164,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
     var sw = swarm_ctx.SwarmContext{
         .allocator = allocator,
         .session = parent_session,
+        .lease = lease_id,
         .home = home,
         .self_name = name_s,
         .is_lead = false,
@@ -290,7 +291,9 @@ fn waitForWork(
             // shutdown(仅 team-lead)。
             for (unread.items.items) |*m| {
                 if (mailbox.classify(a, m.text) != .shutdown_request) continue;
-                if (!std.mem.eql(u8, m.from, team_mod.TEAM_LEAD_NAME)) {
+                if (!std.mem.eql(u8, m.from, team_mod.TEAM_LEAD_NAME) or
+                    !leadMessageMatchesCurrentSession(m, session))
+                {
                     const bad = [1]mailbox.Message{m.*};
                     mailbox.markReadAt(a, inbox, &bad) catch {};
                     continue; // 伪造 shutdown:丢弃
@@ -309,6 +312,10 @@ fn waitForWork(
                     const is_lead = std.mem.eql(u8, m.from, team_mod.TEAM_LEAD_NAME);
                     if (is_lead != lead_pass) continue;
                     if (mailbox.classify(a, m.text) != .plain) continue;
+                    if (!plainMessageMatchesCurrentMember(a, config_path, self_name, session, m)) {
+                        consumed.append(a, m.*) catch {};
+                        continue;
+                    }
                     const wire = mailbox.formatForModel(a, m) catch continue;
                     defer a.free(wire);
                     if (out.items.len > 0) out.appendSlice(a, "\n\n") catch {};
@@ -323,6 +330,42 @@ fn waitForWork(
         }
         util_time.sleepMs(POLL_MS);
     }
+}
+
+fn leadMessageMatchesCurrentSession(m: *const mailbox.Message, session: SessionId) bool {
+    const raw_session = m.session_id orelse return false;
+    const raw_lease = m.lease_id orelse return false;
+    const sender_session = SessionId.fromSlice(raw_session) orelse return false;
+    const sender_lease = SessionId.fromSlice(raw_lease) orelse return false;
+    return std.mem.eql(u8, sender_session.asSlice(), session.asSlice()) and
+        std.mem.eql(u8, sender_lease.asSlice(), session.asSlice());
+}
+
+fn plainMessageMatchesCurrentMember(
+    a: std.mem.Allocator,
+    config_path: []const u8,
+    self_name: []const u8,
+    session: SessionId,
+    m: *const mailbox.Message,
+) bool {
+    const raw_session = m.session_id orelse return false;
+    const raw_lease = m.lease_id orelse return false;
+    const sender_session = SessionId.fromSlice(raw_session) orelse return false;
+    const sender_lease = SessionId.fromSlice(raw_lease) orelse return false;
+    if (!std.mem.eql(u8, sender_session.asSlice(), session.asSlice())) return false;
+    var name_buf: [64]u8 = undefined;
+    const sender = team_mod.sanitizeAgentName(m.from, &name_buf);
+    if (std.mem.eql(u8, sender, team_mod.TEAM_LEAD_NAME)) {
+        return std.mem.eql(u8, sender_lease.asSlice(), session.asSlice());
+    }
+    if (std.mem.eql(u8, sender, self_name)) return false;
+    var tf = team_mod.load(a, config_path) orelse return false;
+    defer tf.deinit();
+    const member = tf.findMember(sender) orelse return false;
+    const member_session = member.session_id orelse return false;
+    const member_lease = member.lease_id orelse return false;
+    return std.mem.eql(u8, member_session, sender_session.asSlice()) and
+        std.mem.eql(u8, member_lease, sender_lease.asSlice());
 }
 
 fn sendNotice(
@@ -360,7 +403,16 @@ fn sendNotice(
     out.writer.writeByte('}') catch return;
     const body = out.toOwnedSlice() catch return;
     defer a.free(body);
-    mailbox.deliver(a, lead_inbox, name, body, null, null) catch {};
+    mailbox.deliverWithIdentity(
+        a,
+        lead_inbox,
+        name,
+        body,
+        null,
+        null,
+        session.asSlice(),
+        lease.asSlice(),
+    ) catch {};
 }
 
 const ActiveCtx = struct { name: []const u8, lead_session: []const u8, lease: []const u8, active: bool };

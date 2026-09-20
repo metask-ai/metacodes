@@ -38,9 +38,11 @@ the same bytes/text failure.
    visible session after Ctrl+B or `/resume`.
 9. A persisted team records `leadSessionId` and every member's `sessionId`.
    Process-mode members also carry a per-spawn `leaseId` and the expected
-   `cwd/worktree`. The child validates all four values at startup and before
-   consuming mailbox work; legacy records without them fail closed instead of
-   routing by name alone.
+   `cwd/worktree`. Mailbox work carries the sender session and lease; the
+   lead, thread child, and process child validate that envelope against the
+   current TeamFile member before consuming plain work. The child validates
+   all four values at startup and before consuming mailbox work; legacy
+   records without them fail closed instead of routing by name alone.
 
 ## Data and boundary API
 
