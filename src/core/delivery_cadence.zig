@@ -168,13 +168,54 @@ fn classifyBash(allocator: std.mem.Allocator, input: []const u8) Class {
     const segments = bash_parser.splitCompound(allocator, command) catch return .mutation;
     defer allocator.free(segments);
     if (segments.len == 0) return .neutral;
+    var commands: usize = 0;
     for (segments) |segment| {
-        const target = bash_parser.stripWrappers(segment);
-        if (!bash_parser.isReadonlyCommand(target)) return .mutation;
-        if (hasFileRedirect(segment)) return .mutation;
+        // Loop and conditional keywords are syntax, not commands: `for f in
+        // a b; do cat "$f"; done` explores. The header and terminators carry
+        // no command; `do`/`then` prefix the real one.
+        const body = stripShellKeywords(segment);
+        if (body.len == 0) continue;
+        commands += 1;
+        const target = bash_parser.stripWrappers(body);
+        if (!bash_parser.isReadonlyCommand(target) and !isReadonlyBuiltin(target)) return .mutation;
+        if (hasFileRedirect(body)) return .mutation;
         if (hasInPlaceFlag(target)) return .mutation;
     }
-    return .exploration;
+    return if (commands == 0) .neutral else .exploration;
+}
+
+/// Shell builtins that only inspect or bind values; the permission roster
+/// lists external commands and leaves these out.
+fn isReadonlyBuiltin(target: []const u8) bool {
+    const space = std.mem.indexOfAny(u8, target, " \t") orelse target.len;
+    const head = target[0..space];
+    for ([_][]const u8{ "read", "test", "[", "[[", ":", "local", "declare" }) |kw| {
+        if (std.mem.eql(u8, head, kw)) return true;
+    }
+    return false;
+}
+
+/// Drop leading shell control keywords from one compound segment and return
+/// the command that remains (empty when the segment is pure syntax such as a
+/// `for` header, `done` or `fi`).
+fn stripShellKeywords(segment: []const u8) []const u8 {
+    var s = std.mem.trim(u8, segment, " \t");
+    while (s.len > 0) {
+        const space = std.mem.indexOfAny(u8, s, " \t") orelse s.len;
+        const head = s[0..space];
+        // Headers and terminators: nothing executable in this segment.
+        for ([_][]const u8{ "for", "select", "case", "esac", "done", "fi", "in" }) |kw| {
+            if (std.mem.eql(u8, head, kw)) return "";
+        }
+        // Prefix keywords: the command follows.
+        var prefixed = false;
+        for ([_][]const u8{ "do", "then", "else", "elif", "if", "while", "until", "!", "{", "}" }) |kw| {
+            if (std.mem.eql(u8, head, kw)) prefixed = true;
+        }
+        if (!prefixed) return s;
+        s = std.mem.trim(u8, s[space..], " \t");
+    }
+    return s;
 }
 
 /// Remove `[N]>&M` and `[N]<&M` descriptor duplications (`2>&1`, `>&2`).
@@ -327,6 +368,17 @@ test "classifier: read-only tools and read-only bash are exploration, bookkeepin
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"touch notes.md\"}"));
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"mkdir -p out\"}"));
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{}"));
+}
+
+test "bash loops and conditionals are judged by their inner commands" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"for f in a.py b.py; do echo \\\"=== $f ===\\\"; cat \\\"$f\\\"; done\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"if grep -q ack workers/x.py; then echo yes; else echo no; fi\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"while read -r l; do echo $l; done < list.txt\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"for f in *.tmp; do rm \\\"$f\\\"; done\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"for f in a b; do python3 tool.py $f; done\"}"));
+    // A bare loop header with nothing executable is neither exploration nor mutation.
+    try std.testing.expectEqual(Class.neutral, classify(a, "Bash", "{\"command\":\"for f in a b\"}"));
 }
 
 test "bash redirects and in-place flags disarm" {

@@ -1065,6 +1065,8 @@ def run_paired(
     budget_used_tokens: int = 0,
     max_cumulative_cost_usd: float | None = None,
     max_cumulative_tokens: int | None = None,
+    max_rollout_cost_usd: float | None = None,
+    max_rollout_metered_tokens: int | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if (
         not math.isfinite(budget_used_cost_usd)
@@ -1072,6 +1074,26 @@ def run_paired(
         or budget_used_tokens < 0
     ):
         raise ValidationError("budget usage offsets must be non-negative")
+    # A per-rollout allowance is the scored analogue of a harness kill: the
+    # binary stops with stop_reason=budget and exits 0, so the rollout stays
+    # valid and its workspace is graded as it stands. Both caps travel
+    # together (the runtime refuses one without the other) and are sealed
+    # into the evaluation metadata fd by run_e2e.sh, never into the model's
+    # environment.
+    if (max_rollout_cost_usd is None) != (max_rollout_metered_tokens is None):
+        raise ValidationError("per-rollout budget requires both cost and token caps")
+    if max_rollout_cost_usd is not None and (
+        not math.isfinite(float(max_rollout_cost_usd)) or float(max_rollout_cost_usd) <= 0
+    ):
+        raise ValidationError("per-rollout max cost must be finite and > 0")
+    if max_rollout_metered_tokens is not None and max_rollout_metered_tokens <= 0:
+        raise ValidationError("per-rollout max metered tokens must be > 0")
+    if (
+        max_rollout_cost_usd is not None
+        and max_cumulative_cost_usd is not None
+        and float(max_rollout_cost_usd) > max_cumulative_cost_usd
+    ):
+        raise ValidationError("per-rollout max cost exceeds the cumulative cap")
     if max_cumulative_cost_usd is not None and (
         not math.isfinite(max_cumulative_cost_usd) or max_cumulative_cost_usd <= 0
     ):
@@ -1135,6 +1157,12 @@ def run_paired(
                 max_cumulative_cost_usd=max_cumulative_cost_usd,
                 max_cumulative_tokens=max_cumulative_tokens,
             )
+            run_once_options: Dict[str, Any] = {
+                "timeout_seconds": expected_tasks[task_id]["constraints"]["timeout_seconds"],
+            }
+            if max_rollout_cost_usd is not None:
+                run_once_options["max_cost_usd"] = float(max_rollout_cost_usd)
+                run_once_options["max_metered_tokens"] = max_rollout_metered_tokens
             run_dir = _run_once(
                 repo_root,
                 binaries[variant],
@@ -1145,7 +1173,7 @@ def run_paired(
                 model_id,
                 effective_suite_path,
                 revisions[variant],
-                timeout_seconds=expected_tasks[task_id]["constraints"]["timeout_seconds"],
+                **run_once_options,
             )
             rollouts = import_run(suite, repo_root, run_dir)
             selected = [

@@ -2223,6 +2223,23 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.delivery_cadence = true;
         } else if (std.mem.eql(u8, arg, "--delivery-cadence-observe")) {
             config.delivery_cadence_observe = true;
+        } else if (std.mem.eql(u8, arg, "--delivery-cadence-thresholds")) {
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --delivery-cadence-thresholds", .{});
+                return;
+            };
+            const comma = std.mem.indexOfScalar(u8, s, ',') orelse {
+                setParseError(config, allocator, "invalid value '{s}' for --delivery-cadence-thresholds (expected <first>,<second>)", .{s});
+                return;
+            };
+            const first = std.fmt.parseInt(u32, s[0..comma], 10) catch 0;
+            const second = std.fmt.parseInt(u32, s[comma + 1 ..], 10) catch 0;
+            if (first == 0 or second <= first) {
+                setParseError(config, allocator, "invalid value '{s}' for --delivery-cadence-thresholds (need 0 < first < second)", .{s});
+                return;
+            }
+            config.delivery_cadence_first = first;
+            config.delivery_cadence_second = second;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
         } else if (std.mem.eql(u8, arg, "--image")) {
@@ -2505,6 +2522,7 @@ fn printHelp() void {
         \\  --requirement-ledger-observe  Record (not enforce) the requirement ledger
         \\  --delivery-cadence    Nudge a run that keeps exploring without writing any deliverable
         \\  --delivery-cadence-observe  Record (not enforce) the delivery-cadence obligation
+        \\  --delivery-cadence-thresholds <a>,<b>  Exploration-call counts for the two nudges (default 40,80)
         \\  --max-tokens <n>      Override max output tokens per request
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing

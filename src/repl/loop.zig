@@ -18,6 +18,7 @@ const oauth_login_mod = @import("../api/oauth_login.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;
 const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
+const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const input = @import("input.zig");
 const complete = @import("complete.zig");
 const paste_mod = @import("paste.zig");
@@ -783,6 +784,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         run_opts.execution_policy = eval_execution_policy;
         run_opts.tool_observer = if (run_control) |control| control.observer() else null;
         run_opts.project_rule_gate = if (run_control) |control| control.formalGate() else null;
+        // Delivery-cadence obligation: the REPL honours the same flags as
+        // headless so a scripted (non-tty) session measures what a print-mode
+        // run measures.
+        run_opts.delivery_cadence = app.config.delivery_cadence;
+        run_opts.delivery_cadence_observe = app.config.delivery_cadence_observe;
+        run_opts.delivery_cadence_thresholds = .{
+            .first = app.config.delivery_cadence_first orelse delivery_cadence_mod.DEFAULT_FIRST_THRESHOLD,
+            .second = app.config.delivery_cadence_second orelse delivery_cadence_mod.DEFAULT_SECOND_THRESHOLD,
+        };
         run_opts.ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null;
         run_opts.spawn_tick_fn = spawn_tick;
         // issue #16:turn 边界刷新 OAuth access token。commit 时拷的是当时有效的

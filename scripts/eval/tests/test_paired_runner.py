@@ -254,6 +254,167 @@ class PairedRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "fail-closed"):
             _require_scoring_rollout(rollout, variant="baseline")
 
+    def test_run_paired_threads_per_rollout_caps_into_every_run(self):
+        """A per-rollout allowance is the scored harness-kill analogue: it must
+        reach _run_once for both arms and every trial, as a pair, or not at all."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario = root / "a_task.txt"
+            scenario.write_text("run a_task\n", encoding="utf-8")
+            suite = {
+                "schema_version": 1,
+                "suite_id": "cap-suite",
+                "tasks": [
+                    {
+                        "id": "a_task",
+                        "scenario": scenario.name,
+                        "layers": ["E", "T", "L", "O", "V"],
+                        "environment": {"reset": "fresh"},
+                        "tools": {"profile": "test-tools", "required": []},
+                        "constraints": {"timeout_seconds": 10, "permission_mode": "default"},
+                        "success": {"checks": [{"type": "file_exists", "path": "answer.txt"}]},
+                        "trajectory_constraints": {"max_turns": 2},
+                        "trajectory_rationale": {"max_turns": "bounded test"},
+                        "grader": {"kind": "deterministic_workspace", "version": "v1"},
+                    }
+                ],
+            }
+            suite_path = root / "suite.json"
+            suite_path.write_text("{}\n", encoding="utf-8")
+            baseline_binary = root / "baseline-bin"
+            candidate_binary = root / "candidate-bin"
+            baseline_binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            candidate_binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            baseline_binary.chmod(0o755)
+            candidate_binary.chmod(0o755)
+            seen = []
+
+            def fake_run_once(
+                _repo_root,
+                binary,
+                variant,
+                trial,
+                selector,
+                model_provider,
+                model_id,
+                observed_suite_path,
+                harness_revision,
+                *,
+                timeout_seconds=None,
+                max_metered_tokens=None,
+                max_cost_usd=None,
+            ):
+                seen.append((variant, trial, max_cost_usd, max_metered_tokens))
+                run_dir = root / f"run-{variant}-{trial}"
+                run_dir.mkdir()
+                return run_dir
+
+            def fake_import(_suite, _root, run_dir):
+                variant = run_dir.name.split("-")[1]
+                trial = int(run_dir.name.split("-")[2])
+                task = suite["tasks"][0]
+                identity = comparison_fingerprints(
+                    task,
+                    root,
+                    model_provider="test",
+                    model_id="model-a",
+                    harness_config_id=variant,
+                    harness_revision=f"{variant}-rev",
+                    permission_mode="default",
+                    binary_path=baseline_binary if variant == "baseline" else candidate_binary,
+                )
+                return [
+                    {
+                        "schema_version": 1,
+                        "run_id": f"{variant}:a_task:{trial}",
+                        "suite_id": suite["suite_id"],
+                        "task_id": "a_task",
+                        "task_fingerprint": identity["task_fingerprint"],
+                        "task_fingerprint_provenance": "recorded_at_execution",
+                        "trial": trial,
+                        "layers": task["layers"],
+                        "model": {"provider": "test", "id": "model-a", "fingerprint": identity["model_fingerprint"]},
+                        "harness": {
+                            "config_id": variant,
+                            "revision": f"{variant}-rev",
+                            "fingerprint": identity["harness_fingerprint"],
+                            "permission_mode": identity["permission_mode"],
+                            "environment_fingerprint": identity["environment_fingerprint"],
+                        },
+                        "readiness": {"status": "pass", "checks": []},
+                        "execution": {"status": "completed", "exit_code": 0, "invalid_reasons": []},
+                        "outcome": {"status": "pass", "checks": []},
+                        "trajectory": {"status": "pass", "checks": [], "tool_failures": []},
+                        "evaluator": {"status": "ready", "kind": "deterministic_workspace", "version": "v1", "fingerprint": identity["grader_fingerprint"]},
+                        "judgement": {"valid_for_scoring": True, "trustworthy_success": True},
+                        "metrics": {"cost_usd": 0.01, "wall_time_ms": 1, "policy_violations": 0},
+                        "attribution": [],
+                        "artifacts": {},
+                    }
+                ]
+
+            patches = (
+                mock.patch("scripts.eval.paired_runner._run_once", side_effect=fake_run_once),
+                mock.patch("scripts.eval.paired_runner.import_run", side_effect=fake_import),
+            )
+            with patches[0], patches[1]:
+                run_paired(
+                    suite,
+                    root,
+                    baseline_binary,
+                    candidate_binary,
+                    trials=2,
+                    scenario_glob="*",
+                    model_provider="test",
+                    model_id="model-a",
+                    baseline_output=root / "baseline.jsonl",
+                    candidate_output=root / "candidate.jsonl",
+                    baseline_revision="baseline-rev",
+                    candidate_revision="candidate-rev",
+                    suite_path=suite_path,
+                    max_cumulative_cost_usd=100.0,
+                    max_rollout_cost_usd=5.0,
+                    max_rollout_metered_tokens=1_200_000,
+                )
+            self.assertEqual(len(seen), 4)
+            self.assertTrue(all(cost == 5.0 and tokens == 1_200_000 for _, _, cost, tokens in seen))
+            with self.assertRaisesRegex(ValidationError, "both cost and token caps"):
+                run_paired(
+                    suite,
+                    root,
+                    baseline_binary,
+                    candidate_binary,
+                    trials=1,
+                    scenario_glob="*",
+                    model_provider="test",
+                    model_id="model-a",
+                    baseline_output=root / "b2.jsonl",
+                    candidate_output=root / "c2.jsonl",
+                    baseline_revision="baseline-rev",
+                    candidate_revision="candidate-rev",
+                    suite_path=suite_path,
+                    max_rollout_cost_usd=5.0,
+                )
+            with self.assertRaisesRegex(ValidationError, "exceeds the cumulative cap"):
+                run_paired(
+                    suite,
+                    root,
+                    baseline_binary,
+                    candidate_binary,
+                    trials=1,
+                    scenario_glob="*",
+                    model_provider="test",
+                    model_id="model-a",
+                    baseline_output=root / "b3.jsonl",
+                    candidate_output=root / "c3.jsonl",
+                    baseline_revision="baseline-rev",
+                    candidate_revision="candidate-rev",
+                    suite_path=suite_path,
+                    max_cumulative_cost_usd=1.0,
+                    max_rollout_cost_usd=5.0,
+                    max_rollout_metered_tokens=10,
+                )
+
     def test_run_once_accepts_hard_assertion_failure_as_scored_rollout(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -347,3 +347,23 @@ test "L2 delivery cadence: read-only bash counts as exploration and a mutating b
         try std.testing.expectEqual(@as(u8, 0), run.record.nudges);
     }
 }
+
+test "L2 delivery cadence: --delivery-cadence-thresholds parses into Config and rejects bad shapes" {
+    const a = std.testing.allocator;
+    {
+        const argv = [_][*:0]const u8{ "metacodes", "--delivery-cadence", "--delivery-cadence-thresholds", "10,20" };
+        const config = cc.parseArgsForTest(&argv, a);
+        defer if (config.parse_error) |e| a.free(e);
+        try std.testing.expect(config.parse_error == null);
+        try std.testing.expect(config.delivery_cadence);
+        try std.testing.expectEqual(@as(?u32, 10), config.delivery_cadence_first);
+        try std.testing.expectEqual(@as(?u32, 20), config.delivery_cadence_second);
+    }
+    for ([_][*:0]const u8{ "20,10", "0,5", "abc", "7" }) |bad| {
+        const argv = [_][*:0]const u8{ "metacodes", "--delivery-cadence-thresholds", bad };
+        const config = cc.parseArgsForTest(&argv, a);
+        defer if (config.parse_error) |e| a.free(e);
+        try std.testing.expect(config.parse_error != null);
+        try std.testing.expect(config.delivery_cadence_first == null);
+    }
+}

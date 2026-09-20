@@ -280,6 +280,8 @@ PY
   if [[ -n "${E2E_MAX_COST_USD:-}" ]]; then
     eval_budget_args+=("--max-cost-usd" "$E2E_MAX_COST_USD")
   fi
+  # `${arr[@]+"${arr[@]}"}`: an empty array is "unbound" under bash 3.2 with
+  # `set -u` (macOS /bin/bash); the idiom expands to nothing instead of dying.
   python3 "$ZIG_ROOT/scripts/eval/cli.py" prepare-e2e \
     --suite "${E2E_EVAL_SUITE:-$ZIG_ROOT/evals/suites/core-e2e.json}" \
     --task "$eval_task" \
@@ -293,7 +295,7 @@ PY
     --harness-revision "$eval_revision" \
     --permission-mode "$CONF_PERMISSION" \
     --binary "$BIN" \
-    "${eval_budget_args[@]}" >/dev/null || return 98
+    ${eval_budget_args[@]+"${eval_budget_args[@]}"} >/dev/null || return 98
   # Budget inputs are now sealed in the inherited metadata fd. Do not expose
   # runner control state to the model or its tools through the child env.
   unset E2E_MAX_METERED_TOKENS E2E_MAX_COST_USD
@@ -332,8 +334,8 @@ PY
       "METACODES_LOG=$E2E_LOG_SPEC" \
       "METACODES_LOG_FILE=$debug_logfile" \
       "METACODES_PROVIDER=$eval_provider" \
-      "${auth_env[@]}" \
-      "${eval_env[@]}" \
+      ${auth_env[@]+"${auth_env[@]}"} \
+      ${eval_env[@]+"${eval_env[@]}"} \
       perl -e '
         my $to=shift; my @cmd=@ARGV;
         my $pid=fork();
