@@ -325,14 +325,14 @@ fn appendChannel(
     }
     try writer.print("\"{s}\":", .{label});
     if (!preview_base64) {
-        try std.json.Stringify.encodeJsonString(preview, .{}, writer);
+        try util_json.writeJsonString(writer, preview);
         try writer.print(",\"{s}_encoding\":\"utf-8\"", .{label});
     } else {
         const encoder = std.base64.standard.Encoder;
         const encoded = try allocator.alloc(u8, encoder.calcSize(preview.len));
         defer allocator.free(encoded);
         _ = encoder.encode(encoded, preview);
-        try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+        try util_json.writeJsonString(writer, encoded);
         try writer.print(",\"{s}_encoding\":\"base64\"", .{label});
     }
     try writer.print(",\"{s}_captured_bytes\":{d},\"{s}_original_bytes\":", .{ label, captured_bytes, label });
@@ -351,9 +351,9 @@ fn appendChannel(
         label,
     });
     if (stored) |receipt| {
-        try std.json.Stringify.encodeJsonString(receipt.id(), .{}, writer);
+        try util_json.writeJsonString(writer, receipt.id());
         try writer.print(",\"{s}_recoverable\":true,\"{s}_read\":{{\"tool\":\"ReadArtifact\",\"artifact_id\":", .{ label, label });
-        try std.json.Stringify.encodeJsonString(receipt.id(), .{}, writer);
+        try util_json.writeJsonString(writer, receipt.id());
         try writer.writeAll(",\"offset\":0,\"limit_max\":32768}");
     } else {
         try writer.writeAll("null");
@@ -365,7 +365,7 @@ fn appendChannel(
     // from the same mapper, so the two families cannot drift.
     if (storage_error) |code| {
         try writer.print(",\"{s}_storage_error\":", .{label});
-        try std.json.Stringify.encodeJsonString(code, .{}, writer);
+        try util_json.writeJsonString(writer, code);
     }
 }
 
@@ -670,7 +670,12 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
                 // Same rule as the auto-backgrounded snapshot: the spool is a
                 // staging path and never model-visible. BashOutput polls by
                 // job_id and reads incrementally.
-                return try std.fmt.allocPrint(allocator, "{{\"job_id\":\"{s}\",\"status\":\"started\"}}", .{j.id[0..]});
+                var started: std.Io.Writer.Allocating = .init(allocator);
+                errdefer started.deinit();
+                try started.writer.writeAll("{\"job_id\":");
+                try util_json.writeJsonString(&started.writer, j.id[0..]);
+                try started.writer.writeAll(",\"status\":\"started\"}");
+                return try started.toOwnedSlice();
             }
         }
     }
@@ -866,11 +871,11 @@ fn formatAutoBackgroundedAndRemember(
     // made the same command serialize differently on every run, which is the
     // prompt-cache contract's "random ids" and "staging paths" clauses at once.
     try aw.writer.writeAll("{\"auto_backgrounded\":true,\"job_id\":");
-    try std.json.Stringify.encodeJsonString(j.id[0..], .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, j.id[0..]);
     try aw.writer.writeAll(",\"partial_stdout\":");
-    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, out_trunc);
     try aw.writer.writeAll(",\"partial_stderr\":");
-    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, err_trunc);
     try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. You will be notified automatically when it exits; do not poll or sleep-wait. Use BashOutput with this job_id to read its output (it waits for new lines if the job is still running).\"}");
     return try aw.toOwnedSlice();
 }

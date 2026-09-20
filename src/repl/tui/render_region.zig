@@ -319,7 +319,7 @@ pub const RenderRegion = struct {
         if (self.ui.agents.view == .viewing) {
             // viewing 时回写 agent_count(供 dispatch ↑↓ 钳制 + 下面预算计算)。
             if (app.agentJobsPtr()) |reg| {
-                const snaps = reg.snapshotJobs(self.allocator) catch null;
+                const snaps = reg.snapshotJobsForSession(self.allocator, app.session_id) catch null;
                 if (snaps) |s| {
                     self.ui.agent_count = s.len;
                     agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, s);
@@ -337,7 +337,7 @@ pub const RenderRegion = struct {
         // 用 App.agentJobsPtr()(指向 App 字段本身),不要 `if (app.agent_jobs) |reg|`
         // 捕获——那是值拷贝,listLock 会锁栈副本的 mutex 而非真 registry 的(race)。
         if (app.agentJobsPtr()) |reg| {
-            const snaps = reg.snapshotJobs(self.allocator) catch null;
+            const snaps = reg.snapshotJobsForSession(self.allocator, app.session_id) catch null;
             if (snaps) |s| {
                 defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, s);
                 // agent_count 镜像回写(dispatch ↓/← 入口 + 选择钳制用,switcher 关闭时也更新)。
@@ -930,7 +930,7 @@ pub const RenderRegion = struct {
         const reg = app.agentJobsPtr() orelse return 0;
         const sel = self.ui.agents.sel;
         const th = self.theme;
-        const snaps = reg.snapshotJobs(self.allocator) catch return 0;
+        const snaps = reg.snapshotJobsForSession(self.allocator, app.session_id) catch return 0;
         defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, snaps);
 
         // viewing_id 落定(Enter 触发的 reconcile):未 committed 时把当前 sel 对应 agent 的 id 拷入。
@@ -1002,7 +1002,7 @@ pub const RenderRegion = struct {
         if (self.ui.agents.view == .closed) return 0;
         const reg = app.agentJobsPtr() orelse return 0;
         const th = self.theme;
-        const snaps = reg.snapshotJobs(self.allocator) catch return 0;
+        const snaps = reg.snapshotJobsForSession(self.allocator, app.session_id) catch return 0;
         defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, snaps);
 
         const cols: usize = if (self.ui.cols > 4) self.ui.cols else 80;

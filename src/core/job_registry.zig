@@ -27,6 +27,7 @@ const rng = @import("platform").rng;
 const log = @import("../util/log.zig");
 const util_fs = @import("../util/fs.zig");
 const util_time = @import("../util/time.zig");
+const utf8 = @import("../util/utf8.zig");
 const ppaths = @import("platform").paths;
 const shell_mod = @import("shell.zig");
 const SessionId = @import("session_id.zig").SessionId;
@@ -275,7 +276,8 @@ pub const JobRegistry = struct {
 
         const started_ms: util_time.Millis = util_time.nowMs();
 
-        const preview = try self.allocator.dupe(u8, command[0..@min(command.len, 120)]);
+        const preview_slice = utf8.pagePrefix(command, 120);
+        const preview = try self.allocator.dupe(u8, preview_slice);
         errdefer self.allocator.free(preview);
 
         const entry = JobEntry{

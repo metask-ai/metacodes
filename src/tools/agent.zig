@@ -332,13 +332,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         var teammate_out: std.Io.Writer.Allocating = .init(ctx.allocator);
         defer teammate_out.deinit();
         try teammate_out.writer.writeAll("{\"teammate\":");
-        try std.json.Stringify.encodeJsonString(entry.name, .{}, &teammate_out.writer);
+        try util_json.writeJsonString(&teammate_out.writer, entry.name);
         try teammate_out.writer.writeAll(",\"agent_id\":");
-        try std.json.Stringify.encodeJsonString(entry.agent_id, .{}, &teammate_out.writer);
+        try util_json.writeJsonString(&teammate_out.writer, entry.agent_id);
         try teammate_out.writer.writeAll(",\"status\":\"spawned\"");
         if (teammate_worktree_path) |path| {
             try teammate_out.writer.writeAll(",\"worktree_path\":");
-            try std.json.Stringify.encodeJsonString(path, .{}, &teammate_out.writer);
+            try util_json.writeJsonString(&teammate_out.writer, path);
         }
         try teammate_out.writer.writeByte('}');
         return try teammate_out.toOwnedSlice();
@@ -355,6 +355,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const job_id = try reg.spawnBackground(.{
             .prompt = prompt,
             .system_prompt = sys_prompt,
+            .session = ctx.session,
             .tool_defs = effective_tool_defs,
             .permission_ctx = effective_perm,
             .agents = ctx.agents,
@@ -401,12 +402,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         var background_out: std.Io.Writer.Allocating = .init(ctx.allocator);
         defer background_out.deinit();
         try background_out.writer.writeAll("{\"agent_job_id\":");
-        try std.json.Stringify.encodeJsonString(job_id, .{}, &background_out.writer);
+        try util_json.writeJsonString(&background_out.writer, job_id);
         try background_out.writer.writeAll(",\"status\":\"running\",\"subagent_type\":");
-        try std.json.Stringify.encodeJsonString(subagent_type_raw, .{}, &background_out.writer);
+        try util_json.writeJsonString(&background_out.writer, subagent_type_raw);
         if (background_worktree_path) |path| {
             try background_out.writer.writeAll(",\"worktree_path\":");
-            try std.json.Stringify.encodeJsonString(path, .{}, &background_out.writer);
+            try util_json.writeJsonString(&background_out.writer, path);
         }
         try background_out.writer.writeByte('}');
         return try background_out.toOwnedSlice();
@@ -485,6 +486,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         prompt,
         .{
             .max_turns = max_turns,
+            .session = ctx.session,
             .system_prompt = sys_prompt,
             .agent_depth = ctx.agent_depth + 1,
             .dyn_registry = ctx.dyn_registry,

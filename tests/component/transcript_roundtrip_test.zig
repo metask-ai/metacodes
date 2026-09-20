@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const pfs = @import("platform").fs;
 
 const Conversation = cc.conversation.Conversation;
 const transcript = cc.transcript;
@@ -93,6 +94,66 @@ test "L2 transcript: openExisting resume 续写不重复已刷盘消息" {
     var pbuf: [512]u8 = undefined;
     _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
     _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr);
+}
+
+test "L2 transcript: arbitrary tool bytes cannot poison the JSONL resume path" {
+    const a = std.testing.allocator;
+    const home = "/tmp/cc-transcript-utf8-boundary";
+    _ = std.c.mkdir(home, 0o755);
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    const dirty = [_]u8{ 'p', 'r', 'e', 'v', 0xe4, '`' };
+    try conv.appendText(.user, &dirty);
+
+    var writer = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
+    const dir = try a.dupe(u8, writer.dir);
+    defer a.free(dir);
+    writer.flush(&conv);
+    writer.deinit();
+
+    var loaded = Conversation.init(a);
+    defer loaded.deinit();
+    try transcript.loadTranscript(&loaded, dir, a);
+    try std.testing.expectEqualStrings("prev�`", firstText(loaded.messages.items[0]));
+
+    var pbuf: [512]u8 = undefined;
+    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
+    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr);
+}
+
+test "L2 transcript: legacy invalid UTF-8 JSONL is repaired before resume" {
+    const a = std.testing.allocator;
+    const home = "/tmp/cc-transcript-legacy-repair";
+    _ = std.c.mkdir(home, 0o755);
+    var writer = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
+    const dir = try a.dupe(u8, writer.dir);
+    defer a.free(dir);
+
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/transcript.jsonl\x00", .{dir});
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    try std.testing.expect(fd >= 0);
+    const raw = "{\"role\":\"user\",\"blocks\":[{\"type\":\"text\",\"text\":\"prev\xe4`\"}]}\n";
+    try std.testing.expectEqual(@as(isize, raw.len), pfs.write(fd, raw));
+    _ = pfs.close(fd);
+    writer.deinit();
+
+    var loaded = Conversation.init(a);
+    defer loaded.deinit();
+    try transcript.loadTranscript(&loaded, dir, a);
+    try std.testing.expectEqualStrings("prev�`", firstText(loaded.messages.items[0]));
+
+    // The repaired file is durable: a second load must not depend on the
+    // in-memory recovery path.
+    var loaded_again = Conversation.init(a);
+    defer loaded_again.deinit();
+    try transcript.loadTranscript(&loaded_again, dir, a);
+    try std.testing.expectEqualStrings("prev�`", firstText(loaded_again.messages.items[0]));
+
+    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
+    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl.corrupt", .{dir}) catch return).ptr);
+    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/meta.json", .{dir}) catch return).ptr);
 }
 
 test "L2 transcript R2/F1回归: /retry 回卷后 flush 全量重写,resume 不复活被丢弃回合" {

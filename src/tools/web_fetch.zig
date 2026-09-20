@@ -18,6 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const util_json = @import("../util/json.zig");
 
 // 出站 User-Agent 与产品版本同源;不再附带早期误标的第三方主页。
 const user_agent = "metacodes/" ++ @import("../version.zig").semver;
@@ -120,15 +121,26 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
     defer result_capture.deinit();
     var result_writer = result_spool.CaptureWriter.init(&result_capture);
     try result_writer.writer.writeAll("{\"url\":");
-    try std.json.Stringify.encodeJsonString(url, .{}, &result_writer.writer);
+    try util_json.writeJsonString(&result_writer.writer, url);
     try result_writer.writer.print(",\"bytes\":{d},\"content\":\"", .{text_capture.bytes});
     try text_capture.rewind();
     var buffer: [64 * 1024]u8 = undefined;
+    var pending: [4]u8 = undefined;
+    var pending_len: usize = 0;
     while (true) {
         const count = try text_capture.read(&buffer);
         if (count == 0) break;
-        try std.json.Stringify.encodeJsonStringChars(buffer[0..count], .{}, &result_writer.writer);
+        var combined: [64 * 1024 + 4]u8 = undefined;
+        @memcpy(combined[0..pending_len], pending[0..pending_len]);
+        @memcpy(combined[pending_len .. pending_len + count], buffer[0..count]);
+        const bytes = combined[0 .. pending_len + count];
+        const complete = utf8CompletePrefix(bytes);
+        try util_json.writeJsonStringContents(&result_writer.writer, bytes[0..complete]);
+        const tail = bytes[complete..];
+        @memcpy(pending[0..tail.len], tail);
+        pending_len = tail.len;
     }
+    if (pending_len > 0) try util_json.writeJsonStringContents(&result_writer.writer, pending[0..pending_len]);
     try result_writer.writer.writeAll("\"}");
     try result_writer.check();
     try result_capture.seal();
@@ -140,6 +152,27 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
         spawned.capture_complete,
         ctx.result_budget,
     );
+}
+
+/// Return a prefix whose valid UTF-8 sequences are complete. At most three
+/// bytes can remain pending (the longest UTF-8 sequence is four bytes and the
+/// leading byte itself is retained). Invalid bytes are emitted immediately so
+/// the canonical JSON writer can replace them with U+FFFD.
+fn utf8CompletePrefix(bytes: []const u8) usize {
+    var p: usize = 0;
+    while (p < bytes.len) {
+        const length = std.unicode.utf8ByteSequenceLength(bytes[p]) catch {
+            p += 1;
+            continue;
+        };
+        if (p + length > bytes.len) break;
+        if (std.unicode.utf8ValidateSlice(bytes[p .. p + length])) {
+            p += length;
+        } else {
+            p += 1;
+        }
+    }
+    return p;
 }
 
 const HtmlStream = struct {
@@ -316,9 +349,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"url\":");
-    try std.json.Stringify.encodeJsonString(url, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, url);
     try aw.writer.print(",\"bytes\":{d},\"content\":", .{text.len});
-    try std.json.Stringify.encodeJsonString(text, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, text);
     try aw.writer.writeAll("}");
     return try aw.toOwnedSlice();
 }
@@ -456,6 +489,16 @@ test "htmlToText collapses whitespace" {
     const t = try htmlToText(html, a);
     defer a.free(t);
     try std.testing.expectEqualStrings("a b c", t);
+}
+
+test "JSON capture paging carries an incomplete UTF-8 suffix" {
+    const first = "prefix\xe4";
+    try std.testing.expectEqual(@as(usize, first.len - 1), utf8CompletePrefix(first));
+    const second = "\xbd\x8c suffix";
+    var combined: [32]u8 = undefined;
+    @memcpy(combined[0..1], first[first.len - 1 ..]);
+    @memcpy(combined[1 .. 1 + second.len], second);
+    try std.testing.expectEqual(@as(usize, 1 + second.len), utf8CompletePrefix(combined[0 .. 1 + second.len]));
 }
 
 test "streamHtmlToText preserves legacy semantics across tag and entity chunk boundaries" {

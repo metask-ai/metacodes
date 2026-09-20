@@ -936,6 +936,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
     _ = try reg.spawnBackground(.{
         .prompt = "", // 忽略(prebuilt 非 null)
         .system_prompt = app.system_prompt orelse "",
+        .session = app.session_id,
         .tool_defs = app.tool_defs,
         .permission_ctx = app.permission_ctx,
         .agents = &app.agents,
@@ -3538,7 +3539,7 @@ fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const
         &app.permission_ctx,
         &app.abort,
         prompt,
-        .{ .max_turns = 1, .agent_depth = 1 }, // 单轮,无工具(纯回答)
+        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id }, // 单轮,无工具(纯回答)
     );
     defer result.deinit();
     return try allocator.dupe(u8, result.final_text);
@@ -3970,7 +3971,7 @@ fn stopSelectedAgent(app: *app_mod.App, region: *render_region_mod.RenderRegion)
     const sel = region.ui.agents.sel;
     if (sel == 0) return;
     const allocator = app.allocator;
-    const snaps = reg.snapshotJobs(allocator) catch return;
+    const snaps = reg.snapshotJobsForSession(allocator, app.session_id) catch return;
     defer agent_job_registry_mod.AgentJobRegistry.freeSnapshots(allocator, snaps);
     if (sel - 1 >= snaps.len) return;
     reg.kill(snaps[sel - 1].id) catch {};
@@ -4004,7 +4005,7 @@ fn printTaskList(app: *app_mod.App) void {
 
     // 后台 subagent jobs(独立于 todo 任务):running/done/failed/killed。
     if (app.agent_jobs) |*reg| {
-        const snaps = reg.snapshotJobs(app.allocator) catch return;
+        const snaps = reg.snapshotJobsForSession(app.allocator, app.session_id) catch return;
         defer @import("../core/agent_job_registry.zig").AgentJobRegistry.freeSnapshots(app.allocator, snaps);
         if (snaps.len == 0) return;
         std.debug.print("\x1b[1mSubagents ({d}):\x1b[0m\n", .{snaps.len});

@@ -22,6 +22,7 @@ const theme_mod = @import("repl/tui/theme.zig");
 const session_intent = @import("session_intent.zig");
 const agent_loop = @import("core/agent_loop.zig");
 const permission_mode = @import("permission/mode.zig");
+const util_json = @import("util/json.zig");
 
 pub const CommandOutcome = struct {
     kind: Kind,
@@ -388,7 +389,7 @@ pub fn shellExecImpl(self: *SessionService, alloc: std.mem.Allocator, command: [
     var args_buf: std.Io.Writer.Allocating = .init(alloc);
     defer args_buf.deinit();
     try args_buf.writer.writeAll("{\"command\":");
-    try std.json.Stringify.encodeJsonString(command, .{}, &args_buf.writer);
+    try util_json.writeJsonString(&args_buf.writer, command);
     try args_buf.writer.writeByte('}');
     const args_json = try args_buf.toOwnedSlice();
     defer alloc.free(args_json);

@@ -17,9 +17,9 @@
 //! - **title_guess**：首条 user text 的前 80 字节（去换行）
 //! - **加载**：逐行 parse JSONL 重建 Conversation；meta 用于 /resume 列表
 //!
-//! 崩溃安全：JSONL append 原子性取决于 write(2) ≤ PIPE_BUF（Linux 4096 字节），
-//! 超大 message（tool_use input 上 MB）不保证原子，但本期 MVP 接受此代价。
-//! meta.json 用 rename() 原子替换。
+//! 写入先完成整条记录并循环处理 short write；JSONL regular file 仍不提供
+//! power-loss framing，loader 必须把未完成尾部识别为未提交并报告。meta.json
+//! 用临时文件 + renameReplace 原子替换。
 
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -28,12 +28,20 @@ const msg_mod = @import("message.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const types = @import("../types.zig");
 const util_json = @import("../util/json.zig");
+const utf8 = @import("../util/utf8.zig");
 const util_fs = @import("../util/fs.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
+const sync = @import("platform").sync;
 
 const session_id_mod = @import("session_id.zig");
 pub const SessionId = session_id_mod.SessionId;
+
+/// Recovery must remain bounded even when a hand-edited or corrupted session
+/// contains an unbounded line. Normal sessions are far smaller; this is a
+/// fail-closed parser limit, not a prompt/output limit.
+const MAX_TRANSCRIPT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_TRANSCRIPT_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// genSessionId 是 session_id.gen 的兼容别名(保留供既有调用方;新代码直接用 session_id.gen)。
 pub fn genSessionId() SessionId {
@@ -66,6 +74,10 @@ pub const Writer = struct {
     /// 上次 flush 时见到的 conversation.shrink_epoch(前缀破坏代数;不等 → 全量重写)。
     seen_shrink_epoch: u64 = 0,
     model: []const u8, // borrowed (session 期间不变)
+    /// A failed append may have reached the file partially. The next flush
+    /// must replace the file from the in-memory conversation before appending.
+    needs_repair: bool = false,
+    flush_mutex: sync.Mutex = .{},
 
     /// "fd 未打开" 哨兵值。POSIX 约定负 fd 无效。
     const FD_UNSET: pfs.Fd = -1;
@@ -123,12 +135,23 @@ pub const Writer = struct {
     /// 把 conversation 里从 flushed_count 起的所有 message 追加到 transcript。
     /// 同时覆盖写 meta.json。失败不 panic——记录 warn 就行（不影响 session 继续）。
     pub fn flush(self: *Writer, conversation: *const Conversation) void {
+        self.flush_mutex.lock();
+        defer self.flush_mutex.unlock();
         self.flushImpl(conversation) catch |err| {
+            self.needs_repair = true;
             log.warn("transcript", "flush failed: {s}", .{@errorName(err)});
         };
     }
 
     fn flushImpl(self: *Writer, conversation: *const Conversation) !void {
+        // A short write followed by an I/O error cannot be rolled back on a
+        // regular file. Rebuild from the authoritative Conversation before
+        // attempting another append so retries never duplicate a record.
+        if (self.needs_repair) {
+            try self.rewriteAll(conversation);
+            self.needs_repair = false;
+            self.seen_shrink_epoch = conversation.shrink_epoch;
+        }
         // 前缀破坏(/retry 回卷、compact replaceWithOwned)后 append-only 假设失效:
         // flushed_count 单调 + O_APPEND 意味着"回卷再涨回同长度"的重生成回合永不落盘,
         // resume 读回的是被丢弃的旧回合(R2/F1)。据 conversation.shrink_epoch 察觉,
@@ -148,11 +171,23 @@ pub const Writer = struct {
         }
 
         const messages = conversation.messages.items;
-        while (self.flushed_count < messages.len) : (self.flushed_count += 1) {
+        while (self.flushed_count < messages.len) {
             const m = messages[self.flushed_count];
-            try self.writeMessage(&m);
+            self.writeMessage(&m) catch |err| {
+                // See needs_repair above. Close the descriptor so the next
+                // attempt cannot accidentally continue with a questionable
+                // offset.
+                _ = pfs.close(self.fd);
+                self.fd = FD_UNSET;
+                return err;
+            };
+            self.flushed_count += 1;
         }
 
+        // The transcript is the durable source of truth. Do this before
+        // replacing meta.json, so a visible session entry never advertises a
+        // message that is still only in the kernel page cache.
+        try pfs.fsyncChecked(self.fd);
         try self.writeMeta(conversation);
     }
 
@@ -174,6 +209,7 @@ pub const Writer = struct {
             self.fd = FD_UNSET;
         }
         for (conversation.messages.items) |*m| try self.writeMessage(m);
+        try pfs.fsyncChecked(self.fd);
         _ = pfs.close(self.fd);
         self.fd = FD_UNSET;
         var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -196,55 +232,53 @@ pub const Writer = struct {
             switch (b) {
                 .text => |t| {
                     try aw.writer.writeAll("{\"type\":\"text\",\"text\":");
-                    try std.json.Stringify.encodeJsonString(t, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, t);
                     try aw.writer.writeAll("}");
                 },
                 .tool_use => |tu| {
                     try aw.writer.writeAll("{\"type\":\"tool_use\",\"id\":");
-                    try std.json.Stringify.encodeJsonString(tu.id, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, tu.id);
                     try aw.writer.writeAll(",\"name\":");
-                    try std.json.Stringify.encodeJsonString(tu.name, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, tu.name);
                     try aw.writer.writeAll(",\"input\":");
-                    try std.json.Stringify.encodeJsonString(tu.input, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, tu.input);
                     try aw.writer.writeAll("}");
                 },
                 .tool_result => |tr| {
                     try aw.writer.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
-                    try std.json.Stringify.encodeJsonString(tr.tool_use_id, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, tr.tool_use_id);
                     try aw.writer.writeAll(",\"content\":");
-                    try std.json.Stringify.encodeJsonString(tr.content, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, tr.content);
                     try aw.writer.print(",\"is_error\":{s},\"delivered\":{s}", .{ if (tr.is_error) "true" else "false", if (tr.delivered) "true" else "false" });
                     try aw.writer.writeAll("}");
                 },
                 .thinking => |t| {
                     try aw.writer.writeAll("{\"type\":\"thinking\",\"thinking\":");
-                    try std.json.Stringify.encodeJsonString(t, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, t);
                     try aw.writer.writeAll("}");
                 },
                 .image => |img| {
                     // base64 载荷 JSON 安全;resume 后图像语义原样恢复(issue #10)。
                     try aw.writer.writeAll("{\"type\":\"image\",\"media_type\":");
-                    try std.json.Stringify.encodeJsonString(img.media_type, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, img.media_type);
                     try aw.writer.writeAll(",\"data\":");
-                    try std.json.Stringify.encodeJsonString(img.data, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, img.data);
                     try aw.writer.writeAll("}");
                 },
                 .reasoning_item => |item| {
                     // provider 私有的推理续传项:item JSON 作为**字符串**存(不内联
                     // 展开),resume 后逐字节还原后回传(issue #23)。
                     try aw.writer.writeAll("{\"type\":\"reasoning_item\",\"model\":");
-                    try std.json.Stringify.encodeJsonString(item.model, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, item.model);
                     try aw.writer.writeAll(",\"item\":");
-                    try std.json.Stringify.encodeJsonString(item.json, .{}, &aw.writer);
+                    try util_json.writeJsonString(&aw.writer, item.json);
                     try aw.writer.writeAll("}");
                 },
             }
         }
         try aw.writer.writeAll("]}\n");
 
-        const bytes = aw.written();
-        const n = pfs.write(self.fd, bytes);
-        if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
+        try writeAllFd(self.fd, aw.written());
     }
 
     fn writeMeta(self: *Writer, conversation: *const Conversation) !void {
@@ -254,7 +288,7 @@ pub const Writer = struct {
         for (messages) |m| {
             if (m.role != .user) continue;
             for (m.blocks) |b| if (b == .text) {
-                title = b.text[0..@min(b.text.len, 80)];
+                title = utf8.pagePrefix(b.text, 80);
                 break;
             };
             if (title.len > 0) break;
@@ -275,14 +309,14 @@ pub const Writer = struct {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         try aw.writer.writeAll("{\"model\":");
-        try std.json.Stringify.encodeJsonString(self.model, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, self.model);
         try aw.writer.print(",\"last_modified_ns\":{d},\"message_count\":{d},\"title_guess\":", .{ util_time.nowWallNs(), messages.len });
-        try std.json.Stringify.encodeJsonString(title, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, title);
         // A(P1.5 投影持久化):存 compact_boundary + compact_summary,resume 时恢复投影窗口,
         // 避免重放全量历史 + 首个请求重复压缩(对齐 cc 的 compact boundary 持久化)。
         try aw.writer.print(",\"compact_boundary\":{d},\"compact_summary\":", .{conversation.compact_boundary});
         if (conversation.compact_summary) |s| {
-            try std.json.Stringify.encodeJsonString(s, .{}, &aw.writer);
+            try util_json.writeJsonString(&aw.writer, s);
         } else {
             try aw.writer.writeAll("null");
         }
@@ -295,13 +329,34 @@ pub const Writer = struct {
         if (tfd < 0) return error.OpenFailed;
 
         const bytes = aw.written();
-        const n = pfs.write(tfd, bytes);
+        var write_ok = true;
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const n = pfs.write(tfd, bytes[written..]);
+            if (n <= 0) {
+                write_ok = false;
+                break;
+            }
+            written += @intCast(n);
+        }
+        if (write_ok) pfs.fsyncChecked(tfd) catch {
+            write_ok = false;
+        };
         pfs.close(tfd); // **rename 前关**:Windows MoveFileEx 遇源仍打开会共享冲突(POSIX 容忍)。
-        if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
+        if (!write_ok) return error.WriteFailed;
 
         var fpath_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const fpath = try std.fmt.bufPrint(&fpath_buf, "{s}/meta.json\x00", .{self.dir});
         if (pfs.renameReplace(@ptrCast(tpath.ptr), @ptrCast(fpath.ptr)) != 0) return error.RenameFailed;
+    }
+
+    fn writeAllFd(fd: pfs.Fd, bytes: []const u8) !void {
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const n = pfs.write(fd, bytes[written..]);
+            if (n <= 0) return error.WriteFailed;
+            written += @intCast(n);
+        }
     }
 };
 
@@ -329,6 +384,36 @@ fn readChunk(fd: c_int, buf: []u8) error{ReadFailed}!usize {
     }
 }
 
+/// Persist a recovered transcript before handing it to the caller. Keeping
+/// this repair in the same transaction as load prevents the next append from
+/// reintroducing the malformed legacy record.
+fn replaceTranscriptFile(session_dir: []const u8, original: []const u8, repaired: []const u8) !void {
+    var backup_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const backup_path = try std.fmt.bufPrint(&backup_buf, "{s}/transcript.jsonl.corrupt\x00", .{session_dir});
+    try writeDurableFile(backup_path, original);
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/transcript.jsonl\x00", .{session_dir});
+    try writeDurableFile(path, repaired);
+}
+
+fn writeDurableFile(path: []const u8, bytes: []const u8) !void {
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.OpenFailed;
+    var close_needed = true;
+    defer {
+        if (close_needed) _ = pfs.close(fd);
+    }
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const n = pfs.write(fd, bytes[written..]);
+        if (n <= 0) return error.WriteFailed;
+        written += @intCast(n);
+    }
+    try pfs.fsyncChecked(fd);
+    _ = pfs.close(fd);
+    close_needed = false;
+}
+
 // ============================================================================
 // 加载器：从 transcript.jsonl 重建 Conversation
 // ============================================================================
@@ -338,9 +423,12 @@ fn readChunk(fd: c_int, buf: []u8) error{ReadFailed}!usize {
 pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allocator: std.mem.Allocator) !void {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl\x00", .{session_dir});
-    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    var fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
-    defer _ = pfs.close(fd);
+    var source_open = true;
+    defer {
+        if (source_open) _ = pfs.close(fd);
+    }
 
     // 读整文件
     var all = std.ArrayList(u8).empty;
@@ -349,7 +437,32 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
     while (true) {
         const n = try readChunk(fd, &buf);
         if (n == 0) break;
+        if (all.items.len > MAX_TRANSCRIPT_BYTES - @as(usize, @intCast(n))) return error.TranscriptTooLarge;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+
+    // JSONL records are committed only at the terminating newline. A process
+    // or power loss can leave a partial final write; discard that uncommitted
+    // tail and keep the complete prefix. Corruption in an earlier record is
+    // still fatal and is reported below with its line/byte location.
+    if (all.items.len > 0 and all.items[all.items.len - 1] != '\n') {
+        const complete_len = if (std.mem.lastIndexOfScalar(u8, all.items, '\n')) |idx| idx + 1 else 0;
+        const dropped = all.items.len - complete_len;
+        log.warn("transcript", "discarding incomplete JSONL tail at byte {d} ({d} bytes)", .{ complete_len, dropped });
+        _ = pfs.close(fd);
+        source_open = false;
+        fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.OpenFailed;
+        source_open = true;
+        pfs.setSize(fd, complete_len) catch |err| {
+            log.warn("transcript", "cannot repair incomplete JSONL tail: {s}", .{@errorName(err)});
+            return err;
+        };
+        pfs.fsyncChecked(fd) catch |err| {
+            log.warn("transcript", "cannot commit JSONL tail repair: {s}", .{@errorName(err)});
+            return err;
+        };
+        all.items.len = complete_len;
     }
 
     // 按行解析。**全解析成功才提交**:此前是边解析边 append,任何一行失败都会
@@ -360,15 +473,52 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
     errdefer for (staged.items) |m| m.deinit(allocator);
 
     var line_start: usize = 0;
+    var line_number: usize = 0;
+    var repaired_file: ?std.ArrayList(u8) = null;
+    defer if (repaired_file) |*r| r.deinit(allocator);
     while (line_start < all.items.len) {
-        const nl = std.mem.indexOfScalarPos(u8, all.items, line_start, '\n') orelse all.items.len;
-        const line = all.items[line_start..nl];
+        const record_start = line_start;
+        const nl = std.mem.indexOfScalarPos(u8, all.items, record_start, '\n') orelse all.items.len;
+        const line = all.items[record_start..nl];
         line_start = nl + 1;
         if (line.len == 0) continue;
+        if (line.len > MAX_TRANSCRIPT_LINE_BYTES) return error.TranscriptLineTooLarge;
 
-        const parsed = try parseMessageLine(line, allocator);
+        var parse_line = line;
+        var repaired_line: ?[]u8 = null;
+        const parsed = parseMessageLine(parse_line, allocator) catch |raw_err| blk: {
+            // Older releases wrote arbitrary command bytes directly through
+            // std.json.Stringify. If the only defect is invalid UTF-8, repair
+            // that record and continue; malformed JSON structure remains a
+            // hard failure.
+            const candidate = try utf8.repairInvalidUtf8(allocator, line);
+            errdefer allocator.free(candidate);
+            parse_line = candidate;
+            const recovered = parseMessageLine(candidate, allocator) catch {
+                log.warn("transcript", "invalid JSONL record line {d} at byte {d}: {s}", .{ line_number + 1, record_start, @errorName(raw_err) });
+                return raw_err;
+            };
+            repaired_line = candidate;
+            if (repaired_file == null) repaired_file = .empty;
+            // Preserve the complete valid prefix exactly; only the damaged
+            // record and subsequent records are rewritten on successful load.
+            if (repaired_file.?.items.len == 0) try repaired_file.?.appendSlice(allocator, all.items[0..record_start]);
+            break :blk recovered;
+        };
+        if (repaired_file) |*r| {
+            try r.appendSlice(allocator, parse_line);
+            try r.append(allocator, '\n');
+        }
+        if (repaired_line) |r| allocator.free(r);
         errdefer parsed.deinit(allocator);
         try staged.append(allocator, parsed);
+        line_number += 1;
+    }
+
+    if (repaired_file) |*r| {
+        _ = pfs.close(fd);
+        source_open = false;
+        try replaceTranscriptFile(session_dir, all.items, r.items);
     }
     // 批量接管:预留成功后逐条追加不可能失败,所以要么一条不进、要么全进。
     // 逐条 append 在第 k>0 条扩容失败时会让前 k 条同时归 conversation 和上面的

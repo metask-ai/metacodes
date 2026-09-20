@@ -829,6 +829,7 @@ fn executeFork(
             .dyn_registry = ctx.dyn_registry,
             .model_override = model_override,
             .host_services = null,
+            .session = ctx.session,
             .project_dir = ctx.project_dir,
             .execution_policy = activation.frame.executionPolicy(),
             .agent_ident = child_ident,

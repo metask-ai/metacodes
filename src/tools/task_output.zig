@@ -10,18 +10,21 @@
 //!
 //! output:
 //!   { "agent_job_id":"...","status":"running|done|failed|killed",
-//!     "output":"<增量文本>","output_total_bytes":N,"output_truncated":bool,
+//!     "output":"<增量文本>","output_total_bytes":N,"output_next_offset":N,
+//!     "output_size_bytes":N,"output_truncated":bool,
 //!     "final_text":"..."?,        // done 时(若与 output 重复可省;这里给最终拼接)
 //!     "stop_reason":"..."?,"turns":N?,"tool_calls":N?,
 //!     "error":"<err_name>"? }
 //!
-//! 增量轮询:模型下次传 since_byte = 上次 output_total_bytes。无新输出时最长等待 30s；
+//! 增量轮询:模型下次传 since_byte = 上次 output_next_offset。无新输出时最长等待 30s；
 //! terminal/output change 会立即唤醒。truncated=true 表示还有。
 
 const std = @import("std");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const util_time = @import("../util/time.zig");
+const util_json = @import("../util/json.zig");
+const utf8 = @import("../util/utf8.zig");
 
 const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 const MAX_MAX_BYTES: usize = 256 * 1024;
@@ -38,7 +41,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     const reg = ctx.agent_jobs orelse return error.AgentJobsUnavailable;
-    const e = reg.getBackground(id) orelse return error.JobNotFound;
+    const e = reg.getBackgroundForSession(id, ctx.session) orelse return error.JobNotFound;
 
     const since_arg = parseUsizeArg(args, "since_byte");
     const since = since_arg orelse 0;
@@ -69,14 +72,21 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         snap.status = e.status;
         snap.total = e.output_buf.items.len;
         const buf = e.output_buf.items;
+        if (since > buf.len or (since < buf.len and utf8.isContinuationByte(buf[since]))) {
+            common.setErrorDetail(ctx.error_detail, allocator, "TaskOutput since_byte must be a UTF-8 boundary within output_size_bytes={d}", .{buf.len});
+            return error.InvalidSinceByte;
+        }
         if (since < buf.len) {
             const remaining = buf.len - since;
-            const take = @min(remaining, max_bytes);
-            snap.output = try allocator.dupe(u8, buf[since .. since + take]);
+            const page = utf8.pagePrefix(buf[since..], max_bytes);
+            const take = page.len;
+            snap.output = try allocator.dupe(u8, page);
             snap.truncated = take < remaining;
+            snap.next = since + take;
         } else {
             snap.output = try allocator.dupe(u8, "");
             snap.truncated = false;
+            snap.next = since;
         }
         snap.stop_reason = e.stop_reason;
         snap.turns = e.turns;
@@ -96,11 +106,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"agent_job_id\":");
-    try std.json.Stringify.encodeJsonString(id, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, id);
     try aw.writer.print(",\"status\":\"{s}\"", .{@tagName(snap.status)});
     try aw.writer.writeAll(",\"output\":");
-    try std.json.Stringify.encodeJsonString(snap.output, .{}, &aw.writer);
-    try aw.writer.print(",\"output_total_bytes\":{d},\"output_truncated\":{s}", .{
+    try util_json.writeJsonString(&aw.writer, snap.output);
+    try aw.writer.print(",\"output_total_bytes\":{d},\"output_next_offset\":{d},\"output_size_bytes\":{d},\"output_truncated\":{s}", .{
+        snap.next,
+        snap.next,
         snap.total,
         if (snap.truncated) "true" else "false",
     });
@@ -109,15 +121,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
     if (snap.final_text) |ft| {
         try aw.writer.writeAll(",\"final_text\":");
-        try std.json.Stringify.encodeJsonString(ft, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, ft);
     }
     if (snap.err_name) |en| {
         try aw.writer.writeAll(",\"error\":");
-        try std.json.Stringify.encodeJsonString(en, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, en);
     }
     if (snap.worktree_path) |path| {
         try aw.writer.writeAll(",\"worktree_path\":");
-        try std.json.Stringify.encodeJsonString(path, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, path);
         if (snap.worktree_kept) |kept| {
             try aw.writer.print(",\"worktree_kept\":{s}", .{if (kept) "true" else "false"});
         }
@@ -134,6 +146,7 @@ const Snapshot = struct {
     output: []const u8 = &.{},
     final_text: ?[]const u8 = null,
     total: usize = 0,
+    next: usize = 0,
     truncated: bool = false,
     stop_reason: ?@import("../core/agent_loop.zig").StopReason = null,
     turns: u32 = 0,

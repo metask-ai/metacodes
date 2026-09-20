@@ -926,10 +926,15 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     };
     if (agent_id) |aid| {
         const reg = ctx.agent_jobs orelse return error.AgentJobsUnavailable;
-        reg.kill(aid) catch |e| switch (e) {
+        reg.killForSession(aid, ctx.session) catch |e| switch (e) {
             error.JobNotFound => return error.JobNotFound,
         };
-        return std.fmt.allocPrint(ctx.allocator, "{{\"agent_job_id\":\"{s}\",\"status\":\"killing\"}}", .{aid});
+        var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+        errdefer out.deinit();
+        try out.writer.writeAll("{\"agent_job_id\":");
+        try util_json.writeJsonString(&out.writer, aid);
+        try out.writer.writeAll(",\"status\":\"killing\"}");
+        return try out.toOwnedSlice();
     }
 
     const id = try extractIdOrError(args, "taskId");

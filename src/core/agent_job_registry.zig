@@ -36,6 +36,7 @@ const log = @import("../util/log.zig");
 const AgentSet = @import("../agents/set.zig").AgentSet;
 const DynRegistry = @import("../tools/dynamic.zig").DynRegistry;
 const SkillSet = @import("../skills/skill.zig").SkillSet;
+const SessionId = @import("session_id.zig").SessionId;
 
 /// 同时存在的后台 job 上限。防线程爆炸 + API 速率打爆。
 pub const MAX_BG_JOBS: usize = 8;
@@ -81,6 +82,9 @@ pub const JobEntry = struct {
     /// 在 entry 锁内清空,cancel 与清空串行,不会指向已 deinit 的 client。
     cancel_provider: ?@import("../api/provider.zig").Provider = null,
     allocator: std.mem.Allocator,
+    /// Immutable parent session for routing output/events after the foreground
+    /// session rotates or resumes another transcript.
+    session: SessionId = .single,
     started_ms: util_time.Millis = 0,
     desc_preview: []u8 = &.{}, // owned
     /// 前台(同步)job 标记。foreground job **无 thread**(跑在主线程/并发批的 worker 上,
@@ -209,6 +213,7 @@ fn appendTranscriptToolLine(list: *std.ArrayList(u8), a: std.mem.Allocator, tool
 pub const SpawnParams = struct {
     prompt: []const u8,
     system_prompt: []const u8,
+    session: SessionId,
     /// 子 agent 可见工具集(已过滤);registry dupe 一份。
     tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: permission_mod.PermissionContext, // 值拷贝
@@ -259,6 +264,7 @@ pub const SpawnParams = struct {
 const JobInput = struct {
     allocator: std.mem.Allocator,
     entry: *JobEntry,
+    session: SessionId,
     // 自有拷贝:
     prompt: []u8,
     system_prompt: []u8,
@@ -552,7 +558,7 @@ pub const AgentJobRegistry = struct {
         // 1) 堆分配 entry(地址稳定)
         const entry = try a.create(JobEntry);
         errdefer if (!committed) a.destroy(entry);
-        entry.* = .{ .allocator = a };
+        entry.* = .{ .allocator = a, .session = p.session };
         entry.mutex = .{};
         entry.abort = AbortSignal.init();
         entry.started_ms = util_time.nowMs();
@@ -637,6 +643,7 @@ pub const AgentJobRegistry = struct {
 
         var permission_owned = p.permission_ctx.scopedDerive(null);
         permission_owned.allocator = a;
+        permission_owned.session = p.session;
         permission_owned.memdir_abs = memdir_owned;
         permission_owned.match_ctx.cwd = cwd_owned;
         permission_owned.match_ctx.project_root = pdir_owned;
@@ -647,6 +654,7 @@ pub const AgentJobRegistry = struct {
         input.* = .{
             .allocator = a,
             .entry = entry,
+            .session = p.session,
             .prompt = prompt_owned,
             .system_prompt = sys_owned,
             .tool_defs_owned = defs_owned,
@@ -814,6 +822,17 @@ pub const AgentJobRegistry = struct {
         return entry;
     }
 
+    /// Session-scoped TaskOutput lookup. A registry is process-global, but a
+    /// job belongs to the immutable session that spawned it; the active UI
+    /// session must not be allowed to read another session's output by id.
+    pub fn getBackgroundForSession(self: *AgentJobRegistry, id: []const u8, session: SessionId) ?*JobEntry {
+        const entry = self.getBackground(id) orelse return null;
+        entry.lock();
+        defer entry.unlock();
+        if (!std.mem.eql(u8, entry.session.asSlice(), session.asSlice())) return null;
+        return entry;
+    }
+
     /// 后台 subagent job 的值语义快照(供 TUI Ctrl+T 列表用,不持锁/不持指针)。
     /// id/desc 拷进调用者 allocator;调用者用完整体 free(freeSnapshots)。
     pub const JobSnapshot = struct {
@@ -838,38 +857,85 @@ pub const AgentJobRegistry = struct {
     };
 
     pub fn snapshotJobs(self: *AgentJobRegistry, allocator: std.mem.Allocator) ![]JobSnapshot {
+        return self.snapshotJobsForSession(allocator, null);
+    }
+
+    /// Session-scoped roster snapshot. Jobs remain process-global so shutdown
+    /// can drain them all, but UI/state projections must never expose a job
+    /// created by a different resumed session.
+    pub fn snapshotJobsForSession(self: *AgentJobRegistry, allocator: std.mem.Allocator, session: ?SessionId) ![]JobSnapshot {
         self.listLock();
         defer self.listUnlock();
-        var out = try allocator.alloc(JobSnapshot, self.entries.items.len);
-        var i: usize = 0;
+        var out: std.ArrayList(JobSnapshot) = .empty;
+        errdefer {
+            for (out.items) |s| {
+                allocator.free(s.id);
+                allocator.free(s.desc);
+                allocator.free(s.current_tool);
+                allocator.free(s.current_tool_input);
+                allocator.free(s.agent_type);
+            }
+            out.deinit(allocator);
+        }
         for (self.entries.items) |e| {
             e.lock();
             defer e.unlock();
-            out[i] = .{
-                .id = try allocator.dupe(u8, e.idSlice()),
+            if (session) |wanted| {
+                if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
+            }
+            var snapshot = JobSnapshot{
+                .id = &.{},
                 .status = e.status,
-                .desc = try allocator.dupe(u8, e.desc_preview),
+                .desc = &.{},
                 .turns = e.turns,
                 .tool_calls = e.tool_calls,
                 .current_turn = e.current_turn,
-                .current_tool = try allocator.dupe(u8, e.current_tool[0..e.current_tool_len]),
-                .current_tool_input = try allocator.dupe(u8, e.current_tool_input[0..e.current_tool_input_len]),
+                .current_tool = &.{},
+                .current_tool_input = &.{},
                 .foreground = e.foreground,
-                .agent_type = try allocator.dupe(u8, e.agent_type),
+                .agent_type = &.{},
                 .tokens = e.tokens,
                 .started_ms = e.started_ms,
             };
-            i += 1;
+            errdefer {
+                if (snapshot.id.len > 0) allocator.free(snapshot.id);
+                if (snapshot.desc.len > 0) allocator.free(snapshot.desc);
+                if (snapshot.current_tool.len > 0) allocator.free(snapshot.current_tool);
+                if (snapshot.current_tool_input.len > 0) allocator.free(snapshot.current_tool_input);
+                if (snapshot.agent_type.len > 0) allocator.free(snapshot.agent_type);
+            }
+            snapshot.id = try allocator.dupe(u8, e.idSlice());
+            snapshot.desc = try allocator.dupe(u8, e.desc_preview);
+            snapshot.current_tool = try allocator.dupe(u8, e.current_tool[0..e.current_tool_len]);
+            snapshot.current_tool_input = try allocator.dupe(u8, e.current_tool_input[0..e.current_tool_input_len]);
+            snapshot.agent_type = try allocator.dupe(u8, e.agent_type);
+            try out.append(allocator, snapshot);
+            // Ownership moved into `out`; leave the local cleanup inert.
+            snapshot = .{
+                .id = &.{},
+                .status = .running,
+                .desc = &.{},
+                .turns = 0,
+                .tool_calls = 0,
+                .current_turn = 0,
+                .current_tool = &.{},
+                .current_tool_input = &.{},
+                .agent_type = &.{},
+            };
         }
-        return out;
+        return try out.toOwnedSlice(allocator);
     }
 
     /// **task#18:后台 job done 事件的跨线程发射**。job 线程只置 e.status(终态),**不能**用父的栈
     /// trampoline reporter(其生命周期=父轮,job 后台续跑时早失效 → 悬挂)。改由**主/driver 线程**周期
     /// reap:排出"终态且 done 未发"的 job(锁内标 done_emitted 防重复,值语义 dup),caller 据此发
     /// agent_lifecycle.done 到 session journal。返回 owned;freeDoneInfos 释放。
-    pub const DoneInfo = struct { id: []u8, status: JobStatus, turns: u32, tool_calls: u32, tokens: u64 };
+    pub const DoneInfo = struct { id: []u8, session: SessionId, status: JobStatus, turns: u32, tool_calls: u32, tokens: u64 };
     pub fn drainNewlyDone(self: *AgentJobRegistry, allocator: std.mem.Allocator) ![]DoneInfo {
+        return self.drainNewlyDoneForSession(allocator, null);
+    }
+
+    pub fn drainNewlyDoneForSession(self: *AgentJobRegistry, allocator: std.mem.Allocator, session: ?SessionId) ![]DoneInfo {
         self.listLock();
         defer self.listUnlock();
         var list: std.ArrayList(DoneInfo) = .empty;
@@ -881,9 +947,13 @@ pub const AgentJobRegistry = struct {
             e.lock();
             defer e.unlock();
             if (e.status == .running or e.done_emitted) continue;
-            const id = try allocator.dupe(u8, e.idSlice()); // 唯一需 dup 的
-            errdefer allocator.free(id);
-            try list.append(allocator, .{ .id = id, .status = e.status, .turns = e.turns, .tool_calls = e.tool_calls, .tokens = e.tokens });
+            if (session) |wanted| {
+                if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
+            }
+            var id = try allocator.dupe(u8, e.idSlice()); // 唯一需 dup 的
+            errdefer if (id.len > 0) allocator.free(id);
+            try list.append(allocator, .{ .id = id, .session = e.session, .status = e.status, .turns = e.turns, .tool_calls = e.tool_calls, .tokens = e.tokens });
+            id = &.{}; // ownership moved into list
             e.done_emitted = true; // 成功入队后才标记(append/dupe OOM 则留 false,下轮重试,不丢事件)
         }
         return list.toOwnedSlice(allocator);
@@ -908,6 +978,14 @@ pub const AgentJobRegistry = struct {
     /// 幂等:对已结束 job 调用安全(abort 标志无副作用)。
     pub fn kill(self: *AgentJobRegistry, id: []const u8) error{JobNotFound}!void {
         const e = self.get(id) orelse return error.JobNotFound;
+        e.abort.abort(.user_ctrl_c);
+    }
+
+    /// User-facing TaskStop is session scoped. Keep the process-wide `kill`
+    /// primitive for shutdown/admin paths, but never let a resumed session
+    /// cancel a job owned by another session by guessing its id.
+    pub fn killForSession(self: *AgentJobRegistry, id: []const u8, session: SessionId) error{JobNotFound}!void {
+        const e = self.getBackgroundForSession(id, session) orelse return error.JobNotFound;
         e.abort.abort(.user_ctrl_c);
     }
 
@@ -1136,6 +1214,7 @@ fn jobThreadMain(input: *JobInput) void {
 
     const opts = subagent.SpawnOptions{
         .max_turns = if (input.max_turns > 0) input.max_turns else 20,
+        .session = input.session,
         .system_prompt = if (input.system_prompt.len > 0) input.system_prompt else null,
         .agent_depth = input.agent_depth,
         .dyn_registry = input.dyn_registry,
@@ -1265,6 +1344,28 @@ test "JobEntry backend 消费 CoreEvent.progress 实时回写 tool_calls(L1:#6 �
     try testing.expectEqualStrings("hello world", out);
 }
 
+test "TaskOutput lookup is scoped to the job's origin session" {
+    const a = testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
+    defer reg.deinit();
+
+    try reg.pushTestEntry("session scoped", 1, "", "");
+    const entry = reg.entries.items[0];
+    entry.foreground = false;
+    const owner = @import("session_id.zig").gen();
+    const other = @import("session_id.zig").gen();
+    entry.session = owner;
+    try testing.expect(reg.getBackgroundForSession(entry.idSlice(), owner) != null);
+    try testing.expect(reg.getBackgroundForSession(entry.idSlice(), other) == null);
+    try testing.expectError(error.JobNotFound, reg.killForSession(entry.idSlice(), other));
+    const owned = try reg.snapshotJobsForSession(testing.allocator, owner);
+    defer AgentJobRegistry.freeSnapshots(testing.allocator, owned);
+    try testing.expectEqual(@as(usize, 1), owned.len);
+    const hidden = try reg.snapshotJobsForSession(testing.allocator, other);
+    defer AgentJobRegistry.freeSnapshots(testing.allocator, hidden);
+    try testing.expectEqual(@as(usize, 0), hidden.len);
+}
+
 test "spawnBackground prebuilt_conversation consume-on-call:失败路径不泄漏(R3)" {
     // Ctrl+B 转后台:spawnBackground 是 consume-on-call —— 失败路径必须释放传入的 prebuilt
     // conversation。填满 registry 触发 TooManyBackgroundJobs 早退,断言 testing.allocator 不报
@@ -1283,6 +1384,7 @@ test "spawnBackground prebuilt_conversation consume-on-call:失败路径不泄�
     const r = reg.spawnBackground(.{
         .prompt = "",
         .system_prompt = "",
+        .session = SessionId.single,
         .tool_defs = &.{},
         .permission_ctx = permission_mod.createContext(.bypass_permissions, a),
         .prebuilt_conversation = copy,
@@ -1344,6 +1446,7 @@ test "spawnBackground committed-flag:input.* 建好后失败也无泄漏(Failing
         const r = reg.spawnBackground(.{
             .prompt = "p",
             .system_prompt = "s",
+            .session = SessionId.single,
             .tool_defs = &.{},
             .permission_ctx = permission_mod.createContext(.bypass_permissions, a),
             .desc = "main",
@@ -1399,7 +1502,10 @@ test "task#18: drainNewlyDone 排终态 job 一次(done_emitted 防重复)+ 跳 
     const first = try reg.drainNewlyDone(a);
     defer AgentJobRegistry.freeDoneInfos(a, first);
     try std.testing.expectEqual(@as(usize, 2), first.len);
-    for (first) |d| try std.testing.expect(d.status == .done or d.status == .failed);
+    for (first) |d| {
+        try std.testing.expect(d.status == .done or d.status == .failed);
+        try std.testing.expectEqual(SessionId.single, d.session);
+    }
 
     // 二次 drain:同样两个已 done_emitted → 返回空(不重复发)。
     const second = try reg.drainNewlyDone(a);

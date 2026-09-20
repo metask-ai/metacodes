@@ -100,7 +100,7 @@ pub const StateSource = struct {
         var job_snaps: []RegT.JobSnapshot = &.{};
         var agent_views: []AgentView = &.{};
         if (self.app.agentJobsPtr()) |reg| {
-            job_snaps = reg.snapshotJobs(allocator) catch &.{};
+            job_snaps = reg.snapshotJobsForSession(allocator, self.app.session_id) catch &.{};
             agent_views = allocator.alloc(AgentView, job_snaps.len) catch &.{};
             for (job_snaps, 0..) |js, i| {
                 if (i >= agent_views.len) break; // alloc 失败降级(agent_views 空)

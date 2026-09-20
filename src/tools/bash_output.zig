@@ -38,6 +38,7 @@ const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const result_budget = @import("../core/result_budget.zig");
+const util_json = @import("../util/json.zig");
 
 /// 单次 tool_result 中 stdout/stderr 的默认字节上限；避免 100MB 文件塞爆 context。
 /// Fixed JSON scaffolding of one BashOutput result: job id, status, exit code,
@@ -142,7 +143,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"job_id\":");
-    try std.json.Stringify.encodeJsonString(job_id, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, job_id);
     try aw.writer.print(",\"status\":\"{s}\"", .{@tagName(job.status)});
     if (job.exit_code) |ec| {
         try aw.writer.print(",\"exit_code\":{d}", .{ec});
@@ -290,9 +291,9 @@ fn writeChannel(
         const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
         defer allocator.free(encoded);
         _ = encoder.encode(encoded, data);
-        try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+        try util_json.writeJsonString(writer, encoded);
     } else {
-        try std.json.Stringify.encodeJsonString(data, .{}, writer);
+        try util_json.writeJsonString(writer, data);
     }
     try writer.print(",\"{s}_encoding\":\"{s}\"", .{ label, if (base64) "base64" else "utf-8" });
 }
