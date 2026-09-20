@@ -93,6 +93,7 @@ class TinyKgBinaryStageTest(unittest.TestCase):
             "targets": ["x86_64-linux"],
         }
         artifact.update(overrides)
+        schema = "metacodes.tinykg-bundle/v2" if "role" in artifact else "metacodes.tinykg-bundle/v1"
         value = {
             "artifacts": [artifact],
             "build": {
@@ -100,7 +101,7 @@ class TinyKgBinaryStageTest(unittest.TestCase):
                 "strip": True,
                 "zig_version": "0.16.0",
             },
-            "bundle_schema": "metacodes.tinykg-bundle/v1",
+            "bundle_schema": schema,
             "source_commit": "a" * 40,
         }
         path = root / "manifest.json"
@@ -302,6 +303,30 @@ class TinyKgBinaryStageTest(unittest.TestCase):
                     artifact,
                     TinyKgContract.load(self.contract(root)),
                 )
+
+    def test_v2_daemon_role_is_staged_with_daemon_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = self.bundled_elf(root)
+            data = bytearray(binary.read_bytes())
+            data[160 : 160 + len(b"tinykg 0.2.0")] = b"tinykgd 0.2.0"
+            daemon = root / "bin/tinykgd-linux-x86_64"
+            daemon.write_bytes(data)
+            daemon.chmod(0o700)
+            manifest = self.manifest(root, daemon, key="linux-x86_64-daemon", path="bin/tinykgd-linux-x86_64", role="daemon")
+            digest = hashlib.sha256(daemon.read_bytes()).hexdigest()
+            output = root / "out/tinykgd"
+            receipt = root / "out/tinykgd.provenance.json"
+            stage_bundled(daemon.resolve(), manifest, "linux-x86_64-daemon", digest, "x86_64-linux", False, self.contract(root), "x86_64-linux-musl", output, receipt, role="daemon")
+            self.assertEqual("tinykgd 0.2.0", json.loads(receipt.read_text(encoding="utf-8"))["binary_version"])
+
+    def test_daemon_marker_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            daemon = self.bundled_elf(root)
+            manifest = self.manifest(root, daemon, key="linux-x86_64-daemon", path="bin/tinykg-linux-x86_64", role="daemon")
+            with self.assertRaisesRegex(StageError, "version marker"):
+                stage_bundled(daemon.resolve(), manifest, "linux-x86_64-daemon", hashlib.sha256(daemon.read_bytes()).hexdigest(), "x86_64-linux", False, self.contract(root), "x86_64-linux-musl", root / "out/tinykgd", root / "out/receipt.json", role="daemon")
 
     def test_mach_o_fat_table_cannot_impersonate_slice_cpu(self) -> None:
         data = bytearray(512)

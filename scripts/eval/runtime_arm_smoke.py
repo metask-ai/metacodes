@@ -399,6 +399,9 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
     agrees with its own report."""
     env = dict(os.environ)
     env["METACODES_KG_BIN"] = str(tinykg_binary)
+    daemon_binary = os.environ.get("METACODES_TEST_TINYKGD_BIN")
+    if daemon_binary:
+        env["METACODES_KGD_BIN"] = daemon_binary
     completed = subprocess.run(
         [str(binary), "doctor", "--json"],
         env=env,
@@ -414,7 +417,7 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
         raise SystemExit(f"doctor --json stdout is not JSON: {completed.stdout[:200]!r}") from exc
     checks = {check.get("name"): check for check in report.get("checks") or []}
     _require(
-        set(checks) == {"ripgrep", "tinykg", "formal_kernel", "project_kernel"},
+        set(checks) == {"ripgrep", "tinykg", "tinykgd", "formal_kernel", "project_kernel"},
         f"doctor checks {sorted(checks)!r}",
     )
     tinykg = checks["tinykg"]
@@ -423,6 +426,12 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
         f"doctor tinykg {tinykg!r} did not come from METACODES_KG_BIN",
     )
     _require(tinykg.get("match") is True, f"doctor tinykg digest did not match the pinned one: {tinykg!r}")
+    daemon = checks["tinykgd"]
+    if daemon_binary:
+        _require(daemon.get("source") == "env" and Path(str(daemon.get("resolved_path"))).resolve() == Path(daemon_binary).resolve(), f"doctor tinykgd {daemon!r} did not come from METACODES_KGD_BIN")
+        _require(daemon.get("match") is True, f"doctor tinykgd digest did not match the pinned one: {daemon!r}")
+    else:
+        _require(daemon.get("resolved_path") is None, f"doctor tinykgd unexpectedly resolved without a test daemon: {daemon!r}")
     strict = subprocess.run(
         [str(binary), "doctor", "--strict"],
         env=env,
@@ -432,9 +441,14 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
         timeout=60,
     )
     def check_healthy(name: str, check: dict) -> bool:
-        if name in {"formal_kernel", "project_kernel"}:
+        # Mirrors doctor.zig Report.healthy(): a binary this build never pinned
+        # may be absent. Without tinykgd here the strict-exit assertion below
+        # fails on every build whose bundle has no daemon artifact.
+        if name in {"formal_kernel", "project_kernel", "tinykgd"}:
             if check.get("resolved_path") is None and check.get("expected_sha256") is None:
                 return True
+            if name == "tinykgd":
+                return check.get("resolved_path") is not None and check.get("match") in (None, True)
             return (
                 check.get("resolved_path") is not None
                 and check.get("match") in (None, True)

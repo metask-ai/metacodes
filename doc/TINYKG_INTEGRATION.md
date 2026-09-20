@@ -9,7 +9,7 @@ bundle so a clean checkout has a deterministic TinyKG runtime by default.
 
 Two files serve different purposes:
 
-- `deps/tinykg.json` freezes TinyKG CLI version 0.2.0, upstream repository,
+- `deps/tinykg.json` freezes TinyKG CLI version 0.2.0 in the current bundle, upstream repository,
   Apache-2.0 license identifier, storage format 3, and store schema 3.
 - `vendor/tinykg/manifest.json` freezes the exact redistributed executable bytes:
   upstream commit, Zig version, ReleaseSafe/strip profile, target ownership,
@@ -23,6 +23,9 @@ The bundle currently supports:
 | Linux x86_64 | `linux-x86_64` | static-musl ELF |
 | Linux arm64 | `linux-aarch64` | static-musl ELF |
 | Windows x86_64 | `windows-x86_64` | PE32+ console executable |
+
+The v2 bundle has a `cli` and `daemon` row for every target family. CLI assets
+are named `tinykg-*`; daemon assets are named `tinykgd-*`.
 
 Windows arm64 and other targets are not declared. A normal product build for an
 undeclared target still builds Metacodes without TinyKG; `tinykg:stage` fails with
@@ -84,7 +87,29 @@ legacy `-Dtinykg=false` disables the bundle.
 
 ## Manual bundle maintenance
 
-Bundle replacement is an explicit release operation, never part of `zig build`:
+Bundle replacement is an explicit release operation, never part of `zig build`.
+Run the reproducible builder from the Metacodes checkout:
+
+```sh
+python3 scripts/build_tinykg_bundle.py --source /path/to/tinykg \
+  --commit <40-lowercase-hex-commit> --version <semver>
+```
+
+It verifies the clean pinned work tree and Zig version, exports to a fixed
+`/tmp/metacodes-tinykg-release-src-<commit-prefix>` root, builds stripped
+ReleaseSafe CLI and daemon binaries for all declared targets, scans every
+executable (including both universal slices), probes native storage/schema, and
+regenerates the v2 manifest and CLI contract before running attestation. Use
+`--dry-run` to print the exact commands without building.
+
+It finally rewrites the `tinykg-bundle-table` block in `build.zig`. That table
+is the second committed copy of every digest: `tinykg:stage` passes the table
+entry to the staging script, which refuses to install a byte unless the bundle
+manifest agrees with it. A regenerated bundle therefore lands in one commit
+that changes the binaries, the manifest and the table together, and any later
+edit to one of them alone fails the next build.
+
+The old manual checklist is retained as review guidance:
 
 1. Select and review one immutable commit in
    `https://github.com/metask-ai/tinykg`.
@@ -96,7 +121,7 @@ Bundle replacement is an explicit release operation, never part of `zig build`:
    `__FILE__` strings can otherwise disclose a maintainer's absolute path.
 3. Run the native TinyKG release tests in its own repository. Execute version and
    fresh-store probes on native runners for each redistributed platform.
-4. Replace only the four files under `vendor/tinykg/bin/`, then update every
+4. Replace only the generated files under `vendor/tinykg/bin/`, then update every
    SHA-256, `source_commit`, and build field in `vendor/tinykg/manifest.json`.
 5. Retain the upstream Apache-2.0 text in `vendor/tinykg/LICENSE`; update
    `deps/tinykg.json` if CLI/storage/schema compatibility changed.
@@ -130,6 +155,10 @@ The exclusive CLI mode must not point at the canonical shared store.
 Automatic staged lookup is limited to `<prefix>/bin` and
 `<prefix>/eval/bin` executable layouts. It never walks arbitrary ancestors in
 search of a `vendor/` directory.
+
+`METACODES_KGD_BIN` selects an explicitly staged `tinykgd` for diagnostics and
+future daemon integration. This release wires resolution, attestation, and the
+doctor check; Metacodes does not start the daemon yet.
 
 When the runtime is degraded, the diagnosis is retained with a kind and a
 fixed repair hint:

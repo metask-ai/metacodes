@@ -342,6 +342,8 @@ pub const KgClient = struct {
         config_store: ?[]const u8 = null,
         /// 测试注入:覆盖 env 读取(null = 读真实 env)。
         env_bin: ?[]const u8 = null,
+        /// 测试注入: TinyKG daemon binary override (null = read METACODES_KGD_BIN).
+        env_daemon_bin: ?[]const u8 = null,
         env_store: ?[]const u8 = null,
         /// 测试注入:覆盖 exe 目录(null = selfExeDirPath 真实定位,不再依赖 argv[0])。
         exe_dir: ?[]const u8 = null,
@@ -626,6 +628,23 @@ pub const KgClient = struct {
         return null;
     }
 
+    /// Resolve the TinyKG daemon with the same explicit-then-adjacent policy as
+    /// the CLI. An explicit but unusable METACODES_KGD_BIN is terminal and
+    /// never falls through to a staged daemon.
+    pub fn resolveTinykgdBinary(allocator: std.mem.Allocator, opts: ResolveOptions) !?ResolvedBinary {
+        if (opts.env_daemon_bin orelse envGet("METACODES_KGD_BIN")) |v| {
+            if (v.len > 0 and isExecutable(v)) return .{ .path = try allocator.dupe(u8, v), .source = .env };
+            if (v.len > 0) return null;
+        }
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_dir: ?[]const u8 = opts.exe_dir orelse selfExeDir(&exe_buf);
+        if (exe_dir) |dir| {
+            if (try findStagedAdjacentNamed(allocator, dir, if (@import("builtin").os.tag == .windows) "tinykgd.exe" else "tinykgd")) |p|
+                return .{ .path = p, .source = .adjacent };
+        }
+        return null;
+    }
+
     fn resolveBinPath(allocator: std.mem.Allocator, opts: ResolveOptions) !?[]u8 {
         var resolved = try resolveTinykgBinary(allocator, opts);
         if (resolved) |*value| return value.path;
@@ -667,6 +686,10 @@ pub const KgClient = struct {
 
     fn findStagedAdjacent(allocator: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
         const bin_name = if (@import("builtin").os.tag == .windows) "tinykg.exe" else "tinykg";
+        return findStagedAdjacentNamed(allocator, start_dir, bin_name);
+    }
+
+    fn findStagedAdjacentNamed(allocator: std.mem.Allocator, start_dir: []const u8, bin_name: []const u8) !?[]u8 {
         var roots: [2][]const u8 = undefined;
         const root_count = stagedSearchRoots(start_dir, &roots);
         for (roots[0..root_count]) |root| {

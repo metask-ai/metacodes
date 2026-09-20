@@ -1,7 +1,7 @@
 //! `metacodes doctor` (#78, #47 stage 3): where the runtime binaries this
 //! build depends on resolve from, and whether they are the ones the build
 //! expected. ripgrep goes through `toolchain.ripgrepResolution` and TinyKG
-//! through `KgClient.resolveTinykgBinary` — the same decisions the tools make
+//! through `KgClient.resolveTinykgBinary` and `resolveTinykgdBinary` — the same decisions the tools make
 //! at run time, taken without side effects (no Store is created, no daemon
 //! contacted, nothing written). The expectations are the digests `build.zig`
 //! pinned into `build_info` for the target; a target without a vendored
@@ -73,14 +73,15 @@ const Resolved = struct { path: []const u8, source: Source };
 pub const Expectations = struct {
     ripgrep_sha256: ?[]const u8,
     tinykg_sha256: ?[]const u8,
+    tinykgd_sha256: ?[]const u8 = null,
     formal_kernel_sha256: ?[]const u8 = null,
     project_kernel_sha256: ?[]const u8 = null,
     exe_path_override: ?[]const u8 = null,
 };
 
 pub const Report = struct {
-    /// `[0]` ripgrep, `[1]` TinyKG, `[2]` formal kernel, `[3]` project kernel.
-    checks: [4]Check,
+    /// `[0]` ripgrep, `[1]` TinyKG CLI, `[2]` formal kernel, `[3]` project kernel, `[4]` tinykgd.
+    checks: [5]Check,
     kg: ?KgDiagnosis = null,
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
@@ -91,13 +92,17 @@ pub const Report = struct {
     /// Every binary resolved, and every one with an expectation matches it.
     pub fn healthy(self: *const Report) bool {
         for (&self.checks) |*check| {
-            const is_kernel = std.mem.eql(u8, check.name, "formal_kernel") or std.mem.eql(u8, check.name, "project_kernel");
             if (check.resolved_path == null) {
-                if (!is_kernel or check.expected_sha256 != null) return false;
+                // A binary this build never pinned may legitimately be absent
+                // (kernels are built by the release, the daemon ships with a v2
+                // bundle). A pinned one that cannot be found is unhealthy.
+                if (!optionalWhenUnpinned(check.name) or check.expected_sha256 != null) return false;
                 continue;
             }
             if (check.match) |matched| if (!matched) return false;
-            if (is_kernel and check.provenance != true) return false;
+            // Only the Lean kernels carry provenance sidecars; a resolved
+            // kernel without a verdict of `true` is not trusted.
+            if (isKernel(check.name) and check.provenance != true) return false;
         }
         return true;
     }
@@ -117,6 +122,18 @@ pub const KgDiagnosis = struct {
     }
 };
 
+fn isKernel(name: []const u8) bool {
+    return std.mem.eql(u8, name, "formal_kernel") or std.mem.eql(u8, name, "project_kernel");
+}
+
+/// Checks whose binary is absent in a normal build until a release stages it.
+fn optionalWhenUnpinned(name: []const u8) bool {
+    for ([_][]const u8{ "formal_kernel", "project_kernel", "tinykgd" }) |optional| {
+        if (std.mem.eql(u8, name, optional)) return true;
+    }
+    return false;
+}
+
 pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
     const ripgrep: ?Resolved = if (toolchain.ripgrepResolution()) |found| .{
         .path = found.path,
@@ -127,7 +144,7 @@ pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
             .fallback => .fallback,
         },
     } else |_| null;
-    var checks: [4]Check = undefined;
+    var checks: [5]Check = undefined;
     checks[0] = try Check.init(allocator, "ripgrep", ripgrep, expected.ripgrep_sha256);
     errdefer checks[0].deinit(allocator);
 
@@ -146,6 +163,7 @@ pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
         },
     } else null;
     checks[1] = try Check.init(allocator, "tinykg", tinykg_resolved, expected.tinykg_sha256);
+    errdefer checks[1].deinit(allocator);
 
     var formal_override_buf: [std.fs.max_path_bytes]u8 = undefined;
     const formal = resolveKernel(.formal, expected.formal_kernel_sha256, expected.exe_path_override, &formal_override_buf);
@@ -156,7 +174,19 @@ pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
     var project_override_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project = resolveKernel(.project, expected.project_kernel_sha256, expected.exe_path_override, &project_override_buf);
     checks[3] = try Check.init(allocator, "project_kernel", project, expected.project_kernel_sha256);
+    errdefer checks[3].deinit(allocator);
     checks[3].provenance = try kernelProvenance(allocator, checks[3].resolved_path, checks[3].sha256);
+    var tinykgd = try kg_client.KgClient.resolveTinykgdBinary(allocator, .{ .home = "", .domain = "" });
+    defer if (tinykgd) |*found| found.deinit(allocator);
+    const tinykgd_resolved: ?Resolved = if (tinykgd) |found| .{
+        .path = found.path,
+        .source = switch (found.source) {
+            .env => .env,
+            .config => .config,
+            .adjacent => .adjacent,
+        },
+    } else null;
+    checks[4] = try Check.init(allocator, "tinykgd", tinykgd_resolved, expected.tinykgd_sha256);
     return .{ .checks = checks, .kg = null };
 }
 
@@ -258,7 +288,7 @@ pub fn writeJson(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
         source: ?[]const u8,
         provenance: ?bool,
     };
-    var entries: [4]Entry = undefined;
+    var entries: [5]Entry = undefined;
     for (&report.checks, &entries) |*check, *entry| {
         entry.* = .{
             .name = check.name,
@@ -302,6 +332,7 @@ fn testReport(allocator: std.mem.Allocator) !Report {
         },
         .{ .name = "formal_kernel", .resolved_path = null, .sha256 = null, .expected_sha256 = null, .match = null, .source = null, .provenance = null },
         .{ .name = "project_kernel", .resolved_path = null, .sha256 = null, .expected_sha256 = null, .match = null, .source = null, .provenance = null },
+        .{ .name = "tinykgd", .resolved_path = null, .sha256 = null, .expected_sha256 = null, .match = null, .source = null, .provenance = null },
     } };
 }
 
@@ -317,9 +348,26 @@ test "doctor json names every field and uses null for what is absent" {
             "\",\"expected_sha256\":\"" ++ ("0123456789abcdef" ** 4) ++ "\",\"match\":true,\"source\":\"path\",\"provenance\":null}," ++
             "{\"name\":\"tinykg\",\"resolved_path\":null,\"sha256\":null,\"expected_sha256\":null,\"match\":null,\"source\":null,\"provenance\":null}," ++
             "{\"name\":\"formal_kernel\",\"resolved_path\":null,\"sha256\":null,\"expected_sha256\":null,\"match\":null,\"source\":null,\"provenance\":null}," ++
-            "{\"name\":\"project_kernel\",\"resolved_path\":null,\"sha256\":null,\"expected_sha256\":null,\"match\":null,\"source\":null,\"provenance\":null}]}\n",
+            "{\"name\":\"project_kernel\",\"resolved_path\":null,\"sha256\":null,\"expected_sha256\":null,\"match\":null,\"source\":null,\"provenance\":null}," ++
+            "{\"name\":\"tinykgd\",\"resolved_path\":null,\"sha256\":null,\"expected_sha256\":null,\"match\":null,\"source\":null,\"provenance\":null}]}\n",
         out.written(),
     );
+}
+
+test "doctor health: an unpinned daemon may be absent, a pinned one may not" {
+    const a = std.testing.allocator;
+    var report = try testReport(a);
+    defer report.deinit(a);
+    // The CLI is required; the daemon and the kernels are not until this build
+    // pins a digest for them (a v1 bundle carries no tinykgd at all).
+    report.checks[1].resolved_path = try a.dupe(u8, "/opt/tools/tinykg");
+    report.checks[1].sha256 = test_digest;
+    report.checks[1].expected_sha256 = &test_digest;
+    report.checks[1].match = true;
+    try std.testing.expect(report.healthy());
+
+    report.checks[4].expected_sha256 = &test_digest;
+    try std.testing.expect(!report.healthy());
 }
 
 test "doctor text is one line per check" {
@@ -333,7 +381,8 @@ test "doctor text is one line per check" {
         "ripgrep /opt/tools/rg source=path sha256=" ++ ("0123456789abcdef" ** 4) ++ " expected=" ++ ("0123456789abcdef" ** 4) ++ " match=true provenance=n/a\n" ++
             "tinykg unresolved source=- sha256=- expected=none match=n/a provenance=n/a\n" ++
             "formal_kernel unresolved source=- sha256=- expected=none match=n/a provenance=n/a\n" ++
-            "project_kernel unresolved source=- sha256=- expected=none match=n/a provenance=n/a\n",
+            "project_kernel unresolved source=- sha256=- expected=none match=n/a provenance=n/a\n" ++
+            "tinykgd unresolved source=- sha256=- expected=none match=n/a provenance=n/a\n",
         out.written(),
     );
 }

@@ -92,49 +92,48 @@ const BundledTinyKg = struct {
     target_family: []const u8,
 };
 
-fn bundledTinyKgForTarget(target: std.Target) ?BundledTinyKg {
-    return switch (target.os.tag) {
-        .macos => switch (target.cpu.arch) {
-            .aarch64 => .{
-                .key = "macos-universal",
-                .path = "vendor/tinykg/bin/tinykg-macos-universal",
-                .sha256 = "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af",
-                .target_family = "aarch64-macos",
-            },
-            .x86_64 => .{
-                .key = "macos-universal",
-                .path = "vendor/tinykg/bin/tinykg-macos-universal",
-                .sha256 = "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af",
-                .target_family = "x86_64-macos",
-            },
-            else => null,
-        },
-        .linux => switch (target.cpu.arch) {
-            .aarch64 => .{
-                .key = "linux-aarch64",
-                .path = "vendor/tinykg/bin/tinykg-linux-aarch64",
-                .sha256 = "9cfe7bf551463068c1bcaa49dea69dce53be6fdf5b9428f39081fcad67e461aa",
-                .target_family = "aarch64-linux",
-            },
-            .x86_64 => .{
-                .key = "linux-x86_64",
-                .path = "vendor/tinykg/bin/tinykg-linux-x86_64",
-                .sha256 = "5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba",
-                .target_family = "x86_64-linux",
-            },
-            else => null,
-        },
-        .windows => switch (target.cpu.arch) {
-            .x86_64 => .{
-                .key = "windows-x86_64",
-                .path = "vendor/tinykg/bin/tinykg-windows-x86_64.exe",
-                .sha256 = "27f72f74babdcc60c327228673f9eb042092b6c82b156e241c66c0acea081e1b",
-                .target_family = "x86_64-windows",
-            },
-            else => null,
-        },
-        else => null,
-    };
+const BundleTableEntry = struct {
+    key: []const u8,
+    role: []const u8,
+    path: []const u8,
+    sha256: []const u8,
+    targets: []const []const u8,
+};
+
+/// The second, independently committed copy of the bundle digests.
+/// `tinykg:stage` hands the digest below to `scripts/stage_tinykg_binary.py`,
+/// which compares it with `vendor/tinykg/manifest.json` before staging a byte,
+/// so editing the manifest alone cannot change what a build installs. Reading
+/// the digest out of that same manifest would make the comparison attest to
+/// itself. `scripts/build_tinykg_bundle.py` regenerates everything between the
+/// markers, which must stay on their own lines.
+// tinykg-bundle-table:begin
+const tinykg_bundle_table = [_]BundleTableEntry{
+    .{ .key = "macos-universal", .role = "cli", .path = "vendor/tinykg/bin/tinykg-macos-universal", .sha256 = "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af", .targets = &.{ "aarch64-macos", "x86_64-macos" } },
+    .{ .key = "linux-x86_64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-linux-x86_64", .sha256 = "5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba", .targets = &.{"x86_64-linux"} },
+    .{ .key = "linux-aarch64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-linux-aarch64", .sha256 = "9cfe7bf551463068c1bcaa49dea69dce53be6fdf5b9428f39081fcad67e461aa", .targets = &.{"aarch64-linux"} },
+    .{ .key = "windows-x86_64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-windows-x86_64.exe", .sha256 = "27f72f74babdcc60c327228673f9eb042092b6c82b156e241c66c0acea081e1b", .targets = &.{"x86_64-windows"} },
+};
+// tinykg-bundle-table:end
+
+fn bundledTinyKgForTarget(b: *std.Build, target: std.Target, role: []const u8) ?BundledTinyKg {
+    const family = b.fmt("{s}-{s}", .{ @tagName(target.cpu.arch), @tagName(target.os.tag) });
+    var selected: ?BundledTinyKg = null;
+    for (tinykg_bundle_table) |entry| {
+        if (!std.mem.eql(u8, entry.role, role)) continue;
+        for (entry.targets) |candidate| {
+            if (!std.mem.eql(u8, candidate, family)) continue;
+            if (selected != null) @panic("duplicate TinyKG target/role ownership");
+            if (!isLowerSha256(entry.sha256)) @panic("invalid TinyKG bundle table SHA-256");
+            selected = .{
+                .key = entry.key,
+                .path = entry.path,
+                .sha256 = entry.sha256,
+                .target_family = candidate,
+            };
+        }
+    }
+    return selected;
 }
 
 fn isLowerSha256(value: []const u8) bool {
@@ -191,6 +190,7 @@ fn buildInfoOptions(
         .explicit => |input| input.sha256,
         .disabled, .unavailable => null,
     });
+    options.addOption(?[]const u8, "tinykgd_expected_sha256", if (tinykg_input == .bundled) (if (bundledTinyKgForTarget(b, target, "daemon")) |daemon| daemon.sha256 else null) else null);
     options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
     options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
     return options;
@@ -272,12 +272,12 @@ fn tinyKgBinaryInput(b: *std.Build, target: std.Target) TinyKgBinaryInput {
     const bundled_option = b.option(bool, "tinykg-bundled", "Install the checked-in target-specific TinyKG binary (default true)");
     if (legacy != null and bundled_option != null) @panic("-Dtinykg and -Dtinykg-bundled cannot be combined");
 
-    const path = b.option([]const u8, "tinykg-bin", "Absolute path to a maintainer-supplied TinyKG override");
-    const sha256 = b.option([]const u8, "tinykg-sha256", "Observed SHA-256 of the TinyKG override");
+    const path = b.option([]const u8, "tinykg-bin", "Absolute path to a maintainer-supplied TinyKG CLI override (CLI-only)");
+    const sha256 = b.option([]const u8, "tinykg-sha256", "Observed SHA-256 of the TinyKG CLI override (CLI-only)");
     if (path == null and sha256 == null) {
         const enabled = bundled_option orelse if (legacy) |value| value else true;
         if (!enabled) return .disabled;
-        return if (bundledTinyKgForTarget(target)) |bundle| .{ .bundled = bundle } else .unavailable;
+        return if (bundledTinyKgForTarget(b, target, "cli")) |bundle| .{ .bundled = bundle } else .unavailable;
     }
     const resolved_path = path orelse @panic("-Dtinykg-bin and -Dtinykg-sha256 must be supplied together");
     const resolved_sha256 = sha256 orelse @panic("-Dtinykg-bin and -Dtinykg-sha256 must be supplied together");
@@ -293,10 +293,23 @@ const StagedTinyKg = struct {
     source_sha256: []const u8,
 };
 
+const StagedTinyKgd = struct {
+    install_step: *std.Build.Step,
+    artifact: std.Build.LazyPath,
+    installed_path: []const u8,
+    source_sha256: []const u8,
+};
+
 fn wireTinyKgTestInput(run: *std.Build.Step.Run, staged: ?StagedTinyKg) void {
     const tinykg = staged orelse return;
     run.step.dependOn(tinykg.install_step);
     run.setEnvironmentVariable("METACODES_TEST_TINYKG_BIN", tinykg.installed_path);
+}
+
+fn wireTinyKgdTestInput(run: *std.Build.Step.Run, staged: ?StagedTinyKgd) void {
+    const daemon = staged orelse return;
+    run.step.dependOn(daemon.install_step);
+    run.setEnvironmentVariable("METACODES_TEST_TINYKGD_BIN", daemon.installed_path);
 }
 
 const aggregate_test_exclusions = [_][]const u8{
@@ -530,6 +543,7 @@ pub fn build(b: *std.Build) void {
     project_harness_shadow_step.dependOn(&install_project_harness_shadow.step);
 
     var staged_tinykg: ?StagedTinyKg = null;
+    var staged_tinykgd: ?StagedTinyKgd = null;
     const tinykg_stage_step = b.step("tinykg:stage", "Validate and install the selected TinyKG binary");
     switch (tinykg_input) {
         .disabled => tinykg_stage_step.dependOn(&b.addFail(
@@ -552,7 +566,7 @@ pub fn build(b: *std.Build) void {
                 "--target-family",
                 input.target_family,
             });
-            const host_bundle = bundledTinyKgForTarget(b.graph.host.result);
+            const host_bundle = bundledTinyKgForTarget(b, b.graph.host.result, "cli");
             if (host_bundle != null and std.mem.eql(u8, host_bundle.?.key, input.key)) {
                 stage.addArg("--runtime-probe");
             }
@@ -587,6 +601,29 @@ pub fn build(b: *std.Build) void {
                 .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, bin_name),
                 .source_sha256 = input.sha256,
             };
+            if (bundledTinyKgForTarget(b, target.result, "daemon")) |daemon| {
+                const daemon_stage = b.addSystemCommand(&.{ python, "scripts/stage_tinykg_binary.py", "bundled", "--binary" });
+                const daemon_path = b.path(daemon.path);
+                daemon_stage.addFileArg(daemon_path);
+                daemon_stage.addArgs(&.{"--manifest"});
+                daemon_stage.addFileArg(b.path("vendor/tinykg/manifest.json"));
+                daemon_stage.addArgs(&.{ "--bundle-key", daemon.key, "--expected-sha256", daemon.sha256, "--target-family", daemon.target_family, "--role", "daemon" });
+                if (bundledTinyKgForTarget(b, b.graph.host.result, "daemon")) |host_daemon| if (std.mem.eql(u8, host_daemon.key, daemon.key)) daemon_stage.addArg("--runtime-probe");
+                daemon_stage.addArg("--contract");
+                daemon_stage.addFileArg(b.path("deps/tinykg.json"));
+                daemon_stage.addArgs(&.{ "--target", target.result.zigTriple(b.allocator) catch @panic("OOM"), "--output" });
+                const daemon_name = if (target.result.os.tag == .windows) "tinykgd.exe" else "tinykgd";
+                const staged_daemon = daemon_stage.addOutputFileArg(daemon_name);
+                daemon_stage.addArg("--receipt");
+                const staged_daemon_receipt = daemon_stage.addOutputFileArg("tinykgd.provenance.json");
+                const install_daemon = b.addInstallFileWithDir(staged_daemon, .{ .custom = "vendor/tinykg" }, daemon_name);
+                const install_daemon_receipt = b.addInstallFileWithDir(staged_daemon_receipt, .{ .custom = "vendor/tinykg" }, "tinykgd.provenance.json");
+                b.getInstallStep().dependOn(&install_daemon.step);
+                b.getInstallStep().dependOn(&install_daemon_receipt.step);
+                tinykg_stage_step.dependOn(&install_daemon.step);
+                tinykg_stage_step.dependOn(&install_daemon_receipt.step);
+                staged_tinykgd = .{ .install_step = &install_daemon.step, .artifact = staged_daemon, .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, daemon_name), .source_sha256 = daemon.sha256 };
+            }
         },
         .explicit => |input| {
             if (target.result.os.tag != b.graph.host.result.os.tag or
@@ -1832,6 +1869,7 @@ pub fn build(b: *std.Build) void {
         "-m",
         "unittest",
         "scripts.tests.test_stage_tinykg_binary",
+        "scripts.tests.test_build_tinykg_bundle",
         "-v",
     });
     const tinykg_contract_test_step = b.step(
@@ -1915,6 +1953,7 @@ pub fn build(b: *std.Build) void {
     });
     const test_run = addTestRunArtifact(b, test_obj, windows_test_prelude);
     wireTinyKgTestInput(test_run, staged_tinykg);
+    wireTinyKgdTestInput(test_run, staged_tinykgd);
     test_step.dependOn(&test_run.step);
 
     // Two independent Metacodes processes share one authenticated StoreActor.
@@ -1969,6 +2008,10 @@ pub fn build(b: *std.Build) void {
             eval_test_cmd.step.dependOn(tinykg.install_step);
             eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_BIN", tinykg.installed_path);
             eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_SHA256", tinykg.source_sha256);
+            if (staged_tinykgd) |daemon| {
+                eval_test_cmd.step.dependOn(daemon.install_step);
+                eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKGD_BIN", daemon.installed_path);
+            }
             const arm_smoke = b.addSystemCommand(&.{
                 eval_python_exe,
                 "scripts/eval/runtime_arm_smoke.py",
@@ -1978,6 +2021,7 @@ pub fn build(b: *std.Build) void {
             arm_smoke.addArg("--tinykg-binary");
             arm_smoke.addFileArg(tinykg.artifact);
             arm_smoke.addArgs(&.{ "--expected-version", manifest.version });
+            wireTinyKgdTestInput(arm_smoke, staged_tinykgd);
             eval_test_step.dependOn(&arm_smoke.step);
             test_step.dependOn(&arm_smoke.step);
 
@@ -2070,6 +2114,7 @@ pub fn build(b: *std.Build) void {
         run_shard.expectExitCode(0);
         run_shard.step.dependOn(&install_mock_mcp.step);
         wireTinyKgTestInput(run_shard, staged_tinykg);
+        wireTinyKgdTestInput(run_shard, staged_tinykgd);
         integration_reports[shard_index] = run_shard.captureStdOut(.{
             .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
         });
@@ -2083,6 +2128,7 @@ pub fn build(b: *std.Build) void {
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
     integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
     wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
+    wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
     integration_monolithic_step.dependOn(&integration_monolithic_run.step);
 
@@ -2098,6 +2144,7 @@ pub fn build(b: *std.Build) void {
     const integration_timed_run = addTestRunArtifact(b, integration_timed_test, windows_test_prelude);
     integration_timed_run.step.dependOn(&install_mock_mcp.step);
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
+    wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
 
@@ -2331,6 +2378,7 @@ pub fn build(b: *std.Build) void {
         });
         const run_t = addTestRunArtifact(b, t, windows_test_prelude);
         wireTinyKgTestInput(run_t, staged_tinykg);
+        wireTinyKgdTestInput(run_t, staged_tinykgd);
         kg_governance_step.dependOn(&run_t.step);
     }
 
@@ -2355,6 +2403,7 @@ pub fn build(b: *std.Build) void {
         });
         const run_t = addTestRunArtifact(b, t, windows_test_prelude);
         wireTinyKgTestInput(run_t, staged_tinykg);
+        wireTinyKgdTestInput(run_t, staged_tinykgd);
         kg_ontology_feedback_step.dependOn(&run_t.step);
     }
 
@@ -2379,6 +2428,7 @@ pub fn build(b: *std.Build) void {
         });
         const run_t = addTestRunArtifact(b, t, windows_test_prelude);
         wireTinyKgTestInput(run_t, staged_tinykg);
+        wireTinyKgdTestInput(run_t, staged_tinykgd);
         kg_experience_feedback_step.dependOn(&run_t.step);
     }
 

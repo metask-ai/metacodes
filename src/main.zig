@@ -965,6 +965,7 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
     var report = doctor.run(allocator, .{
         .ripgrep_sha256 = build_options.ripgrep_expected_sha256,
         .tinykg_sha256 = build_options.tinykg_expected_sha256,
+        .tinykgd_sha256 = build_options.tinykgd_expected_sha256,
         .formal_kernel_sha256 = build_options.formal_kernel_expected_sha256,
         .project_kernel_sha256 = build_options.project_kernel_expected_sha256,
     }) catch |err| {
