@@ -9,7 +9,7 @@ bundle so a clean checkout has a deterministic TinyKG runtime by default.
 
 Two files serve different purposes:
 
-- `deps/tinykg.json` freezes TinyKG CLI version 0.2.0 in the current bundle, upstream repository,
+- `deps/tinykg.json` freezes TinyKG version 0.3.0 for both roles in the current bundle, upstream repository,
   Apache-2.0 license identifier, storage format 3, and store schema 3.
 - `vendor/tinykg/manifest.json` freezes the exact redistributed executable bytes:
   upstream commit, Zig version, ReleaseSafe/strip profile, target ownership,
@@ -45,7 +45,7 @@ Every stage verifies:
 4. executable format and declared architectures: static ELF rejects dynamic
    program headers, universal Mach-O validates each non-overlapping slice, and
    Windows requires an x86_64 PE32+ console subsystem;
-5. an embedded exact `tinykg 0.2.0` version marker;
+5. an embedded exact `tinykg 0.3.0` marker, or `tinykgd 0.3.0` for a daemon artifact;
 6. target-family ownership;
 7. a second digest over the private staging temporary before atomic replacement,
    so a source-path race cannot replace the last known-good output.
@@ -159,6 +159,15 @@ search of a `vendor/` directory.
 `METACODES_KGD_BIN` selects an explicitly staged `tinykgd` for diagnostics and
 future daemon integration. This release wires resolution, attestation, and the
 doctor check; Metacodes does not start the daemon yet.
+
+Because nothing starts it, the daemon is **not** part of the default install or
+the release layout: `zig build tinykg:stage` (and the test wiring) install it
+under `zig-out/vendor/tinykg/`, while `zig build --prefix <dir>` carries only
+the assets `release/manifest_contract.zig` declares and
+`scripts/verify_install_prefix.py` expects. `metacodes doctor` therefore reports
+`tinykgd` as unresolved in a plain install. The change that starts the daemon
+adds it to the install step, the release manifest and the prefix inventory
+together.
 
 When the runtime is degraded, the diagnosis is retained with a kind and a
 fixed repair hint:

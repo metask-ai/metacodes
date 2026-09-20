@@ -381,13 +381,17 @@ def _version_json_smoke(binary: Path, expected_semver: str, repo_root: Path) -> 
     )
     family = "-".join(str(document.get("target", "")).split("-")[:2])
     manifest = json.loads((repo_root / "vendor" / "tinykg" / "manifest.json").read_text(encoding="utf-8"))
-    pinned = None
-    for artifact in manifest["artifacts"]:
-        if family in artifact["targets"]:
-            pinned = artifact["sha256"]
+    # A v2 bundle declares a CLI and a daemon artifact per target family, so the
+    # family alone no longer identifies one artifact; this asset is the CLI.
+    pinned = [
+        artifact["sha256"]
+        for artifact in manifest["artifacts"]
+        if family in artifact["targets"] and artifact.get("role", "cli") == "cli"
+    ]
+    _require(len(pinned) == 1, f"manifest declares {len(pinned)} CLI artifacts for {family}")
     _require(
-        assets["tinykg"].get("sha256") == pinned,
-        f"tinykg sha256 {assets['tinykg'].get('sha256')!r} != manifest value {pinned!r} for {family}",
+        assets["tinykg"].get("sha256") == pinned[0],
+        f"tinykg sha256 {assets['tinykg'].get('sha256')!r} != manifest value {pinned[0]!r} for {family}",
     )
 
 
@@ -429,7 +433,9 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
     daemon = checks["tinykgd"]
     if daemon_binary:
         _require(daemon.get("source") == "env" and Path(str(daemon.get("resolved_path"))).resolve() == Path(daemon_binary).resolve(), f"doctor tinykgd {daemon!r} did not come from METACODES_KGD_BIN")
-        _require(daemon.get("match") is True, f"doctor tinykgd digest did not match the pinned one: {daemon!r}")
+        # The daemon is not part of the install yet, so this build pins no
+        # digest for it; `match` is null until the release stages it.
+        _require(daemon.get("match") in (None, True), f"doctor tinykgd digest did not match the pinned one: {daemon!r}")
     else:
         _require(daemon.get("resolved_path") is None, f"doctor tinykgd unexpectedly resolved without a test daemon: {daemon!r}")
     strict = subprocess.run(
