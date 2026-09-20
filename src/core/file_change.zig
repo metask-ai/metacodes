@@ -35,6 +35,7 @@
 //! says so rather than pretending to be complete.
 
 const std = @import("std");
+const util_json = @import("../util/json.zig");
 const file_reference = @import("file_reference.zig");
 const ToolContext = @import("../tools/context.zig").ToolContext;
 // 裁剪 std 无 Thread.Mutex;全仓惯例走 platform.sync(pthread 包装)。
@@ -462,27 +463,27 @@ pub fn writeJsonArray(w: *std.Io.Writer, records: []const Record) !void {
     for (records, 0..) |rec, i| {
         if (i != 0) try w.writeByte(',');
         try w.writeAll("{\"path\":");
-        try std.json.Stringify.encodeJsonString(rec.path(), .{}, w);
+        try util_json.writeJsonString(w, rec.path());
         try w.writeAll(",\"locator_kind\":\"");
         try w.writeAll(@tagName(rec.locator));
         try w.writeAll("\"");
         if (rec.from_locator) |from| {
             try w.writeAll(",\"from_path\":");
-            try std.json.Stringify.encodeJsonString(switch (from) {
+            try util_json.writeJsonString(w, switch (from) {
                 inline else => |value| value,
-            }, .{}, w);
+            });
         }
         try w.print(
             ",\"kind\":\"{s}\",\"status\":\"{s}\",\"agent_depth\":{d},\"before_bytes\":{d},\"after_bytes\":{d},\"diff_complete\":{}",
             .{ @tagName(rec.kind), @tagName(rec.status), rec.agent_depth, rec.before_bytes, rec.after_bytes, rec.diff_complete },
         );
         try w.writeAll(",\"tool\":");
-        try std.json.Stringify.encodeJsonString(rec.tool, .{}, w);
+        try util_json.writeJsonString(w, rec.tool);
         try w.writeAll(",\"tool_use_id\":");
-        try std.json.Stringify.encodeJsonString(rec.tool_use_id, .{}, w);
+        try util_json.writeJsonString(w, rec.tool_use_id);
         if (rec.unified_diff) |d| {
             try w.writeAll(",\"unified_diff\":");
-            try std.json.Stringify.encodeJsonString(d, .{}, w);
+            try util_json.writeJsonString(w, d);
         }
         try w.writeByte('}');
     }

@@ -681,8 +681,8 @@ pub fn handleSlash(
         null;
     defer if (run_control) |control| control.deinit();
     if (run_control) |control| control.requireDetachedIdle(
-        (if (app.jobs) |*registry| registry.runningCount() else 0) +|
-            (if (app.agent_jobs) |*registry| registry.runningCount() else 0),
+        (if (app.jobs) |*registry| registry.runningCountForOwner(app.session_id) else 0) +|
+            (if (app.agent_jobs) |*registry| registry.runningCountForSession(app.session_id) else 0),
         app.swarm.hasTeam(),
     ) catch |err| {
         try control.finishRun(@errorName(err));
@@ -829,6 +829,7 @@ fn executeFork(
             .dyn_registry = ctx.dyn_registry,
             .model_override = model_override,
             .host_services = null,
+            .session = ctx.session,
             .project_dir = ctx.project_dir,
             .execution_policy = activation.frame.executionPolicy(),
             .agent_ident = child_ident,

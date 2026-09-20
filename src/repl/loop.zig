@@ -708,8 +708,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             null;
         defer if (run_control) |control| control.deinit();
         if (run_control) |control| control.requireDetachedIdle(
-            (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
-                (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+            (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+                (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
             app.swarm.hasTeam(),
         ) catch |err| {
             try control.finishRun(@errorName(err));
@@ -936,6 +936,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
     _ = try reg.spawnBackground(.{
         .prompt = "", // 忽略(prebuilt 非 null)
         .system_prompt = app.system_prompt orelse "",
+        .session = app.session_id,
         .tool_defs = app.tool_defs,
         .permission_ctx = app.permission_ctx,
         .agents = &app.agents,
@@ -3538,7 +3539,7 @@ fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const
         &app.permission_ctx,
         &app.abort,
         prompt,
-        .{ .max_turns = 1, .agent_depth = 1 }, // 单轮,无工具(纯回答)
+        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id }, // 单轮,无工具(纯回答)
     );
     defer result.deinit();
     return try allocator.dupe(u8, result.final_text);
@@ -3920,7 +3921,7 @@ fn printStartupBanner(app: *const app_mod.App) void {
 fn printBannerLine(th: anytype, inner: usize, text: []const u8) void {
     const pad_left = 2;
     const avail = if (inner > pad_left) inner - pad_left else 0; // text 最多占 inner-2 列
-    const shown = if (displayWidthAscii(text) > avail) text[0..@min(text.len, avail)] else text;
+    const shown = if (displayWidthAscii(text) > avail) prefixToDisplayWidth(text, avail) else text;
     std.debug.print("{s}{s}{s}  {s}", .{ th.accent, th.box_v, th.reset, shown });
     // 右补空格,使 pad_left + shown_width + fill == inner,再竖线。
     var w: usize = pad_left + displayWidthAscii(shown);
@@ -3931,6 +3932,23 @@ fn printBannerLine(th: anytype, inner: usize, text: []const u8) void {
 /// 粗略显示宽(ASCII 1/字;非 ASCII 字节按 UTF-8 估算——banner 文本多为路径/模型名,ASCII 为主)。
 fn displayWidthAscii(s: []const u8) usize {
     return @import("tui/term.zig").displayWidth(s);
+}
+
+fn prefixToDisplayWidth(s: []const u8, max_cols: usize) []const u8 {
+    const term = @import("tui/term.zig");
+    var i: usize = 0;
+    var cols: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const width = if (n > 1 and n <= s.len - i and std.unicode.utf8ValidateSlice(s[i .. i + n]))
+            term.displayWidth(s[i .. i + n])
+        else
+            1;
+        if (width > max_cols - cols) break;
+        cols += width;
+        i += if (n > 1 and n <= s.len - i and std.unicode.utf8ValidateSlice(s[i .. i + n])) n else 1;
+    }
+    return s[0..i];
 }
 
 /// 启动建议:跑 `git log` 找最近改动文件,给一条灰色提示。失败静默。
@@ -3970,10 +3988,14 @@ fn stopSelectedAgent(app: *app_mod.App, region: *render_region_mod.RenderRegion)
     const sel = region.ui.agents.sel;
     if (sel == 0) return;
     const allocator = app.allocator;
-    const snaps = reg.snapshotJobs(allocator) catch return;
+    const snaps = reg.snapshotJobsForSession(allocator, app.session_id) catch return;
     defer agent_job_registry_mod.AgentJobRegistry.freeSnapshots(allocator, snaps);
     if (sel - 1 >= snaps.len) return;
-    reg.kill(snaps[sel - 1].id) catch {};
+    if (snaps[sel - 1].foreground) {
+        reg.abortForSession(snaps[sel - 1].id, app.session_id) catch {};
+    } else {
+        reg.killForSession(snaps[sel - 1].id, app.session_id) catch {};
+    }
     std.debug.print("\r\x1b[2K\x1b[33m[stopped agent {s}]\x1b[0m\n", .{snaps[sel - 1].desc});
 }
 
@@ -4004,7 +4026,7 @@ fn printTaskList(app: *app_mod.App) void {
 
     // 后台 subagent jobs(独立于 todo 任务):running/done/failed/killed。
     if (app.agent_jobs) |*reg| {
-        const snaps = reg.snapshotJobs(app.allocator) catch return;
+        const snaps = reg.snapshotJobsForSession(app.allocator, app.session_id) catch return;
         defer @import("../core/agent_job_registry.zig").AgentJobRegistry.freeSnapshots(app.allocator, snaps);
         if (snaps.len == 0) return;
         std.debug.print("\x1b[1mSubagents ({d}):\x1b[0m\n", .{snaps.len});
@@ -4164,6 +4186,15 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
         return;
     };
 
+    // Validate the durable identity before staging or switching any runtime
+    // state. A hand-created/legacy directory with a malformed id must never
+    // leave the writer pointed at one session while routing/permissions still
+    // use another.
+    const target_sid = @import("../core/session_id.zig").SessionId.fromSlice(target_id orelse "") orelse {
+        std.debug.print("load failed: invalid session id (session state unchanged)\n", .{});
+        return;
+    };
+
     // 事务性加载：先在临时 conversation 加载，成功后才 atomic 切换。
     // 失败时保持原 conversation 和 writer 不变，用户下次输入仍写到原 session。
     var staged = Conversation.init(app.allocator);
@@ -4219,18 +4250,28 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     // #16:切换会话身份——路由键(permission_ctx.session)与 transcript 落点必须一致。resume 前
     // app.session_id 是启动时 gen 的旧 id,writer 已指向 resumed 目录,但 session_id 没变 → 后续
     // agent_loop 的 Options.session / 权限对话框路由仍用旧 id(漂移)。同步切到 resumed session id。
-    if (target_id) |tid| {
-        if (@import("../core/session_id.zig").SessionId.fromSlice(tid)) |sid| {
-            app.session_id = sid;
-            app.permission_ctx.session = sid; // 权限对话框路由到本会话视图(M5/M6)
-        }
+    // A team is live process state, not part of the transcript. Drop
+    // the old roster before changing identity so `/resume` cannot
+    // leave an old worker, inbox, or worktree visible to the new run.
+    if (!std.mem.eql(u8, app.session_id.asSlice(), target_sid.asSlice()) and app.swarm.hasTeam()) {
+        app.swarm.detachTeam();
     }
+    app.session_id = target_sid;
+    app.permission_ctx.session = target_sid; // 权限对话框路由到本会话视图(M5/M6)
+    app.swarm.session = target_sid;
 
     // issue #16:恢复本 session 自己的路由选择。它比 global 窄,所以赢——resume
     // 回来的会话应该继续用它当时那条路由,而不是这期间变成 global 的那条。
     // 选择存在但已解析不出来时明说,绝不静默换成别家 provider。
     if (app.restoreSessionSelection()) |restored| {
-        if (restored) std.debug.print("Restored this session's model route: {s}\n", .{app.activeModel()});
+        if (restored) {
+            // The writer was staged before the session-scoped route was
+            // restored. Keep metadata.model tied to the route that will
+            // actually serve the resumed conversation; otherwise the next
+            // flush silently records the previous session's model.
+            if (app.transcript_writer) |*writer| writer.model = app.activeModel();
+            std.debug.print("Restored this session's model route: {s}\n", .{app.activeModel()});
+        }
     } else |err| {
         std.debug.print(
             "\x1b[33mwarning: this session's stored model route is unavailable ({s}); " ++
@@ -4386,6 +4427,7 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     try std.testing.expect(!std.mem.eql(u8, &old_id.bytes, &app.session_id.bytes)); // 变了
     try std.testing.expectEqualStrings(sid.asSlice(), app.session_id.asSlice()); // 切到 resumed
     try std.testing.expectEqualStrings(sid.asSlice(), app.permission_ctx.session.asSlice()); // 路由键同步
+    try std.testing.expectEqualStrings(app.activeModel(), app.transcript_writer.?.model);
 }
 
 test "/goal accounting delta charges only input plus output usage" {

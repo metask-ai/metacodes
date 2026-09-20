@@ -853,6 +853,7 @@ pub const App = struct {
         // 构造参数 + home。api_key/base_url/model 借 App 生命周期稳定内存(App 存活期不变)。
         app.swarm = .{
             .allocator = allocator,
+            .session = app.session_id,
             .home = app.homeDir(),
             .api_key = app.api_key,
             .base_url = config.base_url,
@@ -1835,8 +1836,18 @@ pub const App = struct {
     /// 错位追加)。换 id + 新 writer 后旧 transcript 目录原样封存(仍可 /resume)。
     /// writer 重建失败非致命(warn,transcript 停写——与启动失败同语义)。
     pub fn rotateSessionIdentity(app: *App) void {
+        // A fresh foreground session cannot inherit the old session's live
+        // team. Tear down workers and their durable team directory before the
+        // routing key changes; otherwise the new session sees a team it
+        // cannot address (entries remain owned by the old session).
+        if (app.swarm.hasTeam()) app.swarm.detachTeam();
+        // Clear the old session's skill projection while its session key is
+        // still current. Background jobs retain their own policy-frame
+        // reference, so this cannot invalidate a child worker.
+        app.clearActiveSkill();
         app.session_id = transcript.genSessionId();
         app.permission_ctx.session = app.session_id;
+        app.swarm.session = app.session_id;
         if (app.transcript_writer) |*w| w.deinit();
         app.transcript_writer = null;
         app.initTranscriptWriter() catch |err| {
@@ -1845,11 +1856,27 @@ pub const App = struct {
         // R4-3:goal 属于被转走的旧会话——不清则旧 goal 记进新会话目录、用量记错账,
         // /resume 旧会话时又读到陈旧快照。新会话从无 goal 起步(对齐"新空会话"语义)。
         app.goal_state.clearInMemory();
-        // 已知残留(R4-2,存量收窄未闭):Ctrl+B 时若有 active skill,其 ExecutionState
-        // 仍挂在旧 id 下(后续 clearActiveSkill 用新 id 注销不到 → 泄漏到 App deinit);
-        // 且后台 job 按值拷走的 permission_ctx.active_skill 借着该投影——此处**不能**
-        // 注销旧 id(会毁掉后台正读的投影 = UAF)。正确修法是 spawn 时深拷/引用计数
-        // 投影,见 follow-up。
+    }
+
+    /// Rebind a process-mode teammate to its explicitly inherited parent
+    /// session. App.init creates a writer before command-line teammate mode is
+    /// known, so close that writer and reopen the exact parent directory before
+    /// the first turn is persisted.
+    pub fn adoptSessionIdentity(app: *App, session: @import("core/session_id.zig").SessionId) !void {
+        if (std.mem.eql(u8, app.session_id.asSlice(), session.asSlice())) return;
+        if (app.transcript_writer) |*w| w.deinit();
+        app.transcript_writer = null;
+        if (app.plan_file_path.len > 0) app.allocator.free(app.plan_file_path);
+        app.plan_file_path = &.{};
+        app.permission_ctx.plan_file_path = "";
+        app.session_id = session;
+        app.permission_ctx.session = session;
+        app.swarm.session = session;
+        app.initTranscriptWriter() catch |err| {
+            @import("util/log.zig").warn("transcript", "adopt session writer failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        app.initPlanFilePath();
     }
 
     fn initTranscriptWriter(app: *App) !void {
@@ -2502,14 +2529,7 @@ pub const App = struct {
     /// Ctrl+X Ctrl+K:杀所有 running 后台任务,返回 killed 数。两期共用。
     pub fn killAllBackground(app: *App) usize {
         const jobs = if (app.jobs) |*j| j else return 0;
-        var killed: usize = 0;
-        for (jobs.jobs.items) |*j| {
-            if (j.status != .running) continue;
-            var id_copy: [12]u8 = j.id; // 快照 id(kill 可能改 collection)
-            jobs.kill(id_copy[0..]) catch continue;
-            killed += 1;
-        }
-        return killed;
+        return jobs.killAllForOwner(app.session_id);
     }
 
     /// 激活一个 skill 的权限态。先清旧的(如有),再装新的。

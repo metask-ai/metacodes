@@ -99,6 +99,18 @@ fn extractJobId(a: std.mem.Allocator, out: []const u8) ![]u8 {
     return a.dupe(u8, out[start..end]);
 }
 
+fn extractUsizeField(out: []const u8, key: []const u8) !usize {
+    const marker = try std.fmt.allocPrint(std.testing.allocator, "\"{s}\":", .{key});
+    defer std.testing.allocator.free(marker);
+    const i = std.mem.indexOf(u8, out, marker) orelse return error.MissingField;
+    var start = i + marker.len;
+    while (start < out.len and (out[start] == ' ' or out[start] == '\t')) : (start += 1) {}
+    var end = start;
+    while (end < out.len and out[end] >= '0' and out[end] <= '9') : (end += 1) {}
+    if (end == start) return error.InvalidField;
+    return std.fmt.parseInt(usize, out[start..end], 10);
+}
+
 test "L2 后台A: run_in_background=true 立即返回 agent_job_id 且不阻塞" {
     const a = std.testing.allocator;
 
@@ -174,14 +186,38 @@ test "L2 后台B: TaskOutput running→done 拿到 final_text + stop_reason" {
     const query = try std.fmt.allocPrint(a, "{{\"agent_job_id\":\"{s}\"}}", .{job_id});
     defer a.free(query);
 
-    // One call must long-poll through the cassette delay and observe terminal
-    // state. The old zero-wait snapshot required a caller-side busy loop and
-    // let real models trip the identical-result zero-gain breaker.
-    const r = try cc.task_output_tool.execute(&ctx, query);
-    defer a.free(r);
-    try std.testing.expect(std.mem.indexOf(u8, r, "\"status\":\"done\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r, "BG DONE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r, "\"stop_reason\":\"end_turn\"") != null);
+    // A long-poll wakes when new output arrives, so the first response may be
+    // running with a UTF-8 cursor. Continue from that cursor until the
+    // terminal state instead of assuming one network chunk contains the whole
+    // stream. This tests the actual incremental contract and is deterministic
+    // under the cassette's per-event delay.
+    var since: usize = 0;
+    var saw_running = false;
+    var final_result: []u8 = &.{};
+    defer if (final_result.len > 0) a.free(final_result);
+    var poll: usize = 0;
+    while (poll < 32) : (poll += 1) {
+        var current_query_owned: ?[]u8 = null;
+        defer if (current_query_owned) |owned| a.free(owned);
+        const current_query = if (since == 0)
+            query
+        else blk: {
+            current_query_owned = try std.fmt.allocPrint(a, "{{\"agent_job_id\":\"{s}\",\"since_byte\":{d}}}", .{ job_id, since });
+            break :blk current_query_owned.?;
+        };
+        const r = try cc.task_output_tool.execute(&ctx, current_query);
+        if (std.mem.indexOf(u8, r, "\"status\":\"running\"") != null) saw_running = true;
+        if (std.mem.indexOf(u8, r, "\"status\":\"done\"") != null) {
+            final_result = r;
+            break;
+        }
+        since = try extractUsizeField(r, "output_next_offset");
+        a.free(r);
+    }
+    try std.testing.expect(saw_running);
+    try std.testing.expect(final_result.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, final_result, "BG DONE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_result, "\"stop_reason\":\"end_turn\"") != null);
     const request_body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, request_body, "BACKGROUND_DIALECT_MARKER") != null);
 }

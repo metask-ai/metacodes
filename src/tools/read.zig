@@ -6,6 +6,8 @@ const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
 const code_map = @import("code_map.zig");
+const utf8 = @import("../util/utf8.zig");
+const util_json = @import("../util/json.zig");
 const symbol_provider = @import("symbol_provider.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
@@ -38,8 +40,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         common.extractJsonArg(args, "path") orelse
         return error.MissingPath;
     if (path_raw.len == 0) return error.EmptyPath;
+    const path_unescaped = try util_json.unescapeString(path_raw, allocator);
+    defer allocator.free(path_unescaped);
     // 归一化(展开 ~、折叠、查 traversal)。execve 不经 shell,~ 必须自己展开;openat 同样不认 ~。
-    const path = try path_mod.normalizeChecked(allocator, path_raw, .{
+    const path = try path_mod.normalizeChecked(allocator, path_unescaped, .{
         .home = ctx.home_dir,
         .base_dir = ctx.cwd_abs,
         .resolve_relative = ctx.resolve_relative_paths,
@@ -117,7 +121,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 // 这条已经是终局提示,没有"末尾追加"的机会 → 显式请求过 outline 的话就地交代。
                 if (outline_gap) |u| {
                     var why_buf: [symbol_provider.capability.WHY_BUF]u8 = undefined;
-                    return try std.fmt.allocPrint(allocator, "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content. No outline was available: {s}.\"}}", .{ s.size, MAX_FILE_BYTES, u.why(&why_buf) });
+                    var out: std.Io.Writer.Allocating = .init(allocator);
+                    defer out.deinit();
+                    try out.writer.print("{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content. No outline was available: ", .{ s.size, MAX_FILE_BYTES });
+                    try util_json.writeJsonString(&out.writer, u.why(&why_buf));
+                    try out.writer.writeAll(".\"}");
+                    return try out.toOwnedSlice();
                 }
                 return try std.fmt.allocPrint(allocator, "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content.\"}}", .{ s.size, MAX_FILE_BYTES });
             }
@@ -168,7 +177,14 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 输出封顶(对齐 cc maxBytes):区间内容超 MAX_READ_OUTPUT_BYTES → 截到最后完整行 + 提示。
     // 覆盖显式 limit=huge 在 <10MB 文件上绕过守卫返回过多的情形。
-    const capd = capToLastLine(full[line_start..end], MAX_READ_OUTPUT_BYTES);
+    var selected = full[line_start..end];
+    var repaired_selected: ?[]u8 = null;
+    if (!std.unicode.utf8ValidateSlice(selected)) {
+        repaired_selected = try utf8.repairInvalidUtf8(allocator, selected);
+        selected = repaired_selected.?;
+    }
+    defer if (repaired_selected) |bytes| allocator.free(bytes);
+    const capd = capToLastLine(selected, MAX_READ_OUTPUT_BYTES);
     var rendered = try renderWithLineNumbers(capd.slice, offset_1based, allocator);
     if (capd.truncated) {
         // 有完整行 → 给精确续读行号(offset 分页);无完整行(单行超 cap)→ 长行提示(offset 会死循环)。
@@ -215,7 +231,10 @@ const CapResult = struct { slice: []const u8, truncated: bool };
 fn capToLastLine(content: []const u8, max: usize) CapResult {
     if (content.len <= max) return .{ .slice = content, .truncated = false };
     const nl = std.mem.lastIndexOfScalar(u8, content[0..max], '\n');
-    const cut = if (nl) |i| i + 1 else max;
+    const cut = if (nl) |i| i + 1 else blk: {
+        const bounded = utf8.prefixEnd(content, max);
+        break :blk if (bounded > 0) bounded else utf8.nextBoundary(content, 0);
+    };
     return .{ .slice = content[0..cut], .truncated = true };
 }
 
@@ -295,6 +314,12 @@ fn readRangeStreaming(
     }
     // 流式未读全文件 → content_hash=0(保守:mtime 变即 stale,强制重读)。
     if (ctx.read_state) |rs| rs.recordHashed(path, st.mtime_ns, st.size, 0) catch {};
+    if (!std.unicode.utf8ValidateSlice(out.items)) {
+        const repaired = try utf8.repairInvalidUtf8(allocator, out.items);
+        out.clearRetainingCapacity();
+        try out.appendSlice(allocator, repaired);
+        allocator.free(repaired);
+    }
     var rendered = try renderWithLineNumbers(out.items, offset_1based, allocator);
     if (capped) {
         const lines_shown = countLines(out.items);
@@ -346,8 +371,8 @@ fn renderWithLineNumbers(slice: []const u8, start_line: usize, allocator: std.me
         // 单行超长 → 截断到 MAX_LINE_BYTES(UTF-8 边界安全)+ 标记,防 minified 一行几 MB 撑爆。
         const raw_line = slice[pos..line_end];
         if (raw_line.len > MAX_LINE_BYTES) {
-            var cut = MAX_LINE_BYTES;
-            while (cut > 0 and (raw_line[cut] & 0b1100_0000) == 0b1000_0000) : (cut -= 1) {}
+            var cut = utf8.prefixEnd(raw_line, MAX_LINE_BYTES);
+            if (cut == 0) cut = utf8.nextBoundary(raw_line, 0);
             try out.appendSlice(allocator, raw_line[0..cut]);
             try out.appendSlice(allocator, " … [line truncated]");
         } else {
@@ -458,9 +483,9 @@ fn readImage(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []cons
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"type\":\"image\",\"media_type\":");
-    try std.json.Stringify.encodeJsonString(media_type, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, media_type);
     try out.writer.writeAll(",\"data\":");
-    try std.json.Stringify.encodeJsonString(b64, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, b64);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
 }

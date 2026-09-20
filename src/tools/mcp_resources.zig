@@ -17,6 +17,7 @@ const std = @import("std");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const ToolResultBody = @import("context.zig").ToolResultBody;
+const util_json = @import("../util/json.zig");
 const McpSessionEntry = @import("../core/mcp_session.zig").McpSessionEntry;
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const result_budget = @import("../core/result_budget.zig");
@@ -25,6 +26,11 @@ const result_spool = @import("result_spool.zig");
 const LAST_ERROR_DETAIL_MAX_BYTES: usize = 512;
 
 const NO_MCP_SESSIONS_DETAIL = "No MCP servers are connected in this session. Declare servers in ~/.metacodes/config.json under \"mcp_servers\" (see /mcp) and restart; their tools then register as <server>__<tool> and are listed under \"# Deferred tools\".";
+
+fn extractDecodedField(a: std.mem.Allocator, args: []const u8, field: []const u8) !?[]u8 {
+    const raw = common.extractJsonArg(args, field) orelse return null;
+    return try util_json.unescapeString(raw, a);
+}
 
 /// 本 session 连接的 MCP session 列表。宿主没接 MCP(null)或一个 server 都没连(空)都是
 /// `NoMcpSessions`——空数组 `{"resources":[]}` 会让模型以为"server 在,只是没资源",
@@ -60,7 +66,8 @@ pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
         return ToolResultBody.initInline(try listExecute(ctx, args));
     const allocator = ctx.allocator;
     const sessions = try connectedSessions(ctx);
-    const server_filter = common.extractJsonArg(args, "server");
+    const server_filter = try extractDecodedField(allocator, args, "server");
+    defer if (server_filter) |filter| allocator.free(filter);
     try requireServer(ctx, sessions, server_filter);
     var capture = try artifact_store.Capture.begin(
         allocator,
@@ -86,7 +93,7 @@ pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
                     if (!first) try output.writer.writeByte(',');
                     first = false;
                     try output.writer.writeAll("{\"server\":");
-                    try std.json.Stringify.encodeJsonString(entry.name, .{}, &output.writer);
+                    try util_json.writeJsonString(&output.writer, entry.name);
                     if (object.len > 2) {
                         try output.writer.writeByte(',');
                         try output.writer.writeAll(object[1 .. object.len - 1]);
@@ -100,7 +107,7 @@ pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
                 if (!first) try output.writer.writeByte(',');
                 first = false;
                 try output.writer.writeAll("{\"server\":");
-                try std.json.Stringify.encodeJsonString(entry.name, .{}, &output.writer);
+                try util_json.writeJsonString(&output.writer, entry.name);
                 try output.writer.writeAll(",\"resource_list_artifact\":");
                 try output.writer.writeAll(rendered.bytes);
                 try output.writer.writeByte('}');
@@ -126,24 +133,31 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
         return ToolResultBody.initInline(try readExecute(ctx, args));
     const allocator = ctx.allocator;
     const sessions = ctx.mcp_sessions orelse return error.NoMcpSessions;
-    const uri = common.extractJsonArg(args, "uri") orelse return error.MissingUri;
+    const uri = (try extractDecodedField(allocator, args, "uri")) orelse return error.MissingUri;
+    defer allocator.free(uri);
     if (uri.len == 0) return error.EmptyUri;
-    const server_hint = common.extractJsonArg(args, "server");
+    const server_hint = try extractDecodedField(allocator, args, "server");
+    defer if (server_hint) |hint| allocator.free(hint);
 
     if (server_hint) |hint| {
         for (sessions.*) |*entry| if (std.mem.eql(u8, hint, entry.name)) {
-            return entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err|
-                ToolResultBody.initInline(try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"error\":\"read_failed\",\"server\":\"{s}\",\"message\":\"{s}\"}}",
-                    .{ hint, @errorName(err) },
-                ));
+            return entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| blk: {
+                var failed: std.Io.Writer.Allocating = .init(allocator);
+                errdefer failed.deinit();
+                try failed.writer.writeAll("{\"error\":\"read_failed\",\"server\":");
+                try util_json.writeJsonString(&failed.writer, hint);
+                try failed.writer.writeAll(",\"message\":");
+                try util_json.writeJsonString(&failed.writer, @errorName(err));
+                try failed.writer.writeByte('}');
+                break :blk ToolResultBody.initInline(try failed.toOwnedSlice());
+            };
         };
-        return ToolResultBody.initInline(try std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"server_not_found\",\"server\":\"{s}\"}}",
-            .{hint},
-        ));
+        var missing: std.Io.Writer.Allocating = .init(allocator);
+        errdefer missing.deinit();
+        try missing.writer.writeAll("{\"error\":\"server_not_found\",\"server\":");
+        try util_json.writeJsonString(&missing.writer, hint);
+        try missing.writer.writeByte('}');
+        return ToolResultBody.initInline(try missing.toOwnedSlice());
     }
 
     var last_error: ?[]const u8 = null;
@@ -178,12 +192,12 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try output.writer.writeAll("{\"error\":\"resource_not_found\",\"uri\":");
-    try std.json.Stringify.encodeJsonString(uri, .{}, &output.writer);
+    try util_json.writeJsonString(&output.writer, uri);
     try output.writer.writeAll(",\"last_err\":");
-    try std.json.Stringify.encodeJsonString(last_error orelse "none", .{}, &output.writer);
+    try util_json.writeJsonString(&output.writer, last_error orelse "none");
     if (last_error_detail) |detail| {
         try output.writer.writeAll(",\"last_error_detail\":");
-        try std.json.Stringify.encodeJsonString(detail, .{}, &output.writer);
+        try util_json.writeJsonString(&output.writer, detail);
     }
     try output.writer.writeByte('}');
     return ToolResultBody.initInline(try output.toOwnedSlice());
@@ -220,7 +234,8 @@ fn duplicateStructuredErrorDetail(
 pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const a = ctx.allocator;
     const sessions = try connectedSessions(ctx);
-    const server_filter = common.extractJsonArg(args, "server");
+    const server_filter = try extractDecodedField(a, args, "server");
+    defer if (server_filter) |filter| a.free(filter);
     try requireServer(ctx, sessions, server_filter);
 
     var out: std.Io.Writer.Allocating = .init(a);
@@ -247,7 +262,7 @@ pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             first = false;
             // 把 server 字段注入对象前
             try out.writer.writeAll("{\"server\":");
-            try std.json.Stringify.encodeJsonString(entry.name, .{}, &out.writer);
+            try util_json.writeJsonString(&out.writer, entry.name);
             // 再把原对象内容(去掉外层 {} 的)拼接
             if (obj.len > 2) {
                 try out.writer.writeAll(",");
@@ -263,20 +278,34 @@ pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 pub fn readExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const a = ctx.allocator;
     const sessions = ctx.mcp_sessions orelse return error.NoMcpSessions;
-    const uri = common.extractJsonArg(args, "uri") orelse return error.MissingUri;
+    const uri = (try extractDecodedField(a, args, "uri")) orelse return error.MissingUri;
+    defer a.free(uri);
     if (uri.len == 0) return error.EmptyUri;
-    const server_hint = common.extractJsonArg(args, "server");
+    const server_hint = try extractDecodedField(a, args, "server");
+    defer if (server_hint) |hint| a.free(hint);
 
     // 优先查 hint 的 server
     if (server_hint) |sh| {
         for (sessions.*) |*entry| {
             if (std.mem.eql(u8, sh, entry.name)) {
                 return entry.client.readResource(uri) catch |err| {
-                    return try std.fmt.allocPrint(a, "{{\"error\":\"read_failed\",\"server\":\"{s}\",\"message\":\"{s}\"}}", .{ sh, @errorName(err) });
+                    var out: std.Io.Writer.Allocating = .init(a);
+                    defer out.deinit();
+                    try out.writer.writeAll("{\"error\":\"read_failed\",\"server\":");
+                    try util_json.writeJsonString(&out.writer, sh);
+                    try out.writer.writeAll(",\"message\":");
+                    try util_json.writeJsonString(&out.writer, @errorName(err));
+                    try out.writer.writeByte('}');
+                    return out.toOwnedSlice();
                 };
             }
         }
-        return try std.fmt.allocPrint(a, "{{\"error\":\"server_not_found\",\"server\":\"{s}\"}}", .{sh});
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try out.writer.writeAll("{\"error\":\"server_not_found\",\"server\":");
+        try util_json.writeJsonString(&out.writer, sh);
+        try out.writer.writeByte('}');
+        return out.toOwnedSlice();
     }
 
     // 无 hint:依次尝试所有 server,第一个成功的
@@ -288,7 +317,14 @@ pub fn readExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         };
         return res;
     }
-    return try std.fmt.allocPrint(a, "{{\"error\":\"resource_not_found\",\"uri\":\"{s}\",\"last_err\":\"{s}\"}}", .{ uri, last_err orelse "none" });
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try out.writer.writeAll("{\"error\":\"resource_not_found\",\"uri\":");
+    try util_json.writeJsonString(&out.writer, uri);
+    try out.writer.writeAll(",\"last_err\":");
+    try util_json.writeJsonString(&out.writer, last_err orelse "none");
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
 }
 
 // ============================================================================
@@ -445,7 +481,7 @@ test "read_resource detail respects UTF-8 boundaries" {
     var encoded: std.Io.Writer.Allocating = .init(allocator);
     defer encoded.deinit();
     try encoded.writer.writeAll("{\"error\":{\"detail\":");
-    try std.json.Stringify.encodeJsonString(detail, .{}, &encoded.writer);
+    try util_json.writeJsonString(&encoded.writer, detail);
     try encoded.writer.writeAll("}}");
 
     const bounded = try duplicateStructuredErrorDetail(allocator, encoded.written());

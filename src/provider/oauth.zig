@@ -25,6 +25,7 @@ const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
 const ids = @import("ids.zig");
 const profile_mod = @import("profile.zig");
+const json_util = @import("../util/json.zig");
 
 pub const Slug = ids.Slug;
 
@@ -669,22 +670,7 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn writeJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
-    try out.append(allocator, '"');
-    for (text) |byte| switch (byte) {
-        '"' => try out.appendSlice(allocator, "\\\""),
-        '\\' => try out.appendSlice(allocator, "\\\\"),
-        '\n' => try out.appendSlice(allocator, "\\n"),
-        '\r' => try out.appendSlice(allocator, "\\r"),
-        '\t' => try out.appendSlice(allocator, "\\t"),
-        else => {
-            if (byte < 0x20) {
-                const escaped = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{byte});
-                defer allocator.free(escaped);
-                try out.appendSlice(allocator, escaped);
-            } else try out.append(allocator, byte);
-        },
-    };
-    try out.append(allocator, '"');
+    try json_util.serializeString(text, out, allocator);
 }
 
 fn stringOf(value: ?std.json.Value) ?[]const u8 {
@@ -892,6 +878,25 @@ test "rotated tokens are persisted atomically and survive a reload" {
     try testing.expectEqualStrings("refresh-1", reloaded.tokens.?.refresh_token);
     try testing.expectEqualStrings("access-1", reloaded.tokens.?.access_token);
     try testing.expectEqual(@as(i64, 1_000 + 3600), reloaded.tokens.?.expires_at);
+}
+
+test "persisted OAuth JSON repairs malformed UTF-8" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try renderStored(a, &out, .{
+        .access_token = @constCast("access\xe4\x60\x80"),
+        .refresh_token = @constCast("refresh\xff"),
+        .expires_at = 1,
+        .token_type = @constCast("Bearer"),
+        .client_name = @constCast("host\xc0\x80"),
+    }, null);
+    try testing.expect(std.unicode.utf8ValidateSlice(out.items));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("access�`�", parsed.value.object.get("access_token").?.string);
+    try testing.expectEqualStrings("refresh�", parsed.value.object.get("refresh_token").?.string);
+    try testing.expectEqualStrings("host��", parsed.value.object.get("client_name").?.string);
 }
 
 test "Metask gateway metadata survives initial import and rotated refresh" {

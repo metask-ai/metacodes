@@ -6,6 +6,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const util_json = @import("../util/json.zig");
 
 pub fn createExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const a = ctx.allocator;
@@ -16,7 +17,9 @@ pub fn createExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer a.free(prompt);
     if (prompt.len == 0) return error.EmptyPrompt;
 
-    const cron_expr = common.extractJsonArg(args, "cron") orelse "";
+    const cron_raw = common.extractJsonArg(args, "cron");
+    const cron_expr = if (cron_raw) |raw| try util_json.unescapeString(raw, a) else "";
+    defer if (cron_raw != null) a.free(cron_expr);
     const delay_s: ?i64 = blk: {
         const v = common.extractJsonArg(args, "delaySeconds") orelse common.extractJsonArg(args, "delay_seconds");
         if (v) |s| break :blk std.fmt.parseInt(i64, s, 10) catch null;
@@ -33,15 +36,27 @@ pub fn createExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return try std.fmt.allocPrint(a, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
     };
 
-    return try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"recurring\":{},\"scheduled\":true}}", .{ id[0..], recurring });
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try out.writer.writeAll("{\"id\":");
+    try util_json.writeJsonString(&out.writer, id[0..]);
+    try out.writer.print(",\"recurring\":{},\"scheduled\":true}}", .{recurring});
+    return try out.toOwnedSlice();
 }
 
 pub fn deleteExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const a = ctx.allocator;
     const reg = ctx.cron_registry orelse return error.CronUnavailable;
-    const id = common.extractJsonArg(args, "id") orelse return error.MissingId;
+    const id_raw = common.extractJsonArg(args, "id") orelse return error.MissingId;
+    const id = try util_json.unescapeString(id_raw, a);
+    defer a.free(id);
     const found = reg.delete(id);
-    return try std.fmt.allocPrint(a, "{{\"deleted\":{},\"id\":\"{s}\"}}", .{ found, id });
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try out.writer.print("{{\"deleted\":{},\"id\":", .{found});
+    try util_json.writeJsonString(&out.writer, id);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
 }
 
 pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -54,10 +69,11 @@ pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.writer.writeAll("{\"jobs\":[");
     for (reg.jobs.items, 0..) |j, i| {
         if (i > 0) try out.writer.writeByte(',');
-        try out.writer.print(
-            "{{\"id\":\"{s}\",\"cron\":\"{s}\",\"recurring\":{},\"next_fire_unix\":{d}}}",
-            .{ j.id[0..], j.cron_expr, j.recurring, j.next_fire_unix },
-        );
+        try out.writer.writeAll("{\"id\":");
+        try util_json.writeJsonString(&out.writer, j.id[0..]);
+        try out.writer.writeAll(",\"cron\":");
+        try util_json.writeJsonString(&out.writer, j.cron_expr);
+        try out.writer.print(",\"recurring\":{},\"next_fire_unix\":{d}}}", .{ j.recurring, j.next_fire_unix });
     }
     try out.writer.print("],\"count\":{d}}}", .{reg.count()});
     return try out.toOwnedSlice();

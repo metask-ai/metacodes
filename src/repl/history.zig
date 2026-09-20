@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const util_json = @import("../util/json.zig");
 
 pub const MAX_ENTRIES: usize = 1000;
 
@@ -149,7 +150,7 @@ pub const History = struct {
         for (self.entries.items) |entry| {
             var line: std.Io.Writer.Allocating = .init(self.allocator);
             defer line.deinit();
-            std.json.Stringify.encodeJsonString(entry, .{}, &line.writer) catch continue;
+            util_json.writeJsonString(&line.writer, entry) catch continue;
             line.writer.writeByte('\n') catch continue;
             const bytes = line.written();
             _ = pfs.write(fd, bytes);

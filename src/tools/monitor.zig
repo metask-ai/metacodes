@@ -31,7 +31,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const command = try util_json.unescapeString(command_escaped, ctx.allocator);
     defer ctx.allocator.free(command);
     if (command.len == 0) return error.EmptyCommand;
-    const description = common.extractJsonArg(args, "description") orelse "background monitor";
+    const description_escaped = common.extractJsonArg(args, "description");
+    const description = if (description_escaped) |raw| blk: {
+        const decoded = try util_json.unescapeString(raw, ctx.allocator);
+        break :blk decoded;
+    } else try ctx.allocator.dupe(u8, "background monitor");
+    defer ctx.allocator.free(description);
 
     const jobs = ctx.jobs orelse return error.JobsUnavailable;
 
@@ -65,15 +70,25 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 启动后台 job(已 sandbox 包裹)
     const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-    const entry = jobs.spawnBackgroundOwned(eff_command, cwd_opt, ctx.agent_ident) catch |err| {
-        return try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"spawn_failed\",\"message\":\"{s}\"}}", .{@errorName(err)});
+    const entry = jobs.spawnBackgroundOwned(eff_command, cwd_opt, ctx.session) catch |err| {
+        var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll("{\"error\":\"spawn_failed\",\"message\":");
+        try util_json.writeJsonString(&aw.writer, @errorName(err));
+        try aw.writer.writeAll("}");
+        return try aw.toOwnedSlice();
     };
 
-    return try std.fmt.allocPrint(
-        ctx.allocator,
-        "{{\"job_id\":\"{s}\",\"status\":\"running\",\"description\":\"{s}\",\"hint\":\"Its exit is announced to you automatically. Use BashOutput(job_id) to read streamed lines (it waits for new lines if none are unread); KillShell(job_id) to stop.\"}}",
-        .{ entry.id[0..], description },
-    );
+    var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"job_id\":");
+    try util_json.writeJsonString(&aw.writer, entry.id[0..]);
+    try aw.writer.writeAll(",\"status\":\"running\",\"description\":");
+    try util_json.writeJsonString(&aw.writer, description);
+    try aw.writer.writeAll(",\"hint\":");
+    try util_json.writeJsonString(&aw.writer, "Its exit is announced to you automatically. Use BashOutput(job_id) to read streamed lines (it waits for new lines if none are unread); KillShell(job_id) to stop.");
+    try aw.writer.writeAll("}");
+    return try aw.toOwnedSlice();
 }
 
 // ============================================================================
@@ -115,6 +130,22 @@ test "Monitor: launches background job and returns job_id" {
     var pfd = [_]std.posix.pollfd{};
     _ = std.posix.poll(&pfd, 200) catch {};
     jobs.reapExited();
+}
+
+test "Monitor JSON escapes description and preserves UTF-8" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
+    var jobs = try JobRegistry.init(a);
+    defer jobs.deinit();
+    var ctx = ToolContext.simple(a);
+    ctx.jobs = &jobs;
+    const out = try execute(&ctx, "{\"command\":\"sleep 0.01\",\"description\":\"a\\\"b\\n中文\"}");
+    defer a.free(out);
+    const Parsed = struct { description: []const u8 };
+    var parsed = try std.json.parseFromSlice(Parsed, a, out, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a\"b\n中文", parsed.value.description);
 }
 
 test "Monitor: unescapes command before spawning and captures separate stdout lines" {

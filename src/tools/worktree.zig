@@ -22,6 +22,7 @@ const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const util_json = @import("../util/json.zig");
 
 pub const WorktreeEntry = struct {
     worktree_path: []u8,
@@ -46,7 +47,12 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try chdir(path);
         try pushWorktree(ctx, path, old_cwd);
         a.free(old_cwd);
-        return try std.fmt.allocPrint(a, "{{\"worktree\":\"{s}\",\"entered\":true,\"created\":false}}", .{path});
+        var reply: std.Io.Writer.Allocating = .init(a);
+        defer reply.deinit();
+        try reply.writer.writeAll("{\"worktree\":");
+        try util_json.writeJsonString(&reply.writer, path);
+        try reply.writer.writeAll(",\"entered\":true,\"created\":false}");
+        return reply.toOwnedSlice();
     }
 
     // 创建新 worktree
@@ -89,22 +95,35 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         null,
     };
     const out = common.spawnCaptureWithStderrTimed(argv_args[0..], a, ctx.abort, 30_000, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES, null) catch |err| {
-        return try std.fmt.allocPrint(a, "{{\"error\":\"git_failed\",\"message\":\"{s}\"}}", .{@errorName(err)});
+        var reply: std.Io.Writer.Allocating = .init(a);
+        defer reply.deinit();
+        try reply.writer.writeAll("{\"error\":\"git_failed\",\"message\":");
+        try util_json.writeJsonString(&reply.writer, @errorName(err));
+        try reply.writer.writeByte('}');
+        return reply.toOwnedSlice();
     };
     defer a.free(out.stdout);
     defer a.free(out.stderr);
     if (out.exit_code != 0) {
-        return try std.fmt.allocPrint(a, "{{\"error\":\"git_worktree_add_failed\",\"exit_code\":{d},\"stderr\":\"{s}\"}}", .{ out.exit_code, out.stderr });
+        var reply: std.Io.Writer.Allocating = .init(a);
+        defer reply.deinit();
+        try reply.writer.print("{{\"error\":\"git_worktree_add_failed\",\"exit_code\":{d},\"stderr\":", .{out.exit_code});
+        try util_json.writeJsonString(&reply.writer, out.stderr);
+        try reply.writer.writeByte('}');
+        return reply.toOwnedSlice();
     }
 
     try chdir(wt_path);
     try pushWorktree(ctx, wt_path, cwd);
 
-    return try std.fmt.allocPrint(
-        a,
-        "{{\"worktree\":\"{s}\",\"branch\":\"{s}\",\"entered\":true,\"created\":true}}",
-        .{ wt_path, name },
-    );
+    var reply: std.Io.Writer.Allocating = .init(a);
+    defer reply.deinit();
+    try reply.writer.writeAll("{\"worktree\":");
+    try util_json.writeJsonString(&reply.writer, wt_path);
+    try reply.writer.writeAll(",\"branch\":");
+    try util_json.writeJsonString(&reply.writer, name);
+    try reply.writer.writeAll(",\"entered\":true,\"created\":true}");
+    return reply.toOwnedSlice();
 }
 
 pub fn exitExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -149,11 +168,14 @@ pub fn exitExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
     }
 
-    return try std.fmt.allocPrint(
-        a,
-        "{{\"left\":\"{s}\",\"removed\":{},\"original_cwd\":\"{s}\"}}",
-        .{ entry.worktree_path, removed, entry.original_cwd },
-    );
+    var reply: std.Io.Writer.Allocating = .init(a);
+    defer reply.deinit();
+    try reply.writer.writeAll("{\"left\":");
+    try util_json.writeJsonString(&reply.writer, entry.worktree_path);
+    try reply.writer.print(",\"removed\":{},\"original_cwd\":", .{removed});
+    try util_json.writeJsonString(&reply.writer, entry.original_cwd);
+    try reply.writer.writeByte('}');
+    return reply.toOwnedSlice();
 }
 
 // ============================================================================

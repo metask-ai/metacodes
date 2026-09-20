@@ -11,6 +11,7 @@ const auth = @import("../core/auth.zig");
 const oauth = @import("../provider/oauth.zig");
 const http_status = @import("http_status.zig");
 const util_time = @import("../util/time.zig");
+const util_json = @import("../util/json.zig");
 
 pub const DEFAULT_SITE_URL = "https://metask-ai.com";
 pub const CLIENT_ID = "metacodes";
@@ -66,7 +67,7 @@ pub fn deviceRequestBody(allocator: std.mem.Allocator, hostname: []const u8) ![]
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"client_id\":\"metacodes\",\"client_name\":\"MetaCode on ");
-    try appendJsonEscaped(allocator, &out, hostname);
+    try util_json.serializeStringContents(hostname, &out, allocator);
     try out.appendSlice(allocator, "\"}");
     return out.toOwnedSlice(allocator);
 }
@@ -219,20 +220,7 @@ fn errorCode(body: []const u8) ?[]const u8 {
 }
 
 fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
-    try out.append(allocator, '"');
-    try appendJsonEscaped(allocator, out, value);
-    try out.append(allocator, '"');
-}
-
-fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
-    for (value) |byte| switch (byte) {
-        '"' => try out.appendSlice(allocator, "\\\""),
-        '\\' => try out.appendSlice(allocator, "\\\\"),
-        '\n' => try out.appendSlice(allocator, "\\n"),
-        '\r' => try out.appendSlice(allocator, "\\r"),
-        '\t' => try out.appendSlice(allocator, "\\t"),
-        else => try out.append(allocator, byte),
-    };
+    try util_json.serializeString(value, out, allocator);
 }
 
 test "Metask grants use JSON and refresh omits client_id" {
@@ -246,6 +234,16 @@ test "Metask grants use JSON and refresh omits client_id" {
     try std.testing.expect(std.mem.indexOf(u8, refresh, "client_id") == null);
     try std.testing.expect(isGatewayOrigin("http://localhost:9000/"));
     try std.testing.expect(!isGatewayOrigin("http://localhost:9000/v1/messages"));
+}
+
+test "Metask JSON bodies repair malformed UTF-8 in host text" {
+    const a = std.testing.allocator;
+    const body = try deviceRequestBody(a, "host\xe4\x60\x80");
+    defer a.free(body);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("MetaCode on host�`�", parsed.value.object.get("client_name").?.string);
 }
 
 test "Metask device response and poll errors parse" {

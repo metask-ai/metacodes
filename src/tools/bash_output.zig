@@ -38,6 +38,8 @@ const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const result_budget = @import("../core/result_budget.zig");
+const util_json = @import("../util/json.zig");
+const utf8 = @import("../util/utf8.zig");
 
 /// 单次 tool_result 中 stdout/stderr 的默认字节上限；避免 100MB 文件塞爆 context。
 /// Fixed JSON scaffolding of one BashOutput result: job id, status, exit code,
@@ -61,15 +63,25 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 先 reap 一次最新状态
     registry.reapExited();
 
-    var job = registry.get(job_id) orelse return error.JobNotFound;
+    var job = registry.getForOwner(job_id, ctx.session) orelse return error.JobNotFound;
 
     const want_stdout = if (common.extractJsonArg(args, "stdout")) |v| !std.mem.eql(u8, v, "false") else true;
     const want_stderr = if (common.extractJsonArg(args, "stderr")) |v| !std.mem.eql(u8, v, "false") else true;
+    const stdout_since_raw = common.extractJsonArg(args, "stdout_since_byte");
+    const stderr_since_raw = common.extractJsonArg(args, "stderr_since_byte");
     const stdout_since_arg = parseUsizeArg(args, "stdout_since_byte");
     const stderr_since_arg = parseUsizeArg(args, "stderr_since_byte");
+    if ((stdout_since_raw != null and stdout_since_arg == null) or (stderr_since_raw != null and stderr_since_arg == null)) {
+        common.setErrorDetail(ctx.error_detail, allocator, "BashOutput *_since_byte must be a non-negative integer", .{});
+        return error.InvalidSinceByte;
+    }
     const stdout_since = stdout_since_arg orelse @as(usize, @intCast(job.stdout_read_offset));
     const stderr_since = stderr_since_arg orelse @as(usize, @intCast(job.stderr_read_offset));
     const wait_ms_arg = parseUsizeArg(args, "wait_ms");
+    if (common.extractJsonArg(args, "wait_ms") != null and wait_ms_arg == null) {
+        common.setErrorDetail(ctx.error_detail, allocator, "BashOutput wait_ms must be a non-negative integer", .{});
+        return error.InvalidWaitMs;
+    }
     if (wait_ms_arg) |value| {
         if (value > MAX_WAIT_MS) {
             common.setErrorDetail(ctx.error_detail, allocator, "BashOutput wait_ms must be in 0..{d}", .{MAX_WAIT_MS});
@@ -92,12 +104,27 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // silent and the fix is the same one `ReadArtifact` already got, not
     // because it was happening constantly.
     const allowance = ctx.result_budget.payloadAllowance(ENVELOPE_OVERHEAD_BYTES);
-    const max_bytes = parseUsizeArg(args, "max_bytes") orelse
+    const max_bytes_raw = common.extractJsonArg(args, "max_bytes");
+    const max_bytes_arg = parseUsizeArg(args, "max_bytes");
+    const max_bytes = max_bytes_arg orelse
         @max(1, @min(MAX_MAX_BYTES, allowance.raw()));
+    if (max_bytes_raw != null and max_bytes_arg == null) {
+        common.setErrorDetail(ctx.error_detail, allocator, "BashOutput max_bytes must be a non-negative integer", .{});
+        return error.InvalidMaxBytes;
+    }
     if (max_bytes == 0 or max_bytes > MAX_MAX_BYTES) {
         common.setErrorDetail(ctx.error_detail, allocator, "BashOutput max_bytes must be in 1..{d}", .{MAX_MAX_BYTES});
         return error.InvalidMaxBytes;
     }
+
+    if (want_stdout) validateCursor(job.stdout_path, stdout_since) catch |err| {
+        common.setErrorDetail(ctx.error_detail, allocator, "BashOutput stdout_since_byte is outside the spool", .{});
+        return err;
+    };
+    if (want_stderr) validateCursor(job.stderr_path, stderr_since) catch |err| {
+        common.setErrorDetail(ctx.error_detail, allocator, "BashOutput stderr_since_byte is outside the spool", .{});
+        return err;
+    };
 
     // A BashOutput poll is deliberately demand-driven. It waits only when a
     // running job has no unread bytes on any requested channel; this keeps the
@@ -112,7 +139,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             while (true) {
                 try ctx.throwIfAborted();
                 registry.reapExited();
-                job = registry.get(job_id) orelse return error.JobNotFound;
+                job = registry.getForOwner(job_id, ctx.session) orelse return error.JobNotFound;
                 if (job.status != .running) break;
                 const stdout_ready = if (want_stdout) (fileSize(job.stdout_path) catch 0) > @as(u64, @intCast(stdout_since)) else false;
                 const stderr_ready = if (want_stderr) (fileSize(job.stderr_path) catch 0) > @as(u64, @intCast(stderr_since)) else false;
@@ -142,7 +169,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"job_id\":");
-    try std.json.Stringify.encodeJsonString(job_id, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, job_id);
     try aw.writer.print(",\"status\":\"{s}\"", .{@tagName(job.status)});
     if (job.exit_code) |ec| {
         try aw.writer.print(",\"exit_code\":{d}", .{ec});
@@ -232,8 +259,13 @@ fn readFileRange(path: []const u8, since: usize, max: usize, allocator: std.mem.
     _ = pfs.lseek(fd, @intCast(since), .set);
 
     const available = total_u - since;
-    const to_read: usize = @intCast(@min(@as(u64, max), available));
-    const truncated = to_read < available;
+    // Read a few bytes past the display budget so a valid code point straddling
+    // the budget can be kept whole. The cursor still advances only by the
+    // returned page length, so a subsequent call never starts in a continuation
+    // byte. Malformed/binary data remains byte-addressable and is base64-encoded
+    // by the caller.
+    const read_limit = max + 3; // UTF-8's longest code point is four bytes.
+    const to_read: usize = @intCast(@min(@as(u64, read_limit), available));
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -249,10 +281,16 @@ fn readFileRange(path: []const u8, since: usize, max: usize, allocator: std.mem.
         remaining -= @intCast(n);
     }
 
+    const page = if (std.unicode.utf8ValidateSlice(out.items))
+        utf8.pagePrefix(out.items, max)
+    else
+        out.items[0..@min(out.items.len, max)];
+    const page_len = page.len;
+    out.items.len = page_len;
     return .{
         .data = try out.toOwnedSlice(allocator),
         .total_bytes = total_u,
-        .truncated = truncated,
+        .truncated = page_len < available,
     };
 }
 
@@ -268,6 +306,15 @@ fn fileSize(path: []const u8) !u64 {
     const total = pfs.lseek(fd, 0, .end);
     if (total < 0) return error.SeekFailed;
     return @intCast(total);
+}
+
+/// A cursor is a byte offset contract. It may point anywhere in binary output;
+/// if a page then starts in the middle of a UTF-8 sequence, the channel is
+/// encoded as base64 for that page. The only invalid cursor is one beyond the
+/// current spool end, which otherwise makes a running long poll wait forever.
+fn validateCursor(path: []const u8, since: usize) !void {
+    const total = fileSize(path) catch return;
+    if (@as(u64, @intCast(since)) > total) return error.InvalidSinceByte;
 }
 
 /// Write one channel plus the encoding it is in. `*_next_offset` is the cursor
@@ -290,9 +337,9 @@ fn writeChannel(
         const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
         defer allocator.free(encoded);
         _ = encoder.encode(encoded, data);
-        try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+        try util_json.writeJsonString(writer, encoded);
     } else {
-        try std.json.Stringify.encodeJsonString(data, .{}, writer);
+        try util_json.writeJsonString(writer, data);
     }
     try writer.print(",\"{s}_encoding\":\"{s}\"", .{ label, if (base64) "base64" else "utf-8" });
 }
@@ -367,7 +414,7 @@ test "BashOutput observed exit is not announced" {
     const owner = @import("../core/session_id.zig").gen();
     const j = try r.spawnBackgroundOwned("printf done", null, owner);
     try waitForExit(&r, j.idSlice());
-    const ctx = ToolContext{ .allocator = a, .jobs = &r, .agent_ident = owner };
+    const ctx = ToolContext{ .allocator = a, .jobs = &r, .agent_ident = owner, .session = owner };
     const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
     defer a.free(args);
     const result = try execute(&ctx, args);
@@ -395,6 +442,19 @@ test "BashOutput since_byte skips prefix" {
     // 只应看到 "DEFG"，不是 "ABCDEFG"
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout\":\"DEFG\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_total_bytes\":7") != null);
+}
+
+test "BashOutput rejects a cursor beyond the spool end" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer r.deinit();
+    const job = try r.spawnBackground("printf x; exit 0", null);
+    try waitForExit(&r, job.idSlice());
+    const ctx = ToolContext{ .allocator = a, .jobs = &r };
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\",\"stdout_since_byte\":2,\"wait_ms\":100}}", .{job.idSlice()});
+    defer a.free(args);
+    try std.testing.expectError(error.InvalidSinceByte, execute(&ctx, args));
 }
 
 test "BashOutput max_bytes truncates" {

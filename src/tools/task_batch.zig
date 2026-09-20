@@ -33,6 +33,7 @@ const std = @import("std");
 const ToolContext = @import("context.zig").ToolContext;
 const subagent = @import("../core/subagent.zig");
 const util_json = @import("../util/json.zig");
+const utf8 = @import("../util/utf8.zig");
 const filter_mod = @import("../agents/filter.zig");
 const provider_mod = @import("../api/provider.zig");
 const client_mod = @import("../client.zig");
@@ -236,6 +237,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const shared_opts = subagent.SpawnOptions{
         .max_turns = max_turns,
+        .session = ctx.session,
         .agent_depth = ctx.agent_depth + 1,
         .dyn_registry = ctx.dyn_registry,
         .tool_defs_override = sub_tool_defs, // 始终 override(含剥 TaskBatch);spawnAgentSink 内 override 赢
@@ -405,16 +407,16 @@ fn buildResult(allocator: std.mem.Allocator, jobs: []const BatchJob) ![]u8 {
         if (j.err_name) |e| {
             failed += 1;
             try out.writer.writeAll("\"error\":");
-            try std.json.Stringify.encodeJsonString(e, .{}, &out.writer);
+            try util_json.writeJsonString(&out.writer, e);
             try out.writer.writeByte('}');
         } else {
             completed += 1;
             // per-item final_text 截断:防 N × 长输出撑爆父 context。单项 >PER_ITEM_TEXT_CAP 留头 + 标记。
             const full = j.result_text orelse "";
-            const truncated = full.len > PER_ITEM_TEXT_CAP;
-            const shown = if (truncated) full[0..PER_ITEM_TEXT_CAP] else full;
+            const shown = utf8.pagePrefix(full, PER_ITEM_TEXT_CAP);
+            const truncated = shown.len < full.len;
             try out.writer.writeAll("\"final_text\":");
-            try std.json.Stringify.encodeJsonString(shown, .{}, &out.writer);
+            try util_json.writeJsonString(&out.writer, shown);
             if (truncated) try out.writer.print(",\"truncated\":true,\"full_len\":{d}", .{full.len});
             try out.writer.print(",\"turns\":{d},\"tool_calls\":{d},\"stop_reason\":\"{s}\"}}", .{ j.turns, j.tool_calls, j.stop_reason });
         }
@@ -472,7 +474,7 @@ test "buildResult: 长 final_text 截断 + truncated 标记(防父 context 膨�
         .tool_defs = &.{},
         .perm = undefined,
         .abort = null,
-        .opts = .{},
+        .opts = .{ .session = @import("../core/session_id.zig").SessionId.single },
         .result_text = long,
         .stop_reason = "end_turn",
     }};
@@ -487,7 +489,7 @@ test "buildResult: 长 final_text 截断 + truncated 标记(防父 context 膨�
 
 // 构造一个 watchdog 测试用的最小 job(worker 不跑,只被 watchdog 读 done/started_ms/abort_sig)。
 fn wdTestJob(idx: usize) BatchJob {
-    return .{ .idx = idx, .prompt = "", .tool_defs = &.{}, .perm = undefined, .abort = null, .opts = .{} };
+    return .{ .idx = idx, .prompt = "", .tool_defs = &.{}, .perm = undefined, .abort = null, .opts = .{ .session = @import("../core/session_id.zig").SessionId.single } };
 }
 
 test "watchdog 线程真触发超时 abort(started_ms 远早于 now → 超 deadline)" {

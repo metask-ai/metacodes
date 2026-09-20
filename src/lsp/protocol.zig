@@ -1,10 +1,11 @@
 //! LSP JSON-RPC 2.0 信封构造 + 分类(对齐 hermes protocol.py 的 envelope/classify;帧在 transport.zig)。
 //!
 //! 消息三类:request(有 id + method)/ response(有 id + result|error)/ notification(有 method 无 id)。
-//! 构造侧:makeRequest/makeNotification(params 是**已序列化的 JSON 片段**,调用方拼好)。method 名是
-//! LSP 固定 ASCII 字面量(如 "textDocument/didChange"),无需 JSON 转义,直接加引号。
+//! 构造侧:makeRequest/makeNotification(params 是**已序列化的 JSON 片段**,调用方拼好)。method
+//! 通常是固定 ASCII，但构造器仍对其做完整 JSON 字符串编码，避免测试、扩展或插件输入破坏信封。
 //! 解析侧:classify(std.json.Value)→ 判类别 + 抽 id/method,client reader 据此路由。
 const std = @import("std");
+const json_util = @import("../util/json.zig");
 
 /// LSP/JSON-RPC 错误码(client 需识别的)。
 pub const ERROR_CONTENT_MODIFIED: i64 = -32801; // 文档在处理中被改 → 重试
@@ -23,18 +24,24 @@ pub const Classified = struct {
 /// 构造 request:`{"jsonrpc":"2.0","id":<id>,"method":"<method>","params":<params_json>}`。
 /// params_json 是已序列化 JSON(对象/数组);传 null → 省略 params。owned。
 pub fn makeRequest(alloc: std.mem.Allocator, id: i64, method: []const u8, params_json: ?[]const u8) ![]u8 {
-    if (params_json) |p| {
-        return std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}", .{ id, method, p });
-    }
-    return std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\"}}", .{ id, method });
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":", .{id});
+    try json_util.writeJsonString(&out.writer, method);
+    if (params_json) |p| try out.writer.print(",\"params\":{s}", .{p});
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
 }
 
 /// 构造 notification:`{"jsonrpc":"2.0","method":"<method>","params":<params_json>}`。owned。
 pub fn makeNotification(alloc: std.mem.Allocator, method: []const u8, params_json: ?[]const u8) ![]u8 {
-    if (params_json) |p| {
-        return std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{s}}}", .{ method, p });
-    }
-    return std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\"}}", .{method});
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":");
+    try json_util.writeJsonString(&out.writer, method);
+    if (params_json) |p| try out.writer.print(",\"params\":{s}", .{p});
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
 }
 
 /// 构造 method-not-found 错误响应(server→client 请求我们不支持时回它;passive 模式几乎不用)。owned。
@@ -82,6 +89,21 @@ test "makeRequest / makeNotification 结构正确" {
     const n = try makeNotification(a, "initialized", "{}");
     defer a.free(n);
     try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}", n);
+}
+
+test "makeRequest / makeNotification escape arbitrary method bytes" {
+    const a = testing.allocator;
+    const r = try makeRequest(a, 1, "x\"\\\n", null);
+    defer a.free(r);
+    var parsed_r = try std.json.parseFromSlice(std.json.Value, a, r, .{});
+    defer parsed_r.deinit();
+    try testing.expectEqualStrings("x\"\\\n", parsed_r.value.object.get("method").?.string);
+
+    const n = try makeNotification(a, "中文\x80", "{}");
+    defer a.free(n);
+    var parsed_n = try std.json.parseFromSlice(std.json.Value, a, n, .{});
+    defer parsed_n.deinit();
+    try testing.expectEqualStrings("中文�", parsed_n.value.object.get("method").?.string);
 }
 
 test "classify: request / response / notification / invalid" {

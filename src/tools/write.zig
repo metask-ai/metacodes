@@ -134,7 +134,12 @@ fn renderResult(
     var patch = patch_mod.compute(allocator, old_content, new_content) catch {
         // diff 失败不致命：退回最简结果。改动是真的,只是拿不到 diff → 契约上标注证据不完整。
         publishFileChange(ctx, path, before, old_content, new_content, null, false);
-        return try std.fmt.allocPrint(allocator, "{{\"success\":true, \"path\": \"{s}\"}}", .{path});
+        var receipt: std.Io.Writer.Allocating = .init(allocator);
+        defer receipt.deinit();
+        try receipt.writer.writeAll("{\"success\":true,\"path\":");
+        try util_json.writeJsonString(&receipt.writer, path);
+        try receipt.writer.writeByte('}');
+        return receipt.toOwnedSlice();
     };
     defer patch.deinit(allocator);
 
@@ -147,11 +152,11 @@ fn renderResult(
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"success\":true,\"path\":");
-    try std.json.Stringify.encodeJsonString(path, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, path);
     try out.writer.writeAll(",\"structuredPatch\":");
     try out.writer.writeAll(structured);
     try out.writer.writeAll(",\"gitDiff\":");
-    try std.json.Stringify.encodeJsonString(git_diff, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, git_diff);
     // LSP 被动诊断:写后 delta 诊断附进结果(新建文件的诊断也报)。
     try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, path, new_content);
     try out.writer.writeByte('}');

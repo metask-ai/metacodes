@@ -74,8 +74,6 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             file_path,
             old_unesc,
             new_unesc,
-            old_raw,
-            new_raw,
             args,
         );
     }
@@ -109,7 +107,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             try nc.appendSlice(allocator, original[0..range.start]);
             try nc.appendSlice(allocator, new_unesc);
             try nc.appendSlice(allocator, original[range.end..]);
-            return try finalizeWrite(ctx, allocator, file_path, original, nc.items, old_raw, new_raw);
+            return try finalizeWrite(ctx, allocator, file_path, original, nc.items);
         }
         setDetail(ctx, allocator, "{s}", .{notFoundDetail(original, old_unesc)});
         return error.StringNotFound;
@@ -146,7 +144,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try new_content.appendSlice(allocator, original[i + old_string.len ..]);
     }
 
-    return try finalizeWrite(ctx, allocator, file_path, original, new_content.items, old_raw, new_raw);
+    return try finalizeWrite(ctx, allocator, file_path, original, new_content.items);
 }
 
 /// 写入新内容 + 刷新 ReadState mtime + 返回结果 JSON（含 structuredPatch + gitDiff）。
@@ -157,8 +155,6 @@ fn finalizeWrite(
     file_path: []const u8,
     old_content: []const u8,
     content: []const u8,
-    old_raw: []const u8,
-    new_raw: []const u8,
 ) ![]u8 {
     const write_fd = pfs.openZ(file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
     defer _ = pfs.close(write_fd);
@@ -176,8 +172,6 @@ fn finalizeWrite(
         file_path,
         old_content,
         content,
-        old_raw,
-        new_raw,
         write_fd,
         true,
     );
@@ -195,8 +189,6 @@ fn executeWholeFileExact(
     file_path: []const u8,
     old_content: []const u8,
     new_content: []const u8,
-    old_raw: []const u8,
-    new_raw: []const u8,
     args: []const u8,
 ) ![]u8 {
     if (!pfs.atomic_final_nofollow)
@@ -265,8 +257,6 @@ fn executeWholeFileExact(
         file_path,
         observed,
         new_content,
-        old_raw,
-        new_raw,
         fd,
         false,
     );
@@ -336,8 +326,6 @@ fn finalizeCommittedWrite(
     file_path: []const u8,
     old_content: []const u8,
     content: []const u8,
-    old_raw: []const u8,
-    new_raw: []const u8,
     write_fd: pfs.Fd,
     expose_diff_to_model: bool,
 ) ![]u8 {
@@ -377,7 +365,7 @@ fn finalizeCommittedWrite(
         var receipt: std.Io.Writer.Allocating = .init(allocator);
         defer receipt.deinit();
         try receipt.writer.writeAll("{\"file_path\":");
-        try std.json.Stringify.encodeJsonString(file_path, .{}, &receipt.writer);
+        try util_json.writeJsonString(&receipt.writer, file_path);
         try receipt.writer.writeAll(",\"success\":true,\"recovery\":\"lean_authorized_source_cas\"");
         try @import("lsp_diag.zig").appendToResult(
             ctx,
@@ -394,9 +382,16 @@ fn finalizeCommittedWrite(
     const patch_mod = @import("../core/patch.zig");
     var patch = patch_mod.compute(allocator, old_content, content) catch {
         publishCommittedChange(ctx, allocator, file_path, old_content, content);
-        return try std.fmt.allocPrint(allocator,
-            \\{{"file_path":"{s}","old_string":"{s}","new_string":"{s}","success":true}}
-        , .{ file_path, old_raw, new_raw });
+        var receipt: std.Io.Writer.Allocating = .init(allocator);
+        defer receipt.deinit();
+        try receipt.writer.writeAll("{\"file_path\":");
+        try util_json.writeJsonString(&receipt.writer, file_path);
+        try receipt.writer.writeAll(",\"old_string\":");
+        try util_json.writeJsonString(&receipt.writer, old_content);
+        try receipt.writer.writeAll(",\"new_string\":");
+        try util_json.writeJsonString(&receipt.writer, content);
+        try receipt.writer.writeAll(",\"success\":true}");
+        return receipt.toOwnedSlice();
     };
     defer patch.deinit(allocator);
     const structured = try patch_mod.toStructuredJson(allocator, patch.hunks);
@@ -416,11 +411,11 @@ fn finalizeCommittedWrite(
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"file_path\":");
-    try std.json.Stringify.encodeJsonString(file_path, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, file_path);
     try out.writer.writeAll(",\"success\":true,\"structuredPatch\":");
     try out.writer.writeAll(structured);
     try out.writer.writeAll(",\"gitDiff\":");
-    try std.json.Stringify.encodeJsonString(git_diff, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, git_diff);
     // EOF 事实:尾换行数是模型最常算错的字节级事实——old_string 不带原文件尾
     // \n、new_string 又自带 \n 会留下双尾换行,事后 Read 回读时末尾空行还容易
     // 被误判成"恰好一个换行"。直接把终态事实放进结果,不让模型做换行算术。

@@ -541,6 +541,14 @@ publication failure uses `retainInlineAfterFailedPublish`, falling back to inlin
 when allowed or a bounded `ArtifactPublishFailed` tool error otherwise. Other producers
 that still publish during execution are tracked in #65.
 
+Text returned by a tool is UTF-8 encoded at the text boundary and every bounded
+text page ends on a code-point boundary. Raw process or document bytes remain
+artifacts (or explicit base64 envelopes) and are never written as JSON text.
+`TaskOutput` keeps source byte cursors: `output_next_offset` is the cursor for
+the next request, `output_size_bytes` is the current source size, and the legacy
+`output_total_bytes` field has the cursor value for compatibility. A cursor is
+not a JSON or base64 length.
+
 ## Prompt-cache contract
 
 For equivalent effective configuration, one provider request must be a byte prefix

@@ -9,6 +9,61 @@ const std = @import("std");
 const core = @import("metacodes-core");
 const public = @import("metask_agentcore_protocol");
 
+// This file is compiled both as part of metacodes-core and as the standalone
+// AgentCore ABI module. Keep the final UTF-8 repair local so the two module
+// roots do not import the same source file through different module graphs.
+fn repairJsonUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, input.len);
+    var in_string = false;
+    var escaped = false;
+    var i: usize = 0;
+    while (i < input.len) {
+        const b = input[i];
+        if (!in_string) {
+            try out.append(allocator, b);
+            if (b == '"') in_string = true;
+            i += 1;
+            continue;
+        }
+        if (escaped) {
+            try out.append(allocator, b);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if (b == '\\') {
+            try out.append(allocator, b);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if (b == '"') {
+            try out.append(allocator, b);
+            in_string = false;
+            i += 1;
+            continue;
+        }
+        if (b >= 0x80) {
+            const length = std.unicode.utf8ByteSequenceLength(b) catch null;
+            if (length) |n| {
+                if (n <= input.len - i and std.unicode.utf8ValidateSlice(input[i .. i + n])) {
+                    try out.appendSlice(allocator, input[i .. i + n]);
+                    i += n;
+                    continue;
+                }
+            }
+            try out.appendSlice(allocator, "\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        }
+        try out.append(allocator, b);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 const InternalEvent = core.protocol.ui_event.CoreEvent;
 const InternalUiRequest = core.protocol.ui_request.UiRequest;
 const InternalUiResponse = core.protocol.ui_request.UiResponse;
@@ -209,7 +264,14 @@ pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiR
         // in this presentation-only Core request.
         .permission, .plan_approval, .custom => return error.UnsupportedUiRequest,
     };
-    return std.json.Stringify.valueAlloc(allocator, mapped, .{});
+    // `std.json.Stringify` escapes JSON syntax but accepts borrowed byte
+    // slices that are not valid UTF-8.  UI labels/questions are host-visible
+    // transport, so repair malformed payload bytes before returning them.
+    const raw = std.json.Stringify.valueAlloc(allocator, mapped, .{}) catch
+        return error.OutOfMemory;
+    defer allocator.free(raw);
+    return repairJsonUtf8(allocator, raw) catch
+        return error.OutOfMemory;
 }
 
 /// Validate Host response JSON with the public SDK schema, enforce request /
@@ -380,4 +442,33 @@ test "AskQuestion response validation preserves value boundaries until core proj
         error.InvalidUiRequest,
         encodeUiRequest(std.testing.allocator, &no_options_request),
     );
+}
+
+test "AskQuestion encoding repairs malformed UTF-8 at the ABI boundary" {
+    const malformed_question = [_]u8{ 'w', 0xE2, 0x28, 0xA1 };
+    const malformed_label = [_]u8{ 'l', 0x80 };
+    const malformed_description = [_]u8{ 'd', 0xC3 };
+    const options = [_]core.tool_context.AskOption{.{
+        .label = malformed_label[0..],
+        .description = malformed_description[0..],
+    }};
+    const questions = [_]core.tool_context.AskQuestion{.{
+        .question = malformed_question[0..],
+        .header = "Header",
+        .multi = false,
+        .options = options[0..],
+    }};
+    const request = InternalUiRequest{ .ask_question = questions[0..] };
+    const encoded = try encodeUiRequest(std.testing.allocator, &request);
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, encoded, "\xEF\xBF\xBD"));
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        encoded,
+        .{},
+    );
+    defer parsed.deinit();
 }
