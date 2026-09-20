@@ -500,11 +500,6 @@ fn idleNotificationMatchesCurrentMember(allocator: std.mem.Allocator, sw: *const
     const cfg = sw.configPath(&cfg_buf);
     var tf = team_mod.load(allocator, cfg) orelse return false;
     defer tf.deinit();
-    if (std.mem.eql(u8, name, team_mod.TEAM_LEAD_NAME)) {
-        const lead_session = tf.lead_session_id orelse return false;
-        return std.mem.eql(u8, lead_session, session.asSlice()) and
-            std.mem.eql(u8, lease.asSlice(), session.asSlice());
-    }
     const member = tf.findMember(name) orelse return false;
     const member_session = member.session_id orelse return false;
     const member_lease = member.lease_id orelse return false;
