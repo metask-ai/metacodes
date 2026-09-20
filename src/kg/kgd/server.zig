@@ -30,10 +30,14 @@ pub const MAX_HEAD_BYTES: usize = 16 * 1024;
 /// Markdown import carries a whole document; everything else is far smaller.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub const SOCKET_TIMEOUT_MS: u32 = 30_000;
-/// Wall-clock budget for one complete request. The socket timeout only bounds a
-/// single read, so a peer that dribbles one byte before each timeout could hold
-/// this single-threaded server forever; this bounds the whole exchange.
-pub const REQUEST_DEADLINE_MS: i64 = 30_000;
+/// Wall-clock budget for reading a request and writing its response. The socket
+/// timeout only bounds one read or write, so a peer that dribbles a byte before
+/// each timeout could hold this single-threaded server forever. Time spent in
+/// the child is bounded separately, by the request's own `timeoutMs`.
+pub const SOCKET_IO_DEADLINE_MS: i64 = 30_000;
+/// How long one blocking socket read or write may wait before the deadline is
+/// re-checked. Keeps a failed `SO_RCVTIMEO` from turning into an infinite wait.
+pub const SOCKET_POLL_SLICE_MS: u32 = 250;
 /// How long the accept loop waits for a connection before re-reading the stop
 /// flag. It bounds shutdown latency, nothing else.
 pub const ACCEPT_POLL_SLICE_MS: u32 = 200;
@@ -69,6 +73,9 @@ pub const Supervisor = struct {
     /// Set when the daemon stopped answering. The service then stops, because
     /// every later request would queue behind a child that will not reply.
     daemon_wedged: bool = false,
+    /// Absolute deadline for writing the current response. Set per connection;
+    /// a client that reads one byte at a time cannot outlast it.
+    response_deadline_ms: i64 = 0,
     /// Set by `stop`; the accept loop's only exit condition.
     stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -194,7 +201,8 @@ pub const Supervisor = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
 
-        const deadline = time.nowMs() +| REQUEST_DEADLINE_MS;
+        const deadline = time.nowMs() +| SOCKET_IO_DEADLINE_MS;
+        self.response_deadline_ms = deadline;
         var reader = RequestReader.init(allocator, conn, deadline);
         defer reader.deinit();
 
@@ -239,8 +247,10 @@ pub const Supervisor = struct {
         var response = self.bridge.run(.{
             .request_id = self.nextRequestId(&request_id_buffer),
             .command = "store-info",
-        }) catch {
-            self.sendError(conn, 503, "tinykgd is not answering");
+        }) catch |err| {
+            // Readiness goes through the same handler: a child that died during
+            // a health probe is just as terminal as one that died during a run.
+            self.reportDaemonFailure(conn, err);
             return;
         };
         defer response.deinit();
@@ -288,27 +298,28 @@ pub const Supervisor = struct {
             }
         }
 
+        const session_id = stringOf(root, "sessionId");
         var response = self.bridge.run(.{
             .request_id = request_id,
             .command = command,
             .args = args.items,
-            .session_id = stringOf(root, "sessionId"),
+            .session_id = session_id,
             .timeout_ms = timeoutOf(root),
         }) catch |err| {
             self.reportDaemonFailure(conn, err);
             return;
         };
         defer response.deinit();
-        self.sendEnvelope(conn, allocator, request_id, &response);
+        self.sendEnvelope(conn, allocator, request_id, session_id, &response);
     }
 
-    /// A daemon that timed out has a desynchronized pipe: a late answer would
-    /// be read as the reply to whatever comes next. The bridge is already
-    /// poisoned; stop serving so the operator restarts instead of watching
-    /// every request fail one by one.
+    /// Any failure after the request reached the child desynchronizes the pipe
+    /// — a timeout, an exit, a malformed line — and the bridge marks itself
+    /// broken. Every later request would then fail the same way, so the service
+    /// stops and says so instead of answering 503 forever.
     fn reportDaemonFailure(self: *Supervisor, conn: net.Socket, err: anyerror) void {
         log.warn("kgd", "tinykgd request failed: {s}", .{@errorName(err)});
-        if (err == bridge_mod.Error.ResponseTimedOut) {
+        if (self.bridge.isBroken()) {
             self.daemon_wedged = true;
             self.stop();
         }
@@ -375,7 +386,7 @@ pub const Supervisor = struct {
             return;
         };
         defer response.deinit();
-        self.sendEnvelope(conn, allocator, request_id, &response);
+        self.sendEnvelope(conn, allocator, request_id, null, &response);
     }
 
     fn stageMarkdown(
@@ -445,9 +456,10 @@ pub const Supervisor = struct {
         conn: net.Socket,
         allocator: std.mem.Allocator,
         request_id: []const u8,
+        requested_session: ?[]const u8,
         response: *const bridge_mod.Response,
     ) void {
-        const body = self.renderEnvelope(allocator, request_id, response) catch {
+        const body = self.renderEnvelope(allocator, request_id, requested_session, response) catch {
             self.sendError(conn, 500, "cannot render the response envelope");
             return;
         };
@@ -458,6 +470,7 @@ pub const Supervisor = struct {
         self: *const Supervisor,
         allocator: std.mem.Allocator,
         request_id: []const u8,
+        requested_session: ?[]const u8,
         response: *const bridge_mod.Response,
     ) ![]u8 {
         const Session = struct { sessionId: []const u8, generation: i64 };
@@ -466,9 +479,14 @@ pub const Supervisor = struct {
         // malformed one would turn a broken receipt into an unbound answer.
         const session: ?Session = blk: {
             const raw = response.parsed.value.object.get("session") orelse break :blk null;
-            // The daemon emits `"session":null` when a command has none; that
-            // is an absent session, not a broken one.
-            if (raw == .null) break :blk null;
+            // The daemon emits `"session":null` for commands that have none.
+            // That is an absent session — unless this request asked for one, in
+            // which case an answer without a receipt is exactly the unbound
+            // result the client's session check exists to refuse.
+            if (raw == .null) {
+                if (requested_session != null) return error.MalformedSession;
+                break :blk null;
+            }
             if (raw != .object) return error.MalformedSession;
             const id = raw.object.get("sessionId") orelse return error.MalformedSession;
             const generation = raw.object.get("generation") orelse return error.MalformedSession;
@@ -515,15 +533,15 @@ pub const Supervisor = struct {
     }
 
     fn send(self: *Supervisor, conn: net.Socket, status: u16, body: []const u8) void {
-        _ = self;
         var head_buffer: [256]u8 = undefined;
         const head = std.fmt.bufPrint(
             &head_buffer,
             "HTTP/1.1 {d} {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n",
             .{ status, statusText(status), body.len },
         ) catch return;
-        sendAll(conn, head);
-        sendAll(conn, body);
+        const deadline = self.response_deadline_ms;
+        sendAll(conn, head, deadline);
+        sendAll(conn, body, deadline);
     }
 };
 
@@ -569,6 +587,12 @@ const RequestReader = struct {
     }
 
     fn fill(self: *RequestReader) !void {
+        // Poll in slices rather than trusting SO_RCVTIMEO: if the option did
+        // not take, a peer that sends nothing would block `recv` forever and
+        // the deadline check above it would never run again.
+        while (!net.pollReadable(self.conn, SOCKET_POLL_SLICE_MS)) {
+            if (time.nowMs() >= self.deadline_ms) return error.RequestDeadlineExceeded;
+        }
         if (time.nowMs() >= self.deadline_ms) return error.RequestDeadlineExceeded;
         var chunk: [8 * 1024]u8 = undefined;
         const n = net.recv(self.conn, &chunk);
@@ -585,9 +609,13 @@ fn statusForRead(err: anyerror) u16 {
     };
 }
 
-fn sendAll(conn: net.Socket, bytes: []const u8) void {
+/// Writes until done, the peer goes away, or the deadline passes. Without the
+/// deadline a client that accepts one byte per socket timeout would own this
+/// single-threaded server for as long as it liked.
+fn sendAll(conn: net.Socket, bytes: []const u8, deadline_ms: i64) void {
     var offset: usize = 0;
     while (offset < bytes.len) {
+        if (time.nowMs() >= deadline_ms) return;
         const n = net.send(conn, bytes[offset..]);
         if (n <= 0) return;
         offset += @intCast(n);

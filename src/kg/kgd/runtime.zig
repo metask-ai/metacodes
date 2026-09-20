@@ -100,12 +100,20 @@ fn resolveStore(
     recorded: ?[]const u8,
     override: ?[]const u8,
 ) Error![]u8 {
-    if (override) |given| return allocator.dupe(u8, given) catch Error.OutOfMemory;
-    if (recorded) |value| {
-        if (value.len > 0) return allocator.dupe(u8, value) catch Error.OutOfMemory;
-    }
     const dir = std.fs.path.dirname(config_path) orelse ".";
+    if (override) |given| return beside(allocator, dir, given);
+    if (recorded) |value| {
+        // A hand-edited relative path resolves against the configuration that
+        // records it, never against whatever directory the service happens to
+        // be started from.
+        if (value.len > 0) return beside(allocator, dir, value);
+    }
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, install_mod.STORE_NAME }) catch Error.OutOfMemory;
+}
+
+fn beside(allocator: std.mem.Allocator, dir: []const u8, path: []const u8) Error![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path) catch Error.OutOfMemory;
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, path }) catch Error.OutOfMemory;
 }
 
 /// The interrupt handler needs a way to reach the running supervisor, and a
@@ -161,6 +169,20 @@ fn hint(err: anyerror) []const u8 {
 }
 
 const testing = std.testing;
+
+test "KgdRuntime: a relative store resolves against the configuration, not the working directory" {
+    const a = testing.allocator;
+    // `kgd` is started from anywhere; a recorded relative path must still name
+    // the store the configuration meant, or the service would quietly init a
+    // different one next to wherever the operator happened to be standing.
+    const recorded = try resolveStore(a, "/home/x/.metacodes/kg/daemon.json", "scratch.kg.v2", null);
+    defer a.free(recorded);
+    try testing.expectEqualStrings("/home/x/.metacodes/kg/scratch.kg.v2", recorded);
+
+    const flag = try resolveStore(a, "/home/x/.metacodes/kg/daemon.json", null, "scratch.kg.v2");
+    defer a.free(flag);
+    try testing.expectEqualStrings("/home/x/.metacodes/kg/scratch.kg.v2", flag);
+}
 
 test "KgdRuntime: the store comes from the flag, then the file, then the default" {
     const a = testing.allocator;

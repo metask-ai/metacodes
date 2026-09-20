@@ -46,15 +46,26 @@ pub const StdioTransport = struct {
         };
     }
 
-    /// 写一行 JSON。自动追加 '\n'。
+    /// 写一行 JSON。自动追加 '\n'。设了 `deadline_ms` 时,写前先 poll:子进程
+    /// 停止排空 stdin 会让管道写在填满后阻塞,没有这一步 deadline 只覆盖读半程。
     pub fn send(self: *StdioTransport, json: []const u8) !void {
         var total: usize = 0;
         while (total < json.len) {
+            try self.awaitWritable();
             const n = self.child.write(json[total..]);
             if (n <= 0) return error.WriteFailed;
             total += @as(usize, @intCast(n));
         }
+        try self.awaitWritable();
         if (self.child.write("\n") <= 0) return error.WriteFailed;
+    }
+
+    fn awaitWritable(self: *StdioTransport) !void {
+        const deadline = self.deadline_ms orelse return;
+        while (true) {
+            if (util_time.nowMs() >= deadline) return error.Timeout;
+            if (self.child.pollWritable(100)) return;
+        }
     }
 
     /// 读一行（不含 '\n'）。阻塞直到拿到一行或 EOF。

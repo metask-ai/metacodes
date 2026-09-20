@@ -31,12 +31,16 @@ pub const Error = error{
     ResponseTooLarge,
     ResponseInvalid,
     RequestIdMismatch,
+    RequestTooLarge,
     OutOfMemory,
 };
 
 /// Added to the request's own timeout before this side gives up, so the daemon
 /// gets the chance to fail the request itself and stay usable.
 pub const RESPONSE_GRACE_MS: i64 = 5_000;
+/// The daemon's own `max_request_bytes`. Refusing here means a request it would
+/// reject anyway never gets written into a pipe it may have stopped draining.
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 pub const Request = struct {
     request_id: []const u8,
@@ -120,15 +124,23 @@ pub const Bridge = struct {
         // the pipe untouched and must not poison a healthy bridge.
         const body = try self.encode(request);
         defer self.allocator.free(body);
+        if (body.len > MAX_REQUEST_BYTES) return Error.RequestTooLarge;
+
+        // The deadline is armed before the first byte: a child that has stopped
+        // draining its stdin would otherwise block the write, which no later
+        // read deadline can undo.
+        const deadline: i64 = util_time.nowMs() +| @as(i64, @intCast(@min(request.timeout_ms, std.math.maxInt(i32)))) +| RESPONSE_GRACE_MS;
+        self.transport.deadline_ms = deadline;
+        defer self.transport.deadline_ms = null;
 
         // From here on the child has seen bytes: any failure desynchronizes the
         // stream, so the bridge is done.
         errdefer self.broken = true;
-        self.transport.send(body) catch return Error.WriteFailed;
+        self.transport.send(body) catch |err| return switch (err) {
+            error.Timeout => Error.ResponseTimedOut,
+            else => Error.WriteFailed,
+        };
 
-        const deadline: i64 = util_time.nowMs() +| @as(i64, @intCast(@min(request.timeout_ms, std.math.maxInt(i32)))) +| RESPONSE_GRACE_MS;
-        self.transport.deadline_ms = deadline;
-        defer self.transport.deadline_ms = null;
         const line = self.transport.recvLine() catch |err| return switch (err) {
             error.Timeout => Error.ResponseTimedOut,
             else => Error.ReadFailed,

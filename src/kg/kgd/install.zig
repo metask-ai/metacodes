@@ -83,10 +83,13 @@ pub fn run(allocator: std.mem.Allocator, home: []const u8, options: Options) Err
         KgClient.resolveDaemonConfigPath(allocator, home) catch return Error.OutOfMemory;
     errdefer allocator.free(config_path);
     const config_dir = std.fs.path.dirname(config_path) orelse return Error.ConfigDirUnusable;
+    const dir_existed = directoryExists(allocator, config_dir);
     util_fs.mkdirParents(config_dir) catch return Error.ConfigDirUnusable;
-    // The directory holds an API key: keep it owner-only even if it predates
-    // this command with looser bits.
-    restrictDirectory(allocator, config_dir) catch return Error.ConfigDirUnusable;
+    // Owner-only, but only for a directory this command created. `--config`
+    // can name a path anywhere, and tightening a directory the operator
+    // already had — `/tmp`, a home, a system path under root — is not this
+    // command's business. The file itself is 0600 either way.
+    if (!dir_existed) restrictDirectory(allocator, config_dir) catch return Error.ConfigDirUnusable;
 
     // An existing configuration is read exactly as a session reads it. A file
     // this service would refuse to serve from must not be a source of settings
@@ -127,24 +130,46 @@ pub fn run(allocator: std.mem.Allocator, home: []const u8, options: Options) Err
 }
 
 /// Explicit flag, else what the configuration already serves, else beside it.
+/// Always absolute: the recorded path is read back by a service started from
+/// another working directory, where a relative path would name a different
+/// store — silently, and with `tinykg init` ready to create it.
 fn resolveStorePath(
     allocator: std.mem.Allocator,
     config_dir: []const u8,
     options: Options,
     existing: ?KgClient.ParsedDaemonFile,
 ) Error![]u8 {
-    if (options.store_path) |given| return allocator.dupe(u8, given) catch Error.OutOfMemory;
+    if (options.store_path) |given| return absolutize(allocator, config_dir, given);
     if (existing) |parsed| {
         if (parsed.value.store) |recorded| {
-            if (recorded.len > 0) return allocator.dupe(u8, recorded) catch Error.OutOfMemory;
+            if (recorded.len > 0) return absolutize(allocator, config_dir, recorded);
         }
     }
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, STORE_NAME }) catch Error.OutOfMemory;
 }
 
+/// A relative path is taken as relative to the working directory the operator
+/// typed it in, which is what `--store build/scratch.kg` means to them.
+fn absolutize(allocator: std.mem.Allocator, config_dir: []const u8, path: []const u8) Error![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path) catch Error.OutOfMemory;
+    const cwd = @import("../../util/fs.zig").getCwd(allocator) catch
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, path }) catch Error.OutOfMemory;
+    defer allocator.free(cwd);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, path }) catch Error.OutOfMemory;
+}
+
+fn directoryExists(allocator: std.mem.Allocator, path: []const u8) bool {
+    const path_z = allocator.dupeZ(u8, path) catch return true; // fail safe: do not chmod
+    defer allocator.free(path_z);
+    return pfs.exists(path_z.ptr);
+}
+
 fn portOfExisting(existing: ?KgClient.ParsedDaemonFile) ?u16 {
     const parsed = existing orelse return null;
-    return portOfUrl(parsed.value.url);
+    const port = portOfUrl(parsed.value.url) orelse return null;
+    // Zero is not a port the service can be started from, so preserving it
+    // would turn one unusable configuration into another.
+    return if (port == 0) null else port;
 }
 
 /// The port a configured URL names. Shared with the runtime's own parsing so a
@@ -334,6 +359,35 @@ test "KgdInstall: a key from a configuration the client would refuse is not adop
         defer parsed.deinit();
         try testing.expect(!reuseApiKey(parsed, &key));
     }
+}
+
+test "KgdInstall: an unusable port is not preserved across a reinstall" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const path = try std.fmt.allocPrint(a, "{s}/daemon.json", .{root});
+    defer a.free(path);
+    // A configuration naming port 0 is one `kgd` refuses to start from;
+    // carrying it forward would just produce a second unusable file.
+    try writeRaw(a, path, "{\"url\":\"http://127.0.0.1:0\",\"expected_build_id\":\"sha256:" ++ ("b" ** 64) ++ "\",\"api_key\":\"" ++ ("a" ** 64) ++ "\"}", 0o600);
+    var parsed = try KgClient.loadDaemonConfig(a, path);
+    defer parsed.deinit();
+    try testing.expect(portOfExisting(parsed) == null);
+}
+
+test "KgdInstall: a recorded store path is absolute" {
+    const a = testing.allocator;
+    // Relative here would be read back by a service started elsewhere.
+    const absolute = try resolveStorePath(a, "/home/x/.metacodes/kg", .{ .store_path = "/tmp/explicit" }, null);
+    defer a.free(absolute);
+    try testing.expectEqualStrings("/tmp/explicit", absolute);
+    const relative = try resolveStorePath(a, "/home/x/.metacodes/kg", .{ .store_path = "scratch.kg" }, null);
+    defer a.free(relative);
+    try testing.expect(std.fs.path.isAbsolute(relative));
+    try testing.expect(std.mem.endsWith(u8, relative, "/scratch.kg"));
 }
 
 test "KgdInstall: the port is read back the same way the service binds it" {

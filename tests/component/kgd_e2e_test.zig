@@ -291,6 +291,42 @@ test "Kgd: what install wrote is what the service starts from" {
     defer overridden.deinit(a);
     try std.testing.expectEqualStrings("/tmp/other-store", overridden.store_path);
 
+    // The handoff is only real if a service actually starts from it: the store
+    // install created, the key it generated, the executables it resolved.
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const supervisor = try Supervisor.start(a, .{
+        .store_path = config.store_path,
+        .cli_path = config.cli_path,
+        .daemon_path = config.daemon_path,
+        .api_key = config.api_key,
+        // The configured port is asserted above; binding zero here keeps the
+        // test from fighting whatever else is listening on this machine.
+        .port = 0,
+    });
+    const thread = try std.Thread.spawn(.{}, Supervisor.serveForever, .{supervisor});
+    defer {
+        supervisor.stop();
+        thread.join();
+        supervisor.deinit();
+    }
+    const endpoint = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{supervisor.port()});
+    defer a.free(endpoint);
+    var transport = try WebTransport.init(a, .{
+        .io = io_runtime.io(),
+        .url = endpoint,
+        .api_key = config.api_key,
+        .expected_build_id = &outcome.build_id,
+        .expected_schema_digest = "",
+    });
+    defer transport.deinit();
+    // The build id install wrote is the one the service reports, which is what
+    // a session pins; a mismatch here is what every degraded session looked like.
+    const info = try transport.run("store-info", &.{}, false);
+    defer info.deinit(a);
+    try std.testing.expectEqual(@as(i32, 0), info.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, info.stdout, "storage_format_version=3") != null);
+
     // A configuration the client would refuse must not start a service either.
     const config_c = try a.dupeZ(u8, config_path);
     defer a.free(config_c);

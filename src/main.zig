@@ -1037,7 +1037,7 @@ fn runKgd(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
             // The port is not a flag here: it lives in the configuration the
             // sessions read, so the service cannot bind somewhere its clients
             // do not look. Change it with `kg install --port`.
-            std.debug.print("error: unknown kgd argument '{s}'\n", .{arg});
+            std.debug.print("error: unknown kgd argument '{s}'\nusage: metacodes kgd [--config <path>] [--store <path>]\n", .{arg});
             return 2;
         }
     }

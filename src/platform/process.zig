@@ -168,6 +168,18 @@ pub const PipeChild = struct {
     /// stdout 是否在 timeout_ms 内可读（abort-aware 守卫用：超时回查 abort 再 poll）。
     /// 返 true=有数据可读 or EOF/错误（read 不会无限阻塞）；false=超时无数据。
     /// POSIX=poll；Windows=PeekNamedPipe 轮询（pipe HANDLE 无 poll）。
+    /// stdin 是否在 timeout_ms 内可写。子进程停止排空 stdin 时,写会在管道满后
+    /// 阻塞;调用方据此在 deadline 内放弃,而不是无限期挂住。
+    pub fn pollWritable(self: *const PipeChild, timeout_ms: u32) bool {
+        if (is_windows) {
+            // Windows 匿名管道没有可移植的"可写"查询。写本身会阻塞,调用方的
+            // deadline 仍由上层超时覆盖;这里不假装能提前知道。
+            return true;
+        }
+        var pfds = [_]std.c.pollfd{.{ .fd = self.stdin_h, .events = std.c.POLL.OUT, .revents = 0 }};
+        return std.c.poll(&pfds, 1, @intCast(timeout_ms)) > 0;
+    }
+
     pub fn pollReadable(self: *const PipeChild, timeout_ms: u32) bool {
         if (is_windows) {
             const deadline = nowMs() + @as(i64, timeout_ms);
