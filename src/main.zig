@@ -18,7 +18,7 @@ const catalog_mod = @import("api/catalog.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const provider_ids_mod = @import("provider/ids.zig");
 const version_info = @import("version_info.zig");
-const doctor = @import("app/doctor.zig");
+pub const doctor = @import("app/doctor.zig"); // pub: component tests build the report by hand
 const build_options = @import("build_info");
 
 pub const VERSION = @import("version.zig").semver;
@@ -909,11 +909,47 @@ fn metaskUsesDeviceFlow(mode: LoginMode) bool {
     return mode == .browser;
 }
 
-/// `metacodes doctor [--json] [--strict]` (#78): where ripgrep and TinyKG
-/// resolve from and whether their digests match what this build pinned. Exit 0;
+/// `metacodes doctor [--json] [--strict]` (#78): where ripgrep, TinyKG, and the
+/// Lean kernels resolve from and whether their digests match what this build pinned. Exit 0;
 /// with `--strict`, 1 when a binary is unresolved or mismatched; 2 on an
+/// Builds the doctor's KG object with the read-only probe (a diagnosis command
+/// must never create or migrate a store). Owned strings only; any allocation
+/// failure leaves the report without a `kg` object instead of mixing in statics.
+pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").KgClient, home: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
+    const kclient = kg orelse return try kgDiagnosisOwned(allocator, "unconfigured", "unconfigured", "-", @import("kg/client.zig").KgClient.hintFor(.unconfigured));
+    kclient.ensureReadyReadOnly();
+    const state: []const u8 = if (kclient.ready) "ready" else @tagName(kclient.degradedKind() orelse .unconfigured);
+    const transport = kclient.transportName();
+    const is_cli = std.mem.eql(u8, transport, "cli");
+    // `config` names what the daemon binding was read from: the explicit
+    // METACODES_KG_CONFIG file, the METACODES_KG_* triple ("env"), or the
+    // default daemon.json (whether or not it exists yet).
+    const env_config_path: ?[]const u8 = if (std.c.getenv("METACODES_KG_CONFIG")) |p| std.mem.span(p) else null;
+    const env_triple = std.c.getenv("METACODES_KG_URL") != null or std.c.getenv("METACODES_KG_API_KEY") != null or
+        std.c.getenv("METACODES_KG_EXPECTED_BUILD_ID") != null;
+    const default_path: ?[]u8 = if (!is_cli and !env_triple and env_config_path == null)
+        try std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/daemon.json", .{home})
+    else
+        null;
+    defer if (default_path) |p| allocator.free(p);
+    const config: []const u8 = if (is_cli) "-" else if (env_triple) "env" else (env_config_path orelse default_path.?);
+    const hint: []const u8 = if (kclient.ready) "-" else kclient.degradedHint();
+    return try kgDiagnosisOwned(allocator, state, transport, config, hint);
+}
+
+fn kgDiagnosisOwned(allocator: std.mem.Allocator, state: []const u8, transport: []const u8, config: []const u8, hint: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
+    const s = try allocator.dupe(u8, state);
+    errdefer allocator.free(s);
+    const t = try allocator.dupe(u8, transport);
+    errdefer allocator.free(t);
+    const c = try allocator.dupe(u8, config);
+    errdefer allocator.free(c);
+    const h = try allocator.dupe(u8, hint);
+    return .{ .state = s, .transport = t, .config = c, .hint = h };
+}
+
 /// unknown argument.
-fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
+fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: std.Io) u8 {
     var json = false;
     var strict = false;
     while (args.next()) |arg| {
@@ -929,9 +965,25 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 
     var report = doctor.run(allocator, .{
         .ripgrep_sha256 = build_options.ripgrep_expected_sha256,
         .tinykg_sha256 = build_options.tinykg_expected_sha256,
+        .formal_kernel_sha256 = build_options.formal_kernel_expected_sha256,
+        .project_kernel_sha256 = build_options.project_kernel_expected_sha256,
     }) catch |err| {
         std.debug.print("error: doctor could not resolve the runtime binaries ({s})\n", .{@errorName(err)});
         return 1;
+    };
+    const home = @import("platform").paths.homeDir() orelse "";
+    const cwd = @import("util/fs.zig").getCwd(allocator) catch "";
+    defer if (cwd.len > 0) allocator.free(cwd);
+    const hash = @import("core/transcript.zig").hashCwd(cwd);
+    const domain = std.fmt.allocPrint(allocator, "doctor-{s}", .{hash[0..8]}) catch "doctor";
+    defer if (!std.mem.eql(u8, domain, "doctor")) allocator.free(domain);
+    var kg = @import("kg/client.zig").KgClient.init(allocator, .{ .home = home, .domain = domain, .io = io }) catch null;
+    defer if (kg) |*kclient| kclient.deinit();
+    // KG diagnosis is all-or-nothing: KgDiagnosis.deinit frees every field, so
+    // no static fallback string may ever be stored in it. OOM → no kg object.
+    report.kg = kgDiagnosis(allocator, if (kg) |*kclient| kclient else null, home) catch |err| blk: {
+        @import("util/log.zig").warn("doctor", "unable to allocate KG diagnosis ({s}); omitting kg object", .{@errorName(err)});
+        break :blk null;
     };
     defer report.deinit(allocator);
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -951,7 +1003,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
     defer args.deinit();
     _ = args.next(); // 跳过 argv[0](程序名)
     const cmd = args.next() orelse return null;
-    if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator);
+    if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator, init.io);
     if (std.mem.eql(u8, cmd, "ledger")) {
         const provider = args.next() orelse {
             std.debug.print("usage: metacodes ledger metask\n", .{});

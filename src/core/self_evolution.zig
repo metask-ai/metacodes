@@ -421,7 +421,7 @@ pub fn loadProvisionalGate(
     observation_sink: ?observation.Sink,
 ) ?*ProvisionalGate {
     if (observation_sink == null) return null;
-    const config = switch (kernel.loadConfigFromEnv()) {
+    const config = switch (kernel.loadConfig()) {
         .configured => |value| value,
         else => return null, // 无 kernel 身份 = 无法裁决 = 不装临时规则
     };
@@ -807,7 +807,7 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
     ) catch return finish(allocator, deps, .degraded, "unspecified");
 
     var source = evolution.KgClientSource.init(deps.kg);
-    const kernel_config: ?kernel.Config = switch (kernel.loadConfigFromEnv()) {
+    const kernel_config: ?kernel.Config = switch (kernel.loadConfig()) {
         .configured => |value| value,
         else => null,
     };

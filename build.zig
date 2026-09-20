@@ -9,6 +9,8 @@ const manifest = @import("build.zig.zon");
 // github.com/shuzuan-org/highlight-zig),纯 Zig 模块方式消费其源(每个 root 各按自身
 // optimize 编译;未用的 import 零成本)。tree-sitter 已于 2026-07-13 整体移除。
 var g_hl_mod: ?*std.Build.Module = null;
+var g_formal_kernel_sha256: ?[]const u8 = null;
+var g_project_kernel_sha256: ?[]const u8 = null;
 fn addHl(b: *std.Build, mod: *std.Build.Module) void {
     addHlWithProjectHarnessActuation(b, mod, false);
 }
@@ -28,6 +30,8 @@ fn addHlWithProjectHarnessActuation(
     addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
     const project_harness_options = b.addOptions();
     project_harness_options.addOption(bool, "evaluation_shadow", evaluation_shadow);
+    project_harness_options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
+    project_harness_options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
     mod.addOptions("project_harness_build_options", project_harness_options);
 }
 
@@ -187,6 +191,8 @@ fn buildInfoOptions(
         .explicit => |input| input.sha256,
         .disabled, .unavailable => null,
     });
+    options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
+    options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
     return options;
 }
 
@@ -438,6 +444,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const target_was_explicit = b.user_input_options.contains("target");
     const optimize = b.standardOptimizeOption(.{});
+    g_formal_kernel_sha256 = b.option([]const u8, "formal-kernel-sha256", "SHA-256 of the adjacent formal governance kernel");
+    if (g_formal_kernel_sha256) |value| if (!isLowerSha256(value))
+        @panic("-Dformal-kernel-sha256 must be 64 lowercase hex characters");
+    g_project_kernel_sha256 = b.option([]const u8, "project-kernel-sha256", "SHA-256 of the adjacent project governance kernel");
+    if (g_project_kernel_sha256) |value| if (!isLowerSha256(value))
+        @panic("-Dproject-kernel-sha256 must be 64 lowercase hex characters");
     // TinyKG source remains outside the Metacodes graph. Normal builds select a
     // checked-in, manifest-pinned target binary. A maintainer may override it
     // with an absolute path plus digest. Native staging validates version and a

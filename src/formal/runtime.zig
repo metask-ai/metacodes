@@ -11,6 +11,9 @@ const pfs = @import("platform").fs;
 const process = @import("platform").process;
 const time = @import("../util/time.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const toolchain = @import("../util/toolchain.zig");
+const build_options = @import("project_harness_build_options");
+const test_paths = @import("platform").paths;
 
 pub const REQUEST_SCHEMA = "metacodes-formal-request-v1";
 pub const MEMORY_REQUEST_SCHEMA = "metacodes-memory-migration-request-v1";
@@ -25,7 +28,10 @@ pub const Config = struct {
     checker_path: []const u8,
     expected_sha256: [64]u8,
     timeout_ms: u64 = 5_000,
+    source: Source = .env,
 };
+
+pub const Source = enum { env, adjacent };
 
 pub const ConfigLoad = union(enum) {
     configured: Config,
@@ -225,7 +231,54 @@ pub fn loadConfigFromEnv() ConfigLoad {
         .checker_path = path,
         .expected_sha256 = expected,
         .timeout_ms = timeout_ms,
+        .source = .env,
     } };
+}
+
+pub fn loadConfig() ConfigLoad {
+    const path_set = std.c.getenv("METACODES_FORMAL_KERNEL_PATH") != null;
+    const hash_set = std.c.getenv("METACODES_FORMAL_KERNEL_SHA256") != null;
+    if (path_set or hash_set) return loadConfigFromEnv();
+    const expected_raw = build_options.formal_kernel_expected_sha256 orelse return .missing;
+    const path = toolchain.kernelAdjacentPath(.formal) orelse return .missing;
+    const expected = parseLowerHex64(expected_raw) orelse return .missing;
+    var timeout_ms: u64 = 5_000;
+    if (std.c.getenv("METACODES_FORMAL_KERNEL_TIMEOUT_MS")) |raw_timeout| {
+        timeout_ms = std.fmt.parseInt(u64, std.mem.span(raw_timeout), 10) catch return .invalid;
+        if (timeout_ms < 100 or timeout_ms > 30_000) return .invalid;
+    }
+    return .{ .configured = .{
+        .checker_path = path,
+        .expected_sha256 = expected,
+        .timeout_ms = timeout_ms,
+        .source = .adjacent,
+    } };
+}
+
+test "formal Kernel loadConfig preserves an environment pair" {
+    test_paths.unsetEnv("METACODES_FORMAL_KERNEL_PATH");
+    test_paths.unsetEnv("METACODES_FORMAL_KERNEL_SHA256");
+    test_paths.unsetEnv("METACODES_FORMAL_KERNEL_TIMEOUT_MS");
+    defer test_paths.unsetEnv("METACODES_FORMAL_KERNEL_PATH");
+    defer test_paths.unsetEnv("METACODES_FORMAL_KERNEL_SHA256");
+    defer test_paths.unsetEnv("METACODES_FORMAL_KERNEL_TIMEOUT_MS");
+    test_paths.setEnv("METACODES_FORMAL_KERNEL_PATH", "/tmp/formal-kernel-test");
+    test_paths.setEnv("METACODES_FORMAL_KERNEL_SHA256", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    switch (loadConfig()) {
+        .configured => |config| {
+            try std.testing.expectEqualStrings("/tmp/formal-kernel-test", config.checker_path);
+            try std.testing.expectEqual(Source.env, config.source);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "formal Kernel loadConfig stays missing without compiled digest" {
+    test_paths.unsetEnv("METACODES_FORMAL_KERNEL_PATH");
+    test_paths.unsetEnv("METACODES_FORMAL_KERNEL_SHA256");
+    // The test build intentionally exports no formal digest, so adjacency is
+    // fail-closed even if a file happens to exist beside the test executable.
+    try std.testing.expectEqual(ConfigLoad.missing, loadConfig());
 }
 
 pub fn invoke(

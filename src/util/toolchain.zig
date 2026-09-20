@@ -13,6 +13,16 @@ const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
 
 const RG_NAME = if (is_windows) "rg.exe" else "rg";
+pub const KernelName = enum { formal, project };
+const FORMAL_KERNEL_NAME = if (is_windows) "metacodes-formal-kernel.exe" else "metacodes-formal-kernel";
+const PROJECT_KERNEL_NAME = if (is_windows) "metacodes-project-kernel.exe" else "metacodes-project-kernel";
+
+fn kernelFileName(name: KernelName) []const u8 {
+    return switch (name) {
+        .formal => FORMAL_KERNEL_NAME,
+        .project => PROJECT_KERNEL_NAME,
+    };
+}
 
 /// 仓库 vendored 二进制(manifest-pinned,见 vendor/ripgrep/manifest.json)。
 /// 按编译 target 在 comptime 选中对应文件;无 vendored 二进制的 target(如
@@ -60,6 +70,15 @@ var path_buf: [std.fs.max_path_bytes]u8 = undefined;
 var init_mutex: sync.Mutex = .{};
 pub const Layout = enum { development, release };
 var current_layout: Layout = .development;
+
+var formal_kernel_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+var project_kernel_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+var formal_kernel_buf: [std.fs.max_path_bytes]u8 = undefined;
+var project_kernel_buf: [std.fs.max_path_bytes]u8 = undefined;
+var formal_kernel_initialized = false;
+var project_kernel_initialized = false;
+var formal_kernel_cached: ?[:0]const u8 = null;
+var project_kernel_cached: ?[:0]const u8 = null;
 
 /// Must be called before the first resolution. A later call is a programming error.
 pub fn setLayout(layout: Layout) void {
@@ -159,6 +178,66 @@ fn nextToExecutable() ?[:0]const u8 {
     return null;
 }
 
+/// Resolve the fixed install-prefix location without consulting process state.
+/// The caller owns `buf`; the result is null when the adjacent kernel is absent.
+pub fn kernelPathBeside(exe_path: []const u8, name: KernelName, buf: []u8) ?[:0]const u8 {
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return null;
+    const prefix = std.fs.path.dirname(exe_dir) orelse return null;
+    const sep: u8 = if (is_windows) '\\' else '/';
+    const file_name = kernelFileName(name);
+    const need = prefix.len + 1 + "libexec/metacodes".len + 1 + file_name.len;
+    if (need + 1 > buf.len) return null;
+    var index: usize = 0;
+    @memcpy(buf[index..][0..prefix.len], prefix);
+    index += prefix.len;
+    buf[index] = sep;
+    index += 1;
+    const libexec = "libexec/metacodes";
+    @memcpy(buf[index..][0..libexec.len], libexec);
+    index += libexec.len;
+    buf[index] = sep;
+    index += 1;
+    @memcpy(buf[index..][0..file_name.len], file_name);
+    index += file_name.len;
+    buf[index] = 0;
+    if (!pfs.exists(@ptrCast(buf.ptr))) return null;
+    return buf[0..index :0];
+}
+
+/// Cached adjacent kernel resolution. The init mutex also protects the static
+/// sentinel byte: a first concurrent probe must not return another kernel's path.
+pub fn kernelAdjacentPath(name: KernelName) ?[:0]const u8 {
+    _ = init_mutex.lock();
+    defer _ = init_mutex.unlock();
+    const initialized = switch (name) {
+        .formal => formal_kernel_initialized,
+        .project => project_kernel_initialized,
+    };
+    if (initialized) return switch (name) {
+        .formal => formal_kernel_cached,
+        .project => project_kernel_cached,
+    };
+    const exe = switch (name) {
+        .formal => @import("platform").paths.selfExePath(&formal_kernel_exe_buf),
+        .project => @import("platform").paths.selfExePath(&project_kernel_exe_buf),
+    };
+    const resolved = if (exe) |path| switch (name) {
+        .formal => kernelPathBeside(path, name, &formal_kernel_buf),
+        .project => kernelPathBeside(path, name, &project_kernel_buf),
+    } else null;
+    switch (name) {
+        .formal => {
+            formal_kernel_cached = resolved;
+            formal_kernel_initialized = true;
+        },
+        .project => {
+            project_kernel_cached = resolved;
+            project_kernel_initialized = true;
+        },
+    }
+    return resolved;
+}
+
 /// PATH 逐目录拼 <dir><sep>rg[.exe],存在即返回(写进 path_buf,静态)。
 fn searchPath() ?[:0]const u8 {
     const path_env = std.c.getenv("PATH") orelse return null;
@@ -223,4 +302,25 @@ test "next-to-executable probe finds an adjacent rg" {
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, rg_path) catch {};
     const found = nextToExecutable() orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.endsWith(u8, found, "/rg"));
+}
+
+test "kernelPathBeside finds an adjacent Kernel without dot segments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "bin");
+    try tmp.dir.createDirPath(std.testing.io, "libexec/metacodes");
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = try std.fmt.bufPrint(&exe_buf, "{s}/bin/metacodes", .{root});
+    const file_name = if (is_windows) "metacodes-formal-kernel.exe" else "metacodes-formal-kernel";
+    var file_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file = try std.fmt.bufPrint(&file_buf, "libexec/metacodes/{s}", .{file_name});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file, .data = "kernel" });
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    const found = kernelPathBeside(exe, .formal, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, found, "..") == null);
+    try std.testing.expect(std.mem.endsWith(u8, found, file_name));
+    try tmp.dir.deleteFile(std.testing.io, file);
+    try std.testing.expect(kernelPathBeside(exe, .formal, &out) == null);
 }
