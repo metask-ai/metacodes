@@ -569,6 +569,9 @@ const RequestReader = struct {
     fn readHead(self: *RequestReader) ![]const u8 {
         while (true) {
             if (std.mem.indexOf(u8, self.buffer.items, "\r\n\r\n")) |head_end| {
+                // Checked here too: a head that crosses the cap inside the same
+                // read that completes it would otherwise be accepted.
+                if (head_end + 4 > MAX_HEAD_BYTES) return error.HeadTooLarge;
                 self.body_start = head_end + 4;
                 return try self.allocator.dupe(u8, self.buffer.items[0 .. head_end + 2]);
             }
@@ -609,12 +612,17 @@ fn statusForRead(err: anyerror) u16 {
     };
 }
 
-/// Writes until done, the peer goes away, or the deadline passes. Without the
-/// deadline a client that accepts one byte per socket timeout would own this
-/// single-threaded server for as long as it liked.
+/// Writes until done, the peer goes away, or the deadline passes. Each write
+/// waits for writability in bounded slices first: a peer that stops reading
+/// makes `send` block once the socket buffer fills, and a deadline checked only
+/// between calls would then be one whole socket timeout late — or never, if
+/// `SO_SNDTIMEO` did not take.
 fn sendAll(conn: net.Socket, bytes: []const u8, deadline_ms: i64) void {
     var offset: usize = 0;
     while (offset < bytes.len) {
+        while (!net.pollWritable(conn, SOCKET_POLL_SLICE_MS)) {
+            if (time.nowMs() >= deadline_ms) return;
+        }
         if (time.nowMs() >= deadline_ms) return;
         const n = net.send(conn, bytes[offset..]);
         if (n <= 0) return;

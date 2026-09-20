@@ -170,10 +170,13 @@ pub const PipeChild = struct {
     /// POSIX=poll；Windows=PeekNamedPipe 轮询（pipe HANDLE 无 poll）。
     /// stdin 是否在 timeout_ms 内可写。子进程停止排空 stdin 时,写会在管道满后
     /// 阻塞;调用方据此在 deadline 内放弃,而不是无限期挂住。
+    ///
+    /// **Windows 例外**:匿名管道没有可移植的"可写"查询,这里恒返 true,于是
+    /// 调用方的 deadline **不能**打断一个已经阻塞的 `WriteFile`。要真正可中断
+    /// 需要 overlapped I/O。当前唯一的写方是 `kg/kgd`,它的子进程是本产品自己
+    /// 分发的 tinykgd,且请求上限 1MB;真正修复登记在 doc/TINYKG_INTEGRATION.md。
     pub fn pollWritable(self: *const PipeChild, timeout_ms: u32) bool {
         if (is_windows) {
-            // Windows 匿名管道没有可移植的"可写"查询。写本身会阻塞,调用方的
-            // deadline 仍由上层超时覆盖;这里不假装能提前知道。
             return true;
         }
         var pfds = [_]std.c.pollfd{.{ .fd = self.stdin_h, .events = std.c.POLL.OUT, .revents = 0 }};

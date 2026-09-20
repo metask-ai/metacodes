@@ -998,7 +998,7 @@ fn runKg(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
         return 1;
     };
     defer outcome.deinit(allocator);
-    std.debug.print("TinyKG configured.\n  store:   {s}{s}\n  config:  {s} (0600{s})\n  url:     {s}\n  build:   {s}\nStart it with: metacodes kgd\n", .{
+    std.debug.print("TinyKG configured.\n  store:   {s}{s}\n  config:  {s} (0600{s})\n  url:     {s}\n  build:   {s}\n", .{
         outcome.store_path,
         if (outcome.created_store) " (created)" else "",
         outcome.config_path,
@@ -1006,6 +1006,13 @@ fn runKg(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
         outcome.url,
         outcome.build_id[0..],
     });
+    // A custom `--config` has to appear in the command too, or following this
+    // line starts a service that reads the default configuration instead.
+    if (options.config_path) |custom| {
+        std.debug.print("Start it with: metacodes kgd --config {s}\n", .{custom});
+    } else {
+        std.debug.print("Start it with: metacodes kgd\n", .{});
+    }
     return 0;
 }
 
@@ -1017,9 +1024,10 @@ fn kgInstallHint(err: anyerror) []const u8 {
     };
 }
 
-/// `metacodes kgd [--store PATH] [--port N]`: run the TinyKG service in the
-/// foreground until interrupted. Configuration comes from the same daemon.json
-/// the sessions read, so the port and key can only disagree by editing it.
+/// `metacodes kgd [--config PATH] [--store PATH]`: run the TinyKG service in
+/// the foreground until interrupted. The port and key come from the same
+/// daemon.json the sessions read — there is deliberately no `--port`, so the
+/// service cannot bind somewhere its clients do not look.
 fn runKgd(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
     var options = kgd_runtime.LoadOptions{};
     while (args.next()) |arg| {

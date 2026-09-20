@@ -172,6 +172,21 @@ pub fn pollReadable(s: Socket, timeout_ms: u32) bool {
     }
 }
 
+/// socket 是否在 timeout_ms 内可写。写方向的对端停止读取时,send 会在发送缓冲
+/// 填满后阻塞;调用方据此在自己的 deadline 内放弃,而不是把线程交出去。
+pub fn pollWritable(s: Socket, timeout_ms: u32) bool {
+    if (is_windows) {
+        const POLLWRNORM: i16 = 0x0010; // ws2_32 does not export constants in this std
+        var pfd = WSAPOLLFD{ .fd = s, .events = POLLWRNORM, .revents = 0 };
+        const fds: [*]WSAPOLLFD = @ptrCast(&pfd);
+        return sys.WSAPoll(fds, 1, @intCast(timeout_ms)) > 0 and (pfd.revents & POLLWRNORM) != 0;
+    } else {
+        var pfd = std.c.pollfd{ .fd = s, .events = std.c.POLL.OUT, .revents = 0 };
+        const fds: [*]std.c.pollfd = @ptrCast(&pfd);
+        return std.c.poll(fds, 1, @intCast(timeout_ms)) > 0 and (pfd.revents & std.c.POLL.OUT) != 0;
+    }
+}
+
 /// 连 127.0.0.1:port。
 pub fn connectLoopback(port: u16) Error!Socket {
     const s = try newTcp();

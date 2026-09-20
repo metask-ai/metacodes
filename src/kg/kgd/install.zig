@@ -149,11 +149,19 @@ fn resolveStorePath(
 }
 
 /// A relative path is taken as relative to the working directory the operator
-/// typed it in, which is what `--store build/scratch.kg` means to them.
+/// typed it in, which is what `--store build/scratch.kg` means to them. The
+/// result is always absolute: a relative string in the file would be read back
+/// by a service started from somewhere else, and `runtime` would then resolve
+/// it against the configuration directory instead — two readings of one value.
 fn absolutize(allocator: std.mem.Allocator, config_dir: []const u8, path: []const u8) Error![]u8 {
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path) catch Error.OutOfMemory;
-    const cwd = @import("../../util/fs.zig").getCwd(allocator) catch
+    const cwd = @import("../../util/fs.zig").getCwd(allocator) catch {
+        // No working directory to resolve against. The configuration directory
+        // only helps if it is itself absolute; otherwise refuse rather than
+        // record something whose meaning depends on where it is read.
+        if (!std.fs.path.isAbsolute(config_dir)) return Error.StoreInitFailed;
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, path }) catch Error.OutOfMemory;
+    };
     defer allocator.free(cwd);
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, path }) catch Error.OutOfMemory;
 }
@@ -241,10 +249,22 @@ fn writeConfig(
     }, .{ .whitespace = .indent_2 }, &document.writer) catch return Error.OutOfMemory;
     document.writer.writeByte('\n') catch return Error.OutOfMemory;
 
-    const temporary = std.fmt.allocPrintSentinel(allocator, "{s}.tmp", .{config_path}, 0) catch
+    // `--config` can name a path in a shared directory, so the temporary must
+    // be unguessable and must refuse to open anything that already exists:
+    // a planted `<path>.tmp -> /somewhere/else` symlink would otherwise receive
+    // this machine's API key, written with the privileges of whoever ran this.
+    var suffix: [8]u8 = undefined;
+    if (!rng.randomBytes(&suffix)) return Error.KeyGenerationFailed;
+    var suffix_hex: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&suffix_hex, "{x}", .{&suffix}) catch return Error.ConfigWriteFailed;
+    const temporary = std.fmt.allocPrintSentinel(allocator, "{s}.{s}.tmp", .{ config_path, suffix_hex }, 0) catch
         return Error.OutOfMemory;
     defer allocator.free(temporary);
-    const fd = pfs.open(temporary.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    const fd = pfs.open(
+        temporary.ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true },
+        0o600,
+    );
     if (fd < 0) return Error.ConfigWriteFailed;
     const body = document.written();
     var written: usize = 0;
@@ -359,6 +379,39 @@ test "KgdInstall: a key from a configuration the client would refuse is not adop
         defer parsed.deinit();
         try testing.expect(!reuseApiKey(parsed, &key));
     }
+}
+
+test "KgdInstall: the temporary configuration cannot be a planted symlink" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const config = try std.fmt.allocPrint(a, "{s}/daemon.json", .{root});
+    defer a.free(config);
+    const victim = try std.fmt.allocPrint(a, "{s}/victim", .{root});
+    defer a.free(victim);
+
+    // The old name was `<config>.tmp`, which anyone with write access to the
+    // directory could pre-create as a link to a file of their choosing.
+    const guessed = try std.fmt.allocPrintSentinel(a, "{s}.tmp", .{config}, 0);
+    defer a.free(guessed);
+    const victim_z = try a.dupeZ(u8, victim);
+    defer a.free(victim_z);
+    try writeRaw(a, victim, "untouched", 0o600);
+    try testing.expectEqual(@as(c_int, 0), std.c.symlink(victim_z.ptr, guessed.ptr));
+
+    try writeConfig(a, config, "http://127.0.0.1:8799", "a" ** 64, "sha256:" ++ ("b" ** 64), "/tmp/s");
+
+    // The key went to the configuration, and the planted link still points at
+    // a file nobody wrote through.
+    const written = @import("../../swarm/team.zig").readFileAlloc(a, victim).?;
+    defer a.free(written);
+    try testing.expectEqualStrings("untouched", written);
+    var parsed = try KgClient.loadDaemonConfig(a, config);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a" ** 64, parsed.value.api_key);
 }
 
 test "KgdInstall: an unusable port is not preserved across a reinstall" {

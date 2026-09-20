@@ -203,6 +203,12 @@ Properties worth knowing:
   queueing every later request behind a read that will not return.
 - Nothing starts the daemon automatically yet, there is no idle exit, and the
   daemon is still not part of the product install.
+- Known limitation on Windows: the bridge's response deadline cannot interrupt
+  a write that is already blocked, because anonymous pipes have no portable
+  writability query (`PipeChild.pollWritable` returns true there). A request is
+  capped at the daemon's own 1 MB ceiling and the child is the `tinykgd` this
+  product ships, so the exposure is a misbehaving child rather than a hostile
+  one; making it interruptible needs overlapped I/O.
 
 Because nothing starts it, the daemon is **not** part of the default install or
 the release layout: `zig build tinykg:stage` (and the test wiring) install it
