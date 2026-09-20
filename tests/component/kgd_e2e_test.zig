@@ -22,7 +22,6 @@ const Harness = struct {
     daemon: []u8,
     store: []u8,
     staging: []u8,
-    trusted_root: []const u8,
     supervisor: *Supervisor,
     thread: std.Thread,
     io_runtime: *std.Io.Threaded,
@@ -61,7 +60,7 @@ const Harness = struct {
             .daemon_path = daemon,
             .api_key = api_key,
             .port = 0, // the kernel picks; nothing else may claim a fixed port in a test
-            .staging = .{ .dir = staging, .trusted_root = try allocator.dupe(u8, root) },
+            .staging_dir = staging,
         }) catch |err| {
             io_runtime.deinit();
             allocator.destroy(io_runtime);
@@ -75,7 +74,6 @@ const Harness = struct {
             .daemon = daemon,
             .store = store,
             .staging = staging,
-            .trusted_root = supervisor.options.staging.trusted_root,
             .supervisor = supervisor,
             .thread = thread,
             .io_runtime = io_runtime,
@@ -92,7 +90,6 @@ const Harness = struct {
         self.allocator.free(self.daemon);
         self.allocator.free(self.store);
         self.allocator.free(self.staging);
-        self.allocator.free(@constCast(self.trusted_root));
         self.tmp.cleanup();
     }
 
@@ -357,7 +354,7 @@ test "Kgd: what install wrote is what the service starts from" {
         .port = 0,
         // Staging is anchored under this test's home, the way the service
         // anchors it under the user's.
-        .staging = .{ .dir = handoff_staging, .trusted_root = home },
+        .staging_dir = handoff_staging,
     });
     const thread = try std.Thread.spawn(.{}, Supervisor.serveForever, .{supervisor});
     defer {

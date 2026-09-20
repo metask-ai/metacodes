@@ -162,7 +162,7 @@ pub fn serve(allocator: std.mem.Allocator, config: Config) u8 {
         .daemon_path = config.daemon_path,
         .api_key = config.api_key,
         .port = config.port,
-        .staging = .{ .dir = staging, .trusted_root = config.home },
+        .staging_dir = staging,
     }) catch |err| {
         std.debug.print("error: cannot start the TinyKG service ({s}){s}\n", .{ @errorName(err), hint(err) });
         return 1;

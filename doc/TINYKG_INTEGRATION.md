@@ -208,10 +208,17 @@ Properties worth knowing:
   home directory alone, never from `--config` or `--store`: both can point
   anywhere, and the engine reopens the staged path after the service renames the
   file into place, so an ancestor someone else can rename is an ingestion
-  someone else can redirect. Before staging, every directory from that path up
-  to the home directory must be a non-symlink directory this user owns with no
-  group or world write bits; anything else refuses the import rather than
-  proceeding.
+  someone else can redirect. Before staging, every directory from that path to
+  the filesystem root must be a non-symlink directory with no group or world
+  write bits, owned by this user or by root; anything else refuses the import
+  rather than proceeding. Stopping the walk at the home directory would not be
+  enough — a home inside a directory someone else can write can be renamed out
+  from under the path just as well.
+- Known limitation on POSIX: that check reads mode bits, which extended or
+  NFSv4 ACLs can contradict. A named ACL granting another account write or
+  `delete_child` on a component is not visible here, so on ACL-carrying
+  filesystems the chain is trusted rather than proven private. Inspecting ACLs
+  portably is a platform-specific exercise this has not taken on.
 - Known limitation on Windows: only the leaf is checked, and only for being a
   reparse point. MSVCRT cannot open a directory, so there is no descriptor to
   validate and no portable owner or ACL check; the exclusive temporary file
