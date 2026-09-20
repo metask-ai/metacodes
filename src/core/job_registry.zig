@@ -277,7 +277,9 @@ pub const JobRegistry = struct {
         const started_ms: util_time.Millis = util_time.nowMs();
 
         const preview_slice = utf8.pagePrefix(command, 120);
-        const preview = try self.allocator.dupe(u8, preview_slice);
+        const repaired_preview = try utf8.repairInvalidUtf8(self.allocator, preview_slice);
+        defer self.allocator.free(repaired_preview);
+        const preview = try self.allocator.dupe(u8, repaired_preview);
         errdefer self.allocator.free(preview);
 
         const entry = JobEntry{
@@ -304,6 +306,10 @@ pub const JobRegistry = struct {
     fn registerEntry(self: *JobRegistry, entry: JobEntry) !void {
         self.lock();
         defer self.unlock();
+        // Never let a random-ID collision overwrite the index entry for a
+        // live job. The caller still owns the child until registration
+        // succeeds and its errdefer kills/reaps it on this error.
+        if (self.index.contains(entry.id)) return error.JobIdCollision;
         self.jobs.append(self.allocator, entry) catch |e| {
             return e;
         };
@@ -320,6 +326,16 @@ pub const JobRegistry = struct {
         var n: usize = 0;
         for (self.jobs.items) |*j| {
             if (j.status == .running) n += 1;
+        }
+        return n;
+    }
+
+    pub fn runningCountForOwner(self: *JobRegistry, owner: SessionId) usize {
+        self.lock();
+        defer self.unlock();
+        var n: usize = 0;
+        for (self.jobs.items) |*j| {
+            if (j.status == .running and std.mem.eql(u8, j.owner.asSlice(), owner.asSlice())) n += 1;
         }
         return n;
     }
@@ -355,6 +371,55 @@ pub const JobRegistry = struct {
         self.lock();
         defer self.unlock();
         return if (self.getPtrLocked(id)) |p| p.* else null;
+    }
+
+    pub fn getForOwner(self: *JobRegistry, id: []const u8, owner: SessionId) ?JobEntry {
+        self.lock();
+        defer self.unlock();
+        const entry = self.getPtrLocked(id) orelse return null;
+        if (!std.mem.eql(u8, entry.owner.asSlice(), owner.asSlice())) return null;
+        return entry.*;
+    }
+
+    /// Terminate a job only when it belongs to `owner`.  Ownership is checked
+    /// while the registry lock is held, then the existing blocking kill path
+    /// performs process signalling outside the lock.
+    pub fn killForOwner(self: *JobRegistry, id: []const u8, owner: SessionId) !void {
+        self.lock();
+        const entry = self.getPtrLocked(id) orelse {
+            self.unlock();
+            return error.JobNotFound;
+        };
+        if (!std.mem.eql(u8, entry.owner.asSlice(), owner.asSlice())) {
+            self.unlock();
+            return error.JobNotFound;
+        }
+        self.unlock();
+        return self.kill(id);
+    }
+
+    /// Kill all running jobs belonging to one session.  Pick one id at a time
+    /// under the lock, then perform the blocking kill outside it. This avoids
+    /// an allocation-sized snapshot (and the silent partial cleanup an OOM
+    /// snapshot would cause) while remaining safe when another caller kills a
+    /// job concurrently.
+    pub fn killAllForOwner(self: *JobRegistry, owner: SessionId) usize {
+        var killed: usize = 0;
+        while (true) {
+            var id: ?[12]u8 = null;
+            self.lock();
+            for (self.jobs.items) |j| {
+                if (j.status == .running and std.mem.eql(u8, j.owner.asSlice(), owner.asSlice())) {
+                    id = j.id;
+                    break;
+                }
+            }
+            self.unlock();
+            const selected = id orelse break;
+            self.kill(selected[0..]) catch continue;
+            killed += 1;
+        }
+        return killed;
     }
 
     /// Advance BashOutput's remembered cursors under the registry mutex.

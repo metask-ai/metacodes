@@ -24,12 +24,19 @@ const backend_mod = @import("backend.zig");
 const server_mod = @import("server.zig");
 const msg_queue_mod = @import("../repl/msg_queue.zig");
 const log = @import("../util/log.zig");
+const util_json = @import("../util/json.zig");
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
 const WebServer = server_mod.WebServer;
 const MsgQueue = msg_queue_mod.MsgQueue;
 const ui_event = @import("../core/protocol/ui_event.zig");
+
+fn stringifyJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    const raw = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(raw);
+    return util_json.repairJsonUtf8(allocator, raw);
+}
 
 /// **U4 A4:web 配置变更 sink**。config 变更(model/mode/dirs/reasoning 任一 UI/工具触发)→
 /// journal.append 一条 `{"config_changed":{...}}` → 浏览器 SSE 收到更新状态。与 command_result
@@ -41,7 +48,7 @@ pub const WebConfigSink = struct { // U10-D:daemon app_driver 复用
     alloc: std.mem.Allocator,
     fn emitThunk(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
         const self: *WebConfigSink = @ptrCast(@alignCast(ctx));
-        const line = std.json.Stringify.valueAlloc(self.alloc, .{ .config_changed = ev }, .{}) catch return;
+        const line = stringifyJson(self.alloc, .{ .config_changed = ev }) catch return;
         defer self.alloc.free(line);
         self.journal.append(line); // journal dup → borrow 同步序列化后即可释放
     }
@@ -53,7 +60,7 @@ pub const WebConfigSink = struct { // U10-D:daemon app_driver 复用
 /// U5 B2:把一条 session_lifecycle 事件序列化进 journal（进 seq 流，附着重放可见 session 边界）。
 /// created 挂 journal init 后（seq 0），closed 挂 journal.close 前。best-effort（OOM 静默丢）。
 pub fn journalSessionLifecycle(journal: *EventJournal, alloc: std.mem.Allocator, ev: ui_event.SessionLifecycle) void { // U10-D 复用
-    const line = std.json.Stringify.valueAlloc(alloc, .{ .session_lifecycle = ev }, .{}) catch return;
+    const line = stringifyJson(alloc, .{ .session_lifecycle = ev }) catch return;
     defer alloc.free(line);
     journal.append(line);
 }
@@ -148,7 +155,7 @@ pub const StateSource = struct {
         defer plugin_inventory.deinit();
 
         const u = &self.app.usage; // u64 无锁读，良性 skew（poll-based）
-        return std.json.Stringify.valueAlloc(allocator, .{
+        return stringifyJson(allocator, .{
             .seq = seq,
             .session_id = self.app.session_id.asSlice(),
             .model = slices.model,
@@ -162,7 +169,7 @@ pub const StateSource = struct {
             .agents = agent_views, // U6 A4:附着 roster
             .tasks = task_views, // task#19:mid-session task 列表进快照
             .plugin_inventory = plugin_inventory.value,
-        }, .{});
+        });
     }
 
     /// 斜杠命令入口(HTTP 连接线程调)。**只入队,绝不碰 App**:命令要改 conversation/
@@ -182,7 +189,7 @@ pub const StateSource = struct {
 
 /// 命令结果信封 `{"ok":bool,"message":"…"}`(owned)。
 fn reply(allocator: std.mem.Allocator, ok: bool, msg: []const u8) ![]u8 {
-    return std.json.Stringify.valueAlloc(allocator, .{ .ok = ok, .message = msg }, .{});
+    return stringifyJson(allocator, .{ .ok = ok, .message = msg });
 }
 
 /// driver 线程执行一个命令(独占 conversation/config/app.allocator,无并发)。
@@ -209,7 +216,7 @@ pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem
     // (server.zig 回显在入队前),否则 attach/重放的 SSE 客户端只见 assistant 回合,
     // 可见 transcript 与 conversation 脱节。宏注入(/commit 等)不回显,对齐 TUI。
     if (d.run != null and d.run.?.kind == .user_prompt) {
-        if (std.json.Stringify.valueAlloc(web_alloc, .{ .user_message = trimmed }, .{}) catch null) |echo| {
+        if (stringifyJson(web_alloc, .{ .user_message = trimmed }) catch null) |echo| {
             defer web_alloc.free(echo);
             journal.append(echo);
         }
@@ -221,7 +228,7 @@ pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem
         else => d.outcome.render(&buf),
     };
     const ok = d.outcome.ok and d.outcome.kind != .unhandled;
-    const line = std.json.Stringify.valueAlloc(web_alloc, .{ .command_result = .{ .ok = ok, .message = msg } }, .{}) catch return d.run;
+    const line = stringifyJson(web_alloc, .{ .command_result = .{ .ok = ok, .message = msg } }) catch return d.run;
     defer web_alloc.free(line);
     journal.append(line);
     return d.run;
@@ -232,7 +239,7 @@ const session_service_mod = @import("../session_service.zig");
 /// 摘录上限 2 KiB/流(完整输出已在对话上下文里,模型可见;这里只为浏览器用户回显)。
 fn shellCommandResult(svc: *session_service_mod.SessionService, journal: *EventJournal, web_alloc: std.mem.Allocator, command: []const u8) void {
     const result = session_service_mod.shellExecImpl(svc, web_alloc, command) catch |e| {
-        const line = std.json.Stringify.valueAlloc(web_alloc, .{ .command_result = .{ .ok = false, .message = @errorName(e) } }, .{}) catch return;
+        const line = stringifyJson(web_alloc, .{ .command_result = .{ .ok = false, .message = @errorName(e) } }) catch return;
         defer web_alloc.free(line);
         journal.append(line);
         return;
@@ -261,7 +268,7 @@ fn shellCommandResult(svc: *session_service_mod.SessionService, journal: *EventJ
             }
         }
     }
-    const line = std.json.Stringify.valueAlloc(web_alloc, .{ .command_result = .{ .ok = true, .message = msg_buf.items } }, .{}) catch return;
+    const line = stringifyJson(web_alloc, .{ .command_result = .{ .ok = true, .message = msg_buf.items } }) catch return;
     defer web_alloc.free(line);
     journal.append(line);
 }
@@ -397,8 +404,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
             null;
         defer if (run_control) |control| control.deinit();
         if (run_control) |control| control.requireDetachedIdle(
-            (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
-                (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+            (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+                (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
             app.swarm.hasTeam(),
         ) catch |err| {
             control.finishRun(@errorName(err)) catch {};
@@ -456,9 +463,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
 }
 
 pub fn announceRunDone(journal: *EventJournal, allocator: std.mem.Allocator, stop_reason: []const u8, err_name: ?[]const u8) void { // U10-D 复用
-    const line = std.json.Stringify.valueAlloc(allocator, .{
+    const line = stringifyJson(allocator, .{
         .run_done = .{ .stop_reason = stop_reason, .err = err_name },
-    }, .{}) catch return;
+    }) catch return;
     defer allocator.free(line);
     journal.append(line);
 }

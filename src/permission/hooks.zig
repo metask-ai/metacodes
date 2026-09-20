@@ -333,11 +333,14 @@ fn runPreToolUseFullWithBudget(
     var out = PreHookResult{};
     if (!set.hasPre()) return out;
 
-    const stdin_json = std.fmt.allocPrint(
-        alloc,
-        "{{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"{s}\",\"tool_input\":{s}}}",
-        .{ tool_name, args },
-    ) catch return out;
+    var stdin_builder: std.Io.Writer.Allocating = .init(alloc);
+    defer stdin_builder.deinit();
+    stdin_builder.writer.writeAll("{\"hook_event_name\":\"PreToolUse\",\"tool_name\":") catch return out;
+    util_json.writeJsonString(&stdin_builder.writer, tool_name) catch return out;
+    stdin_builder.writer.writeAll(",\"tool_input\":") catch return out;
+    stdin_builder.writer.writeAll(args) catch return out;
+    stdin_builder.writer.writeByte('}') catch return out;
+    const stdin_json = stdin_builder.toOwnedSlice() catch return out;
     defer alloc.free(stdin_json);
 
     for (set.pre_tool_use) |entry| {
@@ -391,11 +394,16 @@ pub fn runPostToolUse(
 ) ?[]u8 {
     if (!set.hasPost()) return null;
 
-    const stdin_json = std.fmt.allocPrint(
-        alloc,
-        "{{\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"{s}\",\"tool_input\":{s},\"tool_response\":{s}}}",
-        .{ tool_name, args, tool_response },
-    ) catch return null;
+    var stdin_builder: std.Io.Writer.Allocating = .init(alloc);
+    defer stdin_builder.deinit();
+    stdin_builder.writer.writeAll("{\"hook_event_name\":\"PostToolUse\",\"tool_name\":") catch return null;
+    util_json.writeJsonString(&stdin_builder.writer, tool_name) catch return null;
+    stdin_builder.writer.writeAll(",\"tool_input\":") catch return null;
+    stdin_builder.writer.writeAll(args) catch return null;
+    stdin_builder.writer.writeAll(",\"tool_response\":") catch return null;
+    stdin_builder.writer.writeAll(tool_response) catch return null;
+    stdin_builder.writer.writeByte('}') catch return null;
+    const stdin_json = stdin_builder.toOwnedSlice() catch return null;
     defer alloc.free(stdin_json);
 
     const budget = Budget.start();

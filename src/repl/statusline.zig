@@ -32,7 +32,7 @@ pub fn render(app: *const app_mod.App) void {
     const tok_str = formatTokens(&tok_buf, total_tokens);
 
     // 后台任务数 + cron 数(>0 才显示)
-    const bg_count = if (app.jobs) |*j| j.runningCount() else 0;
+    const bg_count = if (app.jobs) |*j| j.runningCountForOwner(app.session_id) else 0;
     const cron_count = app.cron_registry.count();
 
     var extra_buf: [96]u8 = undefined;
@@ -48,7 +48,7 @@ pub fn render(app: *const app_mod.App) void {
     }
     // SW5:有 team 时显示 roster 段(N 活着,M 忙)。计数排除已终止尸体(误导 8👥 0⚙)。
     var tb: [40]u8 = undefined;
-    const team_seg = teamSegmentFor(app.swarm.teammates, &tb);
+    const team_seg = teamSegmentForSession(app.swarm.teammates, app.session_id, &tb);
     extra = std.fmt.bufPrint(&extra_buf, "{s}{s}", .{ jobs_seg, team_seg }) catch jobs_seg;
 
     // effort 段:非 null 时显示在 model 后(对齐 plan 模式的显式努力档位)。
@@ -86,10 +86,19 @@ pub fn swarmSegment(buf: []u8, total: usize, working: usize) []const u8 {
 /// render 的 roster 段接线(可测):无 registry / 无活着队友 → 空;否则 liveCount👥 workingCount⚙。
 /// teammates 是 ?*Registry(const 浅层),值捕获即拿到可用指针,无需 @constCast。
 pub fn teamSegmentFor(teammates: ?*@import("../swarm/teammate.zig").TeammateRegistry, buf: []u8) []const u8 {
+    return teamSegmentForSession(teammates, null, buf);
+}
+
+pub fn teamSegmentForSession(
+    teammates: ?*@import("../swarm/teammate.zig").TeammateRegistry,
+    session: ?@import("../core/session_id.zig").SessionId,
+    buf: []u8,
+) []const u8 {
     const reg = teammates orelse return "";
-    const live = reg.liveCount();
+    const live = if (session) |wanted| reg.liveCountForSession(wanted) else reg.liveCount();
     if (live == 0) return "";
-    return swarmSegment(buf, live, reg.workingCount());
+    const working = if (session) |wanted| reg.workingCountForSession(wanted) else reg.workingCount();
+    return swarmSegment(buf, live, working);
 }
 
 /// 循环写入直到完成或 write 返 0/错误。保证不短写造成行混乱。

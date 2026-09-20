@@ -12,9 +12,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const job_id = common.extractJsonArg(args, "job_id") orelse return error.MissingJobId;
     const registry = ctx.jobs orelse return error.JobsNotAvailable;
 
-    try registry.kill(job_id);
+    try registry.killForOwner(job_id, ctx.session);
     registry.markExitObserved(job_id);
-    const job = registry.get(job_id) orelse return error.JobNotFound;
+    const job = registry.getForOwner(job_id, ctx.session) orelse return error.JobNotFound;
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -37,7 +37,7 @@ test "KillShell on running job" {
     var args_buf: [128]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"job_id\":\"{s}\"}}", .{j.id[0..]});
 
-    const ctx = ToolContext{ .allocator = a, .jobs = &r };
+    const ctx = ToolContext{ .allocator = a, .jobs = &r, .session = @import("../core/session_id.zig").SessionId.single };
     const result = try execute(&ctx, args);
     defer a.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"status\":\"killed\"") != null);
@@ -52,7 +52,7 @@ test "KillShell observed job is never announced" {
     const j = try r.spawnBackgroundOwned("sleep 30", null, owner);
     var args_buf: [128]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"job_id\":\"{s}\"}}", .{j.idSlice()});
-    const ctx = ToolContext{ .allocator = a, .jobs = &r, .agent_ident = owner };
+    const ctx = ToolContext{ .allocator = a, .jobs = &r, .agent_ident = owner, .session = owner };
     const result = try execute(&ctx, args);
     defer a.free(result);
     const events = try r.takeUnannouncedExits(owner, a);

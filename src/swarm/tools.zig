@@ -97,6 +97,10 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
         .created_at_ms = @intCast(@divTrunc(util_time.nowWallNs(), 1_000_000)),
     };
     defer tf.deinit();
+    // Persist the lead's routing identity so a process-mode child (which has
+    // no in-process registry pointer) can reject stale members after a crash
+    // or restart instead of addressing by name alone.
+    tf.lead_session_id = try ctx.allocator.dupe(u8, sw.session.asSlice());
     if (util_json.extractStringField(args, "description")) |d| {
         const desc = try util_json.unescapeString(d, ctx.allocator);
         tf.description = desc; // owned by tf, freed in deinit
@@ -125,22 +129,28 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
         sw.home,
         sw.dialect_resolver,
     );
-    if (sw.limits) |limits| try sw.teammates.?.setLimits(limits);
-    // issue #16:auth scheme 随 lead 已解析的路由走。少了它,teammate 会把正确
-    // 的密钥发到错误的头上。
-    sw.teammates.?.auth_scheme = sw.auth_scheme;
     errdefer if (sw.teammates) |*t| {
         t.deinit();
         sw.teammates = null;
     };
+    if (sw.limits) |limits| try sw.teammates.?.setLimits(limits);
+    // issue #16:auth scheme 随 lead 已解析的路由走。少了它,teammate 会把正确
+    // 的密钥发到错误的头上。
+    sw.teammates.?.auth_scheme = sw.auth_scheme;
     // SW3:确保共享 KG inbox root 存在(lead 的 TaskCreate 落此,teammate frontier 自领此)。
     // best-effort——KG 不可用只是没有 DAG 协调,mailbox 派活仍工作。
     ensureSharedTaskRoot(ctx);
 
     // 出口前最后一步赋值(此后不再有可失败操作);allocPrint 失败由上面两 errdefer 回滚。
-    const out = try std.fmt.allocPrint(ctx.allocator, "{{\"team\":\"{s}\",\"leadAgentId\":\"{s}\",\"status\":\"created\"}}", .{ team_s, lead_id });
+    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"team\":");
+    try util_json.writeJsonString(&out.writer, team_s);
+    try out.writer.writeAll(",\"leadAgentId\":");
+    try util_json.writeJsonString(&out.writer, lead_id);
+    try out.writer.writeAll(",\"status\":\"created\"}");
     sw.team_sanitized = team_owned;
-    return out;
+    return out.toOwnedSlice();
 }
 
 // ============================================================================
@@ -158,6 +168,10 @@ pub fn executeTeamDelete(ctx: *const ToolContext, args: []const u8) anyerror![]u
     if (sw.teammates) |*t| {
         if (t.liveCount() > 0) return error.TeammatesStillActive;
     }
+    // A resumed lead may have no in-memory process list. Consult the durable
+    // roster before removing its mailbox/config directory; an active child
+    // without a local pid record is a fail-closed refusal.
+    if (sw.hasUntrackedProcessMember()) return error.TeammatesStillActive;
     // 进程外 teammate 同款检查(旧缺口:只查 in-process registry,活跃进程外成员时照样 rmrf
     // 掉 team 目录抽走其邮箱)。先非阻塞收尸(已死的清掉),仍存活 → 拒绝。
     if (sw.reapDeadProcessTeammates() > 0) return error.TeammatesStillActive;
@@ -177,7 +191,12 @@ pub fn executeTeamDelete(ctx: *const ToolContext, args: []const u8) anyerror![]u
         sw.allocator.free(team_name);
         sw.team_sanitized = &.{};
     }
-    return std.fmt.allocPrint(ctx.allocator, "{{\"team\":\"{s}\",\"status\":\"deleted\"}}", .{team_name});
+    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"team\":");
+    try util_json.writeJsonString(&out.writer, team_name);
+    try out.writer.writeAll(",\"status\":\"deleted\"}");
+    return out.toOwnedSlice();
 }
 
 // ============================================================================
@@ -190,6 +209,7 @@ pub fn executeTeamDelete(ctx: *const ToolContext, args: []const u8) anyerror![]u
 pub fn executeSendMessage(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const sw = ctx.swarm orelse return error.SwarmUnavailable;
     if (!sw.hasTeam()) return error.NoActiveTeam;
+    if (!std.mem.eql(u8, sw.session.asSlice(), ctx.session.asSlice())) return error.NoActiveTeam;
 
     const to_raw = util_json.extractStringField(args, "to") orelse return error.MissingRecipient;
     const to = try util_json.unescapeString(to_raw, ctx.allocator);
@@ -220,22 +240,62 @@ pub fn executeSendMessage(ctx: *const ToolContext, args: []const u8) anyerror![]
         var cfgbuf: [std.fs.max_path_bytes]u8 = undefined;
         var tf = team_mod.load(ctx.allocator, sw.configPath(&cfgbuf)) orelse return error.NoActiveTeam;
         defer tf.deinit();
-        if (tf.findMember(to_s) == null) return error.UnknownRecipient;
+        const member = tf.findMember(to_s) orelse return error.UnknownRecipient;
+        const member_sid = member.session_id orelse return error.UnknownRecipient;
+        const sid = @import("../core/session_id.zig").SessionId.fromSlice(member_sid) orelse return error.UnknownRecipient;
+        if (!std.mem.eql(u8, sid.asSlice(), sw.session.asSlice())) return error.UnknownRecipient;
+        if (sw.teammates) |*t| {
+            if (!t.hasNameForSession(to_s, sw.session)) {
+                var process_member = false;
+                for (sw.process_teammates.items) |pt| {
+                    if (std.mem.eql(u8, pt.session.asSlice(), sw.session.asSlice()) and std.mem.eql(u8, pt.name, to_s)) {
+                        process_member = true;
+                        break;
+                    }
+                }
+                if (!process_member) return error.UnknownRecipient;
+            }
+        }
     }
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
     const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, to_s, &inbox_buf);
     try mailbox.deliver(ctx.allocator, inbox, sw.self_name, message, null, summary);
-    return std.fmt.allocPrint(ctx.allocator, "{{\"to\":\"{s}\",\"delivered\":1}}", .{to_s});
+    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"to\":");
+    try util_json.writeJsonString(&out.writer, to_s);
+    try out.writer.writeAll(",\"delivered\":1}");
+    return out.toOwnedSlice();
 }
 
 /// 广播给所有 roster 成员(除自己)+ lead(若发送者非 lead)。返回投递数。
-fn broadcast(ctx: *const ToolContext, sw: *const SwarmContext, message: []const u8, summary: ?[]const u8) !usize {
+fn broadcast(ctx: *const ToolContext, sw: *SwarmContext, message: []const u8, summary: ?[]const u8) !usize {
     var cfgbuf: [std.fs.max_path_bytes]u8 = undefined;
     var tf = team_mod.load(ctx.allocator, sw.configPath(&cfgbuf)) orelse return error.NoActiveTeam;
     defer tf.deinit();
     var n: usize = 0;
     for (tf.members.items) |*m| {
         if (std.mem.eql(u8, m.name, sw.self_name)) continue;
+        if (m.session_id) |member_sid| {
+            const sid = @import("../core/session_id.zig").SessionId.fromSlice(member_sid) orelse continue;
+            if (!std.mem.eql(u8, sid.asSlice(), sw.session.asSlice())) continue;
+        } else if (sw.teammates == null) {
+            // A process-mode child cannot prove ownership of a legacy config
+            // member that lacks sessionId; fail closed rather than cross-route.
+            continue;
+        }
+        if (sw.teammates) |*t| {
+            if (!@constCast(t).hasNameForSession(m.name, sw.session)) {
+                var process_member = false;
+                for (sw.process_teammates.items) |pt| {
+                    if (std.mem.eql(u8, pt.session.asSlice(), sw.session.asSlice()) and std.mem.eql(u8, pt.name, m.name)) {
+                        process_member = true;
+                        break;
+                    }
+                }
+                if (!process_member) continue;
+            }
+        }
         var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
         const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, m.name, &inbox_buf);
         mailbox.deliver(ctx.allocator, inbox, sw.self_name, message, null, summary) catch |e| {
@@ -301,10 +361,8 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
                 const alive = if (sw.teammates) |*t| blk: {
                     var nb: [64]u8 = undefined;
                     const ns = team_mod.sanitizeAgentName(m.from, &nb);
-                    if (t.findByName(ns)) |e| {
-                        const s = e.statusSnapshot();
+                    if (t.statusForNameForSession(ns, sw.session)) |s|
                         break :blk (s == .working or s == .idle);
-                    }
                     break :blk false; // 不在 registry = 已收尾,可摘
                 } else false;
                 if (alive) continue; // 仍在跑:留未读,不摘牌(不加入 consumed)

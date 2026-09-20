@@ -55,8 +55,19 @@ pub fn extractJsonArg(data: []const u8, field: []const u8) ?[]const u8 {
 
     if (data[pos] == '"') {
         var end = pos + 1;
+        var escaped = false;
         while (end < data.len) {
-            if (data[end] == '"' and data[end - 1] != '\\') {
+            if (escaped) {
+                escaped = false;
+                end += 1;
+                continue;
+            }
+            if (data[end] == '\\') {
+                escaped = true;
+                end += 1;
+                continue;
+            }
+            if (data[end] == '"') {
                 return data[pos + 1 .. end];
             }
             end += 1;
@@ -478,6 +489,13 @@ test "extractJsonArg nested quote escape preserved" {
     // extractJsonArg 返回原始未反转义的片段
     const data = "{\"msg\":\"a\\\"b\"}";
     try std.testing.expectEqualStrings("a\\\"b", extractJsonArg(data, "msg").?);
+}
+
+test "extractJsonArg even backslashes before closing quote" {
+    // Two backslashes encode one literal backslash; the following quote is
+    // the JSON terminator, not an escaped quote inside the value.
+    const data = "{\"msg\":\"fragment\\\\\"}";
+    try std.testing.expectEqualStrings("fragment\\\\", extractJsonArg(data, "msg").?);
 }
 
 test "extractJsonArg false bool" {

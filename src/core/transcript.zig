@@ -31,6 +31,7 @@ const util_json = @import("../util/json.zig");
 const utf8 = @import("../util/utf8.zig");
 const util_fs = @import("../util/fs.zig");
 const util_time = @import("../util/time.zig");
+const file_lock = @import("../util/file_lock.zig");
 const log = @import("../util/log.zig");
 const sync = @import("platform").sync;
 
@@ -42,6 +43,7 @@ pub const SessionId = session_id_mod.SessionId;
 /// fail-closed parser limit, not a prompt/output limit.
 const MAX_TRANSCRIPT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_META_BYTES: usize = 1 * 1024 * 1024;
 
 /// genSessionId 是 session_id.gen 的兼容别名(保留供既有调用方;新代码直接用 session_id.gen)。
 pub fn genSessionId() SessionId {
@@ -144,6 +146,18 @@ pub const Writer = struct {
     }
 
     fn flushImpl(self: *Writer, conversation: *const Conversation) !void {
+        var lock_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const lock_path = try std.fmt.bufPrint(&lock_buf, "{s}/transcript.jsonl", .{self.dir});
+        var lock = try file_lock.acquire(lock_path, .{});
+        defer lock.release();
+        // A previous flush may have opened the old inode. Another process can
+        // atomically replace the pathname while this writer is idle; reopen
+        // under the inter-process lock so appends always target the current
+        // transcript rather than an unlinked stale inode.
+        if (self.fd != FD_UNSET) {
+            _ = pfs.close(self.fd);
+            self.fd = FD_UNSET;
+        }
         // A short write followed by an I/O error cannot be rolled back on a
         // regular file. Rebuild from the authoritative Conversation before
         // attempting another append so retries never duplicate a record.
@@ -390,10 +404,35 @@ fn readChunk(fd: c_int, buf: []u8) error{ReadFailed}!usize {
 fn replaceTranscriptFile(session_dir: []const u8, original: []const u8, repaired: []const u8) !void {
     var backup_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const backup_path = try std.fmt.bufPrint(&backup_buf, "{s}/transcript.jsonl.corrupt\x00", .{session_dir});
-    try writeDurableFile(backup_path, original);
+    var backup_tmp_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const backup_tmp = try std.fmt.bufPrint(&backup_tmp_buf, "{s}/transcript.jsonl.corrupt.tmp\x00", .{session_dir});
+    try writeDurableFile(backup_tmp, original);
+    if (pfs.renameReplace(@ptrCast(backup_tmp.ptr), @ptrCast(backup_path.ptr)) != 0) return error.RenameFailed;
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/transcript.jsonl\x00", .{session_dir});
-    try writeDurableFile(path, repaired);
+    // Never truncate the live transcript in place. A crash during recovery
+    // must leave either the old complete file or the new complete file, so a
+    // subsequent `/resume` can retry the same repair from the `.corrupt`
+    // backup instead of inheriting a second partial transcript.
+    var repair_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const repair_path = try std.fmt.bufPrint(&repair_buf, "{s}/transcript.jsonl.repair.tmp\x00", .{session_dir});
+    try writeDurableFile(repair_path, repaired);
+    if (pfs.renameReplace(@ptrCast(repair_path.ptr), @ptrCast(path.ptr)) != 0) return error.RenameFailed;
+}
+
+fn replaceMetaFile(session_dir: []const u8, original: []const u8, repaired: []const u8) !void {
+    var backup_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const backup_path = try std.fmt.bufPrint(&backup_buf, "{s}/meta.json.corrupt\x00", .{session_dir});
+    var backup_tmp_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const backup_tmp = try std.fmt.bufPrint(&backup_tmp_buf, "{s}/meta.json.corrupt.tmp\x00", .{session_dir});
+    try writeDurableFile(backup_tmp, original);
+    if (pfs.renameReplace(@ptrCast(backup_tmp.ptr), @ptrCast(backup_path.ptr)) != 0) return error.RenameFailed;
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/meta.json\x00", .{session_dir});
+    var repair_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const repair_path = try std.fmt.bufPrint(&repair_buf, "{s}/meta.json.repair.tmp\x00", .{session_dir});
+    try writeDurableFile(repair_path, repaired);
+    if (pfs.renameReplace(@ptrCast(repair_path.ptr), @ptrCast(path.ptr)) != 0) return error.RenameFailed;
 }
 
 fn writeDurableFile(path: []const u8, bytes: []const u8) !void {
@@ -422,8 +461,12 @@ fn writeDurableFile(path: []const u8, bytes: []const u8) !void {
 /// 失败则 conversation 保持调用前状态。
 pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allocator: std.mem.Allocator) !void {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl\x00", .{session_dir});
-    var fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const lock_path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl", .{session_dir});
+    var lock = try file_lock.acquire(lock_path, .{});
+    defer lock.release();
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/transcript.jsonl\x00", .{session_dir});
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
     var source_open = true;
     defer {
@@ -445,25 +488,20 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
     // or power loss can leave a partial final write; discard that uncommitted
     // tail and keep the complete prefix. Corruption in an earlier record is
     // still fatal and is reported below with its line/byte location.
+    var complete_len = all.items.len;
     if (all.items.len > 0 and all.items[all.items.len - 1] != '\n') {
-        const complete_len = if (std.mem.lastIndexOfScalar(u8, all.items, '\n')) |idx| idx + 1 else 0;
+        complete_len = if (std.mem.lastIndexOfScalar(u8, all.items, '\n')) |idx| idx + 1 else 0;
         const dropped = all.items.len - complete_len;
         log.warn("transcript", "discarding incomplete JSONL tail at byte {d} ({d} bytes)", .{ complete_len, dropped });
-        _ = pfs.close(fd);
-        source_open = false;
-        fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
-        if (fd < 0) return error.OpenFailed;
-        source_open = true;
-        pfs.setSize(fd, complete_len) catch |err| {
-            log.warn("transcript", "cannot repair incomplete JSONL tail: {s}", .{@errorName(err)});
-            return err;
-        };
-        pfs.fsyncChecked(fd) catch |err| {
-            log.warn("transcript", "cannot commit JSONL tail repair: {s}", .{@errorName(err)});
-            return err;
-        };
-        all.items.len = complete_len;
+        // Do not truncate the live file yet. The prefix is parsed below and
+        // replaced atomically only after every complete record succeeds; a
+        // middle-record failure must leave the original bytes available for
+        // diagnosis and a future repair attempt.
     }
+
+    const original_bytes = all.items;
+    const parse_bytes = all.items[0..complete_len];
+    const tail_dropped = parse_bytes.len != original_bytes.len;
 
     // 按行解析。**全解析成功才提交**:此前是边解析边 append,任何一行失败都会
     // 给调用方留下一个半填充的 conversation——一个"恢复了一半的会话"比明确失败
@@ -476,11 +514,12 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
     var line_number: usize = 0;
     var repaired_file: ?std.ArrayList(u8) = null;
     defer if (repaired_file) |*r| r.deinit(allocator);
-    while (line_start < all.items.len) {
+    while (line_start < parse_bytes.len) {
         const record_start = line_start;
-        const nl = std.mem.indexOfScalarPos(u8, all.items, record_start, '\n') orelse all.items.len;
-        const line = all.items[record_start..nl];
+        const nl = std.mem.indexOfScalarPos(u8, parse_bytes, record_start, '\n') orelse parse_bytes.len;
+        const line = parse_bytes[record_start..nl];
         line_start = nl + 1;
+        line_number += 1;
         if (line.len == 0) continue;
         if (line.len > MAX_TRANSCRIPT_LINE_BYTES) return error.TranscriptLineTooLarge;
 
@@ -495,14 +534,14 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
             errdefer allocator.free(candidate);
             parse_line = candidate;
             const recovered = parseMessageLine(candidate, allocator) catch {
-                log.warn("transcript", "invalid JSONL record line {d} at byte {d}: {s}", .{ line_number + 1, record_start, @errorName(raw_err) });
+                log.warn("transcript", "invalid JSONL record line {d} at byte {d}: {s}", .{ line_number, record_start, @errorName(raw_err) });
                 return raw_err;
             };
             repaired_line = candidate;
             if (repaired_file == null) repaired_file = .empty;
             // Preserve the complete valid prefix exactly; only the damaged
             // record and subsequent records are rewritten on successful load.
-            if (repaired_file.?.items.len == 0) try repaired_file.?.appendSlice(allocator, all.items[0..record_start]);
+            if (repaired_file.?.items.len == 0) try repaired_file.?.appendSlice(allocator, parse_bytes[0..record_start]);
             break :blk recovered;
         };
         if (repaired_file) |*r| {
@@ -512,13 +551,19 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
         if (repaired_line) |r| allocator.free(r);
         errdefer parsed.deinit(allocator);
         try staged.append(allocator, parsed);
-        line_number += 1;
     }
 
     if (repaired_file) |*r| {
+        // Windows cannot replace a pathname while the source descriptor is
+        // open. POSIX permits it, but keeping this close explicit gives both
+        // platforms the same atomic-repair behavior.
         _ = pfs.close(fd);
         source_open = false;
-        try replaceTranscriptFile(session_dir, all.items, r.items);
+        try replaceTranscriptFile(session_dir, original_bytes, r.items);
+    } else if (tail_dropped) {
+        _ = pfs.close(fd);
+        source_open = false;
+        try replaceTranscriptFile(session_dir, original_bytes, parse_bytes);
     }
     // 批量接管:预留成功后逐条追加不可能失败,所以要么一条不进、要么全进。
     // 逐条 append 在第 k>0 条扩容失败时会让前 k 条同时归 conversation 和上面的
@@ -547,14 +592,16 @@ fn loadCompactStateFromMeta(conversation: *Conversation, session_dir: []const u8
     while (true) {
         const n = try readChunk(fd, &buf);
         if (n == 0) break;
-        try all.appendSlice(allocator, buf[0..@intCast(n)]);
+        const count: usize = @intCast(n);
+        if (all.items.len > MAX_META_BYTES - count) return error.MetaTooLarge;
+        try all.appendSlice(allocator, buf[0..count]);
     }
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, all.items, .{}) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
     const boundary_v = parsed.value.object.get("compact_boundary");
-    const boundary: usize = if (boundary_v) |bv| (if (bv == .integer and bv.integer >= 0) @intCast(bv.integer) else 0) else 0;
+    const boundary: usize = if (boundary_v) |bv| (if (bv == .integer) std.math.cast(usize, bv.integer) orelse 0 else 0) else 0;
     const summary: ?[]const u8 = blk: {
         const sv = parsed.value.object.get("compact_summary") orelse break :blk null;
         break :blk if (sv == .string) sv.string else null;
@@ -712,6 +759,11 @@ pub fn listSessions(cwd: []const u8, home: []const u8, allocator: std.mem.Alloca
     while (pdir.next(&it)) |ent| {
         const name = ent.name;
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        // Only canonical session IDs are allowed to become resume targets.
+        // Otherwise a hand-created directory such as `latest` could be listed,
+        // loaded, and leave app.session_id pointing at the old routing key.
+        const parsed_id = SessionId.fromSlice(name) orelse continue;
+        if (std.mem.eql(u8, &parsed_id.bytes, &SessionId.single.bytes)) continue;
         // 不判断 is_dir 兼容性——后面 readMeta 失败会跳过
 
         const full_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/projects/{s}/{s}", .{ home, cwd_hash[0..], name });
@@ -751,10 +803,17 @@ fn readMeta(session_dir: []const u8, allocator: std.mem.Allocator) !struct {
     message_count: usize,
 } {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const path = try std.fmt.bufPrint(&pbuf, "{s}/meta.json\x00", .{session_dir});
+    const lock_path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl", .{session_dir});
+    var lock = try file_lock.acquire(lock_path, .{});
+    defer lock.release();
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/meta.json\x00", .{session_dir});
     const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
-    defer _ = pfs.close(fd);
+    var source_open = true;
+    defer {
+        if (source_open) _ = pfs.close(fd);
+    }
 
     var all = std.ArrayList(u8).empty;
     defer all.deinit(allocator);
@@ -762,10 +821,31 @@ fn readMeta(session_dir: []const u8, allocator: std.mem.Allocator) !struct {
     while (true) {
         const n = try readChunk(fd, &buf);
         if (n == 0) break;
-        try all.appendSlice(allocator, buf[0..@intCast(n)]);
+        const count: usize = @intCast(n);
+        if (all.items.len > MAX_META_BYTES - count) return error.MetaTooLarge;
+        try all.appendSlice(allocator, buf[0..count]);
     }
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, all.items, .{});
+    var repaired_json: ?[]u8 = null;
+    var parsed: std.json.Parsed(std.json.Value) = undefined;
+    if (!std.unicode.utf8ValidateSlice(all.items)) {
+        // JSON scanners may accept raw high bytes inside a string. Validate
+        // the byte stream independently so `/resume` never lists malformed
+        // title/model text, then persist the repaired representation.
+        const candidate = try utf8.repairInvalidUtf8(allocator, all.items);
+        errdefer allocator.free(candidate);
+        parsed = std.json.parseFromSlice(std.json.Value, allocator, candidate, .{}) catch return error.InvalidMeta;
+        repaired_json = candidate;
+    } else {
+        parsed = try std.json.parseFromSlice(std.json.Value, allocator, all.items, .{});
+    }
+    // Register this before any durable replacement can fail; otherwise a
+    // failed repair would leak the candidate buffer on the error path.
+    defer {
+        if (repaired_json) |repaired| allocator.free(repaired);
+    }
+    // Register after the candidate cleanup so parsed's borrowed strings stay
+    // valid until its backing allocation is released.
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidMeta;
@@ -775,11 +855,24 @@ fn readMeta(session_dir: []const u8, allocator: std.mem.Allocator) !struct {
     const lm_v = root.object.get("last_modified_ns") orelse std.json.Value{ .integer = 0 };
     const mc_v = root.object.get("message_count") orelse std.json.Value{ .integer = 0 };
 
+    const message_count = if (mc_v == .integer) std.math.cast(usize, mc_v.integer) orelse return error.InvalidMeta else 0;
+    if (repaired_json) |repaired| {
+        _ = pfs.close(fd);
+        source_open = false;
+        replaceMetaFile(session_dir, all.items, repaired) catch |err| {
+            // The in-memory candidate is already valid and can safely power
+            // `/resume`; a read-only or concurrently replaced directory must
+            // not make an otherwise recoverable session disappear. Retry the
+            // durable repair on the next listing and leave an audit trail.
+            log.warn("transcript", "could not persist repaired meta.json in {s}: {s}", .{ session_dir, @errorName(err) });
+        };
+    }
+
     return .{
         .title = try allocator.dupe(u8, if (title_v == .string) title_v.string else ""),
         .model = try allocator.dupe(u8, if (model_v == .string) model_v.string else ""),
         .last_modified_ns = if (lm_v == .integer) lm_v.integer else 0,
-        .message_count = if (mc_v == .integer) @intCast(mc_v.integer) else 0,
+        .message_count = message_count,
     };
 }
 

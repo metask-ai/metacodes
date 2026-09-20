@@ -666,7 +666,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
                 // 后台:profile 文件不能删(进程还在跑),detach
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-                const j = try registry.spawnBackgroundOwned(command, cwd_opt, ctx.agent_ident);
+                const j = try registry.spawnBackgroundOwned(command, cwd_opt, ctx.session);
                 // Same rule as the auto-backgrounded snapshot: the spool is a
                 // staging path and never model-visible. BashOutput polls by
                 // job_id and reads incrementally.
@@ -714,7 +714,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.result_budget,
             ctx.tool_result_metrics,
             attachments,
-            ctx.agent_ident,
+            ctx.session,
         );
     }
 
@@ -738,7 +738,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.result_budget,
             ctx.tool_result_metrics,
             attachments,
-            ctx.agent_ident,
+            ctx.session,
         );
     }
 

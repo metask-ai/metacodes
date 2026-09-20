@@ -708,8 +708,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             null;
         defer if (run_control) |control| control.deinit();
         if (run_control) |control| control.requireDetachedIdle(
-            (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
-                (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+            (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+                (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
             app.swarm.hasTeam(),
         ) catch |err| {
             try control.finishRun(@errorName(err));
@@ -3921,7 +3921,7 @@ fn printStartupBanner(app: *const app_mod.App) void {
 fn printBannerLine(th: anytype, inner: usize, text: []const u8) void {
     const pad_left = 2;
     const avail = if (inner > pad_left) inner - pad_left else 0; // text 最多占 inner-2 列
-    const shown = if (displayWidthAscii(text) > avail) text[0..@min(text.len, avail)] else text;
+    const shown = if (displayWidthAscii(text) > avail) prefixToDisplayWidth(text, avail) else text;
     std.debug.print("{s}{s}{s}  {s}", .{ th.accent, th.box_v, th.reset, shown });
     // 右补空格,使 pad_left + shown_width + fill == inner,再竖线。
     var w: usize = pad_left + displayWidthAscii(shown);
@@ -3932,6 +3932,23 @@ fn printBannerLine(th: anytype, inner: usize, text: []const u8) void {
 /// 粗略显示宽(ASCII 1/字;非 ASCII 字节按 UTF-8 估算——banner 文本多为路径/模型名,ASCII 为主)。
 fn displayWidthAscii(s: []const u8) usize {
     return @import("tui/term.zig").displayWidth(s);
+}
+
+fn prefixToDisplayWidth(s: []const u8, max_cols: usize) []const u8 {
+    const term = @import("tui/term.zig");
+    var i: usize = 0;
+    var cols: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const width = if (n > 1 and i + n <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + n]))
+            term.displayWidth(s[i .. i + n])
+        else
+            1;
+        if (cols + width > max_cols) break;
+        cols += width;
+        i += if (n > 1 and i + n <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + n])) n else 1;
+    }
+    return s[0..i];
 }
 
 /// 启动建议:跑 `git log` 找最近改动文件,给一条灰色提示。失败静默。
@@ -3974,7 +3991,11 @@ fn stopSelectedAgent(app: *app_mod.App, region: *render_region_mod.RenderRegion)
     const snaps = reg.snapshotJobsForSession(allocator, app.session_id) catch return;
     defer agent_job_registry_mod.AgentJobRegistry.freeSnapshots(allocator, snaps);
     if (sel - 1 >= snaps.len) return;
-    reg.kill(snaps[sel - 1].id) catch {};
+    if (snaps[sel - 1].foreground) {
+        reg.abortForSession(snaps[sel - 1].id, app.session_id) catch {};
+    } else {
+        reg.killForSession(snaps[sel - 1].id, app.session_id) catch {};
+    }
     std.debug.print("\r\x1b[2K\x1b[33m[stopped agent {s}]\x1b[0m\n", .{snaps[sel - 1].desc});
 }
 
@@ -4222,8 +4243,15 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     // agent_loop 的 Options.session / 权限对话框路由仍用旧 id(漂移)。同步切到 resumed session id。
     if (target_id) |tid| {
         if (@import("../core/session_id.zig").SessionId.fromSlice(tid)) |sid| {
+            // A team is live process state, not part of the transcript. Drop
+            // the old roster before changing identity so `/resume` cannot
+            // leave an old worker, inbox, or worktree visible to the new run.
+            if (!std.mem.eql(u8, app.session_id.asSlice(), sid.asSlice()) and app.swarm.hasTeam()) {
+                app.swarm.detachTeam();
+            }
             app.session_id = sid;
             app.permission_ctx.session = sid; // 权限对话框路由到本会话视图(M5/M6)
+            app.swarm.session = sid;
         }
     }
 

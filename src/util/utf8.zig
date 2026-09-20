@@ -33,12 +33,28 @@ pub fn prefixEnd(bytes: []const u8, limit: usize) usize {
             p += 1;
             continue;
         };
-        if (p + length > bound) break;
-        if (p + length <= bytes.len and std.unicode.utf8ValidateSlice(bytes[p .. p + length])) {
-            p += length;
-        } else {
-            p += 1;
+        // A sequence that reaches past the requested page is normally left
+        // intact for the next page.  If the bytes already available prove it
+        // malformed (a lead followed by a non-continuation), however, the
+        // lead is a one-byte recovery unit and must be addressable.  Without
+        // this check a page containing `e4 60` would publish offset 1 but
+        // reject that same offset on the next request.
+        const available_end = @min(p + length, bytes.len);
+        var malformed = false;
+        if (available_end > p + 1) {
+            for (bytes[p + 1 .. available_end]) |byte| {
+                if (!isContinuationByte(byte)) {
+                    malformed = true;
+                    break;
+                }
+            }
         }
+        if (malformed) {
+            p += 1;
+            continue;
+        }
+        if (p + length > bytes.len or p + length > bound) break;
+        if (std.unicode.utf8ValidateSlice(bytes[p .. p + length])) p += length else p += 1;
     }
     return p;
 }
@@ -54,14 +70,29 @@ pub fn nextBoundary(bytes: []const u8, offset: usize) usize {
     return p + 1;
 }
 
+/// Return the byte offset of a trailing, otherwise-valid UTF-8 sequence that
+/// is incomplete at the end of `bytes`. Malformed bytes are not classified as
+/// pending: they remain ordinary one-byte data for the caller to repair or
+/// base64-encode.
+pub fn incompleteTailStart(bytes: []const u8) ?usize {
+    if (bytes.len == 0) return null;
+    var start = bytes.len - 1;
+    while (start > 0 and isContinuationByte(bytes[start])) : (start -= 1) {}
+    const length = std.unicode.utf8ByteSequenceLength(bytes[start]) catch return null;
+    if (start + length <= bytes.len) return null;
+    for (bytes[start + 1 ..]) |byte| if (!isContinuationByte(byte)) return null;
+    return start;
+}
+
 /// Return a bounded page which makes progress even when the first code point
 /// is wider than the requested budget. The source cursor remains a raw-byte
 /// offset; the caller decides how an invalid byte is represented downstream.
 pub fn pagePrefix(bytes: []const u8, max_bytes: usize) []const u8 {
     if (bytes.len == 0 or max_bytes == 0) return bytes[0..0];
-    if (bytes.len <= max_bytes) return bytes;
     const end = prefixEnd(bytes, max_bytes);
+    if (end == bytes.len and bytes.len <= max_bytes) return bytes;
     if (end != 0) return bytes[0..end];
+    if (incompleteTailStart(bytes)) |_| return bytes[0..0];
     return bytes[0..nextBoundary(bytes, 0)];
 }
 
@@ -100,14 +131,24 @@ test "UTF-8 boundaries never split a valid sequence and always advance" {
 
 test "UTF-8 boundary treats malformed bytes as progress units" {
     const bytes = "a\xe4\x60";
-    try std.testing.expectEqual(@as(usize, 1), prefixEnd(bytes, 2));
+    try std.testing.expectEqual(@as(usize, 2), prefixEnd(bytes, 2));
     try std.testing.expectEqual(@as(usize, 2), nextBoundary(bytes, 1));
+    // A page may expose the malformed lead as one raw source byte.  The
+    // following cursor must then be accepted by the same boundary predicate.
+    try std.testing.expectEqual(@as(usize, 1), prefixEnd("\xe4\x60", 1));
+    try std.testing.expectEqual(@as(usize, 0), prefixEnd("\xe4\x80", 1));
 }
 
 test "pagePrefix makes progress when a code point exceeds the budget" {
     const text = "中";
     try std.testing.expectEqualStrings(text, pagePrefix(text, 1));
     try std.testing.expectEqualStrings(text, pagePrefix(text, 2));
+}
+
+test "pagePrefix leaves an incomplete trailing code point for the next chunk" {
+    try std.testing.expectEqual(@as(usize, 0), pagePrefix("\xe4", 3).len);
+    try std.testing.expectEqual(@as(?usize, 0), incompleteTailStart("\xe4"));
+    try std.testing.expect(incompleteTailStart("\xe4`") == null);
 }
 
 test "repairInvalidUtf8 replaces malformed bytes without changing valid text" {

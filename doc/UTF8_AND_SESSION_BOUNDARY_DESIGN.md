@@ -36,6 +36,11 @@ the same bytes/text failure.
    production fallback.
 8. A background job keeps its origin session and cannot follow the currently
    visible session after Ctrl+B or `/resume`.
+9. A persisted team records `leadSessionId` and every member's `sessionId`.
+   Process-mode members also carry a per-spawn `leaseId` and the expected
+   `cwd/worktree`. The child validates all four values at startup and before
+   consuming mailbox work; legacy records without them fail closed instead of
+   routing by name alone.
 
 ## Data and boundary API
 
@@ -58,20 +63,25 @@ must not include timestamps or runtime paths.
 ## Producers and persistence
 
 Command previews, `TaskOutput`, web/PDF reads, provider payloads, transcript
-blocks, metadata titles, and notification summaries all use the boundary API.
-All JSON string fields use the repository canonical JSON writer; the existing
-lossy sanitizer is a final defense, not the source-of-truth text model.
+blocks, metadata titles, notification summaries, and the host-facing NDJSON/
+ABI adapters all use the boundary API. Hand-written JSON uses the repository
+canonical writer; generic serializers at a transport boundary pass through the
+UTF-8 repair adapter. Internal content-addressed records still serialize typed
+validated values directly, while binary branches remain explicit base64 or
+artifact envelopes. The lossy sanitizer is a final defense, not the
+source-of-truth text model.
 
 The implementation keeps the current transcript format for compatibility but
 hardens it: serialize complete records, serialize flushes under a writer lock,
 handle short writes, fsync before advancing durable counters, require a final
 newline, and report line/byte diagnostics. A failed append marks the writer for
 full rebuild before retry, so a partial write cannot be duplicated. A torn final
-tail is truncated to the last complete newline. Legacy records containing only
-invalid UTF-8 are repaired with U+FFFD, the pre-repair complete records are
-retained as `transcript.jsonl.corrupt`, and the repaired file is fsynced before
-`/resume` continues. Middle JSON structure corruption remains a hard,
-actionable error.
+tail is treated as uncommitted; after the complete prefix validates, the source
+is replaced atomically and the original bytes are retained as
+`transcript.jsonl.corrupt`. Legacy records containing only invalid UTF-8 are
+repaired with U+FFFD using the same atomic replacement. Metadata reads are
+bounded and repair invalid UTF-8 before publishing the `/resume` index. Middle
+JSON structure corruption remains a hard, actionable error.
 
 A future framed segment/manifest journal can strengthen torn-write guarantees;
 it is deliberately separate from the UTF-8 fix so this change does not alter
@@ -86,6 +96,14 @@ two routing keys must not diverge. Registry entries retain their origin
 session/agent identity, and snapshots, output, abort, notification, and UI
 events filter by that scope. `/resume` changes the foreground session only and
 never rebinds existing jobs.
+
+Process-mode teammate startup binds `--parent-session-id` before `App.init`, so
+KG identity, provider-visible context, plan paths, permissions, and transcript
+all use the same parent session from the first request. Team names are
+canonicalized before path construction. Each spawn receives a fresh lease and
+the child refuses a changed or missing worktree; it never falls back to the
+lead cwd. A child is terminated and reaped if publication of its process record
+fails.
 
 ## Verification
 

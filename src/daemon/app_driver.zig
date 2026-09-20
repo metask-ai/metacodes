@@ -122,8 +122,8 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
             null;
         defer if (run_control) |control| control.deinit();
         if (run_control) |control| control.requireDetachedIdle(
-            (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
-                (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+            (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+                (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
             app.swarm.hasTeam(),
         ) catch |err| {
             control.finishRun(@errorName(err)) catch {};

@@ -681,8 +681,8 @@ pub fn handleSlash(
         null;
     defer if (run_control) |control| control.deinit();
     if (run_control) |control| control.requireDetachedIdle(
-        (if (app.jobs) |*registry| registry.runningCount() else 0) +|
-            (if (app.agent_jobs) |*registry| registry.runningCount() else 0),
+        (if (app.jobs) |*registry| registry.runningCountForOwner(app.session_id) else 0) +|
+            (if (app.agent_jobs) |*registry| registry.runningCountForSession(app.session_id) else 0),
         app.swarm.hasTeam(),
     ) catch |err| {
         try control.finishRun(@errorName(err));

@@ -9,10 +9,12 @@ const teammate_mod = @import("teammate.zig");
 const team_mod = @import("team.zig");
 const types_mod = @import("../types.zig");
 const dialect_mod = @import("../api/dialect.zig");
+const SessionId = @import("../core/session_id.zig").SessionId;
 
 /// 一个进程外 teammate 的 lead 侧记录(owned strings)。
 pub const ProcessTeammate = struct {
     pid: i64, // 平台中立(Windows std.c.pid_t 是 HANDLE=*anyopaque,不能格式化/@intCast)
+    session: SessionId,
     name: []u8, // sanitized
     worktree_path: []u8, // 空 = 无 worktree
     repo: []u8, // git repo 根(removeWorktree 的 git -C);空 = 用进程 cwd
@@ -20,6 +22,9 @@ pub const ProcessTeammate = struct {
 
 pub const SwarmContext = struct {
     allocator: std.mem.Allocator,
+    /// Session that owns this team roster; resume must not address a prior
+    /// session's teammates by name.
+    session: SessionId = SessionId.single,
     /// HOME(teams 目录根 `{home}/.metacodes/teams`)。空 = swarm 不可用。
     home: []const u8 = "",
     /// 调用者身份(lead="team-lead";teammate=自己 sanitized 名)。
@@ -117,21 +122,66 @@ pub const SwarmContext = struct {
         self.process_teammates.clearRetainingCapacity();
     }
 
+    /// A lead can be resumed in a fresh process with no in-memory child list.
+    /// Before deleting the durable team directory, refuse to proceed when the
+    /// persisted roster says a process child exists without a matching local
+    /// pid record. Even an idle child can wake on a mailbox message, so this
+    /// conservative check prevents a resumed lead from deleting a live child's
+    /// mailbox and worktree state.
+    pub fn hasUntrackedProcessMember(self: *SwarmContext) bool {
+        if (!self.is_lead or self.home.len == 0 or self.team_sanitized.len == 0) return false;
+        var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cfg = self.configPath(&cfg_buf);
+        var tf = team_mod.load(self.allocator, cfg) orelse return true;
+        defer tf.deinit();
+        const lead = tf.lead_session_id orelse return true;
+        if (!std.mem.eql(u8, lead, self.session.asSlice())) return true;
+        for (tf.members.items) |*member| {
+            if (!std.mem.eql(u8, member.backend_type, "process")) continue;
+            var tracked = false;
+            for (self.process_teammates.items) |*process_member| {
+                if (std.mem.eql(u8, process_member.session.asSlice(), self.session.asSlice()) and
+                    std.mem.eql(u8, process_member.name, member.name))
+                {
+                    tracked = true;
+                    break;
+                }
+            }
+            if (!tracked) return true;
+        }
+        return false;
+    }
+
     pub fn deinit(self: *SwarmContext) void {
+        self.detachTeam();
+        self.process_teammates.deinit(self.allocator);
+    }
+
+    /// Drop the current roster before changing session identity. A team is
+    /// runtime state, not transcript state; retaining it across `/resume`
+    /// would let the resumed session address workers owned by the old one.
+    /// This is also used by `deinit`, so all worker and worktree cleanup stays
+    /// in one ordered path.
+    pub fn detachTeam(self: *SwarmContext) void {
+        const preserve_durable_team = self.hasUntrackedProcessMember();
         // SW6:先关进程外 teammate(SIGTERM→等死→收尸→removeWorktree;等死在删 worktree 之前,
         // 否则与 teammate 写 worktree 竞态),再收 in-process。
         self.terminateProcessTeammates(2000);
-        self.process_teammates.deinit(self.allocator);
         // 先 abort+join 全 teammate 线程(它们可能在写 config/inbox),再清目录——顺序不可换。
-        if (self.teammates) |*t| t.deinit();
-        // SW4 orphan 清理:lead 退出时删会话创建的 team 目录(对齐 cc cleanupSessionTeams;
-        // 否则 lead 崩溃/正常退出都留一堆 ~/.metacodes/teams/<t> 僵尸目录)。
-        if (self.is_lead and self.team_sanitized.len > 0 and self.home.len > 0) {
+        if (self.teammates) |*t| {
+            t.deinit();
+            self.teammates = null;
+        }
+        // SW4 orphan 清理:lead 退出或 resume 换 session 时删当前 team 目录。
+        if (!preserve_durable_team and self.is_lead and self.team_sanitized.len > 0 and self.home.len > 0) {
             var buf: [std.fs.max_path_bytes]u8 = undefined;
             const dir = team_mod.teamDirPath(self.home, self.team_sanitized, &buf);
-            if (dir.len > 0) @import("../util/fs.zig").removeTeamDirTree(dir); // 生产安全(Linus HIGH-1)
+            if (dir.len > 0) @import("../util/fs.zig").removeTeamDirTree(dir);
         }
-        if (self.team_sanitized.len > 0) self.allocator.free(self.team_sanitized);
+        if (self.team_sanitized.len > 0) {
+            self.allocator.free(self.team_sanitized);
+            self.team_sanitized = &.{};
+        }
     }
 
     /// 是否在一个 team 里(可 SendMessage / 邮箱寻址)。**只看 team 名**——teammate 视角
@@ -139,6 +189,10 @@ pub const SwarmContext = struct {
     /// 另经 is_lead + teammates.? 门控(见 tools.zig)。
     pub fn hasTeam(self: *const SwarmContext) bool {
         return self.team_sanitized.len > 0;
+    }
+
+    pub fn hasTeamForSession(self: *const SwarmContext, session: SessionId) bool {
+        return self.hasTeam() and std.mem.eql(u8, self.session.asSlice(), session.asSlice());
     }
 
     /// config.json 路径(当前 team;无 team → "")。写进 buf。

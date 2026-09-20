@@ -105,9 +105,11 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
-    const head = try std.fmt.allocPrint(ctx.allocator, "{{\"remembered\":{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\"}}", .{ node_id, resolved.schema_type, if (scope_global) "global" else "project" });
-    defer ctx.allocator.free(head);
-    try out.appendSlice(ctx.allocator, head);
+    try out.print(ctx.allocator, "{{\"remembered\":{{\"node_id\":{d},\"type\":", .{node_id});
+    try appendJsonString(&out, ctx.allocator, resolved.schema_type);
+    try out.appendSlice(ctx.allocator, ",\"scope\":");
+    try appendJsonString(&out, ctx.allocator, if (scope_global) "global" else "project");
+    try out.appendSlice(ctx.allocator, "}");
     if (dup_note) |n| {
         try out.appendSlice(ctx.allocator, ",\"note\":");
         try appendJsonString(&out, ctx.allocator, n);
@@ -480,11 +482,13 @@ fn executeRecallBatch(
         try out.print(ctx.allocator, "\"{s}\":{d}", .{ type_name, count });
     }
     try out.appendSlice(ctx.allocator, "},\"lexical_query_plan\":{");
-    try out.print(
-        ctx.allocator,
-        "\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_count\":{d},\"executed_variant_count\":{d},\"all_variants_executed\":true,\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"merged_hit_count\":{d},\"merged_new_hit_count\":{d},\"merged_previously_seen_count\":{d},\"probe_new_hit_count\":{d},\"probe_repeated_hit_count\":{d},\"query_anchor_rewritten\":{s},\"query_anchor_input_sha256\":\"{s}\",\"query_anchor_effective_sha256\":\"{s}\",\"variant_receipts\":[",
-        .{ plan.schema_version.text(), plan.fingerprint, @tagName(plan.intent), @tagName(plan.stage), plan.variants.len, plan.variants.len, ledger_seen_count, ledger_scope, merged_count, merged_new_count, merged_previously_seen_count, probe_new_count, probe_repeated_count, if (plan.query_anchor_rewritten) "true" else "false", plan.query_anchor_input_sha256, plan.query_anchor_effective_sha256 },
-    );
+    try out.print(ctx.allocator, "\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_count\":{d},\"executed_variant_count\":{d},\"all_variants_executed\":true,\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":", .{
+        plan.schema_version.text(), plan.fingerprint, @tagName(plan.intent), @tagName(plan.stage), plan.variants.len, plan.variants.len, ledger_seen_count,
+    });
+    try appendJsonString(&out, ctx.allocator, ledger_scope);
+    try out.print(ctx.allocator, ",\"merged_hit_count\":{d},\"merged_new_hit_count\":{d},\"merged_previously_seen_count\":{d},\"probe_new_hit_count\":{d},\"probe_repeated_hit_count\":{d},\"query_anchor_rewritten\":{s},\"query_anchor_input_sha256\":\"{s}\",\"query_anchor_effective_sha256\":\"{s}\",\"variant_receipts\":[", .{
+        merged_count, merged_new_count, merged_previously_seen_count, probe_new_count, probe_repeated_count, if (plan.query_anchor_rewritten) "true" else "false", plan.query_anchor_input_sha256, plan.query_anchor_effective_sha256,
+    });
     for (plan.variants, 0..) |variant, variant_index| {
         if (variant_index > 0) try out.append(ctx.allocator, ',');
         const receipt = receipts[variant_index];
@@ -599,11 +603,11 @@ pub fn appendRecallHitRow(
     superseded_symbols: []const []const u8,
 ) !void {
     const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
-    const row = try std.fmt.allocPrint(allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
-        hit.node_id, type_str, if (std.mem.eql(u8, hit.domain, "global")) "global" else "project", hit.score,
-    });
-    defer allocator.free(row);
-    try out.appendSlice(allocator, row);
+    try out.print(allocator, "{{\"node_id\":{d},\"type\":", .{hit.node_id});
+    try appendJsonString(out, allocator, type_str);
+    try out.appendSlice(allocator, ",\"scope\":");
+    try appendJsonString(out, allocator, if (std.mem.eql(u8, hit.domain, "global")) "global" else "project");
+    try out.print(allocator, ",\"score\":{d:.2},\"text\":", .{hit.score});
     // The budget is provider-visible JSON payload bytes, not merely decoded
     // source bytes. Control characters can expand 6x when escaped; budgeting
     // before serialization would recreate the oversized-result failure with
@@ -661,25 +665,11 @@ fn appendLexicalPlanReceipt(
         .batch_all, .seed_shape_rewrite => unreachable,
     };
     const selected = plan.selected();
-    const receipt = try std.fmt.allocPrint(
-        allocator,
-        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_index\":{d},\"variant_count\":{d},\"variant_kind\":\"{s}\",\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}",
-        .{
-            plan.schema_version.text(),
-            plan.fingerprint,
-            @tagName(plan.intent),
-            @tagName(plan.stage),
-            variant_index,
-            plan.variants.len,
-            @tagName(selected.kind),
-            seen_node_count,
-            ledger_scope,
-            new_hit_count,
-            repeated_hit_count,
-        },
-    );
-    defer allocator.free(receipt);
-    try out.appendSlice(allocator, receipt);
+    try out.print(allocator, ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_index\":{d},\"variant_count\":{d},\"variant_kind\":\"{s}\",\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":", .{
+        plan.schema_version.text(), plan.fingerprint, @tagName(plan.intent), @tagName(plan.stage), variant_index, plan.variants.len, @tagName(selected.kind), seen_node_count,
+    });
+    try appendJsonString(out, allocator, ledger_scope);
+    try out.print(allocator, ",\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}", .{ new_hit_count, repeated_hit_count });
 }
 
 /// Emit a proof-carrying recovery receipt for the safe malformed v3 shapes:
@@ -735,22 +725,13 @@ fn appendSeedShapeRewriteReceipt(
         if (index > 0) try out.append(allocator, ',');
         try out.print(allocator, "{d}", .{node_id});
     }
-    try out.print(
-        allocator,
-        "],\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}],\"execution\":\"host_seed_shape_rewrite\",\"rewrite\":{{\"schema_version\":\"{s}\",\"reason\":\"{s}\",\"input_plan_sha256\":\"{s}\",\"effective_plan_sha256\":\"{s}\",\"effective_seed_sha256\":\"{s}\",\"input_stage\":\"{s}\",\"effective_stage\":\"seed\",\"declared_variant_count\":{d},\"executed_variant_count\":1,\"unexecuted_semantic_variant_count\":{d}}}}}",
-        .{
-            new_hit_count,
-            repeated_hit_count,
-            lexical_query_plan.SEED_SHAPE_REWRITE_SCHEMA_VERSION,
-            rewrite.reason,
-            rewrite.input_plan_sha256,
-            plan.fingerprint,
-            rewrite.effective_seed_sha256,
-            @tagName(rewrite.input_stage),
-            rewrite.declared_variant_count,
-            rewrite.unexecuted_semantic_variant_count,
-        },
-    );
+    try out.print(allocator, "],\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}],\"execution\":\"host_seed_shape_rewrite\",\"rewrite\":{{\"schema_version\":\"{s}\",\"reason\":", .{
+        new_hit_count, repeated_hit_count, lexical_query_plan.SEED_SHAPE_REWRITE_SCHEMA_VERSION,
+    });
+    try appendJsonString(out, allocator, rewrite.reason);
+    try out.print(allocator, ",\"input_plan_sha256\":\"{s}\",\"effective_plan_sha256\":\"{s}\",\"effective_seed_sha256\":\"{s}\",\"input_stage\":\"{s}\",\"effective_stage\":\"seed\",\"declared_variant_count\":{d},\"executed_variant_count\":1,\"unexecuted_semantic_variant_count\":{d}}}}}", .{
+        rewrite.input_plan_sha256, plan.fingerprint, rewrite.effective_seed_sha256, @tagName(rewrite.input_stage), rewrite.declared_variant_count, rewrite.unexecuted_semantic_variant_count,
+    });
 }
 
 const DEFAULT_CONTEXT_EDGES: usize = 12;

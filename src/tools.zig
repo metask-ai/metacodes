@@ -582,7 +582,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskOutput",
-        .description = "Wait for a backgrounded Task subagent by agent_job_id. Omit since_byte to wait up to 30 seconds for terminal status; pass since_byte = previous output_next_offset to wait for incremental output instead. output_total_bytes is retained as the next cursor for compatibility; output_size_bytes reports the current total. When done, returns final_text + stop_reason. Args: agent_job_id (required), since_byte, max_bytes (optional).",
+        .description = "Read a backgrounded Task subagent by agent_job_id. Omit since_byte to start at offset 0 and wait up to 30 seconds for the first output or terminal status; pass since_byte = previous output_next_offset to wait for incremental output. output_total_bytes is retained as the next cursor for compatibility; output_size_bytes reports the current total. When done, returns final_text + stop_reason. Args: agent_job_id (required), since_byte, max_bytes (optional).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "agent_job_id", .type = "string", .description = "The backgrounded agent job id to read" },
             .{ .name = "since_byte", .type = "integer", .description = "Byte offset to poll from (previous output_next_offset)" },

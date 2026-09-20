@@ -374,8 +374,18 @@ fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
     if (s >= data.len or data[s] != '"') return null;
     s += 1;
     var e = s;
+    var escaped = false;
     while (e < data.len) : (e += 1) {
-        if (data[e] == '"' and data[e - 1] != '\\') break;
+        const byte = data[e];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte == '"') break;
     }
     return data[s..e];
 }

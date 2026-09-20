@@ -23,6 +23,10 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 
 - **磁盘**:`{home}/.metacodes/teams/<team>/config.json`(TeamFile)+ `inboxes/<name>.json`(邮箱)。
 - **身份**:`name@team`(确定性,lead 可推算任何 teammate id,重启不变)。`team-lead` 保留名。
+- **会话归属**:`TeamFile.leadSessionId` 记录创建该队伍的 lead session；每个 member
+  的 `sessionId` 必须等于它所属的 lead session。进程外 member 另外保存每次 spawn 生成的
+  `leaseId`；恢复、轮换 session、删除后重建同名成员或启动进程外 teammate 时都以父 session
+  和 lease 双重校验。缺少字段的旧配置按不属于当前 session 处理并拒绝操作。
 - **file_lock**(`src/util/file_lock.zig`):`<path>.lock` O_EXCL 哨兵 + **原子 rename 两阶段抢占**(防双持有)+ mtime 兜底陈旧检测。
 - **mailbox**:锁内读-改-写;消息 `{from,text,timestamp,read,color?,summary?}`;`classify` 真顶层 JSON parse 认协议类型(非 substring,防误判);`markReadAt` 选择性标读(协议消息留给消费者);软顶 500(裁最旧已读)+ 硬顶 5000(丢最旧未读 + log.warn)。
 - **updateTeam**:一切 team 变更的唯一锁内 RMW 入口(防丢更新)。
@@ -75,8 +79,14 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 
 `src/swarm/teammate_process.zig`
 
-- **`--teammate` runtime**:身份 CLI args(--agent-name/--team-name/--parent-session-id/--teammate-cwd);worktree chdir + **同步更新 app.cwd_abs/project_dir**(光 chdir 没用,工具用 cwd_abs 解析路径);mailbox 消息循环(waitForWork 镜像 in-process);fail-closed 权限。
+- **`--teammate` runtime**:身份 CLI args(--agent-name/--team-name/--parent-session-id/--teammate-lease-id/--teammate-cwd);worktree chdir + **同步更新 app.cwd_abs/project_dir**(光 chdir 没用,工具用 cwd_abs 解析路径);mailbox 消息循环(waitForWork 镜像 in-process);fail-closed 权限。
 - **lead-spawn**:`--teammate-mode process` → Task(name) 走 `spawnTeammateProcess`(createWorktree `git -C repo` + 登记 member `backend_type=process`/worktree_path + `forkExecTeammate` fork **零分配**只 async-signal-safe + 追踪 `process_teammates` 供 deinit kill+removeWorktree)。
+- **进程启动绑定**:父 session 在 `App.init` 之前注入子进程配置，保证 KG、prompt、权限、plan
+  和 transcript 从第一帧就使用同一个 session；子进程另生成独立的 agent identity，避免把
+  协调身份和会话路由身份混用。team 名必须是 canonical sanitized 形式，成员从持久化配置
+  被删除、换绑或 cwd/worktree 改变后，进程在启动和下一次轮询前 fail closed；指定的
+  worktree 无法 chdir/realpath 时也直接退出，绝不降级到 lead cwd。spawn 后尚未登记成功
+  时的子进程会被 kill+reap，避免留下无主进程。
 - **排除(用户指令)**:Linux bubblewrap 沙箱不做。macOS Seatbelt 沙箱复用(同 App/同 Bash 工具,settings 开则自然套 wrapCommand)。
 - register SW7:真 fork+exec e2e / plan-mode 非继承显式 guard / Seatbelt 验证。
 

@@ -43,6 +43,36 @@ const test_long_running_command = if (builtin.os.tag == .windows)
 else
     "sleep 30";
 
+fn repairJsonUtf8(allocator_: std.mem.Allocator, input: []const u8) ![]u8 {
+    if (std.unicode.utf8ValidateSlice(input)) return try allocator_.dupe(u8, input);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator_);
+    var i: usize = 0;
+    while (i < input.len) {
+        const c = input[i];
+        if (c < 0x80) {
+            try out.append(allocator_, c);
+            i += 1;
+            continue;
+        }
+        const width = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        if (width > 1 and i + width <= input.len and std.unicode.utf8ValidateSlice(input[i .. i + width])) {
+            try out.appendSlice(allocator_, input[i .. i + width]);
+            i += width;
+        } else {
+            try out.appendSlice(allocator_, "�");
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator_);
+}
+
+fn stringifyJson(allocator_: std.mem.Allocator, value: anytype) ![]u8 {
+    const raw = try std.json.Stringify.valueAlloc(allocator_, value, .{});
+    defer allocator_.free(raw);
+    return repairJsonUtf8(allocator_, raw);
+}
+
 comptime {
     if (wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 != @as(u64, core.tool_exec.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1))
         @compileError("AgentCore wire and core encoded Host-error limits must match");
@@ -729,7 +759,7 @@ fn encodePublicEventJson(
         },
         else => {},
     }
-    return std.json.Stringify.valueAlloc(event_allocator, normalized, .{});
+    return stringifyJson(event_allocator, normalized);
 }
 
 const AbiSession = struct {
@@ -1266,10 +1296,9 @@ const AbiSession = struct {
                 .allow_session => .allow_session,
             } else null,
         };
-        const json = std.json.Stringify.valueAlloc(
+        const json = stringifyJson(
             allocator,
             public_protocol.CoreEvent{ .permission_provenance = dto },
-            .{},
         ) catch {
             self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
             return error.OutOfMemory;
@@ -1301,10 +1330,9 @@ const AbiSession = struct {
             return false;
         };
         defer allocator.free(snapshot.in_flight_tools);
-        const json = std.json.Stringify.valueAlloc(
+        const json = stringifyJson(
             allocator,
             public_protocol.CoreEvent{ .run_state = snapshot },
-            .{},
         ) catch {
             self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
             return false;
@@ -3855,19 +3883,11 @@ fn canonicalInvocationRecord(
     output.writer.writeAll("\",\"skill_id\":\"") catch return error.OutOfMemory;
     output.writer.writeAll(&plan.skill.execution_id) catch return error.OutOfMemory;
     output.writer.writeAll("\",\"invocation_name\":") catch return error.OutOfMemory;
-    std.json.Stringify.encodeJsonString(
-        plan.skill.invocation_name,
-        .{},
-        &output.writer,
-    ) catch return error.OutOfMemory;
+    std.json.Stringify.encodeJsonString(plan.skill.invocation_name, .{}, &output.writer) catch return error.OutOfMemory;
     output.writer.writeAll(",\"arguments\":{\"values\":[") catch return error.OutOfMemory;
     for (plan.arguments, 0..) |argument, index| {
         if (index != 0) output.writer.writeByte(',') catch return error.OutOfMemory;
-        std.json.Stringify.encodeJsonString(
-            argument,
-            .{},
-            &output.writer,
-        ) catch return error.OutOfMemory;
+        std.json.Stringify.encodeJsonString(argument, .{}, &output.writer) catch return error.OutOfMemory;
     }
     output.writer.writeAll("]}}") catch return error.OutOfMemory;
     return output.toOwnedSlice() catch error.OutOfMemory;
@@ -5257,7 +5277,7 @@ fn encodeMcpCatalogDescription(
         .tools = tools,
         .issues = issues,
     };
-    const encoded = std.json.Stringify.valueAlloc(output_allocator, dto, .{}) catch
+    const encoded = stringifyJson(output_allocator, dto) catch
         return error.OutOfMemory;
     if (encoded.len > wire.MAX_DESCRIPTION_JSON_BYTES_V1) {
         output_allocator.free(encoded);
@@ -6179,7 +6199,7 @@ fn encodeSessionDescription(
             .issues = try encodeAuthorityIssues(a, description.authority_issues),
         },
     };
-    const encoded = std.json.Stringify.valueAlloc(output_allocator, dto, .{}) catch
+    const encoded = stringifyJson(output_allocator, dto) catch
         return error.OutOfMemory;
     if (encoded.len > wire.MAX_DESCRIPTION_JSON_BYTES_V1) {
         output_allocator.free(encoded);
@@ -6217,7 +6237,7 @@ fn encodeRestoreReport(
         },
         .issues = try encodeAuthorityIssues(a, report.issues),
     };
-    const encoded = std.json.Stringify.valueAlloc(output_allocator, dto, .{}) catch
+    const encoded = stringifyJson(output_allocator, dto) catch
         return error.OutOfMemory;
     if (encoded.len > wire.MAX_DESCRIPTION_JSON_BYTES_V1) {
         output_allocator.free(encoded);

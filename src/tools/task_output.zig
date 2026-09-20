@@ -41,14 +41,41 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     const reg = ctx.agent_jobs orelse return error.AgentJobsUnavailable;
-    const e = reg.getBackgroundForSession(id, ctx.session) orelse return error.JobNotFound;
+    const e = reg.acquireBackgroundForSession(id, ctx.session) orelse return error.JobNotFound;
+    defer reg.releaseBackground(e);
 
+    const since_raw = common.extractJsonArg(args, "since_byte");
     const since_arg = parseUsizeArg(args, "since_byte");
+    if (since_raw != null and since_arg == null) {
+        common.setErrorDetail(ctx.error_detail, allocator, "TaskOutput since_byte must be a non-negative integer", .{});
+        return error.InvalidSinceByte;
+    }
     const since = since_arg orelse 0;
-    const max_bytes = parseUsizeArg(args, "max_bytes") orelse DEFAULT_MAX_BYTES;
+    const max_raw = common.extractJsonArg(args, "max_bytes");
+    const max_arg = parseUsizeArg(args, "max_bytes");
+    if (max_raw != null and max_arg == null) {
+        common.setErrorDetail(ctx.error_detail, allocator, "TaskOutput max_bytes must be a non-negative integer", .{});
+        return error.InvalidMaxBytes;
+    }
+    const max_bytes = max_arg orelse DEFAULT_MAX_BYTES;
     if (max_bytes == 0 or max_bytes > MAX_MAX_BYTES) {
         common.setErrorDetail(ctx.error_detail, allocator, "TaskOutput max_bytes must be in 1..{d}", .{MAX_MAX_BYTES});
         return error.InvalidMaxBytes;
+    }
+
+    // Reject stale/malformed cursors before entering the 30s long-poll. A
+    // caller can only resume at a boundary in the currently published byte
+    // stream; waiting cannot make an already-invalid continuation byte valid.
+    {
+        e.lockPublic();
+        const invalid = since > e.output_buf.items.len or
+            (since < e.output_buf.items.len and utf8.prefixEnd(e.output_buf.items, since) != since);
+        const size = e.output_buf.items.len;
+        e.unlockPublic();
+        if (invalid) {
+            common.setErrorDetail(ctx.error_detail, allocator, "TaskOutput since_byte must be a UTF-8 boundary within output_size_bytes={d}", .{size});
+            return error.InvalidSinceByte;
+        }
     }
 
     // A status read with no unseen output is a long-poll, not a zero-wait
@@ -56,11 +83,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // calls before the background thread gets scheduled and trip the generic
     // zero-gain breaker even though the job is making progress.
     const deadline = util_time.nowMs() + LONG_POLL_MS;
-    while (util_time.nowMs() < deadline) {
+    while (true) {
         try ctx.throwIfAborted();
-        const remaining = deadline - util_time.nowMs();
+        const now = util_time.nowMs();
+        if (now >= deadline) break;
+        const remaining = deadline - now;
         const wait_ms: u64 = @intCast(@min(remaining, ABORT_SLICE_MS));
-        if (e.waitForOutputOrTerminal(since_arg, wait_ms * std.time.ns_per_ms)) break;
+        // `since` is the effective cursor. Passing the raw optional here made
+        // an omitted cursor disable the output-change wakeup entirely, so a
+        // running job with already available output waited for the full 30s.
+        if (e.waitForOutputOrTerminal(since, wait_ms * std.time.ns_per_ms)) break;
     }
 
     // 持 entry 锁:把要序列化的内容拷到本地,unlock 后再拼 JSON(锁内不做大分配)。
@@ -71,21 +103,38 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         defer e.unlockPublic();
         snap.status = e.status;
         snap.total = e.output_buf.items.len;
+        snap.truncated = e.output_truncated;
         const buf = e.output_buf.items;
-        if (since > buf.len or (since < buf.len and utf8.isContinuationByte(buf[since]))) {
+        if (since > buf.len or (since < buf.len and utf8.prefixEnd(buf, since) != since)) {
             common.setErrorDetail(ctx.error_detail, allocator, "TaskOutput since_byte must be a UTF-8 boundary within output_size_bytes={d}", .{buf.len});
             return error.InvalidSinceByte;
         }
         if (since < buf.len) {
             const remaining = buf.len - since;
-            const page = utf8.pagePrefix(buf[since..], max_bytes);
+            var page = utf8.pagePrefix(buf[since..], max_bytes);
+            if (page.len == 0 and snap.status != .running) {
+                // A terminal job may end with a malformed/incomplete byte
+                // sequence. Consume the complete incomplete tail as one
+                // recovery unit; consuming only its lead byte would leave a
+                // continuation-byte suffix that the next cursor can never
+                // validate. writeJsonString converts the raw tail to U+FFFD.
+                const tail = buf[since..];
+                const take = if (utf8.incompleteTailStart(tail) != null)
+                    tail.len
+                else
+                    utf8.nextBoundary(tail, 0);
+                page = tail[0..take];
+            }
             const take = page.len;
             snap.output = try allocator.dupe(u8, page);
-            snap.truncated = take < remaining;
+            snap.truncated = snap.truncated or take < remaining;
             snap.next = since + take;
         } else {
             snap.output = try allocator.dupe(u8, "");
-            snap.truncated = false;
+            // Truncation is a property of the retained stream, not only of
+            // this page. Preserve it even when the caller polls at the end
+            // of the current buffer.
+            snap.truncated = e.output_truncated;
             snap.next = since;
         }
         snap.stop_reason = e.stop_reason;
@@ -111,7 +160,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try aw.writer.writeAll(",\"output\":");
     try util_json.writeJsonString(&aw.writer, snap.output);
     try aw.writer.print(",\"output_total_bytes\":{d},\"output_next_offset\":{d},\"output_size_bytes\":{d},\"output_truncated\":{s}", .{
-        snap.next,
+        snap.total,
         snap.next,
         snap.total,
         if (snap.truncated) "true" else "false",

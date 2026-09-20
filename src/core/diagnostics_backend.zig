@@ -18,6 +18,7 @@
 //! NDJSON(字段自解释,如 `{"cache_break":{"cache_read":512,...}}`),可直接喂 jq / OTel。
 
 const std = @import("std");
+const json_util = @import("../util/json.zig");
 const ui_backend = @import("protocol/ui_backend.zig");
 
 const CoreEvent = ui_backend.CoreEvent;
@@ -97,7 +98,9 @@ pub const DiagnosticsBackend = struct {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         for (self.events.items) |e| {
-            const line = try std.json.Stringify.valueAlloc(allocator, e, .{});
+            const raw = try std.json.Stringify.valueAlloc(allocator, e, .{});
+            defer allocator.free(raw);
+            const line = try json_util.repairJsonUtf8(allocator, raw);
             defer allocator.free(line);
             try out.appendSlice(allocator, line);
             try out.append(allocator, '\n');

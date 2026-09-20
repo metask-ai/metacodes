@@ -879,8 +879,8 @@ pub const RenderRegion = struct {
         var has_running_agents = false;
         var has_any_agents = false;
         if (app.agentJobsPtr()) |reg| {
-            has_running_agents = reg.runningCount() > 0;
-            has_any_agents = reg.totalCount() > 0;
+            has_running_agents = reg.runningCountForSession(app.session_id) > 0;
+            has_any_agents = reg.totalCountForSession(app.session_id) > 0;
         }
         var hint_buf: [96]u8 = undefined;
         const hint: []const u8 = blk: {
@@ -970,7 +970,7 @@ pub const RenderRegion = struct {
         const view_rows: u16 = if (budget > 1) budget - 1 else 0;
         if (view_rows == 0) return rows;
 
-        const out = (reg.copyOutputBuf(vid, self.allocator) catch null) orelse {
+        const out = (reg.copyOutputBufForSession(vid, self.allocator, app.session_id) catch null) orelse {
             // 无 output_buf(刚起未产出)→ 占位一行。
             w.writeAll(ansi.clear.line) catch {};
             w.print("  {s}(no output yet){s}", .{ th.dim, th.reset }) catch {};
