@@ -70,7 +70,17 @@ pub const SwarmContext = struct {
             const pt = &self.process_teammates.items[i];
             var status: c_int = 0;
             const WNOHANG: c_int = 1;
-            const r = std.c.waitpid(@intCast(pt.pid), &status, WNOHANG);
+            // SIGCHLD/SIGWINCH and other handlers can interrupt waitpid even
+            // with WNOHANG.  Treat EINTR as "unknown, try again"; classifying
+            // it as ESRCH would free the record and worktree while the child
+            // is still alive.
+            var r: c_int = -1;
+            while (true) {
+                const candidate = std.c.waitpid(@intCast(pt.pid), &status, WNOHANG);
+                if (candidate == -1 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+                r = candidate;
+                break;
+            }
             // r==pid:已退出收尸完成。r==-1(ECHILD/ESRCH):非我子进程/已消失(如测试假 pid、
             // 已被收过)→ 同样清记录,绝不当"存活"(否则 terminate 白等宽限期)。r==0:仍活着。
             if (r == pt.pid or r == -1) {
@@ -113,7 +123,11 @@ pub const SwarmContext = struct {
         for (self.process_teammates.items) |*pt| {
             _ = std.c.kill(@intCast(pt.pid), std.c.SIG.KILL);
             var status: c_int = 0;
-            _ = std.c.waitpid(@intCast(pt.pid), &status, 0);
+            var wait_rc: c_int = -1;
+            while (true) {
+                wait_rc = std.c.waitpid(@intCast(pt.pid), &status, 0);
+                if (wait_rc != -1 or std.c._errno().* != @intFromEnum(std.c.E.INTR)) break;
+            }
             if (pt.worktree_path.len > 0)
                 @import("teammate_process.zig").removeWorktree(self.allocator, pt.worktree_path, pt.repo, null);
             self.allocator.free(pt.name);

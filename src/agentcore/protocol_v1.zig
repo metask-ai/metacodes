@@ -8,7 +8,61 @@
 const std = @import("std");
 const core = @import("metacodes-core");
 const public = @import("metask_agentcore_protocol");
-const util_json = @import("../util/json.zig");
+
+// This file is compiled both as part of metacodes-core and as the standalone
+// AgentCore ABI module. Keep the final UTF-8 repair local so the two module
+// roots do not import the same source file through different module graphs.
+fn repairJsonUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, input.len);
+    var in_string = false;
+    var escaped = false;
+    var i: usize = 0;
+    while (i < input.len) {
+        const b = input[i];
+        if (!in_string) {
+            try out.append(allocator, b);
+            if (b == '"') in_string = true;
+            i += 1;
+            continue;
+        }
+        if (escaped) {
+            try out.append(allocator, b);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if (b == '\\') {
+            try out.append(allocator, b);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if (b == '"') {
+            try out.append(allocator, b);
+            in_string = false;
+            i += 1;
+            continue;
+        }
+        if (b >= 0x80) {
+            const length = std.unicode.utf8ByteSequenceLength(b) catch null;
+            if (length) |n| {
+                if (i + n <= input.len and std.unicode.utf8ValidateSlice(input[i .. i + n])) {
+                    try out.appendSlice(allocator, input[i .. i + n]);
+                    i += n;
+                    continue;
+                }
+            }
+            try out.appendSlice(allocator, "\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        }
+        try out.append(allocator, b);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 const InternalEvent = core.protocol.ui_event.CoreEvent;
 const InternalUiRequest = core.protocol.ui_request.UiRequest;
@@ -216,7 +270,7 @@ pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiR
     const raw = std.json.Stringify.valueAlloc(allocator, mapped, .{}) catch
         return error.OutOfMemory;
     defer allocator.free(raw);
-    return util_json.repairJsonUtf8(allocator, raw) catch
+    return repairJsonUtf8(allocator, raw) catch
         return error.OutOfMemory;
 }
 

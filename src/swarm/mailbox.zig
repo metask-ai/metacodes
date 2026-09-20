@@ -214,15 +214,16 @@ pub fn readUnread(allocator: std.mem.Allocator, path: []const u8) !MessageList {
     errdefer out.deinit();
     for (all.items.items) |*m| {
         if (m.read) continue;
-        const from = try allocator.dupe(u8, m.from);
+        var from = try allocator.dupe(u8, m.from);
         errdefer allocator.free(from);
-        const text = try allocator.dupe(u8, m.text);
+        var text = try allocator.dupe(u8, m.text);
         errdefer allocator.free(text);
-        const timestamp = try allocator.dupe(u8, m.timestamp);
+        var timestamp = try allocator.dupe(u8, m.timestamp);
         errdefer allocator.free(timestamp);
-        const color: ?[]u8 = if (m.color) |c| try allocator.dupe(u8, c) else null;
+        var color: ?[]u8 = if (m.color) |c| try allocator.dupe(u8, c) else null;
         errdefer if (color) |c| allocator.free(c);
-        const summary: ?[]u8 = if (m.summary) |s| try allocator.dupe(u8, s) else null;
+        var summary: ?[]u8 = if (m.summary) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (summary) |s| allocator.free(s);
         try out.items.append(allocator, .{
             .from = from,
             .text = text,
@@ -232,6 +233,11 @@ pub fn readUnread(allocator: std.mem.Allocator, path: []const u8) !MessageList {
             .summary = summary,
             .file_index = m.file_index,
         });
+        from = &.{};
+        text = &.{};
+        timestamp = &.{};
+        color = null;
+        summary = null;
     }
     return out;
 }
@@ -309,15 +315,16 @@ fn readAllUnlocked(allocator: std.mem.Allocator, path: []const u8) !MessageList 
         const from = strField(o, "from") orelse continue;
         const text = strField(o, "text") orelse continue;
         // 分步 dupe + errdefer,防前字段成功后字段 OOM 时前字段泄漏(Linus SW5 pre-existing)。
-        const f_owned = try allocator.dupe(u8, from);
+        var f_owned = try allocator.dupe(u8, from);
         errdefer allocator.free(f_owned);
-        const t_owned = try allocator.dupe(u8, text);
+        var t_owned = try allocator.dupe(u8, text);
         errdefer allocator.free(t_owned);
-        const ts_owned = try allocator.dupe(u8, strField(o, "timestamp") orelse "");
+        var ts_owned = try allocator.dupe(u8, strField(o, "timestamp") orelse "");
         errdefer allocator.free(ts_owned);
-        const c_owned: ?[]const u8 = if (strField(o, "color")) |c| try allocator.dupe(u8, c) else null;
+        var c_owned: ?[]const u8 = if (strField(o, "color")) |c| try allocator.dupe(u8, c) else null;
         errdefer if (c_owned) |c| allocator.free(c);
-        const s_owned: ?[]const u8 = if (strField(o, "summary")) |s| try allocator.dupe(u8, s) else null;
+        var s_owned: ?[]const u8 = if (strField(o, "summary")) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (s_owned) |s| allocator.free(s);
         try out.items.append(allocator, .{
             .from = f_owned,
             .text = t_owned,
@@ -328,6 +335,13 @@ fn readAllUnlocked(allocator: std.mem.Allocator, path: []const u8) !MessageList 
             // 解析序数(非原始数组下标):写侧只落有效消息且保序,故序数在主人视角稳定。
             .file_index = out.items.items.len,
         });
+        // Ownership moved into `out`; leave the iteration errdefers inert so
+        // a later allocation failure cannot double-free earlier messages.
+        f_owned = &.{};
+        t_owned = &.{};
+        ts_owned = &.{};
+        c_owned = null;
+        s_owned = null;
     }
     return out;
 }
@@ -525,6 +539,10 @@ test "deliver → readUnread → markReadCount 全链" {
     try testing.expectEqualStrings("do task 1", unread.items.items[0].text);
     try testing.expectEqualStrings("blue", unread.items.items[0].color.?);
     try testing.expect(unread.items.items[0].timestamp.len >= 24); // ISO 8601
+    // The snapshot carries the owner's file ordinal through to markReadAt;
+    // dropping it would force an ambiguous identity fallback for duplicates.
+    try testing.expectEqual(@as(usize, 0), unread.items.items[0].file_index);
+    try testing.expectEqual(@as(usize, 1), unread.items.items[1].file_index);
 
     // 标记第一条已读。
     try markReadCount(a, path, 1);

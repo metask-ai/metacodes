@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const core = @import("metacodes-core");
-const util_json = @import("../util/json.zig");
 
 pub const ARGUMENT_DIGEST_BYTES: usize = 32;
 pub const REQUEST_ID_BYTES: usize = 32;
@@ -1288,10 +1287,11 @@ pub fn encodeCallbackRequest(
         .responses = responses_buffer[0..response_count],
         .candidate = candidate_dto,
     };
-    const raw = std.json.Stringify.valueAlloc(allocator, dto, .{}) catch
-        return error.OutOfMemory;
-    defer allocator.free(raw);
-    return util_json.repairJsonUtf8(allocator, raw) catch
+    // Every borrowed dynamic field has been validated above (tool identity,
+    // tool_call_id, and arguments_json). The remaining fields are generated
+    // hex/enums/constants, so the standalone ABI module can use its own JSON
+    // stringifier without importing a core-only utility module.
+    return std.json.Stringify.valueAlloc(allocator, dto, .{}) catch
         return error.OutOfMemory;
 }
 

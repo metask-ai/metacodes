@@ -1487,6 +1487,13 @@ test "TeammateRegistry init/deinit 空表干净" {
     reg.deinit();
 }
 
+test "TeammateRegistry mutators reject a closing registry" {
+    var reg = try TeammateRegistry.init(testing.allocator, "k", null, "m", .anthropic, "/tmp");
+    defer reg.deinit();
+    reg.closing = true;
+    try testing.expectError(error.RegistryClosed, reg.setLimits(.{}));
+}
+
 test "TeammateRegistry: 空 home 拒绝" {
     try testing.expectError(error.NoHome, TeammateRegistry.init(testing.allocator, "k", null, "m", .anthropic, ""));
 }
