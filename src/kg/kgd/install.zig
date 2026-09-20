@@ -145,7 +145,14 @@ fn resolveStorePath(
             if (recorded.len > 0) return absolutize(allocator, config_dir, recorded);
         }
     }
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, STORE_NAME }) catch Error.OutOfMemory;
+    // The default sits beside the configuration, and only then is made
+    // absolute. Absolutizing the bare name instead would resolve it against
+    // the working directory — a store in whatever folder the operator happened
+    // to be standing in, which is not what "beside the configuration" means.
+    const beside = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, STORE_NAME }) catch
+        return Error.OutOfMemory;
+    defer allocator.free(beside);
+    return absolutize(allocator, config_dir, beside);
 }
 
 /// A relative path is taken as relative to the working directory the operator
@@ -266,13 +273,16 @@ fn writeConfig(
         0o600,
     );
     if (fd < 0) return Error.ConfigWriteFailed;
+    // From here the temporary exists and holds the API key: every failure path
+    // out of this function must take it with them, including the allocation
+    // below, which is easy to forget precisely because it looks unrelated.
+    errdefer _ = std.c.unlink(temporary.ptr);
     const body = document.written();
     var written: usize = 0;
     while (written < body.len) {
         const n = pfs.write(fd, body[written..]);
         if (n <= 0) {
             _ = pfs.close(fd);
-            _ = std.c.unlink(temporary.ptr);
             return Error.ConfigWriteFailed;
         }
         written += @intCast(n);
@@ -280,10 +290,7 @@ fn writeConfig(
     _ = pfs.close(fd);
     const final = allocator.dupeZ(u8, config_path) catch return Error.OutOfMemory;
     defer allocator.free(final);
-    if (pfs.renameReplace(temporary.ptr, final.ptr) != 0) {
-        _ = std.c.unlink(temporary.ptr);
-        return Error.ConfigWriteFailed;
-    }
+    if (pfs.renameReplace(temporary.ptr, final.ptr) != 0) return Error.ConfigWriteFailed;
 }
 
 fn restrictDirectory(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -431,16 +438,32 @@ test "KgdInstall: an unusable port is not preserved across a reinstall" {
     try testing.expect(portOfExisting(parsed) == null);
 }
 
-test "KgdInstall: a recorded store path is absolute" {
+test "KgdInstall: every recorded store path is absolute" {
     const a = testing.allocator;
-    // Relative here would be read back by a service started elsewhere.
+    // Relative here would be read back by a service started elsewhere, and
+    // `runtime` would resolve it against the configuration directory a second
+    // time — `cfg/cfg/store.kg.v2` for a relative `--config cfg/daemon.json`.
     const absolute = try resolveStorePath(a, "/home/x/.metacodes/kg", .{ .store_path = "/tmp/explicit" }, null);
     defer a.free(absolute);
     try testing.expectEqualStrings("/tmp/explicit", absolute);
-    const relative = try resolveStorePath(a, "/home/x/.metacodes/kg", .{ .store_path = "scratch.kg" }, null);
-    defer a.free(relative);
-    try testing.expect(std.fs.path.isAbsolute(relative));
-    try testing.expect(std.mem.endsWith(u8, relative, "/scratch.kg"));
+
+    const relative_flag = try resolveStorePath(a, "/home/x/.metacodes/kg", .{ .store_path = "scratch.kg" }, null);
+    defer a.free(relative_flag);
+    try testing.expect(std.fs.path.isAbsolute(relative_flag));
+    try testing.expect(std.mem.endsWith(u8, relative_flag, "/scratch.kg"));
+
+    // The default, with a relative configuration directory: the case a first
+    // `kg install --config cfg/daemon.json` takes.
+    const defaulted = try resolveStorePath(a, "cfg", .{}, null);
+    defer a.free(defaulted);
+    try testing.expect(std.fs.path.isAbsolute(defaulted));
+    try testing.expect(std.mem.endsWith(u8, defaulted, "/cfg/" ++ STORE_NAME));
+
+    // And with an absolute one it stays beside the configuration rather than
+    // landing in whatever directory the command was run from.
+    const beside = try resolveStorePath(a, "/home/x/.metacodes/kg", .{}, null);
+    defer a.free(beside);
+    try testing.expectEqualStrings("/home/x/.metacodes/kg/" ++ STORE_NAME, beside);
 }
 
 test "KgdInstall: the port is read back the same way the service binds it" {

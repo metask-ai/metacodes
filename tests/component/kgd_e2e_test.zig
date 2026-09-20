@@ -186,6 +186,44 @@ test "Kgd: the service refuses a wrong key and an undeclared capability" {
     try std.testing.expectError(error.InvalidResponse, transport.run("ontology-rule-snapshot", &.{}, false));
 }
 
+test "Kgd: a planted symlink cannot capture a markdown import" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
+    defer harness.deinit();
+
+    // The staging name is the client's sourceKey, which is predictable, and a
+    // store can live in a shared directory. Someone leaves a link there first.
+    const staging_dir = try std.fmt.allocPrint(a, "{s}.import", .{harness.store});
+    defer a.free(staging_dir);
+    try cc.util_fs.mkdirParents(staging_dir);
+    const victim = try std.fmt.allocPrintSentinel(a, "{s}/victim", .{staging_dir}, 0);
+    defer a.free(victim);
+    const planted = try std.fmt.allocPrintSentinel(a, "{s}/0123456789abcdef.md", .{staging_dir}, 0);
+    defer a.free(planted);
+    {
+        const fd = pfs.open(victim.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+        try std.testing.expect(fd >= 0);
+        try std.testing.expectEqual(@as(isize, 9), pfs.write(fd, "untouched"));
+        _ = pfs.close(fd);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlink(victim.ptr, planted.ptr));
+
+    var transport = try harness.connect(a, TEST_KEY);
+    defer transport.deinit();
+    // The import itself may fail on the engine side; what must not happen is
+    // the victim file being written through the link.
+    const result = transport.importMarkdown("# imported\n", 0x0123456789abcdef, null);
+    if (result) |ok| {
+        var owned = ok;
+        owned.deinit(a);
+    } else |_| {}
+
+    const after = @import("cc").swarm_team.readFileAlloc(a, std.mem.span(victim.ptr)).?;
+    defer a.free(after);
+    try std.testing.expectEqualStrings("untouched", after);
+}
+
 test "Kgd: install writes a configuration this service can be started from" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;

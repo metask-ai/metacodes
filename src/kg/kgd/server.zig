@@ -306,6 +306,12 @@ pub const Supervisor = struct {
             .session_id = session_id,
             .timeout_ms = timeoutOf(root),
         }) catch |err| {
+            // Refused here, before the child saw anything: that is the client's
+            // request being too large, not the daemon failing to answer.
+            if (err == bridge_mod.Error.RequestTooLarge) {
+                self.sendError(conn, 413, "the encoded request exceeds the TinyKG request limit");
+                return;
+            }
             self.reportDaemonFailure(conn, err);
             return;
         };
@@ -389,6 +395,14 @@ pub const Supervisor = struct {
         self.sendEnvelope(conn, allocator, request_id, null, &response);
     }
 
+    /// The engine ingests a file, and its stable-external-key upsert wants the
+    /// name to be the client's `sourceKey`. That name is predictable, and the
+    /// store can sit in a shared directory, so it is never opened directly:
+    /// someone could have left a symlink there and an authenticated import
+    /// would truncate whatever it points at. The bytes go into an exclusive
+    /// randomly named temporary that refuses to follow a link, and a rename
+    /// then puts them under the stable name — replacing a planted link itself
+    /// rather than writing through it.
     fn stageMarkdown(
         self: *Supervisor,
         allocator: std.mem.Allocator,
@@ -397,15 +411,35 @@ pub const Supervisor = struct {
     ) ![]const u8 {
         const dir = try std.fmt.allocPrint(allocator, "{s}.import", .{self.options.store_path});
         try @import("../../util/fs.zig").mkdirParents(dir);
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.md", .{ dir, source_key }, 0);
-        const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+        restrictDirectory(allocator, dir);
+
+        var suffix: [8]u8 = undefined;
+        if (!@import("platform").rng.randomBytes(&suffix)) return error.StageFailed;
+        var suffix_hex: [16]u8 = undefined;
+        _ = std.fmt.bufPrint(&suffix_hex, "{x}", .{&suffix}) catch return error.StageFailed;
+        const temporary = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.{s}.tmp", .{ dir, source_key, suffix_hex }, 0);
+        const fd = pfs.open(
+            temporary.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true },
+            0o600,
+        );
         if (fd < 0) return error.StageFailed;
-        defer _ = pfs.close(fd);
+        errdefer removeFile(temporary);
         var written: usize = 0;
         while (written < markdown.len) {
             const n = pfs.write(fd, markdown[written..]);
-            if (n <= 0) return error.StageFailed;
+            if (n <= 0) {
+                _ = pfs.close(fd);
+                return error.StageFailed;
+            }
             written += @intCast(n);
+        }
+        _ = pfs.close(fd);
+
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.md", .{ dir, source_key }, 0);
+        if (pfs.renameReplace(temporary.ptr, path.ptr) != 0) {
+            removeFile(temporary);
+            return error.StageFailed;
         }
         return path;
     }
@@ -612,21 +646,28 @@ fn statusForRead(err: anyerror) u16 {
     };
 }
 
-/// Writes until done, the peer goes away, or the deadline passes. Each write
-/// waits for writability in bounded slices first: a peer that stops reading
-/// makes `send` block once the socket buffer fills, and a deadline checked only
-/// between calls would then be one whole socket timeout late — or never, if
-/// `SO_SNDTIMEO` did not take.
+/// Writes until done, the peer goes away, or the deadline passes.
+///
+/// The socket is non-blocking for this: writability only promises that *some*
+/// space exists, while `send` is handed the whole remainder, so a blocking
+/// write can still park inside the kernel after the poll said yes. With
+/// `would_block` bouncing back to the poll, the deadline is the only thing that
+/// decides how long this thread stays here.
 fn sendAll(conn: net.Socket, bytes: []const u8, deadline_ms: i64) void {
+    _ = net.setNonblocking(conn, true);
+    defer _ = net.setNonblocking(conn, false);
     var offset: usize = 0;
     while (offset < bytes.len) {
-        while (!net.pollWritable(conn, SOCKET_POLL_SLICE_MS)) {
-            if (time.nowMs() >= deadline_ms) return;
-        }
         if (time.nowMs() >= deadline_ms) return;
-        const n = net.send(conn, bytes[offset..]);
-        if (n <= 0) return;
-        offset += @intCast(n);
+        switch (net.sendSome(conn, bytes[offset..])) {
+            .sent => |n| offset += n,
+            .failed => return,
+            .would_block => {
+                // Waits for space or for the peer to fail; either way the next
+                // iteration re-checks the clock.
+                _ = net.pollWritable(conn, SOCKET_POLL_SLICE_MS);
+            },
+        }
     }
 }
 
@@ -684,6 +725,16 @@ fn infoField(stdout: []const u8, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, trimmed[0..eq], name)) return trimmed[eq + 1 ..];
     }
     return null;
+}
+
+/// Best effort: the directory may predate this build with looser bits, and a
+/// failure here is not a reason to refuse an import that is otherwise safe
+/// because of the exclusive temporary above.
+fn restrictDirectory(allocator: std.mem.Allocator, path: []const u8) void {
+    if (@import("builtin").os.tag == .windows) return;
+    const path_z = allocator.dupeZ(u8, path) catch return;
+    defer allocator.free(path_z);
+    _ = std.c.chmod(path_z.ptr, 0o700);
 }
 
 fn removeFile(path: []const u8) void {
