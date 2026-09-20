@@ -54,7 +54,7 @@
         },
         {
           "file": "doc/LIB_API.md",
-          "regex": "^revision (\\d+) 只有一个"
+          "regex": "^revision (\\d+) \u53ea\u6709\u4e00\u4e2a"
         },
         {
           "file": "doc/PLUGIN_ARCHITECTURE.md",
@@ -70,7 +70,7 @@
         },
         {
           "file": "doc/PLUGIN_EVALUATION.md",
-          "regex": "AgentCore v1 revision (\\d+)、CLI"
+          "regex": "AgentCore v1 revision (\\d+)\u3001CLI"
         }
       ]
     },
@@ -96,11 +96,15 @@
       "assert_in": [
         {
           "file": "doc/TINYKG_INTEGRATION.md",
-          "regex": "TinyKG CLI version ([0-9.]+)"
+          "regex": "TinyKG version ([0-9.]+) for both roles"
         },
         {
           "file": "doc/TINYKG_INTEGRATION.md",
-          "regex": "`tinykg ([0-9.]+)` version marker"
+          "regex": "`tinykg ([0-9.]+)` marker"
+        },
+        {
+          "file": "doc/TINYKG_INTEGRATION.md",
+          "regex": "`tinykgd ([0-9.]+)` for a daemon"
         },
         {
           "file": "THIRD_PARTY_NOTICES.md",

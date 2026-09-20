@@ -109,10 +109,14 @@ const BundleTableEntry = struct {
 /// markers, which must stay on their own lines.
 // tinykg-bundle-table:begin
 const tinykg_bundle_table = [_]BundleTableEntry{
-    .{ .key = "macos-universal", .role = "cli", .path = "vendor/tinykg/bin/tinykg-macos-universal", .sha256 = "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af", .targets = &.{ "aarch64-macos", "x86_64-macos" } },
-    .{ .key = "linux-x86_64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-linux-x86_64", .sha256 = "5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba", .targets = &.{"x86_64-linux"} },
-    .{ .key = "linux-aarch64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-linux-aarch64", .sha256 = "9cfe7bf551463068c1bcaa49dea69dce53be6fdf5b9428f39081fcad67e461aa", .targets = &.{"aarch64-linux"} },
-    .{ .key = "windows-x86_64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-windows-x86_64.exe", .sha256 = "27f72f74babdcc60c327228673f9eb042092b6c82b156e241c66c0acea081e1b", .targets = &.{"x86_64-windows"} },
+    .{ .key = "macos-universal", .role = "cli", .path = "vendor/tinykg/bin/tinykg-macos-universal", .sha256 = "dd53db2aa5219e899daac3caac2332648ac392550fa6f431b5900a1d495688e1", .targets = &.{ "aarch64-macos", "x86_64-macos" } },
+    .{ .key = "macos-universal-daemon", .role = "daemon", .path = "vendor/tinykg/bin/tinykgd-macos-universal", .sha256 = "f1dd9f9a472bb58fa7dcd749a2a4df1a03d63c6dc7093054096beeb3b205722f", .targets = &.{ "aarch64-macos", "x86_64-macos" } },
+    .{ .key = "linux-x86_64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-linux-x86_64", .sha256 = "6ff8346aa0c5e9a9cf10cfa3357bfa2767699bf4735c8fd2e12d39cc12ee1521", .targets = &.{"x86_64-linux"} },
+    .{ .key = "linux-x86_64-daemon", .role = "daemon", .path = "vendor/tinykg/bin/tinykgd-linux-x86_64", .sha256 = "5d8f11e3bfe96a3845aa6d1166ac9341a59b622f355dc5de1c27675f0c5e5614", .targets = &.{"x86_64-linux"} },
+    .{ .key = "linux-aarch64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-linux-aarch64", .sha256 = "2f601a8d27eba6956f61e87da84f83ad3a247db111233de0d74031bbff87fca0", .targets = &.{"aarch64-linux"} },
+    .{ .key = "linux-aarch64-daemon", .role = "daemon", .path = "vendor/tinykg/bin/tinykgd-linux-aarch64", .sha256 = "a5132e77776c607328b5dd7b59b7af643fd406b0ae031dff062d144ac774a3eb", .targets = &.{"aarch64-linux"} },
+    .{ .key = "windows-x86_64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-windows-x86_64.exe", .sha256 = "61b9281880dda0eaadadf051e16191ee46b8c454771e4639171dd90aed5e8044", .targets = &.{"x86_64-windows"} },
+    .{ .key = "windows-x86_64-daemon", .role = "daemon", .path = "vendor/tinykg/bin/tinykgd-windows-x86_64.exe", .sha256 = "aca73b00590df898c65d0a2741dafd6e7805a78ff3fd4ec6ce7a7495a6481281", .targets = &.{"x86_64-windows"} },
 };
 // tinykg-bundle-table:end
 
@@ -190,7 +194,13 @@ fn buildInfoOptions(
         .explicit => |input| input.sha256,
         .disabled, .unavailable => null,
     });
-    options.addOption(?[]const u8, "tinykgd_expected_sha256", if (tinykg_input == .bundled) (if (bundledTinyKgForTarget(b, target, "daemon")) |daemon| daemon.sha256 else null) else null);
+    // The daemon digest is pinned only once the daemon is part of the install,
+    // exactly like the Lean kernels: doctor calls a pinned-but-unresolvable
+    // binary unhealthy, so pinning something the prefix does not carry would
+    // make `doctor --strict` fail on every release. Staging still compares the
+    // build table against the bundle manifest. The change that installs the
+    // daemon pins it here in the same commit.
+    options.addOption(?[]const u8, "tinykgd_expected_sha256", @as(?[]const u8, null));
     options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
     options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
     return options;
@@ -618,8 +628,13 @@ pub fn build(b: *std.Build) void {
                 const staged_daemon_receipt = daemon_stage.addOutputFileArg("tinykgd.provenance.json");
                 const install_daemon = b.addInstallFileWithDir(staged_daemon, .{ .custom = "vendor/tinykg" }, daemon_name);
                 const install_daemon_receipt = b.addInstallFileWithDir(staged_daemon_receipt, .{ .custom = "vendor/tinykg" }, "tinykgd.provenance.json");
-                b.getInstallStep().dependOn(&install_daemon.step);
-                b.getInstallStep().dependOn(&install_daemon_receipt.step);
+                // Deliberately NOT part of the default install step. Nothing
+                // starts the daemon yet, and the product install carries only
+                // what `release/manifest_contract.zig` declares and
+                // `scripts/verify_install_prefix.py` expects. `tinykg:stage`
+                // and the test wiring still stage it, so the bundle stays
+                // attested and the resolution path stays covered; the release
+                // layout gains it in the change that starts it.
                 tinykg_stage_step.dependOn(&install_daemon.step);
                 tinykg_stage_step.dependOn(&install_daemon_receipt.step);
                 staged_tinykgd = .{ .install_step = &install_daemon.step, .artifact = staged_daemon, .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, daemon_name), .source_sha256 = daemon.sha256 };

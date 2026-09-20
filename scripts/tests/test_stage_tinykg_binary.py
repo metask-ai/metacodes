@@ -453,11 +453,17 @@ class TinyKgBinaryStageTest(unittest.TestCase):
     def test_checked_in_universal_contains_version_marker_in_every_slice(self) -> None:
         manifest_path = PROJECT_ROOT / "vendor/tinykg/manifest.json"
         bundle = TinyKgBundle.load(manifest_path)
-        artifact = bundle.artifact("macos-universal")
-        binary = (manifest_path.parent / artifact.path).read_bytes()
-        slices = _validate_mach_o_universal(binary, artifact.architectures)
-        marker = b"tinykg 0.2.0"
-        self.assertTrue(all(marker in binary[start:end] for start, end in slices))
+        for key, marker in (
+            ("macos-universal", b"tinykg 0.3.0"),
+            ("macos-universal-daemon", b"tinykgd 0.3.0"),
+        ):
+            artifact = bundle.artifact(key)
+            binary = (manifest_path.parent / artifact.path).read_bytes()
+            slices = _validate_mach_o_universal(binary, artifact.architectures)
+            self.assertTrue(
+                all(marker in binary[start:end] for start, end in slices),
+                f"{key} is missing {marker!r} in a slice",
+            )
 
 
 class CheckedInTinyKgBundleTest(unittest.TestCase):
@@ -465,16 +471,20 @@ class CheckedInTinyKgBundleTest(unittest.TestCase):
         manifest_path = PROJECT_ROOT / "vendor/tinykg/manifest.json"
         bundle = TinyKgBundle.load(manifest_path)
         contract = TinyKgContract.load(PROJECT_ROOT / "deps/tinykg.json")
-        self.assertEqual("a0544788aeadb3b92c69e539834be54850792285", bundle.source_commit)
+        self.assertEqual("0b04014ba8d0bcb1f9f73c63c12e49f3c2ee1ece", bundle.source_commit)
         self.assertEqual("0.16.0", bundle.zig_version)
         self.assertEqual("ReleaseSafe", bundle.optimize)
         self.assertTrue(bundle.strip)
         self.assertEqual(
             {
                 "linux-aarch64",
+                "linux-aarch64-daemon",
                 "linux-x86_64",
+                "linux-x86_64-daemon",
                 "macos-universal",
+                "macos-universal-daemon",
                 "windows-x86_64",
+                "windows-x86_64-daemon",
             },
             {artifact.key for artifact in bundle.artifacts},
         )
@@ -482,7 +492,8 @@ class CheckedInTinyKgBundleTest(unittest.TestCase):
             binary = (manifest_path.parent / artifact.path).resolve()
             identity = validate_bundle_bytes(binary, artifact, contract)
             self.assertEqual(artifact.sha256, identity.sha256)
-            self.assertEqual("tinykg 0.2.0", identity.version_line)
+            expected = "tinykg 0.3.0" if artifact.role == "cli" else "tinykgd 0.3.0"
+            self.assertEqual(expected, identity.version_line)
 
     def test_bundle_inventory_rejects_undeclared_and_missing_binaries(self) -> None:
         from scripts.verify_tinykg_binary import validate_bundle_inventory
