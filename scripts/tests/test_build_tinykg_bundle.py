@@ -151,6 +151,8 @@ class BuildTinyKgBundleTest(unittest.TestCase):
             with private_release_root(root), mock.patch.object(bundle, "verify_source"), mock.patch.object(
                 bundle, "run", side_effect=fake_builder
             ), mock.patch.object(bundle.platform, "system", return_value="Darwin"), mock.patch.object(
+                bundle.platform, "machine", return_value="arm64"
+            ), mock.patch.object(
                 bundle, "export_source"
             ), mock.patch.object(
                 bundle.subprocess, "run", side_effect=AssertionError("no subprocess in a dry run")
