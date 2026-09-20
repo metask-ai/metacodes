@@ -558,7 +558,7 @@ pub const WebTransport = struct {
         const object = parsed.value.object;
         if (integer(object.get("protocolVersion")) != protocol_version or
             integer(object.get("controlPlaneVersion")) != control_plane_version or
-            !stringEquals(object.get("implementation"), "tinykg-web") or
+            !implementationAccepted(object.get("implementation")) or
             !stringEquals(object.get("schemaMode"), "server-canonical") or
             !stringEquals(object.get("buildId"), self.expected_build_id) or
             !stringEquals(object.get("requestId"), request_id))
@@ -689,6 +689,21 @@ fn buildIdValid(value: []const u8) bool {
 
 fn containsControl(value: []const u8) bool {
     for (value) |byte| if (byte <= 0x20 or byte == 0x7f) return true;
+    return false;
+}
+
+/// Which service implementations this client will talk to. `tinykg-web` is the
+/// upstream service shared deployments run; `metacodes-kgd` is the local
+/// supervisor in this binary (`src/kg/kgd/`). Both serve this exact envelope,
+/// and both are pinned by build id on top of this name, so the list stays a
+/// closed set rather than a free-text field.
+const accepted_implementations = [_][]const u8{ "tinykg-web", "metacodes-kgd" };
+
+fn implementationAccepted(value: ?std.json.Value) bool {
+    const actual = string(value) orelse return false;
+    for (accepted_implementations) |accepted| {
+        if (std.mem.eql(u8, actual, accepted)) return true;
+    }
     return false;
 }
 

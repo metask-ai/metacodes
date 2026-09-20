@@ -157,8 +157,52 @@ Automatic staged lookup is limited to `<prefix>/bin` and
 search of a `vendor/` directory.
 
 `METACODES_KGD_BIN` selects an explicitly staged `tinykgd` for diagnostics and
-future daemon integration. This release wires resolution, attestation, and the
-doctor check; Metacodes does not start the daemon yet.
+for the local service described below.
+
+## The local service: `kg install` and `kgd`
+
+A shared deployment runs TinyKG Web in front of one `tinykgd`. A single machine
+runs the same contract from the product binary instead:
+
+```sh
+metacodes kg install     # create the store, the key and daemon.json
+metacodes kgd            # serve it in the foreground until Ctrl+C
+```
+
+`kg install` resolves the staged executables, creates the Store when it is
+absent, generates a 256-bit API key, computes the build id from the two TinyKG
+executables and the metadata the CLI declares, and writes `daemon.json` (0600)
+in a 0700 directory. It starts nothing. Re-running it keeps the existing key,
+port and Store, so reconfiguring never locks out a session that already read
+them; `--port` and `--store` change them deliberately.
+
+`kgd` owns one `tinykgd` child and serves `POST /api/run`,
+`POST /api/import-markdown` and `GET /api/ready` on loopback, authenticated by
+`x-api-key`. It reads its port, key and Store from the same `daemon.json` the
+sessions read, so the service and its clients cannot disagree about where it
+listens. The envelope it returns names `metacodes-kgd` as its implementation;
+clients accept that name and `tinykg-web`, and pin the build id on top of it.
+
+An isolated second world — a scratch store on another port, leaving the default
+untouched — is one command plus one variable:
+
+```sh
+metacodes kg install --config ~/scratch-kg.json --store /tmp/scratch.kg.v2 --port 8900
+METACODES_KG_CONFIG=~/scratch-kg.json metacodes kgd
+METACODES_KG_CONFIG=~/scratch-kg.json metacodes        # a session in that world
+```
+
+Properties worth knowing:
+
+- The service handles one connection at a time, because `tinykgd` answers one
+  request at a time. A whole request must arrive within 30 seconds, and the
+  client is authenticated after the head and before the body is read, so an
+  unauthenticated peer cannot make it read a large body.
+- A `tinykgd` that accepts a request and stops answering desynchronizes the
+  pipe. The service reports 503, stops, and says to start it again rather than
+  queueing every later request behind a read that will not return.
+- Nothing starts the daemon automatically yet, there is no idle exit, and the
+  daemon is still not part of the product install.
 
 Because nothing starts it, the daemon is **not** part of the default install or
 the release layout: `zig build tinykg:stage` (and the test wiring) install it

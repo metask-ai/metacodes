@@ -21,6 +21,7 @@ const msg_queue_mod = @import("../repl/msg_queue.zig");
 const abort_mod = @import("../util/abort.zig");
 const log = @import("../util/log.zig");
 const net = @import("platform").net;
+const http = @import("../util/http.zig");
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
@@ -442,52 +443,14 @@ pub fn resolveSince(query: []const u8, head: []const u8) usize {
 
 // ── 纯函数(可单测)─────────────────────────────────────────────────────────
 
-pub const RequestLine = struct {
-    method: []const u8,
-    path: []const u8,
-    query: []const u8, // 不含 '?';无 query = ""
-};
-
-/// 解析 "METHOD /path?query HTTP/1.1"(head 的第一行)。
-pub fn parseRequestLine(head: []const u8) ?RequestLine {
-    const eol = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
-    const first = head[0..eol];
-    var it = std.mem.splitScalar(u8, first, ' ');
-    const method = it.next() orelse return null;
-    const target = it.next() orelse return null;
-    if (method.len == 0 or target.len == 0) return null;
-    if (std.mem.indexOfScalar(u8, target, '?')) |q| {
-        return .{ .method = method, .path = target[0..q], .query = target[q + 1 ..] };
-    }
-    return .{ .method = method, .path = target, .query = "" };
-}
-
-/// 从 "a=1&b=2" 里取 name 的值(不做 URL decode——本服务 query 只有数字参数)。
-pub fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, query, '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (std.ascii.eqlIgnoreCase(pair[0..eq], name)) return pair[eq + 1 ..];
-    }
-    return null;
-}
-
-/// 大小写不敏感取 header 值(trim 前导空白)。
-pub fn headerValue(head: []const u8, name: []const u8) ?[]const u8 {
-    var it = std.mem.splitSequence(u8, head, "\r\n");
-    _ = it.next(); // 跳请求行
-    while (it.next()) |h| {
-        const colon = std.mem.indexOfScalar(u8, h, ':') orelse continue;
-        if (!std.ascii.eqlIgnoreCase(h[0..colon], name)) continue;
-        return std.mem.trim(u8, h[colon + 1 ..], " \t");
-    }
-    return null;
-}
-
-pub fn parseContentLength(head: []const u8) ?usize {
-    const v = headerValue(head, "content-length") orelse return null;
-    return std.fmt.parseInt(usize, v, 10) catch null;
-}
+// Head parsing lives in util/http.zig so the `kgd` supervisor parses requests
+// exactly the way this server does. Re-exported: existing callers and tests
+// keep using `server.parseRequestLine` and friends.
+pub const RequestLine = http.RequestLine;
+pub const parseRequestLine = http.parseRequestLine;
+pub const queryParam = http.queryParam;
+pub const headerValue = http.headerValue;
+pub const parseContentLength = http.parseContentLength;
 
 /// POST /message body → 文本(owned by allocator,caller free)。
 /// JSON {"text":"..."} 优先(转义已由 parser 解开,多行消息 OK);非 JSON 时整个 body 当纯文本。

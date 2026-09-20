@@ -19,6 +19,10 @@ const provider_oauth_mod = @import("provider/oauth.zig");
 const provider_ids_mod = @import("provider/ids.zig");
 const version_info = @import("version_info.zig");
 pub const doctor = @import("app/doctor.zig"); // pub: component tests build the report by hand
+pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
+pub const kgd_install = @import("kg/kgd/install.zig");
+pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
+const kgd_runtime = @import("kg/kgd/runtime.zig");
 const build_options = @import("build_info");
 
 pub const VERSION = @import("version.zig").semver;
@@ -949,6 +953,112 @@ fn kgDiagnosisOwned(allocator: std.mem.Allocator, state: []const u8, transport: 
 }
 
 /// unknown argument.
+/// `metacodes kg install [--store PATH] [--port N]`: provision the local
+/// TinyKG runtime. Prints what it did; never prints the API key.
+fn runKg(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
+    const sub = args.next() orelse {
+        std.debug.print("usage: metacodes kg install [--config <path>] [--store <path>] [--port <port>]\n", .{});
+        return 2;
+    };
+    if (!std.mem.eql(u8, sub, "install")) {
+        std.debug.print("error: unknown kg subcommand '{s}'\n", .{sub});
+        return 2;
+    }
+    var options = kgd_install.Options{};
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--config")) {
+            options.config_path = args.next() orelse {
+                std.debug.print("error: --config needs a path\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--store")) {
+            options.store_path = args.next() orelse {
+                std.debug.print("error: --store needs a path\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            const raw = args.next() orelse {
+                std.debug.print("error: --port needs a number\n", .{});
+                return 2;
+            };
+            const port = std.fmt.parseInt(u16, raw, 10) catch 0;
+            if (port == 0) {
+                std.debug.print("error: --port must be a number between 1 and 65535\n", .{});
+                return 2;
+            }
+            options.port = port;
+        } else {
+            std.debug.print("error: unknown kg install argument '{s}'\n", .{arg});
+            return 2;
+        }
+    }
+    const home = @import("platform").paths.homeDir() orelse "";
+    var outcome = kgd_install.run(allocator, home, options) catch |err| {
+        std.debug.print("error: kg install failed ({s}){s}\n", .{ @errorName(err), kgInstallHint(err) });
+        return 1;
+    };
+    defer outcome.deinit(allocator);
+    std.debug.print("TinyKG configured.\n  store:   {s}{s}\n  config:  {s} (0600{s})\n  url:     {s}\n  build:   {s}\nStart it with: metacodes kgd\n", .{
+        outcome.store_path,
+        if (outcome.created_store) " (created)" else "",
+        outcome.config_path,
+        if (outcome.reused_api_key) ", existing key kept" else ", new key",
+        outcome.url,
+        outcome.build_id[0..],
+    });
+    return 0;
+}
+
+fn kgInstallHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.BinariesMissing => "; the TinyKG bundle is not staged next to this executable, run `zig build tinykg:stage` or install a release",
+        error.NoHome => "; no HOME is set",
+        else => "",
+    };
+}
+
+/// `metacodes kgd [--store PATH] [--port N]`: run the TinyKG service in the
+/// foreground until interrupted. Configuration comes from the same daemon.json
+/// the sessions read, so the port and key can only disagree by editing it.
+fn runKgd(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
+    var options = kgd_runtime.LoadOptions{};
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--config")) {
+            options.config_path = args.next() orelse {
+                std.debug.print("error: --config needs a path\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--store")) {
+            options.store_override = args.next() orelse {
+                std.debug.print("error: --store needs a path\n", .{});
+                return 2;
+            };
+        } else {
+            // The port is not a flag here: it lives in the configuration the
+            // sessions read, so the service cannot bind somewhere its clients
+            // do not look. Change it with `kg install --port`.
+            std.debug.print("error: unknown kgd argument '{s}'\n", .{arg});
+            return 2;
+        }
+    }
+    const home = @import("platform").paths.homeDir() orelse "";
+    var config = kgd_runtime.loadConfig(allocator, home, options) catch |err| {
+        std.debug.print("error: cannot read the TinyKG configuration ({s}){s}\n", .{ @errorName(err), kgdConfigHint(err) });
+        return 1;
+    };
+    defer config.deinit(allocator);
+    return kgd_runtime.serve(allocator, config);
+}
+
+fn kgdConfigHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ConfigUnreadable => "; run `metacodes kg install` first",
+        error.ConfigUnsafe => "; the configuration must be a regular non-symlink file with mode 0600",
+        error.BinariesMissing => "; the TinyKG bundle is not staged next to this executable",
+        else => "",
+    };
+}
+
 fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: std.Io) u8 {
     var json = false;
     var strict = false;
@@ -1005,6 +1115,8 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
     _ = args.next(); // 跳过 argv[0](程序名)
     const cmd = args.next() orelse return null;
     if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator, init.io);
+    if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
+    if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "ledger")) {
         const provider = args.next() orelse {
             std.debug.print("usage: metacodes ledger metask\n", .{});
