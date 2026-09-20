@@ -886,8 +886,9 @@ test "Read 流式:offset 超文件行数 → 空" {
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = tt.normalizeSlashes(root_buf[0..root_len]);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/read-stream-eof.txt", .{root_buf[0..root_len]});
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/read-stream-eof.txt", .{root});
     const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // ~11MB 文件,offset 远超行数。
