@@ -39,7 +39,9 @@ pub fn prefixEnd(bytes: []const u8, limit: usize) usize {
         // lead is a one-byte recovery unit and must be addressable.  Without
         // this check a page containing `e4 60` would publish offset 1 but
         // reject that same offset on the next request.
-        const available_end = @min(p + length, bytes.len);
+        // Compare against the remaining slice length before adding; a
+        // caller may hand us a near-max usize borrowed slice.
+        const available_end = p + @min(length, bytes.len - p);
         var malformed = false;
         if (available_end > p + 1) {
             for (bytes[p + 1 .. available_end]) |byte| {
@@ -53,7 +55,7 @@ pub fn prefixEnd(bytes: []const u8, limit: usize) usize {
             p += 1;
             continue;
         }
-        if (p + length > bytes.len or p + length > bound) break;
+        if (length > bytes.len - p or length > bound - p) break;
         if (std.unicode.utf8ValidateSlice(bytes[p .. p + length])) p += length else p += 1;
     }
     return p;
@@ -66,7 +68,7 @@ pub fn nextBoundary(bytes: []const u8, offset: usize) usize {
     const p = @min(offset, bytes.len);
     if (p >= bytes.len) return p;
     const length = std.unicode.utf8ByteSequenceLength(bytes[p]) catch return p + 1;
-    if (p + length <= bytes.len and std.unicode.utf8ValidateSlice(bytes[p .. p + length])) return p + length;
+    if (length <= bytes.len - p and std.unicode.utf8ValidateSlice(bytes[p .. p + length])) return p + length;
     return p + 1;
 }
 
@@ -79,7 +81,7 @@ pub fn incompleteTailStart(bytes: []const u8) ?usize {
     var start = bytes.len - 1;
     while (start > 0 and isContinuationByte(bytes[start])) : (start -= 1) {}
     const length = std.unicode.utf8ByteSequenceLength(bytes[start]) catch return null;
-    if (start + length <= bytes.len) return null;
+    if (length <= bytes.len - start) return null;
     for (bytes[start + 1 ..]) |byte| if (!isContinuationByte(byte)) return null;
     return start;
 }
@@ -109,7 +111,7 @@ pub fn repairInvalidUtf8(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 
             i += 1;
             continue;
         };
-        if (i + length <= bytes.len and std.unicode.utf8ValidateSlice(bytes[i .. i + length])) {
+        if (length <= bytes.len - i and std.unicode.utf8ValidateSlice(bytes[i .. i + length])) {
             try out.appendSlice(allocator, bytes[i .. i + length]);
             i += length;
         } else {

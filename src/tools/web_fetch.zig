@@ -165,7 +165,7 @@ fn utf8CompletePrefix(bytes: []const u8) usize {
             p += 1;
             continue;
         };
-        if (p + length > bytes.len) break;
+        if (length > bytes.len - p) break;
         if (std.unicode.utf8ValidateSlice(bytes[p .. p + length])) {
             p += length;
         } else {

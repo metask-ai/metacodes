@@ -3940,13 +3940,13 @@ fn prefixToDisplayWidth(s: []const u8, max_cols: usize) []const u8 {
     var cols: usize = 0;
     while (i < s.len) {
         const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        const width = if (n > 1 and i + n <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + n]))
+        const width = if (n > 1 and n <= s.len - i and std.unicode.utf8ValidateSlice(s[i .. i + n]))
             term.displayWidth(s[i .. i + n])
         else
             1;
-        if (cols + width > max_cols) break;
+        if (width > max_cols - cols) break;
         cols += width;
-        i += if (n > 1 and i + n <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + n])) n else 1;
+        i += if (n > 1 and n <= s.len - i and std.unicode.utf8ValidateSlice(s[i .. i + n])) n else 1;
     }
     return s[0..i];
 }

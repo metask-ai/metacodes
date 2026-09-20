@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const context = @import("../../tools/context.zig");
+const util_json = @import("../../util/json.zig");
 
 pub const AskQuestion = context.AskQuestion;
 pub const PermissionChoice = @import("permission_choice.zig").PermissionChoice;
@@ -91,7 +92,11 @@ pub const UiRequester = struct {
 /// 把 UiRequest 序列化成 JSON(给异步前端渲染/投递用)。caller free。
 /// 纯数据 union → 可序列化(无指针/闭包)。
 pub fn serializeUiRequest(allocator: std.mem.Allocator, req: *const UiRequest) ![]u8 {
-    return std.json.Stringify.valueAlloc(allocator, req.*, .{});
+    const raw = std.json.Stringify.valueAlloc(allocator, req.*, .{}) catch
+        return error.OutOfMemory;
+    defer allocator.free(raw);
+    return util_json.repairJsonUtf8(allocator, raw) catch
+        return error.OutOfMemory;
 }
 
 // ============================================================================
@@ -115,6 +120,28 @@ test "UiRequest tag 与 UiResponse 对应" {
 test "UiRequest.permission 携带工具名+参数" {
     const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{\"command\":\"ls\"}" } };
     try testing.expectEqualStrings("Bash", req.permission.tool);
+}
+
+test "serializeUiRequest repairs malformed UTF-8 in dynamic UI fields" {
+    const request = UiRequest{ .custom = .{
+        .kind = "timeline",
+        .payload_json = "{\"title\":\"bad\xff\"}",
+    } };
+    const encoded = try serializeUiRequest(std.testing.allocator, &request);
+    defer std.testing.allocator.free(encoded);
+    // Zig's generic serializer represents a byte slice as a JSON array, so a
+    // malformed payload byte is carried as the numeric value 255 rather than
+    // entering the JSON string grammar. The complete envelope must still be
+    // valid UTF-8/JSON at the host boundary.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "255") != null);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        encoded,
+        .{},
+    );
+    defer parsed.deinit();
 }
 
 test "UiRequester.request 经接口触达回调" {

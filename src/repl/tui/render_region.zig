@@ -2088,7 +2088,7 @@ fn nextCharBytes(s: []const u8, i: usize) usize {
     if (i >= s.len) return 1;
     const b = s[i];
     const n: usize = if (b < 0x80) 1 else if (b >= 0xF0) 4 else if (b >= 0xE0) 3 else if (b >= 0xC0) 2 else 1;
-    return if (i + n <= s.len) n else 1;
+    return if (n <= s.len - i) n else 1;
 }
 
 fn displayWidth(s: []const u8) usize {

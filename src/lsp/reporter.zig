@@ -66,20 +66,20 @@ fn sanitizeField(out: *std.ArrayList(u8), alloc: std.mem.Allocator, value: []con
         // 多字节 UTF-8:**整码点一起**处理,绝不切半个码点(否则产坏 UTF-8)。
         const cp_len: usize = std.unicode.utf8ByteSequenceLength(c) catch 1;
         if (c >= 0x80) {
-            if (cp_len == 1 or i + cp_len > value.len or
+            if (cp_len == 1 or cp_len > value.len - i or
                 !std.unicode.utf8ValidateSlice(value[i .. i + cp_len]))
             {
                 // LSP input is external bytes, so a lead byte and a length
                 // check are insufficient: validate the complete sequence.
                 // Keep the output valid UTF-8 and preserve a visible marker
                 // instead of leaking an illegal byte into the host stream.
-                if (written + 3 > limit) break;
+                if (3 > limit - written) break;
                 try out.appendSlice(alloc, "�");
                 written += 3;
                 i += 1;
                 continue;
             }
-            if (written + cp_len > limit) break; // 放不下整码点 → 在码点边界停
+            if (cp_len > limit - written) break; // 放不下整码点 → 在码点边界停
             try out.appendSlice(alloc, value[i .. i + cp_len]);
             written += cp_len;
             i += cp_len;

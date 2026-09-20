@@ -414,7 +414,7 @@ pub fn appendXmlEscaped(out: *std.ArrayList(u8), a: std.mem.Allocator, s: []cons
             0x80...0xff => {
                 const n = std.unicode.utf8ByteSequenceLength(c) catch null;
                 if (n) |len| {
-                    if (i + len <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + len])) {
+                    if (len <= s.len - i and std.unicode.utf8ValidateSlice(s[i .. i + len])) {
                         try out.appendSlice(a, s[i .. i + len]);
                         i += len;
                         continue;
