@@ -16,6 +16,7 @@ const std = @import("std");
 const process = @import("platform").process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const Capture = @import("../core/tool_result_artifact.zig").Capture;
+const util_time = @import("../util/time.zig");
 
 /// 单行(一条 JSON-RPC 响应/resource)字节上限(轴A OOM 防线)。MCP resource 可合法较大(文件内容),
 /// 64MB 对真实响应绰绰;超此值必是无 `\n` 的病态/恶意巨型行 → 断帧报错 error.McpLineTooLarge。
@@ -28,6 +29,11 @@ pub const StdioTransport = struct {
     allocator: std.mem.Allocator,
     /// 可选中断信号(callTool 期设);null=纯阻塞(如 initialize 短握手)。
     abort: ?*const AbortSignal = null,
+    /// Optional absolute deadline (`util_time.nowMs()` scale). A child that
+    /// accepts a request and then emits no newline would otherwise block the
+    /// caller forever; with a deadline the read fails instead. `null` keeps the
+    /// original blocking behaviour.
+    deadline_ms: ?i64 = null,
 
     /// spawn 子进程。argv 以 null 结尾，argv[0] 是绝对路径或在 PATH 内。
     /// 走可移植 platform/process.spawnPipes（POSIX fork+pipe / Windows CreateProcessW+CreatePipe）。
@@ -40,15 +46,26 @@ pub const StdioTransport = struct {
         };
     }
 
-    /// 写一行 JSON。自动追加 '\n'。
+    /// 写一行 JSON。自动追加 '\n'。设了 `deadline_ms` 时,写前先 poll:子进程
+    /// 停止排空 stdin 会让管道写在填满后阻塞,没有这一步 deadline 只覆盖读半程。
     pub fn send(self: *StdioTransport, json: []const u8) !void {
         var total: usize = 0;
         while (total < json.len) {
+            try self.awaitWritable();
             const n = self.child.write(json[total..]);
             if (n <= 0) return error.WriteFailed;
             total += @as(usize, @intCast(n));
         }
+        try self.awaitWritable();
         if (self.child.write("\n") <= 0) return error.WriteFailed;
+    }
+
+    fn awaitWritable(self: *StdioTransport) !void {
+        const deadline = self.deadline_ms orelse return;
+        while (true) {
+            if (util_time.nowMs() >= deadline) return error.Timeout;
+            if (self.child.pollWritable(100)) return;
+        }
     }
 
     /// 读一行（不含 '\n'）。阻塞直到拿到一行或 EOF。
@@ -71,11 +88,16 @@ pub const StdioTransport = struct {
             }
             // abort-aware:有 abort 时 pollReadable 守卫阻塞 read——超时(100ms)回查 abort,中断即返 error.Aborted。
             // 可移植:POSIX poll / Windows PeekNamedPipe(见 platform/process.PipeChild.pollReadable)。
-            if (self.abort) |ab| {
+            if (self.abort != null or self.deadline_ms != null) {
                 while (true) {
-                    if (ab.isAborted()) return error.Aborted;
+                    if (self.abort) |ab| {
+                        if (ab.isAborted()) return error.Aborted;
+                    }
+                    if (self.deadline_ms) |deadline| {
+                        if (util_time.nowMs() >= deadline) return error.Timeout;
+                    }
                     if (self.child.pollReadable(100)) break; // 有数据/EOF/错误 → 下面 read
-                    // 超时 → 回查 abort 后再 poll
+                    // 超时 → 回查 abort/deadline 后再 poll
                 }
             }
             // 读更多

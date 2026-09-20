@@ -157,8 +157,79 @@ Automatic staged lookup is limited to `<prefix>/bin` and
 search of a `vendor/` directory.
 
 `METACODES_KGD_BIN` selects an explicitly staged `tinykgd` for diagnostics and
-future daemon integration. This release wires resolution, attestation, and the
-doctor check; Metacodes does not start the daemon yet.
+for the local service described below.
+
+## The local service: `kg install` and `kgd`
+
+A shared deployment runs TinyKG Web in front of one `tinykgd`. A single machine
+runs the same contract from the product binary instead:
+
+```sh
+metacodes kg install     # create the store, the key and daemon.json
+metacodes kgd            # serve it in the foreground until Ctrl+C
+```
+
+`kg install` resolves the staged executables, creates the Store when it is
+absent, generates a 256-bit API key, computes the build id from the two TinyKG
+executables and the metadata the CLI declares, and writes `daemon.json` (0600)
+in a 0700 directory. It starts nothing. Re-running it keeps the existing key,
+port and Store, so reconfiguring never locks out a session that already read
+them; `--port` and `--store` change them deliberately.
+
+`kgd` owns one `tinykgd` child and serves `POST /api/run`,
+`POST /api/import-markdown` and `GET /api/ready` on loopback, authenticated by
+`x-api-key`. It reads its port, key and Store from the same `daemon.json` the
+sessions read, so the service and its clients cannot disagree about where it
+listens. The envelope it returns names `metacodes-kgd` as its implementation;
+clients accept that name and `tinykg-web`, and pin the build id on top of it.
+
+An isolated second world — a scratch store on another port, leaving the default
+untouched — is one command plus one variable:
+
+```sh
+metacodes kg install --config ~/scratch-kg.json --store /tmp/scratch.kg.v2 --port 8900
+METACODES_KG_CONFIG=~/scratch-kg.json metacodes kgd
+METACODES_KG_CONFIG=~/scratch-kg.json metacodes        # a session in that world
+```
+
+Properties worth knowing:
+
+- The service handles one connection at a time, because `tinykgd` answers one
+  request at a time. A whole request must arrive within 30 seconds, and the
+  client is authenticated after the head and before the body is read, so an
+  unauthenticated peer cannot make it read a large body.
+- A `tinykgd` that accepts a request and stops answering desynchronizes the
+  pipe. The service reports 503, stops, and says to start it again rather than
+  queueing every later request behind a read that will not return.
+- Nothing starts the daemon automatically yet, there is no idle exit, and the
+  daemon is still not part of the product install.
+- Markdown import stages the document where the engine can read it back by
+  pathname, always at `~/.metacodes/kg/import`. The location is derived from the
+  home directory alone, never from `--config` or `--store`: both can point
+  anywhere, and the engine reopens the staged path after the service renames the
+  file into place, so an ancestor someone else can rename is an ingestion
+  someone else can redirect. Before staging, every directory from that path to
+  the filesystem root must be a non-symlink directory with no group or world
+  write bits, owned by this user or by root; anything else refuses the import
+  rather than proceeding. Stopping the walk at the home directory would not be
+  enough — a home inside a directory someone else can write can be renamed out
+  from under the path just as well.
+- Known limitation on POSIX: that check reads mode bits, which extended or
+  NFSv4 ACLs can contradict. A named ACL granting another account write or
+  `delete_child` on a component is not visible here, so on ACL-carrying
+  filesystems the chain is trusted rather than proven private. Inspecting ACLs
+  portably is a platform-specific exercise this has not taken on.
+- Known limitation on Windows: only the leaf is checked, and only for being a
+  reparse point. MSVCRT cannot open a directory, so there is no descriptor to
+  validate and no portable owner or ACL check; the exclusive temporary file
+  still applies, but a Windows staging chain is trusted rather than proven
+  private.
+- Known limitation on Windows: the bridge's response deadline cannot interrupt
+  a write that is already blocked, because anonymous pipes have no portable
+  writability query (`PipeChild.pollWritable` returns true there). A request is
+  capped at the daemon's own 1 MB ceiling and the child is the `tinykgd` this
+  product ships, so the exposure is a misbehaving child rather than a hostile
+  one; making it interruptible needs overlapped I/O.
 
 Because nothing starts it, the daemon is **not** part of the default install or
 the release layout: `zig build tinykg:stage` (and the test wiring) install it

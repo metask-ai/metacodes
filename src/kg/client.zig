@@ -705,11 +705,17 @@ pub const KgClient = struct {
         return std.mem.span(v);
     }
 
-    const DaemonFile = struct {
+    pub const DaemonFile = struct {
         url: []const u8,
         api_key: []const u8 = "",
         expected_build_id: ?[]const u8 = null,
         expected_schema_digest: []const u8 = "",
+        /// The Store the local `metacodes kgd` serves. Declared here, and
+        /// nowhere used by a client, because this file is parsed with
+        /// `ignore_unknown_fields = false`: the service's own setting has to be
+        /// part of the schema or every session would reject the file. A remote
+        /// daemon's configuration simply omits it.
+        store: ?[]const u8 = null,
     };
 
     /// Resolve only the Metacodes-owned local daemon configuration.  The
@@ -773,7 +779,20 @@ pub const KgClient = struct {
         return std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/daemon.json", .{home});
     }
 
-    const ParsedDaemonFile = std.json.Parsed(DaemonFile);
+    pub const ParsedDaemonFile = std.json.Parsed(DaemonFile);
+
+    /// The same strict read a session performs, for `metacodes kgd` and
+    /// `metacodes kg install`: a service that accepted a configuration its own
+    /// clients refuse would hand the API key to whoever could write the file.
+    pub fn loadDaemonConfig(allocator: std.mem.Allocator, path: []const u8) !ParsedDaemonFile {
+        return (try readDaemonConfig(allocator, path)) orelse error.FileNotFound;
+    }
+
+    /// `METACODES_KG_CONFIG`, else the default under `home`. Shared so the
+    /// service and its clients can never read different files.
+    pub fn resolveDaemonConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+        return daemonConfigPath(allocator, home);
+    }
 
     fn readDaemonConfig(allocator: std.mem.Allocator, path: []const u8) !?ParsedDaemonFile {
         const path_z = try allocator.dupeZ(u8, path);
