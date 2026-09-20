@@ -12,6 +12,7 @@
 //! - gitDiff 文本：标准 `--- a/x` / `+++ b/x` / `@@ -a,b +c,d @@` 格式
 
 const std = @import("std");
+const util_json = @import("../util/json.zig");
 
 const CONTEXT_LINES: usize = 3;
 
@@ -214,7 +215,7 @@ pub fn toStructuredJson(allocator: std.mem.Allocator, hunks: []const Hunk) ![]u8
             defer line_buf.deinit();
             try line_buf.writer.writeByte(prefix);
             try line_buf.writer.writeAll(op.text);
-            try std.json.Stringify.encodeJsonString(line_buf.written(), .{}, &out.writer);
+            try util_json.writeJsonString(&out.writer, line_buf.written());
         }
         try out.writer.writeAll("]}");
     }

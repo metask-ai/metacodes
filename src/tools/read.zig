@@ -483,9 +483,9 @@ fn readImage(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []cons
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"type\":\"image\",\"media_type\":");
-    try std.json.Stringify.encodeJsonString(media_type, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, media_type);
     try out.writer.writeAll(",\"data\":");
-    try std.json.Stringify.encodeJsonString(b64, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, b64);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
 }

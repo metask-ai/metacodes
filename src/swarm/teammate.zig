@@ -414,9 +414,20 @@ pub const TeammateRegistry = struct {
 
     /// Publish an owned catalog snapshot; worker teammates never read App's mutable catalog.
     pub fn setLimits(self: *TeammateRegistry, source: @import("../api/model_limits.zig").ModelLimitsSource) !void {
-        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
-        if (source.catalog) |catalog| snapshot = try catalog.clone(self.allocator);
+        // Keep the borrowed source catalog protected by the registry lock while
+        // cloning it.  App closes this registry before releasing that catalog;
+        // cloning outside the lock leaves a close/setLimits race with a stale
+        // source pointer.
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
+        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
+        if (source.catalog) |catalog| snapshot = catalog.clone(self.allocator) catch |err| {
+            self.listUnlock();
+            return err;
+        };
         defer self.listUnlock();
         if (self.catalog_snapshot) |*old| old.deinit();
         self.catalog_snapshot = snapshot;
@@ -427,6 +438,7 @@ pub const TeammateRegistry = struct {
     fn makeProvider(self: *TeammateRegistry, model: []const u8) !pf.OwnedProvider {
         self.listLock();
         defer self.listUnlock();
+        if (self.closing) return error.RegistryClosed;
         var limits = self.limits;
         if (limits) |*value| value.catalog = if (self.catalog_snapshot) |*catalog| catalog else null;
         return pf.makeProviderWithOptions(
@@ -461,6 +473,25 @@ pub const TeammateRegistry = struct {
         for (self.entries.items) |e| {
             if (!std.mem.eql(u8, e.name, name_sanitized)) continue;
             if (std.mem.eql(u8, e.session.asSlice(), session.asSlice())) return true;
+        }
+        return false;
+    }
+
+    /// Check the complete durable identity before routing a message.  Names
+    /// are reusable within one lead session, so session alone is insufficient
+    /// once a stale worker and its replacement overlap during cleanup.
+    pub fn hasNameForSessionAndLease(
+        self: *TeammateRegistry,
+        name_sanitized: []const u8,
+        session: session_id_mod.SessionId,
+        lease: session_id_mod.SessionId,
+    ) bool {
+        self.listLock();
+        defer self.listUnlock();
+        for (self.entries.items) |e| {
+            if (!std.mem.eql(u8, e.name, name_sanitized) or
+                !std.mem.eql(u8, e.session.asSlice(), session.asSlice())) continue;
+            if (std.mem.eql(u8, e.agent_ident.asSlice(), lease.asSlice())) return true;
         }
         return false;
     }
@@ -629,7 +660,7 @@ pub const TeammateRegistry = struct {
                     e.thread = null;
                 }
                 // 也从 config.json 摘牌(名字可复用;lead poll 通常已摘,这里幂等兜底)。
-                removeMemberBestEffort(e.allocator, e.config_path, e.name);
+                removeMemberBestEffort(e.allocator, e.config_path, e.name, e.session, e.agent_ident);
                 _ = self.entries.orderedRemove(i);
                 freeEntry(e);
                 continue; // i 不前进(后一条补位)
@@ -722,9 +753,12 @@ pub const TeammateRegistry = struct {
             model: []const u8,
             cwd: []const u8,
             session: []const u8,
+            lease: []const u8,
         };
         const addMember = struct {
             fn f(ctx: AddCtx, tf: *team_mod.TeamFile) anyerror!void {
+                const lead_session = tf.lead_session_id orelse return error.SessionMismatch;
+                if (!std.mem.eql(u8, lead_session, ctx.session)) return error.SessionMismatch;
                 if (tf.findMember(ctx.name) != null) return error.DuplicateTeammateName;
                 try tf.addMember(.{
                     .agent_id = ctx.agent_id,
@@ -735,6 +769,7 @@ pub const TeammateRegistry = struct {
                     .joined_at_ms = @intCast(@divTrunc(util_time.nowWallNs(), 1_000_000)),
                     .cwd = ctx.cwd,
                     .session_id = ctx.session,
+                    .lease_id = ctx.lease,
                     .backend_type = "in-process",
                     .is_active = true,
                 });
@@ -748,9 +783,10 @@ pub const TeammateRegistry = struct {
             .model = p.model_override orelse "",
             .cwd = p.cwd,
             .session = p.session.asSlice(),
+            .lease = entry.agent_ident.asSlice(),
         }, addMember);
         // 从这里起,失败要把成员摘回去。
-        errdefer if (!committed) removeMemberBestEffort(a, config_path, name_s);
+        errdefer if (!committed) removeMemberBestEffort(a, config_path, name_s, p.session, entry.agent_ident);
 
         // 3) 邮箱就位(空邮箱,ensure 幂等)。
         try mailbox.ensureInbox(inbox_path);
@@ -956,27 +992,51 @@ fn releaseHeldTasks(e: *TeammateEntry, kg: ?*@import("../kg/client.zig").KgClien
     for (ids) |id| k.releaseTask(id, e.agent_id) catch {};
 }
 
-const NameCtx = struct { name: []const u8 };
+const NameCtx = struct { name: []const u8, session: session_id_mod.SessionId, lease: session_id_mod.SessionId };
 fn removeMemberMutate(c: NameCtx, tf: *team_mod.TeamFile) anyerror!void {
+    const lead_session = tf.lead_session_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, lead_session, c.session.asSlice())) return error.SessionMismatch;
+    const member = tf.findMember(c.name) orelse return error.MemberNotFound;
+    const member_session = member.session_id orelse return error.SessionMismatch;
+    const member_lease = member.lease_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, member_session, c.session.asSlice()) or
+        !std.mem.eql(u8, member_lease, c.lease.asSlice())) return error.SessionMismatch;
     _ = tf.removeMember(c.name);
 }
 
 /// 摘成员(spawn 失败回滚/终止收尾;best-effort:锁忙/文件损坏不致命)。
-fn removeMemberBestEffort(a: std.mem.Allocator, config_path: []const u8, name: []const u8) void {
-    team_mod.updateTeam(a, config_path, NameCtx{ .name = name }, removeMemberMutate) catch {};
+fn removeMemberBestEffort(
+    a: std.mem.Allocator,
+    config_path: []const u8,
+    name: []const u8,
+    session: session_id_mod.SessionId,
+    lease: session_id_mod.SessionId,
+) void {
+    team_mod.updateTeam(a, config_path, NameCtx{ .name = name, .session = session, .lease = lease }, removeMemberMutate) catch {};
 }
 
-const ActiveCtx = struct { name: []const u8, session: session_id_mod.SessionId, active: bool };
+const ActiveCtx = struct { name: []const u8, session: session_id_mod.SessionId, lease: session_id_mod.SessionId, active: bool };
 fn setMemberActiveMutate(c: ActiveCtx, tf: *team_mod.TeamFile) anyerror!void {
+    const lead_session = tf.lead_session_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, lead_session, c.session.asSlice())) return error.SessionMismatch;
     const m = tf.findMember(c.name) orelse return error.MemberNotFound;
     const member_session = m.session_id orelse return error.SessionMismatch;
-    if (!std.mem.eql(u8, member_session, c.session.asSlice())) return error.SessionMismatch;
+    const member_lease = m.lease_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, member_session, c.session.asSlice()) or
+        !std.mem.eql(u8, member_lease, c.lease.asSlice())) return error.SessionMismatch;
     m.is_active = c.active;
 }
 
 /// 翻 config.json 里成员的 is_active(best-effort)。
-fn setMemberActiveBestEffort(a: std.mem.Allocator, config_path: []const u8, name: []const u8, session: session_id_mod.SessionId, active: bool) void {
-    team_mod.updateTeam(a, config_path, ActiveCtx{ .name = name, .session = session, .active = active }, setMemberActiveMutate) catch {};
+fn setMemberActiveBestEffort(
+    a: std.mem.Allocator,
+    config_path: []const u8,
+    name: []const u8,
+    session: session_id_mod.SessionId,
+    lease: session_id_mod.SessionId,
+    active: bool,
+) void {
+    team_mod.updateTeam(a, config_path, ActiveCtx{ .name = name, .session = session, .lease = lease, .active = active }, setMemberActiveMutate) catch {};
 }
 
 /// idle_notification 投递(best-effort;cc teammateInit Stop-hook 等价)。
@@ -991,6 +1051,10 @@ fn sendIdleNotification(a: std.mem.Allocator, e: *TeammateEntry, reason: []const
     defer out.deinit();
     out.writer.writeAll("{\"type\":\"idle_notification\",\"from\":") catch return;
     util_json.writeJsonString(&out.writer, e.name) catch return;
+    out.writer.writeAll(",\"session_id\":") catch return;
+    util_json.writeJsonString(&out.writer, e.session.asSlice()) catch return;
+    out.writer.writeAll(",\"lease_id\":") catch return;
+    util_json.writeJsonString(&out.writer, e.agent_ident.asSlice()) catch return;
     out.writer.writeAll(",\"timestamp\":") catch return;
     util_json.writeJsonString(&out.writer, ts) catch return;
     out.writer.writeAll(",\"idleReason\":") catch return;
@@ -1032,6 +1096,10 @@ fn sendShutdownApproved(a: std.mem.Allocator, e: *TeammateEntry, request_text: [
     util_json.writeJsonString(&out.writer, e.name) catch return;
     out.writer.writeAll(",\"request_id\":") catch return;
     util_json.writeJsonString(&out.writer, rid) catch return;
+    out.writer.writeAll(",\"session_id\":") catch return;
+    util_json.writeJsonString(&out.writer, e.session.asSlice()) catch return;
+    out.writer.writeAll(",\"lease_id\":") catch return;
+    util_json.writeJsonString(&out.writer, e.agent_ident.asSlice()) catch return;
     out.writer.writeByte('}') catch return;
     const body = out.toOwnedSlice() catch return;
     defer a.free(body);
@@ -1211,7 +1279,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
 
     if (input.reasoning_effort_override) |effort| {
         input.owned.provider().setReasoningEffort(effort) catch {
-            setMemberActiveBestEffort(a, e.config_path, e.name, input.session, false); // 先落盘再翻状态(#100)
+            setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false); // 先落盘再翻状态(#100)
             e.setStatus(.failed);
             sendIdleNotification(a, e, "failed", null, "AgentEffortUnsupportedProvider");
             input.cleanup();
@@ -1223,7 +1291,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
     var conv = Conversation.init(a);
     defer conv.deinit();
     conv.appendText(.user, input.prompt) catch {
-        setMemberActiveBestEffort(a, e.config_path, e.name, input.session, false); // 先落盘再翻状态(#100)
+        setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false); // 先落盘再翻状态(#100)
         e.setStatus(.failed);
         sendIdleNotification(a, e, "failed", null, "OutOfMemory");
         input.cleanup();
@@ -1305,7 +1373,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
         // deinit 的 abort 之后,agent_loop turn 开始的 abort 检查得以生效;去重后线程立即
         // 进入**不可中断的 HTTP receiveHead**(慢 mock 下 deinit join 从 ~60s 恶化到 240s)。
         // 真正的修法是 abort 感知的 HTTP 等待(登记存量债);在那之前保留此写(也对齐 cc)。
-        setMemberActiveBestEffort(a, e.config_path, e.name, input.session, true);
+        setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, true);
 
         const result = agent_loop.run(
             &conv,
@@ -1350,7 +1418,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
             // 先放租约再翻 failed:failed 同样让 liveCount() 不再计入本 teammate,
             // lead 据此重派或收尸时租约必须已经不在 KG 里(理由同下方 terminated 路径)。
             releaseHeldTasks(e, kg_ptr); // 释放持有租约(PM F4/Linus M1:防卡 TTL)
-            setMemberActiveBestEffort(a, e.config_path, e.name, input.session, false); // 先落盘再翻状态(#100)
+            setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false); // 先落盘再翻状态(#100)
             e.lockPublic();
             e.status = .failed;
             e.err_name = @errorName(err);
@@ -1379,7 +1447,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
         // 才是"干完可接新活";max_turns/tool_loop/budget 等是"没干完",发 needs_continuation
         // + stopReason 让 lead 决定续跑/改派,而非误以为完工。
         // 与 terminated 同序(#100):先落盘 isActive=false,再翻 idle,再通知。
-        setMemberActiveBestEffort(a, e.config_path, e.name, input.session, false);
+        setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false);
         e.setStatus(.idle);
         switch (result.stop_reason) {
             .end_turn => sendIdleNotification(a, e, "available", null, null),
@@ -1403,7 +1471,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
     // terminated 必须蕴含 "持有的租约已经放掉" 且 "config.json 的 isActive=false 已落盘"
     // (best-effort:写失败也不再重试,但此后不会再有写)。
     releaseHeldTasks(e, kg_ptr); // 退出前释放持有租约(PM F4/Linus M1:abort/shutdown 不卡 TTL)
-    setMemberActiveBestEffort(a, e.config_path, e.name, input.session, false);
+    setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false);
     e.setStatus(.terminated);
     input.cleanup();
 }

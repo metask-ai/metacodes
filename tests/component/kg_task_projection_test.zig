@@ -121,3 +121,25 @@ test "L2 task projection Markdown survives marker text and neutralizes terminal 
     defer second.deinit();
     try std.testing.expect(first.eql(&second));
 }
+
+test "L2 task projection repairs malformed UTF-8 at the Markdown boundary" {
+    const allocator = std.testing.allocator;
+    var parsed = try projection.parseSnapshot(
+        allocator,
+        projection.TaskId.fromInt(1),
+        FULL_SNAPSHOT,
+    );
+    defer parsed.deinit();
+
+    // The parser accepts only valid JSON, but provider/user-owned buffers can
+    // still be corrupted after admission. Rendering must keep both the human
+    // text and canonical JSON envelope valid UTF-8.
+    const text = @constCast(parsed.tasks[0].text);
+    text[0] = 0xe4;
+    text[1] = 0x60;
+    text[2] = 0x80;
+    const markdown = try parsed.renderMarkdown(allocator);
+    defer allocator.free(markdown);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(markdown));
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "�`�") != null);
+}

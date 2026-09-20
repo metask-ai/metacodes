@@ -24,6 +24,7 @@ const controls_mod = @import("controls.zig");
 const selection_mod = @import("selection.zig");
 const offer_mod = @import("offer.zig");
 const json_merge = @import("../util/json_merge.zig");
+const util_json = @import("../util/json.zig");
 
 pub const Slug = ids.Slug;
 pub const OfferId = ids.OfferId;
@@ -571,20 +572,7 @@ fn writeJsonString(
     out: *std.ArrayList(u8),
     text: []const u8,
 ) DocumentError!void {
-    try out.append(arena, '"');
-    for (text) |byte| switch (byte) {
-        '"' => try out.appendSlice(arena, "\\\""),
-        '\\' => try out.appendSlice(arena, "\\\\"),
-        '\n' => try out.appendSlice(arena, "\\n"),
-        '\r' => try out.appendSlice(arena, "\\r"),
-        '\t' => try out.appendSlice(arena, "\\t"),
-        else => {
-            if (byte < 0x20) {
-                try out.appendSlice(arena, try std.fmt.allocPrint(arena, "\\u{x:0>4}", .{byte}));
-            } else try out.append(arena, byte);
-        },
-    };
-    try out.append(arena, '"');
+    try util_json.serializeString(text, out, arena);
 }
 
 // ── parsing ──────────────────────────────────────────────────────────────────
@@ -1381,4 +1369,16 @@ test "a credential entry carrying a literal secret is refused" {
         \\{"schema_version":1,"providers":{"openai":{"enabled":true,"credentials":[
         \\  {"id":"work","env":"OPENAI_API_KEY_WORK","secret":"sk-leaked"}]}}}
     ));
+}
+
+test "configuration JSON writer repairs malformed UTF-8" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try writeJsonString(a, &out, "label\xe4\x60\x80");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out.items));
+    try std.testing.expectEqualStrings("\"label�`�\"", out.items);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("label�`�", parsed.value.string);
 }

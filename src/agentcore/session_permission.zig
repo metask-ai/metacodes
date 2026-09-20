@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const core = @import("metacodes-core");
+const util_json = @import("../util/json.zig");
 
 pub const ARGUMENT_DIGEST_BYTES: usize = 32;
 pub const REQUEST_ID_BYTES: usize = 32;
@@ -1227,6 +1228,10 @@ pub fn encodeCallbackRequest(
     if (request.run_id == 0 or request.tool_call_id.len == 0 or
         request.policy_generation == 0 or arguments_json.len == 0)
         return error.InvalidIdentity;
+    if (!std.unicode.utf8ValidateSlice(request.tool_call_id))
+        return error.InvalidIdentity;
+    if (!std.unicode.utf8ValidateSlice(arguments_json))
+        return error.InvalidArguments;
     if (arguments_json.len > DEFAULT_MAX_ARGUMENT_BYTES)
         return error.ResourceLimit;
 
@@ -1283,7 +1288,10 @@ pub fn encodeCallbackRequest(
         .responses = responses_buffer[0..response_count],
         .candidate = candidate_dto,
     };
-    return std.json.Stringify.valueAlloc(allocator, dto, .{}) catch
+    const raw = std.json.Stringify.valueAlloc(allocator, dto, .{}) catch
+        return error.OutOfMemory;
+    defer allocator.free(raw);
+    return util_json.repairJsonUtf8(allocator, raw) catch
         return error.OutOfMemory;
 }
 
@@ -1706,6 +1714,19 @@ test "Revision 6 Permission callback binds response to request and candidate" {
     try std.testing.expectError(
         error.InvalidResponse,
         decodeCallbackResponse(allocator, stale_response, request, .{}),
+    );
+
+    var malformed_identity = request;
+    const malformed_tool_call_id = [_]u8{0x80};
+    malformed_identity.tool_call_id = malformed_tool_call_id[0..];
+    try std.testing.expectError(
+        error.InvalidIdentity,
+        encodeCallbackRequest(allocator, malformed_identity, "{\"command\":\"git status\"}", .{}),
+    );
+    const malformed_arguments = [_]u8{ '{', '"', 'x', '"', ':', 0xC3, '}' };
+    try std.testing.expectError(
+        error.InvalidArguments,
+        encodeCallbackRequest(allocator, request, malformed_arguments[0..], .{}),
     );
 }
 

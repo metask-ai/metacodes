@@ -73,6 +73,18 @@ fn stringifyJson(allocator_: std.mem.Allocator, value: anytype) ![]u8 {
     return repairJsonUtf8(allocator_, raw);
 }
 
+/// This file is also compiled as a standalone ABI module, so it cannot import
+/// the core utility module. Keep its dynamic JSON strings on the same repaired
+/// UTF-8 contract with a local adapter.
+fn writeJsonStringSafe(writer: *std.Io.Writer, value: []const u8) !void {
+    var scratch: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    defer scratch.deinit();
+    std.json.Stringify.encodeJsonString(value, .{}, &scratch.writer) catch return error.OutOfMemory;
+    const repaired = repairJsonUtf8(std.heap.c_allocator, scratch.written()) catch return error.OutOfMemory;
+    defer std.heap.c_allocator.free(repaired);
+    try writer.writeAll(repaired);
+}
+
 comptime {
     if (wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 != @as(u64, core.tool_exec.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1))
         @compileError("AgentCore wire and core encoded Host-error limits must match");
@@ -3883,11 +3895,11 @@ fn canonicalInvocationRecord(
     output.writer.writeAll("\",\"skill_id\":\"") catch return error.OutOfMemory;
     output.writer.writeAll(&plan.skill.execution_id) catch return error.OutOfMemory;
     output.writer.writeAll("\",\"invocation_name\":") catch return error.OutOfMemory;
-    std.json.Stringify.encodeJsonString(plan.skill.invocation_name, .{}, &output.writer) catch return error.OutOfMemory;
+    writeJsonStringSafe(&output.writer, plan.skill.invocation_name) catch return error.OutOfMemory;
     output.writer.writeAll(",\"arguments\":{\"values\":[") catch return error.OutOfMemory;
     for (plan.arguments, 0..) |argument, index| {
         if (index != 0) output.writer.writeByte(',') catch return error.OutOfMemory;
-        std.json.Stringify.encodeJsonString(argument, .{}, &output.writer) catch return error.OutOfMemory;
+        writeJsonStringSafe(&output.writer, argument) catch return error.OutOfMemory;
     }
     output.writer.writeAll("]}}") catch return error.OutOfMemory;
     return output.toOwnedSlice() catch error.OutOfMemory;

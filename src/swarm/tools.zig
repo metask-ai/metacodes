@@ -70,6 +70,7 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
     if (ctx.project_rule_gate != null) return error.ProjectRulesRequireSynchronousAgent;
     const sw = ctx.swarm orelse return error.SwarmUnavailable;
     if (!sw.is_lead) return error.NotTeamLead;
+    if (!std.mem.eql(u8, sw.session.asSlice(), ctx.session.asSlice())) return error.NoActiveTeam;
     if (sw.home.len == 0) return error.SwarmUnavailable;
     if (sw.hasTeam()) return error.TeamAlreadyExists;
 
@@ -162,6 +163,7 @@ pub fn executeTeamDelete(ctx: *const ToolContext, args: []const u8) anyerror![]u
     _ = args;
     const sw = ctx.swarm orelse return error.SwarmUnavailable;
     if (!sw.is_lead) return error.NotTeamLead;
+    if (!std.mem.eql(u8, sw.session.asSlice(), ctx.session.asSlice())) return error.NoActiveTeam;
     if (!sw.hasTeam()) return error.NoActiveTeam;
 
     // 拒绝有 working/idle 成员(对齐 cc:活跃时不删)。
@@ -244,11 +246,16 @@ pub fn executeSendMessage(ctx: *const ToolContext, args: []const u8) anyerror![]
         const member_sid = member.session_id orelse return error.UnknownRecipient;
         const sid = @import("../core/session_id.zig").SessionId.fromSlice(member_sid) orelse return error.UnknownRecipient;
         if (!std.mem.eql(u8, sid.asSlice(), sw.session.asSlice())) return error.UnknownRecipient;
+        const member_lease = member.lease_id orelse return error.UnknownRecipient;
+        const lease = @import("../core/session_id.zig").SessionId.fromSlice(member_lease) orelse return error.UnknownRecipient;
         if (sw.teammates) |*t| {
-            if (!t.hasNameForSession(to_s, sw.session)) {
+            if (!t.hasNameForSessionAndLease(to_s, sw.session, lease)) {
                 var process_member = false;
                 for (sw.process_teammates.items) |pt| {
-                    if (std.mem.eql(u8, pt.session.asSlice(), sw.session.asSlice()) and std.mem.eql(u8, pt.name, to_s)) {
+                    if (std.mem.eql(u8, pt.session.asSlice(), sw.session.asSlice()) and
+                        std.mem.eql(u8, pt.name, to_s) and
+                        std.mem.eql(u8, pt.lease.asSlice(), lease.asSlice()))
+                    {
                         process_member = true;
                         break;
                     }
@@ -276,19 +283,19 @@ fn broadcast(ctx: *const ToolContext, sw: *SwarmContext, message: []const u8, su
     var n: usize = 0;
     for (tf.members.items) |*m| {
         if (std.mem.eql(u8, m.name, sw.self_name)) continue;
-        if (m.session_id) |member_sid| {
-            const sid = @import("../core/session_id.zig").SessionId.fromSlice(member_sid) orelse continue;
-            if (!std.mem.eql(u8, sid.asSlice(), sw.session.asSlice())) continue;
-        } else if (sw.teammates == null) {
-            // A process-mode child cannot prove ownership of a legacy config
-            // member that lacks sessionId; fail closed rather than cross-route.
-            continue;
-        }
+        const member_sid = m.session_id orelse continue;
+        const sid = @import("../core/session_id.zig").SessionId.fromSlice(member_sid) orelse continue;
+        if (!std.mem.eql(u8, sid.asSlice(), sw.session.asSlice())) continue;
+        const member_lease = m.lease_id orelse continue;
+        const lease = @import("../core/session_id.zig").SessionId.fromSlice(member_lease) orelse continue;
         if (sw.teammates) |*t| {
-            if (!@constCast(t).hasNameForSession(m.name, sw.session)) {
+            if (!@constCast(t).hasNameForSessionAndLease(m.name, sw.session, lease)) {
                 var process_member = false;
                 for (sw.process_teammates.items) |pt| {
-                    if (std.mem.eql(u8, pt.session.asSlice(), sw.session.asSlice()) and std.mem.eql(u8, pt.name, m.name)) {
+                    if (std.mem.eql(u8, pt.session.asSlice(), sw.session.asSlice()) and
+                        std.mem.eql(u8, pt.name, m.name) and
+                        std.mem.eql(u8, pt.lease.asSlice(), lease.asSlice()))
+                    {
                         process_member = true;
                         break;
                     }
@@ -346,6 +353,17 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
                 consumed.append(allocator, m.*) catch {};
             },
             .idle_notification => {
+                // Idle status is host-visible roster state.  Require the same
+                // durable session+lease identity as SendMessage so a delayed
+                // notification from an old same-name worker cannot mark the
+                // replacement as available/failed.
+                if (!idleNotificationMatchesCurrentMember(allocator, sw, m)) {
+                    // Consume stale or legacy notifications: they carry no
+                    // actionable state and retaining them would replay the
+                    // same false status on every lead poll.
+                    consumed.append(allocator, m.*) catch {};
+                    continue;
+                }
                 const line = renderIdleNotice(allocator, m) catch continue;
                 defer allocator.free(line);
                 if (out.items.len > 0) out.appendSlice(allocator, "\n\n") catch {};
@@ -366,15 +384,28 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
                     break :blk false; // 不在 registry = 已收尾,可摘
                 } else false;
                 if (alive) continue; // 仍在跑:留未读,不摘牌(不加入 consumed)
+                // A delayed approval from an older same-name worker must not
+                // remove the replacement member.  The approval carries the
+                // lead session and per-spawn lease persisted in TeamFile;
+                // missing or malformed identity is left unread for the
+                // owner of the old protocol to handle rather than deleting
+                // by name alone.
+                const approval_session = util_json.extractStringField(m.text, "session_id") orelse continue;
+                const approval_lease = util_json.extractStringField(m.text, "lease_id") orelse continue;
+                const session_id_mod = @import("../core/session_id.zig");
+                if (session_id_mod.SessionId.fromSlice(approval_session) == null or
+                    session_id_mod.SessionId.fromSlice(approval_lease) == null or
+                    !std.mem.eql(u8, approval_session, sw.session.asSlice())) continue;
                 var cfgbuf: [std.fs.max_path_bytes]u8 = undefined;
                 const cfg = sw.configPath(&cfgbuf);
-                removeMemberFromConfig(allocator, cfg, m.from);
-                var lb: [256]u8 = undefined;
-                const line = std.fmt.bufPrint(&lb, "<teammate-status from=\"{s}\" state=\"shutdown\">teammate has shut down and left the team</teammate-status>", .{m.from}) catch "";
-                if (line.len > 0) {
-                    if (out.items.len > 0) out.appendSlice(allocator, "\n\n") catch {};
-                    out.appendSlice(allocator, line) catch {};
-                }
+                removeMemberFromConfig(allocator, cfg, m.from, approval_session, approval_lease);
+                var line: std.ArrayList(u8) = .empty;
+                defer line.deinit(allocator);
+                line.appendSlice(allocator, "<teammate-status from=\"") catch continue;
+                mailbox.appendXmlEscaped(&line, allocator, m.from) catch continue;
+                line.appendSlice(allocator, "\" state=\"shutdown\">teammate has shut down and left the team</teammate-status>") catch continue;
+                if (out.items.len > 0) out.appendSlice(allocator, "\n\n") catch {};
+                out.appendSlice(allocator, line.items) catch {};
                 consumed.append(allocator, m.*) catch {};
             },
             else => {
@@ -388,15 +419,48 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
     return out.toOwnedSlice(allocator) catch null;
 }
 
-const RmNameCtx = struct { name: []const u8 };
+fn idleNotificationMatchesCurrentMember(allocator: std.mem.Allocator, sw: *const SwarmContext, m: *const mailbox.Message) bool {
+    const raw_session = util_json.extractStringField(m.text, "session_id") orelse return false;
+    const raw_lease = util_json.extractStringField(m.text, "lease_id") orelse return false;
+    const session = @import("../core/session_id.zig").SessionId.fromSlice(raw_session) orelse return false;
+    const lease = @import("../core/session_id.zig").SessionId.fromSlice(raw_lease) orelse return false;
+    if (!std.mem.eql(u8, session.asSlice(), sw.session.asSlice())) return false;
+
+    var name_buf: [64]u8 = undefined;
+    const name = team_mod.sanitizeAgentName(m.from, &name_buf);
+    var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cfg = sw.configPath(&cfg_buf);
+    var tf = team_mod.load(allocator, cfg) orelse return false;
+    defer tf.deinit();
+    const member = tf.findMember(name) orelse return false;
+    const member_session = member.session_id orelse return false;
+    const member_lease = member.lease_id orelse return false;
+    return std.mem.eql(u8, member_session, session.asSlice()) and
+        std.mem.eql(u8, member_lease, lease.asSlice());
+}
+
+const RmNameCtx = struct { name: []const u8, session: []const u8, lease: []const u8 };
 fn rmMemberMutate(c: RmNameCtx, tf: *team_mod.TeamFile) anyerror!void {
+    const lead_session = tf.lead_session_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, lead_session, c.session)) return error.SessionMismatch;
+    const member = tf.findMember(c.name) orelse return error.MemberNotFound;
+    const member_session = member.session_id orelse return error.SessionMismatch;
+    const member_lease = member.lease_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, member_session, c.session) or
+        !std.mem.eql(u8, member_lease, c.lease)) return error.SessionMismatch;
     _ = tf.removeMember(c.name);
 }
-fn removeMemberFromConfig(a: std.mem.Allocator, config_path: []const u8, name_sanitized: []const u8) void {
+fn removeMemberFromConfig(
+    a: std.mem.Allocator,
+    config_path: []const u8,
+    name_sanitized: []const u8,
+    session: []const u8,
+    lease: []const u8,
+) void {
     if (config_path.len == 0) return;
     var nb: [64]u8 = undefined;
     const ns = team_mod.sanitizeAgentName(name_sanitized, &nb);
-    team_mod.updateTeam(a, config_path, RmNameCtx{ .name = ns }, rmMemberMutate) catch {};
+    team_mod.updateTeam(a, config_path, RmNameCtx{ .name = ns, .session = session, .lease = lease }, rmMemberMutate) catch {};
 }
 
 /// SW3:确保共享 KG inbox root 存在并写好 kg_inbox 指针,让 lead 的 TaskCreate 与 teammate
@@ -426,18 +490,18 @@ fn renderIdleNotice(allocator: std.mem.Allocator, m: *const mailbox.Message) ![]
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "<teammate-status from=\"");
-    try out.appendSlice(allocator, m.from);
+    try mailbox.appendXmlEscaped(&out, allocator, m.from);
     try out.appendSlice(allocator, "\" state=\"");
-    try out.appendSlice(allocator, reason);
+    try mailbox.appendXmlEscaped(&out, allocator, reason);
     try out.appendSlice(allocator, "\"");
     if (stop) |s| {
         try out.appendSlice(allocator, " stopReason=\"");
-        try out.appendSlice(allocator, s);
+        try mailbox.appendXmlEscaped(&out, allocator, s);
         try out.appendSlice(allocator, "\"");
     }
     try out.appendSlice(allocator, ">");
     if (failure) |f| {
-        try out.appendSlice(allocator, f);
+        try mailbox.appendXmlEscaped(&out, allocator, f);
     } else if (std.mem.eql(u8, reason, "available")) {
         try out.appendSlice(allocator, "teammate finished its turn and is idle");
     } else if (std.mem.eql(u8, reason, "needs_continuation")) {
@@ -538,10 +602,35 @@ test "pollLeadInbox: plain + idle_notification 消费,协议回执留未读" {
     const r1 = try executeTeamCreate(&ctx, "{\"name\":\"proj\"}");
     a.free(r1);
 
+    // Seed one durable member identity so the notification can be checked
+    // against the same session+lease boundary used by production teammates.
+    var cfgbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const cfg_path = sw.configPath(&cfgbuf);
+    var seeded = team_mod.load(a, cfg_path) orelse return error.NoConfig;
+    defer seeded.deinit();
+    const lease = @import("../core/session_id.zig").gen();
+    try seeded.addMember(.{
+        .agent_id = "bob@proj",
+        .name = "bob",
+        .cwd = "/tmp",
+        .session_id = sw.session.asSlice(),
+        .lease_id = lease.asSlice(),
+    });
+    try team_mod.save(a, &seeded, cfg_path);
+
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
     const lead_inbox = team_mod.inboxPath(home, "proj", "team-lead", &inbox_buf);
     try mailbox.deliver(a, lead_inbox, "bob", "here is my result", "blue", "result");
-    try mailbox.deliver(a, lead_inbox, "bob", "{\"type\":\"idle_notification\",\"from\":\"bob\",\"idleReason\":\"failed\",\"failureReason\":\"boom\"}", null, null);
+    const idle = try std.fmt.allocPrint(
+        a,
+        "{{\"type\":\"idle_notification\",\"from\":\"bob\",\"session_id\":\"{s}\",\"lease_id\":\"{s}\",\"idleReason\":\"failed\",\"stopReason\":\"<stop>\",\"failureReason\":\"<boom>\"}}",
+        .{ sw.session.asSlice(), lease.asSlice() },
+    );
+    defer a.free(idle);
+    try mailbox.deliver(a, lead_inbox, "bob", idle, null, null);
+    // A legacy notification without the durable identity is consumed but
+    // must not affect the visible roster.
+    try mailbox.deliver(a, lead_inbox, "bob", "{\"type\":\"idle_notification\",\"from\":\"bob\",\"idleReason\":\"available\"}", null, null);
     // plan_approval_response 归 SW4 审批代理消费,pollLeadInbox 留未读(不吞)。
     try mailbox.deliver(a, lead_inbox, "bob", "{\"type\":\"plan_approval_response\",\"request_id\":\"r1\",\"approve\":true}", null, null);
 
@@ -550,6 +639,8 @@ test "pollLeadInbox: plain + idle_notification 消费,协议回执留未读" {
     try testing.expect(std.mem.indexOf(u8, pulled, "here is my result") != null);
     try testing.expect(std.mem.indexOf(u8, pulled, "state=\"failed\"") != null);
     try testing.expect(std.mem.indexOf(u8, pulled, "boom") != null);
+    try testing.expect(std.mem.indexOf(u8, pulled, "stopReason=\"&lt;stop&gt;\"") != null);
+    try testing.expect(std.mem.indexOf(u8, pulled, "&lt;boom&gt;") != null);
 
     // plan_approval_response 留未读(SW4 审批代理消费,不被 poll 吞掉)。
     var unread = try mailbox.readUnread(a, lead_inbox);

@@ -163,7 +163,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
     if (git_diff) |g| {
         try out.writer.writeAll(",\"gitDiff\":");
-        try std.json.Stringify.encodeJsonString(g, .{}, &out.writer);
+        try util_json.writeJsonString(&out.writer, g);
     }
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();

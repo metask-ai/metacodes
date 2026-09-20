@@ -41,6 +41,7 @@ fn setupTeam(a: std.mem.Allocator, home_buf: []u8) ![]const u8 {
         .allocator = a,
         .name = try a.dupe(u8, "proj"),
         .lead_agent_id = try a.dupe(u8, "team-lead@proj"),
+        .lead_session_id = try a.dupe(u8, cc.session_id.SessionId.single.asSlice()),
         .created_at_ms = 1,
     };
     defer tf.deinit();

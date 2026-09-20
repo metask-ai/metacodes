@@ -210,6 +210,34 @@ pub fn writeJsonStringContents(w: *std.Io.Writer, s: []const u8) !void {
     try encodeStringInner(s, w);
 }
 
+/// Write human-readable text while repairing malformed UTF-8.  This is the
+/// unquoted counterpart of `writeJsonStringContents`: control-byte policy is
+/// left to the caller, but arbitrary provider/user bytes cannot leak as an
+/// invalid host-visible stream.
+pub fn writeUtf8Repaired(w: *std.Io.Writer, s: []const u8) !void {
+    var i: usize = 0;
+    var plain_start: usize = 0;
+    while (i < s.len) {
+        const b = s[i];
+        if (b < 0x80) {
+            i += 1;
+            continue;
+        }
+        const n = std.unicode.utf8ByteSequenceLength(b) catch null;
+        if (n) |len| {
+            if (i + len <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + len])) {
+                i += len;
+                continue;
+            }
+        }
+        try w.writeAll(s[plain_start..i]);
+        try w.writeAll("\u{FFFD}");
+        i += 1;
+        plain_start = i;
+    }
+    try w.writeAll(s[plain_start..]);
+}
+
 /// Repair raw JSON produced by a generic serializer at the transport
 /// boundary.  The standard stringifier escapes syntax but does not guarantee
 /// that borrowed byte slices are valid UTF-8.  Invalid bytes can only be
@@ -282,7 +310,10 @@ pub fn serializeNumber(v: anytype, buf: *std.ArrayList(u8), allocator: std.mem.A
 /// 不反转义返回值（调用方按需调 unescapeString）。
 pub fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
     var pattern_buf: [256]u8 = undefined;
-    std.debug.assert(field.len < 200);
+    // Keep malformed/provider-controlled field names a normal miss.  The
+    // fixed scratch buffer is an implementation detail and must never turn a
+    // long key into a bounds panic in Debug or ReleaseSafe builds.
+    if (field.len >= pattern_buf.len - 3) return null;
     pattern_buf[0] = '"';
     @memcpy(pattern_buf[1..][0..field.len], field);
     pattern_buf[1 + field.len] = '"';
@@ -372,7 +403,7 @@ pub fn extractAndUnescapeStringField(data: []const u8, field: []const u8, alloca
 /// 字面量;调用方按需 unescape。
 pub fn extractStringOrNumberField(data: []const u8, field: []const u8) ?[]const u8 {
     var pattern_buf: [256]u8 = undefined;
-    std.debug.assert(field.len < 200);
+    if (field.len >= pattern_buf.len - 3) return null;
     pattern_buf[0] = '"';
     @memcpy(pattern_buf[1..][0..field.len], field);
     pattern_buf[1 + field.len] = '"';
@@ -416,7 +447,7 @@ pub fn extractStringOrNumberField(data: []const u8, field: []const u8) ?[]const 
 /// 提取顶层布尔字段 `"field":true|false`(值不带引号)。缺失或非法返回 null。
 pub fn extractBoolField(data: []const u8, field: []const u8) ?bool {
     var pattern_buf: [256]u8 = undefined;
-    std.debug.assert(field.len < 200);
+    if (field.len >= pattern_buf.len - 3) return null;
     pattern_buf[0] = '"';
     @memcpy(pattern_buf[1..][0..field.len], field);
     pattern_buf[1 + field.len] = '"';
@@ -436,7 +467,7 @@ pub fn extractBoolField(data: []const u8, field: []const u8) ?bool {
 /// prompt_tokens_details.cached_tokens)。不处理浮点/负数/科学记数——计数类字段都是非负整数。
 pub fn extractIntField(data: []const u8, field: []const u8) u64 {
     var pat_buf: [256]u8 = undefined;
-    std.debug.assert(field.len < 250);
+    if (field.len >= pat_buf.len - 3) return 0;
     pat_buf[0] = '"';
     @memcpy(pat_buf[1..][0..field.len], field);
     pat_buf[1 + field.len] = '"';
@@ -459,6 +490,14 @@ test "extractIntField basic + nested + missing" {
     try std.testing.expectEqual(@as(u64, 5), extractIntField("{\"k\": 5}", "k"));
     // 缺失 → 0
     try std.testing.expectEqual(@as(u64, 0), extractIntField("{\"a\":1}", "z"));
+}
+
+test "field extractors reject oversized names without touching scratch buffers" {
+    const long_name = "x" ** 253;
+    try std.testing.expect(extractStringField("{}", long_name) == null);
+    try std.testing.expect(extractStringOrNumberField("{}", long_name) == null);
+    try std.testing.expect(extractBoolField("{}", long_name) == null);
+    try std.testing.expectEqual(@as(u64, 0), extractIntField("{}", long_name));
 }
 
 test "unescapeString basic" {

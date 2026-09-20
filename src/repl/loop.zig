@@ -4186,6 +4186,15 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
         return;
     };
 
+    // Validate the durable identity before staging or switching any runtime
+    // state. A hand-created/legacy directory with a malformed id must never
+    // leave the writer pointed at one session while routing/permissions still
+    // use another.
+    const target_sid = @import("../core/session_id.zig").SessionId.fromSlice(target_id orelse "") orelse {
+        std.debug.print("load failed: invalid session id (session state unchanged)\n", .{});
+        return;
+    };
+
     // 事务性加载：先在临时 conversation 加载，成功后才 atomic 切换。
     // 失败时保持原 conversation 和 writer 不变，用户下次输入仍写到原 session。
     var staged = Conversation.init(app.allocator);
@@ -4241,25 +4250,28 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     // #16:切换会话身份——路由键(permission_ctx.session)与 transcript 落点必须一致。resume 前
     // app.session_id 是启动时 gen 的旧 id,writer 已指向 resumed 目录,但 session_id 没变 → 后续
     // agent_loop 的 Options.session / 权限对话框路由仍用旧 id(漂移)。同步切到 resumed session id。
-    if (target_id) |tid| {
-        if (@import("../core/session_id.zig").SessionId.fromSlice(tid)) |sid| {
-            // A team is live process state, not part of the transcript. Drop
-            // the old roster before changing identity so `/resume` cannot
-            // leave an old worker, inbox, or worktree visible to the new run.
-            if (!std.mem.eql(u8, app.session_id.asSlice(), sid.asSlice()) and app.swarm.hasTeam()) {
-                app.swarm.detachTeam();
-            }
-            app.session_id = sid;
-            app.permission_ctx.session = sid; // 权限对话框路由到本会话视图(M5/M6)
-            app.swarm.session = sid;
-        }
+    // A team is live process state, not part of the transcript. Drop
+    // the old roster before changing identity so `/resume` cannot
+    // leave an old worker, inbox, or worktree visible to the new run.
+    if (!std.mem.eql(u8, app.session_id.asSlice(), target_sid.asSlice()) and app.swarm.hasTeam()) {
+        app.swarm.detachTeam();
     }
+    app.session_id = target_sid;
+    app.permission_ctx.session = target_sid; // 权限对话框路由到本会话视图(M5/M6)
+    app.swarm.session = target_sid;
 
     // issue #16:恢复本 session 自己的路由选择。它比 global 窄,所以赢——resume
     // 回来的会话应该继续用它当时那条路由,而不是这期间变成 global 的那条。
     // 选择存在但已解析不出来时明说,绝不静默换成别家 provider。
     if (app.restoreSessionSelection()) |restored| {
-        if (restored) std.debug.print("Restored this session's model route: {s}\n", .{app.activeModel()});
+        if (restored) {
+            // The writer was staged before the session-scoped route was
+            // restored. Keep metadata.model tied to the route that will
+            // actually serve the resumed conversation; otherwise the next
+            // flush silently records the previous session's model.
+            if (app.transcript_writer) |*writer| writer.model = app.activeModel();
+            std.debug.print("Restored this session's model route: {s}\n", .{app.activeModel()});
+        }
     } else |err| {
         std.debug.print(
             "\x1b[33mwarning: this session's stored model route is unavailable ({s}); " ++
@@ -4415,6 +4427,7 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     try std.testing.expect(!std.mem.eql(u8, &old_id.bytes, &app.session_id.bytes)); // 变了
     try std.testing.expectEqualStrings(sid.asSlice(), app.session_id.asSlice()); // 切到 resumed
     try std.testing.expectEqualStrings(sid.asSlice(), app.permission_ctx.session.asSlice()); // 路由键同步
+    try std.testing.expectEqualStrings(app.activeModel(), app.transcript_writer.?.model);
 }
 
 test "/goal accounting delta charges only input plus output usage" {

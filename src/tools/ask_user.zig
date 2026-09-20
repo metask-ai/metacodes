@@ -157,7 +157,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try aw.writer.writeAll("{\"answers\":[");
     for (answers.items, 0..) |a, i| {
         if (i > 0) try aw.writer.writeAll(",");
-        try std.json.Stringify.encodeJsonString(a, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, a);
     }
     try aw.writer.writeAll("]}");
     return try aw.toOwnedSlice();

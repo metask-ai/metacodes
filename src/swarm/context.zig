@@ -15,6 +15,7 @@ const SessionId = @import("../core/session_id.zig").SessionId;
 pub const ProcessTeammate = struct {
     pid: i64, // 平台中立(Windows std.c.pid_t 是 HANDLE=*anyopaque,不能格式化/@intCast)
     session: SessionId,
+    lease: SessionId = SessionId.single,
     name: []u8, // sanitized
     worktree_path: []u8, // 空 = 无 worktree
     repo: []u8, // git repo 根(removeWorktree 的 git -C);空 = 用进程 cwd
@@ -141,7 +142,9 @@ pub const SwarmContext = struct {
             var tracked = false;
             for (self.process_teammates.items) |*process_member| {
                 if (std.mem.eql(u8, process_member.session.asSlice(), self.session.asSlice()) and
-                    std.mem.eql(u8, process_member.name, member.name))
+                    std.mem.eql(u8, process_member.name, member.name) and
+                    member.lease_id != null and
+                    std.mem.eql(u8, process_member.lease.asSlice(), member.lease_id.?))
                 {
                     tracked = true;
                     break;

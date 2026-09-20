@@ -20,6 +20,7 @@
 //!   任何生态永不为零,codec 只是针派生质量的增强器。
 
 const std = @import("std");
+const util_json = @import("../util/json.zig");
 
 /// 单条检查结果(kind 只区分裁决面需要的三类)。
 pub const CheckResult = struct {
@@ -372,19 +373,19 @@ pub fn composeOutcomesJson(gpa: std.mem.Allocator, parsed: *const ParseOutcome, 
     try aw.writer.print(
         \\{{"schema_version":"task-outcome-v1","outcomes":[{{"task":
     , .{});
-    try std.json.Stringify.encodeJsonString(opts.task, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, opts.task);
     try aw.writer.print(",\"attempt_key\":", .{});
-    try std.json.Stringify.encodeJsonString(opts.attempt_key, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, opts.attempt_key);
     try aw.writer.print(",\"reward\":{d:.4},\"tests_passed\":{d},\"tests_total\":{d},\"provenance\":\"{s}\",\"failing_tests\":[{s}]", .{
         reward, parsed.passed, parsed.total, @tagName(opts.provenance), failing.items,
     });
     if (note.items.len > 0) {
         try aw.writer.print(",\"final_note\":", .{});
-        try std.json.Stringify.encodeJsonString(note.items, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, note.items);
     }
     if (opts.best_artifact.len > 0) {
         try aw.writer.print(",\"best_artifact\":", .{});
-        try std.json.Stringify.encodeJsonString(opts.best_artifact, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, opts.best_artifact);
     }
     try aw.writer.print("}}]}}", .{});
     return aw.toOwnedSlice();

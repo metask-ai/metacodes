@@ -19,6 +19,7 @@ const transport_mod = @import("transport.zig");
 const protocol = @import("protocol.zig");
 const reporter = @import("reporter.zig");
 const lsp_symbols = @import("symbols.zig");
+const util_json = @import("../util/json.zig");
 
 pub const LspSymbols = lsp_symbols.LspSymbols;
 
@@ -535,7 +536,7 @@ fn languageIdForPath(path: []const u8) []const u8 {
 fn appendJsonStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
-    try std.json.Stringify.encodeJsonString(s, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, s);
     try out.appendSlice(alloc, aw.written());
 }
 

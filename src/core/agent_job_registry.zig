@@ -512,6 +512,11 @@ pub const AgentJobRegistry = struct {
     pub fn setModel(self: *AgentJobRegistry, model: []const u8) !void {
         const model_owned = try self.allocator.dupe(u8, model);
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            self.allocator.free(model_owned);
+            return error.RegistryClosed;
+        }
         defer self.listUnlock();
         const old = self.model;
         self.model = model_owned;
@@ -520,9 +525,20 @@ pub const AgentJobRegistry = struct {
 
     /// Publish an owned catalog snapshot. Workers never inspect App's mutable catalog.
     pub fn setLimits(self: *AgentJobRegistry, source: @import("../api/model_limits.zig").ModelLimitsSource) !void {
-        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
-        if (source.catalog) |catalog| snapshot = try catalog.clone(self.allocator);
+        // Clone while holding the registry lock.  The source normally borrows
+        // App's catalog, and App teardown closes this registry before freeing
+        // that catalog; keeping the lock across the clone prevents a caller
+        // racing close from reading the borrowed catalog after teardown starts.
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
+        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
+        if (source.catalog) |catalog| snapshot = catalog.clone(self.allocator) catch |err| {
+            self.listUnlock();
+            return err;
+        };
         defer self.listUnlock();
         if (self.catalog_snapshot) |*old| old.deinit();
         self.catalog_snapshot = snapshot;
@@ -535,6 +551,12 @@ pub const AgentJobRegistry = struct {
     pub fn setApiKey(self: *AgentJobRegistry, api_key: []const u8) !void {
         const key_owned = try self.allocator.dupe(u8, api_key);
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            @memset(key_owned, 0);
+            self.allocator.free(key_owned);
+            return error.RegistryClosed;
+        }
         defer self.listUnlock();
         const old = self.api_key;
         self.api_key = key_owned;
@@ -564,8 +586,13 @@ pub const AgentJobRegistry = struct {
             self.allocator.free(key_owned);
         }
         const url_owned: ?[]u8 = if (base_url) |url| try self.allocator.dupe(u8, url) else null;
+        errdefer if (url_owned) |url| self.allocator.free(url);
 
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
         defer self.listUnlock();
         const old_key = self.api_key;
         const old_url = self.base_url;
@@ -1294,6 +1321,7 @@ pub const AgentJobRegistry = struct {
         // 故用 c_allocator(malloc,线程安全)隔离。OwnedProvider 自带此 allocator,deinit 也用它,一致。
         self.listLock();
         defer self.listUnlock();
+        if (self.closing) return error.RegistryClosed;
         var limits = self.limits;
         if (limits) |*value| value.catalog = if (self.catalog_snapshot) |*catalog| catalog else null;
         return pf.makeProviderWithOptions(
@@ -1353,6 +1381,16 @@ pub const AgentJobRegistry = struct {
         entry.agent_type = dupeUtf8Preview(a, agent_type, 32) catch &.{};
         entry.prompt_preview = dupeUtf8Preview(a, prompt, 4096) catch &.{};
         self.listLock();
+        // Foreground jobs do not pass through spawnBackground's admission
+        // reservation, so they need their own close gate.  Without this
+        // check a synchronous request racing registry teardown could append a
+        // new entry after deinit detached the old list, leaving the caller
+        // with an entry backed by an already-freed registry.
+        if (self.closing) {
+            self.listUnlock();
+            freeEntry(entry);
+            return null;
+        }
         const id = self.genId();
         entry.id = id;
         entry.id_len = blk: {
@@ -1671,6 +1709,18 @@ test "AgentJobRegistry setModel updates future providers" {
     try testing.expectEqualStrings("new-model", owned.provider().model());
 }
 
+test "AgentJobRegistry mutators reject a closing registry" {
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", null, "model", .anthropic);
+    defer reg.deinit();
+    reg.closing = true;
+
+    try testing.expectError(error.RegistryClosed, reg.setModel("new-model"));
+    try testing.expectError(error.RegistryClosed, reg.setApiKey("new-key"));
+    try testing.expectError(error.RegistryClosed, reg.setRoute("new-key", null, .anthropic, .chat_completions, null));
+    try testing.expectError(error.RegistryClosed, reg.setLimits(.{}));
+    try testing.expectError(error.RegistryClosed, reg.makeProvider());
+}
+
 test "clearTestEntries removes index keys before freeing entries" {
     var reg = try AgentJobRegistry.init(testing.allocator, "test-key", null, "test-model", .anthropic);
     defer reg.deinit();
@@ -1769,6 +1819,16 @@ test "foreground entries retain session identity for roster and viewing" {
     defer a.free(out);
     try testing.expect(std.mem.endsWith(u8, out, "answer\n"));
     try testing.expect((try reg.copyOutputBufForSession(entry.idSlice(), a, other)) == null);
+}
+
+test "foreground registration rejects a registry that is closing" {
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", null, "test-model", .anthropic);
+    defer reg.deinit();
+    reg.closing = true;
+
+    const owner = @import("session_id.zig").gen();
+    try testing.expect(reg.registerForegroundForSession("Explore", "foreground", "prompt", owner) == null);
+    try testing.expectEqual(@as(usize, 0), reg.totalCount());
 }
 
 test "spawnBackground prebuilt_conversation consume-on-call:失败路径不泄漏(R3)" {

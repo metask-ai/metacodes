@@ -57,7 +57,7 @@ const POLL_MS: u64 = 500;
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
     var name_buf: [64]u8 = undefined;
     const name_s = team_mod.sanitizeAgentName(id.name[0..@min(id.name.len, 64)], &name_buf);
-    if (name_s.len == 0) {
+    if (name_s.len == 0 or id.name.len > 64 or !std.mem.eql(u8, name_s, id.name)) {
         log.err("swarm", "teammate process: empty/invalid --agent-name", .{});
         return 2;
     }
@@ -197,7 +197,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
         if (!ownsPersistedMember(allocator, config_path, name_s, parent_session, lease_id, id.cwd)) break;
 
         // 等下一条工作(mailbox 轮询;shutdown 优先且仅认 team-lead)。
-        const prompt = waitForWork(allocator, &app.abort, inbox, name_s) orelse break;
+        const prompt = waitForWork(allocator, &app.abort, inbox, name_s, config_path, parent_session, lease_id, id.cwd) orelse break;
         defer allocator.free(prompt);
         if (!ownsPersistedMember(allocator, config_path, name_s, parent_session, lease_id, id.cwd)) break;
 
@@ -244,7 +244,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
         ) catch |err| {
             log.warn("swarm", "teammate {s} run failed: {s}", .{ agent_id, @errorName(err) });
             _ = setMemberActive(allocator, config_path, name_s, parent_session, lease_id, false);
-            sendNotice(allocator, lead_inbox, name_s, "failed", @errorName(err));
+            sendNotice(allocator, lead_inbox, name_s, parent_session, lease_id, "failed", @errorName(err));
             exit_code = 1;
             continue; // 进程留活(lead 可 shutdown/nudge),不退出
         };
@@ -252,11 +252,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
         _ = setMemberActive(allocator, config_path, name_s, parent_session, lease_id, false);
         // 软截断不洗白(同 in-process)。
         if (result.stop_reason == .end_turn) {
-            sendNotice(allocator, lead_inbox, name_s, "available", null);
+            sendNotice(allocator, lead_inbox, name_s, parent_session, lease_id, "available", null);
         } else if (result.stop_reason == .aborted) {
             break;
         } else {
-            sendNotice(allocator, lead_inbox, name_s, "needs_continuation", @tagName(result.stop_reason));
+            sendNotice(allocator, lead_inbox, name_s, parent_session, lease_id, "needs_continuation", @tagName(result.stop_reason));
         }
     }
 
@@ -268,10 +268,19 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
 /// 等 mailbox 里下一条工作 prompt(owned)。null = 退出(abort / lead shutdown)。
 /// 复刻 in-process waitForMail 的核心:shutdown 只认 team-lead;plain 组装成 prompt(lead 优先);
 /// 协议消息留未读(SW3/SW4 消费者)。
-fn waitForWork(a: std.mem.Allocator, abort: anytype, inbox: []const u8, self_name: []const u8) ?[]u8 {
-    _ = self_name;
+fn waitForWork(
+    a: std.mem.Allocator,
+    abort: anytype,
+    inbox: []const u8,
+    self_name: []const u8,
+    config_path: []const u8,
+    session: SessionId,
+    lease: SessionId,
+    expected_cwd: []const u8,
+) ?[]u8 {
     while (true) {
         if (abort.isAborted()) return null;
+        if (!ownsPersistedMember(a, config_path, self_name, session, lease, expected_cwd)) return null;
         var unread = mailbox.readUnread(a, inbox) catch {
             util_time.sleepMs(POLL_MS);
             continue;
@@ -316,13 +325,25 @@ fn waitForWork(a: std.mem.Allocator, abort: anytype, inbox: []const u8, self_nam
     }
 }
 
-fn sendNotice(a: std.mem.Allocator, lead_inbox: []const u8, name: []const u8, reason: []const u8, detail: ?[]const u8) void {
+fn sendNotice(
+    a: std.mem.Allocator,
+    lead_inbox: []const u8,
+    name: []const u8,
+    session: SessionId,
+    lease: SessionId,
+    reason: []const u8,
+    detail: ?[]const u8,
+) void {
     var ts_buf: [40]u8 = undefined;
     const ts = mailbox.formatIso8601(@divTrunc(util_time.nowWallNs(), 1_000_000), &ts_buf);
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     out.writer.writeAll("{\"type\":\"idle_notification\",\"from\":") catch return;
     @import("../util/json.zig").writeJsonString(&out.writer, name) catch return;
+    out.writer.writeAll(",\"session_id\":") catch return;
+    @import("../util/json.zig").writeJsonString(&out.writer, session.asSlice()) catch return;
+    out.writer.writeAll(",\"lease_id\":") catch return;
+    @import("../util/json.zig").writeJsonString(&out.writer, lease.asSlice()) catch return;
     out.writer.writeAll(",\"timestamp\":") catch return;
     @import("../util/json.zig").writeJsonString(&out.writer, ts) catch return;
     out.writer.writeAll(",\"idleReason\":") catch return;
@@ -541,6 +562,8 @@ pub fn spawnTeammateProcess(
     const AddCtx = struct { agent_id: []const u8, name: []const u8, cwd: []const u8, wt: []const u8, session: []const u8, lease: []const u8 };
     const addFn = struct {
         fn f(c: AddCtx, tf: *team_mod.TeamFile) anyerror!void {
+            const lead_session = tf.lead_session_id orelse return error.SessionMismatch;
+            if (!std.mem.eql(u8, lead_session, c.session)) return error.SessionMismatch;
             if (tf.findMember(c.name) != null) return error.DuplicateTeammateName;
             try tf.addMember(.{
                 .agent_id = c.agent_id,
@@ -556,13 +579,20 @@ pub fn spawnTeammateProcess(
     }.f;
     try team_mod.updateTeam(a, cfg, AddCtx{ .agent_id = agent_id, .name = name_s, .cwd = effective_wt, .wt = effective_wt, .session = parent_id.asSlice(), .lease = lease_id.asSlice() }, addFn);
     errdefer {
-        const RmCtx = struct { name: []const u8 };
+        const RmCtx = struct { name: []const u8, session: []const u8, lease: []const u8 };
         const rmFn = struct {
             fn f(c: RmCtx, tf: *team_mod.TeamFile) anyerror!void {
+                const lead_session = tf.lead_session_id orelse return error.SessionMismatch;
+                if (!std.mem.eql(u8, lead_session, c.session)) return error.SessionMismatch;
+                const member = tf.findMember(c.name) orelse return error.MemberNotFound;
+                const member_session = member.session_id orelse return error.SessionMismatch;
+                const member_lease = member.lease_id orelse return error.SessionMismatch;
+                if (!std.mem.eql(u8, member_session, c.session) or
+                    !std.mem.eql(u8, member_lease, c.lease)) return error.SessionMismatch;
                 _ = tf.removeMember(c.name);
             }
         }.f;
-        team_mod.updateTeam(a, cfg, RmCtx{ .name = name_s }, rmFn) catch {};
+        team_mod.updateTeam(a, cfg, RmCtx{ .name = name_s, .session = parent_id.asSlice(), .lease = lease_id.asSlice() }, rmFn) catch {};
     }
 
     // ③ fork+exec(或 mock)。
@@ -590,7 +620,7 @@ pub fn spawnTeammateProcess(
     errdefer a.free(wt_owned);
     const repo_owned = try a.dupe(u8, repo);
     errdefer a.free(repo_owned);
-    try sw.process_teammates.append(a, .{ .pid = pid, .session = parent_id, .name = name_owned, .worktree_path = wt_owned, .repo = repo_owned });
+    try sw.process_teammates.append(a, .{ .pid = pid, .session = parent_id, .lease = lease_id, .name = name_owned, .worktree_path = wt_owned, .repo = repo_owned });
     log.info("swarm", "spawned out-of-process teammate {s} pid={d} worktree={s}", .{ agent_id, pid, effective_wt });
     return pid;
 }
