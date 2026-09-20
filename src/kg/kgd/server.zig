@@ -58,6 +58,11 @@ pub const Options = struct {
     /// Compared against every request's `x-api-key`. Never logged.
     api_key: []const u8,
     port: u16,
+    /// Where markdown is staged for the engine to read back by pathname.
+    /// Defaults beside the store, which is wrong whenever the store lives
+    /// somewhere shared, so the service passes the configuration's own
+    /// directory: `kg install` creates that one 0700 under the user's home.
+    staging_dir: ?[]const u8 = null,
 };
 
 pub const Supervisor = struct {
@@ -415,7 +420,10 @@ pub const Supervisor = struct {
         source_key: []const u8,
         markdown: []const u8,
     ) ![]const u8 {
-        const dir = try std.fmt.allocPrint(allocator, "{s}.import", .{self.options.store_path});
+        const dir = if (self.options.staging_dir) |given|
+            try allocator.dupe(u8, given)
+        else
+            try std.fmt.allocPrint(allocator, "{s}.import", .{self.options.store_path});
         try ensurePrivateDirectory(allocator, dir);
 
         var suffix: [8]u8 = undefined;
@@ -754,16 +762,35 @@ fn ensurePrivateDirectory(allocator: std.mem.Allocator, path: []const u8) !void 
     if (!existed and @import("builtin").os.tag != .windows) {
         if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.StagingDirectoryUnusable;
     }
+    if (@import("builtin").os.tag == .windows) {
+        // MSVCRT cannot open a directory, so there is no descriptor to
+        // validate and no portable owner or ACL check here. A reparse point is
+        // refused and the exclusive temporary still applies; the directory
+        // itself is trusted. doc/TINYKG_INTEGRATION.md records the difference.
+        if (pfs.isSymlink(path_z.ptr)) return error.StagingDirectoryUnusable;
+        return;
+    }
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.StagingDirectoryUnusable;
     defer _ = pfs.close(fd);
     const info = pfs.fileInfo(fd) catch return error.StagingDirectoryUnusable;
     if (!info.is_dir) return error.StagingDirectoryUnusable;
-    if (@import("builtin").os.tag == .windows) return;
     if (info.uid != std.c.geteuid()) return error.StagingDirectoryUnusable;
     // No group or world write: those are exactly the bits that would let
     // someone else replace the staged file after the rename.
     if ((info.mode & 0o022) != 0) return error.StagingDirectoryUnusable;
+    // The directory being private is not enough: the engine reopens the staged
+    // file by pathname, so anyone who can write the PARENT can rename this
+    // directory away and put a symlink in its place between our check and that
+    // open. A shared parent is refused rather than guarded.
+    const parent = std.fs.path.dirname(path) orelse return;
+    const parent_z = try allocator.dupeZ(u8, parent);
+    defer allocator.free(parent_z);
+    const parent_fd = pfs.open(parent_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (parent_fd < 0) return error.StagingDirectoryUnusable;
+    defer _ = pfs.close(parent_fd);
+    const parent_info = pfs.fileInfo(parent_fd) catch return error.StagingDirectoryUnusable;
+    if (!parent_info.is_dir or (parent_info.mode & 0o022) != 0) return error.StagingDirectoryUnusable;
 }
 
 fn removeFile(path: []const u8) void {
@@ -844,6 +871,17 @@ test "KgdServer: staging refuses a directory other people can write" {
     try @import("../../util/fs.zig").mkdirParents(std.mem.span(shared.ptr));
     try testing.expectEqual(@as(c_int, 0), std.c.chmod(shared.ptr, 0o777));
     try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, std.mem.span(shared.ptr)));
+
+    // A shared parent: the engine reopens the staged file by pathname, so
+    // someone able to write the parent can swap this directory for a symlink
+    // after the check and before that open. Private child, shared parent, no.
+    const shared_parent = try std.fmt.allocPrintSentinel(a, "{s}/open-parent", .{root}, 0);
+    defer a.free(shared_parent);
+    try @import("../../util/fs.zig").mkdirParents(std.mem.span(shared_parent.ptr));
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(shared_parent.ptr, 0o777));
+    const under_shared = try std.fmt.allocPrint(a, "{s}/open-parent/child.import", .{root});
+    defer a.free(under_shared);
+    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, under_shared));
 
     // A symlink standing in for the directory: following it would stage into
     // someone else's directory, and the old code would have chmod'ed it too.

@@ -203,6 +203,19 @@ Properties worth knowing:
   queueing every later request behind a read that will not return.
 - Nothing starts the daemon automatically yet, there is no idle exit, and the
   daemon is still not part of the product install.
+- Markdown import stages the document where the engine can read it back by
+  pathname. That directory is created beside the configuration (0700, under the
+  user's home) rather than beside the Store, which may be anywhere the operator
+  pointed. The service refuses to stage unless the directory is a non-symlink
+  directory it owns with no group or world write bits, and unless its parent is
+  likewise not writable by others — the engine reopens the path after the
+  service renames the file into place, so a directory anyone else can replace
+  is a directory the engine can be redirected through.
+- Known limitation on Windows: that directory is checked only for being a
+  reparse point. MSVCRT cannot open a directory, so there is no descriptor to
+  validate and no portable owner or ACL check; the exclusive temporary file
+  still applies, but a shared Windows staging directory is trusted rather than
+  proven private.
 - Known limitation on Windows: the bridge's response deadline cannot interrupt
   a write that is already blocked, because anonymous pipes have no portable
   writability query (`PipeChild.pollWritable` returns true there). A request is

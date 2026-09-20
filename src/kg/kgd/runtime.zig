@@ -125,12 +125,23 @@ fn onInterrupt() void {
 }
 
 pub fn serve(allocator: std.mem.Allocator, config: Config) u8 {
+    // Markdown is staged beside the configuration, not beside the store: the
+    // store can be anywhere the operator pointed, including a shared directory,
+    // while the configuration directory is the one `kg install` created 0700.
+    const staging = std.fmt.allocPrint(allocator, "{s}/import", .{
+        std.fs.path.dirname(config.config_path) orelse ".",
+    }) catch {
+        std.debug.print("error: out of memory preparing the TinyKG service\n", .{});
+        return 1;
+    };
+    defer allocator.free(staging);
     const supervisor = server_mod.Supervisor.start(allocator, .{
         .store_path = config.store_path,
         .cli_path = config.cli_path,
         .daemon_path = config.daemon_path,
         .api_key = config.api_key,
         .port = config.port,
+        .staging_dir = staging,
     }) catch |err| {
         std.debug.print("error: cannot start the TinyKG service ({s}){s}\n", .{ @errorName(err), hint(err) });
         return 1;
