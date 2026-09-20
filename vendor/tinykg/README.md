@@ -7,12 +7,16 @@ normal Metacodes build. It contains no TinyKG source code and no runtime store.
 architectures, SHA-256, upstream commit, Zig version, and ReleaseSafe/strip build
 profile. `deps/tinykg.json` independently pins the CLI and store contract.
 
-Supported assets:
+Supported assets (each target family has a CLI and daemon artifact in a v2
+manifest):
 
 - `bin/tinykg-macos-universal`: macOS arm64 and x86_64;
 - `bin/tinykg-linux-x86_64`: static-musl x86_64 Linux;
 - `bin/tinykg-linux-aarch64`: static-musl arm64 Linux;
 - `bin/tinykg-windows-x86_64.exe`: x86_64 Windows.
+- `bin/tinykgd-macos-universal`, `bin/tinykgd-linux-x86_64`,
+  `bin/tinykgd-linux-aarch64`, and `bin/tinykgd-windows-x86_64.exe`: matching
+  `tinykgd` daemon assets.
 
 The default build selects exactly one target-compatible asset, verifies the
 manifest digest and executable format, and installs it as

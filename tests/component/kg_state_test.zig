@@ -341,6 +341,7 @@ test "KgState: doctor reports the KG diagnosis without letting it decide health"
         unresolved,
         .{ .name = "formal_kernel", .resolved_path = null, .sha256 = null, .expected_sha256 = null, .match = null, .source = null, .provenance = null },
         .{ .name = "project_kernel", .resolved_path = null, .sha256 = null, .expected_sha256 = null, .match = null, .source = null, .provenance = null },
+        .{ .name = "tinykgd", .resolved_path = null, .sha256 = null, .expected_sha256 = null, .match = null, .source = null, .provenance = null },
     }, .kg = null };
     defer without.deinit(a);
     var with = cc.doctor.Report{ .checks = without.checks, .kg = .{

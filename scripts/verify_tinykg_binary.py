@@ -17,6 +17,7 @@ from scripts.stage_tinykg_binary import (
     inspect_binary,
     validate_bundle_bytes,
     validate_store_contract,
+    TARGET_CONTRACTS,
 )
 
 
@@ -51,6 +52,17 @@ def validate_bundle_inventory(manifest_path: Path, bundle: TinyKgBundle) -> None
             "bundle inventory drift: "
             f"undeclared={extras or 'none'} missing={missing or 'none'}"
         )
+    if bundle.schema == "metacodes.tinykg-bundle/v2":
+        roles_by_target: dict[str, set[str]] = {}
+        for artifact in bundle.artifacts:
+            for target in artifact.targets:
+                roles_by_target.setdefault(target, set()).add(artifact.role)
+        expected_targets = set(TARGET_CONTRACTS)
+        missing_roles = sorted(
+            target for target in expected_targets if roles_by_target.get(target) != {"cli", "daemon"}
+        )
+        if missing_roles:
+            raise StageError(f"TinyKG v2 inventory is missing cli/daemon pairs: {missing_roles}")
 
 
 def native_bundle_key() -> str:
@@ -58,6 +70,7 @@ def native_bundle_key() -> str:
     arch = {
         "amd64": "x86_64",
         "arm64": "aarch64",
+        "aarch64": "aarch64",
         "x86_64": "x86_64",
     }.get(machine)
     if arch is None:
@@ -69,6 +82,24 @@ def native_bundle_key() -> str:
     if sys.platform == "win32" and arch == "x86_64":
         return "windows-x86_64"
     raise StageError(f"no bundled TinyKG for native platform: {sys.platform}/{arch}")
+
+
+def attest_native(manifest_path: Path, contract: TinyKgContract):
+    """Attest the native CLI and all daemon artifacts owning its target family."""
+    bundle = TinyKgBundle.load(manifest_path)
+    validate_bundle_inventory(manifest_path, bundle)
+    cli = bundle.artifact(native_bundle_key())
+    summaries = []
+    for artifact in bundle.artifacts:
+        if not set(cli.targets).intersection(artifact.targets):
+            continue
+        binary = manifest_path.parent / artifact.path
+        validate_bundle_bytes(binary, artifact, contract)
+        identity = inspect_binary(binary, artifact.sha256, contract, artifact.role)
+        if artifact.role == "cli":
+            validate_store_contract(identity, contract)
+        summaries.append((artifact.key, artifact.role, identity))
+    return summaries
 
 
 def main() -> int:
@@ -90,21 +121,26 @@ def main() -> int:
         validate_bundle_inventory(manifest_path, bundle)
         if path is not None and sha256 is not None:
             identity = inspect_binary(Path(path), sha256, contract)
+            validate_store_contract(identity, contract)
             source = "explicit"
+            summaries = [("tinykg", "cli", identity)]
+            # The override only replaces CLI attestation, never daemon gates.
+            for artifact in bundle.artifacts:
+                cli = bundle.artifact(native_bundle_key())
+                if artifact.role != "daemon" or not set(cli.targets).intersection(artifact.targets):
+                    continue
+                binary = manifest_path.parent / artifact.path
+                validate_bundle_bytes(binary, artifact, contract)
+                summaries.append((artifact.key, artifact.role, inspect_binary(binary, artifact.sha256, contract, "daemon")))
         else:
-            artifact = bundle.artifact(native_bundle_key())
-            binary = (manifest_path.parent / artifact.path).resolve()
-            identity = validate_bundle_bytes(binary, artifact, contract)
-            identity = inspect_binary(binary, artifact.sha256, contract)
-            source = f"bundled:{artifact.key}"
-        validate_store_contract(identity, contract)
+            key = native_bundle_key()
+            summaries = attest_native(manifest_path, contract)
+            source = f"bundled:{key}"
     except (OSError, StageError) as exc:
         print(f"verify-tinykg: error: {exc}", file=os.sys.stderr)
         return 1
-    print(
-        f"TinyKG attested: {identity.version_line} sha256={identity.sha256} "
-        f"source={source}"
-    )
+    for key, role, item in summaries:
+        print(f"TinyKG attested: key={key} role={role} {item.version_line} sha256={item.sha256} source={source}")
     return 0
 
 
