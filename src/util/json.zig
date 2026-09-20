@@ -145,7 +145,7 @@ fn encodeStringInner(s: []const u8, sink: anytype) !void {
         if (c >= 0x80) {
             const seq_len: ?usize = if (std.unicode.utf8ByteSequenceLength(c)) |l| l else |_| null;
             if (seq_len) |l| {
-                if (i + l <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + l])) {
+                if (l <= s.len - i and std.unicode.utf8ValidateSlice(s[i .. i + l])) {
                     i += l; // 合法多字节序列,并入透传段
                     continue;
                 }
@@ -225,7 +225,7 @@ pub fn writeUtf8Repaired(w: *std.Io.Writer, s: []const u8) !void {
         }
         const n = std.unicode.utf8ByteSequenceLength(b) catch null;
         if (n) |len| {
-            if (i + len <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + len])) {
+            if (len <= s.len - i and std.unicode.utf8ValidateSlice(s[i .. i + len])) {
                 i += len;
                 continue;
             }
@@ -281,7 +281,7 @@ pub fn repairJsonUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         if (b >= 0x80) {
             const len = std.unicode.utf8ByteSequenceLength(b) catch null;
             if (len) |n| {
-                if (i + n <= input.len and std.unicode.utf8ValidateSlice(input[i .. i + n])) {
+                if (n <= input.len - i and std.unicode.utf8ValidateSlice(input[i .. i + n])) {
                     try out.appendSlice(allocator, input[i .. i + n]);
                     i += n;
                     continue;

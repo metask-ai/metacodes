@@ -48,7 +48,7 @@ fn repairJsonUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         if (b >= 0x80) {
             const length = std.unicode.utf8ByteSequenceLength(b) catch null;
             if (length) |n| {
-                if (i + n <= input.len and std.unicode.utf8ValidateSlice(input[i .. i + n])) {
+                if (n <= input.len - i and std.unicode.utf8ValidateSlice(input[i .. i + n])) {
                     try out.appendSlice(allocator, input[i .. i + n]);
                     i += n;
                     continue;

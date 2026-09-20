@@ -330,6 +330,11 @@ fn broadcast(ctx: *const ToolContext, sw: *SwarmContext, message: []const u8, su
 /// 提示"队友已关闭")。plan/permission 回执留未读(SW4 审批代理消费)。选择性标读只标消费的。
 pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
     if (!sw.hasTeam()) return null;
+    // Reap exited process teammates before evaluating shutdown approvals. A
+    // process sends its approval just before returning; once waitpid observes
+    // it exited, its durable member can be removed safely. A still-running
+    // process remains in `process_teammates` and is checked below.
+    _ = sw.reapDeadProcessTeammates();
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
     const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, team_mod.TEAM_LEAD_NAME, &inbox_buf);
 
@@ -384,6 +389,21 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
                     break :blk false; // 不在 registry = 已收尾,可摘
                 } else false;
                 if (alive) continue; // 仍在跑:留未读,不摘牌(不加入 consumed)
+                // Process teammates have no in-process registry. A matching
+                // tracked record means the child is still running because
+                // exited records were reaped at the start of this poll.
+                var process_alive = false;
+                const approval_lease_raw = util_json.extractStringField(m.text, "lease_id") orelse continue;
+                for (sw.process_teammates.items) |*process_member| {
+                    if (std.mem.eql(u8, process_member.name, m.from) and
+                        std.mem.eql(u8, process_member.session.asSlice(), sw.session.asSlice()) and
+                        std.mem.eql(u8, process_member.lease.asSlice(), approval_lease_raw))
+                    {
+                        process_alive = true;
+                        break;
+                    }
+                }
+                if (process_alive) continue;
                 // A delayed approval from an older same-name worker must not
                 // remove the replacement member.  The approval carries the
                 // lead session and per-spawn lease persisted in TeamFile;
@@ -398,7 +418,10 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
                     !std.mem.eql(u8, approval_session, sw.session.asSlice())) continue;
                 var cfgbuf: [std.fs.max_path_bytes]u8 = undefined;
                 const cfg = sw.configPath(&cfgbuf);
-                removeMemberFromConfig(allocator, cfg, m.from, approval_session, approval_lease);
+                // Do not consume a stale approval unless the exact member was
+                // removed. This keeps a replacement same-name member's
+                // durable state and avoids presenting a false shutdown line.
+                if (!removeMemberFromConfig(allocator, cfg, m.from, approval_session, approval_lease)) continue;
                 var line: std.ArrayList(u8) = .empty;
                 defer line.deinit(allocator);
                 line.appendSlice(allocator, "<teammate-status from=\"") catch continue;
@@ -456,11 +479,12 @@ fn removeMemberFromConfig(
     name_sanitized: []const u8,
     session: []const u8,
     lease: []const u8,
-) void {
-    if (config_path.len == 0) return;
+) bool {
+    if (config_path.len == 0) return false;
     var nb: [64]u8 = undefined;
     const ns = team_mod.sanitizeAgentName(name_sanitized, &nb);
-    team_mod.updateTeam(a, config_path, RmNameCtx{ .name = ns, .session = session, .lease = lease }, rmMemberMutate) catch {};
+    team_mod.updateTeam(a, config_path, RmNameCtx{ .name = ns, .session = session, .lease = lease }, rmMemberMutate) catch return false;
+    return true;
 }
 
 /// SW3:确保共享 KG inbox root 存在并写好 kg_inbox 指针,让 lead 的 TaskCreate 与 teammate
