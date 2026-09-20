@@ -11,6 +11,7 @@ import MetaCodesControl.ArtifactVerification
 import MetaCodesControl.VerificationGate
 import MetaCodesControl.RequirementLedger
 import MetaCodesControl.ObligationGate
+import MetaCodesControl.DeliveryCadence
 import MetaCodesControl.ContinuityGate
 import MetaCodesControl.HostInjectionMeter
 import MetaCodesControl.CognitiveMode

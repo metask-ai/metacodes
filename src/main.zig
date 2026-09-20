@@ -75,6 +75,7 @@ pub const client_mod = client; // alias for L2 component tests
 pub const api_last_error = @import("api/last_error.zig"); // L2 stream liveness tests read the TUI-facing error text
 pub const task_store = @import("core/task_store.zig"); // L2 requirement-ledger tests
 pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 ledger decide tests
+pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 delivery-cadence tests
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
@@ -2218,6 +2219,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.requirement_ledger = true;
         } else if (std.mem.eql(u8, arg, "--requirement-ledger-observe")) {
             config.requirement_ledger_observe = true;
+        } else if (std.mem.eql(u8, arg, "--delivery-cadence")) {
+            config.delivery_cadence = true;
+        } else if (std.mem.eql(u8, arg, "--delivery-cadence-observe")) {
+            config.delivery_cadence_observe = true;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
         } else if (std.mem.eql(u8, arg, "--image")) {
@@ -2498,6 +2503,8 @@ fn printHelp() void {
         \\  --verification-final-observe  Record (not enforce) the session-end verification obligation
         \\  --requirement-ledger  Enforce the requirement-ledger closure obligation
         \\  --requirement-ledger-observe  Record (not enforce) the requirement ledger
+        \\  --delivery-cadence    Nudge a run that keeps exploring without writing any deliverable
+        \\  --delivery-cadence-observe  Record (not enforce) the delivery-cadence obligation
         \\  --max-tokens <n>      Override max output tokens per request
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing

@@ -33,6 +33,7 @@ const result_projection = @import("result_projection.zig");
 const result_budget_mod = @import("result_budget.zig");
 const verification_progress_mod = @import("verification_progress.zig");
 const requirement_ledger_mod = @import("requirement_ledger.zig");
+const delivery_cadence_mod = @import("delivery_cadence.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const output_semantics = @import("output_semantics.zig");
@@ -439,6 +440,18 @@ pub const Options = struct {
     requirement_ledger: bool = false,
     /// Record-only twin for measurement symmetry in control arms.
     requirement_ledger_observe: bool = false,
+    /// Delivery-cadence obligation (task-agnostic process rule): a run that
+    /// keeps exploring — read-only tool calls only, no file created or
+    /// changed — receives a bounded nudge at the turn boundary to put a first
+    /// version of its deliverable on disk. Never a denial; disarmed for the
+    /// rest of the run by the first mutation. Formal model:
+    /// control-plane/lean/MetaCodesControl/DeliveryCadence.lean.
+    delivery_cadence: bool = false,
+    /// Record-only twin for measurement symmetry in control arms: the same
+    /// counters and threshold crossings, never an injection.
+    delivery_cadence_observe: bool = false,
+    /// Crossing points in exploration-only tool calls (first / second nudge).
+    delivery_cadence_thresholds: delivery_cadence_mod.Thresholds = .{},
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
@@ -846,6 +859,21 @@ pub fn run(
     const MAX_VERIFICATION_NUDGES: u8 = 2;
     var stream_turn_retries: u8 = 0;
     var requirement_ledger_state = requirement_ledger_mod.State{};
+    var delivery_cadence_state = delivery_cadence_mod.State{};
+    defer if (opts.delivery_cadence or opts.delivery_cadence_observe) {
+        if (opts.tool_observer) |observer| {
+            _ = observer.emit(.{ .delivery_cadence = .{
+                .enforced = opts.delivery_cadence,
+                .exploration_calls = delivery_cadence_state.exploration_calls,
+                .mutations_occurred = delivery_cadence_state.mutation_seen,
+                .levels_reached = delivery_cadence_state.level,
+                .nudges = delivery_cadence_state.nudges,
+                .max_nudges = delivery_cadence_mod.MAX_CADENCE_NUDGES,
+                .first_threshold = opts.delivery_cadence_thresholds.first,
+                .second_threshold = opts.delivery_cadence_thresholds.second,
+            } });
+        }
+    };
     // 元规则①:全部 host 注入共享一个计量器——各门自证有界不蕴含合成
     // 有界(Lean HostInjectionMeter.consumed_never_exceeds_cap 对任意门
     // 序列量化)。
@@ -974,6 +1002,34 @@ pub fn run(
                         break :notification_delivery;
                     };
                     log.info("agent", "job notification delivered ids={s} turn={d}", .{ ids.items, turns + 1 });
+                }
+            }
+        }
+
+        // Delivery-cadence obligation: the run is still exploring and nothing
+        // is on disk. Decided at the turn boundary (the conversation is clean:
+        // last turn's tool_results are already appended), bounded through the
+        // shared meter, and never a denial. Observe mode advances the level
+        // without injecting so control arms record the same crossings.
+        // Formal model: DeliveryCadence.lean.
+        if ((opts.delivery_cadence or opts.delivery_cadence_observe) and
+            (!opts.delivery_cadence or host_injection_meter.remaining() > 0))
+        {
+            const decision = delivery_cadence_state.decide(opts.delivery_cadence_thresholds);
+            if (decision != .none) {
+                delivery_cadence_state.noteDecided();
+                if (opts.delivery_cadence) {
+                    _ = host_injection_meter.tryConsume();
+                    delivery_cadence_state.nudges += 1;
+                    const nudge = if (decision == .first)
+                        try std.fmt.allocPrint(allocator, delivery_cadence_mod.FIRST_NUDGE_FMT, .{delivery_cadence_state.exploration_calls})
+                    else
+                        try std.fmt.allocPrint(allocator, delivery_cadence_mod.SECOND_NUDGE_FMT, .{delivery_cadence_state.exploration_calls});
+                    defer allocator.free(nudge);
+                    try conversation.appendText(.user, nudge);
+                    log.info("agent", "delivery cadence nudge {d}/{d} exploration_calls={d}", .{ delivery_cadence_state.nudges, delivery_cadence_mod.MAX_CADENCE_NUDGES, delivery_cadence_state.exploration_calls });
+                } else {
+                    log.info("agent", "delivery cadence observe level={d} exploration_calls={d}", .{ delivery_cadence_state.level, delivery_cadence_state.exploration_calls });
                 }
             }
         }
@@ -2886,6 +2942,8 @@ pub fn run(
         const inject_verification_checkpoint = observe_verification and
             verification_progress.observeTurn(allocator, slots.items) and
             opts.verification_checkpoint;
+        if (opts.delivery_cadence or opts.delivery_cadence_observe)
+            delivery_cadence_state.observeSlots(allocator, slots.items);
         if (observe_verification) {
             if (opts.tool_observer) |observer| {
                 for (slots.items) |slot| {

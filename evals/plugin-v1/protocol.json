@@ -69,7 +69,7 @@
     "treatment_executable": "scripts/eval/fixtures/plugin_candidate.py",
     "treatment_executable_sha256": "1a80f4f240e80df798521cb4cacd9a59d12d494cbee06468412b4fe751f28a61",
     "single_factor": "one namespaced Skill data package",
-    "implementation_fingerprint": "5ca6ea781e6f0def7b66e578a5146a7c12d0fa2fbddc9b5b680966550da26a0b",
+    "implementation_fingerprint": "cb102f997bfb4bcc62826c3fd458cc86e091e00c72da0e81bfa5fb008eb908e5",
     "runtime_binary_sha256": "fd330c2e4c4120a129fb8148091011f014d29d2c496f4a24ffdd8232c5cce054",
     "evaluation_contract_version": 4,
     "model": {
@@ -139,7 +139,7 @@
     "tests/e2e/run_e2e.sh": "38b21bdc939682e870846cc57731c90b2a114aec285b8df6d8019ba7a59314f3",
     "tests/e2e/lib.sh": "6d7de5cd8fe0e70929b32ea82364a12d16787e690687ab098d6eb8a52383c43a",
     "evals/gates/default.json": "0e8da44acfefe11c5ff7ede5b11cc5d40a8edfd6660e18891dd2b79151e13559",
-    "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean": "9e2c42b1a1d99912f9cf96fb54c83ddcaace2e1f6e2511721d42768a32c739d8",
+    "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean": "d92227d7188348af5701ca43b7ddd2b2ffab34455c08869487dd156d06d11d92",
     "control-plane/lean/MetaCodesControl/ObligationGate.lean": "c07307865b182cdebc73c72ed007bb6ae0514833b1247b86fcccb770503e426c"
   },
   "implementation_paths": [

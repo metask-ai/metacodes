@@ -12,16 +12,18 @@
 const std = @import("std");
 
 /// 每 run **咨询性 nudge** 总上限 = 各门预算之和:验证终局闸(2)+ 需求
-/// 账本(2)+ 任务义务(2)。cap=Σ ⇒ 计量器零行为变化,只把隐式合成上界
+/// 账本(2)+ 任务义务(3)+ 交付节奏(2)。cap=Σ ⇒ 计量器零行为变化,只把隐式合成上界
 /// 变成显式受执行的不变量;未来新门必须在总额度内分配,收紧 cap(< Σ)
 /// 是显式政策决定。两类注入**有意排除**:①一次性协议注入(账本 prompt、
 /// 结局 note、截断续写)——无条件、按构造各至多 1 次;②完整性修复
 /// (KG 枚举修复)——其语义是"修复或 fail-closed",不可静默放弃,进表
 /// 会把"额度尽"误判成完整性违规(review 抓到的 tool_loop 误杀地雷)。
 // 账目:required-first provider repair 2 + verification 2 +
-// requirement-ledger 2 + task-obligation 3 = 9。required-first 在任何普通
-// 工具前发生，仍走同一计量器，不能因为它是插件路由就绕过合成上界。
-pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = 9;
+// requirement-ledger 2 + task-obligation 3 + delivery-cadence 2 = 11。
+// required-first 在任何普通工具前发生，仍走同一计量器，不能因为它是插件
+// 路由就绕过合成上界。交付节奏门在 turn 边界(早于终局各门)点火,额度
+// 若不随 Σ 增长会挤占终局义务,故 cap 同步 +2(Lean HostInjectionMeter.cap)。
+pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = 11;
 
 pub const Meter = struct {
     used: u8 = 0,
@@ -53,19 +55,28 @@ test "meter never exceeds the cap regardless of request count" {
 
 test "meter is gate-agnostic: interleaved consumers share one bound" {
     // Lean mirror: HostInjectionMeter.gate_agnostic(对任意门序列量化)。
+    // 三个门轮流申请、总申请数超过 cap:计量器只认总额,不认来源。
     var meter = Meter{};
     var ledger_granted: usize = 0;
     var obligation_granted: usize = 0;
+    var cadence_granted: usize = 0;
     var i: usize = 0;
-    while (i < 10) : (i += 1) {
-        if (i % 2 == 0) {
-            if (meter.tryConsume()) ledger_granted += 1;
-        } else {
-            if (meter.tryConsume()) obligation_granted += 1;
+    while (i < MAX_HOST_INJECTIONS_PER_RUN + 4) : (i += 1) {
+        switch (i % 3) {
+            0 => if (meter.tryConsume()) {
+                ledger_granted += 1;
+            },
+            1 => if (meter.tryConsume()) {
+                obligation_granted += 1;
+            },
+            else => if (meter.tryConsume()) {
+                cadence_granted += 1;
+            },
         }
     }
     try std.testing.expectEqual(
         @as(usize, MAX_HOST_INJECTIONS_PER_RUN),
-        ledger_granted + obligation_granted,
+        ledger_granted + obligation_granted + cadence_granted,
     );
+    try std.testing.expectEqual(@as(u8, 0), meter.remaining());
 }

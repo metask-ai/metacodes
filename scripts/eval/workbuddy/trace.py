@@ -1532,6 +1532,44 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     ):
                         raise TraceError(f"requirement ledger {where} is invalid")
                     formal["requirement_ledger_" + key] = value
+            elif observation_kind == "delivery_cadence":
+                # Terminal record of the delivery-cadence obligation
+                # (exploration that never turned into a deliverable): at
+                # most one per run, both arms carry it (record-only in
+                # observe mode). Counters only, so the lean namespace
+                # contract (non-negative integers) holds unchanged.
+                if (
+                    observation.get("schema_version")
+                    != "metacodes-delivery-cadence-v1"
+                    or not isinstance(observation.get("enforced"), bool)
+                    or not isinstance(observation.get("mutations_occurred"), bool)
+                ):
+                    raise TraceError("delivery cadence record is invalid")
+                if formal.get("delivery_cadence_records"):
+                    raise TraceError("duplicate delivery cadence record")
+                formal["delivery_cadence_records"] = 1
+                formal["delivery_cadence_enforced"] = int(
+                    bool(observation.get("enforced"))
+                )
+                formal["delivery_cadence_mutations_occurred"] = int(
+                    bool(observation.get("mutations_occurred"))
+                )
+                for key, where in (
+                    ("exploration_calls", "exploration calls"),
+                    ("levels_reached", "levels reached"),
+                    ("nudges", "nudges"),
+                    ("max_nudges", "nudge budget"),
+                    ("first_threshold", "first threshold"),
+                    ("second_threshold", "second threshold"),
+                ):
+                    value = observation.get(key)
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                    ):
+                        raise TraceError(f"delivery cadence {where} is invalid")
+                    formal["delivery_cadence_" + key] = value
             elif observation_kind == "test_weakening_candidate":
                 # PO-V2 M2 observe-only candidate: a realized edit to a
                 # test-classified file. Schema pinned; counters split by the

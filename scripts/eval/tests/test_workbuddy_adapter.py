@@ -4214,6 +4214,109 @@ class WorkBuddyRequirementLedgerRecordTest(unittest.TestCase):
             self._metrics(bad)
 
 
+class WorkBuddyDeliveryCadenceRecordTest(unittest.TestCase):
+    """Field-level contract for the delivery-cadence journal record (the
+    union-roster probe only proves the KIND is known)."""
+
+    def _metrics(self, cadence):
+        rows = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 1, "monotonic_elapsed_ns": 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"tool_observation": {"delivery_cadence": cadence}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 2, "monotonic_elapsed_ns": 3,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "t.jsonl"
+            observation = root / "o.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            observation.write_text(
+                "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+            )
+            return load_control_metrics(transcript, observation)
+
+    def _valid(self):
+        return {
+            "schema_version": "metacodes-delivery-cadence-v1",
+            "enforced": True, "exploration_calls": 57,
+            "mutations_occurred": False, "levels_reached": 2,
+            "nudges": 2, "max_nudges": 2,
+            "first_threshold": 40, "second_threshold": 80,
+        }
+
+    def test_valid_record_exports_counters(self):
+        lean = self._metrics(self._valid())["lean"]
+        self.assertEqual(lean["delivery_cadence_records"], 1)
+        self.assertEqual(lean["delivery_cadence_enforced"], 1)
+        self.assertEqual(lean["delivery_cadence_mutations_occurred"], 0)
+        self.assertEqual(lean["delivery_cadence_exploration_calls"], 57)
+        self.assertEqual(lean["delivery_cadence_levels_reached"], 2)
+        self.assertEqual(lean["delivery_cadence_nudges"], 2)
+        self.assertEqual(lean["delivery_cadence_max_nudges"], 2)
+        self.assertEqual(lean["delivery_cadence_first_threshold"], 40)
+        self.assertEqual(lean["delivery_cadence_second_threshold"], 80)
+
+    def test_observe_record_exports_zero_nudges_with_crossings(self):
+        record = self._valid()
+        record["enforced"] = False
+        record["nudges"] = 0
+        lean = self._metrics(record)["lean"]
+        self.assertEqual(lean["delivery_cadence_enforced"], 0)
+        self.assertEqual(lean["delivery_cadence_levels_reached"], 2)
+        self.assertEqual(lean["delivery_cadence_nudges"], 0)
+
+    def test_malformed_count_fails_loudly(self):
+        bad = self._valid()
+        bad["exploration_calls"] = "many"
+        with self.assertRaisesRegex(TraceError, "exploration calls"):
+            self._metrics(bad)
+
+    def test_wrong_schema_fails_loudly(self):
+        bad = self._valid()
+        bad["schema_version"] = "metacodes-delivery-cadence-v0"
+        with self.assertRaisesRegex(TraceError, "delivery cadence record"):
+            self._metrics(bad)
+
+    def test_duplicate_record_fails_loudly(self):
+        rows_record = self._valid()
+        rows = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 1, "monotonic_elapsed_ns": 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"tool_observation": {"delivery_cadence": rows_record}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 2, "monotonic_elapsed_ns": 3,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"tool_observation": {"delivery_cadence": rows_record}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 3, "monotonic_elapsed_ns": 4,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "t.jsonl"
+            observation = root / "o.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            observation.write_text(
+                "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(TraceError, "duplicate delivery cadence"):
+                load_control_metrics(transcript, observation)
+
+
 class WorkBuddyRequirementLedgerTreatmentTest(unittest.TestCase):
     """The requirement-ledger treatment kwargs are wired end to end: the
     adapter validates them, emits the CLI flags, and discloses them in the

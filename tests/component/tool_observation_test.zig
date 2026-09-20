@@ -35,7 +35,7 @@ const Capture = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (event) {
-            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .test_weakening_candidate, .formal_decision, .formal_decision_batch => {},
+            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .test_weakening_candidate, .formal_decision, .formal_decision_batch => {},
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.depth = started.agent_depth;
