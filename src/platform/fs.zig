@@ -293,6 +293,26 @@ pub fn renameReplace(from: [*:0]const u8, to: [*:0]const u8) c_int {
 }
 extern "kernel32" fn MoveFileExW(lpExistingFileName: [*:0]const u16, lpNewFileName: [*:0]const u16, dwFlags: u32) callconv(.winapi) c_int;
 
+/// Whether the last Windows file operation failed transiently because another
+/// handle is replacing/holding the path.  The CRT normally reports these as
+/// EACCES/EAGAIN, while the underlying Win32 call may report sharing/access
+/// denied (or a momentary not-found while a replace is delete-pending).
+/// Callers choose whether a not-found result is retryable; absent paths must
+/// remain fast, while an existing path may use a preflight presence check.
+pub fn isWindowsTransientFileError(include_not_found: bool) bool {
+    if (is_windows) {
+        const win_code = GetLastError();
+        const crt_code = std.c._errno().*;
+        if (include_not_found and (win_code == 2 or win_code == 3 or crt_code == @intFromEnum(std.c.E.NOENT))) return true;
+        if (win_code == 5 or win_code == 32 or win_code == 33) return true;
+        return crt_code == @intFromEnum(std.c.E.ACCES) or
+            crt_code == @intFromEnum(std.c.E.AGAIN) or
+            crt_code == @intFromEnum(std.c.E.BUSY);
+    } else {
+        return false;
+    }
+}
+
 /// Atomically install `from` at an absent `to` without ever replacing an
 /// existing pathname. Content-addressed stores need this stronger primitive:
 /// a verify-then-`renameReplace` sequence has a cross-process race in which a

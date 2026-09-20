@@ -27,10 +27,22 @@
 //! - sanitize 截断超长名(不报错)——两个超长名可能撞同一目录;工具层(SW2)先限名字长度。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const util_fs = @import("../util/fs.zig");
 const util_json = @import("../util/json.zig");
 const file_lock = @import("../util/file_lock.zig");
+const util_time = @import("../util/time.zig");
+const log = @import("../util/log.zig");
+
+const is_windows = builtin.os.tag == .windows;
+// Windows can keep a target in delete-pending state while MoveFileExW and CRT
+// readers contend.  32 attempts × 5 ms = 160 ms per operation: bounded in the
+// low hundreds of milliseconds. A genuinely absent path gets only the short
+// not-found budget below; its preflight can itself hit delete-pending.
+const WINDOWS_FILE_RETRY_LIMIT: usize = 32;
+const WINDOWS_FILE_RETRY_SLEEP_MS: u64 = 5;
+const WINDOWS_ABSENT_FILE_RETRY_LIMIT: usize = 4;
 
 pub const TEAM_LEAD_NAME = "team-lead";
 
@@ -407,7 +419,29 @@ pub fn atomicWrite(path: []const u8, body: []const u8) !void {
     if (path.len >= path_buf.len) return error.PathTooLong;
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
-    if (pfs.renameReplace(tmp.ptr, @ptrCast(&path_buf)) != 0) {
+
+    var rename_ok = false;
+    if (is_windows) {
+        var retries: usize = 0;
+        var retried = false;
+        while (true) {
+            if (pfs.renameReplace(tmp.ptr, @ptrCast(&path_buf)) == 0) {
+                rename_ok = true;
+                break;
+            }
+            if (retries >= WINDOWS_FILE_RETRY_LIMIT or
+                !pfs.isWindowsTransientFileError(false)) break;
+            retries += 1;
+            retried = true;
+            util_time.sleepMs(WINDOWS_FILE_RETRY_SLEEP_MS);
+        }
+        if (retried) {
+            log.warn("swarm", "atomicWrite retried Windows replace for {s} ({d} attempts)", .{ path, retries });
+        }
+    } else {
+        rename_ok = pfs.renameReplace(tmp.ptr, @ptrCast(&path_buf)) == 0;
+    }
+    if (!rename_ok) {
         _ = std.c.unlink(tmp.ptr);
         return error.RenameFailed;
     }
@@ -419,7 +453,31 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     if (path.len >= pbuf.len) return null;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    var was_present = false;
+    if (is_windows) {
+        // Sample before _open: during MoveFileExW's delete-pending window both
+        // lookups can miss. Even a negative sample therefore gets four short
+        // retries (20 ms total); a known-present file gets the full 160 ms.
+        was_present = pfs.exists(@ptrCast(&pbuf));
+    }
+    var fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (is_windows and fd < 0) {
+        var retryable = pfs.isWindowsTransientFileError(true);
+        var retries: usize = 0;
+        var retried = false;
+        const retry_limit = if (was_present) WINDOWS_FILE_RETRY_LIMIT else WINDOWS_ABSENT_FILE_RETRY_LIMIT;
+        while (retries < retry_limit and retryable) {
+            retries += 1;
+            retried = true;
+            util_time.sleepMs(WINDOWS_FILE_RETRY_SLEEP_MS);
+            fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+            if (fd >= 0) break;
+            retryable = pfs.isWindowsTransientFileError(true);
+        }
+        if (retried) {
+            log.warn("swarm", "readFileAlloc retried Windows open for {s} ({d} attempts)", .{ path, retries });
+        }
+    }
     if (fd < 0) return null;
     defer pfs.close(fd);
     var out: std.ArrayList(u8) = .empty;
@@ -479,7 +537,6 @@ fn appendFmt(out: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []cons
 // ============================================================================
 
 const testing = std.testing;
-const util_time = @import("../util/time.zig");
 
 test "sanitize: team 小写化,agent 保大小写,@ 均被清洗" {
     var buf: [64]u8 = undefined;
