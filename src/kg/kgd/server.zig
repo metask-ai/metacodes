@@ -58,11 +58,23 @@ pub const Options = struct {
     /// Compared against every request's `x-api-key`. Never logged.
     api_key: []const u8,
     port: u16,
-    /// Where markdown is staged for the engine to read back by pathname.
-    /// Defaults beside the store, which is wrong whenever the store lives
-    /// somewhere shared, so the service passes the configuration's own
-    /// directory: `kg install` creates that one 0700 under the user's home.
-    staging_dir: ?[]const u8 = null,
+    /// Where markdown is staged for the engine to read back by pathname, and
+    /// the directory every component of that path is validated up to.
+    ///
+    /// Required, and deliberately not derived from `--store` or `--config`:
+    /// both can point anywhere, and a staging path whose ancestors someone
+    /// else can rename is a path the engine can be redirected through. The
+    /// service passes a directory under the user's own home.
+    staging: Staging,
+};
+
+pub const Staging = struct {
+    /// Absolute path of the staging directory itself.
+    dir: []const u8,
+    /// The ancestor the validation walk stops at, trusted because it is the
+    /// user's own home. Everything between it and `dir` must be a directory
+    /// this user owns that nobody else can write.
+    trusted_root: []const u8,
 };
 
 pub const Supervisor = struct {
@@ -420,11 +432,8 @@ pub const Supervisor = struct {
         source_key: []const u8,
         markdown: []const u8,
     ) ![]const u8 {
-        const dir = if (self.options.staging_dir) |given|
-            try allocator.dupe(u8, given)
-        else
-            try std.fmt.allocPrint(allocator, "{s}.import", .{self.options.store_path});
-        try ensurePrivateDirectory(allocator, dir);
+        const dir = try allocator.dupe(u8, self.options.staging.dir);
+        try ensurePrivateDirectory(allocator, dir, self.options.staging.trusted_root);
 
         var suffix: [8]u8 = undefined;
         if (!@import("platform").rng.randomBytes(&suffix)) return error.StageFailed;
@@ -750,8 +759,25 @@ fn infoField(stdout: []const u8, name: []const u8) ?[]const u8 {
 /// does. A best-effort `chmod` was worse than nothing here: it also followed a
 /// directory symlink, so a planted link could redirect both the tightening and
 /// the staging itself.
-fn ensurePrivateDirectory(allocator: std.mem.Allocator, path: []const u8) !void {
+/// Every component from the staging directory up to `trusted_root` must be a
+/// directory this user owns that nobody else can write.
+///
+/// One component is not enough and neither are two. The engine reopens the
+/// staged file by pathname after the service renames it there, so anyone who
+/// can rename *any* ancestor can substitute the whole subtree between our
+/// checks and that open. Validating the chain is what makes the pathname mean
+/// the same thing to both processes; `trusted_root` is where the walk stops,
+/// and it is the user's own home — if that is writable by others, this service
+/// is not the thing that is broken.
+fn ensurePrivateDirectory(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    trusted_root: []const u8,
+) !void {
     const util_fs = @import("../../util/fs.zig");
+    if (!std.fs.path.isAbsolute(path) or !std.fs.path.isAbsolute(trusted_root)) return error.StagingDirectoryUnusable;
+    if (!std.mem.startsWith(u8, path, trusted_root)) return error.StagingDirectoryUnusable;
+
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
     const existed = pfs.exists(path_z.ptr);
@@ -765,32 +791,35 @@ fn ensurePrivateDirectory(allocator: std.mem.Allocator, path: []const u8) !void 
     if (@import("builtin").os.tag == .windows) {
         // MSVCRT cannot open a directory, so there is no descriptor to
         // validate and no portable owner or ACL check here. A reparse point is
-        // refused and the exclusive temporary still applies; the directory
-        // itself is trusted. doc/TINYKG_INTEGRATION.md records the difference.
+        // refused and the rest of the chain is trusted. Staging lives under the
+        // user's profile, which bounds who can reach it in practice;
+        // doc/TINYKG_INTEGRATION.md records what is and is not proven.
         if (pfs.isSymlink(path_z.ptr)) return error.StagingDirectoryUnusable;
         return;
     }
+
+    var component: []const u8 = path;
+    while (true) {
+        try validatePrivateComponent(allocator, component);
+        if (std.mem.eql(u8, component, trusted_root)) return;
+        const parent = std.fs.path.dirname(component) orelse return error.StagingDirectoryUnusable;
+        if (parent.len >= component.len) return error.StagingDirectoryUnusable; // no progress: refuse
+        component = parent;
+    }
+}
+
+fn validatePrivateComponent(allocator: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.StagingDirectoryUnusable;
     defer _ = pfs.close(fd);
     const info = pfs.fileInfo(fd) catch return error.StagingDirectoryUnusable;
     if (!info.is_dir) return error.StagingDirectoryUnusable;
     if (info.uid != std.c.geteuid()) return error.StagingDirectoryUnusable;
-    // No group or world write: those are exactly the bits that would let
-    // someone else replace the staged file after the rename.
+    // Group or world write on any component is what lets someone else rename
+    // the subtree out from under a pathname the engine will reopen.
     if ((info.mode & 0o022) != 0) return error.StagingDirectoryUnusable;
-    // The directory being private is not enough: the engine reopens the staged
-    // file by pathname, so anyone who can write the PARENT can rename this
-    // directory away and put a symlink in its place between our check and that
-    // open. A shared parent is refused rather than guarded.
-    const parent = std.fs.path.dirname(path) orelse return;
-    const parent_z = try allocator.dupeZ(u8, parent);
-    defer allocator.free(parent_z);
-    const parent_fd = pfs.open(parent_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
-    if (parent_fd < 0) return error.StagingDirectoryUnusable;
-    defer _ = pfs.close(parent_fd);
-    const parent_info = pfs.fileInfo(parent_fd) catch return error.StagingDirectoryUnusable;
-    if (!parent_info.is_dir or (parent_info.mode & 0o022) != 0) return error.StagingDirectoryUnusable;
 }
 
 fn removeFile(path: []const u8) void {
@@ -858,10 +887,15 @@ test "KgdServer: staging refuses a directory other people can write" {
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
 
-    // Created fresh: private, and usable.
-    const fresh = try std.fmt.allocPrint(a, "{s}/fresh.import", .{root});
+    // Created fresh under a trusted root: private, and usable.
+    const fresh = try std.fmt.allocPrint(a, "{s}/nested/fresh.import", .{root});
     defer a.free(fresh);
-    try ensurePrivateDirectory(a, fresh);
+    try ensurePrivateDirectory(a, fresh, root);
+
+    // A path outside the trusted root is refused before anything is touched.
+    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, "/tmp/elsewhere", root));
+    // As is a relative one: the chain walk only means something on absolutes.
+    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, "relative/import", root));
 
     // Group- and world-writable: the daemon opens the staged file by name
     // after we rename it, so anyone who can write here can swap it for a
@@ -870,7 +904,7 @@ test "KgdServer: staging refuses a directory other people can write" {
     defer a.free(shared);
     try @import("../../util/fs.zig").mkdirParents(std.mem.span(shared.ptr));
     try testing.expectEqual(@as(c_int, 0), std.c.chmod(shared.ptr, 0o777));
-    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, std.mem.span(shared.ptr)));
+    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, std.mem.span(shared.ptr), root));
 
     // A shared parent: the engine reopens the staged file by pathname, so
     // someone able to write the parent can swap this directory for a symlink
@@ -881,7 +915,13 @@ test "KgdServer: staging refuses a directory other people can write" {
     try testing.expectEqual(@as(c_int, 0), std.c.chmod(shared_parent.ptr, 0o777));
     const under_shared = try std.fmt.allocPrint(a, "{s}/open-parent/child.import", .{root});
     defer a.free(under_shared);
-    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, under_shared));
+    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, under_shared, root));
+
+    // And a grandparent: one level of checking was never enough, because any
+    // ancestor that can be renamed substitutes the whole subtree.
+    const deep = try std.fmt.allocPrint(a, "{s}/open-parent/mid/deep.import", .{root});
+    defer a.free(deep);
+    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, deep, root));
 
     // A symlink standing in for the directory: following it would stage into
     // someone else's directory, and the old code would have chmod'ed it too.
@@ -891,7 +931,7 @@ test "KgdServer: staging refuses a directory other people can write" {
     const linked = try std.fmt.allocPrintSentinel(a, "{s}/linked.import", .{root}, 0);
     defer a.free(linked);
     try testing.expectEqual(@as(c_int, 0), std.c.symlink(target.ptr, linked.ptr));
-    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, std.mem.span(linked.ptr)));
+    try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, std.mem.span(linked.ptr), root));
 }
 
 test "KgdServer: a timeout outside the daemon's range falls back to the default" {

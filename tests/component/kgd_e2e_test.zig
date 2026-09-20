@@ -21,6 +21,8 @@ const Harness = struct {
     cli: []u8,
     daemon: []u8,
     store: []u8,
+    staging: []u8,
+    trusted_root: []const u8,
     supervisor: *Supervisor,
     thread: std.Thread,
     io_runtime: *std.Io.Threaded,
@@ -48,12 +50,18 @@ const Harness = struct {
         errdefer allocator.destroy(io_runtime);
         io_runtime.* = std.Io.Threaded.init(allocator, .{});
 
+        // Staging is required and validated against a trusted root, exactly as
+        // the service supplies it; a harness that omitted it would exercise a
+        // path production never takes.
+        const staging = try std.fmt.allocPrint(allocator, "{s}/kg/import", .{root});
+        errdefer allocator.free(staging);
         const supervisor = Supervisor.start(allocator, .{
             .store_path = store,
             .cli_path = cli,
             .daemon_path = daemon,
             .api_key = api_key,
             .port = 0, // the kernel picks; nothing else may claim a fixed port in a test
+            .staging = .{ .dir = staging, .trusted_root = try allocator.dupe(u8, root) },
         }) catch |err| {
             io_runtime.deinit();
             allocator.destroy(io_runtime);
@@ -66,6 +74,8 @@ const Harness = struct {
             .cli = cli,
             .daemon = daemon,
             .store = store,
+            .staging = staging,
+            .trusted_root = supervisor.options.staging.trusted_root,
             .supervisor = supervisor,
             .thread = thread,
             .io_runtime = io_runtime,
@@ -81,6 +91,8 @@ const Harness = struct {
         self.allocator.free(self.cli);
         self.allocator.free(self.daemon);
         self.allocator.free(self.store);
+        self.allocator.free(self.staging);
+        self.allocator.free(@constCast(self.trusted_root));
         self.tmp.cleanup();
     }
 
@@ -194,7 +206,7 @@ test "Kgd: a planted symlink cannot capture a markdown import" {
 
     // The staging name is the client's sourceKey, which is predictable, and a
     // store can live in a shared directory. Someone leaves a link there first.
-    const staging_dir = try std.fmt.allocPrint(a, "{s}.import", .{harness.store});
+    const staging_dir = try a.dupe(u8, harness.staging);
     defer a.free(staging_dir);
     try cc.util_fs.mkdirParents(staging_dir);
     const victim = try std.fmt.allocPrintSentinel(a, "{s}/victim", .{staging_dir}, 0);
@@ -331,6 +343,8 @@ test "Kgd: what install wrote is what the service starts from" {
 
     // The handoff is only real if a service actually starts from it: the store
     // install created, the key it generated, the executables it resolved.
+    const handoff_staging = try std.fmt.allocPrint(a, "{s}/.metacodes/kg/import", .{home});
+    defer a.free(handoff_staging);
     var io_runtime = std.Io.Threaded.init(a, .{});
     defer io_runtime.deinit();
     const supervisor = try Supervisor.start(a, .{
@@ -341,6 +355,9 @@ test "Kgd: what install wrote is what the service starts from" {
         // The configured port is asserted above; binding zero here keeps the
         // test from fighting whatever else is listening on this machine.
         .port = 0,
+        // Staging is anchored under this test's home, the way the service
+        // anchors it under the user's.
+        .staging = .{ .dir = handoff_staging, .trusted_root = home },
     });
     const thread = try std.Thread.spawn(.{}, Supervisor.serveForever, .{supervisor});
     defer {

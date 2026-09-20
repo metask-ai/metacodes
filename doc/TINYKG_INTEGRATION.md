@@ -204,18 +204,19 @@ Properties worth knowing:
 - Nothing starts the daemon automatically yet, there is no idle exit, and the
   daemon is still not part of the product install.
 - Markdown import stages the document where the engine can read it back by
-  pathname. That directory is created beside the configuration (0700, under the
-  user's home) rather than beside the Store, which may be anywhere the operator
-  pointed. The service refuses to stage unless the directory is a non-symlink
-  directory it owns with no group or world write bits, and unless its parent is
-  likewise not writable by others — the engine reopens the path after the
-  service renames the file into place, so a directory anyone else can replace
-  is a directory the engine can be redirected through.
-- Known limitation on Windows: that directory is checked only for being a
+  pathname, always at `~/.metacodes/kg/import`. The location is derived from the
+  home directory alone, never from `--config` or `--store`: both can point
+  anywhere, and the engine reopens the staged path after the service renames the
+  file into place, so an ancestor someone else can rename is an ingestion
+  someone else can redirect. Before staging, every directory from that path up
+  to the home directory must be a non-symlink directory this user owns with no
+  group or world write bits; anything else refuses the import rather than
+  proceeding.
+- Known limitation on Windows: only the leaf is checked, and only for being a
   reparse point. MSVCRT cannot open a directory, so there is no descriptor to
   validate and no portable owner or ACL check; the exclusive temporary file
-  still applies, but a shared Windows staging directory is trusted rather than
-  proven private.
+  still applies, but a Windows staging chain is trusted rather than proven
+  private.
 - Known limitation on Windows: the bridge's response deadline cannot interrupt
   a write that is already blocked, because anonymous pipes have no portable
   writability query (`PipeChild.pollWritable` returns true there). A request is

@@ -25,6 +25,9 @@ pub const Error = error{
 
 pub const Config = struct {
     config_path: []u8,
+    /// The user's home. Markdown staging is anchored here rather than in a
+    /// directory a flag could point anywhere.
+    home: []u8,
     store_path: []u8,
     cli_path: []u8,
     daemon_path: []u8,
@@ -33,6 +36,7 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.config_path);
+        allocator.free(self.home);
         allocator.free(self.store_path);
         allocator.free(self.cli_path);
         allocator.free(self.daemon_path);
@@ -50,7 +54,9 @@ pub const LoadOptions = struct {
 };
 
 pub fn loadConfig(allocator: std.mem.Allocator, home: []const u8, options: LoadOptions) Error!Config {
-    if (home.len == 0 and options.config_path == null) return Error.NoHome;
+    // A home is required even with an explicit `--config`: markdown staging is
+    // anchored there, and there is nowhere else this service will trust.
+    if (home.len == 0) return Error.NoHome;
     const config_path = if (options.config_path) |given|
         allocator.dupe(u8, given) catch return Error.OutOfMemory
     else
@@ -81,8 +87,12 @@ pub fn loadConfig(allocator: std.mem.Allocator, home: []const u8, options: LoadO
     errdefer allocator.free(store_path);
     const owned_key = allocator.dupe(u8, parsed.value.api_key) catch return Error.OutOfMemory;
 
+    const owned_home = allocator.dupe(u8, home) catch return Error.OutOfMemory;
+    errdefer allocator.free(owned_home);
+
     return .{
         .config_path = config_path,
+        .home = owned_home,
         .store_path = store_path,
         .cli_path = cli.path,
         .daemon_path = daemon.path,
@@ -116,6 +126,17 @@ fn beside(allocator: std.mem.Allocator, dir: []const u8, path: []const u8) Error
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, path }) catch Error.OutOfMemory;
 }
 
+/// Where markdown is staged, derived from the home directory and nothing else.
+///
+/// Not from `--config` and not from `--store`: both can point anywhere, and the
+/// engine reopens a staged file by pathname, so an ancestor someone else can
+/// rename is an ingestion someone else can redirect. Under the home directory
+/// the whole chain belongs to this user, which is what makes validating it
+/// mean something.
+pub fn stagingDir(allocator: std.mem.Allocator, home: []const u8) Error![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/import", .{home}) catch Error.OutOfMemory;
+}
+
 /// The interrupt handler needs a way to reach the running supervisor, and a
 /// signal handler cannot take arguments. One process runs one supervisor.
 var active: ?*server_mod.Supervisor = null;
@@ -125,12 +146,12 @@ fn onInterrupt() void {
 }
 
 pub fn serve(allocator: std.mem.Allocator, config: Config) u8 {
-    // Markdown is staged beside the configuration, not beside the store: the
-    // store can be anywhere the operator pointed, including a shared directory,
-    // while the configuration directory is the one `kg install` created 0700.
-    const staging = std.fmt.allocPrint(allocator, "{s}/import", .{
-        std.fs.path.dirname(config.config_path) orelse ".",
-    }) catch {
+    // Markdown staging is anchored in the user's own home, not derived from
+    // `--config` or `--store`. Both can point anywhere, and the engine reopens
+    // a staged file by pathname: an ancestor someone else can rename is an
+    // ingestion someone else can redirect. Under $HOME the whole chain belongs
+    // to this user, which is what makes validating it meaningful.
+    const staging = stagingDir(allocator, config.home) catch {
         std.debug.print("error: out of memory preparing the TinyKG service\n", .{});
         return 1;
     };
@@ -141,7 +162,7 @@ pub fn serve(allocator: std.mem.Allocator, config: Config) u8 {
         .daemon_path = config.daemon_path,
         .api_key = config.api_key,
         .port = config.port,
-        .staging_dir = staging,
+        .staging = .{ .dir = staging, .trusted_root = config.home },
     }) catch |err| {
         std.debug.print("error: cannot start the TinyKG service ({s}){s}\n", .{ @errorName(err), hint(err) });
         return 1;
@@ -180,6 +201,31 @@ fn hint(err: anyerror) []const u8 {
 }
 
 const testing = std.testing;
+
+test "KgdRuntime: staging is anchored in the home directory, not in the configuration" {
+    const a = testing.allocator;
+    const staging = try stagingDir(a, "/home/x");
+    defer a.free(staging);
+    try testing.expectEqualStrings("/home/x/.metacodes/kg/import", staging);
+
+    // The point of the anchor: a configuration somewhere else does not move it.
+    // Deriving staging from the configuration directory would put the engine's
+    // reopen path wherever `--config` pointed, shared directories included.
+    var config = Config{
+        .config_path = try a.dupe(u8, "/tmp/shared/isolated.json"),
+        .home = try a.dupe(u8, "/home/x"),
+        .store_path = try a.dupe(u8, "/tmp/shared/store.kg.v2"),
+        .cli_path = try a.dupe(u8, "/opt/tinykg"),
+        .daemon_path = try a.dupe(u8, "/opt/tinykgd"),
+        .api_key = try a.dupe(u8, "k"),
+        .port = 8799,
+    };
+    defer config.deinit(a);
+    const anchored = try stagingDir(a, config.home);
+    defer a.free(anchored);
+    try testing.expect(std.mem.startsWith(u8, anchored, config.home));
+    try testing.expect(std.mem.indexOf(u8, anchored, "/tmp/shared") == null);
+}
 
 test "KgdRuntime: a relative store resolves against the configuration, not the working directory" {
     const a = testing.allocator;

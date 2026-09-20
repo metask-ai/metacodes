@@ -952,7 +952,6 @@ fn kgDiagnosisOwned(allocator: std.mem.Allocator, state: []const u8, transport: 
     return .{ .state = s, .transport = t, .config = c, .hint = h };
 }
 
-/// unknown argument.
 /// `metacodes kg install [--store PATH] [--port N]`: provision the local
 /// TinyKG runtime. Prints what it did; never prints the API key.
 fn runKg(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {

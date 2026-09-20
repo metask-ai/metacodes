@@ -21,8 +21,6 @@ const identity_mod = @import("identity.zig");
 const KgClient = @import("../client.zig").KgClient;
 
 pub const DEFAULT_PORT: u16 = 8799;
-pub const CONFIG_DIR_RELATIVE = ".metacodes/kg";
-pub const CONFIG_NAME = "daemon.json";
 pub const STORE_NAME = "store.kg.v2";
 const STORE_INIT_TIMEOUT_MS = 60_000;
 const API_KEY_BYTES = 32;
