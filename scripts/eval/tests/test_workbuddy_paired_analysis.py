@@ -595,6 +595,55 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             )
 
     @requires_posix_budget_journal
+    def test_dated_cache_prefix_locates_the_task_artifact_not_a_twin(self):
+        # task-a and task-b in the treatment arm share reward 1.0, so their
+        # result.json bytes and hashes are identical; a decoy that sorts before
+        # both (and is created first, for inode-ordered filesystems) holds the
+        # same bytes and no requests.jsonl. The exemption must still read
+        # task-a's own request, not the first hash match it stumbles on.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results = root / "checkout" / "results" / "job-treatment"
+            decoy = results / "aaa-decoy"
+            decoy.mkdir(parents=True)
+            (decoy / "result.json").write_bytes(
+                (json.dumps({"verifier_result": {"rewards": {"reward": 1.0}}})
+                 + "\n").encode("utf-8")
+            )
+            bm, br, bj, tm, tr, tj = self._dated_drift_pair(root)
+            report = build_report(
+                baseline_manifest_path=bm, baseline_receipt_path=br,
+                baseline_journal_path=bj, treatment_manifest_path=tm,
+                treatment_receipt_path=tr, treatment_journal_path=tj,
+                accept_dated_cache_prefix=["task-a"],
+            )
+            self.assertEqual(
+                report["cache_prefix_dated_drift_tasks"], ["task-a"]
+            )
+
+    @requires_posix_budget_journal
+    def test_dated_cache_prefix_refuses_ambiguous_twin_artifacts(self):
+        # Two decoys carry the treatment task-a hash, task-a's own artifact is
+        # gone and neither decoy is under a directory named for the task: the
+        # exemption must refuse rather than audit whichever sorts first.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj = self._dated_drift_pair(root)
+            results = root / "checkout" / "results" / "job-treatment"
+            payload = (results / "task-a" / "result.json").read_bytes()
+            (results / "task-a" / "result.json").unlink()
+            for name in ("aaa-decoy", "zzz-decoy"):
+                (results / name).mkdir()
+                (results / name / "result.json").write_bytes(payload)
+            with self.assertRaisesRegex(LaunchError, "none under a directory named"):
+                build_report(
+                    baseline_manifest_path=bm, baseline_receipt_path=br,
+                    baseline_journal_path=bj, treatment_manifest_path=tm,
+                    treatment_receipt_path=tr, treatment_journal_path=tj,
+                    accept_dated_cache_prefix=["task-a"],
+                )
+
+    @requires_posix_budget_journal
     def test_dated_cache_prefix_flag_refuses_non_date_differences(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
