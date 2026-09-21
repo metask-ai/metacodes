@@ -88,7 +88,11 @@ jobs:
                 }
               }
             }
-            Get-ChildItem -Force -Filter '.prelude-ran-*' | ForEach-Object { Write-Host "  prelude marker: $($_.Name)" }
+            Get-ChildItem -Force -Filter '.prelude-ran-*' | ForEach-Object { Write-Host "  prelude marker (workspace): $($_.Name)" }
+            Write-Host "  C:\tmp exists=$(Test-Path 'C:\tmp') contents=[$((Get-ChildItem -Force 'C:\tmp' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ',')]"
+            foreach ($root in @('D:\', 'C:\tmp', 'C:\Users\runneradmin', "$env:TEMP")) {
+              Get-ChildItem -Path $root -Force -Recurse -Depth 4 -Filter '.prelude-ran-*' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  prelude marker found: $($_.FullName)" }
+            }
             Write-Host "after iteration $i drive-tmp-exists=$(Test-Path 'D:\tmp') contents=[$((Get-ChildItem -Force 'D:\tmp' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ',')]"
           }
           Write-Host "total failing iterations: $failures"
