@@ -65,12 +65,21 @@ fn sanitizeField(out: *std.ArrayList(u8), alloc: std.mem.Allocator, value: []con
         }
         // 多字节 UTF-8:**整码点一起**处理,绝不切半个码点(否则产坏 UTF-8)。
         const cp_len: usize = std.unicode.utf8ByteSequenceLength(c) catch 1;
-        if (cp_len > 1) {
-            if (i + cp_len > value.len) {
+        if (c >= 0x80) {
+            if (cp_len == 1 or cp_len > value.len - i or
+                !std.unicode.utf8ValidateSlice(value[i .. i + cp_len]))
+            {
+                // LSP input is external bytes, so a lead byte and a length
+                // check are insufficient: validate the complete sequence.
+                // Keep the output valid UTF-8 and preserve a visible marker
+                // instead of leaking an illegal byte into the host stream.
+                if (3 > limit - written) break;
+                try out.appendSlice(alloc, "�");
+                written += 3;
                 i += 1;
                 continue;
-            } // 非法/截断序列 → 跳过该字节
-            if (written + cp_len > limit) break; // 放不下整码点 → 在码点边界停
+            }
+            if (cp_len > limit - written) break; // 放不下整码点 → 在码点边界停
             try out.appendSlice(alloc, value[i .. i + cp_len]);
             written += cp_len;
             i += cp_len;
@@ -213,6 +222,17 @@ test "sanitizeField: 多字节 UTF-8 截断在码点边界(不产坏字节)" {
     // 整块输出必须是合法 UTF-8(证明没在 CJK 中间切出半个码点)。
     try testing.expect(std.unicode.utf8ValidateSlice(s));
     try testing.expect(std.mem.indexOf(u8, s, "…") != null); // 截断标记在
+}
+
+test "sanitizeField: malformed UTF-8 becomes replacement characters" {
+    const a = testing.allocator;
+    const diags = [_]Diagnostic{
+        .{ .severity = .err, .line = 0, .col = 0, .end_line = 0, .end_col = 1, .message = "bad\xe4\x60\x80tail" },
+    };
+    const s = try reportForFile(a, "x.zig", &diags, &DEFAULT_SEVERITIES);
+    defer a.free(s);
+    try testing.expect(std.unicode.utf8ValidateSlice(s));
+    try testing.expect(std.mem.indexOf(u8, s, "bad�`�tail") != null);
 }
 
 test "truncate: 超 4000 截断 + 标记" {

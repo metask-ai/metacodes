@@ -29,8 +29,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const a = ctx.allocator;
     const path_raw = common.extractJsonArg(args, "notebook_path") orelse return error.MissingNotebookPath;
     if (path_raw.len == 0) return error.EmptyNotebookPath;
+    const path_arg = try util_json.unescapeString(path_raw, a);
+    defer a.free(path_arg);
     // 归一化(展开 ~、折叠、查 traversal)。openat 不认 ~。
-    const path = try path_mod.normalizeChecked(a, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    const path = try path_mod.normalizeChecked(a, path_arg, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
     defer a.free(path);
     if (!std.mem.endsWith(u8, path, ".ipynb")) return error.NotANotebook;
 
@@ -38,13 +40,19 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const new_source = try util_json.unescapeString(new_source_raw, a);
     defer a.free(new_source);
 
-    const cell_id = common.extractJsonArg(args, "cell_id"); // optional
-    const cell_type = common.extractJsonArg(args, "cell_type") orelse "code";
+    const cell_id_raw = common.extractJsonArg(args, "cell_id");
+    const cell_id = if (cell_id_raw) |raw| try util_json.unescapeString(raw, a) else null;
+    defer if (cell_id) |value| a.free(value);
+    const cell_type_raw = common.extractJsonArg(args, "cell_type");
+    const cell_type = if (cell_type_raw) |raw| try util_json.unescapeString(raw, a) else "code";
+    defer if (cell_type_raw != null) a.free(cell_type);
     if (!std.mem.eql(u8, cell_type, "code") and !std.mem.eql(u8, cell_type, "markdown")) {
         return error.InvalidCellType;
     }
 
-    const edit_mode_str = common.extractJsonArg(args, "edit_mode") orelse "replace";
+    const edit_mode_raw = common.extractJsonArg(args, "edit_mode");
+    const edit_mode_str = if (edit_mode_raw) |raw| try util_json.unescapeString(raw, a) else "replace";
+    defer if (edit_mode_raw != null) a.free(edit_mode_str);
     const mode: EditMode = if (std.mem.eql(u8, edit_mode_str, "replace"))
         .replace
     else if (std.mem.eql(u8, edit_mode_str, "insert"))
@@ -80,11 +88,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             const idx = findCellById(cells_list.items, cell_id.?) orelse return error.CellNotFound;
             // 改前抓旧 source(供 diff);cell_type 未显式改时沿用原 cell 类型判 markdown。
             old_src = try cellSourceDup(a, cells_list.items[idx]);
-            if (common.extractJsonArg(args, "cell_type") == null) {
+            if (cell_type_raw == null) {
                 is_markdown = cellIsMarkdown(cells_list.items[idx]);
             }
             try setCellSource(parsed.arena.allocator(), &cells_list.items[idx], new_source);
-            if (common.extractJsonArg(args, "cell_type")) |_| {
+            if (cell_type_raw != null) {
                 try cells_list.items[idx].object.put(parsed.arena.allocator(), "cell_type", .{ .string = cell_type });
             }
             new_src = new_source;
@@ -144,16 +152,18 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
-    try out.writer.print(
-        "{{\"success\":true,\"path\":\"{s}\",\"mode\":\"{s}\",\"cells_after\":{d}",
-        .{ path, edit_mode_str, cells_list.items.len },
-    );
+    try out.writer.writeAll("{\"success\":true,\"path\":");
+    try util_json.writeJsonString(&out.writer, path);
+    try out.writer.writeAll(",\"mode\":");
+    try util_json.writeJsonString(&out.writer, edit_mode_str);
+    try out.writer.print(",\"cells_after\":{d}", .{cells_list.items.len});
     if (lang.len > 0) {
-        try out.writer.print(",\"lang\":\"{s}\"", .{lang});
+        try out.writer.writeAll(",\"lang\":");
+        try util_json.writeJsonString(&out.writer, lang);
     }
     if (git_diff) |g| {
         try out.writer.writeAll(",\"gitDiff\":");
-        try std.json.Stringify.encodeJsonString(g, .{}, &out.writer);
+        try util_json.writeJsonString(&out.writer, g);
     }
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();

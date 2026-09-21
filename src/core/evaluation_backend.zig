@@ -13,6 +13,7 @@ const util_json = @import("../util/json.zig");
 const util_time = @import("../util/time.zig");
 const pricing = @import("../util/pricing.zig");
 const log = @import("../util/log.zig");
+const json_util = @import("../util/json.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const request_gate = @import("request_gate.zig");
 const ToolExecutionPolicy = @import("../tools/context.zig").ToolExecutionPolicy;
@@ -832,9 +833,15 @@ pub const EvaluationBackend = struct {
             .session_id = session.asSlice(),
             .event = event,
         };
-        const line = std.json.Stringify.valueAlloc(self.allocator, envelope, .{}) catch {
+        const raw = std.json.Stringify.valueAlloc(self.allocator, envelope, .{}) catch {
             self.dropped_events += 1;
             log.warn("eval", "dropped evaluation event (serialize OOM)", .{});
+            return;
+        };
+        defer self.allocator.free(raw);
+        const line = json_util.repairJsonUtf8(self.allocator, raw) catch {
+            self.dropped_events += 1;
+            log.warn("eval", "dropped evaluation event (UTF-8 repair OOM)", .{});
             return;
         };
         defer self.allocator.free(line);

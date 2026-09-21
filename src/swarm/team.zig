@@ -58,6 +58,10 @@ pub const Member = struct {
     cwd: []const u8 = "",
     worktree_path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
+    /// Per-spawn lease for process teammates. Unlike session_id (shared by
+    /// the whole lead session), this changes on every spawn and rejects an
+    /// old process after a same-name delete/recreate.
+    lease_id: ?[]const u8 = null,
     /// "in-process" | "process"(cc 是 in-process|tmux;metacodes 进程外走 headless,SW6)
     backend_type: []const u8 = "in-process",
     /// false=idle;true=active(cc isActive?:undefined 视为 active)
@@ -133,6 +137,8 @@ fn dupeMember(a: std.mem.Allocator, src: Member, out: *Member) !void {
     errdefer if (worktree_path) |v| a.free(v);
     const session_id: ?[]const u8 = if (src.session_id) |v| try a.dupe(u8, v) else null;
     errdefer if (session_id) |v| a.free(v);
+    const lease_id: ?[]const u8 = if (src.lease_id) |v| try a.dupe(u8, v) else null;
+    errdefer if (lease_id) |v| a.free(v);
     const mode: ?[]const u8 = if (src.mode) |v| try a.dupe(u8, v) else null;
     out.* = .{
         .agent_id = agent_id,
@@ -145,6 +151,7 @@ fn dupeMember(a: std.mem.Allocator, src: Member, out: *Member) !void {
         .cwd = cwd,
         .worktree_path = worktree_path,
         .session_id = session_id,
+        .lease_id = lease_id,
         .backend_type = backend_type,
         .is_active = src.is_active,
         .mode = mode,
@@ -161,6 +168,7 @@ fn freeMember(a: std.mem.Allocator, m: *Member) void {
     if (m.color) |v| a.free(v);
     if (m.worktree_path) |v| a.free(v);
     if (m.session_id) |v| a.free(v);
+    if (m.lease_id) |v| a.free(v);
     if (m.mode) |v| a.free(v);
 }
 
@@ -289,10 +297,15 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ?TeamFile {
                     .cwd = strField(mo, "cwd") orelse "",
                     .worktree_path = strField(mo, "worktreePath"),
                     .session_id = strField(mo, "sessionId"),
+                    .lease_id = strField(mo, "leaseId"),
                     .backend_type = strField(mo, "backendType") orelse "in-process",
                     .is_active = boolField(mo, "isActive") orelse true,
                     .mode = strField(mo, "mode"),
                 };
+                // Name is the routing key. Duplicate entries make
+                // findMember()/active updates depend on array order and can
+                // route a stale session to the wrong process.
+                if (tf.findMember(m.name) != null) return null;
                 tf.addMember(m) catch return null;
             }
         },
@@ -347,6 +360,10 @@ pub fn serialize(allocator: std.mem.Allocator, tf: *const TeamFile) ![]u8 {
         }
         if (m.session_id) |v| {
             try out.appendSlice(allocator, ",\"sessionId\":");
+            try util_json.serializeString(v, &out, allocator);
+        }
+        if (m.lease_id) |v| {
+            try out.appendSlice(allocator, ",\"leaseId\":");
             try util_json.serializeString(v, &out, allocator);
         }
         try out.appendSlice(allocator, ",\"backendType\":");
@@ -588,6 +605,7 @@ test "TeamFile serialize→parse 往返(全字段)" {
         .cwd = "/tmp/x",
         .worktree_path = "/tmp/wt",
         .session_id = "s1",
+        .lease_id = "lease1",
         .backend_type = "in-process",
         .is_active = false,
         .mode = "acceptEdits",
@@ -601,9 +619,12 @@ test "TeamFile serialize→parse 往返(全字段)" {
     try testing.expectEqualStrings("desc", back.description.?);
     try testing.expectEqual(@as(i64, 1234), back.created_at_ms);
     try testing.expectEqualStrings("team-lead@proj", back.lead_agent_id);
+    try testing.expectEqualStrings("abc123", back.lead_session_id.?);
     try testing.expectEqual(@as(usize, 1), back.members.items.len);
     const m = &back.members.items[0];
     try testing.expectEqualStrings("bob@proj", m.agent_id);
+    try testing.expectEqualStrings("s1", m.session_id.?);
+    try testing.expectEqualStrings("lease1", m.lease_id.?);
     try testing.expectEqualStrings("researcher", m.agent_type.?);
     try testing.expect(m.plan_mode_required);
     try testing.expect(!m.is_active);
@@ -615,6 +636,11 @@ test "parse: 缺必填字段/畸形 JSON → null" {
     try testing.expect(parse(a, "not json") == null);
     try testing.expect(parse(a, "{\"name\":\"x\"}") == null); // 缺 leadAgentId
     try testing.expect(parse(a, "[]") == null);
+}
+
+test "parse: duplicate member names are rejected" {
+    const raw = "{\"name\":\"p\",\"leadAgentId\":\"team-lead@p\",\"members\":[{\"agentId\":\"a@p\",\"name\":\"a\"},{\"agentId\":\"b@p\",\"name\":\"a\"}]}";
+    try testing.expect(parse(testing.allocator, raw) == null);
 }
 
 test "addMember/findMember/removeMember" {

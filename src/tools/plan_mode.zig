@@ -17,6 +17,7 @@ const pfs = @import("platform").fs;
 const ToolContext = @import("context.zig").ToolContext;
 const PlanApproval = ToolContext.PlanApproval;
 const permission_mode = @import("../permission/mode.zig");
+const util_json = @import("../util/json.zig");
 
 /// Plan 模式工作流指令(对齐 mecode collaboration_mode/plan.md)。**两处共用**:
 ///   ① EnterPlanMode 返回 tool_result(模型进 plan 当轮读到);
@@ -68,14 +69,14 @@ pub fn executeEnter(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try w.writeAll("{\"mode\":\"plan\",\"status\":\"entered\",");
     if (ctx.plan_file_path.len > 0) {
         try w.writeAll("\"planFilePath\":");
-        try std.json.Stringify.encodeJsonString(ctx.plan_file_path, .{}, w);
+        try util_json.writeJsonString(w, ctx.plan_file_path);
         try w.writeAll(",\"instruction\":");
-        try std.json.Stringify.encodeJsonString(workflow ++
+        try util_json.writeJsonString(w, workflow ++
             " You MAY write/update your plan in the plan file at the planFilePath above (it is the only file " ++
-            "you can write in plan mode); then pass that same content to ExitPlanMode.", .{}, w);
+            "you can write in plan mode); then pass that same content to ExitPlanMode.");
     } else {
         try w.writeAll("\"instruction\":");
-        try std.json.Stringify.encodeJsonString(workflow, .{}, w);
+        try util_json.writeJsonString(w, workflow);
     }
     try w.writeAll("}");
     return try aw.toOwnedSlice();

@@ -29,6 +29,7 @@ const abort_mod = @import("../util/abort.zig");
 const usage_mod = @import("../core/usage.zig");
 const journal_mod = @import("journal.zig");
 const log = @import("../util/log.zig");
+const util_json = @import("../util/json.zig");
 
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
@@ -103,8 +104,13 @@ pub const WebBackend = struct {
             if (self.usage_totals) |u| u.apply(ev.usage);
         }
         // borrow slice 契约:序列化即拷贝,返回前完成消费。
-        const line = std.json.Stringify.valueAlloc(self.allocator, .{ .core_event = ev }, .{}) catch {
+        const raw = std.json.Stringify.valueAlloc(self.allocator, .{ .core_event = ev }, .{}) catch {
             log.warn("web", "dropped CoreEvent .{s} (serialize OOM)", .{@tagName(ev)});
+            return;
+        };
+        defer self.allocator.free(raw);
+        const line = util_json.repairJsonUtf8(self.allocator, raw) catch {
+            log.warn("web", "dropped CoreEvent .{s} (repair OOM)", .{@tagName(ev)});
             return;
         };
         defer self.allocator.free(line);
@@ -252,7 +258,9 @@ fn parseResponse(req: *const UiRequest, resp_json: []const u8, allocator: std.me
         .custom => {
             const result_v = obj.get("result") orelse return cancelOutcome(req, out);
             // 原样回传结构化结果(重新序列化 value → owned by allocator)
-            const result_json = try std.json.Stringify.valueAlloc(allocator, result_v, .{});
+            const raw_result = try std.json.Stringify.valueAlloc(allocator, result_v, .{});
+            defer allocator.free(raw_result);
+            const result_json = try util_json.repairJsonUtf8(allocator, raw_result);
             out.* = .{ .custom = result_json };
             return .answered;
         },

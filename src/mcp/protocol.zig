@@ -13,6 +13,7 @@
 //! - Notification：{ jsonrpc: "2.0", method, params }（无 id）
 
 const std = @import("std");
+const json_util = @import("../util/json.zig");
 
 pub const JSONRPC_VERSION = "2.0";
 
@@ -42,11 +43,12 @@ pub fn serializeRequest(
     method: []const u8,
     params_json: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"{s}\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}",
-        .{ JSONRPC_VERSION, id, method, params_json },
-    );
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("{{\"jsonrpc\":\"{s}\",\"id\":{d},\"method\":", .{ JSONRPC_VERSION, id });
+    try json_util.writeJsonString(&out.writer, method);
+    try out.writer.print(",\"params\":{s}}}", .{params_json});
+    return out.toOwnedSlice();
 }
 
 /// 序列化 notification（无 id）。
@@ -55,11 +57,12 @@ pub fn serializeNotification(
     method: []const u8,
     params_json: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"{s}\",\"method\":\"{s}\",\"params\":{s}}}",
-        .{ JSONRPC_VERSION, method, params_json },
-    );
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("{{\"jsonrpc\":\"{s}\",\"method\":", .{JSONRPC_VERSION});
+    try json_util.writeJsonString(&out.writer, method);
+    try out.writer.print(",\"params\":{s}}}", .{params_json});
+    return out.toOwnedSlice();
 }
 
 /// 序列化对 server→client 请求的成功响应：`{"jsonrpc","id","result":<result_json>}`。
@@ -69,7 +72,12 @@ pub fn serializeResult(alloc: std.mem.Allocator, id: RequestId, result_json: []c
 
 /// 序列化错误响应(如 method_not_found)。message 只用 ASCII 简单文本(不转义)。
 pub fn serializeErrorResponse(alloc: std.mem.Allocator, id: RequestId, code: i32, message: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"{s}\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}", .{ JSONRPC_VERSION, id, code, message });
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("{{\"jsonrpc\":\"{s}\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":", .{ JSONRPC_VERSION, id, code });
+    try json_util.writeJsonString(&out.writer, message);
+    try out.writer.writeAll("}}}");
+    return out.toOwnedSlice();
 }
 
 /// 取顶层 "method" 字段字符串值(区分 server→client 请求/通知 vs 响应)。null=无 method=响应。
@@ -216,8 +224,18 @@ fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
     const idx = std.mem.indexOf(u8, data, pattern) orelse return null;
     const start = idx + pattern.len;
     var end = start;
+    var escaped = false;
     while (end < data.len) : (end += 1) {
-        if (data[end] == '"' and data[end - 1] != '\\') break;
+        const byte = data[end];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte == '"') break;
     }
     return data[start..end];
 }
@@ -231,9 +249,12 @@ pub fn initializeParams(allocator: std.mem.Allocator) ![]u8 {
     // 声明 client 支持 elicitation(server 据此才会发 elicitation/create;client.handleServerRequest 应答)。
     // protocolVersion 用 2025-06-18(elicitation 引入的版本)——与所声明的 elicitation capability 一致
     // (旧的 2024-11-05 无 elicitation,两者矛盾;server 会协商降级到它支持的版本)。
-    return try std.fmt.allocPrint(allocator,
-        \\{{"protocolVersion":"2025-06-18","capabilities":{{"elicitation":{{}}}},"clientInfo":{{"name":"metacodes","version":"{s}"}}}}
-    , .{@import("../version.zig").semver});
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"elicitation\":{}},\"clientInfo\":{\"name\":\"metacodes\",\"version\":");
+    try json_util.writeJsonString(&out.writer, @import("../version.zig").semver);
+    try out.writer.writeAll("}}");
+    return out.toOwnedSlice();
 }
 
 /// tools/list 无参数
@@ -241,9 +262,12 @@ pub const EMPTY_PARAMS = "{}";
 
 /// 构造 tools/call 的 params
 pub fn callToolParams(allocator: std.mem.Allocator, tool_name: []const u8, arguments_json: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(allocator,
-        \\{{"name":"{s}","arguments":{s}}}
-    , .{ tool_name, arguments_json });
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"name\":");
+    try json_util.writeJsonString(&out.writer, tool_name);
+    try out.writer.print(",\"arguments\":{s}}}", .{arguments_json});
+    return out.toOwnedSlice();
 }
 
 /// 构造 resources/read 的 params（uri 需 JSON 转义）。
@@ -251,7 +275,7 @@ pub fn readResourceParams(allocator: std.mem.Allocator, uri: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"uri\":");
-    try std.json.Stringify.encodeJsonString(uri, .{}, &out.writer);
+    try json_util.writeJsonString(&out.writer, uri);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
 }

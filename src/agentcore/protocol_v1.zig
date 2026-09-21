@@ -175,6 +175,35 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
     };
 }
 
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    // `encodeJsonString` is the canonical JSON string boundary. In addition to
+    // escaping JSON syntax, it replaces malformed UTF-8 with U+FFFD. Passing a
+    // byte slice through `Stringify.value` is not equivalent in Zig 0.16: it
+    // serializes `[]const u8` as an array of integers.
+    std.json.Stringify.encodeJsonString(value, .{}, writer) catch return error.OutOfMemory;
+}
+
+fn writeAskQuestion(writer: *std.Io.Writer, question: public.AskQuestion) !void {
+    try writer.writeAll("{\"question\":");
+    try writeJsonString(writer, question.question);
+    try writer.writeAll(",\"header\":");
+    try writeJsonString(writer, question.header);
+    try writer.writeAll(",\"multi\":");
+    try writer.writeAll(if (question.multi) "true" else "false");
+    try writer.writeAll(",\"options\":[");
+    for (question.options, 0..) |option, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"label\":");
+        try writeJsonString(writer, option.label);
+        try writer.writeAll(",\"description\":");
+        try writeJsonString(writer, option.description);
+        try writer.writeAll(",\"preview\":");
+        try writeJsonString(writer, option.preview);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+}
+
 /// Serialize the internal UI request through the public ABI v1 DTO rather than
 /// relying on the internal union's incidental JSON representation.
 pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiRequest) ![]u8 {
@@ -209,7 +238,15 @@ pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiR
         // in this presentation-only Core request.
         .permission, .plan_approval, .custom => return error.UnsupportedUiRequest,
     };
-    return std.json.Stringify.valueAlloc(allocator, mapped, .{});
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ask_question\":[");
+    for (mapped.ask_question, 0..) |question, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try writeAskQuestion(&output.writer, question);
+    }
+    try output.writer.writeAll("]}");
+    return output.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 /// Validate Host response JSON with the public SDK schema, enforce request /
@@ -380,4 +417,44 @@ test "AskQuestion response validation preserves value boundaries until core proj
         error.InvalidUiRequest,
         encodeUiRequest(std.testing.allocator, &no_options_request),
     );
+}
+
+test "AskQuestion encoding repairs malformed UTF-8 at the ABI boundary" {
+    const malformed_question = [_]u8{ 'w', 0xE2, 0x28, 0xA1 };
+    const malformed_label = [_]u8{ 'l', 0x80 };
+    const malformed_description = [_]u8{ 'd', 0xC3 };
+    const options = [_]core.tool_context.AskOption{.{
+        .label = malformed_label[0..],
+        .description = malformed_description[0..],
+    }};
+    const questions = [_]core.tool_context.AskQuestion{.{
+        .question = malformed_question[0..],
+        .header = "Header",
+        .multi = false,
+        .options = options[0..],
+    }};
+    const request = InternalUiRequest{ .ask_question = questions[0..] };
+    const encoded = try encodeUiRequest(std.testing.allocator, &request);
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, encoded, "\xEF\xBF\xBD"));
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        encoded,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var decoded = try public.decodeUiRequest(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    switch (decoded.value) {
+        .ask_question => |decoded_questions| {
+            try std.testing.expectEqualStrings("w�(�", decoded_questions[0].question);
+            try std.testing.expectEqualStrings("l�", decoded_questions[0].options[0].label);
+            try std.testing.expectEqualStrings("d�", decoded_questions[0].options[0].description);
+        },
+        else => return error.UnexpectedUiResponse,
+    }
 }

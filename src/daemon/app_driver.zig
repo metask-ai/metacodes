@@ -46,7 +46,7 @@ pub fn abortFn(ctx: *anyopaque, reason: abort.Reason) void {
 /// agent_lifecycle.done 到 session journal → attach/SSE 客户端实时见后台 agent 完成(不必再轮询 roster)。
 fn reapAgentDone(app: *app_mod.App, be: *const @import("../core/protocol/ui_backend.zig").UiBackend, session: @import("../core/session_id.zig").SessionId, infra: std.mem.Allocator) void {
     const aj = if (app.agent_jobs) |*a| a else return;
-    const infos = aj.drainNewlyDone(infra) catch return;
+    const infos = aj.drainNewlyDoneForSession(infra, session) catch return;
     defer @import("../core/agent_job_registry.zig").AgentJobRegistry.freeDoneInfos(infra, infos);
     for (infos) |d| {
         be.emitEvent(session, .{ .agent_lifecycle = .{ .done = .{
@@ -122,8 +122,8 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
             null;
         defer if (run_control) |control| control.deinit();
         if (run_control) |control| control.requireDetachedIdle(
-            (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
-                (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+            (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+                (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
             app.swarm.hasTeam(),
         ) catch |err| {
             control.finishRun(@errorName(err)) catch {};

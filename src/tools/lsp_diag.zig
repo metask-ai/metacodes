@@ -5,6 +5,7 @@
 const std = @import("std");
 const ToolContext = @import("context.zig").ToolContext;
 const log = @import("../util/log.zig");
+const util_json = @import("../util/json.zig");
 
 /// 解析 file_path 为绝对路径(LSP 需绝对做 workspace 检测/URI)。写进 buf(须 max_path_bytes)。
 pub fn absPath(file_path: []const u8, buf: []u8) ?[]const u8 {
@@ -47,7 +48,7 @@ pub fn appendToResult(ctx: *const ToolContext, alloc: std.mem.Allocator, out: an
     if (diag.len > 0) {
         log.info("lsp", "attached {d} chars of diagnostics for {s}", .{ diag.len, file_path });
         try out.writeAll(",\"lspDiagnostics\":");
-        try std.json.Stringify.encodeJsonString(diag, .{}, out);
+        try util_json.writeJsonString(out, diag);
     } else {
         log.debug("lsp", "no new diagnostics for {s} (server absent, outside workspace, or code clean)", .{file_path});
     }

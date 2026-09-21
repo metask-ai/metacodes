@@ -35,6 +35,7 @@ const verification_progress_mod = @import("verification_progress.zig");
 const requirement_ledger_mod = @import("requirement_ledger.zig");
 const delivery_cadence_mod = @import("delivery_cadence.zig");
 const util_time = @import("../util/time.zig");
+const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
 const output_semantics = @import("output_semantics.zig");
 const file_change_mod = @import("file_change.zig");
@@ -3667,9 +3668,9 @@ fn buildPostCompactStdin(allocator: std.mem.Allocator, trigger: []const u8, summ
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"hook_event_name\":\"PostCompact\",\"trigger\":");
-    try std.json.Stringify.encodeJsonString(trigger, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, trigger);
     try aw.writer.writeAll(",\"summary\":");
-    try std.json.Stringify.encodeJsonString(summary, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, summary);
     try aw.writer.writeAll("}");
     return try aw.toOwnedSlice();
 }
@@ -3699,9 +3700,9 @@ fn buildStopStdin(allocator: std.mem.Allocator, stop_reason: []const u8, last_me
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"hook_event_name\":\"Stop\",\"stop_reason\":");
-    try std.json.Stringify.encodeJsonString(stop_reason, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, stop_reason);
     try aw.writer.writeAll(",\"last_message\":");
-    try std.json.Stringify.encodeJsonString(last_message, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, last_message);
     try aw.writer.print(",\"num_messages\":{d}}}", .{num_messages});
     return try aw.toOwnedSlice();
 }

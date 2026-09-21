@@ -208,8 +208,8 @@ pub fn run(
         null;
     defer if (run_control) |control| control.deinit();
     if (run_control) |control| control.requireDetachedIdle(
-        (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
-            (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+        (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+            (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
         app.swarm.hasTeam(),
     ) catch |err| {
         try control.finishRun(@errorName(err));
@@ -621,8 +621,8 @@ pub fn resumeSuspended(
     );
     defer run_control.deinit();
     run_control.requireDetachedIdle(
-        (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
-            (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+        (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+            (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
         app.swarm.hasTeam(),
     ) catch |err| {
         try run_control.finishRun(@errorName(err));

@@ -16,6 +16,7 @@
 const std = @import("std");
 const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
+const util_json = @import("../util/json.zig");
 
 /// 把 rule 加入 settings.local.json 的 permissions.allow 数组。
 /// project_dir 非 null → 优先用 project local;否则用 ~/.claude/settings.json。
@@ -54,7 +55,12 @@ pub fn addAllowRule(
     }
 
     // 文件不存在 → 创建 fresh
-    const fresh = try std.fmt.allocPrint(alloc, "{{\"permissions\":{{\"allow\":[\"{s}\"]}}}}\n", .{rule});
+    var fresh_builder: std.ArrayList(u8) = .empty;
+    errdefer fresh_builder.deinit(alloc);
+    try fresh_builder.appendSlice(alloc, "{\"permissions\":{\"allow\":[");
+    try util_json.serializeString(rule, &fresh_builder, alloc);
+    try fresh_builder.appendSlice(alloc, "]}}\n");
+    const fresh = try fresh_builder.toOwnedSlice(alloc);
     defer alloc.free(fresh);
     try writeFile(path, fresh);
     return path;
@@ -209,8 +215,6 @@ fn writeAllowWithRule(out: *std.ArrayList(u8), alloc: std.mem.Allocator, allow: 
     }
     try out.append(alloc, ']');
 }
-
-const util_json = @import("../util/json.zig");
 
 fn writeEscaped(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
     try util_json.serializeStringContents(s, out, alloc);

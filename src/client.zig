@@ -1541,8 +1541,18 @@ fn extractJsonString(data: []const u8, field: []const u8) ?[]const u8 {
     const idx = std.mem.indexOf(u8, data, pattern) orelse return null;
     const start = idx + pattern.len;
     var end = start;
+    var escaped = false;
     while (end < data.len) : (end += 1) {
-        if (data[end] == '"' and data[end - 1] != '\\') break;
+        const byte = data[end];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte == '"') break;
     }
     return data[start..end];
 }

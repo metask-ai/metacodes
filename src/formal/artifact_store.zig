@@ -11,6 +11,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const process = @import("platform").process;
 const util_fs = @import("../util/fs.zig");
+const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
 const time = @import("../util/time.zig");
 
@@ -426,7 +427,7 @@ fn renderIndex(
         ",\"pipeline_admitted\":{s},\"failure_kind\":",
         .{if (metadata.pipeline_admitted) "true" else "false"},
     );
-    try std.json.Stringify.encodeJsonString(metadata.failure_kind, .{}, writer);
+    try util_json.writeJsonString(writer, metadata.failure_kind);
     try writer.writeAll("}\n");
     const owned = try out.toOwnedSlice();
     if (owned.len > MAX_INDEX_LINE_BYTES) {
@@ -438,7 +439,7 @@ fn renderIndex(
 
 fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
     if (value) |text|
-        try std.json.Stringify.encodeJsonString(text, .{}, writer)
+        try util_json.writeJsonString(writer, text)
     else
         try writer.writeAll("null");
 }

@@ -15,6 +15,7 @@ const json_mod = @import("../json.zig");
 const provider_mod = @import("../api/provider.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const UsageDelta = @import("../api/stream.zig").UsageDelta;
+const utf8 = @import("../util/utf8.zig");
 
 const DEFAULT_COMPACT_SYSTEM = @embedFile("templates/compact/prompt.md");
 const DEFAULT_SUMMARY_PREFIX = @embedFile("templates/compact/summary_prefix.md");
@@ -62,7 +63,8 @@ pub fn summarizeWithModel(
                 transcript_buf.appendSlice(allocator, "]") catch return null;
             },
             .tool_result => |tr| {
-                const cap = tr.content[0..@min(tr.content.len, 500)];
+                const cap = utf8.repairInvalidUtf8(allocator, utf8.pagePrefix(tr.content, 500)) catch return null;
+                defer allocator.free(cap);
                 transcript_buf.appendSlice(allocator, "[result: ") catch return null;
                 transcript_buf.appendSlice(allocator, cap) catch return null;
                 transcript_buf.appendSlice(allocator, "]") catch return null;
@@ -133,7 +135,8 @@ pub fn summarizeAbortable(
                 transcript_buf.appendSlice(allocator, "]") catch return null;
             },
             .tool_result => |tr| {
-                const cap = tr.content[0..@min(tr.content.len, 500)];
+                const cap = utf8.repairInvalidUtf8(allocator, utf8.pagePrefix(tr.content, 500)) catch return null;
+                defer allocator.free(cap);
                 transcript_buf.appendSlice(allocator, "[result: ") catch return null;
                 transcript_buf.appendSlice(allocator, cap) catch return null;
                 transcript_buf.appendSlice(allocator, "]") catch return null;

@@ -145,7 +145,7 @@ fn encodeStringInner(s: []const u8, sink: anytype) !void {
         if (c >= 0x80) {
             const seq_len: ?usize = if (std.unicode.utf8ByteSequenceLength(c)) |l| l else |_| null;
             if (seq_len) |l| {
-                if (i + l <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + l])) {
+                if (l <= s.len - i and std.unicode.utf8ValidateSlice(s[i .. i + l])) {
                     i += l; // 合法多字节序列,并入透传段
                     continue;
                 }
@@ -210,6 +210,93 @@ pub fn writeJsonStringContents(w: *std.Io.Writer, s: []const u8) !void {
     try encodeStringInner(s, w);
 }
 
+/// Write human-readable text while repairing malformed UTF-8.  This is the
+/// unquoted counterpart of `writeJsonStringContents`: control-byte policy is
+/// left to the caller, but arbitrary provider/user bytes cannot leak as an
+/// invalid host-visible stream.
+pub fn writeUtf8Repaired(w: *std.Io.Writer, s: []const u8) !void {
+    var i: usize = 0;
+    var plain_start: usize = 0;
+    while (i < s.len) {
+        const b = s[i];
+        if (b < 0x80) {
+            i += 1;
+            continue;
+        }
+        const n = std.unicode.utf8ByteSequenceLength(b) catch null;
+        if (n) |len| {
+            if (len <= s.len - i and std.unicode.utf8ValidateSlice(s[i .. i + len])) {
+                i += len;
+                continue;
+            }
+        }
+        try w.writeAll(s[plain_start..i]);
+        try w.writeAll("\u{FFFD}");
+        i += 1;
+        plain_start = i;
+    }
+    try w.writeAll(s[plain_start..]);
+}
+
+/// Repair raw JSON produced by a generic serializer at the transport
+/// boundary.  The standard stringifier escapes syntax but does not guarantee
+/// that borrowed byte slices are valid UTF-8.  Invalid bytes can only be
+/// payload bytes inside a quoted string in a structurally valid document; keep
+/// syntax and escapes byte-for-byte, replacing each malformed payload byte
+/// with U+FFFD.  Callers that already use `writeJsonString` do not need this
+/// final-defense pass.
+pub fn repairJsonUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, input.len);
+    var in_string = false;
+    var escaped = false;
+    var i: usize = 0;
+    while (i < input.len) {
+        const b = input[i];
+        if (!in_string) {
+            try out.append(allocator, b);
+            if (b == '"') in_string = true;
+            i += 1;
+            continue;
+        }
+        if (escaped) {
+            try out.append(allocator, b);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if (b == '\\') {
+            try out.append(allocator, b);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if (b == '"') {
+            try out.append(allocator, b);
+            in_string = false;
+            i += 1;
+            continue;
+        }
+        if (b >= 0x80) {
+            const len = std.unicode.utf8ByteSequenceLength(b) catch null;
+            if (len) |n| {
+                if (n <= input.len - i and std.unicode.utf8ValidateSlice(input[i .. i + n])) {
+                    try out.appendSlice(allocator, input[i .. i + n]);
+                    i += n;
+                    continue;
+                }
+            }
+            try out.appendSlice(allocator, "\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        }
+        try out.append(allocator, b);
+        i += 1;
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 /// 序列化浮点数为 JSON number,追加到 buf。
 /// 用 std.fmt 整数+小数形式,避免科学计数法(JSON number 接受但厂商兼容性差)。
 pub fn serializeNumber(v: anytype, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -223,7 +310,10 @@ pub fn serializeNumber(v: anytype, buf: *std.ArrayList(u8), allocator: std.mem.A
 /// 不反转义返回值（调用方按需调 unescapeString）。
 pub fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
     var pattern_buf: [256]u8 = undefined;
-    std.debug.assert(field.len < 200);
+    // Keep malformed/provider-controlled field names a normal miss.  The
+    // fixed scratch buffer is an implementation detail and must never turn a
+    // long key into a bounds panic in Debug or ReleaseSafe builds.
+    if (field.len >= pattern_buf.len - 3) return null;
     pattern_buf[0] = '"';
     @memcpy(pattern_buf[1..][0..field.len], field);
     pattern_buf[1 + field.len] = '"';
@@ -239,9 +329,19 @@ pub fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
     if (start >= data.len or data[start] != '"') return null;
     start += 1;
     var end = start;
+    var escaped = false;
     while (end < data.len) : (end += 1) {
-        if (data[end] == '"' and data[end - 1] != '\\') break;
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (data[end] == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (data[end] == '"') break;
     }
+    if (end >= data.len) return null;
     return data[start..end];
 }
 
@@ -303,7 +403,7 @@ pub fn extractAndUnescapeStringField(data: []const u8, field: []const u8, alloca
 /// 字面量;调用方按需 unescape。
 pub fn extractStringOrNumberField(data: []const u8, field: []const u8) ?[]const u8 {
     var pattern_buf: [256]u8 = undefined;
-    std.debug.assert(field.len < 200);
+    if (field.len >= pattern_buf.len - 3) return null;
     pattern_buf[0] = '"';
     @memcpy(pattern_buf[1..][0..field.len], field);
     pattern_buf[1 + field.len] = '"';
@@ -318,9 +418,20 @@ pub fn extractStringOrNumberField(data: []const u8, field: []const u8) ?[]const 
         // 字符串值:沿用 extractStringField 的内层提取(处理转义引号)。
         start += 1;
         var end = start;
+        var escaped = false;
         while (end < data.len) : (end += 1) {
-            if (data[end] == '"' and data[end - 1] != '\\') break;
+            const byte = data[end];
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (byte == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (byte == '"') break;
         }
+        if (end >= data.len) return null;
         return data[start..end];
     }
     // 裸值(数字 / true / false / null):取到分隔符前的 token。
@@ -336,7 +447,7 @@ pub fn extractStringOrNumberField(data: []const u8, field: []const u8) ?[]const 
 /// 提取顶层布尔字段 `"field":true|false`(值不带引号)。缺失或非法返回 null。
 pub fn extractBoolField(data: []const u8, field: []const u8) ?bool {
     var pattern_buf: [256]u8 = undefined;
-    std.debug.assert(field.len < 200);
+    if (field.len >= pattern_buf.len - 3) return null;
     pattern_buf[0] = '"';
     @memcpy(pattern_buf[1..][0..field.len], field);
     pattern_buf[1 + field.len] = '"';
@@ -356,7 +467,7 @@ pub fn extractBoolField(data: []const u8, field: []const u8) ?bool {
 /// prompt_tokens_details.cached_tokens)。不处理浮点/负数/科学记数——计数类字段都是非负整数。
 pub fn extractIntField(data: []const u8, field: []const u8) u64 {
     var pat_buf: [256]u8 = undefined;
-    std.debug.assert(field.len < 250);
+    if (field.len >= pat_buf.len - 3) return 0;
     pat_buf[0] = '"';
     @memcpy(pat_buf[1..][0..field.len], field);
     pat_buf[1 + field.len] = '"';
@@ -379,6 +490,14 @@ test "extractIntField basic + nested + missing" {
     try std.testing.expectEqual(@as(u64, 5), extractIntField("{\"k\": 5}", "k"));
     // 缺失 → 0
     try std.testing.expectEqual(@as(u64, 0), extractIntField("{\"a\":1}", "z"));
+}
+
+test "field extractors reject oversized names without touching scratch buffers" {
+    const long_name = "x" ** 253;
+    try std.testing.expect(extractStringField("{}", long_name) == null);
+    try std.testing.expect(extractStringOrNumberField("{}", long_name) == null);
+    try std.testing.expect(extractBoolField("{}", long_name) == null);
+    try std.testing.expectEqual(@as(u64, 0), extractIntField("{}", long_name));
 }
 
 test "unescapeString basic" {
@@ -554,6 +673,11 @@ test "extractStringField tolerates whitespace after colon" {
     try std.testing.expectEqualStrings("v", extractStringField(nl, "k").?);
     // 非字符串值(数字)→ null(本函数只取 string)
     try std.testing.expect(extractStringField("{\"k\": 5}", "k") == null);
+}
+
+test "extractStringField handles even backslashes before closing quote" {
+    const data = "{\"msg\":\"fragment\\\\\"}";
+    try std.testing.expectEqualStrings("fragment\\\\", extractStringField(data, "msg").?);
 }
 
 test "extractAndUnescapeStringField 解除一层 JSON 转义并处理反斜杠奇偶" {
@@ -738,4 +862,12 @@ test "serializeString empty string" {
     defer buf.deinit(std.testing.allocator);
     try serializeString("", &buf, std.testing.allocator);
     try std.testing.expectEqualStrings("\"\"", buf.items);
+}
+
+test "repairJsonUtf8 repairs malformed payload without changing syntax" {
+    const out = try repairJsonUtf8(std.testing.allocator, "{\"message\":\"ok\xe4\\n\"}");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("{\"message\":\"ok\xef\xbf\xbd\\n\"}", out);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
+    defer parsed.deinit();
 }

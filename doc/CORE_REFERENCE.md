@@ -535,6 +535,12 @@ storage_error、各种 id 与 flag)从来不是超限的原因,却是结果可�
 `run_in_background` 三条路径都不再交出 `stdout_path`/`stderr_path`,统一改用 `job_id`
 (BashOutput 本来就按它读,还支持 `*_since_byte` 增量),能力不减。
 
+**bytes/text 边界**:外部进程和文档内容先按 raw bytes 捕获。只有经过明确
+编码策略并验证的内容才进入文本字段；文本页按 UTF-8 code-point 边界截断，
+`TaskOutput.output_next_offset` 是原始缓冲的下一字节游标，不能用替换、JSON
+转义或 base64 后的长度代替。二进制必须通过 artifact 或显式编码 envelope
+传递；JSON、XML-like notification、Markdown 和 terminal 各自负责 escaping。
+
 **已登记的缺口(别当成已解决)**:`job_id` 自身由随机字节生成,按 contract 的定义它就是
 random id,所以后台命令跨 run 仍不逐字节一致。它不能简单换成序号——同一个值同时用作
 `/tmp/metacodes-jobs/<uid>/<id>.out` 的文件名,而该目录跨进程共享,序号会撞。真正修法是把

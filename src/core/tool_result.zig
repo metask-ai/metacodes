@@ -9,6 +9,7 @@ const std = @import("std");
 const artifact_store = @import("tool_result_artifact.zig");
 const tool_error = @import("tool_error.zig");
 const result_budget = @import("result_budget.zig");
+const util_json = @import("../util/json.zig");
 
 pub const PROJECTION_SCHEMA = "metacodes.tool-result-projection.v1";
 pub const ENVELOPE_PREFIX = "{\"schema_version\":\"" ++ PROJECTION_SCHEMA ++ "\",\"projection\":";
@@ -417,9 +418,9 @@ fn renderArtifactEnvelopeFallible(allocator: std.mem.Allocator, result: Artifact
     defer out.deinit();
     const writer = &out.writer;
     try writer.writeAll(ENVELOPE_PREFIX ++ "\"artifact\",\"artifact_id\":");
-    try std.json.Stringify.encodeJsonString(result.stored.id(), .{}, writer);
+    try util_json.writeJsonString(writer, result.stored.id());
     try writer.writeAll(",\"media_type\":");
-    try std.json.Stringify.encodeJsonString(result.media_type.value(), .{}, writer);
+    try util_json.writeJsonString(writer, result.media_type.value());
     try writer.print(",\"original_bytes\":{d},\"sha256\":\"{s}\",\"capture_complete\":{s},\"recoverable\":true", .{
         result.stored.bytes,
         result.stored.sha256[0..],
@@ -447,12 +448,12 @@ fn appendPreview(writer: *std.Io.Writer, preview: *const artifact_store.Preview)
 }
 
 fn appendPreviewPart(writer: *std.Io.Writer, bytes: []const u8, utf8: bool) !void {
-    if (utf8) return std.json.Stringify.encodeJsonString(bytes, .{}, writer);
+    if (utf8) return util_json.writeJsonString(writer, bytes);
     const encoder = std.base64.standard.Encoder;
     const encoded = try std.heap.page_allocator.alloc(u8, encoder.calcSize(bytes.len));
     defer std.heap.page_allocator.free(encoded);
     _ = encoder.encode(encoded, bytes);
-    try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+    try util_json.writeJsonString(writer, encoded);
 }
 
 fn detectMediaType(bytes: []const u8) MediaType {

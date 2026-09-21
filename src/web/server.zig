@@ -22,10 +22,17 @@ const abort_mod = @import("../util/abort.zig");
 const log = @import("../util/log.zig");
 const net = @import("platform").net;
 const http = @import("../util/http.zig");
+const util_json = @import("../util/json.zig");
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
 const MsgQueue = msg_queue_mod.MsgQueue;
+
+fn stringifyJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    const raw = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(raw);
+    return util_json.repairJsonUtf8(allocator, raw);
+}
 
 pub const INDEX_HTML: []const u8 = @embedFile("index.html");
 
@@ -273,7 +280,7 @@ pub const WebServer = struct {
             };
             defer self.allocator.free(text);
             // 回显先于入队:浏览器(含其它标签页)立刻看到已提交的消息,即使正在生成期排队。
-            const echo = std.json.Stringify.valueAlloc(self.allocator, .{ .user_message = text }, .{}) catch null;
+            const echo = stringifyJson(self.allocator, .{ .user_message = text }) catch null;
             if (echo) |e| {
                 defer self.allocator.free(e);
                 sv.journal.append(e);

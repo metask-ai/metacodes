@@ -83,20 +83,20 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"schema_version\":\"metacodes.read-artifact.v1\",\"artifact_id\":");
-    try std.json.Stringify.encodeJsonString(artifact_id, .{}, writer);
+    try json_util.writeJsonString(writer, artifact_id);
     try writer.print(",\"offset\":{d},\"returned_bytes\":{d},\"total_bytes\":{d},\"next_offset\":", .{ chunk.offset, data.len, chunk.total_bytes });
     if (next_offset) |next| try writer.print("{d}", .{next}) else try writer.writeAll("null");
     try writer.print(",\"truncated\":{s}", .{if (next_offset != null) "true" else "false"});
     if (utf8) {
         try writer.writeAll(",\"encoding\":\"utf-8\",\"data\":");
-        try std.json.Stringify.encodeJsonString(data, .{}, writer);
+        try json_util.writeJsonString(writer, data);
     } else {
         const encoder = std.base64.standard.Encoder;
         const encoded = try ctx.allocator.alloc(u8, encoder.calcSize(data.len));
         defer ctx.allocator.free(encoded);
         _ = encoder.encode(encoded, data);
         try writer.writeAll(",\"encoding\":\"base64\",\"data\":");
-        try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+        try json_util.writeJsonString(writer, encoded);
     }
     try writer.writeAll("}");
     return out.toOwnedSlice();

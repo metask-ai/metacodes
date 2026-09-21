@@ -676,7 +676,7 @@ fn buildResult(allocator: std.mem.Allocator, arena: std.mem.Allocator, plans: []
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.print("{{\"success\":true,\"added\":{d},\"modified\":{d},\"deleted\":{d},\"gitDiff\":", .{ n_add, n_mod, n_del });
-    try std.json.Stringify.encodeJsonString(git_all.items, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, git_all.items);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
 }

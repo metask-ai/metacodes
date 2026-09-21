@@ -37,6 +37,42 @@ pub fn render(allocator: std.mem.Allocator, events: []const JobExitEvent) ![]u8 
 
 fn writeXmlEscaped(writer: *std.Io.Writer, text: []const u8) !void {
     var start: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        const byte = text[index];
+        if (byte >= 0x80) {
+            const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+            if (seq_len != 0 and index + seq_len <= text.len and std.unicode.utf8ValidateSlice(text[index .. index + seq_len])) {
+                index += seq_len;
+                continue;
+            }
+            if (index > start) try writeXmlEscapedAscii(writer, text[start..index]);
+            try writer.writeAll("\u{FFFD}");
+            index += 1;
+            start = index;
+            continue;
+        }
+        const replacement: ?[]const u8 = switch (byte) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '\n' => "&#10;",
+            '\r' => "&#13;",
+            0...0x08, 0x0b...0x0c, 0x0e...0x1f => "\u{FFFD}",
+            else => null,
+        };
+        if (replacement) |escaped| {
+            if (index > start) try writeXmlEscapedAscii(writer, text[start..index]);
+            try writer.writeAll(escaped);
+            start = index + 1;
+        }
+        index += 1;
+    }
+    if (start < text.len) try writeXmlEscapedAscii(writer, text[start..]);
+}
+
+fn writeXmlEscapedAscii(writer: *std.Io.Writer, text: []const u8) !void {
+    var start: usize = 0;
     for (text, 0..) |byte, index| {
         const replacement: ?[]const u8 = switch (byte) {
             '&' => "&amp;",
@@ -137,4 +173,24 @@ test "JobNotify real job output never reaches the notification" {
     try std.testing.expect(std.mem.indexOf(u8, text, stdout_path) == null);
     try std.testing.expect(std.mem.indexOf(u8, text, entry.idSlice()) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "17 bytes") != null);
+}
+
+test "JobNotify replaces an incomplete UTF-8 preview instead of emitting bad text" {
+    const a = std.testing.allocator;
+    const bad = [_]u8{ 0xe4, '`' };
+    var event = JobExitEvent{
+        .id = "000000000004".*,
+        .status = .exited,
+        .exit_code = 0,
+        .started_ms = 0,
+        .ended_ms = 1000,
+        .command_preview = try a.dupe(u8, &bad),
+        .stdout_unread = 0,
+        .stderr_unread = 0,
+    };
+    defer event.deinit(a);
+    const text = try render(a, &.{event});
+    defer a.free(text);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\u{FFFD}") != null);
 }

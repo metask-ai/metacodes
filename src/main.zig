@@ -498,6 +498,36 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // Process-mode teammates must bind the complete App initialization to
+    // their parent's session. Adopting only after App.init would seed KG,
+    // prompts, plan paths, and provider-visible session state from a random
+    // child id, then leave those snapshots stale after the writer switch.
+    if (config.teammate_name.len > 0 and (config.teammate_parent_session.len == 0 or config.teammate_lease_id.len == 0)) {
+        std.debug.print("error: --teammate requires --parent-session-id and --teammate-lease-id\n", .{});
+        std.process.exit(2);
+    }
+    if (config.teammate_name.len > 0 and config.teammate_parent_session.len > 0) {
+        const parent = @import("core/session_id.zig").SessionId.fromSlice(config.teammate_parent_session) orelse {
+            std.debug.print("error: invalid --parent-session-id\n", .{});
+            std.process.exit(2);
+        };
+        if (@import("core/session_id.zig").SessionId.fromSlice(config.teammate_lease_id) == null) {
+            std.debug.print("error: invalid --teammate-lease-id\n", .{});
+            std.process.exit(2);
+        }
+        if (config.session_id) |explicit| {
+            if (!std.mem.eql(u8, explicit, parent.asSlice())) {
+                std.debug.print("error: --session and --parent-session-id must match for a teammate\n", .{});
+                std.process.exit(2);
+            }
+        } else {
+            config.session_id = allocator.dupe(u8, parent.asSlice()) catch {
+                std.debug.print("error: out of memory while binding teammate session\n", .{});
+                std.process.exit(2);
+            };
+        }
+    }
+
     if (config.show_version) {
         // `--json` is the headless output flag; with `--version` it selects the
         // build identity document (doc/API.md, CLI surface).
@@ -801,6 +831,7 @@ pub fn main(init: std.process.Init) !void {
             .name = config.teammate_name,
             .team = config.teammate_team,
             .parent_session = config.teammate_parent_session,
+            .lease_id = config.teammate_lease_id,
             .cwd = config.teammate_cwd,
         }) catch |err| blk: {
             log.err("swarm", "teammate process failed: {s}", .{@errorName(err)});
@@ -2331,6 +2362,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |v| config.teammate_team = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--parent-session-id")) {
             if (args.next()) |v| config.teammate_parent_session = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--teammate-lease-id")) {
+            if (args.next()) |v| config.teammate_lease_id = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--teammate-cwd")) {
             if (args.next()) |v| config.teammate_cwd = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--teammate-mode")) {

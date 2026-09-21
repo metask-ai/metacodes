@@ -17,6 +17,7 @@ const tool_context = @import("../tools/context.zig");
 const tools_mod = @import("../tools.zig");
 const skill_catalog = @import("../skills/runtime/catalog.zig");
 const dialect_mod = @import("../api/dialect.zig");
+const util_json = @import("../util/json.zig");
 
 pub const Error = process_plugin.Error || effect_scope.Error || error{
     InvalidPackageRoot,
@@ -566,22 +567,22 @@ fn writeInventory(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
     for (snapshot.plugins, 0..) |record, index| {
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"id\":");
-        try std.json.Stringify.encodeJsonString(record.descriptor.id.bytes, .{}, writer);
+        try util_json.writeJsonString(writer, record.descriptor.id.bytes);
         try writer.writeAll(",\"version\":");
         try writeVersion(writer, record.descriptor.version);
         try writer.writeAll(",\"form\":");
-        try std.json.Stringify.encodeJsonString(@tagName(record.descriptor.form), .{}, writer);
+        try util_json.writeJsonString(writer, @tagName(record.descriptor.form));
         try writer.writeAll(",\"layer\":");
-        try std.json.Stringify.encodeJsonString(@tagName(record.layer), .{}, writer);
+        try util_json.writeJsonString(writer, @tagName(record.layer));
         try writer.writeAll(",\"lifecycle\":");
-        try std.json.Stringify.encodeJsonString(@tagName(record.lifecycle), .{}, writer);
+        try util_json.writeJsonString(writer, @tagName(record.lifecycle));
         try writer.writeAll(",\"capabilities\":[");
         var capability_index: usize = 0;
         inline for (std.meta.fields(contract.Capability)) |field| {
             const capability: contract.Capability = @enumFromInt(field.value);
             if (record.descriptor.capabilities.contains(capability)) {
                 if (capability_index != 0) try writer.writeByte(',');
-                try std.json.Stringify.encodeJsonString(field.name, .{}, writer);
+                try util_json.writeJsonString(writer, field.name);
                 capability_index += 1;
             }
         }
@@ -590,7 +591,7 @@ fn writeInventory(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
             .{record.contribution_count},
         );
         if (record.root) |root| {
-            try std.json.Stringify.encodeJsonString(root, .{}, writer);
+            try util_json.writeJsonString(writer, root);
         } else {
             try writer.writeAll("null");
         }

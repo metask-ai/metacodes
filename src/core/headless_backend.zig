@@ -14,6 +14,7 @@ const std = @import("std");
 const ui_backend = @import("protocol/ui_backend.zig");
 const ui_event = @import("protocol/ui_event.zig");
 const log = @import("../util/log.zig");
+const json_util = @import("../util/json.zig");
 
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
@@ -42,8 +43,13 @@ pub const HeadlessBackend = struct {
         const self: *HeadlessBackend = @ptrCast(@alignCast(ctx));
         // 整个 CoreEvent → JSON 行。序列化失败(OOM)不致命,但**不静默吞**:
         // 丢一行可能让下游 parser 错位/丢工具结果(违反"No silent caps")→ 记 warn。
-        const line = std.json.Stringify.valueAlloc(self.allocator, ev, .{}) catch {
+        const raw = std.json.Stringify.valueAlloc(self.allocator, ev, .{}) catch {
             log.warn("headless", "dropped CoreEvent .{s} (JSON serialize failed/OOM)", .{@tagName(ev)});
+            return;
+        };
+        defer self.allocator.free(raw);
+        const line = json_util.repairJsonUtf8(self.allocator, raw) catch {
+            log.warn("headless", "dropped CoreEvent .{s} (JSON UTF-8 repair failed/OOM)", .{@tagName(ev)});
             return;
         };
         defer self.allocator.free(line);
@@ -57,4 +63,34 @@ pub const HeadlessBackend = struct {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "HeadlessBackend keeps malformed byte events JSON-valid" {
+    const Capture = struct {
+        bytes: [256]u8 = undefined,
+        len: usize = 0,
+
+        fn sink(ctx: *anyopaque, line: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.len = @min(line.len, self.bytes.len);
+            @memcpy(self.bytes[0..self.len], line[0..self.len]);
+        }
+    };
+    var capture = Capture{};
+    var backend = HeadlessBackend.init(std.testing.allocator, @ptrCast(&capture), &Capture.sink);
+    const event = CoreEvent{ .text_chunk = "bad\xfftail" };
+    backend.backend().emitEvent(SessionId.single, event);
+    const Parsed = struct { text_chunk: []const u8 };
+    var parsed = try std.json.parseFromSlice(
+        Parsed,
+        std.testing.allocator,
+        capture.bytes[0..capture.len],
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    // Zig's generic serializer represents malformed byte slices as a JSON
+    // byte array so the transport remains valid without silently changing
+    // binary data. Text-facing producers repair before entering CoreEvent;
+    // this adapter's contract is therefore JSON validity at the wire edge.
+    try std.testing.expectEqualStrings("bad\xfftail", parsed.value.text_chunk);
 }

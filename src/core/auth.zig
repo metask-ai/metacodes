@@ -22,6 +22,7 @@ const time = @import("../util/time.zig");
 const types = @import("../types.zig");
 const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const util_json = @import("../util/json.zig");
 
 pub const METASK_API_KEY_ENV = "METASK_API_KEY";
 pub const RUNTIME_API_KEY_FD_ENV = "METACODES_API_KEY_FD";
@@ -749,29 +750,29 @@ fn serializeStoredCredentials(allocator: std.mem.Allocator, creds: StoredCredent
     var wrote = false;
     if (creds.api_key) |k| {
         try aw.writer.writeAll("\"api_key\":");
-        try std.json.Stringify.encodeJsonString(k, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, k);
         wrote = true;
     }
     if (creds.oauth) |o| {
         if (wrote) try aw.writer.writeAll(",");
         try aw.writer.writeAll("\"oauth\":{");
         try aw.writer.writeAll("\"access_token\":");
-        try std.json.Stringify.encodeJsonString(o.access_token, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, o.access_token);
         try aw.writer.writeAll(",\"refresh_token\":");
-        try std.json.Stringify.encodeJsonString(o.refresh_token, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, o.refresh_token);
         try aw.writer.writeAll(",\"token_type\":\"Bearer\"");
         try aw.writer.print(",\"expires_at\":{d}", .{o.expires_at});
         if (o.scope) |v| {
             try aw.writer.writeAll(",\"scope\":");
-            try std.json.Stringify.encodeJsonString(v, .{}, &aw.writer);
+            try util_json.writeJsonString(&aw.writer, v);
         }
         if (o.account_id) |v| {
             try aw.writer.writeAll(",\"account_id\":");
-            try std.json.Stringify.encodeJsonString(v, .{}, &aw.writer);
+            try util_json.writeJsonString(&aw.writer, v);
         }
         if (o.profile) |v| {
             try aw.writer.writeAll(",\"profile\":");
-            try std.json.Stringify.encodeJsonString(v, .{}, &aw.writer);
+            try util_json.writeJsonString(&aw.writer, v);
         }
         try aw.writer.writeAll("}");
         wrote = true;
@@ -779,13 +780,13 @@ fn serializeStoredCredentials(allocator: std.mem.Allocator, creds: StoredCredent
     if (creds.selected_model) |m| {
         if (wrote) try aw.writer.writeAll(",");
         try aw.writer.writeAll("\"selected_model\":");
-        try std.json.Stringify.encodeJsonString(m, .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, m);
         wrote = true;
     }
     if (creds.reasoning_effort) |effort| {
         if (wrote) try aw.writer.writeAll(",");
         try aw.writer.writeAll("\"reasoning_effort\":");
-        try std.json.Stringify.encodeJsonString(effort.name(), .{}, &aw.writer);
+        try util_json.writeJsonString(&aw.writer, effort.name());
     }
     try aw.writer.writeAll("}\n");
     return try aw.toOwnedSlice();

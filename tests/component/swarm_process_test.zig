@@ -11,6 +11,7 @@ const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 W
 const tp = cc.swarm_teammate_process;
 const team = cc.swarm_team;
 const swctx = cc.swarm_context;
+const test_session = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
 
 // DI mock spawn:不真 fork,记录被传的 params + 返回假 pid。验证 lead-spawn 接线。
 var g_mock_name: [64]u8 = undefined;
@@ -52,17 +53,17 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
     try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
-    var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj") };
+    var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj"), .lead_session_id = try a.dupe(u8, test_session.asSlice()) };
     defer tf.deinit();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
 
-    var sw = swctx.SwarmContext{ .allocator = a, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
     // deinit 会 kill(99999)(无害:不存在的 pid)+ free。
     defer sw.deinit();
 
     g_mock_name_len = 0;
-    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", null, &mockSpawn, true);
+    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true);
     try std.testing.expectEqual(@as(i64, 99999), pid);
     // mock 收到 name。
     try std.testing.expectEqualStrings("worker", g_mock_name[0..g_mock_name_len]);
@@ -72,6 +73,8 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
     defer back.deinit();
     const m = back.findMember("worker") orelse return error.NoMember;
     try std.testing.expectEqualStrings("process", m.backend_type);
+    try std.testing.expectEqualStrings(test_session.asSlice(), m.session_id.?);
+    try std.testing.expect(m.lease_id != null);
     // 追踪表有记录(deinit 会清)。
     try std.testing.expectEqual(@as(usize, 1), sw.process_teammates.items.len);
     try std.testing.expectEqual(@as(i64, 99999), sw.process_teammates.items[0].pid);
@@ -84,20 +87,43 @@ test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
     try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
-    var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj") };
+    var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj"), .lead_session_id = try a.dupe(u8, test_session.asSlice()) };
     defer tf.deinit();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
-    var sw = swctx.SwarmContext{ .allocator = a, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
     defer sw.deinit();
-    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", null, &mockSpawn, true));
+    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true));
+}
+
+test "L2 SW6: process teammate rejects a parent session different from swarm routing" {
+    const a = std.testing.allocator;
+    var home_buf: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw6-session-{d}", .{cc.util_time.nowNs()});
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
+    try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
+    var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj"), .lead_session_id = try a.dupe(u8, test_session.asSlice()) };
+    defer tf.deinit();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
+    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+    defer sw.deinit();
+    try std.testing.expectError(
+        error.SessionMismatch,
+        tp.spawnTeammateProcess(&sw, "worker", "", "", "", "fedcba987654321001234567", null, &mockSpawn, true),
+    );
+    var cfg: [std.fs.max_path_bytes]u8 = undefined;
+    var after = team.load(a, team.configPath(home, "proj", &cfg)) orelse return error.NoConfig;
+    defer after.deinit();
+    try std.testing.expect(after.findMember("worker") == null);
 }
 
 test "L2 SW6 A: --teammate 身份 args 解析进 config" {
     const a = std.testing.allocator;
     const argv = [_][*:0]const u8{
-        "metacodes",           "--teammate", "--agent-name",   "bob",      "--team-name", "proj",
-        "--parent-session-id", "sess9",      "--teammate-cwd", "/tmp/wt7",
+        "metacodes",           "--teammate", "--agent-name",        "bob",    "--team-name",    "proj",
+        "--parent-session-id", "sess9",      "--teammate-lease-id", "lease9", "--teammate-cwd", "/tmp/wt7",
     };
     const cfg = cc.parseArgsForTest(&argv, a);
     // 注:parseArgsForTest 用 arena/allocator dupe;这里 testing.allocator 会报泄漏若 dupe 未 free。
@@ -106,11 +132,13 @@ test "L2 SW6 A: --teammate 身份 args 解析进 config" {
         if (cfg.teammate_name.len > 0) a.free(cfg.teammate_name);
         if (cfg.teammate_team.len > 0) a.free(cfg.teammate_team);
         if (cfg.teammate_parent_session.len > 0) a.free(cfg.teammate_parent_session);
+        if (cfg.teammate_lease_id.len > 0) a.free(cfg.teammate_lease_id);
         if (cfg.teammate_cwd.len > 0) a.free(cfg.teammate_cwd);
     }
     try std.testing.expectEqualStrings("bob", cfg.teammate_name);
     try std.testing.expectEqualStrings("proj", cfg.teammate_team);
     try std.testing.expectEqualStrings("sess9", cfg.teammate_parent_session);
+    try std.testing.expectEqualStrings("lease9", cfg.teammate_lease_id);
     try std.testing.expectEqualStrings("/tmp/wt7", cfg.teammate_cwd);
     try std.testing.expect(cfg.agent_teams); // --teammate 隐含开 teams
 }
@@ -213,6 +241,7 @@ test "L2 SW6 F7: 进程外 teammate 先等死再收尸——已死收掉,存活�
     try std.testing.expect(dead_pid > 0);
     try sw.process_teammates.append(a, .{
         .pid = dead_pid,
+        .session = test_session,
         .name = try a.dupe(u8, "dead"),
         .worktree_path = try a.dupe(u8, ""),
         .repo = try a.dupe(u8, ""),
@@ -233,6 +262,7 @@ test "L2 SW6 F7: 进程外 teammate 先等死再收尸——已死收掉,存活�
     try std.testing.expect(live_pid > 0);
     try sw.process_teammates.append(a, .{
         .pid = live_pid,
+        .session = test_session,
         .name = try a.dupe(u8, "live"),
         .worktree_path = try a.dupe(u8, ""),
         .repo = try a.dupe(u8, ""),
@@ -254,16 +284,16 @@ test "L2: lead 的 --no-lsp 跟着进程外 teammate 过进程边界" {
         // 每轮重建:lead 的 sw.deinit() 会做 orphan 清理删掉整个 team 目录。
         var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
         try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
-        var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj") };
+        var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj"), .lead_session_id = try a.dupe(u8, test_session.asSlice()) };
         defer tf.deinit();
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
         try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
 
-        var sw = swctx.SwarmContext{ .allocator = a, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+        var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
         defer sw.deinit();
 
         g_mock_flags_len = 0;
-        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", null, &mockSpawn, lead_lsp_on);
+        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, lead_lsp_on);
         // 两侧都断言:开着时不得平白多塞 flag,关着时必须带上。
         try std.testing.expectEqual(!lead_lsp_on, mockSawFlag("--no-lsp"));
     }
