@@ -166,6 +166,36 @@ def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+def _require_rollout_reservation(
+    collected: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    used_cost_usd: float,
+    used_tokens: int,
+    rollout_cost_usd: float,
+    rollout_tokens: int,
+    max_cumulative_cost_usd: float | None,
+    max_cumulative_tokens: int | None,
+) -> None:
+    """Refuse to start a rollout whose full allowance would breach a cumulative cap."""
+    cost = used_cost_usd
+    tokens = used_tokens
+    for rows in collected.values():
+        for row in rows:
+            metrics = row.get("metrics") or {}
+            cost += float(metrics.get("cost_usd") or 0.0)
+            tokens += int(metrics.get("metered_tokens") or metrics.get("total_tokens") or 0)
+    if max_cumulative_cost_usd is not None and cost + rollout_cost_usd > max_cumulative_cost_usd:
+        raise ValidationError(
+            f"next rollout allowance ${rollout_cost_usd:.4f} on top of ${cost:.4f} used "
+            f"would exceed the cumulative cost cap ${max_cumulative_cost_usd:.4f}"
+        )
+    if max_cumulative_tokens is not None and tokens + rollout_tokens > max_cumulative_tokens:
+        raise ValidationError(
+            f"next rollout allowance {rollout_tokens} tokens on top of {tokens} used "
+            f"would exceed the cumulative token cap {max_cumulative_tokens}"
+        )
+
+
 def _require_budget(
     collected: Mapping[str, Sequence[Dict[str, Any]]],
     *,
@@ -1167,6 +1197,19 @@ def run_paired(
                 "timeout_seconds": expected_tasks[task_id]["constraints"]["timeout_seconds"],
             }
             if max_rollout_cost_usd is not None:
+                # Reserve the whole per-rollout allowance against the cumulative
+                # cap before spending: a rollout may use every token of its
+                # allowance, so "cumulative usage still below the cap" is not
+                # enough to guarantee the cap holds after it (Codex review).
+                _require_rollout_reservation(
+                    collected,
+                    used_cost_usd=budget_used_cost_usd,
+                    used_tokens=budget_used_tokens,
+                    rollout_cost_usd=float(max_rollout_cost_usd),
+                    rollout_tokens=max_rollout_metered_tokens,
+                    max_cumulative_cost_usd=max_cumulative_cost_usd,
+                    max_cumulative_tokens=max_cumulative_tokens,
+                )
                 run_once_options["max_cost_usd"] = float(max_rollout_cost_usd)
                 run_once_options["max_metered_tokens"] = max_rollout_metered_tokens
             run_dir = _run_once(

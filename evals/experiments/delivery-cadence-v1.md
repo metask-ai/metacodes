@@ -189,3 +189,75 @@ pair `candidate_dominated` on n = 2 with confidence intervals spanning zero.
    non-trivial rate — longer tasks, or the observed loop pathology induced
    deliberately — and (b) a content-level grader that separates "wrong
    answer" from "wrong line format", registered before the run.
+
+---
+
+## Results v1.1 (re-run 2026-09-21, harness 66ed1be8, corrected sensor)
+
+Same suite, arms, dose (10 / 20), turn cap (40) and model as v1; the only
+change is the binary: commit 66ed1be8, whose Bash sensor counts `rg` as
+exploration and rejects substitutions, `>&file`, awk/sed write payloads,
+`sort -o`, `uniq in out`, `find -fprint` and `fd -x`. 18 hazard rollouts,
+all valid, nominal US$5.35. The binary was rebuilt again at
+08:47:47 local for the follow-up fixes, after the last v1.1 rollout finished
+(08:45:40), so every v1.1 rollout ran the 66ed1be8 sensor; replaying the
+transcripts also finds none of the shapes the later fixes cover.
+
+| | observe (control) | enforce (treatment) |
+|---|---:|---:|
+| deliverable on disk (`report.md`) | 9/9 | 9/9 |
+| correct, preregistered validator | 6/9 | 9/9 |
+| rollouts crossing >= 1 threshold | 6/9 | 7/9 |
+| nudges injected | 0 | 7 |
+| mean tool calls | 15.9 | 17.2 |
+| mean cost (nominal US$) | 0.285 | 0.309 |
+| mean wall time (s) | 35 | 38 |
+
+`cli.py compare` (9 pairs): trustworthy success 66.7% -> 100.0% (Δ +33.3 pp),
+discordant pairs 0 regressions / 3 improvements, exact McNemar p = 0.25;
+paired cost Δ +0.024 US$ [95% CI -0.012, 0.060]; tool calls Δ +1.3 [-13.8,
+16.5]; wall Δ +3.1 s [-7.7, 13.9]; frontier class `tradeoff` (quality up,
+cost not lower). With the roster fixed the gate crossed a threshold in 7/9
+treatment runs (v1: 3/9) and fired 7 nudges; the control crossed in 6/9.
+
+| task | trial | arm | outcome | report.md | validator | exploration calls | levels | nudges | tool calls | turns | cost | wall s |
+|---|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 90_dc_taint_trace | 0 | observe | pass | yes | yes | 6 | 0 | 0 | 7 | 8 | 0.235 | 21 |
+| 90_dc_taint_trace | 1 | observe | pass | yes | yes | 16 | 1 | 0 | 17 | 10 | 0.278 | 32 |
+| 90_dc_taint_trace | 2 | observe | pass | yes | yes | 18 | 1 | 0 | 19 | 8 | 0.252 | 31 |
+| 91_dc_unused_setting | 0 | observe | pass | yes | yes | 9 | 0 | 0 | 10 | 9 | 0.269 | 29 |
+| 91_dc_unused_setting | 1 | observe | fail | yes | no | 10 | 1 | 0 | 11 | 10 | 0.282 | 32 |
+| 91_dc_unused_setting | 2 | observe | pass | yes | yes | 11 | 1 | 0 | 12 | 11 | 0.318 | 37 |
+| 92_dc_invariant_break | 0 | observe | fail | yes | no | 6 | 0 | 0 | 7 | 7 | 0.264 | 37 |
+| 92_dc_invariant_break | 1 | observe | fail | yes | no | 48 | 2 | 0 | 49 | 11 | 0.358 | 56 |
+| 92_dc_invariant_break | 2 | observe | pass | yes | yes | 10 | 1 | 0 | 11 | 10 | 0.310 | 40 |
+| 90_dc_taint_trace | 0 | enforce | pass | yes | yes | 6 | 0 | 0 | 7 | 8 | 0.230 | 18 |
+| 90_dc_taint_trace | 1 | enforce | pass | yes | yes | 13 | 1 | 1 | 16 | 7 | 0.228 | 25 |
+| 90_dc_taint_trace | 2 | enforce | pass | yes | yes | 16 | 1 | 1 | 17 | 10 | 0.281 | 32 |
+| 91_dc_unused_setting | 0 | enforce | pass | yes | yes | 10 | 1 | 1 | 13 | 12 | 0.319 | 35 |
+| 91_dc_unused_setting | 1 | enforce | pass | yes | yes | 10 | 1 | 1 | 11 | 11 | 0.298 | 31 |
+| 91_dc_unused_setting | 2 | enforce | pass | yes | yes | 10 | 1 | 1 | 11 | 10 | 0.298 | 28 |
+| 92_dc_invariant_break | 0 | enforce | pass | yes | yes | 9 | 0 | 0 | 12 | 11 | 0.329 | 42 |
+| 92_dc_invariant_break | 1 | enforce | pass | yes | yes | 13 | 1 | 1 | 14 | 12 | 0.385 | 55 |
+| 92_dc_invariant_break | 2 | enforce | pass | yes | yes | 15 | 1 | 1 | 54 | 12 | 0.416 | 78 |
+
+### Reading, both runs together
+
+- Deliverable rate is tied 9/9 in all four arm-runs: on this cohort the
+  control never fails to write the report inside 40 turns, so the hazard the
+  gate was built for has a base rate of zero here and H1 remains untested.
+- Strict correctness: v1 (dose partly suppressed) 4 regressions / 2
+  improvements; v1.1 (dose delivered) 0 regressions / 3 improvements. Pooled
+  over 18 pairs that is 4 / 5, p ≈ 1.0 — no effect distinguishable from
+  noise. The v1.1 direction is the one the mechanism predicts (a nudged run
+  writes and then keeps improving in place; all nine treatment reports were
+  correct), and 3/0 on 9 pairs is what a real +30 pp effect would look like
+  at this sample size, but it is also what run-to-run variance looks like.
+- Cost: v1 lower with the gate, v1.1 slightly higher; both intervals span
+  zero. The gate neither saves nor costs money at this cohort's scale.
+- Decision unchanged: keep `--delivery-cadence` opt-in and off by default.
+  The evidence now justifies one more step, not a rollout: a confirmatory
+  run of the same design with ~18 pairs and a content-level grader
+  registered up front, which would put a 3/0-per-9 effect at p ≈ 0.03 if it
+  holds. It still would not test H1; that needs a cohort where the control
+  actually fails to deliver.

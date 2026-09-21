@@ -178,6 +178,7 @@ fn classifyBash(allocator: std.mem.Allocator, input: []const u8) Class {
         // a b; do cat "$f"; done` explores. The header and terminators carry
         // no command; `do`/`then` prefix the real one.
         const body = stripShellKeywords(segment);
+        if (body.ptr == CASE_SENTINEL.ptr) return .mutation;
         if (body.len == 0) continue;
         commands += 1;
         const stripped = bash_parser.stripWrappers(body);
@@ -210,11 +211,15 @@ fn stripGitGlobalOptions(target: []const u8) []const u8 {
     while (true) {
         const tok = tokens.next() orelse return target;
         const tok_start = @intFromPtr(tok.ptr) - @intFromPtr(target.ptr);
-        if (std.mem.eql(u8, tok, "-C") or std.mem.eql(u8, tok, "-c")) {
+        if (std.mem.eql(u8, tok, "-C")) {
             _ = tokens.next() orelse return target; // the option's argument
             continue;
         }
-        if (std.mem.startsWith(u8, tok, "--")) continue; // --no-pager, --git-dir=...
+        if (std.mem.eql(u8, tok, "--no-pager") or std.mem.eql(u8, tok, "--no-optional-locks")) continue;
+        // Any other global option (`-c alias.status=!touch x`, `--exec-path`,
+        // `--git-dir`, ...) can change what `git <sub>` executes: keep the
+        // original text so the roster rejects it.
+        if (tok[0] == '-') return target;
         rest_start = tok_start;
         break;
     }
@@ -241,6 +246,10 @@ fn gitScratch(bytes: []const u8) []const u8 {
     return git_scratch[0..bytes.len];
 }
 
+/// Returned by `stripShellKeywords` for `case`/`select` compounds, whose
+/// bodies this sensor cannot see through. Compared by pointer.
+const CASE_SENTINEL: []const u8 = "case-compound";
+
 /// Drop leading shell control keywords from one compound segment and return
 /// the command that remains (empty when the segment is pure syntax such as a
 /// `for` header, `done` or `fi`).
@@ -249,8 +258,11 @@ fn stripShellKeywords(segment: []const u8) []const u8 {
     while (s.len > 0) {
         const space = std.mem.indexOfAny(u8, s, " \t") orelse s.len;
         const head = s[0..space];
+        // `case`/`select` bodies hide commands behind `pattern)` labels the
+        // splitter cannot pair with `esac`; fail closed on the whole call.
+        if (std.mem.eql(u8, head, "case") or std.mem.eql(u8, head, "select")) return CASE_SENTINEL;
         // Headers and terminators: nothing executable in this segment.
-        for ([_][]const u8{ "for", "select", "case", "esac", "done", "fi", "in" }) |kw| {
+        for ([_][]const u8{ "for", "esac", "done", "fi", "in" }) |kw| {
             if (std.mem.eql(u8, head, kw)) return "";
         }
         // Prefix keywords: the command follows.
@@ -340,9 +352,42 @@ fn hasMutatingPayload(target: []const u8) bool {
         return hasSedWriteCommand(target[head.len..]);
     }
     if (std.mem.eql(u8, head, "awk") or std.mem.eql(u8, head, "gawk") or std.mem.eql(u8, head, "mawk") or std.mem.eql(u8, head, "nawk")) {
-        // The program text is quoted, so the redirect scan above skipped it.
-        return std.mem.indexOfScalar(u8, target, '>') != null or std.mem.indexOf(u8, target, "system(") != null;
+        // The program text is quoted, so the redirect scan above skipped it:
+        // `print > "f"`, `print | "cmd"`, `"cmd" | getline`, `system ("cmd")`.
+        return std.mem.indexOfScalar(u8, target, '>') != null or
+            std.mem.indexOfScalar(u8, target, '|') != null or
+            std.mem.indexOf(u8, target, "system") != null;
     }
+    if (std.mem.eql(u8, head, "git")) {
+        // Read-only subcommands with write-capable options.
+        var sub: []const u8 = "";
+        var listing = false;
+        var positional: usize = 0;
+        while (tokens.next()) |tok| {
+            if (sub.len == 0) {
+                sub = tok;
+                continue;
+            }
+            if (std.mem.startsWith(u8, tok, "--output")) return true;
+            if (std.mem.eql(u8, sub, "branch")) {
+                if (tok[0] == '-') {
+                    for ([_][]const u8{ "-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose", "--list", "--show-current", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--color", "--no-color" }) |ok| {
+                        if (std.mem.eql(u8, tok, ok) or std.mem.startsWith(u8, tok, "--sort=") or std.mem.startsWith(u8, tok, "--format=") or std.mem.startsWith(u8, tok, "--color=")) {
+                            listing = true;
+                            break;
+                        }
+                    } else return true; // -d/-D/-m/-M/-c/-C/--set-upstream-to/...
+                } else positional += 1;
+            }
+        }
+        // `git branch <name>` creates a branch unless a listing form is present.
+        return std.mem.eql(u8, sub, "branch") and positional > 0 and !listing;
+    }
+    if (std.mem.eql(u8, head, "tree")) return hasFlag(&tokens, &[_][]const u8{ "-o", "--output" });
+    if (std.mem.eql(u8, head, "xxd")) return hasFlag(&tokens, &[_][]const u8{ "-r", "-revert" });
+    if (std.mem.eql(u8, head, "yq")) return hasFlag(&tokens, &[_][]const u8{ "-i", "--inplace" });
+    if (std.mem.eql(u8, head, "rg")) return hasFlag(&tokens, &[_][]const u8{ "--pre", "--pre-glob" });
+    if (std.mem.eql(u8, head, "date")) return hasFlag(&tokens, &[_][]const u8{ "-s", "--set" });
     if (std.mem.eql(u8, head, "find")) {
         while (tokens.next()) |tok| {
             for ([_][]const u8{ "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls" }) |flag| {
@@ -372,6 +417,15 @@ fn hasMutatingPayload(target: []const u8) bool {
             if (tok[0] != '-') positional += 1;
         }
         return positional >= 2;
+    }
+    return false;
+}
+
+fn hasFlag(tokens: *std.mem.TokenIterator(u8, .any), flags: []const []const u8) bool {
+    while (tokens.next()) |tok| {
+        for (flags) |flag| {
+            if (std.mem.eql(u8, tok, flag) or (flag.len > 2 and std.mem.startsWith(u8, tok, flag) and tok.len > flag.len and tok[flag.len] == '=')) return true;
+        }
     }
     return false;
 }
@@ -524,12 +578,36 @@ test "read-only search commands and git global options count as exploration" {
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"fd -e py\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"tree -L 2\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"git -C sub status\"}"));
-    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"git --no-pager -c color.ui=false log -3\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git --no-pager -c color.ui=false log -3\"}")); // -c can inject aliases
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git -C sub commit -m x\"}"));
     // Unprovable shapes stay mutation: python one-liners, tee, xargs into a writer.
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"python3 -c 'print(1)'\"}"));
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"ls | tee out.txt\"}"));
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"find . -name '*.o' | xargs rm\"}"));
+}
+
+test "case compounds, git config injection, git write options and roster payloads disarm" {
+    // Codex follow-up 2026-09-21.
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"ls; case x in x) touch pwned;; esac\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git -c alias.status='!touch status' status\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git --exec-path=/tmp/x status\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git branch -D feature\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git branch newname\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git diff --output=out.txt\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"tree -o report.md\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"xxd -r dump.hex out.bin\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"yq -i '.x=1' config.yml\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"rg --pre ./decompress pattern\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk 'BEGIN { system (\\\"touch pwned\\\") }'\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk 'BEGIN { \\\"touch pwned\\\" | getline }'\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk '{ print | \\\"sort\\\" }' f\"}"));
+    // Still exploration: listing forms and plain views.
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"git branch -a\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"git --no-pager -C sub log -3\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"tree -L 2\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"xxd dump.bin | head\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk '{ print $1 }' f | sort\"}"));
 }
 
 test "bash redirects and in-place flags disarm" {

@@ -4292,6 +4292,7 @@ class WorkBuddyDeliveryCadenceRecordTest(unittest.TestCase):
             {"nudges": 2, "levels_reached": 1},
             {"enforced": False},  # observe mode with nudges=2
             {"first_threshold": 80, "second_threshold": 40},
+            {"max_nudges": 3},  # v1 pins the proven bound
         ):
             bad = self._valid()
             bad.update(mutate)

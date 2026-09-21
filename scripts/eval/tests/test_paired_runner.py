@@ -378,6 +378,30 @@ class PairedRunnerTest(unittest.TestCase):
                 )
             self.assertEqual(len(seen), 4)
             self.assertTrue(all(cost == 5.0 and tokens == 1_200_000 for _, _, cost, tokens in seen))
+            # Reservation: with 2 rollouts already collected (0.01 each), a third whose
+            # allowance would push past the cumulative cap must not start.
+            seen.clear()
+            with self.assertRaisesRegex(ValidationError, "would exceed the cumulative cost cap"):
+                run_paired(
+                    suite,
+                    root,
+                    baseline_binary,
+                    candidate_binary,
+                    trials=1,
+                    scenario_glob="*",
+                    model_provider="test",
+                    model_id="model-a",
+                    baseline_output=root / "b5.jsonl",
+                    candidate_output=root / "c5.jsonl",
+                    baseline_revision="baseline-rev",
+                    candidate_revision="candidate-rev",
+                    suite_path=suite_path,
+                    budget_used_cost_usd=6.0,
+                    max_cumulative_cost_usd=10.0,
+                    max_rollout_cost_usd=5.0,
+                    max_rollout_metered_tokens=10,
+                )
+            self.assertEqual(seen, [])
             with self.assertRaisesRegex(ValidationError, "both cost and token caps"):
                 run_paired(
                     suite,

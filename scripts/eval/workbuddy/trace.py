@@ -1575,7 +1575,8 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 # mode, ordered thresholds. A record violating them is not a
                 # measurement of this gate.
                 if (
-                    formal["delivery_cadence_levels_reached"] > formal["delivery_cadence_max_nudges"]
+                    formal["delivery_cadence_max_nudges"] != 2  # v1 policy bound (DeliveryCadence.lean maxNudges)
+                    or formal["delivery_cadence_levels_reached"] > formal["delivery_cadence_max_nudges"]
                     or formal["delivery_cadence_nudges"] > formal["delivery_cadence_max_nudges"]
                     or formal["delivery_cadence_nudges"] > formal["delivery_cadence_levels_reached"]
                     or (not observation["enforced"] and formal["delivery_cadence_nudges"] != 0)
