@@ -103,10 +103,11 @@ jobs:
             $events | ForEach-Object { Write-Host "  sampler: $_" }
             $starts = Select-String -Path "suite-$i.log" -Pattern 'test_start now_ns=(\d+)(?: pid=(\d+))? shard=(\S+) name="(.*)"' | ForEach-Object { [PSCustomObject]@{ ms = [long]($_.Matches[0].Groups[1].Value) / 1000000; pid = $_.Matches[0].Groups[2].Value; shard = $_.Matches[0].Groups[3].Value; name = $_.Matches[0].Groups[4].Value } }
             Write-Host "  (test_start stamps parsed: $(@($starts).Count))"
-            $first = $true
+            $seenTrue = $false
             foreach ($ev in $events) {
+              if ($ev -match 'exists=True') { $seenTrue = $true }
               if ($ev -match 'epoch_ms=(\d+) D:\\tmp exists=False') {
-                if ($first) { $first = $false; continue }
+                if (-not $seenTrue) { continue }
                 $t = [long]$Matches[1]
                 Write-Host "  --- deletion at epoch_ms=$t : per process, the last 3 tests started before it (ms relative to deletion):"
                 $starts | Where-Object { $_.ms -le ($t + 30) } | Group-Object -Property pid | ForEach-Object {
