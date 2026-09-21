@@ -2,8 +2,11 @@
 //! each build script writes (`scripts/build-formal-kernel.sh`,
 //! `scripts/build-project-harness-kernel.sh`), field for field, with the
 //! runtime's own constants substituted, and the formal kernel's hash-bound
-//! receipt. Shared by `provenance.zig`, `project_provenance.zig` and
-//! `app/doctor.zig` tests; nothing in the product imports this file.
+//! receipt. Referenced only from `test` blocks and their helpers in
+//! `project_provenance.zig` and `app/doctor.zig`: the imports sit in those
+//! files, but Zig's lazy analysis reaches this module only when a test is
+//! compiled, so the product binary never contains it. The import cycle with
+//! `project_provenance.zig` (for its schema constants) is likewise test-only.
 
 const std = @import("std");
 const runtime = @import("runtime.zig");

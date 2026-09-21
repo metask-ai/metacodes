@@ -47,6 +47,7 @@ KERNEL_CHECKS = ("formal_kernel", "project_kernel")
 # the prefix and nothing the developer's shell points at.
 DOCTOR_ENV_OVERRIDES = (
     "METACODES_KG_BIN",
+    "METACODES_KGD_BIN",
     "RG_BIN",
     "METACODES_FORMAL_KERNEL_PATH",
     "METACODES_FORMAL_KERNEL_SHA256",
@@ -129,8 +130,11 @@ def evaluate_doctor(report: object, prefix: Path, release: bool = False) -> list
 
 def evaluate_daemon(by_name: dict, prefix: Path) -> list[str]:
     """Findings for the TinyKG daemon check, which the report always carries.
-    The v1 bundle ships no daemon and the build pins none; a build that pins
-    one must ship it beside the CLI with a matching digest."""
+    The v1 bundle ships no daemon and the build pins none (build.zig keeps
+    `tinykgd` out of the default install, and `ALLOWED_ENTRIES` refuses it), so
+    through the command line only the unpinned-and-absent shape reaches here;
+    the resolved branch is the contract for a v2 bundle that ships the daemon:
+    beside the CLI, adjacent, matching."""
     daemon = by_name.get("tinykgd")
     if daemon is None:
         return ["doctor: no tinykgd check"]

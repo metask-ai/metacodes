@@ -205,6 +205,7 @@ def _component(manifest: dict, name: str) -> dict:
 NEUTRALIZED_ENV = (
     "RG_BIN",
     "METACODES_KG_BIN",
+    "METACODES_KGD_BIN",
     "METACODES_FORMAL_KERNEL_PATH",
     "METACODES_FORMAL_KERNEL_SHA256",
     "METACODES_FORMAL_KERNEL_TIMEOUT_MS",
@@ -343,6 +344,8 @@ def evaluate_doctor_report(report: object, prefix: Path, manifest: dict) -> None
             raise BundleError(f"doctor pins tinykgd ({expected}) but the bundle ships no daemon under vendor/tinykg")
     else:
         vendored_dir = (prefix / "vendor" / "tinykg").resolve()
+        if daemon.get("source") != "adjacent":
+            raise BundleError(f"doctor resolved tinykgd from {daemon.get('source')!r}, expected the adjacent bundle copy")
         if not isinstance(resolved, str) or Path(resolved).resolve().parent != vendored_dir:
             raise BundleError(f"doctor resolved tinykgd to {resolved}, outside the bundle's vendor/tinykg")
         if daemon.get("match") is not True:
@@ -539,6 +542,8 @@ def self_test() -> int:
         evaluate_doctor_report(pinned_daemon, root, manifest)
         pinned_daemon["checks"][4]["match"] = False
         _expect_bundle_error(lambda: evaluate_doctor_report(pinned_daemon, root, manifest), "the executable pins")
+        pinned_daemon["checks"][4].update({"match": True, "source": "env"})
+        _expect_bundle_error(lambda: evaluate_doctor_report(pinned_daemon, root, manifest), "expected the adjacent bundle copy")
     print("verify_release_bundle: self-test ok")
     return 0
 

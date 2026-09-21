@@ -22,8 +22,10 @@
 //! reported as `source=env` with nothing resolved, which is never healthy.
 //! A kernel is hashed through one descriptor opened the way the runtime opens
 //! it (no symlink, regular, non-empty, within the runtime's size bound, the
-//! size unchanged after the read), so a symlinked or swapped kernel has no
-//! digest and no provenance; the legacy tools keep the plain hash, where a
+//! size unchanged after the read), so a symlinked, empty, oversized or
+//! truncated/grown-during-read kernel has no digest and no provenance — the
+//! same admission the runtime applies, including the same-size in-place
+//! rewrite window it accepts; the legacy tools keep the plain hash, where a
 //! symlinked `rg` on PATH is legitimate.
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -928,12 +930,14 @@ test "doctor timeout override the runtime rejects makes a pinned adjacent kernel
     try std.testing.expect(accepted.healthy());
 }
 
-test "doctor Kernel swapped during the read is not vouched for" {
+test "doctor empty Kernel is refused by the admission read" {
     const allocator = std.testing.allocator;
     var stage = try KernelStage.init(allocator, .project);
     defer stage.deinit(allocator);
     try stage.writeProjectSidecar(allocator);
-    // A kernel the admission read refuses outright: empty.
+    // The runtime's `readChecker` refuses an empty file before reading it;
+    // doctor's admission read must agree (the post-read size check has no
+    // deterministic seam here and is not what this test exercises).
     try stage.tmp.dir.writeFile(std.testing.io, .{ .sub_path = stage.kernel_rel, .data = "" });
     var report = try stage.report(allocator, .project);
     defer report.deinit(allocator);
