@@ -101,12 +101,18 @@ jobs:
             $events = @(Receive-Job $sampler)
             Remove-Job $sampler
             $events | ForEach-Object { Write-Host "  sampler: $_" }
-            $starts = Select-String -Path "suite-$i.log" -Pattern 'test_start now_ns=(\d+) shard=(\S+) name="(.*)"' | ForEach-Object { [PSCustomObject]@{ ms = [long]($_.Matches[0].Groups[1].Value) / 1000000; shard = $_.Matches[0].Groups[2].Value; name = $_.Matches[0].Groups[3].Value } }
+            $starts = Select-String -Path "suite-$i.log" -Pattern 'test_start now_ns=(\d+)(?: pid=(\d+))? shard=(\S+) name="(.*)"' | ForEach-Object { [PSCustomObject]@{ ms = [long]($_.Matches[0].Groups[1].Value) / 1000000; pid = $_.Matches[0].Groups[2].Value; shard = $_.Matches[0].Groups[3].Value; name = $_.Matches[0].Groups[4].Value } }
+            Write-Host "  (test_start stamps parsed: $(@($starts).Count))"
+            $first = $true
             foreach ($ev in $events) {
               if ($ev -match 'epoch_ms=(\d+) D:\\tmp exists=False') {
+                if ($first) { $first = $false; continue }
                 $t = [long]$Matches[1]
-                Write-Host "  --- tests started within 3000 ms before the deletion at epoch_ms=$t (per shard, latest first):"
-                $starts | Where-Object { $_.ms -le $t -and $_.ms -ge ($t - 3000) } | Sort-Object -Property ms -Descending | ForEach-Object { Write-Host "    +$($_.ms - $t) ms shard=$($_.shard) $($_.name)" }
+                Write-Host "  --- deletion at epoch_ms=$t : per process, the last 3 tests started before it (ms relative to deletion):"
+                $starts | Where-Object { $_.ms -le ($t + 30) } | Group-Object -Property pid | ForEach-Object {
+                  $grp = $_.Group | Sort-Object -Property ms -Descending | Select-Object -First 3
+                  $grp | ForEach-Object { Write-Host "    pid=$($_.pid) shard=$($_.shard) $($_.ms - $t) ms  $($_.name)" }
+                }
               }
             }
             if ($code -ne 0) { $failures++ }
