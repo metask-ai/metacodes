@@ -24,78 +24,50 @@ permissions:
 
 jobs:
   native-windows-gate:
-    # Self-hosted isolation guard: never schedule fork-PR code onto the
-    # persistent self-hosted runners; see OPEN_SOURCE_READINESS.md
-    # "Final launch gate".
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # Pinned to metask-pc: this gate provisions a persistent Rust toolchain in
-    # the runner user's profile, so it stays on one known machine, unlike
-    # ci.yml's generic [self-hosted, Windows, X64] pool. Owner: confirm or
-    # align the label if the fleet has a single Windows runner.
-    runs-on: [self-hosted, Windows, X64, metask-pc]
-    # Shares the Windows box with ci.yml's windows-gates full suite; the
-    # runner-serialization group makes the two queue instead of compiling
-    # at -j12 while the other runs the suite (issue #52 suggestion 3; see
-    # ci.yml `gates` for the bucket semantics).
-    concurrency:
-      group: runner-Windows-X64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}
-      cancel-in-progress: false
-    timeout-minutes: 25
+    # GitHub-hosted Windows runner (organization policy keeps public
+    # repositories off the self-hosted fleet). The image ships rustup with a
+    # stable toolchain, which the AgentCore gate's Rust link probe needs.
+    # 45 minutes: a cold Zig cache compiles the whole tree in ReleaseSafe on
+    # 4 cores; warm runs (setup-zig cache hit) are far shorter.
+    runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # See ci.yml `gates` for the cache semantics.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
-          use-cache: false
-      # checkout's default clean wipes the workspace .zig-cache both cache env
-      # vars point at; keep the content-addressed caches outside the workspace
-      # so the ReleaseSafe gates stop cold-compiling every run.
-      - name: Point Zig caches at persistent per-runner storage
-        shell: cmd
-        run: |
-          echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
-          echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
-      - name: Setup Rust toolchain (Windows)
+          use-cache: true
+          cache-size-limit: 4096
+      - name: Rust toolchain (Windows)
         shell: cmd
         env:
-          # Force the missing-toolchain case through the explicit install
-          # branch below instead of rustup's silent auto-install inside
-          # `rustup which`.
+          # Fail loudly if the image ever drops rustup instead of letting
+          # `rustup which` auto-install an unpinned toolchain silently.
           RUSTUP_AUTO_INSTALL: "0"
         run: |
           where rustup >nul 2>nul
           if errorlevel 1 (
-            rem Pinned rustup-init 1.29.0; hash from
-            rem https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-pc-windows-msvc/rustup-init.exe.sha256
-            rem Never execute an unverified download on a persistent runner.
-            curl.exe --proto "=https" --tlsv1.2 --retry 10 --retry-connrefused --fail --silent --show-error https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-pc-windows-msvc/rustup-init.exe -o "%RUNNER_TEMP%\rustup-init.exe"
-            if errorlevel 1 exit /b 1
-            certutil -hashfile "%RUNNER_TEMP%\rustup-init.exe" SHA256 | findstr /i "86478e53f769379d7f0ebfa7c9aa97cb76ca92233f79aa2cc0dbee2efaac73c7" >nul
-            if errorlevel 1 (
-              echo rustup-init.exe SHA-256 mismatch; refusing to execute.
-              exit /b 1
-            )
-            "%RUNNER_TEMP%\rustup-init.exe" --default-toolchain none --profile minimal --no-modify-path -y
-            if errorlevel 1 exit /b 1
+            echo rustup is missing from the hosted Windows image; the AgentCore gate needs a stable Rust toolchain.
+            exit /b 1
           )
-          echo %USERPROFILE%\.cargo\bin>>"%GITHUB_PATH%"
-          set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
           rustup which --toolchain stable rustc >nul 2>nul || rustup toolchain install stable --profile minimal --no-self-update
           if errorlevel 1 exit /b 1
           rustup default stable
           if errorlevel 1 exit /b 1
           rustc --version
           cargo --version
-      # --test-timeout 5m:zig build runner 的 between-test 看门狗 = max(--test-timeout, 60s)。
-      # 该共享 runner(与其它仓 job 抢 CPU/磁盘 + Defender 实时扫描大体积测试 exe 的按需换页)
-      # 曾五次把 abi unit/contract 二进制冻过 60s 静默窗——所有已执行测试全过,却被
-      # "test runner failed to respond for ~1m" 击杀(runs 33182209880/33186110733/33229667443/
-      # 33229697275 等,重跑均绿)。抬到 5m 只影响真挂死的失败延迟,不吞任何测试失败。
+      # --test-timeout 5m: the build runner's between-test watchdog is
+      # max(--test-timeout, 60s). Defender's on-demand paging of the large
+      # test executables froze the abi unit/contract binaries past the
+      # 60 s default five times on the old shared runner (runs 33182209880,
+      # 33186110733, 33229667443, 33229697275; all green on rerun); the
+      # wider window only delays reporting of a genuinely wedged test.
       - name: Native AgentCore delivery gate
         shell: cmd
         run: |
           zig version
-          zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe -j12 --test-timeout 5m
+          zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Native Windows platform gate
         shell: cmd
-        run: zig build windows:gate -Dtarget=x86_64-windows-gnu -j12 --test-timeout 5m
+        run: zig build windows:gate -Dtarget=x86_64-windows-gnu --test-timeout 5m

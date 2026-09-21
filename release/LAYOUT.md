@@ -76,14 +76,14 @@ refusal of untagged stable versions.
 
 ## Publishing
 
-`.github/workflows/release.yml` runs the whole chain per platform on the
-`metacodes-release` runners (`doc/RELEASE_RUNNER.md`) and leaves a *draft*
+`.github/workflows/release.yml` runs the whole chain per platform on
+GitHub-hosted runners (`doc/RELEASE_RUNNER.md`) and leaves a *draft*
 GitHub Release holding every archive, its `.sha256`, and
 `metacodes-<version>-SHA256SUMS`; a maintainer publishes it after verifying an
 unpacked archive on a clean machine with `scripts/verify_release_bundle.py
 --native`. Pre-releases are dispatched by hand and never auto-attached (#47
-Q3); the stable tag trigger is enabled only once the dedicated runners exist
-(Q4).
+Q3); the stable tag trigger is a follow-up (`doc/RELEASE_RUNNER.md`,
+"Enabling the tag trigger").
 
 ## What is deliberately not in the unit
 

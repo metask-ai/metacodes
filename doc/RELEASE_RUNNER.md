@@ -1,79 +1,57 @@
-# The `metacodes-release` runners
+# Release runners
 
-Design for the dedicated release runners (#82, #47 stage 7, owner decision Q4).
-`.github/workflows/release.yml` targets them by label; until they exist the
-workflow runs only as a dry run on the PR pool, and the tag trigger stays off.
+`.github/workflows/release.yml` (#82, #47 stage 7) builds every release on
+GitHub-hosted runners: `ubuntu-latest` (x86_64), `macos-latest` (arm64) and
+`windows-latest` (x86_64). The dedicated self-hosted `metacodes-release` pool
+this document used to design is no longer planned: the repository is public,
+hosted standard runners are free for public repositories, and organization
+policy keeps public repositories off the organization's self-hosted fleet
+(2026-09-21).
 
-## Why a separate pool
+## Why hosted runners give the isolation the pool was for
 
-The PR runners (`[self-hosted, <OS>, <ARCH>]`) execute code from every same-repo
-branch, share one persistent Zig cache per machine, and are serialized with the
-AgentCore and rule-control workflows through concurrency groups. A release build
-must not compete with that queue, must not inherit a cache another branch wrote,
-and must be the only workload that can ever hold the credential that creates a
-GitHub Release. Isolation by machine is the simplest boundary that gives all
-three.
+The pool existed for three properties: a release build must not compete with
+the PR queue, must not inherit a cache another branch wrote, and must be the
+only workload that can ever hold the credential that creates a GitHub Release.
+An ephemeral hosted runner gives all three by construction: every job gets a
+fresh machine, `release.yml` runs `setup-zig` with `use-cache: false` so a
+release always compiles cold, and the token exists only inside the `publish`
+job.
 
-## Labels and shape
+## Shape
 
 | Property | Value |
 |---|---|
-| Labels | `[self-hosted, metacodes-release, Linux, X64]`, `[self-hosted, metacodes-release, macOS, ARM64]`, `[self-hosted, metacodes-release, Windows, X64]` |
-| Count | one runner per platform; the workflow's matrix has one job per platform |
-| Registration | repository-level runner group `metacodes-release`, restricted to the `Release` workflow (GitHub → Settings → Actions → Runner groups → "Selected workflows") |
-| Account | a dedicated unprivileged OS user; no access to developer home directories or PR-pool workspaces |
-| Egress | HTTPS to `github.com`, `api.github.com`, `objects.githubusercontent.com` and the Actions artifact service (`*.actions.githubusercontent.com`, `*.blob.core.windows.net`): the build jobs upload the archives with `actions/upload-artifact` and `publish` downloads them. Verify with one dry run before registering the runner; the CI pool's Linux runner resets that upload today (`ECONNRESET`, run 33939121801), which is why dry runs tolerate a failed upload |
-| Toolchain | Zig 0.16.0 installed by `mlugg/setup-zig` in the job, exactly as CI does; Python ≥ 3.9 from the OS; `git`; `gh`; a Rust stable toolchain (`cargo`) and `bindgen` 0.72.1 for the AgentCore gate's link probe and bindings-regen check — the workflow's toolchain inventory fails a release job that lacks them |
-| Network | outbound only to GitHub (checkout, `setup-zig` download, artifact upload). Nothing in `zig build` downloads: ripgrep and TinyKG are vendored and hash-checked (`verify_ripgrep_binary.py`, `verify_tinykg_binary.py`) |
-
-The PR pool keeps its labels; nothing here changes `ci.yml`.
+| Runners | `ubuntu-latest`, `macos-latest`, `windows-latest`; one job per platform, `publish` on `ubuntu-latest` |
+| Trigger | `workflow_dispatch` only, inputs `tag` (bare `X.Y.Z` for the stable channel, a branch or full 40-hex commit SHA for `0.x.y-dev` pre-releases; `actions/checkout` rejects short SHAs) and `dry_run` (default `true`: build, verify, archive and upload artifacts, no draft) |
+| Toolchain | Zig 0.16.0 from `mlugg/setup-zig` (no cache); the images' Python and Rust stable (`cargo`); `bindgen` 0.72.1 installed by `cargo install bindgen-cli --locked` in the job for the AgentCore gate's bindings-regen check; PyYAML from `requirements-dev.txt` |
+| Network | `zig build` downloads nothing: ripgrep and TinyKG are vendored and hash-checked (`verify_ripgrep_binary.py`, `verify_tinykg_binary.py`). The job itself reaches GitHub (checkout, `setup-zig`, artifacts) and crates.io (`bindgen`) |
 
 ## Credentials
 
 - Build jobs run with `permissions: contents: read` and need no secret.
 - Only the `publish` job holds `contents: write`, only through the ephemeral
   `GITHUB_TOKEN`, and only to run `gh release create --draft --verify-tag`. No
-  long-lived token is stored on any runner.
+  long-lived token is stored anywhere.
 - The draft is published by a human in the GitHub UI after reading the
   SHA256SUMS; the workflow never flips a release to public.
 
-## Caches and cleanup
+## Reproducibility
 
-- `ZIG_GLOBAL_CACHE_DIR` / `ZIG_LOCAL_CACHE_DIR` point at a per-runner directory
-  as in CI; Zig's cache is content-addressed and folds the compiler version into
-  every hash, so reuse across releases is safe. Wipe it when the toolchain
-  changes.
 - Every run starts from `actions/checkout` with `fetch-depth: 0` and
   `fetch-tags: true` (the stable channel needs `git describe --tags
-  --exact-match HEAD`), and `git clean -ffdx` removes anything a previous run
-  left. Prefixes and archives live under `$RUNNER_TEMP`, which the runner
-  deletes after the job.
+  --exact-match HEAD`). Prefixes and archives live under `$RUNNER_TEMP`.
 - The reproducibility step archives twice into two directories and compares
   them byte for byte; a difference fails the release before anything is
   uploaded.
 
 ## Enabling the tag trigger
 
-Until the runners are registered, `release.yml` is `workflow_dispatch` only and
-the `runner_pool: pr-pool` input lets a maintainer dry-run the workflow on the CI
-machines (`dry_run: true`, no publish; `tag` takes a branch name or a full
-40-hex commit SHA, since `actions/checkout` rejects short SHAs). A pr-pool dry
-run joins the CI runner lane of the branch it was dispatched from (`github.ref`,
-normally main; the `tag` input picks what to build, not the lane), so it queues
-behind the CI job a merge
-just started instead of sharing the box with it. GitHub cancels the older
-*queued* job when a newer one joins a group, in both directions: a push to that
-lane cancels a still-queued dry-run job (re-dispatch), and a dispatch cancels a
-still-queued CI job in that lane (rerun it). Dispatch when `gh run list` shows
-the lane idle. Once the three
-runners report online:
-
-1. Remove the `pr-pool` choice from the workflow input.
-2. Add `on: push: tags: ["[0-9]+.[0-9]+.[0-9]+"]` so a bare `X.Y.Z` tag builds
-   the stable channel automatically; keep pre-releases (`0.x.y-dev+<commit12>`)
-   on `workflow_dispatch` only (#47 Q3).
-3. Tick the two "Final launch gate" items in `OPEN_SOURCE_READINESS.md` that
-   point here (dedicated runner; immutable pre-release with checksums).
+`release.yml` is `workflow_dispatch` only. To let a bare `X.Y.Z` tag build the
+stable channel automatically, add `on: push: tags: ["[0-9]+.[0-9]+.[0-9]+"]`
+and keep pre-releases (`0.x.y-dev+<commit12>`) on `workflow_dispatch` (#47
+Q3). The remaining "Final launch gate" item in `OPEN_SOURCE_READINESS.md` is
+the immutable pre-release with checksums.
 
 ## What a release proves
 

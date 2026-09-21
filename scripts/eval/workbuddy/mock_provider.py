@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import socketserver
 import stat
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -497,10 +498,35 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
+# How long a launcher waits for the ready file before declaring the provider
+# stuck. Startup is tens of milliseconds on an idle machine; the margin covers a
+# loaded 3-core hosted runner starting the interpreter beside eight test shards.
+# Launchers still notice an early exit immediately, so a large value only delays
+# the report of a provider that is genuinely hung.
+READY_DEADLINE_S = 30.0
+
+
+class _LoopbackServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer whose bind never resolves a host name.
+
+    ``HTTPServer.server_bind`` calls ``socket.getfqdn(host)`` to fill in
+    ``server_name``; on GitHub-hosted macOS runners that reverse lookup can
+    block for longer than the callers' readiness deadline, so the provider
+    looked hung while it was merely waiting on DNS. The server only ever
+    binds the loopback address and nothing reads ``server_name``.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
+
+
 def serve(*, ready: Path, request_log: Path, port: int, scenario: str = "final-v1") -> None:
     import threading
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    server = _LoopbackServer(("127.0.0.1", port), _Handler)
     server.state_lock = threading.Lock()  # type: ignore[attr-defined]
     server.requests = 0  # type: ignore[attr-defined]
     server.request_log = request_log  # type: ignore[attr-defined]
