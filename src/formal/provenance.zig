@@ -171,7 +171,7 @@ pub fn loadAdjacent(
     };
 }
 
-fn readBounded(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+pub fn readBounded(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.ProvenanceOpenFailed;
@@ -196,7 +196,7 @@ fn readBounded(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return bytes;
 }
 
-fn parseLowerHex64(raw: []const u8) ?[64]u8 {
+pub fn parseLowerHex64(raw: []const u8) ?[64]u8 {
     if (raw.len != 64) return null;
     var result: [64]u8 = undefined;
     for (raw, 0..) |byte, index| {
@@ -206,13 +206,13 @@ fn parseLowerHex64(raw: []const u8) ?[64]u8 {
     return result;
 }
 
-fn validLabel(raw: []const u8, max: usize) bool {
+pub fn validLabel(raw: []const u8, max: usize) bool {
     if (raw.len == 0 or raw.len > max) return false;
     for (raw) |byte| if (byte < 0x20 or byte > 0x7e) return false;
     return true;
 }
 
-fn expectedHostOs() ?[]const u8 {
+pub fn expectedHostOs() ?[]const u8 {
     return switch (builtin.os.tag) {
         .macos => "Darwin",
         .linux => "Linux",
@@ -221,7 +221,7 @@ fn expectedHostOs() ?[]const u8 {
     };
 }
 
-fn expectedHostArch() ?[]const u8 {
+pub fn expectedHostArch() ?[]const u8 {
     return switch (builtin.cpu.arch) {
         .x86_64 => "x86_64",
         .aarch64 => if (builtin.os.tag == .macos) "arm64" else "aarch64",
@@ -249,10 +249,35 @@ fn validUtcTimestamp(raw: []const u8) bool {
     return day > 0 and day <= days_in_month[month - 1];
 }
 
-fn sha256Hex(bytes: []const u8) [64]u8 {
+pub fn sha256Hex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
+}
+
+// ── test fixtures (shared with app/doctor.zig and project_provenance.zig) ────
+
+/// The manifest `scripts/build-formal-kernel.sh` writes, field for field, with
+/// the runtime's own constants substituted; the caller owns it.
+pub fn testManifest(allocator: std.mem.Allocator, binary_sha256: []const u8, binary_bytes: u64) ![]u8 {
+    const host_os = expectedHostOs() orelse return error.SkipZigTest;
+    const host_arch = expectedHostArch() orelse return error.SkipZigTest;
+    const zeros = "0" ** 64;
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"schema_version\":\"{s}\",\"checker_version\":\"{s}\",\"request_schema\":\"{s}\",\"memory_request_schema\":\"{s}\",\"artifact_request_schema\":\"{s}\",\"verdict_schema\":\"{s}\",\"binary_sha256\":\"{s}\",\"binary_bytes\":{d},\"kernel_source_sha256\":\"{s}\",\"memory_kernel_source_sha256\":\"{s}\",\"artifact_kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"{s}\",\"host_arch\":\"{s}\",\"linker\":\"test\",\"lean_version\":\"Lean (version 4.14.0, test)\",\"native_smoke\":\"passed\"}}\n",
+        .{ MANIFEST_SCHEMA, runtime.CHECKER_VERSION, runtime.REQUEST_SCHEMA, runtime.MEMORY_REQUEST_SCHEMA, runtime.ARTIFACT_REQUEST_SCHEMA, runtime.VERDICT_SCHEMA, binary_sha256, binary_bytes, zeros, zeros, zeros, zeros, zeros, host_os, host_arch },
+    );
+}
+
+/// The receipt that binds `manifest` and the binary; the caller owns it.
+pub fn testBuildReceipt(allocator: std.mem.Allocator, manifest: []const u8, binary_sha256: []const u8) ![]u8 {
+    const manifest_sha256 = sha256Hex(manifest);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"schema_version\":\"{s}\",\"artifact_manifest_sha256\":\"{s}\",\"binary_sha256\":\"{s}\",\"built_at_utc\":\"2026-01-01T00:00:00Z\"}}\n",
+        .{ BUILD_RECEIPT_SCHEMA, manifest_sha256[0..], binary_sha256 },
+    );
 }
 
 test "formal checker provenance is mandatory for a deployable admission" {

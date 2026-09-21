@@ -11,7 +11,13 @@ the same files, and `doctor --strict` must find rg beside the executable with
 a matching digest. `--doctor` additionally runs the installed
 `bin/metacodes doctor --json` from a neutral directory with no environment
 override and requires the TinyKG check to resolve to the adjacent vendored
-binary with a matching digest (#78). Python 3.9, stdlib only.
+binary with a matching digest (#78). The Lean kernel checks are evaluated when
+the report carries them: a kernel the executable pins must be shipped under
+`libexec/metacodes/` with a matching digest and a provenance sidecar that the
+kernel's own loader accepts (`provenance: true`); a pinned-but-absent kernel and
+a rejected sidecar are both named. The release layout ships no kernel today
+(release/LAYOUT.md), so a release executable is expected to pin none. Python
+3.9, stdlib only.
 """
 from __future__ import annotations
 
@@ -34,6 +40,17 @@ RELEASE_ENTRIES = frozenset((
     "share/doc/README.md",
 ))
 RELEASE_CHANGELOG_PREFIX = "share/doc/CHANGELOG-"
+KERNEL_CHECKS = ("formal_kernel", "project_kernel")
+# Everything doctor reads from the environment; stripped so the report describes
+# the prefix and nothing the developer's shell points at.
+DOCTOR_ENV_OVERRIDES = (
+    "METACODES_KG_BIN",
+    "RG_BIN",
+    "METACODES_FORMAL_KERNEL_PATH",
+    "METACODES_FORMAL_KERNEL_SHA256",
+    "METACODES_PROJECT_KERNEL_PATH",
+    "METACODES_PROJECT_KERNEL_SHA256",
+)
 
 
 def check(prefix: Path, ripgrep: bool = True, release: bool = False) -> list[str]:
@@ -101,13 +118,46 @@ def evaluate_doctor(report: object, prefix: Path, release: bool = False) -> list
         findings.append(f"doctor: tinykg source is {tinykg.get('source')!r}, expected 'adjacent'")
     if tinykg.get("match") is not True:
         findings.append(f"doctor: tinykg match is {tinykg.get('match')!r}, expected true")
+    findings.extend(evaluate_kernels(by_name, prefix))
+    return findings
+
+
+def evaluate_kernels(by_name: dict, prefix: Path) -> list[str]:
+    """Findings for the Lean kernel checks a doctor report carries. With no
+    environment override a kernel resolves only beside the executable and only
+    when the build pinned its digest, so a resolved kernel must sit under
+    `libexec/metacodes/`, match, and carry a sidecar its own loader accepts; a
+    pinned kernel that did not resolve was not shipped. An absent kernel check
+    (an older report shape) evaluates nothing."""
+    findings: list[str] = []
+    kernel_dir = (prefix / "libexec" / "metacodes").resolve()
+    for name in KERNEL_CHECKS:
+        kernel = by_name.get(name)
+        if kernel is None:
+            continue
+        resolved = kernel.get("resolved_path")
+        expected = kernel.get("expected_sha256")
+        if resolved is None:
+            if expected is not None:
+                findings.append(f"doctor: {name} is pinned ({expected}) but not shipped under {kernel_dir}")
+            continue
+        if kernel.get("source") != "adjacent":
+            findings.append(f"doctor: {name} source is {kernel.get('source')!r}, expected 'adjacent'")
+        if not isinstance(resolved, str) or Path(resolved).resolve().parent != kernel_dir:
+            findings.append(f"doctor: {name} resolved to {resolved!r}, not under {kernel_dir}")
+        if kernel.get("match") is not True:
+            findings.append(f"doctor: {name} match is {kernel.get('match')!r}, expected true")
+        if kernel.get("provenance") is not True:
+            findings.append(f"doctor: {name} provenance is {kernel.get('provenance')!r}, expected true (the sidecar beside it must satisfy the {name} loader)")
     return findings
 
 
 def run_doctor(prefix: Path, release: bool = False) -> list[str]:
     """Run the installed executable's doctor and evaluate its report."""
-    exe = prefix / "bin" / ("metacodes.exe" if os.name == "nt" else "metacodes")
-    env = {key: value for key, value in os.environ.items() if key not in ("METACODES_KG_BIN", "RG_BIN")}
+    # doctor runs from a neutral directory, so a relative prefix must be
+    # resolved before the chdir.
+    exe = (prefix / "bin" / ("metacodes.exe" if os.name == "nt" else "metacodes")).resolve()
+    env = {key: value for key, value in os.environ.items() if key not in DOCTOR_ENV_OVERRIDES}
     with tempfile.TemporaryDirectory() as neutral_cwd:
         completed = subprocess.run(
             [str(exe), "doctor", "--json", "--strict"] if release else [str(exe), "doctor", "--json"],
@@ -118,11 +168,18 @@ def run_doctor(prefix: Path, release: bool = False) -> list[str]:
             encoding="utf-8",
             timeout=120,
         )
-    if completed.returncode != 0:
-        return [f"doctor: exited {completed.returncode}: {completed.stderr.strip()[:200]}"]
     try:
         report = json.loads(completed.stdout)
     except json.JSONDecodeError:
+        report = None
+    if completed.returncode != 0:
+        # `--strict` prints the report before exiting 1: evaluate it so the
+        # finding names the failing check instead of an empty stderr.
+        findings = [f"doctor: exited {completed.returncode}: {completed.stderr.strip()[:200]}"]
+        if report is not None:
+            findings.extend(evaluate_doctor(report, prefix, release))
+        return findings
+    if report is None:
         return [f"doctor: stdout is not JSON: {completed.stdout[:200]!r}"]
     return evaluate_doctor(report, prefix, release)
 

@@ -18,7 +18,12 @@ repository-relative path) and with `RG_BIN` / `METACODES_KG_BIN` removed:
   3. `vendor/tinykg/tinykg version` names the declared version and a fresh store
      reports the declared storage format and store schema;
   4. `bin/metacodes doctor --json --strict` exits 0 and resolves ripgrep and
-     TinyKG to the files inside the prefix, with the manifest's digests.
+     TinyKG to the files inside the prefix, with the manifest's digests. The
+     Lean kernel checks are held to the same bar when the report carries them:
+     a kernel the executable pins must sit under `libexec/metacodes/`, match,
+     and carry a provenance sidecar its own loader accepts; a pin without a
+     shipped kernel fails. The layout ships no kernel today (release/LAYOUT.md),
+     so a release executable pins none and both checks stay unresolved.
 
 Check 6 (byte-identical archives) belongs to `release:archive` (#81).
 
@@ -256,18 +261,32 @@ def check_tinykg(prefix: Path, manifest: dict, cwd: Path) -> None:
         raise BundleError(f"tinykg fresh store reports {observed!r}, manifest declares {declared!r}")
 
 
+KERNEL_CHECKS = ("formal_kernel", "project_kernel")
+
+
 def check_doctor(prefix: Path, manifest: dict, cwd: Path) -> None:
     """Check 4: doctor resolves both runtime assets inside the prefix, digests matching."""
     executable = prefix / _component(manifest, "metacodes")["path"]
     completed = _run([str(executable), "doctor", "--json", "--strict"], cwd)
-    if completed.returncode != 0:
-        raise BundleError(f"doctor --strict exited {completed.returncode}: {completed.stdout.strip()[:200]}")
     try:
         report = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
+        if completed.returncode != 0:
+            raise BundleError(f"doctor --strict exited {completed.returncode}: {completed.stdout.strip()[:200]}") from exc
         raise BundleError(f"doctor --json is not JSON: {completed.stdout[:200]!r}") from exc
-    checks = {check.get("name"): check for check in report.get("checks") or []}
-    resolved_prefix = prefix.resolve()
+    if completed.returncode != 0:
+        # The report precedes the exit code: name the check that failed strict.
+        try:
+            evaluate_doctor_report(report, prefix, manifest)
+        except BundleError as exc:
+            raise BundleError(f"doctor --strict exited {completed.returncode}: {exc}") from exc
+        raise BundleError(f"doctor --strict exited {completed.returncode} on a check this verifier does not evaluate: {completed.stdout.strip()[:200]}")
+    evaluate_doctor_report(report, prefix, manifest)
+
+
+def evaluate_doctor_report(report: object, prefix: Path, manifest: dict) -> None:
+    """The judgement of check 4 over a parsed `doctor --json` document."""
+    checks = {check.get("name"): check for check in (report.get("checks") if isinstance(report, dict) else None) or [] if isinstance(check, dict)}
     for name in ("ripgrep", "tinykg"):
         check = checks.get(name)
         if check is None:
@@ -280,7 +299,23 @@ def check_doctor(prefix: Path, manifest: dict, cwd: Path) -> None:
             raise BundleError(f"doctor resolved {name} to {resolved}, outside the bundle ({expected_path})")
         if check.get("sha256") != _component(manifest, name)["sha256"] or check.get("match") is not True:
             raise BundleError(f"doctor sees {name} digest {check.get('sha256')!r}, manifest ships {_component(manifest, name)['sha256']}")
-        _ = resolved_prefix
+    kernel_dir = (prefix / "libexec" / "metacodes").resolve()
+    for name in KERNEL_CHECKS:
+        check = checks.get(name)
+        if check is None:
+            continue
+        resolved = check.get("resolved_path")
+        expected = check.get("expected_sha256")
+        if resolved is None:
+            if expected is not None:
+                raise BundleError(f"doctor pins {name} ({expected}) but the bundle ships no kernel under libexec/metacodes")
+            continue
+        if not isinstance(resolved, str) or Path(resolved).resolve().parent != kernel_dir:
+            raise BundleError(f"doctor resolved {name} to {resolved}, outside the bundle's libexec/metacodes")
+        if check.get("match") is not True:
+            raise BundleError(f"doctor sees {name} digest {check.get('sha256')!r}, the executable pins {expected}")
+        if check.get("provenance") is not True:
+            raise BundleError(f"doctor rejects the {name} provenance sidecar (provenance={check.get('provenance')!r}); it must satisfy the {name} loader")
 
 
 def verify(prefix: Path, native: bool) -> list[str]:
@@ -377,6 +412,30 @@ def _expect(findings: list[str], needle: str) -> None:
         raise SystemExit(f"self-test: expected a finding containing {needle!r}, got {findings!r}")
 
 
+def _expect_bundle_error(action, needle: str) -> None:
+    try:
+        action()
+    except BundleError as exc:
+        if needle in str(exc):
+            return
+        raise SystemExit(f"self-test: expected an error containing {needle!r}, got {exc!r}")
+    raise SystemExit(f"self-test: expected an error containing {needle!r}, got none")
+
+
+def _doctor_report(root: Path, manifest: dict, **project_kernel) -> dict:
+    """A `doctor --json` document for the fixture bundle; `project_kernel`
+    overrides the project kernel entry (unpinned and unresolved by default)."""
+    kernel = {"name": "project_kernel", "resolved_path": None, "sha256": None, "expected_sha256": None, "match": None, "source": None, "provenance": None}
+    kernel.update(project_kernel)
+    return {"checks": [
+        {"name": "ripgrep", "resolved_path": str(root / "bin/rg"), "sha256": _component(manifest, "ripgrep")["sha256"], "match": True, "source": "adjacent", "provenance": None},
+        {"name": "tinykg", "resolved_path": str(root / "vendor/tinykg/tinykg"), "sha256": _component(manifest, "tinykg")["sha256"], "match": True, "source": "adjacent", "provenance": None},
+        {"name": "formal_kernel", "resolved_path": None, "sha256": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
+        kernel,
+        {"name": "tinykgd", "resolved_path": None, "sha256": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
+    ]}
+
+
 def self_test() -> int:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory) / "bundle"
@@ -427,6 +486,18 @@ def self_test() -> int:
         _write_manifest(root, manifest)
         _write(root, "share/licenses/THIRD_PARTY_NOTICES.md", b"only ripgrep here")
         _expect(verify(root, native=False), "third-party notices do not mention tinykg")
+        _write(root, "share/licenses/THIRD_PARTY_NOTICES.md", b"ripgrep and TinyKG")
+
+        # Check 4's judgement over the report shape doctor prints. The layout
+        # ships no kernel, so an unpinned, unresolved kernel is the healthy case.
+        evaluate_doctor_report(_doctor_report(root, manifest), root, manifest)
+        _expect_bundle_error(lambda: evaluate_doctor_report(_doctor_report(root, manifest, expected_sha256="ab" * 32), root, manifest), "pins project_kernel")
+        shipped = {"resolved_path": str(root / "libexec/metacodes/metacodes-project-kernel"), "sha256": "ab" * 32, "expected_sha256": "ab" * 32, "match": True, "source": "adjacent", "provenance": True}
+        evaluate_doctor_report(_doctor_report(root, manifest, **shipped), root, manifest)
+        _expect_bundle_error(lambda: evaluate_doctor_report(_doctor_report(root, manifest, **dict(shipped, provenance=False)), root, manifest), "rejects the project_kernel provenance sidecar")
+        _expect_bundle_error(lambda: evaluate_doctor_report(_doctor_report(root, manifest, **dict(shipped, match=False)), root, manifest), "the executable pins")
+        _expect_bundle_error(lambda: evaluate_doctor_report(_doctor_report(root, manifest, **dict(shipped, resolved_path="/elsewhere/metacodes-project-kernel")), root, manifest), "outside the bundle's libexec/metacodes")
+        _expect_bundle_error(lambda: evaluate_doctor_report({"checks": []}, root, manifest), "no ripgrep check")
     print("verify_release_bundle: self-test ok")
     return 0
 

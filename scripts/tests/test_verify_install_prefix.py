@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.verify_install_prefix import check, evaluate_doctor
+from scripts.verify_install_prefix import check, evaluate_doctor, evaluate_kernels
 
 
 class VerifyInstallPrefixTest(unittest.TestCase):
@@ -95,3 +95,48 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         self.assertEqual(check(root, release=True), [])
         (root / "share/doc/CHANGELOG-0.2.0-dev.md").unlink()
         self.assertIn("missing: share/doc/CHANGELOG-<version>.md", check(root, release=True))
+
+    def _kernel_report(self, root, **kernel):
+        base = [
+            {"name": "ripgrep", "resolved_path": str(root / "bin/rg"), "match": True, "source": "adjacent"},
+            {"name": "tinykg", "resolved_path": str(root / "vendor/tinykg/tinykg"), "match": True, "source": "adjacent"},
+        ]
+        entry = {"name": "project_kernel", "resolved_path": None, "sha256": None, "expected_sha256": None, "match": None, "source": None, "provenance": None}
+        entry.update(kernel)
+        return {"checks": base + [{"name": "formal_kernel", "resolved_path": None, "expected_sha256": None, "provenance": None}, entry]}
+
+    def test_an_unpinned_absent_kernel_is_fine_and_a_pinned_absent_one_is_named(self):
+        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        self.assertEqual(evaluate_doctor(self._kernel_report(root), root, release=True), [])
+        findings = evaluate_doctor(self._kernel_report(root, expected_sha256="ab" * 32), root, release=True)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("project_kernel is pinned", findings[0])
+        self.assertIn("not shipped", findings[0])
+
+    def test_a_shipped_kernel_needs_a_matching_digest_and_an_accepted_sidecar(self):
+        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json", "libexec/metacodes/metacodes-project-kernel"))
+        shipped = dict(resolved_path=str(root / "libexec/metacodes/metacodes-project-kernel"), sha256="ab" * 32, expected_sha256="ab" * 32, match=True, source="adjacent", provenance=True)
+        self.assertEqual(evaluate_doctor(self._kernel_report(root, **shipped), root, release=True), [])
+        # The 2026-09-21 failure shape: everything matches, the sidecar was
+        # read with the wrong kernel's loader.
+        findings = evaluate_doctor(self._kernel_report(root, **dict(shipped, provenance=False)), root)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("project_kernel provenance is False", findings[0])
+        self.assertIn("project_kernel loader", findings[0])
+        # Every deviation is named, not just the first.
+        findings = evaluate_doctor(self._kernel_report(root, **dict(shipped, resolved_path="/elsewhere/metacodes-project-kernel", source="env", match=False, provenance=None)), root)
+        self.assertEqual(len(findings), 4)
+        self.assertTrue(any("expected 'adjacent'" in f for f in findings))
+        self.assertTrue(any("not under" in f for f in findings))
+        self.assertTrue(any("match is False" in f for f in findings))
+        self.assertTrue(any("provenance is None" in f for f in findings))
+
+    def test_kernel_evaluation_covers_both_kernels_and_tolerates_their_absence(self):
+        root = self._make(("bin/metacodes",))
+        self.assertEqual(evaluate_kernels({}, root), [])
+        by_name = {
+            "formal_kernel": {"resolved_path": None, "expected_sha256": "cd" * 32},
+            "project_kernel": {"resolved_path": None, "expected_sha256": "ef" * 32},
+        }
+        findings = evaluate_kernels(by_name, root)
+        self.assertEqual([f.split(" ")[1] for f in findings], ["formal_kernel", "project_kernel"])
