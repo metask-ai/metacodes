@@ -345,26 +345,8 @@ fn hasFileRedirect(segment: []const u8) bool {
 fn hasMutatingPayload(target: []const u8) bool {
     var tokens = std.mem.tokenizeAny(u8, target, " \t");
     const head = tokens.next() orelse return false;
-    if (std.mem.eql(u8, head, "sed")) {
-        while (tokens.next()) |tok| {
-            if (std.mem.startsWith(u8, tok, "-i") or std.mem.startsWith(u8, tok, "--in-place")) return true;
-            // An external script hides `w`/`e` commands from this scan.
-            if (std.mem.startsWith(u8, tok, "-f") or std.mem.startsWith(u8, tok, "--file")) return true;
-        }
-        const script = target[head.len..];
-        return hasSedWriteCommand(script) or hasSedExecCommand(script);
-    }
-    if (std.mem.eql(u8, head, "awk") or std.mem.eql(u8, head, "gawk") or std.mem.eql(u8, head, "mawk") or std.mem.eql(u8, head, "nawk")) {
-        // The program text is quoted, so the redirect scan above skipped it:
-        // `print > "f"`, `print | "cmd"`, `"cmd" | getline`, `system ("cmd")`.
-        // A program file (`-f prog.awk`) is invisible to this scan: disarm.
-        while (tokens.next()) |tok| {
-            if (std.mem.startsWith(u8, tok, "-f") or std.mem.startsWith(u8, tok, "--file")) return true;
-        }
-        return std.mem.indexOfScalar(u8, target, '>') != null or
-            std.mem.indexOfScalar(u8, target, '|') != null or
-            std.mem.indexOf(u8, target, "system") != null;
-    }
+    if (std.mem.eql(u8, head, "sed")) return !sedInvocationIsReadonly(&tokens);
+    if (std.mem.eql(u8, head, "awk") or std.mem.eql(u8, head, "gawk") or std.mem.eql(u8, head, "mawk") or std.mem.eql(u8, head, "nawk")) return !awkInvocationIsReadonly(&tokens);
     if (std.mem.eql(u8, head, "git")) {
         // Read-only subcommands with write-capable options.
         var sub: []const u8 = "";
@@ -405,7 +387,7 @@ fn hasMutatingPayload(target: []const u8) bool {
     }
     if (std.mem.eql(u8, head, "fd") or std.mem.eql(u8, head, "fdfind")) return hasFlag(&tokens, &[_][]const u8{ "-x", "--exec", "-X", "--exec-batch" });
     // GNU sort runs an external helper when it spills to disk.
-    if (std.mem.eql(u8, head, "sort")) return hasFlag(&tokens, &[_][]const u8{ "-o", "--output", "--compress-program" });
+    if (std.mem.eql(u8, head, "sort")) return hasFlag(&tokens, &[_][]const u8{ "-o", "--output", "--compress-program", "-T", "--temporary-directory" });
     if (std.mem.eql(u8, head, "uniq")) {
         // `uniq INPUT OUTPUT` writes its second positional argument.
         var positional: usize = 0;
@@ -431,28 +413,218 @@ fn hasFlag(tokens: *std.mem.TokenIterator(u8, .any), flags: []const []const u8) 
     return false;
 }
 
-/// GNU sed's `e` command / `s///e` flag execute the pattern space as a
-/// shell command: `sed 'e touch x'`, `sed 's/.*/touch x/e'`, `/re/e`.
-fn hasSedExecCommand(script: []const u8) bool {
+/// sed is admitted only through a small read-only grammar (GNU sed can
+/// execute with `e`, write with `w`/`W`, read with `r`/`R`, edit in place
+/// with `-i`, and hide any of that in `-f` files). Options: `-n -E -r -s -z
+/// -u` (alone or combined), their long forms, `-e SCRIPT` / `-eSCRIPT` /
+/// `--expression=SCRIPT`; the first non-option word is the script when no
+/// `-e` was given; the rest are input files. Scripts are shell words, so a
+/// quoted script may span several whitespace tokens (`'/a/p; /b/p'`).
+/// Anything else, including an unknown option, disarms.
+fn sedInvocationIsReadonly(tokens: *std.mem.TokenIterator(u8, .any)) bool {
+    var scripts_seen = false;
+    var expect_script = false;
+    while (tokens.next()) |tok| {
+        if (expect_script) {
+            const script = takeShellWord(tokens, tok, 0) orelse return false;
+            if (!sedScriptIsReadonly(script)) return false;
+            scripts_seen = true;
+            expect_script = false;
+            continue;
+        }
+        if (std.mem.eql(u8, tok, "-e") or std.mem.eql(u8, tok, "--expression")) {
+            expect_script = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, tok, "--expression=")) {
+            const script = takeShellWord(tokens, tok, "--expression=".len) orelse return false;
+            if (!sedScriptIsReadonly(script)) return false;
+            scripts_seen = true;
+            continue;
+        }
+        if (tok[0] == '-' and tok.len > 1) {
+            if (tok[1] == '-') {
+                for ([_][]const u8{ "--quiet", "--silent", "--regexp-extended", "--separate", "--null-data", "--unbuffered", "--posix" }) |ok| {
+                    if (std.mem.eql(u8, tok, ok)) break;
+                } else return false;
+                continue;
+            }
+            // Combined short flags such as `-ne`, `-rn`, `-nes/a/b/`: every
+            // letter must be safe; `e` ends the cluster and takes the script.
+            var k: usize = 1;
+            while (k < tok.len) : (k += 1) {
+                const c = tok[k];
+                if (c == 'e') {
+                    if (k + 1 < tok.len) {
+                        const script = takeShellWord(tokens, tok, k + 1) orelse return false;
+                        if (!sedScriptIsReadonly(script)) return false;
+                        scripts_seen = true;
+                    } else expect_script = true;
+                    break;
+                }
+                if (c != 'n' and c != 'E' and c != 'r' and c != 's' and c != 'z' and c != 'u') return false;
+            }
+            continue;
+        }
+        if (!scripts_seen) {
+            const script = takeShellWord(tokens, tok, 0) orelse return false;
+            if (!sedScriptIsReadonly(script)) return false;
+            scripts_seen = true;
+            continue;
+        }
+        // input file operand: fine
+    }
+    return scripts_seen and !expect_script;
+}
+
+/// The shell word that starts at `tok[offset..]`. A word opened by `'` or
+/// `"` runs to the matching close quote in the underlying buffer (across
+/// whitespace tokens) and is returned without its quotes; the iterator is
+/// advanced past it. Null (= disarm) when the quote is unterminated, when
+/// the close quote is glued to more characters (`'s/a/b/'e` is one word),
+/// or when an unquoted / double-quoted word carries a `$` expansion whose
+/// value this sensor cannot see (`declare x='e touch f'; sed "$x"`).
+fn takeShellWord(tokens: *std.mem.TokenIterator(u8, .any), tok: []const u8, offset: usize) ?[]const u8 {
+    const word = tok[offset..];
+    if (word.len == 0) return null;
+    const quote = word[0];
+    if (quote != '\'' and quote != '"') return if (std.mem.indexOfScalar(u8, word, '$') != null) null else word;
+    const buffer = tokens.buffer;
+    const start = (@intFromPtr(tok.ptr) - @intFromPtr(buffer.ptr)) + offset + 1;
+    var i = start;
+    while (i < buffer.len) : (i += 1) {
+        if (quote == '"' and buffer[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (buffer[i] == quote) break;
+    }
+    if (i >= buffer.len) return null;
+    if (i + 1 < buffer.len and buffer[i + 1] != ' ' and buffer[i + 1] != '\t') return null;
+    if (quote == '"' and std.mem.indexOfScalar(u8, buffer[start..i], '$') != null) return null;
+    tokens.index = i + 1;
+    return buffer[start..i];
+}
+
+/// One sed script: commands separated by `;` / newline, each optionally
+/// prefixed by an address (`12`, `$`, `1,5`, `/re/`, `\%re%`, `!`). Allowed
+/// commands: `p d q Q = l n N h H g G x D P b t T { } #` and `s`/`y` whose
+/// flags are drawn from `g p i I m M digits`. `s` and `y` bodies are skipped
+/// by delimiter; everything else (e, w, W, r, R, a, i, c, F, z, v, e-flag)
+/// disarms. `script` is the shell word without its quotes (takeShellWord).
+fn sedScriptIsReadonly(script: []const u8) bool {
     var i: usize = 0;
+    while (i < script.len) {
+        // separators and whitespace
+        if (script[i] == ';' or script[i] == '\n' or script[i] == ' ' or script[i] == '\t') {
+            i += 1;
+            continue;
+        }
+        // address: numbers, `$`, commas, `/re/` or `\%re%`, `!`
+        while (i < script.len) {
+            const c = script[i];
+            if (std.ascii.isDigit(c) or c == '$' or c == ',' or c == '!' or c == ' ') {
+                i += 1;
+            } else if (c == '/' or c == '\\') {
+                const delim: u8 = if (c == '\\') blk: {
+                    if (i + 1 >= script.len) return false;
+                    i += 1;
+                    break :blk script[i];
+                } else '/';
+                i += 1;
+                const end = sedFindDelimiter(script, i, delim) orelse return false;
+                i = end + 1;
+            } else break;
+        }
+        if (i >= script.len) return true;
+        const cmd = script[i];
+        i += 1;
+        switch (cmd) {
+            'p', 'd', 'q', 'Q', '=', 'l', 'n', 'N', 'h', 'H', 'g', 'G', 'x', 'D', 'P', '{', '}' => {},
+            'b', 't', 'T' => {
+                // optional label up to ; or newline
+                while (i < script.len and script[i] != ';' and script[i] != '\n') : (i += 1) {}
+            },
+            '#' => {
+                while (i < script.len and script[i] != '\n') : (i += 1) {}
+            },
+            's', 'y' => {
+                if (i >= script.len) return false;
+                const delim = script[i];
+                i += 1;
+                const mid = sedFindDelimiter(script, i, delim) orelse return false;
+                const end = sedFindDelimiter(script, mid + 1, delim) orelse return false;
+                i = end + 1;
+                // flags
+                while (i < script.len and script[i] != ';' and script[i] != '\n' and script[i] != ' ') : (i += 1) {
+                    const f = script[i];
+                    if (!(f == 'g' or f == 'p' or f == 'i' or f == 'I' or f == 'm' or f == 'M' or std.ascii.isDigit(f))) return false;
+                }
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// Index of the next unescaped `delim` at or after `from`.
+fn sedFindDelimiter(script: []const u8, from: usize, delim: u8) ?usize {
+    var i = from;
     while (i < script.len) : (i += 1) {
-        if (script[i] != 'e') continue;
-        const prev_ok = i > 0 and (script[i - 1] == '/' or script[i - 1] == ';' or script[i - 1] == '{' or script[i - 1] == '\'' or script[i - 1] == '"');
-        const next_ok = i + 1 >= script.len or script[i + 1] == ' ' or script[i + 1] == ';' or script[i + 1] == '}' or script[i + 1] == '\'' or script[i + 1] == '"' or script[i + 1] == '\n';
-        if (prev_ok and next_ok) return true;
+        if (script[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (script[i] == delim) return i;
+    }
+    return null;
+}
+
+/// awk is admitted only as `awk [-F sep] [-v var=val]... 'program' files...`
+/// where the program plus file operands contain no `>`, `|`, `@` or a
+/// `system(` call (output redirection, pipes to commands, `@include`/`@load`,
+/// command execution). The program is shell-quoted, so whitespace tokens do
+/// not bound it: the scan covers everything after the options. Any other
+/// option (`-f`, `-i inplace`, `-l`, `-M`, `-e`, `--`, ...) disarms.
+fn awkInvocationIsReadonly(tokens: *std.mem.TokenIterator(u8, .any)) bool {
+    while (tokens.peek()) |tok| {
+        if (tok[0] != '-' or tok.len < 2) break;
+        _ = tokens.next();
+        if (std.mem.eql(u8, tok, "-F") or std.mem.eql(u8, tok, "-v")) {
+            if (tokens.next() == null) return false; // dangling option
+            continue;
+        }
+        if (std.mem.startsWith(u8, tok, "-F") or std.mem.startsWith(u8, tok, "-v")) continue; // attached value
+        return false;
+    }
+    const program = tokens.rest();
+    if (program.len == 0) return false;
+    if (std.mem.indexOfAny(u8, program, ">|@") != null) return false;
+    if (hasExpansionOutsideSingleQuotes(program)) return false;
+    return !hasAwkSystemCall(program);
+}
+
+/// `$` that the shell would expand (outside single quotes): `awk "$PROG"`,
+/// `awk '{print}' "$f"`. Field references inside the single-quoted program
+/// (`'{ print $1 }'`) do not count.
+fn hasExpansionOutsideSingleQuotes(text: []const u8) bool {
+    var in_single = false;
+    for (text) |c| {
+        if (c == '\'') in_single = !in_single;
+        if (c == '$' and !in_single) return true;
     }
     return false;
 }
 
-/// A `w`/`W` command in a sed script (`s/a/b/w out`, `/x/w out`, `-e 'w f'`).
-fn hasSedWriteCommand(script: []const u8) bool {
-    var i: usize = 0;
-    while (i + 1 < script.len) : (i += 1) {
-        const c = script[i];
-        if ((c == 'w' or c == 'W') and script[i + 1] == ' ' and i > 0) {
-            const prev = script[i - 1];
-            if (prev == '/' or prev == ';' or prev == '{' or prev == ' ' or prev == '\'' or prev == '"') return true;
-        }
+/// `system(` / `system (`: awk builtins may take whitespace before the
+/// parenthesis. Plain `system` (a file named system.log) does not match.
+fn hasAwkSystemCall(program: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, program, from, "system")) |at| {
+        var i = at + "system".len;
+        while (i < program.len and (program[i] == ' ' or program[i] == '\t')) : (i += 1) {}
+        if (i < program.len and program[i] == '(') return true;
+        from = at + 1;
     }
     return false;
 }
@@ -653,6 +825,50 @@ test "external scripts and executing commands in awk, sed and sort disarm" {
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed 's/tea/coffee/' menu.txt\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk -F: '{ print $1 }' /etc/passwd\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sort -u words.txt\"}"));
+}
+
+test "sed and awk grammar allowlists: GNU execution forms disarm, plain scripts explore" {
+    // Codex pass 5: `sed -e e`, `s///ep`, `s///pe`, `awk -i inplace`, `@include`, `sort -T .`.
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"printf 'touch report.md\\\\n' | sed -e e\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"printf x | sed 's/.*/touch report.md/ep'\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"printf x | sed 's/.*/touch report.md/pe'\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed '1r other.txt' f\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed -ne 'w out' f\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed --debug -n p f\"}")); // unknown option
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed -n 's/a/b/'e f\"}")); // glued word
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed -ni 's/a/b/' f\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed -n 's/a/b\"}")); // unterminated quote
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -ne '/x/p' f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -nes/a/b/p f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n \\\"s/foo bar/x/p\\\" f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed '/^$/d; s/  */ /g' f | head\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk -i inplace '{ $0=\\\"changed\\\"; print }' file\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk '@include \\\"mutator.awk\\\"' input\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk -e '{print}' input\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sort -T . big.txt\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sort --temporary-directory=. big.txt\"}"));
+    // Read-only shapes the models actually use.
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n '10,20p' src/main.zig\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n '/error/p; /warn/p' log.txt\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n 's/^\\\\(.*\\\\)=.*$/\\\\1/p' settings.ini\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -E 's/tea/coffee/g; 3d; $=' menu.txt\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n -e '1p' -e '5,$p' f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk -F: '{ print $1 }' /etc/passwd\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk -v n=2 'NR != n { print $0 }' f\"}"));
+    // A `>` comparison is indistinguishable from a redirect without a real parser: disarms by design.
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk -v n=2 'NR>n { print $0 }' f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sort -u words.txt\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk '{ print $2 }' system.log\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk 'BEGIN { system (\\\"touch x\\\") }' /dev/null\"}"));
+    // Shell expansion inside the script word: the value is invisible here.
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"declare x='e touch f'; printf y | sed \\\"$x\\\"\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"printf y | sed $x\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed -n \\\"s/$v/x/p\\\" f\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk \\\"$PROG\\\" f\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk '{ print $1 }' \\\"$f\\\"\"}")); // over-disarms: acceptable
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n '$=' f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n '/x$/p' f\"}"));
 }
 
 test "bash redirects and in-place flags disarm" {
