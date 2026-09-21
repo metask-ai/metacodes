@@ -31,6 +31,7 @@
 //!   - **排除(用户指令)**:Linux bubblewrap 沙箱不做(登记差距矩阵)。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const mailbox = @import("mailbox.zig");
@@ -660,9 +661,17 @@ pub fn spawnTeammateProcess(
     // The child is live but not yet owned by process_teammates. Any
     // allocation/append failure below must terminate and reap it before the
     // config rollback removes its membership.
+    // `forkExecTeammate` is POSIX-only and returns an integer pid.  The
+    // injected spawn seam is still compiled on Windows for ABI/component
+    // tests, where the platform process handle is a pointer.  Keep the
+    // cleanup branch compile-time eliminated there instead of attempting an
+    // invalid integer cast (and keep Windows ownership cleanup in
+    // `terminateProcessTeammates`).
     errdefer {
-        process_mod.killJob(@intCast(pid));
-        process_mod.reapBlocking(@intCast(pid));
+        if (comptime builtin.os.tag != .windows) {
+            process_mod.killJob(@intCast(pid));
+            process_mod.reapBlocking(@intCast(pid));
+        }
     }
 
     // ④ 记录供关闭清理。

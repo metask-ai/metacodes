@@ -47,7 +47,7 @@ test "L2 验收①: budget 包装下内置 Write 仍是内置身份并产出 fil
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
 
     var catalog = try core.tool_catalog.Catalog.initBuiltins(a, &.{ "Read", "Write" });
     defer catalog.deinit();
@@ -93,7 +93,7 @@ test "L2 验收①: budget 包装下 denied Write 产生 rejected file_change �
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
 
     var catalog = try core.tool_catalog.Catalog.initBuiltins(a, &.{"Write"});
     defer catalog.deinit();
@@ -136,7 +136,7 @@ test "L2 验收①: 观察面经 budget 包装看到 Read 的 replay 解析为 r
         .data = "wrapped read fixture",
     });
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const path = try std.fmt.allocPrint(a, "{s}/wrapped-read.txt", .{root});
     defer a.free(path);
     const input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\"}}", .{path});
@@ -511,7 +511,7 @@ test "L2 验收④: budget∘skill∘mcp∘Selection 一次解析贯穿全栈且
         .data = "composed-read-fixture",
     });
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const path = try std.fmt.allocPrint(a, "{s}/composed-read.txt", .{root});
     defer a.free(path);
     const read_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\"}}", .{path});
@@ -697,7 +697,7 @@ test "L2 budget 包装:超过 tool_result_cap 的 Read 图片保持 inline 图�
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
 
     // 9000 原始字节 → 12000 base64:高于 8 KiB 的 cap。
     const raw = try a.alloc(u8, 9000);
@@ -751,7 +751,7 @@ test "L2 budget 包装:cap 低于 IMAGE_RESULT_BUDGET_BYTES 时图片按 6400 �
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
     const raw = try a.alloc(u8, 9000);
     defer a.free(raw);
     for (raw, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% 3);
