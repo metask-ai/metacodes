@@ -75,8 +75,8 @@ test "L2 SW2 端到端: TeamCreate → Task spawn teammate → SendMessage → p
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw2-l2-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw2-l2");
     defer cc.util_fs.testing.rmrfBestEffort(home);
     try cc.util_fs.mkdirParents(home);
 
@@ -205,8 +205,8 @@ test "L2 SW2 F1/F2: teammate SendMessage 回 lead 送达 lead 邮箱" {
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw2-f1-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw2-f1");
     defer cc.util_fs.testing.rmrfBestEffort(home);
     try cc.util_fs.mkdirParents(home);
 
@@ -285,8 +285,8 @@ test "L2 SW2 F6: SendMessage 广播送达两 teammate" {
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw2-bc-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw2-bc");
     defer cc.util_fs.testing.rmrfBestEffort(home);
     try cc.util_fs.mkdirParents(home);
 
@@ -336,8 +336,8 @@ test "L2 SW2: 非 lead 上下文的 Task(name) 被拒(teammate 不 spawn teammat
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw2-nonlead-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw2-nonlead");
     defer cc.util_fs.testing.rmrfBestEffort(home);
     try cc.util_fs.mkdirParents(home);
 
