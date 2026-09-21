@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Dict
 
 
-# Mirrors scripts.eval.workbuddy.mock_provider.READY_DEADLINE_S (this script
-# runs as a file, not as a package member, so it cannot import it): how long to
-# wait for a mock provider's ready file before calling it stuck.
-READY_DEADLINE_S = 30.0
+# This script runs as a file, not as a package member; put the repository root
+# on sys.path so the readiness deadline stays single-sourced in mock_provider.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from scripts.eval.workbuddy.mock_provider import READY_DEADLINE_S  # noqa: E402
 
 ARMS = ("codex_style", "claude_style", "tinykg")
 KG_TOOL_MARKERS = ("\n----- KgRemember -----\n", "\n----- KgRecall -----\n")
@@ -40,7 +42,7 @@ def _headless_protocol_smoke(binary: Path) -> None:
         target = work / ".gitignore"
         ready = root / "ready.json"
         request_log = root / "requests.jsonl"
-        repo = Path(__file__).resolve().parents[2]
+        repo = REPO_ROOT
         provider = subprocess.Popen(
             [
                 sys.executable,
@@ -136,7 +138,7 @@ def _workbuddy_tool_policy_smoke(binary: Path, tinykg_binary: Path) -> None:
         root = Path(directory)
         ready = root / "ready.json"
         request_log = root / "requests.jsonl"
-        repo = Path(__file__).resolve().parents[2]
+        repo = REPO_ROOT
         provider = subprocess.Popen(
             [
                 sys.executable,
@@ -490,7 +492,7 @@ def main() -> int:
         _require(path.is_file() and os.access(path, os.X_OK), f"{label} is not executable: {path}")
 
     _version_output_smoke(binary, args.expected_version)
-    _version_json_smoke(binary, args.expected_version, Path(__file__).resolve().parents[2])
+    _version_json_smoke(binary, args.expected_version, REPO_ROOT)
     _doctor_smoke(binary, tinykg_binary)
 
     dumps = {arm: _dump(binary, tinykg_binary, arm) for arm in ARMS}

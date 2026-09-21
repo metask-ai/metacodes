@@ -12,37 +12,23 @@
 const std = @import("std");
 const cc = @import("cc");
 const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
-const pprocess = @import("platform").process;
-const ppaths = @import("platform").paths;
 
 const render = cc.skills_render;
 
-// 每进程唯一的 fixture 目录 `<tmp>/cc-zig-fr-l2-<pid>`(POSIX /tmp,Windows %TEMP%)。
-// 8 个分片进程并行跑本文件的不同用例,共用一个固定目录会互相踩;Windows 上还额外
-// 依赖当前驱动器根下的 \tmp 存在。见 src/tools/test_tmp.zig 头注释。
+// 每进程唯一的 fixture 目录 `<tmp>/cc-zig-fr-l2-<pid>`(util/fs.zig testing.tmpRoot 定平台规则)。
+// 8 个分片进程并行跑本文件的不同用例,共用一个固定目录会互相踩。每个建目录的用例
+// 自己 `defer rmdir`,不往 /tmp 里留东西。
 var base_buf: [512]u8 = undefined;
 var base_len: usize = 0;
 
 fn base() [:0]const u8 {
-    if (base_len == 0) {
-        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const tmp = if (@import("builtin").os.tag == .windows) fwd(&tmp_buf, ppaths.tempDir()) else "/tmp";
-        const s = std.fmt.bufPrintZ(&base_buf, "{s}/cc-zig-fr-l2-{d}", .{ tmp, pprocess.currentPid() }) catch unreachable;
-        base_len = s.len;
-    }
+    if (base_len == 0) base_len = cc.util_fs.testing.perPidDir(&base_buf, "cc-zig-fr-l2").len;
     return base_buf[0..base_len :0];
 }
 
 /// `<base>/<name>`,NUL 结尾写进 buf。
 fn sub(buf: []u8, name: []const u8) [:0]const u8 {
     return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ base(), name }) catch unreachable;
-}
-
-/// 反斜杠 → 正斜杠(拷进 out)。Windows API 两种都认;正斜杠可直接拼进 @path 渲染。
-fn fwd(out: []u8, s: []const u8) []const u8 {
-    const n = @min(s.len, out.len);
-    for (s[0..n], 0..) |c, i| out[i] = if (c == '\\') '/' else c;
-    return out[0..n];
 }
 
 fn writeTmp(path: [*:0]const u8, content: []const u8) void {
@@ -55,6 +41,7 @@ fn writeTmp(path: [*:0]const u8, content: []const u8) void {
 test "L2 fileref: @relative inlines content anchored to skill_dir" {
     const a = std.testing.allocator;
     _ = std.c.mkdir(base().ptr, 0o755);
+    defer _ = std.c.rmdir(base().ptr);
     var nb: [512]u8 = undefined;
     const note = sub(&nb, "note.md");
     writeTmp(note.ptr, "NOTE BODY");
@@ -68,6 +55,7 @@ test "L2 fileref: @relative inlines content anchored to skill_dir" {
 test "L2 fileref: @\"quoted\" with spaces" {
     const a = std.testing.allocator;
     _ = std.c.mkdir(base().ptr, 0o755);
+    defer _ = std.c.rmdir(base().ptr);
     var sb: [512]u8 = undefined;
     const spaced = sub(&sb, "a b.txt");
     writeTmp(spaced.ptr, "SPACED");
@@ -96,9 +84,11 @@ test "L2 fileref: @/absolute outside boundary refused" {
 test "L2 fileref: @../ escape refused" {
     const a = std.testing.allocator;
     _ = std.c.mkdir(base().ptr, 0o755);
+    defer _ = std.c.rmdir(base().ptr);
     var subdir_buf: [512]u8 = undefined;
     const subdir = sub(&subdir_buf, "sub");
     _ = std.c.mkdir(subdir.ptr, 0o755);
+    defer _ = std.c.rmdir(subdir.ptr);
     var secret_buf: [512]u8 = undefined;
     const secret = sub(&secret_buf, "secret.md");
     writeTmp(secret.ptr, "SECRET");

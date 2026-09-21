@@ -18,7 +18,6 @@
 const std = @import("std");
 const cc = @import("cc");
 const pfs = @import("platform").fs;
-const pprocess = @import("platform").process;
 const ppaths = @import("platform").paths;
 
 const tools = cc.tools;
@@ -36,16 +35,6 @@ fn dispatchOk(ctx: *const ToolContext, name: []const u8, args: []const u8) ![]u8
             return error.UnexpectedDispatchOutcome;
         },
     };
-}
-
-/// 临时目录根:POSIX 固定 "/tmp"(macOS $TMPDIR 与其它按 /tmp 拼路径的测试要对得上),
-/// Windows 用 %TEMP% 并把反斜杠归一为正斜杠(Windows API 两种都认,嵌 JSON 免转义)。
-fn tmpRoot(buf: []u8) []const u8 {
-    if (@import("builtin").os.tag != .windows) return "/tmp";
-    const raw = ppaths.tempDir();
-    const n = @min(raw.len, buf.len);
-    for (raw[0..n], 0..) |c, i| buf[i] = if (c == '\\') '/' else c;
-    return buf[0..n];
 }
 
 fn mkdirAt(path: []const u8) void {
@@ -84,11 +73,9 @@ const Sandbox = struct {
     svc: *Service,
 
     fn init(a: std.mem.Allocator, tag: []const u8, basename: []const u8, content: []const u8) !Sandbox {
-        // POSIX /tmp,Windows %TEMP%(正斜杠归一,路径要嵌进 JSON 参数):不依赖当前
-        // 驱动器根下的 \tmp 存在,也不与其它测试进程共用一个固定目录。
-        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const tmp = tmpRoot(&tmp_buf);
-        const dir = try std.fmt.allocPrint(a, "{s}/{s}-{d}", .{ tmp, tag, pprocess.currentPid() });
+        // 每进程唯一目录,根按平台选(util/fs.zig testing.tmpRoot);路径要嵌进 JSON 参数,已归一正斜杠。
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try a.dupe(u8, cc.util_fs.testing.perPidDir(&dir_buf, tag));
         errdefer a.free(dir);
         mkdirAt(dir);
         const file = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, basename });
