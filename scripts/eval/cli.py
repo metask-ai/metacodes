@@ -658,6 +658,8 @@ def cmd_run_paired(args: argparse.Namespace) -> int:
         budget_used_tokens=args.budget_used_tokens,
         max_cumulative_cost_usd=args.max_cumulative_cost_usd,
         max_cumulative_tokens=args.max_cumulative_tokens,
+        max_rollout_cost_usd=args.max_rollout_cost_usd,
+        max_rollout_metered_tokens=args.max_rollout_metered_tokens,
     )
     print(
         f"paired E2E complete: baseline={len(baseline)} candidate={len(candidate)} "
@@ -1281,6 +1283,12 @@ def parser() -> argparse.ArgumentParser:
     paired_parser.add_argument("--budget-used-tokens", type=int, default=0)
     paired_parser.add_argument("--max-cumulative-cost-usd", type=float)
     paired_parser.add_argument("--max-cumulative-tokens", type=int)
+    paired_parser.add_argument(
+        "--max-rollout-cost-usd",
+        type=float,
+        help="per-rollout allowance sealed into the runtime budget; the binary stops with stop_reason=budget instead of being killed",
+    )
+    paired_parser.add_argument("--max-rollout-metered-tokens", type=int)
     paired_parser.set_defaults(func=cmd_run_paired)
 
     multi_parser = commands.add_parser(

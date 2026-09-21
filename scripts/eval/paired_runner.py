@@ -166,6 +166,38 @@ def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+def _require_rollout_reservation(
+    collected: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    used_cost_usd: float,
+    used_tokens: int,
+    rollout_cost_usd: float,
+    rollout_tokens: int,
+    max_cumulative_cost_usd: float | None,
+    max_cumulative_tokens: int | None,
+) -> None:
+    """Refuse to start a rollout whose full allowance would breach a cumulative cap."""
+    # Same accounting as _require_budget: import_run records the four
+    # TOKEN_METRICS, never a pre-summed total (Codex review pass 3).
+    cost = used_cost_usd
+    tokens = used_tokens
+    for rows in collected.values():
+        for row in rows:
+            metrics = row.get("metrics") or {}
+            cost += float(metrics.get("cost_usd") or 0.0)
+            tokens += sum(int(metrics.get(key) or 0) for key in TOKEN_METRICS)
+    if max_cumulative_cost_usd is not None and cost + rollout_cost_usd > max_cumulative_cost_usd:
+        raise ValidationError(
+            f"next rollout allowance ${rollout_cost_usd:.4f} on top of ${cost:.4f} used "
+            f"would exceed the cumulative cost cap ${max_cumulative_cost_usd:.4f}"
+        )
+    if max_cumulative_tokens is not None and tokens + rollout_tokens > max_cumulative_tokens:
+        raise ValidationError(
+            f"next rollout allowance {rollout_tokens} tokens on top of {tokens} used "
+            f"would exceed the cumulative token cap {max_cumulative_tokens}"
+        )
+
+
 def _require_budget(
     collected: Mapping[str, Sequence[Dict[str, Any]]],
     *,
@@ -1065,6 +1097,8 @@ def run_paired(
     budget_used_tokens: int = 0,
     max_cumulative_cost_usd: float | None = None,
     max_cumulative_tokens: int | None = None,
+    max_rollout_cost_usd: float | None = None,
+    max_rollout_metered_tokens: int | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if (
         not math.isfinite(budget_used_cost_usd)
@@ -1072,6 +1106,32 @@ def run_paired(
         or budget_used_tokens < 0
     ):
         raise ValidationError("budget usage offsets must be non-negative")
+    # A per-rollout allowance is the scored analogue of a harness kill: the
+    # binary stops with stop_reason=budget and exits 0, so the rollout stays
+    # valid and its workspace is graded as it stands. Both caps travel
+    # together (the runtime refuses one without the other) and are sealed
+    # into the evaluation metadata fd by run_e2e.sh, never into the model's
+    # environment.
+    if (max_rollout_cost_usd is None) != (max_rollout_metered_tokens is None):
+        raise ValidationError("per-rollout budget requires both cost and token caps")
+    if max_rollout_cost_usd is not None and (
+        not math.isfinite(float(max_rollout_cost_usd)) or float(max_rollout_cost_usd) <= 0
+    ):
+        raise ValidationError("per-rollout max cost must be finite and > 0")
+    if max_rollout_metered_tokens is not None and max_rollout_metered_tokens <= 0:
+        raise ValidationError("per-rollout max metered tokens must be > 0")
+    if (
+        max_rollout_cost_usd is not None
+        and max_cumulative_cost_usd is not None
+        and float(max_rollout_cost_usd) > max_cumulative_cost_usd
+    ):
+        raise ValidationError("per-rollout max cost exceeds the cumulative cap")
+    if (
+        max_rollout_metered_tokens is not None
+        and max_cumulative_tokens is not None
+        and max_rollout_metered_tokens > max_cumulative_tokens
+    ):
+        raise ValidationError("per-rollout max metered tokens exceeds the cumulative cap")
     if max_cumulative_cost_usd is not None and (
         not math.isfinite(max_cumulative_cost_usd) or max_cumulative_cost_usd <= 0
     ):
@@ -1135,6 +1195,25 @@ def run_paired(
                 max_cumulative_cost_usd=max_cumulative_cost_usd,
                 max_cumulative_tokens=max_cumulative_tokens,
             )
+            run_once_options: Dict[str, Any] = {
+                "timeout_seconds": expected_tasks[task_id]["constraints"]["timeout_seconds"],
+            }
+            if max_rollout_cost_usd is not None:
+                # Reserve the whole per-rollout allowance against the cumulative
+                # cap before spending: a rollout may use every token of its
+                # allowance, so "cumulative usage still below the cap" is not
+                # enough to guarantee the cap holds after it (Codex review).
+                _require_rollout_reservation(
+                    collected,
+                    used_cost_usd=budget_used_cost_usd,
+                    used_tokens=budget_used_tokens,
+                    rollout_cost_usd=float(max_rollout_cost_usd),
+                    rollout_tokens=max_rollout_metered_tokens,
+                    max_cumulative_cost_usd=max_cumulative_cost_usd,
+                    max_cumulative_tokens=max_cumulative_tokens,
+                )
+                run_once_options["max_cost_usd"] = float(max_rollout_cost_usd)
+                run_once_options["max_metered_tokens"] = max_rollout_metered_tokens
             run_dir = _run_once(
                 repo_root,
                 binaries[variant],
@@ -1145,7 +1224,7 @@ def run_paired(
                 model_id,
                 effective_suite_path,
                 revisions[variant],
-                timeout_seconds=expected_tasks[task_id]["constraints"]["timeout_seconds"],
+                **run_once_options,
             )
             rollouts = import_run(suite, repo_root, run_dir)
             selected = [

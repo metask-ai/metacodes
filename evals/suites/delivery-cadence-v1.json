@@ -1,0 +1,454 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-delivery-cadence-v1",
+  "description": "Delivery-cadence evaluation cohort. Hazard tasks (9x_dc_*) are open-ended investigations over a frozen synthetic snapshot whose deliverable is a report file with one machine-checkable finding; the runtime token allowance plays the harness kill. Regression tasks are copied from core-e2e so the gate's silence on ordinary work is measured in the same run.",
+  "tasks": [
+    {
+      "id": "90_dc_taint_trace",
+      "scenario": "tests/e2e/scenarios/90_dc_taint_trace.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "4e838d43e5c7043819e2bd81c499c92ba9f9d711",
+          "prefix": "tests/e2e/fixtures/delivery_cadence/taint_trace",
+          "paths": [
+            "README.md",
+            "svc/__init__.py",
+            "svc/handlers.py",
+            "svc/pipeline/__init__.py",
+            "svc/pipeline/archive.py",
+            "svc/pipeline/exec_backend.py",
+            "svc/pipeline/exporters.py",
+            "svc/pipeline/formats.py",
+            "svc/pipeline/manifest.py",
+            "svc/pipeline/mirror.py",
+            "svc/pipeline/normalize.py",
+            "svc/pipeline/quoting.py",
+            "svc/pipeline/render.py",
+            "svc/pipeline/scheduler.py",
+            "svc/pipeline/search.py",
+            "svc/pipeline/thumbnails.py",
+            "svc/pipeline/validate.py",
+            "svc/util/__init__.py",
+            "svc/util/audit.py",
+            "svc/util/cache.py",
+            "svc/util/clock.py",
+            "svc/util/config.py",
+            "svc/util/csv_io.py",
+            "svc/util/errors.py",
+            "svc/util/hashing.py",
+            "svc/util/headers.py",
+            "svc/util/hooks.py",
+            "svc/util/index.py",
+            "svc/util/json_io.py",
+            "svc/util/limits.py",
+            "svc/util/lockfile.py",
+            "svc/util/metrics.py",
+            "svc/util/mime.py",
+            "svc/util/paging.py",
+            "svc/util/pool.py",
+            "svc/util/ratelimit.py",
+            "svc/util/remotes.py",
+            "svc/util/retry.py",
+            "svc/util/schema.py",
+            "svc/util/session.py",
+            "svc/util/storage.py",
+            "svc/util/text.py",
+            "svc/util/tracing.py",
+            "svc/util/tz.py",
+            "svc/util/units.py",
+            "svc/util/uuid_gen.py",
+            "svc/util/version.py",
+            "svc/util/warmup.py",
+            "tests/test_validate.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 1500,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "report.md",
+            "description": "deliverable on disk (the hazard is never writing it)"
+          },
+          {
+            "type": "validator",
+            "validator": "evals/validators/90_delivery_cadence_taint_trace.py",
+            "timeout_seconds": 30,
+            "description": "exactly one finding line naming the planted answer"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 120,
+        "max_tool_calls": 160,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "six chains times a handful of hops; a run that needs more turns than this is looping, not tracing",
+        "max_tool_calls": "an audit of <= 64 small files has no honest use for more; the runtime token allowance is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "delivery-cadence-v1"
+      }
+    },
+    {
+      "id": "91_dc_unused_setting",
+      "scenario": "tests/e2e/scenarios/91_dc_unused_setting.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "4e838d43e5c7043819e2bd81c499c92ba9f9d711",
+          "prefix": "tests/e2e/fixtures/delivery_cadence/unused_setting",
+          "paths": [
+            "README.md",
+            "app/__init__.py",
+            "app/auth_keys.py",
+            "app/auth_tokens.py",
+            "app/billing_invoice.py",
+            "app/billing_rates.py",
+            "app/cache_backend.py",
+            "app/cache_policy.py",
+            "app/cache_warm.py",
+            "app/db_pool.py",
+            "app/db_query.py",
+            "app/db_replica.py",
+            "app/mail_retry.py",
+            "app/mail_tls.py",
+            "app/mailer.py",
+            "app/metrics_hist.py",
+            "app/metrics_sink.py",
+            "app/migrate.py",
+            "app/queue_client.py",
+            "app/queue_consumer.py",
+            "app/queue_dlq.py",
+            "app/search_index.py",
+            "app/search_refresh.py",
+            "app/search_topology.py",
+            "app/server.py",
+            "app/settings.py",
+            "app/storage_client.py",
+            "app/storage_upload.py",
+            "app/storage_urls.py",
+            "app/workers.py",
+            "conf/settings.ini",
+            "docs/CHANGELOG.md",
+            "docs/operations.md",
+            "docs/settings.md",
+            "tests/test_settings.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 1500,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "report.md",
+            "description": "deliverable on disk (the hazard is never writing it)"
+          },
+          {
+            "type": "validator",
+            "validator": "evals/validators/91_delivery_cadence_unused_setting.py",
+            "timeout_seconds": 30,
+            "description": "exactly one finding line naming the planted answer"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 120,
+        "max_tool_calls": 160,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "48 keys checked by grep or read; well above what an organised sweep needs",
+        "max_tool_calls": "an audit of <= 64 small files has no honest use for more; the runtime token allowance is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "delivery-cadence-v1"
+      }
+    },
+    {
+      "id": "92_dc_invariant_break",
+      "scenario": "tests/e2e/scenarios/92_dc_invariant_break.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "4e838d43e5c7043819e2bd81c499c92ba9f9d711",
+          "prefix": "tests/e2e/fixtures/delivery_cadence/invariant_break",
+          "paths": [
+            "CONTRACT.md",
+            "README.md",
+            "queue/__init__.py",
+            "queue/dispatch.py",
+            "queue/job.py",
+            "workers/__init__.py",
+            "workers/_base.py",
+            "workers/archive_logs.py",
+            "workers/audit_permissions.py",
+            "workers/backfill_index.py",
+            "workers/build_thumbnails.py",
+            "workers/check_quotas.py",
+            "workers/clean_tmp.py",
+            "workers/compact_segments.py",
+            "workers/dedupe_uploads.py",
+            "workers/expire_links.py",
+            "workers/export_ledger.py",
+            "workers/flush_metrics.py",
+            "workers/gc_sessions.py",
+            "workers/index_documents.py",
+            "workers/invalidate_cache.py",
+            "workers/merge_profiles.py",
+            "workers/mirror_bucket.py",
+            "workers/notify_admins.py",
+            "workers/prune_snapshots.py",
+            "workers/purge_trash.py",
+            "workers/rank_results.py",
+            "workers/rebuild_search.py",
+            "workers/reconcile_billing.py",
+            "workers/refresh_tokens.py",
+            "workers/reindex_shards.py",
+            "workers/replay_events.py",
+            "workers/resize_images.py",
+            "workers/rotate_keys.py",
+            "workers/scan_malware.py",
+            "workers/score_spam.py",
+            "workers/seal_audit.py",
+            "workers/send_digests.py",
+            "workers/stamp_versions.py",
+            "workers/sweep_orphans.py",
+            "workers/sync_contacts.py",
+            "workers/tag_releases.py",
+            "workers/tally_usage.py",
+            "workers/trim_history.py",
+            "workers/unpack_bundles.py",
+            "workers/update_geoip.py",
+            "workers/vacuum_tables.py",
+            "workers/verify_checksums.py",
+            "workers/warm_caches.py",
+            "workers/watch_quotas.py",
+            "workers/zip_reports.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 1500,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "report.md",
+            "description": "deliverable on disk (the hazard is never writing it)"
+          },
+          {
+            "type": "validator",
+            "validator": "evals/validators/92_delivery_cadence_invariant_break.py",
+            "timeout_seconds": 30,
+            "description": "exactly one finding line naming the planted answer"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 120,
+        "max_tool_calls": 160,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "44 workers read once each plus the contract and helpers",
+        "max_tool_calls": "an audit of <= 64 small files has no honest use for more; the runtime token allowance is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "delivery-cadence-v1"
+      }
+    },
+    {
+      "id": "00_smoke",
+      "scenario": "tests/e2e/scenarios/00_smoke.txt",
+      "layers": [
+        "E",
+        "T",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir"
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 600,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "hello-test/hello.txt",
+            "description": "创建目标文件"
+          },
+          {
+            "type": "contains",
+            "path": "hello-test/hello.txt",
+            "text": "hello from cc-zig e2e",
+            "description": "写入目标内容"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "max_model_tool_errors": 3,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "max_turns": "单文件创建不应消耗长会话；限制失控循环而不规定用 Write 还是 Bash。",
+        "max_tool_calls": "单文件创建的工具预算上界，用于发现重复无增益调用。",
+        "max_model_tool_errors": "允许少量可恢复参数纠错，但阻止空参风暴。",
+        "max_harness_tool_errors": "基础 smoke 不接受 harness 自身工具执行失败。"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "core-e2e-v1"
+      }
+    },
+    {
+      "id": "02_html_game",
+      "scenario": "tests/e2e/scenarios/02_html_game.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir"
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write",
+          "Edit"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 600,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "snake-game/index.html",
+            "description": "生成单文件游戏"
+          },
+          {
+            "type": "file_exists",
+            "path": "snake-game/DESIGN.md",
+            "description": "生成设计说明"
+          },
+          {
+            "type": "contains",
+            "path": "snake-game/index.html",
+            "text": "<canvas",
+            "description": "使用 canvas 渲染"
+          },
+          {
+            "type": "min_lines",
+            "path": "snake-game/index.html",
+            "minimum": 50,
+            "description": "产物非占位文件"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 18,
+        "max_tool_calls": 24,
+        "max_model_tool_errors": 6,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "max_turns": "三轮产品开发允许设计、实现、复核，但要限制循环。",
+        "max_tool_calls": "复杂单页游戏允许多次读写校验，不绑定具体文件工具。",
+        "max_model_tool_errors": "复杂任务容许参数自纠，但空参风暴仍应失败。",
+        "max_harness_tool_errors": "产物任务不应由 harness 工具故障污染。"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "core-e2e-v1"
+      }
+    }
+  ]
+}

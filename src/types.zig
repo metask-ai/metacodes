@@ -127,6 +127,14 @@ pub const Config = struct {
     requirement_ledger: bool = false,
     requirement_ledger_observe: bool = false,
     verification_final_observe: bool = false,
+    /// `--delivery-cadence[-observe]`: bounded turn-boundary nudge when a run
+    /// keeps exploring without putting any deliverable on disk.
+    delivery_cadence: bool = false,
+    delivery_cadence_observe: bool = false,
+    /// `--delivery-cadence-thresholds <first>,<second>`: crossing points in
+    /// exploration-only tool calls. null = the product defaults (40 / 80).
+    delivery_cadence_first: ?u32 = null,
+    delivery_cadence_second: ?u32 = null,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,

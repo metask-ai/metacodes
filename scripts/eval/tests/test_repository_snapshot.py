@@ -95,3 +95,22 @@ class RepositorySnapshotTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_deep_prefix_skips_ancestor_directory_entries(self):
+        # `git archive` emits `tests/`, `tests/e2e/`, ... for a deep pathspec;
+        # those ancestors carry no bytes and must not count as escapes.
+        suite = load_json(ROOT / "evals/suites/delivery-cadence-v1.json")
+        task = next(t for t in suite["tasks"] if t["id"] == "92_dc_invariant_break")
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            MATERIALIZER.materialize(
+                ROOT, workspace, task["environment"]["repository_snapshot"]
+            )
+            self.assertTrue((workspace / "CONTRACT.md").is_file())
+            self.assertTrue((workspace / "workers" / "reindex_shards.py").is_file())
+            self.assertFalse((workspace / "tests").exists())
+            self.assertEqual(
+                sorted(p.name for p in workspace.iterdir()),
+                ["CONTRACT.md", "README.md", "queue", "workers"],
+            )
+

@@ -205,6 +205,28 @@ test "U11 parity: run Options 装配单源(web 只比 canonical 多 ui_requester
     try std.testing.expect(std.meta.eql(canonical, web_opts));
 }
 
+test "U11 parity: 过程义务门是宿主契约字段,canonical 不带(delivery_cadence 显式排除)" {
+    // Codex round 6 (2026-09-21):注入宏 run / web 会话走 canonical 装配,若 canonical 带
+    // cadence,一次 `/commit` 就多落一条终局记录,trace 契约(每份 journal 一条)作废。
+    // 排除是设计决定,本测试让"顺手接上"变成显式改动。正向面见
+    // tests/component/delivery_cadence_test.zig(REPL 主 run 与 headless 都接)。
+    var fx: AppFixture = undefined;
+    try fx.setup();
+    defer fx.deinit();
+    const app = fx.app;
+    app.config.delivery_cadence = true;
+    app.config.delivery_cadence_observe = true;
+    app.config.delivery_cadence_first = 1;
+    app.config.delivery_cadence_second = 2;
+    const canonical = session_service.buildRunOptions(app, null);
+    const defaults = cc.agent_loop.Options{ .session = canonical.session, .abort = canonical.abort };
+    try std.testing.expect(!canonical.delivery_cadence);
+    try std.testing.expect(!canonical.delivery_cadence_observe);
+    try std.testing.expect(std.meta.eql(defaults.delivery_cadence_thresholds, canonical.delivery_cadence_thresholds));
+    try std.testing.expect(!canonical.verification_final_gate);
+    try std.testing.expect(!canonical.requirement_ledger);
+}
+
 test "R3-1回归: Ctrl+B 身份轮换 —— 新 session_id + 新 transcript 目录,权限路由同步" {
     // 缺陷形态:转后台后前台开新空会话(shrink_epoch=0)却复用旧 writer(seen>=1,
     // flushed=N)→ 下一次 flush 把旧 transcript 整个重写成新会话数条(历史被毁)。
