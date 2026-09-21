@@ -368,7 +368,7 @@ fn hasMutatingPayload(target: []const u8) bool {
                 sub = tok;
                 continue;
             }
-            if (std.mem.startsWith(u8, tok, "--output")) return true;
+            if (std.mem.startsWith(u8, tok, "--output") or std.mem.startsWith(u8, tok, "-o")) return true;
             if (std.mem.eql(u8, sub, "branch")) {
                 if (tok[0] == '-') {
                     for ([_][]const u8{ "-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose", "--list", "--show-current", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--color", "--no-color" }) |ok| {
@@ -396,20 +396,8 @@ fn hasMutatingPayload(target: []const u8) bool {
         }
         return false;
     }
-    if (std.mem.eql(u8, head, "fd") or std.mem.eql(u8, head, "fdfind")) {
-        while (tokens.next()) |tok| {
-            for ([_][]const u8{ "-x", "--exec", "-X", "--exec-batch" }) |flag| {
-                if (std.mem.eql(u8, tok, flag)) return true;
-            }
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, head, "sort")) {
-        while (tokens.next()) |tok| {
-            if (std.mem.eql(u8, tok, "-o") or std.mem.startsWith(u8, tok, "--output")) return true;
-        }
-        return false;
-    }
+    if (std.mem.eql(u8, head, "fd") or std.mem.eql(u8, head, "fdfind")) return hasFlag(&tokens, &[_][]const u8{ "-x", "--exec", "-X", "--exec-batch" });
+    if (std.mem.eql(u8, head, "sort")) return hasFlag(&tokens, &[_][]const u8{ "-o", "--output" });
     if (std.mem.eql(u8, head, "uniq")) {
         // `uniq INPUT OUTPUT` writes its second positional argument.
         var positional: usize = 0;
@@ -421,10 +409,15 @@ fn hasMutatingPayload(target: []const u8) bool {
     return false;
 }
 
+/// Flag match that also catches attached values and combined short flags
+/// (`-oout`, `-rp`, `-s2026-01-01`) and `--long=value`. Over-matching is
+/// fine: this only ever moves a call towards `mutation`.
 fn hasFlag(tokens: *std.mem.TokenIterator(u8, .any), flags: []const []const u8) bool {
     while (tokens.next()) |tok| {
         for (flags) |flag| {
-            if (std.mem.eql(u8, tok, flag) or (flag.len > 2 and std.mem.startsWith(u8, tok, flag) and tok.len > flag.len and tok[flag.len] == '=')) return true;
+            if (std.mem.eql(u8, tok, flag)) return true;
+            if (flag.len == 2 and flag[0] == '-' and flag[1] != '-' and std.mem.startsWith(u8, tok, flag)) return true;
+            if (flag.len > 2 and std.mem.startsWith(u8, tok, flag) and tok.len > flag.len and tok[flag.len] == '=') return true;
         }
     }
     return false;
@@ -451,13 +444,13 @@ fn isReadonlyExplorationCommand(target: []const u8) bool {
     const head = target[0..space];
     for ([_][]const u8{
         // shell builtins that only inspect or bind values
-        "read",     "test",     "[",       "[[",      ":",         "local",    "declare",
+        "read",    "test",    "[",         "[[",       ":",       "local",    "declare",
         // search / view
-        "rg",       "fd",       "fdfind",  "tree",    "less",      "more",     "nl",
-        "od",       "xxd",      "hexdump", "strings", "tac",       "rev",      "column",
-        "comm",     "paste",    "jq",      "yq",      "date",      "basename", "dirname",
-        "realpath", "readlink", "md5sum",  "shasum",  "sha256sum", "sha1sum",  "cksum",
-        "printenv", "env",      "true",
+        "rg",      "fd",      "fdfind",    "tree",     "nl",      "od",       "xxd",
+        "hexdump", "strings", "tac",       "rev",      "column",  "comm",     "paste",
+        "jq",      "yq",      "date",      "basename", "dirname", "realpath", "readlink",
+        "md5sum",  "shasum",  "sha256sum", "sha1sum",  "cksum",   "printenv", "env",
+        "true",
     }) |kw| {
         if (std.mem.eql(u8, head, kw)) return true;
     }
@@ -608,6 +601,21 @@ test "case compounds, git config injection, git write options and roster payload
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"tree -L 2\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"xxd dump.bin | head\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk '{ print $1 }' f | sort\"}"));
+}
+
+test "attached and combined write flags disarm" {
+    // Codex pass 3: `-oout`, `-s2026...`, `--exec=rm`, `less -o`.
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sort -oout input\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"tree -oout\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"date -s2026-01-01\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"fd --exec=rm -e tmp\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git diff -o out\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"xxd -rp dump.hex out\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"less -o log.txt f\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"more f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sort -n input\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"date +%s\"}"));
 }
 
 test "bash redirects and in-place flags disarm" {

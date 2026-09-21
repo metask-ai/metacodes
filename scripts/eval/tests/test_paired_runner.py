@@ -402,6 +402,43 @@ class PairedRunnerTest(unittest.TestCase):
                     max_rollout_metered_tokens=10,
                 )
             self.assertEqual(seen, [])
+            # Token side of the reservation must read the four TOKEN_METRICS
+            # the adapter records, not a pre-summed field.
+            from scripts.eval.paired_runner import _require_rollout_reservation
+
+            collected = {
+                "baseline": [
+                    {
+                        "metrics": {
+                            "cost_usd": 0.0,
+                            "input_tokens": 400,
+                            "output_tokens": 100,
+                            "cache_read_tokens": 300,
+                            "cache_write_tokens": 0,
+                        }
+                    }
+                ],
+                "candidate": [],
+            }
+            with self.assertRaisesRegex(ValidationError, "would exceed the cumulative token cap"):
+                _require_rollout_reservation(
+                    collected,
+                    used_cost_usd=0.0,
+                    used_tokens=0,
+                    rollout_cost_usd=1.0,
+                    rollout_tokens=300,
+                    max_cumulative_cost_usd=None,
+                    max_cumulative_tokens=1000,
+                )
+            _require_rollout_reservation(
+                collected,
+                used_cost_usd=0.0,
+                used_tokens=0,
+                rollout_cost_usd=1.0,
+                rollout_tokens=200,
+                max_cumulative_cost_usd=None,
+                max_cumulative_tokens=1000,
+            )
             with self.assertRaisesRegex(ValidationError, "both cost and token caps"):
                 run_paired(
                     suite,

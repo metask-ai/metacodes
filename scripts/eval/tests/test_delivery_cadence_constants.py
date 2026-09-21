@@ -8,7 +8,10 @@ ROOT = Path(__file__).resolve().parents[3]
 class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
     """The Lean proof, the Zig runtime and the eval parser each carry the
     nudge bound as a literal; they must agree or the proof stops describing
-    the runtime (Codex review of #128)."""
+    the runtime (Codex review of #128). This is drift detection over source
+    text, not a semantic link: it catches one side changing alone, it cannot
+    prove the Lean policy is the Zig policy — the mirrored theorem/test names
+    carry that burden."""
 
     def test_nudge_bound_is_identical_in_lean_zig_and_trace(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/DeliveryCadence.lean").read_text(encoding="utf-8")

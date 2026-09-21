@@ -246,13 +246,17 @@ treatment runs (v1: 3/9) and fired 7 nudges; the control crossed in 6/9.
 - Deliverable rate is tied 9/9 in all four arm-runs: on this cohort the
   control never fails to write the report inside 40 turns, so the hazard the
   gate was built for has a base rate of zero here and H1 remains untested.
-- Strict correctness: v1 (dose partly suppressed) 4 regressions / 2
-  improvements; v1.1 (dose delivered) 0 regressions / 3 improvements. Pooled
-  over 18 pairs that is 4 / 5, p ≈ 1.0 — no effect distinguishable from
-  noise. The v1.1 direction is the one the mechanism predicts (a nudged run
-  writes and then keeps improving in place; all nine treatment reports were
-  correct), and 3/0 on 9 pairs is what a real +30 pp effect would look like
-  at this sample size, but it is also what run-to-run variance looks like.
+- Strict correctness, kept separate by sensor version because the delivered
+  dose differed: v1 (roster silenced the gate on `rg` in 6/18 rollouts)
+  4 regressions / 2 improvements, p = 0.69; v1.1 (corrected sensor)
+  0 regressions / 3 improvements, p = 0.25. Neither run shows an effect
+  distinguishable from noise. The pooled figure (4 / 5 over 18 pairs,
+  p ≈ 1.0) is a descriptive sensitivity check only, not a single treatment
+  estimate: the two runs are not comparable pairs. The v1.1 direction
+  matches what the mechanism is designed to do (a nudged run writes, then
+  keeps improving in place; all nine treatment reports were correct), which
+  is a reason to run a confirmatory study, not evidence of causation — the
+  control delivered 9/9 in both runs, so H1 is untested either way.
 - Cost: v1 lower with the gate, v1.1 slightly higher; both intervals span
   zero. The gate neither saves nor costs money at this cohort's scale.
 - Decision unchanged: keep `--delivery-cadence` opt-in and off by default.

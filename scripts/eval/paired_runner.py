@@ -177,13 +177,15 @@ def _require_rollout_reservation(
     max_cumulative_tokens: int | None,
 ) -> None:
     """Refuse to start a rollout whose full allowance would breach a cumulative cap."""
+    # Same accounting as _require_budget: import_run records the four
+    # TOKEN_METRICS, never a pre-summed total (Codex review pass 3).
     cost = used_cost_usd
     tokens = used_tokens
     for rows in collected.values():
         for row in rows:
             metrics = row.get("metrics") or {}
             cost += float(metrics.get("cost_usd") or 0.0)
-            tokens += int(metrics.get("metered_tokens") or metrics.get("total_tokens") or 0)
+            tokens += sum(int(metrics.get(key) or 0) for key in TOKEN_METRICS)
     if max_cumulative_cost_usd is not None and cost + rollout_cost_usd > max_cumulative_cost_usd:
         raise ValidationError(
             f"next rollout allowance ${rollout_cost_usd:.4f} on top of ${cost:.4f} used "
