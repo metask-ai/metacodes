@@ -1,10 +1,11 @@
 name: Release
 
-# The release pipeline (#82, #47 stage 7). Dispatch-only until the dedicated
-# `metacodes-release` runners exist (doc/RELEASE_RUNNER.md, owner decision
-# Q4): a bare `X.Y.Z` tag is the stable channel, a `0.x.y-dev` commit the pre
-# channel (#47 Q1/Q3), and neither is published without a human pressing the
-# button on the draft this workflow leaves behind.
+# The release pipeline (#82, #47 stage 7). Dispatch-only: a bare `X.Y.Z` tag is
+# the stable channel, a `0.x.y-dev` commit the pre channel (#47 Q1/Q3), and
+# neither is published without a human pressing the button on the draft this
+# workflow leaves behind. Every job runs on an ephemeral GitHub-hosted runner
+# (doc/RELEASE_RUNNER.md): nothing from a PR job or an earlier release can
+# precondition the machine, and no self-hosted machine ever holds the token.
 on:
   workflow_dispatch:
     inputs:
@@ -17,12 +18,6 @@ on:
         required: true
         type: boolean
         default: true
-      runner_pool:
-        description: "metacodes-release = the dedicated runners; pr-pool = the CI runners (dry runs only, until the dedicated pool exists)"
-        required: true
-        type: choice
-        options: [metacodes-release, pr-pool]
-        default: metacodes-release
 
 permissions:
   contents: read
@@ -31,13 +26,15 @@ concurrency:
   group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
+# bindgen for the AgentCore bindings-regen gate; the hosted images ship cargo
+# but not bindgen. Pinned to the version doc/RELEASE_RUNNER.md names.
+env:
+  BINDGEN_VERSION: 0.72.1
+
 jobs:
   build-posix:
     name: Release (${{ matrix.os }})
     timeout-minutes: 90
-    # A dry run may borrow the CI machines; a real release runs only on the
-    # dedicated pool, which no PR job can reach.
-    if: inputs.runner_pool == 'metacodes-release' || inputs.dry_run
     strategy:
       # Every platform reports its own verdict: a rehearsal needs all three,
       # and the publish job already waits for all of them.
@@ -46,60 +43,38 @@ jobs:
         include:
           - os: Linux
             arch: X64
+            runner: ubuntu-latest
             zig_target: x86_64-linux-gnu
           - os: macOS
             arch: ARM64
+            runner: macos-latest
             zig_target: aarch64-macos
-    runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON(format('["self-hosted","{0}","{1}"]', matrix.os, matrix.arch)) || fromJSON(format('["self-hosted","metacodes-release","{0}","{1}"]', matrix.os, matrix.arch)) }}
-    # One physical runner per platform: a dry run on the CI pool joins the CI
-    # workflow's runner group for the lane of the ref it was dispatched from
-    # (github.ref, normally main; the tag input is a ref to build, not a lane;
-    # same expression as ci.yml), so it never overlaps the CI job that a merge
-    # just started on the same box. The second dry run did,
-    # and the Windows unit tests tripped the build runner's one-minute
-    # no-response watchdog under that load; ci.yml records the same contention
-    # as the cause of its timing flakes. The price is the pending-cancel rule
-    # ci.yml describes, in both directions: a push to the same lane while a
-    # dry-run job is still queued cancels that job, and a dispatch while a CI
-    # job is still queued in the lane cancels that CI job. Both are loud;
-    # dispatch when the lane is idle, or rerun whatever was cancelled. The
-    # dedicated pool serializes only with itself.
-    concurrency:
-      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-{0}-{1}-{2}', matrix.os, matrix.arch, github.ref == 'refs/heads/main' && 'main' || 'pr') || format('release-runner-{0}-{1}', matrix.os, matrix.arch) }}
-      cancel-in-progress: false
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           fetch-tags: true
+      # A release build must not inherit a cache another branch wrote: no
+      # setup-zig cache here, every release compiles cold.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
-      - name: Point Zig caches at persistent per-runner storage
-        shell: bash
-        run: |
-          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
-          echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
-      # The AgentCore gate needs cargo (Rust link probe) and bindgen (bindings
-      # regen gate). The dedicated pool must have them (doc/RELEASE_RUNNER.md);
-      # a dry run on the CI pool may lack them and then skips the AgentCore
-      # steps with a warning rather than failing the whole rehearsal.
+      - name: Install bindgen
+        run: cargo install bindgen-cli --version "$BINDGEN_VERSION" --locked
       - name: Toolchain inventory
-        id: tools
         shell: bash
         run: |
-          have=true
-          command -v cargo >/dev/null 2>&1 || have=false
-          command -v bindgen >/dev/null 2>&1 || have=false
-          echo "agentcore=$have" >> "$GITHUB_OUTPUT"
-          if [ "$have" != true ]; then
-            if [ "${{ inputs.runner_pool }}" = "metacodes-release" ]; then
-              echo "::error::cargo and bindgen are required on metacodes-release runners (doc/RELEASE_RUNNER.md)"; exit 1
-            fi
-            echo "::warning::cargo/bindgen missing on this dry-run runner; AgentCore gate and archive are skipped"
-          fi
+          set -euo pipefail
+          for tool in cargo bindgen; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "::error::$tool is required for the AgentCore gate (doc/RELEASE_RUNNER.md)"; exit 1; }
+          done
+          cargo --version
+          bindgen --version
+      - name: Install Python development dependencies
+        run: python3 -m pip install --break-system-packages -r requirements-dev.txt
       - name: Vendored runtime assets are attested
         run: python3 scripts/verify_tinykg_binary.py && python3 scripts/verify_ripgrep_binary.py
       # Same test watchdog as ci.yml: the build runner's one-minute default
@@ -112,12 +87,10 @@ jobs:
       - name: Installed prefix matches the release layout
         run: python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release" --release --doctor
       - name: AgentCore gate for the native target
-        if: steps.tools.outputs.agentcore == 'true'
         run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
       - name: Archive (CLI unit)
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist"
       - name: Archive (AgentCore SDK)
-        if: steps.tools.outputs.agentcore == 'true'
         run: zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
       - name: Archives are reproducible
         run: |
@@ -127,13 +100,7 @@ jobs:
       # cross-staged unit with `release:check -Dtarget=aarch64-linux-musl`.
       # Building it here as a cross-compiled release unit is a matrix change
       # for a later issue: it needs a runner-independent verify path.
-      # A dry run rehearses the build, not the runner's egress: an upload that
-      # fails there is reported as a step failure but does not decide the
-      # rehearsal (the CI pool's Linux runner has never uploaded an artifact;
-      # doc/RELEASE_RUNNER.md lists the endpoints a release runner must reach).
-      # A real release keeps the upload fatal: publish needs the archives.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        continue-on-error: ${{ inputs.dry_run }}
         with:
           name: archives-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/dist/*
@@ -143,12 +110,7 @@ jobs:
   build-windows:
     name: Release (Windows)
     timeout-minutes: 90
-    if: inputs.runner_pool == 'metacodes-release' || inputs.dry_run
-    runs-on: ${{ inputs.runner_pool == 'pr-pool' && fromJSON('["self-hosted","Windows","X64"]') || fromJSON('["self-hosted","metacodes-release","Windows","X64"]') }}
-    # Same runner-serialization rule as the POSIX jobs.
-    concurrency:
-      group: ${{ inputs.runner_pool == 'pr-pool' && format('runner-Windows-X64-{0}', github.ref == 'refs/heads/main' && 'main' || 'pr') || 'release-runner-Windows-X64' }}
-      cancel-in-progress: false
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -159,29 +121,27 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
-      # cmd throughout: the Windows runner is not guaranteed to provide bash.
-      - name: Point Zig caches at persistent per-runner storage
+      # cmd throughout: Git-Bash paths are POSIX-style and native zig.exe
+      # cannot use them.
+      - name: Install bindgen
         shell: cmd
-        run: |
-          echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
-          echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
+        run: cargo install bindgen-cli --version %BINDGEN_VERSION% --locked
       - name: Toolchain inventory
-        id: tools
         shell: cmd
         run: |
-          set HAVE=true
-          where cargo >nul 2>nul || set HAVE=false
-          where bindgen >nul 2>nul || set HAVE=false
-          echo agentcore=%HAVE%>>"%GITHUB_OUTPUT%"
-          if "%HAVE%"=="true" exit /b 0
-          if "${{ inputs.runner_pool }}"=="metacodes-release" ( echo ::error::cargo and bindgen are required on metacodes-release runners ^(doc/RELEASE_RUNNER.md^) & exit /b 1 )
-          echo ::warning::cargo/bindgen missing on this dry-run runner; AgentCore gate and archive are skipped
+          where cargo >nul 2>nul || ( echo ::error::cargo is required for the AgentCore gate ^(doc/RELEASE_RUNNER.md^) & exit /b 1 )
+          where bindgen >nul 2>nul || ( echo ::error::bindgen is required for the AgentCore gate ^(doc/RELEASE_RUNNER.md^) & exit /b 1 )
+          cargo --version
+          bindgen --version
+      - name: Install Python development dependencies
+        shell: cmd
+        run: python -m pip install -r requirements-dev.txt
       - name: Vendored runtime assets are attested
         shell: cmd
         run: python scripts\verify_tinykg_binary.py && python scripts\verify_ripgrep_binary.py
       - name: Full suite in release configuration
         shell: cmd
-        run: zig build test -Doptimize=ReleaseSafe -j6 --test-timeout 5m
+        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Stage, manifest and verify the release unit
         shell: cmd
         run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release"
@@ -189,22 +149,18 @@ jobs:
         shell: cmd
         run: python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release" --release --doctor
       - name: AgentCore gate for the native target
-        if: steps.tools.outputs.agentcore == 'true'
         shell: cmd
         run: zig build agentcore:gate -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
       - name: Archive (CLI unit)
         shell: cmd
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist"
       - name: Archive (AgentCore SDK)
-        if: steps.tools.outputs.agentcore == 'true'
         shell: cmd
         run: zig build agentcore:archive -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -Dagentcore-archive-dir="%RUNNER_TEMP%\dist"
       - name: Archives are reproducible
         shell: cmd
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
-      # Same dry-run rule as the POSIX upload.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        continue-on-error: ${{ inputs.dry_run }}
         with:
           name: archives-Windows-X64
           path: ${{ runner.temp }}\dist\*
@@ -214,9 +170,9 @@ jobs:
   publish:
     name: Draft release
     needs: [build-posix, build-windows]
-    if: ${{ !inputs.dry_run && inputs.runner_pool == 'metacodes-release' }}
+    if: ${{ !inputs.dry_run }}
     timeout-minutes: 20
-    runs-on: [self-hosted, metacodes-release, Linux, X64]
+    runs-on: ubuntu-latest
     # The only job that can write to the repository, and only through the
     # ephemeral token, and only to create a *draft*.
     permissions:
