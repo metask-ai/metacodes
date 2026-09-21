@@ -652,18 +652,12 @@ pub const KgClient = struct {
     }
 
     /// OS 级真实 exe 目录(**不依赖 argv[0]**,PATH 裸名启动也可靠——修 exe_dir=null 静默落 dev
-    /// 的根)。三 OS 实现收敛在 platform.paths.selfExePath(macOS/Linux/Windows),此处补
-    /// realpath 解 symlink(安装常经 /usr/local/bin symlink)+ 取 dirname。失败 → null。
+    /// 的根)。三 OS 实现 + realpath 解 symlink(安装常经 ~/bin symlink)收敛在
+    /// platform.paths.selfExeRealPath——与 toolchain 的 rg / kernel 相邻查找同一入口,三个
+    /// 解析器不再各自决定解不解 symlink。此处只取 dirname。失败 → null。
     fn selfExeDir(buf: []u8) ?[]const u8 {
-        var raw: [std.fs.max_path_bytes]u8 = undefined;
-        const exe_slice = @import("platform").paths.selfExePath(&raw) orelse return null;
-        var exe_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        if (exe_slice.len >= exe_z_buf.len) return null;
-        @memcpy(exe_z_buf[0..exe_slice.len], exe_slice);
-        exe_z_buf[exe_slice.len] = 0;
-        var rp: [std.fs.max_path_bytes]u8 = undefined;
-        const resolved = pfs.realpath(@ptrCast(&exe_z_buf), &rp);
-        const full: []const u8 = if (resolved != null) std.mem.span(resolved.?) else exe_slice;
+        var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const full = @import("platform").paths.selfExeRealPath(&full_buf) orelse return null;
         const dir = std.fs.path.dirname(full) orelse return null;
         if (dir.len == 0 or dir.len >= buf.len) return null;
         @memcpy(buf[0..dir.len], dir);

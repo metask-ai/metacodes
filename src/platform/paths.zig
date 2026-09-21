@@ -81,10 +81,29 @@ pub fn unsetEnvChecked(name: [*:0]const u8) bool {
     }
 }
 
-/// 本进程可执行文件绝对路径(**不依赖 argv[0]**,PATH 裸名启动也可靠)。写进 buf,返回 slice;
-/// 失败/不支持平台 → null。macOS `_NSGetExecutablePath` / Linux `/proc/self/exe` /
-/// Windows `GetModuleFileNameW`。消费方:swarm teammate fork-exec、KgClient vendored 定位。
+/// 测试 seam(仅测试构建存在;生产构建为 void,不可误用):把 `selfExePath` 观测到的
+/// **被调用路径**替换成任意值,用来在进程内复现"经别处 symlink 启动"——macOS 的
+/// `_NSGetExecutablePath` 返回的就是 symlink 自身,而 zig 测试二进制永远从真路径起。
+/// 串行 test runner 内设置后必须 defer 复位为 null。
+pub var test_self_exe_override: if (builtin.is_test) ?[]const u8 else void =
+    if (builtin.is_test) null else {};
+
+/// 本进程可执行文件的**被调用路径**(**不依赖 argv[0]**,PATH 裸名启动也可靠)。写进 buf,
+/// 返回 slice;失败/不支持平台 → null。macOS `_NSGetExecutablePath` / Linux `/proc/self/exe` /
+/// Windows `GetModuleFileNameW`。
+///
+/// **不解 symlink**:`ln -s <prefix>/bin/metacodes ~/bin/metacodes` 安装后,macOS 返回的是
+/// `~/bin/metacodes`(Linux 的 /proc/self/exe 已由内核解好)。凡是要从自身位置推导相邻
+/// 产物(bin/rg、libexec/metacodes/<kernel>、vendor/tinykg)的,必须用 `selfExeRealPath`;
+/// 本函数只给"再次执行自己"这类不关心物理位置的消费方(swarm teammate fork-exec)。
 pub fn selfExePath(buf: []u8) ?[]const u8 {
+    if (comptime builtin.is_test) {
+        if (test_self_exe_override) |forced| {
+            if (forced.len >= buf.len) return null;
+            @memcpy(buf[0..forced.len], forced);
+            return buf[0..forced.len];
+        }
+    }
     switch (builtin.os.tag) {
         .macos, .ios => {
             var size: u32 = @intCast(buf.len);
@@ -112,6 +131,28 @@ pub fn selfExePath(buf: []u8) ?[]const u8 {
     }
 }
 extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
+
+/// 本进程可执行文件的**物理路径**:`selfExePath` 再经 realpath 解 symlink 与 `.`/`..`。
+/// 相邻产物定位(toolchain 的 rg / Lean kernel、KgClient 的 vendored tinykg)的唯一入口——
+/// 三处解析器共用此函数,不再各自决定要不要解 symlink(2026-09-21 实测:经 ~/bin symlink
+/// 启动的 release 布局,rg 与两个 kernel 落到 ~/bin 找不到,只有已 realpath 的 tinykg 命中)。
+///
+/// realpath 失败(路径被删、权限、Windows `_fullpath` 不解 symlink 但不会失败)时**回退到
+/// 被调用路径**而不是返回 null:退化成旧行为,不让一次 realpath 故障把所有相邻产物变成
+/// unresolved。selfExePath 本身失败才返回 null。写进 buf,返回 slice。
+pub fn selfExeRealPath(buf: []u8) ?[]const u8 {
+    var invoked: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const invoked_slice = selfExePath(invoked[0 .. invoked.len - 1]) orelse return null;
+    invoked[invoked_slice.len] = 0;
+    var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const resolved: []const u8 = if (@import("fs.zig").realpath(invoked[0..invoked_slice.len :0], &resolved_buf)) |r|
+        std.mem.span(r)
+    else
+        invoked_slice;
+    if (resolved.len >= buf.len) return null;
+    @memcpy(buf[0..resolved.len], resolved);
+    return buf[0..resolved.len];
+}
 extern "kernel32" fn GetModuleFileNameW(hModule: ?*anyopaque, lpFilename: [*]u16, nSize: u32) callconv(.winapi) u32;
 
 /// 当前用户 id。POSIX getuid;Windows 无 uid 概念 → 用 GetCurrentProcessId 做进程私有目录
@@ -133,4 +174,46 @@ test "null_device 平台正确" {
 
 test "tempDir 非空" {
     try std.testing.expect(tempDir().len > 0);
+}
+
+test "selfExeRealPath resolves a symlinked invocation to the physical executable" {
+    if (is_windows) return error.SkipZigTest; // symlink 需特权;Windows 走 _fullpath 不解 symlink
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "prefix/bin");
+    try tmp.dir.createDirPath(std.testing.io, "elsewhere");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prefix/bin/metacodes", .data = "#!/bin/sh\n" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = try std.fmt.bufPrint(&real_buf, "{s}/prefix/bin/metacodes", .{root});
+    try tmp.dir.symLink(std.testing.io, real, "elsewhere/metacodes", .{});
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "{s}/elsewhere/metacodes", .{root});
+
+    test_self_exe_override = link;
+    defer test_self_exe_override = null;
+    var raw_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(link, selfExePath(&raw_buf).?);
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(real, selfExeRealPath(&out).?);
+}
+
+test "selfExeRealPath falls back to the invoked path when realpath fails" {
+    // 被调用路径已不存在(安装被删/权限)→ realpath 失败 → 退回原值,而不是 null。
+    const ghost = if (is_windows) "C:\\definitely-missing-metacodes-xyzzy\\bin\\metacodes.exe" else "/definitely-missing-metacodes-xyzzy/bin/metacodes";
+    test_self_exe_override = ghost;
+    defer test_self_exe_override = null;
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(ghost, selfExeRealPath(&out).?);
+}
+
+test "selfExeRealPath of the real test binary is an existing absolute path" {
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    const p = selfExeRealPath(&out) orelse return error.SkipZigTest;
+    try std.testing.expect(std.fs.path.isAbsolute(p));
+    var z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    @memcpy(z[0..p.len], p);
+    z[p.len] = 0;
+    try std.testing.expect(@import("fs.zig").exists(z[0..p.len :0]));
 }
