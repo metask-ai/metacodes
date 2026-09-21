@@ -8,16 +8,16 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: win-repro-${{ github.ref }}
-  cancel-in-progress: true
+  group: win-repro-${{ github.sha }}
+  cancel-in-progress: false
 jobs:
   loop:
     name: Windows suite loop (${{ matrix.variant }} ${{ matrix.slot }})
     strategy:
       fail-fast: false
       matrix:
-        variant: [original, fixed]
-        slot: [1, 2]
+        variant: [original, original-keep]
+        slot: [1, 2, 3]
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -36,7 +36,7 @@ jobs:
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
       - name: Restore the original /tmp fixture literals (diagnostics kept)
-        if: matrix.variant == 'original'
+        if: startsWith(matrix.variant, 'original')
         shell: cmd
         run: git apply --verbose .github/workflows/win-repro-original.patch && git diff --stat
       - name: Install Python development dependencies
@@ -45,15 +45,37 @@ jobs:
       - name: Verify native bundle and fresh-store contract
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage
-      - name: Loop the full offline suite
+      - name: Pre-create D:\tmp with a keep file (control variant)
+        if: matrix.variant == 'original-keep'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force 'D:\tmp' | Out-Null
+          New-Item -ItemType File -Force 'D:\tmp\.keep' | Out-Null
+          Get-ChildItem -Force 'D:\tmp' | Select-Object -ExpandProperty Name
+      - name: Loop the full offline suite with a D:\tmp sampler
         shell: pwsh
         run: |
           $failures = 0
-          for ($i = 1; $i -le 4; $i++) {
-            Write-Host "=== iteration $i === cwd=$(Get-Location) drive-tmp-exists=$(Test-Path '\tmp') temp=$env:TEMP"
+          for ($i = 1; $i -le 2; $i++) {
+            Write-Host "=== iteration $i === cwd=$(Get-Location) drive-tmp-exists=$(Test-Path 'D:\tmp') temp=$env:TEMP start=$(Get-Date -Format 'HH:mm:ss.fff')"
+            $sampler = Start-Job -ScriptBlock {
+              $prev = $null
+              while ($true) {
+                $e = Test-Path 'D:\tmp'
+                if ($e -ne $prev) {
+                  $names = if ($e) { (Get-ChildItem -Force 'D:\tmp' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ',' } else { '' }
+                  "$(Get-Date -Format 'HH:mm:ss.fff') D:\tmp exists=$e contents=[$names]"
+                  $prev = $e
+                }
+                Start-Sleep -Milliseconds 25
+              }
+            }
             & zig build test --test-timeout 5m *> "suite-$i.log"
             $code = $LASTEXITCODE
-            Write-Host "iteration $i exit=$code"
+            Write-Host "iteration $i exit=$code end=$(Get-Date -Format 'HH:mm:ss.fff')"
+            Stop-Job $sampler
+            Receive-Job $sampler | ForEach-Object { Write-Host "  sampler: $_" }
+            Remove-Job $sampler
             if ($code -ne 0) { $failures++ }
             $lines = Get-Content "suite-$i.log"
             for ($k = 0; $k -lt $lines.Count; $k++) {
@@ -61,11 +83,11 @@ jobs:
               if ($l -match 'status=fail|fixture:|Build Summary|tests passed|steps succeeded') {
                 Write-Host $l
                 if ($l -match 'status=fail') {
-                  $end = [Math]::Min($k + 24, $lines.Count - 1)
+                  $end = [Math]::Min($k + 12, $lines.Count - 1)
                   for ($j = $k + 1; $j -le $end; $j++) { Write-Host "    $($lines[$j])" }
                 }
               }
             }
-            Write-Host "after iteration $i drive-tmp-exists=$(Test-Path '\tmp')"
+            Write-Host "after iteration $i drive-tmp-exists=$(Test-Path 'D:\tmp') contents=[$((Get-ChildItem -Force 'D:\tmp' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ',')]"
           }
           Write-Host "total failing iterations: $failures"
