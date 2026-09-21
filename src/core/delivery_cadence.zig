@@ -348,12 +348,19 @@ fn hasMutatingPayload(target: []const u8) bool {
     if (std.mem.eql(u8, head, "sed")) {
         while (tokens.next()) |tok| {
             if (std.mem.startsWith(u8, tok, "-i") or std.mem.startsWith(u8, tok, "--in-place")) return true;
+            // An external script hides `w`/`e` commands from this scan.
+            if (std.mem.startsWith(u8, tok, "-f") or std.mem.startsWith(u8, tok, "--file")) return true;
         }
-        return hasSedWriteCommand(target[head.len..]);
+        const script = target[head.len..];
+        return hasSedWriteCommand(script) or hasSedExecCommand(script);
     }
     if (std.mem.eql(u8, head, "awk") or std.mem.eql(u8, head, "gawk") or std.mem.eql(u8, head, "mawk") or std.mem.eql(u8, head, "nawk")) {
         // The program text is quoted, so the redirect scan above skipped it:
         // `print > "f"`, `print | "cmd"`, `"cmd" | getline`, `system ("cmd")`.
+        // A program file (`-f prog.awk`) is invisible to this scan: disarm.
+        while (tokens.next()) |tok| {
+            if (std.mem.startsWith(u8, tok, "-f") or std.mem.startsWith(u8, tok, "--file")) return true;
+        }
         return std.mem.indexOfScalar(u8, target, '>') != null or
             std.mem.indexOfScalar(u8, target, '|') != null or
             std.mem.indexOf(u8, target, "system") != null;
@@ -397,7 +404,8 @@ fn hasMutatingPayload(target: []const u8) bool {
         return false;
     }
     if (std.mem.eql(u8, head, "fd") or std.mem.eql(u8, head, "fdfind")) return hasFlag(&tokens, &[_][]const u8{ "-x", "--exec", "-X", "--exec-batch" });
-    if (std.mem.eql(u8, head, "sort")) return hasFlag(&tokens, &[_][]const u8{ "-o", "--output" });
+    // GNU sort runs an external helper when it spills to disk.
+    if (std.mem.eql(u8, head, "sort")) return hasFlag(&tokens, &[_][]const u8{ "-o", "--output", "--compress-program" });
     if (std.mem.eql(u8, head, "uniq")) {
         // `uniq INPUT OUTPUT` writes its second positional argument.
         var positional: usize = 0;
@@ -419,6 +427,19 @@ fn hasFlag(tokens: *std.mem.TokenIterator(u8, .any), flags: []const []const u8) 
             if (flag.len == 2 and flag[0] == '-' and flag[1] != '-' and std.mem.startsWith(u8, tok, flag)) return true;
             if (flag.len > 2 and std.mem.startsWith(u8, tok, flag) and tok.len > flag.len and tok[flag.len] == '=') return true;
         }
+    }
+    return false;
+}
+
+/// GNU sed's `e` command / `s///e` flag execute the pattern space as a
+/// shell command: `sed 'e touch x'`, `sed 's/.*/touch x/e'`, `/re/e`.
+fn hasSedExecCommand(script: []const u8) bool {
+    var i: usize = 0;
+    while (i < script.len) : (i += 1) {
+        if (script[i] != 'e') continue;
+        const prev_ok = i > 0 and (script[i - 1] == '/' or script[i - 1] == ';' or script[i - 1] == '{' or script[i - 1] == '\'' or script[i - 1] == '"');
+        const next_ok = i + 1 >= script.len or script[i + 1] == ' ' or script[i + 1] == ';' or script[i + 1] == '}' or script[i + 1] == '\'' or script[i + 1] == '"' or script[i + 1] == '\n';
+        if (prev_ok and next_ok) return true;
     }
     return false;
 }
@@ -612,10 +633,26 @@ test "attached and combined write flags disarm" {
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"fd --exec=rm -e tmp\"}"));
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git diff -o out\"}"));
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"xxd -rp dump.hex out\"}"));
-    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"less -o log.txt f\"}"));
-    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"more f\"}"));
+    // Pagers are off the roster entirely (so these would pass without the
+    // flag logic); the payload checks are exercised by the lines above.
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sort -n input\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"date +%s\"}"));
+}
+
+test "external scripts and executing commands in awk, sed and sort disarm" {
+    // Codex pass 4: `awk -f`, `sed -f`, sed `e`, `sort --compress-program`.
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk -f mutator.awk input\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk --file=prog.awk input\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed -f mutator.sed input\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"printf x | sed 'e touch report.md'\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"printf x | sed 's/.*/touch report.md/e'\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sort --compress-program=helper big.txt\"}"));
+    // Innocent sed/awk/sort shapes stay exploration.
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n '/error/p' log.txt\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed 's/tea/coffee/' menu.txt\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk -F: '{ print $1 }' /etc/passwd\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sort -u words.txt\"}"));
 }
 
 test "bash redirects and in-place flags disarm" {
