@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         variant: [original]
-        slot: [1, 2, 3, 4, 5, 6]
+        slot: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -63,8 +63,10 @@ jobs:
               while ($true) {
                 $e = Test-Path 'D:\tmp'
                 if ($e -ne $prev) {
+                  $ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
                   $names = if ($e) { (Get-ChildItem -Force 'D:\tmp' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ',' } else { '' }
-                  "$(Get-Date -Format 'HH:mm:ss.fff') D:\tmp exists=$e contents=[$names]"
+                  $procs = (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match 'test|suite|cc-|metacodes|tinykg|python|zig|reporter|gate' } | Select-Object -ExpandProperty ProcessName | Sort-Object | Group-Object | ForEach-Object { "$($_.Name)x$($_.Count)" }) -join ','
+                  "$(Get-Date -Format 'HH:mm:ss.fff') epoch_ms=$ms D:\tmp exists=$e contents=[$names] procs=[$procs]"
                   $prev = $e
                 }
                 Start-Sleep -Milliseconds 25
@@ -74,8 +76,17 @@ jobs:
             $code = $LASTEXITCODE
             Write-Host "iteration $i exit=$code end=$(Get-Date -Format 'HH:mm:ss.fff')"
             Stop-Job $sampler
-            Receive-Job $sampler | ForEach-Object { Write-Host "  sampler: $_" }
+            $events = @(Receive-Job $sampler)
             Remove-Job $sampler
+            $events | ForEach-Object { Write-Host "  sampler: $_" }
+            $starts = Select-String -Path "suite-$i.log" -Pattern 'test_start now_ns=(\d+) shard=(\S+) name="(.*)"' | ForEach-Object { [PSCustomObject]@{ ms = [long]($_.Matches[0].Groups[1].Value) / 1000000; shard = $_.Matches[0].Groups[2].Value; name = $_.Matches[0].Groups[3].Value } }
+            foreach ($ev in $events) {
+              if ($ev -match 'epoch_ms=(\d+) D:\\tmp exists=False') {
+                $t = [long]$Matches[1]
+                Write-Host "  --- tests started within 3000 ms before the deletion at epoch_ms=$t (per shard, latest first):"
+                $starts | Where-Object { $_.ms -le $t -and $_.ms -ge ($t - 3000) } | Sort-Object -Property ms -Descending | ForEach-Object { Write-Host "    +$($_.ms - $t) ms shard=$($_.shard) $($_.name)" }
+              }
+            }
             if ($code -ne 0) { $failures++ }
             $lines = Get-Content "suite-$i.log"
             for ($k = 0; $k -lt $lines.Count; $k++) {

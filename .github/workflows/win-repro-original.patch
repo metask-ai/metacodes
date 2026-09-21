@@ -1,3 +1,16 @@
+diff --git a/scripts/sharded_test_runner.zig b/scripts/sharded_test_runner.zig
+index fa2e3494..fc66f42a 100644
+--- a/scripts/sharded_test_runner.zig
++++ b/scripts/sharded_test_runner.zig
+@@ -117,6 +117,8 @@ pub fn main(init: std.process.Init.Minimal) void {
+         // behind, so a later failure would print them ahead of its own. Start each test
+         // from an empty trace so what is dumped belongs to the test that failed.
+         if (@errorReturnTrace()) |trace| trace.index = 0;
++        // REPRO: wall-clock start of every test so a D:\tmp transition can be correlated.
++        std.debug.print("test_start now_ns={d} shard={}/{} name=\"{s}\"\n", .{ std.Io.Clock.real.now(std.testing.io).nanoseconds, shard.index, shard.count, test_fn.name });
+         const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+         const result = test_fn.func();
+         const end_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
 diff --git a/scripts/windows_test_prelude.zig b/scripts/windows_test_prelude.zig
 index f574e4e5..4a3e2670 100644
 --- a/scripts/windows_test_prelude.zig
