@@ -4403,11 +4403,13 @@ test "/loop command parser covers user input command surface" {
 test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随会话)" {
     const a = std.testing.allocator;
     const ppaths = @import("platform").paths;
-    const home = "/tmp/cc-resume-l2-16";
-    _ = std.c.mkdir(home, 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = util_fs.testing.perPidDir(&home_buf, "cc-zig-resume-l2-16");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer util_fs.testing.rmrfBestEffort(home);
     // handleResume 走 homeDir()(env);setEnv HOME 后 defer 还原,免污染同 binary 其它测试(单线程顺序跑)。
     const old_home = std.c.getenv("HOME");
-    ppaths.setEnv("HOME", home);
+    ppaths.setEnv("HOME", home.ptr);
     defer if (old_home) |h| ppaths.setEnv("HOME", h) else ppaths.unsetEnv("HOME");
     ppaths.setEnv("METACODES_NO_PROBE", "1"); // 跳过 App.init 的终端背景 probe
 

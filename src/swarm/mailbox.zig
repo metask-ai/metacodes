@@ -566,7 +566,9 @@ fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
 const testing = std.testing;
 
 fn testInbox(buf: []u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, "/tmp/cc-zig-mailbox-test-{d}/inboxes/bob.json", .{util_time.nowNs()});
+    var root_buf: [256]u8 = undefined;
+    const root = util_fs.testing.uniqueDir(&root_buf, "cc-zig-mailbox-test");
+    return std.fmt.bufPrint(buf, "{s}/inboxes/bob.json", .{root});
 }
 
 fn rmTestRoot(path: []const u8) void {

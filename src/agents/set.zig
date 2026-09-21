@@ -398,7 +398,8 @@ test "AgentSet: injectBuiltins gives Explore/Plan/general-purpose" {
 
 test "AgentSet: load custom from dir" {
     const a = testing.allocator;
-    const dir = "/tmp/cc-zig-agents-test";
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-agents-test");
     defer cleanupDir(dir);
     try makeAgent(dir, "code-reviewer.md", "---\nname: code-reviewer\ndescription: review\n---\nYou review code.\n");
 
@@ -413,7 +414,8 @@ test "AgentSet: load custom from dir" {
 
 test "AgentSet: name from frontmatter wins over filename" {
     const a = testing.allocator;
-    const dir = "/tmp/cc-zig-agents-name";
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-agents-name");
     defer cleanupDir(dir);
     try makeAgent(dir, "wrong-filename.md", "---\nname: my-real-name\ndescription: x\n---\nbody\n");
 
@@ -426,12 +428,14 @@ test "AgentSet: name from frontmatter wins over filename" {
 
 test "AgentSet: recursive subfolder discovery (path doesn't affect name)" {
     const a = testing.allocator;
-    const dir = "/tmp/cc-zig-agents-sub";
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-agents-sub");
     defer cleanupDir(dir);
-    const sub_dir = dir ++ "/review";
+    var sub_buf: [512]u8 = undefined;
+    const sub_dir = try std.fmt.bufPrint(&sub_buf, "{s}/review", .{dir});
     const sub_z = std.fmt.allocPrintSentinel(a, "{s}", .{sub_dir}, 0) catch unreachable;
     defer a.free(sub_z);
-    _ = std.c.mkdir(dir, 0o755);
+    _ = std.c.mkdir(dir.ptr, 0o755);
     _ = std.c.mkdir(sub_z, 0o755);
     try makeAgentInDir(sub_dir, "security.md", "---\nname: security\ndescription: sec review\n---\nbody\n");
 
@@ -450,8 +454,10 @@ test "AgentSet: recursive subfolder discovery (path doesn't affect name)" {
 
 test "AgentSet: later load overwrites earlier (project beats personal)" {
     const a = testing.allocator;
-    const p1 = "/tmp/cc-zig-agents-p1";
-    const p2 = "/tmp/cc-zig-agents-p2";
+    var p1_buf: [512]u8 = undefined;
+    const p1 = @import("../util/fs.zig").testing.perPidDir(&p1_buf, "cc-zig-agents-p1");
+    var p2_buf: [512]u8 = undefined;
+    const p2 = @import("../util/fs.zig").testing.perPidDir(&p2_buf, "cc-zig-agents-p2");
     defer cleanupDir(p1);
     defer cleanupDir(p2);
     try makeAgent(p1, "x.md", "---\nname: shared\ndescription: from-personal\n---\nA\n");

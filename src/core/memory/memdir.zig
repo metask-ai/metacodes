@@ -292,9 +292,8 @@ test "memoryIndexPath: 末尾 MEMORY.md" {
 test "isAutoMemPath: 真实 memdir 内放行,外部拒绝(含分隔符边界 + 穿越)" {
     const a = testing.allocator;
     // 真建一个 memdir 子树
-    const util_time = @import("../../util/time.zig");
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-memdir-test-{d}", .{util_time.nowMs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memdir-test");
     const fsmod = @import("../../util/fs.zig");
     defer fsmod.testing.rmrfBestEffort(home);
 
@@ -333,9 +332,8 @@ test "isAutoMemPath: 真实 memdir 内放行,外部拒绝(含分隔符边界 + �
 test "isAutoMemPath: memdir 内 symlink 末段指向外部(悬空目标)→ 拒绝(Linus #1 TOCTOU)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 用 POSIX symlink() 造真符号链接测拒绝,windows 无此 syscall
     const a = testing.allocator;
-    const util_time = @import("../../util/time.zig");
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-memdir-symlink-{d}", .{util_time.nowMs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memdir-symlink");
     const fsmod = @import("../../util/fs.zig");
     defer fsmod.testing.rmrfBestEffort(home);
 
@@ -363,9 +361,8 @@ extern "c" fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
 
 test "readIndexTruncated: 不存在返 null;短文件原样;超行截断" {
     const a = testing.allocator;
-    const util_time = @import("../../util/time.zig");
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-memidx-test-{d}", .{util_time.nowMs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memidx-test");
     const fsmod = @import("../../util/fs.zig");
     defer fsmod.testing.rmrfBestEffort(home);
 
@@ -402,9 +399,8 @@ test "readIndexTruncated: 不存在返 null;短文件原样;超行截断" {
 
 test "readIndexTruncated: 字节超限退到行边界不腰斩(Linus #2)" {
     const a = testing.allocator;
-    const util_time = @import("../../util/time.zig");
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-memidx-bytes-{d}", .{util_time.nowMs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memidx-bytes");
     const fsmod = @import("../../util/fs.zig");
     defer fsmod.testing.rmrfBestEffort(home);
     try ensureDir(home, "/fake/repo");

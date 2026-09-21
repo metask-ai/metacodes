@@ -9,6 +9,7 @@
 //! 测试策略：LineEditor 全部用 fake keystream 驱动。termios 只做 "不崩" 测试（真 tty 行为难在 CI 里验证）。
 
 const std = @import("std");
+const ppaths = @import("platform").paths;
 const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
 const process = @import("platform").process;
@@ -371,9 +372,13 @@ pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
     const editor_env = std.c.getenv("VISUAL") orelse std.c.getenv("EDITOR") orelse return error.NoEditor;
     const editor_cmd = std.mem.span(editor_env);
 
-    const tmp_path = "/tmp/cc-zig-edit-buffer.txt";
+    // 每进程一个缓冲文件,放平台临时目录(POSIX $TMPDIR/… 或 /tmp,Windows %TEMP%):
+    // 固定的 /tmp/cc-zig-edit-buffer.txt 会让两个并行 REPL 互相覆盖对方正在编辑的内容,
+    // 在 Windows 上还依赖当前驱动器根下的 \tmp 存在。
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrintZ(&tmp_path_buf, "{s}/metacodes-edit-buffer-{d}.txt", .{ ppaths.tempDir(), process.currentPid() });
     {
-        const fd = pfs.open(tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        const fd = pfs.open(tmp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.WriteFailed;
         defer _ = pfs.close(fd);
         if (current.len > 0) _ = pfs.write(fd, current[0..current.len]);
@@ -382,7 +387,7 @@ pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, tmp_path);
     defer allocator.free(path_z);
     var argv = [_]?[*:0]const u8{ "/bin/sh", "-c", undefined, null };
-    const sh_cmd = try std.fmt.allocPrintSentinel(allocator, "{s} {s}", .{ editor_cmd, tmp_path }, 0);
+    const sh_cmd = try std.fmt.allocPrintSentinel(allocator, "{s} \"{s}\"", .{ editor_cmd, tmp_path }, 0);
     defer allocator.free(sh_cmd);
     argv[2] = sh_cmd.ptr;
 

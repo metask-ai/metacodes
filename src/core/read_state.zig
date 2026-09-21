@@ -17,6 +17,7 @@
 //!   const meta = rs.get(path);             // Write/Edit 查询
 
 const std = @import("std");
+const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
 const builtin = @import("builtin");
@@ -286,9 +287,10 @@ test "clearAll" {
 }
 
 test "statPath real file" {
-    const path = "/tmp/cc-zig-readstate-stat-test.txt";
-    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    defer _ = std.c.unlink(path);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "readstate-stat-test.txt");
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    defer _ = std.c.unlink(path.ptr);
     _ = pfs.write(fd, "hello");
     _ = pfs.close(fd);
 

@@ -98,9 +98,12 @@ gone.
       fixed `/tmp/...` path: they share one directory across the eight
       parallel shards and depend on `\tmp` at the drive root, and the second
       Windows run lost four of them at once while a rerun of the same commit
-      passed. Migration to per-process `%TEMP%` fixtures
-      (`src/tools/test_tmp.zig`) is the fix; the `windows_test_prelude`
-      stays until the last `/tmp` literal is gone.
+      passed. Fixed: every disk-touching fixture in `tests/component` and
+      `src` now derives its path from `util/fs.zig` `testing.tmpRoot`
+      (per-process `%TEMP%` directories on Windows; #142 and the src
+      follow-up), and the `windows_test_prelude` that pre-created `\tmp` is
+      gone. What still spells `/tmp` is inert strings and the POSIX-only UDS
+      socket test.
 - [x] Release-gate isolation: `rule-control` and every `release.yml` job run
       on ephemeral hosted runners, so PR-authored code cannot precondition the
       machine that produces a release decision. The dedicated

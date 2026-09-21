@@ -1569,8 +1569,8 @@ test "snapshotRoster: 空表返回空;freeRoster 无泄漏" {
 
 test "spawnTeammate: team 不存在 → TeamNotFound 且无残留 entry" {
     const a = testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-tm-noteam-{d}", .{util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-tm-noteam");
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
     var reg = try TeammateRegistry.init(a, "k", null, "m", .anthropic, home);
     defer reg.deinit();
