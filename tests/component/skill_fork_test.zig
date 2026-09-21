@@ -161,7 +161,8 @@ const Fixture = struct {
 
 test "L2: shared Runtime fork sends rendered body to child" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-fork-body";
+    var root_buf: [512]u8 = undefined;
+    const root = cc.util_fs.testing.perPidDir(&root_buf, "cc-zig-skill-fork-body");
     defer cleanup(root, "forky");
     try makeSkill(
         root,
@@ -210,7 +211,8 @@ test "L2: shared Runtime fork sends rendered body to child" {
 
 test "L2: shared Runtime inline does not spawn child" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-inline";
+    var root_buf: [512]u8 = undefined;
+    const root = cc.util_fs.testing.perPidDir(&root_buf, "cc-zig-skill-inline");
     defer cleanup(root, "inliney");
     try makeSkill(
         root,
@@ -252,7 +254,8 @@ test "L2: shared Runtime inline does not spawn child" {
 
 test "L2: shared Runtime fork honors model override" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-fork-model";
+    var root_buf: [512]u8 = undefined;
+    const root = cc.util_fs.testing.perPidDir(&root_buf, "cc-zig-skill-fork-model");
     defer cleanup(root, "haikufork");
     try makeSkill(
         root,
@@ -298,7 +301,8 @@ test "L2: shared Runtime fork honors model override" {
 
 test "L2: unsupported agent binding fails before child execution" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-agent-unavailable";
+    var root_buf: [512]u8 = undefined;
+    const root = cc.util_fs.testing.perPidDir(&root_buf, "cc-zig-skill-agent-unavailable");
     defer cleanup(root, "agentfork");
     try makeSkill(
         root,
@@ -318,7 +322,8 @@ test "L2: unsupported agent binding fails before child execution" {
 
 test "L2: fork without child runner fails closed and never falls back inline" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-fork-unavailable";
+    var root_buf: [512]u8 = undefined;
+    const root = cc.util_fs.testing.perPidDir(&root_buf, "cc-zig-skill-fork-unavailable");
     defer cleanup(root, "nofork");
     try makeSkill(
         root,

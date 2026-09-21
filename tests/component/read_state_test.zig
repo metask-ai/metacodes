@@ -17,13 +17,18 @@ fn writeFile(path: [*:0]const u8, content: []const u8) void {
 }
 
 test "L2 read_state: hashFileContent 一致 + 内容变则哈希变" {
-    const p = "/tmp/cc-rs-hash.txt";
-    writeFile(p, "hello world");
-    defer _ = std.c.unlink(p);
+    var dir_buf: [512]u8 = undefined;
+    const dir = cc.util_fs.testing.perPidDir(&dir_buf, "cc-zig-rs");
+    _ = std.c.mkdir(dir.ptr, 0o755);
+    defer _ = std.c.rmdir(dir.ptr);
+    var p_buf: [512]u8 = undefined;
+    const p = try std.fmt.bufPrintZ(&p_buf, "{s}/hash.txt", .{dir});
+    writeFile(p.ptr, "hello world");
+    defer _ = std.c.unlink(p.ptr);
     const h1 = cc.core_read_state.hashFileContent(p);
     const h2 = cc.core_read_state.hashFileContent(p);
     try std.testing.expectEqual(h1, h2);
-    writeFile(p, "hello WORLD");
+    writeFile(p.ptr, "hello WORLD");
     const h3 = cc.core_read_state.hashFileContent(p);
     try std.testing.expect(h1 != h3);
 }

@@ -113,7 +113,8 @@ test "issue#10 e2e: transcript resume 后图像仍到达请求(恢复语义活�
     const a = std.testing.allocator;
 
     // ① 会话 A:带图 user 消息 → flush transcript。
-    const tmp_home = "/tmp/cc-zig-mm-resume-l2";
+    var home_buf: [512]u8 = undefined;
+    const tmp_home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-mm-resume-l2");
     cc.util_fs.testing.rmrfBestEffort(tmp_home);
     defer cc.util_fs.testing.rmrfBestEffort(tmp_home);
     var writer = try cc.transcript.Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4-20250514", cc.transcript.genSessionId());

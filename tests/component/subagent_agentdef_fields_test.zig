@@ -634,8 +634,8 @@ fn lockWorktreeProbe(ctx: *const cc.tool_context.ToolContext, _: []const u8, _: 
 test "L2 后台组合: effort/memory_scope/mcp_servers/isolation 穿过 JobInput 且终态原子" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var base_buf: [160]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buf, "/tmp/metacodes-agentdef-background-{d}", .{cc.util_time.nowNs()});
+    var base_buf: [256]u8 = undefined;
+    const base = cc.util_fs.testing.uniqueDir(&base_buf, "cc-zig-agentdef-background");
     defer cc.util_fs.testing.rmrfBestEffort(base);
     const repo = try std.fmt.allocPrint(a, "{s}/repo", .{base});
     defer a.free(repo);
@@ -741,8 +741,8 @@ test "L2 后台组合: effort/memory_scope/mcp_servers/isolation 穿过 JobInput
 test "L3 AgentDef.isolation=worktree: 相对 Write 只落隔离树，有变化则返回并保留路径" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var base_buf: [160]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buf, "/tmp/metacodes-agentdef-isolation-{d}", .{cc.util_time.nowNs()});
+    var base_buf: [256]u8 = undefined;
+    const base = cc.util_fs.testing.uniqueDir(&base_buf, "cc-zig-agentdef-isolation");
     defer cc.util_fs.testing.rmrfBestEffort(base);
     const repo = try std.fmt.allocPrint(a, "{s}/repo", .{base});
     defer a.free(repo);
@@ -802,8 +802,8 @@ test "L3 AgentDef.isolation=worktree: 相对 Write 只落隔离树，有变化�
 test "L2 AgentDef isolation cleanup failure reports worktree_kept true" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var base_buf: [160]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buf, "/tmp/metacodes-agentdef-cleanup-{d}", .{cc.util_time.nowNs()});
+    var base_buf: [256]u8 = undefined;
+    const base = cc.util_fs.testing.uniqueDir(&base_buf, "cc-zig-agentdef-cleanup");
     defer cc.util_fs.testing.rmrfBestEffort(base);
     const repo = try std.fmt.allocPrint(a, "{s}/repo", .{base});
     defer a.free(repo);

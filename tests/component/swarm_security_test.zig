@@ -27,7 +27,7 @@ fn sleepMs(ms: u32) void {
 }
 
 fn setup(a: std.mem.Allocator, home_buf: []u8, url: []const u8) !swctx.SwarmContext {
-    const home = try std.fmt.bufPrint(home_buf, "/tmp/cc-zig-sw4-{d}", .{cc.util_time.nowNs()});
+    const home = cc.util_fs.testing.uniqueDir(home_buf, "cc-zig-sw4");
     try cc.util_fs.mkdirParents(home);
     return swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
 }
@@ -46,8 +46,9 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
+    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
     const home = sw.home;
 
@@ -97,8 +98,8 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
 
 test "L2 SW4 A2: 'team-lead' 是保留名,不能 spawn 冒充队友" {
     const a = std.testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw4-reserved-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw4-reserved");
     try cc.util_fs.mkdirParents(home);
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var sw = swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .model = "m" };
@@ -126,8 +127,9 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
+    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
     const home = sw.home;
 
@@ -242,8 +244,9 @@ test "L2 SW4 MED-1: 仍在跑的 teammate 自发 shutdown_approved 不摘牌(防
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
+    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
     srv.gateNextResponse();
     defer srv.releaseGatedResponse(); // release before sw.deinit joins teammate
@@ -288,8 +291,9 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
     var agents = cc.agents_set.AgentSet.init(a);
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
+    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
     const home = sw.home;
     const perm = cc.permission.createContext(.bypass_permissions, a);
@@ -330,8 +334,8 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
 
 test "L2 SW4 C: orphan 清理(lead deinit 删会话 team 目录)" {
     const a = std.testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw4-orphan-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw4-orphan");
     try cc.util_fs.mkdirParents(home);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
