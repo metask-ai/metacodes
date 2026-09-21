@@ -786,7 +786,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         run_opts.project_rule_gate = if (run_control) |control| control.formalGate() else null;
         // Delivery-cadence obligation: the REPL honours the same flags as
         // headless so a scripted (non-tty) session measures what a print-mode
-        // run measures.
+        // run measures. Primary run only: canonical buildRunOptions excludes
+        // the process-obligation fields by contract (see its comment), so
+        // injected macro runs (cron / retry / `/commit`) stay ungated.
         run_opts.delivery_cadence = app.config.delivery_cadence;
         run_opts.delivery_cadence_observe = app.config.delivery_cadence_observe;
         run_opts.delivery_cadence_thresholds = .{

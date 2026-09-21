@@ -110,10 +110,15 @@ pub const State = struct {
 
     /// Observe one completed tool turn. Denied, deferred and suspended slots
     /// never executed and are skipped.
+    /// Observe the slots of one batch after `executeSlots`. Only slots that
+    /// actually started count: after a serial host fatal the remaining `.run`
+    /// slots were never executed (no content, not pending, no effect) and must
+    /// not enter the record (Codex round 6).
     pub fn observeSlots(self: *State, allocator: std.mem.Allocator, slots: []const tool_exec.Slot) void {
         for (slots) |slot| {
             if (slot.decision != .run or slot.pending) continue;
             const realized = verification_progress.isRealizedMutation(slot.effect, slot.effect_valid);
+            if (slot.content == null and !realized) continue;
             self.observeCall(classify(allocator, slot.name, slot.input), realized);
         }
     }
@@ -531,6 +536,7 @@ fn sedScriptIsReadonly(script: []const u8) bool {
                     i += 1;
                     break :blk script[i];
                 } else '/';
+                if (delim == '\n' or delim == '\\') return false;
                 i += 1;
                 const end = sedFindDelimiter(script, i, delim) orelse return false;
                 i = end + 1;
@@ -551,6 +557,7 @@ fn sedScriptIsReadonly(script: []const u8) bool {
             's', 'y' => {
                 if (i >= script.len) return false;
                 const delim = script[i];
+                if (delim == '\n' or delim == '\\') return false;
                 i += 1;
                 const mid = sedFindDelimiter(script, i, delim) orelse return false;
                 const end = sedFindDelimiter(script, mid + 1, delim) orelse return false;
@@ -634,13 +641,16 @@ fn hasExpansionOutsideSingleQuotes(text: []const u8) bool {
     return false;
 }
 
-/// `system(` / `system (`: awk builtins may take whitespace before the
-/// parenthesis. Plain `system` (a file named system.log) does not match.
+/// `system(` / `system (` / `system \<newline>(`: awk builtins may take
+/// whitespace before the parenthesis and a backslash-newline is a line
+/// continuation, so every blank, newline and backslash between the name and
+/// the `(` is skipped (Codex round 6). Plain `system` (a file named
+/// system.log) does not match.
 fn hasAwkSystemCall(program: []const u8) bool {
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, program, from, "system")) |at| {
         var i = at + "system".len;
-        while (i < program.len and (program[i] == ' ' or program[i] == '\t')) : (i += 1) {}
+        while (i < program.len and (program[i] == ' ' or program[i] == '\t' or program[i] == '\r' or program[i] == '\n' or program[i] == '\\')) : (i += 1) {}
         if (i < program.len and program[i] == '(') return true;
         from = at + 1;
     }
@@ -680,6 +690,30 @@ test "mutation disarms the cadence gate" {
     var effect = State{};
     effect.observeCall(.exploration, true);
     try std.testing.expect(effect.mutation_seen);
+}
+
+test "observeSlots skips slots that never started after a host fatal" {
+    // Batch shape `[fatal host slot, Read, Write]`: executeSlots stops after
+    // the fatal, so Read and Write have no content and no effect.
+    const a = std.testing.allocator;
+    var read_result = "{\"content\":\"...\"}".*;
+    const slots = [_]tool_exec.Slot{
+        .{ .decision = .run, .name = "Read", .id = "1", .input = "{\"file_path\":\"a.zig\"}", .content = read_result[0..] },
+        .{ .decision = .run, .name = "Read", .id = "2", .input = "{\"file_path\":\"b.zig\"}" },
+        .{ .decision = .run, .name = "Write", .id = "3", .input = "{\"file_path\":\"c.zig\",\"content\":\"x\"}" },
+    };
+    var state = State{};
+    state.observeSlots(a, slots[0..]);
+    try std.testing.expectEqual(@as(u32, 1), state.exploration_calls);
+    try std.testing.expect(!state.mutation_seen);
+    // The same batch fully executed: the Write disarms.
+    var write_result = "{\"ok\":true}".*;
+    var executed = slots;
+    executed[1].content = read_result[0..];
+    executed[2].content = write_result[0..];
+    var state2 = State{};
+    state2.observeSlots(a, executed[0..]);
+    try std.testing.expect(state2.mutation_seen);
 }
 
 test "below the first threshold nothing fires" {
@@ -890,6 +924,10 @@ test "sed and awk grammar allowlists: GNU execution forms disarm, plain scripts 
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed ':a;N;$!ba;s/\\\\n/ /g' f\"}"));
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk \\\"{ print \\\\\\\"it's $x\\\\\\\" }\\\" f\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk '{ print \\\"it\\\\047s\\\", $1 }' f\"}"));
+    // Codex round 6: backslash-newline continuation between `system` and `(`.
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk 'BEGIN { system \\\\\\n(\\\"touch report.md\\\") }'\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk 'BEGIN { system\\n(\\\"touch x\\\") }'\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed '1\\\\\\ne touch f\\np' f\"}"));
 }
 
 test "bash redirects and in-place flags disarm" {

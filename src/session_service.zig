@@ -425,6 +425,13 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         // 目前只有主 REPL 实现,见 loop.zig 主 run 后的 .backgrounded 分支)——由该宿主自补。
         // 注入/skill/web 路径不接:接了而不消化,残留 flag 会让后续注入 run 在第 1 轮前
         // 静默 .backgrounded(宏 append 了却永不执行)。
+        // 过程义务门(verification_final_gate / requirement_ledger* / delivery_cadence*)
+        // 同样是**宿主契约字段**,canonical 有意不带:它们各自在 run 末尾落一条终局
+        // 观测记录,而 trace 契约(scripts/eval/workbuddy/trace.py "duplicate delivery
+        // cadence record")只接受每份 journal 一条——注入宏 run(cron / retry / `/commit`)
+        // 与 web/daemon 多 run 会话若也接上,一次 `/commit` 就让整份 trace 作废。由能
+        // 出评估 trace 的宿主自补:headless 全部接;主 REPL run 只接 delivery_cadence
+        // (脚本化 e2e 走 REPL)。session_api_parity_test 钉住此排除。
         .read_state = &app.read_state,
         .edit_hl_cache = &app.edit_hl_cache,
         .lsp = app.lsp_service,
