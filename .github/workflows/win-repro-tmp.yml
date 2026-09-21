@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [audit]
+        variant: [audit-deny]
         slot: [1, 2, 3]
     runs-on: windows-latest
     timeout-minutes: 120
@@ -36,7 +36,7 @@ jobs:
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
       - name: Restore the original /tmp fixture literals (diagnostics kept)
-        if: startsWith(matrix.variant, 'original') || matrix.variant == 'audit'
+        if: startsWith(matrix.variant, 'original') || startsWith(matrix.variant, 'audit')
         shell: cmd
         run: git apply --verbose .github/workflows/win-repro-original.patch && git diff --stat
       - name: Install Python development dependencies
@@ -45,17 +45,28 @@ jobs:
       - name: Verify native bundle and fresh-store contract
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage
-      - name: Pre-create D:\tmp with a DELETE audit rule (audit variant)
-        if: matrix.variant == 'audit'
+      - name: Pre-create D:\tmp with a DELETE audit rule and deny child creation (audit-deny variant)
+        if: matrix.variant == 'audit-deny'
         shell: pwsh
         run: |
           auditpol /set /subcategory:"File System" /success:enable /failure:enable
-          New-Item -ItemType Directory -Force 'D:\tmp' | Out-Null
-          $acl = Get-Acl -Path 'D:\tmp' -Audit
-          $rule = New-Object System.Security.AccessControl.FileSystemAuditRule('Everyone', 'Delete', 'None', 'None', 'Success,Failure')
-          $acl.AddAuditRule($rule)
-          Set-Acl -Path 'D:\tmp' -AclObject $acl
-          (Get-Acl -Path 'D:\tmp' -Audit).Audit | Format-Table -AutoSize | Out-String | Write-Host
+          function Arm-Tmp {
+            New-Item -ItemType Directory -Force 'D:\tmp' | Out-Null
+            $acl = Get-Acl -Path 'D:\tmp' -Audit
+            $acl.AddAuditRule((New-Object System.Security.AccessControl.FileSystemAuditRule('Everyone', 'Delete', 'None', 'None', 'Success,Failure')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('Everyone', 'CreateFiles, CreateDirectories', 'None', 'None', 'Deny')))
+            Set-Acl -Path 'D:\tmp' -AclObject $acl
+          }
+          Arm-Tmp
+          try { New-Item -ItemType Directory -Path 'D:\tmp\probe' -ErrorAction Stop | Out-Null; Write-Host "SELFTEST: child creation unexpectedly succeeded" } catch { Write-Host "SELFTEST: child creation denied as intended" }
+          python -c "import os; os.rmdir('/tmp'); print('SELFTEST: python removed D:\\tmp')"
+          Start-Sleep -Seconds 2
+          $sec = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=@(4663,4660,4656)} -ErrorAction SilentlyContinue
+          $n = 0
+          foreach ($e in $sec) { $x = [xml]$e.ToXml(); $d = @{}; foreach ($f in $x.Event.EventData.Data) { $d[$f.Name] = $f.'#text' }; if ($d.ObjectName -like 'D:\tmp*') { $n++; Write-Host "SELFTEST event: $($e.TimeCreated.ToString('HH:mm:ss.fff')) id=$($e.Id) access=$($d.AccessMask) proc=$($d.ProcessName) obj=$($d.ObjectName)" } }
+          Write-Host "SELFTEST: $n events on D:\tmp after the python rmdir (expect > 0)"
+          Arm-Tmp
+          (Get-Acl -Path 'D:\tmp' -Audit).Access | Format-Table -AutoSize | Out-String | Write-Host
       - name: Pre-create D:\tmp with a keep file (control variant)
         if: matrix.variant == 'original-keep'
         shell: pwsh
@@ -115,7 +126,7 @@ jobs:
             foreach ($root in @('D:\', 'C:\tmp', 'C:\Users\runneradmin', "$env:TEMP")) {
               Get-ChildItem -Path $root -Force -Recurse -Depth 4 -Filter '.prelude-ran-*' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  prelude marker found: $($_.FullName)" }
             }
-            if ('${{ matrix.variant }}' -eq 'audit') {
+            if ('${{ matrix.variant }}' -like 'audit*') {
               Write-Host "  --- Security log: handles opened on D:\tmp itself with DELETE access (4663/4660/4659/4656):"
               $sec = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=@(4663,4660,4659,4656)} -ErrorAction SilentlyContinue
               $hits = @()
@@ -126,6 +137,7 @@ jobs:
                   $hits += [PSCustomObject]@{ t = $e.TimeCreated; id = $e.Id; proc = $d.ProcessName; pid = [Convert]::ToInt64($d.ProcessId, 16); access = $d.AccessMask; obj = $d.ObjectName }
                 }
               }
+              Write-Host "    (security events scanned: $(@($sec).Count); on D:\tmp: $(@($hits).Count))"
               $hits | Sort-Object t | ForEach-Object { Write-Host "    $($_.t.ToString('HH:mm:ss.fff')) id=$($_.id) access=$($_.access) pid=$($_.pid) proc=$($_.proc)" }
               $starts = Select-String -Path "suite-$i.log" -Pattern 'test_start now_ns=(\d+) pid=(\d+) shard=(\S+) name="(.*)"' | ForEach-Object { [PSCustomObject]@{ ms = [long]($_.Matches[0].Groups[1].Value) / 1000000; pid = [long]$_.Matches[0].Groups[2].Value; shard = $_.Matches[0].Groups[3].Value; name = $_.Matches[0].Groups[4].Value } }
               foreach ($h in ($hits | Where-Object { $_.id -eq 4663 -or $_.id -eq 4660 })) {
