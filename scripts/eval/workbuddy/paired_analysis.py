@@ -893,12 +893,33 @@ def _first_request_body(
     wanted = str(row.get("trial_result_sha256"))
     located = None
     if result_root.exists():
-        for candidate in result_root.rglob("result.json"):
+        # Two tasks with the same verifier outcome produce byte-identical
+        # result.json files, so the content hash alone is ambiguous. Prefer a
+        # match whose directory names this task (WorkBuddy lays trials out as
+        # <task> or <task>__<attempt>), and walk candidates in sorted order so
+        # the choice never depends on the filesystem's directory order (ext4
+        # hash order picked the wrong task where APFS picked the right one).
+        matches = []
+        for candidate in sorted(result_root.rglob("result.json")):
             if not candidate.is_file():
                 continue
             if hashlib.sha256(candidate.read_bytes()).hexdigest() == wanted:
+                matches.append(candidate)
+        for candidate in matches:
+            parts = candidate.relative_to(result_root).parts
+            if any(part == task or part.startswith(task + "__") for part in parts):
                 located = candidate
                 break
+        if located is None and len(matches) == 1:
+            located = matches[0]
+        elif located is None and matches:
+            # Several twins and none of them names the task: picking any of
+            # them would audit another task's request. Fail closed.
+            raise LaunchError(
+                f"dated cache-prefix exemption found {len(matches)} trial "
+                "artifacts with the receipt's hash and none under a directory "
+                f"named for the task: {task}"
+            )
     if located is None:
         raise LaunchError(
             f"dated cache-prefix exemption cannot locate the trial artifact: {task}"

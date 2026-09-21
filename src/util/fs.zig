@@ -230,11 +230,42 @@ pub const testing = struct {
 
         _ = std.c.rmdir(@ptrCast(&pbuf));
     }
+
+    /// 测试 fixture 的临时目录根(不含末尾分隔符)。**唯一规则源**,src 内测试经
+    /// tools/test_tmp.zig、组件测试经 `cc.util_fs.testing` 都走这里:
+    /// - POSIX 固定 "/tmp"(macOS $TMPDIR ≠ /tmp,其它按 /tmp 拼路径的测试要对得上);
+    /// - Windows 用 %TEMP%(当前驱动器根下的 `\tmp` 不保证存在),拷进 buf 并把反斜杠
+    ///   归一为正斜杠——Windows API 两种都认,而路径常要嵌进 JSON 工具参数。
+    pub fn tmpRoot(buf: []u8) []const u8 {
+        if (@import("builtin").os.tag != .windows) return "/tmp";
+        const raw = @import("platform").paths.tempDir();
+        std.debug.assert(raw.len <= buf.len); // 截断的路径是陷阱,不是降级
+        for (raw, 0..) |c, i| buf[i] = if (c == '\\') '/' else c;
+        return buf[0..raw.len];
+    }
+
+    /// `<tmpRoot>/<tag>-<pid>`,NUL 结尾写进 buf。固定路径被并行的测试进程共用会互相踩;
+    /// 每个进程一个自己的目录。调用方负责 mkdir 与清理。
+    pub fn perPidDir(buf: []u8, tag: []const u8) [:0]const u8 {
+        var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const pid = @import("platform").process.currentPid();
+        return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}", .{ tmpRoot(&rbuf), tag, pid }) catch unreachable;
+    }
 };
 
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "testing.perPidDir: root + tag + pid, forward slashes only, NUL-terminated" {
+    var buf: [512]u8 = undefined;
+    const d = testing.perPidDir(&buf, "cc-zig-fs-selftest");
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, d, testing.tmpRoot(&rbuf)));
+    try std.testing.expect(std.mem.indexOf(u8, d, "/cc-zig-fs-selftest-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "\\") == null);
+    try std.testing.expect(d[d.len] == 0);
+}
 
 const pfs = @import("platform").fs;
 

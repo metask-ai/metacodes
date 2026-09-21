@@ -12,6 +12,7 @@ from unittest import mock
 
 from scripts.eval.workbuddy.mock_provider import (
     MOCK_CREDENTIAL,
+    READY_DEADLINE_S,
     ScenarioError,
     _control_plane_sse,
     _private_new,
@@ -187,7 +188,10 @@ class WorkBuddyMockProviderTest(unittest.TestCase):
                 text=True,
             )
             try:
-                deadline = time.monotonic() + 5
+                # Generous: a loaded 3-core hosted runner starts the interpreter
+                # slowly, and the assertion only fires when the provider is
+                # genuinely stuck (an early exit is reported separately).
+                deadline = time.monotonic() + READY_DEADLINE_S
                 while not ready.exists() and time.monotonic() < deadline:
                     if process.poll() is not None:
                         self.fail(f"mock provider exited early: {process.stderr.read()}")
