@@ -9,6 +9,34 @@ const std = @import("std");
 const core = @import("metacodes-core");
 const public = @import("metask_agentcore_protocol");
 
+fn repairUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    if (std.unicode.utf8ValidateSlice(input)) return allocator.dupe(u8, input);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, input.len);
+    var i: usize = 0;
+    while (i < input.len) {
+        const byte = input[i];
+        if (byte < 0x80) {
+            try out.append(allocator, byte);
+            i += 1;
+            continue;
+        }
+        const width = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+        if (width > 1 and width <= input.len - i and
+            std.unicode.utf8ValidateSlice(input[i .. i + width]))
+        {
+            try out.appendSlice(allocator, input[i .. i + width]);
+            i += width;
+        } else {
+            try out.appendSlice(allocator, "\xEF\xBF\xBD");
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 const InternalEvent = core.protocol.ui_event.CoreEvent;
 const InternalUiRequest = core.protocol.ui_request.UiRequest;
 const InternalUiResponse = core.protocol.ui_request.UiResponse;
@@ -175,30 +203,40 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
     };
 }
 
-fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
-    // `encodeJsonString` is the canonical JSON string boundary. In addition to
-    // escaping JSON syntax, it replaces malformed UTF-8 with U+FFFD. Passing a
-    // byte slice through `Stringify.value` is not equivalent in Zig 0.16: it
-    // serializes `[]const u8` as an array of integers.
-    std.json.Stringify.encodeJsonString(value, .{}, writer) catch return error.OutOfMemory;
+fn writeJsonString(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    value: []const u8,
+) !void {
+    // Normalize bytes before handing them to the JSON writer. Zig 0.16's
+    // `encodeJsonString` escapes JSON syntax but preserves malformed UTF-8;
+    // passing a byte slice through `Stringify.value` can also serialize it as
+    // an array of integers. The ABI contract requires a valid JSON string.
+    const repaired = repairUtf8(allocator, value) catch return error.OutOfMemory;
+    defer allocator.free(repaired);
+    std.json.Stringify.encodeJsonString(repaired, .{}, writer) catch return error.OutOfMemory;
 }
 
-fn writeAskQuestion(writer: *std.Io.Writer, question: public.AskQuestion) !void {
+fn writeAskQuestion(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    question: public.AskQuestion,
+) !void {
     try writer.writeAll("{\"question\":");
-    try writeJsonString(writer, question.question);
+    try writeJsonString(allocator, writer, question.question);
     try writer.writeAll(",\"header\":");
-    try writeJsonString(writer, question.header);
+    try writeJsonString(allocator, writer, question.header);
     try writer.writeAll(",\"multi\":");
     try writer.writeAll(if (question.multi) "true" else "false");
     try writer.writeAll(",\"options\":[");
     for (question.options, 0..) |option, index| {
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"label\":");
-        try writeJsonString(writer, option.label);
+        try writeJsonString(allocator, writer, option.label);
         try writer.writeAll(",\"description\":");
-        try writeJsonString(writer, option.description);
+        try writeJsonString(allocator, writer, option.description);
         try writer.writeAll(",\"preview\":");
-        try writeJsonString(writer, option.preview);
+        try writeJsonString(allocator, writer, option.preview);
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
@@ -243,7 +281,7 @@ pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiR
     try output.writer.writeAll("{\"ask_question\":[");
     for (mapped.ask_question, 0..) |question, index| {
         if (index != 0) try output.writer.writeByte(',');
-        try writeAskQuestion(&output.writer, question);
+        try writeAskQuestion(allocator, &output.writer, question);
     }
     try output.writer.writeAll("]}");
     return output.toOwnedSlice() catch return error.OutOfMemory;
