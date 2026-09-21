@@ -10,6 +10,19 @@ const cc = @import("cc");
 // 可移植 env 写入走 platform.paths(POSIX setenv / Windows _putenv_s)。
 // 保留 POSIX 调用形状的薄壳,免改下面二十多个调用点。
 const ppaths = @import("platform").paths;
+/// 每进程唯一的 auth fixture 目录 `<tmpRoot>/cc-zig-auth-l2-<pid>`(建好)。
+var auth_dir_buf: [512]u8 = undefined;
+fn authDir() [:0]const u8 {
+    const d = cc.util_fs.testing.perPidDir(&auth_dir_buf, "cc-zig-auth-l2");
+    _ = std.c.mkdir(d.ptr, 0o755);
+    return d;
+}
+
+/// `<authDir>/<name>.json`,NUL 结尾写进 buf(可直接 setenv / saveToPath)。
+fn authPath(buf: []u8, name: []const u8) [:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{s}.json", .{ authDir(), name }) catch unreachable;
+}
+
 fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int {
     _ = overwrite;
     ppaths.setEnv(name, value);
@@ -58,9 +71,11 @@ fn rawHasAuth(raw: []const u8, expected: []const u8) bool {
 
 test "L2 auth: stored OAuth resolves into Anthropic Authorization header" {
     const a = std.testing.allocator;
-    const auth_path = "/tmp/cc-zig-auth-l2-oauth.json";
+    var auth_path_buf: [512]u8 = undefined;
+    const auth_path = authPath(&auth_path_buf, "oauth");
+    defer cc.util_fs.testing.rmrfBestEffort(authDir());
     _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
-    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path, 1);
+    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path.ptr, 1);
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer {
         if (std.heap.c_allocator.dupeZ(u8, auth_path)) |z| {
@@ -100,8 +115,10 @@ test "L2 auth: stored OAuth resolves into Anthropic Authorization header" {
 
 test "L2 auth: env API key wins by default, oauth-first is explicit override" {
     const a = std.testing.allocator;
-    const auth_path = "/tmp/cc-zig-auth-l2-precedence.json";
-    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path, 1);
+    var auth_path_buf: [512]u8 = undefined;
+    const auth_path = authPath(&auth_path_buf, "precedence");
+    defer cc.util_fs.testing.rmrfBestEffort(authDir());
+    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path.ptr, 1);
     _ = setenv(cc.core_auth.METASK_API_KEY_ENV, "env-key-l2", 1);
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
@@ -133,9 +150,11 @@ test "L2 auth: env API key wins by default, oauth-first is explicit override" {
 
 test "L2 auth: ordinary environment credential remains compatible with process teammates" {
     const a = std.testing.allocator;
-    const auth_path = "/tmp/cc-zig-auth-l2-runtime-scrub-missing.json";
+    var auth_path_buf: [512]u8 = undefined;
+    const auth_path = authPath(&auth_path_buf, "runtime-scrub-missing");
+    defer cc.util_fs.testing.rmrfBestEffort(authDir());
     const secret = "runtime-env-secret-l2";
-    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path, 1);
+    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path.ptr, 1);
     _ = setenv(cc.core_auth.METASK_API_KEY_ENV, secret, 1);
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
@@ -176,8 +195,10 @@ test "L2 auth: inherited credential FD authenticates without secret in initial e
     const pfs = @import("platform").fs;
     const ppaths_local = @import("platform").paths;
     const secret = "runtime-fd-secret-l2";
-    const missing_auth = "/tmp/cc-zig-auth-l2-fd-missing.json";
-    _ = setenv(cc.core_auth.AUTH_FILE_ENV, missing_auth, 1);
+    var missing_auth_buf: [512]u8 = undefined;
+    const missing_auth = authPath(&missing_auth_buf, "fd-missing");
+    defer cc.util_fs.testing.rmrfBestEffort(authDir());
+    _ = setenv(cc.core_auth.AUTH_FILE_ENV, missing_auth.ptr, 1);
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     const path = try std.fmt.allocPrint(a, "{s}/metacodes-auth-fd-l2-{d}", .{
         ppaths_local.tempDir(),
@@ -316,9 +337,11 @@ test "L2 auth: malformed runtime credential descriptor fails without mutating en
 
 test "L2 auth: stored API key wins over OAuth unless oauth-first is explicit" {
     const a = std.testing.allocator;
-    const auth_path = "/tmp/cc-zig-auth-l2-stored-api-key-precedence.json";
+    var auth_path_buf: [512]u8 = undefined;
+    const auth_path = authPath(&auth_path_buf, "stored-api-key-precedence");
+    defer cc.util_fs.testing.rmrfBestEffort(authDir());
     _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
-    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path, 1);
+    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path.ptr, 1);
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer {
         if (std.heap.c_allocator.dupeZ(u8, auth_path)) |z| {
@@ -351,9 +374,11 @@ test "L2 auth: stored API key wins over OAuth unless oauth-first is explicit" {
 
 test "L2 auth: expiring OAuth refreshes before request and persists replacement" {
     const a = std.testing.allocator;
-    const auth_path = "/tmp/cc-zig-auth-l2-refresh.json";
+    var auth_path_buf: [512]u8 = undefined;
+    const auth_path = authPath(&auth_path_buf, "refresh");
+    defer cc.util_fs.testing.rmrfBestEffort(authDir());
     _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
-    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path, 1);
+    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path.ptr, 1);
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer {
         if (std.heap.c_allocator.dupeZ(u8, auth_path)) |z| {
@@ -415,8 +440,10 @@ test "L2 auth: expiring OAuth refreshes before request and persists replacement"
 
 test "L2 auth: invalid refresh grant surfaces login required without fallback" {
     const a = std.testing.allocator;
-    const auth_path = "/tmp/cc-zig-auth-l2-invalid-grant.json";
-    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path, 1);
+    var auth_path_buf: [512]u8 = undefined;
+    const auth_path = authPath(&auth_path_buf, "invalid-grant");
+    defer cc.util_fs.testing.rmrfBestEffort(authDir());
+    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path.ptr, 1);
     _ = setenv(cc.core_auth.METASK_API_KEY_ENV, "env-fallback-must-not-win", 1);
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);

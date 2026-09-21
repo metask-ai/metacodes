@@ -23,8 +23,10 @@ test "L2 transcript: 写 → loadTranscript 往返,消息数/角色/text 一致"
     const a = std.testing.allocator;
 
     // 隔离 HOME(Writer.init 写 $HOME/.metacodes/projects/<hash>/<sid>/)
-    const home = "/tmp/cc-transcript-l2";
-    _ = std.c.mkdir(home, 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-l2");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer cc.util_fs.testing.rmrfBestEffort(home);
 
     // 1) 造一段对话
     var conv = Conversation.init(a);
@@ -64,8 +66,10 @@ test "L2 transcript: 写 → loadTranscript 往返,消息数/角色/text 一致"
 
 test "L2 transcript: openExisting resume 续写不重复已刷盘消息" {
     const a = std.testing.allocator;
-    const home = "/tmp/cc-transcript-l2b";
-    _ = std.c.mkdir(home, 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-l2b");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer cc.util_fs.testing.rmrfBestEffort(home);
 
     // 第一段:写 2 条
     var conv = Conversation.init(a);
@@ -98,8 +102,10 @@ test "L2 transcript: openExisting resume 续写不重复已刷盘消息" {
 
 test "L2 transcript: arbitrary tool bytes cannot poison the JSONL resume path" {
     const a = std.testing.allocator;
-    const home = "/tmp/cc-transcript-utf8-boundary";
-    _ = std.c.mkdir(home, 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-utf8-boundary");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer cc.util_fs.testing.rmrfBestEffort(home);
 
     var conv = Conversation.init(a);
     defer conv.deinit();
@@ -124,8 +130,10 @@ test "L2 transcript: arbitrary tool bytes cannot poison the JSONL resume path" {
 
 test "L2 transcript: legacy invalid UTF-8 JSONL is repaired before resume" {
     const a = std.testing.allocator;
-    const home = "/tmp/cc-transcript-legacy-repair";
-    _ = std.c.mkdir(home, 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-legacy-repair");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer cc.util_fs.testing.rmrfBestEffort(home);
     var writer = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
     defer a.free(dir);
@@ -158,8 +166,10 @@ test "L2 transcript: legacy invalid UTF-8 JSONL is repaired before resume" {
 
 test "L2 transcript: invalid UTF-8 in meta is repaired and remains listable" {
     const a = std.testing.allocator;
-    const home = "/tmp/cc-transcript-meta-repair";
-    _ = std.c.mkdir(home, 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-meta-repair");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer cc.util_fs.testing.rmrfBestEffort(home);
     var writer = try transcript.Writer.init(a, "/meta-repair-cwd", home, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
     defer a.free(dir);
@@ -186,8 +196,10 @@ test "L2 transcript: invalid UTF-8 in meta is repaired and remains listable" {
 
 test "L2 transcript: torn final JSONL record is atomically discarded" {
     const a = std.testing.allocator;
-    const home = "/tmp/cc-transcript-torn-tail";
-    _ = std.c.mkdir(home, 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-torn-tail");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer cc.util_fs.testing.rmrfBestEffort(home);
     var writer = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
     defer a.free(dir);
@@ -236,8 +248,10 @@ test "L2 transcript R2/F1回归: /retry 回卷后 flush 全量重写,resume 不�
     // flush 无事可写,盘上仍是回卷前的旧第 4 条;loadTranscript 复活被丢弃的回合、
     // 丢掉重生成的回合。修复:conversation.shrink_epoch 变更 → Writer 原子全量重写。
     const a = std.testing.allocator;
-    const home = "/tmp/cc-transcript-l2";
-    _ = std.c.mkdir(home, 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-l2-retry");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer cc.util_fs.testing.rmrfBestEffort(home);
 
     var conv = Conversation.init(a);
     defer conv.deinit();
