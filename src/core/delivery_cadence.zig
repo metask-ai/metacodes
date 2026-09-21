@@ -508,7 +508,7 @@ fn takeShellWord(tokens: *std.mem.TokenIterator(u8, .any), tok: []const u8, offs
 
 /// One sed script: commands separated by `;` / newline, each optionally
 /// prefixed by an address (`12`, `$`, `1,5`, `/re/`, `\%re%`, `!`). Allowed
-/// commands: `p d q Q = l n N h H g G x D P b t T { } #` and `s`/`y` whose
+/// commands: `p d q Q = l n N h H g G x D P b t T : { } #` and `s`/`y` whose
 /// flags are drawn from `g p i I m M digits`. `s` and `y` bodies are skipped
 /// by delimiter; everything else (e, w, W, r, R, a, i, c, F, z, v, e-flag)
 /// disarms. `script` is the shell word without its quotes (takeShellWord).
@@ -541,7 +541,7 @@ fn sedScriptIsReadonly(script: []const u8) bool {
         i += 1;
         switch (cmd) {
             'p', 'd', 'q', 'Q', '=', 'l', 'n', 'N', 'h', 'H', 'g', 'G', 'x', 'D', 'P', '{', '}' => {},
-            'b', 't', 'T' => {
+            'b', 't', 'T', ':' => {
                 // optional label up to ; or newline
                 while (i < script.len and script[i] != ';' and script[i] != '\n') : (i += 1) {}
             },
@@ -604,14 +604,32 @@ fn awkInvocationIsReadonly(tokens: *std.mem.TokenIterator(u8, .any)) bool {
     return !hasAwkSystemCall(program);
 }
 
-/// `$` that the shell would expand (outside single quotes): `awk "$PROG"`,
-/// `awk '{print}' "$f"`. Field references inside the single-quoted program
-/// (`'{ print $1 }'`) do not count.
+/// `$` that the shell would expand: unquoted or inside double quotes
+/// (`awk "$PROG"`, `awk '{print}' "$f"`, `awk "{ print \"it's $x\" }"`).
+/// Field references inside the single-quoted program (`'{ print $1 }'`) do
+/// not count; an apostrophe inside double quotes does not open a single
+/// quote; `\$` outside single quotes is literal.
 fn hasExpansionOutsideSingleQuotes(text: []const u8) bool {
     var in_single = false;
-    for (text) |c| {
-        if (c == '\'') in_single = !in_single;
-        if (c == '$' and !in_single) return true;
+    var in_double = false;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_single) {
+            if (c == '\'') in_single = false;
+        } else if (in_double) {
+            if (c == '\\') {
+                i += 1;
+            } else if (c == '"') {
+                in_double = false;
+            } else if (c == '$') return true;
+        } else if (c == '\'') {
+            in_single = true;
+        } else if (c == '"') {
+            in_double = true;
+        } else if (c == '\\') {
+            i += 1;
+        } else if (c == '$') return true;
     }
     return false;
 }
@@ -869,6 +887,9 @@ test "sed and awk grammar allowlists: GNU execution forms disarm, plain scripts 
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk '{ print $1 }' \\\"$f\\\"\"}")); // over-disarms: acceptable
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n '$=' f\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n '/x$/p' f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed ':a;N;$!ba;s/\\\\n/ /g' f\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk \\\"{ print \\\\\\\"it's $x\\\\\\\" }\\\" f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk '{ print \\\"it\\\\047s\\\", $1 }' f\"}"));
 }
 
 test "bash redirects and in-place flags disarm" {
