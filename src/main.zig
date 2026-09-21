@@ -544,10 +544,6 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // (曾在此从 argv[0] 推导 exe_dir 交给 KgClient 定位 vendor/tinykg。已删:argv[0] 可伪造、
-    // PATH 裸名时为空,且与 rg / kernel 用的 OS 级 self-exe 路径是两套基准;KgClient 现在与
-    // toolchain 一样走 platform.paths.selfExeRealPath,见 kg/client.zig selfExeDir。)
-
     // 初始化日志：读 METACODES_LOG / METACODES_LOG_FILE 环境变量
     const log = @import("util/log.zig");
     log.initFromEnv();
