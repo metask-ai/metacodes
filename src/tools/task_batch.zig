@@ -492,15 +492,22 @@ fn wdTestJob(idx: usize) BatchJob {
     return .{ .idx = idx, .prompt = "", .tool_defs = &.{}, .perm = undefined, .abort = null, .opts = .{ .session = @import("../core/session_id.zig").SessionId.single } };
 }
 
+/// watchdog 测试等待轮数(每轮 100ms):10s 上限,见下方注释。
+const WD_TEST_WAIT_ROUNDS: usize = 100;
+
 test "watchdog 线程真触发超时 abort(started_ms 远早于 now → 超 deadline)" {
     var jobs = [_]BatchJob{wdTestJob(0)};
-    // started_ms=1(单调钟 1ms 处启动,now 是当前单调时间,elapsed 远超 300s deadline)→ 必被砍。
+    // started_ms=1(单调钟 1ms 处启动)配 1ms deadline:elapsed = now-1 在任何机器上都
+    // 超过它。此前用默认 300s deadline,隐含假设"单调钟(自启动计时)已过 5 分钟"——
+    // 长驻的 self-hosted runner 上恒成立,托管 VM 开机不到 5 分钟就跑到这里时 watchdog
+    // 永不触发,等满 10s 后断言失败(main a7390b8b / 3066add7 Linux 实测)。
     jobs[0].started_ms.store(1, .release);
-    var wd = Watchdog{ .jobs = &jobs, .parent_abort = null };
+    var wd = Watchdog{ .jobs = &jobs, .parent_abort = null, .deadline_ms = 1 };
     const t = try std.Thread.spawn(.{}, watchdogMain, .{&wd});
-    // 轮询等 watchdog 把 abort_sig 砍掉(≤200ms 一轮;给 2s 上限防挂)。
+    // 轮询等 watchdog 把 abort_sig 砍掉(≤200ms 一轮)。上限 10s:只决定"真挂了"时多久
+    // 报错,正常路径一两轮就结束;2s 在满载的托管 runner 上不够(PR #139 Linux 实测 flake)。
     var waited: usize = 0;
-    while (!jobs[0].abort_sig.isAborted() and waited < 20) : (waited += 1) {
+    while (!jobs[0].abort_sig.isAborted() and waited < WD_TEST_WAIT_ROUNDS) : (waited += 1) {
         util_time.sleepMs(100);
     }
     // 让 watchdog 退出。
@@ -519,7 +526,7 @@ test "watchdog 线程中继父 abort(未超 deadline 但父 abort → 砍 job)" 
     const t = try std.Thread.spawn(.{}, watchdogMain, .{&wd});
     parent.abort(.user_ctrl_c); // 触发父 abort
     var waited: usize = 0;
-    while (!jobs[0].abort_sig.isAborted() and waited < 20) : (waited += 1) {
+    while (!jobs[0].abort_sig.isAborted() and waited < WD_TEST_WAIT_ROUNDS) : (waited += 1) {
         util_time.sleepMs(100);
     }
     jobs[0].done.store(true, .release);

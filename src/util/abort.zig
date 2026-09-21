@@ -12,6 +12,7 @@
 //! 不获锁——async-signal-safe。
 
 const std = @import("std");
+const util_time = @import("time.zig");
 
 pub const Reason = enum(u8) {
     not_aborted = 0,
@@ -128,13 +129,16 @@ test "cross-thread: worker observes flag set by main" {
 
     const Worker = struct {
         fn run(sig: *AbortSignal, stopped: *std.atomic.Value(bool)) void {
-            // 忙等最多 ~1 秒
-            var i: usize = 0;
-            while (i < 10_000_000) : (i += 1) {
+            // 按时间而不是按迭代次数忙等:10M 次原子读只有几十毫秒,主线程在满载的
+            // 3 核托管 runner 上被调度出去更久就会让 worker 先放弃(CI 实测 flake)。
+            // 上限 10 秒只决定"真坏了"时多久报错,正常路径几微秒就结束。
+            const deadline = util_time.nowMs() + 10 * std.time.ms_per_s;
+            while (util_time.nowMs() < deadline) {
                 if (sig.isAborted()) {
                     stopped.store(true, .release);
                     return;
                 }
+                std.Thread.yield() catch {};
             }
             stopped.store(false, .release);
         }

@@ -4,7 +4,6 @@
 //! 单层文件不存在 / 解析失败 → 只 log,不阻塞其它层和启动。
 
 const std = @import("std");
-const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const settings = @import("settings.zig");
 const log = @import("../util/log.zig");
@@ -147,16 +146,15 @@ const testing = std.testing;
 test "load: cli layer parse + evaluate" {
     const alloc = testing.allocator;
 
-    // 用 pid + 时间拼一个唯一路径(规避 0.16 std.c 无 mkstemp)
-    const pid: i64 = pprocess.currentPid();
-    var path_buf: [128]u8 = undefined;
-    const path_with_nul = try std.fmt.bufPrint(&path_buf, "/tmp/cczig_settings_{d}.json\x00", .{pid});
-    const path = path_with_nul[0 .. path_with_nul.len - 1];
+    // per-pid 临时目录(POSIX /tmp,Windows %TEMP%):不再依赖当前驱动器根下的 \tmp,
+    // 也不与并发跑的其它测试进程共用一个固定路径(tools/test_tmp.zig 头注释)。
+    var path_buf: [512]u8 = undefined;
+    const path = @import("../tools/test_tmp.zig").path(&path_buf, "cczig_settings.json");
 
-    const fd = pfs.open(@ptrCast(path_with_nul.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.WriteFailed;
     defer _ = pfs.close(fd);
-    defer _ = std.c.unlink(@ptrCast(path_with_nul.ptr));
+    defer _ = std.c.unlink(path.ptr);
 
     const json_body = "{\"permissions\":{\"allow\":[\"Bash(git *)\"],\"deny\":[\"Bash(git push)\"]}}";
     _ = pfs.write(fd, json_body);

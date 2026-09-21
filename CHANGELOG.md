@@ -77,6 +77,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- CI, AgentCore Windows, Release and Maintainer rule control all run on
+  GitHub-hosted runners (`ubuntu-latest`, `macos-latest`, `windows-latest`):
+  the repository is public, hosted standard runners are free for public
+  repositories, and organization policy keeps public repositories off the
+  self-hosted fleet. Runner-specific machinery is gone — the fork-isolation
+  `if:` guards, the persistent per-machine Zig/Lean cache directories, the
+  per-machine `concurrency` lanes, `-j6`/`-j12` sized for the old boxes, and
+  `release.yml`'s `runner_pool` input. In their place: `mlugg/setup-zig`'s
+  `use-cache` for the Zig cache, `actions/cache` for `~/.elan` and
+  `control-plane/lean/.lake`, `scripts/ci/install-elan.sh` (elan from a
+  pinned release asset with a pinned SHA-256; a no-op on a cache hit),
+  `requirements-dev.txt` installed on every leg, and `cargo install
+  bindgen-cli --version 0.72.1 --locked` in the release jobs. Job timeouts are
+  45 min for the gates (cold hosted runners compile the whole tree) and
+  unchanged elsewhere. `doc/RELEASE_RUNNER.md` now describes the hosted
+  release pipeline; the dedicated `metacodes-release` pool is no longer
+  planned.
+
 - Vendored ripgrep moves from 14.1.1 to 15.2.0 (#86): the four existing
   targets are replaced by the upstream 15.2.0 release binaries and
   `rg-linux-aarch64` (upstream's `aarch64-unknown-linux-musl`, static-pie,

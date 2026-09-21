@@ -10,7 +10,6 @@
 const std = @import("std");
 const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
-const ppaths = @import("platform").paths;
 
 var dir_made: bool = false;
 
@@ -19,10 +18,9 @@ var dir_made: bool = false;
 /// buf 须够大(建议 512)。返回不含 NUL 的 slice;`ptr` 可直接喂 pfs.open。
 pub fn path(buf: []u8, name: []const u8) [:0]const u8 {
     const pid = pprocess.currentPid();
-    // POSIX 保持 "/tmp" 不变(macOS $TMPDIR≠/tmp,独立拼 /tmp/... 的测试如 read home_dir 会
-    // 撞不上);仅 Windows 用 TEMP(无 /tmp)。tempDir 归一正斜杠(Windows 也认 '/',嵌 JSON 免转义)。
+    // 根的平台规则(POSIX /tmp、Windows %TEMP% 正斜杠)只在 util/fs.zig testing.tmpRoot 一处。
     var tmpbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp = if (@import("builtin").os.tag == .windows) fwd(&tmpbuf, ppaths.tempDir()) else "/tmp";
+    const tmp = @import("../util/fs.zig").testing.tmpRoot(&tmpbuf);
     if (!dir_made) {
         var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
         const dpath = std.fmt.bufPrint(&dirbuf, "{s}/cc-zig-test-{d}", .{ tmp, pid }) catch return "";
@@ -39,7 +37,7 @@ pub fn dir(buf: []u8) [:0]const u8 {
     _ = path(&b, "."); // 触发建目录
     const pid = pprocess.currentPid();
     var tmpbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp = if (@import("builtin").os.tag == .windows) fwd(&tmpbuf, ppaths.tempDir()) else "/tmp";
+    const tmp = @import("../util/fs.zig").testing.tmpRoot(&tmpbuf);
     return std.fmt.bufPrintZ(buf, "{s}/cc-zig-test-{d}", .{ tmp, pid }) catch unreachable;
 }
 
@@ -54,13 +52,6 @@ pub fn normalizeSlashes(s: []u8) []const u8 {
         if (c.* == '\\') c.* = '/';
     }
     return s;
-}
-
-/// 反斜杠 → 正斜杠(拷进 out,返回 slice)。
-fn fwd(out: []u8, s: []const u8) []const u8 {
-    const n = @min(s.len, out.len);
-    for (s[0..n], 0..) |c, i| out[i] = if (c == '\\') '/' else c;
-    return out[0..n];
 }
 
 test "path: per-pid 唯一目录 + 可建文件" {

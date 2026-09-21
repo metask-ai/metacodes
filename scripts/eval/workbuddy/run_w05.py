@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 
 from . import WORKBUDDY_PINNED_COMMIT
 from .install_overlay import install
-from .mock_provider import MOCK_CREDENTIAL
+from .mock_provider import MOCK_CREDENTIAL, READY_DEADLINE_S
 from .stage_artifacts import stage
 from .trace import OBSERVATION_FILENAME, TraceError, load_control_metrics
 from ..model import fsync_directory, mode_violation, open_nofollow
@@ -498,7 +498,7 @@ def run_w05(
             encoding="utf-8",
         )
         try:
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + READY_DEADLINE_S
             while not ready.exists() and time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise W05Error(

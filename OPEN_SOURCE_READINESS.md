@@ -36,21 +36,27 @@ The repository is prepared for review but is **not approved for public visibilit
 - [ ] Run native ReleaseSafe tests and AgentCore source-free consumer gates on the
       supported matrix.
 - [ ] Verify public examples use placeholders and no paid endpoint by default.
-- [ ] Enable branch protection, required CI, private vulnerability reporting,
-      Dependabot, and least-privilege GitHub Actions permissions.
-- [ ] Resolve self-hosted runner exposure before visibility flips: keep the
-      fork-PR isolation guard on every `pull_request` job, set Actions fork
-      approval to "Require approval for all outside collaborators", and either
-      move public-facing CI to GitHub-hosted or ephemeral runners or record an
-      explicit owner decision that persistent runners may execute contributor
-      PR code. Register the dedicated `metacodes-release` runners described in
-      `doc/RELEASE_RUNNER.md` (one per platform, a runner group restricted to
-      the `Release` workflow) so release builds and the `rule-control` gate
-      never share a machine with the PR pool; until they exist,
-      `.github/workflows/release.yml` runs only as a dry run.
+- [x] Enable branch protection, required CI, private vulnerability reporting,
+      Dependabot, and least-privilege GitHub Actions permissions (2026-09-21:
+      ruleset "Protect main" — no deletion or force-push, pull request
+      required, required checks `Gates (Linux)` / `Gates (macOS)` /
+      `Gates (Windows)` with the branch up to date, review threads resolved,
+      admin bypass only inside a pull request; secret scanning with push
+      protection, Dependabot alerts and security updates, private
+      vulnerability reporting all enabled; every workflow declares
+      `permissions: contents: read`, `publish` alone holds `contents: write`).
+- [x] Resolve self-hosted runner exposure (2026-09-21): Actions fork-PR
+      approval is "Require approval for all external contributors" at both the
+      repository and the organization; every workflow runs on GitHub-hosted
+      runners (organization policy keeps public repositories off the
+      self-hosted fleet), so no contributor PR code ever reaches a persistent
+      machine and the fork-isolation `if:` guards were removed. Release builds
+      and the `rule-control` gate run on ephemeral hosted runners too; the
+      dedicated `metacodes-release` pool is no longer planned
+      (`doc/RELEASE_RUNNER.md`).
 - [ ] Tag an immutable pre-release and publish its checksums: run
       `.github/workflows/release.yml` (`workflow_dispatch`, `dry_run: false`)
-      on the dedicated runners for a `0.x.y-dev` commit, verify one unpacked
+      for a `0.x.y-dev` commit, verify one unpacked
       archive per platform with `scripts/verify_release_bundle.py --native`,
       then publish the draft it created (archives, `.sha256` sidecars and
       `metacodes-<version>-SHA256SUMS`). SBOM/provenance attestations remain

@@ -16,13 +16,10 @@ jobs:
     # running the closed-loop controller on Linux would skip those tests and
     # correctly fail the fail-closed release decision.
     #
-    # NOTE: [self-hosted, macOS, ARM64] is the same label set as the CI
-    # pull_request jobs, so this release gate can land on a machine that has
-    # just executed PR-authored code. Before the repository becomes public,
-    # restore a dedicated release label (e.g. metacodes-release) on an
-    # isolated or re-imaged runner; see OPEN_SOURCE_READINESS.md
-    # "Final launch gate".
-    runs-on: [self-hosted, macOS, ARM64]
+    # GitHub-hosted macOS runner: ephemeral, so no PR-authored code can
+    # precondition the machine that produces a release decision (the
+    # isolation item ROADMAP M1 tracked for the shared self-hosted runner).
+    runs-on: macos-latest
     # The closed-loop gate replays every rule's feedback suite (multiple full
     # zig build test-class runs plus Lean kernel work); a 30-minute budget was
     # measured structurally insufficient (killed at 30m with feedback still
@@ -31,29 +28,26 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # See ci.yml `gates` for the cache semantics.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
-          use-cache: false
-      # Keep Zig caches outside the workspace; see ci.yml's `test` job.
-      - name: Point Zig caches at persistent per-runner storage
-        shell: bash
-        run: |
-          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
-          echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
-      # elan is a presence-checked runner prerequisite (see ci.yml's Lean
-      # step for why lean-action was dropped: it executed an unpinned
-      # installer from elan's master branch on every run).
-      - name: Put pinned Lean toolchain on PATH
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ ! -x "$HOME/.elan/bin/elan" ]; then
-            echo "elan is a runner prerequisite (see ROADMAP M1); install it once:" >&2
-            echo "  https://github.com/leanprover/elan  (or: brew install elan-init)" >&2
-            exit 1
-          fi
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          use-cache: true
+          cache-size-limit: 4096
+      # Same Lean cache and pinned elan installer as ci.yml `gates`.
+      - name: Restore Lean toolchain and build products
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            control-plane/lean/.lake
+          key: lean-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('control-plane/lean/lean-toolchain', 'control-plane/lean/lakefile.toml', 'control-plane/lean/lake-manifest.json', 'control-plane/lean/**/*.lean') }}
+          restore-keys: |
+            lean-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install pinned elan
+        run: bash scripts/ci/install-elan.sh
+      - name: Install Python development dependencies
+        run: python3 -m pip install --break-system-packages -r requirements-dev.txt
       - name: Verify checked-in TinyKG bundle
         run: python3 scripts/verify_tinykg_binary.py
       - name: Run closed-loop release gate
