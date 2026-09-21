@@ -353,9 +353,9 @@ test "REGRESSION issue #17: LSP 在位但符号能力缺失 → 仍不是裸 []"
     //   · 装了 zls  → /tmp 不是 git 仓,fetchSymbols 判 outside_workspace。
     // 两条都必须给出限定语,断言取二者的公共不变量。
     const a = std.testing.allocator;
-    const pprocess = @import("platform").process;
-
-    const base = try std.fmt.allocPrint(a, "/tmp/cc_fs_capgap_{d}", .{pprocess.currentPid()});
+    
+    var base_buf: [512]u8 = undefined;
+    const base = try a.dupe(u8, @import("../util/fs.zig").testing.perPidDir(&base_buf, "cc-zig-fs-capgap"));
     defer a.free(base);
     {
         var zbuf: [std.fs.max_path_bytes]u8 = undefined;

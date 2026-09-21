@@ -7,6 +7,7 @@
 //! 不再像旧版那样把所有东西扁平化成 text。
 
 const std = @import("std");
+const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 const types = @import("../types.zig");
 const client_mod = @import("../client.zig");
@@ -5271,9 +5272,12 @@ test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触�
     try c.appendText(.user, "do something");
     try c.appendText(.assistant, "DONE_MARKER_ANSWER");
 
-    const marker: [:0]const u8 = "/tmp/cc_stop_hook_fired.marker";
-    _ = std.c.unlink(@ptrCast(marker.ptr));
-    const cmds = [_][]const u8{"cat > /tmp/cc_stop_hook_fired.marker"};
+    var marker_buf: [512]u8 = undefined;
+    const marker = tt.path(&marker_buf, "stop-hook-fired.marker");
+    _ = std.c.unlink(marker.ptr);
+    const hook_cmd = try std.fmt.allocPrint(a, "cat > {s}", .{marker});
+    defer a.free(hook_cmd);
+    const cmds = [_][]const u8{hook_cmd};
     const entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &cmds }};
     const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .stop = &entries, .allocator = a };
 

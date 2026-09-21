@@ -358,8 +358,10 @@ test "removeTeamDirTree: `..` 穿越被拒" {
 }
 
 test "mkdirParents creates nested dirs" {
-    const root = "/tmp/cc-zig-mkdirp-test-root";
-    const tmp = root ++ "/a/b/c/d";
+    var root_buf: [512]u8 = undefined;
+    const root = testing.perPidDir(&root_buf, "cc-zig-mkdirp-test-root");
+    var tmp_buf: [600]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}/a/b/c/d", .{root});
     defer testing.rmrfBestEffort(root);
     try mkdirParents(tmp);
     // 再调一次应该静默成功（幂等）

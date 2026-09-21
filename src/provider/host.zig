@@ -10,6 +10,7 @@
 //! into a struct field would leave the kernel pointing at the old address.
 
 const std = @import("std");
+const util_fs = @import("../util/fs.zig");
 const ids = @import("ids.zig");
 const registry_mod = @import("registry.zig");
 const control_plane = @import("control_plane.zig");
@@ -628,7 +629,10 @@ test "durable state adoption survives a config file that does not exist" {
     const a = std.testing.allocator;
     const host = try Host.create(a);
     defer host.destroy();
-    var store = try config_store.Store.initPath(a, "/tmp/metacodes-provider-host-absent.json");
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var absent_buf: [512]u8 = undefined;
+    const absent = try std.fmt.bufPrint(&absent_buf, "{s}/cc-zig-provider-host-absent-{d}.json", .{ util_fs.testing.tmpRoot(&root_buf), @import("platform").process.currentPid() });
+    var store = try config_store.Store.initPath(a, absent);
     defer store.deinit();
     // Absent is not an error: a fresh installation has no control-plane state.
     host.adoptDurableState(&store);

@@ -12,6 +12,7 @@
 //! parsing is worth more than a second copy that can drift from it.
 
 const std = @import("std");
+const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const rng = @import("platform").rng;
 const process = @import("platform").process;
 const pfs = @import("platform").fs;
@@ -998,7 +999,8 @@ test "import OAuth token response requires refresh token and positive expiry" {
 
 test "stored credentials roundtrip keeps file private" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-auth-roundtrip.json";
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "auth-roundtrip.json");
     var creds = StoredCredentials{ .api_key = try a.dupe(u8, "stored-key") };
     defer creds.deinit(a);
     try saveToPath(a, path, creds);

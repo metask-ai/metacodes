@@ -211,13 +211,13 @@ const testing = std.testing;
 const test_fs = @import("fs.zig");
 
 fn testDir(buf: []u8) ![]const u8 {
-    const d = try std.fmt.bufPrint(buf, "/tmp/cc-zig-filelock-test-{d}", .{util_time.nowNs()});
+    const d = @import("fs.zig").testing.uniqueDir(buf, "cc-zig-filelock-test");
     try test_fs.mkdirParents(d);
     return d;
 }
 
 test "acquire + release 往返" {
-    var dbuf: [128]u8 = undefined;
+    var dbuf: [256]u8 = undefined;
     const dir = try testDir(&dbuf);
     defer test_fs.testing.rmrfBestEffort(dir);
     var pbuf: [256]u8 = undefined;
@@ -233,7 +233,7 @@ test "acquire + release 往返" {
 }
 
 test "二次 acquire 被拒(LockBusy),释放后可再获" {
-    var dbuf: [128]u8 = undefined;
+    var dbuf: [256]u8 = undefined;
     const dir = try testDir(&dbuf);
     defer test_fs.testing.rmrfBestEffort(dir);
     var pbuf: [256]u8 = undefined;
@@ -248,7 +248,7 @@ test "二次 acquire 被拒(LockBusy),释放后可再获" {
 }
 
 test "陈旧锁被抢" {
-    var dbuf: [128]u8 = undefined;
+    var dbuf: [256]u8 = undefined;
     const dir = try testDir(&dbuf);
     defer test_fs.testing.rmrfBestEffort(dir);
     var pbuf: [256]u8 = undefined;
@@ -273,7 +273,7 @@ test "陈旧锁被抢" {
 }
 
 test "空内容陈旧锁也能被抢(mtime 兜底,Linus MED-2 回归)" {
-    var dbuf: [128]u8 = undefined;
+    var dbuf: [256]u8 = undefined;
     const dir = try testDir(&dbuf);
     defer test_fs.testing.rmrfBestEffort(dir);
     var pbuf: [256]u8 = undefined;

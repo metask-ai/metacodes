@@ -458,6 +458,7 @@ test "shutdownSocket wakes a blocked accept before close" {
 test "UDS listen/connect/send/recv roundtrip(POSIX)" {
     if (is_windows) return; // UDS 仅 POSIX(此早退不影响 windows 分析:上面 pub fn 已被 acceptConn 等引用)
     // 唯一 path,避免并发测试撞(pid + 栈地址熵;此 Zig 0.16 无 std.time.nanoTimestamp)。
+    // 刻意留在 /tmp:sun_path 上限 104 字节,macOS $TMPDIR(/var/folders/…)会超;本测试 POSIX-only。
     var pbuf: [64]u8 = undefined;
     const ts: u64 = @as(u64, @intCast(pproc.currentPid())) ^ @intFromPtr(&pbuf);
     const path = try std.fmt.bufPrint(&pbuf, "/tmp/cc-zig-uds-test-{x}.sock", .{ts & 0xffffffff});

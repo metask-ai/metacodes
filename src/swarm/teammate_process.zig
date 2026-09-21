@@ -788,8 +788,8 @@ test "process ownership requires lead session and per-spawn lease" {
     const session = SessionId.fromSlice("0123456789abcdef01234567").?;
     const lease = SessionId.fromSlice("fedcba987654321001234567").?;
     const other_lease = SessionId.fromSlice("aaaaaaaaaaaaaaaaaaaaaaaa").?;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-process-owner-{d}", .{util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-process-owner");
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     try @import("../util/fs.zig").mkdirParents(team_mod.teamDirPath(home, "proj", &dir_buf));
