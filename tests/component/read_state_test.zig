@@ -9,22 +9,51 @@ const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 W
 
 const ReadState = cc.core_read_state.ReadState;
 
-fn writeFile(path: [*:0]const u8, content: []const u8) void {
+/// Fixture I/O must fail the test, not fall through. The historical helper swallowed a
+/// failed open, so an unwritable fixture path collapsed both hashes to the "unreadable"
+/// sentinel 0 and the test reported a hash bug (`h1 != h3` false) instead of the real
+/// cause. Print what the CRT saw so a CI log carries the evidence.
+fn writeFile(path: [*:0]const u8, content: []const u8) !void {
     const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    if (fd < 0) return;
+    if (fd < 0) return fixtureFailure("open", path);
     defer pfs.close(fd);
-    _ = pfs.write(fd, content);
+    const n = pfs.write(fd, content);
+    if (n < 0 or @as(usize, @intCast(n)) != content.len) return fixtureFailure("write", path);
+}
+
+fn fixtureFailure(op: []const u8, path: [*:0]const u8) error{FixtureIoFailed} {
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd: []const u8 = if (std.c.getcwd(&cwd_buf, cwd_buf.len)) |raw|
+        std.mem.span(@as([*:0]const u8, @ptrCast(raw)))
+    else
+        "?";
+    std.debug.print(
+        "read_state fixture: {s} failed path={s} errno={d} cwd={s}\n",
+        .{ op, path, std.c._errno().*, cwd },
+    );
+    return error.FixtureIoFailed;
 }
 
 test "L2 read_state: hashFileContent 一致 + 内容变则哈希变" {
-    const p = "/tmp/cc-rs-hash.txt";
-    writeFile(p, "hello world");
+    // Per-process directory under the platform temp root (util/fs.zig testing.tmpRoot):
+    // absolute with a drive letter on Windows. A bare `/tmp/...` literal is resolved by
+    // the Windows CRT against the process's current drive and is shared by every
+    // parallel shard; this test has no business depending on either.
+    var dir_buf: [512]u8 = undefined;
+    const dir = cc.util_fs.testing.perPidDir(&dir_buf, "cc-zig-read-state");
+    if (std.c.mkdir(dir.ptr, 0o755) != 0 and !pfs.exists(dir.ptr)) return fixtureFailure("mkdir", dir.ptr);
+    defer _ = std.c.rmdir(dir.ptr);
+    var path_buf: [512]u8 = undefined;
+    const p = try std.fmt.bufPrintZ(&path_buf, "{s}/cc-rs-hash.txt", .{dir});
+    try writeFile(p, "hello world");
     defer _ = std.c.unlink(p);
     const h1 = cc.core_read_state.hashFileContent(p);
     const h2 = cc.core_read_state.hashFileContent(p);
+    try std.testing.expect(h1 != 0); // 0 is hashFileContent's "unreadable" sentinel, not a hash
     try std.testing.expectEqual(h1, h2);
-    writeFile(p, "hello WORLD");
+    try writeFile(p, "hello WORLD");
     const h3 = cc.core_read_state.hashFileContent(p);
+    try std.testing.expect(h3 != 0);
     try std.testing.expect(h1 != h3);
 }
 
