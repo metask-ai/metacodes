@@ -25,6 +25,19 @@ fn simpleCtx(a: std.mem.Allocator) ToolContext {
 
 /// Built-in smoke cases can only produce `.ok`; keep the typed dispatch
 /// boundary explicit while transferring the returned bytes to the caller.
+/// 每进程唯一的 smoke fixture 目录 `<tmpRoot>/cc-zig-smoke-<pid>`(建好);同进程的用例共用它,
+/// 各自 unlink 自己的文件。buf 须 ≥ 512。
+fn smokeDir(buf: []u8) [:0]const u8 {
+    const d = cc.util_fs.testing.perPidDir(buf, "cc-zig-smoke");
+    _ = std.c.mkdir(d.ptr, 0o755);
+    return d;
+}
+
+/// `<dir>/<name>`,NUL 结尾写进 buf。
+fn sub(buf: []u8, dir: []const u8, name: []const u8) [:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, name }) catch unreachable;
+}
+
 fn dispatchOk(ctx: *const ToolContext, name: []const u8, args: []const u8) ![]u8 {
     var outcome = try tools.dispatch(ctx, name, args);
     return switch (outcome) {
@@ -89,15 +102,20 @@ test "L2 smoke: Bash 非零退出 → exit_code 透传" {
 test "L2 smoke: Write 新文件 → Read 读回内容一致" {
     const a = std.testing.allocator;
     var ctx = simpleCtx(a);
-    const path = "/tmp/cc-smoke-write-read.txt";
-    defer _ = std.c.unlink(path);
+    var dir_buf: [512]u8 = undefined;
+    const dir = smokeDir(&dir_buf);
+    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    var path_buf: [512]u8 = undefined;
+    const path = sub(&path_buf, dir, "write-read.txt");
+    defer _ = std.c.unlink(path.ptr);
+    var args_buf: [1024]u8 = undefined;
 
-    const wout = try dispatchOk(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-write-read.txt\",\"content\":\"smoke_body_42\"}");
+    const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"smoke_body_42\"}}", .{path}));
     defer a.free(wout);
     // Write 成功不应是 error JSON
     try std.testing.expect(std.mem.indexOf(u8, wout, "\"error\"") == null);
 
-    const rout = try dispatchOk(&ctx, "Read", "{\"file_path\":\"/tmp/cc-smoke-write-read.txt\"}");
+    const rout = try dispatchOk(&ctx, "Read", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{path}));
     defer a.free(rout);
     try std.testing.expect(std.mem.indexOf(u8, rout, "smoke_body_42") != null);
 }
@@ -105,7 +123,12 @@ test "L2 smoke: Write 新文件 → Read 读回内容一致" {
 test "L2 smoke: Read 不存在文件 → FileNotFound" {
     const a = std.testing.allocator;
     var ctx = simpleCtx(a);
-    try std.testing.expectError(error.FileNotFound, tools.dispatch(&ctx, "Read", "{\"file_path\":\"/tmp/cc-smoke-nope-9z9z.txt\"}"));
+    var dir_buf: [512]u8 = undefined;
+    const dir = smokeDir(&dir_buf);
+    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    var args_buf: [1024]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}/nope-9z9z.txt\"}}", .{dir});
+    try std.testing.expectError(error.FileNotFound, tools.dispatch(&ctx, "Read", args));
 }
 
 test "L2 smoke: ReadArtifact registry schema dispatches bounded recovery" {
@@ -134,17 +157,22 @@ test "L2 smoke: ReadArtifact registry schema dispatches bounded recovery" {
 test "L2 smoke: Edit 替换字符串 → Read 读回新内容" {
     const a = std.testing.allocator;
     var ctx = simpleCtx(a);
-    const path = "/tmp/cc-smoke-edit.txt";
-    defer _ = std.c.unlink(path);
+    var dir_buf: [512]u8 = undefined;
+    const dir = smokeDir(&dir_buf);
+    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    var path_buf: [512]u8 = undefined;
+    const path = sub(&path_buf, dir, "edit.txt");
+    defer _ = std.c.unlink(path.ptr);
+    var args_buf: [1024]u8 = undefined;
 
-    const wout = try dispatchOk(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-edit.txt\",\"content\":\"before_X done\"}");
+    const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"before_X done\"}}", .{path}));
     a.free(wout);
 
-    const eout = try dispatchOk(&ctx, "Edit", "{\"file_path\":\"/tmp/cc-smoke-edit.txt\",\"old_string\":\"before_X\",\"new_string\":\"after_Y\"}");
+    const eout = try dispatchOk(&ctx, "Edit", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"old_string\":\"before_X\",\"new_string\":\"after_Y\"}}", .{path}));
     defer a.free(eout);
     try std.testing.expect(std.mem.indexOf(u8, eout, "\"success\":true") != null);
 
-    const rout = try dispatchOk(&ctx, "Read", "{\"file_path\":\"/tmp/cc-smoke-edit.txt\"}");
+    const rout = try dispatchOk(&ctx, "Read", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{path}));
     defer a.free(rout);
     try std.testing.expect(std.mem.indexOf(u8, rout, "after_Y") != null);
     try std.testing.expect(std.mem.indexOf(u8, rout, "before_X") == null);
@@ -153,13 +181,18 @@ test "L2 smoke: Edit 替换字符串 → Read 读回新内容" {
 test "L2 smoke: Edit old_string 未找到 → 错误(不静默成功)" {
     const a = std.testing.allocator;
     var ctx = simpleCtx(a);
-    const path = "/tmp/cc-smoke-edit-nf.txt";
-    defer _ = std.c.unlink(path);
-    const wout = try dispatchOk(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-edit-nf.txt\",\"content\":\"hello\"}");
+    var dir_buf: [512]u8 = undefined;
+    const dir = smokeDir(&dir_buf);
+    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    var path_buf: [512]u8 = undefined;
+    const path = sub(&path_buf, dir, "edit-nf.txt");
+    defer _ = std.c.unlink(path.ptr);
+    var args_buf: [1024]u8 = undefined;
+    const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"hello\"}}", .{path}));
     a.free(wout);
 
     // old_string 不存在 → execute 返 error(具名),dispatch 透传
-    const r = tools.dispatch(&ctx, "Edit", "{\"file_path\":\"/tmp/cc-smoke-edit-nf.txt\",\"old_string\":\"NOPE\",\"new_string\":\"x\"}");
+    const r = tools.dispatch(&ctx, "Edit", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"old_string\":\"NOPE\",\"new_string\":\"x\"}}", .{path}));
     try std.testing.expectError(error.StringNotFound, r);
 }
 
@@ -170,12 +203,17 @@ test "L2 smoke: Edit old_string 未找到 → 错误(不静默成功)" {
 test "L2 smoke: Grep 在临时文件里匹配已知串(content 模式带行号)" {
     const a = std.testing.allocator;
     var ctx = simpleCtx(a);
-    const path = "/tmp/cc-smoke-grep.txt";
-    defer _ = std.c.unlink(path);
-    const wout = try dispatchOk(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-grep.txt\",\"content\":\"alpha\\nNEEDLE_777\\nbeta\"}");
+    var dir_buf: [512]u8 = undefined;
+    const dir = smokeDir(&dir_buf);
+    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    var path_buf: [512]u8 = undefined;
+    const path = sub(&path_buf, dir, "grep.txt");
+    defer _ = std.c.unlink(path.ptr);
+    var args_buf: [1024]u8 = undefined;
+    const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"alpha\\nNEEDLE_777\\nbeta\"}}", .{path}));
     a.free(wout);
 
-    const out = dispatchOk(&ctx, "Grep", "{\"pattern\":\"NEEDLE_777\",\"path\":\"/tmp/cc-smoke-grep.txt\",\"output_mode\":\"content\"}") catch |err| {
+    const out = dispatchOk(&ctx, "Grep", try std.fmt.bufPrint(&args_buf, "{{\"pattern\":\"NEEDLE_777\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{path})) catch |err| {
         if (err == error.RipgrepNotFound) return error.SkipZigTest;
         return err;
     };
@@ -186,17 +224,22 @@ test "L2 smoke: Grep 在临时文件里匹配已知串(content 模式带行号)"
 test "L2 smoke: Glob 匹配临时目录下文件" {
     const a = std.testing.allocator;
     var ctx = simpleCtx(a);
-    const path = "/tmp/cc-smoke-glob-uniq.md";
-    defer _ = std.c.unlink(path);
-    const wout = try dispatchOk(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-glob-uniq.md\",\"content\":\"x\"}");
+    var dir_buf: [512]u8 = undefined;
+    const dir = smokeDir(&dir_buf);
+    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    var path_buf: [512]u8 = undefined;
+    const path = sub(&path_buf, dir, "glob-uniq.md");
+    defer _ = std.c.unlink(path.ptr);
+    var args_buf: [1024]u8 = undefined;
+    const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"x\"}}", .{path}));
     a.free(wout);
 
-    const out = dispatchOk(&ctx, "Glob", "{\"pattern\":\"cc-smoke-glob-uniq.md\",\"path\":\"/tmp\"}") catch |err| {
+    const out = dispatchOk(&ctx, "Glob", try std.fmt.bufPrint(&args_buf, "{{\"pattern\":\"glob-uniq.md\",\"path\":\"{s}\"}}", .{dir})) catch |err| {
         if (err == error.RipgrepNotFound) return error.SkipZigTest;
         return err;
     };
     defer a.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "cc-smoke-glob-uniq.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "glob-uniq.md") != null);
 }
 
 // ============================================================================
@@ -226,14 +269,20 @@ test "L2 smoke: TaskCreate → TaskList → TaskUpdate(完整 CRUD 经 dispatch)
 test "L2 e2e: Edit no-op 经 executeSlots → 富 detail 到达 slot(code=no_op_edit)" {
     const a = std.testing.allocator;
     const tool_exec = cc.tool_exec;
-    const path = "/tmp/cc-smoke-edit-noop-e2e.txt";
-    defer _ = std.c.unlink(path);
+    var dir_buf: [512]u8 = undefined;
+    const dir = smokeDir(&dir_buf);
+    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    var path_buf: [512]u8 = undefined;
+    const path = sub(&path_buf, dir, "edit-noop-e2e.txt");
+    defer _ = std.c.unlink(path.ptr);
+    var args_buf: [1024]u8 = undefined;
     var ctx = simpleCtx(a);
-    a.free(try dispatchOk(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-edit-noop-e2e.txt\",\"content\":\"abc\"}"));
+    a.free(try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"abc\"}}", .{path})));
 
     // 经 executeSlots(真正接 error_detail 通道的路径,非 dispatch 直调)。
+    var slot_buf: [1024]u8 = undefined;
     var slots = [_]tool_exec.Slot{
-        .{ .decision = .run, .name = "Edit", .id = "e0", .input = "{\"file_path\":\"/tmp/cc-smoke-edit-noop-e2e.txt\",\"old_string\":\"abc\",\"new_string\":\"abc\"}" },
+        .{ .decision = .run, .name = "Edit", .id = "e0", .input = try std.fmt.bufPrint(&slot_buf, "{{\"file_path\":\"{s}\",\"old_string\":\"abc\",\"new_string\":\"abc\"}}", .{path}) },
     };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
     defer slots[0].deinit(a);
@@ -249,13 +298,19 @@ test "L2 e2e: Edit no-op 经 executeSlots → 富 detail 到达 slot(code=no_op_
 test "L2 e2e: Edit not-found 经 executeSlots → 富诊断到达 slot" {
     const a = std.testing.allocator;
     const tool_exec = cc.tool_exec;
-    const path = "/tmp/cc-smoke-edit-nf-e2e.txt";
-    defer _ = std.c.unlink(path);
+    var dir_buf: [512]u8 = undefined;
+    const dir = smokeDir(&dir_buf);
+    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    var path_buf: [512]u8 = undefined;
+    const path = sub(&path_buf, dir, "edit-nf-e2e.txt");
+    defer _ = std.c.unlink(path.ptr);
+    var args_buf: [1024]u8 = undefined;
     var ctx = simpleCtx(a);
-    a.free(try dispatchOk(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-edit-nf-e2e.txt\",\"content\":\"hello world\"}"));
+    a.free(try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"hello world\"}}", .{path})));
 
+    var slot_buf: [1024]u8 = undefined;
     var slots = [_]tool_exec.Slot{
-        .{ .decision = .run, .name = "Edit", .id = "e0", .input = "{\"file_path\":\"/tmp/cc-smoke-edit-nf-e2e.txt\",\"old_string\":\"nonexistent\",\"new_string\":\"x\"}" },
+        .{ .decision = .run, .name = "Edit", .id = "e0", .input = try std.fmt.bufPrint(&slot_buf, "{{\"file_path\":\"{s}\",\"old_string\":\"nonexistent\",\"new_string\":\"x\"}}", .{path}) },
     };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
     defer slots[0].deinit(a);

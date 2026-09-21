@@ -738,7 +738,8 @@ test "L2 ㉔: 一等用户图片占掉额度后,新读入的图片结果在投�
 
 test "L2 ㉓: transcript resume 后(送达标记随 transcript 持久化)请求级图片上限仍生效——最老的已送达图片被裁掉,wire 上只剩一张" {
     const a = std.testing.allocator;
-    const tmp_home = "/tmp/cc-zig-image-cap-resume-l2";
+    var home_buf: [512]u8 = undefined;
+    const tmp_home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-image-cap-resume-l2");
     cc.util_fs.testing.rmrfBestEffort(tmp_home);
     defer cc.util_fs.testing.rmrfBestEffort(tmp_home);
     var writer = try cc.transcript.Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4-20250514", cc.transcript.genSessionId());
