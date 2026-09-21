@@ -200,8 +200,15 @@ exploration and rejects substitutions, `>&file`, awk/sed write payloads,
 `sort -o`, `uniq in out`, `find -fprint` and `fd -x`. 18 hazard rollouts,
 all valid, nominal US$5.35. The binary was rebuilt again at
 08:47:47 local for the follow-up fixes, after the last v1.1 rollout finished
-(08:45:40), so every v1.1 rollout ran the 66ed1be8 sensor; replaying the
-transcripts also finds none of the shapes the later fixes cover.
+(08:45:40), so every v1.1 rollout ran the 66ed1be8 sensor. The sensor kept
+narrowing after v1.1 (Codex passes 2–5: `case` bodies, git write options,
+attached flags, pagers, awk/sed program files, sed/awk read-only grammars,
+`sort -T`, shell expansion inside script words). None of those passes was
+re-run; instead every Bash call in the 18 v1.1 transcripts (72 calls, 66
+distinct) was replayed through the real classifier at 66ed1be8 and at the
+pass-5 commit, and each call gets the same class under both (71
+exploration, 1 mutation: a `python3` heredoc). The later passes would not
+have changed any v1.1 threshold crossing.
 
 | | observe (control) | enforce (treatment) |
 |---|---:|---:|
