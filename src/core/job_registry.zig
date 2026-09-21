@@ -875,7 +875,12 @@ test "JobRegistry owner and observed exit suppress notification" {
     defer r.deinit();
     const owner = @import("session_id.zig").gen();
     const other = @import("session_id.zig").gen();
-    const j = try r.spawnBackgroundOwned("true", null, owner);
+    // `hasPendingNotifyJobs` reaps first and counts only running jobs, so the
+    // job must still be alive at the first assertion. `true` exits within a
+    // millisecond and lost that race on a loaded hosted runner (main fd8165f1
+    // era, Gates (Linux)); a short sleep keeps the check deterministic and
+    // waitUntilExited still returns in well under a second.
+    const j = try r.spawnBackgroundOwned("sleep 0.5", null, owner);
     try std.testing.expect(r.hasPendingNotifyJobs(owner));
     try waitUntilExited(&r, j.idSlice());
     try std.testing.expect(!r.hasPendingNotifyJobs(owner));
