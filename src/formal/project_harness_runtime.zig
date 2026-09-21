@@ -52,17 +52,24 @@ pub fn loadConfigFromEnv() ConfigLoad {
     const path = std.mem.span(raw_path.?);
     const expected = parseLowerHex64(std.mem.span(raw_hash.?)) orelse return .invalid;
     if (!std.fs.path.isAbsolute(path)) return .invalid;
-    var timeout_ms: u64 = 5_000;
-    if (std.c.getenv("METACODES_PROJECT_KERNEL_TIMEOUT_MS")) |raw_timeout| {
-        timeout_ms = std.fmt.parseInt(u64, std.mem.span(raw_timeout), 10) catch return .invalid;
-        if (timeout_ms < 100 or timeout_ms > 30_000) return .invalid;
-    }
+    const timeout_ms = timeoutMsFromEnv() orelse return .invalid;
     return .{ .configured = .{
         .checker_path = path,
         .expected_sha256 = expected,
         .timeout_ms = timeout_ms,
         .source = .env,
     } };
+}
+
+/// `METACODES_PROJECT_KERNEL_TIMEOUT_MS` as the runtime applies it: the
+/// default when unset, null when set to anything but an integer in
+/// 100..30_000. Every configuration path (environment pair or adjacent pin)
+/// fails closed on null, and `app/doctor.zig` reports that refusal the same way.
+pub fn timeoutMsFromEnv() ?u64 {
+    const raw = std.c.getenv("METACODES_PROJECT_KERNEL_TIMEOUT_MS") orelse return 5_000;
+    const parsed = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch return null;
+    if (parsed < 100 or parsed > 30_000) return null;
+    return parsed;
 }
 
 pub fn loadConfig() ConfigLoad {
@@ -72,11 +79,7 @@ pub fn loadConfig() ConfigLoad {
     const expected_raw = build_options.project_kernel_expected_sha256 orelse return .missing;
     const path = toolchain.kernelAdjacentPath(.project) orelse return .missing;
     const expected = parseLowerHex64(expected_raw) orelse return .missing;
-    var timeout_ms: u64 = 5_000;
-    if (std.c.getenv("METACODES_PROJECT_KERNEL_TIMEOUT_MS")) |raw_timeout| {
-        timeout_ms = std.fmt.parseInt(u64, std.mem.span(raw_timeout), 10) catch return .invalid;
-        if (timeout_ms < 100 or timeout_ms > 30_000) return .invalid;
-    }
+    const timeout_ms = timeoutMsFromEnv() orelse return .invalid;
     return .{ .configured = .{
         .checker_path = path,
         .expected_sha256 = expected,

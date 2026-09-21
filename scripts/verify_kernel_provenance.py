@@ -62,7 +62,9 @@ def evaluate(report: object, kernels: dict[str, tuple[Path, str]]) -> list[str]:
             findings.append(f"{name}: doctor reports no such check")
             continue
         resolved = check.get("resolved_path")
-        if not isinstance(resolved, str) or Path(resolved).resolve() != path.resolve():
+        # Lexical comparison: doctor echoes the path it was given, and a
+        # symlink must be judged as the symlink (the runtime opens NOFOLLOW).
+        if not isinstance(resolved, str) or Path(resolved).absolute() != path.absolute():
             findings.append(f"{name}: resolved to {resolved!r}, expected {path}")
         if check.get("source") != "env":
             findings.append(f"{name}: source is {check.get('source')!r}, expected 'env'")
@@ -82,7 +84,9 @@ def run(executable: Path, kernels: dict[str, tuple[Path, str]]) -> list[str]:
     env = {key: value for key, value in os.environ.items() if key not in KERNEL_ENV}
     for kind, (path, digest) in kernels.items():
         _, path_var, sha_var = KINDS[kind]
-        env[path_var] = str(path.resolve())
+        # The path exactly as supplied (made absolute lexically, symlinks
+        # kept): doctor must admit or refuse *this* path, as the runtime would.
+        env[path_var] = str(path.absolute())
         env[sha_var] = digest
     with tempfile.TemporaryDirectory() as neutral_cwd:
         completed = subprocess.run(
@@ -122,7 +126,7 @@ def main(argv: list[str]) -> int:
         if not path.is_file():
             print(f"{KINDS[kind][0]}: {path} is not a file", file=sys.stderr)
             return 2
-        kernels[kind] = (path.resolve(), sha256_file(path))
+        kernels[kind] = (path.absolute(), sha256_file(path))
     if not kernels:
         parser.error("name at least one kernel (--formal / --project)")
     findings = run(executable, kernels)

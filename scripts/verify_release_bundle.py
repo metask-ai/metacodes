@@ -22,7 +22,8 @@ repository-relative path) and with `RG_BIN` / `METACODES_KG_BIN` removed:
      Lean kernel checks are held to the same bar when the report carries them:
      a kernel the executable pins must sit under `libexec/metacodes/`, match,
      and carry a provenance sidecar its own loader accepts; a pin without a
-     shipped kernel fails, as does a report without the kernel checks. The
+     shipped kernel fails, as does a report without the kernel checks; the
+     TinyKG daemon check is held to the same pinned-must-ship rule. The
      layout ships no kernel today (release/LAYOUT.md), so a release executable
      pins none and both checks stay unresolved. The kernel environment pairs are
      stripped like `RG_BIN` so the bundle is judged on its own contents.
@@ -332,6 +333,20 @@ def evaluate_doctor_report(report: object, prefix: Path, manifest: dict) -> None
             raise BundleError(f"doctor sees {name} digest {check.get('sha256')!r}, the executable pins {expected}")
         if check.get("provenance") is not True:
             raise BundleError(f"doctor rejects the {name} provenance sidecar (provenance={check.get('provenance')!r}); it must satisfy the {name} loader")
+    daemon = checks.get("tinykgd")
+    if daemon is None:
+        raise BundleError("doctor reports no tinykgd check")
+    resolved = daemon.get("resolved_path")
+    expected = daemon.get("expected_sha256")
+    if resolved is None:
+        if expected is not None:
+            raise BundleError(f"doctor pins tinykgd ({expected}) but the bundle ships no daemon under vendor/tinykg")
+    else:
+        vendored_dir = (prefix / "vendor" / "tinykg").resolve()
+        if not isinstance(resolved, str) or Path(resolved).resolve().parent != vendored_dir:
+            raise BundleError(f"doctor resolved tinykgd to {resolved}, outside the bundle's vendor/tinykg")
+        if daemon.get("match") is not True:
+            raise BundleError(f"doctor sees tinykgd digest {daemon.get('sha256')!r}, the executable pins {expected}")
 
 
 def verify(prefix: Path, native: bool) -> list[str]:
@@ -517,6 +532,13 @@ def self_test() -> int:
         without_kernels = _doctor_report(root, manifest)
         without_kernels["checks"] = [check for check in without_kernels["checks"] if check["name"] not in KERNEL_CHECKS]
         _expect_bundle_error(lambda: evaluate_doctor_report(without_kernels, root, manifest), "no formal_kernel check")
+        pinned_daemon = _doctor_report(root, manifest)
+        pinned_daemon["checks"][4]["expected_sha256"] = "ab" * 32
+        _expect_bundle_error(lambda: evaluate_doctor_report(pinned_daemon, root, manifest), "pins tinykgd")
+        pinned_daemon["checks"][4].update({"resolved_path": str(root / "vendor/tinykg/tinykgd"), "sha256": "ab" * 32, "match": True, "source": "adjacent"})
+        evaluate_doctor_report(pinned_daemon, root, manifest)
+        pinned_daemon["checks"][4]["match"] = False
+        _expect_bundle_error(lambda: evaluate_doctor_report(pinned_daemon, root, manifest), "the executable pins")
     print("verify_release_bundle: self-test ok")
     return 0
 

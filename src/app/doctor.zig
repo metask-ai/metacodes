@@ -18,9 +18,13 @@
 //! `_SHA256`) is held to the pair's digest instead of the compiled pin — the
 //! same digest the runtime enforces before it executes the kernel — and a
 //! pair the runtime would reject (incomplete, malformed digest, relative
-//! path) is reported as `source=env` with nothing resolved, which is never
-//! healthy. The kernel file itself is opened the way the runtime opens it:
-//! no symlink, regular, non-empty, within the runtime's size bound.
+//! path, an out-of-range `_TIMEOUT_MS` even beside a pinned kernel) is
+//! reported as `source=env` with nothing resolved, which is never healthy.
+//! A kernel is hashed through one descriptor opened the way the runtime opens
+//! it (no symlink, regular, non-empty, within the runtime's size bound, the
+//! size unchanged after the read), so a symlinked or swapped kernel has no
+//! digest and no provenance; the legacy tools keep the plain hash, where a
+//! symlinked `rg` on PATH is legitimate.
 const std = @import("std");
 const pfs = @import("platform").fs;
 const toolchain = @import("../util/toolchain.zig");
@@ -29,6 +33,7 @@ const formal_runtime = @import("../formal/runtime.zig");
 const project_runtime = @import("../formal/project_harness_runtime.zig");
 const provenance = @import("../formal/provenance.zig");
 const project_provenance = @import("../formal/project_provenance.zig");
+const kernel_fixtures = @import("../formal/kernel_test_fixtures.zig");
 
 /// Where a binary was found. `config` is TinyKG-only (config.json `kg_bin`);
 /// `path` and `fallback` are ripgrep-only (PATH scan, the fixed system
@@ -61,6 +66,9 @@ pub const Check = struct {
     /// manifest *for that kernel* (see `kernelProvenance`); null for
     /// unresolved kernels and legacy tools.
     provenance: ?bool,
+    /// Kernel-only, not rendered: the byte count of the file `sha256` was
+    /// computed over, taken on the same descriptor, for the sidecar binding.
+    kernel_bytes: ?u64 = null,
 
     pub fn deinit(self: *Check, allocator: std.mem.Allocator) void {
         if (self.resolved_path) |path| allocator.free(path);
@@ -87,7 +95,14 @@ pub const Check = struct {
         check.resolved_path = try allocator.dupe(u8, found.path);
         errdefer check.deinit(allocator);
         check.source = found.source;
-        check.sha256 = hashFile(found.path) catch null;
+        if (found.kernel) |kernel| {
+            if (hashKernel(kernel, found.path)) |hashed| {
+                check.sha256 = hashed.sha256;
+                check.kernel_bytes = hashed.bytes;
+            }
+        } else {
+            check.sha256 = hashFile(found.path) catch null;
+        }
         if (check.expected_sha256) |*want| {
             if (check.sha256) |*digest| check.match = std.mem.eql(u8, digest, want);
         }
@@ -100,6 +115,9 @@ const Resolved = struct {
     source: Source,
     /// The digest an environment pair named; null for every other source.
     expected_override: ?[64]u8 = null,
+    /// Set for the Lean kernels: the file is hashed under that runtime's
+    /// admission rules instead of the plain `hashFile`.
+    kernel: ?toolchain.KernelName = null,
 };
 
 /// What resolving a kernel found. `invalid_env` is an environment pair the
@@ -223,14 +241,14 @@ pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
     checks[2] = try Check.init(allocator, "formal_kernel", formal.resolved(), try pinDigest(expected.formal_kernel_sha256));
     errdefer checks[2].deinit(allocator);
     if (formal == .invalid_env) checks[2].source = .env;
-    checks[2].provenance = try kernelProvenance(allocator, .formal, checks[2].resolved_path, checks[2].sha256);
+    checks[2].provenance = try kernelProvenance(allocator, .formal, &checks[2]);
 
     var project_override_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project = resolveKernel(.project, expected.project_kernel_sha256, expected.exe_path_override, &project_override_buf);
     checks[3] = try Check.init(allocator, "project_kernel", project.resolved(), try pinDigest(expected.project_kernel_sha256));
     errdefer checks[3].deinit(allocator);
     if (project == .invalid_env) checks[3].source = .env;
-    checks[3].provenance = try kernelProvenance(allocator, .project, checks[3].resolved_path, checks[3].sha256);
+    checks[3].provenance = try kernelProvenance(allocator, .project, &checks[3]);
     var tinykgd = try kg_client.KgClient.resolveTinykgdBinary(allocator, .{ .home = "", .domain = "" });
     defer if (tinykgd) |*found| found.deinit(allocator);
     const tinykgd_resolved: ?Resolved = if (tinykgd) |found| .{
@@ -267,31 +285,41 @@ fn resolveKernel(name: toolchain.KernelName, expected: ?[]const u8, exe_override
         // pair's digest exactly as the runtime will).
         return switch (name) {
             .formal => switch (formal_runtime.loadConfigFromEnv()) {
-                .configured => |config| .{ .found = .{ .path = config.checker_path, .source = .env, .expected_override = config.expected_sha256 } },
+                .configured => |config| .{ .found = .{ .path = config.checker_path, .source = .env, .expected_override = config.expected_sha256, .kernel = name } },
                 else => .invalid_env,
             },
             .project => switch (project_runtime.loadConfigFromEnv()) {
-                .configured => |config| .{ .found = .{ .path = config.checker_path, .source = .env, .expected_override = config.expected_sha256 } },
+                .configured => |config| .{ .found = .{ .path = config.checker_path, .source = .env, .expected_override = config.expected_sha256, .kernel = name } },
                 else => .invalid_env,
             },
         };
     }
     if (expected == null) return .absent;
-    if (exe_override) |exe| {
-        return if (toolchain.kernelPathBeside(exe, name, override_buf)) |path| .{ .found = .{ .path = path, .source = .adjacent } } else .absent;
-    }
-    const path = toolchain.kernelAdjacentPath(name) orelse return .absent;
-    return .{ .found = .{ .path = path, .source = .adjacent } };
+    const path = if (exe_override) |exe|
+        toolchain.kernelPathBeside(exe, name, override_buf) orelse return .absent
+    else
+        toolchain.kernelAdjacentPath(name) orelse return .absent;
+    // The runtime's `loadConfig` parses the timeout after it has the pinned
+    // adjacent path, and refuses the kernel on an out-of-range value; doctor
+    // reports that refusal rather than a healthy kernel nothing will run.
+    const timeout_ok = switch (name) {
+        .formal => formal_runtime.timeoutMsFromEnv() != null,
+        .project => project_runtime.timeoutMsFromEnv() != null,
+    };
+    if (!timeout_ok) return .invalid_env;
+    return .{ .found = .{ .path = path, .source = .adjacent, .kernel = name } };
 }
 
 /// Validates the provenance sidecar beside a resolved kernel with the loader
 /// that owns that kernel's manifest schema. Every rejection (missing sidecar,
 /// other kernel's schema, unbound binary digest, foreign host) is `false`;
 /// only allocation failure propagates.
-fn kernelProvenance(allocator: std.mem.Allocator, kernel: toolchain.KernelName, path: ?[]u8, digest: ?[64]u8) error{OutOfMemory}!?bool {
-    const checker_path = path orelse return null;
-    const actual_sha256 = digest orelse return false;
-    const actual_bytes = kernelFileBytes(kernel, checker_path) orelse return false;
+fn kernelProvenance(allocator: std.mem.Allocator, kernel: toolchain.KernelName, check: *const Check) error{OutOfMemory}!?bool {
+    const checker_path = check.resolved_path orelse return null;
+    // Both come from the one admission-checked read in `hashKernel`; a kernel
+    // that read refused has neither, and no sidecar can vouch for it.
+    const actual_sha256 = check.sha256 orelse return false;
+    const actual_bytes = check.kernel_bytes orelse return false;
     switch (kernel) {
         .formal => {
             var loaded = provenance.loadAdjacent(allocator, checker_path, actual_sha256, actual_bytes) catch |err| switch (err) {
@@ -311,11 +339,15 @@ fn kernelProvenance(allocator: std.mem.Allocator, kernel: toolchain.KernelName, 
     return true;
 }
 
-/// The kernel's size under the runtime's own admission rules for the file it
-/// executes (`formal/runtime.zig` `readChecker`): opened without following a
-/// symlink, a regular file, non-empty, within the runtime's byte bound. Null
-/// means the runtime would refuse this path, so no sidecar can vouch for it.
-fn kernelFileBytes(kernel: toolchain.KernelName, path: []const u8) ?u64 {
+const KernelHash = struct { sha256: [64]u8, bytes: u64 };
+
+/// SHA-256 and size of a kernel under the runtime's own admission rules for
+/// the file it executes (`formal/runtime.zig` `readChecker`): one descriptor
+/// opened without following a symlink, a regular non-empty file within the
+/// runtime's byte bound, hashed in full, and its size re-read afterwards so a
+/// swap during the read is not vouched for. Null means the runtime would
+/// refuse this path.
+fn hashKernel(kernel: toolchain.KernelName, path: []const u8) ?KernelHash {
     var path_z: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= path_z.len) return null;
     @memcpy(path_z[0..path.len], path);
@@ -323,15 +355,30 @@ fn kernelFileBytes(kernel: toolchain.KernelName, path: []const u8) ?u64 {
     const fd = pfs.open(path_z[0..path.len :0], .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
     defer _ = pfs.close(fd);
-    const info = pfs.fileInfo(fd) catch return null;
+    const before = pfs.fileInfo(fd) catch return null;
     const bound: u64 = switch (kernel) {
         .formal => formal_runtime.MAX_CHECKER_BYTES,
         .project => project_runtime.MAX_CHECKER_BYTES,
     };
-    if (!info.is_regular or info.size <= 0) return null;
-    const size: u64 = @intCast(info.size);
+    if (!before.is_regular or before.size <= 0) return null;
+    const size: u64 = @intCast(before.size);
     if (size > bound) return null;
-    return size;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        const n = pfs.read(fd, &buffer);
+        if (n < 0) return null;
+        if (n == 0) break;
+        total += @intCast(n);
+        if (total > size) return null;
+        hasher.update(buffer[0..@intCast(n)]);
+    }
+    const after = pfs.fileInfo(fd) catch return null;
+    if (total != size or !after.is_regular or after.size != before.size) return null;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return .{ .sha256 = std.fmt.bytesToHex(digest, .lower), .bytes = size };
 }
 
 /// SHA-256 of a file streamed in 64 KiB chunks; a binary is never loaded whole.
@@ -637,9 +684,9 @@ const KernelStage = struct {
 
     /// The formal kernel's sidecars: v4 manifest plus its hash-bound receipt.
     fn writeFormalSidecars(self: *KernelStage, allocator: std.mem.Allocator) !void {
-        const manifest = try provenance.testManifest(allocator, &self.binary_sha256, "kernel".len);
+        const manifest = try kernel_fixtures.formalManifest(allocator, &self.binary_sha256, "kernel".len);
         defer allocator.free(manifest);
-        const receipt = try provenance.testBuildReceipt(allocator, manifest, &self.binary_sha256);
+        const receipt = try kernel_fixtures.formalBuildReceipt(allocator, manifest, &self.binary_sha256);
         defer allocator.free(receipt);
         try self.writeSidecar(allocator, ".provenance.json", manifest);
         try self.writeSidecar(allocator, ".build-receipt.json", receipt);
@@ -647,7 +694,7 @@ const KernelStage = struct {
 
     /// The project kernel's sidecar: the v6 manifest alone (no receipt).
     fn writeProjectSidecar(self: *KernelStage, allocator: std.mem.Allocator) !void {
-        const manifest = try project_provenance.testManifest(allocator, &self.binary_sha256, "kernel".len);
+        const manifest = try kernel_fixtures.projectManifest(allocator, &self.binary_sha256, "kernel".len);
         defer allocator.free(manifest);
         try self.writeSidecar(allocator, ".provenance.json", manifest);
     }
@@ -742,9 +789,9 @@ test "doctor formal Kernel rejects a project-schema sidecar" {
 
     // Adding the receipt the formal loader wants does not rescue a manifest
     // of the wrong schema.
-    const manifest = try project_provenance.testManifest(allocator, &stage.binary_sha256, "kernel".len);
+    const manifest = try kernel_fixtures.projectManifest(allocator, &stage.binary_sha256, "kernel".len);
     defer allocator.free(manifest);
-    const receipt = try provenance.testBuildReceipt(allocator, manifest, &stage.binary_sha256);
+    const receipt = try kernel_fixtures.formalBuildReceipt(allocator, manifest, &stage.binary_sha256);
     defer allocator.free(receipt);
     try stage.writeSidecar(allocator, ".build-receipt.json", receipt);
     var still = try stage.report(allocator, .formal);
@@ -771,10 +818,15 @@ test "doctor env pair holds the kernel to the pair's digest, not the pin" {
     defer allocator.free(path_z);
     env_paths.setEnv("METACODES_PROJECT_KERNEL_PATH", path_z);
 
+    // A compiled pin that would match the file, so that a doctor consulting
+    // the pin instead of the pair is caught below.
+    const pin: []const u8 = &stage.binary_sha256;
+
     // The pair names a digest the file does not have: the runtime would
-    // refuse to execute it, so doctor must not call it a match.
+    // refuse to execute it, so doctor must not call it a match — even though
+    // the compiled pin does match.
     env_paths.setEnv("METACODES_PROJECT_KERNEL_SHA256", "b" ** 64);
-    var wrong = try run(allocator, .{ .ripgrep_sha256 = null, .tinykg_sha256 = null, .exe_path_override = stage.exe });
+    var wrong = try run(allocator, .{ .ripgrep_sha256 = null, .tinykg_sha256 = null, .project_kernel_sha256 = pin, .exe_path_override = stage.exe });
     for (wrong.checks[0..2]) |*check| {
         if (check.resolved_path == null) check.resolved_path = try allocator.dupe(u8, "/test/legacy-tool");
     }
@@ -786,12 +838,12 @@ test "doctor env pair holds the kernel to the pair's digest, not the pin" {
     try std.testing.expect(!wrong.healthy());
     wrong.deinit(allocator);
 
-    // The pair's digest is the file's: healthy, and the pin (absent here)
-    // played no part.
+    // The pair's digest is the file's: healthy, and a compiled pin that does
+    // NOT match plays no part.
     const digest_z = try allocator.dupeZ(u8, &stage.binary_sha256);
     defer allocator.free(digest_z);
     env_paths.setEnv("METACODES_PROJECT_KERNEL_SHA256", digest_z);
-    var right = try run(allocator, .{ .ripgrep_sha256 = null, .tinykg_sha256 = null, .exe_path_override = stage.exe });
+    var right = try run(allocator, .{ .ripgrep_sha256 = null, .tinykg_sha256 = null, .project_kernel_sha256 = "c" ** 64, .exe_path_override = stage.exe });
     defer right.deinit(allocator);
     for (right.checks[0..2]) |*check| {
         if (check.resolved_path == null) check.resolved_path = try allocator.dupe(u8, "/test/legacy-tool");
@@ -841,9 +893,52 @@ test "doctor Kernel reached through a symlink is not trusted" {
     var report = try stage.report(allocator, .project);
     defer report.deinit(allocator);
     try std.testing.expectEqualStrings(stage.kernel_path, report.checks[3].resolved_path.?);
-    // The generic hash follows the link and matches; the runtime opens the
-    // path NOFOLLOW and would refuse it, so provenance must not vouch.
-    try std.testing.expectEqual(@as(?bool, true), report.checks[3].match);
+    // The runtime opens the path NOFOLLOW and would refuse it; doctor hashes
+    // the same way, so the link has no digest, no match and no provenance.
+    try std.testing.expect(report.checks[3].sha256 == null);
+    try std.testing.expectEqual(@as(?bool, false), report.checks[3].match);
+    try std.testing.expectEqual(@as(?bool, false), report.checks[3].provenance);
+    try std.testing.expect(!report.healthy());
+}
+
+test "doctor timeout override the runtime rejects makes a pinned adjacent kernel unhealthy" {
+    const allocator = std.testing.allocator;
+    var stage = try KernelStage.init(allocator, .project);
+    defer stage.deinit(allocator);
+    try stage.writeProjectSidecar(allocator);
+    clearKernelEnv();
+    defer clearKernelEnv();
+
+    // Only the timeout is set, out of range: `loadConfig` answers `.invalid`
+    // for the pinned adjacent kernel, so nothing will execute it.
+    env_paths.setEnv("METACODES_PROJECT_KERNEL_TIMEOUT_MS", "50");
+    var rejected = try stage.report(allocator, .project);
+    try std.testing.expect(rejected.checks[3].resolved_path == null);
+    try std.testing.expectEqual(Source.env, rejected.checks[3].source.?);
+    try std.testing.expect(!rejected.healthy());
+    rejected.deinit(allocator);
+
+    // In range: the adjacent kernel is used as pinned.
+    env_paths.setEnv("METACODES_PROJECT_KERNEL_TIMEOUT_MS", "250");
+    var accepted = try stage.report(allocator, .project);
+    defer accepted.deinit(allocator);
+    try std.testing.expectEqual(Source.adjacent, accepted.checks[3].source.?);
+    try std.testing.expectEqual(@as(?bool, true), accepted.checks[3].match);
+    try std.testing.expectEqual(@as(?bool, true), accepted.checks[3].provenance);
+    try std.testing.expect(accepted.healthy());
+}
+
+test "doctor Kernel swapped during the read is not vouched for" {
+    const allocator = std.testing.allocator;
+    var stage = try KernelStage.init(allocator, .project);
+    defer stage.deinit(allocator);
+    try stage.writeProjectSidecar(allocator);
+    // A kernel the admission read refuses outright: empty.
+    try stage.tmp.dir.writeFile(std.testing.io, .{ .sub_path = stage.kernel_rel, .data = "" });
+    var report = try stage.report(allocator, .project);
+    defer report.deinit(allocator);
+    try std.testing.expect(report.checks[3].sha256 == null);
+    try std.testing.expectEqual(@as(?bool, false), report.checks[3].match);
     try std.testing.expectEqual(@as(?bool, false), report.checks[3].provenance);
     try std.testing.expect(!report.healthy());
 }

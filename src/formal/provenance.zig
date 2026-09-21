@@ -255,31 +255,6 @@ pub fn sha256Hex(bytes: []const u8) [64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-// ── test fixtures (shared with app/doctor.zig and project_provenance.zig) ────
-
-/// The manifest `scripts/build-formal-kernel.sh` writes, field for field, with
-/// the runtime's own constants substituted; the caller owns it.
-pub fn testManifest(allocator: std.mem.Allocator, binary_sha256: []const u8, binary_bytes: u64) ![]u8 {
-    const host_os = expectedHostOs() orelse return error.SkipZigTest;
-    const host_arch = expectedHostArch() orelse return error.SkipZigTest;
-    const zeros = "0" ** 64;
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"schema_version\":\"{s}\",\"checker_version\":\"{s}\",\"request_schema\":\"{s}\",\"memory_request_schema\":\"{s}\",\"artifact_request_schema\":\"{s}\",\"verdict_schema\":\"{s}\",\"binary_sha256\":\"{s}\",\"binary_bytes\":{d},\"kernel_source_sha256\":\"{s}\",\"memory_kernel_source_sha256\":\"{s}\",\"artifact_kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"{s}\",\"host_arch\":\"{s}\",\"linker\":\"test\",\"lean_version\":\"Lean (version 4.14.0, test)\",\"native_smoke\":\"passed\"}}\n",
-        .{ MANIFEST_SCHEMA, runtime.CHECKER_VERSION, runtime.REQUEST_SCHEMA, runtime.MEMORY_REQUEST_SCHEMA, runtime.ARTIFACT_REQUEST_SCHEMA, runtime.VERDICT_SCHEMA, binary_sha256, binary_bytes, zeros, zeros, zeros, zeros, zeros, host_os, host_arch },
-    );
-}
-
-/// The receipt that binds `manifest` and the binary; the caller owns it.
-pub fn testBuildReceipt(allocator: std.mem.Allocator, manifest: []const u8, binary_sha256: []const u8) ![]u8 {
-    const manifest_sha256 = sha256Hex(manifest);
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"schema_version\":\"{s}\",\"artifact_manifest_sha256\":\"{s}\",\"binary_sha256\":\"{s}\",\"built_at_utc\":\"2026-01-01T00:00:00Z\"}}\n",
-        .{ BUILD_RECEIPT_SCHEMA, manifest_sha256[0..], binary_sha256 },
-    );
-}
-
 test "formal checker provenance is mandatory for a deployable admission" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

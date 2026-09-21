@@ -4,12 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.verify_install_prefix import check, evaluate_doctor, evaluate_kernels
+from scripts.verify_install_prefix import check, evaluate_daemon, evaluate_doctor, evaluate_kernels
 
-# The doctor always reports both kernels; unpinned and absent is the release shape.
+# The doctor always reports both kernels and the daemon; unpinned and absent is
+# the release shape.
 KERNELS_ABSENT = [
     {"name": "formal_kernel", "resolved_path": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
     {"name": "project_kernel", "resolved_path": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
+    {"name": "tinykgd", "resolved_path": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
 ]
 
 
@@ -82,10 +84,11 @@ class VerifyInstallPrefixTest(unittest.TestCase):
             ]
         }
         findings = evaluate_doctor(report, root)
-        self.assertEqual(len(findings), 6)
+        self.assertEqual(len(findings), 7)
         self.assertTrue(any("no ripgrep check" in finding for finding in findings))
         self.assertTrue(any("no formal_kernel check" in finding for finding in findings))
         self.assertTrue(any("no project_kernel check" in finding for finding in findings))
+        self.assertTrue(any("no tinykgd check" in finding for finding in findings))
         self.assertTrue(any("not under" in finding for finding in findings))
         self.assertTrue(any("expected 'adjacent'" in finding for finding in findings))
         self.assertTrue(any("expected true" in finding for finding in findings))
@@ -112,7 +115,7 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         ]
         entry = {"name": "project_kernel", "resolved_path": None, "sha256": None, "expected_sha256": None, "match": None, "source": None, "provenance": None}
         entry.update(kernel)
-        return {"checks": base + [{"name": "formal_kernel", "resolved_path": None, "expected_sha256": None, "provenance": None}, entry]}
+        return {"checks": base + [{"name": "formal_kernel", "resolved_path": None, "expected_sha256": None, "provenance": None}, entry, KERNELS_ABSENT[2]]}
 
     def test_an_unpinned_absent_kernel_is_fine_and_a_pinned_absent_one_is_named(self):
         root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
@@ -150,3 +153,16 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         }
         findings = evaluate_kernels(by_name, root)
         self.assertEqual([f.split(" ")[1] for f in findings], ["formal_kernel", "project_kernel"])
+
+    def test_a_pinned_daemon_must_ship_beside_the_cli(self):
+        root = self._make(("bin/metacodes", "vendor/tinykg/tinykg", "vendor/tinykg/tinykgd"))
+        self.assertEqual(evaluate_daemon({}, root), ["doctor: no tinykgd check"])
+        self.assertEqual(evaluate_daemon({"tinykgd": KERNELS_ABSENT[2]}, root), [])
+        pinned_absent = dict(KERNELS_ABSENT[2], expected_sha256="ab" * 32)
+        findings = evaluate_daemon({"tinykgd": pinned_absent}, root)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("tinykgd is pinned", findings[0])
+        shipped = {"name": "tinykgd", "resolved_path": str(root / "vendor/tinykg/tinykgd"), "sha256": "ab" * 32, "expected_sha256": "ab" * 32, "match": True, "source": "adjacent", "provenance": None}
+        self.assertEqual(evaluate_daemon({"tinykgd": shipped}, root), [])
+        findings = evaluate_daemon({"tinykgd": dict(shipped, resolved_path="/elsewhere/tinykgd", source="env", match=False)}, root)
+        self.assertEqual(len(findings), 3)

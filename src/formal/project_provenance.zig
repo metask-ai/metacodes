@@ -182,43 +182,7 @@ pub fn loadAdjacent(
 const test_binary_sha256: [64]u8 = ("a" ** 64).*;
 const test_binary_bytes: u64 = 7;
 
-/// The manifest `scripts/build-project-harness-kernel.sh` writes, field for
-/// field, with the runtime's own constants substituted; the caller owns it.
-pub fn testManifest(allocator: std.mem.Allocator, binary_sha256: []const u8, binary_bytes: u64) ![]u8 {
-    const host_os = formal_provenance.expectedHostOs() orelse return error.SkipZigTest;
-    const host_arch = formal_provenance.expectedHostArch() orelse return error.SkipZigTest;
-    const zeros = "0" ** 64;
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"schema_version\":\"{s}\",\"checker_version\":\"{s}\",\"request_schema\":\"{s}\",\"verdict_schema\":\"{s}\",\"batch_request_schema\":\"{s}\",\"batch_verdict_schema\":\"{s}\",\"impact_request_schema\":\"{s}\",\"impact_verdict_schema\":\"{s}\",\"impact_aggregate_request_schema\":\"{s}\",\"impact_aggregate_verdict_schema\":\"{s}\",\"max_batch_requests\":{d},\"max_impact_aggregate_members\":{d},\"binary_sha256\":\"{s}\",\"binary_bytes\":{d},\"kernel_source_sha256\":\"{s}\",\"rule_source_sha256\":\"{s}\",\"impact_source_sha256\":\"{s}\",\"impact_aggregate_source_sha256\":\"{s}\",\"formal_kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"{s}\",\"axiom_audit\":\"passed\",\"host_os\":\"{s}\",\"host_arch\":\"{s}\",\"linker\":\"test\",\"lean_version\":\"Lean (version 4.14.0, test)\",\"native_smoke\":\"passed\",\"native_rule_author_promotion_smoke\":\"passed\",\"native_batch_smoke\":\"passed\",\"native_recovery_smoke\":\"passed\",\"native_impact_smoke\":\"passed\",\"native_impact_aggregate_smoke\":\"passed\"}}\n",
-        .{
-            MANIFEST_SCHEMA,
-            runtime.CHECKER_VERSION,
-            runtime.REQUEST_SCHEMA,
-            runtime.VERDICT_SCHEMA,
-            runtime.BATCH_REQUEST_SCHEMA,
-            runtime.BATCH_VERDICT_SCHEMA,
-            runtime.IMPACT_REQUEST_SCHEMA,
-            runtime.IMPACT_VERDICT_SCHEMA,
-            runtime.IMPACT_AGGREGATE_REQUEST_SCHEMA,
-            runtime.IMPACT_AGGREGATE_VERDICT_SCHEMA,
-            runtime.MAX_BATCH_REQUESTS,
-            impact_aggregate.MAX_MEMBERS,
-            binary_sha256,
-            binary_bytes,
-            zeros,
-            zeros,
-            zeros,
-            zeros,
-            zeros,
-            zeros,
-            zeros,
-            AXIOM_POLICY,
-            host_os,
-            host_arch,
-        },
-    );
-}
+const fixtures = @import("kernel_test_fixtures.zig");
 
 const TestSidecar = struct {
     tmp: std.testing.TmpDir,
@@ -260,7 +224,7 @@ test "project Kernel provenance is mandatory" {
 test "project Kernel v6 manifest loads and binds binary, sources and host" {
     var sidecar = try TestSidecar.init();
     defer sidecar.deinit();
-    const manifest = try testManifest(std.testing.allocator, &test_binary_sha256, test_binary_bytes);
+    const manifest = try fixtures.projectManifest(std.testing.allocator, &test_binary_sha256, test_binary_bytes);
     defer std.testing.allocator.free(manifest);
     try sidecar.write(manifest);
 
@@ -292,13 +256,13 @@ test "project Kernel v6 manifest loads and binds binary, sources and host" {
 test "project Kernel loader rejects the formal kernel's manifest and any schema drift" {
     var sidecar = try TestSidecar.init();
     defer sidecar.deinit();
-    const manifest = try testManifest(std.testing.allocator, &test_binary_sha256, test_binary_bytes);
+    const manifest = try fixtures.projectManifest(std.testing.allocator, &test_binary_sha256, test_binary_bytes);
     defer std.testing.allocator.free(manifest);
 
     // The formal v4 manifest names fields this schema does not have
     // (memory/artifact request schemas, a receipt-bound identity) and lacks
     // the batch/impact ones: a different document, not a looser one.
-    const formal_manifest = try formal_provenance.testManifest(std.testing.allocator, &test_binary_sha256, test_binary_bytes);
+    const formal_manifest = try fixtures.formalManifest(std.testing.allocator, &test_binary_sha256, test_binary_bytes);
     defer std.testing.allocator.free(formal_manifest);
     try sidecar.write(formal_manifest);
     try std.testing.expectError(error.InvalidProvenanceJson, sidecar.load());

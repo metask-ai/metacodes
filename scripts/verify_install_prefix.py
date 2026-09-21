@@ -15,8 +15,9 @@ binary with a matching digest (#78). The Lean kernel checks are evaluated when
 the report carries them: a kernel the executable pins must be shipped under
 `libexec/metacodes/` with a matching digest and a provenance sidecar that the
 kernel's own loader accepts (`provenance: true`); a pinned-but-absent kernel and
-a rejected sidecar are both named, as is a report without the kernel checks.
-The release layout ships no kernel today
+a rejected sidecar are both named, as is a report without the kernel checks;
+the TinyKG daemon check is held to the same pinned-must-ship rule. The release
+layout ships no kernel today
 (release/LAYOUT.md), so a release executable is expected to pin none. Python
 3.9, stdlib only.
 """
@@ -122,6 +123,31 @@ def evaluate_doctor(report: object, prefix: Path, release: bool = False) -> list
     if tinykg.get("match") is not True:
         findings.append(f"doctor: tinykg match is {tinykg.get('match')!r}, expected true")
     findings.extend(evaluate_kernels(by_name, prefix))
+    findings.extend(evaluate_daemon(by_name, prefix))
+    return findings
+
+
+def evaluate_daemon(by_name: dict, prefix: Path) -> list[str]:
+    """Findings for the TinyKG daemon check, which the report always carries.
+    The v1 bundle ships no daemon and the build pins none; a build that pins
+    one must ship it beside the CLI with a matching digest."""
+    daemon = by_name.get("tinykgd")
+    if daemon is None:
+        return ["doctor: no tinykgd check"]
+    findings: list[str] = []
+    resolved = daemon.get("resolved_path")
+    expected = daemon.get("expected_sha256")
+    vendored_dir = (prefix / "vendor" / "tinykg").resolve()
+    if resolved is None:
+        if expected is not None:
+            findings.append(f"doctor: tinykgd is pinned ({expected}) but not shipped under {vendored_dir}")
+        return findings
+    if daemon.get("source") != "adjacent":
+        findings.append(f"doctor: tinykgd source is {daemon.get('source')!r}, expected 'adjacent'")
+    if not isinstance(resolved, str) or Path(resolved).resolve().parent != vendored_dir:
+        findings.append(f"doctor: tinykgd resolved to {resolved!r}, not under {vendored_dir}")
+    if daemon.get("match") is not True:
+        findings.append(f"doctor: tinykgd match is {daemon.get('match')!r}, expected true")
     return findings
 
 
@@ -131,7 +157,10 @@ def evaluate_kernels(by_name: dict, prefix: Path) -> list[str]:
     kernel resolves only beside the executable and only when the build pinned
     its digest, so a resolved kernel must sit under `libexec/metacodes/`,
     match, and carry a sidecar its own loader accepts; a pinned kernel that did
-    not resolve was not shipped."""
+    not resolve was not shipped. Today `check()` refuses any `libexec/` entry
+    (the layout ships no kernel), so through the command line only the
+    unpinned-and-absent shape reaches here; the resolved branch is the
+    contract for a layout that ships kernels."""
     findings: list[str] = []
     kernel_dir = (prefix / "libexec" / "metacodes").resolve()
     for name in KERNEL_CHECKS:
