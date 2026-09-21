@@ -1094,6 +1094,12 @@ def run_paired(
         and float(max_rollout_cost_usd) > max_cumulative_cost_usd
     ):
         raise ValidationError("per-rollout max cost exceeds the cumulative cap")
+    if (
+        max_rollout_metered_tokens is not None
+        and max_cumulative_tokens is not None
+        and max_rollout_metered_tokens > max_cumulative_tokens
+    ):
+        raise ValidationError("per-rollout max metered tokens exceeds the cumulative cap")
     if max_cumulative_cost_usd is not None and (
         not math.isfinite(max_cumulative_cost_usd) or max_cumulative_cost_usd <= 0
     ):

@@ -4285,6 +4285,19 @@ class WorkBuddyDeliveryCadenceRecordTest(unittest.TestCase):
         with self.assertRaisesRegex(TraceError, "delivery cadence record"):
             self._metrics(bad)
 
+    def test_policy_relationships_are_enforced(self):
+        for mutate in (
+            {"levels_reached": 255},
+            {"nudges": 99},
+            {"nudges": 2, "levels_reached": 1},
+            {"enforced": False},  # observe mode with nudges=2
+            {"first_threshold": 80, "second_threshold": 40},
+        ):
+            bad = self._valid()
+            bad.update(mutate)
+            with self.assertRaisesRegex(TraceError, "violates the gate policy"):
+                self._metrics(bad)
+
     def test_duplicate_record_fails_loudly(self):
         rows_record = self._valid()
         rows = [

@@ -160,6 +160,10 @@ fn classifyBash(allocator: std.mem.Allocator, input: []const u8) Class {
     const encoded = common.extractJsonArg(input, "command") orelse return .mutation;
     const raw = util_json.unescapeString(encoded, allocator) catch return .mutation;
     defer allocator.free(raw);
+    // Command, process and backtick substitutions run whatever they contain
+    // and the compound splitter cannot see inside them (`echo "$(touch f)"`
+    // is one read-only-looking segment). Fail towards silence.
+    if (containsSubstitution(raw)) return .mutation;
     // The permission splitter treats a lone `&` as a separator, so `2>&1`
     // would become the segments `cat f 2>` and `1`. Descriptor dups carry no
     // file effect: drop them before splitting.
@@ -176,23 +180,65 @@ fn classifyBash(allocator: std.mem.Allocator, input: []const u8) Class {
         const body = stripShellKeywords(segment);
         if (body.len == 0) continue;
         commands += 1;
-        const target = bash_parser.stripWrappers(body);
-        if (!bash_parser.isReadonlyCommand(target) and !isReadonlyBuiltin(target)) return .mutation;
+        const stripped = bash_parser.stripWrappers(body);
+        // `git -C dir status` is read-only; the roster keys on the token after
+        // `git`, so drop the global options first.
+        const target = stripGitGlobalOptions(stripped);
+        if (!bash_parser.isReadonlyCommand(target) and !isReadonlyExplorationCommand(target)) return .mutation;
         if (hasFileRedirect(body)) return .mutation;
-        if (hasInPlaceFlag(target)) return .mutation;
+        if (hasMutatingPayload(target)) return .mutation;
     }
     return if (commands == 0) .neutral else .exploration;
 }
 
-/// Shell builtins that only inspect or bind values; the permission roster
-/// lists external commands and leaves these out.
-fn isReadonlyBuiltin(target: []const u8) bool {
-    const space = std.mem.indexOfAny(u8, target, " \t") orelse target.len;
-    const head = target[0..space];
-    for ([_][]const u8{ "read", "test", "[", "[[", ":", "local", "declare" }) |kw| {
-        if (std.mem.eql(u8, head, kw)) return true;
-    }
+/// `$(...)`, backticks and process substitution `<(...)` / `>(...)`.
+fn containsSubstitution(command: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, command, '`') != null) return true;
+    if (std.mem.indexOf(u8, command, "$(") != null) return true;
+    if (std.mem.indexOf(u8, command, "<(") != null) return true;
+    if (std.mem.indexOf(u8, command, ">(") != null) return true;
     return false;
+}
+
+/// `git -C <path> -c <k=v> --no-pager <sub> ...` → `git <sub> ...` so the
+/// permission roster sees the subcommand.
+fn stripGitGlobalOptions(target: []const u8) []const u8 {
+    var tokens = std.mem.tokenizeAny(u8, target, " \t");
+    const head = tokens.next() orelse return target;
+    if (!std.mem.eql(u8, head, "git")) return target;
+    var rest_start: usize = head.len;
+    while (true) {
+        const tok = tokens.next() orelse return target;
+        const tok_start = @intFromPtr(tok.ptr) - @intFromPtr(target.ptr);
+        if (std.mem.eql(u8, tok, "-C") or std.mem.eql(u8, tok, "-c")) {
+            _ = tokens.next() orelse return target; // the option's argument
+            continue;
+        }
+        if (std.mem.startsWith(u8, tok, "--")) continue; // --no-pager, --git-dir=...
+        rest_start = tok_start;
+        break;
+    }
+    // Rebuild as `git <rest>` without allocating: the head is already the
+    // first token of `target`, so return a view starting at the subcommand
+    // prefixed by the literal head is not possible in place — instead check
+    // the subcommand roster directly through bash_parser on a synthetic
+    // slice. The roster only inspects `git <sub>`, so hand it the tail with
+    // the head re-attached via a fixed buffer.
+    var buf: [512]u8 = undefined;
+    const tail = target[rest_start..];
+    if (4 + tail.len > buf.len) return target;
+    @memcpy(buf[0..4], "git ");
+    @memcpy(buf[4 .. 4 + tail.len], tail);
+    // A stack buffer cannot escape; classify through a static scratch instead.
+    return gitScratch(buf[0 .. 4 + tail.len]);
+}
+
+/// Static scratch for the rebuilt `git <sub>` view (classification is
+/// synchronous and single-threaded per call; the view dies with the call).
+threadlocal var git_scratch: [512]u8 = undefined;
+fn gitScratch(bytes: []const u8) []const u8 {
+    @memcpy(git_scratch[0..bytes.len], bytes);
+    return git_scratch[0..bytes.len];
 }
 
 /// Drop leading shell control keywords from one compound segment and return
@@ -267,7 +313,12 @@ fn hasFileRedirect(segment: []const u8) bool {
         if (in_single or in_double or c != '>') continue;
         var rest = segment[i + 1 ..];
         if (rest.len > 0 and rest[0] == '>') rest = rest[1..];
-        if (rest.len > 0 and rest[0] == '&') continue; // descriptor dup
+        if (rest.len > 0 and rest[0] == '|') rest = rest[1..]; // `>|` clobber
+        if (rest.len > 0 and rest[0] == '&') {
+            // `2>&1` is a descriptor dup; `>&file` sends both streams to a file.
+            if (rest.len > 1 and std.ascii.isDigit(rest[1])) continue;
+            return true;
+        }
         const trimmed = std.mem.trimStart(u8, rest, " \t");
         if (std.mem.startsWith(u8, trimmed, "/dev/null")) continue;
         return true;
@@ -275,23 +326,86 @@ fn hasFileRedirect(segment: []const u8) bool {
     return false;
 }
 
-/// In-place or destructive flags on commands the read-only roster admits.
-fn hasInPlaceFlag(target: []const u8) bool {
+/// Programs and options through which a roster-admitted command can still
+/// write: `sed -i` / `sed 's/x/y/w out'`, `awk '{print > "f"}'` /
+/// `awk 'BEGIN{system(...)}'`, `find -delete/-exec/-fprint`, `sort -o`,
+/// `uniq in out`, `fd -x`. Anything doubtful disarms.
+fn hasMutatingPayload(target: []const u8) bool {
     var tokens = std.mem.tokenizeAny(u8, target, " \t");
     const head = tokens.next() orelse return false;
     if (std.mem.eql(u8, head, "sed")) {
         while (tokens.next()) |tok| {
             if (std.mem.startsWith(u8, tok, "-i") or std.mem.startsWith(u8, tok, "--in-place")) return true;
         }
-        return false;
+        return hasSedWriteCommand(target[head.len..]);
+    }
+    if (std.mem.eql(u8, head, "awk") or std.mem.eql(u8, head, "gawk") or std.mem.eql(u8, head, "mawk") or std.mem.eql(u8, head, "nawk")) {
+        // The program text is quoted, so the redirect scan above skipped it.
+        return std.mem.indexOfScalar(u8, target, '>') != null or std.mem.indexOf(u8, target, "system(") != null;
     }
     if (std.mem.eql(u8, head, "find")) {
         while (tokens.next()) |tok| {
-            for ([_][]const u8{ "-delete", "-exec", "-execdir", "-ok", "-okdir" }) |flag| {
+            for ([_][]const u8{ "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls" }) |flag| {
                 if (std.mem.eql(u8, tok, flag)) return true;
             }
         }
         return false;
+    }
+    if (std.mem.eql(u8, head, "fd") or std.mem.eql(u8, head, "fdfind")) {
+        while (tokens.next()) |tok| {
+            for ([_][]const u8{ "-x", "--exec", "-X", "--exec-batch" }) |flag| {
+                if (std.mem.eql(u8, tok, flag)) return true;
+            }
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, head, "sort")) {
+        while (tokens.next()) |tok| {
+            if (std.mem.eql(u8, tok, "-o") or std.mem.startsWith(u8, tok, "--output")) return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, head, "uniq")) {
+        // `uniq INPUT OUTPUT` writes its second positional argument.
+        var positional: usize = 0;
+        while (tokens.next()) |tok| {
+            if (tok[0] != '-') positional += 1;
+        }
+        return positional >= 2;
+    }
+    return false;
+}
+
+/// A `w`/`W` command in a sed script (`s/a/b/w out`, `/x/w out`, `-e 'w f'`).
+fn hasSedWriteCommand(script: []const u8) bool {
+    var i: usize = 0;
+    while (i + 1 < script.len) : (i += 1) {
+        const c = script[i];
+        if ((c == 'w' or c == 'W') and script[i + 1] == ' ' and i > 0) {
+            const prev = script[i - 1];
+            if (prev == '/' or prev == ';' or prev == '{' or prev == ' ' or prev == '\'' or prev == '"') return true;
+        }
+    }
+    return false;
+}
+
+/// Read-only commands this sensor accepts beyond the permission roster: the
+/// roster is a "no prompt needed" list of external commands, this is a "no
+/// file effect" list. `fd`/`find` executors are handled by hasMutatingPayload.
+fn isReadonlyExplorationCommand(target: []const u8) bool {
+    const space = std.mem.indexOfAny(u8, target, " \t") orelse target.len;
+    const head = target[0..space];
+    for ([_][]const u8{
+        // shell builtins that only inspect or bind values
+        "read",     "test",     "[",       "[[",      ":",         "local",    "declare",
+        // search / view
+        "rg",       "fd",       "fdfind",  "tree",    "less",      "more",     "nl",
+        "od",       "xxd",      "hexdump", "strings", "tac",       "rev",      "column",
+        "comm",     "paste",    "jq",      "yq",      "date",      "basename", "dirname",
+        "realpath", "readlink", "md5sum",  "shasum",  "sha256sum", "sha1sum",  "cksum",
+        "printenv", "env",      "true",
+    }) |kw| {
+        if (std.mem.eql(u8, head, kw)) return true;
     }
     return false;
 }
@@ -379,6 +493,43 @@ test "bash loops and conditionals are judged by their inner commands" {
     try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"for f in a b; do python3 tool.py $f; done\"}"));
     // A bare loop header with nothing executable is neither exploration nor mutation.
     try std.testing.expectEqual(Class.neutral, classify(a, "Bash", "{\"command\":\"for f in a b\"}"));
+}
+
+test "substitutions, both-stream redirects and programmable payloads disarm" {
+    // Codex review 2026-09-21: nested effects the compound splitter cannot see.
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"echo \\\"$(touch report.md)\\\"\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"echo `touch report.md`\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"cat <(touch x)\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"printf x >&report.md\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"cat <> report.md\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"cat a >| b\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk 'BEGIN { system(\\\"touch report.md\\\") }' /dev/null\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"awk '{ print > \\\"report.md\\\" }' input\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed 's/a/b/w out.txt' f\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sed --in-place=.bak s/a/b/ f\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"sort -o sorted.txt input\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"uniq input output\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"find . -name x -fprint hits.txt\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"fd -e py -x rm\"}"));
+    // Still exploration: descriptor dups, awk/sed that only print, plain sort/uniq.
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"awk '{ print $1 }' input 2>&1\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sed -n 's/a/b/p' f\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"sort input | uniq -c\"}"));
+}
+
+test "read-only search commands and git global options count as exploration" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"rg -n pattern src\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"fd -e py\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"tree -L 2\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"git -C sub status\"}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"git --no-pager -c color.ui=false log -3\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"git -C sub commit -m x\"}"));
+    // Unprovable shapes stay mutation: python one-liners, tee, xargs into a writer.
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"python3 -c 'print(1)'\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"ls | tee out.txt\"}"));
+    try std.testing.expectEqual(Class.mutation, classify(a, "Bash", "{\"command\":\"find . -name '*.o' | xargs rm\"}"));
 }
 
 test "bash redirects and in-place flags disarm" {

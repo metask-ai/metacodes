@@ -414,6 +414,26 @@ class PairedRunnerTest(unittest.TestCase):
                     max_rollout_cost_usd=5.0,
                     max_rollout_metered_tokens=10,
                 )
+            with self.assertRaisesRegex(ValidationError, "metered tokens exceeds the cumulative cap"):
+                run_paired(
+                    suite,
+                    root,
+                    baseline_binary,
+                    candidate_binary,
+                    trials=1,
+                    scenario_glob="*",
+                    model_provider="test",
+                    model_id="model-a",
+                    baseline_output=root / "b4.jsonl",
+                    candidate_output=root / "c4.jsonl",
+                    baseline_revision="baseline-rev",
+                    candidate_revision="candidate-rev",
+                    suite_path=suite_path,
+                    max_cumulative_cost_usd=100.0,
+                    max_cumulative_tokens=100,
+                    max_rollout_cost_usd=5.0,
+                    max_rollout_metered_tokens=1000,
+                )
 
     def test_run_once_accepts_hard_assertion_failure_as_scored_rollout(self):
         with tempfile.TemporaryDirectory() as directory:

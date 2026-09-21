@@ -2810,6 +2810,12 @@ pub fn run(
         }
         if (deferred_recovery > 0) log.info("agent", "recovery allowance: charged={d} allowance={d} deferred={d}", .{ recovery_plan.charged_bytes, recovery_plan.allowance_bytes, deferred_recovery });
         const exec_outcome = tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        // Delivery-cadence sensor: observe every executed slot now, before the
+        // suspend and host-fatal paths return without reaching the turn's
+        // tail (Codex review 2026-09-21: a suspended sibling batch used to
+        // leave the terminal record at zero).
+        if (opts.delivery_cadence or opts.delivery_cadence_observe)
+            delivery_cadence_state.observeSlots(allocator, slots.items);
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
         try exec_outcome;
@@ -2942,8 +2948,6 @@ pub fn run(
         const inject_verification_checkpoint = observe_verification and
             verification_progress.observeTurn(allocator, slots.items) and
             opts.verification_checkpoint;
-        if (opts.delivery_cadence or opts.delivery_cadence_observe)
-            delivery_cadence_state.observeSlots(allocator, slots.items);
         if (observe_verification) {
             if (opts.tool_observer) |observer| {
                 for (slots.items) |slot| {

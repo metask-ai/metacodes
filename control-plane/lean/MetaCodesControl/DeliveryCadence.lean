@@ -41,7 +41,9 @@ inductive Decision where
   | second
   deriving Repr, DecidableEq
 
-/-- Line-for-line transcription of `State.decide`. -/
+/-- Transcription of `State.decide`; `maxNudges` mirrors the Zig
+`MAX_CADENCE_NUDGES` by convention (the two `if` arms are the bound, the
+constant names it). -/
 def decide (t : Thresholds) (s : State) : Decision :=
   if s.mutationSeen then .none
   else if s.level = 0 ∧ t.first ≤ s.readOnlyCalls then .first
@@ -128,11 +130,12 @@ theorem step_level_le (t : Thresholds) (s : State) (h : s.level ≤ maxNudges) :
   · rw [if_neg hd]
     exact decision_needs_level_below_max t s hd
 
-/-- One turn: the sensor adds `calls` exploration calls (or reports a
-mutation), then the boundary decides. -/
+/-- One turn: the sensor adds `calls` exploration calls unless a mutation was
+seen before or during this turn (the Zig `observeCall` stops counting once
+`mutation_seen` is set), then the boundary decides. -/
 def turn (t : Thresholds) (s : State) (calls : Nat) (mutation : Bool) : State :=
   step t { s with
-    readOnlyCalls := if mutation then s.readOnlyCalls else s.readOnlyCalls + calls,
+    readOnlyCalls := if s.mutationSeen || mutation then s.readOnlyCalls else s.readOnlyCalls + calls,
     mutationSeen := s.mutationSeen || mutation }
 
 def run (t : Thresholds) : List (Nat × Bool) → State → State

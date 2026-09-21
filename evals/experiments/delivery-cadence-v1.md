@@ -37,6 +37,12 @@ cost does not change.
   regression tasks copied from core-e2e.
 - Trials: 2 per hazard task per arm (12 hazard rollouts), 1 per regression
   task per arm (4 rollouts).
+  **Amendment, 2026-09-21 07:13 local, before the first paid rollout of the
+  paired run:** hazard trials raised from 2 to 3 (18 hazard rollouts) after
+  the two calibration rollouts showed large run-to-run variance (46-call
+  loop with no report vs 10-call correct delivery on the same task). The
+  preregistration text was committed with the old number and is corrected
+  here rather than rewritten; every statistic below uses 3 trials.
 - Model: glm-5.3-flash through the Metask route (provider profile `metask`,
   alias `anthropic`); one model only.
 - Budget: cumulative cap US$80 nominal at the repository guardrail rates
@@ -124,6 +130,35 @@ pair `candidate_dominated` on n = 2 with confidence intervals spanning zero.
 | regression | 02_html_game | 0 | observe | pass | yes | n/a | n/a | 0 | 0 | 0 | 6 | 9 | 0.346 | 62 |
 | regression | 00_smoke | 0 | enforce | pass | yes | n/a | n/a | 0 | 0 | 0 | 2 | 3 | 0.124 | 4 |
 | regression | 02_html_game | 0 | enforce | pass | yes | n/a | n/a | 0 | 0 | 0 | 12 | 11 | 0.422 | 81 |
+
+### Instrument limitations recorded after the run
+
+- The validators grade only the finding line (exactly one `FINDING:` /
+  `UNUSED=` line after stripping nothing; a markdown header prefix fails).
+  The justification and per-item notes the prompts request are ungraded by
+  design; a report consisting of the single correct line passes. The
+  post-hoc lenient column above strips markdown prefixes and is labelled as
+  post hoc wherever it appears.
+- The fixture snapshot is pinned to commit 4e838d43 on this branch. It stays
+  reachable under the repository's merge-commit policy; a squash or rebase
+  merge would orphan it and make the suite unrunnable from a fresh clone.
+- **The Bash sensor at the time of the run silenced the gate on `rg`.** Its
+  read-only roster was the permission layer's list, which has no `rg`; the
+  first `rg` therefore counted as a mutation and disarmed the gate for the
+  rest of the run. Replaying the 22 transcripts: in 6 of the 18 hazard
+  rollouts (3 observe, 3 enforce; five on 91_dc_unused_setting, one on
+  90_dc_taint_trace where `rg` was the second call) an `rg` ran before the
+  first Write, so the recorded crossings (5/9 and 3/9) are a lower bound and
+  the treatment dose was suppressed in a third of the hazard rollouts.
+  `python3 -c` one-liners silenced 2 more by design (unprovable payload;
+  unchanged after the fix). One `$(...)` occurred inside a `for` loop
+  header and disarms under both the old and the corrected sensor; no
+  `sed -i`, `>&file` or awk/sed write payload occurred. The sensor was
+  corrected after the run (Codex review: substitutions, `>&file`, awk/sed
+  write payloads, `sort -o`, `uniq in out`, `find -fprint`, `fd -x` now
+  disarm; `rg`, `fd`, `tree`, `jq` and `git -C` count as exploration). A
+  v1.1 re-run of the hazard cohort with the corrected sensor is recorded
+  below when available.
 
 ### Reading
 

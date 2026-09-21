@@ -1570,6 +1570,18 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     ):
                         raise TraceError(f"delivery cadence {where} is invalid")
                     formal["delivery_cadence_" + key] = value
+                # Policy relationships the Zig gate proves (DeliveryCadence.lean):
+                # at most max_nudges levels and nudges, no injection in observe
+                # mode, ordered thresholds. A record violating them is not a
+                # measurement of this gate.
+                if (
+                    formal["delivery_cadence_levels_reached"] > formal["delivery_cadence_max_nudges"]
+                    or formal["delivery_cadence_nudges"] > formal["delivery_cadence_max_nudges"]
+                    or formal["delivery_cadence_nudges"] > formal["delivery_cadence_levels_reached"]
+                    or (not observation["enforced"] and formal["delivery_cadence_nudges"] != 0)
+                    or formal["delivery_cadence_first_threshold"] >= formal["delivery_cadence_second_threshold"]
+                ):
+                    raise TraceError("delivery cadence record violates the gate policy")
             elif observation_kind == "test_weakening_candidate":
                 # PO-V2 M2 observe-only candidate: a realized edit to a
                 # test-classified file. Schema pinned; counters split by the
