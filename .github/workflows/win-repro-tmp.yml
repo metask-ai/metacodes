@@ -16,8 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [original]
-        slot: [1, 2, 3, 4, 5, 6, 7, 8]
+        variant: [audit]
+        slot: [1, 2, 3]
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -36,7 +36,7 @@ jobs:
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
       - name: Restore the original /tmp fixture literals (diagnostics kept)
-        if: startsWith(matrix.variant, 'original')
+        if: startsWith(matrix.variant, 'original') || matrix.variant == 'audit'
         shell: cmd
         run: git apply --verbose .github/workflows/win-repro-original.patch && git diff --stat
       - name: Install Python development dependencies
@@ -45,6 +45,17 @@ jobs:
       - name: Verify native bundle and fresh-store contract
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage
+      - name: Pre-create D:\tmp with a DELETE audit rule (audit variant)
+        if: matrix.variant == 'audit'
+        shell: pwsh
+        run: |
+          auditpol /set /subcategory:"File System" /success:enable /failure:enable
+          New-Item -ItemType Directory -Force 'D:\tmp' | Out-Null
+          $acl = Get-Acl -Path 'D:\tmp' -Audit
+          $rule = New-Object System.Security.AccessControl.FileSystemAuditRule('Everyone', 'Delete', 'None', 'None', 'Success,Failure')
+          $acl.AddAuditRule($rule)
+          Set-Acl -Path 'D:\tmp' -AclObject $acl
+          (Get-Acl -Path 'D:\tmp' -Audit).Audit | Format-Table -AutoSize | Out-String | Write-Host
       - name: Pre-create D:\tmp with a keep file (control variant)
         if: matrix.variant == 'original-keep'
         shell: pwsh
@@ -103,6 +114,26 @@ jobs:
             Write-Host "  C:\tmp exists=$(Test-Path 'C:\tmp') contents=[$((Get-ChildItem -Force 'C:\tmp' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ',')]"
             foreach ($root in @('D:\', 'C:\tmp', 'C:\Users\runneradmin', "$env:TEMP")) {
               Get-ChildItem -Path $root -Force -Recurse -Depth 4 -Filter '.prelude-ran-*' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  prelude marker found: $($_.FullName)" }
+            }
+            if ('${{ matrix.variant }}' -eq 'audit') {
+              Write-Host "  --- Security log: handles opened on D:\tmp itself with DELETE access (4663/4660/4659/4656):"
+              $sec = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=@(4663,4660,4659,4656)} -ErrorAction SilentlyContinue
+              $hits = @()
+              foreach ($e in $sec) {
+                $x = [xml]$e.ToXml(); $d = @{}
+                foreach ($f in $x.Event.EventData.Data) { $d[$f.Name] = $f.'#text' }
+                if ($d.ObjectName -eq 'D:\tmp' -or $d.ObjectName -eq 'D:\tmp\') {
+                  $hits += [PSCustomObject]@{ t = $e.TimeCreated; id = $e.Id; proc = $d.ProcessName; pid = [Convert]::ToInt64($d.ProcessId, 16); access = $d.AccessMask; obj = $d.ObjectName }
+                }
+              }
+              $hits | Sort-Object t | ForEach-Object { Write-Host "    $($_.t.ToString('HH:mm:ss.fff')) id=$($_.id) access=$($_.access) pid=$($_.pid) proc=$($_.proc)" }
+              $starts = Select-String -Path "suite-$i.log" -Pattern 'test_start now_ns=(\d+) pid=(\d+) shard=(\S+) name="(.*)"' | ForEach-Object { [PSCustomObject]@{ ms = [long]($_.Matches[0].Groups[1].Value) / 1000000; pid = [long]$_.Matches[0].Groups[2].Value; shard = $_.Matches[0].Groups[3].Value; name = $_.Matches[0].Groups[4].Value } }
+              foreach ($h in ($hits | Where-Object { $_.id -eq 4663 -or $_.id -eq 4660 })) {
+                $t = [long]([DateTimeOffset]$h.t.ToUniversalTime()).ToUnixTimeMilliseconds()
+                $last = $starts | Where-Object { $_.pid -eq $h.pid -and $_.ms -le ($t + 50) } | Sort-Object -Property ms -Descending | Select-Object -First 3
+                Write-Host "  --- event at $($h.t.ToString('HH:mm:ss.fff')) pid=$($h.pid) proc=$($h.proc): last tests started in that process:"
+                $last | ForEach-Object { Write-Host "    $($_.ms - $t) ms shard=$($_.shard) $($_.name)" }
+              }
             }
             Write-Host "after iteration $i drive-tmp-exists=$(Test-Path 'D:\tmp') contents=[$((Get-ChildItem -Force 'D:\tmp' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ',')]"
           }
