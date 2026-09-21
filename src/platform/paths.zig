@@ -139,7 +139,10 @@ extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
 ///
 /// realpath 失败(路径被删、权限、Windows `_fullpath` 不解 symlink 但不会失败)时**回退到
 /// 被调用路径**而不是返回 null:退化成旧行为,不让一次 realpath 故障把所有相邻产物变成
-/// unresolved。selfExePath 本身失败才返回 null。写进 buf,返回 slice。
+/// unresolved。但回退值必须是**绝对路径**:相对的被调用路径在进程 chdir 之后(swarm
+/// `--teammate` 进 worktree)会被当成相对新 cwd 解释,相邻查找就可能捡到别的目录里的 rg /
+/// kernel——那比 unresolved 更糟,所以相对路径回退直接返回 null(Codex review 2026-09-21)。
+/// selfExePath 本身失败也返回 null。写进 buf,返回 slice。
 pub fn selfExeRealPath(buf: []u8) ?[]const u8 {
     var invoked: [std.fs.max_path_bytes + 1]u8 = undefined;
     const invoked_slice = selfExePath(invoked[0 .. invoked.len - 1]) orelse return null;
@@ -147,8 +150,10 @@ pub fn selfExeRealPath(buf: []u8) ?[]const u8 {
     var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
     const resolved: []const u8 = if (@import("fs.zig").realpath(invoked[0..invoked_slice.len :0], &resolved_buf)) |r|
         std.mem.span(r)
+    else if (std.fs.path.isAbsolute(invoked_slice))
+        invoked_slice
     else
-        invoked_slice;
+        return null;
     if (resolved.len >= buf.len) return null;
     @memcpy(buf[0..resolved.len], resolved);
     return buf[0..resolved.len];
@@ -206,6 +211,15 @@ test "selfExeRealPath falls back to the invoked path when realpath fails" {
     defer test_self_exe_override = null;
     var out: [std.fs.max_path_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(ghost, selfExeRealPath(&out).?);
+}
+
+test "selfExeRealPath refuses a relative invoked path that realpath cannot resolve" {
+    // 相对路径 + realpath 失败 = 会随 cwd 漂移的基准 → null,不回退。
+    const ghost = if (is_windows) "bin\\definitely-missing-metacodes-xyzzy.exe" else "bin/definitely-missing-metacodes-xyzzy";
+    test_self_exe_override = ghost;
+    defer test_self_exe_override = null;
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect(selfExeRealPath(&out) == null);
 }
 
 test "selfExeRealPath of the real test binary is an existing absolute path" {

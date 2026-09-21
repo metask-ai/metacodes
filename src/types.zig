@@ -151,8 +151,6 @@ pub const Config = struct {
     /// `--base-url <url>` / `METACODES_BASE_URL`:覆盖 API 端点(默认硬编码)。
     /// 用于 record/replay(指向 mock server)。须以 `/v1/messages` 结尾。
     base_url: ?[]const u8 = null,
-    /// metacodes 可执行文件所在目录(main 从 argv[0] 解析)。定位 staged TinyKG。null=未知。
-    exe_dir: ?[]const u8 = null,
     /// Credential resolver precedence. Default matches docs: explicit CLI/env API
     /// key wins over stored OAuth unless user opts into oauth-first.
     auth_precedence: AuthPrecedence = .api_key_first,

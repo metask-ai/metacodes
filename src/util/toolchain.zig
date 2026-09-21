@@ -171,12 +171,15 @@ var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
 /// 目录取自物理路径(selfExeRealPath):经 symlink 启动时 rg 在 symlink 目标旁,不在 symlink 旁。
 fn nextToExecutable() ?[:0]const u8 {
     const paths = @import("platform").paths;
-    const exe = paths.selfExeRealPath(exe_dir_buf[0 .. exe_dir_buf.len - RG_NAME.len - 2]) orelse return null;
+    // 可执行文件路径用满尺寸缓冲解析,再把 <dir>/rg 拼进静态 exe_dir_buf:旧写法把缩短了
+    // RG_NAME.len+2 的 buf 交给解析器,接近 PATH_MAX 的合法路径会在拼接前就被拒(Codex review)。
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = paths.selfExeRealPath(&exe_buf) orelse return null;
     const dir_sep: u8 = if (is_windows) '\\' else '/';
     const cut = std.mem.lastIndexOfScalar(u8, exe, dir_sep) orelse return null;
     const need = cut + 1 + RG_NAME.len;
     if (need + 1 > exe_dir_buf.len) return null;
-    // selfExeRealPath 写在 buf 头部;截到目录后原地续接文件名。
+    @memcpy(exe_dir_buf[0 .. cut + 1], exe[0 .. cut + 1]);
     @memcpy(exe_dir_buf[cut + 1 ..][0..RG_NAME.len], RG_NAME);
     exe_dir_buf[need] = 0;
     if (pfs.exists(@ptrCast(&exe_dir_buf))) return exe_dir_buf[0..need :0];
