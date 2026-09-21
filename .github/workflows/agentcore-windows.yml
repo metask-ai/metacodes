@@ -2,19 +2,6 @@ name: AgentCore Windows
 
 on:
   pull_request:
-    paths:
-      - "build.zig"
-      - "scripts/agentcore_manifest.zig"
-      - "scripts/windows_test_prelude.zig"
-      - "src/agentcore/**"
-      - "src/core/**"
-      - "src/lsp/**"
-      - "src/lsp_test_root.zig"
-      - "src/platform/**"
-      - "sdk/**"
-      - "tests/component/agentcore_abi_test.zig"
-      - "tests/agentcore_artifact_consumer/**"
-      - ".github/workflows/agentcore-windows.yml"
   push:
     branches: [main]
   workflow_dispatch:
@@ -33,13 +20,39 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # `native-windows-gate` is a required status check on main, so the job
+      # must report on every pull request; the old `on.pull_request.paths`
+      # filter left doc-only / evals-only PRs permanently BLOCKED (#134). The
+      # expensive steps still run only when a path that can affect the native
+      # gate changed; other PRs report success from this step alone.
+      - name: Decide whether the change can affect the native gate
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          git fetch -q --depth=1 origin "$base"
+          changed=$(git diff --name-only "$base" HEAD)
+          pattern='^build\.zig|^scripts/agentcore_manifest\.zig|^scripts/windows_test_prelude\.zig|^src/agentcore/.*|^src/core/.*|^src/lsp/.*|^src/lsp_test_root\.zig|^src/platform/.*|^sdk/.*|^tests/component/agentcore_abi_test\.zig|^tests/agentcore_artifact_consumer/.*|^\.github/workflows/agentcore-windows\.yml'
+          if grep -Eq "$pattern" <<<"$changed"; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+            echo "no native-gate path changed; reporting success without building"
+          fi
+          printf 'changed files:\n%s\n' "$changed"
       # See ci.yml `gates` for the cache semantics.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.scope.outputs.relevant == 'true'
         with:
           version: 0.16.0
           use-cache: true
           cache-size-limit: 4096
       - name: Rust toolchain (Windows)
+        if: steps.scope.outputs.relevant == 'true'
         shell: cmd
         env:
           # Fail loudly if the image ever drops rustup instead of letting
@@ -64,10 +77,12 @@ jobs:
       # 33186110733, 33229667443, 33229697275; all green on rerun); the
       # wider window only delays reporting of a genuinely wedged test.
       - name: Native AgentCore delivery gate
+        if: steps.scope.outputs.relevant == 'true'
         shell: cmd
         run: |
           zig version
           zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Native Windows platform gate
+        if: steps.scope.outputs.relevant == 'true'
         shell: cmd
         run: zig build windows:gate -Dtarget=x86_64-windows-gnu --test-timeout 5m
