@@ -497,9 +497,12 @@ const WD_TEST_WAIT_ROUNDS: usize = 100;
 
 test "watchdog 线程真触发超时 abort(started_ms 远早于 now → 超 deadline)" {
     var jobs = [_]BatchJob{wdTestJob(0)};
-    // started_ms=1(单调钟 1ms 处启动,now 是当前单调时间,elapsed 远超 300s deadline)→ 必被砍。
+    // started_ms=1(单调钟 1ms 处启动)配 1ms deadline:elapsed = now-1 在任何机器上都
+    // 超过它。此前用默认 300s deadline,隐含假设"单调钟(自启动计时)已过 5 分钟"——
+    // 长驻的 self-hosted runner 上恒成立,托管 VM 开机不到 5 分钟就跑到这里时 watchdog
+    // 永不触发,等满 10s 后断言失败(main a7390b8b / 3066add7 Linux 实测)。
     jobs[0].started_ms.store(1, .release);
-    var wd = Watchdog{ .jobs = &jobs, .parent_abort = null };
+    var wd = Watchdog{ .jobs = &jobs, .parent_abort = null, .deadline_ms = 1 };
     const t = try std.Thread.spawn(.{}, watchdogMain, .{&wd});
     // 轮询等 watchdog 把 abort_sig 砍掉(≤200ms 一轮)。上限 10s:只决定"真挂了"时多久
     // 报错,正常路径一两轮就结束;2s 在满载的托管 runner 上不够(PR #139 Linux 实测 flake)。
