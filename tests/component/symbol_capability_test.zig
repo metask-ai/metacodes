@@ -38,6 +38,16 @@ fn dispatchOk(ctx: *const ToolContext, name: []const u8, args: []const u8) ![]u8
     };
 }
 
+/// 临时目录根:POSIX 固定 "/tmp"(macOS $TMPDIR 与其它按 /tmp 拼路径的测试要对得上),
+/// Windows 用 %TEMP% 并把反斜杠归一为正斜杠(Windows API 两种都认,嵌 JSON 免转义)。
+fn tmpRoot(buf: []u8) []const u8 {
+    if (@import("builtin").os.tag != .windows) return "/tmp";
+    const raw = ppaths.tempDir();
+    const n = @min(raw.len, buf.len);
+    for (raw[0..n], 0..) |c, i| buf[i] = if (c == '\\') '/' else c;
+    return buf[0..n];
+}
+
 fn mkdirAt(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
@@ -74,7 +84,11 @@ const Sandbox = struct {
     svc: *Service,
 
     fn init(a: std.mem.Allocator, tag: []const u8, basename: []const u8, content: []const u8) !Sandbox {
-        const dir = try std.fmt.allocPrint(a, "/tmp/{s}-{d}", .{ tag, pprocess.currentPid() });
+        // POSIX /tmp,Windows %TEMP%(正斜杠归一,路径要嵌进 JSON 参数):不依赖当前
+        // 驱动器根下的 \tmp 存在,也不与其它测试进程共用一个固定目录。
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = tmpRoot(&tmp_buf);
+        const dir = try std.fmt.allocPrint(a, "{s}/{s}-{d}", .{ tmp, tag, pprocess.currentPid() });
         errdefer a.free(dir);
         mkdirAt(dir);
         const file = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, basename });
