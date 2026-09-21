@@ -64,7 +64,11 @@ cost does not change.
 Internal single-factor evidence on a self-authored synthetic cohort with one
 model. Directional only: 3 tasks x 2 trials cannot establish significance. It
 says whether the mechanism fires and whether firing moves the deliverable
-rate; it says nothing about external benchmarks.
+rate; it says nothing about external benchmarks. **It also says nothing about
+the full harness**: both runs used a binary without the Lean governance
+kernels and workspaces without an active project-rule bundle, so the
+governance layer the production harness runs with was absent from every
+rollout (details under "Instrument limitations").
 
 ---
 
@@ -159,6 +163,28 @@ pair `candidate_dominated` on n = 2 with confidence intervals spanning zero.
   disarm; `rg`, `fd`, `tree`, `jq` and `git -C` count as exploration). A
   v1.1 re-run of the hazard cohort with the corrected sensor is recorded
   below when available.
+- **The runs did not exercise the harness's Lean governance layer.** The
+  evaluation binary was built without the formal and project governance
+  kernels (`metacodes doctor`: `formal_kernel unresolved`, `project_kernel
+  unresolved`, `expected=none`), no `METACODES_FORMAL_KERNEL_PATH/SHA256`
+  pair was set, and every rollout workspace's state root carried no active
+  `project-rules` bundle, so `RunGate.load` returned null and the kernel
+  was never invoked: all 18 v1.1 journals contain only `dispatch_started`,
+  `dispatch_finished` and `delivery_cadence` records, no rule or formal
+  decision. `run-paired` does not require `--formal-kernel` (only
+  `validate-experiment` / `multi` do, and those freeze the kernel identity
+  into the receipt as `fk-…`), so the v1 / v1.1 receipts carry no kernel
+  fingerprint. The observe-vs-enforce comparison is unaffected (same binary
+  in both arms, the treatment is pure Zig, and a rule needing a missing
+  kernel fails closed rather than degrading), but the result is evidence
+  about the cadence gate on a harness stripped of its governance layer, not
+  about its value under the production harness, where kernel-authorized
+  rules shape the tool stream and therefore the exploration counts. A
+  confirmatory run must build and pin both kernels
+  (`scripts/build-formal-kernel.sh`, `scripts/build-project-harness-kernel.sh`,
+  `-Dformal-kernel-sha256` / `-Dproject-kernel-sha256`), go through the
+  `multi` / `validate-experiment` path, and use a cohort whose workspaces
+  carry an active project-rule bundle, in both arms.
 
 ### Reading
 
@@ -271,4 +297,6 @@ treatment runs (v1: 3/9) and fired 7 nudges; the control crossed in 6/9.
   run of the same design with ~18 pairs and a content-level grader
   registered up front, which would put a 3/0-per-9 effect at p ≈ 0.03 if it
   holds. It still would not test H1; that needs a cohort where the control
-  actually fails to deliver.
+  actually fails to deliver. And it must run on the full harness (Lean
+  kernels pinned, active project rules, the receipt-freezing experiment
+  path): neither v1 nor v1.1 did, see the instrument limitations.
