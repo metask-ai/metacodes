@@ -103,7 +103,10 @@ def fake_builder(argv, *, cwd=None, dry_run=False):
     if "build" in argv:
         binaries = Path(argv[argv.index("--prefix") + 1]) / "bin"
         binaries.mkdir(parents=True, exist_ok=True)
-        windows = any("windows" in value for value in argv)
+        # Decide from the target triple alone: on a GitHub-hosted Windows
+        # runner the compiler itself lives under zig-x86_64-windows-0.16.0/,
+        # and matching every argument made a macOS build emit .exe files.
+        windows = any(value.startswith("-Dtarget=") and "windows" in value for value in argv)
         for name in ("tinykg", "tinykgd"):
             target = binaries / (name + (".exe" if windows else ""))
             target.write_bytes(b"executable bytes for " + target.name.encode("ascii"))

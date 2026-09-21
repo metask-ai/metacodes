@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Dict
 
 
+# Mirrors scripts.eval.workbuddy.mock_provider.READY_DEADLINE_S (this script
+# runs as a file, not as a package member, so it cannot import it): how long to
+# wait for a mock provider's ready file before calling it stuck.
+READY_DEADLINE_S = 30.0
+
 ARMS = ("codex_style", "claude_style", "tinykg")
 KG_TOOL_MARKERS = ("\n----- KgRemember -----\n", "\n----- KgRecall -----\n")
 TASK_TOOL_MARKER = "\n----- TaskList -----\n"
@@ -54,7 +59,7 @@ def _headless_protocol_smoke(binary: Path) -> None:
             text=True,
             encoding="utf-8",
         )
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + READY_DEADLINE_S
         while not ready.exists() and provider.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         _require(ready.exists(), "headless protocol mock provider did not become ready")
@@ -150,7 +155,7 @@ def _workbuddy_tool_policy_smoke(binary: Path, tinykg_binary: Path) -> None:
             text=True,
             encoding="utf-8",
         )
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + READY_DEADLINE_S
         while not ready.exists() and provider.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         _require(ready.exists(), "WorkBuddy tool-policy provider did not become ready")
