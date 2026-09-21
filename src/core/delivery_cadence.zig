@@ -39,6 +39,7 @@ const common = @import("../tools/common.zig");
 const util_json = @import("../util/json.zig");
 const bash_parser = @import("../permission/bash_parser.zig");
 const tool_exec = @import("tool_exec.zig");
+const file_change = @import("file_change.zig");
 const verification_progress = @import("verification_progress.zig");
 
 pub const MAX_CADENCE_NUDGES: u8 = 2;
@@ -113,14 +114,27 @@ pub const State = struct {
     /// Observe the slots of one batch after `executeSlots`. Only slots that
     /// actually started count: after a serial host fatal the remaining `.run`
     /// slots were never executed (no content, not pending, no effect) and must
-    /// not enter the record (Codex round 6).
+    /// not enter the record (Codex round 6). The fatal slot itself carries no
+    /// content and no effect but may have changed the disk; its file-change
+    /// evidence counts as a realized mutation (Codex round 7).
     pub fn observeSlots(self: *State, allocator: std.mem.Allocator, slots: []const tool_exec.Slot) void {
         for (slots) |slot| {
             if (slot.decision != .run or slot.pending) continue;
-            const realized = verification_progress.isRealizedMutation(slot.effect, slot.effect_valid);
+            const realized = verification_progress.isRealizedMutation(slot.effect, slot.effect_valid) or fileChangesRealized(slot);
             if (slot.content == null and !realized) continue;
             self.observeCall(classify(allocator, slot.name, slot.input), realized);
         }
+    }
+
+    /// File-change evidence that says the disk changed: any applied/partial
+    /// record, or an overflow/lost marker (more changed than was reported).
+    fn fileChangesRealized(slot: tool_exec.Slot) bool {
+        if (slot.file_changes_overflow or slot.file_changes_lost) return true;
+        const changes = slot.file_changes orelse return false;
+        for (changes) |rec| {
+            if (rec.status.changedDisk()) return true;
+        }
+        return false;
     }
 
     pub fn observeCall(self: *State, class: Class, realized_mutation: bool) void {
@@ -714,6 +728,44 @@ test "observeSlots skips slots that never started after a host fatal" {
     var state2 = State{};
     state2.observeSlots(a, executed[0..]);
     try std.testing.expect(state2.mutation_seen);
+    // Codex round 7: the fatal slot itself has no content and no effect, but
+    // its file-change evidence says the disk changed → realized mutation.
+    const applied = [_]file_change.Record{.{
+        .locator = .{ .workspace_path = "report.md" },
+        .kind = .created,
+        .status = .applied,
+        .tool = "Write",
+        .tool_use_id = "3",
+        .agent_depth = 0,
+        .before_bytes = 0,
+        .after_bytes = 5,
+    }};
+    var fatal_write = slots[2];
+    fatal_write.file_changes = @constCast(applied[0..]);
+    var state3 = State{};
+    state3.observeSlots(a, &.{fatal_write});
+    try std.testing.expect(state3.mutation_seen);
+    // A rejected-only record (nothing landed) stays unstarted-equivalent.
+    const rejected = [_]file_change.Record{.{
+        .locator = .{ .workspace_path = "report.md" },
+        .kind = .created,
+        .status = .rejected,
+        .tool = "Write",
+        .tool_use_id = "3",
+        .agent_depth = 0,
+        .before_bytes = 0,
+        .after_bytes = 0,
+    }};
+    fatal_write.file_changes = @constCast(rejected[0..]);
+    var state4 = State{};
+    state4.observeSlots(a, &.{fatal_write});
+    try std.testing.expect(!state4.mutation_seen);
+    // Overflow marker: more changed than was reported → realized.
+    fatal_write.file_changes = null;
+    fatal_write.file_changes_overflow = true;
+    var state5 = State{};
+    state5.observeSlots(a, &.{fatal_write});
+    try std.testing.expect(state5.mutation_seen);
 }
 
 test "below the first threshold nothing fires" {
