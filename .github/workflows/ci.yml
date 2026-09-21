@@ -162,6 +162,12 @@ jobs:
         run: python3 scripts/check_doc_links.py
       - name: Default install prefix
         run: zig build --prefix "$RUNNER_TEMP/install-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/install-prefix" --doctor
+      # The sidecar the kernel build script wrote, read by the installed
+      # product's own loader: the pairing no unit test can cover (the project
+      # kernel's v6 sidecar was validated with the formal v4 loader for as long
+      # as nothing ran a real one through doctor, 2026-09-21).
+      - name: Built project kernel provenance is accepted by doctor
+        run: python3 scripts/verify_kernel_provenance.py "$RUNNER_TEMP/install-prefix/bin/metacodes" --project "$RUNNER_TEMP/metacodes-project-kernel"
       - name: Release layout prefix
         run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
       - name: Release bundle verifier self-test
@@ -187,6 +193,8 @@ jobs:
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
       - name: Verify install prefix unit tests
         run: python3 -m unittest scripts.tests.test_verify_install_prefix -v
+      - name: Kernel provenance verifier unit tests
+        run: python3 -m unittest scripts.tests.test_verify_kernel_provenance -v
       - name: Python floor unit tests
         run: python3 -m unittest scripts.tests.test_python_floor -v
       - name: Diff whitespace check
@@ -263,6 +271,9 @@ jobs:
       - name: Verify install prefix unit tests
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_install_prefix -v
+      - name: Kernel provenance verifier unit tests
+        shell: cmd
+        run: python -m unittest scripts.tests.test_verify_kernel_provenance -v
       # The repository-wide suite on the native Windows host (#53). No Lean
       # step and no METACODES_TEST_REQUIRE_LEAN_SDK here: the kernel-gated
       # tests take their checker from operator-provided

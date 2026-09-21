@@ -41,7 +41,9 @@ metacodes-core 是一个**无 UI、无 CLI** 的 LLM 编码-agent 引擎。它�
 
 Lean 治理 kernel 是这个边界的固定外部裁决面：发布时放在 `bin/` 旁的
 `libexec/metacodes/`，运行时先看环境变量路径与摘要配对，再看相邻文件及编译进二进制的摘要；
-`metacodes doctor` 会同时报告 formal kernel 与 project kernel 的路径、摘要和 provenance。
+`metacodes doctor` 会同时报告 formal kernel 与 project kernel 的路径、摘要和 provenance，两者的
+provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest + build receipt 走
+`formal/provenance.zig`，project v6 manifest 走 `formal/project_provenance.zig`），拿错 loader 即 `provenance=false`。
 
 ---
 
