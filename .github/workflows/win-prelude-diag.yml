@@ -1,0 +1,33 @@
+# TEMPORARY: where does scripts/windows_test_prelude.zig actually create "/tmp"?
+name: win-prelude-diag
+on:
+  push:
+    branches: [claude/musing-lumiere-cd9e13]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: win-prelude-diag-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  diag:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Run the prelude alone and locate the directory it made
+        shell: pwsh
+        run: |
+          Write-Host "cwd=$(Get-Location)"
+          Write-Host "before: D:\tmp=$(Test-Path 'D:\tmp') C:\tmp=$(Test-Path 'C:\tmp') cwd\tmp=$(Test-Path (Join-Path (Get-Location) 'tmp'))"
+          & zig run scripts/windows_test_prelude.zig
+          Write-Host "prelude exit=$LASTEXITCODE"
+          Write-Host "after:  D:\tmp=$(Test-Path 'D:\tmp') C:\tmp=$(Test-Path 'C:\tmp') cwd\tmp=$(Test-Path (Join-Path (Get-Location) 'tmp'))"
+          Get-ChildItem D:\ -Force | Select-Object -ExpandProperty Name
+          Write-Host "--- now the CRT spelling: python os.makedirs('/tmp/probe')"
+          python -c "import os; os.makedirs('/tmp/probe', exist_ok=True); print('python made', os.path.abspath('/tmp/probe'))"
+          Write-Host "after python: D:\tmp=$(Test-Path 'D:\tmp')"
