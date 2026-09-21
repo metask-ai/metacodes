@@ -15,7 +15,8 @@ binary with a matching digest (#78). The Lean kernel checks are evaluated when
 the report carries them: a kernel the executable pins must be shipped under
 `libexec/metacodes/` with a matching digest and a provenance sidecar that the
 kernel's own loader accepts (`provenance: true`); a pinned-but-absent kernel and
-a rejected sidecar are both named. The release layout ships no kernel today
+a rejected sidecar are both named, as is a report without the kernel checks.
+The release layout ships no kernel today
 (release/LAYOUT.md), so a release executable is expected to pin none. Python
 3.9, stdlib only.
 """
@@ -50,6 +51,8 @@ DOCTOR_ENV_OVERRIDES = (
     "METACODES_FORMAL_KERNEL_SHA256",
     "METACODES_PROJECT_KERNEL_PATH",
     "METACODES_PROJECT_KERNEL_SHA256",
+    "METACODES_FORMAL_KERNEL_TIMEOUT_MS",
+    "METACODES_PROJECT_KERNEL_TIMEOUT_MS",
 )
 
 
@@ -123,17 +126,18 @@ def evaluate_doctor(report: object, prefix: Path, release: bool = False) -> list
 
 
 def evaluate_kernels(by_name: dict, prefix: Path) -> list[str]:
-    """Findings for the Lean kernel checks a doctor report carries. With no
-    environment override a kernel resolves only beside the executable and only
-    when the build pinned its digest, so a resolved kernel must sit under
-    `libexec/metacodes/`, match, and carry a sidecar its own loader accepts; a
-    pinned kernel that did not resolve was not shipped. An absent kernel check
-    (an older report shape) evaluates nothing."""
+    """Findings for the Lean kernel checks. The report always carries both (a
+    report without them is not this doctor's). With no environment override a
+    kernel resolves only beside the executable and only when the build pinned
+    its digest, so a resolved kernel must sit under `libexec/metacodes/`,
+    match, and carry a sidecar its own loader accepts; a pinned kernel that did
+    not resolve was not shipped."""
     findings: list[str] = []
     kernel_dir = (prefix / "libexec" / "metacodes").resolve()
     for name in KERNEL_CHECKS:
         kernel = by_name.get(name)
         if kernel is None:
+            findings.append(f"doctor: no {name} check")
             continue
         resolved = kernel.get("resolved_path")
         expected = kernel.get("expected_sha256")

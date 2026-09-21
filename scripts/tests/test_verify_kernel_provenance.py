@@ -17,7 +17,7 @@ class VerifyKernelProvenanceTest(unittest.TestCase):
         self.kernels = {"project": (self.kernel, self.digest)}
 
     def _report(self, **override):
-        check = {"name": "project_kernel", "resolved_path": str(self.kernel), "sha256": self.digest, "expected_sha256": None, "match": None, "source": "env", "provenance": True}
+        check = {"name": "project_kernel", "resolved_path": str(self.kernel), "sha256": self.digest, "expected_sha256": self.digest, "match": True, "source": "env", "provenance": True}
         check.update(override)
         return {"checks": [{"name": "ripgrep", "resolved_path": None}, check]}
 
@@ -30,9 +30,17 @@ class VerifyKernelProvenanceTest(unittest.TestCase):
         self.assertIn("provenance is False", findings[0])
         self.assertIn("rejected by the project_kernel loader", findings[0])
 
+    def test_the_pair_digest_must_be_what_doctor_holds_the_file_to(self):
+        findings = evaluate(self._report(expected_sha256=None, match=None), self.kernels)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("holds the file to None with match=None", findings[0])
+        findings = evaluate(self._report(match=False), self.kernels)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("match=False", findings[0])
+
     def test_every_deviation_is_named(self):
-        findings = evaluate(self._report(resolved_path="/elsewhere/kernel", source="adjacent", sha256="00" * 32, provenance=None), self.kernels)
-        self.assertEqual(len(findings), 4)
+        findings = evaluate(self._report(resolved_path="/elsewhere/kernel", source="adjacent", sha256="00" * 32, match=False, provenance=None), self.kernels)
+        self.assertEqual(len(findings), 5)
         self.assertTrue(any("expected 'env'" in f for f in findings))
         self.assertTrue(any("doctor hashed" in f for f in findings))
         self.assertTrue(any("resolved to" in f for f in findings))

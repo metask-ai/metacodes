@@ -6,6 +6,12 @@ from pathlib import Path
 
 from scripts.verify_install_prefix import check, evaluate_doctor, evaluate_kernels
 
+# The doctor always reports both kernels; unpinned and absent is the release shape.
+KERNELS_ABSENT = [
+    {"name": "formal_kernel", "resolved_path": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
+    {"name": "project_kernel", "resolved_path": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
+]
+
 
 class VerifyInstallPrefixTest(unittest.TestCase):
     def _make(self, names):
@@ -50,6 +56,7 @@ class VerifyInstallPrefixTest(unittest.TestCase):
             "checks": [
                 {"name": "ripgrep", "resolved_path": "/usr/bin/rg", "sha256": "ab", "expected_sha256": None, "match": None, "source": "path"},
                 {"name": "tinykg", "resolved_path": str(root / "vendor" / "tinykg" / "tinykg"), "sha256": "cd", "expected_sha256": "cd", "match": True, "source": "adjacent"},
+                *KERNELS_ABSENT,
             ]
         }
         self.assertEqual(evaluate_doctor(report, root), [])
@@ -57,7 +64,7 @@ class VerifyInstallPrefixTest(unittest.TestCase):
     def test_release_doctor_requires_adjacent_ripgrep(self):
         root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
         base = {"name": "tinykg", "resolved_path": str(root / "vendor/tinykg/tinykg"), "match": True, "source": "adjacent"}
-        report = {"checks": [{"name": "ripgrep", "resolved_path": str(root / "bin/rg"), "match": True, "source": "adjacent"}, base]}
+        report = {"checks": [{"name": "ripgrep", "resolved_path": str(root / "bin/rg"), "match": True, "source": "adjacent"}, base, *KERNELS_ABSENT]}
         self.assertEqual(evaluate_doctor(report, root, release=True), [])
         report["checks"][0]["source"] = "path"
         findings = evaluate_doctor(report, root, release=True)
@@ -75,8 +82,10 @@ class VerifyInstallPrefixTest(unittest.TestCase):
             ]
         }
         findings = evaluate_doctor(report, root)
-        self.assertEqual(len(findings), 4)
+        self.assertEqual(len(findings), 6)
         self.assertTrue(any("no ripgrep check" in finding for finding in findings))
+        self.assertTrue(any("no formal_kernel check" in finding for finding in findings))
+        self.assertTrue(any("no project_kernel check" in finding for finding in findings))
         self.assertTrue(any("not under" in finding for finding in findings))
         self.assertTrue(any("expected 'adjacent'" in finding for finding in findings))
         self.assertTrue(any("expected true" in finding for finding in findings))
@@ -131,9 +140,10 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         self.assertTrue(any("match is False" in f for f in findings))
         self.assertTrue(any("provenance is None" in f for f in findings))
 
-    def test_kernel_evaluation_covers_both_kernels_and_tolerates_their_absence(self):
+    def test_kernel_evaluation_covers_both_kernels_and_requires_their_presence(self):
         root = self._make(("bin/metacodes",))
-        self.assertEqual(evaluate_kernels({}, root), [])
+        # A report without the kernel checks is not this doctor's report.
+        self.assertEqual(evaluate_kernels({}, root), ["doctor: no formal_kernel check", "doctor: no project_kernel check"])
         by_name = {
             "formal_kernel": {"resolved_path": None, "expected_sha256": "cd" * 32},
             "project_kernel": {"resolved_path": None, "expected_sha256": "ef" * 32},

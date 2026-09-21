@@ -12,9 +12,9 @@ v4 loader, so `doctor --strict` failed on every pinned project kernel
 
 The executable need not pin the kernels: each kernel is handed to doctor
 through its environment pair (`METACODES_<KIND>_KERNEL_PATH` plus `_SHA256`,
-the digest computed here), which resolves it with `source=env` and validates
-the sidecar exactly as an adjacent, pinned kernel would be. Python 3.9, stdlib
-only.
+the digest computed here), which resolves it with `source=env`, holds the file
+to the pair's digest (`expected_sha256` / `match`) and validates the sidecar
+exactly as an adjacent, pinned kernel would be. Python 3.9, stdlib only.
 
 usage: verify_kernel_provenance.py <metacodes-exe> [--formal <kernel>] [--project <kernel>]
 """
@@ -48,8 +48,8 @@ def sha256_file(path: Path) -> str:
 def evaluate(report: object, kernels: dict[str, tuple[Path, str]]) -> list[str]:
     """Findings for a `doctor --json` document run with `kernels` (kind ->
     (absolute path, sha256)) in the environment: each named kernel must have
-    resolved from the environment at that path with that digest, and its
-    sidecar must have been accepted (`provenance: true`)."""
+    resolved from the environment at that path, be held to that digest and
+    match it, and its sidecar must have been accepted (`provenance: true`)."""
     checks = report.get("checks") if isinstance(report, dict) else None
     if not isinstance(checks, list):
         return ["doctor: report has no checks array"]
@@ -68,6 +68,8 @@ def evaluate(report: object, kernels: dict[str, tuple[Path, str]]) -> list[str]:
             findings.append(f"{name}: source is {check.get('source')!r}, expected 'env'")
         if check.get("sha256") != digest:
             findings.append(f"{name}: doctor hashed {check.get('sha256')!r}, the file is {digest}")
+        if check.get("expected_sha256") != digest or check.get("match") is not True:
+            findings.append(f"{name}: doctor holds the file to {check.get('expected_sha256')!r} with match={check.get('match')!r}, expected the pair's digest and true")
         if check.get("provenance") is not True:
             findings.append(
                 f"{name}: provenance is {check.get('provenance')!r}, expected true "

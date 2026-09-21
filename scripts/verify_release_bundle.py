@@ -22,8 +22,10 @@ repository-relative path) and with `RG_BIN` / `METACODES_KG_BIN` removed:
      Lean kernel checks are held to the same bar when the report carries them:
      a kernel the executable pins must sit under `libexec/metacodes/`, match,
      and carry a provenance sidecar its own loader accepts; a pin without a
-     shipped kernel fails. The layout ships no kernel today (release/LAYOUT.md),
-     so a release executable pins none and both checks stay unresolved.
+     shipped kernel fails, as does a report without the kernel checks. The
+     layout ships no kernel today (release/LAYOUT.md), so a release executable
+     pins none and both checks stay unresolved. The kernel environment pairs are
+     stripped like `RG_BIN` so the bundle is judged on its own contents.
 
 Check 6 (byte-identical archives) belongs to `release:archive` (#81).
 
@@ -197,8 +199,22 @@ def _component(manifest: dict, name: str) -> dict:
     raise BundleError(f"manifest has no component {name!r}")
 
 
+# Everything the executables read from the environment to find a runtime asset
+# or a kernel; stripped so the bundle is judged on its own contents.
+NEUTRALIZED_ENV = (
+    "RG_BIN",
+    "METACODES_KG_BIN",
+    "METACODES_FORMAL_KERNEL_PATH",
+    "METACODES_FORMAL_KERNEL_SHA256",
+    "METACODES_FORMAL_KERNEL_TIMEOUT_MS",
+    "METACODES_PROJECT_KERNEL_PATH",
+    "METACODES_PROJECT_KERNEL_SHA256",
+    "METACODES_PROJECT_KERNEL_TIMEOUT_MS",
+)
+
+
 def _run(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    env = {key: value for key, value in os.environ.items() if key not in ("RG_BIN", "METACODES_KG_BIN")}
+    env = {key: value for key, value in os.environ.items() if key not in NEUTRALIZED_ENV}
     return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
 
 
@@ -303,7 +319,7 @@ def evaluate_doctor_report(report: object, prefix: Path, manifest: dict) -> None
     for name in KERNEL_CHECKS:
         check = checks.get(name)
         if check is None:
-            continue
+            raise BundleError(f"doctor reports no {name} check")
         resolved = check.get("resolved_path")
         expected = check.get("expected_sha256")
         if resolved is None:
@@ -498,6 +514,9 @@ def self_test() -> int:
         _expect_bundle_error(lambda: evaluate_doctor_report(_doctor_report(root, manifest, **dict(shipped, match=False)), root, manifest), "the executable pins")
         _expect_bundle_error(lambda: evaluate_doctor_report(_doctor_report(root, manifest, **dict(shipped, resolved_path="/elsewhere/metacodes-project-kernel")), root, manifest), "outside the bundle's libexec/metacodes")
         _expect_bundle_error(lambda: evaluate_doctor_report({"checks": []}, root, manifest), "no ripgrep check")
+        without_kernels = _doctor_report(root, manifest)
+        without_kernels["checks"] = [check for check in without_kernels["checks"] if check["name"] not in KERNEL_CHECKS]
+        _expect_bundle_error(lambda: evaluate_doctor_report(without_kernels, root, manifest), "no formal_kernel check")
     print("verify_release_bundle: self-test ok")
     return 0
 
