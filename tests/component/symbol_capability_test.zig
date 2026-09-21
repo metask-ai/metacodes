@@ -18,7 +18,6 @@
 const std = @import("std");
 const cc = @import("cc");
 const pfs = @import("platform").fs;
-const pprocess = @import("platform").process;
 const ppaths = @import("platform").paths;
 
 const tools = cc.tools;
@@ -74,7 +73,9 @@ const Sandbox = struct {
     svc: *Service,
 
     fn init(a: std.mem.Allocator, tag: []const u8, basename: []const u8, content: []const u8) !Sandbox {
-        const dir = try std.fmt.allocPrint(a, "/tmp/{s}-{d}", .{ tag, pprocess.currentPid() });
+        // 每进程唯一目录,根按平台选(util/fs.zig testing.tmpRoot);路径要嵌进 JSON 参数,已归一正斜杠。
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try a.dupe(u8, cc.util_fs.testing.perPidDir(&dir_buf, tag));
         errdefer a.free(dir);
         mkdirAt(dir);
         const file = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, basename });

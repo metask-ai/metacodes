@@ -910,8 +910,16 @@ def _first_request_body(
             if any(part == task or part.startswith(task + "__") for part in parts):
                 located = candidate
                 break
-        if located is None and matches:
+        if located is None and len(matches) == 1:
             located = matches[0]
+        elif located is None and matches:
+            # Several twins and none of them names the task: picking any of
+            # them would audit another task's request. Fail closed.
+            raise LaunchError(
+                f"dated cache-prefix exemption found {len(matches)} trial "
+                "artifacts with the receipt's hash and none under a directory "
+                f"named for the task: {task}"
+            )
     if located is None:
         raise LaunchError(
             f"dated cache-prefix exemption cannot locate the trial artifact: {task}"

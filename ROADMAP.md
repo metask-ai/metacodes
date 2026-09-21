@@ -90,8 +90,17 @@ gone.
       source; elan installs from a pinned release asset with a pinned SHA-256
       (`scripts/ci/install-elan.sh`, a no-op on a cache hit); PyYAML installs
       from `requirements-dev.txt` on every leg. Timeouts are 45 min per gate
-      job (a cold hosted runner compiles the whole tree and the Lean kernel);
-      record the measured warm/cold durations here after the first runs.
+      job (a cold hosted runner compiles the whole tree and the Lean kernel).
+      Measured on PR #137 (2026-09-21): cold (no setup-zig/Lean cache) Linux
+      13:31, macOS 12:36, Windows 13:57, AgentCore Windows 13:40; warm
+      Linux 15:17, macOS 9:26, Windows 4:35, AgentCore Windows 12:50. The
+      remaining Windows exposure is tests that still spell fixtures as a
+      fixed `/tmp/...` path: they share one directory across the eight
+      parallel shards and depend on `\tmp` at the drive root, and the second
+      Windows run lost four of them at once while a rerun of the same commit
+      passed. Migration to per-process `%TEMP%` fixtures
+      (`src/tools/test_tmp.zig`) is the fix; the `windows_test_prelude`
+      stays until the last `/tmp` literal is gone.
 - [x] Release-gate isolation: `rule-control` and every `release.yml` job run
       on ephemeral hosted runners, so PR-authored code cannot precondition the
       machine that produces a release decision. The dedicated
