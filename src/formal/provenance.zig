@@ -171,7 +171,7 @@ pub fn loadAdjacent(
     };
 }
 
-fn readBounded(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+pub fn readBounded(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.ProvenanceOpenFailed;
@@ -196,7 +196,7 @@ fn readBounded(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return bytes;
 }
 
-fn parseLowerHex64(raw: []const u8) ?[64]u8 {
+pub fn parseLowerHex64(raw: []const u8) ?[64]u8 {
     if (raw.len != 64) return null;
     var result: [64]u8 = undefined;
     for (raw, 0..) |byte, index| {
@@ -206,13 +206,13 @@ fn parseLowerHex64(raw: []const u8) ?[64]u8 {
     return result;
 }
 
-fn validLabel(raw: []const u8, max: usize) bool {
+pub fn validLabel(raw: []const u8, max: usize) bool {
     if (raw.len == 0 or raw.len > max) return false;
     for (raw) |byte| if (byte < 0x20 or byte > 0x7e) return false;
     return true;
 }
 
-fn expectedHostOs() ?[]const u8 {
+pub fn expectedHostOs() ?[]const u8 {
     return switch (builtin.os.tag) {
         .macos => "Darwin",
         .linux => "Linux",
@@ -221,7 +221,7 @@ fn expectedHostOs() ?[]const u8 {
     };
 }
 
-fn expectedHostArch() ?[]const u8 {
+pub fn expectedHostArch() ?[]const u8 {
     return switch (builtin.cpu.arch) {
         .x86_64 => "x86_64",
         .aarch64 => if (builtin.os.tag == .macos) "arm64" else "aarch64",
@@ -249,7 +249,7 @@ fn validUtcTimestamp(raw: []const u8) bool {
     return day > 0 and day <= days_in_month[month - 1];
 }
 
-fn sha256Hex(bytes: []const u8) [64]u8 {
+pub fn sha256Hex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
