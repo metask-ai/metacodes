@@ -149,20 +149,23 @@ test "iterate a real directory finds seeded files" {
     if (is_windows) return; // 运行期仅 POSIX;windows 编译由全量 build -Dtarget 覆盖
     // 用 pid 唯一 tmp 目录,建两文件,遍历应见到。走 std.c/pfs(裁剪 std 无 std.fs.*Absolute)。
     const pid: i64 = std.c.getpid();
-    var dbuf: [128]u8 = undefined;
-    const dir_z = try std.fmt.bufPrintZ(&dbuf, "/tmp/cczig_dir_{d}", .{pid});
+    // platform 层测试单独用 `zig test` 编译,不能依赖 util/fs.zig;根的规则就地写一遍:
+    // POSIX /tmp,Windows %TEMP%(当前驱动器根下的 \tmp 不保证存在)。
+    const tmp_root = if (@import("builtin").os.tag == .windows) @import("paths.zig").tempDir() else "/tmp";
+    var dbuf: [512]u8 = undefined;
+    const dir_z = try std.fmt.bufPrintZ(&dbuf, "{s}/cczig_dir_{d}", .{ tmp_root, pid });
     _ = std.c.mkdir(dir_z.ptr, 0o755);
     defer {
-        var ab: [160]u8 = undefined;
+        var ab: [600]u8 = undefined;
         const a = std.fmt.bufPrintZ(&ab, "{s}/alpha.md", .{dir_z}) catch unreachable;
         _ = std.c.unlink(a.ptr);
-        var bb: [160]u8 = undefined;
+        var bb: [600]u8 = undefined;
         const b = std.fmt.bufPrintZ(&bb, "{s}/beta.md", .{dir_z}) catch unreachable;
         _ = std.c.unlink(b.ptr);
         _ = std.c.rmdir(dir_z.ptr);
     }
     inline for (.{ "alpha.md", "beta.md" }) |fname| {
-        var fb: [160]u8 = undefined;
+        var fb: [600]u8 = undefined;
         const fp = try std.fmt.bufPrintZ(&fb, "{s}/{s}", .{ dir_z, fname });
         const fd = pfs.open(fp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
         try testing.expect(fd >= 0);

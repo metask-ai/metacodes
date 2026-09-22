@@ -149,9 +149,8 @@ test "readPlan: 不存在返 null" {
 
 test "ensureDir + readPlan 往返" {
     const a = testing.allocator;
-    const util_time = @import("../util/time.zig");
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-planfile-test-{d}", .{util_time.nowMs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-planfile-test");
     defer fs.testing.rmrfBestEffort(home);
     try ensureDir(home);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;

@@ -755,8 +755,8 @@ test "TaskStore: mirror 开启时 updateStatus(t.id) 不悬垂(reload 释放旧 
     // 返回的 t.id 直接传回 updateStatus 时,id 在调用内部 reload 后指向已释放内存 →
     // 查找失配 → TaskNotFound 被调用方吞掉,状态静默停在 pending。修复:入口先拷贝 id。
     const test_fs = @import("../util/fs.zig");
-    var dbuf: [128]u8 = undefined;
-    const dir_path = try std.fmt.bufPrint(&dbuf, "/tmp/cc-zig-taskstore-test-{d}", .{util_time.nowNs()});
+    var dbuf: [256]u8 = undefined;
+    const dir_path = @import("../util/fs.zig").testing.uniqueDir(&dbuf, "cc-zig-taskstore-test");
     try test_fs.mkdirParents(dir_path);
     defer test_fs.testing.rmrfBestEffort(dir_path);
     var pbuf: [192]u8 = undefined;

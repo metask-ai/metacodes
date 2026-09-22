@@ -96,22 +96,26 @@ gone.
       Linux 15:17, macOS 9:26, Windows 4:35, AgentCore Windows 12:50. The
       remaining Windows exposure is tests that still spell fixtures as a
       fixed `/tmp/...` path: they share one directory across the eight
-      parallel shards and depend on `\tmp` at the drive root. The 2026-09-21
-      losses (four at once on PR #137's second run, two at main@fd8165f1)
-      had one cause, found by sampling `D:\tmp` on hosted runners with
-      per-test wall-clock stamps: `provider_offer_test`'s OAuth fixtures sat
-      directly in `/tmp` and their teardown `rmdir`'d `dirname(path)`, i.e.
-      `/tmp` itself; a no-op on POSIX, but on a fresh Windows runner the
-      prelude has just created `\tmp` empty, so the call succeeded and every
-      `/tmp` fixture in the concurrent shards failed with ENOENT until some
-      `mkdirParents` recreated it. Fixed by keeping every fixture in its own
-      directory below a per-process root and failing loudly when a teardown
-      would reach the temp root. 21 suite files (93 literals) still use
-      `/tmp/...`; migration to per-process `%TEMP%` fixtures
-      (`src/tools/test_tmp.zig`, `util/fs.zig testing.perPidDir`) remains
-      the plan, and the `windows_test_prelude` stays until the last literal
-      is gone. Test fixtures must never `rmdir` a directory they did not
-      create.
+      parallel shards and depend on `\tmp` at the drive root, and the second
+      Windows run lost four of them at once while a rerun of the same commit
+      passed. Fixed in two parts. Every disk-touching fixture in
+      `tests/component`, `tests/integration` and `src` now derives its path
+      from `util/fs.zig` `testing.tmpRoot` (per-process `%TEMP%` directories
+      on Windows; #142, #143, #144), and the `windows_test_prelude` that
+      pre-created `\tmp` is gone; what still spells `/tmp` is inert strings
+      and the POSIX-only UDS socket test. The 2026-09-21 losses themselves
+      (four at once on PR #137's second run, two at main@fd8165f1) had one
+      cause, found by sampling `D:\tmp` on hosted runners with per-test
+      wall-clock stamps: `provider_offer_test`'s OAuth fixtures sat directly
+      in the temp root and their teardown `rmdir`'d `dirname(path)`, i.e.
+      the temp root itself; a no-op on POSIX, but on a fresh Windows runner
+      the prelude had just created `\tmp` empty, so the call succeeded and
+      every `/tmp` fixture in the concurrent shards failed with ENOENT until
+      some `mkdirParents` recreated it (#145). Moving the file under
+      `%TEMP%` would not have changed that shape, so every fixture now sits
+      in its own directory below a per-process root and a teardown that
+      would reach the root fails loudly. Rule: test fixtures never `rmdir`
+      a directory they did not create.
 - [x] Release-gate isolation: `rule-control` and every `release.yml` job run
       on ephemeral hosted runners, so PR-authored code cannot precondition the
       machine that produces a release decision. The dedicated

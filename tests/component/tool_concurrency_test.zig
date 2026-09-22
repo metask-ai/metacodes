@@ -169,27 +169,39 @@ fn touch(p: [*:0]const u8) void {
     const fd = pfs.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     if (fd >= 0) pfs.close(fd);
 }
+/// `<dir>/<name>`,NUL 结尾写进 buf。
+fn sub(buf: []u8, dir: []const u8, name: []const u8) [:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, name }) catch unreachable;
+}
 
 test "L2 并发: 3 个 Glob safe 批并发执行,结果按原顺序回填" {
     const a = std.testing.allocator;
-    // 准备 3 个目录各含一个独特文件
-    mkdir("/tmp/cc-conc");
-    mkdir("/tmp/cc-conc/d0");
-    mkdir("/tmp/cc-conc/d1");
-    mkdir("/tmp/cc-conc/d2");
-    touch("/tmp/cc-conc/d0/aaa.txt");
-    touch("/tmp/cc-conc/d1/bbb.txt");
-    touch("/tmp/cc-conc/d2/ccc.txt");
-    defer {
-        _ = std.c.unlink("/tmp/cc-conc/d0/aaa.txt");
-        _ = std.c.unlink("/tmp/cc-conc/d1/bbb.txt");
-        _ = std.c.unlink("/tmp/cc-conc/d2/ccc.txt");
-    }
+    // 准备 3 个目录各含一个独特文件(每进程唯一根目录,结束整棵删)
+    var base_buf: [512]u8 = undefined;
+    const base = cc.util_fs.testing.perPidDir(&base_buf, "cc-zig-conc");
+    defer cc.util_fs.testing.rmrfBestEffort(base);
+    mkdir(base.ptr);
+    var d0_buf: [512]u8 = undefined;
+    var d1_buf: [512]u8 = undefined;
+    var d2_buf: [512]u8 = undefined;
+    const d0 = sub(&d0_buf, base, "d0");
+    const d1 = sub(&d1_buf, base, "d1");
+    const d2 = sub(&d2_buf, base, "d2");
+    mkdir(d0.ptr);
+    mkdir(d1.ptr);
+    mkdir(d2.ptr);
+    var f_buf: [512]u8 = undefined;
+    touch(sub(&f_buf, d0, "aaa.txt").ptr);
+    touch(sub(&f_buf, d1, "bbb.txt").ptr);
+    touch(sub(&f_buf, d2, "ccc.txt").ptr);
 
+    var in0: [640]u8 = undefined;
+    var in1: [640]u8 = undefined;
+    var in2: [640]u8 = undefined;
     var slots = [_]tool_exec.Slot{
-        .{ .decision = .run, .name = "Glob", .id = "t0", .input = "{\"pattern\":\"*.txt\",\"path\":\"/tmp/cc-conc/d0\"}" },
-        .{ .decision = .run, .name = "Glob", .id = "t1", .input = "{\"pattern\":\"*.txt\",\"path\":\"/tmp/cc-conc/d1\"}" },
-        .{ .decision = .run, .name = "Glob", .id = "t2", .input = "{\"pattern\":\"*.txt\",\"path\":\"/tmp/cc-conc/d2\"}" },
+        .{ .decision = .run, .name = "Glob", .id = "t0", .input = try std.fmt.bufPrint(&in0, "{{\"pattern\":\"*.txt\",\"path\":\"{s}\"}}", .{d0}) },
+        .{ .decision = .run, .name = "Glob", .id = "t1", .input = try std.fmt.bufPrint(&in1, "{{\"pattern\":\"*.txt\",\"path\":\"{s}\"}}", .{d1}) },
+        .{ .decision = .run, .name = "Glob", .id = "t2", .input = try std.fmt.bufPrint(&in2, "{{\"pattern\":\"*.txt\",\"path\":\"{s}\"}}", .{d2}) },
     };
     const ctx = cc.tool_context.ToolContext{ .allocator = a };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
@@ -236,7 +248,10 @@ test "L2 并发: unsafe 工具串行单跑(未知工具→错误,不崩)" {
 
 test "L2 并发: executeSlots 保留聚合大结果给 hook/UI 后置投影" {
     const a = std.testing.allocator;
-    _ = std.c.mkdir("/tmp/cc-budget-home", 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-cc-budget-home");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer cc.util_fs.testing.rmrfBestEffort(home);
     // 3 个 denied slot 各预填 ~80k 内容。dispatch 层必须保持原字节；
     // agent_loop 才是唯一投影提交点。
     const big = try a.alloc(u8, 80_000);
@@ -248,7 +263,7 @@ test "L2 并发: executeSlots 保留聚合大结果给 hook/UI 后置投影" {
         .{ .decision = .denied, .name = "Grep", .id = "c", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
     };
     defer for (&slots) |*s| if (s.content) |c| a.free(c);
-    const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = "/tmp/cc-budget-home" };
+    const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = home };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
 
     var total: usize = 0;
@@ -273,7 +288,10 @@ test "L2 并发: per-input 分类(Bash readonly safe / 写 unsafe)" {
 
 test "L2 并发: executeSlots 对 Read/Grep 都不提前投影" {
     const a = std.testing.allocator;
-    _ = std.c.mkdir("/tmp/cc-budget-home2", 0o755);
+    var home_buf: [512]u8 = undefined;
+    const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-cc-budget-home2");
+    _ = std.c.mkdir(home.ptr, 0o755);
+    defer cc.util_fs.testing.rmrfBestEffort(home);
     // ReadArtifact 的防环由 result_projection 的 inline-only policy 保证；
     // dispatch 层不再按工具名做持久化分叉。
     const big = try a.alloc(u8, 90_000);
@@ -285,7 +303,7 @@ test "L2 并发: executeSlots 对 Read/Grep 都不提前投影" {
         .{ .decision = .denied, .name = "Grep", .id = "g2", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
     };
     defer for (&slots) |*s| if (s.content) |c| a.free(c);
-    const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = "/tmp/cc-budget-home2" };
+    const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = home };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
 
     for (slots) |slot| {

@@ -17,6 +17,7 @@
 //! 不做 must-read-first(notebook 通常不大,Read 单独读 cells)。
 
 const std = @import("std");
+const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
@@ -311,12 +312,14 @@ test "NotebookEdit: invalid edit_mode" {
 
 test "NotebookEdit: replace cell source" {
     const a = testing.allocator;
-    const p = "/tmp/cc-zig-nbedit-replace.ipynb";
-    defer _ = std.c.unlink(p);
+    var p_buf: [512]u8 = undefined;
+    const p = tt.path(&p_buf, "nbedit-replace.ipynb");
+    var args_buf: [1024]u8 = undefined;
+    defer _ = std.c.unlink(p.ptr);
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
-    const out = try execute(&ctx, "{\"notebook_path\":\"/tmp/cc-zig-nbedit-replace.ipynb\",\"cell_id\":\"c1\",\"new_source\":\"x = 42\"}");
+    const out = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"notebook_path\":\"{s}\",\"cell_id\":\"c1\",\"new_source\":\"x = 42\"}}", .{p}));
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"success\":true") != null);
 
@@ -329,12 +332,14 @@ test "NotebookEdit: replace cell source" {
 
 test "NotebookEdit: insert cell at start" {
     const a = testing.allocator;
-    const p = "/tmp/cc-zig-nbedit-insert-start.ipynb";
-    defer _ = std.c.unlink(p);
+    var p_buf: [512]u8 = undefined;
+    const p = tt.path(&p_buf, "nbedit-insert-start.ipynb");
+    var args_buf: [1024]u8 = undefined;
+    defer _ = std.c.unlink(p.ptr);
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
-    const out = try execute(&ctx, "{\"notebook_path\":\"/tmp/cc-zig-nbedit-insert-start.ipynb\",\"edit_mode\":\"insert\",\"new_source\":\"import numpy as np\",\"cell_type\":\"code\"}");
+    const out = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"notebook_path\":\"{s}\",\"edit_mode\":\"insert\",\"new_source\":\"import numpy as np\",\"cell_type\":\"code\"}}", .{p}));
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"cells_after\":3") != null);
 
@@ -345,24 +350,28 @@ test "NotebookEdit: insert cell at start" {
 
 test "NotebookEdit: insert cell after cell_id" {
     const a = testing.allocator;
-    const p = "/tmp/cc-zig-nbedit-insert-after.ipynb";
-    defer _ = std.c.unlink(p);
+    var p_buf: [512]u8 = undefined;
+    const p = tt.path(&p_buf, "nbedit-insert-after.ipynb");
+    var args_buf: [1024]u8 = undefined;
+    defer _ = std.c.unlink(p.ptr);
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
-    const out = try execute(&ctx, "{\"notebook_path\":\"/tmp/cc-zig-nbedit-insert-after.ipynb\",\"cell_id\":\"c1\",\"edit_mode\":\"insert\",\"new_source\":\"y = 2\",\"cell_type\":\"code\"}");
+    const out = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"notebook_path\":\"{s}\",\"cell_id\":\"c1\",\"edit_mode\":\"insert\",\"new_source\":\"y = 2\",\"cell_type\":\"code\"}}", .{p}));
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"cells_after\":3") != null);
 }
 
 test "NotebookEdit: delete cell" {
     const a = testing.allocator;
-    const p = "/tmp/cc-zig-nbedit-delete.ipynb";
-    defer _ = std.c.unlink(p);
+    var p_buf: [512]u8 = undefined;
+    const p = tt.path(&p_buf, "nbedit-delete.ipynb");
+    var args_buf: [1024]u8 = undefined;
+    defer _ = std.c.unlink(p.ptr);
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
-    const out = try execute(&ctx, "{\"notebook_path\":\"/tmp/cc-zig-nbedit-delete.ipynb\",\"cell_id\":\"m1\",\"edit_mode\":\"delete\",\"new_source\":\"\"}");
+    const out = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"notebook_path\":\"{s}\",\"cell_id\":\"m1\",\"edit_mode\":\"delete\",\"new_source\":\"\"}}", .{p}));
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"cells_after\":1") != null);
 
@@ -374,10 +383,12 @@ test "NotebookEdit: delete cell" {
 
 test "NotebookEdit: cell_id not found errors" {
     const a = testing.allocator;
-    const p = "/tmp/cc-zig-nbedit-notfound.ipynb";
-    defer _ = std.c.unlink(p);
+    var p_buf: [512]u8 = undefined;
+    const p = tt.path(&p_buf, "nbedit-notfound.ipynb");
+    var args_buf: [1024]u8 = undefined;
+    defer _ = std.c.unlink(p.ptr);
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
-    try testing.expectError(error.CellNotFound, execute(&ctx, "{\"notebook_path\":\"/tmp/cc-zig-nbedit-notfound.ipynb\",\"cell_id\":\"nope\",\"new_source\":\"y\"}"));
+    try testing.expectError(error.CellNotFound, execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"notebook_path\":\"{s}\",\"cell_id\":\"nope\",\"new_source\":\"y\"}}", .{p})));
 }

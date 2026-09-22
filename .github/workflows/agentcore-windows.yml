@@ -36,7 +36,7 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           git fetch -q --depth=1 origin "$base"
           changed=$(git diff --name-only "$base" HEAD)
-          pattern='^build\.zig|^scripts/agentcore_manifest\.zig|^scripts/windows_test_prelude\.zig|^src/agentcore/.*|^src/core/.*|^src/lsp/.*|^src/lsp_test_root\.zig|^src/platform/.*|^sdk/.*|^tests/component/agentcore_abi_test\.zig|^tests/agentcore_artifact_consumer/.*|^\.github/workflows/agentcore-windows\.yml'
+          pattern='^build\.zig|^scripts/agentcore_manifest\.zig|^src/agentcore/.*|^src/core/.*|^src/lsp/.*|^src/lsp_test_root\.zig|^src/platform/.*|^sdk/.*|^tests/component/agentcore_abi_test\.zig|^tests/agentcore_artifact_consumer/.*|^\.github/workflows/agentcore-windows\.yml'
           if grep -Eq "$pattern" <<<"$changed"; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
           else

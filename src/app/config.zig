@@ -13,6 +13,7 @@
 //! 本模块只负责"从文件加载" + "保存到文件"。CLI 和 env 合并由 main.zig 控制。
 
 const std = @import("std");
+const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 const util_json = @import("../util/json.zig");
 const json_merge = @import("../util/json_merge.zig");
@@ -227,8 +228,9 @@ test "FileConfig: load missing file returns empty" {
 }
 
 test "FileConfig: save + load roundtrip" {
-    const path = "/tmp/cc-zig-config-roundtrip.json";
-    defer _ = std.c.unlink(path);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "config-roundtrip.json");
+    defer _ = std.c.unlink(path.ptr);
 
     const src = FileConfig{
         .model = "claude-test",
@@ -250,8 +252,9 @@ test "FileConfig: save + load roundtrip" {
 }
 
 test "FileConfig: partial fields" {
-    const path = "/tmp/cc-zig-config-partial.json";
-    defer _ = std.c.unlink(path);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "config-partial.json");
+    defer _ = std.c.unlink(path.ptr);
     const src = FileConfig{ .model = "only-model" };
     try saveToFile(src, testing.allocator, path);
     const loaded = try loadFromFile(testing.allocator, path);
@@ -273,7 +276,8 @@ test "FileConfig: parseJson handles formatted JSON" {
 
 test "saving preserves keys owned by other writers" {
     const a = std.testing.allocator;
-    const path = "/tmp/metacodes-config-preserve-test.json";
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "config-preserve-test.json");
     const path_z: [:0]const u8 = path;
     defer _ = pfs.unlinkPath(path_z) catch {};
 
@@ -307,7 +311,8 @@ test "saving preserves keys owned by other writers" {
 
 test "a malformed existing document is never silently overwritten" {
     const a = std.testing.allocator;
-    const path = "/tmp/metacodes-config-malformed-test.json";
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "config-malformed-test.json");
     const path_z: [:0]const u8 = path;
     defer _ = pfs.unlinkPath(path_z) catch {};
     {
@@ -326,7 +331,8 @@ test "an unreadable existing document is never treated as empty" {
     const a = std.testing.allocator;
     // A directory in place of the config file makes `open` fail with something
     // other than ENOENT, which must not be read as "no configuration yet".
-    const dir_path = "/tmp/metacodes-config-unreadable-test";
+    var dir_path_buf: [512]u8 = undefined;
+    const dir_path = tt.path(&dir_path_buf, "config-unreadable-test");
     const dir_z: [:0]const u8 = dir_path;
     _ = std.c.mkdir(dir_z.ptr, 0o700);
     defer _ = std.c.rmdir(dir_z.ptr);

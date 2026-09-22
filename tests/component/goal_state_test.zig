@@ -19,8 +19,10 @@ fn ensureDir(path: []const u8) !void {
 
 test "L2 goal: set active goal, account tokens, cross budget, persist and reload" {
     const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-goal-l2";
+    var dir_buf: [512]u8 = undefined;
+    const dir = cc.util_fs.testing.perPidDir(&dir_buf, "cc-zig-goal-l2");
     try ensureDir(dir);
+    defer cc.util_fs.testing.rmrfBestEffort(dir);
 
     var state = cc.core_goal.State.init(a);
     defer state.deinit();
@@ -93,8 +95,10 @@ test "L2 goal: stale goal id accounting is a no-op" {
 
 test "L2 goal: clear removes persisted goal file" {
     const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-goal-l2-clear";
+    var dir_buf: [512]u8 = undefined;
+    const dir = cc.util_fs.testing.perPidDir(&dir_buf, "cc-zig-goal-l2-clear");
     try ensureDir(dir);
+    defer cc.util_fs.testing.rmrfBestEffort(dir);
 
     var state = cc.core_goal.State.init(a);
     defer state.deinit();

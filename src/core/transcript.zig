@@ -946,7 +946,8 @@ test "write then load roundtrip" {
 
 test "delivery watermark round-trip:消息级与块级 delivered 随 transcript 持久化,缺字段默认 false" {
     const a = std.testing.allocator;
-    const tmp_home = "/tmp/cc-zig-transcript-delivered-rt";
+    var home_buf: [512]u8 = undefined;
+    const tmp_home = util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-delivered-rt");
     @import("../util/fs.zig").testing.rmrfBestEffort(tmp_home);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(tmp_home);
     var writer = try Writer.init(a, "/dummy", tmp_home, "m", genSessionId());

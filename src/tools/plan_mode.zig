@@ -499,12 +499,11 @@ test "ExitPlanMode 模型未传 plan → 从 plan 文件读盘兜底(对齐 cc n
     const permission = @import("../permission.zig");
     const types = @import("../types.zig");
     const plan_file = @import("../core/plan_file.zig");
-    const util_time = @import("../util/time.zig");
     const fs = @import("../util/fs.zig");
 
     // 准备一个真 plan 文件。
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-exitplan-test-{d}", .{util_time.nowMs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-exitplan-test");
     defer fs.testing.rmrfBestEffort(home);
     try plan_file.ensureDir(home);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
