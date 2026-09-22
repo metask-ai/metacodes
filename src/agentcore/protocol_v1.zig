@@ -188,6 +188,7 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
         .diag_compact_end,
         .diag_tool_stage,
         .diag_breaker_tripped,
+        .environment_fault,
         .diag_cache_break,
         .diag_continuation,
         .context_projection,

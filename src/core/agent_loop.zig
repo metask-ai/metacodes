@@ -50,6 +50,37 @@ const job_notification_mod = @import("job_notification.zig");
 
 pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget, max_tokens_exhausted };
 
+/// 环境故障熔断阈值:一个 run 内累计 N 条 `system_error` + `recoverable:false` 的工具结果后
+/// 以 `.tool_loop` 收口。这类故障(工作目录没了、shell 起不来)换命令重试不可能修好——
+/// 2026-09-22 事故里模型在 exit 127 里试了 383 次直到 400 轮上限。每次出现都发
+/// `environment_fault` 事件告知用户;第 N 次后停,把处置交还给唯一持全局意图的人。
+/// 与 max_turns 不冲突:那是预算,这是按故障分类停止,不数模型行为。
+pub const MAX_ENVIRONMENT_FAULTS: u32 = 3;
+
+/// 一条工具结果是否是环境故障:结构化错误信封(`{"error":{…}}`)里 `category` 为
+/// `system_error` 且 `recoverable` 明确为 false。任何别的形状(普通输出、user_error、
+/// 可重试的 system_error、safety 拒绝)都不算。
+pub fn isEnvironmentFault(content: []const u8) bool {
+    if (!std.mem.startsWith(u8, content, "{\"error\":")) return false;
+    const category = util_json.extractStringField(content, "category") orelse return false;
+    if (!std.mem.eql(u8, category, "system_error")) return false;
+    const recoverable = util_json.extractBoolField(content, "recoverable") orelse return false;
+    return !recoverable;
+}
+
+test "isEnvironmentFault: 只认 system_error + recoverable:false 的结构化错误" {
+    try std.testing.expect(isEnvironmentFault("{\"error\":{\"code\":\"working_dir_unavailable\",\"category\":\"system_error\",\"detail\":\"gone\",\"recoverable\":false}}"));
+    // 可重试的 system_error(如 Timeout)不是环境故障。
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"timeout\",\"category\":\"system_error\",\"detail\":\"x\",\"recoverable\":true}}"));
+    // user_error / safety 是模型或规则的事,不算。
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"not_read\",\"category\":\"user_error\",\"detail\":\"x\",\"recoverable\":true}}"));
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"permission_denied\",\"category\":\"safety\",\"detail\":\"x\",\"recoverable\":false}}"));
+    // 普通输出里哪怕带这些词也不算:必须是错误信封。
+    try std.testing.expect(!isEnvironmentFault("{\"stdout\":\"category system_error recoverable false\",\"exit_code\":0}"));
+    // 缺 recoverable 字段 → 不算(不猜)。
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"other\",\"category\":\"system_error\",\"detail\":\"x\"}}"));
+}
+
 /// Event capture is independent of execution depth. The default preserves the
 /// existing CLI/UI card behavior. Both AgentCore modes emit the complete raw
 /// semantic stream into the facade's private projector without pretending that
@@ -939,6 +970,8 @@ pub fn run(
     var job_wakeups: u32 = 0;
     var verification_progress = verification_progress_mod.State{};
     var total_tool_calls: u32 = 0;
+    // 环境故障计数(本 run 累计,不重置):见 MAX_ENVIRONMENT_FAULTS。
+    var environment_faults: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
     // 上一轮以 max_tokens 续写提示收尾 → 下一个 turn 边界不消费 UI 队列(见 drainUiEvents)。
@@ -3153,6 +3186,19 @@ pub fn run(
             } });
             content_transferred = true;
 
+            // 环境故障:出现即告知(事件),累计到阈值本轮结束后停(见下方对话提交处)。
+            // content 的所有权已归 result_blocks,这里只读。
+            if (s.is_error and isEnvironmentFault(content)) {
+                environment_faults += 1;
+                backend.emitEvent(sess, .{ .environment_fault = .{
+                    .tool = s.name,
+                    .code = util_json.extractStringField(content, "code") orelse "",
+                    .detail = util_json.extractStringField(content, "detail") orelse "",
+                    .count = environment_faults,
+                    .limit = MAX_ENVIRONMENT_FAULTS,
+                } });
+            }
+
             // PostToolUse hook(执行后,仅真跑过的 slot):收集 additionalContext 注入下轮上下文。
             if (s.decision == .run) {
                 if (hookset) |hs| if (hs.hasPost()) {
@@ -3273,6 +3319,16 @@ pub fn run(
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
+
+        // 环境故障熔断:第 MAX_ENVIRONMENT_FAULTS 次之后停。放在结果提交进对话**之后**,
+        // 续接时模型看得到全部证据;用 .tool_loop 收口(ABI 里保留的熔断停止原因),并发
+        // diag_breaker_tripped 供评估/诊断流。
+        if (environment_faults >= MAX_ENVIRONMENT_FAULTS) {
+            backend.emitEvent(sess, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = depth, .same_err_count = environment_faults } });
+            backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+            fireStopHook(permission_ctx.hooks, allocator, conversation, "tool_loop", depth);
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
 
         // Mid-turn follow-up compact: after tool_result blocks are appended and
         // before the next sampling request, re-check the actual pending request.
