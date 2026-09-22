@@ -1,0 +1,65 @@
+{
+  "workbuddy": {
+    "domains": {
+      "code": {
+        "n": 80,
+        "sum": 58.1251,
+        "mean": 0.7265637500000001,
+        "full_pass": 33,
+        "exceptions": 0
+      },
+      "office": {
+        "n": 50,
+        "sum": 39.403,
+        "mean": 0.78806,
+        "full_pass": 0,
+        "exceptions": 1
+      },
+      "security": {
+        "n": 60,
+        "sum": 35.3819645021645,
+        "mean": 0.5896994083694084,
+        "full_pass": 11,
+        "exceptions": 3
+      },
+      "web": {
+        "n": 70,
+        "sum": 56.8,
+        "mean": 0.8114285714285714,
+        "full_pass": 36,
+        "exceptions": 0
+      }
+    },
+    "total": {
+      "n": 260,
+      "sum": 189.7100645021645,
+      "mean": 0.7296540942390942,
+      "full_pass": 80,
+      "exceptions": 4
+    },
+    "equal_domain_mean": 0.7289379324494949,
+    "receipt_states": {
+      "committed": 7,
+      "authorized_failure": 10
+    },
+    "committed_cost_usd": 82.778014,
+    "failed_authorized_cap_usd": 714.0,
+    "partial_reported_actor_cost_usd": 293.153968,
+    "actor_cost_missing_trials": 9
+  },
+  "frontierchallenge": {
+    "graded": 79,
+    "passed": 45,
+    "mean": 0.6955120516455696,
+    "official_97_mean": 0.566447959587629,
+    "official_97_pass_rate": 0.4639175257731959
+  },
+  "checks": {
+    "full_task_identity_coverage": true,
+    "unique_task_rows": true,
+    "score_range": true,
+    "launch_receipt_identity": true,
+    "all_launch_artifacts_match_manifest": true,
+    "provider_requests_by_collector": 0
+  }
+}

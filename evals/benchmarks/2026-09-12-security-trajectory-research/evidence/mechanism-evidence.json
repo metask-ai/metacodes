@@ -1,0 +1,49 @@
+{
+  "signal_findings": [
+    {
+      "task": "bb-bin-firmware-audit-007",
+      "last_tool_id": "call_723d44be160b4bd2a5e2bbe3",
+      "last_tool_name": "Bash",
+      "cleanup_match": "/usr/local/sbin/dropbear",
+      "match_in_launch_command": true,
+      "recorded_exit_code": 143,
+      "native_terminal_results": 0,
+      "exception_type": "NetworkConnectionError",
+      "classification_log": [
+        "Classified failed command as NetworkConnectionError (pattern: 'Connection refused')"
+      ],
+      "source_trace_sha256": "b916d867804e1982c56c9797f070a5b50256b19b1dcb11f994c517014be3de40"
+    },
+    {
+      "task": "bb-bin-dns-parse-010",
+      "last_tool_id": "call_rvovn61s0gzk30odpr5l6ytj",
+      "last_tool_name": "Bash",
+      "cleanup_match": "/usr/local/sbin/named",
+      "match_in_launch_command": true,
+      "recorded_exit_code": 143,
+      "native_terminal_results": 0,
+      "exception_type": "NonZeroAgentExitCodeError",
+      "classification_log": [],
+      "source_trace_sha256": "d1db52fbf9d287b377c56e482693a583aab7a4bbdfd5ee69859895f8ba6e3099"
+    },
+    {
+      "task": "bb-bin-oob-read-003",
+      "last_tool_id": "call_5c7405c6e11a4d82b685174c",
+      "last_tool_name": "Bash",
+      "cleanup_match": "tlsgateway",
+      "match_in_launch_command": true,
+      "recorded_exit_code": 143,
+      "native_terminal_results": 0,
+      "exception_type": "NonZeroAgentExitCodeError",
+      "classification_log": [],
+      "source_trace_sha256": "4547868c1c0eec6b1a726a367be1746aae3610e4b049c26de479ac6cd1e9138a"
+    }
+  ],
+  "current_source_sha256": {
+    "scripts/eval/workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py": "1399f2acb072b6bdc5094d782e1bed2e37b2a3cd09dd498d93dc953fb00070b5",
+    "src/core/agent_loop.zig": "760276a8775e359d15117c8ded5f1915afe86d4b341c4df85991db357c5d74ec",
+    "src/tools/grep.zig": "74fca65e835d6de319f4a57bd227128cfd22a92b4082cea21faaed42e37fee82",
+    "src/core/tool_result_artifact.zig": "90790c8129f2253715f9bbd1babb8e4dffb051e6fa33b6b509b58089e4783623"
+  },
+  "raw_cache_policy": "Full local traces and submitted reports remain in the external local cache, not remote memory."
+}

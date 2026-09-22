@@ -1,0 +1,170 @@
+{
+  "job_dir": "/home/shuzuan/frontier-bench/FrontierAgent/benchmarks/frontierchallenge/results/harbor/mc1d27f07-oj-long",
+  "n_tasks_expected": 97,
+  "n_trials_found": 14,
+  "n_graded": 14,
+  "n_zero_missing_artifact": 2,
+  "n_verifier_failed": 0,
+  "n_missing_or_errored": 0,
+  "complete": false,
+  "n_passed": 3,
+  "pass_rate": 0.21428571428571427,
+  "mean_task_score": 0.46701057714285715,
+  "mean_task_score_100": 46.70105771428572,
+  "rows": [
+    {
+      "task_id": "task_055_opp_c60_xtb_igm",
+      "trial_name": "task_055_opp_c60_xtb_igm__yuxDDed",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.4,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_057_tunel_dapi_image_ratio",
+      "trial_name": "task_057_tunel_dapi_image_ratio__Lpwzs79",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.36,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_058_ki67_hscore_imaging",
+      "trial_name": "task_058_ki67_hscore_imaging__GomMdPh",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.75,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_068_wgcna_analysis_visualization",
+      "trial_name": "task_068_wgcna_analysis_visualiz__K3GWrCP",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.43278855,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_073_ion_diffusion_lammps",
+      "trial_name": "task_073_ion_diffusion_lammps__7NPHdZe",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.0,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": "required artifact missing from submission - genuine 0",
+      "scored_zero_missing_artifact": true
+    },
+    {
+      "task_id": "task_075_n2_nevpt2_pes",
+      "trial_name": "task_075_n2_nevpt2_pes__inMfM4c",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.99466667,
+      "passed": 1.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_115_ccrcc_blind_annotation",
+      "trial_name": "task_115_ccrcc_blind_annotation__cQKXaTi",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.5203,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_116_eis_equivalent_circuit_analysis",
+      "trial_name": "task_116_eis_equivalent_circuit__oPSkvVj",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.82039286,
+      "passed": 1.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_117_cp2k_mgo_phonon",
+      "trial_name": "task_117_cp2k_mgo_phonon__RsjymvJ",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.0,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": "required artifact missing from submission - genuine 0",
+      "scored_zero_missing_artifact": true
+    },
+    {
+      "task_id": "task_201_qmmm_lysozyme_benzene_min",
+      "trial_name": "task_201_qmmm_lysozyme_benzene_m__VSU2bNU",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.53,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_203_qmmm_trypsin_link_atom",
+      "trial_name": "task_203_qmmm_trypsin_link_atom__rRQjuz7",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.35,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_204_opes_metad_alanine_fes",
+      "trial_name": "task_204_opes_metad_alanine_fes__fzsLvom",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.75,
+      "passed": 1.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_205_umbrella_wham_nacl_pmf",
+      "trial_name": "task_205_umbrella_wham_nacl_pmf__AePzR3L",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.07,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    },
+    {
+      "task_id": "task_206_smd_jarzynski_ala10",
+      "trial_name": "task_206_smd_jarzynski_ala10__L2qR8Ps",
+      "agent": "metacodes_agent:MetacodesCLI",
+      "model": "glm-5.2",
+      "task_score": 0.56,
+      "passed": 0.0,
+      "evaluation_complete": 1.0,
+      "error": null,
+      "scored_zero_missing_artifact": false
+    }
+  ]
+}
