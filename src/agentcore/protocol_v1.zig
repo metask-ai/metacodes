@@ -9,6 +9,34 @@ const std = @import("std");
 const core = @import("metacodes-core");
 const public = @import("metask_agentcore_protocol");
 
+fn repairUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    if (std.unicode.utf8ValidateSlice(input)) return allocator.dupe(u8, input);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, input.len);
+    var i: usize = 0;
+    while (i < input.len) {
+        const byte = input[i];
+        if (byte < 0x80) {
+            try out.append(allocator, byte);
+            i += 1;
+            continue;
+        }
+        const width = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+        if (width > 1 and width <= input.len - i and
+            std.unicode.utf8ValidateSlice(input[i .. i + width]))
+        {
+            try out.appendSlice(allocator, input[i .. i + width]);
+            i += width;
+        } else {
+            try out.appendSlice(allocator, "\xEF\xBF\xBD");
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 const InternalEvent = core.protocol.ui_event.CoreEvent;
 const InternalUiRequest = core.protocol.ui_request.UiRequest;
 const InternalUiResponse = core.protocol.ui_request.UiResponse;
@@ -175,6 +203,45 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
     };
 }
 
+fn writeJsonString(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    value: []const u8,
+) !void {
+    // Normalize bytes before handing them to the JSON writer. Zig 0.16's
+    // `encodeJsonString` escapes JSON syntax but preserves malformed UTF-8;
+    // passing a byte slice through `Stringify.value` can also serialize it as
+    // an array of integers. The ABI contract requires a valid JSON string.
+    const repaired = repairUtf8(allocator, value) catch return error.OutOfMemory;
+    defer allocator.free(repaired);
+    std.json.Stringify.encodeJsonString(repaired, .{}, writer) catch return error.OutOfMemory;
+}
+
+fn writeAskQuestion(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    question: public.AskQuestion,
+) !void {
+    try writer.writeAll("{\"question\":");
+    try writeJsonString(allocator, writer, question.question);
+    try writer.writeAll(",\"header\":");
+    try writeJsonString(allocator, writer, question.header);
+    try writer.writeAll(",\"multi\":");
+    try writer.writeAll(if (question.multi) "true" else "false");
+    try writer.writeAll(",\"options\":[");
+    for (question.options, 0..) |option, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"label\":");
+        try writeJsonString(allocator, writer, option.label);
+        try writer.writeAll(",\"description\":");
+        try writeJsonString(allocator, writer, option.description);
+        try writer.writeAll(",\"preview\":");
+        try writeJsonString(allocator, writer, option.preview);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+}
+
 /// Serialize the internal UI request through the public ABI v1 DTO rather than
 /// relying on the internal union's incidental JSON representation.
 pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiRequest) ![]u8 {
@@ -209,7 +276,15 @@ pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiR
         // in this presentation-only Core request.
         .permission, .plan_approval, .custom => return error.UnsupportedUiRequest,
     };
-    return std.json.Stringify.valueAlloc(allocator, mapped, .{});
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ask_question\":[");
+    for (mapped.ask_question, 0..) |question, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try writeAskQuestion(allocator, &output.writer, question);
+    }
+    try output.writer.writeAll("]}");
+    return output.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 /// Validate Host response JSON with the public SDK schema, enforce request /
@@ -380,4 +455,44 @@ test "AskQuestion response validation preserves value boundaries until core proj
         error.InvalidUiRequest,
         encodeUiRequest(std.testing.allocator, &no_options_request),
     );
+}
+
+test "AskQuestion encoding repairs malformed UTF-8 at the ABI boundary" {
+    const malformed_question = [_]u8{ 'w', 0xE2, 0x28, 0xA1 };
+    const malformed_label = [_]u8{ 'l', 0x80 };
+    const malformed_description = [_]u8{ 'd', 0xC3 };
+    const options = [_]core.tool_context.AskOption{.{
+        .label = malformed_label[0..],
+        .description = malformed_description[0..],
+    }};
+    const questions = [_]core.tool_context.AskQuestion{.{
+        .question = malformed_question[0..],
+        .header = "Header",
+        .multi = false,
+        .options = options[0..],
+    }};
+    const request = InternalUiRequest{ .ask_question = questions[0..] };
+    const encoded = try encodeUiRequest(std.testing.allocator, &request);
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, encoded, "\xEF\xBF\xBD"));
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        encoded,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var decoded = try public.decodeUiRequest(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    switch (decoded.value) {
+        .ask_question => |decoded_questions| {
+            try std.testing.expectEqualStrings("w�(�", decoded_questions[0].question);
+            try std.testing.expectEqualStrings("l�", decoded_questions[0].options[0].label);
+            try std.testing.expectEqualStrings("d�", decoded_questions[0].options[0].description);
+        },
+        else => return error.UnexpectedUiResponse,
+    }
 }

@@ -36,6 +36,7 @@ test {
     _ = @import("component/verification_checkpoint_test.zig");
     _ = @import("component/verification_final_gate_test.zig");
     _ = @import("component/requirement_ledger_test.zig");
+    _ = @import("component/delivery_cadence_test.zig");
     _ = @import("component/memdir_inject_test.zig");
     _ = @import("component/agent_background_test.zig");
     _ = @import("component/skill_fileref_test.zig");
@@ -55,6 +56,7 @@ test {
     _ = @import("component/rule_impact_governance_test.zig");
     _ = @import("component/rule_impact_operational_observation_test.zig");
     _ = @import("component/tool_result_storage_test.zig");
+    _ = @import("component/bash_output_wait_test.zig");
     _ = @import("component/sealed_publication_test.zig");
     _ = @import("component/inline_threshold_test.zig");
     _ = @import("component/cache_break_test.zig");
@@ -105,4 +107,10 @@ test {
     _ = @import("component/overrides_test.zig");
     _ = @import("component/ontology_rule_projection_test.zig");
     _ = @import("component/ontology_rule_snapshot_adapter_test.zig");
+    _ = @import("component/job_notification_test.zig");
+    _ = @import("component/kg_state_test.zig");
+    _ = @import("component/tinykgd_resolution_test.zig");
+    _ = @import("component/adjacent_symlink_test.zig");
+    _ = @import("component/swarm_file_race_test.zig");
+    _ = @import("component/kgd_e2e_test.zig");
 }

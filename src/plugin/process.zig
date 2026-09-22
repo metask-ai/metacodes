@@ -14,6 +14,7 @@ const json = @import("../json.zig");
 const tools = @import("../tools.zig");
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const tool_result = @import("../core/tool_result.zig");
+const util_json = @import("../util/json.zig");
 
 pub const PROTOCOL_SCHEMA = "metacodes.plugin-process/v1";
 pub const PROTOCOL_MAJOR: u32 = 1;
@@ -513,11 +514,11 @@ fn buildHandshakeRequest(allocator: std.mem.Allocator, package: *const PackageCo
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try out.writer.writeAll("{\"schema\":");
-    try std.json.Stringify.encodeJsonString(PROTOCOL_SCHEMA, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, PROTOCOL_SCHEMA);
     try out.writer.writeAll(",\"operation\":\"handshake\",\"protocol_major\":1,\"contract_major\":1,\"plugin_id\":");
-    try std.json.Stringify.encodeJsonString(package.plugin_id, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, package.plugin_id);
     try out.writer.writeAll(",\"plugin_version\":");
-    try std.json.Stringify.encodeJsonString(package.plugin_version, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, package.plugin_version);
     try out.writer.print(
         ",\"requested_capabilities\":[\"host_tool\",\"artifact_spool_v1\"],\"limits\":{{\"max_request_frame_bytes\":{d},\"max_response_bytes\":{d},\"max_artifact_bytes\":{d}}},\"cancellation\":\"terminate_process_group\"}}",
         .{ MAX_REQUEST_FRAME_BYTES, package.max_response_bytes, artifact_store.MAX_ARTIFACT_BYTES },
@@ -535,18 +536,18 @@ fn buildCallRequest(
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try out.writer.writeAll("{\"schema\":");
-    try std.json.Stringify.encodeJsonString(PROTOCOL_SCHEMA, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, PROTOCOL_SCHEMA);
     try out.writer.writeAll(",\"operation\":\"call\",\"protocol_major\":1,\"plugin_id\":");
-    try std.json.Stringify.encodeJsonString(package.plugin_id, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, package.plugin_id);
     try out.writer.writeAll(",\"plugin_version\":");
-    try std.json.Stringify.encodeJsonString(package.plugin_version, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, package.plugin_version);
     try out.writer.writeAll(",\"tool\":");
-    try std.json.Stringify.encodeJsonString(local_name, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, local_name);
     try out.writer.writeAll(",\"arguments\":");
     try out.writer.writeAll(args);
     if (spool_path) |path| {
         try out.writer.writeAll(",\"result_spool\":{\"schema_version\":1,\"path\":");
-        try std.json.Stringify.encodeJsonString(path, .{}, &out.writer);
+        try util_json.writeJsonString(&out.writer, path);
         try out.writer.print(",\"max_bytes\":{d}}}", .{artifact_store.MAX_ARTIFACT_BYTES});
     }
     try out.writer.writeByte('}');

@@ -1,0 +1,105 @@
+{
+  "round": "2026-09-05-metacodes-1d27f07-glm52-fullbench",
+  "status": "FrontierChallenge complete(冻结 2026-09-04 21:17Z)。WorkBuddy complete:260 题全跑完(code 80/office 50/security 60/web 70),单臂基线。web 与 security 的 GitHub/Ghidra 题经 kunshan sing-box 解决网络后补齐;security 另修复了 /workdir 权限缺陷并重跑 26 题。最终:mean 0.730、full pass 79;code 0.735、web 0.764、office 0.668、security 0.598。收据按方案 B 多为 authorized_failure,分数取自 harbor result.json。",
+  "system_under_test": {
+    "scaffold": "metacodes",
+    "commit": "1d27f074f7ae90a428d805b8b387b20d574ca9df",
+    "commit_title": "core: MCP, host stream and process-plugin results are sealed during execution and published at the batch commit boundary (#65) (#76)",
+    "zig": "0.16.0",
+    "binary_sha256": "e2552aad56c3c11139d2a8f042599adab49382e90d84bda399e76ac6d2e81cd6",
+    "model": "glm-5.2",
+    "gateway": "napi.metask-ai.com (anthropic wire, /v1/messages)"
+  },
+  "frontierchallenge": {
+    "source": "ApodexAI/FrontierAgent benchmarks/frontierchallenge",
+    "track": "open",
+    "official_denominator": 97,
+    "open_track_tasks": 81,
+    "excluded": [
+      "task_098_orca_claisen_thermochemistry (ORCA licence, upstream #27)"
+    ],
+    "judge": {
+      "model": "gpt-5.6-sol",
+      "repeats": 3,
+      "endpoint": "napi.metask-ai.com/v1 (OpenAI route)",
+      "official_pinned": true
+    },
+    "topology": "patron(vm-ubuntu3): long(15, conc3) + mainA(43, conc5); kunshan(vm-ubuntu4): mainB(22, conc3)",
+    "job": "mc1d27f07-oj",
+    "adapter": "metacodes_agent.py headless -p --permission bypassPermissions --add-dir /app (binary served over docker bridge :4401)",
+    "reference_previous_round": {
+      "round": "2026-09-01-frontierchallenge-official-judge",
+      "tasks_present": 78,
+      "graded": 72,
+      "passed": 45,
+      "pass_graded": 0.625,
+      "mean_graded_100": 70.4,
+      "median": 0.885,
+      "pass_97": 0.464,
+      "score_97_100": 52.3,
+      "pass_81": 0.556
+    },
+    "rerun_rounds": {
+      "long": 1,
+      "mainA": 1,
+      "mainB": 2
+    },
+    "absent_tasks": [
+      {
+        "task": "task_072_pt_co_adsorption",
+        "reason": "harness failed while collecting /app/output ('no container found for service main'), pruned as infra in rerun round 1 but not re-enqueued on resume (same chronic failure as the 2026-08-31 and 2026-09-01 rounds); counted zero"
+      }
+    ],
+    "judge_shape_incident": "~40% of first-pass trials came back 'judge response lacks criterion_scores array'; the FC_DIAG stderr patch showed gpt-5.6-sol returning criterion_scores as {id: {...}} (complete content, wrong container shape). FC_NORM (shape normalization, 63/69 grader variants) + 5 judge attempts per repetition were applied from the rerun rounds on; all pruned trials then graded. Scores from the first pass and the rerun rounds are therefore not judged under byte-identical wrapper code, but the normalization changes only the parsed container shape, never scores or ids."
+  },
+  "workbuddy": {
+    "framework": "Tencent/workbuddy-bench",
+    "workbuddy_commit": "b516950be5b56eb3be406c2f76ee1c5111dcb57f",
+    "dataset_archives_sha256_verified_against": "metacodes/scripts/eval/workbuddy/manifests/workbuddy-v1-cohorts.json (content_sha256 607b7172…)",
+    "arm": "baseline: all 9 experimental treatment keys declared false/null; project control NOT staged (no project kernel/rules in split mount); harness tool policy per overlay _defaults.yaml",
+    "runner": "metacodes launch_gate (paid, single-machine): environment_preflight → create → run; n_attempts=1, n_concurrent_trials=1, record_full_io=true, WBBENCH_PROXY_MAX_RETRIES=0",
+    "caps_per_transaction": "USD 4/task (security 6), 6M metered tokens/task (raised from 1.5/3M after code promotion-B and harder cohorts exceeded the tighter ceiling; caps are the journal's max exposure, not a spend target)",
+    "split_mount": {
+      "metacodes_commit": "1d27f074f7ae90a428d805b8b387b20d574ca9df",
+      "tinykg": "bundled vendor/tinykg (source a0544788, sha 5288e818…)",
+      "ripgrep": "vendor rg-linux-x86_64",
+      "formal_kernel": "built on patron from control-plane/lean at HEAD (sha d43fe94d…)"
+    },
+    "hosts": "patron (shuzuan@58.211.6.130:103): code + office. kunshan: security (all 4 cohorts, GitHub/Ghidra tasks built via the sing-box route) + web (all 4 cohorts); job proxy PROXY_PORT=4401; build traffic (apt/pip/git/playwright/node) tunneled through a local HTTP->SOCKS bridge (http2socks.py on 172.17.0.1:4400) to the host's sing-box SOCKS5 (127.0.0.1:10879). h200 no longer used.",
+    "reference_previous": "2026-08-16 Code dev16 baseline arm (metacodes 0a9af4b, disabled project control): mean reward 0.774, full pass 7/16, $7.41, 2577 s",
+    "status": "COMPLETE (single-arm baseline): 260 题全跑完。security 曾因 /workdir 权限缺陷被严重低估,修复并重跑 26 道受影响题后 mean 0.543(原 0.285);整体 mean 0.686、full pass 78。",
+    "blocker": "Resolved 2026-09-05 03:19Z with the owner's approval: the overlay adapter now declares a user-defined provider `workbuddy-proxy` (channel = job proxy root, anthropic_messages wire, x-api-key auth, explicit require_tls:false) and delivers the per-trial route token through that provider's env alias METACODES_ROUTE_TOKEN (metacodes' registry credential path ignores METACODES_API_KEY_FD; the anonymous descriptor only works on the legacy Metask path). Root cause of the original failure: EndpointPolicy.require_tls since 2f0b375 (2026-09-01) vs the adapter's plaintext http://host.docker.internal:<port> route.",
+    "prepared": "datasets ×4 verified against the cohort manifest; base images pulled via mirrors; overlay import regression patched; W0 synthetic green on patron/kunshan/h200; split-mount staged (metacodes e2552aad…, tinykg 5288e818…, rg, formal kernel d43fe94d…); 16 cohort job YAMLs + judge model config; preflight image receipts for code-dev and (in progress) the other patron cohorts",
+    "burned_transactions": "9 authorized_failure receipts before the fix landed: code-dev ×2 (InsecureEndpoint, then MissingCredentials), and one each for office-dev/code-proma/code-promb/office-proma/office-promb/code-sealed because the first relaunch's driver continued past failures (journal exposure only, 0 provider requests each; driver is fail-closed since). Data only grows: these receipts stay under private/<job>/ beside the later successful transaction.",
+    "not_attempted": {},
+    "office_web_policy": "Owner decision 2026-09-05 (方案 B): Office/Web cohorts run one transaction at a time without modifying the launch gate; every trial runs and is scored by harbor, but each receipt ends as authorized_failure(post_run_evidence_audit) because the verifier-side LLM judge shares the job proxy's request sequence. Scores come from harbor result.json; judge spend is outside the journal's actuals."
+  },
+  "timeline": "FC launched 2026-09-04 17:20Z (patron long+mainA, kunshan mainB); first pass ~20:15Z; reruns (infra-only) done 21:17Z. WorkBuddy 2026-09-05: hosts prepared 18:00-19:05Z(-1d); actor->proxy transport blocker resolved 03:19Z (custom provider + env-route-token); code cohorts (patron) and security diagnostic subsets (kunshan) graded through the morning; office cohorts (patron) graded; office-sealed aborted at 17/30 (non-UTF-8 control evidence) and security-sealed-diag1 at 3/24 (killed agent) ~10:30-11:00Z; both bugs fixed+deployed ~11:00Z; security-sealed-diag1 re-run complete 12:57Z (24 attempted, runner exit 0), office-sealed re-run complete ~13:10Z (30/30); h200 web probe 0/42 image builds -> web not run; 之后在 kunshan 预拉 gogost/gost egress sidecar 后补跑 linux-ld-preload-investigation(reward 0.73,sealed 25/36)。; 2026-09-06: 发现 kunshan 已装 sing-box(SOCKS5 :10879,实测 pypi/github/nodejs 2.4-6.4 MB/s),加一个本机 HTTP->SOCKS 桥(172.17.0.1:4400)让 BuildKit 经 https_proxy 走该路由;security 14 题 GitHub 任务 + web 全 70 题据此补跑完成(security 60/60,web 70/70),02:18Z 收尾；2026-09-06 晚:定位并修复 security `/workdir` 权限缺陷(Codex 实现 + Claude review + 端到端验证 0.0→1.0),重跑 26 道受影响题,security 0.285→0.543、整体 0.628→0.686,并更正报告中错误的“会分析不会打”结论；2026-09-06 深夜:定位 max_output_tokens=16384 导致的静默空交付(10 office/1 code/1 web),配置改 32768 重跑 12 题,10 题恢复,overall 0.686→0.717;上游修复 7b3ad99(max_tokens_exhausted 显式终态)由 Codex 实现、Claude review 后提交。",
+  "raw_artifact_locations": "patron:~/frontier-bench/FrontierAgent/benchmarks/frontierchallenge/results/harbor/mc1d27f07-oj-{long,mainA}; kunshan:…/mc1d27f07-oj-mainB; patron/h200:~/frontier-bench/workbuddy/checkout/results/<job>, gate receipts in ~/frontier-bench/workbuddy/private/<job>/",
+  "disclosures": [
+    "FrontierChallenge grader 包装补丁(仅基建加固,不碰评分语义):judge 每重复失败重试——首轮 3 次尝试,补跑轮起 5 次尝试;补跑轮起新增 FC_NORM:judge 返回的 criterion_scores 若为 {id: {...}} 字典形则无损转为数组形(上游 task_025 变体本已接受字典形;本轮官方 judge 约四成首轮 trial 因此形状不可判);httpx proxies 垫片;fitz/PIL 守卫;dotenv 兜底;非图 mime 跳过;pip 回退链;仅写 stderr 的判分诊断输出(FC_DIAG)",
+    "FrontierChallenge 补跑纪律:只对 verifier/harness 基建失败删 trial 同参重跑(≤2 轮);缺交付 genuine 0 保留原判",
+    "metacodes 二进制为 Mac 交叉编译(zig -Dtarget=x86_64-linux-gnu),非 patron 本机编译;`--version` 与无头冒烟均在任务镜像内验证",
+    "WorkBuddy overlay 在 metacodes HEAD 存在导入回归(trace.py 相对导入 ..model),本轮以本地补丁修复(install_overlay.py 附带 _metacodes_model.py),未上游",
+    "WorkBuddy 单臂全量为 leaderboard 口径(含 dev 题),不是 held-out 证据;sealed cohort 的任务在本轮被执行过一次;门禁收据按协议标 quality_evidence=false(单臂且无 comparison-id)",
+    "WorkBuddy 未挂载 project control(promoted w05 规则包绑定 8 月 17 日的 project kernel sha,与 HEAD 重建的 kernel 不一致);因此与 dev16 baseline(disabled 模式,同样不激活规则)可比但 split-mount 内容不同",
+    "WorkBuddy 任务镜像构建期 apt 流量经本机改写代理走清华镜像(仅影响构建速度;pip/npm/nodejs 直连)",
+    "build-project-harness-kernel.sh 在 Linux 上首个 smoke 失败(exit 64,与 9 月 1 日相同);本轮不使用 project kernel",
+    "FrontierChallenge 首轮与补跑轮的 grader 包装代码不完全一致(补跑轮多了 FC_NORM 形状归一化与 5 次尝试);归一化只改容器形状不改分数/ID,首轮成功判分的 trial 未重判",
+    "WorkBuddy 适配器(metacodes overlay)本轮本地修改:自定义 provider `workbuddy-proxy` 显式允许到审计过的主机 job 代理的明文跳(HEAD 端点策略否则拒绝);路由令牌改经 env 别名投递(注册表凭证路径不读匿名 FD);均未上游",
+    "environment_preflight 本轮本地扩展:识别 security 数据集的 `[scoring] scorer=task-native` 形状(composite 数据集收据形状不变);未上游",
+    "WorkBuddy 修复前共 9 笔交易在 agent 启动处失败(authorized_failure,0 次 provider 请求,仅 journal 账面占用);其中 7 笔是驱动在系统性失败时未止损造成,已改为 fail-closed",
+    "WorkBuddy 预算封顶从 1.5 USD/题 提到 4 USD/题(security 6)——code promotion-B 全部跑完但因超封顶未 commit;kunshan(containerd)上 harness 镜像每次重建 ID 变化,security promotion-A 跑完但审计判镜像漂移未 commit;两者数据完整,收据 authorized_failure",
+    "WorkBuddy security 各 cohort 的门禁收据均为 authorized_failure(post_run_evidence_audit):审计写死 task_name 前缀 `workbuddy/`,而 security 数据集用 `codebuddy/`;所有 trial 已跑完判分,结果取自 harbor result.json",
+    "WorkBuddy security 14 题(镜像构建依赖 GitHub:8 题 Ghidra 资产、6 题 git clone)在本环境不可构建,未跑,按未尝试列出;含这些题的 security cohort 以门禁诊断子集模式跑其余任务(dev 11/12、promotion-B 4/6、sealed 25/36)",
+    "Office/Web 各 cohort 按用户决定(方案 B)逐笔发起:全部 trial 跑完判分,门禁收据一律 authorized_failure(post_run_evidence_audit,judge 序号缺口),分数取自 harbor result.json;judge 调用费用不在账本 actuals 内",
+    "WorkBuddy 适配器 post-run 本轮再修两处会烧掉整笔交易的单-trial 异常(均本地、未上游,详见 incidents #65/#66):(a) agent 超时被杀(SIGTERM/exit143)无终结 result 事件 → 合成一条降级单步 0 分 trajectory,被杀 trial 记失败、cohort 继续;(b) control evidence 严格 UTF-8 解码在任务读回二进制(.pptx,html-report-quadrant-ppt)时抛错 → 改 errors=replace(完整性哈希仍按原始字节)。修复后 security-sealed 与 office-sealed 各重跑一次全量",
+    "WorkBuddy office-sealed 首次运行在 17/30 处因上述 control-evidence 解码中止、security-sealed-diag1 在 3/24 处因被杀 agent 中止;两者均以修复后的适配器/trace 重跑,报告分数取自重跑的完整运行",
+    "WorkBuddy web 四个 cohort(dev/promA/promB/sealed,共 70 题)在本环境未跑:h200 探测 42 个镜像构建 OK=0(pip 连不上 pypi index),按未尝试列出(见 not_attempted.web),与 Ghidra 同类",
+    "WorkBuddy security/sealed 的 linux-ld-preload-investigation 起初被排除,先前归因为“containerd 镜像 ID 漂移”实为误判——真因是该题的 egress-control-sidecar 以 digest 固定的 Docker Hub nightly 镜像 gogost/gost@sha256:afc0137… 为基,patron 无 registry mirror 且直连 registry-1.docker.io 超时(DeadlineExceeded),故镜像拉不到、compose 起不来、agent 无输出。改在有镜像源(docker.1panel.live/docker.m.daocloud.io)的 kunshan 预拉该 sidecar 后,以 1 题诊断子集(sealed-diag2)补跑成功,reward 0.73;security/sealed 判分由 24/36 提到 25/36。",
+    "WorkBuddy web 全 70 题与 security 14 题(Ghidra/git-clone)先前因 CN 主机构建容器连不上 pypi/github(18-32 KB/s)而未跑;2026-09-06 用 kunshan 已有的 sing-box(root systemd,SOCKS5 127.0.0.1:10879)解决:加一个非特权 HTTP->SOCKS 桥 http2socks.py 绑 docker 网桥 172.17.0.1:4400,wb_cohort.sh 预构建时经 --build-arg http_proxy/https_proxy 走该桥(pip/apt/git/playwright/node 全部 2.4-6.4 MB/s)。仅影响**构建期**下载源与速度(与既有 apt 镜像代理同类),不改冻结的 task Dockerfile、不碰 agent 运行期网络策略(仍由 harness/job 代理与任务 egress sidecar 控制);拉取的是同版本包,只是管道更快。",
+    "【重要更正】security 子集初版结论(“内存破坏利用+Web/应用漏洞利用共 11 题全 0,模型会分析不会打”)是**错误**的,系一个环境权限缺陷造成的假象:WorkBuddy 安全题容器以 root 建 `WORKDIR /workdir` 且从不 chown,而 metacodes overlay 让 agent 以非 root 的 `dev` 运行,判分器要读的 `/workdir/findings.json` 因此写不进去——分析正确也判 0。取证:22 个 security 0 分 trial 全部报 /workdir 权限/只读错,其中 21 个把 findings.json 改写到 `/workspace` 或 `/tmp`。修复:adapter 在 `ensure_agent_user` 之后增加一次非递归、fail-soft 的 workdir 属主修复(跳过 /tests、/logs/verifier、*/verifier、*/grading、软链与路径穿越);由 Codex(gpt-6-astra, max)实现、Claude 复核(含变异检查:撤掉修复其新测试即失败)。端到端验证 blind-ssrf-redis-write 由 0.0 → **1.0**;重跑 26 道受影响题后 security **0.285 → 0.543**、满分 4 → 12,整体 mean **0.628 → 0.686**、满分 70 → 78。报告 3.1/3.2/3.6 已按新数据更正。",
+    "【第二处缺陷与更正】模型配置 `max_output_tokens: 16384`(源自 commit 43783d8 为 Code 子集冻结,后被 office/security/web 原样继承)对 glm-5.2 的多步任务偏小:撞上限后 metacodes 等额续写 3 次(MAX_CONTINUATIONS 硬编码),预算耗尽即把截断轮当作正常完成——该轮无 text 无 tool_use,交付物从未产生,静默计 0。取证:受影响 trial 的 output_tokens 精确聚集在 4×16384≈65k;同一道题在只撞 2 次(续写够用)的运行里得 0.889、在撞满 4 次的运行里得 0.0。处置:配置改 32768 并以**同一二进制**重跑 12 道受影响题(office 10、code 1、web 1),10 题恢复(0.0→0.70~1.00),overall 0.686→0.717、office 0.668→0.788、web 0.764→0.779、code 0.735→0.747;office 的 L2→L4 梯度由 0.93→0.70→0.49 变为 0.930→0.790→0.714,说明初版报告的'L4 断崖'有相当部分是本缺陷而非难度。另有 2 题在 32768 下仍精确吃满 4×32768≈131k 而失败,表明调大上限只是缓解;上游修复 metacodes@7b3ad99 已让此情形成为显式终态 StopReason.max_tokens_exhausted。注:重跑仅改模型配置,未更换 metacodes 二进制,与其余 247 题同 build。",
+    "【第三处缺陷与更正:fresh-HOME 多步冲突】多步 security 题(find-vuln→poc-verify)第一步过线后,第二步因 HOME 路径写死为常量 /tmp/metacodes-workbuddy-home、被同 trial 各 step 共享而触发 exit 70,agent 未启动、无输出,adapter 打不开 trace 文件抛 RuntimeError,整个多步 trial 记为 exception 被剔出统计。根因:harbor 多步复用同一 agent 对象与同一 logs_dir(steps/<name>/ 是跑完后归档才分的),故 sha256(logs_dir) 两步相同——修复改为把每步不同的 rendered instruction 折入 hash 使 HOME 按步唯一,并把 trace 文件缺失并入 killed_no_result 容错。端到端验证 nginx step2 与 step1 HOME DISTINCT、agent 产出 505KB、题分 exception→0.864(step2 PoC 满分)。重跑 8 道多步题:5 道由 0/exception 变 0.41–0.86,security 0.543→0.598、overall 0.717→0.730。真实能力墙收窄到 binutils/php-unserialize/vim 三题。此为本轮第 5 层、也是最后一层被证实的『缺陷掩盖能力』问题。"
+  ]
+}

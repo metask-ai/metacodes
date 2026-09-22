@@ -1160,7 +1160,7 @@ fn validUtf8PrefixLen(s: []const u8, desired: usize) usize {
     const limit = @min(desired, s.len);
     while (i < limit) {
         const n = std.unicode.utf8ByteSequenceLength(s[i]) catch break;
-        if (i + n > limit) break;
+        if (n > limit - i) break;
         _ = std.unicode.utf8Decode(s[i .. i + n]) catch break;
         i += n;
         last = i;

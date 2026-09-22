@@ -14,6 +14,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
+const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const output_semantics = @import("../core/output_semantics.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const permission_mod = @import("../permission.zig");
@@ -26,6 +27,9 @@ const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend = @import("../core/writer_backend.zig");
 const stream_json_mod = @import("stream_json_backend.zig");
 const util_json = @import("../util/json.zig");
+
+/// A headless invocation must not wait forever on a child that never exits.
+pub const HEADLESS_JOB_WAIT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 /// Headless callers can make tool availability part of their frozen runtime
 /// contract with `--disallowed-tools`. The ordinary permission settings still
@@ -204,8 +208,8 @@ pub fn run(
         null;
     defer if (run_control) |control| control.deinit();
     if (run_control) |control| control.requireDetachedIdle(
-        (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
-            (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+        (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+            (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
         app.swarm.hasTeam(),
     ) catch |err| {
         try control.finishRun(@errorName(err));
@@ -508,6 +512,12 @@ fn buildOptions(
         .verification_final_observe = app.config.verification_final_observe,
         .requirement_ledger = app.config.requirement_ledger,
         .requirement_ledger_observe = app.config.requirement_ledger_observe,
+        .delivery_cadence = app.config.delivery_cadence,
+        .delivery_cadence_observe = app.config.delivery_cadence_observe,
+        .delivery_cadence_thresholds = .{
+            .first = app.config.delivery_cadence_first orelse delivery_cadence_mod.DEFAULT_FIRST_THRESHOLD,
+            .second = app.config.delivery_cadence_second orelse delivery_cadence_mod.DEFAULT_SECOND_THRESHOLD,
+        },
         .max_stream_turn_retries = 2,
         // Tool lifecycle events are part of the evaluation protocol even
         // though the null writer renders no cards.  Leaving this false made
@@ -516,6 +526,8 @@ fn buildOptions(
         .read_state = &app.read_state,
         .lsp = app.lsp_service, // Y2:headless 也接 LSP 诊断
         .jobs = if (app.jobs) |*j| j else null,
+        .job_notifications = if (app.jobs) |*j| j else null,
+        .job_wait = .{ .timeout_ms = HEADLESS_JOB_WAIT_TIMEOUT_MS },
         .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
         .swarm = &app.swarm, // SW7:headless 也接 swarm
         .plan_prev_mode = &app.plan_prev_mode,
@@ -609,8 +621,8 @@ pub fn resumeSuspended(
     );
     defer run_control.deinit();
     run_control.requireDetachedIdle(
-        (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
-            (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+        (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+            (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
         app.swarm.hasTeam(),
     ) catch |err| {
         try run_control.finishRun(@errorName(err));

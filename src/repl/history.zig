@@ -10,7 +10,9 @@
 //! 不在 append 时立即写盘——一次 session 的批量追加更省 IO；崩溃时最多丢当前 session。
 
 const std = @import("std");
+const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
+const util_json = @import("../util/json.zig");
 
 pub const MAX_ENTRIES: usize = 1000;
 
@@ -149,7 +151,7 @@ pub const History = struct {
         for (self.entries.items) |entry| {
             var line: std.Io.Writer.Allocating = .init(self.allocator);
             defer line.deinit();
-            std.json.Stringify.encodeJsonString(entry, .{}, &line.writer) catch continue;
+            util_json.writeJsonString(&line.writer, entry) catch continue;
             line.writer.writeByte('\n') catch continue;
             const bytes = line.written();
             _ = pfs.write(fd, bytes);
@@ -233,8 +235,9 @@ test "History: next past newest returns empty pending" {
 }
 
 test "History: roundtrip save/load" {
-    const path = "/tmp/cc-zig-history-test.txt";
-    defer _ = std.c.unlink(path);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "history-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
     var h1 = History.init(testing.allocator);
     try h1.append("alpha");
@@ -253,8 +256,9 @@ test "History: roundtrip save/load" {
 }
 
 test "History: multiline command survives JSONL round-trip" {
-    const path = "/tmp/cc-zig-history-multiline.jsonl";
-    defer _ = std.c.unlink(path);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "history-multiline.jsonl");
+    defer _ = std.c.unlink(path.ptr);
 
     var h1 = History.init(testing.allocator);
     try h1.append("line1\nline2\nline3");
@@ -272,10 +276,11 @@ test "History: multiline command survives JSONL round-trip" {
 }
 
 test "History: legacy plain-text file auto-migrates" {
-    const path = "/tmp/cc-zig-history-legacy.txt";
-    defer _ = std.c.unlink(path);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "history-legacy.txt");
+    defer _ = std.c.unlink(path.ptr);
     // 手写旧版纯文本（无引号）
-    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     const legacy = "oldcmd1\noldcmd2\n";
     _ = pfs.write(fd, legacy);
     _ = pfs.close(fd);

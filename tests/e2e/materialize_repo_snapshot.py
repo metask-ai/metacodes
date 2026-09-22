@@ -90,6 +90,13 @@ def materialize(repo_root: Path, workspace: Path, snapshot: dict) -> None:
                 try:
                     relative = source.relative_to(prefix)
                 except ValueError as exc:
+                    # `git archive` emits a directory entry for every ancestor
+                    # of a deep pathspec (`tests/`, `tests/e2e/`, ...). Those
+                    # carry no bytes and sit above the prefix by construction;
+                    # only a *file* or an unrelated directory outside the
+                    # prefix is an escape.
+                    if member.isdir() and (source == prefix or source in prefix.parents):
+                        continue
                     raise ValueError(f"archive member escaped snapshot prefix: {member.name}") from exc
                 if not relative.parts or ".." in relative.parts:
                     continue

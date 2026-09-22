@@ -1,5 +1,6 @@
 import MetaCodesControl.VerificationGate
 import MetaCodesControl.RequirementLedger
+import MetaCodesControl.DeliveryCadence
 import MetaCodesControl.RuleMetaGovernance
 
 -- Build automation treats this output as part of the shipped trust boundary:
@@ -17,6 +18,12 @@ import MetaCodesControl.RuleMetaGovernance
 #print axioms MetaCodesControl.RequirementLedger.nudges_bounded
 #print axioms MetaCodesControl.RequirementLedger.closure_disarms_open_items
 #print axioms MetaCodesControl.RequirementLedger.coverage_is_one_shot
+#print axioms MetaCodesControl.DeliveryCadence.mutation_disarms
+#print axioms MetaCodesControl.DeliveryCadence.pristine_never_nudged
+#print axioms MetaCodesControl.DeliveryCadence.first_requires_threshold
+#print axioms MetaCodesControl.DeliveryCadence.second_requires_first_fired
+#print axioms MetaCodesControl.DeliveryCadence.level_bounded
+#print axioms MetaCodesControl.DeliveryCadence.fresh_run_bounded
 #print axioms MetaCodesControl.RuleMetaGovernance.llm_cannot_promote_deny
 #print axioms MetaCodesControl.RuleMetaGovernance.unanchored_cannot_promote
 #print axioms MetaCodesControl.RuleMetaGovernance.evidence_unanchored_cannot_promote

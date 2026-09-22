@@ -14,6 +14,7 @@ const projection = @import("../kg/task_projection.zig");
 const ToolContext = @import("../tools/context.zig").ToolContext;
 const pfs = @import("platform").fs;
 const time = @import("../util/time.zig");
+const util_json = @import("../util/json.zig");
 
 pub const RECEIPT_SCHEMA = "metacodes-formal-audit-receipt-v1";
 pub const PROPOSAL_SCHEMA = "metacodes-formal-proposal-v1";
@@ -186,7 +187,7 @@ const Args = struct {
 };
 
 pub fn execute(ctx: *const ToolContext, args_json: []const u8) anyerror![]u8 {
-    return switch (runtime.loadConfigFromEnv()) {
+    return switch (runtime.loadConfig()) {
         .configured => |config| executeWithConfig(ctx, args_json, config, null),
         .missing => renderPreflight(ctx, args_json, .config_missing, null),
         .invalid => renderPreflight(ctx, args_json, .config_invalid, null),
@@ -679,15 +680,15 @@ fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
                 "{{\"schema_version\":\"{s}\",\"manifest_sha256\":\"{s}\",\"build_receipt_schema\":\"{s}\",\"build_receipt_sha256\":\"{s}\",\"kernel_source_sha256\":\"{s}\",\"memory_kernel_source_sha256\":\"{s}\",\"artifact_kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"source_identity_claim\":\"binary_hash_and_build_receipt_bound\",\"host_os\":",
                 .{ provenance.MANIFEST_SCHEMA, loaded.manifest_sha256[0..], provenance.BUILD_RECEIPT_SCHEMA, loaded.build_receipt_sha256[0..], loaded.kernel_source_sha256[0..], loaded.memory_kernel_source_sha256[0..], loaded.artifact_kernel_source_sha256[0..], loaded.main_source_sha256[0..], loaded.axiom_audit_source_sha256[0..] },
             );
-            try std.json.Stringify.encodeJsonString(loaded.host_os, .{}, writer);
+            try util_json.writeJsonString(writer, loaded.host_os);
             try writer.writeAll(",\"host_arch\":");
-            try std.json.Stringify.encodeJsonString(loaded.host_arch, .{}, writer);
+            try util_json.writeJsonString(writer, loaded.host_arch);
             try writer.writeAll(",\"linker\":");
-            try std.json.Stringify.encodeJsonString(loaded.linker, .{}, writer);
+            try util_json.writeJsonString(writer, loaded.linker);
             try writer.writeAll(",\"lean_version\":");
-            try std.json.Stringify.encodeJsonString(loaded.lean_version, .{}, writer);
+            try util_json.writeJsonString(writer, loaded.lean_version);
             try writer.writeAll(",\"built_at_utc\":");
-            try std.json.Stringify.encodeJsonString(loaded.built_at_utc, .{}, writer);
+            try util_json.writeJsonString(writer, loaded.built_at_utc);
             try writer.writeAll(",\"integrity_model\":\"hash_linked_not_signed\"}");
         } else {
             try writer.writeAll("null");
@@ -723,12 +724,12 @@ fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
         .{ boolText(receipt.pipelineAdmitted()), @tagName(receipt.pipeline_failure) },
     );
     if (receipt.source_error) |name|
-        try std.json.Stringify.encodeJsonString(name, .{}, writer)
+        try util_json.writeJsonString(writer, name)
     else
         try writer.writeAll("null");
     try writer.writeAll(",\"source_detail\":");
     if (receipt.source_detail) |detail|
-        try std.json.Stringify.encodeJsonString(boundedUtf8(detail, 4096), .{}, writer)
+        try util_json.writeJsonString(writer, boundedUtf8(detail, 4096))
     else
         try writer.writeAll("null");
     try writer.print(

@@ -1,0 +1,15 @@
+task_id,trial_name,agent,model,task_score,passed,evaluation_complete,scored_zero_missing_artifact,error
+task_055_opp_c60_xtb_igm,task_055_opp_c60_xtb_igm__yuxDDed,metacodes_agent:MetacodesCLI,glm-5.2,0.4,0.0,1.0,False,
+task_057_tunel_dapi_image_ratio,task_057_tunel_dapi_image_ratio__Lpwzs79,metacodes_agent:MetacodesCLI,glm-5.2,0.36,0.0,1.0,False,
+task_058_ki67_hscore_imaging,task_058_ki67_hscore_imaging__GomMdPh,metacodes_agent:MetacodesCLI,glm-5.2,0.75,0.0,1.0,False,
+task_068_wgcna_analysis_visualization,task_068_wgcna_analysis_visualiz__K3GWrCP,metacodes_agent:MetacodesCLI,glm-5.2,0.43278855,0.0,1.0,False,
+task_073_ion_diffusion_lammps,task_073_ion_diffusion_lammps__7NPHdZe,metacodes_agent:MetacodesCLI,glm-5.2,0.0,0.0,1.0,True,required artifact missing from submission - genuine 0
+task_075_n2_nevpt2_pes,task_075_n2_nevpt2_pes__inMfM4c,metacodes_agent:MetacodesCLI,glm-5.2,0.99466667,1.0,1.0,False,
+task_115_ccrcc_blind_annotation,task_115_ccrcc_blind_annotation__cQKXaTi,metacodes_agent:MetacodesCLI,glm-5.2,0.5203,0.0,1.0,False,
+task_116_eis_equivalent_circuit_analysis,task_116_eis_equivalent_circuit__oPSkvVj,metacodes_agent:MetacodesCLI,glm-5.2,0.82039286,1.0,1.0,False,
+task_117_cp2k_mgo_phonon,task_117_cp2k_mgo_phonon__RsjymvJ,metacodes_agent:MetacodesCLI,glm-5.2,0.0,0.0,1.0,True,required artifact missing from submission - genuine 0
+task_201_qmmm_lysozyme_benzene_min,task_201_qmmm_lysozyme_benzene_m__VSU2bNU,metacodes_agent:MetacodesCLI,glm-5.2,0.53,0.0,1.0,False,
+task_203_qmmm_trypsin_link_atom,task_203_qmmm_trypsin_link_atom__rRQjuz7,metacodes_agent:MetacodesCLI,glm-5.2,0.35,0.0,1.0,False,
+task_204_opes_metad_alanine_fes,task_204_opes_metad_alanine_fes__fzsLvom,metacodes_agent:MetacodesCLI,glm-5.2,0.75,1.0,1.0,False,
+task_205_umbrella_wham_nacl_pmf,task_205_umbrella_wham_nacl_pmf__AePzR3L,metacodes_agent:MetacodesCLI,glm-5.2,0.07,0.0,1.0,False,
+task_206_smd_jarzynski_ala10,task_206_smd_jarzynski_ala10__L2qR8Ps,metacodes_agent:MetacodesCLI,glm-5.2,0.56,0.0,1.0,False,

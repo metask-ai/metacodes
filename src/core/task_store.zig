@@ -19,6 +19,7 @@ const util_time = @import("../util/time.zig");
 const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
 const file_lock = @import("../util/file_lock.zig");
+const util_json = @import("../util/json.zig");
 
 const max_mirror_bytes = 4 * 1024 * 1024;
 
@@ -207,21 +208,21 @@ pub const TaskStore = struct {
     fn appendTaskJson(self: *TaskStore, w: *std.Io.Writer.Allocating, t: *const Task) !void {
         _ = self; // 仅用于命名空间;无字段访问(状态全在 t)
         try w.writer.writeAll("{\"id\":");
-        try std.json.Stringify.encodeJsonString(t.id, .{}, &w.writer);
+        try util_json.writeJsonString(&w.writer, t.id);
         try w.writer.writeAll(",\"subject\":");
-        try std.json.Stringify.encodeJsonString(t.subject, .{}, &w.writer);
+        try util_json.writeJsonString(&w.writer, t.subject);
         try w.writer.writeAll(",\"description\":");
-        try std.json.Stringify.encodeJsonString(t.description, .{}, &w.writer);
+        try util_json.writeJsonString(&w.writer, t.description);
         try w.writer.writeAll(",\"status\":\"");
         try w.writer.writeAll(t.status.toString());
         try w.writer.writeAll("\"");
         if (t.active_form) |af| {
             try w.writer.writeAll(",\"active_form\":");
-            try std.json.Stringify.encodeJsonString(af, .{}, &w.writer);
+            try util_json.writeJsonString(&w.writer, af);
         }
         if (t.owner) |o| {
             try w.writer.writeAll(",\"owner\":");
-            try std.json.Stringify.encodeJsonString(o, .{}, &w.writer);
+            try util_json.writeJsonString(&w.writer, o);
         }
         if (t.completed_ms != 0) {
             try w.writer.print(",\"completed_ms\":{d}", .{t.completed_ms});
@@ -232,7 +233,7 @@ pub const TaskStore = struct {
             for (t.blocks.items) |b| {
                 if (!first_b) try w.writer.writeAll(",");
                 first_b = false;
-                try std.json.Stringify.encodeJsonString(b, .{}, &w.writer);
+                try util_json.writeJsonString(&w.writer, b);
             }
             try w.writer.writeAll("]");
         }
@@ -242,7 +243,7 @@ pub const TaskStore = struct {
             for (t.blocked_by.items) |b| {
                 if (!first_bb) try w.writer.writeAll(",");
                 first_bb = false;
-                try std.json.Stringify.encodeJsonString(b, .{}, &w.writer);
+                try util_json.writeJsonString(&w.writer, b);
             }
             try w.writer.writeAll("]");
         }
@@ -754,8 +755,8 @@ test "TaskStore: mirror 开启时 updateStatus(t.id) 不悬垂(reload 释放旧 
     // 返回的 t.id 直接传回 updateStatus 时,id 在调用内部 reload 后指向已释放内存 →
     // 查找失配 → TaskNotFound 被调用方吞掉,状态静默停在 pending。修复:入口先拷贝 id。
     const test_fs = @import("../util/fs.zig");
-    var dbuf: [128]u8 = undefined;
-    const dir_path = try std.fmt.bufPrint(&dbuf, "/tmp/cc-zig-taskstore-test-{d}", .{util_time.nowNs()});
+    var dbuf: [256]u8 = undefined;
+    const dir_path = @import("../util/fs.zig").testing.uniqueDir(&dbuf, "cc-zig-taskstore-test");
     try test_fs.mkdirParents(dir_path);
     defer test_fs.testing.rmrfBestEffort(dir_path);
     var pbuf: [192]u8 = undefined;

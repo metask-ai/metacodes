@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const definition_mod = @import("definition.zig");
+const util_json = @import("../../util/json.zig");
 
 const Dir = std.Io.Dir;
 const File = std.Io.File;
@@ -970,40 +971,40 @@ fn buildDescriptor(
 
 fn writeDescriptor(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
     try writer.writeAll("{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":");
-    try std.json.Stringify.encodeJsonString(&snapshot.scope_id, .{}, writer);
+    try util_json.writeJsonString(writer, &snapshot.scope_id);
     try writer.writeAll(",\"catalog_revision\":");
-    try std.json.Stringify.encodeJsonString(&snapshot.revision, .{}, writer);
+    try util_json.writeJsonString(writer, &snapshot.revision);
     try writer.writeAll(",\"health\":");
-    try std.json.Stringify.encodeJsonString(@tagName(snapshot.health), .{}, writer);
+    try util_json.writeJsonString(writer, @tagName(snapshot.health));
     try writer.writeAll(",\"skills\":[");
     for (snapshot.skills, 0..) |*record, index| {
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"skill_id\":");
-        try std.json.Stringify.encodeJsonString(&record.execution_id, .{}, writer);
+        try util_json.writeJsonString(writer, &record.execution_id);
         try writer.writeAll(",\"skill_policy_key\":");
-        try std.json.Stringify.encodeJsonString(record.invocation_name, .{}, writer);
+        try util_json.writeJsonString(writer, record.invocation_name);
         try writer.writeAll(",\"invocation_name\":");
-        try std.json.Stringify.encodeJsonString(record.invocation_name, .{}, writer);
+        try util_json.writeJsonString(writer, record.invocation_name);
         try writer.writeAll(",\"source\":{\"provider_id\":");
-        try std.json.Stringify.encodeJsonString(record.provider_id, .{}, writer);
+        try util_json.writeJsonString(writer, record.provider_id);
         try writer.writeAll(",\"source_scope\":");
-        try std.json.Stringify.encodeJsonString(publicScope(record.source_scope), .{}, writer);
+        try util_json.writeJsonString(writer, publicScope(record.source_scope));
         try writer.writeAll(",\"source_instance_id\":");
-        try std.json.Stringify.encodeJsonString(record.source_instance_id, .{}, writer);
+        try util_json.writeJsonString(writer, record.source_instance_id);
         try writer.writeAll(",\"contribution_id\":");
-        try std.json.Stringify.encodeJsonString(&record.contribution_id, .{}, writer);
+        try util_json.writeJsonString(writer, &record.contribution_id);
         try writer.writeAll("},\"content_revision\":");
-        try std.json.Stringify.encodeJsonString(&record.content_revision, .{}, writer);
+        try util_json.writeJsonString(writer, &record.content_revision);
         try writer.writeAll(",\"display_name\":");
-        try std.json.Stringify.encodeJsonString(record.definition.name, .{}, writer);
+        try util_json.writeJsonString(writer, record.definition.name);
         try writer.writeAll(",\"description\":");
-        try std.json.Stringify.encodeJsonString(record.definition.description, .{}, writer);
+        try util_json.writeJsonString(writer, record.definition.description);
         try writer.writeAll(
             ",\"argument_schema\":{\"schema\":\"metask.skill-arguments/v1\",\"max_values\":64,\"names\":[",
         );
         for (record.definition.arguments, 0..) |name, name_index| {
             if (name_index != 0) try writer.writeByte(',');
-            try std.json.Stringify.encodeJsonString(name, .{}, writer);
+            try util_json.writeJsonString(writer, name);
         }
         try writer.writeAll("]}}");
     }
@@ -1011,25 +1012,25 @@ fn writeDescriptor(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
     for (snapshot.issues, 0..) |*issue, index| {
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"kind\":");
-        try std.json.Stringify.encodeJsonString(issueKind(issue), .{}, writer);
+        try util_json.writeJsonString(writer, issueKind(issue));
         try writer.writeAll(",\"code\":");
-        try std.json.Stringify.encodeJsonString(@tagName(issue.code), .{}, writer);
+        try util_json.writeJsonString(writer, @tagName(issue.code));
         try writer.writeAll(",\"skill_policy_key\":");
         if (issue.invocation_name) |name|
-            try std.json.Stringify.encodeJsonString(name, .{}, writer)
+            try util_json.writeJsonString(writer, name)
         else
             try writer.writeAll("null");
         try writer.writeAll(",\"reason\":");
         if (issue.reason) |reason|
-            try std.json.Stringify.encodeJsonString(@tagName(reason), .{}, writer)
+            try util_json.writeJsonString(writer, @tagName(reason))
         else
             try writer.writeAll("null");
         try writer.writeAll(",\"source_scope\":");
-        try std.json.Stringify.encodeJsonString(publicScope(issue.source_scope), .{}, writer);
+        try util_json.writeJsonString(writer, publicScope(issue.source_scope));
         try writer.writeAll(",\"provider_id\":");
-        try std.json.Stringify.encodeJsonString(issue.provider_id, .{}, writer);
+        try util_json.writeJsonString(writer, issue.provider_id);
         try writer.writeAll(",\"source_instance_id\":");
-        try std.json.Stringify.encodeJsonString(issue.source_instance_id, .{}, writer);
+        try util_json.writeJsonString(writer, issue.source_instance_id);
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");

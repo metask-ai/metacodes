@@ -18,6 +18,7 @@ const ToolContext = tools_mod.ToolContext;
 const tool_observation = @import("../tools/observation.zig");
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
+const util_json = @import("../util/json.zig");
 const pfs = platform.fs;
 const project_gate_protocol = @import("../tools/project_rule_gate.zig");
 const project_rule_signal = @import("../tools/project_rule_signal.zig");
@@ -242,7 +243,7 @@ pub fn renderRecoveryDeferral(allocator: std.mem.Allocator, input: []const u8, p
     errdefer out.deinit();
     const w = &out.writer;
     try w.writeAll("{\"error\":\"recovery_allowance_exhausted\",\"artifact_id\":");
-    if (req.artifact_id) |id| try std.json.Stringify.encodeJsonString(id, .{}, w) else try w.writeAll("null");
+    if (req.artifact_id) |id| try util_json.writeJsonString(w, id) else try w.writeAll("null");
     try w.print(
         ",\"offset\":{d},\"allowance_bytes\":{d},\"charged_bytes\":{d}," ++
             "\"hint\":\"the recovery allowance for this turn is spent; call ReadArtifact again from this offset in the next turn\"}}",
@@ -636,7 +637,7 @@ const ObservationCapture = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (event) {
-            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .test_weakening_candidate, .formal_decision, .formal_decision_batch => return true,
+            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .test_weakening_candidate, .formal_decision, .formal_decision_batch => return true,
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.depth = started.agent_depth;
@@ -2398,7 +2399,7 @@ test "project post gate runs before terminal observation and block preserves act
         fn emit(raw: *anyopaque, event: tool_observation.Event) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
-                .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .test_weakening_candidate, .formal_decision, .formal_decision_batch => {},
+                .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .test_weakening_candidate, .formal_decision, .formal_decision_batch => {},
                 .dispatch_started => self.starts += 1,
                 .dispatch_finished => |finished| {
                     self.finishes += 1;

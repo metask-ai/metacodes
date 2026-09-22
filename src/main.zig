@@ -18,7 +18,11 @@ const catalog_mod = @import("api/catalog.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const provider_ids_mod = @import("provider/ids.zig");
 const version_info = @import("version_info.zig");
-const doctor = @import("app/doctor.zig");
+pub const doctor = @import("app/doctor.zig"); // pub: component tests build the report by hand
+pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
+pub const kgd_install = @import("kg/kgd/install.zig");
+pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
+const kgd_runtime = @import("kg/kgd/runtime.zig");
 const build_options = @import("build_info");
 
 pub const VERSION = @import("version.zig").semver;
@@ -71,6 +75,7 @@ pub const client_mod = client; // alias for L2 component tests
 pub const api_last_error = @import("api/last_error.zig"); // L2 stream liveness tests read the TUI-facing error text
 pub const task_store = @import("core/task_store.zig"); // L2 requirement-ledger tests
 pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 ledger decide tests
+pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 delivery-cadence tests
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
@@ -493,6 +498,36 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // Process-mode teammates must bind the complete App initialization to
+    // their parent's session. Adopting only after App.init would seed KG,
+    // prompts, plan paths, and provider-visible session state from a random
+    // child id, then leave those snapshots stale after the writer switch.
+    if (config.teammate_name.len > 0 and (config.teammate_parent_session.len == 0 or config.teammate_lease_id.len == 0)) {
+        std.debug.print("error: --teammate requires --parent-session-id and --teammate-lease-id\n", .{});
+        std.process.exit(2);
+    }
+    if (config.teammate_name.len > 0 and config.teammate_parent_session.len > 0) {
+        const parent = @import("core/session_id.zig").SessionId.fromSlice(config.teammate_parent_session) orelse {
+            std.debug.print("error: invalid --parent-session-id\n", .{});
+            std.process.exit(2);
+        };
+        if (@import("core/session_id.zig").SessionId.fromSlice(config.teammate_lease_id) == null) {
+            std.debug.print("error: invalid --teammate-lease-id\n", .{});
+            std.process.exit(2);
+        }
+        if (config.session_id) |explicit| {
+            if (!std.mem.eql(u8, explicit, parent.asSlice())) {
+                std.debug.print("error: --session and --parent-session-id must match for a teammate\n", .{});
+                std.process.exit(2);
+            }
+        } else {
+            config.session_id = allocator.dupe(u8, parent.asSlice()) catch {
+                std.debug.print("error: out of memory while binding teammate session\n", .{});
+                std.process.exit(2);
+            };
+        }
+    }
+
     if (config.show_version) {
         // `--json` is the headless output flag; with `--version` it selects the
         // build identity document (doc/API.md, CLI surface).
@@ -507,24 +542,6 @@ pub fn main(init: std.process.Init) !void {
         };
         dumpWrite(out.written());
         return;
-    }
-
-    // 捕获 argv[0] 解析可执行文件目录(供 KgClient 定位 vendor/tinykg;H1)。
-    // argv[0] 含 '/' 才可定位;裸命令名(PATH 启动)→ null,回落 env/dev。realpath 解 symlink。
-    {
-        var a0_it = argsIter(init);
-        defer a0_it.deinit();
-        if (a0_it.next()) |argv0| {
-            if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
-                const z = allocator.dupeZ(u8, argv0) catch null;
-                if (z) |zz| {
-                    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-                    const resolved = pfs.realpath(zz.ptr, &rbuf);
-                    const full = if (resolved != null) std.mem.span(resolved.?) else argv0;
-                    if (std.fs.path.dirname(full)) |d| config.exe_dir = allocator.dupe(u8, d) catch null;
-                }
-            }
-        }
     }
 
     // 初始化日志：读 METACODES_LOG / METACODES_LOG_FILE 环境变量
@@ -796,6 +813,7 @@ pub fn main(init: std.process.Init) !void {
             .name = config.teammate_name,
             .team = config.teammate_team,
             .parent_session = config.teammate_parent_session,
+            .lease_id = config.teammate_lease_id,
             .cwd = config.teammate_cwd,
         }) catch |err| blk: {
             log.err("swarm", "teammate process failed: {s}", .{@errorName(err)});
@@ -909,11 +927,160 @@ fn metaskUsesDeviceFlow(mode: LoginMode) bool {
     return mode == .browser;
 }
 
-/// `metacodes doctor [--json] [--strict]` (#78): where ripgrep and TinyKG
-/// resolve from and whether their digests match what this build pinned. Exit 0;
+/// `metacodes doctor [--json] [--strict]` (#78): where ripgrep, TinyKG, and the
+/// Lean kernels resolve from and whether their digests match what this build pinned. Exit 0;
 /// with `--strict`, 1 when a binary is unresolved or mismatched; 2 on an
-/// unknown argument.
-fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
+/// Builds the doctor's KG object with the read-only probe (a diagnosis command
+/// must never create or migrate a store). Owned strings only; any allocation
+/// failure leaves the report without a `kg` object instead of mixing in statics.
+pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").KgClient, home: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
+    const kclient = kg orelse return try kgDiagnosisOwned(allocator, "unconfigured", "unconfigured", "-", @import("kg/client.zig").KgClient.hintFor(.unconfigured));
+    kclient.ensureReadyReadOnly();
+    const state: []const u8 = if (kclient.ready) "ready" else @tagName(kclient.degradedKind() orelse .unconfigured);
+    const transport = kclient.transportName();
+    const is_cli = std.mem.eql(u8, transport, "cli");
+    // `config` names what the daemon binding was read from: the explicit
+    // METACODES_KG_CONFIG file, the METACODES_KG_* triple ("env"), or the
+    // default daemon.json (whether or not it exists yet).
+    const env_config_path: ?[]const u8 = if (std.c.getenv("METACODES_KG_CONFIG")) |p| std.mem.span(p) else null;
+    const env_triple = std.c.getenv("METACODES_KG_URL") != null or std.c.getenv("METACODES_KG_API_KEY") != null or
+        std.c.getenv("METACODES_KG_EXPECTED_BUILD_ID") != null;
+    const default_path: ?[]u8 = if (!is_cli and !env_triple and env_config_path == null)
+        try std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/daemon.json", .{home})
+    else
+        null;
+    defer if (default_path) |p| allocator.free(p);
+    const config: []const u8 = if (is_cli) "-" else if (env_triple) "env" else (env_config_path orelse default_path.?);
+    const hint: []const u8 = if (kclient.ready) "-" else kclient.degradedHint();
+    return try kgDiagnosisOwned(allocator, state, transport, config, hint);
+}
+
+fn kgDiagnosisOwned(allocator: std.mem.Allocator, state: []const u8, transport: []const u8, config: []const u8, hint: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
+    const s = try allocator.dupe(u8, state);
+    errdefer allocator.free(s);
+    const t = try allocator.dupe(u8, transport);
+    errdefer allocator.free(t);
+    const c = try allocator.dupe(u8, config);
+    errdefer allocator.free(c);
+    const h = try allocator.dupe(u8, hint);
+    return .{ .state = s, .transport = t, .config = c, .hint = h };
+}
+
+/// `metacodes kg install [--store PATH] [--port N]`: provision the local
+/// TinyKG runtime. Prints what it did; never prints the API key.
+fn runKg(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
+    const sub = args.next() orelse {
+        std.debug.print("usage: metacodes kg install [--config <path>] [--store <path>] [--port <port>]\n", .{});
+        return 2;
+    };
+    if (!std.mem.eql(u8, sub, "install")) {
+        std.debug.print("error: unknown kg subcommand '{s}'\n", .{sub});
+        return 2;
+    }
+    var options = kgd_install.Options{};
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--config")) {
+            options.config_path = args.next() orelse {
+                std.debug.print("error: --config needs a path\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--store")) {
+            options.store_path = args.next() orelse {
+                std.debug.print("error: --store needs a path\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            const raw = args.next() orelse {
+                std.debug.print("error: --port needs a number\n", .{});
+                return 2;
+            };
+            const port = std.fmt.parseInt(u16, raw, 10) catch 0;
+            if (port == 0) {
+                std.debug.print("error: --port must be a number between 1 and 65535\n", .{});
+                return 2;
+            }
+            options.port = port;
+        } else {
+            std.debug.print("error: unknown kg install argument '{s}'\n", .{arg});
+            return 2;
+        }
+    }
+    const home = @import("platform").paths.homeDir() orelse "";
+    var outcome = kgd_install.run(allocator, home, options) catch |err| {
+        std.debug.print("error: kg install failed ({s}){s}\n", .{ @errorName(err), kgInstallHint(err) });
+        return 1;
+    };
+    defer outcome.deinit(allocator);
+    std.debug.print("TinyKG configured.\n  store:   {s}{s}\n  config:  {s} (0600{s})\n  url:     {s}\n  build:   {s}\n", .{
+        outcome.store_path,
+        if (outcome.created_store) " (created)" else "",
+        outcome.config_path,
+        if (outcome.reused_api_key) ", existing key kept" else ", new key",
+        outcome.url,
+        outcome.build_id[0..],
+    });
+    // A custom `--config` has to appear in the command too, or following this
+    // line starts a service that reads the default configuration instead.
+    if (options.config_path) |custom| {
+        std.debug.print("Start it with: metacodes kgd --config {s}\n", .{custom});
+    } else {
+        std.debug.print("Start it with: metacodes kgd\n", .{});
+    }
+    return 0;
+}
+
+fn kgInstallHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.BinariesMissing => "; the TinyKG bundle is not staged next to this executable, run `zig build tinykg:stage` or install a release",
+        error.NoHome => "; no HOME is set",
+        else => "",
+    };
+}
+
+/// `metacodes kgd [--config PATH] [--store PATH]`: run the TinyKG service in
+/// the foreground until interrupted. The port and key come from the same
+/// daemon.json the sessions read — there is deliberately no `--port`, so the
+/// service cannot bind somewhere its clients do not look.
+fn runKgd(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
+    var options = kgd_runtime.LoadOptions{};
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--config")) {
+            options.config_path = args.next() orelse {
+                std.debug.print("error: --config needs a path\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--store")) {
+            options.store_override = args.next() orelse {
+                std.debug.print("error: --store needs a path\n", .{});
+                return 2;
+            };
+        } else {
+            // The port is not a flag here: it lives in the configuration the
+            // sessions read, so the service cannot bind somewhere its clients
+            // do not look. Change it with `kg install --port`.
+            std.debug.print("error: unknown kgd argument '{s}'\nusage: metacodes kgd [--config <path>] [--store <path>]\n", .{arg});
+            return 2;
+        }
+    }
+    const home = @import("platform").paths.homeDir() orelse "";
+    var config = kgd_runtime.loadConfig(allocator, home, options) catch |err| {
+        std.debug.print("error: cannot read the TinyKG configuration ({s}){s}\n", .{ @errorName(err), kgdConfigHint(err) });
+        return 1;
+    };
+    defer config.deinit(allocator);
+    return kgd_runtime.serve(allocator, config);
+}
+
+fn kgdConfigHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ConfigUnreadable => "; run `metacodes kg install` first",
+        error.ConfigUnsafe => "; the configuration must be a regular non-symlink file with mode 0600",
+        error.BinariesMissing => "; the TinyKG bundle is not staged next to this executable",
+        else => "",
+    };
+}
+
+fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: std.Io) u8 {
     var json = false;
     var strict = false;
     while (args.next()) |arg| {
@@ -929,9 +1096,26 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 
     var report = doctor.run(allocator, .{
         .ripgrep_sha256 = build_options.ripgrep_expected_sha256,
         .tinykg_sha256 = build_options.tinykg_expected_sha256,
+        .tinykgd_sha256 = build_options.tinykgd_expected_sha256,
+        .formal_kernel_sha256 = build_options.formal_kernel_expected_sha256,
+        .project_kernel_sha256 = build_options.project_kernel_expected_sha256,
     }) catch |err| {
         std.debug.print("error: doctor could not resolve the runtime binaries ({s})\n", .{@errorName(err)});
         return 1;
+    };
+    const home = @import("platform").paths.homeDir() orelse "";
+    const cwd = @import("util/fs.zig").getCwd(allocator) catch "";
+    defer if (cwd.len > 0) allocator.free(cwd);
+    const hash = @import("core/transcript.zig").hashCwd(cwd);
+    const domain = std.fmt.allocPrint(allocator, "doctor-{s}", .{hash[0..8]}) catch "doctor";
+    defer if (!std.mem.eql(u8, domain, "doctor")) allocator.free(domain);
+    var kg = @import("kg/client.zig").KgClient.init(allocator, .{ .home = home, .domain = domain, .io = io }) catch null;
+    defer if (kg) |*kclient| kclient.deinit();
+    // KG diagnosis is all-or-nothing: KgDiagnosis.deinit frees every field, so
+    // no static fallback string may ever be stored in it. OOM → no kg object.
+    report.kg = kgDiagnosis(allocator, if (kg) |*kclient| kclient else null, home) catch |err| blk: {
+        @import("util/log.zig").warn("doctor", "unable to allocate KG diagnosis ({s}); omitting kg object", .{@errorName(err)});
+        break :blk null;
     };
     defer report.deinit(allocator);
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -951,7 +1135,9 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
     defer args.deinit();
     _ = args.next(); // 跳过 argv[0](程序名)
     const cmd = args.next() orelse return null;
-    if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator);
+    if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator, init.io);
+    if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
+    if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "ledger")) {
         const provider = args.next() orelse {
             std.debug.print("usage: metacodes ledger metask\n", .{});
@@ -2046,6 +2232,27 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.requirement_ledger = true;
         } else if (std.mem.eql(u8, arg, "--requirement-ledger-observe")) {
             config.requirement_ledger_observe = true;
+        } else if (std.mem.eql(u8, arg, "--delivery-cadence")) {
+            config.delivery_cadence = true;
+        } else if (std.mem.eql(u8, arg, "--delivery-cadence-observe")) {
+            config.delivery_cadence_observe = true;
+        } else if (std.mem.eql(u8, arg, "--delivery-cadence-thresholds")) {
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --delivery-cadence-thresholds", .{});
+                return;
+            };
+            const comma = std.mem.indexOfScalar(u8, s, ',') orelse {
+                setParseError(config, allocator, "invalid value '{s}' for --delivery-cadence-thresholds (expected <first>,<second>)", .{s});
+                return;
+            };
+            const first = std.fmt.parseInt(u32, s[0..comma], 10) catch 0;
+            const second = std.fmt.parseInt(u32, s[comma + 1 ..], 10) catch 0;
+            if (first == 0 or second <= first) {
+                setParseError(config, allocator, "invalid value '{s}' for --delivery-cadence-thresholds (need 0 < first < second)", .{s});
+                return;
+            }
+            config.delivery_cadence_first = first;
+            config.delivery_cadence_second = second;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
         } else if (std.mem.eql(u8, arg, "--image")) {
@@ -2137,6 +2344,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |v| config.teammate_team = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--parent-session-id")) {
             if (args.next()) |v| config.teammate_parent_session = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--teammate-lease-id")) {
+            if (args.next()) |v| config.teammate_lease_id = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--teammate-cwd")) {
             if (args.next()) |v| config.teammate_cwd = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--teammate-mode")) {
@@ -2326,6 +2535,9 @@ fn printHelp() void {
         \\  --verification-final-observe  Record (not enforce) the session-end verification obligation
         \\  --requirement-ledger  Enforce the requirement-ledger closure obligation
         \\  --requirement-ledger-observe  Record (not enforce) the requirement ledger
+        \\  --delivery-cadence    Nudge a run that keeps exploring without writing any deliverable
+        \\  --delivery-cadence-observe  Record (not enforce) the delivery-cadence obligation
+        \\  --delivery-cadence-thresholds <a>,<b>  Exploration-call counts for the two nudges (default 40,80)
         \\  --max-tokens <n>      Override max output tokens per request
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing

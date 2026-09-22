@@ -118,6 +118,13 @@ pub const FileInfo = struct {
     /// matching size/content alone cannot detect a same-byte final-path swap.
     device: u64,
     inode: u64,
+    /// Owner. Zero on Windows, where the concept does not map; callers that
+    /// need ownership there must use a Windows-specific check instead of
+    /// trusting this field.
+    uid: u32,
+    /// True for a directory. `is_regular` answers the common case; a caller
+    /// that hands a pathname to another process has to know the difference.
+    is_dir: bool,
 };
 
 /// 对已打开 fd 做类型与大小检查。安全敏感读取必须先 open(O_NOFOLLOW)，再 fstat fd，
@@ -133,6 +140,8 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .mode = @intCast(st.st_mode),
             .device = @intCast(st.st_dev),
             .inode = @intCast(st.st_ino),
+            .uid = 0,
+            .is_dir = (@as(u32, st.st_mode) & S_IFMT) == S_IFDIR,
         };
     }
     if (builtin.os.tag == .linux) {
@@ -148,6 +157,8 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .mode = stx.mode,
             .device = (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor),
             .inode = stx.ino,
+            .uid = stx.uid,
+            .is_dir = (@as(u32, stx.mode) & S_IFMT) == S_IFDIR,
         };
     }
     var st: std.c.Stat = undefined;
@@ -159,6 +170,8 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
         .mode = @intCast(st.mode),
         .device = @intCast(st.dev),
         .inode = @intCast(st.ino),
+        .uid = @intCast(st.uid),
+        .is_dir = (@as(u32, @intCast(st.mode)) & S_IFMT) == S_IFDIR,
     };
 }
 
@@ -292,6 +305,26 @@ pub fn renameReplace(from: [*:0]const u8, to: [*:0]const u8) c_int {
     return std.c.rename(from, to);
 }
 extern "kernel32" fn MoveFileExW(lpExistingFileName: [*:0]const u16, lpNewFileName: [*:0]const u16, dwFlags: u32) callconv(.winapi) c_int;
+
+/// Whether the last Windows file operation failed transiently because another
+/// handle is replacing/holding the path.  The CRT normally reports these as
+/// EACCES/EAGAIN, while the underlying Win32 call may report sharing/access
+/// denied (or a momentary not-found while a replace is delete-pending).
+/// Callers choose whether a not-found result is retryable; absent paths must
+/// remain fast, while an existing path may use a preflight presence check.
+pub fn isWindowsTransientFileError(include_not_found: bool) bool {
+    if (is_windows) {
+        const win_code = GetLastError();
+        const crt_code = std.c._errno().*;
+        if (include_not_found and (win_code == 2 or win_code == 3 or crt_code == @intFromEnum(std.c.E.NOENT))) return true;
+        if (win_code == 5 or win_code == 32 or win_code == 33) return true;
+        return crt_code == @intFromEnum(std.c.E.ACCES) or
+            crt_code == @intFromEnum(std.c.E.AGAIN) or
+            crt_code == @intFromEnum(std.c.E.BUSY);
+    } else {
+        return false;
+    }
+}
 
 /// Atomically install `from` at an absent `to` without ever replacing an
 /// existing pathname. Content-addressed stores need this stronger primitive:

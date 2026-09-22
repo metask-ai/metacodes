@@ -12,6 +12,7 @@
 //!   const json_str = try e.toJson(allocator);  // owned
 
 const std = @import("std");
+const util_json = @import("../util/json.zig");
 
 pub const Code = enum {
     not_read,
@@ -95,7 +96,7 @@ pub const ToolError = struct {
         try writer.writeAll("\",\"category\":\"");
         try writer.writeAll(self.category.name());
         try writer.writeAll("\",\"detail\":");
-        try std.json.Stringify.encodeJsonString(self.detail, .{}, writer);
+        try util_json.writeJsonString(writer, self.detail);
         try writer.print(",\"recoverable\":{s}}}}}", .{if (self.recoverable) "true" else "false"});
     }
 
@@ -246,7 +247,7 @@ fn errToJsonState(tool: []const u8, hint: []const u8, allocator: std.mem.Allocat
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"error\":{\"code\":\"project_rule_blocked\",\"category\":\"safety\",\"detail\":");
-    try std.json.Stringify.encodeJsonString(detail, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, detail);
     try aw.writer.writeAll(",\"recoverable\":false}}");
     return aw.toOwnedSlice();
 }
@@ -264,34 +265,18 @@ pub fn projectRuleExactEditBlockedJson(
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"error\":{\"code\":\"project_rule_blocked\",\"category\":\"safety\",\"detail\":");
-    try std.json.Stringify.encodeJsonString(detail, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, detail);
     try aw.writer.print(
         ",\"recoverable\":false,\"recovery\":{{\"schema_version\":\"{s}\",\"task_recoverable\":true,\"action\":\"edit_existing_file_exact\",\"requirements\":[",
         .{PROJECT_RULE_RECOVERY_SCHEMA},
     );
-    try std.json.Stringify.encodeJsonString(
-        "Use Edit on the existing regular file; this is not permission to retry Write.",
-        .{},
-        &aw.writer,
-    );
+    try util_json.writeJsonString(&aw.writer, "Use Edit on the existing regular file; this is not permission to retry Write.");
     try aw.writer.writeByte(',');
-    try std.json.Stringify.encodeJsonString(
-        "For whole-file replacement, old_string must match the current file exactly, including whether it ends with a newline.",
-        .{},
-        &aw.writer,
-    );
+    try util_json.writeJsonString(&aw.writer, "For whole-file replacement, old_string must match the current file exactly, including whether it ends with a newline.");
     try aw.writer.writeByte(',');
-    try std.json.Stringify.encodeJsonString(
-        "Reuse the blocked Write content as new_string exactly; do not add or remove a terminal newline.",
-        .{},
-        &aw.writer,
-    );
+    try util_json.writeJsonString(&aw.writer, "Reuse the blocked Write content as new_string exactly; do not add or remove a terminal newline.");
     try aw.writer.writeByte(',');
-    try std.json.Stringify.encodeJsonString(
-        "Read or otherwise reobserve the final file before reporting completion.",
-        .{},
-        &aw.writer,
-    );
+    try util_json.writeJsonString(&aw.writer, "Read or otherwise reobserve the final file before reporting completion.");
     try aw.writer.writeAll("]}}}");
     return try aw.toOwnedSlice();
 }

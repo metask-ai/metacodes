@@ -20,11 +20,13 @@
 //!   a fake exchange rather than a network.
 
 const std = @import("std");
+const util_fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
 const ids = @import("ids.zig");
 const profile_mod = @import("profile.zig");
+const json_util = @import("../util/json.zig");
 
 pub const Slug = ids.Slug;
 
@@ -669,22 +671,7 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn writeJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
-    try out.append(allocator, '"');
-    for (text) |byte| switch (byte) {
-        '"' => try out.appendSlice(allocator, "\\\""),
-        '\\' => try out.appendSlice(allocator, "\\\\"),
-        '\n' => try out.appendSlice(allocator, "\\n"),
-        '\r' => try out.appendSlice(allocator, "\\r"),
-        '\t' => try out.appendSlice(allocator, "\\t"),
-        else => {
-            if (byte < 0x20) {
-                const escaped = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{byte});
-                defer allocator.free(escaped);
-                try out.appendSlice(allocator, escaped);
-            } else try out.append(allocator, byte);
-        },
-    };
-    try out.append(allocator, '"');
+    try json_util.serializeString(text, out, allocator);
 }
 
 fn stringOf(value: ?std.json.Value) ?[]const u8 {
@@ -765,7 +752,12 @@ const FakeExchange = struct {
 
 fn tempSession(a: std.mem.Allocator, name: []const u8) !Session {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buffer, "/tmp/metacodes-oauth-{s}.json", .{name});
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buffer, "{s}/cc-zig-oauth-{s}-{d}.json", .{
+        util_fs.testing.tmpRoot(&root_buf),
+        name,
+        @import("platform").process.currentPid(),
+    });
     var cleanup: [std.fs.max_path_bytes]u8 = undefined;
     for ([_][]const u8{ "", ".tmp" }) |suffix| {
         const target = std.fmt.bufPrintZ(&cleanup, "{s}{s}", .{ path, suffix }) catch continue;
@@ -892,6 +884,25 @@ test "rotated tokens are persisted atomically and survive a reload" {
     try testing.expectEqualStrings("refresh-1", reloaded.tokens.?.refresh_token);
     try testing.expectEqualStrings("access-1", reloaded.tokens.?.access_token);
     try testing.expectEqual(@as(i64, 1_000 + 3600), reloaded.tokens.?.expires_at);
+}
+
+test "persisted OAuth JSON repairs malformed UTF-8" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try renderStored(a, &out, .{
+        .access_token = @constCast("access\xe4\x60\x80"),
+        .refresh_token = @constCast("refresh\xff"),
+        .expires_at = 1,
+        .token_type = @constCast("Bearer"),
+        .client_name = @constCast("host\xc0\x80"),
+    }, null);
+    try testing.expect(std.unicode.utf8ValidateSlice(out.items));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("access�`�", parsed.value.object.get("access_token").?.string);
+    try testing.expectEqualStrings("refresh�", parsed.value.object.get("refresh_token").?.string);
+    try testing.expectEqualStrings("host��", parsed.value.object.get("client_name").?.string);
 }
 
 test "Metask gateway metadata survives initial import and rotated refresh" {
@@ -1087,26 +1098,12 @@ test "the lifecycle serves the OAuth kinds and leaves Metask on its own path" {
 
 test "the token store creates every missing parent directory" {
     const a = std.testing.allocator;
-    const root = "/tmp/metacodes-oauth-parents";
-    const path = root ++ "/nested/deeper/openai.json";
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const cleanup = struct {
-        fn run(buf: []u8) void {
-            for ([_][]const u8{
-                root ++ "/nested/deeper/openai.json",
-                root ++ "/nested/deeper/openai.json.tmp",
-            }) |target| {
-                const z = std.fmt.bufPrintZ(buf, "{s}", .{target}) catch continue;
-                pfs.unlinkPath(z) catch {};
-            }
-            for ([_][]const u8{ root ++ "/nested/deeper", root ++ "/nested", root }) |dir| {
-                const z = std.fmt.bufPrintZ(buf, "{s}", .{dir}) catch continue;
-                _ = std.c.rmdir(z.ptr);
-            }
-        }
-    }.run;
-    cleanup(&buffer);
-    defer cleanup(&buffer);
+    var root_buf: [512]u8 = undefined;
+    const root = util_fs.testing.perPidDir(&root_buf, "cc-zig-oauth-parents");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/nested/deeper/openai.json", .{root});
+    util_fs.testing.rmrfBestEffort(root);
+    defer util_fs.testing.rmrfBestEffort(root);
 
     var session = try Session.init(a, Slug.lit("openai"), path);
     defer session.deinit();

@@ -24,7 +24,7 @@
 //! → 在 bash_parser.zig(下一步)
 
 const std = @import("std");
-const pprocess = @import("platform").process;
+const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 
 pub const Spec = union(enum) {
@@ -1017,31 +1017,27 @@ test "matches: Bash with wrapper stripped before match" {
 
 test "matchesMode: symlink deny triggers if target matches (任一)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 用 POSIX symlink() 造真符号链接测拒绝,windows 无此 syscall
-    // 建一个真 symlink: /tmp/cczig_link_<pid> → /tmp/cczig_secret_<pid>
-    const pid = pprocess.currentPid();
-    var secret_buf: [128]u8 = undefined;
-    const secret = try std.fmt.bufPrint(&secret_buf, "/tmp/cczig_secret_{d}.env\x00", .{pid});
-    const secret_path = secret[0 .. secret.len - 1];
-    _ = secret_path;
-    var link_buf: [128]u8 = undefined;
-    const link = try std.fmt.bufPrint(&link_buf, "/tmp/cczig_link_{d}.txt\x00", .{pid});
-    const link_path = link[0 .. link.len - 1];
+    // 建一个真 symlink: <per-pid dir>/link.txt → <per-pid dir>/secret.env
+    var secret_buf: [512]u8 = undefined;
+    const secret = tt.path(&secret_buf, "secret.env");
+    var link_buf: [512]u8 = undefined;
+    const link = tt.path(&link_buf, "link.txt");
+    const link_path: []const u8 = link;
 
     // 创建 secret 文件
-    const fd = pfs.open(@ptrCast(secret.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(secret.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.SkipZigTest;
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(@ptrCast(secret.ptr));
+    defer _ = std.c.unlink(secret.ptr);
     // 创建 symlink link → secret
-    _ = std.c.unlink(@ptrCast(link.ptr));
-    if (std.c.symlink(@ptrCast(secret.ptr), @ptrCast(link.ptr)) != 0) return error.SkipZigTest;
-    defer _ = std.c.unlink(@ptrCast(link.ptr));
+    _ = std.c.unlink(link.ptr);
+    if (std.c.symlink(secret.ptr, link.ptr) != 0) return error.SkipZigTest;
+    defer _ = std.c.unlink(link.ptr);
 
     // deny 规则:Read(secret 的 basename) — 裸文件名 gitignore 语义,匹配任意深度
-    // 用户访问 link(basename=cczig_link_*.txt 不匹配),但 realpath 解析到 secret
-    // (basename=cczig_secret_*.env 匹配)→ deny 任一即触发
-    var name_buf: [64]u8 = undefined;
-    const secret_name = try std.fmt.bufPrint(&name_buf, "cczig_secret_{d}.env", .{pid});
+    // 用户访问 link(basename=link.txt 不匹配),但 realpath 解析到 secret
+    // (basename=secret.env 匹配)→ deny 任一即触发;两者都在 cwd(/tmp)之下的 per-pid 目录里
+    const secret_name = "secret.env";
     var pat_buf: [96]u8 = undefined;
     const pat = try std.fmt.bufPrint(&pat_buf, "Read({s})", .{secret_name}); // cwd anchor 裸文件名
     const r = try parseRule(pat);
@@ -1101,14 +1097,12 @@ test "isInWorkingDirs: cwd 内/外 + additional_dirs + .. 逃逸 + 边界" {
 
 test "isInWorkingDirs: 指向区外的 symlink 不放行(allow 双匹配语义)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const pid = std.c.getpid();
-    // /tmp 里造 dir + 指向 /etc/hosts 的 symlink
-    var dir_buf: [128]u8 = undefined;
-    const dirz = try std.fmt.bufPrint(&dir_buf, "/tmp/cczig_wd_{d}\x00", .{pid});
-    const dir = dirz[0 .. dirz.len - 1];
-    _ = std.c.mkdir(@ptrCast(dirz.ptr), 0o755);
-    defer _ = std.c.rmdir(@ptrCast(dirz.ptr));
-    var link_buf: [160]u8 = undefined;
+    // 每进程唯一目录里造 dir + 指向 /etc/hosts 的 symlink
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-wd");
+    _ = std.c.mkdir(dir.ptr, 0o755);
+    defer _ = std.c.rmdir(dir.ptr);
+    var link_buf: [600]u8 = undefined;
     const linkz = try std.fmt.bufPrint(&link_buf, "{s}/esc.txt\x00", .{dir});
     const link = linkz[0 .. linkz.len - 1];
     _ = std.c.unlink(@ptrCast(linkz.ptr));

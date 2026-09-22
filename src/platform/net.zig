@@ -42,7 +42,12 @@ const sys = struct {
     extern "ws2_32" fn setsockopt(s: SOCKET, level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
     extern "ws2_32" fn getsockname(s: SOCKET, addr: *anyopaque, addrlen: *i32) callconv(.winapi) i32;
     extern "ws2_32" fn WSAPoll(fdArray: [*]WSAPOLLFD, fds: u32, timeout: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: c_long, argp: *c_ulong) callconv(.winapi) i32;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
 };
+
+const FIONBIO: c_long = @bitCast(@as(c_ulong, 0x8004667e));
+const WSAEWOULDBLOCK: i32 = 10035;
 
 /// 中立 socket 句柄。POSIX=fd(c_int),Windows=SOCKET(UINT_PTR)。
 pub const Socket = if (is_windows) SOCKET else c_int;
@@ -170,6 +175,60 @@ pub fn pollReadable(s: Socket, timeout_ms: u32) bool {
         const fds: [*]std.c.pollfd = @ptrCast(&pfd);
         return std.c.poll(fds, 1, @intCast(timeout_ms)) > 0 and (pfd.revents & std.c.POLL.IN) != 0;
     }
+}
+
+/// socket 是否在 timeout_ms 内可写,或已经出错/对端关闭。后两种也返回 true:
+/// 调用方接着 send 会立刻失败,这正是我们要的——否则一个已经死掉的对端要一直
+/// 等到 deadline 才被发现。
+pub fn pollWritable(s: Socket, timeout_ms: u32) bool {
+    if (is_windows) {
+        const POLLWRNORM: i16 = 0x0010; // ws2_32 does not export constants in this std
+        const POLLERR: i16 = 0x0001;
+        const POLLHUP: i16 = 0x0002;
+        var pfd = WSAPOLLFD{ .fd = s, .events = POLLWRNORM, .revents = 0 };
+        const fds: [*]WSAPOLLFD = @ptrCast(&pfd);
+        if (sys.WSAPoll(fds, 1, @intCast(timeout_ms)) <= 0) return false;
+        return (pfd.revents & (POLLWRNORM | POLLERR | POLLHUP)) != 0;
+    } else {
+        var pfd = std.c.pollfd{ .fd = s, .events = std.c.POLL.OUT, .revents = 0 };
+        const fds: [*]std.c.pollfd = @ptrCast(&pfd);
+        if (std.c.poll(fds, 1, @intCast(timeout_ms)) <= 0) return false;
+        return (pfd.revents & (std.c.POLL.OUT | std.c.POLL.ERR | std.c.POLL.HUP)) != 0;
+    }
+}
+
+/// 把 socket 设成非阻塞。可写只保证"有一些空间",而 send 递交的是整段剩余数据:
+/// 空间不够时阻塞式 send 仍会挂住,poll 挡不住。非阻塞 + EAGAIN 重试才让
+/// deadline 真正可执行。
+pub fn setNonblocking(s: Socket, enable: bool) bool {
+    if (is_windows) {
+        var mode: c_ulong = if (enable) 1 else 0;
+        return sys.ioctlsocket(s, FIONBIO, &mode) == 0;
+    }
+    const flags = std.c.fcntl(s, std.c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return false;
+    const nonblock: c_int = @bitCast(@as(u32, 0x0004)); // O_NONBLOCK on Darwin and Linux
+    const updated = if (enable) flags | nonblock else flags & ~nonblock;
+    return std.c.fcntl(s, std.c.F.SETFL, updated) >= 0;
+}
+
+/// send 的结果三分:写了多少、对端还没准备好(重试)、失败。
+pub const SendResult = union(enum) { sent: usize, would_block, failed };
+
+pub fn sendSome(s: Socket, buf: []const u8) SendResult {
+    if (is_windows) {
+        const n = sys.send(s, buf.ptr, @intCast(buf.len), 0);
+        if (n == SOCKET_ERROR) {
+            return if (sys.WSAGetLastError() == WSAEWOULDBLOCK) .would_block else .failed;
+        }
+        return .{ .sent = @intCast(n) };
+    }
+    const n = std.c.write(s, buf.ptr, buf.len);
+    if (n > 0) return .{ .sent = @intCast(n) };
+    if (n == 0) return .failed;
+    const err = std.c._errno().*;
+    if (err == @intFromEnum(std.c.E.AGAIN) or err == @intFromEnum(std.c.E.INTR)) return .would_block;
+    return .failed;
 }
 
 /// 连 127.0.0.1:port。
@@ -399,6 +458,7 @@ test "shutdownSocket wakes a blocked accept before close" {
 test "UDS listen/connect/send/recv roundtrip(POSIX)" {
     if (is_windows) return; // UDS 仅 POSIX(此早退不影响 windows 分析:上面 pub fn 已被 acceptConn 等引用)
     // 唯一 path,避免并发测试撞(pid + 栈地址熵;此 Zig 0.16 无 std.time.nanoTimestamp)。
+    // 刻意留在 /tmp:sun_path 上限 104 字节,macOS $TMPDIR(/var/folders/…)会超;本测试 POSIX-only。
     var pbuf: [64]u8 = undefined;
     const ts: u64 = @as(u64, @intCast(pproc.currentPid())) ^ @intFromPtr(&pbuf);
     const path = try std.fmt.bufPrint(&pbuf, "/tmp/cc-zig-uds-test-{x}.sock", .{ts & 0xffffffff});

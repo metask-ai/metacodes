@@ -13,6 +13,7 @@ const types = @import("../types.zig");
 const conversation_mod = @import("conversation.zig");
 const result_budget = @import("result_budget.zig");
 const json_mod = @import("../json.zig");
+const util_json = @import("../util/json.zig");
 
 pub const SCHEMA = tool_result.PROJECTION_SCHEMA;
 pub const ENVELOPE_PREFIX = tool_result.ENVELOPE_PREFIX;
@@ -563,8 +564,13 @@ fn regrowCommittedEnvelope(
     // committed envelope is exempt from the spill pass, so nothing downstream
     // would trim it back. One chunk per side keeps this to two reads, which
     // each re-verify the artifact's digest.
-    const head_read: usize = @min(target_as_source_bound.raw() * 3 / 4, artifact.MAX_READ_BYTES);
-    const tail_read: usize = @min(target_as_source_bound.raw() -| head_read, artifact.MAX_READ_BYTES);
+    // Each artifact read is capped below, so there is no value in carrying an
+    // unbounded caller-supplied preview through the arithmetic. Clamp before
+    // multiplying; otherwise a `preview_bytes = maxInt(usize)` override could
+    // overflow here even though both eventual reads are only 32 KiB.
+    const source_bound = @min(target_as_source_bound.raw(), artifact.MAX_READ_BYTES * 2);
+    const head_read: usize = @min(source_bound / 4 * 3, artifact.MAX_READ_BYTES);
+    const tail_read: usize = @min(source_bound -| head_read, artifact.MAX_READ_BYTES);
     if (head_read == 0) return false;
     var head = artifact.readChunk(allocator, config.session_root, identity.artifact_id, 0, head_read) catch return false;
     defer head.deinit();
@@ -722,12 +728,10 @@ fn decodePreviewPart(allocator: std.mem.Allocator, value: ?std.json.Value, utf8:
 /// its own key order, every short value verbatim, and only the long strings
 /// cut to a shared water line found by binary search.
 ///
-/// Counters that describe a trimmed string are corrected as they are written.
-/// Both families that have them put the string before its counters
-/// (`stdout` before `stdout_truncated`, `preview_head` before
-/// `preview_head_bytes`), so a single pass in key order is enough - and a
-/// counter that still claimed the original length would be exactly the kind of
-/// quiet lie this whole change is about.
+/// Counters that describe a trimmed string are corrected as the object is
+/// re-emitted.  The source JSON is allowed to use any object key order, so
+/// metadata is collected in a first pass instead of relying on a producer's
+/// canonical ordering (`stdout` before `stdout_truncated`, etc.).
 /// Whether this result is JSON at all - an object, but also a top-level array
 /// or scalar, which tools do return. The generic text truncation is only ever
 /// safe for content that was not structured to begin with: applied to any of
@@ -785,12 +789,12 @@ const TrimLedger = struct {
     original_bytes: ?u64 = null,
     head_shown: ?result_budget.Source = null,
     tail_shown: ?result_budget.Source = null,
-    trimmed_channel: ?[]const u8 = null,
+    trimmed_stdout: bool = false,
+    trimmed_stderr: bool = false,
     /// Whether `preview_head`/`preview_tail` hold base64 rather than the bytes
-    /// themselves. `preview_encoding` precedes both, so a single pass knows in
-    /// time. Two consequences, and the counters are the lesser one: a base64
-    /// field cut into head + marker + tail is not base64 any more and no
-    /// consumer can decode it.
+    /// themselves. Two consequences, and the counters are the lesser one: a
+    /// base64 field cut into head + marker + tail is not base64 any more and
+    /// no consumer can decode it.
     preview_base64: bool = false,
 
     /// `omitted_bytes` is only recomputable once both preview counters are
@@ -828,22 +832,45 @@ fn renderTrimmedObject(
     const writer = &out.writer;
     try writer.writeByte('{');
 
+    // Collect all fields that counters may refer to before writing anything.
+    // ObjectMap preserves insertion order, but input JSON does not promise the
+    // canonical order produced by our own envelopes.
     var ledger = TrimLedger{};
+    var metadata = object.iterator();
+    while (metadata.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (value == .integer and value.integer >= 0 and std.mem.eql(u8, key, "original_bytes"))
+            ledger.original_bytes = @intCast(value.integer);
+        if (value == .string and std.mem.eql(u8, key, "preview_encoding"))
+            ledger.preview_base64 = std.mem.eql(u8, value.string, "base64");
+    }
+    var preview = object.iterator();
+    while (preview.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (value != .string) continue;
+        if (std.mem.eql(u8, key, "preview_head")) {
+            ledger.head_shown = trimmedStringSource(value.string, water, ledger.preview_base64);
+        } else if (std.mem.eql(u8, key, "preview_tail")) {
+            ledger.tail_shown = trimmedStringSource(value.string, water, ledger.preview_base64);
+        } else if (value.string.len > water and std.mem.eql(u8, key, "stdout")) {
+            ledger.trimmed_stdout = true;
+        } else if (value.string.len > water and std.mem.eql(u8, key, "stderr")) {
+            ledger.trimmed_stderr = true;
+        }
+    }
+
     var first = true;
     var it = object.iterator();
     while (it.next()) |entry| {
         if (!first) try writer.writeByte(',');
         first = false;
         const key = entry.key_ptr.*;
-        try std.json.Stringify.encodeJsonString(key, .{}, writer);
+        try util_json.writeJsonString(writer, key);
         try writer.writeByte(':');
 
         const value = entry.value_ptr.*;
-        if (value == .integer and value.integer >= 0 and std.mem.eql(u8, key, "original_bytes"))
-            ledger.original_bytes = @intCast(value.integer);
-        if (value == .string and std.mem.eql(u8, key, "preview_encoding"))
-            ledger.preview_base64 = std.mem.eql(u8, value.string, "base64");
-
         if (value == .string) {
             const is_preview = std.mem.eql(u8, key, "preview_head") or
                 std.mem.eql(u8, key, "preview_tail");
@@ -852,19 +879,11 @@ fn renderTrimmedObject(
             // counter is the *decoded* length - the unit `original_bytes` and
             // `omitted_bytes` are in.
             const base64_field = is_preview and ledger.preview_base64;
-            const kept: result_budget.Source = if (value.string.len > water)
-                try writeTrimmedString(writer, value.string, water, base64_field)
-            else blk: {
-                try std.json.Stringify.encodeJsonString(value.string, .{}, writer);
-                // The unit crossing, made explicit: a base64 field's character
-                // count is Encoded; only its decoded length is Source.
-                break :blk if (base64_field) base64DecodedLen(value.string) else result_budget.Source.of(value.string.len);
-            };
-            if (std.mem.eql(u8, key, "preview_head")) ledger.head_shown = kept;
-            if (std.mem.eql(u8, key, "preview_tail")) ledger.tail_shown = kept;
-            if (value.string.len > water and
-                (std.mem.eql(u8, key, "stdout") or std.mem.eql(u8, key, "stderr")))
-                ledger.trimmed_channel = key;
+            if (value.string.len > water) {
+                _ = try writeTrimmedString(writer, value.string, water, base64_field);
+            } else {
+                try util_json.writeJsonString(writer, value.string);
+            }
             continue;
         }
 
@@ -883,12 +902,11 @@ fn renderTrimmedObject(
                 continue;
             }
         }
-        if (ledger.trimmed_channel) |label| {
-            var key_buffer: [32]u8 = undefined;
-            if (std.mem.eql(u8, key, channelKey(&key_buffer, label, "_truncated"))) {
-                try writer.writeAll("true");
-                continue;
-            }
+        if ((ledger.trimmed_stdout and std.mem.eql(u8, key, "stdout_truncated")) or
+            (ledger.trimmed_stderr and std.mem.eql(u8, key, "stderr_truncated")))
+        {
+            try writer.writeAll("true");
+            continue;
         }
         try writeTrimmedValue(writer, value, water);
     }
@@ -906,7 +924,7 @@ fn writeTrimmedValue(writer: *std.Io.Writer, value: std.json.Value, water: usize
             if (text.len > water) {
                 _ = try writeTrimmedString(writer, text, water, false);
             } else {
-                try std.json.Stringify.encodeJsonString(text, .{}, writer);
+                try util_json.writeJsonString(writer, text);
             }
         },
         .array => |items| {
@@ -924,7 +942,7 @@ fn writeTrimmedValue(writer: *std.Io.Writer, value: std.json.Value, water: usize
             while (it.next()) |entry| {
                 if (!first) try writer.writeByte(',');
                 first = false;
-                try std.json.Stringify.encodeJsonString(entry.key_ptr.*, .{}, writer);
+                try util_json.writeJsonString(writer, entry.key_ptr.*);
                 try writer.writeByte(':');
                 try writeTrimmedValue(writer, entry.value_ptr.*, water);
             }
@@ -946,6 +964,26 @@ fn base64DecodedLen(text: []const u8) result_budget.Source {
     return result_budget.Source.of(std.base64.standard.Decoder.calcSizeForSlice(text) catch text.len / 4 * 3);
 }
 
+/// Return the source-byte count that `writeTrimmedString` will keep without
+/// writing anything.  This lets the counter ledger be computed independently
+/// of object key order.
+fn trimmedStringSource(source: []const u8, water: usize, base64: bool) result_budget.Source {
+    if (source.len <= water)
+        return if (base64) base64DecodedLen(source) else result_budget.Source.of(source.len);
+    if (base64) {
+        const chars = @min(water, source.len) / 4 * 4;
+        return base64DecodedLen(source[0..chars]);
+    }
+    if (water <= PREVIEW_ELISION.len) {
+        return result_budget.Source.of(alignedCut(source, @min(water, source.len)));
+    }
+    const budget = water - PREVIEW_ELISION.len;
+    const head_len = alignedCut(source, budget * 3 / 4);
+    const want_tail = budget -| head_len;
+    const tail_start = source.len - alignedCut(source[head_len..], want_tail);
+    return result_budget.Source.of(head_len + (source.len - tail_start));
+}
+
 /// Write `source` cut to roughly `water` bytes and return how many bytes of the
 /// *original* it still shows.
 ///
@@ -956,12 +994,12 @@ fn base64DecodedLen(text: []const u8) result_budget.Source {
 fn writeTrimmedString(writer: *std.Io.Writer, source: []const u8, water: usize, base64: bool) !result_budget.Source {
     if (base64) {
         const chars = @min(water, source.len) / 4 * 4;
-        try std.json.Stringify.encodeJsonString(source[0..chars], .{}, writer);
+        try util_json.writeJsonString(writer, source[0..chars]);
         return base64DecodedLen(source[0..chars]);
     }
     if (water <= PREVIEW_ELISION.len) {
         const head = alignedCut(source, @min(water, source.len));
-        try std.json.Stringify.encodeJsonString(source[0..head], .{}, writer);
+        try util_json.writeJsonString(writer, source[0..head]);
         return result_budget.Source.of(head);
     }
     const budget = water - PREVIEW_ELISION.len;
@@ -979,11 +1017,7 @@ fn writeTrimmedString(writer: *std.Io.Writer, source: []const u8, water: usize, 
 /// `encodeJsonString` writes its own quotes; a three-part string has to share
 /// one pair, so the body is escaped directly.
 fn writeJsonStringBody(writer: *std.Io.Writer, bytes: []const u8) !void {
-    var scratch: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-    defer scratch.deinit();
-    try std.json.Stringify.encodeJsonString(bytes, .{}, &scratch.writer);
-    const quoted = scratch.written();
-    try writer.writeAll(quoted[1 .. quoted.len - 1]);
+    try util_json.writeJsonStringContents(writer, bytes);
 }
 
 /// Longest prefix of `source` at most `desired` bytes that is safe to cut at:
@@ -1130,9 +1164,9 @@ fn writeArtifactEnvelopeHead(
     capture_complete: bool,
 ) !void {
     try writer.writeAll(ENVELOPE_PREFIX ++ "\"artifact\",\"artifact_id\":");
-    try std.json.Stringify.encodeJsonString(artifact_id, .{}, writer);
+    try util_json.writeJsonString(writer, artifact_id);
     try writer.writeAll(",\"media_type\":");
-    try std.json.Stringify.encodeJsonString(media_type, .{}, writer);
+    try util_json.writeJsonString(writer, media_type);
     try writer.print(",\"original_bytes\":{d},\"sha256\":\"{s}\",\"capture_complete\":{s},\"recoverable\":true", .{
         original_bytes,
         sha256_hex,
@@ -1152,9 +1186,9 @@ fn renderFallbackEnvelope(
     defer out.deinit();
     const writer = &out.writer;
     try writer.writeAll(ENVELOPE_PREFIX ++ "\"fallback\",\"artifact_id\":null,\"media_type\":");
-    try std.json.Stringify.encodeJsonString(media_type, .{}, writer);
+    try util_json.writeJsonString(writer, media_type);
     try writer.print(",\"original_bytes\":{d},\"sha256\":\"{s}\",\"capture_complete\":true,\"recoverable\":false,\"storage_error\":", .{ content.len, digest[0..] });
-    try std.json.Stringify.encodeJsonString(storage_error, .{}, writer);
+    try util_json.writeJsonString(writer, storage_error);
     try appendPreview(writer, content, preview_bytes);
     try writer.writeAll("}");
     return out.toOwnedSlice();
@@ -1195,12 +1229,12 @@ fn appendPreviewParts(
 }
 
 fn appendPreviewPart(writer: *std.Io.Writer, bytes: []const u8, utf8: bool) !void {
-    if (utf8) return std.json.Stringify.encodeJsonString(bytes, .{}, writer);
+    if (utf8) return util_json.writeJsonString(writer, bytes);
     const encoder = std.base64.standard.Encoder;
     const encoded = try std.heap.page_allocator.alloc(u8, encoder.calcSize(bytes.len));
     defer std.heap.page_allocator.free(encoded);
     _ = encoder.encode(encoded, bytes);
-    try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+    try util_json.writeJsonString(writer, encoded);
 }
 
 fn isInlineUtf8(content: []const u8) bool {
@@ -1586,6 +1620,32 @@ test "an oversized capture-time envelope keeps its receipt and grows its preview
     try std.testing.expectEqual(@as(i64, 256 * 1024), after.value.object.get("original_bytes").?.integer);
 }
 
+test "unbounded preview override cannot overflow artifact re-render arithmetic" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const payload = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(payload);
+    @memset(payload, 'Q');
+    var content: []const u8 = try captureTimeEnvelope(allocator, root, payload);
+    defer allocator.free(@constCast(content));
+    var items = [_]Item{.{ .tool_name = "Probe", .content = &content, .is_error = false }};
+
+    // `preview_bytes` is an embedders' override. Even an absurd value must be
+    // clamped before read-size arithmetic rather than wrapping usize.
+    const stats = try project(allocator, &items, .{
+        .session_root = root,
+        .budget = result_budget.Budget.fromModel(200_000),
+        .preview_bytes = std.math.maxInt(usize),
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.envelope_regrown_count);
+    try std.testing.expect(isRecoverableEnvelope(content));
+}
+
 test "raw_bytes bills a Bash envelope by what its channels captured" {
     const allocator = std.testing.allocator;
     var content: []const u8 = try allocator.dupe(
@@ -1969,6 +2029,27 @@ test "a structured result keeps its short fields and stays parseable when trimme
     try std.testing.expect(obj.get("stdout_truncated").?.bool);
 }
 
+test "structured trimming marks both output channels when both are cut" {
+    const allocator = std.testing.allocator;
+    const filler = try allocator.alloc(u8, 32 * 1024);
+    defer allocator.free(filler);
+    @memset(filler, 'x');
+    const content = try std.fmt.allocPrint(
+        allocator,
+        "{{\"stdout\":\"{s}\",\"stdout_truncated\":false,\"stderr\":\"{s}\",\"stderr_truncated\":false,\"exit_code\":0}}",
+        .{ filler, filler },
+    );
+    defer allocator.free(content);
+
+    const shrunk = shrinkStructuredResult(allocator, content, content.len / 3) orelse
+        return error.ShrinkRefused;
+    defer allocator.free(shrunk);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
+    try std.testing.expect(parsed.value.object.get("stderr_truncated").?.bool);
+}
+
 test "trimming a fallback envelope corrects the counters it invalidates" {
     // A non-recoverable fallback envelope has no artifact to re-render from,
     // so it goes through the generic string trim - and its preview counters
@@ -2135,6 +2216,43 @@ test "a trimmed base64 preview is still decodable, and its counter is decoded by
         object.get("original_bytes").?.integer,
         shown + object.get("omitted_bytes").?.integer,
     );
+}
+
+test "structured counter repair does not depend on JSON key order" {
+    const allocator = std.testing.allocator;
+    const binary = try allocator.alloc(u8, 30 * 1024);
+    defer allocator.free(binary);
+    @memset(binary, 0x01);
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try allocator.alloc(u8, encoder.calcSize(binary.len));
+    defer allocator.free(encoded);
+    _ = encoder.encode(encoded, binary);
+
+    // Deliberately put the encoding and counters after the preview values,
+    // unlike our canonical envelope writer.  A consumer may legally reorder
+    // object keys before handing the result back to the projection valve.
+    const content = try std.fmt.allocPrint(
+        allocator,
+        "{{\"preview_head\":\"{s}\",\"preview_head_bytes\":999999,\"omitted_bytes\":0,\"preview_encoding\":\"base64\",\"preview_tail\":\"{s}\",\"preview_tail_bytes\":999999,\"original_bytes\":{d}}}",
+        .{ encoded, encoded, binary.len },
+    );
+    defer allocator.free(content);
+
+    const shrunk = shrinkStructuredResult(allocator, content, content.len / 3) orelse
+        return error.ShrinkRefused;
+    defer allocator.free(shrunk);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, shrunk, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const head = object.get("preview_head").?.string;
+    const tail = object.get("preview_tail").?.string;
+    try std.testing.expectEqualStrings("base64", object.get("preview_encoding").?.string);
+    _ = try std.base64.standard.Decoder.calcSizeForSlice(head);
+    _ = try std.base64.standard.Decoder.calcSizeForSlice(tail);
+    const head_bytes = object.get("preview_head_bytes").?.integer;
+    const tail_bytes = object.get("preview_tail_bytes").?.integer;
+    const omitted = object.get("omitted_bytes").?.integer;
+    try std.testing.expectEqual(object.get("original_bytes").?.integer, head_bytes + tail_bytes + omitted);
 }
 
 test "a top-level array is structured too, and is trimmed rather than mangled" {

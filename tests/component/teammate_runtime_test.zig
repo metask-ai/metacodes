@@ -34,13 +34,14 @@ fn sleepMs(ms: u32) void {
 
 /// 建隔离 HOME + team 目录 + config.json(lead 成员为空 roster)。返回 home(owned by buf)。
 fn setupTeam(a: std.mem.Allocator, home_buf: []u8) ![]const u8 {
-    const home = try std.fmt.bufPrint(home_buf, "/tmp/cc-zig-teammate-l2-{d}", .{cc.util_time.nowNs()});
+    const home = cc.util_fs.testing.uniqueDir(home_buf, "cc-zig-teammate-l2");
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
     try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
     var tf = team.TeamFile{
         .allocator = a,
         .name = try a.dupe(u8, "proj"),
         .lead_agent_id = try a.dupe(u8, "team-lead@proj"),
+        .lead_session_id = try a.dupe(u8, cc.session_id.SessionId.single.asSlice()),
         .created_at_ms = 1,
     };
     defer tf.deinit();
@@ -81,7 +82,7 @@ test "L2 teammate 全链: spawn→idle→消息续跑→shutdown 优雅退出" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     const home = try setupTeam(a, &home_buf);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
@@ -126,7 +127,7 @@ test "L2 teammate 全链: spawn→idle→消息续跑→shutdown 优雅退出" {
     // C: 投 plain 消息 → 第二轮跑 → 第二条 idle notification + 输出含 TURN2 + 消息标已读。
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
     const bob_inbox = team.inboxPath(home, "proj", "bob", &inbox_buf);
-    try mailbox.deliver(a, bob_inbox, "team-lead", "continue with step 2", null, null);
+    try mailbox.deliverWithIdentity(a, bob_inbox, "team-lead", "continue with step 2", null, null, entry.session.asSlice(), entry.session.asSlice());
     try waitIdleCount(a, home, 2, 5000);
     {
         entry.lockPublic();
@@ -139,7 +140,7 @@ test "L2 teammate 全链: spawn→idle→消息续跑→shutdown 优雅退出" {
     }
 
     // D: shutdown_request → 线程优雅退出。
-    try mailbox.deliver(a, bob_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r1\"}", null, null);
+    try mailbox.deliverWithIdentity(a, bob_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r1\"}", null, null, entry.session.asSlice(), entry.session.asSlice());
     var waited: u32 = 0;
     while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
@@ -163,7 +164,7 @@ test "L2 teammate deinit: idle-wait 中 abort 打断,join 不挂" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     const home = try setupTeam(a, &home_buf);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
@@ -196,7 +197,7 @@ test "L2 teammate 失败必达 lead: 401 快速失败 → idleReason=failed + fa
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     const home = try setupTeam(a, &home_buf);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
@@ -253,7 +254,7 @@ test "L2 teammate 软截断不洗白: max_turns → needs_continuation + stopRea
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     const home = try setupTeam(a, &home_buf);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
@@ -300,7 +301,7 @@ test "L2 teammate 协议消息不吞: task_assignment 留未读,teammate 保持 
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     const home = try setupTeam(a, &home_buf);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
@@ -330,7 +331,7 @@ test "L2 teammate 协议消息不吞: task_assignment 留未读,teammate 保持 
         try std.testing.expectEqual(@as(usize, 1), unread.items.items.len); // 留给 SW3 消费者
     }
     // shutdown:只标读 shutdown,task_assignment 仍未读。
-    try mailbox.deliver(a, hal_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r9\"}", null, null);
+    try mailbox.deliverWithIdentity(a, hal_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r9\"}", null, null, entry.session.asSlice(), entry.session.asSlice());
     var waited: u32 = 0;
     while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
@@ -356,7 +357,7 @@ test "L2 teammate MAX_TEAMMATES 上限强制执行 + working 期 is_active=true"
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     const home = try setupTeam(a, &home_buf);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
@@ -419,7 +420,7 @@ test "L2 teammate 重名拒绝 + 上限存在" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     const home = try setupTeam(a, &home_buf);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 

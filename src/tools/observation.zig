@@ -25,6 +25,7 @@ pub const RULE_FILTER_SCHEMA_VERSION = "metacodes-project-rule-filter-v1";
 pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-gap-v1";
 pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-overflow-v1";
 pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v3";
+pub const DELIVERY_CADENCE_SCHEMA_VERSION = "metacodes-delivery-cadence-v1";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
 pub const TEST_WEAKENING_SCHEMA_VERSION = "metacodes-test-weakening-candidate-v1";
 
@@ -226,6 +227,26 @@ pub const Event = union(enum) {
         mutations_occurred: bool,
         nudges: u8,
         max_nudges: u8,
+    },
+    /// Terminal record of the delivery-cadence obligation (exploration that
+    /// never turned into a deliverable). Emitted exactly once per run when
+    /// the gate was armed: how many exploration-only tool calls ran before
+    /// the first file mutation (or in total when none happened), whether a
+    /// mutation ever happened, how many cadence thresholds were crossed and
+    /// how many bounded nudges were actually injected. Observe mode reports
+    /// the same counters with `enforced=false` and `nudges=0`, so control
+    /// arms measure the identical crossings.
+    delivery_cadence: struct {
+        schema_version: []const u8 = DELIVERY_CADENCE_SCHEMA_VERSION,
+        /// Treatment-actuation witness: true when nudges could be injected.
+        enforced: bool,
+        exploration_calls: u32,
+        mutations_occurred: bool,
+        levels_reached: u8,
+        nudges: u8,
+        max_nudges: u8,
+        first_threshold: u32,
+        second_threshold: u32,
     },
     verification_final_gate: struct {
         schema_version: []const u8 = VERIFICATION_FINAL_GATE_SCHEMA_VERSION,

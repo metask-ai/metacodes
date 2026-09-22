@@ -114,15 +114,9 @@ const ChannelPreview = struct {
 /// 切点回退到不超过上限的最近 UTF-8 字符边界 + 最近换行(不切坏多字节/半行)。
 /// 返回 owned slice(调用方 free);未超限时返回原文 dupe。
 fn truncateHead(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    if (s.len <= MAX_OUTPUT_BYTES) return try allocator.dupe(u8, s);
+    const cut = truncateHeadSourceBytes(s);
+    if (cut == s.len) return try allocator.dupe(u8, s);
 
-    // 1. 先定到 MAX_OUTPUT_BYTES,回退到 UTF-8 字符边界(continuation byte 0b10xxxxxx)。
-    var cut = MAX_OUTPUT_BYTES;
-    while (cut > 0 and (s[cut] & 0b1100_0000) == 0b1000_0000) : (cut -= 1) {}
-    // 2. 再回退到最近换行(让截断落在行边界,输出更整齐);若该行很长找不到则就用 cut。
-    if (std.mem.lastIndexOfScalar(u8, s[0..cut], '\n')) |nl| {
-        if (nl + 1 >= MAX_OUTPUT_BYTES / 2) cut = nl + 1; // 仅当不会砍掉过多时才退到换行
-    }
     // 统计被砍掉的行数(剩余部分的 \n 数 + 1 行尾)。
     var dropped_lines: usize = 0;
     for (s[cut..]) |c| {
@@ -135,6 +129,21 @@ fn truncateHead(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     try out.writer.writeAll(s[0..cut]);
     try out.writer.print("\n... [{d} lines truncated] ...\n", .{dropped_lines});
     return try out.toOwnedSlice();
+}
+
+/// Number of source bytes represented by the visible head. The formatted
+/// preview also contains an omission marker, so its length is not a safe
+/// cursor for BashOutput to resume from.
+fn truncateHeadSourceBytes(s: []const u8) usize {
+    if (s.len <= MAX_OUTPUT_BYTES) return s.len;
+    // 1. 先定到 MAX_OUTPUT_BYTES,回退到 UTF-8 字符边界(continuation byte 0b10xxxxxx)。
+    var cut = MAX_OUTPUT_BYTES;
+    while (cut > 0 and (s[cut] & 0b1100_0000) == 0b1000_0000) : (cut -= 1) {}
+    // 2. 再回退到最近换行(让截断落在行边界,输出更整齐);若该行很长找不到则就用 cut。
+    if (std.mem.lastIndexOfScalar(u8, s[0..cut], '\n')) |nl| {
+        if (nl + 1 >= MAX_OUTPUT_BYTES / 2) cut = nl + 1; // 仅当不会砍掉过多时才退到换行
+    }
+    return cut;
 }
 
 fn sha256Hex(bytes: []const u8) [64]u8 {
@@ -316,14 +325,14 @@ fn appendChannel(
     }
     try writer.print("\"{s}\":", .{label});
     if (!preview_base64) {
-        try std.json.Stringify.encodeJsonString(preview, .{}, writer);
+        try util_json.writeJsonString(writer, preview);
         try writer.print(",\"{s}_encoding\":\"utf-8\"", .{label});
     } else {
         const encoder = std.base64.standard.Encoder;
         const encoded = try allocator.alloc(u8, encoder.calcSize(preview.len));
         defer allocator.free(encoded);
         _ = encoder.encode(encoded, preview);
-        try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+        try util_json.writeJsonString(writer, encoded);
         try writer.print(",\"{s}_encoding\":\"base64\"", .{label});
     }
     try writer.print(",\"{s}_captured_bytes\":{d},\"{s}_original_bytes\":", .{ label, captured_bytes, label });
@@ -342,9 +351,9 @@ fn appendChannel(
         label,
     });
     if (stored) |receipt| {
-        try std.json.Stringify.encodeJsonString(receipt.id(), .{}, writer);
+        try util_json.writeJsonString(writer, receipt.id());
         try writer.print(",\"{s}_recoverable\":true,\"{s}_read\":{{\"tool\":\"ReadArtifact\",\"artifact_id\":", .{ label, label });
-        try std.json.Stringify.encodeJsonString(receipt.id(), .{}, writer);
+        try util_json.writeJsonString(writer, receipt.id());
         try writer.writeAll(",\"offset\":0,\"limit_max\":32768}");
     } else {
         try writer.writeAll("null");
@@ -356,7 +365,7 @@ fn appendChannel(
     // from the same mapper, so the two families cannot drift.
     if (storage_error) |code| {
         try writer.print(",\"{s}_storage_error\":", .{label});
-        try std.json.Stringify.encodeJsonString(code, .{}, writer);
+        try util_json.writeJsonString(writer, code);
     }
 }
 
@@ -657,11 +666,16 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
                 // 后台:profile 文件不能删(进程还在跑),detach
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-                const j = try registry.spawnBackground(command, cwd_opt);
+                const j = try registry.spawnBackgroundOwned(command, cwd_opt, ctx.session);
                 // Same rule as the auto-backgrounded snapshot: the spool is a
                 // staging path and never model-visible. BashOutput polls by
                 // job_id and reads incrementally.
-                return try std.fmt.allocPrint(allocator, "{{\"job_id\":\"{s}\",\"status\":\"started\"}}", .{j.id[0..]});
+                var started: std.Io.Writer.Allocating = .init(allocator);
+                errdefer started.deinit();
+                try started.writer.writeAll("{\"job_id\":");
+                try util_json.writeJsonString(&started.writer, j.id[0..]);
+                try started.writer.writeAll(",\"status\":\"started\"}");
+                return try started.toOwnedSlice();
             }
         }
     }
@@ -700,6 +714,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.result_budget,
             ctx.tool_result_metrics,
             attachments,
+            ctx.session,
         );
     }
 
@@ -723,6 +738,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.result_budget,
             ctx.tool_result_metrics,
             attachments,
+            ctx.session,
         );
     }
 
@@ -770,11 +786,12 @@ fn runAutoBackgroundable(
     budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
     attachments: *tool_result.SealedHandles,
+    owner: @import("../core/session_id.zig").SessionId,
 ) ![]u8 {
     // Spooled as private to this call. Every exit below either renders the
     // output and releases the files, or hands the job id to the model and
     // promotes the job so its spool survives for `BashOutput` (issue #37).
-    const j_entry = try registry.spawnSynchronous(command, cwd);
+    const j_entry = try registry.spawnSynchronousOwned(command, cwd, owner);
     const job_id = j_entry.id; // 值拷贝，不持指针（registry 可能扩容移动）
 
     const effective_budget = if (allow_auto_background) @min(timeout_ms, AUTO_BACKGROUND_MS) else timeout_ms;
@@ -809,7 +826,7 @@ fn runAutoBackgroundable(
             // 此刻 job id 进入模型可见结果，BashOutput 随后任何一轮都可能凭它来读
             // → 转为 background 保留期。
             registry.promoteToBackground(job_id[0..]);
-            return try formatAutoBackgrounded(allocator, &j);
+            return try formatAutoBackgroundedAndRemember(allocator, &j, registry);
         }
     }
 }
@@ -819,6 +836,14 @@ fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_re
 }
 
 fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
+    return formatAutoBackgroundedAndRemember(allocator, j, null);
+}
+
+fn formatAutoBackgroundedAndRemember(
+    allocator: std.mem.Allocator,
+    j: *const @import("../core/job_registry.zig").JobEntry,
+    registry: ?*@import("../core/job_registry.zig").JobRegistry,
+) ![]u8 {
     const out_bytes = readWholeFile(j.stdout_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
     defer allocator.free(out_bytes);
     const err_bytes = readWholeFile(j.stderr_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
@@ -829,6 +854,15 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
     const err_trunc = try truncateHead(allocator, err_bytes);
     defer allocator.free(err_trunc);
 
+    // The auto-background result already exposed these head bytes. Remember
+    // exactly the shown prefix so the first BashOutput call starts after it;
+    // truncateHead's length is the authority, never the full spool size.
+    if (registry) |r| r.updateReadCursors(
+        j.idSlice(),
+        truncateHeadSourceBytes(out_bytes),
+        truncateHeadSourceBytes(err_bytes),
+    );
+
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     // No staging path here either. `job_id` is the stable handle - it is what
@@ -837,12 +871,12 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
     // made the same command serialize differently on every run, which is the
     // prompt-cache contract's "random ids" and "staging paths" clauses at once.
     try aw.writer.writeAll("{\"auto_backgrounded\":true,\"job_id\":");
-    try std.json.Stringify.encodeJsonString(j.id[0..], .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, j.id[0..]);
     try aw.writer.writeAll(",\"partial_stdout\":");
-    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, out_trunc);
     try aw.writer.writeAll(",\"partial_stderr\":");
-    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. Poll it with BashOutput using this job_id; stdout_since_byte/stderr_since_byte read incrementally so a long job does not re-send what you already have.\"}");
+    try util_json.writeJsonString(&aw.writer, err_trunc);
+    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. You will be notified automatically when it exits; do not poll or sleep-wait. Use BashOutput with this job_id to read its output (it waits for new lines if the job is still running).\"}");
     return try aw.toOwnedSlice();
 }
 

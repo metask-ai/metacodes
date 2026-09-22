@@ -703,6 +703,7 @@ thread, the network and `App` live in the host and the worker.
 | `src/repl/picker_host.zig` | commit + rebind against the session |
 | `src/api/auth_header.zig` | transport-side auth materialization |
 | `src/util/json_merge.zig` | order-preserving JSON object merge |
+| `src/util/json.zig` | canonical JSON string escaping and UTF-8 repair |
 
 `zig build test:provider` compiles the subsystem from a narrow root, proving it
 builds standalone. It does **not** enforce the import boundary — that root sits
@@ -711,7 +712,7 @@ compiles cleanly.
 
 `zig build subsystem:boundary` enforces the rule where the rule lives, in the
 source: every `@import` in `src/provider/**` must resolve inside the subsystem,
-to one of six named leaf files, or to `std`/`builtin`/`platform`; the picker's
+to one of seven named leaf files, or to `std`/`builtin`/`platform`; the picker's
 two files may reach the provider kernel and the terminal theme and nothing else.
 Imports are resolved against the importing file, so `../ids.zig` from a profile
 and `ids.zig` from the kernel are checked as the one path they name — and the

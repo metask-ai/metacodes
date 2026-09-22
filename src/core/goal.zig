@@ -9,6 +9,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const session_id = @import("session_id.zig");
 const time = @import("../util/time.zig");
+const util_json = @import("../util/json.zig");
 
 pub const Status = enum {
     active,
@@ -186,9 +187,9 @@ fn serializeGoal(allocator: std.mem.Allocator, goal: Goal) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"id\":");
-    try std.json.Stringify.encodeJsonString(goal.id[0..], .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, goal.id[0..]);
     try aw.writer.writeAll(",\"objective\":");
-    try std.json.Stringify.encodeJsonString(goal.objective, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, goal.objective);
     try aw.writer.print(",\"status\":\"{s}\"", .{@tagName(goal.status)});
     if (goal.token_budget) |b| {
         try aw.writer.print(",\"token_budget\":{d}", .{b});

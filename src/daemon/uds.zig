@@ -20,6 +20,7 @@ const net = @import("platform").net;
 const log = @import("../util/log.zig");
 const time = @import("../util/time.zig");
 const server_mod = @import("../web/server.zig");
+const json_util = @import("../util/json.zig");
 const SessionView = server_mod.SessionView;
 
 pub const Deps = struct {
@@ -186,10 +187,14 @@ pub const UdsServer = struct {
                 return false;
             };
             // 回显先于入队(附着的 attach 立刻见已提交消息)。inbox.push 内部 dupe,text(arena)传入即可。
-            const echo = std.json.Stringify.valueAlloc(self.allocator, .{ .user_message = text }, .{}) catch null;
-            if (echo) |e| {
-                defer self.allocator.free(e);
-                sv.journal.append(e);
+            const raw_echo = std.json.Stringify.valueAlloc(self.allocator, .{ .user_message = text }, .{}) catch null;
+            if (raw_echo) |raw| {
+                defer self.allocator.free(raw);
+                const echo = json_util.repairJsonUtf8(self.allocator, raw) catch null;
+                if (echo) |e| {
+                    defer self.allocator.free(e);
+                    sv.journal.append(e);
+                }
             }
             if (!sv.inbox.push(text)) {
                 _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"queue push failed\"}");

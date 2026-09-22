@@ -21,11 +21,42 @@ const READ_TOOL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+/// Per-process fixture root `<tmp>/<tag>-<pid>` (util/fs.zig testing.tmpRoot decides the
+/// platform root). A fixed `/tmp/...` literal is shared by all parallel shards and, on
+/// Windows, is resolved by the CRT against the process's current drive; neither is a
+/// property this test should depend on.
+fn fixtureRoot(buf: []u8, tag: []const u8) [:0]const u8 {
+    return cc.util_fs.testing.perPidDir(buf, tag);
+}
+
+fn mkdirOrExisting(path: [*:0]const u8) !void {
+    if (std.c.mkdir(path, 0o755) == 0) return;
+    if (pfs.exists(path)) return;
+    return fixtureFailure("mkdir", path);
+}
+
+/// Every fixture I/O failure fails the test with the CRT's view of it. The historical
+/// helper discarded mkdir/open/write results, so a missing directory surfaced later as
+/// `error.SkillUnavailable` from `registerModelTool` (no skill discovered) and looked
+/// like a Skill Runtime bug.
+fn fixtureFailure(op: []const u8, path: [*:0]const u8) error{FixtureIoFailed} {
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd: []const u8 = if (std.c.getcwd(&cwd_buf, cwd_buf.len)) |raw|
+        std.mem.span(@as([*:0]const u8, @ptrCast(raw)))
+    else
+        "?";
+    std.debug.print(
+        "skill_fork fixture: {s} failed path={s} errno={d} cwd={s}\n",
+        .{ op, path, std.c._errno().*, cwd },
+    );
+    return error.FixtureIoFailed;
+}
+
 fn makeSkill(root: []const u8, name: []const u8, definition: []const u8) !void {
     const allocator = std.testing.allocator;
     const root_z = try allocator.dupeZ(u8, root);
     defer allocator.free(root_z);
-    _ = std.c.mkdir(root_z, 0o755);
+    try mkdirOrExisting(root_z);
     const skill_dir = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/{s}",
@@ -33,7 +64,7 @@ fn makeSkill(root: []const u8, name: []const u8, definition: []const u8) !void {
         0,
     );
     defer allocator.free(skill_dir);
-    _ = std.c.mkdir(skill_dir, 0o755);
+    try mkdirOrExisting(skill_dir);
     const path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/{s}/SKILL.md",
@@ -46,8 +77,10 @@ fn makeSkill(root: []const u8, name: []const u8, definition: []const u8) !void {
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
         0o644,
     );
-    _ = pfs.write(fd, definition);
-    pfs.close(fd);
+    if (fd < 0) return fixtureFailure("open", path);
+    defer pfs.close(fd);
+    const n = pfs.write(fd, definition);
+    if (n < 0 or @as(usize, @intCast(n)) != definition.len) return fixtureFailure("write", path);
 }
 
 fn cleanup(root: []const u8, name: []const u8) void {
@@ -161,7 +194,8 @@ const Fixture = struct {
 
 test "L2: shared Runtime fork sends rendered body to child" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-fork-body";
+    var root_buf: [512]u8 = undefined;
+    const root = fixtureRoot(&root_buf, "cc-zig-skill-fork-body");
     defer cleanup(root, "forky");
     try makeSkill(
         root,
@@ -210,7 +244,8 @@ test "L2: shared Runtime fork sends rendered body to child" {
 
 test "L2: shared Runtime inline does not spawn child" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-inline";
+    var root_buf: [512]u8 = undefined;
+    const root = fixtureRoot(&root_buf, "cc-zig-skill-inline");
     defer cleanup(root, "inliney");
     try makeSkill(
         root,
@@ -252,7 +287,8 @@ test "L2: shared Runtime inline does not spawn child" {
 
 test "L2: shared Runtime fork honors model override" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-fork-model";
+    var root_buf: [512]u8 = undefined;
+    const root = fixtureRoot(&root_buf, "cc-zig-skill-fork-model");
     defer cleanup(root, "haikufork");
     try makeSkill(
         root,
@@ -298,7 +334,8 @@ test "L2: shared Runtime fork honors model override" {
 
 test "L2: unsupported agent binding fails before child execution" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-agent-unavailable";
+    var root_buf: [512]u8 = undefined;
+    const root = fixtureRoot(&root_buf, "cc-zig-skill-agent-unavailable");
     defer cleanup(root, "agentfork");
     try makeSkill(
         root,
@@ -318,7 +355,8 @@ test "L2: unsupported agent binding fails before child execution" {
 
 test "L2: fork without child runner fails closed and never falls back inline" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-skill-fork-unavailable";
+    var root_buf: [512]u8 = undefined;
+    const root = fixtureRoot(&root_buf, "cc-zig-skill-fork-unavailable");
     defer cleanup(root, "nofork");
     try makeSkill(
         root,

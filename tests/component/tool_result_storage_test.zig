@@ -736,6 +736,7 @@ test "L2 BashOutput paging schema fields drive bounded registry dispatch" {
         "stderr",
         "stdout_since_byte",
         "stderr_since_byte",
+        "wait_ms",
         "max_bytes",
     };
     for (expected) |name| {

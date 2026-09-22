@@ -39,6 +39,12 @@ metacodes-core 是一个**无 UI、无 CLI** 的 LLM 编码-agent 引擎。它�
    全部是**接口 struct**(`{ctx: *anyopaque, fn}` + method),不是裸函数指针对——接错配对编译失败,
    不会运行时 UAF。
 
+Lean 治理 kernel 是这个边界的固定外部裁决面：发布时放在 `bin/` 旁的
+`libexec/metacodes/`，运行时先看环境变量路径与摘要配对，再看相邻文件及编译进二进制的摘要；
+`metacodes doctor` 会同时报告 formal kernel 与 project kernel 的路径、摘要和 provenance，两者的
+provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest + build receipt 走
+`formal/provenance.zig`，project v6 manifest 走 `formal/project_provenance.zig`），拿错 loader 即 `provenance=false`。
+
 ---
 
 ## 2. 模块地图与依赖方向
@@ -531,6 +537,12 @@ storage_error、各种 id 与 flag)从来不是超限的原因,却是结果可�
 `run_in_background` 三条路径都不再交出 `stdout_path`/`stderr_path`,统一改用 `job_id`
 (BashOutput 本来就按它读,还支持 `*_since_byte` 增量),能力不减。
 
+**bytes/text 边界**:外部进程和文档内容先按 raw bytes 捕获。只有经过明确
+编码策略并验证的内容才进入文本字段；文本页按 UTF-8 code-point 边界截断，
+`TaskOutput.output_next_offset` 是原始缓冲的下一字节游标，不能用替换、JSON
+转义或 base64 后的长度代替。二进制必须通过 artifact 或显式编码 envelope
+传递；JSON、XML-like notification、Markdown 和 terminal 各自负责 escaping。
+
 **已登记的缺口(别当成已解决)**:`job_id` 自身由随机字节生成,按 contract 的定义它就是
 random id,所以后台命令跨 run 仍不逐字节一致。它不能简单换成序号——同一个值同时用作
 `/tmp/metacodes-jobs/<uid>/<id>.out` 的文件名,而该目录跨进程共享,序号会撞。真正修法是把
@@ -584,9 +596,11 @@ JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次�
 path + 随机 id,两条都踩)。恢复面只有内容寻址的 `<channel>_artifact_id`(配 `Grep(artifact_id)`
 就地搜索);捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时就是**真的不可恢复**,由
 `<channel>_storage_error` 如实命名原因,而不是靠一条违约的句柄把它装成可恢复。后台作业则用
-稳定的 `job_id` + `BashOutput`(`*_next_offset` 是续读游标)。MCP stdio、AgentCore MCP
+稳定的 `job_id` + `BashOutput`(`*_next_offset` 是续读游标;无新请求字节时默认等待 30 秒直到新输出或退出,`wait_ms=0` 为快照)。MCP stdio、AgentCore MCP
 connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt/`ReadArtifact`
 恢复面。
+
+后台作业退出通过 core 的第二输入通道送回会话：通知是 metadata-only 的 user 消息（只含 job id、状态、退出码、耗时和各通道未读字节，避免把任意进程输出从 tool_result 提升成 user-role 提示注入），按 owner 隔离且每个退出最多通知一次。它在 turn boundary 投递，也会在自然 end_turn 时按 `job_wait` 等待并继续运行；`job_wait.max_wakeups` 默认 20，`timeout_ms` 默认 null（headless 设为 30 分钟），`poll_slice_ms` 默认 200，`pending_input` 探针、abort、超时和 wakeup cap 都会结束等待而把事件留给下一轮边界。
 
 真实 rollout 的非敏感证据用 `scripts/eval/tool_result_projection_eval.py <cassette>
 --headless-result <result.ndjson> --time-file <time.txt>` 导出；报告只含尺寸、hash、usage、

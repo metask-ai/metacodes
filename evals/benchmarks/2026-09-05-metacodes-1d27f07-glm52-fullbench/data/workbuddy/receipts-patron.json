@@ -1,0 +1,474 @@
+{
+ "metacodes-glm52-code-dev-full1": {
+  "launches": [
+   "launch-20260904t1908z.json",
+   "launch-20260905t0312z.json",
+   "launch-20260905t0319z.json"
+  ],
+  "journals": [
+   "budget-20260904t1908z.json",
+   "budget-20260905t0312z.json",
+   "budget-20260905t0319z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260904t1908z.json",
+    "run_id": "wb-metacodes-glm52-code-dev-full1-20260904t1908z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 24.0,
+    "elapsed_s": 20.445545321,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t0312z.json",
+    "run_id": "wb-metacodes-glm52-code-dev-full1-20260905t0312z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 24.0,
+    "elapsed_s": 21.032143216,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t0319z.json",
+    "run_id": "wb-metacodes-glm52-code-dev-full1-20260905t0319z",
+    "state": "committed",
+    "schema": "metacodes-workbuddy-paid-receipt-v2",
+    "quality_evidence": false,
+    "failure_stage": null,
+    "actual_cost_usd": 9.226765,
+    "actual_metered_tokens": 14122027,
+    "max_cost_usd": 24.0,
+    "elapsed_s": 1925.6498975,
+    "returncode": null,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0319z.json",
+  "run_id": "wb-metacodes-glm52-code-dev-full1-20260905t0319z",
+  "state": "committed",
+  "schema": "metacodes-workbuddy-paid-receipt-v2",
+  "quality_evidence": false,
+  "failure_stage": null,
+  "actual_cost_usd": 9.226765,
+  "actual_metered_tokens": 14122027,
+  "max_cost_usd": 24.0,
+  "elapsed_s": 1925.6498975,
+  "returncode": null,
+  "task_count": 0
+ },
+ "metacodes-glm52-code-proma-full1": {
+  "launches": [
+   "launch-20260905t0313z.json",
+   "launch-20260905t0457z.json"
+  ],
+  "journals": [
+   "budget-20260905t0313z.json",
+   "budget-20260905t0457z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0313z.json",
+    "run_id": "wb-metacodes-glm52-code-proma-full1-20260905t0313z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 12.0,
+    "elapsed_s": 19.386103252,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t0457z.json",
+    "run_id": "wb-metacodes-glm52-code-proma-full1-20260905t0457z",
+    "state": "committed",
+    "schema": "metacodes-workbuddy-paid-receipt-v2",
+    "quality_evidence": false,
+    "failure_stage": null,
+    "actual_cost_usd": 4.805503,
+    "actual_metered_tokens": 5690050,
+    "max_cost_usd": 12.0,
+    "elapsed_s": 1306.704916305,
+    "returncode": null,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0457z.json",
+  "run_id": "wb-metacodes-glm52-code-proma-full1-20260905t0457z",
+  "state": "committed",
+  "schema": "metacodes-workbuddy-paid-receipt-v2",
+  "quality_evidence": false,
+  "failure_stage": null,
+  "actual_cost_usd": 4.805503,
+  "actual_metered_tokens": 5690050,
+  "max_cost_usd": 12.0,
+  "elapsed_s": 1306.704916305,
+  "returncode": null,
+  "task_count": 0
+ },
+ "metacodes-glm52-code-promb-full1": {
+  "launches": [
+   "launch-20260905t0313z.json",
+   "launch-20260905t0519z.json"
+  ],
+  "journals": [
+   "budget-20260905t0313z.json",
+   "budget-20260905t0519z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0313z.json",
+    "run_id": "wb-metacodes-glm52-code-promb-full1-20260905t0313z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 12.0,
+    "elapsed_s": 19.241384671,
+    "returncode": 1,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0313z.json",
+  "run_id": "wb-metacodes-glm52-code-promb-full1-20260905t0313z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "runner_nonzero",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 12.0,
+  "elapsed_s": 19.241384671,
+  "returncode": 1,
+  "task_count": 0
+ },
+ "metacodes-glm52-code-sealed-full1": {
+  "launches": [
+   "launch-20260905t0314z.json",
+   "launch-20260905t0549z.json"
+  ],
+  "journals": [
+   "budget-20260905t0314z.json",
+   "budget-20260905t0549z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0314z.json",
+    "run_id": "wb-metacodes-glm52-code-sealed-full1-20260905t0314z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 72.0,
+    "elapsed_s": 19.678492902,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t0549z.json",
+    "run_id": "wb-metacodes-glm52-code-sealed-full1-20260905t0549z",
+    "state": "committed",
+    "schema": "metacodes-workbuddy-paid-receipt-v2",
+    "quality_evidence": false,
+    "failure_stage": null,
+    "actual_cost_usd": 37.108704,
+    "actual_metered_tokens": 63830471,
+    "max_cost_usd": 192.0,
+    "elapsed_s": 6735.025889081,
+    "returncode": null,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0549z.json",
+  "run_id": "wb-metacodes-glm52-code-sealed-full1-20260905t0549z",
+  "state": "committed",
+  "schema": "metacodes-workbuddy-paid-receipt-v2",
+  "quality_evidence": false,
+  "failure_stage": null,
+  "actual_cost_usd": 37.108704,
+  "actual_metered_tokens": 63830471,
+  "max_cost_usd": 192.0,
+  "elapsed_s": 6735.025889081,
+  "returncode": null,
+  "task_count": 0
+ },
+ "metacodes-glm52-office-dev-full1": {
+  "launches": [
+   "launch-20260905t0313z.json",
+   "launch-20260905t0351z.json",
+   "launch-20260905t0408z.json"
+  ],
+  "journals": [
+   "budget-20260905t0313z.json",
+   "budget-20260905t0351z.json",
+   "budget-20260905t0408z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0313z.json",
+    "run_id": "wb-metacodes-glm52-office-dev-full1-20260905t0313z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 15.0,
+    "elapsed_s": 18.983311245,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t0351z.json",
+    "run_id": "wb-metacodes-glm52-office-dev-full1-20260905t0351z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 15.0,
+    "elapsed_s": 548.485083281,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t0408z.json",
+    "run_id": "wb-metacodes-glm52-office-dev-full1-20260905t0408z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 15.0,
+    "elapsed_s": 2183.080375165,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0408z.json",
+  "run_id": "wb-metacodes-glm52-office-dev-full1-20260905t0408z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 15.0,
+  "elapsed_s": 2183.080375165,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-office-proma-full1": {
+  "launches": [
+   "launch-20260905t0314z.json",
+   "launch-20260905t0858z.json"
+  ],
+  "journals": [
+   "budget-20260905t0314z.json",
+   "budget-20260905t0858z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0314z.json",
+    "run_id": "wb-metacodes-glm52-office-proma-full1-20260905t0314z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 7.5,
+    "elapsed_s": 18.875676196,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t0858z.json",
+    "run_id": "wb-metacodes-glm52-office-proma-full1-20260905t0858z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 20.0,
+    "elapsed_s": 2044.267769223,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0858z.json",
+  "run_id": "wb-metacodes-glm52-office-proma-full1-20260905t0858z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 20.0,
+  "elapsed_s": 2044.267769223,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-office-promb-full1": {
+  "launches": [
+   "launch-20260905t0314z.json",
+   "launch-20260905t0932z.json"
+  ],
+  "journals": [
+   "budget-20260905t0314z.json",
+   "budget-20260905t0932z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0314z.json",
+    "run_id": "wb-metacodes-glm52-office-promb-full1-20260905t0314z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 7.5,
+    "elapsed_s": 18.950430248,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t0932z.json",
+    "run_id": "wb-metacodes-glm52-office-promb-full1-20260905t0932z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 20.0,
+    "elapsed_s": 1077.882812657,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0932z.json",
+  "run_id": "wb-metacodes-glm52-office-promb-full1-20260905t0932z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 20.0,
+  "elapsed_s": 1077.882812657,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-office-sealed-full1": {
+  "launches": [
+   "launch-20260905t0315z.json",
+   "launch-20260905t0950z.json",
+   "launch-20260905t1206z.json"
+  ],
+  "journals": [
+   "budget-20260905t0315z.json",
+   "budget-20260905t0950z.json",
+   "budget-20260905t1206z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0950z.json",
+    "run_id": "wb-metacodes-glm52-office-sealed-full1-20260905t0950z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 120.0,
+    "elapsed_s": 4525.6804726,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t1206z.json",
+    "run_id": "wb-metacodes-glm52-office-sealed-full1-20260905t1206z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 120.0,
+    "elapsed_s": 6157.754398532,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t1206z.json",
+  "run_id": "wb-metacodes-glm52-office-sealed-full1-20260905t1206z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 120.0,
+  "elapsed_s": 6157.754398532,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-sealed-diag2": {
+  "launches": [
+   "launch-20260905t1536z.json"
+  ],
+  "journals": [
+   "budget-20260905t1536z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t1536z.json",
+    "run_id": "wb-metacodes-glm52-security-sealed-diag2-20260905t1536z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 6.0,
+    "elapsed_s": 67.321289088,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t1536z.json",
+  "run_id": "wb-metacodes-glm52-security-sealed-diag2-20260905t1536z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 6.0,
+  "elapsed_s": 67.321289088,
+  "returncode": 0,
+  "task_count": 0
+ }
+}

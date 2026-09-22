@@ -15,9 +15,10 @@ Each theorem names the mirroring Zig test. -/
 namespace MetaCodesControl.HostInjectionMeter
 
 /- Runtime allocation: required-first provider repair 2 + verification 2 +
-requirement ledger 2 + task obligations 3. The proofs below are parametric in
-request order; changing this concrete policy cap does not weaken composition. -/
-def cap : Nat := 9
+requirement ledger 2 + task obligations 3 + delivery cadence 2. The proofs
+below are parametric in request order; changing this concrete policy cap does
+not weaken composition. -/
+def cap : Nat := 11
 
 /-- One meter step: a gate asks for an injection; the request is granted
 iff budget remains. Returns (granted?, next used). -/

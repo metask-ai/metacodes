@@ -14,8 +14,8 @@
 //! 容错:文件不存在 → 创建 + 完整 JSON;parse 失败 → log + 不写(避免覆盖损坏的 settings)。
 
 const std = @import("std");
-const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
+const util_json = @import("../util/json.zig");
 
 /// 把 rule 加入 settings.local.json 的 permissions.allow 数组。
 /// project_dir 非 null → 优先用 project local;否则用 ~/.claude/settings.json。
@@ -54,7 +54,12 @@ pub fn addAllowRule(
     }
 
     // 文件不存在 → 创建 fresh
-    const fresh = try std.fmt.allocPrint(alloc, "{{\"permissions\":{{\"allow\":[\"{s}\"]}}}}\n", .{rule});
+    var fresh_builder: std.ArrayList(u8) = .empty;
+    errdefer fresh_builder.deinit(alloc);
+    try fresh_builder.appendSlice(alloc, "{\"permissions\":{\"allow\":[");
+    try util_json.serializeString(rule, &fresh_builder, alloc);
+    try fresh_builder.appendSlice(alloc, "]}}\n");
+    const fresh = try fresh_builder.toOwnedSlice(alloc);
     defer alloc.free(fresh);
     try writeFile(path, fresh);
     return path;
@@ -210,8 +215,6 @@ fn writeAllowWithRule(out: *std.ArrayList(u8), alloc: std.mem.Allocator, allow: 
     try out.append(alloc, ']');
 }
 
-const util_json = @import("../util/json.zig");
-
 fn writeEscaped(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
     try util_json.serializeStringContents(s, out, alloc);
 }
@@ -306,22 +309,19 @@ test "rewriteWithAllow: 保留其它顶层字段" {
 }
 
 test "addAllowRule: 端到端创建文件" {
-    const pid: i64 = pprocess.currentPid();
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cczig_psave_{d}", .{pid});
-    var home_z: [129]u8 = undefined;
-    @memcpy(home_z[0..home.len], home);
-    home_z[home.len] = 0;
-    _ = std.c.mkdir(@ptrCast(&home_z), 0o755);
+    // per-pid 临时目录(POSIX /tmp,Windows %TEMP%),见 tools/test_tmp.zig 头注释。
+    var home_buf: [512]u8 = undefined;
+    const home = @import("../tools/test_tmp.zig").path(&home_buf, "cczig_psave");
+    _ = std.c.mkdir(home.ptr, 0o755);
     defer {
         // 清理:.claude 子目录 + settings.json + home
-        var p_buf: [256]u8 = undefined;
-        const p1 = std.fmt.bufPrint(&p_buf, "{s}/.claude/settings.json\x00", .{home}) catch unreachable;
-        _ = std.c.unlink(@ptrCast(p1.ptr));
-        var p2_buf: [256]u8 = undefined;
-        const p2 = std.fmt.bufPrint(&p2_buf, "{s}/.claude\x00", .{home}) catch unreachable;
-        _ = std.c.rmdir(@ptrCast(p2.ptr));
-        _ = std.c.rmdir(@ptrCast(&home_z));
+        var p_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const p1 = std.fmt.bufPrintZ(&p_buf, "{s}/.claude/settings.json", .{home}) catch unreachable;
+        _ = std.c.unlink(p1.ptr);
+        var p2_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const p2 = std.fmt.bufPrintZ(&p2_buf, "{s}/.claude", .{home}) catch unreachable;
+        _ = std.c.rmdir(p2.ptr);
+        _ = std.c.rmdir(home.ptr);
     }
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;

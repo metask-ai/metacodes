@@ -45,6 +45,8 @@ pub const SpawnOptions = struct {
     system_prompt: ?[]const u8 = null,
     /// UI/event routing identity. It is deliberately separate from
     /// `agent_ident`, which remains the child's coordination identity.
+    /// Defaults only for standalone callers/tests. Production dispatchers must
+    /// pass the parent's session explicitly so routing cannot drift.
     session: @import("session_id.zig").SessionId = .single,
     /// 嵌套深度。Agent 工具 spawn 时传 parent_depth+1。
     agent_depth: u8 = 1,
@@ -185,11 +187,14 @@ pub fn spawnAgentSink(
     // 选择实际用的 tool_defs:override > 父
     const effective_tool_defs = opts.tool_defs_override orelse tool_defs;
 
-    // 选择实际用的 permission_ctx。U4:override 走 scopedDerive 单 seam(值拷贝+null sink,
-    // scoped 的 mode override 绝不 emit 到 session sink)。无 override 用父 ctx 指针(pointer-share,
-    // 见 U4 裁定 task#15)。
+    // 选择实际用的 permission_ctx。每个 child 都走 scopedDerive 单 seam(值拷贝+null
+    // sink)，这样 session 与 mode 两个路由/权限字段在同一个 child-owned snapshot 中一致。
     var ctx_override: permission_mod.PermissionContext = permission_ctx.scopedDerive(opts.permission_mode_override);
-    const ctx_to_use: *const permission_mod.PermissionContext = if (opts.permission_mode_override != null) &ctx_override else permission_ctx;
+    // ToolContext.session and PermissionContext.session are one routing
+    // identity. Keep the child copy explicit so a caller cannot route UI/tool
+    // events to `.single` while permission requests remain on the parent.
+    ctx_override.session = opts.session;
+    const ctx_to_use: *const permission_mod.PermissionContext = &ctx_override;
 
     // subagent 是隔离上下文:给它**自己的** TaskStore。早先未挂 store(opts 无 tasks 字段)→
     // subagent 调 TaskCreate 时 requireStore 返 TaskStoreUnavailable → 第一轮多个 TaskCreate
@@ -234,6 +239,7 @@ pub fn spawnAgentSink(
             .ui_requester = opts.ui_requester,
             .read_state = opts.read_state,
             .jobs = opts.jobs,
+            .job_notifications = opts.jobs,
             .agent_jobs = opts.agent_jobs,
             .project_dir = opts.project_dir,
             .session_id = opts.session.asSlice(),
@@ -304,7 +310,7 @@ test "SubagentResult roundtrip allocation" {
 }
 
 test "SpawnOptions defaults" {
-    const o = SpawnOptions{};
+    const o = SpawnOptions{ .session = SessionId.single };
     try testing.expect(o.max_turns == 20);
     try testing.expect(o.system_prompt == null);
     try testing.expectEqualSlices(u8, SessionId.single.asSlice(), o.session.asSlice());

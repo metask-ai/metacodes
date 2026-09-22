@@ -1,5 +1,4 @@
 const std = @import("std");
-const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
@@ -69,7 +68,28 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .EXCL = true }
     else
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
-    const fd = pfs.openZ(path, write_flags, 0o666) catch return error.WriteError;
+    const fd = pfs.openZ(path, write_flags, 0o666) catch {
+        // EACCES/EROFS 与其他 open 失败对模型是不同的可行动作:权限失败应换目标
+        // 路径或报告权限问题,而不是盲目重试。带 errno 的富 detail 走 error_detail
+        // 通道(与 edit.zig setDetail 同款),无通道时退回裸 WriteError。
+        const errno: std.c.E = @enumFromInt(std.c._errno().*);
+        if (ctx.error_detail) |slot| {
+            slot.* = switch (errno) {
+                .ACCES, .ROFS => std.fmt.allocPrint(
+                    ctx.allocator,
+                    "permission denied writing '{s}' (errno {d}): the target directory is not writable by the current user. Write to a writable location instead or report the permission problem.",
+                    .{ path, @intFromEnum(errno) },
+                ) catch null,
+                .NOENT, .NOTDIR => std.fmt.allocPrint(
+                    ctx.allocator,
+                    "cannot create '{s}' (errno {d}): a path component is missing or not a directory.",
+                    .{ path, @intFromEnum(errno) },
+                ) catch null,
+                else => null,
+            };
+        }
+        return error.WriteError;
+    };
     defer _ = pfs.close(fd);
 
     var pos: usize = 0;
@@ -134,7 +154,12 @@ fn renderResult(
     var patch = patch_mod.compute(allocator, old_content, new_content) catch {
         // diff 失败不致命：退回最简结果。改动是真的,只是拿不到 diff → 契约上标注证据不完整。
         publishFileChange(ctx, path, before, old_content, new_content, null, false);
-        return try std.fmt.allocPrint(allocator, "{{\"success\":true, \"path\": \"{s}\"}}", .{path});
+        var receipt: std.Io.Writer.Allocating = .init(allocator);
+        defer receipt.deinit();
+        try receipt.writer.writeAll("{\"success\":true,\"path\":");
+        try util_json.writeJsonString(&receipt.writer, path);
+        try receipt.writer.writeByte('}');
+        return receipt.toOwnedSlice();
     };
     defer patch.deinit(allocator);
 
@@ -147,11 +172,11 @@ fn renderResult(
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"success\":true,\"path\":");
-    try std.json.Stringify.encodeJsonString(path, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, path);
     try out.writer.writeAll(",\"structuredPatch\":");
     try out.writer.writeAll(structured);
     try out.writer.writeAll(",\"gitDiff\":");
-    try std.json.Stringify.encodeJsonString(git_diff, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, git_diff);
     // LSP 被动诊断:写后 delta 诊断附进结果(新建文件的诊断也报)。
     try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, path, new_content);
     try out.writer.writeByte('}');
@@ -272,6 +297,56 @@ test "WriteTool auto-mkdir creates missing parent directory" {
     _ = std.c.rmdir((tt.path(&dbuf, "mkdir-parent-9a8b")).ptr);
 }
 
+test "WriteTool EACCES detail names the unwritable directory (errno through error_detail)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (std.c.geteuid() == 0) return error.SkipZigTest; // root ignores mode bits
+    const a = std.testing.allocator;
+    var rs = read_state.ReadState.init(a);
+    defer rs.deinit();
+    var detail: ?[]const u8 = null;
+    const ctx = ToolContext{ .allocator = a, .read_state = &rs, .error_detail = &detail };
+    var dbuf: [256]u8 = undefined;
+    const dir = tt.path(&dbuf, "ro-dir-4c1e");
+    try std.testing.expect(std.c.mkdir(dir.ptr, 0o500) == 0);
+    defer {
+        _ = std.c.chmod(dir.ptr, 0o700);
+        _ = std.c.rmdir(dir.ptr);
+    }
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "ro-dir-4c1e/x.txt");
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
+    try std.testing.expectError(error.WriteError, execute(&ctx, args));
+    try std.testing.expect(detail != null);
+    defer if (detail) |d| a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "permission denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, path) != null);
+}
+
+test "WriteTool ENOTDIR detail: a file as a path component" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var rs = read_state.ReadState.init(a);
+    defer rs.deinit();
+    var detail: ?[]const u8 = null;
+    const ctx = ToolContext{ .allocator = a, .read_state = &rs, .error_detail = &detail };
+    var fbuf: [256]u8 = undefined;
+    const file = tt.path(&fbuf, "notdir-7b2d");
+    {
+        const fd = try pfs.openZ(file, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        _ = pfs.close(fd);
+    }
+    defer _ = std.c.unlink(file.ptr);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "notdir-7b2d/child.txt");
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
+    try std.testing.expectError(error.WriteError, execute(&ctx, args));
+    try std.testing.expect(detail != null);
+    defer if (detail) |d| a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "not a directory") != null);
+}
+
 test "WriteTool not-read-first rejects existing file" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
@@ -342,8 +417,8 @@ test "WriteTool ~ 展开端到端" {
     const a = std.testing.allocator;
     var seed: [256]u8 = undefined;
     _ = tt.path(&seed, "seed"); // 触发 test_tmp 建 /tmp/cc-zig-test-<pid> 目录
-    var hbuf: [128]u8 = undefined;
-    const home = std.fmt.bufPrint(&hbuf, "/tmp/cc-zig-test-{d}", .{@as(i64, pprocess.currentPid())}) catch unreachable;
+    var hbuf: [512]u8 = undefined;
+    const home = tt.dir(&hbuf);
     var ctx = testCtx();
     ctx.home_dir = home;
     const r = try execute(&ctx, "{\"file_path\":\"~/tilde-write-test.txt\",\"content\":\"hello-tilde\"}");

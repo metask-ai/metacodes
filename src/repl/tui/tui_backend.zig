@@ -580,7 +580,7 @@ pub const TuiBackend = struct {
                         ab.abort(.user_ctrl_c);
                         app.provider().cancel(ab);
                     }
-                    if (app.agent_jobs) |*reg| _ = reg.abortAllRunning();
+                    if (app.agent_jobs) |*reg| _ = reg.abortAllRunningForSession(app.session_id);
                     return;
                 }
                 continue;
@@ -715,7 +715,7 @@ pub const TuiBackend = struct {
                 // 已被打断,但**后台/嵌套** agent job 持自己的 entry.abort,app.abort 不触达,否则 esc 后
                 // 它们继续跑(用户实测 bug:启动多 agent 后 esc 不终止)。非阻塞 abort,不 join。
                 if (app.agent_jobs) |*reg| {
-                    _ = reg.abortAllRunning();
+                    _ = reg.abortAllRunningForSession(app.session_id);
                 }
                 return; // 中断不重画(主线程很快收尾)
             },

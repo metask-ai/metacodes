@@ -142,11 +142,21 @@ versions with the digests the vendored manifests pin for the target, layout).
 contract: {binary_abi_version, binary_abi_revision, config_schema_version},
 expected_runtime_assets: [{name, version, sha256}]}`, where `sha256` is null
 when the vendored bundle has no artifact for the target. `metacodes doctor
-[--json] [--strict]` reports where ripgrep and TinyKG resolve from (`source`:
-`env`, `config`, `adjacent`, `path`, `fallback`), the SHA-256 of each resolved
-file, the digest this build pinned, and `match`; `--json` emits
-`{checks: [{name, resolved_path, sha256, expected_sha256, match, source}]}` and
-`--strict` exits 1 when a binary is unresolved or mismatched. The flag
+[--json] [--strict]` reports where ripgrep, TinyKG (CLI and daemon) and the two
+Lean governance kernels resolve from (`source`: `env`, `config`, `adjacent`,
+`path`, `fallback`), the SHA-256 of each resolved file, the digest the file is
+held to (the build's pin, or the environment pair's digest for a kernel named by
+`METACODES_<FORMAL|PROJECT>_KERNEL_PATH`/`_SHA256`), `match`, and for the
+kernels `provenance`: whether the sidecar beside the kernel is a valid manifest
+for *that* kernel (`formal_kernel`: the v4 manifest plus build receipt;
+`project_kernel`: the v6 manifest), null for the other checks; `--json` emits
+`{checks: [{name, resolved_path, sha256, expected_sha256, match, source,
+provenance}]}` with `name` in `ripgrep`, `tinykg`, `formal_kernel`,
+`project_kernel`, `tinykgd`, plus a `kg` object when the TinyKG diagnosis could
+be built. `--strict` exits 1 when a binary is unresolved or mismatched, when a
+resolved kernel's `provenance` is not `true`, or when an environment override
+was present but resolved nothing (`source: "env"` with a null `resolved_path`);
+an unpinned kernel or daemon may be absent. The flag
 surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
 harnesses pass treatment configuration through this surface. Headless
@@ -540,6 +550,14 @@ batch commit boundary. The sealed receipt renders a byte-identical artifact enve
 publication failure uses `retainInlineAfterFailedPublish`, falling back to inline bytes
 when allowed or a bounded `ArtifactPublishFailed` tool error otherwise. Other producers
 that still publish during execution are tracked in #65.
+
+Text returned by a tool is UTF-8 encoded at the text boundary and every bounded
+text page ends on a code-point boundary. Raw process or document bytes remain
+artifacts (or explicit base64 envelopes) and are never written as JSON text.
+`TaskOutput` keeps source byte cursors: `output_next_offset` is the cursor for
+the next request, `output_size_bytes` is the current source size, and the legacy
+`output_total_bytes` field has the cursor value for compatibility. A cursor is
+not a JSON or base64 length.
 
 ## Prompt-cache contract
 

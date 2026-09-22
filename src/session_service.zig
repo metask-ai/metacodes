@@ -22,6 +22,7 @@ const theme_mod = @import("repl/tui/theme.zig");
 const session_intent = @import("session_intent.zig");
 const agent_loop = @import("core/agent_loop.zig");
 const permission_mode = @import("permission/mode.zig");
+const util_json = @import("util/json.zig");
 
 pub const CommandOutcome = struct {
     kind: Kind,
@@ -388,7 +389,7 @@ pub fn shellExecImpl(self: *SessionService, alloc: std.mem.Allocator, command: [
     var args_buf: std.Io.Writer.Allocating = .init(alloc);
     defer args_buf.deinit();
     try args_buf.writer.writeAll("{\"command\":");
-    try std.json.Stringify.encodeJsonString(command, .{}, &args_buf.writer);
+    try util_json.writeJsonString(&args_buf.writer, command);
     try args_buf.writer.writeByte('}');
     const args_json = try args_buf.toOwnedSlice();
     defer alloc.free(args_json);
@@ -424,10 +425,18 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         // 目前只有主 REPL 实现,见 loop.zig 主 run 后的 .backgrounded 分支)——由该宿主自补。
         // 注入/skill/web 路径不接:接了而不消化,残留 flag 会让后续注入 run 在第 1 轮前
         // 静默 .backgrounded(宏 append 了却永不执行)。
+        // 过程义务门(verification_final_gate / requirement_ledger* / delivery_cadence*)
+        // 同样是**宿主契约字段**,canonical 有意不带:它们各自在 run 末尾落一条终局
+        // 观测记录,而 trace 契约(scripts/eval/workbuddy/trace.py "duplicate delivery
+        // cadence record")只接受每份 journal 一条——注入宏 run(cron / retry / `/commit`)
+        // 与 web/daemon 多 run 会话若也接上,一次 `/commit` 就让整份 trace 作废。由能
+        // 出评估 trace 的宿主自补:headless 全部接;主 REPL run 只接 delivery_cadence
+        // (脚本化 e2e 走 REPL)。session_api_parity_test 钉住此排除。
         .read_state = &app.read_state,
         .edit_hl_cache = &app.edit_hl_cache,
         .lsp = app.lsp_service,
         .jobs = if (app.jobs) |*j| j else null,
+        .job_notifications = if (app.jobs) |*j| j else null,
         .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
         .swarm = &app.swarm,
         .plan_prev_mode = &app.plan_prev_mode,

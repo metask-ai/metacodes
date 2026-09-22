@@ -8,7 +8,23 @@
       "format": "mach-o-universal",
       "key": "macos-universal",
       "path": "bin/tinykg-macos-universal",
-      "sha256": "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af",
+      "role": "cli",
+      "sha256": "dd53db2aa5219e899daac3caac2332648ac392550fa6f431b5900a1d495688e1",
+      "targets": [
+        "aarch64-macos",
+        "x86_64-macos"
+      ]
+    },
+    {
+      "architectures": [
+        "aarch64",
+        "x86_64"
+      ],
+      "format": "mach-o-universal",
+      "key": "macos-universal-daemon",
+      "path": "bin/tinykgd-macos-universal",
+      "role": "daemon",
+      "sha256": "f1dd9f9a472bb58fa7dcd749a2a4df1a03d63c6dc7093054096beeb3b205722f",
       "targets": [
         "aarch64-macos",
         "x86_64-macos"
@@ -21,7 +37,21 @@
       "format": "elf-static",
       "key": "linux-x86_64",
       "path": "bin/tinykg-linux-x86_64",
-      "sha256": "5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba",
+      "role": "cli",
+      "sha256": "6ff8346aa0c5e9a9cf10cfa3357bfa2767699bf4735c8fd2e12d39cc12ee1521",
+      "targets": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "architectures": [
+        "x86_64"
+      ],
+      "format": "elf-static",
+      "key": "linux-x86_64-daemon",
+      "path": "bin/tinykgd-linux-x86_64",
+      "role": "daemon",
+      "sha256": "5d8f11e3bfe96a3845aa6d1166ac9341a59b622f355dc5de1c27675f0c5e5614",
       "targets": [
         "x86_64-linux"
       ]
@@ -33,7 +63,21 @@
       "format": "elf-static",
       "key": "linux-aarch64",
       "path": "bin/tinykg-linux-aarch64",
-      "sha256": "9cfe7bf551463068c1bcaa49dea69dce53be6fdf5b9428f39081fcad67e461aa",
+      "role": "cli",
+      "sha256": "2f601a8d27eba6956f61e87da84f83ad3a247db111233de0d74031bbff87fca0",
+      "targets": [
+        "aarch64-linux"
+      ]
+    },
+    {
+      "architectures": [
+        "aarch64"
+      ],
+      "format": "elf-static",
+      "key": "linux-aarch64-daemon",
+      "path": "bin/tinykgd-linux-aarch64",
+      "role": "daemon",
+      "sha256": "a5132e77776c607328b5dd7b59b7af643fd406b0ae031dff062d144ac774a3eb",
       "targets": [
         "aarch64-linux"
       ]
@@ -45,7 +89,21 @@
       "format": "pe",
       "key": "windows-x86_64",
       "path": "bin/tinykg-windows-x86_64.exe",
-      "sha256": "27f72f74babdcc60c327228673f9eb042092b6c82b156e241c66c0acea081e1b",
+      "role": "cli",
+      "sha256": "61b9281880dda0eaadadf051e16191ee46b8c454771e4639171dd90aed5e8044",
+      "targets": [
+        "x86_64-windows"
+      ]
+    },
+    {
+      "architectures": [
+        "x86_64"
+      ],
+      "format": "pe",
+      "key": "windows-x86_64-daemon",
+      "path": "bin/tinykgd-windows-x86_64.exe",
+      "role": "daemon",
+      "sha256": "aca73b00590df898c65d0a2741dafd6e7805a78ff3fd4ec6ce7a7495a6481281",
       "targets": [
         "x86_64-windows"
       ]
@@ -56,6 +114,6 @@
     "strip": true,
     "zig_version": "0.16.0"
   },
-  "bundle_schema": "metacodes.tinykg-bundle/v1",
-  "source_commit": "a0544788aeadb3b92c69e539834be54850792285"
+  "bundle_schema": "metacodes.tinykg-bundle/v2",
+  "source_commit": "0b04014ba8d0bcb1f9f73c63c12e49f3c2ee1ece"
 }

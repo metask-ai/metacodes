@@ -36,10 +36,22 @@ metacodes-<version>-<target-id>/
 | `share/doc/*` | operator documentation | repository files | listed in `files[]` |
 | `manifest.json` | the contract | `scripts/release_manifest.zig` | `release/manifest_contract.zig` (schema, identity, files, components, compatibility) |
 
+The Lean governance kernels (`libexec/metacodes/metacodes-{formal,project}-kernel`
+and their provenance sidecars) are **not** part of this unit: a release
+executable is built without `-Dformal-kernel-sha256` / `-Dproject-kernel-sha256`,
+so `doctor` reports both kernel checks unresolved and `--strict` passes. An
+executable that pins a kernel must ship it beside itself with a sidecar its own
+loader accepts, or `release:verify` and `verify_install_prefix.py --doctor` name
+the pin (`scripts/verify_kernel_provenance.py` runs real kernels through doctor).
+
 The relative position of `bin/` and `vendor/tinykg/` is load-bearing: the
 executable resolves TinyKG at `../vendor/tinykg/` from its own directory and, under
-the release layout, ripgrep beside itself before `PATH` (#78, #79). Unpack the
-archive anywhere; do not move files inside it.
+the release layout, ripgrep beside itself before `PATH` (#78, #79). "Its own
+directory" is the physical one: the self-executable path is passed through
+`realpath` before any adjacent lookup, so `ln -s <prefix>/bin/metacodes
+~/bin/metacodes` keeps rg, both Lean kernels and TinyKG resolving inside
+`<prefix>` rather than beside the symlink. Unpack the archive anywhere; do not
+move files inside it.
 
 ## Release channels
 
@@ -76,14 +88,14 @@ refusal of untagged stable versions.
 
 ## Publishing
 
-`.github/workflows/release.yml` runs the whole chain per platform on the
-`metacodes-release` runners (`doc/RELEASE_RUNNER.md`) and leaves a *draft*
+`.github/workflows/release.yml` runs the whole chain per platform on
+GitHub-hosted runners (`doc/RELEASE_RUNNER.md`) and leaves a *draft*
 GitHub Release holding every archive, its `.sha256`, and
 `metacodes-<version>-SHA256SUMS`; a maintainer publishes it after verifying an
 unpacked archive on a clean machine with `scripts/verify_release_bundle.py
 --native`. Pre-releases are dispatched by hand and never auto-attached (#47
-Q3); the stable tag trigger is enabled only once the dedicated runners exist
-(Q4).
+Q3); the stable tag trigger is a follow-up (`doc/RELEASE_RUNNER.md`,
+"Enabling the tag trigger").
 
 ## What is deliberately not in the unit
 

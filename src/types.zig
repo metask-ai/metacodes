@@ -58,6 +58,7 @@ pub const Config = struct {
     teammate_name: []const u8 = "",
     teammate_team: []const u8 = "",
     teammate_parent_session: []const u8 = "",
+    teammate_lease_id: []const u8 = "",
     teammate_cwd: []const u8 = "",
     /// SW6:lead 用 `--teammate-mode process` 让 Task(name) spawn 进程外 teammate(fork+exec +
     /// worktree 隔离)而非进程内线程。默认 false(进程内,SW1)。
@@ -126,6 +127,14 @@ pub const Config = struct {
     requirement_ledger: bool = false,
     requirement_ledger_observe: bool = false,
     verification_final_observe: bool = false,
+    /// `--delivery-cadence[-observe]`: bounded turn-boundary nudge when a run
+    /// keeps exploring without putting any deliverable on disk.
+    delivery_cadence: bool = false,
+    delivery_cadence_observe: bool = false,
+    /// `--delivery-cadence-thresholds <first>,<second>`: crossing points in
+    /// exploration-only tool calls. null = the product defaults (40 / 80).
+    delivery_cadence_first: ?u32 = null,
+    delivery_cadence_second: ?u32 = null,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,
@@ -142,8 +151,6 @@ pub const Config = struct {
     /// `--base-url <url>` / `METACODES_BASE_URL`:覆盖 API 端点(默认硬编码)。
     /// 用于 record/replay(指向 mock server)。须以 `/v1/messages` 结尾。
     base_url: ?[]const u8 = null,
-    /// metacodes 可执行文件所在目录(main 从 argv[0] 解析)。定位 staged TinyKG。null=未知。
-    exe_dir: ?[]const u8 = null,
     /// Credential resolver precedence. Default matches docs: explicit CLI/env API
     /// key wins over stored OAuth unless user opts into oauth-first.
     auth_precedence: AuthPrecedence = .api_key_first,

@@ -27,7 +27,7 @@ fn sleepMs(ms: u32) void {
 }
 
 fn setup(a: std.mem.Allocator, home_buf: []u8, url: []const u8) !swctx.SwarmContext {
-    const home = try std.fmt.bufPrint(home_buf, "/tmp/cc-zig-sw4-{d}", .{cc.util_time.nowNs()});
+    const home = cc.util_fs.testing.uniqueDir(home_buf, "cc-zig-sw4");
     try cc.util_fs.mkdirParents(home);
     return swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
 }
@@ -46,8 +46,9 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
+    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
     const home = sw.home;
 
@@ -86,7 +87,7 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
     try std.testing.expectEqual(teammate.TeammateStatus.idle, entry.statusSnapshot()); // 仍活着
 
     // 真 lead 发 shutdown → 退出。
-    try mailbox.deliver(a, victim_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"real1\"}", null, null);
+    try mailbox.deliverWithIdentity(a, victim_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"real1\"}", null, null, sw.session.asSlice(), sw.session.asSlice());
     waited = 0;
     while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
@@ -97,8 +98,8 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
 
 test "L2 SW4 A2: 'team-lead' 是保留名,不能 spawn 冒充队友" {
     const a = std.testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw4-reserved-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw4-reserved");
     try cc.util_fs.mkdirParents(home);
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var sw = swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .model = "m" };
@@ -114,7 +115,7 @@ test "L2 SW4 A2: 'team-lead' 是保留名,不能 spawn 冒充队友" {
 
 test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
     const a = std.testing.allocator;
-    var srv = try harness.MockServer.startCassette(&[_][]const u8{TURN}, 0);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ TURN, TURN }, 0);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
@@ -126,8 +127,9 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
+    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
     const home = sw.home;
 
@@ -148,7 +150,16 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
     // lead 发 shutdown。
     var ib: [std.fs.max_path_bytes]u8 = undefined;
     const solo_inbox = team.inboxPath(home, "proj", "solo", &ib);
-    try mailbox.deliver(a, solo_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"rid42\"}", null, null);
+    try mailbox.deliverWithIdentity(a, solo_inbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"rid42\"}", null, null, sw.session.asSlice(), sw.session.asSlice());
+    // The approval must carry the persisted generation identity.  Read it
+    // here to mirror the real teammate response and make the test fail if
+    // spawn stops recording a lease.
+    var cfgbuf0: [std.fs.max_path_bytes]u8 = undefined;
+    var before_shutdown = team.load(a, sw.configPath(&cfgbuf0)) orelse return error.NoConfig;
+    defer before_shutdown.deinit();
+    const solo_member = before_shutdown.findMember("solo") orelse return error.NoMember;
+    const solo_session = solo_member.session_id orelse return error.NoSession;
+    const solo_lease = solo_member.lease_id orelse return error.NoLease;
     waited = 0;
     while (waited < 20_000) : (waited += 20) {
         if (entry.statusSnapshot() == .terminated) break;
@@ -164,7 +175,13 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
         var all = try mailbox.readAll(a, lead_inbox);
         defer all.deinit();
         for (all.items.items) |*m| {
-            if (std.mem.indexOf(u8, m.text, "shutdown_approved") != null and std.mem.indexOf(u8, m.text, "rid42") != null) got_approved = true;
+            if (std.mem.indexOf(u8, m.text, "shutdown_approved") != null and
+                std.mem.indexOf(u8, m.text, "rid42") != null)
+            {
+                try std.testing.expect(std.mem.indexOf(u8, m.text, solo_session) != null);
+                try std.testing.expect(std.mem.indexOf(u8, m.text, solo_lease) != null);
+                got_approved = true;
+            }
         }
         if (got_approved) break;
         sleepMs(20);
@@ -180,6 +197,37 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
     var tf = team.load(a, sw.configPath(&cfgbuf)) orelse return error.NoConfig;
     defer tf.deinit();
     try std.testing.expect(tf.findMember("solo") == null);
+
+    // Reuse the name for a new generation, then deliver the old approval
+    // again.  The stale lease must not remove the replacement member.
+    const replacement = try sw.teammates.?.spawnTeammate(.{
+        .name = "solo",
+        .team = "proj",
+        .prompt = "replacement",
+        .tool_defs = empty_defs,
+        .permission_ctx = perm,
+    });
+    replacement.abort.abort(.user_interrupt);
+    waited = 0;
+    while (waited < 20_000) : (waited += 20) {
+        if (replacement.statusSnapshot() == .terminated) break;
+        sleepMs(20);
+    }
+    try std.testing.expectEqual(teammate.TeammateStatus.terminated, replacement.statusSnapshot());
+    const stale = try std.fmt.allocPrint(
+        a,
+        "{{\"type\":\"shutdown_approved\",\"from\":\"solo\",\"request_id\":\"rid42\",\"session_id\":\"{s}\",\"lease_id\":\"{s}\"}}",
+        .{ solo_session, solo_lease },
+    );
+    defer a.free(stale);
+    try mailbox.deliver(a, lead_inbox, "solo", stale, null, null);
+    if (try swtools.pollLeadInbox(a, &sw)) |p| a.free(p);
+    var cfgbuf1: [std.fs.max_path_bytes]u8 = undefined;
+    var replacement_tf = team.load(a, sw.configPath(&cfgbuf1)) orelse return error.NoConfig;
+    defer replacement_tf.deinit();
+    const replacement_member = replacement_tf.findMember("solo") orelse return error.ReplacementRemoved;
+    try std.testing.expect(replacement_member.lease_id != null);
+    try std.testing.expect(!std.mem.eql(u8, replacement_member.lease_id.?, solo_lease));
 }
 
 test "L2 SW4 MED-1: 仍在跑的 teammate 自发 shutdown_approved 不摘牌(防不可寻址)" {
@@ -196,8 +244,9 @@ test "L2 SW4 MED-1: 仍在跑的 teammate 自发 shutdown_approved 不摘牌(防
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
 
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
+    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
     srv.gateNextResponse();
     defer srv.releaseGatedResponse(); // release before sw.deinit joins teammate
@@ -242,8 +291,9 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
     var agents = cc.agents_set.AgentSet.init(a);
     defer agents.deinit();
     try agents.loadFromStandardPaths("");
-    var home_buf: [128]u8 = undefined;
+    var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
+    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
     const home = sw.home;
     const perm = cc.permission.createContext(.bypass_permissions, a);
@@ -266,7 +316,7 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
         }
         var ib: [std.fs.max_path_bytes]u8 = undefined;
         const winbox = team.inboxPath(home, "proj", "w", &ib);
-        try mailbox.deliver(a, winbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r\"}", null, null);
+        try mailbox.deliverWithIdentity(a, winbox, "team-lead", "{\"type\":\"shutdown_request\",\"request_id\":\"r\"}", null, null, sw.session.asSlice(), sw.session.asSlice());
         waited = 0;
         while (waited < 20_000) : (waited += 20) {
             const en = sw.teammates.?.findByName("w") orelse break;
@@ -284,8 +334,8 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
 
 test "L2 SW4 C: orphan 清理(lead deinit 删会话 team 目录)" {
     const a = std.testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw4-orphan-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw4-orphan");
     try cc.util_fs.mkdirParents(home);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 

@@ -12,6 +12,38 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Adjacent-artifact resolution disagreed across resolvers when `metacodes` was
+  started through a symlink (the common `ln -s <prefix>/bin/metacodes
+  ~/bin/metacodes` install): macOS reports the invoked symlink as the
+  executable path, so the release-layout lookups for `bin/rg` and both Lean
+  kernels landed in `~/bin` — rg silently fell back to a PATH copy with a
+  non-matching digest and the pinned kernels were unresolved (`doctor --strict`
+  red, project-rule activation failing closed) — while the TinyKG lookup, which
+  already applied `realpath`, resolved. All three now derive their prefix from
+  one helper, `platform.paths.selfExeRealPath` (self-exe path resolved through
+  `realpath`; a relative invoked path is refused outright, and the fallback to
+  the invoked path applies only when `realpath` fails). The REPL's TinyKG client no longer receives an
+  `argv[0]`-derived executable directory (forgeable, empty for a bare-name
+  `PATH` start, and a second basis next to the OS-reported one); it uses the
+  same helper.
+  A new process-level harness (`selfexe_probe`) is copied into a staged prefix
+  and started through a symlink in another directory to prove rg and both
+  kernels resolve beside the physical binary.
+- Image input was rejected locally (`image_input_unsupported`, status 28, no
+  HTTP request) for non-Claude vision models reached through an Anthropic
+  Messages-compatible endpoint, because the Anthropic profile only granted
+  vision to names containing `claude` (#112). `provider_kind: anthropic`
+  selects the wire format, not the model family: vision is now resolved in
+  two layers — the catalog's per-model `image_input` declaration wins when it
+  names the model, otherwise one route-independent family table
+  (`model_adapter.knownVisionFamily`: Claude 3+, OpenAI GPT-4o/4.1/4.5/5 and
+  o-series, Gemini, Qwen VL, GLM-V) shared by the Anthropic and
+  OpenAI-compatible profiles — so `gpt-5.6-sol` gets the same answer on both
+  routes and the image goes out as an Anthropic base64 `image` source block.
+  Text models and unknown names on either route still fail closed before any
+  network I/O. The AgentCore ABI suite now proves the positive path end to
+  end: a multimodal Run on the Anthropic route for `gpt-5.6-sol` is admitted
+  and the provider receives exactly one request carrying the image bytes.
 - Stream liveness killed legitimate long tool calls: the idle clock was reset
   per parsed event, so a tool call's `input_json_delta` frames, SSE pings and
   unknown events counted as silence, and the flat 120 s limit also applied to
@@ -44,6 +76,24 @@ status, compatibility boundaries, and entry points are defined by
   input tokens succeeded; 1,101,379 was rejected).
 
 ### Changed
+
+- CI, AgentCore Windows, Release and Maintainer rule control all run on
+  GitHub-hosted runners (`ubuntu-latest`, `macos-latest`, `windows-latest`):
+  the repository is public, hosted standard runners are free for public
+  repositories, and organization policy keeps public repositories off the
+  self-hosted fleet. Runner-specific machinery is gone — the fork-isolation
+  `if:` guards, the persistent per-machine Zig/Lean cache directories, the
+  per-machine `concurrency` lanes, `-j6`/`-j12` sized for the old boxes, and
+  `release.yml`'s `runner_pool` input. In their place: `mlugg/setup-zig`'s
+  `use-cache` for the Zig cache, `actions/cache` for `~/.elan` and
+  `control-plane/lean/.lake`, `scripts/ci/install-elan.sh` (elan from a
+  pinned release asset with a pinned SHA-256; a no-op on a cache hit),
+  `requirements-dev.txt` installed on every leg, and `cargo install
+  bindgen-cli --version 0.72.1 --locked` in the release jobs. Job timeouts are
+  45 min for the gates (cold hosted runners compile the whole tree) and
+  unchanged elsewhere. `doc/RELEASE_RUNNER.md` now describes the hosted
+  release pipeline; the dedicated `metacodes-release` pool is no longer
+  planned.
 
 - Vendored ripgrep moves from 14.1.1 to 15.2.0 (#86): the four existing
   targets are replaced by the upstream 15.2.0 release binaries and

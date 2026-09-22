@@ -197,7 +197,7 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
             \\- The command argument is required. Write **PowerShell** syntax (this runs via `powershell -NoProfile -Command`, not bash).
             \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
             \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
-            \\- Use the `run_in_background` parameter to run in the background; do not append '&'.
+            \\- Use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (BashOutput waits for new output if the job is still running); do not append '&'.
             \\- VERY IMPORTANT: avoid search/read via the shell — use Grep, Glob, Read, LS tools instead of `Select-String`/`Get-Content`/`Get-ChildItem` for finding and reading files. If you still must grep, prefer ripgrep at `rg`.
             \\- Chain multiple commands with ';'. DO NOT use newlines.
             \\- PowerShell examples: list all incl hidden → `Get-ChildItem -Force`; recursive by name → `Get-ChildItem -Recurse -Filter *.py`; set env var → `$env:FOO='bar'; echo $env:FOO`.
@@ -213,7 +213,7 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\- The command argument is required.
         \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
         \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
-        \\- You can use the `run_in_background` parameter to run the command in the background. Only use this if you don't need the result immediately and are OK being notified when the command completes later. You do not need to use '&' at the end of the command when using this parameter.
+        \\- You can use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (BashOutput waits for new output if the job is still running). You do not need to use '&' at the end of the command when using this parameter.
         \\- VERY IMPORTANT: You MUST avoid using search commands like `find` and `grep`. Instead use Grep, Glob, or Agent to search. You MUST avoid read tools like `cat`, `head`, `tail`, and `ls`, and use Read and LS to read files.
         \\- If you _still_ need to run `grep`, STOP. ALWAYS USE ripgrep at `rg` first, which all MetaCode users have pre-installed.
         \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.

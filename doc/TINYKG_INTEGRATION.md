@@ -9,7 +9,7 @@ bundle so a clean checkout has a deterministic TinyKG runtime by default.
 
 Two files serve different purposes:
 
-- `deps/tinykg.json` freezes TinyKG CLI version 0.2.0, upstream repository,
+- `deps/tinykg.json` freezes TinyKG version 0.3.0 for both roles in the current bundle, upstream repository,
   Apache-2.0 license identifier, storage format 3, and store schema 3.
 - `vendor/tinykg/manifest.json` freezes the exact redistributed executable bytes:
   upstream commit, Zig version, ReleaseSafe/strip profile, target ownership,
@@ -23,6 +23,9 @@ The bundle currently supports:
 | Linux x86_64 | `linux-x86_64` | static-musl ELF |
 | Linux arm64 | `linux-aarch64` | static-musl ELF |
 | Windows x86_64 | `windows-x86_64` | PE32+ console executable |
+
+The v2 bundle has a `cli` and `daemon` row for every target family. CLI assets
+are named `tinykg-*`; daemon assets are named `tinykgd-*`.
 
 Windows arm64 and other targets are not declared. A normal product build for an
 undeclared target still builds Metacodes without TinyKG; `tinykg:stage` fails with
@@ -42,7 +45,7 @@ Every stage verifies:
 4. executable format and declared architectures: static ELF rejects dynamic
    program headers, universal Mach-O validates each non-overlapping slice, and
    Windows requires an x86_64 PE32+ console subsystem;
-5. an embedded exact `tinykg 0.2.0` version marker;
+5. an embedded exact `tinykg 0.3.0` marker, or `tinykgd 0.3.0` for a daemon artifact;
 6. target-family ownership;
 7. a second digest over the private staging temporary before atomic replacement,
    so a source-path race cannot replace the last known-good output.
@@ -84,7 +87,29 @@ legacy `-Dtinykg=false` disables the bundle.
 
 ## Manual bundle maintenance
 
-Bundle replacement is an explicit release operation, never part of `zig build`:
+Bundle replacement is an explicit release operation, never part of `zig build`.
+Run the reproducible builder from the Metacodes checkout:
+
+```sh
+python3 scripts/build_tinykg_bundle.py --source /path/to/tinykg \
+  --commit <40-lowercase-hex-commit> --version <semver>
+```
+
+It verifies the clean pinned work tree and Zig version, exports to a fixed
+`/tmp/metacodes-tinykg-release-src-<commit-prefix>` root, builds stripped
+ReleaseSafe CLI and daemon binaries for all declared targets, scans every
+executable (including both universal slices), probes native storage/schema, and
+regenerates the v2 manifest and CLI contract before running attestation. Use
+`--dry-run` to print the exact commands without building.
+
+It finally rewrites the `tinykg-bundle-table` block in `build.zig`. That table
+is the second committed copy of every digest: `tinykg:stage` passes the table
+entry to the staging script, which refuses to install a byte unless the bundle
+manifest agrees with it. A regenerated bundle therefore lands in one commit
+that changes the binaries, the manifest and the table together, and any later
+edit to one of them alone fails the next build.
+
+The old manual checklist is retained as review guidance:
 
 1. Select and review one immutable commit in
    `https://github.com/metask-ai/tinykg`.
@@ -96,7 +121,7 @@ Bundle replacement is an explicit release operation, never part of `zig build`:
    `__FILE__` strings can otherwise disclose a maintainer's absolute path.
 3. Run the native TinyKG release tests in its own repository. Execute version and
    fresh-store probes on native runners for each redistributed platform.
-4. Replace only the four files under `vendor/tinykg/bin/`, then update every
+4. Replace only the generated files under `vendor/tinykg/bin/`, then update every
    SHA-256, `source_commit`, and build field in `vendor/tinykg/manifest.json`.
 5. Retain the upstream Apache-2.0 text in `vendor/tinykg/LICENSE`; update
    `deps/tinykg.json` if CLI/storage/schema compatibility changed.
@@ -130,6 +155,120 @@ The exclusive CLI mode must not point at the canonical shared store.
 Automatic staged lookup is limited to `<prefix>/bin` and
 `<prefix>/eval/bin` executable layouts. It never walks arbitrary ancestors in
 search of a `vendor/` directory.
+
+`METACODES_KGD_BIN` selects an explicitly staged `tinykgd` for diagnostics and
+for the local service described below.
+
+## The local service: `kg install` and `kgd`
+
+A shared deployment runs TinyKG Web in front of one `tinykgd`. A single machine
+runs the same contract from the product binary instead:
+
+```sh
+metacodes kg install     # create the store, the key and daemon.json
+metacodes kgd            # serve it in the foreground until Ctrl+C
+```
+
+`kg install` resolves the staged executables, creates the Store when it is
+absent, generates a 256-bit API key, computes the build id from the two TinyKG
+executables and the metadata the CLI declares, and writes `daemon.json` (0600)
+in a 0700 directory. It starts nothing. Re-running it keeps the existing key,
+port and Store, so reconfiguring never locks out a session that already read
+them; `--port` and `--store` change them deliberately.
+
+`kgd` owns one `tinykgd` child and serves `POST /api/run`,
+`POST /api/import-markdown` and `GET /api/ready` on loopback, authenticated by
+`x-api-key`. It reads its port, key and Store from the same `daemon.json` the
+sessions read, so the service and its clients cannot disagree about where it
+listens. The envelope it returns names `metacodes-kgd` as its implementation;
+clients accept that name and `tinykg-web`, and pin the build id on top of it.
+
+An isolated second world — a scratch store on another port, leaving the default
+untouched — is one command plus one variable:
+
+```sh
+metacodes kg install --config ~/scratch-kg.json --store /tmp/scratch.kg.v2 --port 8900
+METACODES_KG_CONFIG=~/scratch-kg.json metacodes kgd
+METACODES_KG_CONFIG=~/scratch-kg.json metacodes        # a session in that world
+```
+
+Properties worth knowing:
+
+- The service handles one connection at a time, because `tinykgd` answers one
+  request at a time. A whole request must arrive within 30 seconds, and the
+  client is authenticated after the head and before the body is read, so an
+  unauthenticated peer cannot make it read a large body.
+- A `tinykgd` that accepts a request and stops answering desynchronizes the
+  pipe. The service reports 503, stops, and says to start it again rather than
+  queueing every later request behind a read that will not return.
+- Nothing starts the daemon automatically yet, there is no idle exit, and the
+  daemon is still not part of the product install.
+- Markdown import stages the document where the engine can read it back by
+  pathname, always at `~/.metacodes/kg/import`. The location is derived from the
+  home directory alone, never from `--config` or `--store`: both can point
+  anywhere, and the engine reopens the staged path after the service renames the
+  file into place, so an ancestor someone else can rename is an ingestion
+  someone else can redirect. Before staging, every directory from that path to
+  the filesystem root must be a non-symlink directory with no group or world
+  write bits, owned by this user or by root; anything else refuses the import
+  rather than proceeding. Stopping the walk at the home directory would not be
+  enough — a home inside a directory someone else can write can be renamed out
+  from under the path just as well.
+- Known limitation on POSIX: that check reads mode bits, which extended or
+  NFSv4 ACLs can contradict. A named ACL granting another account write or
+  `delete_child` on a component is not visible here, so on ACL-carrying
+  filesystems the chain is trusted rather than proven private. Inspecting ACLs
+  portably is a platform-specific exercise this has not taken on.
+- Known limitation on Windows: only the leaf is checked, and only for being a
+  reparse point. MSVCRT cannot open a directory, so there is no descriptor to
+  validate and no portable owner or ACL check; the exclusive temporary file
+  still applies, but a Windows staging chain is trusted rather than proven
+  private.
+- Known limitation on Windows: the bridge's response deadline cannot interrupt
+  a write that is already blocked, because anonymous pipes have no portable
+  writability query (`PipeChild.pollWritable` returns true there). A request is
+  capped at the daemon's own 1 MB ceiling and the child is the `tinykgd` this
+  product ships, so the exposure is a misbehaving child rather than a hostile
+  one; making it interruptible needs overlapped I/O.
+
+Because nothing starts it, the daemon is **not** part of the default install or
+the release layout: `zig build tinykg:stage` (and the test wiring) install it
+under `zig-out/vendor/tinykg/`, while `zig build --prefix <dir>` carries only
+the assets `release/manifest_contract.zig` declares and
+`scripts/verify_install_prefix.py` expects. `metacodes doctor` therefore reports
+`tinykgd` as unresolved in a plain install. The change that starts the daemon
+adds it to the install step, the release manifest and the prefix inventory
+together.
+
+When the runtime is degraded, the diagnosis is retained with a kind and a
+fixed repair hint:
+
+| Kind | Hint |
+|---|---|
+| `unconfigured` | write `~/.metacodes/kg/daemon.json` (0600) or set the KG URL/key/build-id variables |
+| `config_unsafe` | make the file regular, non-symlink, under 64 KB, and mode 0600 |
+| `config_invalid` | fix the URL, API key, and expected build-id JSON |
+| `daemon_unreachable` | start tinykgd/tinykg-web at the configured URL |
+| `auth_failed` | match the daemon's `TINYKG_WEB_API_KEY` |
+| `pin_mismatch` | use the running daemon's catalog build/schema values |
+| `store_contract_mismatch` | migrate storage and schema to 3/3 |
+| `server_degraded` | inspect the daemon's degraded-store logs |
+| `cli_bin_missing` | set `METACODES_KG_BIN` or install the staged bundle |
+| `cli_store_failed` | inspect the reason for disk, permission, or store corruption |
+
+A daemon without `/api/ready` (404/405/501) is treated as ready once `store-info`
+succeeded; only an explicit `degraded`/`ready:false` answer yields `server_degraded`.
+Degraded sessions re-probe from the KG tools after 5 seconds, doubling to a
+5 minute cap; `/kg` probes immediately. A root client whose diagnosis is
+`unconfigured`, `config_unsafe` or `config_invalid` re-reads `daemon.json` (or
+the environment) on that probe, so a configuration repaired mid-session takes
+effect without a restart. Subagent and teammate clones never re-read
+configuration: a transport rebuilt inside a clone would carry a private write
+fence, and the ambiguous-commit poison must stay shared across the in-process
+client family. Clones created after the root re-read inherit its binding. The
+state appears in the startup line, `/kg`, and `metacodes doctor`, whose `kg`
+object names the configuration source (`METACODES_KG_CONFIG`, `env` for the
+`METACODES_KG_*` triple, or the default `daemon.json` path).
 
 ## Ownership and prompt-cache boundary
 

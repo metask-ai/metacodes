@@ -14,6 +14,9 @@ const spec_mod = @import("../core/project_rule_spec.zig");
 const impact_receipt = @import("../core/rule_impact_receipt.zig");
 const impact_aggregate = @import("../core/rule_impact_aggregate_receipt.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const toolchain = @import("../util/toolchain.zig");
+const build_options = @import("project_harness_build_options");
+const test_paths = @import("platform").paths;
 
 pub const REQUEST_SCHEMA = "metacodes-project-harness-request-v3";
 pub const VERDICT_SCHEMA = "metacodes-project-harness-verdict-v3";
@@ -34,7 +37,10 @@ pub const Config = struct {
     checker_path: []const u8,
     expected_sha256: [64]u8,
     timeout_ms: u64 = 5_000,
+    source: Source = .env,
 };
+
+pub const Source = enum { env, adjacent };
 
 pub const ConfigLoad = union(enum) { missing, invalid, configured: Config };
 
@@ -46,16 +52,66 @@ pub fn loadConfigFromEnv() ConfigLoad {
     const path = std.mem.span(raw_path.?);
     const expected = parseLowerHex64(std.mem.span(raw_hash.?)) orelse return .invalid;
     if (!std.fs.path.isAbsolute(path)) return .invalid;
-    var timeout_ms: u64 = 5_000;
-    if (std.c.getenv("METACODES_PROJECT_KERNEL_TIMEOUT_MS")) |raw_timeout| {
-        timeout_ms = std.fmt.parseInt(u64, std.mem.span(raw_timeout), 10) catch return .invalid;
-        if (timeout_ms < 100 or timeout_ms > 30_000) return .invalid;
-    }
+    const timeout_ms = timeoutMsFromEnv() orelse return .invalid;
     return .{ .configured = .{
         .checker_path = path,
         .expected_sha256 = expected,
         .timeout_ms = timeout_ms,
+        .source = .env,
     } };
+}
+
+/// `METACODES_PROJECT_KERNEL_TIMEOUT_MS` as the runtime applies it: the
+/// default when unset, null when set to anything but an integer in
+/// 100..30_000. Every configuration path (environment pair or adjacent pin)
+/// fails closed on null, and `app/doctor.zig` reports that refusal the same way.
+pub fn timeoutMsFromEnv() ?u64 {
+    const raw = std.c.getenv("METACODES_PROJECT_KERNEL_TIMEOUT_MS") orelse return 5_000;
+    const parsed = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch return null;
+    if (parsed < 100 or parsed > 30_000) return null;
+    return parsed;
+}
+
+pub fn loadConfig() ConfigLoad {
+    const path_set = std.c.getenv("METACODES_PROJECT_KERNEL_PATH") != null;
+    const hash_set = std.c.getenv("METACODES_PROJECT_KERNEL_SHA256") != null;
+    if (path_set or hash_set) return loadConfigFromEnv();
+    const expected_raw = build_options.project_kernel_expected_sha256 orelse return .missing;
+    const path = toolchain.kernelAdjacentPath(.project) orelse return .missing;
+    const expected = parseLowerHex64(expected_raw) orelse return .missing;
+    const timeout_ms = timeoutMsFromEnv() orelse return .invalid;
+    return .{ .configured = .{
+        .checker_path = path,
+        .expected_sha256 = expected,
+        .timeout_ms = timeout_ms,
+        .source = .adjacent,
+    } };
+}
+
+test "project Kernel loadConfig preserves an environment pair" {
+    test_paths.unsetEnv("METACODES_PROJECT_KERNEL_PATH");
+    test_paths.unsetEnv("METACODES_PROJECT_KERNEL_SHA256");
+    test_paths.unsetEnv("METACODES_PROJECT_KERNEL_TIMEOUT_MS");
+    defer test_paths.unsetEnv("METACODES_PROJECT_KERNEL_PATH");
+    defer test_paths.unsetEnv("METACODES_PROJECT_KERNEL_SHA256");
+    defer test_paths.unsetEnv("METACODES_PROJECT_KERNEL_TIMEOUT_MS");
+    test_paths.setEnv("METACODES_PROJECT_KERNEL_PATH", "/tmp/project-kernel-test");
+    test_paths.setEnv("METACODES_PROJECT_KERNEL_SHA256", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    switch (loadConfig()) {
+        .configured => |config| {
+            try std.testing.expectEqualStrings("/tmp/project-kernel-test", config.checker_path);
+            try std.testing.expectEqual(Source.env, config.source);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "project Kernel loadConfig stays missing without compiled digest" {
+    test_paths.unsetEnv("METACODES_PROJECT_KERNEL_PATH");
+    test_paths.unsetEnv("METACODES_PROJECT_KERNEL_SHA256");
+    // The test build intentionally exports no project digest, so adjacency is
+    // fail-closed even if a file happens to exist beside the test executable.
+    try std.testing.expectEqual(ConfigLoad.missing, loadConfig());
 }
 
 pub const Operation = enum {

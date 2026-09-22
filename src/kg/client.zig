@@ -53,6 +53,19 @@ pub const KgError = error{
     OutOfMemory,
 };
 
+pub const DegradedKind = enum {
+    unconfigured,
+    config_unsafe,
+    config_invalid,
+    daemon_unreachable,
+    auth_failed,
+    pin_mismatch,
+    store_contract_mismatch,
+    server_degraded,
+    cli_bin_missing,
+    cli_store_failed,
+};
+
 /// 记忆节点写入的 kind 白名单(core kind,不经 schema JSON;设计 §5)。
 pub const MemoryKind = enum {
     observation,
@@ -238,6 +251,13 @@ pub const KgClient = struct {
     ready: bool = false,
     /// 降级原因(owned;ready=false 且非 null 时有效)。含修复提示。
     degraded_reason: ?[]u8 = null,
+    degraded_kind: ?DegradedKind = null,
+    /// Configuration inputs retained so a session can re-read a repaired daemon.json.
+    daemon_home: ?[]u8 = null,
+    daemon_io: ?std.Io = null,
+    unconfigured_kind: DegradedKind = .unconfigured,
+    last_probe_ms: i64 = 0,
+    probe_backoff_ms: i64 = 0,
     /// 最近一次 data 类错误的 detail(owned,透传给模型)。
     last_detail: ?[]u8 = null,
     /// last_detail 的 alloc/free 配对锁(pthread,全仓惯例——裁剪版 std 无 Thread.Mutex)。
@@ -301,6 +321,7 @@ pub const KgClient = struct {
         }
         self.allocator.free(self.domain);
         if (self.degraded_reason) |r| self.allocator.free(r);
+        if (self.daemon_home) |h| self.allocator.free(h);
         if (self.last_detail) |d| self.allocator.free(d);
         if (self.autosync_last_err) |e| self.allocator.free(e);
         var kit = self.scoped_types.keyIterator();
@@ -321,6 +342,8 @@ pub const KgClient = struct {
         config_store: ?[]const u8 = null,
         /// 测试注入:覆盖 env 读取(null = 读真实 env)。
         env_bin: ?[]const u8 = null,
+        /// 测试注入: TinyKG daemon binary override (null = read METACODES_KGD_BIN).
+        env_daemon_bin: ?[]const u8 = null,
         env_store: ?[]const u8 = null,
         /// 测试注入:覆盖 exe 目录(null = selfExeDirPath 真实定位,不再依赖 argv[0])。
         exe_dir: ?[]const u8 = null,
@@ -357,20 +380,37 @@ pub const KgClient = struct {
         const domain = try allocator.dupe(u8, opts.domain);
         errdefer allocator.free(domain);
         const bin = if (use_cli) try resolveBinPath(allocator, opts) else null;
+        var unconfigured_kind: DegradedKind = .unconfigured;
         const transport: Transport = if (use_cli)
             .exclusive_cli
         else daemon: {
             const io = opts.io orelse break :daemon .unconfigured;
-            const configured = initDaemonTransport(allocator, io, opts) catch
+            const configured = initDaemonTransport(allocator, io, opts) catch |err| {
+                unconfigured_kind = switch (err) {
+                    error.ConfigUnsafe => .config_unsafe,
+                    error.FileNotFound => if (envGet("METACODES_KG_CONFIG") != null) .config_invalid else .unconfigured,
+                    error.InvalidRemoteConfiguration, error.ConfigInvalid => .config_invalid,
+                    else => blk: {
+                        log.warn("kg", "daemon configuration probe failed: {s}", .{@errorName(err)});
+                        break :blk .unconfigured;
+                    },
+                };
                 break :daemon .unconfigured;
-            break :daemon if (configured) |value| .{ .daemon = value } else .unconfigured;
+            };
+            unconfigured_kind = configured.kind;
+            break :daemon if (configured.transport) |value| .{ .daemon = value } else .unconfigured;
         };
+        const daemon_home = if (!use_cli) try allocator.dupe(u8, opts.home) else null;
+        errdefer if (daemon_home) |h| allocator.free(h);
         return .{
             .allocator = allocator,
             .transport = transport,
             .bin_path = bin,
             .store = store,
             .domain = domain,
+            .daemon_home = daemon_home,
+            .daemon_io = if (!use_cli) opts.io else null,
+            .unconfigured_kind = unconfigured_kind,
             .scoped_types = std.StringHashMap(void).init(allocator),
             .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
             .execution_ledger = execution_knowledge.Ledger.init(allocator),
@@ -397,6 +437,14 @@ pub const KgClient = struct {
                 .scoped_types = std.StringHashMap(void).init(allocator),
                 .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
                 .execution_ledger = execution_knowledge.Ledger.init(allocator),
+                // Clones never re-read daemon.json: a rebuilt transport would carry
+                // its own write fence, and the ambiguous-commit poison must stay
+                // shared across the whole in-process client family. They still
+                // re-probe a transport they already hold; only the root client
+                // re-reads configuration and hands the shared fence to later clones.
+                .daemon_home = null,
+                .daemon_io = null,
+                .unconfigured_kind = self.unconfigured_kind,
             };
         }
         // issue #30:此前这里只判 `.daemon`,于是 `.unconfigured` 客户端落到下面的
@@ -418,6 +466,14 @@ pub const KgClient = struct {
                 .scoped_types = std.StringHashMap(void).init(allocator),
                 .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
                 .execution_ledger = execution_knowledge.Ledger.init(allocator),
+                // Clones never re-read daemon.json: a rebuilt transport would carry
+                // its own write fence, and the ambiguous-commit poison must stay
+                // shared across the whole in-process client family. They still
+                // re-probe a transport they already hold; only the root client
+                // re-reads configuration and hands the shared fence to later clones.
+                .daemon_home = null,
+                .daemon_io = null,
+                .unconfigured_kind = self.unconfigured_kind,
             };
         };
         return KgClient.init(allocator, .{
@@ -572,6 +628,23 @@ pub const KgClient = struct {
         return null;
     }
 
+    /// Resolve the TinyKG daemon with the same explicit-then-adjacent policy as
+    /// the CLI. An explicit but unusable METACODES_KGD_BIN is terminal and
+    /// never falls through to a staged daemon.
+    pub fn resolveTinykgdBinary(allocator: std.mem.Allocator, opts: ResolveOptions) !?ResolvedBinary {
+        if (opts.env_daemon_bin orelse envGet("METACODES_KGD_BIN")) |v| {
+            if (v.len > 0 and isExecutable(v)) return .{ .path = try allocator.dupe(u8, v), .source = .env };
+            if (v.len > 0) return null;
+        }
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_dir: ?[]const u8 = opts.exe_dir orelse selfExeDir(&exe_buf);
+        if (exe_dir) |dir| {
+            if (try findStagedAdjacentNamed(allocator, dir, if (@import("builtin").os.tag == .windows) "tinykgd.exe" else "tinykgd")) |p|
+                return .{ .path = p, .source = .adjacent };
+        }
+        return null;
+    }
+
     fn resolveBinPath(allocator: std.mem.Allocator, opts: ResolveOptions) !?[]u8 {
         var resolved = try resolveTinykgBinary(allocator, opts);
         if (resolved) |*value| return value.path;
@@ -579,18 +652,12 @@ pub const KgClient = struct {
     }
 
     /// OS 级真实 exe 目录(**不依赖 argv[0]**,PATH 裸名启动也可靠——修 exe_dir=null 静默落 dev
-    /// 的根)。三 OS 实现收敛在 platform.paths.selfExePath(macOS/Linux/Windows),此处补
-    /// realpath 解 symlink(安装常经 /usr/local/bin symlink)+ 取 dirname。失败 → null。
+    /// 的根)。三 OS 实现 + realpath 解 symlink(安装常经 ~/bin symlink)收敛在
+    /// platform.paths.selfExeRealPath——与 toolchain 的 rg / kernel 相邻查找同一入口,三个
+    /// 解析器不再各自决定解不解 symlink。此处只取 dirname。失败 → null。
     fn selfExeDir(buf: []u8) ?[]const u8 {
-        var raw: [std.fs.max_path_bytes]u8 = undefined;
-        const exe_slice = @import("platform").paths.selfExePath(&raw) orelse return null;
-        var exe_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        if (exe_slice.len >= exe_z_buf.len) return null;
-        @memcpy(exe_z_buf[0..exe_slice.len], exe_slice);
-        exe_z_buf[exe_slice.len] = 0;
-        var rp: [std.fs.max_path_bytes]u8 = undefined;
-        const resolved = pfs.realpath(@ptrCast(&exe_z_buf), &rp);
-        const full: []const u8 = if (resolved != null) std.mem.span(resolved.?) else exe_slice;
+        var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const full = @import("platform").paths.selfExeRealPath(&full_buf) orelse return null;
         const dir = std.fs.path.dirname(full) orelse return null;
         if (dir.len == 0 or dir.len >= buf.len) return null;
         @memcpy(buf[0..dir.len], dir);
@@ -613,6 +680,10 @@ pub const KgClient = struct {
 
     fn findStagedAdjacent(allocator: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
         const bin_name = if (@import("builtin").os.tag == .windows) "tinykg.exe" else "tinykg";
+        return findStagedAdjacentNamed(allocator, start_dir, bin_name);
+    }
+
+    fn findStagedAdjacentNamed(allocator: std.mem.Allocator, start_dir: []const u8, bin_name: []const u8) !?[]u8 {
         var roots: [2][]const u8 = undefined;
         const root_count = stagedSearchRoots(start_dir, &roots);
         for (roots[0..root_count]) |root| {
@@ -628,11 +699,17 @@ pub const KgClient = struct {
         return std.mem.span(v);
     }
 
-    const DaemonFile = struct {
+    pub const DaemonFile = struct {
         url: []const u8,
         api_key: []const u8 = "",
         expected_build_id: ?[]const u8 = null,
         expected_schema_digest: []const u8 = "",
+        /// The Store the local `metacodes kgd` serves. Declared here, and
+        /// nowhere used by a client, because this file is parsed with
+        /// `ignore_unknown_fields = false`: the service's own setting has to be
+        /// part of the schema or every session would reject the file. A remote
+        /// daemon's configuration simply omits it.
+        store: ?[]const u8 = null,
     };
 
     /// Resolve only the Metacodes-owned local daemon configuration.  The
@@ -643,23 +720,28 @@ pub const KgClient = struct {
     /// METACODES_KG_* remains an all-or-nothing explicit injection surface for
     /// tests and deliberate debugging against another endpoint. It is never
     /// populated from the Skill's credential store.
+    const DaemonInit = struct { transport: ?transport_mod.WebTransport, kind: DegradedKind };
+
     fn initDaemonTransport(
         allocator: std.mem.Allocator,
         io: std.Io,
         opts: ResolveOptions,
-    ) !?transport_mod.WebTransport {
+    ) !DaemonInit {
         const explicit_url = opts.daemon_url orelse envGet("METACODES_KG_URL");
         const explicit_key = opts.daemon_api_key orelse envGet("METACODES_KG_API_KEY");
         const explicit_build = opts.daemon_expected_build_id orelse envGet("METACODES_KG_EXPECTED_BUILD_ID");
         const explicit_schema = opts.daemon_expected_schema_digest orelse envGet("METACODES_KG_EXPECTED_SCHEMA_DIGEST") orelse "";
         if (explicit_url != null or explicit_key != null or explicit_build != null or explicit_schema.len != 0) {
-            return @as(?transport_mod.WebTransport, try transport_mod.WebTransport.init(allocator, .{
+            return .{ .transport = transport_mod.WebTransport.init(allocator, .{
                 .io = io,
                 .url = explicit_url orelse return error.InvalidRemoteConfiguration,
                 .api_key = explicit_key orelse return error.InvalidRemoteConfiguration,
                 .expected_build_id = explicit_build orelse return error.InvalidRemoteConfiguration,
                 .expected_schema_digest = explicit_schema,
-            }));
+            }) catch |err| switch (err) {
+                error.InvalidConfiguration, error.InvalidUrl => return error.ConfigInvalid,
+                else => return err,
+            }, .kind = .unconfigured };
         }
 
         const env_config_path = envGet("METACODES_KG_CONFIG");
@@ -669,18 +751,21 @@ pub const KgClient = struct {
             // A user-selected config is authoritative and must fail closed;
             // the default path being absent means daemon mode is simply not
             // configured. Other open/stat failures remain unsafe.
-            if (err == error.FileNotFound and env_config_path == null) return null;
+            if (err == error.FileNotFound and env_config_path == null) return .{ .transport = null, .kind = .unconfigured };
             return err;
         };
         defer if (file) |*loaded| loaded.deinit();
-        const file_value: DaemonFile = if (file) |loaded| loaded.value else return null;
-        return @as(?transport_mod.WebTransport, try transport_mod.WebTransport.init(allocator, .{
+        const file_value: DaemonFile = if (file) |loaded| loaded.value else return .{ .transport = null, .kind = .unconfigured };
+        return .{ .transport = transport_mod.WebTransport.init(allocator, .{
             .io = io,
             .url = file_value.url,
             .api_key = file_value.api_key,
             .expected_build_id = file_value.expected_build_id orelse return error.InvalidRemoteConfiguration,
             .expected_schema_digest = file_value.expected_schema_digest,
-        }));
+        }) catch |err| switch (err) {
+            error.InvalidConfiguration, error.InvalidUrl => return error.ConfigInvalid,
+            else => return err,
+        }, .kind = .unconfigured };
     }
 
     fn daemonConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
@@ -688,7 +773,20 @@ pub const KgClient = struct {
         return std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/daemon.json", .{home});
     }
 
-    const ParsedDaemonFile = std.json.Parsed(DaemonFile);
+    pub const ParsedDaemonFile = std.json.Parsed(DaemonFile);
+
+    /// The same strict read a session performs, for `metacodes kgd` and
+    /// `metacodes kg install`: a service that accepted a configuration its own
+    /// clients refuse would hand the API key to whoever could write the file.
+    pub fn loadDaemonConfig(allocator: std.mem.Allocator, path: []const u8) !ParsedDaemonFile {
+        return (try readDaemonConfig(allocator, path)) orelse error.FileNotFound;
+    }
+
+    /// `METACODES_KG_CONFIG`, else the default under `home`. Shared so the
+    /// service and its clients can never read different files.
+    pub fn resolveDaemonConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+        return daemonConfigPath(allocator, home);
+    }
 
     fn readDaemonConfig(allocator: std.mem.Allocator, path: []const u8) !?ParsedDaemonFile {
         const path_z = try allocator.dupeZ(u8, path);
@@ -696,26 +794,27 @@ pub const KgClient = struct {
         const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
         if (fd < 0) {
             if (!pfs.exists(path_z.ptr)) return error.FileNotFound;
-            return error.InvalidRemoteConfiguration;
+            if (pfs.isSymlink(path_z.ptr)) return error.ConfigUnsafe;
+            return error.ConfigInvalid;
         }
         defer pfs.close(fd);
         const info = pfs.fileInfo(fd) catch return error.InvalidRemoteConfiguration;
         if (!info.is_regular or info.link_count != 1 or info.size > 64 * 1024)
-            return error.InvalidRemoteConfiguration;
+            return error.ConfigUnsafe;
         if (@import("builtin").os.tag != .windows and (info.mode & 0o077) != 0)
-            return error.InvalidRemoteConfiguration;
+            return error.ConfigUnsafe;
         const bytes = common.readAllFromFdCapped(fd, allocator, 64 * 1024) catch
-            return error.InvalidRemoteConfiguration;
+            return error.ConfigInvalid;
         defer allocator.free(bytes);
         var parsed = std.json.parseFromSlice(DaemonFile, allocator, bytes, .{
             .ignore_unknown_fields = false,
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
-        }) catch return error.InvalidRemoteConfiguration;
+        }) catch return error.ConfigInvalid;
         errdefer parsed.deinit();
         if (parsed.value.url.len == 0 or parsed.value.api_key.len == 0 or
             parsed.value.expected_build_id == null)
-            return error.InvalidRemoteConfiguration;
+            return error.ConfigInvalid;
         return parsed;
     }
 
@@ -737,17 +836,17 @@ pub const KgClient = struct {
         if (self.ready) return;
         switch (self.transport) {
             .unconfigured => {
-                self.setDegraded("Metacodes 本地 TinyKG daemon 未配置或配置不安全。写入 ~/.metacodes/kg/daemon.json（或 METACODES_KG_CONFIG），也可完整设置 METACODES_KG_URL/METACODES_KG_API_KEY/METACODES_KG_EXPECTED_BUILD_ID；TinyKG Skill remote.json 不属于本地 runtime，且共享 Store 禁止 CLI fallback", .{});
+                self.setDegraded(self.unconfigured_kind, "Metacodes 本地 TinyKG daemon 未配置或配置不可用", .{});
                 return;
             },
             .daemon => |*daemon| {
                 const result = daemon.run("store-info", &.{}, false) catch |err| {
-                    self.setDegraded("TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(err)});
+                    self.setDegraded(classifyDaemonError(err), "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(err)});
                     return;
                 };
                 defer result.deinit(self.allocator);
                 if (result.exit_code != 0) {
-                    self.setDegraded("TinyKG daemon store-info 失败: {s}", .{trimForLog(result.stderr)});
+                    self.setDegraded(.daemon_unreachable, "TinyKG daemon store-info 失败: {s}", .{trimForLog(result.stderr)});
                     return;
                 }
                 const ver = extractInfoField(result.stdout, "storage_format_version") orelse "missing";
@@ -755,7 +854,15 @@ pub const KgClient = struct {
                 if (!std.mem.eql(u8, ver, EXPECTED_STORAGE_FORMAT_VERSION) or
                     !std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION))
                 {
-                    self.setDegraded("TinyKG daemon Store contract mismatch: storage={s} schema={s}", .{ ver, schema_ver });
+                    self.setDegraded(.store_contract_mismatch, "TinyKG daemon Store contract mismatch: storage={s} schema={s}", .{ ver, schema_ver });
+                    return;
+                }
+                const readiness = daemon.ready() catch |err| {
+                    self.setDegraded(classifyDaemonError(err), "TinyKG daemon readiness 失败: {s}", .{@errorName(err)});
+                    return;
+                };
+                if (readiness.supported and (readiness.degraded or !readiness.ready)) {
+                    self.setDegraded(.server_degraded, "TinyKG daemon reports degraded or not ready", .{});
                     return;
                 }
                 self.ready = true;
@@ -765,7 +872,7 @@ pub const KgClient = struct {
             .exclusive_cli => {},
         }
         const bin = self.bin_path orelse {
-            self.setDegraded("tinykg 二进制未找到。只接受 METACODES_KG_BIN、config kg_bin 或构建时从 checked-in bundle staged 的 <prefix>/vendor/tinykg/tinykg。源码仓库不构建 TinyKG；见 doc/TINYKG_INTEGRATION.md", .{});
+            self.setDegraded(.cli_bin_missing, "tinykg 二进制未找到。只接受 METACODES_KG_BIN、config kg_bin 或构建时从 checked-in bundle staged 的 <prefix>/vendor/tinykg/tinykg。源码仓库不构建 TinyKG；见 doc/TINYKG_INTEGRATION.md", .{});
             return;
         };
         // 与 bin 同一套写法:在边界解包一次,往下传参。`.unowned` 到这里就是矛盾
@@ -774,7 +881,7 @@ pub const KgClient = struct {
         const store = self.store.fsPath() orelse {
             // 措辞刻意避开 "未打开本地 Store"——那是 daemon preflight 那条消息的规则标记,
             // 复用会让它不再唯一:原消息被删掉时规则仍会因为这条而通过。
-            self.setDegraded("内部状态矛盾:CLI 传输却不拥有 Store(store=daemon-owned);拒绝在当前目录建库", .{});
+            self.setDegraded(.cli_store_failed, "内部状态矛盾:CLI 传输却不拥有 Store(store=daemon-owned);拒绝在当前目录建库", .{});
             return;
         };
         // store 缺 → init(先建父目录)。
@@ -788,12 +895,12 @@ pub const KgClient = struct {
         if (!dirExists(store)) {
             ensureParentDir(self.allocator, store) catch {};
             const out = self.runRaw(&.{ "init", store }) catch {
-                self.setDegraded("tinykg init 失败(bin={s} store={s});检查磁盘/权限", .{ bin, store });
+                self.setDegraded(.cli_store_failed, "tinykg init 失败(bin={s} store={s});检查磁盘/权限", .{ bin, store });
                 return;
             };
             defer self.freeOut(out);
             if (out.exit_code != 0) {
-                self.setDegraded("tinykg init 退出码 {d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
+                self.setDegraded(.cli_store_failed, "tinykg init 退出码 {d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
                 return;
             }
         }
@@ -809,12 +916,12 @@ pub const KgClient = struct {
     /// 版本门检查;legacy store 自动 migrate 到 v2 后重新验证。true=通过,false=已 setDegraded。
     fn checkStoreVersionOrMigrate(self: *KgClient, bin: []const u8, store: []const u8) bool {
         const out = self.runRaw(&.{ "store-info", store }) catch {
-            self.setDegraded("tinykg store-info 失败(bin={s} store={s})", .{ bin, store });
+            self.setDegraded(.cli_store_failed, "tinykg store-info 失败(bin={s} store={s})", .{ bin, store });
             return false;
         };
         defer self.freeOut(out);
         if (out.exit_code != 0) {
-            self.setDegraded("tinykg store-info 退出码 {d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
+            self.setDegraded(.cli_store_failed, "tinykg store-info 退出码 {d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
             return false;
         }
         const ver = extractInfoField(out.stdout, "storage_format_version") orelse "missing";
@@ -824,6 +931,7 @@ pub const KgClient = struct {
             const schema_ver = extractInfoField(out.stdout, "schema_version") orelse "missing";
             if (!std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION)) {
                 self.setDegraded(
+                    .store_contract_mismatch,
                     "store schema 版本不符:期望 {s} 实际 {s}(store={s})。不要原地改 canonical store;请先运行 `tinykg migrate-store-v2 {s} <new-store> --task-status-v1 --verify`,核验后再切换 store",
                     .{ EXPECTED_SCHEMA_VERSION, schema_ver, store, store },
                 );
@@ -833,12 +941,12 @@ pub const KgClient = struct {
         }
         // storage_format 不符:仅 legacy 自动 migrate,其它版本直接 degraded
         if (!std.mem.eql(u8, ver, "legacy")) {
-            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});手动跑 `tinykg upgrade {s} <new-store>` 核验后替换,见 deps/tinykg.json", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, store, store });
+            self.setDegraded(.store_contract_mismatch, "store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});手动跑 `tinykg upgrade {s} <new-store>` 核验后替换,见 deps/tinykg.json", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, store, store });
             return false;
         }
         // legacy → current format 自动 migrate(本机 KG 是基础特性,不应让用户手动跑 tinykg 命令)
         if (!self.autoMigrateLegacyStore(store)) {
-            self.setDegraded("store legacy→v2 自动 migrate 失败(bin={s} store={s});手动跑 `tinykg migrate-store-v2 {s} <new> --task-status-v1 --verify` 后替换", .{ bin, store, store });
+            self.setDegraded(.cli_store_failed, "store legacy→v2 自动 migrate 失败(bin={s} store={s});手动跑 `tinykg migrate-store-v2 {s} <new> --task-status-v1 --verify` 后替换", .{ bin, store, store });
             return false;
         }
         log.info("kg", "legacy→v2 自动 migrate 成功 store={s}", .{store});
@@ -873,7 +981,7 @@ pub const KgClient = struct {
         }
         // 与 migrate 共用 host lock:并发进程只允许一个执行隔离。
         var lock = self.acquireMigrationLock(store) catch |err| {
-            self.setDegraded("store integrity quarantine lock failed: {s}(store={s})", .{ @errorName(err), store });
+            self.setDegraded(.cli_store_failed, "store integrity quarantine lock failed: {s}(store={s})", .{ @errorName(err), store });
             return false;
         };
         defer lock.release();
@@ -885,22 +993,22 @@ pub const KgClient = struct {
         } else |_| {}
         const ts: u64 = @intCast(@max(0, time.nowUnix()));
         const quarantine_path = std.fmt.allocPrint(self.allocator, "{s}.quarantined.{d}", .{ store, ts }) catch {
-            self.setDegraded("store integrity quarantine path allocation failed(err={s} store={s})", .{ err_name, store });
+            self.setDegraded(.cli_store_failed, "store integrity quarantine path allocation failed(err={s} store={s})", .{ err_name, store });
             return false;
         };
         defer self.allocator.free(quarantine_path);
         if (!renamePath(store, quarantine_path)) {
-            self.setDegraded("store integrity quarantine rename failed(err={s} store={s})", .{ err_name, store });
+            self.setDegraded(.cli_store_failed, "store integrity quarantine rename failed(err={s} store={s})", .{ err_name, store });
             return false;
         }
         log.warn("kg", "store integrity quarantine: deep probe failed err={s}; broken store preserved at {s}; initializing FRESH store (outcome-root re-ingest restores dose)", .{ err_name, quarantine_path });
         const init_out = self.runRaw(&.{ "init", store }) catch {
-            self.setDegraded("post-quarantine tinykg init failed(bin={s} store={s})", .{ bin, store });
+            self.setDegraded(.cli_store_failed, "post-quarantine tinykg init failed(bin={s} store={s})", .{ bin, store });
             return false;
         };
         defer self.freeOut(init_out);
         if (init_out.exit_code != 0) {
-            self.setDegraded("post-quarantine tinykg init exit={d}: {s}", .{ init_out.exit_code, trimForLog(init_out.stderr) });
+            self.setDegraded(.cli_store_failed, "post-quarantine tinykg init exit={d}: {s}", .{ init_out.exit_code, trimForLog(init_out.stderr) });
             return false;
         }
         return true;
@@ -942,30 +1050,30 @@ pub const KgClient = struct {
     /// resume TinyKG's idempotent migration rather than creating a new empty store.
     fn recoverInterruptedAutoMigration(self: *KgClient, bin: []const u8, store: []const u8) MigrationRecovery {
         const backup = self.migrationBackupPath(store) catch {
-            self.setDegraded("legacy migrate recovery path allocation failed(store={s})", .{store});
+            self.setDegraded(.cli_store_failed, "legacy migrate recovery path allocation failed(store={s})", .{store});
             return .failed;
         };
         defer self.allocator.free(backup);
         if (!dirExists(backup)) return .not_needed;
 
         var lock = self.acquireMigrationLock(store) catch |err| {
-            self.setDegraded("legacy migrate recovery lock failed: {s}(store={s})", .{ @errorName(err), store });
+            self.setDegraded(.cli_store_failed, "legacy migrate recovery lock failed: {s}(store={s})", .{ @errorName(err), store });
             return .failed;
         };
         defer lock.release();
         if (dirExists(store)) return .recovered; // another process completed while we waited
         if (self.probeStore(backup) != .legacy) {
-            self.setDegraded("legacy migrate recovery found an incompatible rollback artifact(bin={s} backup={s})", .{ bin, backup });
+            self.setDegraded(.cli_store_failed, "legacy migrate recovery found an incompatible rollback artifact(bin={s} backup={s})", .{ bin, backup });
             return .failed;
         }
         if (self.migrateBackupToCanonical(backup, store)) return .recovered;
         if (!dirExists(store)) {
             if (!renamePath(backup, store)) {
-                self.setDegraded("legacy migrate recovery failed and rollback rename failed(bin={s} backup={s} store={s})", .{ bin, backup, store });
+                self.setDegraded(.cli_store_failed, "legacy migrate recovery failed and rollback rename failed(bin={s} backup={s} store={s})", .{ bin, backup, store });
                 return .failed;
             }
         }
-        self.setDegraded("legacy migrate recovery failed; original store restored, automatic retry disabled for this session(bin={s} store={s})", .{ bin, store });
+        self.setDegraded(.cli_store_failed, "legacy migrate recovery failed; original store restored, automatic retry disabled for this session(bin={s} store={s})", .{ bin, store });
         return .failed;
     }
 
@@ -1022,17 +1130,163 @@ pub const KgClient = struct {
         return pfs.renameReplace(@ptrCast(&from_buf), @ptrCast(&to_buf)) == 0;
     }
 
-    fn setDegraded(self: *KgClient, comptime fmt: []const u8, args: anytype) void {
+    fn setDegraded(self: *KgClient, kind: DegradedKind, comptime fmt: []const u8, args: anytype) void {
         self.ready = false;
         const reason = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
         if (self.degraded_reason) |old| self.allocator.free(old);
         self.degraded_reason = reason;
+        self.degraded_kind = kind;
         log.warn("kg", "degraded: {s}", .{reason});
+    }
+
+    fn classifyDaemonError(err: transport_mod.Error) DegradedKind {
+        return switch (err) {
+            transport_mod.Error.AuthenticationFailed => .auth_failed,
+            transport_mod.Error.IncompatibleDaemon => .pin_mismatch,
+            transport_mod.Error.RequestFailed, transport_mod.Error.RequestTimedOut, transport_mod.Error.DaemonUnavailable, transport_mod.Error.Backpressure => .daemon_unreachable,
+            else => .daemon_unreachable,
+        };
+    }
+
+    pub fn degradedKind(self: *const KgClient) ?DegradedKind {
+        return self.degraded_kind;
+    }
+
+    pub fn degradedHint(self: *const KgClient) []const u8 {
+        return hintFor(self.degraded_kind orelse .unconfigured);
+    }
+
+    /// One fixed repair hint per kind; the same text is shown by the tools,
+    /// `/kg`, and `doctor`, including for a session that has no client at all.
+    pub fn hintFor(kind: DegradedKind) []const u8 {
+        return switch (kind) {
+            .unconfigured => "write ~/.metacodes/kg/daemon.json (url, api_key, expected_build_id; 0600) or set METACODES_KG_URL/_API_KEY/_EXPECTED_BUILD_ID",
+            .config_unsafe => "chmod 600 and make it a regular non-symlink file under 64 KB",
+            .config_invalid => "fix url/api_key/expected_build_id JSON",
+            .daemon_unreachable => "start tinykgd/tinykg-web at the configured url",
+            .auth_failed => "api_key must match the daemon's TINYKG_WEB_API_KEY",
+            .pin_mismatch => "set expected_build_id/schema digest to the running daemon's /api/catalog values",
+            .store_contract_mismatch => "migrate the store to storage 3 / schema 3",
+            .server_degraded => "the daemon is up but reports a degraded store, check its logs",
+            .cli_bin_missing => "set METACODES_KG_BIN or install the staged bundle",
+            .cli_store_failed => "see the reason (disk/permissions/corrupt store)",
+        };
+    }
+
+    pub fn probeDue(now_ms: i64, last_probe_ms: i64, backoff_ms: i64) bool {
+        return backoff_ms <= 0 or now_ms >= last_probe_ms + backoff_ms;
+    }
+
+    pub fn nextBackoff(current_ms: i64) i64 {
+        if (current_ms <= 0) return 5_000;
+        return @min(current_ms * 2, 300_000);
+    }
+
+    /// `/kg` and other explicit user requests: probe now regardless of the
+    /// backoff window (a failed forced probe restarts the schedule at 5 s).
+    pub fn retryReadyNow(self: *KgClient) bool {
+        if (self.ready) return true;
+        self.last_probe_ms = 0;
+        self.probe_backoff_ms = 0;
+        return self.retryReadyIfDue();
+    }
+
+    /// Tool path: re-probe a degraded client only when its backoff window has
+    /// elapsed (5 s doubling to 5 min), so a dead daemon costs one bounded
+    /// probe per window instead of one per KG tool call.
+    pub fn retryReadyIfDue(self: *KgClient) bool {
+        if (self.ready) return true;
+        const now = time.nowMs();
+        if (now <= 0 or !probeDue(now, self.last_probe_ms, self.probe_backoff_ms)) return false;
+        if (self.degraded_kind == .unconfigured or self.degraded_kind == .config_unsafe or self.degraded_kind == .config_invalid) {
+            if (self.daemon_io) |io| if (self.daemon_home) |home| {
+                const rebuilt = initDaemonTransport(self.allocator, io, .{ .home = home, .domain = self.domain, .io = io }) catch |err| blk: {
+                    self.unconfigured_kind = switch (err) {
+                        error.ConfigUnsafe => .config_unsafe,
+                        error.FileNotFound => if (envGet("METACODES_KG_CONFIG") != null) .config_invalid else .unconfigured,
+                        error.InvalidRemoteConfiguration, error.ConfigInvalid => .config_invalid,
+                        else => .unconfigured,
+                    };
+                    break :blk null;
+                };
+                if (rebuilt) |state| {
+                    switch (self.transport) {
+                        .daemon => |*daemon| daemon.deinit(),
+                        else => {},
+                    }
+                    self.transport = if (state.transport) |daemon| .{ .daemon = daemon } else .unconfigured;
+                    self.unconfigured_kind = state.kind;
+                }
+            };
+        }
+        self.ready = false;
+        if (self.degraded_reason) |old| {
+            self.allocator.free(old);
+            self.degraded_reason = null;
+        }
+        self.degraded_kind = null;
+        self.ensureReady();
+        if (self.ready) {
+            self.last_probe_ms = 0;
+            self.probe_backoff_ms = 0;
+            return true;
+        }
+        self.last_probe_ms = now;
+        self.probe_backoff_ms = nextBackoff(self.probe_backoff_ms);
+        return false;
+    }
+
+    /// Readiness probe used by doctor; it never creates, migrates, quarantines,
+    /// or otherwise mutates a CLI-owned store.
+    pub fn ensureReadyReadOnly(self: *KgClient) void {
+        if (self.ready) return;
+        switch (self.transport) {
+            .daemon => self.ensureReady(),
+            .unconfigured => self.setDegraded(self.unconfigured_kind, "Metacodes 本地 TinyKG daemon 未配置或配置不可用", .{}),
+            .exclusive_cli => {
+                const bin = self.bin_path orelse {
+                    self.setDegraded(.cli_bin_missing, "tinykg 二进制未找到", .{});
+                    return;
+                };
+                const store = self.store.fsPath() orelse {
+                    self.setDegraded(.cli_store_failed, "store missing (doctor does not create stores)", .{});
+                    return;
+                };
+                if (!dirExists(store)) {
+                    self.setDegraded(.cli_store_failed, "store missing (doctor does not create stores)", .{});
+                    return;
+                }
+                const out = self.runRaw(&.{ "store-info", store }) catch {
+                    self.setDegraded(.cli_store_failed, "tinykg store-info 失败(bin={s} store={s})", .{ bin, store });
+                    return;
+                };
+                defer self.freeOut(out);
+                if (out.exit_code != 0) {
+                    self.setDegraded(.cli_store_failed, "tinykg store-info 退出码 {d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
+                    return;
+                }
+                const ver = extractInfoField(out.stdout, "storage_format_version") orelse "missing";
+                const schema_ver = extractInfoField(out.stdout, "schema_version") orelse "missing";
+                if (!std.mem.eql(u8, ver, EXPECTED_STORAGE_FORMAT_VERSION) or !std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION)) {
+                    self.setDegraded(.store_contract_mismatch, "store contract mismatch: storage={s} schema={s}", .{ ver, schema_ver });
+                    return;
+                }
+                self.ready = true;
+            },
+        }
     }
 
     /// degraded 时给工具层的结构化说明(borrow;调用方勿 free)。
     pub fn degradedMessage(self: *const KgClient) []const u8 {
         return self.degraded_reason orelse "KG 未就绪";
+    }
+
+    pub fn transportName(self: *const KgClient) []const u8 {
+        return switch (self.transport) {
+            .daemon => "daemon",
+            .exclusive_cli => "cli",
+            .unconfigured => "unconfigured",
+        };
     }
 
     // ── project-containment(tinykg ce3a7f0:domain_id 移除,图拓扑隔离)────
@@ -2796,7 +3050,12 @@ pub const KgClient = struct {
             transport_mod.Error.Backpressure => KgError.Backpressure,
             transport_mod.Error.OutOfMemory => KgError.OutOfMemory,
             transport_mod.Error.AuthenticationFailed, transport_mod.Error.IncompatibleDaemon, transport_mod.Error.InvalidConfiguration, transport_mod.Error.InvalidUrl => blk: {
-                self.setDegraded("TinyKG daemon contract 失败: {s}；禁止 CLI fallback", .{@errorName(err)});
+                const kind: DegradedKind = switch (err) {
+                    transport_mod.Error.AuthenticationFailed => .auth_failed,
+                    transport_mod.Error.IncompatibleDaemon => .pin_mismatch,
+                    else => .config_invalid,
+                };
+                self.setDegraded(kind, "TinyKG daemon contract 失败: {s}；禁止 CLI fallback", .{@errorName(err)});
                 break :blk KgError.Degraded;
             },
             else => KgError.DaemonUnavailable,

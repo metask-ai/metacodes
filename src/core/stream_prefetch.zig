@@ -4,8 +4,8 @@
 //! tool_use 攒到流结束再统一 executeSlots——对"多工具 + 大 Read"的长回合,首个工具本可在流还在跑时
 //! 就启动。cc 的 StreamingToolExecutor / codex 的 in-flight futures 都证明边流边执行是核心能力。
 //!
-//! **可流子集**:所有 **concurrency-safe**(只读语义:Read/Grep/Glob/BashOutput/WebFetch + 只读 Bash
-//! `git status`/`ls`)+ **isStreamable**(排除 WebSearch,它子请求竞争模型 client)+ 权限 auto-allow +
+//! **可流子集**:所有 **concurrency-safe**(只读语义:Read/Grep/Glob/WebFetch + 只读 Bash
+//! `git status`/`ls`)+ **isStreamable**(排除 WebSearch 与 BashOutput)+ 权限 auto-allow +
 //! 无 PreToolUse hook 匹配。这类工具"提前跑或丢弃"都无害,故不改动权限/提交/执行主管线:
 //!   - tool_use_start 到达 → 若可流 → 开线程跑,结果按 tool_use id 存;
 //!   - 流结束后 executeSlots 处理该工具时 → 若有结果 → 直接用,不重复执行;
@@ -23,12 +23,14 @@ const file_reference = @import("file_reference.zig");
 const file_change = @import("file_change.zig");
 const tool_result = @import("tool_result.zig");
 
-/// 可流式执行的工具:除 **WebSearch** 外的一切。WebSearch 在其隔离子请求里发子 LLM 请求,
+/// 可流式执行的工具:除 **WebSearch** 和 **BashOutput** 外的一切。BashOutput 的长轮询必须
+/// 对模型可见，不能在 tool card 出现前藏在预取线程里。
+/// WebSearch 在其隔离子请求里发子 LLM 请求,
 /// 是重量级付费调用——主 stream 后续还可能取消/改写本轮工具,投机预取的浪费远高于 Read/Grep
 /// (成本论;std.http.Client 连接池本身线程安全,并发不是排除理由)→ 留给流末 executeSlots。
 /// 真正能否边流边执行由调用方叠加 `isConcurrencySafeInput`(只读语义)+ 权限 allow + 无 PreToolUse hook。
 pub fn isStreamable(name: []const u8) bool {
-    return !std.mem.eql(u8, name, "WebSearch");
+    return !std.mem.eql(u8, name, "WebSearch") and !std.mem.eql(u8, name, "BashOutput");
 }
 
 /// 历史名(保留兼容/文档):纯只读工具白名单。现广播到全 concurrency-safe 集,门见 isStreamable。
@@ -234,14 +236,14 @@ pub const Prefetch = struct {
     }
 };
 
-test "isStreamable 除 WebSearch 外皆可流(WebSearch 重量级子请求,成本论排除)" {
-    // 可流性只排 WebSearch;真正能否流由调用方叠加 isConcurrencySafeInput + 权限 + 无 hook。
+test "isStreamable 排除 WebSearch 与 BashOutput(长轮询必须可见)" {
+    // BashOutput 的等待不能藏在 tool card 出现前的预取线程里。
     try std.testing.expect(isStreamable("Read"));
     try std.testing.expect(isStreamable("Bash"));
-    try std.testing.expect(isStreamable("BashOutput"));
+    try std.testing.expect(!isStreamable("BashOutput"));
     try std.testing.expect(isStreamable("WebFetch"));
     try std.testing.expect(isStreamable("Write")); // isStreamable 不看并发安全(下游 gate 挡)
-    try std.testing.expect(!isStreamable("WebSearch")); // 唯一排除
+    try std.testing.expect(!isStreamable("WebSearch"));
 }
 
 test "广播:只读 Bash 经 executeOne 流式执行(非 read-only 白名单也能跑)" {

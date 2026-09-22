@@ -33,8 +33,9 @@ const Subsystem = struct {
 
 const SUBSYSTEMS = [_]Subsystem{
     .{
-        // The provider kernel: `std`, `types.zig`, three leaf utilities, and
-        // the portable platform layer. Not the transport, not a UI.
+        // The provider kernel: `std`, `types.zig`, the approved leaf
+        // utilities, and the portable platform layer. Not the transport, not
+        // a UI.
         .dir = "src/provider",
         .recursive = true,
         .modules = &.{ "std", "builtin", "platform" },
@@ -45,6 +46,7 @@ const SUBSYSTEMS = [_]Subsystem{
             "src/util/fs.zig",
             "src/util/file_lock.zig",
             "src/util/json_merge.zig",
+            "src/util/json.zig",
         },
     },
     .{

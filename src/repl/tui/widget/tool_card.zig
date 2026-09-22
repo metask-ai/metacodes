@@ -399,6 +399,16 @@ pub fn renderLiveDone(
     try out.appendSlice(alloc, title);
     try out.append(alloc, '\n');
 
+    if (std.mem.eql(u8, tool_name, "BashOutput")) {
+        // 2026-09-19 事故:模型曾把 BashOutput 当成后台启动卡,看不到每轮返回的状态/字节数。
+        // BashOutput 已有自己的 envelope, committed 卡只留一行可读摘要。
+        if (try bashOutputSummaryLine(alloc, content)) |line| {
+            defer alloc.free(line);
+            try appendLine(alloc, &out, th.dim, line, th.reset);
+            return try out.toOwnedSlice(alloc);
+        }
+    }
+
     // 行2:⎿ 预览。
     // **后台 Bash 例外**:auto-bg(超 15s)/explicit bg(run_in_background)的 committed 卡
     // 必须显 `▶ moved to background job …` / `▶ background job …`——否则用户看不出命令转了后台
@@ -594,7 +604,7 @@ fn renderResultBody(
         return renderJsonToolSummary(alloc, th, tool_name, output_text, out, opts);
     }
     if (std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "BashOutput")) {
-        return renderBashResult(alloc, th, output_text, out, opts);
+        return renderBashResult(alloc, th, tool_name, output_text, out, opts);
     }
     if (std.mem.startsWith(u8, tool_name, "Task") or std.mem.eql(u8, tool_name, "Agent")) {
         return renderTaskResult(alloc, th, tool_name, output_text, out, opts);
@@ -684,7 +694,11 @@ fn appendLine(alloc: std.mem.Allocator, out: *std.ArrayList(u8), color: []const 
 
 /// Bash 结果:从结果 JSON 提取 stdout/stderr/exit_code,**unescape 后**显示真实多行输出,
 /// 而非裸 JSON。对齐 cc BashToolResultMessage(渲染 stdout 文本本身,不含 JSON 包装)。
-fn renderBashResult(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+fn renderBashResult(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+    if (std.mem.eql(u8, tool_name, "BashOutput")) {
+        return renderBashOutputResult(alloc, th, output_text, out, opts);
+    }
+
     // 后台 Bash → 一行提示,不展开裸 JSON(两类:explicit/auto)。与 renderLiveDone 共用 bgJobLine。
     if (try bgJobLine(alloc, "Bash", output_text)) |line| {
         defer alloc.free(line);
@@ -742,6 +756,81 @@ fn renderBashResult(alloc: std.mem.Allocator, th: Theme, output_text: []const u8
 
     if (!printed_any) {
         try appendLine(alloc, out, th.dim, "(no output)", th.reset);
+    }
+}
+
+/// BashOutput envelope 的人话摘要。返回 owned line; caller free。
+/// 通道字段缺失时省略该通道,长度按 JSON 字符串 unescape 后的字节数计算。
+/// `<channel>_encoding: base64` 时按编码后字符数计数,不在此处解码(已知显示小问题)。
+fn bashOutputSummaryLine(alloc: std.mem.Allocator, content: []const u8) !?[]u8 {
+    const job_id = extractField(content, "job_id") orelse return null;
+    const status = extractField(content, "status") orelse return null;
+
+    var stdout: ?[]u8 = null;
+    defer if (stdout) |value| alloc.free(value);
+    if (extractField(content, "stdout")) |raw| stdout = try jsonUnescape(alloc, raw);
+
+    var stderr: ?[]u8 = null;
+    defer if (stderr) |value| alloc.free(value);
+    if (extractField(content, "stderr")) |raw| stderr = try jsonUnescape(alloc, raw);
+
+    var line: std.ArrayList(u8) = .empty;
+    errdefer line.deinit(alloc);
+    try line.print(alloc, "job {s} · {s}", .{ job_id, status });
+    if (extractNumberField(content, "exit_code")) |code| {
+        try line.print(alloc, " {d}", .{code});
+    }
+    if (stdout) |value| try line.print(alloc, " · +{d} B stdout", .{value.len});
+    if (stderr) |value| try line.print(alloc, " · +{d} B stderr", .{value.len});
+    if (extractNumberField(content, "waited_ms")) |waited| {
+        if (waited > 0) try line.print(alloc, " · waited {d:.1}s", .{@as(f64, @floatFromInt(waited)) / 1000.0});
+    }
+    return try line.toOwnedSlice(alloc);
+}
+
+/// BashOutput 的 transcript 卡保留摘要并展开已返回的 stdout/stderr。
+/// 没有可见通道内容时只显示摘要,不补 Bash 的 `(no output)` 行。
+fn renderBashOutputResult(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+    const summary = try bashOutputSummaryLine(alloc, output_text);
+    if (summary) |line| {
+        defer alloc.free(line);
+        try appendLine(alloc, out, th.dim, line, th.reset);
+    } else {
+        return renderGenericFold(alloc, th, output_text, out, opts);
+    }
+
+    const stdout_raw = extractField(output_text, "stdout");
+    const stderr_raw = extractField(output_text, "stderr");
+    var printed_any = false;
+
+    if (stdout_raw) |raw| {
+        const decoded = try jsonUnescape(alloc, raw);
+        defer alloc.free(decoded);
+        const trimmed = std.mem.trim(u8, decoded, "\n");
+        if (trimmed.len > 0) {
+            try renderGenericFold(alloc, th, trimmed, out, opts);
+            printed_any = true;
+        }
+    }
+    if (stderr_raw) |raw| {
+        const decoded = try jsonUnescape(alloc, raw);
+        defer alloc.free(decoded);
+        const trimmed = std.mem.trim(u8, decoded, "\n");
+        if (trimmed.len > 0) {
+            try appendLine(alloc, out, th.dim, "stderr:", th.reset);
+            try renderGenericFold(alloc, th, trimmed, out, opts);
+            printed_any = true;
+        }
+    }
+
+    if (printed_any) {
+        if (extractNumberField(output_text, "exit_code")) |code| {
+            if (code != 0) {
+                const line = try std.fmt.allocPrint(alloc, "exit {d}", .{code});
+                defer alloc.free(line);
+                try appendLine(alloc, out, th.danger, line, th.reset);
+            }
+        }
     }
 }
 
@@ -2065,6 +2154,38 @@ test "renderLiveDone: 普通 Bash(非后台)committed 卡仍只显输入预览(�
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "$ echo hello") != null); // 输入预览在
     try testing.expect(std.mem.indexOf(u8, s, "background job") == null); // 非后台,无 ▶ 后台行
+}
+
+test "renderResult: BashOutput summary renders exited status, bytes, waited_ms, and body" {
+    const th = theme_mod.monochrome;
+    const json = "{\"job_id\":\"dd83d155db82\",\"status\":\"exited\",\"exit_code\":3,\"stdout\":\"one\\ntwo\\n\",\"stderr\":\"\",\"waited_ms\":1250}";
+    const s = try renderResult(testing.allocator, th, "BashOutput", "{\"job_id\":\"dd83d155db82\"}", json, .ok, 100, .{ .transcript = true });
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "job dd83d155db82 · exited 3 · +8 B stdout · +0 B stderr · waited 1.3s") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "one") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "two") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "background job") == null);
+}
+
+test "renderLiveDone: BashOutput committed card is a summary line, never a background start" {
+    const th = theme_mod.monochrome;
+    const json = "{\"job_id\":\"dd83d155db82\",\"status\":\"running\",\"stdout\":\"progress\\n\",\"stderr\":\"\",\"waited_ms\":30000}";
+    const s = try renderLiveDone(testing.allocator, th, "BashOutput", "{\"job_id\":\"dd83d155db82\"}", json, .ok, 100, .{ .cols = 80 });
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "job dd83d155db82 · running · +9 B stdout · +0 B stderr · waited 30.0s") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "background job") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "progress") == null);
+}
+
+test "renderLiveDone: BashOutput omitted stderr and zero wait stay out of summary" {
+    const th = theme_mod.monochrome;
+    const json = "{\"job_id\":\"dd83d155db82\",\"status\":\"running\",\"stdout\":\"a\\n\",\"waited_ms\":0}";
+    const s = try renderLiveDone(testing.allocator, th, "BashOutput", "{\"job_id\":\"dd83d155db82\"}", json, .ok, 100, .{ .cols = 80 });
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "job dd83d155db82 · running · +2 B stdout") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "stderr") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "waited") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "background job") == null);
 }
 
 test "renderJsonToolSummary: 提人话不裸吐 JSON" {

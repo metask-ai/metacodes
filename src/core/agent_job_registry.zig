@@ -32,13 +32,17 @@ const agent_loop = @import("agent_loop.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const util_time = @import("../util/time.zig");
+const utf8 = @import("../util/utf8.zig");
 const log = @import("../util/log.zig");
 const AgentSet = @import("../agents/set.zig").AgentSet;
 const DynRegistry = @import("../tools/dynamic.zig").DynRegistry;
 const SkillSet = @import("../skills/skill.zig").SkillSet;
+const ActiveSkillState = @import("../skills/active.zig").ActiveSkillState;
+const SessionId = @import("session_id.zig").SessionId;
 
 /// 同时存在的后台 job 上限。防线程爆炸 + API 速率打爆。
 pub const MAX_BG_JOBS: usize = 8;
+const OUTPUT_CAP: usize = 512 * 1024;
 
 pub const JobStatus = enum { running, done, failed, killed };
 
@@ -58,6 +62,9 @@ pub const JobEntry = struct {
     done_emitted: bool = false,
     /// 增量输出缓冲。线程边跑边 append(持锁);TaskOutput since_byte 增量读。
     output_buf: std.ArrayList(u8) = .empty,
+    output_truncated: bool = false,
+    utf8_pending: [4]u8 = undefined,
+    utf8_pending_len: u8 = 0,
     final_text: ?[]u8 = null, // owned by allocator;done 后非空
     stop_reason: ?agent_loop.StopReason = null,
     turns: u32 = 0,
@@ -81,6 +88,9 @@ pub const JobEntry = struct {
     /// 在 entry 锁内清空,cancel 与清空串行,不会指向已 deinit 的 client。
     cancel_provider: ?@import("../api/provider.zig").Provider = null,
     allocator: std.mem.Allocator,
+    /// Immutable parent session for routing output/events after the foreground
+    /// session rotates or resumes another transcript.
+    session: SessionId = .single,
     started_ms: util_time.Millis = 0,
     desc_preview: []u8 = &.{}, // owned
     /// 前台(同步)job 标记。foreground job **无 thread**(跑在主线程/并发批的 worker 上,
@@ -88,6 +98,9 @@ pub const JobEntry = struct {
     /// 与后台 job 共用 entries/snapshot/agent_tree 渲染链;区别仅在生命周期(transient,
     /// 父轮结束即 removeForeground)与释放路径(无 thread → 不 join)。
     foreground: bool = false,
+    /// Long-poll readers holding this background entry. Protected by the
+    /// registry list mutex so teardown can wait before freeing the entry.
+    readers: usize = 0,
     /// agent 类型(如 "Explore"),从 desc 拆出。进度树标题按 type 分组计数需要。owned。
     agent_type: []u8 = &.{},
     /// 累计 token(input+output,经 usage_sink 持锁累加)。进度树行 `· X tokens` 用。
@@ -126,8 +139,63 @@ pub const JobEntry = struct {
     fn appendOutput(self: *JobEntry, bytes: []const u8) void {
         self.lock();
         defer self.unlock();
-        self.output_buf.appendSlice(self.allocator, bytes) catch {};
+        if (self.output_truncated) {
+            self.condition.broadcast();
+            return;
+        }
+        if (self.utf8_pending_len > 0) {
+            const pending = self.utf8_pending[0..self.utf8_pending_len];
+            if (pending.len > OUTPUT_CAP -| self.output_buf.items.len) {
+                self.output_truncated = true;
+                self.utf8_pending_len = 0;
+                self.condition.broadcast();
+                return;
+            }
+            self.output_buf.appendSlice(self.allocator, pending) catch {
+                self.output_truncated = true;
+                self.utf8_pending_len = 0;
+                self.condition.broadcast();
+                return;
+            };
+            self.utf8_pending_len = 0;
+        }
+        const room = OUTPUT_CAP -| self.output_buf.items.len;
+        const take = @min(bytes.len, room);
+        self.output_buf.appendSlice(self.allocator, bytes[0..take]) catch {
+            self.output_truncated = true;
+            self.condition.broadcast();
+            return;
+        };
+        if (take < bytes.len) self.output_truncated = true;
+        if (utf8.incompleteTailStart(self.output_buf.items)) |start| {
+            const tail_len = self.output_buf.items.len - start;
+            @memcpy(self.utf8_pending[0..tail_len], self.output_buf.items[start..]);
+            self.utf8_pending_len = @intCast(tail_len);
+            self.output_buf.items.len = start;
+        }
         self.condition.broadcast();
+    }
+
+    fn flushPendingOutput(self: *JobEntry) void {
+        if (self.utf8_pending_len == 0) return;
+        // Keep the source-byte cursor contract at stream end.  The pending
+        // bytes are an incomplete source sequence, so append them as-is and
+        // let the canonical JSON writer render U+FFFD.  Appending the
+        // three-byte replacement here would make output_size_bytes and
+        // output_next_offset jump by a different unit than the provider's
+        // source bytes.
+        const pending = self.utf8_pending[0..self.utf8_pending_len];
+        if (pending.len > OUTPUT_CAP -| self.output_buf.items.len) {
+            self.output_truncated = true;
+            self.utf8_pending_len = 0;
+            return;
+        }
+        self.output_buf.appendSlice(self.allocator, pending) catch {
+            self.output_truncated = true;
+            self.utf8_pending_len = 0;
+            return;
+        };
+        self.utf8_pending_len = 0;
     }
 
     /// Wait for TaskOutput-observable state to change. The caller supplies a
@@ -184,13 +252,19 @@ pub const JobEntry = struct {
         self.current_turn = turn;
         self.tool_calls = tool_calls;
         if (tool_name.len == 0) return;
-        const n = @min(tool_name.len, self.current_tool.len);
-        @memcpy(self.current_tool[0..n], tool_name[0..n]);
+        const repaired_name = utf8.repairInvalidUtf8(self.allocator, tool_name) catch return;
+        defer self.allocator.free(repaired_name);
+        const name_page = utf8.pagePrefix(repaired_name, self.current_tool.len);
+        const n = name_page.len;
+        @memcpy(self.current_tool[0..n], name_page);
         self.current_tool_len = @intCast(n);
-        const m = @min(tool_input.len, self.current_tool_input.len);
-        @memcpy(self.current_tool_input[0..m], tool_input[0..m]);
+        const repaired_input = utf8.repairInvalidUtf8(self.allocator, tool_input) catch return;
+        defer self.allocator.free(repaired_input);
+        const input_page = utf8.pagePrefix(repaired_input, self.current_tool_input.len);
+        const m = input_page.len;
+        @memcpy(self.current_tool_input[0..m], input_page);
         self.current_tool_input_len = @intCast(m);
-        appendTranscriptToolLine(&self.transcript, self.allocator, tool_name[0..n], tool_input[0..m]) catch {};
+        appendTranscriptToolLine(&self.transcript, self.allocator, name_page, input_page) catch {};
     }
 };
 
@@ -198,10 +272,20 @@ pub const JobEntry = struct {
 /// 截断超长 input 防 transcript 膨胀。
 fn appendTranscriptToolLine(list: *std.ArrayList(u8), a: std.mem.Allocator, tool: []const u8, input: []const u8) !void {
     if (tool.len == 0) return;
-    try list.appendSlice(a, tool);
+    const repaired_tool = try utf8.repairInvalidUtf8(a, tool);
+    defer a.free(repaired_tool);
+    const repaired_input = try utf8.repairInvalidUtf8(a, input);
+    defer a.free(repaired_input);
+    try list.appendSlice(a, utf8.pagePrefix(repaired_tool, 32));
     try list.append(a, '\t');
-    try list.appendSlice(a, input[0..@min(input.len, 256)]);
+    try list.appendSlice(a, utf8.pagePrefix(repaired_input, 256));
     try list.append(a, '\n');
+}
+
+fn dupeUtf8Preview(a: std.mem.Allocator, bytes: []const u8, max: usize) ![]u8 {
+    const repaired = try utf8.repairInvalidUtf8(a, bytes);
+    defer a.free(repaired);
+    return a.dupe(u8, utf8.pagePrefix(repaired, max));
 }
 
 /// 启动后台 job 所需的全部参数。调用方(agent.zig)填好后交给 spawnBackground,
@@ -209,6 +293,7 @@ fn appendTranscriptToolLine(list: *std.ArrayList(u8), a: std.mem.Allocator, tool
 pub const SpawnParams = struct {
     prompt: []const u8,
     system_prompt: []const u8,
+    session: SessionId,
     /// 子 agent 可见工具集(已过滤);registry dupe 一份。
     tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: permission_mod.PermissionContext, // 值拷贝
@@ -259,6 +344,7 @@ pub const SpawnParams = struct {
 const JobInput = struct {
     allocator: std.mem.Allocator,
     entry: *JobEntry,
+    session: SessionId,
     // 自有拷贝:
     prompt: []u8,
     system_prompt: []u8,
@@ -300,6 +386,9 @@ const JobInput = struct {
     /// Ctrl+B 主对话转后台:预建对话(深拷贝副本,所有权在此)。jobThreadMain move 进 SpawnOptions
     /// 后立即置 null(单一所有者);仅 spawn 失败回滚时 cleanup 命中 deinit。null=普通 subagent(从 prompt 起)。
     prebuilt_conversation: ?Conversation = null,
+    /// A background job owns a retained policy-frame projection. The parent
+    /// may rotate sessions or clear its skill while this thread is running.
+    active_skill_owned: ?ActiveSkillState = null,
     // 嵌套后台:子 agent 也能 Task(run_in_background) 注册进同一 root registry。
     registry: *AgentJobRegistry,
 
@@ -337,6 +426,7 @@ const JobInput = struct {
         }
         if (self.model_override) |m| a.free(m);
         if (self.prebuilt_conversation) |*c| c.deinit(); // 仅 spawn 失败回滚命中(jobThreadMain 成功路径已 move 置 null)
+        if (self.active_skill_owned) |*skill| skill.deinit();
         self.owned.deinit();
         a.destroy(self);
     }
@@ -346,6 +436,8 @@ pub const AgentJobRegistry = struct {
     allocator: std.mem.Allocator,
     list_mutex: sync.Mutex = .{},
     entries: std.ArrayList(*JobEntry) = .empty,
+    closing: bool = false,
+    starting: usize = 0,
     index: std.AutoHashMap([16]u8, *JobEntry),
     // 造 per-job provider 用(dupe 自 App):
     api_key: []u8,
@@ -420,6 +512,11 @@ pub const AgentJobRegistry = struct {
     pub fn setModel(self: *AgentJobRegistry, model: []const u8) !void {
         const model_owned = try self.allocator.dupe(u8, model);
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            self.allocator.free(model_owned);
+            return error.RegistryClosed;
+        }
         defer self.listUnlock();
         const old = self.model;
         self.model = model_owned;
@@ -428,9 +525,20 @@ pub const AgentJobRegistry = struct {
 
     /// Publish an owned catalog snapshot. Workers never inspect App's mutable catalog.
     pub fn setLimits(self: *AgentJobRegistry, source: @import("../api/model_limits.zig").ModelLimitsSource) !void {
-        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
-        if (source.catalog) |catalog| snapshot = try catalog.clone(self.allocator);
+        // Clone while holding the registry lock.  The source normally borrows
+        // App's catalog, and App teardown closes this registry before freeing
+        // that catalog; keeping the lock across the clone prevents a caller
+        // racing close from reading the borrowed catalog after teardown starts.
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
+        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
+        if (source.catalog) |catalog| snapshot = catalog.clone(self.allocator) catch |err| {
+            self.listUnlock();
+            return err;
+        };
         defer self.listUnlock();
         if (self.catalog_snapshot) |*old| old.deinit();
         self.catalog_snapshot = snapshot;
@@ -443,6 +551,12 @@ pub const AgentJobRegistry = struct {
     pub fn setApiKey(self: *AgentJobRegistry, api_key: []const u8) !void {
         const key_owned = try self.allocator.dupe(u8, api_key);
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            @memset(key_owned, 0);
+            self.allocator.free(key_owned);
+            return error.RegistryClosed;
+        }
         defer self.listUnlock();
         const old = self.api_key;
         self.api_key = key_owned;
@@ -472,8 +586,13 @@ pub const AgentJobRegistry = struct {
             self.allocator.free(key_owned);
         }
         const url_owned: ?[]u8 = if (base_url) |url| try self.allocator.dupe(u8, url) else null;
+        errdefer if (url_owned) |url| self.allocator.free(url);
 
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
         defer self.listUnlock();
         const old_key = self.api_key;
         const old_url = self.base_url;
@@ -496,12 +615,61 @@ pub const AgentJobRegistry = struct {
 
     /// running job 计数(持 list 锁)。TUI(TaskTab)用。
     pub fn runningCount(self: *AgentJobRegistry) usize {
+        // `entries` is a growable pointer array.  Callers can register or
+        // remove foreground/background entries concurrently with the UI
+        // ticker, so iterating it without the registry lock is a real race
+        // (and can observe a freed/reallocated slice).
+        self.listLock();
+        defer self.listUnlock();
         var n: usize = 0;
         for (self.entries.items) |e| {
             e.lock();
             const running = e.status == .running;
             e.unlock();
             if (running) n += 1;
+        }
+        return n;
+    }
+
+    fn runningBackgroundCountLocked(self: *AgentJobRegistry) usize {
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            e.lock();
+            const running = !e.foreground and e.status == .running;
+            e.unlock();
+            if (running) n += 1;
+        }
+        return n;
+    }
+
+    fn runningBackgroundCount(self: *AgentJobRegistry) usize {
+        self.listLock();
+        defer self.listUnlock();
+        return self.runningBackgroundCountLocked();
+    }
+
+    pub fn runningCountForSession(self: *AgentJobRegistry, session: SessionId) usize {
+        self.listLock();
+        defer self.listUnlock();
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            e.lock();
+            const owned_running = std.mem.eql(u8, e.session.asSlice(), session.asSlice()) and e.status == .running;
+            e.unlock();
+            if (owned_running) n += 1;
+        }
+        return n;
+    }
+
+    pub fn totalCountForSession(self: *AgentJobRegistry, session: SessionId) usize {
+        self.listLock();
+        defer self.listUnlock();
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            e.lock();
+            const owned = std.mem.eql(u8, e.session.asSlice(), session.asSlice());
+            e.unlock();
+            if (owned) n += 1;
         }
         return n;
     }
@@ -515,15 +683,20 @@ pub const AgentJobRegistry = struct {
 
     fn genId(self: *AgentJobRegistry) [16]u8 {
         self.seq +%= 1;
-        var raw: [4]u8 = undefined;
+        var raw: [5]u8 = undefined;
         if (!rng.randomBytes(&raw)) {
             // 退化:用 seq + 时间低位(可移植熵源不可用时)
-            const t: u32 = @truncate(@as(u64, @bitCast(util_time.nowMs())));
-            raw = @bitCast(t ^ self.seq);
+            const t: u64 = @bitCast(util_time.nowMs());
+            const fallback: u64 = t ^ self.seq;
+            const fallback_bytes = std.mem.asBytes(&fallback);
+            @memcpy(&raw, fallback_bytes[0..raw.len]);
         }
         var id: [16]u8 = undefined;
-        // "agent_" (6) + 8 hex = 14 字节;余 NUL
-        const written = std.fmt.bufPrint(&id, "agent_{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ raw[0], raw[1], raw[2], raw[3] }) catch unreachable;
+        // "agent_" (6) + 10 hex = 16 bytes.  Keep the fixed-width id while
+        // increasing entropy from 32 to 40 bits; publication below also
+        // rejects the (still possible) duplicate instead of overwriting the
+        // index entry for an older live job.
+        const written = std.fmt.bufPrint(&id, "agent_{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ raw[0], raw[1], raw[2], raw[3], raw[4] }) catch unreachable;
         for (id[written.len..]) |*b| b.* = 0;
         return id;
     }
@@ -535,6 +708,25 @@ pub const AgentJobRegistry = struct {
     /// double-free:Zig errdefer 在 catch+return e 时照样触发,实测验证)。`p.prebuilt_conversation`
     /// 同样 consume-on-call:失败由 errdefer 释放,成功由 job(jobThreadMain move 进 spawnAgentSink)释放。
     pub fn spawnBackground(self: *AgentJobRegistry, p_in: SpawnParams) ![]const u8 {
+        // Hold an in-flight reservation for the *whole* call.  Deinit may
+        // close the registry while a caller is still building provider/input
+        // state, before the entry is published; counting only the publication
+        // window lets it free the registry allocator/config out from under
+        // this function.  The defer is registered first so every later
+        // errdefer rolls back before the reservation is released.
+        self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
+        self.starting += 1;
+        self.listUnlock();
+        defer {
+            self.listLock();
+            self.starting -= 1;
+            self.listUnlock();
+        }
+
         var p = p_in;
         var committed = false; // spawn 成功才置 true;此前所有 errdefer 都 gate 在 !committed
         // prebuilt_conversation 的释放(失败路径):consume-on-call,errdefer 接管。
@@ -545,27 +737,20 @@ pub const AgentJobRegistry = struct {
                 wt.deinit();
             }
         };
-        if (self.runningCount() >= MAX_BG_JOBS) return error.TooManyBackgroundJobs;
+        if (self.runningBackgroundCount() >= MAX_BG_JOBS) return error.TooManyBackgroundJobs;
 
         const a = self.allocator;
 
         // 1) 堆分配 entry(地址稳定)
         const entry = try a.create(JobEntry);
         errdefer if (!committed) a.destroy(entry);
-        entry.* = .{ .allocator = a };
+        entry.* = .{ .allocator = a, .session = p.session };
         entry.mutex = .{};
         entry.abort = AbortSignal.init();
         entry.started_ms = util_time.nowMs();
-        const id = self.genId();
-        entry.id = id;
-        entry.id_len = blk: {
-            var n: u8 = 0;
-            while (n < id.len and id[n] != 0) : (n += 1) {}
-            break :blk n;
-        };
-        entry.desc_preview = try a.dupe(u8, p.desc[0..@min(p.desc.len, 80)]);
+        entry.desc_preview = try dupeUtf8Preview(a, p.desc, 80);
         errdefer if (!committed) a.free(entry.desc_preview);
-        entry.agent_type = a.dupe(u8, p.agent_type[0..@min(p.agent_type.len, 32)]) catch &.{};
+        entry.agent_type = dupeUtf8Preview(a, p.agent_type, 32) catch &.{};
         errdefer if (!committed and entry.agent_type.len > 0) a.free(entry.agent_type);
         entry.worktree_path = if (p.worktree) |wt| try a.dupe(u8, wt.path) else &.{};
         errdefer if (!committed and entry.worktree_path.len > 0) a.free(entry.worktree_path);
@@ -576,7 +761,12 @@ pub const AgentJobRegistry = struct {
         //    不一致 → Invalid free(GPA 实测)。后台单/多 job 用 registry.allocator 全程一致,已验证能跑。
         //    ⚠️ 线程安全存疑(见 HANDOFF):后台 job 线程用 registry.allocator 做 HTTP,若 App gpa 非线程安全
         //    且与 io_runtime worker 并发理论上有 TaskBatch 同款风险,但后台测试历来通过、未实测崩溃,留查。
-        var owned = try pf.makeProviderWithOptions(
+        // Route/model credentials can be rotated while the UI is spawning a
+        // job.  Keep the registry lock across the snapshot and provider
+        // construction so setRoute/setApiKey/setModel cannot free or replace
+        // these slices mid-call.
+        self.listLock();
+        var owned = pf.makeProviderWithOptions(
             self.allocator,
             self.provider_kind,
             self.api_key,
@@ -585,7 +775,11 @@ pub const AgentJobRegistry = struct {
             self.openai_protocol,
             self.dialect_resolver,
             .{ .auth_scheme = self.auth_scheme, .limits = self.limits, .stream_idle_timeout_ms = self.stream_idle_timeout_ms, .stream_body_idle_timeout_ms = self.stream_body_idle_timeout_ms },
-        );
+        ) catch |err| {
+            self.listUnlock();
+            return err;
+        };
+        self.listUnlock();
         errdefer if (!committed) owned.deinit();
 
         // 3) dupe 所有借用内存进 JobInput(必须在 spawn 之前)
@@ -637,6 +831,7 @@ pub const AgentJobRegistry = struct {
 
         var permission_owned = p.permission_ctx.scopedDerive(null);
         permission_owned.allocator = a;
+        permission_owned.session = p.session;
         permission_owned.memdir_abs = memdir_owned;
         permission_owned.match_ctx.cwd = cwd_owned;
         permission_owned.match_ctx.project_root = pdir_owned;
@@ -644,9 +839,16 @@ pub const AgentJobRegistry = struct {
         permission_owned.match_ctx.additional_dirs = adirs_owned;
         permission_owned.match_ctx.alloc = a;
 
+        var active_skill_owned: ?ActiveSkillState = if (p.permission_ctx.active_skill) |skill|
+            try ActiveSkillState.initFromPolicyFrame(a, skill.skill_name, skill.policy_frame)
+        else
+            null;
+        errdefer if (!committed) if (active_skill_owned) |*skill| skill.deinit();
+
         input.* = .{
             .allocator = a,
             .entry = entry,
+            .session = p.session,
             .prompt = prompt_owned,
             .system_prompt = sys_owned,
             .tool_defs_owned = defs_owned,
@@ -678,17 +880,53 @@ pub const AgentJobRegistry = struct {
             .worktree = p.worktree,
             .owned = owned,
             .prebuilt_conversation = p.prebuilt_conversation, // move(Ctrl+B 转后台);普通 subagent=null
+            .active_skill_owned = active_skill_owned,
             .registry = self,
         };
+        if (input.active_skill_owned) |*skill| input.permission_ctx.active_skill = skill;
 
         // 4) 注册进 entries + index(持 list 锁),在 spawn 之前——保证 id 立即可查。
         //    失败:只 return e,上面所有 !committed errdefer 统一释放(不手动 cleanup → 防 double-free)。
         self.listLock();
+        // The early runningCount check is only a fast rejection.  Admission
+        // must be rechecked while holding the same publication lock or two
+        // concurrent Task calls can both observe one free slot and exceed
+        // MAX_BG_JOBS before either entry is appended.
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
+        if (self.runningBackgroundCountLocked() >= MAX_BG_JOBS) {
+            self.listUnlock();
+            return error.TooManyBackgroundJobs;
+        }
+        var id = self.genId();
+        var collision_attempts: usize = 0;
+        while (self.index.contains(id)) : (collision_attempts += 1) {
+            if (collision_attempts >= 8) {
+                self.listUnlock();
+                return error.JobIdCollision;
+            }
+            id = self.genId();
+        }
+        entry.id = id;
+        entry.id_len = blk: {
+            var n: u8 = 0;
+            while (n < id.len and id[n] != 0) : (n += 1) {}
+            break :blk n;
+        };
         self.entries.append(a, entry) catch |e| {
             self.listUnlock();
             return e;
         };
-        self.index.put(entry.id, entry) catch {};
+        self.index.put(entry.id, entry) catch |err| {
+            // Do not publish a job that cannot be looked up.  Silently
+            // swallowing OOM here leaves an entry in the roster without an
+            // index key, making TaskOutput/TaskStop appear to lose the job.
+            _ = self.entries.pop();
+            self.listUnlock();
+            return err;
+        };
         self.listUnlock();
         // 注册成功后 entry 已进 entries——若下面 spawn 失败,需从 entries 摘掉再让 errdefer 释放。
         errdefer if (!committed) {
@@ -705,7 +943,9 @@ pub const AgentJobRegistry = struct {
 
         // 5) spawn 线程。成功 → committed=true,所有权(input/entry/client/io/prebuilt)归线程 + registry,
         //    所有 errdefer 失效。失败 → return e,errdefer 统一回滚(摘 registry + 释放全部资源)。
-        entry.thread = try std.Thread.spawn(.{}, jobThreadMain, .{input});
+        entry.thread = std.Thread.spawn(.{}, jobThreadMain, .{input}) catch |err| {
+            return err;
+        };
         committed = true;
 
         log.info("agent", "background job spawned id={s} desc={s}", .{ entry.idSlice(), entry.desc_preview });
@@ -727,22 +967,18 @@ pub const AgentJobRegistry = struct {
     ) !void {
         const a = self.allocator;
         const entry = try a.create(JobEntry);
-        errdefer a.destroy(entry);
         entry.* = .{ .allocator = a };
+        // One cleanup owner for every failure before publication.  In
+        // particular, do not call freeEntry in an append/index catch while a
+        // separate destroy/desc errdefer is still armed (that used to
+        // double-free test entries on allocator failure).
+        errdefer freeEntry(entry);
         entry.mutex = .{};
         entry.abort = AbortSignal.init();
         entry.started_ms = util_time.nowMs();
         entry.foreground = true;
-        const id = self.genId();
-        entry.id = id;
-        entry.id_len = blk: {
-            var n: u8 = 0;
-            while (n < id.len and id[n] != 0) : (n += 1) {}
-            break :blk n;
-        };
-        entry.desc_preview = try a.dupe(u8, desc[0..@min(desc.len, 80)]);
-        errdefer a.free(entry.desc_preview);
-        entry.agent_type = a.dupe(u8, agent_type[0..@min(agent_type.len, 32)]) catch &.{};
+        entry.desc_preview = try dupeUtf8Preview(a, desc, 80);
+        entry.agent_type = dupeUtf8Preview(a, agent_type, 32) catch &.{};
         entry.status = status;
         entry.current_turn = 1;
         entry.tool_calls = tool_calls;
@@ -754,17 +990,27 @@ pub const AgentJobRegistry = struct {
         @memcpy(entry.current_tool_input[0..tin], tool_input[0..tin]);
         entry.current_tool_input_len = @intCast(tin);
         // 测试用 transcript:prompt(从 desc 派生)+ 当前工具行,供区域2 viewing 渲染。
-        entry.prompt_preview = a.dupe(u8, desc) catch &.{};
+        entry.prompt_preview = dupeUtf8Preview(a, desc, 4096) catch &.{};
         if (tool.len > 0) {
             appendTranscriptToolLine(&entry.transcript, a, tool, tool_input) catch {};
         }
         self.listLock();
+        const id = self.genId();
+        entry.id = id;
+        entry.id_len = blk: {
+            var n: u8 = 0;
+            while (n < id.len and id[n] != 0) : (n += 1) {}
+            break :blk n;
+        };
         self.entries.append(a, entry) catch |e| {
             self.listUnlock();
-            freeEntry(entry);
             return e;
         };
-        self.index.put(entry.id, entry) catch {};
+        self.index.put(entry.id, entry) catch |err| {
+            _ = self.entries.pop();
+            self.listUnlock();
+            return err;
+        };
         self.listUnlock();
     }
 
@@ -784,6 +1030,7 @@ pub const AgentJobRegistry = struct {
         defer self.listUnlock();
         while (self.entries.items.len > 0) {
             const e = self.entries.pop().?;
+            _ = self.index.remove(e.id);
             freeEntry(e);
         }
     }
@@ -814,6 +1061,40 @@ pub const AgentJobRegistry = struct {
         return entry;
     }
 
+    /// Session-scoped TaskOutput lookup. A registry is process-global, but a
+    /// job belongs to the immutable session that spawned it; the active UI
+    /// session must not be allowed to read another session's output by id.
+    pub fn getBackgroundForSession(self: *AgentJobRegistry, id: []const u8, session: SessionId) ?*JobEntry {
+        const entry = self.getBackground(id) orelse return null;
+        entry.lock();
+        defer entry.unlock();
+        if (!std.mem.eql(u8, entry.session.asSlice(), session.asSlice())) return null;
+        return entry;
+    }
+
+    pub fn acquireBackgroundForSession(self: *AgentJobRegistry, id: []const u8, session: SessionId) ?*JobEntry {
+        if (id.len > 16) return null;
+        var key: [16]u8 = undefined;
+        @memcpy(key[0..id.len], id);
+        for (key[id.len..]) |*b| b.* = 0;
+        self.listLock();
+        defer self.listUnlock();
+        const entry = self.index.get(key) orelse return null;
+        if (entry.foreground) return null;
+        entry.lock();
+        const owned = std.mem.eql(u8, entry.session.asSlice(), session.asSlice());
+        entry.unlock();
+        if (!owned) return null;
+        entry.readers += 1;
+        return entry;
+    }
+
+    pub fn releaseBackground(self: *AgentJobRegistry, entry: *JobEntry) void {
+        self.listLock();
+        if (entry.readers > 0) entry.readers -= 1;
+        self.listUnlock();
+    }
+
     /// 后台 subagent job 的值语义快照(供 TUI Ctrl+T 列表用,不持锁/不持指针)。
     /// id/desc 拷进调用者 allocator;调用者用完整体 free(freeSnapshots)。
     pub const JobSnapshot = struct {
@@ -838,38 +1119,85 @@ pub const AgentJobRegistry = struct {
     };
 
     pub fn snapshotJobs(self: *AgentJobRegistry, allocator: std.mem.Allocator) ![]JobSnapshot {
+        return self.snapshotJobsForSession(allocator, null);
+    }
+
+    /// Session-scoped roster snapshot. Jobs remain process-global so shutdown
+    /// can drain them all, but UI/state projections must never expose a job
+    /// created by a different resumed session.
+    pub fn snapshotJobsForSession(self: *AgentJobRegistry, allocator: std.mem.Allocator, session: ?SessionId) ![]JobSnapshot {
         self.listLock();
         defer self.listUnlock();
-        var out = try allocator.alloc(JobSnapshot, self.entries.items.len);
-        var i: usize = 0;
+        var out: std.ArrayList(JobSnapshot) = .empty;
+        errdefer {
+            for (out.items) |s| {
+                allocator.free(s.id);
+                allocator.free(s.desc);
+                allocator.free(s.current_tool);
+                allocator.free(s.current_tool_input);
+                allocator.free(s.agent_type);
+            }
+            out.deinit(allocator);
+        }
         for (self.entries.items) |e| {
             e.lock();
             defer e.unlock();
-            out[i] = .{
-                .id = try allocator.dupe(u8, e.idSlice()),
+            if (session) |wanted| {
+                if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
+            }
+            var snapshot = JobSnapshot{
+                .id = &.{},
                 .status = e.status,
-                .desc = try allocator.dupe(u8, e.desc_preview),
+                .desc = &.{},
                 .turns = e.turns,
                 .tool_calls = e.tool_calls,
                 .current_turn = e.current_turn,
-                .current_tool = try allocator.dupe(u8, e.current_tool[0..e.current_tool_len]),
-                .current_tool_input = try allocator.dupe(u8, e.current_tool_input[0..e.current_tool_input_len]),
+                .current_tool = &.{},
+                .current_tool_input = &.{},
                 .foreground = e.foreground,
-                .agent_type = try allocator.dupe(u8, e.agent_type),
+                .agent_type = &.{},
                 .tokens = e.tokens,
                 .started_ms = e.started_ms,
             };
-            i += 1;
+            errdefer {
+                if (snapshot.id.len > 0) allocator.free(snapshot.id);
+                if (snapshot.desc.len > 0) allocator.free(snapshot.desc);
+                if (snapshot.current_tool.len > 0) allocator.free(snapshot.current_tool);
+                if (snapshot.current_tool_input.len > 0) allocator.free(snapshot.current_tool_input);
+                if (snapshot.agent_type.len > 0) allocator.free(snapshot.agent_type);
+            }
+            snapshot.id = try allocator.dupe(u8, e.idSlice());
+            snapshot.desc = try allocator.dupe(u8, e.desc_preview);
+            snapshot.current_tool = try allocator.dupe(u8, e.current_tool[0..e.current_tool_len]);
+            snapshot.current_tool_input = try allocator.dupe(u8, e.current_tool_input[0..e.current_tool_input_len]);
+            snapshot.agent_type = try allocator.dupe(u8, e.agent_type);
+            try out.append(allocator, snapshot);
+            // Ownership moved into `out`; leave the local cleanup inert.
+            snapshot = .{
+                .id = &.{},
+                .status = .running,
+                .desc = &.{},
+                .turns = 0,
+                .tool_calls = 0,
+                .current_turn = 0,
+                .current_tool = &.{},
+                .current_tool_input = &.{},
+                .agent_type = &.{},
+            };
         }
-        return out;
+        return try out.toOwnedSlice(allocator);
     }
 
     /// **task#18:后台 job done 事件的跨线程发射**。job 线程只置 e.status(终态),**不能**用父的栈
     /// trampoline reporter(其生命周期=父轮,job 后台续跑时早失效 → 悬挂)。改由**主/driver 线程**周期
     /// reap:排出"终态且 done 未发"的 job(锁内标 done_emitted 防重复,值语义 dup),caller 据此发
     /// agent_lifecycle.done 到 session journal。返回 owned;freeDoneInfos 释放。
-    pub const DoneInfo = struct { id: []u8, status: JobStatus, turns: u32, tool_calls: u32, tokens: u64 };
+    pub const DoneInfo = struct { id: []u8, session: SessionId, status: JobStatus, turns: u32, tool_calls: u32, tokens: u64 };
     pub fn drainNewlyDone(self: *AgentJobRegistry, allocator: std.mem.Allocator) ![]DoneInfo {
+        return self.drainNewlyDoneForSession(allocator, null);
+    }
+
+    pub fn drainNewlyDoneForSession(self: *AgentJobRegistry, allocator: std.mem.Allocator, session: ?SessionId) ![]DoneInfo {
         self.listLock();
         defer self.listUnlock();
         var list: std.ArrayList(DoneInfo) = .empty;
@@ -881,9 +1209,13 @@ pub const AgentJobRegistry = struct {
             e.lock();
             defer e.unlock();
             if (e.status == .running or e.done_emitted) continue;
-            const id = try allocator.dupe(u8, e.idSlice()); // 唯一需 dup 的
-            errdefer allocator.free(id);
-            try list.append(allocator, .{ .id = id, .status = e.status, .turns = e.turns, .tool_calls = e.tool_calls, .tokens = e.tokens });
+            if (session) |wanted| {
+                if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
+            }
+            var id = try allocator.dupe(u8, e.idSlice()); // 唯一需 dup 的
+            errdefer if (id.len > 0) allocator.free(id);
+            try list.append(allocator, .{ .id = id, .session = e.session, .status = e.status, .turns = e.turns, .tool_calls = e.tool_calls, .tokens = e.tokens });
+            id = &.{}; // ownership moved into list
             e.done_emitted = true; // 成功入队后才标记(append/dupe OOM 则留 false,下轮重试,不丢事件)
         }
         return list.toOwnedSlice(allocator);
@@ -911,6 +1243,34 @@ pub const AgentJobRegistry = struct {
         e.abort.abort(.user_ctrl_c);
     }
 
+    /// User-facing TaskStop is session scoped. Keep the process-wide `kill`
+    /// primitive for shutdown/admin paths, but never let a resumed session
+    /// cancel a job owned by another session by guessing its id.
+    pub fn killForSession(self: *AgentJobRegistry, id: []const u8, session: SessionId) error{JobNotFound}!void {
+        const e = self.acquireBackgroundForSession(id, session) orelse return error.JobNotFound;
+        defer self.releaseBackground(e);
+        e.abort.abort(.user_ctrl_c);
+    }
+
+    /// Abort either a foreground or background entry owned by `session`.
+    /// The switcher includes foreground entries, so using the background-only
+    /// reader lease there would report success while leaving the visible task
+    /// running.
+    pub fn abortForSession(self: *AgentJobRegistry, id: []const u8, session: SessionId) error{JobNotFound}!void {
+        if (id.len > 16) return error.JobNotFound;
+        var key: [16]u8 = undefined;
+        @memcpy(key[0..id.len], id);
+        for (key[id.len..]) |*b| b.* = 0;
+        self.listLock();
+        defer self.listUnlock();
+        const e = self.index.get(key) orelse return error.JobNotFound;
+        e.lock();
+        defer e.unlock();
+        if (!std.mem.eql(u8, e.session.asSlice(), session.asSlice())) return error.JobNotFound;
+        e.abort.abort(.user_ctrl_c);
+        if (e.cancel_provider) |p| p.cancel(&e.abort);
+    }
+
     /// 非阻塞 abort 所有 running job(esc 中断用)。**不 join**(watcher 线程调,不能阻塞)——
     /// 各 job 跑到检查点后自退。前台 Task 的 subagent 走 app.abort 已被中断;此处补齐**后台/嵌套**
     /// agent job(它们持自己的 entry.abort,app.abort 不触达)。返回触发的数量。幂等。
@@ -934,6 +1294,23 @@ pub const AgentJobRegistry = struct {
         return n;
     }
 
+    pub fn abortAllRunningForSession(self: *AgentJobRegistry, session: SessionId) usize {
+        self.listLock();
+        defer self.listUnlock();
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            e.lock();
+            const owned_running = std.mem.eql(u8, e.session.asSlice(), session.asSlice()) and e.status == .running;
+            if (owned_running) {
+                e.abort.abort(.user_ctrl_c);
+                if (e.cancel_provider) |p| p.cancel(&e.abort);
+                n += 1;
+            }
+            e.unlock();
+        }
+        return n;
+    }
+
     /// 造一个专属 OwnedProvider(据 parent 的 provider_kind 造对应具体 client + 独立 io_runtime,
     /// 堆分配,所有权归调用者)。供同步前台 Task 并发执行时每个 spawn 用独立 provider,避免跨线程
     /// 共享 App 的单例 client。调用者用完 `.deinit()`。P0.5:构造路径 provider-neutral。
@@ -944,6 +1321,7 @@ pub const AgentJobRegistry = struct {
         // 故用 c_allocator(malloc,线程安全)隔离。OwnedProvider 自带此 allocator,deinit 也用它,一致。
         self.listLock();
         defer self.listUnlock();
+        if (self.closing) return error.RegistryClosed;
         var limits = self.limits;
         if (limits) |*value| value.catalog = if (self.catalog_snapshot) |*catalog| catalog else null;
         return pf.makeProviderWithOptions(
@@ -970,19 +1348,49 @@ pub const AgentJobRegistry = struct {
         return .{ .ctx = @ptrCast(self), .makeFn = &makeProviderForTool };
     }
 
+    /// Backwards-compatible single-session wrapper for library callers that do
+    /// not have a session identity. Production dispatchers must use the
+    /// session-aware entry point below.
+    pub fn registerForeground(self: *AgentJobRegistry, agent_type: []const u8, desc: []const u8, prompt: []const u8) ?*JobEntry {
+        return self.registerForegroundForSession(agent_type, desc, prompt, .single);
+    }
+
     /// 前台(同步)job 注册:堆分配一个无线程的 running entry,返回稳定 *JobEntry
     /// 供 agent.zig 同步路径传 progress_state/usage_state。spawn 在主线程/并发批 worker
     /// 上同步驱动,进度经 trampoline 写入,被 watcher tickSpinner 拾取渲染。
     /// agent_type 从 desc 拆出(用于进度树按 type 分组)。失败返回 null(降级为无进度可见)。
-    pub fn registerForeground(self: *AgentJobRegistry, agent_type: []const u8, desc: []const u8, prompt: []const u8) ?*JobEntry {
+    pub fn registerForegroundForSession(
+        self: *AgentJobRegistry,
+        agent_type: []const u8,
+        desc: []const u8,
+        prompt: []const u8,
+        session: SessionId,
+    ) ?*JobEntry {
         const a = self.allocator;
         const entry = a.create(JobEntry) catch return null;
-        entry.* = .{ .allocator = a };
+        entry.* = .{ .allocator = a, .session = session };
         entry.mutex = .{};
         entry.abort = AbortSignal.init();
         entry.started_ms = util_time.nowMs();
         entry.status = .running;
         entry.foreground = true;
+        entry.desc_preview = dupeUtf8Preview(a, desc, 80) catch {
+            a.destroy(entry);
+            return null;
+        };
+        entry.agent_type = dupeUtf8Preview(a, agent_type, 32) catch &.{};
+        entry.prompt_preview = dupeUtf8Preview(a, prompt, 4096) catch &.{};
+        self.listLock();
+        // Foreground jobs do not pass through spawnBackground's admission
+        // reservation, so they need their own close gate.  Without this
+        // check a synchronous request racing registry teardown could append a
+        // new entry after deinit detached the old list, leaving the caller
+        // with an entry backed by an already-freed registry.
+        if (self.closing) {
+            self.listUnlock();
+            freeEntry(entry);
+            return null;
+        }
         const id = self.genId();
         entry.id = id;
         entry.id_len = blk: {
@@ -990,19 +1398,17 @@ pub const AgentJobRegistry = struct {
             while (n < id.len and id[n] != 0) : (n += 1) {}
             break :blk n;
         };
-        entry.desc_preview = a.dupe(u8, desc[0..@min(desc.len, 80)]) catch {
-            a.destroy(entry);
-            return null;
-        };
-        entry.agent_type = a.dupe(u8, agent_type[0..@min(agent_type.len, 32)]) catch &.{};
-        entry.prompt_preview = a.dupe(u8, prompt[0..@min(prompt.len, 4096)]) catch &.{};
-        self.listLock();
         self.entries.append(a, entry) catch {
             self.listUnlock();
             freeEntry(entry);
             return null;
         };
-        self.index.put(entry.id, entry) catch {};
+        self.index.put(entry.id, entry) catch {
+            _ = self.entries.pop();
+            self.listUnlock();
+            freeEntry(entry);
+            return null;
+        };
         self.listUnlock();
         return entry;
     }
@@ -1015,6 +1421,7 @@ pub const AgentJobRegistry = struct {
         e.turns = turns;
         e.tool_calls = tool_calls;
         e.stop_reason = stop_reason;
+        e.flushPendingOutput();
         e.status = if (e.abort.isAborted()) .killed else .done;
         e.condition.broadcast();
         e.unlock();
@@ -1024,6 +1431,10 @@ pub const AgentJobRegistry = struct {
     /// 父轮结束 / Region 1 transient 消失时调用。
     pub fn removeForeground(self: *AgentJobRegistry, e: *JobEntry) void {
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return;
+        }
         _ = self.index.remove(e.id);
         for (self.entries.items, 0..) |it, i| {
             if (it == e) {
@@ -1038,9 +1449,26 @@ pub const AgentJobRegistry = struct {
     /// 拷贝某 agent 的 transcript(prompt + 工具行原料)到调用者 allocator。
     /// 区域2 Enter 查看 agent 上下文用。持锁 dup,无跨线程借用。找不到返 null。
     pub fn copyTranscript(self: *AgentJobRegistry, id: []const u8, allocator: std.mem.Allocator) !?[]u8 {
-        const e = self.get(id) orelse return null;
+        return self.copyTranscriptForSession(id, allocator, null);
+    }
+
+    /// Session-scoped transcript copy.  Keep the registry lock while taking
+    /// the entry lock: foreground entries can be removed immediately after a
+    /// parent tool returns, so a get-then-lock sequence would otherwise race
+    /// `removeForeground` and dereference freed memory.
+    pub fn copyTranscriptForSession(self: *AgentJobRegistry, id: []const u8, allocator: std.mem.Allocator, session: ?SessionId) !?[]u8 {
+        if (id.len > 16) return null;
+        var key: [16]u8 = undefined;
+        @memcpy(key[0..id.len], id);
+        for (key[id.len..]) |*b| b.* = 0;
+        self.listLock();
+        defer self.listUnlock();
+        const e = self.index.get(key) orelse return null;
         e.lock();
         defer e.unlock();
+        if (session) |wanted| {
+            if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) return null;
+        }
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         if (e.prompt_preview.len > 0) {
@@ -1056,9 +1484,24 @@ pub const AgentJobRegistry = struct {
     /// 可能在跑、output_buf 在变 → 拷快照防 race)。找不到 id 返 null。owned,caller free。
     /// 与 copyTranscript 区别:本函数含 output_buf(助手文本+工具卡完整流),非只工具行。
     pub fn copyOutputBuf(self: *AgentJobRegistry, id: []const u8, allocator: std.mem.Allocator) !?[]u8 {
-        const e = self.get(id) orelse return null;
+        return self.copyOutputBufForSession(id, allocator, null);
+    }
+
+    /// Session-scoped output copy with the same list+entry lock ordering as
+    /// `copyTranscriptForSession`.
+    pub fn copyOutputBufForSession(self: *AgentJobRegistry, id: []const u8, allocator: std.mem.Allocator, session: ?SessionId) !?[]u8 {
+        if (id.len > 16) return null;
+        var key: [16]u8 = undefined;
+        @memcpy(key[0..id.len], id);
+        for (key[id.len..]) |*b| b.* = 0;
+        self.listLock();
+        defer self.listUnlock();
+        const e = self.index.get(key) orelse return null;
         e.lock();
         defer e.unlock();
+        if (session) |wanted| {
+            if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) return null;
+        }
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         if (e.prompt_preview.len > 0) {
@@ -1071,7 +1514,20 @@ pub const AgentJobRegistry = struct {
 
     /// abort 全部 running → join 全部线程 → free。drain 循环覆盖迟注册的嵌套 job。
     pub fn deinit(self: *AgentJobRegistry) void {
-        if (self.catalog_snapshot) |*catalog| catalog.deinit();
+        self.listLock();
+        self.closing = true;
+        self.listUnlock();
+        // A spawn that passed admission may still be between publication and
+        // Thread.spawn. Wait for that hand-off to finish before taking the
+        // join snapshot, otherwise deinit could free an entry just before its
+        // thread handle is assigned.
+        while (true) {
+            self.listLock();
+            const starting = self.starting;
+            self.listUnlock();
+            if (starting == 0) break;
+            util_time.sleepMs(1);
+        }
         // drain:反复 abort + join,直到没有未 join 的线程。
         while (true) {
             // 快照当前 entries(持锁拷指针,join 时不持锁避免与线程注册死锁)
@@ -1093,12 +1549,41 @@ pub const AgentJobRegistry = struct {
             if (!pending) break;
         }
 
+        // TaskOutput may still be between lookup and its final snapshot. Its
+        // reader reference is independent of the worker join above, so wait
+        // before freeing the pointed-to JobEntry.
+        while (true) {
+            self.listLock();
+            var readers = false;
+            for (self.entries.items) |e| if (e.readers != 0) {
+                readers = true;
+                break;
+            };
+            self.listUnlock();
+            if (!readers) break;
+            util_time.sleepMs(1);
+        }
+
+        // Detach the pointer array under the list lock before freeing entries;
+        // a concurrent foreground cleanup must not swapRemove the same slice
+        // while teardown is iterating it. `closing` makes new spawns and
+        // removeForeground no-ops, so the detached array is stable.
+        self.listLock();
+        var detached = self.entries;
+        self.entries = .empty;
+        self.index.clearRetainingCapacity();
+        self.listUnlock();
+
         // 所有线程已退,单线程 free 每个 entry
-        for (self.entries.items) |e| {
+        for (detached.items) |e| {
             freeEntry(e);
         }
-        self.entries.deinit(self.allocator);
+        detached.deinit(self.allocator);
         self.index.deinit();
+        // Workers may still consult the catalog while they are being joined.
+        // Release it only after the join barrier, otherwise makeProvider can
+        // read a freed catalog through the limits snapshot.
+        if (self.catalog_snapshot) |*catalog| catalog.deinit();
         self.allocator.free(self.api_key);
         if (self.base_url) |u| self.allocator.free(u);
         self.allocator.free(self.model);
@@ -1136,6 +1621,7 @@ fn jobThreadMain(input: *JobInput) void {
 
     const opts = subagent.SpawnOptions{
         .max_turns = if (input.max_turns > 0) input.max_turns else 20,
+        .session = input.session,
         .system_prompt = if (input.system_prompt.len > 0) input.system_prompt else null,
         .agent_depth = input.agent_depth,
         .dyn_registry = input.dyn_registry,
@@ -1188,6 +1674,7 @@ fn jobThreadMain(input: *JobInput) void {
     ) catch |err| {
         input.finalizeWorktree();
         e.lock();
+        e.flushPendingOutput();
         e.status = .failed;
         e.err_name = @errorName(err);
         e.condition.broadcast();
@@ -1202,6 +1689,7 @@ fn jobThreadMain(input: *JobInput) void {
     e.stop_reason = result.stop_reason;
     e.turns = result.turns;
     e.tool_calls = result.tool_calls;
+    e.flushPendingOutput();
     e.status = if (e.abort.isAborted()) .killed else .done;
     e.condition.broadcast();
     e.unlock();
@@ -1219,6 +1707,29 @@ test "AgentJobRegistry setModel updates future providers" {
     defer owned.deinit();
     // provider() 出中立 vtable,model 经具体 client 透传。
     try testing.expectEqualStrings("new-model", owned.provider().model());
+}
+
+test "AgentJobRegistry mutators reject a closing registry" {
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", null, "model", .anthropic);
+    defer reg.deinit();
+    reg.closing = true;
+
+    try testing.expectError(error.RegistryClosed, reg.setModel("new-model"));
+    try testing.expectError(error.RegistryClosed, reg.setApiKey("new-key"));
+    try testing.expectError(error.RegistryClosed, reg.setRoute("new-key", null, .anthropic, .chat_completions, null));
+    try testing.expectError(error.RegistryClosed, reg.setLimits(.{}));
+    try testing.expectError(error.RegistryClosed, reg.makeProvider());
+}
+
+test "clearTestEntries removes index keys before freeing entries" {
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", null, "test-model", .anthropic);
+    defer reg.deinit();
+    try reg.pushTestEntry("stale", 1, "", "");
+    var id: [16]u8 = undefined;
+    const entry = reg.entries.items[0];
+    @memcpy(&id, &entry.id);
+    reg.clearTestEntries();
+    try std.testing.expect(reg.get(id[0..]) == null);
 }
 
 test "JobEntry backend 消费 CoreEvent.progress 实时回写 tool_calls(L1:#6 进度=事件)" {
@@ -1265,6 +1776,61 @@ test "JobEntry backend 消费 CoreEvent.progress 实时回写 tool_calls(L1:#6 �
     try testing.expectEqualStrings("hello world", out);
 }
 
+test "TaskOutput lookup is scoped to the job's origin session" {
+    const a = testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
+    defer reg.deinit();
+
+    try reg.pushTestEntry("session scoped", 1, "", "");
+    const entry = reg.entries.items[0];
+    entry.foreground = false;
+    const owner = @import("session_id.zig").gen();
+    const other = @import("session_id.zig").gen();
+    entry.session = owner;
+    try testing.expect(reg.getBackgroundForSession(entry.idSlice(), owner) != null);
+    try testing.expect(reg.getBackgroundForSession(entry.idSlice(), other) == null);
+    try testing.expectError(error.JobNotFound, reg.killForSession(entry.idSlice(), other));
+    const owned = try reg.snapshotJobsForSession(testing.allocator, owner);
+    defer AgentJobRegistry.freeSnapshots(testing.allocator, owned);
+    try testing.expectEqual(@as(usize, 1), owned.len);
+    const hidden = try reg.snapshotJobsForSession(testing.allocator, other);
+    defer AgentJobRegistry.freeSnapshots(testing.allocator, hidden);
+    try testing.expectEqual(@as(usize, 0), hidden.len);
+}
+
+test "foreground entries retain session identity for roster and viewing" {
+    const a = testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
+    defer reg.deinit();
+    const owner = @import("session_id.zig").gen();
+    const other = @import("session_id.zig").gen();
+    const entry = reg.registerForegroundForSession("Explore", "foreground", "prompt", owner) orelse return error.TestUnexpectedResult;
+    defer reg.removeForeground(entry);
+    entry.appendOutput("answer\n");
+
+    const owned = try reg.snapshotJobsForSession(a, owner);
+    defer AgentJobRegistry.freeSnapshots(a, owned);
+    try testing.expectEqual(@as(usize, 1), owned.len);
+    const hidden = try reg.snapshotJobsForSession(a, other);
+    defer AgentJobRegistry.freeSnapshots(a, hidden);
+    try testing.expectEqual(@as(usize, 0), hidden.len);
+
+    const out = (try reg.copyOutputBufForSession(entry.idSlice(), a, owner)).?;
+    defer a.free(out);
+    try testing.expect(std.mem.endsWith(u8, out, "answer\n"));
+    try testing.expect((try reg.copyOutputBufForSession(entry.idSlice(), a, other)) == null);
+}
+
+test "foreground registration rejects a registry that is closing" {
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", null, "test-model", .anthropic);
+    defer reg.deinit();
+    reg.closing = true;
+
+    const owner = @import("session_id.zig").gen();
+    try testing.expect(reg.registerForegroundForSession("Explore", "foreground", "prompt", owner) == null);
+    try testing.expectEqual(@as(usize, 0), reg.totalCount());
+}
+
 test "spawnBackground prebuilt_conversation consume-on-call:失败路径不泄漏(R3)" {
     // Ctrl+B 转后台:spawnBackground 是 consume-on-call —— 失败路径必须释放传入的 prebuilt
     // conversation。填满 registry 触发 TooManyBackgroundJobs 早退,断言 testing.allocator 不报
@@ -1274,7 +1840,10 @@ test "spawnBackground prebuilt_conversation consume-on-call:失败路径不泄�
     defer reg.deinit();
 
     var i: usize = 0;
-    while (i < MAX_BG_JOBS) : (i += 1) try reg.pushTestEntry("filler", 1, "", "");
+    while (i < MAX_BG_JOBS) : (i += 1) {
+        try reg.pushTestEntry("filler", 1, "", "");
+        reg.entries.items[reg.entries.items.len - 1].foreground = false;
+    }
 
     var copy = Conversation.init(a);
     try copy.appendText(.user, "continue this");
@@ -1283,6 +1852,7 @@ test "spawnBackground prebuilt_conversation consume-on-call:失败路径不泄�
     const r = reg.spawnBackground(.{
         .prompt = "",
         .system_prompt = "",
+        .session = SessionId.single,
         .tool_defs = &.{},
         .permission_ctx = permission_mod.createContext(.bypass_permissions, a),
         .prebuilt_conversation = copy,
@@ -1344,6 +1914,7 @@ test "spawnBackground committed-flag:input.* 建好后失败也无泄漏(Failing
         const r = reg.spawnBackground(.{
             .prompt = "p",
             .system_prompt = "s",
+            .session = SessionId.single,
             .tool_defs = &.{},
             .permission_ctx = permission_mod.createContext(.bypass_permissions, a),
             .desc = "main",
@@ -1399,7 +1970,10 @@ test "task#18: drainNewlyDone 排终态 job 一次(done_emitted 防重复)+ 跳 
     const first = try reg.drainNewlyDone(a);
     defer AgentJobRegistry.freeDoneInfos(a, first);
     try std.testing.expectEqual(@as(usize, 2), first.len);
-    for (first) |d| try std.testing.expect(d.status == .done or d.status == .failed);
+    for (first) |d| {
+        try std.testing.expect(d.status == .done or d.status == .failed);
+        try std.testing.expectEqual(SessionId.single, d.session);
+    }
 
     // 二次 drain:同样两个已 done_emitted → 返回空(不重复发)。
     const second = try reg.drainNewlyDone(a);

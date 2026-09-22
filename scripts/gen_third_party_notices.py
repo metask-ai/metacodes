@@ -105,7 +105,7 @@ def rows(root: Path) -> list:
         "redistributed as the AgentCore bundle `bin/rg[.exe]` runtime asset | `vendor/ripgrep/manifest.json` "
         f"({ripgrep['source_repository']}, revision `{ripgrep['upstream_revision']}`) | {ripgrep['license']}; "
         "MIT text retained at `vendor/ripgrep/LICENSE-MIT` and shipped with the bundle notice |",
-        f"| TinyKG {tinykg['tinykg_version']} | checked-in target-specific CLI binaries | `vendor/tinykg/manifest.json` "
+        f"| TinyKG {tinykg['tinykg_version']} | checked-in target-specific CLI and daemon binaries | `vendor/tinykg/manifest.json` "
         f"({tinykg['source_repository']}, source commit `{tinykg_bundle['source_commit'][:12]}`) | {tinykg['license']}; "
         "license retained at `vendor/tinykg/LICENSE` |",
         ZIG_ROW,

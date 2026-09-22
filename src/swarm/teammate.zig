@@ -90,6 +90,8 @@ const session_id_mod = @import("../core/session_id.zig");
 const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const util_time = @import("../util/time.zig");
+const utf8 = @import("../util/utf8.zig");
+const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
 
 /// 同队同时存活的 teammate 上限(线程/API 并发保护;正式产品语义归 SW5)。
@@ -103,6 +105,7 @@ pub const TeammateStatus = enum { working, idle, terminated, failed };
 /// 一个 teammate(堆分配,地址稳定;线程与主线程共享)。
 pub const TeammateEntry = struct {
     allocator: std.mem.Allocator,
+    session: session_id_mod.SessionId = session_id_mod.SessionId.single,
     mutex: sync.Mutex = .{},
     status: TeammateStatus = .working,
     thread: ?std.Thread = null,
@@ -126,6 +129,9 @@ pub const TeammateEntry = struct {
     // (PM F2 登记:写路径先行保正确,消费者在 SW5;err_name 对齐 agent_job_registry
     // 同名字段的 task_output 消费模式)。output_buf 由组件测试消费断言。
     output_buf: std.ArrayList(u8) = .empty,
+    output_utf8_pending: [4]u8 = undefined,
+    output_utf8_pending_len: u8 = 0,
+    output_truncated: bool = false,
     tokens: u64 = 0, // = tokens_base + 当前 run 最新 usage 快照
     tokens_base: u64 = 0, // 已完成 run 的沉淀值(run 结束时 tokens→tokens_base)
     turns_total: u32 = 0,
@@ -174,8 +180,27 @@ pub const TeammateEntry = struct {
                 // 上限保护(Linus LOW-2):长寿 teammate 的输出单调增长,cap 后丢尾
                 // (SW5 若要完整 transcript 走落盘方案)。
                 const OUTPUT_CAP: usize = 512 * 1024;
-                if (self.output_buf.items.len < OUTPUT_CAP) {
-                    self.output_buf.appendSlice(self.allocator, t) catch {};
+                if (self.output_buf.items.len < OUTPUT_CAP and self.output_truncated == false) {
+                    if (self.output_utf8_pending_len > 0) {
+                        const pending = self.output_utf8_pending[0..self.output_utf8_pending_len];
+                        const room = OUTPUT_CAP - self.output_buf.items.len;
+                        if (pending.len > room) {
+                            self.output_truncated = true;
+                            return;
+                        }
+                        self.output_buf.appendSlice(self.allocator, pending) catch return;
+                        self.output_utf8_pending_len = 0;
+                    }
+                    const room = OUTPUT_CAP - self.output_buf.items.len;
+                    const take = @min(t.len, room);
+                    self.output_buf.appendSlice(self.allocator, t[0..take]) catch return;
+                    if (take < t.len) self.output_truncated = true;
+                    if (utf8.incompleteTailStart(self.output_buf.items)) |start| {
+                        const tail_len = self.output_buf.items.len - start;
+                        @memcpy(self.output_utf8_pending[0..tail_len], self.output_buf.items[start..]);
+                        self.output_utf8_pending_len = @intCast(tail_len);
+                        self.output_buf.items.len = start;
+                    }
                 }
             },
             .usage => |u| {
@@ -187,6 +212,23 @@ pub const TeammateEntry = struct {
             else => {},
         }
     }
+
+    fn flushOutputPending(self: *TeammateEntry) void {
+        self.lockPublic();
+        defer self.unlockPublic();
+        if (self.output_utf8_pending_len == 0) return;
+        const pending = self.output_utf8_pending[0..self.output_utf8_pending_len];
+        if (pending.len <= 512 * 1024 -| self.output_buf.items.len) {
+            // Preserve source-byte offsets; JSON serialization repairs this
+            // incomplete tail to U+FFFD at the transport boundary.
+            self.output_buf.appendSlice(self.allocator, pending) catch return;
+        } else {
+            // The source tail could not fit in the bounded preview. Keep the
+            // truncation signal instead of silently dropping captured bytes.
+            self.output_truncated = true;
+        }
+        self.output_utf8_pending_len = 0;
+    }
 };
 
 /// spawn 参数(borrowed;registry 内部 dupe)。
@@ -196,6 +238,9 @@ pub const SpawnTeammateParams = struct {
     /// 已清洗 team 名(config.json 必须已存在——TeamCreate 先行)。
     team: []const u8,
     prompt: []const u8,
+    /// Session routing key inherited from the lead. Every backend event and
+    /// permission request from this teammate must remain in the parent's view.
+    session: session_id_mod.SessionId = session_id_mod.SessionId.single,
     system_prompt: []const u8 = "",
     tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: permission_mod.PermissionContext, // 值拷贝
@@ -233,6 +278,7 @@ const TeammateInput = struct {
     allocator: std.mem.Allocator,
     entry: *TeammateEntry,
     prompt: []u8,
+    session: session_id_mod.SessionId,
     system_prompt: []u8,
     tool_defs_owned: []json_mod.ToolDefinition,
     desc_copies: [][]u8, // 深拷贝的 description(同 AgentJobRegistry UAF 防护)
@@ -291,6 +337,8 @@ pub const TeammateRegistry = struct {
     allocator: std.mem.Allocator,
     list_mutex: sync.Mutex = .{},
     entries: std.ArrayList(*TeammateEntry) = .empty,
+    closing: bool = false,
+    starting: usize = 0,
     // per-teammate provider 构造参数(dupe 自 App;同 AgentJobRegistry)。
     api_key: []u8,
     base_url: ?[]u8,
@@ -366,9 +414,20 @@ pub const TeammateRegistry = struct {
 
     /// Publish an owned catalog snapshot; worker teammates never read App's mutable catalog.
     pub fn setLimits(self: *TeammateRegistry, source: @import("../api/model_limits.zig").ModelLimitsSource) !void {
-        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
-        if (source.catalog) |catalog| snapshot = try catalog.clone(self.allocator);
+        // Keep the borrowed source catalog protected by the registry lock while
+        // cloning it.  App closes this registry before releasing that catalog;
+        // cloning outside the lock leaves a close/setLimits race with a stale
+        // source pointer.
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
+        var snapshot: ?@import("../api/catalog.zig").Catalog = null;
+        if (source.catalog) |catalog| snapshot = catalog.clone(self.allocator) catch |err| {
+            self.listUnlock();
+            return err;
+        };
         defer self.listUnlock();
         if (self.catalog_snapshot) |*old| old.deinit();
         self.catalog_snapshot = snapshot;
@@ -379,6 +438,7 @@ pub const TeammateRegistry = struct {
     fn makeProvider(self: *TeammateRegistry, model: []const u8) !pf.OwnedProvider {
         self.listLock();
         defer self.listUnlock();
+        if (self.closing) return error.RegistryClosed;
         var limits = self.limits;
         if (limits) |*value| value.catalog = if (self.catalog_snapshot) |*catalog| catalog else null;
         return pf.makeProviderWithOptions(
@@ -394,23 +454,93 @@ pub const TeammateRegistry = struct {
     }
 
     pub fn findByName(self: *TeammateRegistry, name_sanitized: []const u8) ?*TeammateEntry {
+        return self.findByNameForSession(name_sanitized, null);
+    }
+
+    pub fn findByNameForSession(self: *TeammateRegistry, name_sanitized: []const u8, session: ?session_id_mod.SessionId) ?*TeammateEntry {
         self.listLock();
         defer self.listUnlock();
         for (self.entries.items) |e| {
+            if (session) |wanted| if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
             if (std.mem.eql(u8, e.name, name_sanitized)) return e;
         }
         return null;
     }
 
-    pub fn liveCount(self: *TeammateRegistry) usize {
+    pub fn hasNameForSession(self: *TeammateRegistry, name_sanitized: []const u8, session: session_id_mod.SessionId) bool {
         self.listLock();
         defer self.listUnlock();
+        for (self.entries.items) |e| {
+            if (!std.mem.eql(u8, e.name, name_sanitized)) continue;
+            if (std.mem.eql(u8, e.session.asSlice(), session.asSlice())) return true;
+        }
+        return false;
+    }
+
+    /// Check the complete durable identity before routing a message.  Names
+    /// are reusable within one lead session, so session alone is insufficient
+    /// once a stale worker and its replacement overlap during cleanup.
+    pub fn hasNameForSessionAndLease(
+        self: *TeammateRegistry,
+        name_sanitized: []const u8,
+        session: session_id_mod.SessionId,
+        lease: session_id_mod.SessionId,
+    ) bool {
+        self.listLock();
+        defer self.listUnlock();
+        for (self.entries.items) |e| {
+            if (!std.mem.eql(u8, e.name, name_sanitized) or
+                !std.mem.eql(u8, e.session.asSlice(), session.asSlice())) continue;
+            if (std.mem.eql(u8, e.agent_ident.asSlice(), lease.asSlice())) return true;
+        }
+        return false;
+    }
+
+    pub fn statusForNameForSession(self: *TeammateRegistry, name_sanitized: []const u8, session: session_id_mod.SessionId) ?TeammateStatus {
+        self.listLock();
+        defer self.listUnlock();
+        for (self.entries.items) |e| {
+            if (!std.mem.eql(u8, e.name, name_sanitized)) continue;
+            if (!std.mem.eql(u8, e.session.asSlice(), session.asSlice())) continue;
+            e.lockPublic();
+            const status = e.status;
+            e.unlockPublic();
+            return status;
+        }
+        return null;
+    }
+
+    pub fn liveCount(self: *TeammateRegistry) usize {
+        return self.liveCountForSession(null);
+    }
+
+    pub fn liveCountForSession(self: *TeammateRegistry, session: ?session_id_mod.SessionId) usize {
+        self.listLock();
+        defer self.listUnlock();
+        return self.liveCountLockedForSession(session);
+    }
+
+    fn liveCountLocked(self: *TeammateRegistry) usize {
+        return self.liveCountLockedForSession(null);
+    }
+
+    fn liveCountLockedForSession(self: *TeammateRegistry, session: ?session_id_mod.SessionId) usize {
         var n: usize = 0;
         for (self.entries.items) |e| {
+            if (session) |wanted| if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
             const s = e.statusSnapshot();
             if (s == .working or s == .idle) n += 1;
         }
         return n;
+    }
+
+    fn hasActiveNameLocked(self: *TeammateRegistry, name: []const u8) bool {
+        for (self.entries.items) |e| {
+            if (!std.mem.eql(u8, e.name, name)) continue;
+            const s = e.statusSnapshot();
+            if (s == .working or s == .idle) return true;
+        }
+        return false;
     }
 
     /// 全部 entry 数(含 terminated/failed 尸体;测试断言 reap 用)。
@@ -425,7 +555,7 @@ pub const TeammateRegistry = struct {
     pub fn pushTestEntry(self: *TeammateRegistry, name: []const u8, status: TeammateStatus) !void {
         const a = std.heap.c_allocator;
         const e = try a.create(TeammateEntry);
-        e.* = .{ .allocator = a };
+        e.* = .{ .allocator = a, .session = session_id_mod.SessionId.single };
         e.mutex = .{};
         e.abort = AbortSignal.init();
         e.status = status;
@@ -444,10 +574,15 @@ pub const TeammateRegistry = struct {
 
     /// 正在跑(.working)的 teammate 数(statusline "M⚙" 用;不含 idle)。
     pub fn workingCount(self: *TeammateRegistry) usize {
+        return self.workingCountForSession(null);
+    }
+
+    pub fn workingCountForSession(self: *TeammateRegistry, session: ?session_id_mod.SessionId) usize {
         self.listLock();
         defer self.listUnlock();
         var n: usize = 0;
         for (self.entries.items) |e| {
+            if (session) |wanted| if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
             if (e.statusSnapshot() == .working) n += 1;
         }
         return n;
@@ -463,9 +598,18 @@ pub const TeammateRegistry = struct {
         runs: u32,
     };
     pub fn snapshotRoster(self: *TeammateRegistry, allocator: std.mem.Allocator) ![]RosterRow {
+        return self.snapshotRosterForSession(allocator, null);
+    }
+
+    pub fn snapshotRosterForSession(self: *TeammateRegistry, allocator: std.mem.Allocator, session: ?session_id_mod.SessionId) ![]RosterRow {
         self.listLock();
         defer self.listUnlock();
-        var out = try allocator.alloc(RosterRow, self.entries.items.len);
+        var count: usize = 0;
+        for (self.entries.items) |e| {
+            if (session) |wanted| if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
+            count += 1;
+        }
+        var out = try allocator.alloc(RosterRow, count);
         var i: usize = 0;
         errdefer {
             for (out[0..i]) |r| {
@@ -475,6 +619,7 @@ pub const TeammateRegistry = struct {
             allocator.free(out);
         }
         for (self.entries.items) |e| {
+            if (session) |wanted| if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
             e.lockPublic();
             defer e.unlockPublic();
             // 分步 dupe + errdefer,防 name 成功但 agent_type OOM 时 name 泄漏(Linus SW5:
@@ -504,6 +649,7 @@ pub const TeammateRegistry = struct {
     pub fn reapTerminated(self: *TeammateRegistry) void {
         self.listLock();
         defer self.listUnlock();
+        if (self.closing) return;
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const e = self.entries.items[i];
@@ -514,7 +660,7 @@ pub const TeammateRegistry = struct {
                     e.thread = null;
                 }
                 // 也从 config.json 摘牌(名字可复用;lead poll 通常已摘,这里幂等兜底)。
-                removeMemberBestEffort(e.allocator, e.config_path, e.name);
+                removeMemberBestEffort(e.allocator, e.config_path, e.name, e.session, e.agent_ident);
                 _ = self.entries.orderedRemove(i);
                 freeEntry(e);
                 continue; // i 不前进(后一条补位)
@@ -524,6 +670,19 @@ pub const TeammateRegistry = struct {
     }
 
     pub fn spawnTeammate(self: *TeammateRegistry, p: SpawnTeammateParams) !*TeammateEntry {
+        self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
+        self.starting += 1;
+        self.listUnlock();
+        defer {
+            self.listLock();
+            self.starting -= 1;
+            self.listUnlock();
+        }
+
         self.reapTerminated(); // 先清死尸体,防 entries 无界累积(SW5 内存纪律)
         if (self.liveCount() >= MAX_TEAMMATES) return error.TooManyTeammates;
 
@@ -547,10 +706,9 @@ pub const TeammateRegistry = struct {
         // 防御靠 from==team-lead 字符串比较)。大小写变体(Team-Lead)功能上是不同字符串不构成
         // 冒充,但视觉混淆——一并保留(defense-in-depth,case-insensitive)。SW4 review 前置堵死。
         if (std.ascii.eqlIgnoreCase(name_s, team_mod.TEAM_LEAD_NAME)) return error.ReservedName;
-        if (self.findByName(name_s)) |existing| {
-            const st = existing.statusSnapshot();
-            if (st == .working or st == .idle) return error.DuplicateTeammateName;
-        }
+        // Name/admission is rechecked under the publication lock below. Do
+        // not retain a pointer returned by findByName across this setup phase:
+        // reapTerminated may remove that entry concurrently.
         var id_buf: [160]u8 = undefined;
         const agent_id = team_mod.formatAgentId(name_s, p.team, &id_buf) orelse return error.BadName;
         var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -564,7 +722,7 @@ pub const TeammateRegistry = struct {
         // 1) entry(堆分配,地址稳定)。
         const entry = try a.create(TeammateEntry);
         errdefer if (!committed) a.destroy(entry);
-        entry.* = .{ .allocator = a };
+        entry.* = .{ .allocator = a, .session = p.session };
         entry.mutex = .{};
         entry.abort = AbortSignal.init();
         entry.started_ms = util_time.nowMs();
@@ -594,9 +752,13 @@ pub const TeammateRegistry = struct {
             agent_type: []const u8,
             model: []const u8,
             cwd: []const u8,
+            session: []const u8,
+            lease: []const u8,
         };
         const addMember = struct {
             fn f(ctx: AddCtx, tf: *team_mod.TeamFile) anyerror!void {
+                const lead_session = tf.lead_session_id orelse return error.SessionMismatch;
+                if (!std.mem.eql(u8, lead_session, ctx.session)) return error.SessionMismatch;
                 if (tf.findMember(ctx.name) != null) return error.DuplicateTeammateName;
                 try tf.addMember(.{
                     .agent_id = ctx.agent_id,
@@ -606,6 +768,8 @@ pub const TeammateRegistry = struct {
                     .color = if (ctx.color.len > 0) ctx.color else null,
                     .joined_at_ms = @intCast(@divTrunc(util_time.nowWallNs(), 1_000_000)),
                     .cwd = ctx.cwd,
+                    .session_id = ctx.session,
+                    .lease_id = ctx.lease,
                     .backend_type = "in-process",
                     .is_active = true,
                 });
@@ -618,9 +782,11 @@ pub const TeammateRegistry = struct {
             .agent_type = p.agent_type,
             .model = p.model_override orelse "",
             .cwd = p.cwd,
+            .session = p.session.asSlice(),
+            .lease = entry.agent_ident.asSlice(),
         }, addMember);
         // 从这里起,失败要把成员摘回去。
-        errdefer if (!committed) removeMemberBestEffort(a, config_path, name_s);
+        errdefer if (!committed) removeMemberBestEffort(a, config_path, name_s, p.session, entry.agent_ident);
 
         // 3) 邮箱就位(空邮箱,ensure 幂等)。
         try mailbox.ensureInbox(inbox_path);
@@ -677,6 +843,7 @@ pub const TeammateRegistry = struct {
 
         var permission_owned = p.permission_ctx.scopedDerive(null);
         permission_owned.allocator = a;
+        permission_owned.session = p.session;
         permission_owned.memdir_abs = memdir_owned;
         permission_owned.match_ctx.cwd = cwd_sb_owned;
         permission_owned.match_ctx.project_root = pdir_owned;
@@ -688,6 +855,7 @@ pub const TeammateRegistry = struct {
             .allocator = a,
             .entry = entry,
             .prompt = prompt_owned,
+            .session = p.session,
             .system_prompt = sys_owned,
             .tool_defs_owned = defs_owned,
             .desc_copies = desc_copies,
@@ -719,6 +887,21 @@ pub const TeammateRegistry = struct {
         // 6) 注册 + spawn。entries 列表本身归 registry allocator(deinit 同款);entry 指针
         // 指向的内存归 c_allocator(freeEntry 用 e.allocator)。
         self.listLock();
+        if (self.closing) {
+            self.listUnlock();
+            return error.RegistryClosed;
+        }
+        // The earlier checks are only a fast path. Recheck admission and the
+        // sanitized name while publishing so concurrent spawns cannot exceed
+        // MAX_TEAMMATES or create two live entries with the same name.
+        if (self.liveCountLocked() >= MAX_TEAMMATES) {
+            self.listUnlock();
+            return error.TooManyTeammates;
+        }
+        if (self.hasActiveNameLocked(name_s)) {
+            self.listUnlock();
+            return error.DuplicateTeammateName;
+        }
         self.entries.append(self.allocator, entry) catch |e| {
             self.listUnlock();
             return e;
@@ -743,20 +926,36 @@ pub const TeammateRegistry = struct {
 
     /// abort 全部 → join 全部 → free(deinit 铁律)。
     pub fn deinit(self: *TeammateRegistry) void {
-        if (self.catalog_snapshot) |*catalog| catalog.deinit();
         self.listLock();
-        const items = self.entries.items;
-        for (items) |e| e.abort.abort(.user_ctrl_c);
+        self.closing = true;
+        self.listUnlock();
+        while (true) {
+            self.listLock();
+            const starting = self.starting;
+            self.listUnlock();
+            if (starting == 0) break;
+            util_time.sleepMs(1);
+        }
+        // Detach the backing array while holding the list lock. This makes
+        // the post-close join/free phase immune to a concurrent reader or a
+        // future maintenance path that might otherwise invalidate the slice.
+        self.listLock();
+        var detached = self.entries;
+        self.entries = .empty;
+        for (detached.items) |e| e.abort.abort(.user_ctrl_c);
         self.listUnlock();
         // join 不持 list 锁(线程退出路径不再注册新 entry,teammate 无嵌套 spawn)。
-        for (self.entries.items) |e| {
+        for (detached.items) |e| {
             if (e.thread) |t| {
                 t.join();
                 e.thread = null;
             }
         }
-        for (self.entries.items) |e| freeEntry(e);
-        self.entries.deinit(self.allocator);
+        for (detached.items) |e| freeEntry(e);
+        detached.deinit(self.allocator);
+        // Provider workers borrow this snapshot through ModelLimitsSource;
+        // release it only after every teammate has joined.
+        if (self.catalog_snapshot) |*catalog| catalog.deinit();
         self.allocator.free(self.api_key);
         if (self.base_url) |u| self.allocator.free(u);
         self.allocator.free(self.model);
@@ -793,24 +992,51 @@ fn releaseHeldTasks(e: *TeammateEntry, kg: ?*@import("../kg/client.zig").KgClien
     for (ids) |id| k.releaseTask(id, e.agent_id) catch {};
 }
 
-const NameCtx = struct { name: []const u8 };
+const NameCtx = struct { name: []const u8, session: session_id_mod.SessionId, lease: session_id_mod.SessionId };
 fn removeMemberMutate(c: NameCtx, tf: *team_mod.TeamFile) anyerror!void {
+    const lead_session = tf.lead_session_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, lead_session, c.session.asSlice())) return error.SessionMismatch;
+    const member = tf.findMember(c.name) orelse return error.MemberNotFound;
+    const member_session = member.session_id orelse return error.SessionMismatch;
+    const member_lease = member.lease_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, member_session, c.session.asSlice()) or
+        !std.mem.eql(u8, member_lease, c.lease.asSlice())) return error.SessionMismatch;
     _ = tf.removeMember(c.name);
 }
 
 /// 摘成员(spawn 失败回滚/终止收尾;best-effort:锁忙/文件损坏不致命)。
-fn removeMemberBestEffort(a: std.mem.Allocator, config_path: []const u8, name: []const u8) void {
-    team_mod.updateTeam(a, config_path, NameCtx{ .name = name }, removeMemberMutate) catch {};
+fn removeMemberBestEffort(
+    a: std.mem.Allocator,
+    config_path: []const u8,
+    name: []const u8,
+    session: session_id_mod.SessionId,
+    lease: session_id_mod.SessionId,
+) void {
+    team_mod.updateTeam(a, config_path, NameCtx{ .name = name, .session = session, .lease = lease }, removeMemberMutate) catch {};
 }
 
-const ActiveCtx = struct { name: []const u8, active: bool };
+const ActiveCtx = struct { name: []const u8, session: session_id_mod.SessionId, lease: session_id_mod.SessionId, active: bool };
 fn setMemberActiveMutate(c: ActiveCtx, tf: *team_mod.TeamFile) anyerror!void {
-    if (tf.findMember(c.name)) |m| m.is_active = c.active;
+    const lead_session = tf.lead_session_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, lead_session, c.session.asSlice())) return error.SessionMismatch;
+    const m = tf.findMember(c.name) orelse return error.MemberNotFound;
+    const member_session = m.session_id orelse return error.SessionMismatch;
+    const member_lease = m.lease_id orelse return error.SessionMismatch;
+    if (!std.mem.eql(u8, member_session, c.session.asSlice()) or
+        !std.mem.eql(u8, member_lease, c.lease.asSlice())) return error.SessionMismatch;
+    m.is_active = c.active;
 }
 
 /// 翻 config.json 里成员的 is_active(best-effort)。
-fn setMemberActiveBestEffort(a: std.mem.Allocator, config_path: []const u8, name: []const u8, active: bool) void {
-    team_mod.updateTeam(a, config_path, ActiveCtx{ .name = name, .active = active }, setMemberActiveMutate) catch {};
+fn setMemberActiveBestEffort(
+    a: std.mem.Allocator,
+    config_path: []const u8,
+    name: []const u8,
+    session: session_id_mod.SessionId,
+    lease: session_id_mod.SessionId,
+    active: bool,
+) void {
+    team_mod.updateTeam(a, config_path, ActiveCtx{ .name = name, .session = session, .lease = lease, .active = active }, setMemberActiveMutate) catch {};
 }
 
 /// idle_notification 投递(best-effort;cc teammateInit Stop-hook 等价)。
@@ -821,26 +1047,39 @@ fn setMemberActiveBestEffort(a: std.mem.Allocator, config_path: []const u8, name
 fn sendIdleNotification(a: std.mem.Allocator, e: *TeammateEntry, reason: []const u8, stop_reason: ?[]const u8, failure: ?[]const u8) void {
     var ts_buf: [40]u8 = undefined;
     const ts = mailbox.formatIso8601(@divTrunc(util_time.nowWallNs(), 1_000_000), &ts_buf);
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    const head = std.fmt.allocPrint(
-        a,
-        "{{\"type\":\"idle_notification\",\"from\":\"{s}\",\"timestamp\":\"{s}\",\"idleReason\":\"{s}\"",
-        .{ e.name, ts, reason },
-    ) catch return;
-    defer a.free(head);
-    out.appendSlice(a, head) catch return;
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    out.writer.writeAll("{\"type\":\"idle_notification\",\"from\":") catch return;
+    util_json.writeJsonString(&out.writer, e.name) catch return;
+    out.writer.writeAll(",\"session_id\":") catch return;
+    util_json.writeJsonString(&out.writer, e.session.asSlice()) catch return;
+    out.writer.writeAll(",\"lease_id\":") catch return;
+    util_json.writeJsonString(&out.writer, e.agent_ident.asSlice()) catch return;
+    out.writer.writeAll(",\"timestamp\":") catch return;
+    util_json.writeJsonString(&out.writer, ts) catch return;
+    out.writer.writeAll(",\"idleReason\":") catch return;
+    util_json.writeJsonString(&out.writer, reason) catch return;
     if (stop_reason) |sr| {
-        const seg = std.fmt.allocPrint(a, ",\"stopReason\":\"{s}\"", .{sr}) catch return;
-        defer a.free(seg);
-        out.appendSlice(a, seg) catch return;
+        out.writer.writeAll(",\"stopReason\":") catch return;
+        util_json.writeJsonString(&out.writer, sr) catch return;
     }
     if (failure) |f| {
-        out.appendSlice(a, ",\"failureReason\":") catch return;
-        @import("../util/json.zig").serializeString(f, &out, a) catch return;
+        out.writer.writeAll(",\"failureReason\":") catch return;
+        util_json.writeJsonString(&out.writer, f) catch return;
     }
-    out.append(a, '}') catch return;
-    mailbox.deliver(a, e.lead_inbox_path, e.name, out.items, if (e.color.len > 0) e.color else null, null) catch |err| {
+    out.writer.writeByte('}') catch return;
+    const body = out.toOwnedSlice() catch return;
+    defer a.free(body);
+    mailbox.deliverWithIdentity(
+        a,
+        e.lead_inbox_path,
+        e.name,
+        body,
+        if (e.color.len > 0) e.color else null,
+        null,
+        e.session.asSlice(),
+        e.agent_ident.asSlice(),
+    ) catch |err| {
         log.warn("swarm", "idle notification delivery failed for {s}: {s}", .{ e.agent_id, @errorName(err) });
     };
 }
@@ -859,14 +1098,30 @@ pub fn nextClaimBackoffMs(cur: i64) i64 {
 /// SW4:回 shutdown_approved 给 lead(echo request_id,对齐 cc handleShutdownApproval)。
 /// lead 的 pollLeadInbox 据此摘牌 + 标记 teammate 完成。best-effort。
 fn sendShutdownApproved(a: std.mem.Allocator, e: *TeammateEntry, request_text: []const u8) void {
-    const rid = @import("../util/json.zig").extractStringField(request_text, "request_id") orelse "";
-    const body = std.fmt.allocPrint(
-        a,
-        "{{\"type\":\"shutdown_approved\",\"from\":\"{s}\",\"request_id\":\"{s}\"}}",
-        .{ e.name, rid },
-    ) catch return;
+    const rid = util_json.extractStringField(request_text, "request_id") orelse "";
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    out.writer.writeAll("{\"type\":\"shutdown_approved\",\"from\":") catch return;
+    util_json.writeJsonString(&out.writer, e.name) catch return;
+    out.writer.writeAll(",\"request_id\":") catch return;
+    util_json.writeJsonString(&out.writer, rid) catch return;
+    out.writer.writeAll(",\"session_id\":") catch return;
+    util_json.writeJsonString(&out.writer, e.session.asSlice()) catch return;
+    out.writer.writeAll(",\"lease_id\":") catch return;
+    util_json.writeJsonString(&out.writer, e.agent_ident.asSlice()) catch return;
+    out.writer.writeByte('}') catch return;
+    const body = out.toOwnedSlice() catch return;
     defer a.free(body);
-    mailbox.deliver(a, e.lead_inbox_path, e.name, body, if (e.color.len > 0) e.color else null, null) catch {};
+    mailbox.deliverWithIdentity(
+        a,
+        e.lead_inbox_path,
+        e.name,
+        body,
+        if (e.color.len > 0) e.color else null,
+        null,
+        e.session.asSlice(),
+        e.agent_ident.asSlice(),
+    ) catch {};
 }
 
 /// idle-wait:轮询自己邮箱直到有下一轮 prompt 或退出信号。
@@ -894,7 +1149,9 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
             // lead 发 shutdown 不得终止别人(对齐 cc "plan/mode 响应仅认 from==team-lead")。
             for (unread.items.items) |*m| {
                 if (mailbox.classify(a, m.text) != .shutdown_request) continue;
-                if (!std.mem.eql(u8, m.from, team_mod.TEAM_LEAD_NAME)) {
+                if (!std.mem.eql(u8, m.from, team_mod.TEAM_LEAD_NAME) or
+                    !leadMessageMatchesCurrentSession(e, m))
+                {
                     // 非 lead 发的 shutdown:标读丢弃 + 记日志(不终止)。
                     const bad = [1]mailbox.Message{m.*};
                     mailbox.markReadAt(a, e.inbox_path, &bad) catch {};
@@ -913,8 +1170,8 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
             defer out.deinit(a);
             var consumed: std.ArrayList(mailbox.Message) = .empty;
             defer consumed.deinit(a); // 元素借 unread 的内存,不 free
-            appendPlainFrom(a, &out, &unread, team_mod.TEAM_LEAD_NAME, true, &consumed);
-            appendPlainFrom(a, &out, &unread, team_mod.TEAM_LEAD_NAME, false, &consumed);
+            appendPlainFrom(a, e, &out, &unread, team_mod.TEAM_LEAD_NAME, true, &consumed);
+            appendPlainFrom(a, e, &out, &unread, team_mod.TEAM_LEAD_NAME, false, &consumed);
 
             // **只标读真正消费的 plain**(Linus MED-2/PM F4):协议消息(task_assignment/
             // plan_approval_response…)留在未读,SW3/SW4 的消费者接手;绝不 mark-all 吞掉。
@@ -1010,6 +1267,7 @@ pub fn tryClaimFrontierTask(a: std.mem.Allocator, kg: *@import("../kg/client.zig
 /// 协议消息跳过(由 waitForMail 统一记日志)。
 fn appendPlainFrom(
     a: std.mem.Allocator,
+    e: *TeammateEntry,
     out: *std.ArrayList(u8),
     unread: *mailbox.MessageList,
     lead_name: []const u8,
@@ -1020,6 +1278,13 @@ fn appendPlainFrom(
         const is_lead = std.mem.eql(u8, m.from, lead_name);
         if (is_lead != match_lead) continue;
         if (mailbox.classify(a, m.text) != .plain) continue;
+        // A plain message is actionable work. Legacy entries without the
+        // envelope identity, or a delayed same-name sender after a resume,
+        // must be consumed and discarded instead of reaching the teammate.
+        if (!plainMessageMatchesCurrentMember(a, e, m)) {
+            consumed.append(a, m.*) catch {};
+            continue;
+        }
         const wire = mailbox.formatForModel(a, m) catch continue;
         defer a.free(wire);
         if (out.items.len > 0) out.appendSlice(a, "\n\n") catch {};
@@ -1028,19 +1293,53 @@ fn appendPlainFrom(
     }
 }
 
+fn plainMessageMatchesCurrentMember(a: std.mem.Allocator, e: *const TeammateEntry, m: *const mailbox.Message) bool {
+    const raw_session = m.session_id orelse return false;
+    const raw_lease = m.lease_id orelse return false;
+    const session = session_id_mod.SessionId.fromSlice(raw_session) orelse return false;
+    const lease = session_id_mod.SessionId.fromSlice(raw_lease) orelse return false;
+    if (!std.mem.eql(u8, session.asSlice(), e.session.asSlice())) return false;
+
+    var name_buf: [64]u8 = undefined;
+    const sender = team_mod.sanitizeAgentName(m.from, &name_buf);
+    if (std.mem.eql(u8, sender, team_mod.TEAM_LEAD_NAME)) {
+        // Lead messages use the lead session as both session and lease.
+        return std.mem.eql(u8, lease.asSlice(), session.asSlice());
+    }
+
+    var tf = team_mod.load(a, e.config_path) orelse return false;
+    defer tf.deinit();
+    const member = tf.findMember(sender) orelse return false;
+    const member_session = member.session_id orelse return false;
+    const member_lease = member.lease_id orelse return false;
+    return std.mem.eql(u8, member_session, session.asSlice()) and
+        std.mem.eql(u8, member_lease, lease.asSlice());
+}
+
+fn leadMessageMatchesCurrentSession(e: *const TeammateEntry, m: *const mailbox.Message) bool {
+    const raw_session = m.session_id orelse return false;
+    const raw_lease = m.lease_id orelse return false;
+    const session = session_id_mod.SessionId.fromSlice(raw_session) orelse return false;
+    const lease = session_id_mod.SessionId.fromSlice(raw_lease) orelse return false;
+    return std.mem.eql(u8, session.asSlice(), e.session.asSlice()) and
+        std.mem.eql(u8, lease.asSlice(), e.session.asSlice());
+}
+
 /// teammate 线程主函数:多轮持久对话 + idle-wait 循环。
 fn teammateThreadMain(input: *TeammateInput) void {
     const a = input.allocator;
     const e = input.entry;
+    defer e.flushOutputPending();
 
     var ctx_override = input.permission_ctx.scopedDerive(input.perm_override);
+    ctx_override.session = input.session;
     // teammate 线程绝不读 fd 0(与 lead REPL 争抢/卡死):`.ask` 无 ui_requester → fail-closed deny
     // (PM SW4 3c)。SW7 权限代理会给 teammate 一个转发到 lead 的 ui_requester。
     ctx_override.no_interactive_prompt = true;
 
     if (input.reasoning_effort_override) |effort| {
         input.owned.provider().setReasoningEffort(effort) catch {
-            setMemberActiveBestEffort(a, e.config_path, e.name, false); // 先落盘再翻状态(#100)
+            setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false); // 先落盘再翻状态(#100)
             e.setStatus(.failed);
             sendIdleNotification(a, e, "failed", null, "AgentEffortUnsupportedProvider");
             input.cleanup();
@@ -1052,7 +1351,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
     var conv = Conversation.init(a);
     defer conv.deinit();
     conv.appendText(.user, input.prompt) catch {
-        setMemberActiveBestEffort(a, e.config_path, e.name, false); // 先落盘再翻状态(#100)
+        setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false); // 先落盘再翻状态(#100)
         e.setStatus(.failed);
         sendIdleNotification(a, e, "failed", null, "OutOfMemory");
         input.cleanup();
@@ -1107,6 +1406,8 @@ fn teammateThreadMain(input: *TeammateInput) void {
     // (teammates=null 无 registry;两串是借用,deinit 会误 free)。
     var teammate_sw = @import("context.zig").SwarmContext{
         .allocator = a,
+        .session = input.session,
+        .lease = e.agent_ident,
         .home = input.home,
         .self_name = e.name,
         .is_lead = false,
@@ -1133,7 +1434,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
         // deinit 的 abort 之后,agent_loop turn 开始的 abort 检查得以生效;去重后线程立即
         // 进入**不可中断的 HTTP receiveHead**(慢 mock 下 deinit join 从 ~60s 恶化到 240s)。
         // 真正的修法是 abort 感知的 HTTP 等待(登记存量债);在那之前保留此写(也对齐 cc)。
-        setMemberActiveBestEffort(a, e.config_path, e.name, true);
+        setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, true);
 
         const result = agent_loop.run(
             &conv,
@@ -1142,6 +1443,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
             &ctx_override,
             .{
                 .max_turns = if (input.max_turns_per_run > 0) input.max_turns_per_run else 20,
+                .session = input.session,
                 .system_prompt = if (input.system_prompt.len > 0) input.system_prompt else null,
                 .abort = &e.abort,
                 .api_client = input.owned.anthropicClient(),
@@ -1177,7 +1479,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
             // 先放租约再翻 failed:failed 同样让 liveCount() 不再计入本 teammate,
             // lead 据此重派或收尸时租约必须已经不在 KG 里(理由同下方 terminated 路径)。
             releaseHeldTasks(e, kg_ptr); // 释放持有租约(PM F4/Linus M1:防卡 TTL)
-            setMemberActiveBestEffort(a, e.config_path, e.name, false); // 先落盘再翻状态(#100)
+            setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false); // 先落盘再翻状态(#100)
             e.lockPublic();
             e.status = .failed;
             e.err_name = @errorName(err);
@@ -1206,7 +1508,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
         // 才是"干完可接新活";max_turns/tool_loop/budget 等是"没干完",发 needs_continuation
         // + stopReason 让 lead 决定续跑/改派,而非误以为完工。
         // 与 terminated 同序(#100):先落盘 isActive=false,再翻 idle,再通知。
-        setMemberActiveBestEffort(a, e.config_path, e.name, false);
+        setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false);
         e.setStatus(.idle);
         switch (result.stop_reason) {
             .end_turn => sendIdleNotification(a, e, "available", null, null),
@@ -1230,7 +1532,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
     // terminated 必须蕴含 "持有的租约已经放掉" 且 "config.json 的 isActive=false 已落盘"
     // (best-effort:写失败也不再重试,但此后不会再有写)。
     releaseHeldTasks(e, kg_ptr); // 退出前释放持有租约(PM F4/Linus M1:abort/shutdown 不卡 TTL)
-    setMemberActiveBestEffort(a, e.config_path, e.name, false);
+    setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false);
     e.setStatus(.terminated);
     input.cleanup();
 }
@@ -1244,6 +1546,13 @@ const testing = std.testing;
 test "TeammateRegistry init/deinit 空表干净" {
     var reg = try TeammateRegistry.init(testing.allocator, "k", null, "m", .anthropic, "/tmp");
     reg.deinit();
+}
+
+test "TeammateRegistry mutators reject a closing registry" {
+    var reg = try TeammateRegistry.init(testing.allocator, "k", null, "m", .anthropic, "/tmp");
+    defer reg.deinit();
+    reg.closing = true;
+    try testing.expectError(error.RegistryClosed, reg.setLimits(.{}));
 }
 
 test "TeammateRegistry: 空 home 拒绝" {
@@ -1260,8 +1569,8 @@ test "snapshotRoster: 空表返回空;freeRoster 无泄漏" {
 
 test "spawnTeammate: team 不存在 → TeamNotFound 且无残留 entry" {
     const a = testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-tm-noteam-{d}", .{util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-tm-noteam");
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
     var reg = try TeammateRegistry.init(a, "k", null, "m", .anthropic, home);
     defer reg.deinit();

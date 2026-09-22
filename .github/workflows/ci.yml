@@ -13,118 +13,86 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Topology: one job per platform. The fleet has one runner per platform, so
-# splitting a platform's gates across jobs only serializes them behind extra
-# checkout/setup overhead and queue gaps (measured: the macOS test job waited
-# 5m16s behind its own platform/bundle jobs). Cross-platform parallelism comes
-# from the matrix; intra-platform steps run cheapest-first for fail-fast.
+# Topology: one job per platform on GitHub-hosted runners (the repository is
+# public; organization policy keeps public repositories off the self-hosted
+# fleet, and hosted standard runners are free for public repositories).
+# Cross-platform parallelism comes from the matrix; intra-platform steps run
+# cheapest-first for fail-fast. Every runner is ephemeral: nothing persists
+# between runs except what actions/cache and setup-zig restore explicitly.
 jobs:
   gates:
     name: Gates (${{ matrix.os }})
     # This job's steps are a superset of the AGENTS.md "Before submitting"
     # checklist; scripts/tests/test_gate_manifest.py asserts that every checklist
     # command has a step here, so the two cannot drift apart silently.
-    timeout-minutes: 30
-    # Self-hosted isolation guard: never schedule fork-PR code onto the
-    # persistent self-hosted runners. Same-repo PRs, pushes to main, and
-    # workflow_dispatch runs are unaffected (github.event.pull_request is
-    # null for non-PR events, so the first clause passes them). Remove only
-    # when public CI moves to GitHub-hosted or ephemeral runners
-    # (OPEN_SOURCE_READINESS.md, "Final launch gate").
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # 45 minutes: a cold hosted runner compiles the whole tree and the Lean
+    # kernel; warm runs (setup-zig + Lean cache hits) are far shorter.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: Linux
-            arch: X64
+            runner: ubuntu-latest
           - os: macOS
-            arch: ARM64
-    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}"]
-    # One physical runner per platform is shared by jobs from different
-    # workflows (AgentCore Windows compiles at -j12 while this job runs the
-    # full suite; issue #52 suggestion 3). GitHub runs at most one job per
-    # concurrency group, so heavy jobs queue behind each other instead of
-    # overlapping on the same box, which is the load that made timing-
-    # sensitive L2 tests flake (#51/#52). GitHub also cancels an *older*
-    # pending job when a newer one joins the group, so pushes to main get
-    # their own bucket: a PR push can never cancel a waiting main run.
-    # rule-control stays outside these groups on purpose: it is dispatch-
-    # only and runs for up to two hours, and that pending-cancel rule would
-    # let a PR push cancel a release gate a maintainer is waiting for; its
-    # isolation is the dedicated-runner item in ROADMAP M1.
-    concurrency:
-      group: runner-${{ matrix.os }}-${{ matrix.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}
-      cancel-in-progress: false
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      # use-cache: setup-zig points both Zig cache env vars at one directory
+      # and restores/saves it through actions/cache keyed by OS and Zig
+      # version. Zig's cache is content-addressed and folds the compiler
+      # version into every hash, so a restored directory is always safe; test
+      # execution is not affected because test Run steps are has_side_effects
+      # in build.zig. cache-size-limit: the directory is dropped instead of
+      # saved once it exceeds this many MiB (the default 2 GiB is below what
+      # one full run of these gates produces).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
-          use-cache: false
-      # checkout's default `git clean -ffdx` wipes the workspace .zig-cache
-      # that setup-zig points both cache env vars at, so without this every
-      # run recompiles the world cold. Zig's cache is content-addressed,
-      # folds the compiler version into every hash, and takes advisory locks,
-      # so a shared per-runner directory is safe; test execution is not
-      # affected because test Run steps are has_side_effects in build.zig.
-      - name: Point Zig caches at persistent per-runner storage
-        shell: bash
-        run: |
-          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/metacodes-zig/global" >> "$GITHUB_ENV"
-          echo "ZIG_LOCAL_CACHE_DIR=$HOME/.cache/metacodes-zig/local" >> "$GITHUB_ENV"
+          use-cache: true
+          cache-size-limit: 4096
       - name: Zig format check
         if: runner.os == 'Linux'
         run: zig fmt --check build.zig src tests
-      # Lean kernel build without lean-action: the action re-ran an unpinned
-      # `curl .../elan/master/elan-init.sh | sh` on every run (mutable script
-      # executed on a persistent runner, ~40 s, and the reinstall invalidated
-      # Lake's toolchain traces so the kernel cold-built each time despite the
-      # restored .lake). elan is a presence-checked runner prerequisite like
-      # rg; the pinned toolchain in control-plane/lean/lean-toolchain installs
-      # once into the persistent ~/.elan via elan's own resolver.
-      # control-plane/lean/.lake sits in the workspace and is wiped by the
-      # checkout clean; Lake hash-verifies restored products, so a stale or
+      # Lean toolchain and build products. Key: the pinned toolchain plus every
+      # Lean source, so a source change rebuilds from the previous products
+      # (restore-keys) and Lake hash-verifies what it restores; a stale or
       # torn copy self-heals into a rebuild rather than wrong results.
+      - name: Restore Lean toolchain and build products
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            control-plane/lean/.lake
+          key: lean-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('control-plane/lean/lean-toolchain', 'control-plane/lean/lakefile.toml', 'control-plane/lean/lake-manifest.json', 'control-plane/lean/**/*.lean') }}
+          restore-keys: |
+            lean-${{ runner.os }}-${{ runner.arch }}-
+      # scripts/ci/install-elan.sh: a pinned elan release asset with a pinned
+      # SHA-256, never the mutable elan-init.sh from elan's master branch (the
+      # reason lean-action was dropped). A no-op on a cache hit. The toolchain
+      # named in control-plane/lean/lean-toolchain installs on first use
+      # through elan's own resolver into ~/.elan, which the cache above
+      # persists.
+      - name: Install pinned elan
+        run: bash scripts/ci/install-elan.sh
       - name: Build pinned Lean kernel
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -x "$HOME/.elan/bin/elan" ] && ! command -v lake >/dev/null 2>&1; then
-            echo "elan is a runner prerequisite (see ROADMAP M1); install it once:" >&2
-            echo "  https://github.com/leanprover/elan  (or: brew install elan-init)" >&2
-            exit 1
-          fi
-          export PATH="$HOME/.elan/bin:$PATH"
-          if [ -d "$HOME/.cache/metacodes-lean/lake" ]; then
-            mkdir -p control-plane/lean/.lake
-            if command -v rsync >/dev/null 2>&1; then
-              rsync -a "$HOME/.cache/metacodes-lean/lake/" control-plane/lean/.lake/ || true
-            else
-              cp -a "$HOME/.cache/metacodes-lean/lake/." control-plane/lean/.lake/ || true
-            fi
-          fi
           (cd control-plane/lean && lake build)
           # The project-harness kernel is linked and smoked by its build
           # script, not by `lake build`: the smoke requests are hand-written
           # canonical JSON that the strict Lean parser must accept field for
           # field, and nothing else exercises that pairing. They drifted from
           # the kernel for three weeks (within_root, 33cf238) because no job
-          # ran the script on any platform. Runs before the cache save so the
-          # executable objects persist with the rest of .lake; the output goes
-          # outside the workspace so no test can pick up a kernel that the
-          # suite did not stage itself. One line: test_gate_manifest.py
-          # shlex-splits every line of this block on its own.
+          # ran the script on any platform. The output goes outside the
+          # workspace so no test can pick up a kernel that the suite did not
+          # stage itself. One line: test_gate_manifest.py shlex-splits every
+          # line of this block on its own.
           LAKE="$(command -v lake)" bash scripts/build-project-harness-kernel.sh "$RUNNER_TEMP/metacodes-project-kernel"
-          mkdir -p "$HOME/.cache/metacodes-lean/lake"
-          if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete control-plane/lean/.lake/ "$HOME/.cache/metacodes-lean/lake/"
-          else
-            rm -rf "$HOME/.cache/metacodes-lean/lake"
-            cp -a control-plane/lean/.lake "$HOME/.cache/metacodes-lean/lake"
-          fi
       - name: Install ripgrep
         shell: bash
         run: |
@@ -137,6 +105,12 @@ jobs:
               sudo apt-get install -y ripgrep
             fi
           fi
+      # PyYAML for scripts/eval/workbuddy and its tests (requirements-dev.txt).
+      # --break-system-packages: the hosted images' system Python is PEP 668
+      # "externally managed"; the runner is ephemeral so there is nothing to
+      # protect.
+      - name: Install Python development dependencies
+        run: python3 -m pip install --break-system-packages -r requirements-dev.txt
       - name: TinyKG binary-contract unit tests
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
       - name: ripgrep binary-contract unit tests
@@ -168,9 +142,9 @@ jobs:
           done
       - name: Full offline test suite
         env:
-          # Both legs build control-plane/lean above (lean-action, build: true),
-          # so a missing/mislocated ProjectRule.olean is a regression, not an
-          # environment gap: fail instead of skip.
+          # Both legs build control-plane/lean above, so a missing/mislocated
+          # ProjectRule.olean is a regression, not an environment gap: fail
+          # instead of skip.
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
         # --test-timeout 5m: the build runner watchdog between tests is
         # max(--test-timeout, 60s); same value as the Windows leg and the
@@ -188,6 +162,12 @@ jobs:
         run: python3 scripts/check_doc_links.py
       - name: Default install prefix
         run: zig build --prefix "$RUNNER_TEMP/install-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/install-prefix" --doctor
+      # The sidecar the kernel build script wrote, read by the installed
+      # product's own loader: the pairing no unit test can cover (the project
+      # kernel's v6 sidecar was validated with the formal v4 loader for as long
+      # as nothing ran a real one through doctor, 2026-09-21).
+      - name: Built project kernel provenance is accepted by doctor
+        run: python3 scripts/verify_kernel_provenance.py "$RUNNER_TEMP/install-prefix/bin/metacodes" --project "$RUNNER_TEMP/metacodes-project-kernel"
       - name: Release layout prefix
         run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
       - name: Release bundle verifier self-test
@@ -213,6 +193,8 @@ jobs:
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
       - name: Verify install prefix unit tests
         run: python3 -m unittest scripts.tests.test_verify_install_prefix -v
+      - name: Kernel provenance verifier unit tests
+        run: python3 -m unittest scripts.tests.test_verify_kernel_provenance -v
       - name: Python floor unit tests
         run: python3 -m unittest scripts.tests.test_python_floor -v
       - name: Diff whitespace check
@@ -220,17 +202,10 @@ jobs:
 
   windows-gates:
     name: Gates (Windows)
-    # Measured on the self-hosted runner with warm caches: full suite step 1:09,
-    # job 1:47. A cold cache compiles the whole tree; 30 matches the `gates` job.
-    timeout-minutes: 30
-    # Self-hosted isolation guard; see the `gates` job.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Windows, X64]
-    # Same runner-serialization group as AgentCore Windows; see the `gates`
-    # job for the semantics.
-    concurrency:
-      group: runner-Windows-X64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}
-      cancel-in-progress: false
+    # 45 minutes: same reasoning as the `gates` job; the hosted Windows runner
+    # has 4 cores and a cold Zig cache compiles the whole tree.
+    timeout-minutes: 45
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -238,26 +213,20 @@ jobs:
           # fingerprint tests resolve historical commits with `git rev-parse`,
           # which a depth-1 checkout cannot (5 errors on the first full run).
           fetch-depth: 0
+      # See the `gates` job for the cache semantics.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
-          use-cache: false
-      # See the `gates` job for why; cmd because the Windows runner is not
-      # guaranteed to provide bash, and Git-Bash $HOME would be a POSIX-style
-      # path that native zig.exe cannot use.
-      - name: Point Zig caches at persistent per-runner storage
-        shell: cmd
-        run: |
-          echo ZIG_GLOBAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\global>>"%GITHUB_ENV%"
-          echo ZIG_LOCAL_CACHE_DIR=%USERPROFILE%\.cache\metacodes-zig\local>>"%GITHUB_ENV%"
-      # The workspace persists between runs and git treats a CRLF file whose
-      # normalized content matches the index as clean, so `checkout --force`
-      # never repairs line endings some other process rewrote (run 33768501933
-      # failed exactly that way: plugin.json and pinned fixtures hashed as CRLF
-      # while the previous run on the same machine had them as LF). List what is
-      # wrong for the record, rewrite the tree from the index under
-      # .gitattributes, and fail closed if anything still carries CRLF.
-      - name: Normalize line endings of the persistent workspace
+          use-cache: true
+          cache-size-limit: 4096
+      # The hosted Windows image checks out with core.autocrlf=true, and
+      # .gitattributes (`* text=auto eol=lf`) is the contract: @embedFile'd
+      # templates and pinned fixtures hash by the byte. List what is wrong for
+      # the record, rewrite the tree from the index under .gitattributes, and
+      # fail closed if anything still carries CRLF. cmd throughout the job:
+      # Git-Bash $HOME would be a POSIX-style path that native zig.exe cannot
+      # use.
+      - name: Normalize line endings of the checkout
         shell: cmd
         run: |
           git config --show-origin --get-all core.autocrlf & echo (core.autocrlf origins above, if any)
@@ -265,6 +234,11 @@ jobs:
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
+      # PyYAML for the Python suites that `zig build test` runs; see the
+      # `gates` job.
+      - name: Install Python development dependencies
+        shell: cmd
+        run: python -m pip install -r requirements-dev.txt
       - name: Native platform modules
         shell: cmd
         env:
@@ -297,22 +271,20 @@ jobs:
       - name: Verify install prefix unit tests
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_install_prefix -v
-      # The repository-wide suite on the native Windows host. Until #53 this was
-      # the "independent gate" build.zig talked about that no workflow ran, so
-      # Windows portability regressions accumulated silently (1 compile error,
-      # 8 unit tests, 8 integration shards, 330 Python cases by the time it was
-      # first run). -j6: the default job count is one LLVM codegen per core; on a
-      # 28-core/32 GB box that surfaces as bogus "out of memory" compile failures
-      # rather than a clean signal, and the runner finishes in ~1 min anyway. --test-timeout 5m: the build runner
-      # watchdog between tests is max(--test-timeout, 60s), same as the AgentCore
-      # gate. No Lean step and no METACODES_TEST_REQUIRE_LEAN_SDK here: the
-      # kernel-gated tests take their checker from operator-provided
-      # METACODES_TEST_*_KERNEL_* variables that no job sets, and the runner does
-      # not provision elan; they skip on this leg exactly as documented in
+      - name: Kernel provenance verifier unit tests
+        shell: cmd
+        run: python -m unittest scripts.tests.test_verify_kernel_provenance -v
+      # The repository-wide suite on the native Windows host (#53). No Lean
+      # step and no METACODES_TEST_REQUIRE_LEAN_SDK here: the kernel-gated
+      # tests take their checker from operator-provided
+      # METACODES_TEST_*_KERNEL_* variables that no job sets, and this leg does
+      # not provision elan; they skip exactly as documented in
       # scripts/eval/tests/posix_only.py and the component tests.
+      # --test-timeout 5m: the build runner watchdog between tests is
+      # max(--test-timeout, 60s), same as the AgentCore gate.
       - name: Full offline test suite
         shell: cmd
-        run: zig build test -j6 --test-timeout 5m
+        run: zig build test --test-timeout 5m
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite

@@ -9,6 +9,8 @@ const manifest = @import("build.zig.zon");
 // github.com/shuzuan-org/highlight-zig),纯 Zig 模块方式消费其源(每个 root 各按自身
 // optimize 编译;未用的 import 零成本)。tree-sitter 已于 2026-07-13 整体移除。
 var g_hl_mod: ?*std.Build.Module = null;
+var g_formal_kernel_sha256: ?[]const u8 = null;
+var g_project_kernel_sha256: ?[]const u8 = null;
 fn addHl(b: *std.Build, mod: *std.Build.Module) void {
     addHlWithProjectHarnessActuation(b, mod, false);
 }
@@ -28,6 +30,8 @@ fn addHlWithProjectHarnessActuation(
     addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
     const project_harness_options = b.addOptions();
     project_harness_options.addOption(bool, "evaluation_shadow", evaluation_shadow);
+    project_harness_options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
+    project_harness_options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
     mod.addOptions("project_harness_build_options", project_harness_options);
 }
 
@@ -47,7 +51,6 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
 fn addTestRunArtifact(
     b: *std.Build,
     artifact: *std.Build.Step.Compile,
-    windows_prelude: ?*std.Build.Step.Run,
 ) *std.Build.Step.Run {
     const run = b.addRunArtifact(artifact);
     // A test gate must execute on every invocation; a warm build cache may
@@ -55,7 +58,6 @@ fn addTestRunArtifact(
     // steps regardless, but state the doctrine here so a future caching change
     // cannot silently turn cached test binaries into stale green evidence.
     run.has_side_effects = true;
-    if (windows_prelude) |prelude| run.step.dependOn(&prelude.step);
     return run;
 }
 
@@ -88,49 +90,52 @@ const BundledTinyKg = struct {
     target_family: []const u8,
 };
 
-fn bundledTinyKgForTarget(target: std.Target) ?BundledTinyKg {
-    return switch (target.os.tag) {
-        .macos => switch (target.cpu.arch) {
-            .aarch64 => .{
-                .key = "macos-universal",
-                .path = "vendor/tinykg/bin/tinykg-macos-universal",
-                .sha256 = "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af",
-                .target_family = "aarch64-macos",
-            },
-            .x86_64 => .{
-                .key = "macos-universal",
-                .path = "vendor/tinykg/bin/tinykg-macos-universal",
-                .sha256 = "b42b2ba239f161be53dc1cfa49106004f91474be92e6f52e0f02bbd1f53d63af",
-                .target_family = "x86_64-macos",
-            },
-            else => null,
-        },
-        .linux => switch (target.cpu.arch) {
-            .aarch64 => .{
-                .key = "linux-aarch64",
-                .path = "vendor/tinykg/bin/tinykg-linux-aarch64",
-                .sha256 = "9cfe7bf551463068c1bcaa49dea69dce53be6fdf5b9428f39081fcad67e461aa",
-                .target_family = "aarch64-linux",
-            },
-            .x86_64 => .{
-                .key = "linux-x86_64",
-                .path = "vendor/tinykg/bin/tinykg-linux-x86_64",
-                .sha256 = "5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba",
-                .target_family = "x86_64-linux",
-            },
-            else => null,
-        },
-        .windows => switch (target.cpu.arch) {
-            .x86_64 => .{
-                .key = "windows-x86_64",
-                .path = "vendor/tinykg/bin/tinykg-windows-x86_64.exe",
-                .sha256 = "27f72f74babdcc60c327228673f9eb042092b6c82b156e241c66c0acea081e1b",
-                .target_family = "x86_64-windows",
-            },
-            else => null,
-        },
-        else => null,
-    };
+const BundleTableEntry = struct {
+    key: []const u8,
+    role: []const u8,
+    path: []const u8,
+    sha256: []const u8,
+    targets: []const []const u8,
+};
+
+/// The second, independently committed copy of the bundle digests.
+/// `tinykg:stage` hands the digest below to `scripts/stage_tinykg_binary.py`,
+/// which compares it with `vendor/tinykg/manifest.json` before staging a byte,
+/// so editing the manifest alone cannot change what a build installs. Reading
+/// the digest out of that same manifest would make the comparison attest to
+/// itself. `scripts/build_tinykg_bundle.py` regenerates everything between the
+/// markers, which must stay on their own lines.
+// tinykg-bundle-table:begin
+const tinykg_bundle_table = [_]BundleTableEntry{
+    .{ .key = "macos-universal", .role = "cli", .path = "vendor/tinykg/bin/tinykg-macos-universal", .sha256 = "dd53db2aa5219e899daac3caac2332648ac392550fa6f431b5900a1d495688e1", .targets = &.{ "aarch64-macos", "x86_64-macos" } },
+    .{ .key = "macos-universal-daemon", .role = "daemon", .path = "vendor/tinykg/bin/tinykgd-macos-universal", .sha256 = "f1dd9f9a472bb58fa7dcd749a2a4df1a03d63c6dc7093054096beeb3b205722f", .targets = &.{ "aarch64-macos", "x86_64-macos" } },
+    .{ .key = "linux-x86_64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-linux-x86_64", .sha256 = "6ff8346aa0c5e9a9cf10cfa3357bfa2767699bf4735c8fd2e12d39cc12ee1521", .targets = &.{"x86_64-linux"} },
+    .{ .key = "linux-x86_64-daemon", .role = "daemon", .path = "vendor/tinykg/bin/tinykgd-linux-x86_64", .sha256 = "5d8f11e3bfe96a3845aa6d1166ac9341a59b622f355dc5de1c27675f0c5e5614", .targets = &.{"x86_64-linux"} },
+    .{ .key = "linux-aarch64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-linux-aarch64", .sha256 = "2f601a8d27eba6956f61e87da84f83ad3a247db111233de0d74031bbff87fca0", .targets = &.{"aarch64-linux"} },
+    .{ .key = "linux-aarch64-daemon", .role = "daemon", .path = "vendor/tinykg/bin/tinykgd-linux-aarch64", .sha256 = "a5132e77776c607328b5dd7b59b7af643fd406b0ae031dff062d144ac774a3eb", .targets = &.{"aarch64-linux"} },
+    .{ .key = "windows-x86_64", .role = "cli", .path = "vendor/tinykg/bin/tinykg-windows-x86_64.exe", .sha256 = "61b9281880dda0eaadadf051e16191ee46b8c454771e4639171dd90aed5e8044", .targets = &.{"x86_64-windows"} },
+    .{ .key = "windows-x86_64-daemon", .role = "daemon", .path = "vendor/tinykg/bin/tinykgd-windows-x86_64.exe", .sha256 = "aca73b00590df898c65d0a2741dafd6e7805a78ff3fd4ec6ce7a7495a6481281", .targets = &.{"x86_64-windows"} },
+};
+// tinykg-bundle-table:end
+
+fn bundledTinyKgForTarget(b: *std.Build, target: std.Target, role: []const u8) ?BundledTinyKg {
+    const family = b.fmt("{s}-{s}", .{ @tagName(target.cpu.arch), @tagName(target.os.tag) });
+    var selected: ?BundledTinyKg = null;
+    for (tinykg_bundle_table) |entry| {
+        if (!std.mem.eql(u8, entry.role, role)) continue;
+        for (entry.targets) |candidate| {
+            if (!std.mem.eql(u8, candidate, family)) continue;
+            if (selected != null) @panic("duplicate TinyKG target/role ownership");
+            if (!isLowerSha256(entry.sha256)) @panic("invalid TinyKG bundle table SHA-256");
+            selected = .{
+                .key = entry.key,
+                .path = entry.path,
+                .sha256 = entry.sha256,
+                .target_family = candidate,
+            };
+        }
+    }
+    return selected;
 }
 
 fn isLowerSha256(value: []const u8) bool {
@@ -187,6 +192,15 @@ fn buildInfoOptions(
         .explicit => |input| input.sha256,
         .disabled, .unavailable => null,
     });
+    // The daemon digest is pinned only once the daemon is part of the install,
+    // exactly like the Lean kernels: doctor calls a pinned-but-unresolvable
+    // binary unhealthy, so pinning something the prefix does not carry would
+    // make `doctor --strict` fail on every release. Staging still compares the
+    // build table against the bundle manifest. The change that installs the
+    // daemon pins it here in the same commit.
+    options.addOption(?[]const u8, "tinykgd_expected_sha256", @as(?[]const u8, null));
+    options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
+    options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
     return options;
 }
 
@@ -266,12 +280,12 @@ fn tinyKgBinaryInput(b: *std.Build, target: std.Target) TinyKgBinaryInput {
     const bundled_option = b.option(bool, "tinykg-bundled", "Install the checked-in target-specific TinyKG binary (default true)");
     if (legacy != null and bundled_option != null) @panic("-Dtinykg and -Dtinykg-bundled cannot be combined");
 
-    const path = b.option([]const u8, "tinykg-bin", "Absolute path to a maintainer-supplied TinyKG override");
-    const sha256 = b.option([]const u8, "tinykg-sha256", "Observed SHA-256 of the TinyKG override");
+    const path = b.option([]const u8, "tinykg-bin", "Absolute path to a maintainer-supplied TinyKG CLI override (CLI-only)");
+    const sha256 = b.option([]const u8, "tinykg-sha256", "Observed SHA-256 of the TinyKG CLI override (CLI-only)");
     if (path == null and sha256 == null) {
         const enabled = bundled_option orelse if (legacy) |value| value else true;
         if (!enabled) return .disabled;
-        return if (bundledTinyKgForTarget(target)) |bundle| .{ .bundled = bundle } else .unavailable;
+        return if (bundledTinyKgForTarget(b, target, "cli")) |bundle| .{ .bundled = bundle } else .unavailable;
     }
     const resolved_path = path orelse @panic("-Dtinykg-bin and -Dtinykg-sha256 must be supplied together");
     const resolved_sha256 = sha256 orelse @panic("-Dtinykg-bin and -Dtinykg-sha256 must be supplied together");
@@ -287,10 +301,23 @@ const StagedTinyKg = struct {
     source_sha256: []const u8,
 };
 
+const StagedTinyKgd = struct {
+    install_step: *std.Build.Step,
+    artifact: std.Build.LazyPath,
+    installed_path: []const u8,
+    source_sha256: []const u8,
+};
+
 fn wireTinyKgTestInput(run: *std.Build.Step.Run, staged: ?StagedTinyKg) void {
     const tinykg = staged orelse return;
     run.step.dependOn(tinykg.install_step);
     run.setEnvironmentVariable("METACODES_TEST_TINYKG_BIN", tinykg.installed_path);
+}
+
+fn wireTinyKgdTestInput(run: *std.Build.Step.Run, staged: ?StagedTinyKgd) void {
+    const daemon = staged orelse return;
+    run.step.dependOn(daemon.install_step);
+    run.setEnvironmentVariable("METACODES_TEST_TINYKGD_BIN", daemon.installed_path);
 }
 
 const aggregate_test_exclusions = [_][]const u8{
@@ -438,6 +465,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const target_was_explicit = b.user_input_options.contains("target");
     const optimize = b.standardOptimizeOption(.{});
+    g_formal_kernel_sha256 = b.option([]const u8, "formal-kernel-sha256", "SHA-256 of the adjacent formal governance kernel");
+    if (g_formal_kernel_sha256) |value| if (!isLowerSha256(value))
+        @panic("-Dformal-kernel-sha256 must be 64 lowercase hex characters");
+    g_project_kernel_sha256 = b.option([]const u8, "project-kernel-sha256", "SHA-256 of the adjacent project governance kernel");
+    if (g_project_kernel_sha256) |value| if (!isLowerSha256(value))
+        @panic("-Dproject-kernel-sha256 must be 64 lowercase hex characters");
     // TinyKG source remains outside the Metacodes graph. Normal builds select a
     // checked-in, manifest-pinned target binary. A maintainer may override it
     // with an absolute path plus digest. Native staging validates version and a
@@ -459,23 +492,6 @@ pub fn build(b: *std.Build) void {
     const integration_test_shards = b.option(u8, "integration-test-shards", "Parallel component/integration test shards (1-64)") orelse 8;
     if (integration_test_shards == 0 or integration_test_shards > 64) @panic("-Dintegration-test-shards must be between 1 and 64");
     const agentcore_strip = b.option(bool, "agentcore-strip", "Strip AgentCore library debug information") orelse (optimize != .Debug);
-
-    // Compatibility prelude for the remaining tests that spell temporary
-    // paths as `/tmp/...`. On Windows that means `\tmp` at the current drive
-    // root. Every Windows test run depends on this host-native step so a fresh
-    // machine cannot fail merely because the legacy directory is absent.
-    const windows_test_prelude = if (target.result.os.tag == .windows) blk: {
-        const prelude_mod = b.createModule(.{
-            .root_source_file = b.path("scripts/windows_test_prelude.zig"),
-            .target = b.graph.host,
-            .optimize = .ReleaseSafe,
-        });
-        const prelude_exe = b.addExecutable(.{
-            .name = "windows-test-prelude",
-            .root_module = prelude_mod,
-        });
-        break :blk b.addRunArtifact(prelude_exe);
-    } else null;
 
     // 固定产出两个二进制：metacodes (ReleaseSmall) 和 metacodes-debug (Debug)。
     // 不受 -Doptimize 影响，一次 build 同时得到发布版和调试版。
@@ -518,6 +534,7 @@ pub fn build(b: *std.Build) void {
     project_harness_shadow_step.dependOn(&install_project_harness_shadow.step);
 
     var staged_tinykg: ?StagedTinyKg = null;
+    var staged_tinykgd: ?StagedTinyKgd = null;
     const tinykg_stage_step = b.step("tinykg:stage", "Validate and install the selected TinyKG binary");
     switch (tinykg_input) {
         .disabled => tinykg_stage_step.dependOn(&b.addFail(
@@ -540,7 +557,7 @@ pub fn build(b: *std.Build) void {
                 "--target-family",
                 input.target_family,
             });
-            const host_bundle = bundledTinyKgForTarget(b.graph.host.result);
+            const host_bundle = bundledTinyKgForTarget(b, b.graph.host.result, "cli");
             if (host_bundle != null and std.mem.eql(u8, host_bundle.?.key, input.key)) {
                 stage.addArg("--runtime-probe");
             }
@@ -575,6 +592,34 @@ pub fn build(b: *std.Build) void {
                 .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, bin_name),
                 .source_sha256 = input.sha256,
             };
+            if (bundledTinyKgForTarget(b, target.result, "daemon")) |daemon| {
+                const daemon_stage = b.addSystemCommand(&.{ python, "scripts/stage_tinykg_binary.py", "bundled", "--binary" });
+                const daemon_path = b.path(daemon.path);
+                daemon_stage.addFileArg(daemon_path);
+                daemon_stage.addArgs(&.{"--manifest"});
+                daemon_stage.addFileArg(b.path("vendor/tinykg/manifest.json"));
+                daemon_stage.addArgs(&.{ "--bundle-key", daemon.key, "--expected-sha256", daemon.sha256, "--target-family", daemon.target_family, "--role", "daemon" });
+                if (bundledTinyKgForTarget(b, b.graph.host.result, "daemon")) |host_daemon| if (std.mem.eql(u8, host_daemon.key, daemon.key)) daemon_stage.addArg("--runtime-probe");
+                daemon_stage.addArg("--contract");
+                daemon_stage.addFileArg(b.path("deps/tinykg.json"));
+                daemon_stage.addArgs(&.{ "--target", target.result.zigTriple(b.allocator) catch @panic("OOM"), "--output" });
+                const daemon_name = if (target.result.os.tag == .windows) "tinykgd.exe" else "tinykgd";
+                const staged_daemon = daemon_stage.addOutputFileArg(daemon_name);
+                daemon_stage.addArg("--receipt");
+                const staged_daemon_receipt = daemon_stage.addOutputFileArg("tinykgd.provenance.json");
+                const install_daemon = b.addInstallFileWithDir(staged_daemon, .{ .custom = "vendor/tinykg" }, daemon_name);
+                const install_daemon_receipt = b.addInstallFileWithDir(staged_daemon_receipt, .{ .custom = "vendor/tinykg" }, "tinykgd.provenance.json");
+                // Deliberately NOT part of the default install step. Nothing
+                // starts the daemon yet, and the product install carries only
+                // what `release/manifest_contract.zig` declares and
+                // `scripts/verify_install_prefix.py` expects. `tinykg:stage`
+                // and the test wiring still stage it, so the bundle stays
+                // attested and the resolution path stays covered; the release
+                // layout gains it in the change that starts it.
+                tinykg_stage_step.dependOn(&install_daemon.step);
+                tinykg_stage_step.dependOn(&install_daemon_receipt.step);
+                staged_tinykgd = .{ .install_step = &install_daemon.step, .artifact = staged_daemon, .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, daemon_name), .source_sha256 = daemon.sha256 };
+            }
         },
         .explicit => |input| {
             if (target.result.os.tag != b.graph.host.result.os.tag or
@@ -748,6 +793,29 @@ pub fn build(b: *std.Build) void {
     });
     const install_mock_mcp = b.addInstallArtifact(mock_mcp_exe, .{});
 
+    // selfexe_probe 二进制:相邻产物解析的进程级探针(adjacent_symlink_test 把它复制成
+    // <prefix>/bin/metacodes 后经 symlink 启动)。只链 platform + toolchain,不拖整个 app 图。
+    const toolchain_probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/util/toolchain.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, toolchain_probe_mod);
+    const selfexe_probe_mod = b.createModule(.{
+        .root_source_file = b.path("tests/_harness/selfexe_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, selfexe_probe_mod);
+    selfexe_probe_mod.addImport("toolchain", toolchain_probe_mod);
+    const selfexe_probe_exe = b.addExecutable(.{
+        .name = "selfexe_probe",
+        .root_module = selfexe_probe_mod,
+    });
+    const install_selfexe_probe = b.addInstallArtifact(selfexe_probe_exe, .{});
+
     // replay_server 二进制(Stage 7):从 cassette 起 mock,供 e2e replay。测试专用。
     // 三端可编:曾经的三个 Windows blocker 已清(socket server→platform/net、
     // args→iterateAllocator、cassette 文件 IO→pfs)。TTY ui_tools 用例依赖它。
@@ -772,9 +840,10 @@ pub fn build(b: *std.Build) void {
         .root_module = replay_mod,
     });
     const install_replay = b.addInstallArtifact(replay_exe, .{});
-    const test_harness_step = b.step("test:harness", "Install the test harness binaries: mock_mcp_server and replay_server");
+    const test_harness_step = b.step("test:harness", "Install the test harness binaries: mock_mcp_server, replay_server and selfexe_probe");
     test_harness_step.dependOn(&install_mock_mcp.step);
     test_harness_step.dependOn(&install_replay.step);
+    test_harness_step.dependOn(&install_selfexe_probe.step);
 
     // ── metacodes-core 可复用库 module(root=src/lib.zig,UI 图不可达)──────────
     // 供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。
@@ -810,7 +879,7 @@ pub fn build(b: *std.Build) void {
         "Enforce the unique HTTP response status boundary",
     );
     http_status_gate_step.dependOn(&http_status_gate_run.step);
-    http_status_gate_step.dependOn(&addTestRunArtifact(b, http_status_gate_unit, windows_test_prelude).step);
+    http_status_gate_step.dependOn(&addTestRunArtifact(b, http_status_gate_unit).step);
 
     // One-shot paid feasibility probe for the isolated rule-author adapter.
     // It is intentionally absent from the default install graph; the Python
@@ -903,25 +972,25 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_abi_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test).step);
     const agentcore_types_test = b.addTest(.{
         .name = "agentcore-types-unit",
         .root_module = agentcore_types_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test).step);
     const agentcore_protocol_test = b.addTest(.{
         .name = "agentcore-protocol-unit",
         .root_module = agentcore_protocol_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test).step);
     const agentcore_sdk_test = b.addTest(.{
         .name = "agentcore-sdk-unit",
         .root_module = agentcore_sdk_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_sdk_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_sdk_test).step);
     const agentcore_zig_package_build_test_mod = b.createModule(.{
         .root_source_file = b.path("sdk/zig/build.zig"),
         .target = b.graph.host,
@@ -932,7 +1001,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_zig_package_build_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_zig_package_build_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_zig_package_build_test).step);
     const agentcore_manifest_contract_mod = b.createModule(.{
         .root_source_file = b.path("tests/agentcore_artifact_consumer/manifest_contract.zig"),
         .target = target,
@@ -943,7 +1012,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_manifest_contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_contract_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_contract_test).step);
     const agentcore_manifest_tool_mod = b.createModule(.{
         .root_source_file = b.path("scripts/agentcore_manifest.zig"),
         .target = b.graph.host,
@@ -964,7 +1033,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_manifest_tool_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test).step);
 
     // ── release:manifest / release:check / release:verify (#80, #47 stage 5) ──
     // The CLI release unit is the staged prefix sealed with manifest.json
@@ -1012,9 +1081,9 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     const release_test_step = b.step("release:test", "Unit tests of the release manifest generator and contract");
-    release_test_step.dependOn(&addTestRunArtifact(b, release_manifest_tool_test, windows_test_prelude).step);
-    release_test_step.dependOn(&addTestRunArtifact(b, manifest_common_test, windows_test_prelude).step);
-    release_test_step.dependOn(&addTestRunArtifact(b, release_contract_test, windows_test_prelude).step);
+    release_test_step.dependOn(&addTestRunArtifact(b, release_manifest_tool_test).step);
+    release_test_step.dependOn(&addTestRunArtifact(b, manifest_common_test).step);
+    release_test_step.dependOn(&addTestRunArtifact(b, release_contract_test).step);
 
     const release_manifest_cmd = b.addRunArtifact(release_manifest_tool);
     release_manifest_cmd.addArgs(&.{
@@ -1107,7 +1176,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_symbol_gate_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_symbol_gate_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_symbol_gate_test).step);
     // header 可编译性检查:走 zig 构建系统原生 C 对象(不 install,只编译)。
     // 不用系统 cc(Windows 没有),也不用 `zig cc -fsyntax-only`(zig 0.16 Windows 实测
     // 对任何输入报 FileNotFound;`-c` 正常)。对象编译 = 语法+类型检查,跨平台等价。
@@ -1151,7 +1220,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_contract_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_contract_test).step);
 
     const agentcore_lib = b.addLibrary(.{
         .name = "metask_agentcore",
@@ -1613,7 +1682,7 @@ pub fn build(b: *std.Build) void {
     const core_test_step = b.step("test:lib", "Run the complete metacodes-core suite in checked deterministic shards");
     const core_shard_reports = b.allocator.alloc(std.Build.LazyPath, lib_test_shards) catch @panic("OOM");
     for (0..lib_test_shards) |shard_index| {
-        const run_shard = addTestRunArtifact(b, core_test, windows_test_prelude);
+        const run_shard = addTestRunArtifact(b, core_test);
         // captureStdOut would otherwise make the Run step cacheable. A test
         // gate must execute on every invocation; cached reports are evidence
         // from an earlier repository/environment state, not current feedback.
@@ -1637,7 +1706,7 @@ pub fn build(b: *std.Build) void {
     for (core_shard_reports) |report| run_core_shard_reporter.addFileArg(report);
     core_test_step.dependOn(&run_core_shard_reporter.step);
 
-    const core_monolithic_run = addTestRunArtifact(b, core_test, windows_test_prelude);
+    const core_monolithic_run = addTestRunArtifact(b, core_test);
     core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
     const core_test_monolithic_step = b.step("test:lib-monolithic", "Run the complete metacodes-core suite in one diagnostic process");
@@ -1674,7 +1743,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const core_test_times_step = b.step("test:lib-times", "Run metacodes-core tests with per-test timing diagnostics");
-    core_test_times_step.dependOn(&addTestRunArtifact(b, core_timed_test, windows_test_prelude).step);
+    core_test_times_step.dependOn(&addTestRunArtifact(b, core_timed_test).step);
     core_test_step.dependOn(http_status_gate_step);
 
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
@@ -1689,7 +1758,7 @@ pub fn build(b: *std.Build) void {
     addPlatform(b, lsp_test_mod); // lsp/ 依赖 platform（sync/process），隔离测试也需
     const lsp_test = b.addTest(.{ .name = "lsp-test", .root_module = lsp_test_mod });
     const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
-    lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test, windows_test_prelude).step);
+    lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test).step);
 
     // test:provider —— issue #16 provider offer kernel, in isolation.
     // Compiles the subsystem from a narrow root, which proves it *builds*
@@ -1707,7 +1776,7 @@ pub fn build(b: *std.Build) void {
     addPlatform(b, provider_test_mod); // control_plane guards its state with platform/sync
     const provider_test = b.addTest(.{ .name = "provider-test", .root_module = provider_test_mod });
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
-    provider_test_step.dependOn(&addTestRunArtifact(b, provider_test, windows_test_prelude).step);
+    provider_test_step.dependOn(&addTestRunArtifact(b, provider_test).step);
 
     // subsystem:boundary —— the provider kernel and the picker may import only
     // what their doc comments say. The compile-from-a-narrow-root gates below
@@ -1734,7 +1803,7 @@ pub fn build(b: *std.Build) void {
         "Enforce the provider and picker import boundaries (issue #16)",
     );
     subsystem_boundary_step.dependOn(&subsystem_boundary_run.step);
-    subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit, windows_test_prelude).step);
+    subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit).step);
 
     // test:picker —— issue #16 cross-UI model picker, in isolation.
     // Same shape as `test:provider`: it proves the picker builds standalone.
@@ -1749,7 +1818,7 @@ pub fn build(b: *std.Build) void {
     addPlatform(b, picker_test_mod);
     const picker_test = b.addTest(.{ .name = "picker-test", .root_module = picker_test_mod });
     const picker_test_step = b.step("test:picker", "Test the cross-UI model picker in isolation (issue #16)");
-    picker_test_step.dependOn(&addTestRunArtifact(b, picker_test, windows_test_prelude).step);
+    picker_test_step.dependOn(&addTestRunArtifact(b, picker_test).step);
 
     // test:platform —— 可移植抽象层(sync/process/fs/signal/rng/paths)。platform 成独立命名模块后
     // 其测试不再聚合进 cc-test，故独立入口。process fork 真子进程测试需 METACODES_PROC_TEST=1 启用。
@@ -1761,7 +1830,7 @@ pub fn build(b: *std.Build) void {
     });
     const platform_test = b.addTest(.{ .name = "platform-test", .root_module = platform_test_mod });
     const platform_test_step = b.step("test:platform", "Test the portable platform abstraction layer");
-    const platform_test_run = addTestRunArtifact(b, platform_test, windows_test_prelude);
+    const platform_test_run = addTestRunArtifact(b, platform_test);
     platform_test_step.dependOn(&platform_test_run.step);
 
     // example —— 独立消费者,经 module 用库跑一轮 agent loop(见 example/main.zig)。
@@ -1820,6 +1889,7 @@ pub fn build(b: *std.Build) void {
         "-m",
         "unittest",
         "scripts.tests.test_stage_tinykg_binary",
+        "scripts.tests.test_build_tinykg_bundle",
         "-v",
     });
     const tinykg_contract_test_step = b.step(
@@ -1901,8 +1971,9 @@ pub fn build(b: *std.Build) void {
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const test_run = addTestRunArtifact(b, test_obj, windows_test_prelude);
+    const test_run = addTestRunArtifact(b, test_obj);
     wireTinyKgTestInput(test_run, staged_tinykg);
+    wireTinyKgdTestInput(test_run, staged_tinykgd);
     test_step.dependOn(&test_run.step);
 
     // Two independent Metacodes processes share one authenticated StoreActor.
@@ -1957,6 +2028,10 @@ pub fn build(b: *std.Build) void {
             eval_test_cmd.step.dependOn(tinykg.install_step);
             eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_BIN", tinykg.installed_path);
             eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_SHA256", tinykg.source_sha256);
+            if (staged_tinykgd) |daemon| {
+                eval_test_cmd.step.dependOn(daemon.install_step);
+                eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKGD_BIN", daemon.installed_path);
+            }
             const arm_smoke = b.addSystemCommand(&.{
                 eval_python_exe,
                 "scripts/eval/runtime_arm_smoke.py",
@@ -1966,6 +2041,7 @@ pub fn build(b: *std.Build) void {
             arm_smoke.addArg("--tinykg-binary");
             arm_smoke.addFileArg(tinykg.artifact);
             arm_smoke.addArgs(&.{ "--expected-version", manifest.version });
+            wireTinyKgdTestInput(arm_smoke, staged_tinykgd);
             eval_test_step.dependOn(&arm_smoke.step);
             test_step.dependOn(&arm_smoke.step);
 
@@ -2023,7 +2099,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         spike_step.dependOn(&run_t.step);
     }
 
@@ -2051,13 +2127,15 @@ pub fn build(b: *std.Build) void {
     });
     const integration_reports = b.allocator.alloc(std.Build.LazyPath, integration_test_shards) catch @panic("OOM");
     for (0..integration_test_shards) |shard_index| {
-        const run_shard = addTestRunArtifact(b, integration_suite_test, windows_test_prelude);
+        const run_shard = addTestRunArtifact(b, integration_suite_test);
         run_shard.has_side_effects = true;
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{integration_test_shards}));
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
         run_shard.expectExitCode(0);
         run_shard.step.dependOn(&install_mock_mcp.step);
+        run_shard.step.dependOn(&install_selfexe_probe.step);
         wireTinyKgTestInput(run_shard, staged_tinykg);
+        wireTinyKgdTestInput(run_shard, staged_tinykgd);
         integration_reports[shard_index] = run_shard.captureStdOut(.{
             .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
         });
@@ -2066,11 +2144,12 @@ pub fn build(b: *std.Build) void {
     for (integration_reports) |report| run_integration_reporter.addFileArg(report);
     spike_step.dependOn(&run_integration_reporter.step);
 
-    const integration_monolithic_run = addTestRunArtifact(b, integration_suite_test, windows_test_prelude);
+    const integration_monolithic_run = addTestRunArtifact(b, integration_suite_test);
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
     integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
     wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
+    wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
     integration_monolithic_step.dependOn(&integration_monolithic_run.step);
 
@@ -2083,9 +2162,10 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const integration_timed_run = addTestRunArtifact(b, integration_timed_test, windows_test_prelude);
+    const integration_timed_run = addTestRunArtifact(b, integration_timed_test);
     integration_timed_run.step.dependOn(&install_mock_mcp.step);
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
+    wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
 
@@ -2108,7 +2188,7 @@ pub fn build(b: *std.Build) void {
         .root_module = dispatcher_metadata_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const dispatcher_metadata_run = addTestRunArtifact(b, dispatcher_metadata_test, windows_test_prelude);
+    const dispatcher_metadata_run = addTestRunArtifact(b, dispatcher_metadata_test);
     const dispatcher_metadata_step = b.step("test:dispatcher-metadata", "Run the ToolDispatcher metadata acceptance suite");
     dispatcher_metadata_step.dependOn(&dispatcher_metadata_run.step);
     test_step.dependOn(&dispatcher_metadata_run.step);
@@ -2139,7 +2219,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         skill_runtime_step.dependOn(&run_t.step);
     }
     const skill_runtime_unit_mod = b.createModule(.{
@@ -2163,7 +2243,6 @@ pub fn build(b: *std.Build) void {
         &addTestRunArtifact(
             b,
             skill_runtime_unit,
-            windows_test_prelude,
         ).step,
     );
 
@@ -2249,7 +2328,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        new_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
+        new_step.dependOn(&addTestRunArtifact(b, t).step);
     }
 
     // 五个 AgentDef 运行字段的聚焦门；开发时无需编译整套 component artifacts。
@@ -2269,7 +2348,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        agentdef_fields_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
+        agentdef_fields_step.dependOn(&addTestRunArtifact(b, t).step);
     }
 
     // test:mem —— 记忆系统 L2 组件测试(隔离 artifact,绕开主套件 integration 挂起)。
@@ -2295,7 +2374,7 @@ pub fn build(b: *std.Build) void {
                 .root_module = m,
                 .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
             });
-            mem_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
+            mem_step.dependOn(&addTestRunArtifact(b, t).step);
         }
     }
 
@@ -2317,8 +2396,9 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG governance:"},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         wireTinyKgTestInput(run_t, staged_tinykg);
+        wireTinyKgdTestInput(run_t, staged_tinykgd);
         kg_governance_step.dependOn(&run_t.step);
     }
 
@@ -2341,8 +2421,9 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG ontology feedback:"},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         wireTinyKgTestInput(run_t, staged_tinykg);
+        wireTinyKgdTestInput(run_t, staged_tinykgd);
         kg_ontology_feedback_step.dependOn(&run_t.step);
     }
 
@@ -2365,8 +2446,9 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG experience feedback:"},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         wireTinyKgTestInput(run_t, staged_tinykg);
+        wireTinyKgdTestInput(run_t, staged_tinykgd);
         kg_experience_feedback_step.dependOn(&run_t.step);
     }
 
@@ -2442,7 +2524,6 @@ pub fn build(b: *std.Build) void {
         windows_tty_cmd.step.dependOn(&install_debug.step);
         windows_tty_cmd.step.dependOn(&install_mock_mcp.step);
         windows_tty_cmd.step.dependOn(&install_replay.step);
-        if (windows_test_prelude) |prelude| windows_tty_cmd.step.dependOn(&prelude.step);
         windows_tty_step.dependOn(&windows_tty_cmd.step);
     }
 

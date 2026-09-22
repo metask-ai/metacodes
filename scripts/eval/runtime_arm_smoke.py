@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import Dict
 
 
+# This script runs as a file, not as a package member; put the repository root
+# on sys.path so the readiness deadline stays single-sourced in mock_provider.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from scripts.eval.workbuddy.mock_provider import READY_DEADLINE_S  # noqa: E402
+
 ARMS = ("codex_style", "claude_style", "tinykg")
 KG_TOOL_MARKERS = ("\n----- KgRemember -----\n", "\n----- KgRecall -----\n")
 TASK_TOOL_MARKER = "\n----- TaskList -----\n"
@@ -35,7 +42,7 @@ def _headless_protocol_smoke(binary: Path) -> None:
         target = work / ".gitignore"
         ready = root / "ready.json"
         request_log = root / "requests.jsonl"
-        repo = Path(__file__).resolve().parents[2]
+        repo = REPO_ROOT
         provider = subprocess.Popen(
             [
                 sys.executable,
@@ -54,7 +61,7 @@ def _headless_protocol_smoke(binary: Path) -> None:
             text=True,
             encoding="utf-8",
         )
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + READY_DEADLINE_S
         while not ready.exists() and provider.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         _require(ready.exists(), "headless protocol mock provider did not become ready")
@@ -131,7 +138,7 @@ def _workbuddy_tool_policy_smoke(binary: Path, tinykg_binary: Path) -> None:
         root = Path(directory)
         ready = root / "ready.json"
         request_log = root / "requests.jsonl"
-        repo = Path(__file__).resolve().parents[2]
+        repo = REPO_ROOT
         provider = subprocess.Popen(
             [
                 sys.executable,
@@ -150,7 +157,7 @@ def _workbuddy_tool_policy_smoke(binary: Path, tinykg_binary: Path) -> None:
             text=True,
             encoding="utf-8",
         )
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + READY_DEADLINE_S
         while not ready.exists() and provider.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         _require(ready.exists(), "WorkBuddy tool-policy provider did not become ready")
@@ -381,13 +388,17 @@ def _version_json_smoke(binary: Path, expected_semver: str, repo_root: Path) -> 
     )
     family = "-".join(str(document.get("target", "")).split("-")[:2])
     manifest = json.loads((repo_root / "vendor" / "tinykg" / "manifest.json").read_text(encoding="utf-8"))
-    pinned = None
-    for artifact in manifest["artifacts"]:
-        if family in artifact["targets"]:
-            pinned = artifact["sha256"]
+    # A v2 bundle declares a CLI and a daemon artifact per target family, so the
+    # family alone no longer identifies one artifact; this asset is the CLI.
+    pinned = [
+        artifact["sha256"]
+        for artifact in manifest["artifacts"]
+        if family in artifact["targets"] and artifact.get("role", "cli") == "cli"
+    ]
+    _require(len(pinned) == 1, f"manifest declares {len(pinned)} CLI artifacts for {family}")
     _require(
-        assets["tinykg"].get("sha256") == pinned,
-        f"tinykg sha256 {assets['tinykg'].get('sha256')!r} != manifest value {pinned!r} for {family}",
+        assets["tinykg"].get("sha256") == pinned[0],
+        f"tinykg sha256 {assets['tinykg'].get('sha256')!r} != manifest value {pinned[0]!r} for {family}",
     )
 
 
@@ -399,6 +410,9 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
     agrees with its own report."""
     env = dict(os.environ)
     env["METACODES_KG_BIN"] = str(tinykg_binary)
+    daemon_binary = os.environ.get("METACODES_TEST_TINYKGD_BIN")
+    if daemon_binary:
+        env["METACODES_KGD_BIN"] = daemon_binary
     completed = subprocess.run(
         [str(binary), "doctor", "--json"],
         env=env,
@@ -413,13 +427,24 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
     except json.JSONDecodeError as exc:
         raise SystemExit(f"doctor --json stdout is not JSON: {completed.stdout[:200]!r}") from exc
     checks = {check.get("name"): check for check in report.get("checks") or []}
-    _require(set(checks) == {"ripgrep", "tinykg"}, f"doctor checks {sorted(checks)!r}")
+    _require(
+        set(checks) == {"ripgrep", "tinykg", "tinykgd", "formal_kernel", "project_kernel"},
+        f"doctor checks {sorted(checks)!r}",
+    )
     tinykg = checks["tinykg"]
     _require(
         tinykg.get("source") == "env" and Path(str(tinykg.get("resolved_path"))).resolve() == tinykg_binary.resolve(),
         f"doctor tinykg {tinykg!r} did not come from METACODES_KG_BIN",
     )
     _require(tinykg.get("match") is True, f"doctor tinykg digest did not match the pinned one: {tinykg!r}")
+    daemon = checks["tinykgd"]
+    if daemon_binary:
+        _require(daemon.get("source") == "env" and Path(str(daemon.get("resolved_path"))).resolve() == Path(daemon_binary).resolve(), f"doctor tinykgd {daemon!r} did not come from METACODES_KGD_BIN")
+        # The daemon is not part of the install yet, so this build pins no
+        # digest for it; `match` is null until the release stages it.
+        _require(daemon.get("match") in (None, True), f"doctor tinykgd digest did not match the pinned one: {daemon!r}")
+    else:
+        _require(daemon.get("resolved_path") is None, f"doctor tinykgd unexpectedly resolved without a test daemon: {daemon!r}")
     strict = subprocess.run(
         [str(binary), "doctor", "--strict"],
         env=env,
@@ -428,9 +453,23 @@ def _doctor_smoke(binary: Path, tinykg_binary: Path) -> None:
         encoding="utf-8",
         timeout=60,
     )
-    healthy = all(
-        check.get("resolved_path") is not None and check.get("match") in (None, True) for check in checks.values()
-    )
+    def check_healthy(name: str, check: dict) -> bool:
+        # Mirrors doctor.zig Report.healthy(): a binary this build never pinned
+        # may be absent. Without tinykgd here the strict-exit assertion below
+        # fails on every build whose bundle has no daemon artifact.
+        if name in {"formal_kernel", "project_kernel", "tinykgd"}:
+            if check.get("resolved_path") is None and check.get("expected_sha256") is None:
+                return True
+            if name == "tinykgd":
+                return check.get("resolved_path") is not None and check.get("match") in (None, True)
+            return (
+                check.get("resolved_path") is not None
+                and check.get("match") in (None, True)
+                and check.get("provenance") is True
+            )
+        return check.get("resolved_path") is not None and check.get("match") in (None, True)
+
+    healthy = all(check_healthy(name, check) for name, check in checks.items())
     _require(
         strict.returncode == (0 if healthy else 1),
         f"doctor --strict exited {strict.returncode} for a report that is {'healthy' if healthy else 'unhealthy'}",
@@ -453,7 +492,7 @@ def main() -> int:
         _require(path.is_file() and os.access(path, os.X_OK), f"{label} is not executable: {path}")
 
     _version_output_smoke(binary, args.expected_version)
-    _version_json_smoke(binary, args.expected_version, Path(__file__).resolve().parents[2])
+    _version_json_smoke(binary, args.expected_version, REPO_ROOT)
     _doctor_smoke(binary, tinykg_binary)
 
     dumps = {arm: _dump(binary, tinykg_binary, arm) for arm in ARMS}

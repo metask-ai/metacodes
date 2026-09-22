@@ -7,6 +7,7 @@
 //! 不再像旧版那样把所有东西扁平化成 text。
 
 const std = @import("std");
+const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 const types = @import("../types.zig");
 const client_mod = @import("../client.zig");
@@ -33,7 +34,9 @@ const result_projection = @import("result_projection.zig");
 const result_budget_mod = @import("result_budget.zig");
 const verification_progress_mod = @import("verification_progress.zig");
 const requirement_ledger_mod = @import("requirement_ledger.zig");
+const delivery_cadence_mod = @import("delivery_cadence.zig");
 const util_time = @import("../util/time.zig");
+const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
 const output_semantics = @import("output_semantics.zig");
 const file_change_mod = @import("file_change.zig");
@@ -42,6 +45,7 @@ const ui_backend = @import("protocol/ui_backend.zig");
 const ui_event = @import("protocol/ui_event.zig");
 const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
+const job_notification_mod = @import("job_notification.zig");
 
 pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget, max_tokens_exhausted };
 
@@ -220,6 +224,23 @@ pub const RunResult = struct {
     suspend_info: ?SuspendInfo = null,
 };
 
+/// Probe supplied by an interactive host so a queued user message can end the
+/// background-job wait without consuming the still-pending exit event.
+pub const PendingInputProbe = struct {
+    ctx: *anyopaque,
+    hasPendingFn: *const fn (*anyopaque) bool,
+
+    pub fn hasPending(self: PendingInputProbe) bool {
+        return self.hasPendingFn(self.ctx);
+    }
+};
+
+pub const JobWaitOptions = struct {
+    max_wakeups: u32 = 20,
+    timeout_ms: ?u64 = null,
+    poll_slice_ms: u64 = 200,
+};
+
 pub const Options = struct {
     /// **唯一兜底 backstop**(对齐 codex:无主动熔断,只靠 max_turns + 用户中断)。
     /// 轮数不度量任何真实风险,只防真失控。长任务靠 pre-sampling auto-compact 压缩续接。
@@ -290,6 +311,14 @@ pub const Options = struct {
     auto_compact_keep_recent: usize = 10,
     /// Bash 后台作业注册表（给 ToolContext 用，工具侧 Bash/BashOutput/KillShell 用）
     jobs: ?*@import("job_registry.zig").JobRegistry = null,
+    /// Optional turn-boundary exit delivery. Null keeps existing embedders
+    /// unchanged; ownership is the spawning tool context's agent identity.
+    job_notifications: ?*@import("job_registry.zig").JobRegistry = null,
+    /// Interactive input ends the in-core wait while leaving exits for the next
+    /// turn boundary; this prevents the 2026-09-19 polling incident from
+    /// competing with a user's already queued message.
+    pending_input: ?PendingInputProbe = null,
+    job_wait: JobWaitOptions = .{},
     /// 后台 subagent 作业注册表（Task run_in_background + TaskOutput + TaskStop agent_ 分流用）
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
     /// Swarm 会话状态（TeamCreate/TeamDelete/SendMessage + Task name+team_name spawn）。
@@ -413,6 +442,18 @@ pub const Options = struct {
     requirement_ledger: bool = false,
     /// Record-only twin for measurement symmetry in control arms.
     requirement_ledger_observe: bool = false,
+    /// Delivery-cadence obligation (task-agnostic process rule): a run that
+    /// keeps exploring — read-only tool calls only, no file created or
+    /// changed — receives a bounded nudge at the turn boundary to put a first
+    /// version of its deliverable on disk. Never a denial; disarmed for the
+    /// rest of the run by the first mutation. Formal model:
+    /// control-plane/lean/MetaCodesControl/DeliveryCadence.lean.
+    delivery_cadence: bool = false,
+    /// Record-only twin for measurement symmetry in control arms: the same
+    /// counters and threshold crossings, never an injection.
+    delivery_cadence_observe: bool = false,
+    /// Crossing points in exploration-only tool calls (first / second nudge).
+    delivery_cadence_thresholds: delivery_cadence_mod.Thresholds = .{},
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
@@ -805,6 +846,7 @@ pub fn run(
     const trace_id = log.genRequestId().bytes;
     const depth = opts.agent_depth;
     var turns: u32 = 0;
+    var job_wakeups: u32 = 0;
     var verification_progress = verification_progress_mod.State{};
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
@@ -819,6 +861,21 @@ pub fn run(
     const MAX_VERIFICATION_NUDGES: u8 = 2;
     var stream_turn_retries: u8 = 0;
     var requirement_ledger_state = requirement_ledger_mod.State{};
+    var delivery_cadence_state = delivery_cadence_mod.State{};
+    defer if (opts.delivery_cadence or opts.delivery_cadence_observe) {
+        if (opts.tool_observer) |observer| {
+            _ = observer.emit(.{ .delivery_cadence = .{
+                .enforced = opts.delivery_cadence,
+                .exploration_calls = delivery_cadence_state.exploration_calls,
+                .mutations_occurred = delivery_cadence_state.mutation_seen,
+                .levels_reached = delivery_cadence_state.level,
+                .nudges = delivery_cadence_state.nudges,
+                .max_nudges = delivery_cadence_mod.MAX_CADENCE_NUDGES,
+                .first_threshold = opts.delivery_cadence_thresholds.first,
+                .second_threshold = opts.delivery_cadence_thresholds.second,
+            } });
+        }
+    };
     // 元规则①:全部 host 注入共享一个计量器——各门自证有界不蕴含合成
     // 有界(Lean HostInjectionMeter.consumed_never_exceeds_cap 对任意门
     // 序列量化)。
@@ -888,7 +945,7 @@ pub fn run(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    while (turns < opts.max_turns +| kg_coverage_borrowed_turns) : (turns += 1) {
+    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
@@ -909,6 +966,75 @@ pub fn run(
             log.info("agent", "background requested before turn {d} → backgrounding", .{turns + 1});
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
         };
+
+        // 2026-09-19 polling incident: deliver metadata at the boundary so
+        // the model need not poll, while keeping child bytes behind BashOutput
+        // and preserving owner/duplicate/role invariants.
+        if (opts.job_notifications) |registry| {
+            notification_delivery: {
+                const owner = opts.agent_ident orelse opts.session;
+                const events = registry.takeUnannouncedExits(owner, allocator) catch |err| {
+                    log.warn("agent", "job notification skipped: {s}", .{@errorName(err)});
+                    break :notification_delivery;
+                };
+                defer @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                if (events.len > 0) {
+                    // Build every fallible piece before appending the user message;
+                    // notification delivery is best-effort and must not fail a run.
+                    var ids = std.ArrayList(u8).empty;
+                    defer ids.deinit(allocator);
+                    for (events, 0..) |event, index| {
+                        if (index != 0) ids.append(allocator, ',') catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break :notification_delivery;
+                        };
+                        ids.appendSlice(allocator, event.id[0..]) catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break :notification_delivery;
+                        };
+                    }
+                    if (ids.items.len == 0) break :notification_delivery;
+                    const text = job_notification_mod.render(allocator, events) catch |err| {
+                        log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                        break :notification_delivery;
+                    };
+                    defer allocator.free(text);
+                    conversation.appendText(.user, text) catch |err| {
+                        log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                        break :notification_delivery;
+                    };
+                    log.info("agent", "job notification delivered ids={s} turn={d}", .{ ids.items, turns + 1 });
+                }
+            }
+        }
+
+        // Delivery-cadence obligation: the run is still exploring and nothing
+        // is on disk. Decided at the turn boundary (the conversation is clean:
+        // last turn's tool_results are already appended), bounded through the
+        // shared meter, and never a denial. Observe mode advances the level
+        // without injecting so control arms record the same crossings.
+        // Formal model: DeliveryCadence.lean.
+        if ((opts.delivery_cadence or opts.delivery_cadence_observe) and
+            (!opts.delivery_cadence or host_injection_meter.remaining() > 0))
+        {
+            const decision = delivery_cadence_state.decide(opts.delivery_cadence_thresholds);
+            if (decision != .none) {
+                delivery_cadence_state.noteDecided();
+                if (opts.delivery_cadence) {
+                    _ = host_injection_meter.tryConsume();
+                    delivery_cadence_state.nudges += 1;
+                    const nudge = if (decision == .first)
+                        try std.fmt.allocPrint(allocator, delivery_cadence_mod.FIRST_NUDGE_FMT, .{delivery_cadence_state.exploration_calls})
+                    else
+                        try std.fmt.allocPrint(allocator, delivery_cadence_mod.SECOND_NUDGE_FMT, .{delivery_cadence_state.exploration_calls});
+                    defer allocator.free(nudge);
+                    try conversation.appendText(.user, nudge);
+                    log.info("agent", "delivery cadence nudge {d}/{d} exploration_calls={d}", .{ delivery_cadence_state.nudges, delivery_cadence_mod.MAX_CADENCE_NUDGES, delivery_cadence_state.exploration_calls });
+                } else {
+                    log.info("agent", "delivery cadence observe level={d} exploration_calls={d}", .{ delivery_cadence_state.level, delivery_cadence_state.exploration_calls });
+                }
+            }
+        }
 
         // 进度事件:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具
         // (JobEntry 后端据空名跳过工具更新,对齐 cc 持续显示最近动作)。
@@ -2214,6 +2340,83 @@ pub fn run(
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
             backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+
+            // A background job can be the only remaining work after the model
+            // says it will wait. Keep this in core so every host gets the same
+            // owner-scoped, metadata-only channel and no frontend needs an idle
+            // polling loop. User input and abort always win without consuming
+            // the event; that preserves the next turn's boundary delivery.
+            if (opts.job_notifications) |registry| wait_for_jobs: {
+                const owner = opts.agent_ident orelse opts.session;
+                const pending = registry.pendingNotifySummary(owner);
+                if (pending.count == 0) break :wait_for_jobs;
+                if (job_wakeups >= opts.job_wait.max_wakeups) {
+                    // Backstop against unattended self-continuation (hazard: turn storms).
+                    log.info("agent", "job wait cap reached turn={d} wakeups={d} max_wakeups={d}", .{ turns + 1, job_wakeups, opts.job_wait.max_wakeups });
+                    break :wait_for_jobs;
+                }
+                // Spinner label: reuse set_current_tool (no new CoreEvent variants, ABI freeze).
+                // The buffer lives on this frame until the deferred clear_current_tool.
+                var label_buf: [160]u8 = undefined;
+                const label: []const u8 = if (pending.count == 1)
+                    std.fmt.bufPrint(&label_buf, "waiting for background job {s} ({s}) · Ctrl+C to stop waiting", .{ pending.first_id[0..], pending.preview() }) catch "waiting for background job · Ctrl+C to stop waiting"
+                else
+                    std.fmt.bufPrint(&label_buf, "waiting for {d} background jobs · Ctrl+C to stop waiting", .{pending.count}) catch "waiting for background jobs · Ctrl+C to stop waiting";
+                backend.emitEvent(sess, .{ .set_current_tool = .{ .name = label } });
+                defer backend.emitEvent(sess, .clear_current_tool);
+                log.info("agent", "job wait begin turn={d} pending={d} first={s}", .{ turns + 1, pending.count, pending.first_id[0..] });
+                const wait_started_ms = util_time.nowMs();
+                while (true) {
+                    // Escape hatch 1: abort. The answer given before the wait was complete,
+                    // so it stays the final segment.
+                    if (opts.abort) |a| if (a.isAborted()) {
+                        output_channel.close(.final, assistant_text.items);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                    };
+                    // Escape hatch 2: queued user input wins; the exit stays unannounced and
+                    // rides with that message through the next run's boundary drain.
+                    if (opts.pending_input) |probe| if (probe.hasPending()) {
+                        log.info("agent", "job wait ended: user input pending turn={d}", .{turns + 1});
+                        break;
+                    };
+                    // Escape hatch 3: bounded wait (headless sets it; TUI leaves it open).
+                    if (opts.job_wait.timeout_ms) |limit| {
+                        const now = util_time.nowMs();
+                        const elapsed: u64 = if (now >= wait_started_ms) @intCast(now - wait_started_ms) else 0;
+                        if (elapsed >= limit) {
+                            log.info("agent", "job wait timeout reached turn={d} elapsed_ms={d}", .{ turns + 1, elapsed });
+                            break;
+                        }
+                    }
+                    const events = registry.takeUnannouncedExits(owner, allocator) catch |err| {
+                        log.warn("agent", "job wait notification skipped: {s}", .{@errorName(err)});
+                        break;
+                    };
+                    if (events.len > 0) {
+                        defer @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                        const text = job_notification_mod.render(allocator, events) catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break;
+                        };
+                        defer allocator.free(text);
+                        // Persist first. Only a delivered notification turns the earlier text into
+                        // commentary; on failure the segment stays open for the .final close below,
+                        // so it is never closed twice.
+                        conversation.appendText(.user, text) catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break;
+                        };
+                        output_channel.close(.commentary, assistant_text.items);
+                        job_wakeups += 1;
+                        log.info("agent", "job notification delivered after wait id={s} turn={d} wakeups={d}", .{ events[0].id[0..], turns + 1, job_wakeups });
+                        continue :outer_turn;
+                    }
+                    @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                    // Jobs ended but were already observed via BashOutput/KillShell: nothing to say.
+                    if (!registry.hasPendingNotifyJobs(owner)) break;
+                    if (opts.job_wait.poll_slice_ms > 0) util_time.sleepMs(opts.job_wait.poll_slice_ms);
+                }
+            }
             // 自然 end_turn 且无任何主机异议 → 这一段(连同同 group 的续写段)就是最终结果。
             output_channel.close(.final, assistant_text.items);
             // Stop hook:顶层 agent 自然结束 → 触发(记忆提取挂载点)。
@@ -2609,6 +2812,12 @@ pub fn run(
         }
         if (deferred_recovery > 0) log.info("agent", "recovery allowance: charged={d} allowance={d} deferred={d}", .{ recovery_plan.charged_bytes, recovery_plan.allowance_bytes, deferred_recovery });
         const exec_outcome = tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        // Delivery-cadence sensor: observe every executed slot now, before the
+        // suspend and host-fatal paths return without reaching the turn's
+        // tail (Codex review 2026-09-21: a suspended sibling batch used to
+        // leave the terminal record at zero).
+        if (opts.delivery_cadence or opts.delivery_cadence_observe)
+            delivery_cadence_state.observeSlots(allocator, slots.items);
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
         try exec_outcome;
@@ -3460,9 +3669,9 @@ fn buildPostCompactStdin(allocator: std.mem.Allocator, trigger: []const u8, summ
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"hook_event_name\":\"PostCompact\",\"trigger\":");
-    try std.json.Stringify.encodeJsonString(trigger, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, trigger);
     try aw.writer.writeAll(",\"summary\":");
-    try std.json.Stringify.encodeJsonString(summary, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, summary);
     try aw.writer.writeAll("}");
     return try aw.toOwnedSlice();
 }
@@ -3492,9 +3701,9 @@ fn buildStopStdin(allocator: std.mem.Allocator, stop_reason: []const u8, last_me
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"hook_event_name\":\"Stop\",\"stop_reason\":");
-    try std.json.Stringify.encodeJsonString(stop_reason, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, stop_reason);
     try aw.writer.writeAll(",\"last_message\":");
-    try std.json.Stringify.encodeJsonString(last_message, .{}, &aw.writer);
+    try util_json.writeJsonString(&aw.writer, last_message);
     try aw.writer.print(",\"num_messages\":{d}}}", .{num_messages});
     return try aw.toOwnedSlice();
 }
@@ -5063,9 +5272,12 @@ test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触�
     try c.appendText(.user, "do something");
     try c.appendText(.assistant, "DONE_MARKER_ANSWER");
 
-    const marker: [:0]const u8 = "/tmp/cc_stop_hook_fired.marker";
-    _ = std.c.unlink(@ptrCast(marker.ptr));
-    const cmds = [_][]const u8{"cat > /tmp/cc_stop_hook_fired.marker"};
+    var marker_buf: [512]u8 = undefined;
+    const marker = tt.path(&marker_buf, "stop-hook-fired.marker");
+    _ = std.c.unlink(marker.ptr);
+    const hook_cmd = try std.fmt.allocPrint(a, "cat > {s}", .{marker});
+    defer a.free(hook_cmd);
+    const cmds = [_][]const u8{hook_cmd};
     const entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &cmds }};
     const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .stop = &entries, .allocator = a };
 

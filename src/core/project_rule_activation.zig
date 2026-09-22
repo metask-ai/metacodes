@@ -171,7 +171,7 @@ pub const RunGate = struct {
         // available to focused tests, but the product loader never creates an
         // active gate that can silently discard its verdict evidence.
         if (observation_sink == null) return error.ProjectObservationSinkMissing;
-        const config = switch (kernel.loadConfigFromEnv()) {
+        const config = switch (kernel.loadConfig()) {
             .configured => |value| value,
             .missing => return error.ProjectKernelConfigurationMissing,
             .invalid => return error.ProjectKernelConfigurationInvalid,

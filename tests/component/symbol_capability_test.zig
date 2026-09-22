@@ -18,7 +18,6 @@
 const std = @import("std");
 const cc = @import("cc");
 const pfs = @import("platform").fs;
-const pprocess = @import("platform").process;
 const ppaths = @import("platform").paths;
 
 const tools = cc.tools;
@@ -74,7 +73,9 @@ const Sandbox = struct {
     svc: *Service,
 
     fn init(a: std.mem.Allocator, tag: []const u8, basename: []const u8, content: []const u8) !Sandbox {
-        const dir = try std.fmt.allocPrint(a, "/tmp/{s}-{d}", .{ tag, pprocess.currentPid() });
+        // 每进程唯一目录,根按平台选(util/fs.zig testing.tmpRoot);路径要嵌进 JSON 参数,已归一正斜杠。
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try a.dupe(u8, cc.util_fs.testing.perPidDir(&dir_buf, tag));
         errdefer a.free(dir);
         mkdirAt(dir);
         const file = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, basename });
@@ -118,7 +119,7 @@ fn expectNamesAConcreteReason(text: []const u8) !void {
 
 test "L2 issue #17: FindSymbol 在 LSP 在位、符号能力缺失时不返裸 []" {
     const a = std.testing.allocator;
-    var sb = try Sandbox.init(a, "cc-capgap-fs", "probe.zig", "pub fn CapGapProbeSymbol() void {}\n");
+    var sb = try Sandbox.init(a, "cc-zig-capgap-fs", "probe.zig", "pub fn CapGapProbeSymbol() void {}\n");
     defer sb.deinit();
     const ctx = sb.ctx();
 
@@ -151,7 +152,7 @@ test "L2 issue #17: 候选文件混语言时,报最可操作的原因(别被 REA
     // 不保证输出顺序,所以这里不假装能控制顺序——它验的是那条规则真的接进了 FindSymbol
     // 这条路:混语言候选下,结论必须落在可操作的那一侧,与 rg 先吐哪个无关。
     const a = std.testing.allocator;
-    var sb = try Sandbox.init(a, "cc-capgap-mix", "aaa_readme.md", "mentions MixProbeSymbol in prose\n");
+    var sb = try Sandbox.init(a, "cc-zig-capgap-mix", "aaa_readme.md", "mentions MixProbeSymbol in prose\n");
     defer sb.deinit();
     const src = try std.fmt.allocPrint(a, "{s}/zzz_probe.py", .{sb.dir});
     defer a.free(src);
@@ -178,7 +179,7 @@ test "L2 issue #17: 候选文件混语言时,报最可操作的原因(别被 REA
 
 test "L2 issue #17: CodeMap 报具体原因,不把能力缺失写成 (no symbols)" {
     const a = std.testing.allocator;
-    var sb = try Sandbox.init(a, "cc-capgap-cm", "probe.zig", "pub const Probe = struct { x: u8 };\n");
+    var sb = try Sandbox.init(a, "cc-zig-capgap-cm", "probe.zig", "pub const Probe = struct { x: u8 };\n");
     defer sb.deinit();
     const ctx = sb.ctx();
 
@@ -195,7 +196,7 @@ test "L2 issue #17: CodeMap 报具体原因,不把能力缺失写成 (no symbols
 
 test "L2 issue #17: Read(outline) 回退正常读取时必须交代原因,不静默降级" {
     const a = std.testing.allocator;
-    var sb = try Sandbox.init(a, "cc-capgap-rd", "probe.zig", "pub fn probe() void {}\n");
+    var sb = try Sandbox.init(a, "cc-zig-capgap-rd", "probe.zig", "pub fn probe() void {}\n");
     defer sb.deinit();
     const ctx = sb.ctx();
 
@@ -211,7 +212,7 @@ test "L2 issue #17: Read(outline) 回退正常读取时必须交代原因,不静
 
 test "L2 issue #17: Read(outline) 对无注册 server 的文件类型给确定原因(不依赖装了什么)" {
     const a = std.testing.allocator;
-    var sb = try Sandbox.init(a, "cc-capgap-md", "notes.md", "# Heading\n\ntext\n");
+    var sb = try Sandbox.init(a, "cc-zig-capgap-md", "notes.md", "# Heading\n\ntext\n");
     defer sb.deinit();
     const ctx = sb.ctx();
 

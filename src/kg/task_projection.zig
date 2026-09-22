@@ -7,6 +7,7 @@
 //! deliberately not an edit/write-back protocol.
 
 const std = @import("std");
+const json_util = @import("../util/json.zig");
 
 pub const SNAPSHOT_SCHEMA = "tinykg-task-snapshot-v1";
 pub const MARKDOWN_SCHEMA = "metacodes-task-projection-v1";
@@ -813,7 +814,7 @@ fn print(writer: *std.Io.Writer, comptime format: []const u8, args: anytype) Err
 }
 
 fn jsonString(writer: *std.Io.Writer, bytes: []const u8) Error!void {
-    std.json.Stringify.encodeJsonString(bytes, .{}, writer) catch return error.OutOfMemory;
+    json_util.writeJsonString(writer, bytes) catch return error.OutOfMemory;
 }
 
 fn writeIndentedText(writer: *std.Io.Writer, text: []const u8) Error!void {
@@ -824,17 +825,29 @@ fn writeIndentedText(writer: *std.Io.Writer, text: []const u8) Error!void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         try writeAll(writer, "    ");
-        for (line) |byte| {
-            switch (byte) {
-                '\t' => try writeAll(writer, "    "),
-                0...0x08, 0x0b...0x1f, 0x7f => {
-                    const hex = "0123456789abcdef";
-                    const escaped = [_]u8{ '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 0x0f] };
-                    try writeAll(writer, &escaped);
-                },
-                else => try writeAll(writer, &.{byte}),
+        var segment_start: usize = 0;
+        var i: usize = 0;
+        while (i < line.len) {
+            const byte = line[i];
+            if (byte == '\t') {
+                json_util.writeUtf8Repaired(writer, line[segment_start..i]) catch return error.OutOfMemory;
+                try writeAll(writer, "    ");
+                i += 1;
+                segment_start = i;
+                continue;
             }
+            if (byte < 0x20 or byte == 0x7f) {
+                json_util.writeUtf8Repaired(writer, line[segment_start..i]) catch return error.OutOfMemory;
+                const hex = "0123456789abcdef";
+                const escaped = [_]u8{ '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 0x0f] };
+                try writeAll(writer, &escaped);
+                i += 1;
+                segment_start = i;
+                continue;
+            }
+            i += 1;
         }
+        json_util.writeUtf8Repaired(writer, line[segment_start..]) catch return error.OutOfMemory;
         try writeAll(writer, "\n");
     }
 }

@@ -4,6 +4,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const paths = @import("platform").paths;
 const fs_util = @import("../util/fs.zig");
+const json_util = @import("../util/json.zig");
 
 pub const Record = struct {
     schema_version: u32 = 1,
@@ -102,22 +103,7 @@ pub fn read(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn jsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
-    try out.append(allocator, '"');
-    for (value) |byte| switch (byte) {
-        '"' => try out.appendSlice(allocator, "\\\""),
-        '\\' => try out.appendSlice(allocator, "\\\\"),
-        '\n' => try out.appendSlice(allocator, "\\n"),
-        '\r' => try out.appendSlice(allocator, "\\r"),
-        '\t' => try out.appendSlice(allocator, "\\t"),
-        else => {
-            if (byte < 0x20) {
-                const escaped = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{byte});
-                defer allocator.free(escaped);
-                try out.appendSlice(allocator, escaped);
-            } else try out.append(allocator, byte);
-        },
-    };
-    try out.append(allocator, '"');
+    try json_util.serializeString(value, out, allocator);
 }
 
 test "Metask ledger renders one complete NDJSON record" {
@@ -138,4 +124,29 @@ test "Metask ledger renders one complete NDJSON record" {
     try std.testing.expect(std.mem.indexOf(u8, line, "\"ts\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"server_request_id\":\"req-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"input_tokens\":4") != null);
+}
+
+test "Metask ledger replaces invalid UTF-8 in string fields" {
+    const line = try render(std.testing.allocator, .{
+        .ts = 1,
+        .session_id = "sess\x80\xe4\xbd",
+        .protocol = "anthropic_messages",
+        .model = "m\xff",
+        .local_request_id = "local",
+        .server_request_id = "req-1",
+        .http_status = 200,
+        .outcome = "completed\xc0\x80",
+    });
+    defer std.testing.allocator.free(line);
+
+    // The ledger is NDJSON, so each line must be accepted as a valid UTF-8
+    // JSON object even when a provider or session identifier supplied bytes
+    // that were not UTF-8.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trimEnd(u8, line, "\n"), .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("sess\u{FFFD}\u{FFFD}\u{FFFD}", object.get("session_id").?.string);
+    try std.testing.expectEqualStrings("m\u{FFFD}", object.get("model").?.string);
+    try std.testing.expectEqualStrings("completed\u{FFFD}\u{FFFD}", object.get("outcome").?.string);
 }

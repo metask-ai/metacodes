@@ -8,7 +8,6 @@
 //! 容错:文件不存在 → 写时自建;JSON 解析失败 → 读返 null / 写直接覆盖为 {"theme":"X"}。
 
 const std = @import("std");
-const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const theme_mod = @import("theme.zig");
 
@@ -229,13 +228,9 @@ test "writeWithTheme: 字段不存在时追加" {
 }
 
 test "loadTheme + saveTheme 往返(临时 home)" {
-    const pid: i64 = pprocess.currentPid();
-    var dir_buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/cczig_thtest_{d}", .{pid});
-    var dir_z: [129]u8 = undefined;
-    @memcpy(dir_z[0..dir.len], dir);
-    dir_z[dir.len] = 0;
-    _ = std.c.mkdir(@ptrCast(&dir_z), 0o755);
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("../../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-thtest");
+    _ = std.c.mkdir(dir.ptr, 0o755);
     defer {
         // 清理 ~/.metacodes/config.json + ~/.metacodes + tmp 目录
         var p1_buf: [256]u8 = undefined;
@@ -244,7 +239,7 @@ test "loadTheme + saveTheme 往返(临时 home)" {
         var p2_buf: [256]u8 = undefined;
         const p2 = std.fmt.bufPrint(&p2_buf, "{s}/.metacodes\x00", .{dir}) catch unreachable;
         _ = std.c.rmdir(@ptrCast(p2.ptr));
-        _ = std.c.rmdir(@ptrCast(&dir_z));
+        _ = std.c.rmdir(dir.ptr);
     }
 
     // 初始无文件 → loadTheme = null

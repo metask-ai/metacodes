@@ -3,7 +3,8 @@
 
 Metacodes never builds TinyKG from source. An operator may supply an absolute
 binary plus its observed SHA-256, while normal builds select a checked-in native
-artifact from the manually maintained cross-platform bundle.
+artifact from the manually maintained cross-platform bundle. ``bundled`` accepts
+``--role daemon`` for ``tinykgd``; explicit overrides remain CLI-only.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Mapping, Sequence
 
 
 CONTRACT_SCHEMA = "metacodes.tinykg-binary/v1"
+BUNDLE_SCHEMAS = {"metacodes.tinykg-bundle/v1", "metacodes.tinykg-bundle/v2"}
 BUNDLE_SCHEMA = "metacodes.tinykg-bundle/v1"
 RECEIPT_SCHEMA = "metacodes.tinykg-binary-receipt/v2"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -91,6 +93,7 @@ class BundleArtifact:
     binary_format: str
     architectures: tuple[str, ...]
     targets: tuple[str, ...]
+    role: str = "cli"
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,7 @@ class TinyKgBundle:
     zig_version: str
     optimize: str
     strip: bool
+    schema: str
     artifacts: tuple[BundleArtifact, ...]
 
     @classmethod
@@ -114,7 +118,7 @@ class TinyKgBundle:
             "source_commit",
         }:
             raise StageError("TinyKG bundle manifest has missing or unknown fields")
-        if raw["bundle_schema"] != BUNDLE_SCHEMA:
+        if raw["bundle_schema"] not in BUNDLE_SCHEMAS:
             raise StageError("unsupported TinyKG bundle schema")
         if not isinstance(raw["source_commit"], str) or not COMMIT_RE.fullmatch(
             raw["source_commit"]
@@ -140,16 +144,19 @@ class TinyKgBundle:
         artifacts: list[BundleArtifact] = []
         keys: set[str] = set()
         paths: set[str] = set()
-        targets: set[str] = set()
+        targets: set[tuple[str, str]] = set()
         for value in artifacts_raw:
-            if not isinstance(value, dict) or set(value) != {
+            required = {
                 "architectures",
                 "format",
                 "key",
                 "path",
                 "sha256",
                 "targets",
-            }:
+            }
+            if raw["bundle_schema"] == "metacodes.tinykg-bundle/v2":
+                required.add("role")
+            if not isinstance(value, dict) or set(value) != required:
                 raise StageError("TinyKG bundle artifact has missing or unknown fields")
             key = value["key"]
             relative = value["path"]
@@ -157,6 +164,9 @@ class TinyKgBundle:
             binary_format = value["format"]
             architectures = value["architectures"]
             artifact_targets = value["targets"]
+            role = value.get("role", "cli")
+            if role not in {"cli", "daemon"}:
+                raise StageError("TinyKG bundle artifact role is unsupported")
             if not isinstance(key, str) or not key or key in keys:
                 raise StageError("TinyKG bundle artifact keys must be unique")
             if (
@@ -189,7 +199,7 @@ class TinyKgBundle:
                 or not artifact_targets
                 or len(set(artifact_targets)) != len(artifact_targets)
                 or any(target not in TARGET_CONTRACTS for target in artifact_targets)
-                or any(target in targets for target in artifact_targets)
+                or any((role, target) in targets for target in artifact_targets)
             ):
                 raise StageError("TinyKG bundle targets must be supported and unique")
             target_contracts = [TARGET_CONTRACTS[target] for target in artifact_targets]
@@ -199,9 +209,10 @@ class TinyKgBundle:
                 raise StageError("TinyKG bundle target and architecture declarations disagree")
             keys.add(key)
             paths.add(relative)
-            targets.update(artifact_targets)
+            targets.update((role, target) for target in artifact_targets)
             artifacts.append(
                 BundleArtifact(
+                    role=role,
                     key=key,
                     path=relative,
                     sha256=digest,
@@ -215,6 +226,7 @@ class TinyKgBundle:
             zig_version=build["zig_version"],
             optimize=build["optimize"],
             strip=build["strip"],
+            schema=raw["bundle_schema"],
             artifacts=tuple(artifacts),
         )
 
@@ -278,15 +290,18 @@ def inspect_binary(
     binary: Path,
     expected_sha256: str,
     contract: TinyKgContract,
+    role: str = "cli",
 ) -> BinaryIdentity:
     _validate_regular_binary(binary, expected_sha256)
-    version = _run(binary, ("version",))
+    arguments = ("version",) if role == "cli" else ("--version",)
+    version = _run(binary, arguments)
     if version.returncode != 0:
         raise StageError(f"TinyKG version probe failed: {version.stdout.strip()}")
     version_line = version.stdout.strip()
-    if version_line != f"tinykg {contract.tinykg_version}":
+    expected_line = f"tinykg {contract.tinykg_version}" if role == "cli" else f"tinykgd {contract.tinykg_version}"
+    if version_line != expected_line:
         raise StageError(
-            f"TinyKG version mismatch: expected {contract.tinykg_version}, "
+            f"TinyKG version mismatch: expected {expected_line}, "
             f"observed {version_line or '<empty>'}"
         )
     return BinaryIdentity(binary, expected_sha256, version_line)
@@ -445,7 +460,7 @@ def validate_bundle_bytes(
         _validate_pe(data, artifact.architectures)
     else:  # TinyKgBundle.load makes this state unrepresentable.
         raise AssertionError(artifact.binary_format)
-    version_line = f"tinykg {contract.tinykg_version}"
+    version_line = f"tinykg {contract.tinykg_version}" if artifact.role == "cli" else f"tinykgd {contract.tinykg_version}"
     version_marker = version_line.encode("utf-8")
     if mach_slices and any(
         version_marker not in data[start:end] for start, end in mach_slices
@@ -520,6 +535,26 @@ def _atomic_copy(source: Path, destination: Path, expected_sha256: str) -> None:
             pass
 
 
+def _atomic_text(destination: Path, payload: str) -> None:
+    """Replace a checked-in text file without leaving a half-written one."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _atomic_json(destination: Path, value: Mapping[str, object]) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
@@ -549,6 +584,7 @@ def _publish(
     distribution: str,
     bundle_key: str | None = None,
     source_commit: str | None = None,
+    role: str = "cli",
 ) -> None:
     _atomic_copy(identity.path, output, identity.sha256)
     value: dict[str, object] = {
@@ -563,6 +599,8 @@ def _publish(
         "store_schema_version": contract.store_schema_version,
         "target": target,
     }
+    if role == "daemon":
+        value["role"] = role
     if distribution == "bundled":
         if bundle_key is None or source_commit is None:
             raise AssertionError("bundled provenance requires key and source commit")
@@ -584,7 +622,7 @@ def stage(
     contract = TinyKgContract.load(contract_path)
     identity = inspect_binary(binary, expected_sha256, contract)
     validate_store_contract(identity, contract)
-    _publish(identity, contract, target, output, receipt, "explicit")
+    _publish(identity, contract, target, output, receipt, "explicit", role="cli")
 
 
 def stage_bundled(
@@ -598,12 +636,15 @@ def stage_bundled(
     target: str,
     output: Path,
     receipt: Path,
+    role: str = "cli",
 ) -> None:
     if not target or not target_family:
         raise StageError("target triple and family must be non-empty")
     contract = TinyKgContract.load(contract_path)
     bundle = TinyKgBundle.load(manifest_path)
     artifact = bundle.artifact(bundle_key)
+    if artifact.role != role:
+        raise StageError(f"TinyKG bundle {bundle_key} has role {artifact.role}, expected {role}")
     if artifact.sha256 != expected_sha256:
         raise StageError("TinyKG build selection digest does not match its manifest")
     expected = (manifest_path.parent / artifact.path).resolve()
@@ -615,8 +656,9 @@ def stage_bundled(
         )
     identity = validate_bundle_bytes(binary, artifact, contract)
     if runtime_probe:
-        probed = inspect_binary(binary, artifact.sha256, contract)
-        validate_store_contract(probed, contract)
+        probed = inspect_binary(binary, artifact.sha256, contract, role)
+        if role == "cli":
+            validate_store_contract(probed, contract)
         identity = probed
     _publish(
         identity,
@@ -627,6 +669,7 @@ def stage_bundled(
         "bundled",
         bundle_key=bundle_key,
         source_commit=bundle.source_commit,
+        role=role,
     )
 
 
@@ -651,6 +694,7 @@ def build_parser() -> argparse.ArgumentParser:
     bundled.add_argument("--expected-sha256", required=True)
     bundled.add_argument("--target-family", required=True)
     bundled.add_argument("--runtime-probe", action="store_true")
+    bundled.add_argument("--role", choices=("cli", "daemon"), default="cli")
     _add_common_arguments(bundled)
     return parser
 
@@ -679,6 +723,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target=args.target,
                 output=args.output,
                 receipt=args.receipt,
+                role=args.role,
             )
     except (OSError, StageError) as exc:
         print(f"stage-tinykg: error: {exc}", file=os.sys.stderr)

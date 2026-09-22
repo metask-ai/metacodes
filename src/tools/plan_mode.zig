@@ -17,6 +17,7 @@ const pfs = @import("platform").fs;
 const ToolContext = @import("context.zig").ToolContext;
 const PlanApproval = ToolContext.PlanApproval;
 const permission_mode = @import("../permission/mode.zig");
+const util_json = @import("../util/json.zig");
 
 /// Plan 模式工作流指令(对齐 mecode collaboration_mode/plan.md)。**两处共用**:
 ///   ① EnterPlanMode 返回 tool_result(模型进 plan 当轮读到);
@@ -68,14 +69,14 @@ pub fn executeEnter(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try w.writeAll("{\"mode\":\"plan\",\"status\":\"entered\",");
     if (ctx.plan_file_path.len > 0) {
         try w.writeAll("\"planFilePath\":");
-        try std.json.Stringify.encodeJsonString(ctx.plan_file_path, .{}, w);
+        try util_json.writeJsonString(w, ctx.plan_file_path);
         try w.writeAll(",\"instruction\":");
-        try std.json.Stringify.encodeJsonString(workflow ++
+        try util_json.writeJsonString(w, workflow ++
             " You MAY write/update your plan in the plan file at the planFilePath above (it is the only file " ++
-            "you can write in plan mode); then pass that same content to ExitPlanMode.", .{}, w);
+            "you can write in plan mode); then pass that same content to ExitPlanMode.");
     } else {
         try w.writeAll("\"instruction\":");
-        try std.json.Stringify.encodeJsonString(workflow, .{}, w);
+        try util_json.writeJsonString(w, workflow);
     }
     try w.writeAll("}");
     return try aw.toOwnedSlice();
@@ -498,12 +499,11 @@ test "ExitPlanMode 模型未传 plan → 从 plan 文件读盘兜底(对齐 cc n
     const permission = @import("../permission.zig");
     const types = @import("../types.zig");
     const plan_file = @import("../core/plan_file.zig");
-    const util_time = @import("../util/time.zig");
     const fs = @import("../util/fs.zig");
 
     // 准备一个真 plan 文件。
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-exitplan-test-{d}", .{util_time.nowMs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-exitplan-test");
     defer fs.testing.rmrfBestEffort(home);
     try plan_file.ensureDir(home);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;

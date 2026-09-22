@@ -30,7 +30,7 @@ pub const StatusBar = struct {
         var tok_buf: [16]u8 = undefined;
         const tok_str = formatTokens(&tok_buf, total_tokens);
 
-        const bg_count = if (app.jobs) |*j| j.runningCount() else 0;
+        const bg_count = if (app.jobs) |*j| j.runningCountForOwner(app.session_id) else 0;
         const cron_count = app.cron_registry.count();
 
         var extra_buf: [64]u8 = undefined;

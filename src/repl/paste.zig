@@ -147,8 +147,10 @@ test "isLarge by bytes" {
 
 test "store + load + expand round trip" {
     const a = testing.allocator;
-    const home = "/tmp/cc-zig-paste-home";
-    _ = std.c.mkdir("/tmp/cc-zig-paste-home", 0o700);
+    var home_buf: [512]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-home");
+    _ = std.c.mkdir(home.ptr, 0o700);
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
     defer {
         // cleanup
         var pz: [256]u8 = undefined;
@@ -177,8 +179,10 @@ test "store + load + expand round trip" {
 
 test "store placeholder count = lines - 1 (cc v2.1.172)" {
     const a = testing.allocator;
-    const home = "/tmp/cc-zig-paste-home";
-    _ = std.c.mkdir(home, 0o700);
+    var home_buf: [512]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-home");
+    _ = std.c.mkdir(home.ptr, 0o700);
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
     defer {
         var pz: [256]u8 = undefined;
         inline for (.{ 4, 20 }) |id| {

@@ -93,11 +93,11 @@ pub fn synthesizeExactEditInput(
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"file_path\":");
-    try std.json.Stringify.encodeJsonString(normalized, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, normalized);
     try out.writer.writeAll(",\"old_string\":");
-    try std.json.Stringify.encodeJsonString(source, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, source);
     try out.writer.writeAll(",\"new_string\":");
-    try std.json.Stringify.encodeJsonString(replacement, .{}, &out.writer);
+    try util_json.writeJsonString(&out.writer, replacement);
     try out.writer.writeAll(",\"replace_all\":false}");
     if (out.written().len > project_rule_spec.MAX_INPUT_BYTES)
         return error.ProjectExactEditInputTooLarge;

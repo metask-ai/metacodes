@@ -27,10 +27,22 @@
 //! - sanitize 截断超长名(不报错)——两个超长名可能撞同一目录;工具层(SW2)先限名字长度。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const util_fs = @import("../util/fs.zig");
 const util_json = @import("../util/json.zig");
 const file_lock = @import("../util/file_lock.zig");
+const util_time = @import("../util/time.zig");
+const log = @import("../util/log.zig");
+
+const is_windows = builtin.os.tag == .windows;
+// Windows can keep a target in delete-pending state while MoveFileExW and CRT
+// readers contend.  32 attempts × 5 ms = 160 ms per operation: bounded in the
+// low hundreds of milliseconds. A genuinely absent path gets only the short
+// not-found budget below; its preflight can itself hit delete-pending.
+const WINDOWS_FILE_RETRY_LIMIT: usize = 32;
+const WINDOWS_FILE_RETRY_SLEEP_MS: u64 = 5;
+const WINDOWS_ABSENT_FILE_RETRY_LIMIT: usize = 4;
 
 pub const TEAM_LEAD_NAME = "team-lead";
 
@@ -46,6 +58,10 @@ pub const Member = struct {
     cwd: []const u8 = "",
     worktree_path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
+    /// Per-spawn lease for process teammates. Unlike session_id (shared by
+    /// the whole lead session), this changes on every spawn and rejects an
+    /// old process after a same-name delete/recreate.
+    lease_id: ?[]const u8 = null,
     /// "in-process" | "process"(cc 是 in-process|tmux;metacodes 进程外走 headless,SW6)
     backend_type: []const u8 = "in-process",
     /// false=idle;true=active(cc isActive?:undefined 视为 active)
@@ -121,6 +137,8 @@ fn dupeMember(a: std.mem.Allocator, src: Member, out: *Member) !void {
     errdefer if (worktree_path) |v| a.free(v);
     const session_id: ?[]const u8 = if (src.session_id) |v| try a.dupe(u8, v) else null;
     errdefer if (session_id) |v| a.free(v);
+    const lease_id: ?[]const u8 = if (src.lease_id) |v| try a.dupe(u8, v) else null;
+    errdefer if (lease_id) |v| a.free(v);
     const mode: ?[]const u8 = if (src.mode) |v| try a.dupe(u8, v) else null;
     out.* = .{
         .agent_id = agent_id,
@@ -133,6 +151,7 @@ fn dupeMember(a: std.mem.Allocator, src: Member, out: *Member) !void {
         .cwd = cwd,
         .worktree_path = worktree_path,
         .session_id = session_id,
+        .lease_id = lease_id,
         .backend_type = backend_type,
         .is_active = src.is_active,
         .mode = mode,
@@ -149,6 +168,7 @@ fn freeMember(a: std.mem.Allocator, m: *Member) void {
     if (m.color) |v| a.free(v);
     if (m.worktree_path) |v| a.free(v);
     if (m.session_id) |v| a.free(v);
+    if (m.lease_id) |v| a.free(v);
     if (m.mode) |v| a.free(v);
 }
 
@@ -277,10 +297,15 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ?TeamFile {
                     .cwd = strField(mo, "cwd") orelse "",
                     .worktree_path = strField(mo, "worktreePath"),
                     .session_id = strField(mo, "sessionId"),
+                    .lease_id = strField(mo, "leaseId"),
                     .backend_type = strField(mo, "backendType") orelse "in-process",
                     .is_active = boolField(mo, "isActive") orelse true,
                     .mode = strField(mo, "mode"),
                 };
+                // Name is the routing key. Duplicate entries make
+                // findMember()/active updates depend on array order and can
+                // route a stale session to the wrong process.
+                if (tf.findMember(m.name) != null) return null;
                 tf.addMember(m) catch return null;
             }
         },
@@ -335,6 +360,10 @@ pub fn serialize(allocator: std.mem.Allocator, tf: *const TeamFile) ![]u8 {
         }
         if (m.session_id) |v| {
             try out.appendSlice(allocator, ",\"sessionId\":");
+            try util_json.serializeString(v, &out, allocator);
+        }
+        if (m.lease_id) |v| {
+            try out.appendSlice(allocator, ",\"leaseId\":");
             try util_json.serializeString(v, &out, allocator);
         }
         try out.appendSlice(allocator, ",\"backendType\":");
@@ -407,7 +436,29 @@ pub fn atomicWrite(path: []const u8, body: []const u8) !void {
     if (path.len >= path_buf.len) return error.PathTooLong;
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
-    if (pfs.renameReplace(tmp.ptr, @ptrCast(&path_buf)) != 0) {
+
+    var rename_ok = false;
+    if (is_windows) {
+        var retries: usize = 0;
+        var retried = false;
+        while (true) {
+            if (pfs.renameReplace(tmp.ptr, @ptrCast(&path_buf)) == 0) {
+                rename_ok = true;
+                break;
+            }
+            if (retries >= WINDOWS_FILE_RETRY_LIMIT or
+                !pfs.isWindowsTransientFileError(false)) break;
+            retries += 1;
+            retried = true;
+            util_time.sleepMs(WINDOWS_FILE_RETRY_SLEEP_MS);
+        }
+        if (retried) {
+            log.warn("swarm", "atomicWrite retried Windows replace for {s} ({d} attempts)", .{ path, retries });
+        }
+    } else {
+        rename_ok = pfs.renameReplace(tmp.ptr, @ptrCast(&path_buf)) == 0;
+    }
+    if (!rename_ok) {
         _ = std.c.unlink(tmp.ptr);
         return error.RenameFailed;
     }
@@ -419,7 +470,31 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     if (path.len >= pbuf.len) return null;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    var was_present = false;
+    if (is_windows) {
+        // Sample before _open: during MoveFileExW's delete-pending window both
+        // lookups can miss. Even a negative sample therefore gets four short
+        // retries (20 ms total); a known-present file gets the full 160 ms.
+        was_present = pfs.exists(@ptrCast(&pbuf));
+    }
+    var fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (is_windows and fd < 0) {
+        var retryable = pfs.isWindowsTransientFileError(true);
+        var retries: usize = 0;
+        var retried = false;
+        const retry_limit = if (was_present) WINDOWS_FILE_RETRY_LIMIT else WINDOWS_ABSENT_FILE_RETRY_LIMIT;
+        while (retries < retry_limit and retryable) {
+            retries += 1;
+            retried = true;
+            util_time.sleepMs(WINDOWS_FILE_RETRY_SLEEP_MS);
+            fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+            if (fd >= 0) break;
+            retryable = pfs.isWindowsTransientFileError(true);
+        }
+        if (retried) {
+            log.warn("swarm", "readFileAlloc retried Windows open for {s} ({d} attempts)", .{ path, retries });
+        }
+    }
     if (fd < 0) return null;
     defer pfs.close(fd);
     var out: std.ArrayList(u8) = .empty;
@@ -479,7 +554,6 @@ fn appendFmt(out: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []cons
 // ============================================================================
 
 const testing = std.testing;
-const util_time = @import("../util/time.zig");
 
 test "sanitize: team 小写化,agent 保大小写,@ 均被清洗" {
     var buf: [64]u8 = undefined;
@@ -531,6 +605,7 @@ test "TeamFile serialize→parse 往返(全字段)" {
         .cwd = "/tmp/x",
         .worktree_path = "/tmp/wt",
         .session_id = "s1",
+        .lease_id = "lease1",
         .backend_type = "in-process",
         .is_active = false,
         .mode = "acceptEdits",
@@ -544,9 +619,12 @@ test "TeamFile serialize→parse 往返(全字段)" {
     try testing.expectEqualStrings("desc", back.description.?);
     try testing.expectEqual(@as(i64, 1234), back.created_at_ms);
     try testing.expectEqualStrings("team-lead@proj", back.lead_agent_id);
+    try testing.expectEqualStrings("abc123", back.lead_session_id.?);
     try testing.expectEqual(@as(usize, 1), back.members.items.len);
     const m = &back.members.items[0];
     try testing.expectEqualStrings("bob@proj", m.agent_id);
+    try testing.expectEqualStrings("s1", m.session_id.?);
+    try testing.expectEqualStrings("lease1", m.lease_id.?);
     try testing.expectEqualStrings("researcher", m.agent_type.?);
     try testing.expect(m.plan_mode_required);
     try testing.expect(!m.is_active);
@@ -558,6 +636,11 @@ test "parse: 缺必填字段/畸形 JSON → null" {
     try testing.expect(parse(a, "not json") == null);
     try testing.expect(parse(a, "{\"name\":\"x\"}") == null); // 缺 leadAgentId
     try testing.expect(parse(a, "[]") == null);
+}
+
+test "parse: duplicate member names are rejected" {
+    const raw = "{\"name\":\"p\",\"leadAgentId\":\"team-lead@p\",\"members\":[{\"agentId\":\"a@p\",\"name\":\"a\"},{\"agentId\":\"b@p\",\"name\":\"a\"}]}";
+    try testing.expect(parse(testing.allocator, raw) == null);
 }
 
 test "addMember/findMember/removeMember" {
@@ -581,8 +664,8 @@ test "addMember/findMember/removeMember" {
 
 test "save/load 磁盘往返(原子写)" {
     const a = testing.allocator;
-    var dbuf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&dbuf, "/tmp/cc-zig-team-test-{d}", .{util_time.nowNs()});
+    var dbuf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&dbuf, "cc-zig-team-test");
     defer util_fs.testing.rmrfBestEffort(home);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -615,8 +698,8 @@ test "load: 不存在 → null" {
 
 test "updateTeam: 锁内 RMW 生效 + 不存在报 TeamNotFound + mutate 出错不落盘" {
     const a = testing.allocator;
-    var dbuf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&dbuf, "/tmp/cc-zig-team-upd-{d}", .{util_time.nowNs()});
+    var dbuf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&dbuf, "cc-zig-team-upd");
     defer util_fs.testing.rmrfBestEffort(home);
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
     try util_fs.mkdirParents(teamDirPath(home, "proj", &dirbuf));

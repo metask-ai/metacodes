@@ -56,6 +56,24 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args: object) -> None:
         pass
 
+    def do_GET(self) -> None:  # noqa: N802
+        # Metacodes probes readiness after store-info; the contract mock answers
+        # it so the probe exercises the same call the product makes.
+        if self.headers.get("x-api-key") != API_KEY:
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.path != "/api/ready":
+            self.send_response(404)
+            self.end_headers()
+            return
+        payload = json.dumps({"ok": True, "ready": True, "degraded": False}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_POST(self) -> None:  # noqa: N802
         if self.headers.get("x-api-key") != API_KEY:
             self.send_response(401)

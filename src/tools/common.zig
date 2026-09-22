@@ -1,4 +1,5 @@
 const std = @import("std");
+const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 const process = @import("platform").process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
@@ -55,8 +56,19 @@ pub fn extractJsonArg(data: []const u8, field: []const u8) ?[]const u8 {
 
     if (data[pos] == '"') {
         var end = pos + 1;
+        var escaped = false;
         while (end < data.len) {
-            if (data[end] == '"' and data[end - 1] != '\\') {
+            if (escaped) {
+                escaped = false;
+                end += 1;
+                continue;
+            }
+            if (data[end] == '\\') {
+                escaped = true;
+                end += 1;
+                continue;
+            }
+            if (data[end] == '"') {
                 return data[pos + 1 .. end];
             }
             end += 1;
@@ -480,6 +492,13 @@ test "extractJsonArg nested quote escape preserved" {
     try std.testing.expectEqualStrings("a\\\"b", extractJsonArg(data, "msg").?);
 }
 
+test "extractJsonArg even backslashes before closing quote" {
+    // Two backslashes encode one literal backslash; the following quote is
+    // the JSON terminator, not an escaped quote inside the value.
+    const data = "{\"msg\":\"fragment\\\\\"}";
+    try std.testing.expectEqualStrings("fragment\\\\", extractJsonArg(data, "msg").?);
+}
+
 test "extractJsonArg false bool" {
     const data = "{\"enabled\":false}";
     try std.testing.expectEqualStrings("false", extractJsonArg(data, "enabled").?);
@@ -558,14 +577,15 @@ test "spawnCaptureStdoutCapped 截断无限输出且不挂死" {
 
 test "readAllFromFdCapped:超 cap 返 FileTooLarge、cap 内正常读(轴A 统一入口)" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-readcapped-test.txt";
-    const fd_w = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "readcapped-test.txt");
+    const fd_w = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     try std.testing.expect(fd_w >= 0);
     var payload: [10000]u8 = undefined;
     @memset(&payload, 'z');
     _ = pfs.write(fd_w, &payload); // 10KB
     _ = pfs.close(fd_w);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
     // cap=5KB < 10KB → FileTooLarge。
     {
