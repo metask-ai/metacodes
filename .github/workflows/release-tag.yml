@@ -1,0 +1,80 @@
+name: Release tag
+
+# Stage B of doc/RELEASE_AUTOMATION_DESIGN.md: when a release PR (opened by
+# `scripts/release_cut.py`, label `release`, title `release: X.Y.Z`) merges,
+# tag its merge commit and start release.yml.
+#
+# `pull_request_target`, not `pull_request`: a pull_request run would execute
+# the workflow file from the PR's merge commit, so a PR that edited this file
+# would run its own edit with the write token below. pull_request_target runs
+# the file from the base branch, and this job checks out nothing: every input
+# comes from the event payload or the API.
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    name: Tag the merged release PR
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      contains(github.event.pull_request.labels.*.name, 'release') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.title, 'release: ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the tag through the git-data API
+      actions: write # dispatch release.yml
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }} # no checkout: gh needs the repository named explicitly
+      MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+    steps:
+      - name: Version from build.zig.zon at the merge commit must match the title
+        id: version
+        run: |
+          set -euo pipefail
+          version="${PR_TITLE#release: }"
+          if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "title version '$version' is not a bare X.Y.Z" >&2; exit 1
+          fi
+          zon=$(gh api "repos/${GITHUB_REPOSITORY}/contents/build.zig.zon?ref=${MERGE_SHA}" --jq .content | base64 -d)
+          declared=$(printf '%s' "$zon" | sed -nE 's/.*\.version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' | head -1)
+          if [ "$declared" != "$version" ]; then
+            echo "build.zig.zon at $MERGE_SHA declares '$declared', PR title says '$version'" >&2; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Create the annotated tag at the merge commit (fail on a mismatched existing tag)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            type=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.type)
+            if [ "$type" = "tag" ]; then
+              existing=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${existing}" --jq .object.sha)
+            fi
+            if [ "$existing" != "$MERGE_SHA" ]; then
+              echo "tag $VERSION already exists at $existing, but the release PR merged as $MERGE_SHA; refusing" >&2; exit 1
+            fi
+            echo "tag $VERSION already points at $MERGE_SHA; nothing to create"
+            exit 0
+          fi
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags" -f tag="$VERSION" -f message="metacodes $VERSION" -f object="$MERGE_SHA" -f type=commit --jq .sha)
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="$tag_sha" >/dev/null
+          echo "created tag $VERSION -> $MERGE_SHA"
+      - name: Start release.yml for the tag
+        # A tag created with the repository token does not fire release.yml's
+        # push trigger (recursion guard); workflow_dispatch is the documented
+        # exception. The run uses the workflow file at the tag.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh workflow run release.yml --repo "$GH_REPO" --ref "$VERSION" -f tag="$VERSION" -f dry_run=false
