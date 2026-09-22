@@ -1618,13 +1618,25 @@ fn reportAndExit(fd: std.c.fd_t, msg: []const u8) noreturn {
     std.c._exit(0);
 }
 
-/// 两个 fd 是否指向同一个文件对象(dev+ino)。走 platform/fs.fileInfo:`std.c.fstat` 在
-/// Linux 目标上是 void(glibc 的 fstat 不是导出符号),直接调会在 Linux CI 上编译失败。
+/// 两个 fd 是否指向同一个文件对象(dev+ino),**原样比较、不做整型转换**:platform/fs.fileInfo
+/// 把 darwin 的 `dev_t`(i32)`@intCast` 成 u64,devfs 上 /dev/null 的 st_dev 在 CI 的 macOS 上
+/// 为负 → 子进程里安全 panic、静默死掉,父端只读到 EOF(CI macOS 一次实红)。Linux 上
+/// `std.c.fstat` 是 void(glibc 不导出该符号),走 statx(AT_EMPTY_PATH)。
 fn sameFile(a: std.c.fd_t, b: std.c.fd_t) bool {
-    const pfs = @import("fs.zig");
-    const ia = pfs.fileInfo(a) catch return false;
-    const ib = pfs.fileInfo(b) catch return false;
-    return ia.inode == ib.inode and ia.device == ib.device;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const AT_EMPTY_PATH: u32 = 0x1000;
+        var sa: linux.Statx = undefined;
+        var sb: linux.Statx = undefined;
+        if (@as(isize, @bitCast(linux.statx(a, "", AT_EMPTY_PATH, linux.STATX.BASIC_STATS, &sa))) < 0) return false;
+        if (@as(isize, @bitCast(linux.statx(b, "", AT_EMPTY_PATH, linux.STATX.BASIC_STATS, &sb))) < 0) return false;
+        return sa.ino == sb.ino and sa.dev_major == sb.dev_major and sa.dev_minor == sb.dev_minor;
+    } else {
+        var sa: std.c.Stat = undefined;
+        var sb: std.c.Stat = undefined;
+        if (std.c.fstat(a, &sa) != 0 or std.c.fstat(b, &sb) != 0) return false;
+        return sa.ino == sb.ino and sa.dev == sb.dev;
+    }
 }
 
 /// 读回副本写的结论。
