@@ -206,6 +206,12 @@ class ThrowawayRepoTest(unittest.TestCase):
         self.assertIn("mid-flight", check_version_state.check(self.root, "main"))
         self.assertEqual(check_version_state.check(self.root, "release/0.2.0"), "")
         self.assertIn("mid-flight", check_version_state.check(self.root, "release/0.2.1"))
+        # the release PR's own merge commit on main is accepted before the tag exists
+        _git("checkout", "-q", "-b", "release/0.2.0", cwd=self.root)
+        _commit(self.root, "release: 0.2.0")
+        _git("checkout", "-q", "main", cwd=self.root)
+        _git("merge", "-q", "--no-ff", "-m", "Merge pull request #7 from metask-ai/release/0.2.0", "release/0.2.0", cwd=self.root)
+        self.assertEqual(check_version_state.check(self.root, "main"), "")
         _git("tag", "0.2.0", cwd=self.root)
         self.assertEqual(check_version_state.check(self.root, "main"), "")
         _commit(self.root, "fix: landed in the window")  # bare version, HEAD no longer the tagged commit

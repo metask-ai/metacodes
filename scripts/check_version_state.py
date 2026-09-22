@@ -39,9 +39,17 @@ def check(root: Path, head_ref: str) -> str:
     version = match.group(1)
     if version.endswith("-dev"):
         return ""
+    # CI checkouts fetch no tags (ci.yml: fetch-depth 0 without fetch-tags);
+    # try to see them, but do not depend on the network being there.
+    git("fetch", "--quiet", "--tags", "--no-recurse-submodules", "origin", root=root)
     if git("describe", "--tags", "--exact-match", "HEAD", root=root) == version:
         return ""
     if head_ref == f"release/{version}":
+        return ""
+    # main's own run on the release PR's merge commit: release-tag.yml tags
+    # this very commit concurrently, so the tag may not exist yet.
+    subject = git("log", "-1", "--format=%s", "HEAD", root=root)
+    if re.match(r"^Merge pull request #\d+ from \S+/release/" + re.escape(version) + r"$", subject):
         return ""
     return (
         f"build.zig.zon says {version} (no -dev) but HEAD is not tagged {version} and the head branch "
