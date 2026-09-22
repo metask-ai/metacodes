@@ -1583,6 +1583,49 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     or formal["delivery_cadence_first_threshold"] >= formal["delivery_cadence_second_threshold"]
                 ):
                     raise TraceError("delivery cadence record violates the gate policy")
+            elif observation_kind == "progress_updates":
+                # Terminal record of the progress-update obligation (#114:
+                # silent tool rounds earn a bounded request for a progress
+                # note): at most one per run, emitted whenever the gate was
+                # enforced or observed. Counters only.
+                if (
+                    observation.get("schema_version")
+                    != "metacodes-progress-updates-v1"
+                    or not isinstance(observation.get("enforced"), bool)
+                ):
+                    raise TraceError("progress updates record is invalid")
+                if formal.get("progress_updates_records"):
+                    raise TraceError("duplicate progress updates record")
+                formal["progress_updates_records"] = 1
+                formal["progress_updates_enforced"] = int(
+                    bool(observation.get("enforced"))
+                )
+                for key, where in (
+                    ("silent_rounds_threshold", "silent rounds threshold"),
+                    ("min_silent_ms", "silence floor"),
+                    ("max_silent_rounds", "longest silent stretch"),
+                    ("decisions", "decisions"),
+                    ("nudges", "nudges"),
+                    ("max_nudges", "nudge budget"),
+                ):
+                    value = observation.get(key)
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                    ):
+                        raise TraceError(f"progress updates {where} is invalid")
+                    formal["progress_updates_" + key] = value
+                # Policy relationships the Zig gate proves (ProgressUpdates.lean):
+                # at most max_nudges decisions, an injection per decision at
+                # most, none in observe mode.
+                if (
+                    formal["progress_updates_max_nudges"] != 2  # v1 policy bound (ProgressUpdates.lean maxNudges)
+                    or formal["progress_updates_decisions"] > formal["progress_updates_max_nudges"]
+                    or formal["progress_updates_nudges"] > formal["progress_updates_decisions"]
+                    or (not observation["enforced"] and formal["progress_updates_nudges"] != 0)
+                ):
+                    raise TraceError("progress updates record violates the gate policy")
             elif observation_kind == "test_weakening_candidate":
                 # PO-V2 M2 observe-only candidate: a realized edit to a
                 # test-classified file. Schema pinned; counters split by the

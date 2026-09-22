@@ -225,6 +225,7 @@
     "src/core/agent_loop.zig",
     "src/core/response_candidate.zig",
     "src/core/host_injection_meter.zig",
+    "src/core/progress_updates.zig",
     "src/core/tool_error.zig",
     "src/repl/headless.zig",
     "src/swarm/context.zig",

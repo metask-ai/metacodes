@@ -173,14 +173,26 @@ core 因此把它**已经知道**的判定发出来。一个 **段** = 一次 pr
 
 **进度更新义务(#114,`core/progress_updates.zig`)**:定性只回答"这段文本是什么",回答不了
 "为什么一段文本都没有"——模型可以一轮接一轮只调工具不说话,用户只剩工具生命周期事件,看不出
-阶段、发现与下一步。`run()` 因此观察每个工具轮是否带可见文本;连续
-`Options.progress_update_silent_rounds`(默认 3)轮沉默之后,在 turn 边界注入一条 host 消息
-(`[progress update]` 开头)要模型用一两句话说明阶段、发现与下一步——每 Run 至多
-`MAX_PROGRESS_NUDGES`(2)条,走全局 host 注入计量器,任何一轮带文本或注入一次后计数归零,仅根
-agent(`agent_depth == 0`)。回复按上表定性(后面跟工具调用 → `commentary`;自然 end_turn →
-`final`),core 不合成任何占位式进度文本,也不触碰最终答案。`Options.progress_updates=false`
-关闭。默认系统提示同时新增 "Progress updates on longer tasks" 段,定义多阶段任务的进度沟通
-预期(简单任务不要求)。
+阶段、发现与下一步。`run()` 因此观察每一轮:用户看到的模型文本(非空白字节;thinking 与 host
+渲染的装饰不算)结束沉默段,只调工具不说话的一轮让沉默段长一轮,沉默段还有一个从上次可见文本起算
+的时长。turn 边界上沉默段同时满足 `Options.progress_update_thresholds` 的轮数(`rounds`,默认
+`DEFAULT_SILENT_ROUNDS`)与时长(`min_silent_ms`,默认 `DEFAULT_MIN_SILENT_MS`)时,注入一条 host
+消息(`[progress update]` 开头)要模型在同一条回复里先用一两句话说明阶段、发现与下一步,再接着干
+——每 Run 至多 `MAX_PROGRESS_NUDGES` 次决策,走全局 host 注入计量器(cap = Σ 各门预算,agent_loop
+的 comptime 断言钉死),每次决策或任何可见文本之后沉默段归零。回复按上表定性(后面跟工具调用 →
+`commentary`;自然 end_turn → `final`),core 不合成任何占位式进度文本,也不触碰最终答案。
+
+它是**宿主契约字段**,与交付节奏门同款:`Options.progress_updates` 默认关,canonical
+`buildRunOptions` 不带(宏 run / skill run / AgentCore 不被提醒);有人在看的宿主自己接——REPL 主
+run、web 会话、`--stream-json` 的 print 模式(`--no-progress-updates` 关,
+`--progress-updates-observe` 只记录不注入);且只对 `event_projection` 认为有人读其 commentary 的
+Run 生效(legacy 根 agent、AgentCore 外部 run root)。Run 结束时向 `tool_observer` 发一条
+`progress_updates` 终局记录(decisions / nudges / max_silent_rounds / 阈值),评测 trace 据此归因
+host 注入。host 注入的 user 记录不是用户原话:`host_injection_meter.isHostInjectedText` 让
+web_search 显示 query、transcript 回放与 `/recap` 把它们与用户输入分开。策略由
+`control-plane/lean/MetaCodesControl/ProgressUpdates.lean` 证明(叙述归零、任一阈值未达不触发、
+任意轨迹下决策数有界)。默认系统提示同时新增 "Progress updates on longer tasks" 段,定义多阶段
+任务的进度沟通预期(单步任务不要求)。
 
 #### 3.2.1.1 候选响应边界:这条响应能不能进 Conversation(`core/response_candidate.zig`)
 

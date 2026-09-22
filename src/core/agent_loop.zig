@@ -88,6 +88,17 @@ pub const EventProjection = enum {
             .run_root, .model_tool => true,
         };
     }
+
+    /// Progress-update nudges (#114) go to a run whose commentary a person can
+    /// read: the legacy root only (a subagent's narration is its parent's tool
+    /// result), the AgentCore external run root, never a model-tool child.
+    fn admitsProgressNudge(self: EventProjection, agent_depth: u8) bool {
+        return switch (self) {
+            .legacy => agent_depth == 0,
+            .run_root => true,
+            .model_tool => false,
+        };
+    }
 };
 
 test "EventProjection is orthogonal to true agent depth and preserves legacy defaults" {
@@ -456,19 +467,24 @@ pub const Options = struct {
     /// Crossing points in exploration-only tool calls (first / second nudge).
     delivery_cadence_thresholds: delivery_cadence_mod.Thresholds = .{},
     /// Progress-update obligation (#114, task-agnostic process rule): a run
-    /// whose tool rounds stay silent — no visible assistant text before the
-    /// tool calls, round after round — receives a bounded nudge at the turn
-    /// boundary asking for a short progress note (stage, findings, next step).
-    /// On by default for every execution path that shares this loop; a task
-    /// that finishes within the threshold never sees it, and only the root
-    /// agent (`agent_depth == 0`) is nudged — a subagent's narration is not
-    /// user-visible. Never a denial; the reply is ordinary commentary (or the
-    /// final answer if the model ends the turn). Formal shape: same as
-    /// delivery cadence (bounded, meter-counted, boundary-only).
-    progress_updates: bool = true,
-    /// Consecutive silent tool rounds before a nudge (the stretch restarts
-    /// after each nudge and on any narrated round).
-    progress_update_silent_rounds: u32 = progress_updates_mod.DEFAULT_SILENT_ROUNDS,
+    /// whose tool rounds stay silent — no visible model text, round after
+    /// round, for longer than a few seconds — receives a bounded nudge at the
+    /// turn boundary asking for a short progress note (stage, findings, next
+    /// step). Host-contract field like the sibling gates: off here, switched
+    /// on by hosts with a reader (interactive REPL, web session, --stream-json
+    /// print mode); canonical buildRunOptions leaves it off, so macro runs,
+    /// skill runs and embedders are not nudged. Only a run whose commentary a
+    /// person can read is nudged (`event_projection`). Never a denial; the
+    /// reply is ordinary commentary (or the final answer if the model ends the
+    /// turn). Formal shape: same as delivery cadence (bounded, meter-counted,
+    /// boundary-only; ProgressUpdates.lean).
+    progress_updates: bool = false,
+    /// Record the gate's decisions (terminal `progress_updates` observation
+    /// record) without injecting: the control arm of an evaluation.
+    progress_updates_observe: bool = false,
+    /// Silent tool rounds and wall-clock silence both required before a nudge
+    /// (the stretch restarts after each decision and on any visible text).
+    progress_update_thresholds: progress_updates_mod.Thresholds = .{},
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
@@ -568,6 +584,17 @@ fn conversationHasSuccessfulRequiredFirst(
 }
 
 const MAX_REQUIRED_FIRST_REPAIRS: u8 = 2;
+/// 验证终局闸每 run 的 nudge 上限(VerificationGate.lean nudges_bounded)。
+const MAX_VERIFICATION_NUDGES: u8 = 2;
+
+comptime {
+    // 元规则①(host_injection_meter.zig):cap = Σ 各门预算,计量器才是"零行为变化"的显式上界。
+    // 加门、改某门预算而不改 cap(或反过来)在这里编译不过——计量器头注释里的账目不再靠人对齐。
+    std.debug.assert(@import("host_injection_meter.zig").MAX_HOST_INJECTIONS_PER_RUN ==
+        MAX_REQUIRED_FIRST_REPAIRS + MAX_VERIFICATION_NUDGES +
+            requirement_ledger_mod.MAX_LEDGER_NUDGES + @import("obligation_gate.zig").MAX_OBLIGATION_NUDGES +
+            delivery_cadence_mod.MAX_CADENCE_NUDGES + progress_updates_mod.MAX_PROGRESS_NUDGES);
+}
 
 fn requiredFirstRepairText(
     allocator: std.mem.Allocator,
@@ -873,14 +900,27 @@ pub fn run(
     defer output_channel.close(.partial, "");
     var verification_nudges: u8 = 0;
     var required_first_repairs: u8 = 0;
-    const MAX_VERIFICATION_NUDGES: u8 = 2;
     var stream_turn_retries: u8 = 0;
     var requirement_ledger_state = requirement_ledger_mod.State{};
     var delivery_cadence_state = delivery_cadence_mod.State{};
-    // 进度更新义务(#114):连续"只调工具不说话"的轮数;任何带文本的工具轮或一次 nudge 归零。
-    var progress_state = progress_updates_mod.State{};
-    defer if (opts.progress_updates and progress_state.nudges > 0) {
-        log.info("agent", "progress update nudges={d} max_silent_rounds={d}", .{ progress_state.nudges, progress_state.max_silent_rounds });
+    // 进度更新义务(#114):沉默段 = 连续"只调工具不说话"的轮数 + 距上一次可见文本的时长;任何可见
+    // 文本或一次决策归零。终局记录与交付节奏门同款(评测 trace 据此归因 host 注入)。
+    var progress_state = progress_updates_mod.State.init(util_time.nowNs());
+    defer if (opts.progress_updates or opts.progress_updates_observe) {
+        if (opts.tool_observer) |observer| {
+            _ = observer.emit(.{ .progress_updates = .{
+                .enforced = opts.progress_updates,
+                .silent_rounds_threshold = opts.progress_update_thresholds.rounds,
+                .min_silent_ms = opts.progress_update_thresholds.min_silent_ms,
+                .max_silent_rounds = progress_state.max_silent_rounds,
+                .decisions = progress_state.decisions,
+                .nudges = progress_state.nudges,
+                .max_nudges = progress_updates_mod.MAX_PROGRESS_NUDGES,
+            } });
+        }
+        if (progress_state.decisions > 0) {
+            log.info("agent", "progress update decisions={d} nudges={d} max_silent_rounds={d}", .{ progress_state.decisions, progress_state.nudges, progress_state.max_silent_rounds });
+        }
     };
     defer if (opts.delivery_cadence or opts.delivery_cadence_observe) {
         if (opts.tool_observer) |observer| {
@@ -1056,21 +1096,28 @@ pub fn run(
             }
         }
 
-        // Progress-update obligation (#114): consecutive silent tool rounds earn a
-        // bounded nudge asking for a short progress note. Same shape as the cadence
-        // gate above — turn boundary, shared meter, never a denial. Root agent only:
-        // a subagent's narration is its parent's tool result, not user-visible.
-        if (opts.progress_updates and opts.agent_depth == 0 and
-            host_injection_meter.remaining() > 0 and
-            progress_state.decide(opts.progress_update_silent_rounds))
+        // Progress-update obligation (#114): a silent stretch long enough in rounds
+        // and in time earns a bounded nudge asking for a short progress note. Same
+        // shape as the cadence gate above — turn boundary, shared meter, never a
+        // denial; observe mode counts the decision without injecting. Only a run
+        // whose commentary a person reads (event_projection). Formal model:
+        // ProgressUpdates.lean.
+        if ((opts.progress_updates or opts.progress_updates_observe) and
+            opts.event_projection.admitsProgressNudge(opts.agent_depth))
         {
-            _ = host_injection_meter.tryConsume();
-            const silent_rounds = progress_state.silent_rounds;
-            progress_state.noteNudged();
-            const nudge = try std.fmt.allocPrint(allocator, progress_updates_mod.NUDGE_FMT, .{silent_rounds});
-            defer allocator.free(nudge);
-            try conversation.appendText(.user, nudge);
-            log.info("agent", "progress update nudge {d}/{d} silent_rounds={d}", .{ progress_state.nudges, progress_updates_mod.MAX_PROGRESS_NUDGES, silent_rounds });
+            const now_ns = util_time.nowNs();
+            if (progress_state.decide(opts.progress_update_thresholds, now_ns)) {
+                if (!opts.progress_updates) {
+                    progress_state.noteDecided(false, now_ns);
+                    log.info("agent", "progress update observe decision {d}/{d} silent_rounds={d}", .{ progress_state.decisions, progress_updates_mod.MAX_PROGRESS_NUDGES, progress_state.silent_rounds });
+                } else if (host_injection_meter.tryConsume()) {
+                    const nudge = try std.fmt.allocPrint(allocator, progress_updates_mod.NUDGE_FMT, .{progress_state.silent_rounds});
+                    defer allocator.free(nudge);
+                    progress_state.noteDecided(true, now_ns);
+                    try conversation.appendText(.user, nudge);
+                    log.info("agent", "progress update nudge {d}/{d}", .{ progress_state.nudges, progress_updates_mod.MAX_PROGRESS_NUDGES });
+                }
+            }
         }
 
         // 进度事件:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具
@@ -1408,6 +1455,9 @@ pub fn run(
         }
         var assistant_text = std.ArrayList(u8).empty;
         defer assistant_text.deinit(allocator);
+        // 进度更新传感器(#114)的输入:本轮用户看到的模型文本里非空白的字节数(host 渲染的
+        // web_search 装饰、thinking 都不算)。
+        var visible_model_text_bytes: usize = 0;
 
         // 思考过程累加器:本轮所有 thinking_delta/reasoning_content 拼成一个 thinking block,
         // 存入 assistant message(preserved thinking)。下轮请求 serializeContent 回传。
@@ -1745,6 +1795,7 @@ pub fn run(
                         backend.emitEvent(sess, .{ .text_chunk = text });
                         output_channel.note(text.len);
                         try assistant_text.appendSlice(allocator, text);
+                        visible_model_text_bytes += progress_updates_mod.visibleLen(text);
                         log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
                         const admission = observeCandidate(
                             opts.response_observer,
@@ -1956,6 +2007,7 @@ pub fn run(
                 for (assistant_blocks.items) |b| b.deinit(allocator);
                 assistant_blocks.deinit(allocator);
                 assistant_text.clearRetainingCapacity();
+                visible_model_text_bytes = 0;
                 thinking_text.clearRetainingCapacity();
                 for (reasoning_items.items) |item| allocator.free(item);
                 reasoning_items.clearRetainingCapacity();
@@ -2039,6 +2091,7 @@ pub fn run(
                 for (assistant_blocks.items) |b| b.deinit(allocator);
                 assistant_blocks.clearRetainingCapacity();
                 assistant_text.clearRetainingCapacity();
+                visible_model_text_bytes = 0;
                 thinking_text.clearRetainingCapacity();
                 for (reasoning_items.items) |item| allocator.free(item);
                 reasoning_items.clearRetainingCapacity();
@@ -2174,12 +2227,11 @@ pub fn run(
             has_tool_use = true;
             break;
         };
+        // 进度更新传感器(#114):这一轮用户看到模型的字了吗。每轮都观察——被终局门退回的叙述、
+        // max_tokens 截断的叙述也是叙述,沉默段归零;只调工具不说话才算一轮沉默。
+        progress_state.observeTurn(visible_model_text_bytes, has_tool_use, util_time.nowNs());
         // 本轮跟着工具调用 → 这段文字是执行过程中的可见说明,不是最终答案。
-        if (has_tool_use) {
-            output_channel.close(.commentary, assistant_text.items);
-            // 进度更新传感器(#114):这一轮有没有对用户说话(可见文本;thinking 不算)。
-            progress_state.observeToolRound(assistant_text.items.len);
-        }
+        if (has_tool_use) output_channel.close(.commentary, assistant_text.items);
 
         if (!has_tool_use) {
             if (turn_stop_reason == .max_tokens and
@@ -3302,7 +3354,8 @@ fn latestUserText(conversation: *const @import("conversation.zig").Conversation)
         const m = conversation.messages.items[i];
         if (m.role != .user) continue;
         for (m.blocks) |b| {
-            if (b == .text and b.text.len > 0) return b.text;
+            // host 注入的记录(进度提醒等)不是用户原话:跳过,继续往前找。
+            if (b == .text and b.text.len > 0 and !@import("host_injection_meter.zig").isHostInjectedText(b.text)) return b.text;
         }
     }
     return "";

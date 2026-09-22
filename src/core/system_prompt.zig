@@ -122,7 +122,7 @@ const TONE_SECTION =
 const PROGRESS_SECTION =
     \\# Progress updates on longer tasks
     \\
-    \\When a task takes several tool calls or more than a few seconds, tell the user where things stand before you continue: one or two sentences at a natural milestone — the stage you have reached, what you found, and what you will do next. These updates are process information, not the answer, and for multi-stage work they take precedence over the brevity rules above. Do not narrate every tool call, do not report private reasoning, and do not add updates to a task that finishes in a single step.
+    \\On multi-stage work (several tool calls, more than a few seconds), say where things stand at natural milestones: one or two sentences on the stage reached, what you found, and what comes next. This outranks the brevity rules above. Never for single-step tasks, never per tool call, never private reasoning.
 ;
 
 /// getOutputEfficiencySection 非 ant 分支。逐字复制。

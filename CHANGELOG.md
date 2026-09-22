@@ -110,23 +110,43 @@ status, compatibility boundaries, and entry points are defined by
   and classified whatever visible text the model produced, but a model that
   called tools round after round without writing a word left the user with
   nothing but tool lifecycle events, and the default prompt's brevity rules
-  pushed in that direction. Two provider-neutral changes: the default system
+  pushed in that direction. Two provider-neutral changes. The default system
   prompt gains a short "Progress updates on longer tasks" section that defines
-  the expectation (a sentence or two at a natural milestone — stage, findings,
-  next step — taking precedence over the brevity rules for multi-stage work;
-  never for single-step tasks, never private reasoning), and the agent loop
-  gains a bounded progress-update obligation shaped like the delivery-cadence
-  gate: after `progress_update_silent_rounds` (default 3) consecutive tool
-  rounds with no visible assistant text, one host message at the turn boundary
-  asks for a short progress note; at most two per Run, counted by the shared
-  host-injection meter (cap 11 → 13, Lean model updated in lockstep), the
-  counter restarting after each nudge and on any narrated round; root agent
-  only. On by default for every path that shares the loop
-  (`agent_loop.Options.progress_updates`). The reply is ordinary `commentary`
-  (or the final answer if the model ends the turn); the output-segment
-  protocol is untouched. `tests/component/progress_updates_test.zig` drives
-  the loop through silent, narrated, bounded, disabled and single-step shapes
-  and asserts on the real request bytes and segment dispositions.
+  the expectation (a sentence or two at natural milestones — stage, findings,
+  next step — outranking the brevity rules on multi-stage work; never for
+  single-step tasks, never per tool call, never private reasoning); this
+  changes the static prompt prefix once, so the prompt cache is intentionally
+  invalidated one time on upgrade and stable afterwards. The agent loop gains
+  a bounded progress-update obligation shaped like the delivery-cadence gate:
+  a silent stretch — consecutive tool rounds with no visible model text
+  (whitespace and host-rendered decorations do not count; text the loop
+  continued past, or that max_tokens cut off, does) — that is long enough in
+  both rounds and wall-clock time (`Options.progress_update_thresholds`,
+  defaults 3 rounds and 10 s) earns one host message at the turn boundary
+  asking for a short progress note in the same reply, then the continuation.
+  At most two decisions per Run, counted by the shared host-injection meter
+  (cap 11 → 13, mirrored in Lean and now pinned by a comptime `cap = Σ`
+  assertion), the stretch restarting after each decision. It is a
+  host-contract field like its siblings: off in `agent_loop.Options`, left off
+  by canonical `buildRunOptions` (macro runs, skill runs and AgentCore hosts
+  are not nudged), switched on by hosts with a reader — the interactive REPL,
+  the web session and `--stream-json` print mode — and only for a Run whose
+  commentary a person can read (`event_projection`); `--no-progress-updates`
+  turns it off, `--progress-updates-observe` records decisions without
+  injecting. A terminal `progress_updates` observation record (decisions,
+  nudges, longest stretch, thresholds) is emitted for the eval trace parser,
+  whose policy check is lockstep-tested against the Zig bound and the new
+  `ProgressUpdates.lean` policy model (narration resets, below either
+  threshold never fires, decisions bounded over any trace). Host-injected user
+  records are no longer mistaken for the user's own words: `latestUserText`
+  (web-search display query), the transcript viewer and `/recap` skip or
+  label them. The reply is ordinary `commentary` (or the final answer if the
+  model ends the turn); the output-segment protocol is untouched.
+  `tests/component/progress_updates_test.zig` drives the loop through silent,
+  narrated, continued-text, whitespace, bounded, time-floored, observe, off,
+  subagent and single-step shapes and asserts on the real request bytes,
+  segment dispositions and the terminal record;
+  `session_api_parity_test.zig` pins the canonical exclusion.
 
 - `providers.<id>.oauth_client_id` in `~/.metacodes/config.json` (#87): the
   OAuth client an installation registered for a built-in profile that declares

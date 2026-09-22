@@ -2237,6 +2237,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.delivery_cadence = true;
         } else if (std.mem.eql(u8, arg, "--delivery-cadence-observe")) {
             config.delivery_cadence_observe = true;
+        } else if (std.mem.eql(u8, arg, "--no-progress-updates")) {
+            config.progress_updates = false;
+        } else if (std.mem.eql(u8, arg, "--progress-updates-observe")) {
+            config.progress_updates_observe = true;
         } else if (std.mem.eql(u8, arg, "--delivery-cadence-thresholds")) {
             const s = args.next() orelse {
                 setParseError(config, allocator, "missing value for --delivery-cadence-thresholds", .{});
@@ -2539,6 +2543,8 @@ fn printHelp() void {
         \\  --delivery-cadence    Nudge a run that keeps exploring without writing any deliverable
         \\  --delivery-cadence-observe  Record (not enforce) the delivery-cadence obligation
         \\  --delivery-cadence-thresholds <a>,<b>  Exploration-call counts for the two nudges (default 40,80)
+        \\  --no-progress-updates  Do not ask the model for a progress note after silent tool rounds
+        \\  --progress-updates-observe  Record (not enforce) the progress-update obligation
         \\  --max-tokens <n>      Override max output tokens per request
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
