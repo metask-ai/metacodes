@@ -29,7 +29,12 @@ pub const Transport = struct {
     /// spawn language server。argv null 结尾,argv[0] 绝对路径或在 PATH。走可移植 platform/process.spawnPipes
     /// (server stderr → null/NUL:M1 防 chatty server 日志糊花 TUI;inherit_env=true:server 需 PATH/HOME 找 node/python)。
     pub fn spawn(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8) !Transport {
-        const child = process.spawnPipes(argv, true, null) catch return error.SpawnFailed;
+        const child = process.spawnPipes(argv, true, null) catch {
+            // 取走(清掉)子进程的报告:lsp/ 是隔离模块,进不了 util/log,这里不记日志;留着
+            // 只会让同线程下一次读它的人看到过期原因。
+            _ = process.takeLastSpawnFailure();
+            return error.SpawnFailed;
+        };
         return .{ .allocator = allocator, .child = child };
     }
 

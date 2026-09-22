@@ -23,6 +23,9 @@ pub const Code = enum {
     timeout,
     aborted,
     spawn_failed,
+    /// 会话工作目录进不去了(改名/删除):platform/process 的子进程报告通道认定的
+    /// chdir 失败。换命令重试无意义 —— 每次 Bash 都在这个目录里起。
+    working_dir_unavailable,
     path_traversal,
     invalid_args,
     unknown_tool,
@@ -47,6 +50,7 @@ pub const Code = enum {
             .timeout => "timeout",
             .aborted => "aborted",
             .spawn_failed => "spawn_failed",
+            .working_dir_unavailable => "working_dir_unavailable",
             .path_traversal => "path_traversal",
             .invalid_args => "invalid_args",
             .unknown_tool => "unknown_tool",
@@ -126,6 +130,11 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "Timeout", .code = .timeout, .category = .system_error, .recoverable = true },
     .{ .name = "Aborted", .code = .aborted, .category = .system_error, .recoverable = false },
     .{ .name = "SpawnError", .code = .spawn_failed, .category = .system_error, .recoverable = true },
+    // 子进程自己交代的启动失败(platform/process 报告通道):cwd 进不去 / 程序起不来。
+    // 同一调用换个命令重试没有意义,所以不可恢复;它们是环境故障,不是模型的错。
+    .{ .name = "WorkingDirectoryUnavailable", .code = .working_dir_unavailable, .category = .system_error, .recoverable = false },
+    .{ .name = "ChildChdirFailed", .code = .working_dir_unavailable, .category = .system_error, .recoverable = false },
+    .{ .name = "ChildExecFailed", .code = .spawn_failed, .category = .system_error, .recoverable = false },
     // A sealed result could not be published at the batch commit boundary (#45): a storage problem, not the tool's fault; retrying the call may succeed.
     .{ .name = "ArtifactPublishFailed", .code = .io_error, .category = .system_error, .recoverable = true },
     .{ .name = "PathTraversal", .code = .path_traversal, .category = .safety, .recoverable = false },
@@ -470,4 +479,27 @@ test "no-recovery block detail names a non-regular target actionably" {
     defer a.free(plain);
     try std.testing.expect(std.mem.indexOf(u8, plain, "symlink") == null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "project_rule_blocked") != null);
+}
+
+test "spawn 报告通道的错误名:环境故障,不可恢复,带专属 code" {
+    const a = std.testing.allocator;
+    const wd = fromErrorName("WorkingDirectoryUnavailable", try a.dupe(u8, "gone"));
+    defer wd.deinit(a);
+    try std.testing.expectEqual(Code.working_dir_unavailable, wd.code);
+    try std.testing.expectEqual(Category.system_error, wd.category);
+    try std.testing.expect(!wd.recoverable);
+    const json = try wd.toJson(a);
+    defer a.free(json);
+    try std.testing.expectEqualStrings("{\"error\":{\"code\":\"working_dir_unavailable\",\"category\":\"system_error\",\"detail\":\"gone\",\"recoverable\":false}}", json);
+    const chdir = fromErrorName("ChildChdirFailed", try a.dupe(u8, "x"));
+    defer chdir.deinit(a);
+    try std.testing.expectEqual(Code.working_dir_unavailable, chdir.code);
+    const exec = fromErrorName("ChildExecFailed", try a.dupe(u8, "x"));
+    defer exec.deinit(a);
+    try std.testing.expectEqual(Code.spawn_failed, exec.code);
+    try std.testing.expect(!exec.recoverable);
+    // 资源性 spawn 失败(fork/pipe)仍然可重试:与子进程报告的确定性失败区分开。
+    const res = fromErrorName("SpawnError", try a.dupe(u8, "x"));
+    defer res.deinit(a);
+    try std.testing.expect(res.recoverable);
 }

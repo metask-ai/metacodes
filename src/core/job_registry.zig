@@ -265,7 +265,12 @@ pub const JobRegistry = struct {
         defer self.allocator.free(cmd_z);
         var argv: [6]?[*:0]const u8 = undefined;
         shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
-        const proc = process.spawnToFiles(argv[0..], out_fd, err_fd, cwd) catch return error.SpawnFailed;
+        const proc = process.spawnToFiles(argv[0..], out_fd, err_fd, cwd) catch |e| return switch (e) {
+            // 子进程自己交代的失败原样上抛:Bash 据此告诉模型是 cwd 没了还是 shell 起不来,
+            // 而不是登记一个 exit 127、双空流的 job 让模型去猜。
+            error.ChildChdirFailed, error.ChildExecFailed => e,
+            else => error.SpawnFailed,
+        };
         // From this point until registerEntry succeeds, the child has no owner
         // in jobs[]. OOM while allocating the preview/index must not leak a
         // live background process.
@@ -891,4 +896,16 @@ test "JobRegistry owner and observed exit suppress notification" {
     const observed = try r.takeUnannouncedExits(owner, a);
     defer freeJobExitEvents(a, observed);
     try std.testing.expectEqual(@as(usize, 0), observed.len);
+}
+
+test "spawn: cwd 已消失 → 子进程的报告原样上抛,不登记一个 exit 127 的 job" {
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("../tools/test_tmp.zig").path(&dir_buf, "job-vanished-cwd");
+    _ = std.c.mkdir(dir.ptr, 0o700);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.rmdir(dir.ptr));
+    try std.testing.expectError(error.ChildChdirFailed, r.spawnSynchronous("echo hello", dir));
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }

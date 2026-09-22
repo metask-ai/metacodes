@@ -720,6 +720,7 @@ fn executeChecker(
         result.failure = switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.SpawnFailed => .spawn_failed,
+            error.ChildChdirFailed, error.ChildExecFailed => .spawn_failed,
             error.PipeFailed => .pipe_failed,
             error.ReadError => .read_failed,
             error.Timeout => .timeout,

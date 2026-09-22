@@ -27,7 +27,79 @@ const psync = @import("sync.zig");
 // 正解是 PROC_THREAD_ATTRIBUTE_HANDLE_LIST 白名单(roadmap);串行化是小而正确的第一刀。
 var g_spawn_serial: psync.Mutex = .{};
 
-pub const CaptureError = error{ SpawnFailed, PipeFailed, ReadError, OutOfMemory, Aborted, Timeout };
+pub const CaptureError = error{ SpawnFailed, PipeFailed, ReadError, OutOfMemory, Aborted, Timeout, ChildChdirFailed, ChildExecFailed };
+
+/// The step at which a child gave up before it ran anything of the caller's.
+pub const SpawnStep = enum(u8) {
+    /// `chdir` into the requested working directory refused (POSIX), or
+    /// `CreateProcessW` rejected `lpCurrentDirectory` (Windows).
+    chdir = 1,
+    /// `execve` refused the program (POSIX), or `CreateProcessW` could not
+    /// start it (Windows).
+    exec = 2,
+};
+
+/// A child's own account of why it never started.
+///
+/// POSIX: between fork and exec the child writes this record to a
+/// close-on-exec pipe and `_exit`s; a parent that reads EOF instead knows the
+/// exec succeeded. Windows: derived from `GetLastError` after `CreateProcessW`
+/// refused. Before this channel existed every pre-exec failure looked exactly
+/// like the command itself exiting 127 with nothing on either stream — a
+/// renamed working directory and a missing shell were indistinguishable from
+/// a typo, and a model given that signal retries until its turn budget is gone.
+pub const SpawnFailure = struct {
+    step: SpawnStep,
+    /// errno on POSIX; the Win32 error code on Windows.
+    code: i32,
+
+    /// The path named nothing: POSIX `ENOENT`, Win32 `ERROR_FILE_NOT_FOUND` /
+    /// `ERROR_PATH_NOT_FOUND` / `ERROR_DIRECTORY`. Only this reading licenses a
+    /// "renamed or removed" diagnosis; `EACCES`, `ENOTDIR`, `ENAMETOOLONG` are
+    /// different stories and are reported as what they are.
+    pub fn isNotFound(self: SpawnFailure) bool {
+        if (is_windows) {
+            return self.code == ERROR_FILE_NOT_FOUND or self.code == ERROR_PATH_NOT_FOUND or self.code == ERROR_DIRECTORY;
+        } else {
+            return self.code == @intFromEnum(std.c.E.NOENT);
+        }
+    }
+
+    /// Symbolic form for diagnostics: "ENOENT" on POSIX, "Win32 error 267" on Windows.
+    pub fn describeCode(self: SpawnFailure, buf: []u8) []const u8 {
+        if (is_windows) {
+            return std.fmt.bufPrint(buf, "Win32 error {d}", .{self.code}) catch "?";
+        } else {
+            if (std.enums.fromInt(std.c.E, self.code)) |e| {
+                if (std.enums.tagName(std.c.E, e)) |name| {
+                    return std.fmt.bufPrint(buf, "E{s}", .{name}) catch "?";
+                }
+            }
+            return std.fmt.bufPrint(buf, "errno {d}", .{self.code}) catch "?";
+        }
+    }
+};
+
+/// The most recent spawn on this thread that returned `ChildChdirFailed` or
+/// `ChildExecFailed`; every spawn entry point clears it first, and
+/// `takeLastSpawnFailure` clears it on read. Thread-local for the reason errno
+/// is: the failing call and its reader share a thread, and the primitives keep
+/// their signatures.
+threadlocal var last_spawn_failure: ?SpawnFailure = null;
+
+pub fn takeLastSpawnFailure() ?SpawnFailure {
+    const failure = last_spawn_failure;
+    last_spawn_failure = null;
+    return failure;
+}
+
+fn spawnFailureError(failure: SpawnFailure) CaptureError {
+    last_spawn_failure = failure;
+    return switch (failure.step) {
+        .chdir => error.ChildChdirFailed,
+        .exec => error.ChildExecFailed,
+    };
+}
 
 /// abort 轮询回调：返 true=应中止。tick 回调：周期报告 elapsed_ms + 命令 label。
 pub const CaptureOpts = struct {
@@ -65,6 +137,7 @@ pub const Captured = struct {
 
 /// spawn argv、抽干 stdout[+stderr]、返回结果。timeout_ms==0 无超时。
 pub fn capture(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
+    last_spawn_failure = null;
     if (is_windows) return captureWindows(argv, allocator, opts);
     return capturePosix(argv, allocator, opts);
 }
@@ -77,6 +150,7 @@ pub fn captureStdout(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator,
 /// spawn argv、**继承父进程 stdio**（交互式，如 $EDITOR）、等待，返回 exit code。
 /// POSIX：fork+execve(inherit fd 0/1/2)+waitpid；Windows：CreateProcessW(继承 console)+Wait。
 pub fn runInherit(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!i32 {
+    last_spawn_failure = null;
     if (is_windows) {
         const a = std.heap.page_allocator;
         const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
@@ -84,7 +158,7 @@ pub fn runInherit(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!
         var si = std.mem.zeroes(win.STARTUPINFOW);
         si.cb = @sizeOf(win.STARTUPINFOW); // 不设 USESTDHANDLES → 子进程继承本进程 console
         var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
-        if (win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(0), .{}, null, null, &si, &pi) == .FALSE) return error.SpawnFailed;
+        if (win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(0), .{}, null, null, &si, &pi) == .FALSE) return windowsSpawnFailure(GetLastError(), null);
         _ = WaitForSingleObject(pi.hProcess, INFINITE);
         var code: win.DWORD = 0;
         _ = GetExitCodeProcess(pi.hProcess, &code);
@@ -92,22 +166,28 @@ pub fn runInherit(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!
         win.CloseHandle(pi.hThread);
         return @bitCast(code);
     }
+    g_fork_serial.lock();
+    const report = ReportPipe.open() orelse {
+        g_fork_serial.unlock();
+        return error.PipeFailed;
+    };
     const pid = std.c.fork();
-    if (pid < 0) return error.SpawnFailed;
-    if (pid == 0) {
-        const argv0 = argv[0] orelse std.c._exit(127);
-        const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
-        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
-        std.c._exit(127);
+    if (pid < 0) {
+        report.closeBoth();
+        g_fork_serial.unlock();
+        return error.SpawnFailed;
     }
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
-    return posixExitCode(status);
+    if (pid == 0) execChild(argv, inherit_env, null, report.wr);
+    _ = std.c.close(report.wr);
+    g_fork_serial.unlock();
+    if (awaitChildReport(report, pid)) |failure| return spawnFailureError(failure);
+    return posixExitCode(waitpidRetry(pid));
 }
 
 /// spawn argv、**detached**（关闭 stdio、不等待，fire-and-forget，如打开浏览器）。
 /// POSIX：fork+setpgid+close(0/1/2)+execve，父不 waitpid；Windows：CreateProcessW(DETACHED_PROCESS)。
 pub fn spawnDetached(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!void {
+    last_spawn_failure = null;
     if (is_windows) {
         const a = std.heap.page_allocator;
         const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
@@ -115,24 +195,34 @@ pub fn spawnDetached(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureErr
         var si = std.mem.zeroes(win.STARTUPINFOW);
         si.cb = @sizeOf(win.STARTUPINFOW);
         var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
-        if (win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(0), .{ .detached_process = true }, null, null, &si, &pi) == .FALSE) return error.SpawnFailed;
+        if (win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(0), .{ .detached_process = true }, null, null, &si, &pi) == .FALSE) return windowsSpawnFailure(GetLastError(), null);
         win.CloseHandle(pi.hProcess);
         win.CloseHandle(pi.hThread);
         return;
     }
+    g_fork_serial.lock();
+    const report = ReportPipe.open() orelse {
+        g_fork_serial.unlock();
+        return error.PipeFailed;
+    };
     const pid = std.c.fork();
-    if (pid < 0) return error.SpawnFailed;
+    if (pid < 0) {
+        report.closeBoth();
+        g_fork_serial.unlock();
+        return error.SpawnFailed;
+    }
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
         _ = std.c.close(0);
         _ = std.c.close(1);
         _ = std.c.close(2);
-        const argv0 = argv[0] orelse std.c._exit(127);
-        const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
-        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
-        std.c._exit(127);
+        execChild(argv, inherit_env, null, report.wr);
     }
-    // 父：fire-and-forget，不 waitpid（对齐原 openBrowser）。
+    _ = std.c.close(report.wr);
+    g_fork_serial.unlock();
+    // 父：fire-and-forget，不 waitpid（对齐原 openBrowser）——除非子进程根本没起来:
+    // 那时 awaitChildReport 已把它收尸,这里只把原因交出去。
+    if (awaitChildReport(report, pid)) |failure| return spawnFailureError(failure);
 }
 
 // ============================================================================
@@ -224,7 +314,7 @@ pub const PipeChild = struct {
             const WNOHANG: c_int = 1;
             if (std.c.waitpid(self.proc, &status, WNOHANG) == 0) {
                 _ = std.c.kill(-self.proc, std.c.SIG.KILL);
-                _ = std.c.waitpid(self.proc, &status, 0);
+                _ = waitpidRetry(self.proc);
             }
         }
     }
@@ -232,6 +322,7 @@ pub const PipeChild = struct {
 
 /// spawn 长连接子进程，返回持久 stdin(父写)/stdout(父读) 端点。stderr 丢弃（→null/NUL）。
 pub fn spawnPipes(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const u8) CaptureError!PipeChild {
+    last_spawn_failure = null;
     if (is_windows) return spawnPipesWindows(argv, cwd);
     return spawnPipesPosix(argv, inherit_env, cwd);
 }
@@ -239,43 +330,46 @@ pub fn spawnPipes(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const
 fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const u8) CaptureError!PipeChild {
     var in_pipe: [2]std.c.fd_t = undefined; // 父写 → 子读
     var out_pipe: [2]std.c.fd_t = undefined; // 子写 → 父读
+    // 从建第一条 pipe 到父端关完子进程侧的端,持 fork 串行锁(见 g_fork_serial)。
+    g_fork_serial.lock();
+    var fork_locked = true;
+    defer if (fork_locked) g_fork_serial.unlock();
     if (std.c.pipe(&in_pipe) != 0) return error.PipeFailed;
     if (std.c.pipe(&out_pipe) != 0) {
-        _ = std.c.close(in_pipe[0]);
-        _ = std.c.close(in_pipe[1]);
+        closePair(in_pipe);
         return error.PipeFailed;
     }
+    const report = ReportPipe.open() orelse {
+        closePair(in_pipe);
+        closePair(out_pipe);
+        return error.PipeFailed;
+    };
     const pid = std.c.fork();
     if (pid < 0) {
-        _ = std.c.close(in_pipe[0]);
-        _ = std.c.close(in_pipe[1]);
-        _ = std.c.close(out_pipe[0]);
-        _ = std.c.close(out_pipe[1]);
+        closePair(in_pipe);
+        closePair(out_pipe);
+        report.closeBoth();
         return error.SpawnFailed;
     }
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
-        _ = std.c.dup2(in_pipe[0], 0);
-        _ = std.c.dup2(out_pipe[1], 1);
-        _ = std.c.close(in_pipe[0]);
         _ = std.c.close(in_pipe[1]);
         _ = std.c.close(out_pipe[0]);
-        _ = std.c.close(out_pipe[1]);
         const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-        if (devnull >= 0) {
-            _ = std.c.dup2(devnull, 2);
-            if (devnull != 2) _ = std.c.close(devnull);
-        }
-        // 缺陷 B 修复:子进程 chdir。
-        if (!chdirChild(cwd)) std.c._exit(127);
-        const argv0 = argv[0] orelse std.c._exit(127);
-        const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
-        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
-        std.c._exit(127);
+        wireStdioOrExit(.{ in_pipe[0], out_pipe[1], devnull }, report.wr);
+        execChild(argv, inherit_env, cwd, report.wr);
     }
     _ = std.c.close(in_pipe[0]); // 父不读 stdin pipe
     _ = std.c.close(out_pipe[1]); // 父不写 stdout pipe
+    _ = std.c.close(report.wr);
     _ = std.c.setpgid(pid, pid);
+    g_fork_serial.unlock(); // 子进程侧的端全关,可继承窗口结束
+    fork_locked = false;
+    if (awaitChildReport(report, pid)) |failure| {
+        _ = std.c.close(in_pipe[1]);
+        _ = std.c.close(out_pipe[0]);
+        return spawnFailureError(failure);
+    }
     return .{ .proc = pid, .stdin_h = in_pipe[1], .stdout_h = out_pipe[0] };
 }
 
@@ -314,6 +408,7 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8, cwd: ?[]const u8) CaptureErro
     var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
     const cwd_ptr: ?[*:0]u16 = if (cwd_w) |w| w.ptr else null;
     const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, cwd_ptr, &si, &pi);
+    const create_error: u32 = if (created == .FALSE) GetLastError() else 0; // 任何后续 Win32 调用都会覆盖它
     win.CloseHandle(in_rd); // 父端关子进程侧
     win.CloseHandle(out_wr);
     g_spawn_serial.unlock(); // 可继承句柄的父端副本已全关
@@ -321,7 +416,7 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8, cwd: ?[]const u8) CaptureErro
     if (created == .FALSE) {
         win.CloseHandle(in_wr);
         win.CloseHandle(out_rd);
-        return error.SpawnFailed;
+        return windowsSpawnFailure(create_error, cwd);
     }
     win.CloseHandle(pi.hThread);
     return .{ .proc = pi.hProcess, .stdin_h = in_wr, .stdout_h = out_rd };
@@ -365,6 +460,7 @@ pub fn spawnToFilesWithEnv(
     cwd: ?[]const u8,
     inherit_env: bool,
 ) CaptureError!ProcHandle {
+    last_spawn_failure = null;
     if (is_windows) {
         const out_raw = _get_osfhandle(out_fd);
         const err_raw = _get_osfhandle(err_fd);
@@ -398,29 +494,35 @@ pub fn spawnToFilesWithEnv(
         var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
         const cwd_ptr: ?win.LPCWSTR = if (cwd_w) |w| w.ptr else null;
         const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{ .create_no_window = true }, null, cwd_ptr, &si, &pi);
+        const create_error: u32 = if (created == .FALSE) GetLastError() else 0; // 任何后续 Win32 调用都会覆盖它
         _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, 0);
         _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
         g_spawn_serial.unlock();
-        if (created == .FALSE) return error.SpawnFailed;
+        if (created == .FALSE) return windowsSpawnFailure(create_error, cwd);
         win.CloseHandle(pi.hThread);
         return pi.hProcess;
     }
+    g_fork_serial.lock();
+    const report = ReportPipe.open() orelse {
+        g_fork_serial.unlock();
+        return error.PipeFailed;
+    };
     const pid = std.c.fork();
-    if (pid < 0) return error.SpawnFailed;
+    if (pid < 0) {
+        report.closeBoth();
+        g_fork_serial.unlock();
+        return error.SpawnFailed;
+    }
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
-        _ = std.c.dup2(out_fd, 1);
-        _ = std.c.dup2(err_fd, 2);
-        _ = std.c.close(out_fd);
-        _ = std.c.close(err_fd);
-        // 缺陷 B 修复:子进程 chdir。
-        if (!chdirChild(cwd)) std.c._exit(127);
-        const argv0 = argv[0] orelse std.c._exit(127);
-        const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
-        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
-        std.c._exit(127);
+        // out_fd/err_fd 是调用方开的落盘文件:父进程关着 stdio 时它们也可能落在 0..2。
+        wireStdioOrExit(.{ -1, out_fd, err_fd }, report.wr);
+        execChild(argv, inherit_env, cwd, report.wr);
     }
+    _ = std.c.close(report.wr);
     _ = std.c.setpgid(pid, pid);
+    g_fork_serial.unlock();
+    if (awaitChildReport(report, pid)) |failure| return spawnFailureError(failure);
     return pid;
 }
 
@@ -468,8 +570,7 @@ pub fn reapBlocking(h: ProcHandle) void {
         _ = WaitForSingleObject(h, 2000);
         win.CloseHandle(h);
     } else {
-        var status: c_int = 0;
-        _ = std.c.waitpid(h, &status, 0);
+        _ = waitpidRetry(h);
     }
 }
 
@@ -510,91 +611,311 @@ fn killGroupPosix(pgid: std.c.pid_t) void {
 }
 
 /// fork-child 内 chdir(缺陷 B)。异步信号安全:仅栈 buffer + chdir,无 malloc/lock。
-/// 成功返 true;失败或 cwd 过长返 false(调用方 _exit(127))。
+/// 成功返 true;失败或 cwd 过长返 false,errno 说明原因(调用方经报告管道交给父进程)。
 /// 三处 spawn 原语共用,避免 7 行代码重复(Linus R2)。
 fn chdirChild(cwd: ?[]const u8) bool {
     const c = cwd orelse return true;
-    if (c.len >= std.fs.max_path_bytes) return false;
+    if (c.len >= std.fs.max_path_bytes) {
+        std.c._errno().* = @intFromEnum(std.c.E.NAMETOOLONG);
+        return false;
+    }
     var cwd_z: [std.fs.max_path_bytes:0]u8 = undefined;
     @memcpy(cwd_z[0..c.len], c);
     cwd_z[c.len] = 0;
     return std.c.chdir(&cwd_z) == 0;
 }
 
+// ============================================================================
+// 子进程失败报告通道(POSIX)
+// ============================================================================
+
+/// POSIX fork serial lock. A pipe end created for a child is inheritable until
+/// the parent closes its own copy; a fork on another thread inside that window
+/// hands the descriptor to an unrelated child, whose exec'd program then holds
+/// a write end open and the parent's EOF never comes. Holding this from the
+/// first pipe until the parent has closed every child-side end removes that
+/// window for every spawn in this module — the rule `g_spawn_serial` already
+/// applies to inheritable handles on Windows. Forks outside this module take
+/// it through `forkSerialLock`/`forkSerialUnlock`.
+var g_fork_serial: psync.Mutex = .{};
+
+pub fn forkSerialLock() void {
+    g_fork_serial.lock();
+}
+
+pub fn forkSerialUnlock() void {
+    g_fork_serial.unlock();
+}
+
+fn closePair(p: [2]std.c.fd_t) void {
+    _ = std.c.close(p[0]);
+    _ = std.c.close(p[1]);
+}
+
+/// 阻塞收尸,EINTR 重试。被信号(SIGWINCH/SIGINT 等)打断的 waitpid 返 -1/EINTR;不重试就
+/// 把已退出的子进程留成僵尸,还会把"退出码 0"报给调用方(codex R1 #2)。返回 wait status
+/// (交给 posixExitCode);其它错误(ECHILD)按旧行为当 0。
+fn waitpidRetry(pid: std.c.pid_t) c_int {
+    var status: c_int = 0;
+    while (true) {
+        const rc = std.c.waitpid(pid, &status, 0);
+        if (rc >= 0) return status;
+        if (std.c.errno(rc) != .INTR) return 0;
+    }
+}
+
+/// 子进程侧:把 `srcs[slot]` 接到 stdio 槽位 0/1/2(-1 = 不动该槽)。
+///
+/// 父进程若关着某个 stdio,pipe()/open() 会把 0/1/2 发回来当管道端;朴素的
+/// `dup2(src, slot); close(src)` 在 src == slot 时先 no-op 再把刚接好的槽关掉,
+/// src 落在别的槽上时又会被后一个 dup2 盖掉(codex R1 #1)。所以分三步:先把所有落在
+/// 0..2 的源抬到 ≥3(F_DUPFD_CLOEXEC),再 dup2,最后只关 ≥3 的源(同一源接多个槽只关一次)。
+/// 只用 fcntl/dup2/close,异步信号安全。同一个低位源出现在多个槽位时,每个槽位各拿一份
+/// 抬起来的副本(第一阶段不关原 fd),所以 {0, hi, 0} 这类形状是安全的。
+///
+/// 抬不上去(EMFILE/ENFILE)就返回 false,**一个槽都不接**:半接好的 stdio 会让后一个 dup2
+/// 盖掉还没用到的源,或让一个低位源穿过 exec 泄给程序;调用方经报告通道交代 errno 后
+/// `_exit`(codex R2 #2)。
+fn applyStdioWiring(srcs_in: [3]std.c.fd_t) bool {
+    var srcs = srcs_in;
+    for (&srcs) |*s| {
+        if (s.* >= 0 and s.* < 3) {
+            const lifted = std.c.fcntl(s.*, std.c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+            if (lifted < 3) return false;
+            s.* = lifted;
+        }
+    }
+    for (srcs, 0..) |s, slot| {
+        if (s >= 0) _ = std.c.dup2(s, @intCast(slot));
+    }
+    for (srcs, 0..) |s, i| {
+        if (s < 3) continue;
+        var seen = false;
+        for (srcs[0..i]) |earlier| {
+            if (earlier == s) seen = true;
+        }
+        if (!seen) _ = std.c.close(s);
+    }
+    return true;
+}
+
+/// 子进程侧:接线失败就把 fcntl 的 errno 当 exec 步骤的失败交代出去,然后退出。
+fn wireStdioOrExit(srcs: [3]std.c.fd_t, report_fd: std.c.fd_t) void {
+    if (applyStdioWiring(srcs)) return;
+    reportChildFailure(report_fd, .exec, currentErrno());
+    std.c._exit(127);
+}
+
+/// Wire form of the child's report: `extern` so both sides of the fork agree
+/// on the layout; written and read as raw bytes.
+const ChildReport = extern struct {
+    step: u8,
+    pad: [3]u8 = .{ 0, 0, 0 },
+    code: i32,
+};
+
+/// The parent stops waiting for a report after this long. A successful exec
+/// produces EOF within microseconds; the bound only matters if a descriptor
+/// leaked into a process forked outside `g_fork_serial`, and then the worst
+/// case is a late report being missed — the child still exits 127, exactly
+/// the behaviour before the channel existed. It never makes a running child
+/// look failed.
+const REPORT_WAIT_MS: i64 = 2000;
+
+/// The close-on-exec pipe carrying the child's report.
+const ReportPipe = struct {
+    rd: std.c.fd_t,
+    wr: std.c.fd_t,
+
+    fn open() ?ReportPipe {
+        var fds: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) return null;
+        // Close-on-exec on the write end *is* the mechanism: a successful
+        // execve closes it and the parent reads EOF. The read end gets the
+        // flag too so a sibling spawn's child cannot inherit it either.
+        if (!setCloseOnExec(fds[0]) or !setCloseOnExec(fds[1])) {
+            closePair(fds);
+            return null;
+        }
+        // A parent running with any of 0/1/2 closed would get one of them back
+        // from pipe(); the child's dup2 onto 0/1/2 would then clobber the write
+        // end and a failure record could land in the program's stdout instead
+        // of here. Keep both ends above the stdio range.
+        const rd = liftAboveStdio(fds[0]) orelse {
+            closePair(fds);
+            return null;
+        };
+        const wr = liftAboveStdio(fds[1]) orelse {
+            _ = std.c.close(rd);
+            _ = std.c.close(fds[1]);
+            return null;
+        };
+        return .{ .rd = rd, .wr = wr };
+    }
+
+    fn closeBoth(self: ReportPipe) void {
+        _ = std.c.close(self.rd);
+        _ = std.c.close(self.wr);
+    }
+};
+
+fn setCloseOnExec(fd: std.c.fd_t) bool {
+    const current = std.c.fcntl(fd, std.c.F.GETFD);
+    return current >= 0 and std.c.fcntl(fd, std.c.F.SETFD, current | std.c.FD_CLOEXEC) >= 0;
+}
+
+/// Returns `fd` itself when it is already ≥ 3, otherwise a close-on-exec
+/// duplicate ≥ 3 (the original is closed). Null when the dup fails.
+fn liftAboveStdio(fd: std.c.fd_t) ?std.c.fd_t {
+    if (fd >= 3) return fd;
+    const lifted = std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+    _ = std.c.close(fd);
+    return if (lifted >= 3) lifted else null;
+}
+
+fn currentErrno() i32 {
+    return @intCast(std.c._errno().*);
+}
+
+/// Child side, between fork and exec: one fixed-size write and nothing else —
+/// no allocation, no locks — so it is async-signal-safe.
+fn reportChildFailure(fd: std.c.fd_t, step: SpawnStep, code: i32) void {
+    const report = ChildReport{ .step = @intFromEnum(step), .code = code };
+    const bytes = std.mem.asBytes(&report);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = std.c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (n < 0) {
+            if (std.c.errno(n) == .INTR) continue;
+            return;
+        }
+        if (n == 0) return;
+        off += @intCast(n);
+    }
+}
+
+/// The child's tail shared by every POSIX spawn: enter the working directory,
+/// exec, and account for whichever step refused. Never returns.
+fn execChild(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const u8, report_fd: std.c.fd_t) noreturn {
+    if (!chdirChild(cwd)) {
+        reportChildFailure(report_fd, .chdir, currentErrno());
+        std.c._exit(127);
+    }
+    const argv0 = argv[0] orelse {
+        reportChildFailure(report_fd, .exec, @intFromEnum(std.c.E.INVAL));
+        std.c._exit(127);
+    };
+    const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
+    _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
+    reportChildFailure(report_fd, .exec, currentErrno());
+    std.c._exit(127);
+}
+
+/// Parent side. Waits for the child's report, or for the EOF a successful exec
+/// produces. On a report the child has already exited: it is reaped here and
+/// the failure returned; null means the child is running the program. Always
+/// closes the read end.
+fn awaitChildReport(report: ReportPipe, pid: std.c.pid_t) ?SpawnFailure {
+    defer _ = std.c.close(report.rd);
+    var record: ChildReport = undefined;
+    const bytes = std.mem.asBytes(&record);
+    var got: usize = 0;
+    const deadline = nowMs() + REPORT_WAIT_MS;
+    while (got < bytes.len) {
+        const remaining = deadline - nowMs();
+        if (remaining <= 0) break;
+        var pfd = [_]std.c.pollfd{.{ .fd = report.rd, .events = std.c.POLL.IN, .revents = 0 }};
+        const rc = std.c.poll(&pfd, 1, @intCast(@min(remaining, 100)));
+        if (rc < 0) {
+            if (std.c.errno(rc) == .INTR) continue;
+            break;
+        }
+        if (rc == 0) continue;
+        const n = std.c.read(report.rd, bytes.ptr + got, bytes.len - got);
+        if (n < 0) {
+            if (std.c.errno(n) == .INTR) continue;
+            break;
+        }
+        if (n == 0) break; // EOF: the write end went away with a successful exec
+        got += @intCast(n);
+    }
+    if (got == 0) return null;
+    // Even a short record came from a child that gave up before exec.
+    const failure: SpawnFailure = if (got < bytes.len)
+        .{ .step = .exec, .code = 0 }
+    else
+        .{ .step = std.enums.fromInt(SpawnStep, record.step) orelse .exec, .code = record.code };
+    _ = waitpidRetry(pid);
+    return failure;
+}
+
 fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
+    // 从建第一条 pipe 到父端关完子进程侧的端,持 fork 串行锁(见 g_fork_serial);
+    // 喂 stdin 与抽干在锁外。
+    g_fork_serial.lock();
+    var fork_locked = true;
+    defer if (fork_locked) g_fork_serial.unlock();
+
     var out_pipe: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&out_pipe) != 0) return error.PipeFailed;
     var err_pipe: [2]std.c.fd_t = .{ -1, -1 };
     if (opts.want_stderr) {
         if (std.c.pipe(&err_pipe) != 0) {
-            _ = std.c.close(out_pipe[0]);
-            _ = std.c.close(out_pipe[1]);
+            closePair(out_pipe);
             return error.PipeFailed;
         }
     }
     var in_pipe: [2]std.c.fd_t = .{ -1, -1 };
     if (opts.stdin_data != null) {
         if (std.c.pipe(&in_pipe) != 0) {
-            _ = std.c.close(out_pipe[0]);
-            _ = std.c.close(out_pipe[1]);
-            if (opts.want_stderr) {
-                _ = std.c.close(err_pipe[0]);
-                _ = std.c.close(err_pipe[1]);
-            }
+            closePair(out_pipe);
+            if (opts.want_stderr) closePair(err_pipe);
             return error.PipeFailed;
         }
     }
+    const report = ReportPipe.open() orelse {
+        closePair(out_pipe);
+        if (opts.want_stderr) closePair(err_pipe);
+        if (opts.stdin_data != null) closePair(in_pipe);
+        return error.PipeFailed;
+    };
 
     const pid = std.c.fork();
     if (pid < 0) {
-        _ = std.c.close(out_pipe[0]);
-        _ = std.c.close(out_pipe[1]);
-        if (opts.want_stderr) {
-            _ = std.c.close(err_pipe[0]);
-            _ = std.c.close(err_pipe[1]);
-        }
-        if (opts.stdin_data != null) {
-            _ = std.c.close(in_pipe[0]);
-            _ = std.c.close(in_pipe[1]);
-        }
+        closePair(out_pipe);
+        if (opts.want_stderr) closePair(err_pipe);
+        if (opts.stdin_data != null) closePair(in_pipe);
+        report.closeBoth();
         return error.SpawnFailed;
     }
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
+        // 先关父端的端,再统一接线(applyStdioWiring:源若落在 0..2 先抬走再 dup2)。
         _ = std.c.close(out_pipe[0]);
-        _ = std.c.dup2(out_pipe[1], 1);
-        if (opts.stdin_data != null) {
-            _ = std.c.close(in_pipe[1]);
-            _ = std.c.dup2(in_pipe[0], 0);
-            _ = std.c.close(in_pipe[0]);
-        }
-        if (opts.want_stderr) {
-            _ = std.c.close(err_pipe[0]);
-            _ = std.c.dup2(err_pipe[1], 2);
-            _ = std.c.close(err_pipe[1]);
-        } else {
-            const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-            if (devnull >= 0) {
-                _ = std.c.dup2(devnull, 2);
-                if (devnull != 2) _ = std.c.close(devnull);
-            }
-        }
-        _ = std.c.close(out_pipe[1]);
-        // 缺陷 B 修复:子进程 chdir(仅影响本子进程,父进程 cwd 不变)。
-        if (!chdirChild(opts.cwd)) std.c._exit(127);
-        const argv0 = argv[0] orelse std.c._exit(127);
-        const envp: [*:null]const ?[*:0]const u8 = if (opts.inherit_env) @ptrCast(std.c.environ) else &.{null};
-        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
-        std.c._exit(127);
+        if (opts.stdin_data != null) _ = std.c.close(in_pipe[1]);
+        if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
+        const stderr_src: std.c.fd_t = if (opts.want_stderr) err_pipe[1] else std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        wireStdioOrExit(.{ if (opts.stdin_data != null) in_pipe[0] else -1, out_pipe[1], stderr_src }, report.wr);
+        execChild(argv, opts.inherit_env, opts.cwd, report.wr);
     }
 
     _ = std.c.close(out_pipe[1]);
     if (opts.want_stderr) _ = std.c.close(err_pipe[1]);
+    if (opts.stdin_data != null) _ = std.c.close(in_pipe[0]);
+    _ = std.c.close(report.wr);
     _ = std.c.setpgid(pid, pid);
+    g_fork_serial.unlock(); // 子进程侧的端全关,可继承窗口结束
+    fork_locked = false;
+
+    if (awaitChildReport(report, pid)) |failure| {
+        _ = std.c.close(out_pipe[0]);
+        if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
+        if (opts.stdin_data != null) _ = std.c.close(in_pipe[1]);
+        return spawnFailureError(failure);
+    }
 
     // 喂 stdin（小数据：先写完再 drain）。SIGPIPE 全局忽略 → 子进程早退时 write 返 EPIPE 不杀本进程。
     if (opts.stdin_data) |data| {
-        _ = std.c.close(in_pipe[0]);
         var w: usize = 0;
         while (w < data.len) {
             const n = std.c.write(in_pipe[1], data.ptr + w, data.len - w);
@@ -623,8 +944,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
             killGroupPosix(pid);
             _ = std.c.close(out_pipe[0]);
             if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
-            var st: c_int = 0;
-            _ = std.c.waitpid(pid, &st, 0);
+            _ = waitpidRetry(pid);
             return error.Aborted;
         };
         const elapsed = nowMs() - start;
@@ -678,8 +998,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
     _ = std.c.close(out_pipe[0]);
     if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
 
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
+    const status = waitpidRetry(pid);
 
     if (timed_out and !opts.timeout_partial) return error.Timeout; // errdefer 释放 out/err（勿显式 deinit → 双 free）
     return .{
@@ -712,6 +1031,49 @@ extern "kernel32" fn GetExitCodeProcess(hProcess: win.HANDLE, lpExitCode: *win.D
 extern "kernel32" fn TerminateProcess(hProcess: win.HANDLE, uExitCode: win.UINT) callconv(.winapi) c_int;
 extern "kernel32" fn PeekNamedPipe(hNamedPipe: win.HANDLE, lpBuffer: ?[*]u8, nBufferSize: win.DWORD, lpBytesRead: ?*win.DWORD, lpTotalBytesAvail: ?*win.DWORD, lpBytesLeftThisMessage: ?*win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn Sleep(dwMilliseconds: win.DWORD) callconv(.winapi) void;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
+
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_BAD_EXE_FORMAT: u32 = 193;
+const ERROR_DIRECTORY: u32 = 267;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+/// `CreateProcessW` refused with `code` (captured straight after the call —
+/// any Win32 call in between overwrites it). Classified the way the POSIX
+/// child report is, so callers see the same two errors on both platforms. A
+/// not-found code does not say whether the program or `lpCurrentDirectory` was
+/// missing; the directory is looked at to settle the wording — naming only,
+/// it gates no retry.
+fn windowsSpawnFailure(code: u32, cwd: ?[]const u8) CaptureError {
+    const step: SpawnStep = switch (code) {
+        ERROR_DIRECTORY => .chdir,
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => blk: {
+            const c = cwd orelse break :blk .exec;
+            break :blk if (windowsIsDirectory(c)) .exec else .chdir;
+        },
+        ERROR_ACCESS_DENIED, ERROR_BAD_EXE_FORMAT => .exec,
+        else => return error.SpawnFailed,
+    };
+    return spawnFailureError(.{ .step = step, .code = @bitCast(code) });
+}
+
+/// `lpCurrentDirectory` must name a directory (a regular file at that path is
+/// just as unusable as nothing), so the attribute bit is required, not mere
+/// existence (codex R1 #5). The path is evaluated as the caller gave it;
+/// `CreateProcessW` wants a full path there, and every caller in this
+/// repository passes an absolute session root.
+fn windowsIsDirectory(path: []const u8) bool {
+    var wbuf: [win.PATH_MAX_WIDE + 1]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return false;
+    if (wlen >= wbuf.len) return false;
+    wbuf[wlen] = 0;
+    const attrs = GetFileAttributesW(@ptrCast(&wbuf));
+    if (attrs == 0xFFFF_FFFF) return false; // INVALID_FILE_ATTRIBUTES
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
 
 // 每个 reader 线程独占自己的 list（out_reader→out / err_reader→err），main 在 join 后才读，
 // 无跨线程并发访问同一 list → 无需锁。
@@ -835,6 +1197,7 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
     var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
     const cwd_ptr: ?win.LPCWSTR = if (cwd_w) |w| w.ptr else null;
     const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, cwd_ptr, &si, &pi);
+    const create_error: u32 = if (created == .FALSE) GetLastError() else 0; // 任何后续 Win32 调用都会覆盖它
     // 父端**先**关掉全部可继承句柄副本(out_wr/in_rd/err_wr)再解串行锁——锁窗口 = 可继承
     // 句柄存活期。stdin 写(in_wr 不可继承)移到锁外,大输入阻塞不占全局锁。
     win.CloseHandle(out_wr);
@@ -858,7 +1221,7 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
     if (created == .FALSE) {
         win.CloseHandle(out_rd);
         if (err_rd) |h| win.CloseHandle(h);
-        return error.SpawnFailed;
+        return windowsSpawnFailure(create_error, opts.cwd);
     }
 
     var out = std.ArrayList(u8).empty;
@@ -1105,6 +1468,259 @@ test "capture cwd:子进程 pwd 在指定 cwd 而非父进程 cwd" {
         // 都能满足,会漏掉 chdir 回归。
         try std.testing.expect(std.mem.endsWith(u8, observed, target_dir));
     }
+}
+
+/// Per-process scratch path for the vanishing-cwd tests: `<tmp>/metacodes-proc-<pid>-<name>`.
+fn testScratchPath(a: std.mem.Allocator, buf: []u8, name: []const u8) ![:0]const u8 {
+    var root_owned: ?[]u8 = null;
+    defer if (root_owned) |r| a.free(r);
+    const root: []const u8 = if (is_windows) blk: {
+        root_owned = (std.process.Environ{ .block = .global }).getAlloc(a, "TEMP") catch null;
+        break :blk root_owned orelse "C:\\Windows\\Temp";
+    } else "/tmp";
+    return std.fmt.bufPrintZ(buf, "{s}/metacodes-proc-{d}-{s}", .{ root, currentPid(), name });
+}
+
+/// A directory that really existed and then went away — what an agent does
+/// to its own cwd when it renames or removes it mid-session.
+fn testVanishedDir(a: std.mem.Allocator, buf: []u8, name: []const u8) ![:0]const u8 {
+    const dir = try testScratchPath(a, buf, name);
+    _ = std.c.mkdir(dir.ptr, 0o700);
+    if (std.c.rmdir(dir.ptr) != 0) return error.TestScratchDirNotRemovable;
+    return dir;
+}
+
+test "capture: cwd 在 spawn 前消失 → ChildChdirFailed 带原因,不再伪装成 exit 127" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try testVanishedDir(a, &dir_buf, "vanished-cwd");
+    const argv: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "cmd.exe", "/c", "echo still-ran", null }
+    else
+        &.{ "/bin/sh", "-c", "echo still-ran", null };
+    try std.testing.expectError(error.ChildChdirFailed, capture(argv, a, .{ .cwd = dir, .timeout_ms = 10_000 }));
+    const failure = takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure;
+    try std.testing.expectEqual(SpawnStep.chdir, failure.step);
+    var code_buf: [32]u8 = undefined;
+    if (!is_windows) {
+        try std.testing.expectEqual(@as(i32, @intFromEnum(std.c.E.NOENT)), failure.code);
+        try std.testing.expectEqualStrings("ENOENT", failure.describeCode(&code_buf));
+    }
+    // 取过一次即清空:下一次 spawn 的失败不会被旧记录冒充。
+    try std.testing.expect(takeLastSpawnFailure() == null);
+}
+
+test "capture: 程序不存在 → ChildExecFailed(ENOENT),而不是 exit 127 双空流" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const argv: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "C:\\metacodes-no-such-program.exe", null }
+    else
+        &.{ "/metacodes-no-such-program", null };
+    try std.testing.expectError(error.ChildExecFailed, capture(argv, a, .{ .timeout_ms = 10_000 }));
+    const failure = takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure;
+    try std.testing.expectEqual(SpawnStep.exec, failure.step);
+    if (!is_windows) try std.testing.expectEqual(@as(i32, @intFromEnum(std.c.E.NOENT)), failure.code);
+}
+
+test "capture: 成功的 spawn 不留下上一次的失败记录" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bad: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "C:\\metacodes-no-such-program.exe", null }
+    else
+        &.{ "/metacodes-no-such-program", null };
+    try std.testing.expectError(error.ChildExecFailed, capture(bad, a, .{ .timeout_ms = 10_000 }));
+    // 故意不 take:下一次成功的 spawn 必须自己清掉它。
+    const good: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "cmd.exe", "/c", "echo fine", null }
+    else
+        &.{ "/bin/sh", "-c", "echo fine", null };
+    const r = try capture(good, a, .{ .timeout_ms = 10_000 });
+    defer a.free(r.stdout);
+    defer a.free(r.stderr);
+    try std.testing.expectEqual(@as(i32, 0), r.exit_code);
+    try std.testing.expect(takeLastSpawnFailure() == null);
+}
+
+test "spawnPipes / spawnToFiles: 同一条报告通道,cwd 消失同样返 ChildChdirFailed" {
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try testVanishedDir(a, &dir_buf, "vanished-cwd-2");
+    const argv: []const ?[*:0]const u8 = &.{ "/bin/sh", "-c", "echo still-ran", null };
+    try std.testing.expectError(error.ChildChdirFailed, spawnPipes(argv, true, dir));
+    try std.testing.expectEqual(SpawnStep.chdir, (takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure).step);
+    const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(devnull >= 0);
+    defer _ = std.c.close(devnull);
+    try std.testing.expectError(error.ChildChdirFailed, spawnToFiles(argv, devnull, devnull, dir));
+    try std.testing.expectEqual(SpawnStep.chdir, (takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure).step);
+}
+
+test "runInherit / spawnDetached: 程序不存在 → ChildExecFailed(同一条报告通道)" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const bad: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "C:\\metacodes-no-such-program.exe", null }
+    else
+        &.{ "/metacodes-no-such-program", null };
+    try std.testing.expectError(error.ChildExecFailed, runInherit(bad, true));
+    try std.testing.expectEqual(SpawnStep.exec, (takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure).step);
+    try std.testing.expectError(error.ChildExecFailed, spawnDetached(bad, true));
+    try std.testing.expectEqual(SpawnStep.exec, (takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure).step);
+}
+
+test "capture: 父进程 fd 1/2 已关闭时,子进程 stdout/stderr 接线仍正确(codex R1 #1)" {
+    // 关掉 1/2 会毁掉测试进程自己的输出,所以在 fork 出来的副本里做:副本关 1/2、走一次
+    // capture、把结果经管道交回。父进程关着 stdio 时 pipe() 会把 1/2 发回来,子进程
+    // dup2(2, 1) 之后再 close(out_pipe[1]=2) 就把刚接好的 stderr 关掉了——err-line 丢失。
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    var result_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expect(std.c.pipe(&result_pipe) == 0);
+    const helper = std.c.fork();
+    try std.testing.expect(helper >= 0);
+    if (helper == 0) {
+        _ = std.c.close(result_pipe[0]);
+        _ = std.c.close(1);
+        _ = std.c.close(2);
+        const argv: []const ?[*:0]const u8 = &.{ "/bin/sh", "-c", "echo out-line; echo err-line 1>&2", null };
+        const r = capture(argv, std.heap.page_allocator, .{ .timeout_ms = 10_000 }) catch {
+            _ = std.c.write(result_pipe[1], "spawn-error", 11);
+            std.c._exit(0);
+        };
+        var msg_buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "out={d} err={d} code={d}", .{
+            @intFromBool(std.mem.indexOf(u8, r.stdout, "out-line") != null),
+            @intFromBool(std.mem.indexOf(u8, r.stderr, "err-line") != null),
+            r.exit_code,
+        }) catch "fmt";
+        _ = std.c.write(result_pipe[1], msg.ptr, msg.len);
+        std.c._exit(0);
+    }
+    _ = std.c.close(result_pipe[1]);
+    var buf: [128]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.c.read(result_pipe[0], buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    _ = std.c.close(result_pipe[0]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(helper, &st, 0);
+    try std.testing.expectEqualStrings("out=1 err=1 code=0", buf[0..total]);
+}
+
+/// 测试助手:在 fork 出来的副本里把结论写回父进程后退出。
+fn reportAndExit(fd: std.c.fd_t, msg: []const u8) noreturn {
+    _ = std.c.write(fd, msg.ptr, msg.len);
+    std.c._exit(0);
+}
+
+/// 两个 fd 是否指向同一个文件对象(dev+ino),**原样比较、不做整型转换**:platform/fs.fileInfo
+/// 把 darwin 的 `dev_t`(i32)`@intCast` 成 u64,devfs 上 /dev/null 的 st_dev 在 CI 的 macOS 上
+/// 为负 → 子进程里安全 panic、静默死掉,父端只读到 EOF(CI macOS 一次实红)。Linux 上
+/// `std.c.fstat` 是 void(glibc 不导出该符号),走 statx(AT_EMPTY_PATH)。
+fn sameFile(a: std.c.fd_t, b: std.c.fd_t) bool {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const AT_EMPTY_PATH: u32 = 0x1000;
+        var sa: linux.Statx = undefined;
+        var sb: linux.Statx = undefined;
+        if (@as(isize, @bitCast(linux.statx(a, "", AT_EMPTY_PATH, linux.STATX.BASIC_STATS, &sa))) < 0) return false;
+        if (@as(isize, @bitCast(linux.statx(b, "", AT_EMPTY_PATH, linux.STATX.BASIC_STATS, &sb))) < 0) return false;
+        return sa.ino == sb.ino and sa.dev_major == sb.dev_major and sa.dev_minor == sb.dev_minor;
+    } else {
+        var sa: std.c.Stat = undefined;
+        var sb: std.c.Stat = undefined;
+        if (std.c.fstat(a, &sa) != 0 or std.c.fstat(b, &sb) != 0) return false;
+        return sa.ino == sb.ino and sa.dev == sb.dev;
+    }
+}
+
+/// 读回副本写的结论。
+fn readHelperReport(fd: std.c.fd_t, buf: []u8) []const u8 {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.c.read(fd, buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    return buf[0..total];
+}
+
+test "applyStdioWiring: stdio 全关时的重复低位源({0, hi, 0})各自抬起,接线正确(codex R2 #1)" {
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    var result_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expect(std.c.pipe(&result_pipe) == 0);
+    const helper = std.c.fork();
+    try std.testing.expect(helper >= 0);
+    if (helper == 0) {
+        _ = std.c.close(result_pipe[0]);
+        _ = std.c.close(0);
+        _ = std.c.close(1);
+        _ = std.c.close(2);
+        // 0/1/2 空着:pipe() 拿到 {0,1},open 拿到 2,再 open 一次拿一个 ≥3 的源。
+        var a: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&a) != 0) reportAndExit(result_pipe[1], "pipe-failed");
+        const two = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        const hi = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        if (!(a[0] == 0 and a[1] == 1 and two == 2 and hi >= 3)) reportAndExit(result_pipe[1], "layout-unexpected");
+        // 探针:各源的高位副本(接线会覆盖/关掉原 fd)。
+        const probe_pipe = std.c.dup(a[0]);
+        const probe_hi = std.c.dup(hi);
+        _ = std.c.close(two); // 槽位 2 空出来
+        if (!applyStdioWiring(.{ a[0], hi, a[0] })) reportAndExit(result_pipe[1], "wiring-returned-false");
+        // 0 与 2 都应是管道读端,1 应是 /dev/null。
+        if (!sameFile(0, probe_pipe) or !sameFile(2, probe_pipe) or !sameFile(1, probe_hi)) reportAndExit(result_pipe[1], "miswired");
+        reportAndExit(result_pipe[1], "ok");
+    }
+    _ = std.c.close(result_pipe[1]);
+    var buf: [64]u8 = undefined;
+    const got = readHelperReport(result_pipe[0], &buf);
+    _ = std.c.close(result_pipe[0]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(helper, &st, 0);
+    try std.testing.expectEqualStrings("ok", got);
+}
+
+test "applyStdioWiring: 低位源抬不起来(RLIMIT_NOFILE 收紧 → EMFILE)→ 返回 false,不半接(codex R2 #2)" {
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    var result_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expect(std.c.pipe(&result_pipe) == 0);
+    const helper = std.c.fork();
+    try std.testing.expect(helper >= 0);
+    if (helper == 0) {
+        _ = std.c.close(result_pipe[0]);
+        _ = std.c.close(0);
+        var a: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&a) != 0 or a[0] != 0) reportAndExit(result_pipe[1], "layout-unexpected");
+        // 探针 = 读端自己的副本(同一个打开文件描述;写端在 macOS 上是另一个 inode,不能当探针),
+        // 必须在收紧 rlimit 之前 dup。
+        const probe_pipe = std.c.dup(a[0]);
+        if (probe_pipe < 3) reportAndExit(result_pipe[1], "probe-failed");
+        // pipe()/dup() 各取最低空闲 fd,所以 [3, probe] 此刻全被占着;把软上限设成 probe+1,
+        // F_DUPFD_CLOEXEC(3) 在上限内找不到空位 → EMFILE(上限设成 3 会因 arg ≥ 上限而返 EINVAL,
+        // 测的就不是"没 fd 可用"了)。已开着的 fd 照常可用。
+        var rl: std.c.rlimit = undefined;
+        if (std.c.getrlimit(.NOFILE, &rl) != 0) reportAndExit(result_pipe[1], "getrlimit-failed");
+        rl.cur = @intCast(probe_pipe + 1);
+        if (std.c.setrlimit(.NOFILE, &rl) != 0) reportAndExit(result_pipe[1], "setrlimit-failed");
+        if (applyStdioWiring(.{ a[0], -1, -1 })) reportAndExit(result_pipe[1], "wiring-returned-true");
+        const e = std.c.errno(@as(c_int, -1)); // 紧接着读,后面的 fstat 会盖掉它
+        // 失败时一个槽都不接:0 仍是那条管道的读端,且 errno 说明原因。
+        if (!sameFile(0, probe_pipe)) reportAndExit(result_pipe[1], "slot-touched");
+        if (e != .MFILE and e != .NFILE) reportAndExit(result_pipe[1], "unexpected-errno");
+        reportAndExit(result_pipe[1], "ok");
+    }
+    _ = std.c.close(result_pipe[1]);
+    var buf: [64]u8 = undefined;
+    const got = readHelperReport(result_pipe[0], &buf);
+    _ = std.c.close(result_pipe[0]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(helper, &st, 0);
+    try std.testing.expectEqualStrings("ok", got);
 }
 
 test "capture 超时返 error.Timeout（有缓冲输出，验不 double-free）" {
