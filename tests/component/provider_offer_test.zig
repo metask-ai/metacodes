@@ -436,7 +436,9 @@ test "L2: two clients read the same catalog and selection from one kernel" {
 // ── durable configuration ────────────────────────────────────────────────────
 
 fn tempConfigPath(a: std.mem.Allocator, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(a, "/tmp/metacodes-provider-test-{s}/config.json", .{name});
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const pid = @import("platform").process.currentPid();
+    return std.fmt.allocPrint(a, "{s}/cc-zig-provider-test-{s}-{d}/config.json", .{ cc.util_fs.testing.tmpRoot(&rbuf), name, pid });
 }
 
 fn removeTempDir(path: []const u8) void {
@@ -1205,7 +1207,9 @@ test "L2: a configured provider's declared metadata reaches every client the sam
 // ── provider-scoped OAuth lifecycle ──────────────────────────────────────────
 
 fn oauthTempPath(a: std.mem.Allocator, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(a, "/tmp/metacodes-oauth-l2-{s}.json", .{name});
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const pid = @import("platform").process.currentPid();
+    return std.fmt.allocPrint(a, "{s}/cc-zig-oauth-l2-{s}-{d}.json", .{ cc.util_fs.testing.tmpRoot(&rbuf), name, pid });
 }
 
 test "L2: an expired provider token refreshes over real HTTP and persists the rotation" {

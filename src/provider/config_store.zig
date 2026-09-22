@@ -18,6 +18,7 @@
 //! `crash_after` hook exists so that claim is a test, not a comment.
 
 const std = @import("std");
+const util_fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const fs_util = @import("../util/fs.zig");
@@ -456,9 +457,18 @@ pub fn setSessionSelection(
     });
 }
 
+/// 测试 fixture 路径 `<tmpRoot>/cc-zig-provider-<name>-<pid>`(本子系统不得导入 tools/,
+/// 走 util/fs.zig 的规则源;文件直接放在临时根下,不需要先建目录)。
+fn testFixturePath(buf: []u8, name: []const u8) ![]const u8 {
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const pid = @import("platform").process.currentPid();
+    return std.fmt.bufPrint(buf, "{s}/cc-zig-provider-{s}-{d}", .{ util_fs.testing.tmpRoot(&root_buf), name, pid });
+}
+
 test "an empty idempotency key is rejected rather than matching every other one" {
     const a = std.testing.allocator;
-    const path = "/tmp/metacodes-provider-empty-op-test.json";
+    var path_buf: [512]u8 = undefined;
+    const path = try testFixturePath(&path_buf, "empty-op-test.json");
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
         const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
@@ -508,9 +518,11 @@ test "the home store resolves either the override or the home path" {
 
 test "two sessions keep separate selections and neither touches the other" {
     const a = std.testing.allocator;
+    var dir_a_buf: [512]u8 = undefined;
+    var dir_b_buf: [512]u8 = undefined;
     const dirs = [_][]const u8{
-        "/tmp/metacodes-provider-session-a",
-        "/tmp/metacodes-provider-session-b",
+        try testFixturePath(&dir_a_buf, "session-a"),
+        try testFixturePath(&dir_b_buf, "session-b"),
     };
     var paths: [dirs.len][]u8 = undefined;
     var made: usize = 0;
@@ -564,7 +576,8 @@ test "two sessions keep separate selections and neither touches the other" {
 
 test "a learned credential failure is durable and leaves the other members alone" {
     const a = std.testing.allocator;
-    const path = "/tmp/metacodes-provider-credential-failure.json";
+    var path_buf: [512]u8 = undefined;
+    const path = try testFixturePath(&path_buf, "credential-failure.json");
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
         const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ path, suffix }) catch continue;

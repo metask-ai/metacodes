@@ -745,10 +745,12 @@ test "stripLineNumberPrefix ignores line without tab after digits" {
 
 test "EditTool not-read-first rejects" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-edit-mrf-test.txt";
-    defer _ = std.c.unlink(path);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "edit-mrf-test.txt");
+    var args_buf: [1024]u8 = undefined;
+    defer _ = std.c.unlink(path.ptr);
 
-    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.write(fd, "hello");
     _ = pfs.close(fd);
 
@@ -756,7 +758,7 @@ test "EditTool not-read-first rejects" {
     defer rs.deinit();
 
     const ctx = ToolContext{ .allocator = a, .read_state = &rs };
-    try std.testing.expectError(error.NotRead, execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-mrf-test.txt\",\"old_string\":\"hello\",\"new_string\":\"world\"}"));
+    try std.testing.expectError(error.NotRead, execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"old_string\":\"hello\",\"new_string\":\"world\"}}", .{path})));
 }
 
 test "EditTool stale rejected" {

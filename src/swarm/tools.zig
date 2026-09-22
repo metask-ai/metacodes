@@ -620,7 +620,7 @@ const permission_mod = @import("../permission.zig");
 const json_mod = @import("../json.zig");
 
 fn mkHome(buf: []u8) ![]const u8 {
-    const home = try std.fmt.bufPrint(buf, "/tmp/cc-zig-swtools-{d}", .{util_time.nowNs()});
+    const home = @import("../util/fs.zig").testing.uniqueDir(buf, "cc-zig-swtools");
     try @import("../util/fs.zig").mkdirParents(home);
     return home;
 }
@@ -631,7 +631,7 @@ fn leadCtx(a: std.mem.Allocator, sw: *SwarmContext) ToolContext {
 
 test "TeamCreate → SendMessage(lead→lead 自投拒 via unknown?) + TeamDelete 全链" {
     const a = testing.allocator;
-    var hbuf: [128]u8 = undefined;
+    var hbuf: [256]u8 = undefined;
     const home = try mkHome(&hbuf);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
 
@@ -669,7 +669,7 @@ test "TeamCreate → SendMessage(lead→lead 自投拒 via unknown?) + TeamDelet
 
 test "SendMessage 无 team → NoActiveTeam;非 lead TeamCreate → NotTeamLead" {
     const a = testing.allocator;
-    var hbuf: [128]u8 = undefined;
+    var hbuf: [256]u8 = undefined;
     const home = try mkHome(&hbuf);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
 
@@ -686,7 +686,7 @@ test "SendMessage 无 team → NoActiveTeam;非 lead TeamCreate → NotTeamLead"
 
 test "pollLeadInbox: plain + idle_notification 消费,协议回执留未读" {
     const a = testing.allocator;
-    var hbuf: [128]u8 = undefined;
+    var hbuf: [256]u8 = undefined;
     const home = try mkHome(&hbuf);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
 

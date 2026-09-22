@@ -463,11 +463,10 @@ test "plan mode: 特许写 plan 文件,其它 Write 仍 deny(对齐 cc isSession
 test "memdir 写豁免:子树内任何模式 allow,外部按常规;deny 仍优先(通道 B)" {
     const a = std.testing.allocator;
     // 真建一个 memdir 子树(isAutoMemPath 走 realpath,需真实路径)。
-    const util_time = @import("../util/time.zig");
     const memdir = @import("../core/memory/memdir.zig");
     const fsmod = @import("../util/fs.zig");
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-decision-memdir-{d}", .{util_time.nowMs()});
+    var home_buf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-decision-memdir");
     defer fsmod.testing.rmrfBestEffort(home);
     try memdir.ensureDir(home, "/fake/repo");
     var mdbuf: [std.fs.max_path_bytes]u8 = undefined;

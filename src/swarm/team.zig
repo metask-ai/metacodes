@@ -664,8 +664,8 @@ test "addMember/findMember/removeMember" {
 
 test "save/load 磁盘往返(原子写)" {
     const a = testing.allocator;
-    var dbuf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&dbuf, "/tmp/cc-zig-team-test-{d}", .{util_time.nowNs()});
+    var dbuf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&dbuf, "cc-zig-team-test");
     defer util_fs.testing.rmrfBestEffort(home);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -698,8 +698,8 @@ test "load: 不存在 → null" {
 
 test "updateTeam: 锁内 RMW 生效 + 不存在报 TeamNotFound + mutate 出错不落盘" {
     const a = testing.allocator;
-    var dbuf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&dbuf, "/tmp/cc-zig-team-upd-{d}", .{util_time.nowNs()});
+    var dbuf: [256]u8 = undefined;
+    const home = @import("../util/fs.zig").testing.uniqueDir(&dbuf, "cc-zig-team-upd");
     defer util_fs.testing.rmrfBestEffort(home);
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
     try util_fs.mkdirParents(teamDirPath(home, "proj", &dirbuf));

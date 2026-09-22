@@ -8,6 +8,7 @@
 //! 调用方（loop.zig）负责：唯一候选直接补全；多候选打印列表 + 补到公共前缀。
 
 const std = @import("std");
+const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
 
@@ -261,36 +262,45 @@ test "commonPrefix" {
 }
 
 test "path completion finds known file" {
-    // /tmp 一定存在；造一个唯一前缀文件
-    const path = "/tmp/cc-zig-complete-uniq-xyz.txt";
-    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    // 每进程唯一目录里造一个唯一前缀文件
+    var dir_buf: [512]u8 = undefined;
+    const dir = tt.dir(&dir_buf);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "complete-uniq-xyz.txt");
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
-    var r = try compute(testing.allocator, "cat /tmp/cc-zig-complete-uniq-", 30);
-    defer r.deinit(testing.allocator);
-    try testing.expect(r.candidates.len >= 1);
-    var found = false;
-    for (r.candidates) |c| {
-        if (std.mem.eql(u8, c, "cc-zig-complete-uniq-xyz.txt")) found = true;
-    }
-    try testing.expect(found);
-}
-
-test "@-mention completion finds file" {
-    const path = "/tmp/cc-zig-atmention-uniq.txt";
-    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = pfs.close(fd);
-    defer _ = std.c.unlink(path);
-
-    // 输入 "review @/tmp/cc-zig-atmention-" → 补全应找到文件,replace_start 在 @ 之后
-    const line = "review @/tmp/cc-zig-atmention-";
+    var line_buf: [600]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "cat {s}/complete-uniq-", .{dir});
     var r = try compute(testing.allocator, line, line.len);
     defer r.deinit(testing.allocator);
     try testing.expect(r.candidates.len >= 1);
     var found = false;
     for (r.candidates) |c| {
-        if (std.mem.eql(u8, c, "cc-zig-atmention-uniq.txt")) found = true;
+        if (std.mem.eql(u8, c, "complete-uniq-xyz.txt")) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "@-mention completion finds file" {
+    var dir_buf: [512]u8 = undefined;
+    const dir = tt.dir(&dir_buf);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "atmention-uniq.txt");
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.close(fd);
+    defer _ = std.c.unlink(path.ptr);
+
+    // 输入 "review @<dir>/atmention-" → 补全应找到文件,replace_start 在 @ 之后
+    var line_buf: [600]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "review @{s}/atmention-", .{dir});
+    var r = try compute(testing.allocator, line, line.len);
+    defer r.deinit(testing.allocator);
+    try testing.expect(r.candidates.len >= 1);
+    var found = false;
+    for (r.candidates) |c| {
+        if (std.mem.eql(u8, c, "atmention-uniq.txt")) found = true;
     }
     try testing.expect(found);
     // replace_start 指向 @ 后的 / (保留 @ 前缀不被覆盖)

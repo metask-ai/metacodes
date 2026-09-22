@@ -174,12 +174,21 @@ fn rmrfSafeImpl(path: []const u8, depth_left: u32) void {
 /// 测试专用 helpers。放在命名空间里，避免 pub API 鼓励生产误用。
 pub const testing = struct {
     /// 类 `rm -rf` 递归删除。
-    /// **安全护栏**：路径必须以 `/tmp/cc-zig-` 前缀开头，否则直接返回不做事。
-    /// 避免测试代码误删用户数据。
-    /// best-effort：遇到错误跳过，不 return。仅用于测试 cleanup。
+    /// **安全护栏**:路径必须位于 `<tmpRoot>/cc-zig-*`(见 `isFixturePath`),否则直接返回
+    /// 不做事,避免测试代码误删用户数据。POSIX 上即老规则 `/tmp/cc-zig-`;Windows 上是
+    /// `%TEMP%/cc-zig-`——老规则在那里永远不匹配,cleanup 曾是静默 no-op。
+    /// best-effort:遇到错误跳过,不 return。仅用于测试 cleanup。
     pub fn rmrfBestEffort(path: []const u8) void {
-        if (!std.mem.startsWith(u8, path, "/tmp/cc-zig-")) return;
-        rmrfImpl(path, 32); // 32 层深度上限：防对抗性路径栈溢出；测试数据远低于此
+        var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+        if (!isFixturePath(path, &rbuf)) return;
+        rmrfImpl(path, 32); // 32 层深度上限:防对抗性路径栈溢出;测试数据远低于此
+    }
+
+    /// `path` 是否落在 `<tmpRoot>/cc-zig-` 之下——测试 fixture 的唯一合法家。
+    pub fn isFixturePath(path: []const u8, buf: []u8) bool {
+        const root = tmpRoot(buf);
+        if (!std.mem.startsWith(u8, path, root)) return false;
+        return std.mem.startsWith(u8, path[root.len..], "/cc-zig-");
     }
 
     /// 内部递归实现。深度上限防对抗性场景（虽然前缀护栏已限制到 /tmp/cc-zig-*，
@@ -245,11 +254,23 @@ pub const testing = struct {
     }
 
     /// `<tmpRoot>/<tag>-<pid>`,NUL 结尾写进 buf。固定路径被并行的测试进程共用会互相踩;
-    /// 每个进程一个自己的目录。调用方负责 mkdir 与清理。
+    /// 每个进程一个自己的目录。调用方负责 mkdir 与清理。`tag` 须以 `cc-zig-` 开头,
+    /// 否则 `rmrfBestEffort` 的护栏会拒绝清理它。
     pub fn perPidDir(buf: []u8, tag: []const u8) [:0]const u8 {
+        std.debug.assert(std.mem.startsWith(u8, tag, "cc-zig-"));
         var rbuf: [std.fs.max_path_bytes]u8 = undefined;
         const pid = @import("platform").process.currentPid();
         return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}", .{ tmpRoot(&rbuf), tag, pid }) catch unreachable;
+    }
+
+    /// `<tmpRoot>/<tag>-<pid>-<单调纳秒>`:同一进程内多次调用也互不相同(同一 helper 被
+    /// 多个用例反复 setup 时用这个;只需进程级隔离用 `perPidDir`)。规则同上。
+    pub fn uniqueDir(buf: []u8, tag: []const u8) [:0]const u8 {
+        std.debug.assert(std.mem.startsWith(u8, tag, "cc-zig-"));
+        var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const pid = @import("platform").process.currentPid();
+        const ns = @import("time.zig").nowNs();
+        return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}-{d}", .{ tmpRoot(&rbuf), tag, pid, ns }) catch unreachable;
     }
 };
 
@@ -257,7 +278,7 @@ pub const testing = struct {
 // Tests
 // ============================================================================
 
-test "testing.perPidDir: root + tag + pid, forward slashes only, NUL-terminated" {
+test "testing.perPidDir / uniqueDir: root + tag + pid, forward slashes, NUL-terminated, guard accepts them" {
     var buf: [512]u8 = undefined;
     const d = testing.perPidDir(&buf, "cc-zig-fs-selftest");
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -265,15 +286,36 @@ test "testing.perPidDir: root + tag + pid, forward slashes only, NUL-terminated"
     try std.testing.expect(std.mem.indexOf(u8, d, "/cc-zig-fs-selftest-") != null);
     try std.testing.expect(std.mem.indexOf(u8, d, "\\") == null);
     try std.testing.expect(d[d.len] == 0);
+    try std.testing.expect(testing.isFixturePath(d, &rbuf));
+
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    const first = testing.uniqueDir(&b1, "cc-zig-fs-selftest");
+    const second = testing.uniqueDir(&b2, "cc-zig-fs-selftest");
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(testing.isFixturePath(first, &rbuf));
+}
+
+test "testing.isFixturePath: refuses anything outside <tmpRoot>/cc-zig-" {
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect(!testing.isFixturePath("/", &rbuf));
+    try std.testing.expect(!testing.isFixturePath("/home/alice/cc-zig-x", &rbuf));
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined; // 独立于 rbuf:isFixturePath 会改写 rbuf
+    const root = testing.tmpRoot(&root_buf);
+    var b1: [512]u8 = undefined;
+    const outside = try std.fmt.bufPrint(&b1, "{s}/metacodes-not-a-fixture", .{root});
+    try std.testing.expect(!testing.isFixturePath(outside, &rbuf));
+    var b2: [512]u8 = undefined;
+    const sibling = try std.fmt.bufPrint(&b2, "{s}-evil/cc-zig-x", .{root});
+    try std.testing.expect(!testing.isFixturePath(sibling, &rbuf));
 }
 
 const pfs = @import("platform").fs;
 
 test "removeTeamDirTree: 删 teams 子树 + 护栏拒非 teams 路径 + 不跟随 symlink" {
-    const util_time = @import("time.zig");
-    var hb: [128]u8 = undefined;
-    // 造 {home}/.metacodes/teams/proj/{config.json, inboxes/bob.json}(home 在 /tmp/cc-zig-)。
-    const home = std.fmt.bufPrint(&hb, "/tmp/cc-zig-rmteam-{d}", .{util_time.nowNs()}) catch unreachable;
+    var hb: [256]u8 = undefined;
+    // 造 {home}/.metacodes/teams/proj/{config.json, inboxes/bob.json}(home 在 <tmpRoot>/cc-zig-)。
+    const home = testing.uniqueDir(&hb, "cc-zig-rmteam");
     var db: [512]u8 = undefined;
     const teamdir = std.fmt.bufPrint(&db, "{s}/.metacodes/teams/proj", .{home}) catch unreachable;
     var ib: [600]u8 = undefined;
@@ -316,8 +358,10 @@ test "removeTeamDirTree: `..` 穿越被拒" {
 }
 
 test "mkdirParents creates nested dirs" {
-    const root = "/tmp/cc-zig-mkdirp-test-root";
-    const tmp = root ++ "/a/b/c/d";
+    var root_buf: [512]u8 = undefined;
+    const root = testing.perPidDir(&root_buf, "cc-zig-mkdirp-test-root");
+    var tmp_buf: [600]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}/a/b/c/d", .{root});
     defer testing.rmrfBestEffort(root);
     try mkdirParents(tmp);
     // 再调一次应该静默成功（幂等）
