@@ -417,6 +417,9 @@ fn shellDispatchImpl(self: *SessionService, alloc: std.mem.Allocator, command: [
 /// 宿主专属字段(ui_requester、run_control 三件套、eval gate/policy、max_turns、
 /// spawn_tick_fn)由宿主在返回值上补;emit_tool_cards 默认开,WriterBackend 宿主可关。
 pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) agent_loop.Options {
+    // 会话根目录的唯一校验点:改名了就先跟过去,再装配(cwd_abs / project_dir / system_prompt
+    // 都在这之后读)。REPL 在自己的 run 前也调它以便打印一行;这里的再次调用是 no-op。
+    _ = app.refreshWorkspaceRoot();
     return .{
         .session = app.session_id,
         .verbose = app.config.verbose,

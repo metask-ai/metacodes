@@ -772,6 +772,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
         const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
+        // 会话根目录跟着改名走:这里是唯一向用户说一句的地方(buildRunOptions 里的再次调用是 no-op)。
+        switch (app.refreshWorkspaceRoot()) {
+            .unchanged => {},
+            .renamed => |now| std.debug.print("working directory was renamed; now {s}\n", .{now}),
+            .missing => if (!app.root_missing_warned) {
+                app.root_missing_warned = true;
+                std.debug.print("working directory {s} no longer exists; shell commands will fail until it is restored\n", .{app.cwdAbs()});
+            },
+        }
         // U11:App 可导出字段统一走 canonical buildRunOptions(五处前端装配漂移的收敛点);
         // 宿主专属字段(eval gate/policy、run_control 三件套、预算、UI requester、心跳)在此补。
         var run_opts = session_service.buildRunOptions(app, scoped_recall);
