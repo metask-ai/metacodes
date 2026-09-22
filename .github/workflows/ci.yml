@@ -111,6 +111,12 @@ jobs:
       # protect.
       - name: Install Python development dependencies
         run: python3 -m pip install --break-system-packages -r requirements-dev.txt
+      # A version without -dev is legal only on its tagged commit, the release
+      # PR, or main's run of the release merge commit; in the latter two the
+      # gate tags HEAD locally so the release-layout steps below can run the
+      # stable channel on the candidate (doc/RELEASE_AUTOMATION_DESIGN.md §3).
+      - name: Version state gate and release rehearsal
+        run: python3 scripts/check_version_state.py --rehearse
       - name: TinyKG binary-contract unit tests
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
       - name: ripgrep binary-contract unit tests
@@ -197,6 +203,8 @@ jobs:
         run: python3 -m unittest scripts.tests.test_verify_kernel_provenance -v
       - name: Python floor unit tests
         run: python3 -m unittest scripts.tests.test_python_floor -v
+      - name: Release cut unit tests
+        run: python3 -m unittest scripts.tests.test_release_cut -v
       - name: Diff whitespace check
         run: git diff --check
 
@@ -253,6 +261,9 @@ jobs:
           zig test src/platform/net.zig -lc &&
           zig test src/platform/dir.zig -lc &&
           zig test src/platform/exe_lookup.zig -lc
+      - name: Version state gate and release rehearsal
+        shell: cmd
+        run: python scripts\check_version_state.py --rehearse
       - name: Verify native bundle and fresh-store contract
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage

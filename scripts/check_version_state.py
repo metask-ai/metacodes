@@ -11,7 +11,13 @@ CI run it. Between releases (`X.Y.Z-dev`) it is a no-op.
 
 Head branch detection: `GITHUB_HEAD_REF` (pull_request events check out a
 merge commit, so the branch name is only in the environment), else
-`git rev-parse --abbrev-ref HEAD`. Python 3.9, stdlib only.
+`git rev-parse --abbrev-ref HEAD`. Tags: `actions/checkout` with
+`fetch-depth: 0` fetches every branch and tag, so no fetch is needed here.
+
+`--rehearse` (CI only): on a release PR head or on main's run of the release
+merge commit, tag HEAD locally so `release:verify` / `release:archive` can run
+the stable channel on the candidate before the real tag exists (design §3 C).
+Python 3.9, stdlib only.
 """
 from __future__ import annotations
 
@@ -39,17 +45,9 @@ def check(root: Path, head_ref: str) -> str:
     version = match.group(1)
     if version.endswith("-dev"):
         return ""
-    # CI checkouts fetch no tags (ci.yml: fetch-depth 0 without fetch-tags);
-    # try to see them, but do not depend on the network being there.
-    git("fetch", "--quiet", "--tags", "--no-recurse-submodules", "origin", root=root)
     if git("describe", "--tags", "--exact-match", "HEAD", root=root) == version:
         return ""
-    if head_ref == f"release/{version}":
-        return ""
-    # main's own run on the release PR's merge commit: release-tag.yml tags
-    # this very commit concurrently, so the tag may not exist yet.
-    subject = git("log", "-1", "--format=%s", "HEAD", root=root)
-    if re.match(r"^Merge pull request #\d+ from \S+/release/" + re.escape(version) + r"$", subject):
+    if rehearsable(root, version, head_ref):
         return ""
     return (
         f"build.zig.zon says {version} (no -dev) but HEAD is not tagged {version} and the head branch "
@@ -58,12 +56,47 @@ def check(root: Path, head_ref: str) -> str:
     )
 
 
+def rehearsable(root: Path, version: str, head_ref: str) -> bool:
+    """The two legitimate untagged bare-version states: the release PR itself
+    (head `release/<version>`) and main's own run on its merge commit, which
+    release-tag.yml is tagging concurrently."""
+    if head_ref == f"release/{version}":
+        return True
+    subject = git("log", "-1", "--format=%s", "HEAD", root=root)
+    return re.match(r"^Merge pull request #\d+ from \S+/release/" + re.escape(version) + r"$", subject) is not None
+
+
+def rehearse(root: Path, head_ref: str) -> str:
+    """`--rehearse`: in a rehearsable state, create the release tag *locally*
+    (never pushed) so the existing release chain (`release:manifest` stable
+    channel: clean tree + `git describe --exact-match`) can run on the
+    candidate exactly as it will on the tag. Returns what was done."""
+    match = ZON_VERSION_RE.search((root / "build.zig.zon").read_text(encoding="utf-8"))
+    version = match.group(1) if match else ""
+    if not version or version.endswith("-dev"):
+        return "no rehearsal needed (development version)"
+    if git("describe", "--tags", "--exact-match", "HEAD", root=root) == version:
+        return f"HEAD already carries tag {version}"
+    if not rehearsable(root, version, head_ref):
+        return ""
+    proc = subprocess.run(["git", "tag", version, "HEAD"], cwd=str(root), capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        return ""
+    return f"rehearsal: tagged HEAD as {version} locally (not pushed)"
+
+
 def main() -> int:
     head_ref = os.environ.get("GITHUB_HEAD_REF") or git("rev-parse", "--abbrev-ref", "HEAD", root=ROOT)
     finding = check(ROOT, head_ref)
     if finding:
         print(f"check_version_state: {finding}", file=sys.stderr)
         return 1
+    if "--rehearse" in sys.argv[1:]:
+        done = rehearse(ROOT, head_ref)
+        if not done:
+            print("check_version_state: cannot rehearse this state", file=sys.stderr)
+            return 1
+        print(done)
     print("version state ok")
     return 0
 

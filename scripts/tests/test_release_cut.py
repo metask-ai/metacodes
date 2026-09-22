@@ -159,11 +159,20 @@ class ChangelogTest(unittest.TestCase):
         self.assertEqual(restored.splitlines().count("## Unreleased"), 1)
         self.assertEqual(rc.ensure_unreleased(restored), restored)
 
-    def test_real_changelog_is_cuttable(self):
-        text = (ROOT / rc.CHANGELOG).read_text(encoding="utf-8")
-        new, section = rc.rewrite_changelog(text, "9.9.9", "2026-01-01")
-        self.assertIn("## 9.9.9 — 2026-01-01", new)
-        self.assertGreater(len(section.splitlines()), 3)
+    def test_real_changelog_has_the_shape_the_cut_parses(self):
+        # Structural only: right after a cut the real Unreleased block is empty
+        # by design, so cut eligibility is tested on the fixture, not here.
+        lines = (ROOT / rc.CHANGELOG).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines.count(rc.UNRELEASED), 1)
+        releases = [l for l in lines if rc.RELEASE_HEADING_RE.match(l)]
+        self.assertIn("## 0.1.0 — 2026-08-29", releases)
+        self.assertLess(lines.index(rc.UNRELEASED), lines.index(releases[0]))
+        start = lines.index(rc.UNRELEASED)
+        end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("## "))
+        for line in lines[start + 1:end]:
+            if line.startswith("### "):
+                self.assertIn(line[4:], rc.SUBSECTIONS, line)
+        self.assertEqual(rc.release_section("\n".join(lines) + "\n", "0.1.0").splitlines()[0], "## 0.1.0 — 2026-08-29")
 
     def test_pr_body_lists_drivers_and_unknowns(self):
         body = rc.pr_body("0.2.0", "minor", "## 0.2.0 — d\n\n- x\n", {"minor": ["feat: a"], "patch": ["fix: b"]}, ["merge main"])
@@ -216,6 +225,17 @@ class ThrowawayRepoTest(unittest.TestCase):
         self.assertEqual(check_version_state.check(self.root, "main"), "")
         _commit(self.root, "fix: landed in the window")  # bare version, HEAD no longer the tagged commit
         self.assertIn("mid-flight", check_version_state.check(self.root, "main"))
+
+    def test_rehearsal_tags_only_the_legitimate_states_locally(self):
+        self.assertIn("no rehearsal needed", check_version_state.rehearse(self.root, "main"))
+        _git("checkout", "-q", "-b", "release/0.2.0", cwd=self.root)
+        self._set_version("0.2.0", "release: 0.2.0")
+        self.assertIn("tagged HEAD as 0.2.0 locally", check_version_state.rehearse(self.root, "release/0.2.0"))
+        self.assertEqual(_git("describe", "--tags", "--exact-match", "HEAD", cwd=self.root), "0.2.0")
+        self.assertIn("already carries", check_version_state.rehearse(self.root, "release/0.2.0"))
+        _git("tag", "-d", "0.2.0", cwd=self.root)
+        _commit(self.root, "fix: unrelated on a bare version")
+        self.assertEqual(check_version_state.rehearse(self.root, "some/other-branch"), "")
 
     def test_commit_messages_and_merge_discipline(self):
         _git("checkout", "-q", "-b", "topic", cwd=self.root)

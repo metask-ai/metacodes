@@ -12,6 +12,7 @@ name: Release tag
 on:
   pull_request_target:
     types: [closed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -21,6 +22,7 @@ jobs:
     name: Tag the merged release PR
     if: >-
       github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
       contains(github.event.pull_request.labels.*.name, 'release') &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.title, 'release: ')
@@ -31,6 +33,7 @@ jobs:
       actions: write # dispatch release.yml
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }} # no checkout: gh needs the repository named explicitly
       MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
       PR_TITLE: ${{ github.event.pull_request.title }}
     steps:
@@ -39,10 +42,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${PR_TITLE#release: }"
-          case "$version" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "title version '$version' is not a bare X.Y.Z" >&2; exit 1 ;;
-          esac
+          if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "title version '$version' is not a bare X.Y.Z" >&2; exit 1
+          fi
           zon=$(gh api "repos/${GITHUB_REPOSITORY}/contents/build.zig.zon?ref=${MERGE_SHA}" --jq .content | base64 -d)
           declared=$(printf '%s' "$zon" | sed -nE 's/.*\.version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' | head -1)
           if [ "$declared" != "$version" ]; then
@@ -75,4 +77,4 @@ jobs:
         # exception. The run uses the workflow file at the tag.
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: gh workflow run release.yml --ref "$VERSION" -f tag="$VERSION" -f dry_run=false
+        run: gh workflow run release.yml --repo "$GH_REPO" --ref "$VERSION" -f tag="$VERSION" -f dry_run=false

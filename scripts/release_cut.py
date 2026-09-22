@@ -228,11 +228,19 @@ def run(argv: Sequence[str], cwd: Path, check: bool = True) -> str:
 
 
 def require_clean_main(root: Path) -> None:
+    """Clean tree, on main, and main == freshly fetched origin/main: the cut
+    must classify the commits that are actually on the remote, and the reopen
+    must see the tag stage B created."""
     if run(["git", "status", "--porcelain", "--untracked-files=no"], root).strip():
         raise CutError("working tree has modifications; commit or stash them first")
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], root).strip()
     if branch != "main":
         raise CutError(f"run this on main (currently on {branch})")
+    run(["git", "fetch", "--quiet", "--tags", "origin", "main"], root)
+    head = run(["git", "rev-parse", "HEAD"], root).strip()
+    remote = run(["git", "rev-parse", "origin/main"], root).strip()
+    if head != remote:
+        raise CutError(f"main ({head[:8]}) is not at origin/main ({remote[:8]}); pull --ff-only first")
 
 
 def last_tag(root: Path) -> str:
@@ -287,10 +295,40 @@ def apply_version(root: Path, version: str) -> None:
     write(root, VERSION_ZIG, set_version_text(read(root, VERSION_ZIG), ZIG_VERSION_RE, version, VERSION_ZIG))
 
 
+def open_release_prs(root: Path) -> List[Tuple[int, str]]:
+    """(number, head branch) of every open PR labelled `release`."""
+    out = run(["gh", "pr", "list", "--state", "open", "--label", "release", "--json", "number,headRefName", "--jq", ".[] | \"\\(.number) \\(.headRefName)\""], root)
+    prs = []
+    for line in out.splitlines():
+        number, _, head = line.partition(" ")
+        if number.isdigit():
+            prs.append((int(number), head))
+    return prs
+
+
+def branch_was_merged(root: Path, branch: str) -> bool:
+    out = run(["gh", "pr", "list", "--state", "merged", "--head", branch, "--json", "number", "--jq", "length"], root).strip()
+    return out.isdigit() and int(out) > 0
+
+
 def open_pr(root: Path, branch: str, title: str, body: str, label: Optional[str], dry_run: bool) -> None:
+    """Commit the generated files on `branch`, push, and create the PR — or
+    update the body of the open PR that already has this head. Refuses when
+    a different release PR is open (one cut in flight) or when this branch
+    name already went through a merged PR (a version is released once)."""
     files = [ZON, VERSION_ZIG, CHANGELOG, PROTOCOL]
+    existing = None
+    if label == "release":
+        for number, head in open_release_prs(root):
+            if head == branch:
+                existing = number
+            else:
+                raise CutError(f"release PR #{number} ({head}) is already open; finish or close it before cutting another version")
+    if branch_was_merged(root, branch):
+        raise CutError(f"branch {branch} already went through a merged PR; a version is released once")
     if dry_run:
-        print(f"[dry-run] would commit {files} on {branch}, push --force-with-lease, and open PR {title!r}")
+        action = f"update PR #{existing}" if existing else f"open PR {title!r}"
+        print(f"[dry-run] would commit {files} on {branch}, push --force-with-lease, and {action}")
         return
     run(["git", "checkout", "-B", branch], root)
     run(["git", "add", "--"] + files, root)
@@ -299,10 +337,14 @@ def open_pr(root: Path, branch: str, title: str, body: str, label: Optional[str]
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as handle:
         handle.write(body)
         body_path = handle.name
-    argv = ["gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body-file", body_path]
-    if label:
-        argv += ["--label", label]
-    print(run(argv, root).strip())
+    if existing:
+        run(["gh", "pr", "edit", str(existing), "--title", title, "--body-file", body_path], root)
+        print(f"updated PR #{existing}")
+    else:
+        argv = ["gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body-file", body_path]
+        if label:
+            argv += ["--label", label]
+        print(run(argv, root).strip())
     run(["git", "checkout", "main"], root)
 
 
@@ -354,9 +396,17 @@ def cmd_reopen(root: Path, reopen_level: str, dry_run: bool) -> int:
     released, _ = current_versions(root)
     if released.endswith("-dev"):
         raise CutError(f"{ZON} already carries {released}; nothing to reopen")
-    tagged = run(["git", "tag", "--list", released], root).strip()
-    if tagged != released:
-        raise CutError(f"tag {released} does not exist yet; let release-tag.yml tag the merge commit first")
+    # The tag must exist on the remote (stage B creates it there) and point at
+    # a commit main already contains: a local tag with the right name is not
+    # evidence, and a remote tag elsewhere means a different release happened.
+    remote = run(["git", "ls-remote", "--tags", "origin", f"{released}^{{}}", released], root)
+    shas = [line.split()[0] for line in remote.splitlines() if line.strip()]
+    if not shas:
+        raise CutError(f"tag {released} does not exist on origin yet; let release-tag.yml tag the merge commit first")
+    peeled = shas[0]
+    ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", peeled, "HEAD"], cwd=str(root), capture_output=True)
+    if ancestor.returncode != 0:
+        raise CutError(f"tag {released} on origin points at {peeled[:8]}, which is not on this main")
     target = next_dev(released, reopen_level)
     print(f"reopening development at {target}")
     if dry_run:

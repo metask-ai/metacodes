@@ -205,10 +205,9 @@ jobs:
         # version is ever drafted, and its version state must be consistent.
         run: |
           set -euo pipefail
-          case "$RELEASE_REF" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "release ref '$RELEASE_REF' is not a bare X.Y.Z tag; pre-channel builds are never published" >&2; exit 1 ;;
-          esac
+          if ! [[ "$RELEASE_REF" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release ref '$RELEASE_REF' is not a bare X.Y.Z tag; pre-channel builds are never published" >&2; exit 1
+          fi
           test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
           python3 scripts/check_version_state.py
       - name: SHA256SUMS over every archive
@@ -218,12 +217,17 @@ jobs:
       - name: Create or update the draft release (a human publishes it)
         env:
           GH_TOKEN: ${{ github.token }}
-        # Rerun-safe: a rerun after a failed upload updates the existing draft
-        # (--clobber) instead of failing on `create`; the archives were rebuilt
-        # from the immutable tag, never reused from expired artifacts.
+        # Rerun-safe: a rerun after a failed upload updates the existing
+        # *draft* (--clobber) instead of failing on `create`; the archives were
+        # rebuilt from the immutable tag, never reused from expired artifacts.
+        # A release a human already published is immutable here: the job stops
+        # without touching it.
         run: |
           set -euo pipefail
           if gh release view "$RELEASE_REF" >/dev/null 2>&1; then
+            if [ "$(gh release view "$RELEASE_REF" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "release $RELEASE_REF is already published; refusing to modify it" >&2; exit 1
+            fi
             gh release upload "$RELEASE_REF" --clobber "$RUNNER_TEMP"/dist/*
             gh release edit "$RELEASE_REF" --draft --title "metacodes $RELEASE_REF" --notes-file "$RUNNER_TEMP/notes.md"
           else

@@ -123,11 +123,23 @@ month. The script (Python 3.9, stdlib only, tested under `scripts/tests/`):
    subjects and changelog text can never become flags or commands.
 
 The PR is gated by the ordinary ruleset (four required checks, branch up to
-date). Merging it is the human decision that a release happens.
+date). Its merge commit carries the bare version before any tag exists, which
+the existing chain refuses (`release:manifest` stable channel needs `git
+describe --exact-match`); CI therefore runs `check_version_state.py
+--rehearse` first, which on a `release/<version>` head (and on main's own run
+of the release merge commit) tags HEAD **locally, never pushed**, so
+`release:verify` / `release:archive` exercise the candidate exactly as the
+tag build will. Re-running the cut updates the open release PR in place; a
+second, different release PR is refused (one cut in flight), and a branch that
+already went through a merged PR is refused (a version is released once). The
+script also requires `main` to equal freshly fetched `origin/main`. Merging
+the PR is the human decision that a release happens.
 
 ### Stage B — tag (`release-tag.yml`)
 
-`on: pull_request_target: types: [closed]` — not `pull_request`: a
+`on: pull_request_target: types: [closed], branches: [main]` (and
+`base.ref == 'main'` in the job condition, so a labelled PR merged into an
+unprotected branch cannot mint a tag) — not `pull_request`: a
 `pull_request` run executes the workflow file from the PR's merge commit, so a
 PR that edited `release-tag.yml` would run its own edit with the write token
 below. `pull_request_target` runs the file from the base branch, and the job
@@ -176,9 +188,10 @@ changelog rewrite imposes no parser contract on the bundle. Two changes to
   (fixes gap §9.3: `release_sums.py` and `gh release create` never see a
   branch name). Concurrency groups on `RELEASE_REF`.
 - reruns are safe: `gh release view <tag>` decides between `create --draft` and
-  `upload --clobber` onto the existing draft; because build artifacts expire
-  after seven days, a rerun always rebuilds from the immutable tag rather than
-  reusing artifacts.
+  `upload --clobber` onto the existing draft, and a release a human already
+  published (`isDraft == false`) is immutable to the job, which stops instead;
+  because build artifacts expire after seven days, a rerun always rebuilds
+  from the immutable tag rather than reusing artifacts.
 - release notes come from the CHANGELOG section for that version
   (`scripts/release_notes.py <version>` prints it) instead of the fixed
   sentence; the draft is still published by a human.
@@ -248,6 +261,9 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 - **Draft exists / artifacts expired**: rerun rebuilds from the tag and updates
   the existing draft (§3 C).
 - **Malformed changelog**: the cut refuses with the line; nothing is pushed.
+- **Stale clone**: the cut and the reopen refuse unless `main` equals freshly
+  fetched `origin/main`; the reopen also requires the tag to exist on origin
+  and to point at a commit `main` contains.
 
 ## 7. Follow-ups scheduled, not designed here
 
@@ -325,3 +341,13 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
   changed: a `workflow_dispatch` run uses the workflow file at the dispatched
   ref (the file must also exist on the default branch), so the build procedure
   is pinned by the tag.
+- Round 3 (Codex on the implementation): `gh workflow run` needs `GH_REPO`
+  without a checkout; the release PR could never pass `release:verify` /
+  `release:archive` on its untagged merge commit (rehearsal tag, above); the
+  real-changelog test demanded a non-empty Unreleased block, which every cut
+  empties; reruns could clobber a published release (draft-only now);
+  `pull_request_target` gained `branches: [main]` + a base check; shell globs
+  accepted `0.2.0-dev` as a bare version (anchored regex); the gate was in
+  `doc:check` but `ci.yml` runs scripts individually (explicit step, both
+  platforms); cut reruns update the open PR and refuse a second cut; cut and
+  reopen verify against a fresh `origin/main` and the remote tag.
