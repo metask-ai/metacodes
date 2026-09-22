@@ -53,6 +53,18 @@ pub const SpawnFailure = struct {
     /// errno on POSIX; the Win32 error code on Windows.
     code: i32,
 
+    /// The path named nothing: POSIX `ENOENT`, Win32 `ERROR_FILE_NOT_FOUND` /
+    /// `ERROR_PATH_NOT_FOUND` / `ERROR_DIRECTORY`. Only this reading licenses a
+    /// "renamed or removed" diagnosis; `EACCES`, `ENOTDIR`, `ENAMETOOLONG` are
+    /// different stories and are reported as what they are.
+    pub fn isNotFound(self: SpawnFailure) bool {
+        if (is_windows) {
+            return self.code == ERROR_FILE_NOT_FOUND or self.code == ERROR_PATH_NOT_FOUND or self.code == ERROR_DIRECTORY;
+        } else {
+            return self.code == @intFromEnum(std.c.E.NOENT);
+        }
+    }
+
     /// Symbolic form for diagnostics: "ENOENT" on POSIX, "Win32 error 267" on Windows.
     pub fn describeCode(self: SpawnFailure, buf: []u8) []const u8 {
         if (is_windows) {
@@ -169,9 +181,7 @@ pub fn runInherit(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!
     _ = std.c.close(report.wr);
     g_fork_serial.unlock();
     if (awaitChildReport(report, pid)) |failure| return spawnFailureError(failure);
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
-    return posixExitCode(status);
+    return posixExitCode(waitpidRetry(pid));
 }
 
 /// spawn argv、**detached**（关闭 stdio、不等待，fire-and-forget，如打开浏览器）。
@@ -304,7 +314,7 @@ pub const PipeChild = struct {
             const WNOHANG: c_int = 1;
             if (std.c.waitpid(self.proc, &status, WNOHANG) == 0) {
                 _ = std.c.kill(-self.proc, std.c.SIG.KILL);
-                _ = std.c.waitpid(self.proc, &status, 0);
+                _ = waitpidRetry(self.proc);
             }
         }
     }
@@ -343,17 +353,10 @@ fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]cons
     }
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
-        _ = std.c.dup2(in_pipe[0], 0);
-        _ = std.c.dup2(out_pipe[1], 1);
-        _ = std.c.close(in_pipe[0]);
         _ = std.c.close(in_pipe[1]);
         _ = std.c.close(out_pipe[0]);
-        _ = std.c.close(out_pipe[1]);
         const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-        if (devnull >= 0) {
-            _ = std.c.dup2(devnull, 2);
-            if (devnull != 2) _ = std.c.close(devnull);
-        }
+        applyStdioWiring(.{ in_pipe[0], out_pipe[1], devnull });
         execChild(argv, inherit_env, cwd, report.wr);
     }
     _ = std.c.close(in_pipe[0]); // 父不读 stdin pipe
@@ -512,10 +515,8 @@ pub fn spawnToFilesWithEnv(
     }
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
-        _ = std.c.dup2(out_fd, 1);
-        _ = std.c.dup2(err_fd, 2);
-        _ = std.c.close(out_fd);
-        _ = std.c.close(err_fd);
+        // out_fd/err_fd 是调用方开的落盘文件:父进程关着 stdio 时它们也可能落在 0..2。
+        applyStdioWiring(.{ -1, out_fd, err_fd });
         execChild(argv, inherit_env, cwd, report.wr);
     }
     _ = std.c.close(report.wr);
@@ -569,8 +570,7 @@ pub fn reapBlocking(h: ProcHandle) void {
         _ = WaitForSingleObject(h, 2000);
         win.CloseHandle(h);
     } else {
-        var status: c_int = 0;
-        _ = std.c.waitpid(h, &status, 0);
+        _ = waitpidRetry(h);
     }
 }
 
@@ -650,6 +650,46 @@ pub fn forkSerialUnlock() void {
 fn closePair(p: [2]std.c.fd_t) void {
     _ = std.c.close(p[0]);
     _ = std.c.close(p[1]);
+}
+
+/// 阻塞收尸,EINTR 重试。被信号(SIGWINCH/SIGINT 等)打断的 waitpid 返 -1/EINTR;不重试就
+/// 把已退出的子进程留成僵尸,还会把"退出码 0"报给调用方(codex R1 #2)。返回 wait status
+/// (交给 posixExitCode);其它错误(ECHILD)按旧行为当 0。
+fn waitpidRetry(pid: std.c.pid_t) c_int {
+    var status: c_int = 0;
+    while (true) {
+        const rc = std.c.waitpid(pid, &status, 0);
+        if (rc >= 0) return status;
+        if (std.c.errno(rc) != .INTR) return 0;
+    }
+}
+
+/// 子进程侧:把 `srcs[slot]` 接到 stdio 槽位 0/1/2(-1 = 不动该槽)。
+///
+/// 父进程若关着某个 stdio,pipe()/open() 会把 0/1/2 发回来当管道端;朴素的
+/// `dup2(src, slot); close(src)` 在 src == slot 时先 no-op 再把刚接好的槽关掉,
+/// src 落在别的槽上时又会被后一个 dup2 盖掉(codex R1 #1)。所以分三步:先把所有落在
+/// 0..2 的源抬到 ≥3(F_DUPFD_CLOEXEC),再 dup2,最后只关 ≥3 的源(同一源接多个槽只关一次)。
+/// 只用 fcntl/dup2/close,异步信号安全。抬不上去的源原样使用——最坏退回旧行为。
+fn applyStdioWiring(srcs_in: [3]std.c.fd_t) void {
+    var srcs = srcs_in;
+    for (&srcs) |*s| {
+        if (s.* >= 0 and s.* < 3) {
+            const lifted = std.c.fcntl(s.*, std.c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+            if (lifted >= 3) s.* = lifted;
+        }
+    }
+    for (srcs, 0..) |s, slot| {
+        if (s >= 0) _ = std.c.dup2(s, @intCast(slot));
+    }
+    for (srcs, 0..) |s, i| {
+        if (s < 3) continue;
+        var seen = false;
+        for (srcs[0..i]) |earlier| {
+            if (earlier == s) seen = true;
+        }
+        if (!seen) _ = std.c.close(s);
+    }
 }
 
 /// Wire form of the child's report: `extern` so both sides of the fork agree
@@ -791,8 +831,7 @@ fn awaitChildReport(report: ReportPipe, pid: std.c.pid_t) ?SpawnFailure {
         .{ .step = .exec, .code = 0 }
     else
         .{ .step = std.enums.fromInt(SpawnStep, record.step) orelse .exec, .code = record.code };
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
+    _ = waitpidRetry(pid);
     return failure;
 }
 
@@ -837,25 +876,12 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
     }
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
+        // 先关父端的端,再统一接线(applyStdioWiring:源若落在 0..2 先抬走再 dup2)。
         _ = std.c.close(out_pipe[0]);
-        _ = std.c.dup2(out_pipe[1], 1);
-        if (opts.stdin_data != null) {
-            _ = std.c.close(in_pipe[1]);
-            _ = std.c.dup2(in_pipe[0], 0);
-            _ = std.c.close(in_pipe[0]);
-        }
-        if (opts.want_stderr) {
-            _ = std.c.close(err_pipe[0]);
-            _ = std.c.dup2(err_pipe[1], 2);
-            _ = std.c.close(err_pipe[1]);
-        } else {
-            const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-            if (devnull >= 0) {
-                _ = std.c.dup2(devnull, 2);
-                if (devnull != 2) _ = std.c.close(devnull);
-            }
-        }
-        _ = std.c.close(out_pipe[1]);
+        if (opts.stdin_data != null) _ = std.c.close(in_pipe[1]);
+        if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
+        const stderr_src: std.c.fd_t = if (opts.want_stderr) err_pipe[1] else std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        applyStdioWiring(.{ if (opts.stdin_data != null) in_pipe[0] else -1, out_pipe[1], stderr_src });
         execChild(argv, opts.inherit_env, opts.cwd, report.wr);
     }
 
@@ -904,8 +930,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
             killGroupPosix(pid);
             _ = std.c.close(out_pipe[0]);
             if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
-            var st: c_int = 0;
-            _ = std.c.waitpid(pid, &st, 0);
+            _ = waitpidRetry(pid);
             return error.Aborted;
         };
         const elapsed = nowMs() - start;
@@ -959,8 +984,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
     _ = std.c.close(out_pipe[0]);
     if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
 
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
+    const status = waitpidRetry(pid);
 
     if (timed_out and !opts.timeout_partial) return error.Timeout; // errdefer 释放 out/err（勿显式 deinit → 双 free）
     return .{
@@ -1001,6 +1025,7 @@ const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_BAD_EXE_FORMAT: u32 = 193;
 const ERROR_DIRECTORY: u32 = 267;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
 /// `CreateProcessW` refused with `code` (captured straight after the call —
 /// any Win32 call in between overwrites it). Classified the way the POSIX
@@ -1013,7 +1038,7 @@ fn windowsSpawnFailure(code: u32, cwd: ?[]const u8) CaptureError {
         ERROR_DIRECTORY => .chdir,
         ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => blk: {
             const c = cwd orelse break :blk .exec;
-            break :blk if (windowsDirectoryExists(c)) .exec else .chdir;
+            break :blk if (windowsIsDirectory(c)) .exec else .chdir;
         },
         ERROR_ACCESS_DENIED, ERROR_BAD_EXE_FORMAT => .exec,
         else => return error.SpawnFailed,
@@ -1021,12 +1046,19 @@ fn windowsSpawnFailure(code: u32, cwd: ?[]const u8) CaptureError {
     return spawnFailureError(.{ .step = step, .code = @bitCast(code) });
 }
 
-fn windowsDirectoryExists(path: []const u8) bool {
+/// `lpCurrentDirectory` must name a directory (a regular file at that path is
+/// just as unusable as nothing), so the attribute bit is required, not mere
+/// existence (codex R1 #5). The path is evaluated as the caller gave it;
+/// `CreateProcessW` wants a full path there, and every caller in this
+/// repository passes an absolute session root.
+fn windowsIsDirectory(path: []const u8) bool {
     var wbuf: [win.PATH_MAX_WIDE + 1]u16 = undefined;
     const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return false;
     if (wlen >= wbuf.len) return false;
     wbuf[wlen] = 0;
-    return GetFileAttributesW(@ptrCast(&wbuf)) != 0xFFFF_FFFF; // INVALID_FILE_ATTRIBUTES
+    const attrs = GetFileAttributesW(@ptrCast(&wbuf));
+    if (attrs == 0xFFFF_FFFF) return false; // INVALID_FILE_ATTRIBUTES
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
 // 每个 reader 线程独占自己的 list（out_reader→out / err_reader→err），main 在 join 后才读，
@@ -1511,6 +1543,59 @@ test "spawnPipes / spawnToFiles: 同一条报告通道,cwd 消失同样返 Child
     defer _ = std.c.close(devnull);
     try std.testing.expectError(error.ChildChdirFailed, spawnToFiles(argv, devnull, devnull, dir));
     try std.testing.expectEqual(SpawnStep.chdir, (takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure).step);
+}
+
+test "runInherit / spawnDetached: 程序不存在 → ChildExecFailed(同一条报告通道)" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const bad: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "C:\\metacodes-no-such-program.exe", null }
+    else
+        &.{ "/metacodes-no-such-program", null };
+    try std.testing.expectError(error.ChildExecFailed, runInherit(bad, true));
+    try std.testing.expectEqual(SpawnStep.exec, (takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure).step);
+    try std.testing.expectError(error.ChildExecFailed, spawnDetached(bad, true));
+    try std.testing.expectEqual(SpawnStep.exec, (takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure).step);
+}
+
+test "capture: 父进程 fd 1/2 已关闭时,子进程 stdout/stderr 接线仍正确(codex R1 #1)" {
+    // 关掉 1/2 会毁掉测试进程自己的输出,所以在 fork 出来的副本里做:副本关 1/2、走一次
+    // capture、把结果经管道交回。父进程关着 stdio 时 pipe() 会把 1/2 发回来,子进程
+    // dup2(2, 1) 之后再 close(out_pipe[1]=2) 就把刚接好的 stderr 关掉了——err-line 丢失。
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    var result_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expect(std.c.pipe(&result_pipe) == 0);
+    const helper = std.c.fork();
+    try std.testing.expect(helper >= 0);
+    if (helper == 0) {
+        _ = std.c.close(result_pipe[0]);
+        _ = std.c.close(1);
+        _ = std.c.close(2);
+        const argv: []const ?[*:0]const u8 = &.{ "/bin/sh", "-c", "echo out-line; echo err-line 1>&2", null };
+        const r = capture(argv, std.heap.page_allocator, .{ .timeout_ms = 10_000 }) catch {
+            _ = std.c.write(result_pipe[1], "spawn-error", 11);
+            std.c._exit(0);
+        };
+        var msg_buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "out={d} err={d} code={d}", .{
+            @intFromBool(std.mem.indexOf(u8, r.stdout, "out-line") != null),
+            @intFromBool(std.mem.indexOf(u8, r.stderr, "err-line") != null),
+            r.exit_code,
+        }) catch "fmt";
+        _ = std.c.write(result_pipe[1], msg.ptr, msg.len);
+        std.c._exit(0);
+    }
+    _ = std.c.close(result_pipe[1]);
+    var buf: [128]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.c.read(result_pipe[0], buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    _ = std.c.close(result_pipe[0]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(helper, &st, 0);
+    try std.testing.expectEqualStrings("out=1 err=1 code=0", buf[0..total]);
 }
 
 test "capture 超时返 error.Timeout（有缓冲输出，验不 double-free）" {

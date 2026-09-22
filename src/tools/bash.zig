@@ -620,6 +620,13 @@ fn describeSpawnFailure(ctx: *const ToolContext, err: anyerror, cwd: ?[]const u8
         return error.ChildExecFailed;
     }
     const dir = cwd orelse ".";
+    // 只有"路径不存在"才能说它被改名或删除;EACCES / ENOTDIR / ENAMETOOLONG 是别的故事,
+    // 照实说,不编造历史(codex R1 #4)。
+    const not_found = if (failure) |f| f.isNotFound() else false;
+    if (!not_found) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "working directory '{s}' is unavailable: the shell could not enter it ({s}). Every Bash call runs in the session working directory, so another command will fail the same way until it can be entered again — check that the path is a directory this user may search.", .{ dir, cause });
+        return error.WorkingDirectoryUnavailable;
+    }
     // 进程自己的 cwd 是内核句柄:在 CLI 里它就是会话目录,改名后照样解析出新名字,所以
     // 它是"被改名了、现在叫什么"的最好线索。但嵌入宿主(agentcore)里会话根与进程 cwd
     // 本就无关,所以只陈述事实、不断言二者是同一个目录,由读者判断。
@@ -1013,6 +1020,28 @@ test "BashTool: 会话 cwd 已消失 → WorkingDirectoryUnavailable,detail 说�
     const d = detail orelse return error.TestExpectedDetail;
     try std.testing.expect(std.mem.indexOf(u8, d, dir) != null);
     if (@import("builtin").os.tag != .windows) try std.testing.expect(std.mem.indexOf(u8, d, "ENOENT") != null);
+}
+
+test "BashTool: cwd 存在但进不去(EACCES)→ detail 说的是权限,不编造\"被改名或删除\"(codex R1 #4)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 权限位
+    if (std.c.geteuid() == 0) return error.SkipZigTest; // root 无视 mode 位,进得去
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("test_tmp.zig").path(&dir_buf, "bash-unsearchable-cwd");
+    _ = std.c.mkdir(dir.ptr, 0o700);
+    try std.testing.expect(std.c.chmod(dir.ptr, 0o000) == 0);
+    defer {
+        _ = std.c.chmod(dir.ptr, 0o700);
+        _ = std.c.rmdir(dir.ptr);
+    }
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| std.testing.allocator.free(d);
+    var ctx = testCtx();
+    ctx.cwd_abs = dir;
+    ctx.error_detail = &detail;
+    try std.testing.expectError(error.WorkingDirectoryUnavailable, execute(&ctx, "{\"command\":\"echo hello\"}"));
+    const d = detail orelse return error.TestExpectedDetail;
+    try std.testing.expect(std.mem.indexOf(u8, d, "EACCES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "renamed or removed") == null);
 }
 
 test "BashTool description is parsed without error" {

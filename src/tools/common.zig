@@ -322,8 +322,13 @@ pub fn spawnCaptureToSpoolTimed(
             else => {},
         }
         util_time.sleepMs(150);
-        break :blk process.spawnToFilesWithEnv(argv, out_fd, err_fd, cwd, false) catch
-            return error.SpawnError;
+        // 第二次同样放行子进程自己交代的失败:150ms 里 cwd 被改名/shell 消失,报告不能被
+        // 抹成可重试的 SpawnError(codex R1 #3)。
+        break :blk process.spawnToFilesWithEnv(argv, out_fd, err_fd, cwd, false) catch |second_err| switch (second_err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ChildChdirFailed, error.ChildExecFailed => return second_err,
+            else => return error.SpawnError,
+        };
     };
     var proc_live = true;
     defer if (proc_live) {
