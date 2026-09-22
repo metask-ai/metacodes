@@ -315,7 +315,7 @@ test "NotebookEdit: replace cell source" {
     var p_buf: [512]u8 = undefined;
     const p = tt.path(&p_buf, "nbedit-replace.ipynb");
     var args_buf: [1024]u8 = undefined;
-    defer _ = std.c.unlink(p.ptr);
+    defer pfs.unlinkPath(p.ptr) catch {};
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
@@ -335,7 +335,7 @@ test "NotebookEdit: insert cell at start" {
     var p_buf: [512]u8 = undefined;
     const p = tt.path(&p_buf, "nbedit-insert-start.ipynb");
     var args_buf: [1024]u8 = undefined;
-    defer _ = std.c.unlink(p.ptr);
+    defer pfs.unlinkPath(p.ptr) catch {};
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
@@ -353,7 +353,7 @@ test "NotebookEdit: insert cell after cell_id" {
     var p_buf: [512]u8 = undefined;
     const p = tt.path(&p_buf, "nbedit-insert-after.ipynb");
     var args_buf: [1024]u8 = undefined;
-    defer _ = std.c.unlink(p.ptr);
+    defer pfs.unlinkPath(p.ptr) catch {};
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
@@ -367,7 +367,7 @@ test "NotebookEdit: delete cell" {
     var p_buf: [512]u8 = undefined;
     const p = tt.path(&p_buf, "nbedit-delete.ipynb");
     var args_buf: [1024]u8 = undefined;
-    defer _ = std.c.unlink(p.ptr);
+    defer pfs.unlinkPath(p.ptr) catch {};
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);
@@ -386,7 +386,7 @@ test "NotebookEdit: cell_id not found errors" {
     var p_buf: [512]u8 = undefined;
     const p = tt.path(&p_buf, "nbedit-notfound.ipynb");
     var args_buf: [1024]u8 = undefined;
-    defer _ = std.c.unlink(p.ptr);
+    defer pfs.unlinkPath(p.ptr) catch {};
     try writeNb(p, SAMPLE_NB);
 
     const ctx = ToolContext.simple(a);

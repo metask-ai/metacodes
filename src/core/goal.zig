@@ -154,7 +154,7 @@ pub const State = struct {
         if (self.current == null) {
             const path_z = try self.allocator.dupeZ(u8, path);
             defer self.allocator.free(path_z);
-            _ = std.c.unlink(path_z.ptr);
+            pfs.unlinkPath(path_z.ptr) catch {}; // 宽字符(#121):goal.json 由 pfs 按精确名写,也按精确名删
             return;
         }
         const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});

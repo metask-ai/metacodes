@@ -235,7 +235,7 @@ test "L2 operational observer rejects identity drift tamper symlink and hardlink
     const alias = try std.fmt.allocPrintSentinel(allocator, "{s}/observer-hardlink.json", .{fixture.root}, 0);
     defer allocator.free(alias);
     if (std.c.link(path.ptr, alias.ptr) != 0) return error.SkipZigTest;
-    defer _ = std.c.unlink(alias.ptr);
+    defer pfs.unlinkPath(alias.ptr) catch {};
     try std.testing.expectError(
         error.InvalidFile,
         cc.rule_impact_operational_observation.loadBound(

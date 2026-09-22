@@ -77,31 +77,82 @@ extern "c" fn _fullpath(absPath: ?[*]u8, relPath: [*:0]const u8, maxLength: usiz
 // 两条路指到两个不同的文件系统对象。本模块所有接路径的 CRT 调用一律先转 UTF-16。
 extern "c" fn _wopen(path: [*:0]const u16, oflag: c_int, ...) c_int;
 extern "c" fn _wmkdir(path: [*:0]const u16) c_int;
-
-const WideError = error{ InvalidUtf8, NameTooLong };
+extern "c" fn _wrmdir(path: [*:0]const u16) c_int;
+extern "c" fn _wchdir(path: [*:0]const u16) c_int;
+extern "c" fn _wchmod(path: [*:0]const u16, pmode: c_int) c_int;
+extern "c" fn _wfopen(path: [*:0]const u16, mode: [*:0]const u16) ?*std.c.FILE;
+extern "c" fn _wfullpath(absPath: ?[*]u16, relPath: [*:0]const u16, maxLength: usize) ?[*:0]u16;
 
 /// UTF-8 → NUL 结尾 UTF-16,供 Win32/UCRT 宽字符入口用。非法 UTF-8 或放不下 → 错误(**绝不截断**:
 /// 截断的路径会指向别的文件)。UTF-16 code unit 数 ≤ UTF-8 字节数,故 `len < wbuf.len` 即放得下——
 /// `utf8ToUtf16Le` 自身不对输出做边界检查,这条前置判断是唯一的护栏。
-fn toWide(path: []const u8, wbuf: *[std.os.windows.PATH_MAX_WIDE + 1]u16) WideError![:0]const u16 {
-    if (path.len >= wbuf.len) return error.NameTooLong;
-    const wlen = std.unicode.utf8ToUtf16Le(wbuf, path) catch return error.InvalidUtf8;
+///
+/// 失败时**先写好 errno 与 GetLastError**(ENAMETOOLONG / ERROR_FILENAME_EXCED_RANGE,
+/// EINVAL / ERROR_INVALID_NAME)再返回:本模块没调 CRT 就拒绝了操作,调用方无论按 errno 还是
+/// GetLastError 分类(`isWindowsTransientFileError` 的重试判定)拿到的都是本次失败的原因,
+/// 不是上一次调用的残留值。
+fn toWide(path: []const u8, wbuf: *[std.os.windows.PATH_MAX_WIDE + 1]u16) error{InvalidPath}![:0]const u16 {
+    if (path.len >= wbuf.len) {
+        setErrno(.NAMETOOLONG);
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return error.InvalidPath;
+    }
+    const wlen = std.unicode.utf8ToUtf16Le(wbuf, path) catch {
+        setErrno(.INVAL);
+        SetLastError(ERROR_INVALID_NAME);
+        return error.InvalidPath;
+    };
     wbuf[wlen] = 0;
     return wbuf[0..wlen :0];
 }
 
-/// 转码失败时给调用方一个说得通的 errno(本模块没调 CRT,不能让调用方读到上一次的残留值)。
-fn wideErrno(err: WideError) void {
-    setErrno(switch (err) {
-        error.InvalidUtf8 => .INVAL,
-        error.NameTooLong => .NAMETOOLONG,
-    });
+/// UTF-16 → UTF-8 写进 `out`,NUL 结尾,返回哨兵指针。`utf16LeToUtf8` 不对输出做边界检查,
+/// 先按最坏 3 字节/code unit 保证放得下(同 dir.zig / paths.zig)。放不下或非法 → null。
+fn fromWide(wide: []const u16, out: []u8) ?[*:0]u8 {
+    if (wide.len * 3 + 1 > out.len) return null;
+    const len = std.unicode.utf16LeToUtf8(out, wide) catch return null;
+    out[len] = 0;
+    return out[0..len :0].ptr;
 }
 
 fn windowsAttributes(wide: [:0]const u16) ?u32 {
     const attr = GetFileAttributesW(wide.ptr);
     return if (attr == 0xFFFF_FFFF) null else attr; // INVALID_FILE_ATTRIBUTES
 }
+
+/// 路径是否 symlink / junction——按 reparse **tag** 判,不是 REPARSE_POINT 属性位:OneDrive
+/// 按需文件占位、去重、AppExecLink 等**普通文件**也带 reparse 位,按位判会把用户 Documents 下的
+/// 每个文件当成链接(Edit 的 NOFOLLOW 全部 ELOOP)。有 reparse 位但 tag 查不到 → 保守当链接。
+fn windowsIsLink(wide: [:0]const u16) bool {
+    const attr = windowsAttributes(wide) orelse return false;
+    if ((attr & FILE_ATTRIBUTE_REPARSE_POINT) == 0) return false;
+    var data: WIN32_FIND_DATAW = undefined;
+    const handle = FindFirstFileW(wide.ptr, &data);
+    if (handle == std.os.windows.INVALID_HANDLE_VALUE) return true;
+    _ = FindClose(handle);
+    return data.dwReserved0 == IO_REPARSE_TAG_SYMLINK or data.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT;
+}
+
+const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: [2]u32,
+    ftLastAccessTime: [2]u32,
+    ftLastWriteTime: [2]u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    dwReserved0: u32, // reparse tag(仅当 dwFileAttributes 含 REPARSE_POINT 时有意义)
+    dwReserved1: u32,
+    cFileName: [260]u16,
+    cAlternateFileName: [14]u16,
+};
+extern "kernel32" fn FindFirstFileW(lpFileName: [*:0]const u16, lpFindFileData: *WIN32_FIND_DATAW) callconv(.winapi) std.os.windows.HANDLE;
+extern "kernel32" fn FindClose(hFindFile: std.os.windows.HANDLE) callconv(.winapi) c_int;
+extern "kernel32" fn SetLastError(dwErrCode: u32) callconv(.winapi) void;
+extern "kernel32" fn GetCurrentDirectoryW(nBufferLength: u32, lpBuffer: [*]u16) callconv(.winapi) u32;
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+const ERROR_INVALID_NAME: u32 = 123;
+const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
 
 fn windowsOflag(flags: WindowsO) c_int {
     var o: c_int = _O_BINARY;
@@ -130,18 +181,13 @@ pub fn open(path: [*:0]const u8, flags: O, mode: c_uint) c_int {
         // 路径先转 UTF-16 走 `_wopen`(#121,见文件头 extern 处的说明);errno 语义与 CRT 同款,
         // 失败一律 -1。
         var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
-        const wide = toWide(std.mem.span(path), &wbuf) catch |err| {
-            wideErrno(err);
+        const wide = toWide(std.mem.span(path), &wbuf) catch return -1;
+        // MSVCRT 没有 O_NOFOLLOW。先拒绝 symlink/junction(按 reparse tag,见 windowsIsLink),并像
+        // POSIX 一样给出 ELOOP——调用方按 errno 分类失败原因时不能拿到上一次调用的残留值。真正
+        // 需要抵抗路径竞态的安全边界应传已打开 fd(evaluation harness 正是如此),不要依赖此检查。
+        if (flags.NOFOLLOW and windowsIsLink(wide)) {
+            setErrno(.LOOP);
             return -1;
-        };
-        // MSVCRT 没有 O_NOFOLLOW。先拒绝 reparse point,并像 POSIX 一样给出 ELOOP——调用方按
-        // errno 分类失败原因时不能拿到上一次调用的残留值。真正需要抵抗路径竞态的安全边界应传
-        // 已打开 fd(evaluation harness 正是如此),不要依赖此检查。
-        if (flags.NOFOLLOW) {
-            if (windowsAttributes(wide)) |attr| if ((attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-                setErrno(.LOOP);
-                return -1;
-            };
         }
         // UCRT _wopen:第三变参是 pmode(_S_IREAD/_S_IWRITE),仅 CREAT 时生效。
         return _wopen(wide.ptr, windowsOflag(flags), @as(c_int, @intCast(mode & 0o777)));
@@ -157,13 +203,83 @@ pub fn open(path: [*:0]const u8, flags: O, mode: c_uint) c_int {
 pub fn mkdir(path: [*:0]const u8, mode: c_uint) c_int {
     if (is_windows) {
         var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
-        const wide = toWide(std.mem.span(path), &wbuf) catch |err| {
-            wideErrno(err);
-            return -1;
-        };
+        const wide = toWide(std.mem.span(path), &wbuf) catch return -1;
         return _wmkdir(wide.ptr);
     } else {
-        return std.c.mkdir(path, @intCast(mode));
+        return std.c.mkdir(path, @intCast(mode & 0o7777));
+    }
+}
+
+/// rmdir(2) 形状的删空目录。Windows `_wrmdir`。返回 0 / -1(errno 同各平台 CRT)。
+pub fn rmdir(path: [*:0]const u8) c_int {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wide = toWide(std.mem.span(path), &wbuf) catch return -1;
+        return _wrmdir(wide.ptr);
+    } else {
+        return std.c.rmdir(path);
+    }
+}
+
+/// chdir(2) 形状的切换进程工作目录。Windows `_wchdir`。返回 0 / -1。
+pub fn chdir(path: [*:0]const u8) c_int {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wide = toWide(std.mem.span(path), &wbuf) catch return -1;
+        return _wchdir(wide.ptr);
+    } else {
+        return std.c.chdir(path);
+    }
+}
+
+/// chmod(2) 形状的改权限。Windows `_wchmod`(只有 _S_IREAD/_S_IWRITE 两位有意义:0o200 ⇔ 可写,
+/// 其余位忽略——调用方在 Windows 上得到的是"只读属性"语义,不是 POSIX 权限)。返回 0 / -1。
+pub fn chmod(path: [*:0]const u8, mode: c_uint) c_int {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wide = toWide(std.mem.span(path), &wbuf) catch return -1;
+        return _wchmod(wide.ptr, @as(c_int, @intCast(mode & 0o777)));
+    } else {
+        return std.c.chmod(path, @intCast(mode & 0o7777));
+    }
+}
+
+/// fopen(3) 形状的流式打开。Windows `_wfopen`(mode 串限 ASCII,如 "r"/"w"/"rb")。失败 → null。
+/// 只给仍在用 FILE* 的旧站点(kg 指针文件);新代码用 `openZ` + `read`/`write`。
+pub fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*std.c.FILE {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wide = toWide(std.mem.span(path), &wbuf) catch return null;
+        const mode_bytes = std.mem.span(mode);
+        var wmode: [16:0]u16 = undefined;
+        if (mode_bytes.len >= wmode.len) return null;
+        for (mode_bytes, 0..) |byte, index| wmode[index] = byte;
+        wmode[mode_bytes.len] = 0;
+        return _wfopen(wide.ptr, @ptrCast(&wmode));
+    } else {
+        return std.c.fopen(path, mode);
+    }
+}
+
+/// 当前工作目录(UTF-8)写进 `buf`,返回 slice;失败/放不下 → null。Windows 走
+/// `GetCurrentDirectoryW`:窄字符 `_getcwd` 给的是 ANSI 代码页字节,中文目录下不是 UTF-8,喂给
+/// 本模块的宽字符入口会被当成非法 UTF-8 拒掉(#121 输入侧)。POSIX `getcwd(3)`,手工哨兵 NUL
+/// 保证扫描不越界(见 util/fs.zig getCwd 的说明)。
+pub fn getCwd(buf: []u8) ?[]const u8 {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const n = GetCurrentDirectoryW(wbuf.len, &wbuf);
+        if (n == 0 or n >= wbuf.len) return null;
+        if (buf.len < @as(usize, n) * 3) return null;
+        const len = std.unicode.utf16LeToUtf8(buf, wbuf[0..n]) catch return null;
+        return buf[0..len];
+    } else {
+        if (buf.len < 2) return null;
+        buf[buf.len - 1] = 0; // 哨兵:libc 最多写 len-1 字节,NUL 扫描永远在边界内终止
+        if (std.c.getcwd(buf.ptr, buf.len - 1) == null) return null;
+        const end = std.mem.indexOfScalar(u8, buf, 0) orelse return null;
+        if (end == 0) return null;
+        return buf[0..end];
     }
 }
 
@@ -187,11 +303,6 @@ pub fn errnoTag(raw: c_int) ?std.c.E {
         if (raw == field.value) return @enumFromInt(field.value);
     }
     return null;
-}
-
-/// 上一次失败调用的 errno 名,见 `errnoTag`。
-pub fn lastErrnoTag() ?std.c.E {
-    return errnoTag(lastErrno());
 }
 
 /// 日志用:errno 的名字;`std.c.E` 没命名的值返回 "unnamed"(数值另行打印)。
@@ -380,22 +491,41 @@ pub fn setSize(fd: Fd, size: u64) error{ResizeFailed}!void {
 }
 
 /// 规范化绝对路径。签名对齐 std.c.realpath(失败返 null;`resolved_name` 至少
-/// `std.fs.max_path_bytes` 字节)。POSIX realpath(解 symlink)。
+/// `std.fs.max_path_bytes` 字节)。POSIX realpath(解 symlink;不存在的路径失败)。
 ///
-/// Windows:先经**句柄**解析——`CreateFileW` + `GetFinalPathNameByHandleW` 跟随 NTFS symlink 与
-/// junction,给出物理路径(#140:`_fullpath` 只做 `.`/`..`/分隔符的词法规范化,经 symlink/junction
-/// 启动的 metacodes.exe 会把相邻的 rg/kernel/tinykg 找到链接旁边而不是真二进制旁边)。打不开
-/// (不存在、无权限)时退回 `_fullpath` 的词法答案:只需要规范化的调用方行为与从前一致。
+/// Windows:**词法**规范化(`_wfullpath`:补全成绝对路径、折叠 `.`/`..`、统一分隔符),不跟随
+/// symlink/junction,也不改大小写、不展开 8.3 短名、不把映射盘符换成 UNC——调用方拿它和自己拼的
+/// 路径做前缀比较(workspace root、权限规则、memdir),物理化会让 `Z:\proj` 与 `\\srv\share\proj`
+/// 对不上。要物理路径(相邻产物定位)用 `finalPath`。路径不存在照样成功(与 POSIX 不同,沿袭
+/// `_fullpath` 的旧契约)。宽字符版:窄字符 `_fullpath` 按 ANSI 代码页解码 UTF-8 字节,会把中文
+/// 路径里的 `\` 吃进双字节字符(#121)。
 pub fn realpath(file_name: [*:0]const u8, resolved_name: [*]u8) ?[*:0]u8 {
     if (is_windows) {
-        if (windowsFinalPath(std.mem.span(file_name), resolved_name)) |resolved| return resolved;
-        return _fullpath(resolved_name, file_name, std.fs.max_path_bytes);
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wide = toWide(std.mem.span(file_name), &wbuf) catch return null;
+        var abs: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const resolved = _wfullpath(&abs, wide.ptr, abs.len) orelse return null;
+        return fromWide(std.mem.span(resolved), resolved_name[0..std.fs.max_path_bytes]);
     } else {
         return std.c.realpath(file_name, resolved_name);
     }
 }
 
-/// 经句柄取物理路径(见 `realpath`)。任何一步失败 → null,由调用方决定退路。
+/// **物理**路径:跟随 symlink 与 junction。POSIX = realpath(3);Windows = `CreateFileW` +
+/// `GetFinalPathNameByHandleW`(#140:`_fullpath` 是纯词法的,经 symlink/junction 启动的
+/// metacodes.exe 会把相邻的 rg/kernel/tinykg 找到链接旁边而不是真二进制旁边)。打不开
+/// (不存在、无权限)→ null,与 POSIX realpath 对不存在路径失败一致——调用方决定退路
+/// (`selfExeRealPath` 退回被调用路径)。Windows 上给出的是磁盘上的规范形态(真实大小写、
+/// 长文件名、映射盘符展开成 `\\server\share`),所以只用于定位,不用于和用户输入比较。
+pub fn finalPath(file_name: [*:0]const u8, resolved_name: [*]u8) ?[*:0]u8 {
+    if (is_windows) {
+        return windowsFinalPath(std.mem.span(file_name), resolved_name);
+    } else {
+        return std.c.realpath(file_name, resolved_name);
+    }
+}
+
+/// 经句柄取物理路径(见 `finalPath`)。任何一步失败 → null。
 fn windowsFinalPath(path: []const u8, resolved_name: [*]u8) ?[*:0]u8 {
     const win = std.os.windows;
     var wbuf: [win.PATH_MAX_WIDE + 1]u16 = undefined;
@@ -404,17 +534,11 @@ fn windowsFinalPath(path: []const u8, resolved_name: [*]u8) ?[*:0]u8 {
     const handle = CreateFileW(wide.ptr, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, null);
     if (handle == win.INVALID_HANDLE_VALUE) return null;
     defer win.CloseHandle(handle);
-    var fbuf: [win.PATH_MAX_WIDE + 1]u16 = undefined;
+    // 输入路径此后不再需要:复用 wbuf 接结果(省一个 64 KiB 栈缓冲)。
     // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS(两者都是 0):`\\?\C:\...` 或 `\\?\UNC\server\share\...`。
-    const n = GetFinalPathNameByHandleW(handle, &fbuf, fbuf.len, 0);
-    if (n == 0 or n >= fbuf.len) return null;
-    const final = stripWin32ExtendedPrefix(fbuf[0..n]);
-    const out = resolved_name[0..std.fs.max_path_bytes];
-    // utf16LeToUtf8 不对输出做边界检查:先保证最坏 3 字节/code unit 放得下(同 dir.zig)。
-    if (final.len * 3 + 1 > out.len) return null;
-    const len = std.unicode.utf16LeToUtf8(out, final) catch return null;
-    out[len] = 0;
-    return out[0..len :0].ptr;
+    const n = GetFinalPathNameByHandleW(handle, &wbuf, wbuf.len, 0);
+    if (n == 0 or n >= wbuf.len) return null;
+    return fromWide(stripWin32ExtendedPrefix(wbuf[0..n]), resolved_name[0..std.fs.max_path_bytes]);
 }
 
 /// `\\?\C:\x` → `C:\x`;`\\?\UNC\srv\share\x` → `\\srv\share\x`(原地改写一个分隔符,零拷贝)。
@@ -614,16 +738,23 @@ pub fn isExistingNonDir(path: [*:0]const u8) bool {
 }
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
-/// 删除一个已解析的普通文件路径。控制面 lease 用它显式释放独占标记；失败必须由
-/// 调用方处理，不能把“仍被占用”静默解释成成功。
-pub fn unlinkPath(path: [*:0]const u8) error{UnlinkFailed}!void {
+/// 删除一个已解析的普通文件路径。控制面 lease 用它显式释放独占标记;失败必须由
+/// 调用方处理,不能把"仍被占用"静默解释成成功。`NotFound` 单独报出(POSIX ENOENT / Win32
+/// ERROR_FILE_NOT_FOUND、ERROR_PATH_NOT_FOUND):"已经不在"对幂等的清理是达成目的,对其它
+/// 失败(EACCES、共享冲突)则不是——调用方不必事后再 `exists()` 猜一次。
+pub fn unlinkPath(path: [*:0]const u8) error{ NotFound, UnlinkFailed }!void {
     if (is_windows) {
         var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
         const wide = toWide(std.mem.span(path), &wbuf) catch return error.UnlinkFailed;
-        if (DeleteFileW(wide.ptr) == 0) return error.UnlinkFailed;
+        if (DeleteFileW(wide.ptr) == 0) {
+            const code = GetLastError();
+            return if (code == 2 or code == 3) error.NotFound else error.UnlinkFailed;
+        }
         return;
     }
-    if (std.c.unlink(path) != 0) return error.UnlinkFailed;
+    if (std.c.unlink(path) != 0) {
+        return if (lastErrnoIs(.NOENT)) error.NotFound else error.UnlinkFailed;
+    }
 }
 extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.winapi) c_int;
 
@@ -653,9 +784,10 @@ pub fn pathKindNoFollow(path_z: [*:0]const u8) PathKind {
             const code = GetLastError();
             return if (code == 2 or code == 3) .missing else .unavailable;
         };
-        // Reparse points and directories exist, but they are not regular file
-        // targets and must never be confused with a safe new-file creation.
-        if ((attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0 or (attr & FILE_ATTRIBUTE_DIRECTORY) != 0) return .other;
+        // Symlinks/junctions (by reparse tag) and directories exist, but they
+        // are not regular file targets and must never be confused with a safe
+        // new-file creation. A cloud placeholder is a regular file.
+        if ((attr & FILE_ATTRIBUTE_DIRECTORY) != 0 or windowsIsLink(wide)) return .other;
         return .regular;
     } else if (builtin.os.tag == .linux) {
         var stx: std.os.linux.Statx = undefined;
@@ -738,13 +870,12 @@ pub fn statMode(path_z: [*:0]const u8, follow: bool) ?u32 {
 }
 
 /// path 是否 symlink（**不跟随**，lstat 语义；防 symlink 逃逸）。
-/// Windows:GetFileAttributesW 的 REPARSE_POINT 位（不跟随，等价 lstat 语义）。
+/// Windows:symlink 或 junction(按 reparse tag,见 windowsIsLink;不跟随,等价 lstat 语义)。
 pub fn isSymlink(path_z: [*:0]const u8) bool {
     if (is_windows) {
         var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
         const wide = toWide(std.mem.span(path_z), &wbuf) catch return false;
-        const attr = windowsAttributes(wide) orelse return false;
-        return (attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        return windowsIsLink(wide);
     }
     const m = statMode(path_z, false) orelse return false;
     return (m & S_IFMT) == S_IFLNK;
@@ -823,20 +954,8 @@ test "windowsOflag 映射（编译期常量，两平台可跑）" {
 
 // ── #121 / #140 回归:UTF-8 路径与 symlink/junction 解析(Windows 原生 CI 真跑)──────────
 
-/// 目录里除 `.`/`..` 外的条目数,并断言每个条目都叫 `expected_name`。走 platform/dir.zig
-/// (Windows FindFirstFileW / POSIX readdir),与被测的 CRT 窄路径无关——是独立的证据通道。
-fn countEntriesNamed(dir_z: [*:0]const u8, expected_name: []const u8) !usize {
-    const pdir = @import("dir.zig");
-    var it = pdir.open(dir_z) orelse return error.TestUnexpectedResult;
-    defer pdir.close(&it);
-    var entries: usize = 0;
-    while (pdir.next(&it)) |ent| {
-        if (std.mem.eql(u8, ent.name, ".") or std.mem.eql(u8, ent.name, "..")) continue;
-        try std.testing.expectEqualStrings(expected_name, ent.name);
-        entries += 1;
-    }
-    return entries;
-}
+const test_support = @import("test_support.zig");
+const countEntriesNamed = test_support.countEntriesNamed;
 
 test "UTF-8 paths reach the exact directory entry through mkdir/open (verified through std.Io and directory enumeration)" {
     // #121:Windows 窄字符 `_open`/`_mkdir` 用 ANSI 代码页解码 UTF-8 字节,`测试.txt` 会落成乱码名。
@@ -878,20 +997,64 @@ test "UTF-8 paths reach the exact directory entry through mkdir/open (verified t
     try std.testing.expect(lastErrnoIs(.EXIST));
     try unlinkPath(file.ptr);
     try std.testing.expect(!exists(file.ptr));
+    // 已经不在:幂等清理靠这个变体区分"达成目的"与"删不掉"。
+    try std.testing.expectError(error.NotFound, unlinkPath(file.ptr));
+    // 目录本身也按精确名删除(宽字符 rmdir)。
+    try std.testing.expectEqual(@as(c_int, 0), rmdir(dir.ptr));
+    try std.testing.expect(!exists(dir.ptr));
+}
+
+test "chdir/getCwd/fopen/chmod take UTF-8 paths and report the cwd as UTF-8 (verified through std.Io)" {
+    // #121 输入侧:窄字符 `_getcwd`/`getenv` 给出 ANSI 代码页字节,与本模块的宽字符入口互不相认。
+    // 进 CJK 目录再读回 cwd,拿到的必须是 UTF-8 的精确名字;fopen/chmod 同样按精确名落到磁盘。
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "目录");
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const dir = try std.fmt.allocPrintSentinel(a, "{s}/目录", .{root}, 0);
+    defer a.free(dir);
+    var expected_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const expected = expected_buf[0..try tmp.dir.realPathFile(io, "目录", &expected_buf)];
+
+    var saved_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const saved = getCwd(&saved_buf) orelse return error.TestUnexpectedResult;
+    const saved_z = try a.dupeZ(u8, saved);
+    defer a.free(saved_z);
+    try std.testing.expectEqual(@as(c_int, 0), chdir(dir.ptr));
+    defer _ = chdir(saved_z.ptr); // 其它用例依赖构建根 cwd(zig-out/bin/...)
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = getCwd(&cwd_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected, cwd);
+
+    // fopen:相对当前 cwd 的 CJK 文件名,std.Io 按精确名读回。
+    const stream = fopen("文件.txt", "wb") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 5), std.c.fwrite("hello", 1, 5, stream));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fclose(stream));
+    const bytes = try tmp.dir.readFileAlloc(io, "目录/文件.txt", a, .limited(16));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("hello", bytes);
+    // chmod:能找到精确名(窄字符 `_chmod` 对 UTF-8 字节报 ENOENT)。
+    const file = try std.fmt.allocPrintSentinel(a, "{s}/文件.txt", .{expected}, 0);
+    defer a.free(file);
+    try std.testing.expectEqual(@as(c_int, 0), chmod(file.ptr, 0o600));
+    try std.testing.expectEqual(@as(c_int, 0), chmod(file.ptr, 0o644)); // 恢复可写,cleanup 才能删
 }
 
 test "errno helpers: unnamed or negative values are reported as null, never converted unsafely" {
     setErrno(.NOENT);
     try std.testing.expect(lastErrnoIs(.NOENT));
-    try std.testing.expectEqual(std.c.E.NOENT, lastErrnoTag().?);
+    try std.testing.expectEqual(std.c.E.NOENT, errnoTag(lastErrno()).?);
     try std.testing.expectEqualStrings("NOENT", errnoName(lastErrno()));
     // 注入 CRT 可能给出但 `std.c.E` 没命名的值,以及负数:老写法 `@enumFromInt` 在 Debug/ReleaseSafe
     // 下会 panic(#121)。
     std.c._errno().* = -1;
-    try std.testing.expect(lastErrnoTag() == null);
+    try std.testing.expect(errnoTag(lastErrno()) == null);
     try std.testing.expect(!lastErrnoIs(.NOENT));
     std.c._errno().* = 60_000;
-    try std.testing.expect(lastErrnoTag() == null);
+    try std.testing.expect(errnoTag(lastErrno()) == null);
     try std.testing.expectEqualStrings("unnamed", errnoName(60_000));
     setErrno(.SUCCESS);
 }
@@ -909,7 +1072,7 @@ test "open with NOFOLLOW refuses a symlink and reports ELOOP, not a stale errno"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "target.txt", .data = "t" });
-    try @import("test_links.zig").symlinkOrSkip(tmp.dir, io, "target.txt", "link.txt", .{});
+    try @import("test_support.zig").symlinkOrSkip(tmp.dir, io, "target.txt", "link.txt", .{});
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
     const link = try std.fmt.allocPrintSentinel(a, "{s}/link.txt", .{root}, 0);
@@ -923,7 +1086,7 @@ test "open with NOFOLLOW refuses a symlink and reports ELOOP, not a stale errno"
     close(fd);
 }
 
-test "realpath follows a symlink to the physical path" {
+test "finalPath follows a symlink to the physical path" {
     const io = std.testing.io;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -936,15 +1099,19 @@ test "realpath follows a symlink to the physical path" {
     // 期望值来自 std(Windows 走 NT API + GetFinalPathNameByHandle),不是被测函数自己。
     var real_buf: [std.fs.max_path_bytes]u8 = undefined;
     const real = real_buf[0..try tmp.dir.realPathFile(io, "prefix/bin/target.txt", &real_buf)];
-    try @import("test_links.zig").symlinkOrSkip(tmp.dir, io, real, "elsewhere/target.txt", .{});
+    try test_support.symlinkOrSkip(tmp.dir, io, real, "elsewhere/target.txt", .{});
     const link = try std.fmt.allocPrintSentinel(a, "{s}/elsewhere/target.txt", .{root}, 0);
     defer a.free(link);
     var out: [std.fs.max_path_bytes]u8 = undefined;
-    const resolved = realpath(link.ptr, &out) orelse return error.TestUnexpectedResult;
+    const resolved = finalPath(link.ptr, &out) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(real, std.mem.span(resolved));
+    // 不存在的路径 → null(与 POSIX realpath 一致),调用方自己决定退路。
+    const ghost = try std.fmt.allocPrintSentinel(a, "{s}/elsewhere/missing.txt", .{root}, 0);
+    defer a.free(ghost);
+    try std.testing.expect(finalPath(ghost.ptr, &out) == null);
 }
 
-test "Windows: realpath follows an NTFS junction (no privilege needed) to the physical path" {
+test "Windows: finalPath follows an NTFS junction (no privilege needed); realpath stays lexical but wide" {
     if (!is_windows) return error.SkipZigTest; // junction 是 Windows 独有的目录重解析点
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -960,15 +1127,19 @@ test "Windows: realpath follows an NTFS junction (no privilege needed) to the ph
     defer a.free(junction);
     const target = try std.fmt.allocPrint(a, "{s}\\prefix", .{root});
     defer a.free(target);
-    try @import("test_links.zig").junction(a, junction, target);
+    try test_support.junction(a, junction, target);
     const through = try std.fmt.allocPrintSentinel(a, "{s}\\elsewhere_j\\bin\\target.txt", .{root}, 0);
     defer a.free(through);
     var out: [std.fs.max_path_bytes]u8 = undefined;
-    const resolved = realpath(through.ptr, &out) orelse return error.TestUnexpectedResult;
+    const resolved = finalPath(through.ptr, &out) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(real, std.mem.span(resolved));
-    // 词法回退仍在:不存在的路径照旧被 `_fullpath` 规范化,而不是变成 null。
-    const ghost = try std.fmt.allocPrintSentinel(a, "{s}\\elsewhere_j\\bin\\..\\bin\\missing.txt", .{root}, 0);
-    defer a.free(ghost);
-    const lexical = realpath(ghost.ptr, &out) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(lexical), "..") == null);
+
+    // realpath 是词法的:折叠 `..`,**不**解 junction(调用方拿它做前缀比较,物理化会对不上),
+    // 不存在的叶子照样成功;宽字符版对 CJK 分量按 UTF-8 原样返回。
+    const lexical_in = try std.fmt.allocPrintSentinel(a, "{s}\\elsewhere_j\\bin\\..\\bin\\缺失.txt", .{root}, 0);
+    defer a.free(lexical_in);
+    const lexical = std.mem.span(realpath(lexical_in.ptr, &out) orelse return error.TestUnexpectedResult);
+    try std.testing.expect(std.mem.indexOf(u8, lexical, "..") == null);
+    try std.testing.expect(std.mem.indexOf(u8, lexical, "elsewhere_j") != null);
+    try std.testing.expect(std.mem.endsWith(u8, lexical, "\\bin\\缺失.txt"));
 }

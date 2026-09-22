@@ -237,7 +237,7 @@ test "History: next past newest returns empty pending" {
 test "History: roundtrip save/load" {
     var path_buf: [512]u8 = undefined;
     const path = tt.path(&path_buf, "history-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var h1 = History.init(testing.allocator);
     try h1.append("alpha");
@@ -258,7 +258,7 @@ test "History: roundtrip save/load" {
 test "History: multiline command survives JSONL round-trip" {
     var path_buf: [512]u8 = undefined;
     const path = tt.path(&path_buf, "history-multiline.jsonl");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var h1 = History.init(testing.allocator);
     try h1.append("line1\nline2\nline3");
@@ -278,7 +278,7 @@ test "History: multiline command survives JSONL round-trip" {
 test "History: legacy plain-text file auto-migrates" {
     var path_buf: [512]u8 = undefined;
     const path = tt.path(&path_buf, "history-legacy.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     // 手写旧版纯文本（无引号）
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     const legacy = "oldcmd1\noldcmd2\n";

@@ -155,7 +155,7 @@ test "store + load + expand round trip" {
         // cleanup
         var pz: [256]u8 = undefined;
         const p = std.fmt.bufPrintZ(&pz, "{s}/.metacodes/pastes/1.txt", .{home}) catch unreachable;
-        _ = std.c.unlink(p.ptr);
+        pfs.unlinkPath(p.ptr) catch {};
     }
 
     const text = "line A\nline B\nline C\n";
@@ -187,7 +187,7 @@ test "store placeholder count = lines - 1 (cc v2.1.172)" {
         var pz: [256]u8 = undefined;
         inline for (.{ 4, 20 }) |id| {
             const p = std.fmt.bufPrintZ(&pz, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }) catch unreachable;
-            _ = std.c.unlink(p.ptr);
+            pfs.unlinkPath(p.ptr) catch {};
         }
     }
 

@@ -375,10 +375,10 @@ test "REGRESSION issue #17: LSP 在位但符号能力缺失 → 仍不是裸 []"
     defer {
         var zbuf: [std.fs.max_path_bytes]u8 = undefined;
         if (std.fmt.bufPrintZ(&zbuf, "{s}", .{file})) |z| {
-            _ = std.c.unlink(z.ptr);
+            pfs.unlinkPath(z.ptr) catch {};
         } else |_| {}
         if (std.fmt.bufPrintZ(&zbuf, "{s}", .{base})) |z| {
-            _ = std.c.rmdir(z.ptr);
+            _ = pfs.rmdir(z.ptr);
         } else |_| {}
     }
 

@@ -235,11 +235,11 @@ test "loadTheme + saveTheme 往返(临时 home)" {
         // 清理 ~/.metacodes/config.json + ~/.metacodes + tmp 目录
         var p1_buf: [256]u8 = undefined;
         const p1 = std.fmt.bufPrint(&p1_buf, "{s}/.metacodes/config.json\x00", .{dir}) catch unreachable;
-        _ = std.c.unlink(@ptrCast(p1.ptr));
+        pfs.unlinkPath(@ptrCast(p1.ptr)) catch {};
         var p2_buf: [256]u8 = undefined;
         const p2 = std.fmt.bufPrint(&p2_buf, "{s}/.metacodes\x00", .{dir}) catch unreachable;
-        _ = std.c.rmdir(@ptrCast(p2.ptr));
-        _ = std.c.rmdir(dir.ptr);
+        _ = pfs.rmdir(@ptrCast(p2.ptr));
+        _ = pfs.rmdir(dir.ptr);
     }
 
     // 初始无文件 → loadTheme = null

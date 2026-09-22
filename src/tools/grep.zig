@@ -636,7 +636,7 @@ test "GrepTool content mode with -n" {
     const text = "pre\nneedle line\npost\n";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var abuf: [320]u8 = undefined;
     const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"needle\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{path});
@@ -656,7 +656,7 @@ test "GrepTool count mode" {
     const text = "x\nx\ny\nx\n";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var abuf: [320]u8 = undefined;
     const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"x\",\"path\":\"{s}\",\"output_mode\":\"count\"}}", .{path});
@@ -676,7 +676,7 @@ test "GrepTool case insensitive" {
     const text = "HELLO\nworld\n";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var abuf: [320]u8 = undefined;
     const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"hello\",\"path\":\"{s}\",\"output_mode\":\"content\",\"-i\":true}}", .{path});
@@ -694,7 +694,7 @@ test "GrepTool -B -A context" {
     const text = "before\nmatch\nafter\nother\n";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var abuf: [360]u8 = undefined;
     const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"match\",\"path\":\"{s}\",\"output_mode\":\"content\",\"-B\":\"1\",\"-A\":\"1\"}}", .{path});
@@ -714,7 +714,7 @@ test "GrepTool -C context shorthand" {
     const text = "a\nb\nHIT\nc\nd\n";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var abuf: [360]u8 = undefined;
     const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"HIT\",\"path\":\"{s}\",\"output_mode\":\"content\",\"-C\":\"1\"}}", .{path});
@@ -740,8 +740,8 @@ test "GrepTool glob filter" {
     const fd2 = pfs.open(txt_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.write(fd2, text);
     _ = pfs.close(fd2);
-    defer _ = std.c.unlink(zig_path.ptr);
-    defer _ = std.c.unlink(txt_path.ptr);
+    defer pfs.unlinkPath(zig_path.ptr) catch {};
+    defer pfs.unlinkPath(txt_path.ptr) catch {};
 
     // 搜索 per-pid 目录,glob 只命中 .zig。
     var dbuf: [256]u8 = undefined;
@@ -803,7 +803,7 @@ test "GrepTool global head_limit across content" {
     const text = "m\nm\nm\nm\nm\n";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"m\",\"path\":\"{s}\",\"output_mode\":\"content\",\"head_limit\":2}}", .{path});
     defer std.testing.allocator.free(json);
@@ -822,7 +822,7 @@ test "GrepTool 默认 head_limit=250:不传时宽匹配被截断(防撑爆)" {
     var i: usize = 0;
     while (i < 300) : (i += 1) _ = pfs.write(fd, "match\n");
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"match\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{path});
     defer std.testing.allocator.free(json);
@@ -847,7 +847,7 @@ test "GrepTool head_limit=0 显式无限:返回全部不截断" {
     var i: usize = 0;
     while (i < 300) : (i += 1) _ = pfs.write(fd, "match\n");
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"match\",\"path\":\"{s}\",\"output_mode\":\"content\",\"head_limit\":0}}", .{path});
     defer std.testing.allocator.free(json);
@@ -900,7 +900,7 @@ test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发(需 zl
     @import("../util/fs.zig").mkdirParents(gdir) catch {};
     var fbuf: [320]u8 = undefined;
     const fpath = std.fmt.bufPrintZ(&fbuf, "{s}/sample.zig", .{dir}) catch unreachable;
-    defer _ = std.c.unlink(fpath.ptr);
+    defer pfs.unlinkPath(fpath.ptr) catch {};
     {
         const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
@@ -960,7 +960,7 @@ test "GrepTool v39 repair ladder: double-escaped pattern auto-collapses" {
     try std.testing.expect(fd >= 0);
     _ = pfs.write(fd, "call validate(x) here\n");
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var abuf: [400]u8 = undefined;
     // 生产形态:extractJsonArg 不做 JSON 反转义,模型按 JSON 规范写的 `\\(`
@@ -980,7 +980,7 @@ test "GrepTool v39 repair ladder: hopeless regex degrades to fixed-string" {
     try std.testing.expect(fd >= 0);
     _ = pfs.write(fd, "weird (?:token here\n");
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var abuf: [400]u8 = undefined;
     // 无双反斜杠可折叠、本身也不是合法正则 → 第三级 -F 字面量命中。

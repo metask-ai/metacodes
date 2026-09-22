@@ -290,7 +290,7 @@ test "statPath real file" {
     var path_buf: [512]u8 = undefined;
     const path = tt.path(&path_buf, "readstate-stat-test.txt");
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     _ = pfs.write(fd, "hello");
     _ = pfs.close(fd);
 

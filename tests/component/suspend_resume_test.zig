@@ -7,6 +7,7 @@
 //!   suspend.json → resumeRun 注入响应 JSON 作为 tool_result → 模型续跑到 end_turn。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const harness = @import("harness");
 const cc = @import("cc");
 
@@ -313,7 +314,7 @@ fn makeSessionDir(buf: []u8) []const u8 {
     const pid = @import("platform").process.currentPid();
     const tmp = @import("platform").paths.tempDir();
     const dir = std.fmt.bufPrintZ(buf, "{s}/cc-zig-l3-{d}", .{ tmp, pid }) catch unreachable;
-    _ = std.c.mkdir(dir.ptr, 0o755);
+    _ = pfs.mkdir(dir.ptr, 0o755);
     return dir;
 }
 
@@ -321,7 +322,7 @@ fn clearSession(dir: []const u8) void {
     var b: [300]u8 = undefined;
     inline for (.{ "transcript.jsonl", "meta.json", "suspend.json" }) |f| {
         const p = std.fmt.bufPrintZ(&b, "{s}/{s}", .{ dir, f }) catch return;
-        _ = std.c.unlink(p.ptr);
+        pfs.unlinkPath(p.ptr) catch {};
     }
 }
 

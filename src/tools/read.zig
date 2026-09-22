@@ -594,7 +594,7 @@ test "ReadTool image returns structured json" {
     const bytes = [_]u8{ 0x89, 0x50, 0x4E, 0x47 };
     _ = pfs.write(fd, &bytes);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{path}));
     defer std.testing.allocator.free(r);
@@ -654,7 +654,7 @@ test "ReadTool offset/limit extracts correct slice" {
     const text = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path_cstr.ptr);
+    defer pfs.unlinkPath(path_cstr.ptr) catch {};
 
     // offset=3, limit=2 → 带 cat -n 前缀，行号从 3 开始
     const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"offset\":3,\"limit\":2}}", .{path_cstr}));
@@ -672,7 +672,7 @@ test "ReadTool first line has line-number prefix 1" {
     const text = "hello\nworld\n";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path_cstr.ptr);
+    defer pfs.unlinkPath(path_cstr.ptr) catch {};
 
     const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{path_cstr}));
     defer std.testing.allocator.free(r);
@@ -689,7 +689,7 @@ test "ReadTool file without trailing newline still gets prefix" {
     const text = "noeol";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path_cstr.ptr);
+    defer pfs.unlinkPath(path_cstr.ptr) catch {};
 
     const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{path_cstr}));
     defer std.testing.allocator.free(r);
@@ -725,7 +725,7 @@ test "ReadTool 大文件整读被拒(防撑爆);带 offset/limit 放行" {
     var i: usize = 0;
     while (i < 30000) : (i += 1) _ = pfs.write(fd, line); // ~330KB
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     // 整读(无 offset/limit)→ 拒读 + too large 提示。
     const r1 = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{path}));
@@ -751,7 +751,7 @@ test "ReadTool 超长单行被截断 + 标记" {
     _ = pfs.write(fd, big_line);
     _ = pfs.write(fd, "\n");
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{path}));
     defer std.testing.allocator.free(r);
@@ -794,7 +794,7 @@ test "Read 输出封顶:显式 limit=huge 在 <10MB 文件上超 256KB → 截�
         _ = pfs.write(fd, &lbuf);
     }
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"limit\":999999}}", .{path}));
     defer a.free(r);
@@ -819,7 +819,7 @@ test "Read 输出封顶:单行 >100KB → 长行提示不给 offset(防死循环
     @memset(&payload, 'q');
     _ = pfs.write(fd, &payload);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{path}));
     defer a.free(r);
@@ -849,7 +849,7 @@ test "Read 流式:≥10MB 文件读中间区间不 OOM,返回正确的中间行"
         _ = pfs.write(fd, buf[0..w]);
     }
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     // 读中间:offset=200000, limit=3 → 应返回 L199999/L200000/L200001(1-based offset=200000 = 第 200000 行)。
     const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"offset\":200000,\"limit\":3}}", .{path}));
@@ -887,7 +887,7 @@ test "Read 流式:≥10MB 大范围触发 100KB 封顶 → 裁到完整行 + 精
         _ = pfs.write(fd, buf[0..w]);
     }
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     // offset=1 大 limit → 流式从头累积到 100KB(2560 行)封顶。
     const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"offset\":1,\"limit\":9999999}}", .{path}));
@@ -959,7 +959,7 @@ test "Read 弱提示:LSP 在位 + >150行 + zls 真装了 → CodeMap reminder;�
             _ = pfs.write(fd, line);
         }
         _ = pfs.close(fd);
-        defer _ = std.c.unlink(path.ptr);
+        defer pfs.unlinkPath(path.ptr) catch {};
 
         const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"path\":\"{s}\"}}", .{path}));
         defer a.free(r);
@@ -976,7 +976,7 @@ test "Read 弱提示:LSP 在位 + >150行 + zls 真装了 → CodeMap reminder;�
         const text = "const a = 1;\nconst b = 2;\n";
         _ = pfs.write(fd, text);
         _ = pfs.close(fd);
-        defer _ = std.c.unlink(path.ptr);
+        defer pfs.unlinkPath(path.ptr) catch {};
 
         const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"path\":\"{s}\"}}", .{path}));
         defer a.free(r);
@@ -995,7 +995,7 @@ test "Read 弱提示:LSP 在位 + >150行 + zls 真装了 → CodeMap reminder;�
             _ = pfs.write(fd, line);
         }
         _ = pfs.close(fd);
-        defer _ = std.c.unlink(path.ptr);
+        defer pfs.unlinkPath(path.ptr) catch {};
 
         const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"path\":\"{s}\"}}", .{path}));
         defer a.free(r);
@@ -1015,7 +1015,7 @@ test "Read 弱提示:LSP 在位 + >150行 + zls 真装了 → CodeMap reminder;�
             _ = pfs.write(fd, line);
         }
         _ = pfs.close(fd);
-        defer _ = std.c.unlink(path.ptr);
+        defer pfs.unlinkPath(path.ptr) catch {};
 
         const r = try execute(&noctx, try std.fmt.bufPrint(&args_buf, "{{\"path\":\"{s}\"}}", .{path}));
         defer a.free(r);
@@ -1050,7 +1050,7 @@ test "Read 弱提示:同 session 同文件只提一次(dedup);没装 server 则�
             _ = pfs.write(fd, line);
         }
         _ = pfs.close(fd);
-        defer _ = std.c.unlink(path.ptr);
+        defer pfs.unlinkPath(path.ptr) catch {};
 
         const r1 = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"path\":\"{s}\"}}", .{path}));
         defer a.free(r1);
@@ -1074,7 +1074,7 @@ test "ReadTool ~ 展开端到端(主 bug 回归)" {
     const text = "tilde-needle-content";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(fpath.ptr);
+    defer pfs.unlinkPath(fpath.ptr) catch {};
 
     // home_dir = per-pid 临时目录(可移植);故 ~/tilde-expand-read.txt 展开到 fixture。
     var hbuf: [512]u8 = undefined;
@@ -1096,7 +1096,7 @@ test "ReadTool 含 .. 的合法文件名不被误杀" {
     try std.testing.expect(fd >= 0);
     _ = pfs.write(fd, "ok");
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(fpath.ptr);
+    defer pfs.unlinkPath(fpath.ptr) catch {};
 
     var abuf: [320]u8 = undefined;
     const args = std.fmt.bufPrint(&abuf, "{{\"file_path\":\"{s}\"}}", .{fpath}) catch unreachable;

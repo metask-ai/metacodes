@@ -40,19 +40,19 @@ fn dispatchOk(ctx: *const ToolContext, name: []const u8, args: []const u8) ![]u8
 fn mkdirAt(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
-    _ = std.c.mkdir(z.ptr, 0o755);
+    _ = pfs.mkdir(z.ptr, 0o755);
 }
 
 fn rmAt(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
-    _ = std.c.unlink(z.ptr);
+    pfs.unlinkPath(z.ptr) catch {};
 }
 
 fn rmdirAt(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
-    _ = std.c.rmdir(z.ptr);
+    _ = pfs.rmdir(z.ptr);
 }
 
 fn writeAt(path: []const u8, content: []const u8) void {

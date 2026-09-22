@@ -3028,7 +3028,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
                         if (full.len >= zbuf.len) break :blk false;
                         @memcpy(zbuf[0..full.len], full);
                         zbuf[full.len] = 0;
-                        break :blk std.c.access(@ptrCast(&zbuf), std.c.F_OK) == 0;
+                        break :blk pfs.exists(@ptrCast(&zbuf));
                     } else false;
                     if (exists) {
                         std.debug.print("注意:node {d} 来自记忆文件 {s} —— 直接 forget 会在下次写该文件时复活。\n正确删法:清空该文件(Write 空内容,或 vim 清空后 /kg sync)。仍要强删:/kg forget! {d}\n", .{ id, full, id });
@@ -3806,7 +3806,7 @@ fn printMemorySlot(slot: []const u8, path: []const u8, desc: []const u8) void {
         if (path.len + 1 > buf.len) break :blk false;
         @memcpy(buf[0..path.len], path);
         buf[path.len] = 0;
-        break :blk std.c.access(@ptrCast(&buf), std.c.F_OK) == 0;
+        break :blk pfs.exists(@ptrCast(&buf));
     };
     const tag = if (exists) "        " else " (new)  ";
     std.debug.print("  \x1b[36m{s: <8}\x1b[0m{s}{s}\n    \x1b[2m{s}\x1b[0m\n", .{ slot, tag, path, desc });

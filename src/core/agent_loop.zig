@@ -5274,7 +5274,7 @@ test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触�
 
     var marker_buf: [512]u8 = undefined;
     const marker = tt.path(&marker_buf, "stop-hook-fired.marker");
-    _ = std.c.unlink(marker.ptr);
+    pfs.unlinkPath(marker.ptr) catch {};
     const hook_cmd = try std.fmt.allocPrint(a, "cat > {s}", .{marker});
     defer a.free(hook_cmd);
     const cmds = [_][]const u8{hook_cmd};
@@ -5297,7 +5297,7 @@ test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触�
     }
 
     // 负向:subagent(depth=1)不触发(marker 删后不重现)。
-    _ = std.c.unlink(@ptrCast(marker.ptr));
+    pfs.unlinkPath(@ptrCast(marker.ptr)) catch {};
     fireStopHook(&hs, a, &c, "end_turn", 1);
     const fd2 = pfs.open(@ptrCast(marker.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     try std.testing.expect(fd2 < 0); // 不触发 → 文件不存在

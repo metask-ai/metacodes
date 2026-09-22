@@ -309,7 +309,7 @@ pub fn saveToPath(allocator: std.mem.Allocator, path: []const u8, creds: StoredC
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return error.OpenFailed;
     defer _ = pfs.close(fd);
-    _ = std.c.chmod(path_z.ptr, 0o600);
+    _ = pfs.chmod(path_z.ptr, 0o600);
     const n = pfs.write(fd, json);
     if (n < 0 or @as(usize, @intCast(n)) != json.len) return error.WriteFailed;
 }
@@ -319,10 +319,11 @@ pub fn clearDefault(allocator: std.mem.Allocator) !void {
     defer allocator.free(path);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    // 宽字符删除(Windows DeleteFileW;#121)。已经不存在 = 目标状态达成,不算失败。
-    pfs.unlinkPath(path_z.ptr) catch {
-        if (!pfs.exists(path_z.ptr)) return;
-        return error.UnlinkFailed;
+    // 宽字符删除(Windows DeleteFileW;#121)。已经不存在 = 目标状态达成,不算失败;其它失败
+    // (EACCES、共享冲突)如实上报——不能靠事后 exists() 猜,父目录不可搜索时它同样失败。
+    pfs.unlinkPath(path_z.ptr) catch |err| switch (err) {
+        error.NotFound => return,
+        error.UnlinkFailed => return error.UnlinkFailed,
     };
 }
 
@@ -1006,7 +1007,7 @@ test "stored credentials roundtrip keeps file private" {
     try saveToPath(a, path, creds);
     defer {
         if (std.heap.c_allocator.dupeZ(u8, path)) |z| {
-            _ = std.c.unlink(z.ptr);
+            pfs.unlinkPath(z.ptr) catch {};
             std.heap.c_allocator.free(z);
         } else |_| {}
     }

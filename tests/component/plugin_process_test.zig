@@ -2,6 +2,7 @@
 //! provider advertisement -> native permission -> one-shot child -> tool result.
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const harness = @import("harness");
 const cc = @import("cc");
 const psync = @import("platform").sync;
@@ -184,7 +185,7 @@ fn createPackage(root: []const u8, mode: CallMode, call_timeout_ms: u64) ![]u8 {
     allocator.free(script);
     const entrypoint_z = try allocator.dupeZ(u8, entrypoint);
     defer allocator.free(entrypoint_z);
-    if (std.c.chmod(entrypoint_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(entrypoint_z.ptr, 0o700) != 0) return error.SkipZigTest;
 
     var digest: [32]u8 = undefined;
     const script_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, entrypoint, allocator, .limited(1024 * 1024));

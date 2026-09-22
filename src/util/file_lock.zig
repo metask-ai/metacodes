@@ -50,14 +50,20 @@ pub const Lock = struct {
         // unlink 失败必须重试:Windows 上并发读句柄(诊断路径/Defender 扫描)让 DeleteFile 吃
         // sharing violation;静默泄漏 = 全体等待者卡到 stale_ms。碰撞窗口 µs 级,短重试必过。
         var attempt: u32 = 0;
-        while (std.c.unlink(@ptrCast(&self.lock_path)) != 0) {
-            if (!pfs.exists(@ptrCast(&self.lock_path))) break; // 已消失(如被 steal)= 达成目的
-            attempt += 1;
-            if (attempt > 20) {
-                log.warn("file_lock", "release unlink 反复失败,锁文件泄漏: {s}", .{self.lock_path[0..self.lock_path_len]});
-                break;
-            }
-            util_time.sleepMs(2);
+        // 宽字符删除(#121):锁文件由 pfs.open 按精确名创建,删除也必须按精确名,否则中文路径下
+        // 窄字符 unlink 永远删不到、exists 却一直看得见 → 重试烧完、锁泄漏。
+        while (true) {
+            pfs.unlinkPath(@ptrCast(&self.lock_path)) catch |err| {
+                if (err == error.NotFound) break; // 已消失(如被 steal)= 达成目的
+                attempt += 1;
+                if (attempt > 20) {
+                    log.warn("file_lock", "release unlink 反复失败,锁文件泄漏: {s}", .{self.lock_path[0..self.lock_path_len]});
+                    break;
+                }
+                util_time.sleepMs(2);
+                continue;
+            };
+            break;
         }
         self.lock_path_len = 0;
     }
@@ -150,8 +156,9 @@ fn stealRename(lock: *Lock) bool {
     var grave: [std.fs.max_path_bytes:0]u8 = undefined;
     const g = std.fmt.bufPrintZ(&grave, "{s}.steal{d}", .{ lock.lock_path[0..lock.lock_path_len], pid() }) catch return false;
     lock.lock_path[lock.lock_path_len] = 0;
-    if (std.c.rename(@ptrCast(&lock.lock_path), g.ptr) != 0) return false;
-    _ = std.c.unlink(g.ptr);
+    // 宽字符 rename/unlink(#121);POSIX rename 本就替换,Windows MoveFileExW 同款语义。
+    if (pfs.renameReplace(@ptrCast(&lock.lock_path), g.ptr) != 0) return false;
+    pfs.unlinkPath(g.ptr) catch {};
     return true;
 }
 

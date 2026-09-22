@@ -3,6 +3,7 @@
 //! changes are needed for a Host-owned UI.
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const harness = @import("harness");
 const cc = @import("cc");
 
@@ -157,5 +158,5 @@ test "L2 AgentSession routes permission prompts through the same Host UiRequeste
     const result = try session.runText(1, "use host write", 4, .{ .ctx = &sink_state, .emit = Sink.emit });
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     try std.testing.expectEqual(@as(usize, 1), ui.permissions);
-    try std.testing.expect(std.c.access(file_path.ptr, std.c.F_OK) == 0);
+    try std.testing.expect(pfs.exists(file_path.ptr));
 }

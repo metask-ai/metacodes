@@ -40,12 +40,12 @@ fn writeTmp(path: [*:0]const u8, content: []const u8) void {
 
 test "L2 fileref: @relative inlines content anchored to skill_dir" {
     const a = std.testing.allocator;
-    _ = std.c.mkdir(base().ptr, 0o755);
-    defer _ = std.c.rmdir(base().ptr);
+    _ = pfs.mkdir(base().ptr, 0o755);
+    defer _ = pfs.rmdir(base().ptr);
     var nb: [512]u8 = undefined;
     const note = sub(&nb, "note.md");
     writeTmp(note.ptr, "NOTE BODY");
-    defer _ = std.c.unlink(note.ptr);
+    defer pfs.unlinkPath(note.ptr) catch {};
 
     const out = try render.renderBody(a, "see @note.md here", .{ .skill_dir = base() });
     defer a.free(out);
@@ -54,12 +54,12 @@ test "L2 fileref: @relative inlines content anchored to skill_dir" {
 
 test "L2 fileref: @\"quoted\" with spaces" {
     const a = std.testing.allocator;
-    _ = std.c.mkdir(base().ptr, 0o755);
-    defer _ = std.c.rmdir(base().ptr);
+    _ = pfs.mkdir(base().ptr, 0o755);
+    defer _ = pfs.rmdir(base().ptr);
     var sb: [512]u8 = undefined;
     const spaced = sub(&sb, "a b.txt");
     writeTmp(spaced.ptr, "SPACED");
-    defer _ = std.c.unlink(spaced.ptr);
+    defer pfs.unlinkPath(spaced.ptr) catch {};
 
     const out = try render.renderBody(a, "x @\"a b.txt\" y", .{ .skill_dir = base() });
     defer a.free(out);
@@ -83,16 +83,16 @@ test "L2 fileref: @/absolute outside boundary refused" {
 
 test "L2 fileref: @../ escape refused" {
     const a = std.testing.allocator;
-    _ = std.c.mkdir(base().ptr, 0o755);
-    defer _ = std.c.rmdir(base().ptr);
+    _ = pfs.mkdir(base().ptr, 0o755);
+    defer _ = pfs.rmdir(base().ptr);
     var subdir_buf: [512]u8 = undefined;
     const subdir = sub(&subdir_buf, "sub");
-    _ = std.c.mkdir(subdir.ptr, 0o755);
-    defer _ = std.c.rmdir(subdir.ptr);
+    _ = pfs.mkdir(subdir.ptr, 0o755);
+    defer _ = pfs.rmdir(subdir.ptr);
     var secret_buf: [512]u8 = undefined;
     const secret = sub(&secret_buf, "secret.md");
     writeTmp(secret.ptr, "SECRET");
-    defer _ = std.c.unlink(secret.ptr);
+    defer pfs.unlinkPath(secret.ptr) catch {};
 
     const out = try render.renderBody(a, "x @../secret.md y", .{ .skill_dir = subdir });
     defer a.free(out);

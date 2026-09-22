@@ -229,7 +229,7 @@ test "FileConfig: load missing file returns empty" {
 test "FileConfig: save + load roundtrip" {
     var path_buf: [512]u8 = undefined;
     const path = tt.path(&path_buf, "config-roundtrip.json");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const src = FileConfig{
         .model = "claude-test",
@@ -253,7 +253,7 @@ test "FileConfig: save + load roundtrip" {
 test "FileConfig: partial fields" {
     var path_buf: [512]u8 = undefined;
     const path = tt.path(&path_buf, "config-partial.json");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     const src = FileConfig{ .model = "only-model" };
     try saveToFile(src, testing.allocator, path);
     const loaded = try loadFromFile(testing.allocator, path);
@@ -334,7 +334,7 @@ test "an unreadable existing document is never treated as empty" {
     const dir_path = tt.path(&dir_path_buf, "config-unreadable-test");
     const dir_z: [:0]const u8 = dir_path;
     _ = pfs.mkdir(dir_z.ptr, 0o700);
-    defer _ = std.c.rmdir(dir_z.ptr);
+    defer _ = pfs.rmdir(dir_z.ptr);
 
     try std.testing.expectError(error.ConfigUnreadable, readWhole(a, dir_z));
     try std.testing.expectError(error.ConfigUnreadable, saveToFile(.{ .model = "x" }, a, dir_path));

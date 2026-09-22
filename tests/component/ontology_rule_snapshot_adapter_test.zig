@@ -5,6 +5,7 @@
 //! only a private temporary store.
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const cc = @import("cc");
 const tinykg_binary = @import("tinykg_binary.zig");
@@ -387,7 +388,7 @@ fn writeExecutable(allocator: std.mem.Allocator, path: []const u8, bytes: []cons
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
 }
 
 test "L2 consistent TinyKG source becomes bound projection receipt for rule-author v2" {

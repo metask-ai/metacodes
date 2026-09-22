@@ -93,7 +93,7 @@ pub fn freeState(state: SuspendState, allocator: std.mem.Allocator) void {
 pub fn clear(session_dir: []const u8) void {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = std.fmt.bufPrint(&pbuf, "{s}/suspend.json\x00", .{session_dir}) catch return;
-    _ = std.c.unlink(@ptrCast(path.ptr));
+    pfs.unlinkPath(@ptrCast(path.ptr)) catch {}; // 宽字符(#121):写与删看同一个文件
 }
 
 /// 便利:直接从 agent_loop.SuspendInfo 落盘(避免每个调用点手转 CompletedResult)。

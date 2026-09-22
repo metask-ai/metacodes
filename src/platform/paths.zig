@@ -25,20 +25,42 @@ fn envNonEmpty(name: [*:0]const u8) ?[]const u8 {
     return if (s.len > 0) s else null;
 }
 
-/// 用户 home 目录。POSIX=$HOME；Windows=$HOME 优先（少见但尊重）否则 $USERPROFILE。
-/// 返回 null=均未设（调用方决定 error.NoHome / 兜底）。
+// Windows 环境块是 UTF-16;窄字符 `getenv` 给的是按进程 ANSI 代码页转过的字节,中文用户名下
+// (`C:\Users\张三`)不是 UTF-8——喂给 platform/fs 的宽字符入口会被当成非法 UTF-8 拒掉,而
+// 从前的窄字符 `_open`/`_mkdir` 恰好用同一个代码页解回去,所以"看起来能用"。这里改从
+// `GetEnvironmentVariableW` 读、转成 UTF-8 写进**每个公开函数自己的静态缓冲**(#121 输入侧)。
+// 静态缓冲:homeDir/tempDir 的返回值被调用方长期持有(App 配置),不能借用栈;每次调用都重新
+// 读环境(测试会 setEnv 后再调),并发调用写入同样的字节,无害。
+var home_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
+var temp_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
+
+fn envNonEmptyW(name: [*:0]const u16, out: []u8) ?[]const u8 {
+    var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+    const n = GetEnvironmentVariableW(name, &wbuf, wbuf.len);
+    if (n == 0 or n >= wbuf.len) return null;
+    if (out.len < @as(usize, n) * 3) return null; // utf16LeToUtf8 不做输出边界检查
+    const len = std.unicode.utf16LeToUtf8(out, wbuf[0..n]) catch return null;
+    return if (len > 0) out[0..len] else null;
+}
+extern "kernel32" fn GetEnvironmentVariableW(lpName: [*:0]const u16, lpBuffer: [*]u16, nSize: u32) callconv(.winapi) u32;
+
+/// 用户 home 目录。POSIX=$HOME;Windows=$HOME 优先(少见但尊重)否则 $USERPROFILE,UTF-8。
+/// 返回 null=均未设(调用方决定 error.NoHome / 兜底)。
 pub fn homeDir() ?[]const u8 {
-    if (envNonEmpty("HOME")) |h| return h;
     if (is_windows) {
-        if (envNonEmpty("USERPROFILE")) |u| return u;
+        if (envNonEmptyW(std.unicode.utf8ToUtf16LeStringLiteral("HOME"), &home_utf8)) |h| return h;
+        if (envNonEmptyW(std.unicode.utf8ToUtf16LeStringLiteral("USERPROFILE"), &home_utf8)) |u| return u;
+        return null;
     }
-    return null;
+    return envNonEmpty("HOME");
 }
 
-/// 临时目录。POSIX=$TMPDIR or /tmp；Windows=$TEMP or $TMP or C:\Windows\Temp。
+/// 临时目录。POSIX=$TMPDIR or /tmp;Windows=$TEMP or $TMP or C:\Windows\Temp,UTF-8。
 pub fn tempDir() []const u8 {
     if (is_windows) {
-        return envNonEmpty("TEMP") orelse envNonEmpty("TMP") orelse "C:\\Windows\\Temp";
+        return envNonEmptyW(std.unicode.utf8ToUtf16LeStringLiteral("TEMP"), &temp_utf8) orelse
+            envNonEmptyW(std.unicode.utf8ToUtf16LeStringLiteral("TMP"), &temp_utf8) orelse
+            "C:\\Windows\\Temp";
     }
     return envNonEmpty("TMPDIR") orelse "/tmp";
 }
@@ -132,7 +154,8 @@ pub fn selfExePath(buf: []u8) ?[]const u8 {
 }
 extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
 
-/// 本进程可执行文件的**物理路径**:`selfExePath` 再经 realpath 解 symlink 与 `.`/`..`。
+/// 本进程可执行文件的**物理路径**:`selfExePath` 再经 `fs.finalPath` 解 symlink/junction 与 `.`/`..`
+/// (Windows 走 CreateFileW + GetFinalPathNameByHandleW,#140;`fs.realpath` 在 Windows 是词法的,解不开)。
 /// 相邻产物定位(toolchain 的 rg / Lean kernel、KgClient 的 vendored tinykg)的唯一入口——
 /// 三处解析器共用此函数,不再各自决定要不要解 symlink(2026-09-21 实测:经 ~/bin symlink
 /// 启动的 release 布局,rg 与两个 kernel 落到 ~/bin 找不到,只有已 realpath 的 tinykg 命中)。
@@ -143,8 +166,8 @@ extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
 /// kernel,那比 unresolved 更糟(Codex review 2026-09-21;Windows CI 抓到 `_fullpath` 那一半)。
 /// 三个 OS 的 selfExePath 生产实现都返回绝对路径,这条只防测试注入与未来的实现漂移。
 ///
-/// realpath 失败(路径被删、权限)时**回退到被调用路径**而不是返回 null:退化成旧行为,不让
-/// 一次 realpath 故障把所有相邻产物变成 unresolved。selfExePath 本身失败也返回 null。
+/// finalPath 失败(路径被删、权限)时**回退到被调用路径**而不是返回 null:退化成旧行为,不让
+/// 一次解析故障把所有相邻产物变成 unresolved。selfExePath 本身失败也返回 null。
 /// 写进 buf,返回 slice。
 pub fn selfExeRealPath(buf: []u8) ?[]const u8 {
     var invoked: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -152,7 +175,7 @@ pub fn selfExeRealPath(buf: []u8) ?[]const u8 {
     if (!std.fs.path.isAbsolute(invoked_slice)) return null;
     invoked[invoked_slice.len] = 0;
     var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const resolved: []const u8 = if (@import("fs.zig").realpath(invoked[0..invoked_slice.len :0], &resolved_buf)) |r|
+    const resolved: []const u8 = if (@import("fs.zig").finalPath(invoked[0..invoked_slice.len :0], &resolved_buf)) |r|
         std.mem.span(r)
     else
         invoked_slice;
@@ -183,6 +206,30 @@ test "tempDir 非空" {
     try std.testing.expect(tempDir().len > 0);
 }
 
+test "Windows: homeDir/tempDir come back as UTF-8 for a CJK environment value" {
+    // #121 输入侧:环境值经 SetEnvironmentVariableW 以 UTF-16 写入(绕开窄字符 _putenv 的
+    // 代码页转换),读回必须是 UTF-8 的精确字节,而不是 ANSI 代码页字节。
+    if (!is_windows) return error.SkipZigTest;
+    const name_w = std.unicode.utf8ToUtf16LeStringLiteral("HOME");
+    var saved: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+    const saved_len = GetEnvironmentVariableW(name_w, &saved, saved.len);
+    if (saved_len < saved.len) saved[saved_len] = 0;
+    defer _ = SetEnvironmentVariableW(name_w, if (saved_len == 0) null else @ptrCast(&saved));
+
+    const value = "C:\\Users\\张三";
+    try std.testing.expect(SetEnvironmentVariableW(name_w, std.unicode.utf8ToUtf16LeStringLiteral(value)) != 0);
+    try std.testing.expectEqualStrings(value, homeDir().?);
+
+    const temp_w = std.unicode.utf8ToUtf16LeStringLiteral("TEMP");
+    var saved_temp: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+    const saved_temp_len = GetEnvironmentVariableW(temp_w, &saved_temp, saved_temp.len);
+    if (saved_temp_len < saved_temp.len) saved_temp[saved_temp_len] = 0;
+    defer _ = SetEnvironmentVariableW(temp_w, if (saved_temp_len == 0) null else @ptrCast(&saved_temp));
+    try std.testing.expect(SetEnvironmentVariableW(temp_w, std.unicode.utf8ToUtf16LeStringLiteral("C:\\Users\\张三\\临时")) != 0);
+    try std.testing.expectEqualStrings("C:\\Users\\张三\\临时", tempDir());
+}
+extern "kernel32" fn SetEnvironmentVariableW(lpName: [*:0]const u16, lpValue: ?[*:0]const u16) callconv(.winapi) c_int;
+
 test "selfExeRealPath resolves a symlinked invocation to the physical executable" {
     // Windows 也跑:realpath 现在经句柄解析 symlink/junction(#140)。runner 没有 symlink 特权时
     // 由 symlinkOrSkip 标成 skip;junction 形态由下一个用例覆盖(不需特权)。
@@ -197,7 +244,7 @@ test "selfExeRealPath resolves a symlinked invocation to the physical executable
     // 物理路径的期望值来自 std(Windows 走 NT 宽字符 API + GetFinalPathNameByHandle),不是被测函数自己。
     var real_buf: [std.fs.max_path_bytes]u8 = undefined;
     const real = real_buf[0..try tmp.dir.realPathFile(io, "prefix/bin/metacodes", &real_buf)];
-    try @import("test_links.zig").symlinkOrSkip(tmp.dir, io, real, "elsewhere/metacodes", .{});
+    try @import("test_support.zig").symlinkOrSkip(tmp.dir, io, real, "elsewhere/metacodes", .{});
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     const link = try std.fmt.bufPrint(&link_buf, "{s}/elsewhere/metacodes", .{root});
 
@@ -226,7 +273,7 @@ test "selfExeRealPath resolves an invocation through an NTFS junction to the phy
     defer a.free(junction);
     const target = try std.fmt.allocPrint(a, "{s}\\prefix", .{root});
     defer a.free(target);
-    try @import("test_links.zig").junction(a, junction, target);
+    try @import("test_support.zig").junction(a, junction, target);
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     const link = try std.fmt.bufPrint(&link_buf, "{s}\\elsewhere_j\\bin\\metacodes.exe", .{root});
 
@@ -239,7 +286,7 @@ test "selfExeRealPath resolves an invocation through an NTFS junction to the phy
 }
 
 test "selfExeRealPath falls back to the invoked path when realpath fails" {
-    // 被调用路径已不存在(安装被删/权限)→ realpath 失败 → 退回原值,而不是 null。
+    // 被调用路径已不存在(安装被删/权限)→ finalPath 失败 → 退回原值,而不是 null。
     const ghost = if (is_windows) "C:\\definitely-missing-metacodes-xyzzy\\bin\\metacodes.exe" else "/definitely-missing-metacodes-xyzzy/bin/metacodes";
     test_self_exe_override = ghost;
     defer test_self_exe_override = null;
@@ -248,7 +295,7 @@ test "selfExeRealPath falls back to the invoked path when realpath fails" {
 }
 
 test "selfExeRealPath refuses a relative invoked path before consulting realpath" {
-    // 相对路径 = 会随 cwd 漂移的基准 → null。**不能**靠 realpath 失败来拒:Windows `_fullpath`
+    // 相对路径 = 会随 cwd 漂移的基准 → null。**不能**靠解析失败来拒:Windows 词法 `_wfullpath`
     // 对相对路径会成功补全(CI 2026-09-21 实证),所以先看 isAbsolute。存在的相对路径也一样拒。
     const ghost = if (is_windows) "bin\\definitely-missing-metacodes-xyzzy.exe" else "bin/definitely-missing-metacodes-xyzzy";
     test_self_exe_override = ghost;

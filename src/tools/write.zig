@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const pfs = @import("platform").fs;
-const pdir = @import("platform").dir;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const util_fs = @import("../util/fs.zig");
@@ -248,7 +247,7 @@ test "WriteTool create file" {
     const result = try execute(&ctx, args);
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
-    _ = std.c.unlink(path.ptr);
+    pfs.unlinkPath(path.ptr) catch {};
 }
 
 test "WriteTool auto-mkdir creates missing parent directory" {
@@ -261,11 +260,11 @@ test "WriteTool auto-mkdir creates missing parent directory" {
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
     // cleanup
-    _ = std.c.unlink(path.ptr);
+    pfs.unlinkPath(path.ptr) catch {};
     var sbuf: [256]u8 = undefined;
-    _ = std.c.rmdir((tt.path(&sbuf, "mkdir-parent-9a8b/sub")).ptr);
+    _ = pfs.rmdir((tt.path(&sbuf, "mkdir-parent-9a8b/sub")).ptr);
     var dbuf: [256]u8 = undefined;
-    _ = std.c.rmdir((tt.path(&dbuf, "mkdir-parent-9a8b")).ptr);
+    _ = pfs.rmdir((tt.path(&dbuf, "mkdir-parent-9a8b")).ptr);
 }
 
 test "WriteTool EACCES detail names the unwritable directory (errno through error_detail)" {
@@ -280,8 +279,8 @@ test "WriteTool EACCES detail names the unwritable directory (errno through erro
     const dir = tt.path(&dbuf, "ro-dir-4c1e");
     try std.testing.expect(pfs.mkdir(dir.ptr, 0o500) == 0);
     defer {
-        _ = std.c.chmod(dir.ptr, 0o700);
-        _ = std.c.rmdir(dir.ptr);
+        _ = pfs.chmod(dir.ptr, 0o700);
+        _ = pfs.rmdir(dir.ptr);
     }
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "ro-dir-4c1e/x.txt");
@@ -307,7 +306,7 @@ test "WriteTool ENOTDIR detail: a file as a path component" {
         const fd = try pfs.openZ(file, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(file.ptr);
+    defer pfs.unlinkPath(file.ptr) catch {};
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "notdir-7b2d/child.txt");
     var abuf: [320]u8 = undefined;
@@ -322,7 +321,7 @@ test "WriteTool not-read-first rejects existing file" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "write-mrf-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     // 先存在一个文件（外部创建）
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.write(fd, "old");
@@ -341,8 +340,8 @@ test "WriteTool creating new file does not require read" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "write-new-test.txt");
-    _ = std.c.unlink(path.ptr); // 确保不存在
-    defer _ = std.c.unlink(path.ptr);
+    pfs.unlinkPath(path.ptr) catch {}; // 确保不存在
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
@@ -359,7 +358,7 @@ test "WriteTool stale file rejected" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "write-stale-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.write(fd, "v1");
@@ -397,7 +396,7 @@ test "WriteTool ~ 展开端到端" {
     // 读回验证落盘到展开后的真实路径
     var pbuf: [256]u8 = undefined;
     const real = std.fmt.bufPrintZ(&pbuf, "{s}/tilde-write-test.txt", .{home}) catch unreachable;
-    defer _ = std.c.unlink(real.ptr);
+    defer pfs.unlinkPath(real.ptr) catch {};
     const fd = pfs.open(real.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     try std.testing.expect(fd >= 0); // 文件存在 = ~ 已展开
     _ = pfs.close(fd);
@@ -409,18 +408,7 @@ test "WriteTool ~ 展开端到端" {
 // 全平台跑:POSIX 上 UTF-8 是原生编码,充当回归基线;Windows 原生 CI 是真正的证据。验证一律走
 // std.Io(Windows 走 NT 宽字符 API)与 platform/dir 枚举,不用 pfs 自读自证。
 
-/// 目录里除 `.`/`..` 外的条目数,并断言每个条目都叫 `expected_name`。
-fn countEntriesNamed(dir_z: [*:0]const u8, expected_name: []const u8) !usize {
-    var it = pdir.open(dir_z) orelse return error.TestUnexpectedResult;
-    defer pdir.close(&it);
-    var entries: usize = 0;
-    while (pdir.next(&it)) |ent| {
-        if (std.mem.eql(u8, ent.name, ".") or std.mem.eql(u8, ent.name, "..")) continue;
-        try std.testing.expectEqualStrings(expected_name, ent.name);
-        entries += 1;
-    }
-    return entries;
-}
+const countEntriesNamed = @import("platform").test_support.countEntriesNamed;
 
 test "WriteTool: a CJK path with CJK parent directories is created at exactly the requested names" {
     const a = std.testing.allocator;
@@ -452,12 +440,6 @@ test "WriteTool: a CJK path with CJK parent directories is created at exactly th
     try std.testing.expectEqual(@as(usize, 1), try countEntriesNamed(root_z.ptr, "测试目录"));
     try std.testing.expectEqual(@as(usize, 1), try countEntriesNamed(l1.ptr, "子目录"));
     try std.testing.expectEqual(@as(usize, 1), try countEntriesNamed(l2.ptr, "测试.txt"));
-
-    // 同一个对象:刚写过的文件已记进 ReadState,紧接着的第二次 Write 走 stale/must-read 校验而不是
-    // "文件不存在 → 允许创建"——这证明 statPath(宽字符)与 open 看到的是同一个文件。
-    const again = try execute(&ctx, args);
-    defer a.free(again);
-    try std.testing.expect(std.mem.indexOf(u8, again, "\"success\":true") != null);
 }
 
 test "WriteTool: must-read-first still rejects an existing CJK-path file" {

@@ -448,8 +448,8 @@ test "AgentSet: recursive subfolder discovery (path doesn't affect name)" {
     // cleanup sub
     const md_z = std.fmt.allocPrintSentinel(a, "{s}/security.md", .{sub_dir}, 0) catch unreachable;
     defer a.free(md_z);
-    _ = std.c.unlink(md_z);
-    _ = std.c.rmdir(sub_z);
+    pfs.unlinkPath(md_z) catch {};
+    _ = pfs.rmdir(sub_z);
 }
 
 test "AgentSet: later load overwrites earlier (project beats personal)" {
@@ -500,7 +500,7 @@ fn cleanupDir(parent: []const u8) void {
         if (name.len == 0 or name[0] == '.') continue;
         const sub = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ parent, name }, 0) catch continue;
         defer a.free(sub);
-        _ = std.c.unlink(sub);
+        pfs.unlinkPath(sub) catch {};
     }
-    _ = std.c.rmdir(parent_z);
+    _ = pfs.rmdir(parent_z);
 }

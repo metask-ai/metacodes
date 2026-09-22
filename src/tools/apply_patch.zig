@@ -895,7 +895,7 @@ test "execute e2e: Update File 真写盘" {
         _ = pfs.write(fd, "foo\nbar\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(fpath.ptr);
+    defer pfs.unlinkPath(fpath.ptr) catch {};
 
     var ctx = ToolContext.simple(a);
     ctx.cwd_abs = "/"; // fpath 已是绝对路径
@@ -927,8 +927,8 @@ test "execute e2e: Add + Delete 事务性(context 失败则整批不落盘)" {
         _ = pfs.write(fd, "keep\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(existing.ptr);
-    defer _ = std.c.unlink(to_add.ptr);
+    defer pfs.unlinkPath(existing.ptr) catch {};
+    defer pfs.unlinkPath(to_add.ptr) catch {};
 
     var ctx = ToolContext.simple(a);
     ctx.cwd_abs = "/";
@@ -962,8 +962,8 @@ test "execute e2e: Move(重命名到新目录)写新 + 删旧(codex fixture 004)
         _ = pfs.write(fd, "old content\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(src.ptr);
-    defer _ = std.c.unlink(dst.ptr);
+    defer pfs.unlinkPath(src.ptr) catch {};
+    defer pfs.unlinkPath(dst.ptr) catch {};
 
     var ctx = ToolContext.simple(a);
     ctx.cwd_abs = "/";
@@ -995,7 +995,7 @@ test "execute e2e: Add File 撞已存在文件 → 报错不覆盖(比 codex 更
         _ = pfs.write(fd, "PRECIOUS\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(fpath.ptr);
+    defer pfs.unlinkPath(fpath.ptr) catch {};
 
     var ctx = ToolContext.simple(a);
     ctx.cwd_abs = "/";
@@ -1022,7 +1022,7 @@ test "execute: protected path(.env)拦住 ApplyPatch(不再绕过细粒度权限
         _ = pfs.write(fd, "SECRET=1\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(fpath.ptr);
+    defer pfs.unlinkPath(fpath.ptr) catch {};
 
     const permission = @import("../permission.zig");
     var pctx = permission.createContext(.default, a); // 非 bypass → 权限门生效
