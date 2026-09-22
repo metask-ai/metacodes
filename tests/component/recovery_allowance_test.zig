@@ -221,6 +221,9 @@ fn runTurns(allocator: std.mem.Allocator, fixture: *const Fixture, url: []const 
         &permission,
         .{
             .max_turns = max_turns,
+            // 这套场景连跑多轮静默工具回合;进度提醒(progress_updates)会在第 3 个静默回合后
+            // 追加一条 user 记录,把"最后一条 user 消息只有 tool_result"的断言换成别的东西。关掉。
+            .progress_updates = false,
             .tool_dispatcher = dispatcher.asDispatcher(),
             .artifact_root = fixture.root(),
             .tool_result_metrics = &run.metrics,
