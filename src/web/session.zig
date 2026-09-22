@@ -280,6 +280,9 @@ fn shellCommandResult(svc: *session_service_mod.SessionService, journal: *EventJ
 pub fn buildWebOptions(app: *app_mod.App, wb: *WebBackend, scoped_recall: ?[]const u8) agent_loop.Options {
     var options = session_service_mod.buildRunOptions(app, scoped_recall);
     options.ui_requester = wb.requester();
+    // 进度更新义务(#114):web 会话有人在看,与 REPL 主 run 同样接上(宿主契约字段,canonical 不带)。
+    options.progress_updates = app.config.progress_updates;
+    options.progress_updates_observe = app.config.progress_updates_observe;
     return options;
 }
 

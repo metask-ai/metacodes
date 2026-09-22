@@ -514,6 +514,11 @@ fn buildOptions(
         .requirement_ledger_observe = app.config.requirement_ledger_observe,
         .delivery_cadence = app.config.delivery_cadence,
         .delivery_cadence_observe = app.config.delivery_cadence_observe,
+        // Progress notes need a reader: only the --stream-json timeline forwards
+        // commentary live; --json / plain print mode discard it, so a nudge
+        // there would cost tokens for nobody (and every eval rollout runs here).
+        .progress_updates = app.config.progress_updates and app.config.stream_json,
+        .progress_updates_observe = app.config.progress_updates_observe,
         .delivery_cadence_thresholds = .{
             .first = app.config.delivery_cadence_first orelse delivery_cadence_mod.DEFAULT_FIRST_THRESHOLD,
             .second = app.config.delivery_cadence_second orelse delivery_cadence_mod.DEFAULT_SECOND_THRESHOLD,

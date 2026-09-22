@@ -69,7 +69,7 @@
     "treatment_executable": "scripts/eval/fixtures/plugin_candidate.py",
     "treatment_executable_sha256": "1a80f4f240e80df798521cb4cacd9a59d12d494cbee06468412b4fe751f28a61",
     "single_factor": "one namespaced Skill data package",
-    "implementation_fingerprint": "6330ad948be9a5e0eea0ed7a83202d2d2d8a11b33b8511b8c263af3ef62351d6",
+    "implementation_fingerprint": "75eecf8674c6aefb843033022e3f7e76d709431e9e15219b7611320d036435a7",
     "runtime_binary_sha256": "fd330c2e4c4120a129fb8148091011f014d29d2c496f4a24ffdd8232c5cce054",
     "evaluation_contract_version": 4,
     "model": {
@@ -139,7 +139,7 @@
     "tests/e2e/run_e2e.sh": "38b21bdc939682e870846cc57731c90b2a114aec285b8df6d8019ba7a59314f3",
     "tests/e2e/lib.sh": "625b48249cb41b777bd2183c6d01190d67518d866d172e380bca20abb0cd4133",
     "evals/gates/default.json": "0e8da44acfefe11c5ff7ede5b11cc5d40a8edfd6660e18891dd2b79151e13559",
-    "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean": "d92227d7188348af5701ca43b7ddd2b2ffab34455c08869487dd156d06d11d92",
+    "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean": "9ac5611a40f49bbf029162b863a216198bc70e34cf4ac1efbaf13b6271e7447a",
     "control-plane/lean/MetaCodesControl/ObligationGate.lean": "c07307865b182cdebc73c72ed007bb6ae0514833b1247b86fcccb770503e426c"
   },
   "implementation_paths": [
@@ -225,6 +225,7 @@
     "src/core/agent_loop.zig",
     "src/core/response_candidate.zig",
     "src/core/host_injection_meter.zig",
+    "src/core/progress_updates.zig",
     "src/core/tool_error.zig",
     "src/repl/headless.zig",
     "src/swarm/context.zig",

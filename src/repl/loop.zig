@@ -19,6 +19,7 @@ const Conversation = @import("../core/conversation.zig").Conversation;
 const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
+const host_injection_meter = @import("../core/host_injection_meter.zig");
 const input = @import("input.zig");
 const complete = @import("complete.zig");
 const paste_mod = @import("paste.zig");
@@ -796,6 +797,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             .first = app.config.delivery_cadence_first orelse delivery_cadence_mod.DEFAULT_FIRST_THRESHOLD,
             .second = app.config.delivery_cadence_second orelse delivery_cadence_mod.DEFAULT_SECOND_THRESHOLD,
         };
+        // Progress-update obligation (#114): a person is reading this run, so the
+        // model is asked for a progress note after a long silent stretch. Same
+        // host-contract shape as the cadence gate: primary run only.
+        run_opts.progress_updates = app.config.progress_updates;
+        run_opts.progress_updates_observe = app.config.progress_updates_observe;
         run_opts.ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null;
         run_opts.spawn_tick_fn = spawn_tick;
         // issue #16:turn 边界刷新 OAuth access token。commit 时拷的是当时有效的
@@ -3492,7 +3498,9 @@ fn flattenConversation(app: *app_mod.App, allocator: std.mem.Allocator) ![]u8 {
         };
         for (m.blocks) |b| switch (b) {
             .text => |t| {
-                try out.appendSlice(allocator, role);
+                // host 注入的 user 记录(进度提醒等)不是用户说的话:标 Host,别让 /recap 当成用户诉求。
+                const label = if (m.role == .user and host_injection_meter.isHostInjectedText(t)) "Host" else role;
+                try out.appendSlice(allocator, label);
                 try out.appendSlice(allocator, ": ");
                 try out.appendSlice(allocator, t);
                 try out.append(allocator, '\n');

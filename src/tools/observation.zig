@@ -26,6 +26,7 @@ pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-ga
 pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-overflow-v1";
 pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v3";
 pub const DELIVERY_CADENCE_SCHEMA_VERSION = "metacodes-delivery-cadence-v1";
+pub const PROGRESS_UPDATES_SCHEMA_VERSION = "metacodes-progress-updates-v1";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
 pub const TEST_WEAKENING_SCHEMA_VERSION = "metacodes-test-weakening-candidate-v1";
 
@@ -247,6 +248,22 @@ pub const Event = union(enum) {
         max_nudges: u8,
         first_threshold: u32,
         second_threshold: u32,
+    },
+    /// Terminal record of the progress-update obligation (#114): at most one
+    /// per run, emitted whenever the gate was enforced or observed. Counters
+    /// only. `decisions` = boundaries where the policy fired (would-have-fired
+    /// in observe mode); `nudges` = injections actually made (0 in observe
+    /// mode, ≤ decisions ≤ max_nudges).
+    progress_updates: struct {
+        schema_version: []const u8 = PROGRESS_UPDATES_SCHEMA_VERSION,
+        /// Treatment-actuation witness: true when nudges could be injected.
+        enforced: bool,
+        silent_rounds_threshold: u32,
+        min_silent_ms: u64,
+        max_silent_rounds: u32,
+        decisions: u8,
+        nudges: u8,
+        max_nudges: u8,
     },
     verification_final_gate: struct {
         schema_version: []const u8 = VERIFICATION_FINAL_GATE_SCHEMA_VERSION,
