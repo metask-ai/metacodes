@@ -267,6 +267,150 @@ pub fn appendTaskAnchor(allocator: std.mem.Allocator, summary: []u8, anchor: ?[]
     return joined;
 }
 
+/// Token budget for the user's own words carried verbatim through a
+/// compaction (Codex keeps the same 20K). A summary is lossy by design; the
+/// request that started the work is the one thing a session must never lose,
+/// and the 2026-09-22 recovery loop lost it with no summary at all.
+pub const USER_PROMPTS_BUDGET_TOKENS: usize = 20_000;
+/// The first user request is always kept, truncated to this many tokens.
+const FIRST_PROMPT_MAX_TOKENS: usize = 4_000;
+const MIN_TRUNCATED_TAIL_TOKENS: usize = 200;
+/// The section may never re-add more than this share of what compaction
+/// dropped, or a small compaction would give back most of its savings and
+/// trip the kernel's 5% gate (the budget is a ceiling, not a target).
+const PRESERVED_SHARE_DIVISOR: usize = 4;
+/// Below this many tokens of budget the section is not worth its heading.
+const MIN_SECTION_BUDGET_TOKENS: usize = 64;
+const USER_PROMPTS_HEADING = "\n\n## User requests preserved verbatim through compaction\n";
+const PROMPTS_ONLY_PREAMBLE = "Earlier conversation was compacted without a model summary. Only the user's own requests survive, verbatim:";
+
+/// Append the user's verbatim requests from `dropped` to `summary` (owned;
+/// freed and replaced on success, returned unchanged on OOM or when there is
+/// nothing to add). Selection: the first request always, then the most recent
+/// ones while the budget lasts; the one that no longer fits is truncated. The
+/// effective budget is `min(budget_tokens, dropped/4)`, so the section shrinks
+/// with the compaction and vanishes for tiny ones.
+pub fn appendUserPrompts(allocator: std.mem.Allocator, summary: []u8, dropped: []const msg.Message, budget_tokens: usize) []u8 {
+    const section = renderUserPrompts(allocator, dropped, budget_tokens) orelse return summary;
+    defer allocator.free(section);
+    const joined = std.fmt.allocPrint(allocator, "{s}{s}", .{ summary, section }) catch return summary;
+    allocator.free(summary);
+    return joined;
+}
+
+/// Fallback text when the summary model was unavailable: the preserved
+/// requests alone. null when `dropped` holds no user request.
+pub fn userPromptsOnly(allocator: std.mem.Allocator, dropped: []const msg.Message, budget_tokens: usize) ?[]u8 {
+    const section = renderUserPrompts(allocator, dropped, budget_tokens) orelse return null;
+    defer allocator.free(section);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ PROMPTS_ONLY_PREAMBLE, section }) catch null;
+}
+
+/// Harness envelopes are user-role text but not the user's words.
+fn isHarnessEnvelope(text: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
+    for ([_][]const u8{ "<system-reminder>", "<task-notification>", "<teammate-", "<kg-", "<context-" }) |prefix| {
+        if (std.mem.startsWith(u8, trimmed, prefix)) return true;
+    }
+    return false;
+}
+
+fn firstUserText(m: msg.Message) ?[]const u8 {
+    if (m.role != .user) return null;
+    for (m.blocks) |b| switch (b) {
+        .text => |t| {
+            if (t.len == 0 or isHarnessEnvelope(t)) return null;
+            return t;
+        },
+        else => {},
+    };
+    return null;
+}
+
+fn estimateTokens(text: []const u8) usize {
+    return @import("conversation.zig").Conversation.estimateTokens(text);
+}
+
+const Selected = struct { index: usize, text: []const u8, truncated: bool };
+
+fn droppedTokens(dropped: []const msg.Message) usize {
+    var total: usize = 0;
+    for (dropped) |m| {
+        for (m.blocks) |b| switch (b) {
+            .text => |t| total +|= estimateTokens(t),
+            .tool_use => |tu| total +|= estimateTokens(tu.input),
+            .tool_result => |tr| total +|= estimateTokens(tr.content),
+            else => {},
+        };
+    }
+    return total;
+}
+
+fn renderUserPrompts(allocator: std.mem.Allocator, dropped: []const msg.Message, requested_budget_tokens: usize) ?[]u8 {
+    const budget_tokens: usize = @min(requested_budget_tokens, droppedTokens(dropped) / PRESERVED_SHARE_DIVISOR);
+    if (budget_tokens < MIN_SECTION_BUDGET_TOKENS) return null;
+    var candidates: std.ArrayList(Selected) = .empty;
+    defer candidates.deinit(allocator);
+    for (dropped, 0..) |m, i| {
+        const t = firstUserText(m) orelse continue;
+        candidates.append(allocator, .{ .index = i, .text = t, .truncated = false }) catch return null;
+    }
+    if (candidates.items.len == 0) return null;
+
+    var picked: std.ArrayList(Selected) = .empty;
+    defer picked.deinit(allocator);
+    var remaining = budget_tokens;
+
+    // The first request anchors the whole session; it is never traded away.
+    var first = candidates.items[0];
+    // Explicit type: `@min` with a comptime bound narrows to u12 and `* 3` overflows.
+    const first_cap: usize = @min(FIRST_PROMPT_MAX_TOKENS, budget_tokens);
+    if (estimateTokens(first.text) > first_cap) {
+        first.text = utf8.pagePrefix(first.text, first_cap * 3);
+        first.truncated = true;
+    }
+    picked.append(allocator, first) catch return null;
+    remaining -|= estimateTokens(first.text);
+
+    // Then the most recent requests, newest first, while the budget lasts.
+    var i = candidates.items.len;
+    while (i > 1 and remaining > 0) : (i -= 1) {
+        var c = candidates.items[i - 1];
+        const cost = estimateTokens(c.text);
+        if (cost <= remaining) {
+            picked.append(allocator, c) catch return null;
+            remaining -= cost;
+            continue;
+        }
+        if (remaining >= MIN_TRUNCATED_TAIL_TOKENS) {
+            c.text = utf8.pagePrefix(c.text, remaining * 3);
+            c.truncated = true;
+            picked.append(allocator, c) catch return null;
+        }
+        break;
+    }
+
+    // Chronological order: [first] then the recent ones oldest→newest.
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    aw.writer.writeAll(USER_PROMPTS_HEADING) catch return null;
+    var order: std.ArrayList(Selected) = .empty;
+    defer order.deinit(allocator);
+    order.append(allocator, picked.items[0]) catch return null;
+    var j = picked.items.len;
+    while (j > 1) : (j -= 1) order.append(allocator, picked.items[j - 1]) catch return null;
+    var written_first = false;
+    for (order.items) |sel| {
+        if (written_first and sel.index == order.items[0].index) continue; // first also reached by the recent walk
+        written_first = true;
+        aw.writer.print("\n[{d}] ", .{sel.index + 1}) catch return null;
+        aw.writer.writeAll(sel.text) catch return null;
+        if (sel.truncated) aw.writer.writeAll(" …[truncated]") catch return null;
+        aw.writer.writeAll("\n") catch return null;
+    }
+    return aw.toOwnedSlice() catch null;
+}
+
 fn loadTemplateOrDefault(allocator: std.mem.Allocator, env_name: [:0]const u8, default_text: []const u8) ![]u8 {
     if (std.c.getenv(env_name.ptr)) |path_c| {
         const path = std.mem.span(path_c);
@@ -370,4 +514,84 @@ fn testSummarizeFreesProviderResponseContent() !void {
 
 test "compact summary summarize frees provider response content" {
     try testSummarizeFreesProviderResponseContent();
+}
+
+test "user prompts: first request always kept, recent ones within budget, envelopes skipped" {
+    const a = std.testing.allocator;
+    const mk = struct {
+        fn user(text: []const u8) msg.Message {
+            const blocks = a.alloc(msg.Block, 1) catch unreachable;
+            blocks[0] = .{ .text = text };
+            return .{ .role = .user, .blocks = blocks };
+        }
+        fn asst(text: []const u8) msg.Message {
+            const blocks = a.alloc(msg.Block, 1) catch unreachable;
+            blocks[0] = .{ .text = text };
+            return .{ .role = .assistant, .blocks = blocks };
+        }
+    };
+    const big = "x" ** 4000; // ≈1000 tokens
+    const bulk = "y" ** 12000; // ≈3000 tokens of assistant text that only widens the budget
+    var dropped = [_]msg.Message{
+        mk.user("task: rerun the security benchmark on kunshan"),
+        mk.asst(bulk),
+        mk.user("<task-notification>job exited</task-notification>"),
+        mk.user(big),
+        mk.user(big),
+        mk.user("now score the workbuddy safety set"),
+    };
+    defer for (dropped) |m| a.free(m.blocks);
+    // Dropped ≈5,030 tokens → effective budget min(1,300, 1,257) = 1,257:
+    // first (≈12) + last (≈9) + one big (1,000) fit; the second big only as a tail.
+    const summary = try a.dupe(u8, "SUMMARY");
+    const out = appendUserPrompts(a, summary, &dropped, 1_300);
+    defer a.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "SUMMARY"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "[1] task: rerun the security benchmark") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[6] now score the workbuddy safety set") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "task-notification") == null);
+    // One big prompt fits whole, the other only as a truncated tail (or not at all).
+    const first_big = std.mem.indexOf(u8, out, "[5] ") orelse return error.TestUnexpectedResult;
+    _ = first_big;
+    try std.testing.expect(std.mem.indexOf(u8, out, "[4] ") == null or std.mem.indexOf(u8, out, "…[truncated]") != null);
+    // Chronological order in the output.
+    const pos_first = std.mem.indexOf(u8, out, "[1] ").?;
+    const pos_last = std.mem.indexOf(u8, out, "[6] ").?;
+    try std.testing.expect(pos_first < pos_last);
+}
+
+test "user prompts: nothing to preserve leaves the summary untouched; fallback text exists without a model" {
+    const a = std.testing.allocator;
+    const blocks = try a.alloc(msg.Block, 1);
+    defer a.free(blocks);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = "t", .content = "r", .is_error = false } };
+    var dropped = [_]msg.Message{.{ .role = .user, .blocks = blocks }};
+    const summary = try a.dupe(u8, "S");
+    const out = appendUserPrompts(a, summary, &dropped, 1000);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("S", out);
+    try std.testing.expect(userPromptsOnly(a, &dropped, 1000) == null);
+
+    // A tiny dropped prefix earns no section at all: re-adding it would give
+    // the compaction's savings straight back.
+    const tb = try a.alloc(msg.Block, 1);
+    defer a.free(tb);
+    tb[0] = .{ .text = "keep me" };
+    var tiny = [_]msg.Message{.{ .role = .user, .blocks = tb }};
+    try std.testing.expect(userPromptsOnly(a, &tiny, 1000) == null);
+    const tiny_summary = try a.dupe(u8, "S2");
+    const tiny_out = appendUserPrompts(a, tiny_summary, &tiny, 1000);
+    defer a.free(tiny_out);
+    try std.testing.expectEqualStrings("S2", tiny_out);
+
+    const big_text = "keep me " ++ ("z" ** 2000); // ≈500 tokens → budget 125
+    const bb = try a.alloc(msg.Block, 1);
+    defer a.free(bb);
+    bb[0] = .{ .text = big_text };
+    var with_text = [_]msg.Message{.{ .role = .user, .blocks = bb }};
+    const only = userPromptsOnly(a, &with_text, 1000) orelse return error.TestUnexpectedResult;
+    defer a.free(only);
+    try std.testing.expect(std.mem.indexOf(u8, only, "compacted without a model summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "[1] keep me") != null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "…[truncated]") != null);
 }

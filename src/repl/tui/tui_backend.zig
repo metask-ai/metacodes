@@ -260,12 +260,22 @@ pub const TuiBackend = struct {
                 // 当前 no-op(TUI config 变更本就走各自 handler 的直接重绘;A4 统一到 sink)。
             },
             .auto_compact => |c| {
-                var buf: [256]u8 = undefined;
-                const s = std.fmt.bufPrint(
-                    &buf,
-                    "\x1b[33m[auto-compacted {d} old messages, kept last {d}]\x1b[0m\n",
-                    .{ c.dropped, c.kept },
-                ) catch return;
+                // Same split as writer_backend: recovery is not compaction and
+                // must not read like it (2026-09-22: 75 rejections looked like
+                // "frequent auto-compact").
+                var buf: [320]u8 = undefined;
+                const s = if (std.mem.startsWith(u8, c.cause, "context_window_exceeded"))
+                    std.fmt.bufPrint(
+                        &buf,
+                        "\x1b[33m[context-window recovery ({s}): dropped {d} oldest messages, kept {d}]\x1b[0m\n",
+                        .{ c.cause, c.dropped, c.kept },
+                    ) catch return
+                else
+                    std.fmt.bufPrint(
+                        &buf,
+                        "\x1b[33m[auto-compacted {d} old messages, kept last {d}; cause={s}]\x1b[0m\n",
+                        .{ c.dropped, c.kept, c.cause },
+                    ) catch return;
                 self.region.writeGenText(s);
             },
             .context_warning => |w| {

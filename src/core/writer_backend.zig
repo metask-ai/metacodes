@@ -89,12 +89,24 @@ pub const WriterBackend = struct {
                 }
             },
             .auto_compact => |c| {
-                var buf: [256]u8 = undefined;
-                const s = std.fmt.bufPrint(
-                    &buf,
-                    "\x1b[33m[auto-compacted {d} old messages, kept last {d}]\x1b[0m\n",
-                    .{ c.dropped, c.kept },
-                ) catch return;
+                // Two different things share this event: a summary compaction
+                // (cause = which threshold fired) and the context-window
+                // recovery (the server rejected the request). Until 2026-09-22
+                // both printed the same line, which hid a session that was being
+                // trimmed two messages per turn behind "compaction is frequent".
+                var buf: [320]u8 = undefined;
+                const s = if (std.mem.startsWith(u8, c.cause, "context_window_exceeded"))
+                    std.fmt.bufPrint(
+                        &buf,
+                        "\x1b[33m[context-window recovery ({s}): dropped {d} oldest messages, kept {d}]\x1b[0m\n",
+                        .{ c.cause, c.dropped, c.kept },
+                    ) catch return
+                else
+                    std.fmt.bufPrint(
+                        &buf,
+                        "\x1b[33m[auto-compacted {d} old messages, kept last {d}; cause={s}]\x1b[0m\n",
+                        .{ c.dropped, c.kept, c.cause },
+                    ) catch return;
                 self.emit(s);
             },
             .context_warning => |w| {

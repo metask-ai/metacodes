@@ -811,6 +811,7 @@ pub const StreamHandle = struct {
     serverRequestIdFn: *const fn (ctx: *anyopaque) []const u8 = emptyServerRequestId,
     httpStatusFn: *const fn (ctx: *anyopaque) u16 = emptyHttpStatus,
     retryAttemptFn: *const fn (ctx: *anyopaque) u32 = emptyRetryAttempt,
+    contextWindowNumbersFn: *const fn (ctx: *anyopaque) error_class.ContextWindowNumbers = emptyContextWindowNumbers,
 
     pub inline fn next(self: StreamHandle) anyerror!?StreamEvent {
         return self.nextFn(self.ctx);
@@ -833,8 +834,17 @@ pub const StreamHandle = struct {
     pub inline fn retryAttempt(self: StreamHandle) u32 {
         return self.retryAttemptFn(self.ctx);
     }
+    /// Numbers carried by a mid-stream context-window-exceeded error frame.
+    /// Empty for handles that never saw one (and for transports that do not
+    /// implement the hook): the agent loop then falls back to observed sizes.
+    pub inline fn contextWindowNumbers(self: StreamHandle) error_class.ContextWindowNumbers {
+        return self.contextWindowNumbersFn(self.ctx);
+    }
 };
 
+fn emptyContextWindowNumbers(_: *anyopaque) error_class.ContextWindowNumbers {
+    return .{};
+}
 fn emptyServerRequestId(_: *anyopaque) []const u8 {
     return "";
 }
@@ -866,6 +876,10 @@ pub const EventIterator = struct {
     reader: *std.Io.Reader,
     abort: ?*const AbortSignal = null,
     done_flag: bool = false,
+    /// Numbers parsed from a context-window-exceeded error frame (best effort,
+    /// see error_class.parseContextWindowNumbers). Set together with
+    /// error.ContextWindowExceededEvent so the client can hand them upward.
+    context_window_numbers: error_class.ContextWindowNumbers = .{},
     /// 本次 SSE 流对应的 request_id（client 层设置）。用来把 stream 事件日志和
     /// 更上游的 HTTP 请求/下游 agent turn 串起来。未设置时日志无 id 上下文。
     req_id: ?log.RequestId = null,
@@ -1203,7 +1217,10 @@ pub const EventIterator = struct {
                     self.logWarn("API error event: {s}", .{err_obj});
                     @import("last_error.zig").recordNamed("API 错误帧", err_obj);
                     self.done_flag = true;
-                    if (error_class.isContextWindowExceeded(err_obj)) return error.ContextWindowExceededEvent;
+                    if (error_class.isContextWindowExceeded(err_obj)) {
+                        self.context_window_numbers = error_class.parseContextWindowNumbers(err_obj);
+                        return error.ContextWindowExceededEvent;
+                    }
                     return error.ApiErrorEvent;
                 },
                 // ping / unknown → 跳过

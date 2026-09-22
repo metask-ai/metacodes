@@ -101,6 +101,11 @@ pub const Options = struct {
     request_gate: ?request_gate.Gate = null,
     target_tokens: ?usize = null,
     committer: ?Committer = null,
+    /// Token budget for carrying the user's own requests verbatim through the
+    /// summary (compact_summary.appendUserPrompts). 0 = off, which keeps the
+    /// public/manual compaction contract exactly as before: the summary alone
+    /// replaces the prefix. The agent loop's automatic compaction turns it on.
+    preserve_user_prompts_tokens: usize = 0,
 };
 
 pub const Error = error{
@@ -187,6 +192,7 @@ pub fn run(
         abort: *const AbortSignal,
         model_override: ?[]const u8,
         task_anchor: ?[]const u8,
+        preserve_user_prompts_tokens: usize,
         usage: UsageDelta = .{},
         aborted: bool = false,
         degraded: bool = false,
@@ -215,16 +221,35 @@ pub fn run(
                     .outcome = .degraded,
                 };
                 self.degraded = true;
-                return null;
+                // No model summary: still carry the user's own requests (and
+                // the task anchor) across the boundary instead of nothing.
+                if (self.preserve_user_prompts_tokens == 0) return null;
+                const fallback = compact_summary.userPromptsOnly(
+                    self.allocator,
+                    drop_msgs,
+                    self.preserve_user_prompts_tokens,
+                ) orelse return null;
+                return compact_summary.appendTaskAnchor(
+                    self.allocator,
+                    fallback,
+                    self.task_anchor,
+                );
             };
             self.summary_request = .{
                 .elapsed_ms = elapsedMs(started_ns),
                 .outcome = .success,
             };
-            return compact_summary.appendTaskAnchor(
+            const with_anchor = compact_summary.appendTaskAnchor(
                 self.allocator,
                 summary,
                 self.task_anchor,
+            );
+            if (self.preserve_user_prompts_tokens == 0) return with_anchor;
+            return compact_summary.appendUserPrompts(
+                self.allocator,
+                with_anchor,
+                drop_msgs,
+                self.preserve_user_prompts_tokens,
             );
         }
     };
@@ -234,6 +259,7 @@ pub fn run(
         .abort = abort,
         .model_override = options.model_override,
         .task_anchor = options.task_anchor,
+        .preserve_user_prompts_tokens = options.preserve_user_prompts_tokens,
     };
     const compact_report = preview.conversation.compactWithSummaryReport(
         options.keep_recent,
