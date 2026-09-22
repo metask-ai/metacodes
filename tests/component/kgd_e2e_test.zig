@@ -382,6 +382,6 @@ test "Kgd: what install wrote is what the service starts from" {
     // A configuration the client would refuse must not start a service either.
     const config_c = try a.dupeZ(u8, config_path);
     defer a.free(config_c);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(config_c.ptr, 0o644));
+    try std.testing.expectEqual(@as(c_int, 0), pfs.chmod(config_c.ptr, 0o644));
     try std.testing.expectError(error.ConfigUnsafe, cc.kgd_runtime_exports.loadConfig(a, home, .{ .config_path = config_path }));
 }

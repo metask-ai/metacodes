@@ -1168,7 +1168,7 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
     try copyTestFile(checker_path, copied_checker_path, runtime.MAX_CHECKER_BYTES);
     const copied_checker_path_z = try std.testing.allocator.dupeZ(u8, copied_checker_path);
     defer std.testing.allocator.free(copied_checker_path_z);
-    if (std.c.chmod(copied_checker_path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(copied_checker_path_z.ptr, 0o700) != 0) return error.SkipZigTest;
 
     const source_provenance_path = try std.fmt.allocPrint(
         std.testing.allocator,

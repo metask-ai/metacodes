@@ -24,6 +24,44 @@ pub const MkdirError = error{
 ///
 /// 失败时 log.warn 记录 errno + path，便于生产调试（error.MkdirFailed 本身不带信息）。
 pub fn mkdirParents(dir: []const u8) MkdirError!void {
+    return mkdirAll(dir, 0o700, .strict);
+}
+
+/// best-effort 的 `mkdir -p dir`(Write / ApplyPatch / worktree 落盘前自动建目录):任一层失败且
+/// 不是 EEXIST 即停,权限等问题交给随后的 open 暴露;只有路径过长是本函数自己的错误。`mode`
+/// 一般是 0o755(用户可见的项目目录;`mkdirParents` 的 0o700 是 cache/session 私有目录)。
+pub fn mkdirBestEffort(dir: []const u8, mode: c_uint) error{PathTooLong}!void {
+    mkdirAll(dir, mode, .best_effort) catch |err| switch (err) {
+        error.PathTooLong => return error.PathTooLong,
+        error.MkdirFailed => return, // best-effort:按构造不会走到这里
+    };
+}
+
+/// 为 `path` 建所有缺失的**父**目录(等价 `mkdir -p $(dirname path)`),对齐 TS:Write 到不存在
+/// 的目录会先 mkdir -p。Windows 两种分隔符都认。
+pub fn mkdirParentsOf(path: []const u8) error{PathTooLong}!void {
+    const is_windows = @import("builtin").os.tag == .windows;
+    const slash = (if (is_windows) std.mem.lastIndexOfAny(u8, path, "/\\") else std.mem.lastIndexOfScalar(u8, path, '/')) orelse return; // 无目录分量
+    if (slash == 0) return; // 直接在根目录下,无需建
+    return mkdirBestEffort(path[0..slash], 0o755);
+}
+
+const Strictness = enum { strict, best_effort };
+
+/// 唯一的 `mkdir -p` 走查器(#121 review:此前三份拷贝各自漂移——apply_patch 那份没有反斜杠
+/// 与盘符处理)。已存在的目录先用一次 `exists` 短路:编辑已有文件是常态,不必逐级发一串必失败
+/// 的 mkdir。Windows:跳过盘符前缀——`mkdir("C:")` 报非 EEXIST 错会把 mid_failed 置真(strict)
+/// 或让第一层就早退(best-effort),一层都建不出来;UNC(`\\server\share\...`)不支持,首段
+/// 同样失败,交给随后的 open 报错。建目录走 `pfs.mkdir`,中文分量在 Windows 落到精确的名字。
+///
+/// strict 的错误语义(cache/session 目录):
+///   - 中间层 EEXIST(常态)忽略;其它错误记下来;
+///   - 最终 mkdir 成功 → OK;最终 EEXIST 且中间无其它错误 → OK;
+///   - 最终 EEXIST 但中间有其它错误 → MkdirFailed(路径可能被部分创建过,不可信任);
+///   - 最终非 EEXIST → MkdirFailed。失败时 log.warn 记 errno + path。
+/// best-effort:任一层非 EEXIST 失败即静默返回。errno 只按整数比较/按名查表
+/// (`pfs.errnoName`):裸 `@enumFromInt` 遇到 `std.c.E` 没命名的值会 panic(#121)。
+fn mkdirAll(dir: []const u8, mode: c_uint, strictness: Strictness) MkdirError!void {
     if (dir.len == 0) return;
     var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (dir.len >= buf.len) {
@@ -32,49 +70,41 @@ pub fn mkdirParents(dir: []const u8) MkdirError!void {
     }
     @memcpy(buf[0..dir.len], dir);
     buf[dir.len] = 0;
+    if (pfs.exists(@ptrCast(&buf))) return; // 常态:整条链已在
 
-    // 记录中间层第一个非 EEXIST 错误（用于日志；返回路径用 mid_failed bool）
     var mid_failed = false;
-    var mid_errno: std.c.E = .SUCCESS;
-    // Windows:跳过盘符前缀——mkdir("C:") 报非 EEXIST 错会把 mid_failed 置真,
-    // 使"目录已存在"的重复调用(final EEXIST + mid_failed)返回假 MkdirFailed。
+    var mid_errno: c_int = 0;
     const is_windows = @import("builtin").os.tag == .windows;
     var i: usize = 1;
     if (is_windows and dir.len >= 2 and dir[1] == ':') i = 3;
     while (i < dir.len) : (i += 1) {
         if (dir[i] != '/' and !(is_windows and dir[i] == '\\')) continue;
         buf[i] = 0;
-        if (std.c.mkdir(@ptrCast(&buf), 0o700) != 0) {
-            const e = currentErrno();
-            if (e != .EXIST and !mid_failed) {
+        if (pfs.mkdir(@ptrCast(&buf), mode) != 0 and !pfs.lastErrnoIs(.EXIST)) {
+            const e = pfs.lastErrno();
+            if (strictness == .best_effort) return;
+            if (!mid_failed) {
                 mid_failed = true;
                 mid_errno = e;
-                log.warn("fs", "mkdirParents: intermediate mkdir failed errno={s} at prefix={s}", .{ @tagName(e), buf[0..i] });
+                log.warn("fs", "mkdirParents: intermediate mkdir failed errno={s}({d}) at prefix={s}", .{ pfs.errnoName(e), e, buf[0..i] });
             }
         }
         buf[i] = dir[i]; // 还原原分隔符(Windows 可能是 '\\')
     }
 
     // 最终完整路径
-    if (std.c.mkdir(@ptrCast(&buf), 0o700) == 0) return;
-    const final_errno = currentErrno();
-    switch (final_errno) {
-        .EXIST => {
-            if (mid_failed) {
-                log.warn("fs", "mkdirParents: final EEXIST but mid failed errno={s}; not trusted: {s}", .{ @tagName(mid_errno), dir });
-                return error.MkdirFailed;
-            }
-            return;
-        },
-        else => {
-            log.warn("fs", "mkdirParents: final mkdir failed errno={s} path={s} (mid_failed={})", .{ @tagName(final_errno), dir, mid_failed });
+    if (pfs.mkdir(@ptrCast(&buf), mode) == 0) return;
+    const final_errno = pfs.lastErrno();
+    if (pfs.lastErrnoIs(.EXIST)) {
+        if (mid_failed) {
+            log.warn("fs", "mkdirParents: final EEXIST but mid failed errno={s}({d}); not trusted: {s}", .{ pfs.errnoName(mid_errno), mid_errno, dir });
             return error.MkdirFailed;
-        },
+        }
+        return;
     }
-}
-
-fn currentErrno() std.c.E {
-    return @enumFromInt(std.c._errno().*);
+    if (strictness == .best_effort) return;
+    log.warn("fs", "mkdirParents: final mkdir failed errno={s}({d}) path={s} (mid_failed={})", .{ pfs.errnoName(final_errno), final_errno, dir, mid_failed });
+    return error.MkdirFailed;
 }
 
 /// 包装 `getcwd(3)`，返回 allocator-owned 的 slice。
@@ -91,12 +121,10 @@ fn currentErrno() std.c.E {
 pub const GetCwdError = error{ GetCwdFailed, OutOfMemory };
 
 pub fn getCwd(allocator: std.mem.Allocator) GetCwdError![]u8 {
+    // 哨兵与 NUL 扫描住在 pfs.getCwd 里;Windows 在那里走 GetCurrentDirectoryW(UTF-8 输出,#121)。
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    buf[buf.len - 1] = 0; // 哨兵：libc 最多写 len-1 字节，保证 NUL 可扫到
-    if (std.c.getcwd(&buf, buf.len - 1) == null) return error.GetCwdFailed;
-    const end = std.mem.indexOfScalar(u8, &buf, 0) orelse unreachable;
-    if (end == 0) return error.GetCwdFailed; // getcwd 成功但路径长度为 0 是异常
-    return try allocator.dupe(u8, buf[0..end]);
+    const cwd = pfs.getCwd(&buf) orelse return error.GetCwdFailed;
+    return try allocator.dupe(u8, cwd);
 }
 
 // ============================================================================
@@ -133,11 +161,11 @@ fn rmrfSafeImpl(path: []const u8, depth_left: u32) void {
     pbuf[path.len] = 0;
     // 目录本身若是 symlink,只 unlink 链接、不进入。
     if (isSymlink(@ptrCast(&pbuf))) {
-        _ = std.c.unlink(@ptrCast(&pbuf));
+        pfs.unlinkPath(@ptrCast(&pbuf)) catch {};
         return;
     }
     var it = pdir.open(@ptrCast(&pbuf)) orelse {
-        _ = std.c.unlink(@ptrCast(&pbuf));
+        pfs.unlinkPath(@ptrCast(&pbuf)) catch {};
         return;
     };
     const MAX_CHILDREN = 512;
@@ -163,12 +191,12 @@ fn rmrfSafeImpl(path: []const u8, depth_left: u32) void {
         if (child.len >= child_buf.len) continue;
         child_buf[child.len] = 0;
         if (isSymlink(@ptrCast(&child_buf))) {
-            _ = std.c.unlink(@ptrCast(&child_buf)); // symlink:删链接不跟随
+            pfs.unlinkPath(@ptrCast(&child_buf)) catch {}; // symlink:删链接不跟随
         } else {
             rmrfSafeImpl(child, depth_left - 1); // 目录递归 / 文件在其内部 unlink
         }
     }
-    _ = std.c.rmdir(@ptrCast(&pbuf));
+    _ = pfs.rmdir(@ptrCast(&pbuf));
 }
 
 /// 测试专用 helpers。放在命名空间里，避免 pub API 鼓励生产误用。
@@ -204,7 +232,7 @@ pub const testing = struct {
         @memcpy(pbuf[0..path.len], path);
         pbuf[path.len] = 0;
         var it = pdir.open(@ptrCast(&pbuf)) orelse {
-            _ = std.c.unlink(@ptrCast(&pbuf));
+            pfs.unlinkPath(@ptrCast(&pbuf)) catch {};
             return;
         };
 
@@ -237,7 +265,7 @@ pub const testing = struct {
             rmrfImpl(child, depth_left - 1);
         }
 
-        _ = std.c.rmdir(@ptrCast(&pbuf));
+        _ = pfs.rmdir(@ptrCast(&pbuf));
     }
 
     /// 测试 fixture 的临时目录根(不含末尾分隔符)。**唯一规则源**,src 内测试经
@@ -372,6 +400,22 @@ test "mkdirParents empty is noop" {
     try mkdirParents("");
 }
 
+test "mkdirParentsOf creates the parent chain of a file path and leaves the leaf alone" {
+    var root_buf: [512]u8 = undefined;
+    const root = testing.perPidDir(&root_buf, "cc-zig-mkdirp-of-root");
+    defer testing.rmrfBestEffort(root);
+    var file_buf: [600]u8 = undefined;
+    const file = try std.fmt.bufPrintZ(&file_buf, "{s}/a/b/leaf.txt", .{root});
+    try mkdirParentsOf(file);
+    var parent_buf: [600]u8 = undefined;
+    const parent = try std.fmt.bufPrintZ(&parent_buf, "{s}/a/b", .{root});
+    try std.testing.expect(pfs.exists(parent.ptr));
+    try std.testing.expect(!pfs.exists(file.ptr)); // 只建父目录,叶子归调用方
+    try mkdirParentsOf(file); // 幂等
+    try mkdirParentsOf("leaf.txt"); // 无目录分量 → no-op
+    try mkdirParentsOf("/leaf.txt"); // 根下 → no-op
+}
+
 test "mkdirParents existing dir ok" {
     try mkdirParents("/tmp"); // 已存在
 }
@@ -399,6 +443,7 @@ test "getCwd returns non-empty absolute path" {
 }
 
 test "getCwd matches libc's native result exactly" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 窄字符 getcwd 在 Windows 给 ANSI 字节,不是 oracle
     // 对比 wrapper 返回和 std.c.getcwd 的原生 NUL-terminated 结果。
     // 如果 wrapper 的边界/哨兵逻辑错（例如返回整个 undefined buf），长度和内容会不一致。
     var expected_buf: [std.fs.max_path_bytes]u8 = [_]u8{0} ** std.fs.max_path_bytes;

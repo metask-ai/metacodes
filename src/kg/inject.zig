@@ -9,6 +9,7 @@
 //! turn 边界取用(设计 §5 要求启动零阻塞)。此处不谎称已线程化(Linus M2)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const client_mod = @import("client.zig");
 
 pub const MAX_READY_SHOWN: usize = 3;
@@ -18,7 +19,7 @@ pub const MAX_READY_SHOWN: usize = 3;
 pub fn readIdPointer(allocator: std.mem.Allocator, projects_dir: []const u8, name: []const u8) ?u64 {
     const path = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ projects_dir, name }, 0) catch return null;
     defer allocator.free(path);
-    const f = std.c.fopen(path.ptr, "r") orelse return null;
+    const f = pfs.fopen(path.ptr, "r") orelse return null;
     defer _ = std.c.fclose(f);
     var buf: [32]u8 = undefined;
     const n = std.c.fread(&buf, 1, buf.len - 1, f);
@@ -31,7 +32,7 @@ pub fn readIdPointer(allocator: std.mem.Allocator, projects_dir: []const u8, nam
 pub fn writeIdPointer(allocator: std.mem.Allocator, projects_dir: []const u8, name: []const u8, id: u64) !void {
     const path = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ projects_dir, name }, 0) catch return error.OutOfMemory;
     defer allocator.free(path);
-    const f = std.c.fopen(path.ptr, "w") orelse return error.WriteFailed;
+    const f = pfs.fopen(path.ptr, "w") orelse return error.WriteFailed;
     defer _ = std.c.fclose(f);
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{d}\n", .{id}) catch unreachable;
@@ -42,7 +43,7 @@ pub fn writeIdPointer(allocator: std.mem.Allocator, projects_dir: []const u8, na
 pub fn clearIdPointer(allocator: std.mem.Allocator, projects_dir: []const u8, name: []const u8) void {
     const path = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ projects_dir, name }, 0) catch return;
     defer allocator.free(path);
-    _ = std.c.unlink(path.ptr);
+    pfs.unlinkPath(path.ptr) catch {};
 }
 
 const RootLoad = enum { loaded, invalid, unavailable };

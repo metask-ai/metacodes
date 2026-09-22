@@ -5,6 +5,7 @@
 //! task-agnostic process rule — these tests carry no benchmark content.
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const harness = @import("harness");
 const cc = @import("cc");
 
@@ -15,7 +16,7 @@ const cc = @import("cc");
 /// 文本"的用例会无条件通过)。所以在那里直接跳过,让结果诚实。
 fn makeExecutable(path_z: [:0]const u8) !void {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
 }
 
 const END_TURN =

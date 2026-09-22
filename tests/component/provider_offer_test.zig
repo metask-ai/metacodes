@@ -474,8 +474,8 @@ fn removeTempDir(path: []const u8) void {
         std.debug.panic("fixture {s} is not in its own directory below {s}", .{ path, root });
     }
     const dir_z = std.fmt.bufPrintZ(&buffer, "{s}", .{dir}) catch return;
-    _ = std.c.rmdir(dir_z.ptr);
-    _ = std.c.rmdir(root.ptr); // fails while sibling fixtures still exist; that is fine
+    _ = pfs.rmdir(dir_z.ptr);
+    _ = pfs.rmdir(root.ptr); // fails while sibling fixtures still exist; that is fine
 }
 
 fn readWholeFile(a: std.mem.Allocator, path: []const u8) ![]u8 {

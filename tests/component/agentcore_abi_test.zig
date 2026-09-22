@@ -1,4 +1,5 @@
 const std = @import("std");
+const pfs = @import("platform").fs;
 const harness = @import("harness");
 const abi = @import("agentcore-abi");
 const sdk = @import("agentcore-sdk");
@@ -7980,7 +7981,7 @@ fn createAgentCoreProcessPackage(root: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = entrypoint, .data = script });
     const entrypoint_z = try allocator.dupeZ(u8, entrypoint);
     defer allocator.free(entrypoint_z);
-    if (std.c.chmod(entrypoint_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(entrypoint_z.ptr, 0o700) != 0) return error.SkipZigTest;
 
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});

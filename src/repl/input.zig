@@ -406,7 +406,7 @@ pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
         if (n <= 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
     }
-    _ = std.c.unlink(path_z.ptr);
+    pfs.unlinkPath(path_z.ptr) catch {};
     var result = try out.toOwnedSlice(allocator);
     if (result.len > 0 and result[result.len - 1] == '\n') {
         result = try allocator.realloc(result, result.len - 1);

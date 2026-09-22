@@ -189,8 +189,7 @@ pub const Store = struct {
             // Only a genuinely absent file is an empty document. Treating a
             // permission or I/O error the same way would make the next commit
             // overwrite a document it could not read.
-            const errno: std.c.E = @enumFromInt(std.c._errno().*);
-            if (errno != .NOENT) return error.OpenFailed;
+            if (!pfs.lastErrnoIs(.NOENT)) return error.OpenFailed;
             return self.allocator.dupe(u8, "") catch error.OutOfMemory;
         }
         defer pfs.close(fd);
@@ -535,7 +534,7 @@ test "two sessions keep separate selections and neither touches the other" {
                 pfs.unlinkPath(target) catch {};
             }
             const dir_z = std.fmt.bufPrintZ(&buffer, "{s}", .{dirs[index]}) catch continue;
-            _ = std.c.rmdir(dir_z.ptr);
+            _ = pfs.rmdir(dir_z.ptr);
             a.free(paths[index]);
         }
     }

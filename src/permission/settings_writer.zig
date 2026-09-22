@@ -82,7 +82,7 @@ fn ensureDir(path: []const u8) !void {
     @memcpy(dir_buf[0..sep], path[0..sep]);
     dir_buf[sep] = 0;
     // mkdir 不存在则建,EEXIST 忽略;父父级不存在直接失败(让 caller 报错)
-    _ = std.c.mkdir(@ptrCast(&dir_buf), 0o755);
+    _ = pfs.mkdir(@ptrCast(&dir_buf), 0o755);
 }
 
 fn readFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -312,16 +312,16 @@ test "addAllowRule: 端到端创建文件" {
     // per-pid 临时目录(POSIX /tmp,Windows %TEMP%),见 tools/test_tmp.zig 头注释。
     var home_buf: [512]u8 = undefined;
     const home = @import("../tools/test_tmp.zig").path(&home_buf, "cczig_psave");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer {
         // 清理:.claude 子目录 + settings.json + home
         var p_buf: [std.fs.max_path_bytes]u8 = undefined;
         const p1 = std.fmt.bufPrintZ(&p_buf, "{s}/.claude/settings.json", .{home}) catch unreachable;
-        _ = std.c.unlink(p1.ptr);
+        pfs.unlinkPath(p1.ptr) catch {};
         var p2_buf: [std.fs.max_path_bytes]u8 = undefined;
         const p2 = std.fmt.bufPrintZ(&p2_buf, "{s}/.claude", .{home}) catch unreachable;
-        _ = std.c.rmdir(p2.ptr);
-        _ = std.c.rmdir(home.ptr);
+        _ = pfs.rmdir(p2.ptr);
+        _ = pfs.rmdir(home.ptr);
     }
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -332,7 +332,7 @@ test "addAllowRule: 端到端创建文件" {
     var pz: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(pz[0..written_path.len], written_path);
     pz[written_path.len] = 0;
-    try testing.expect(std.c.access(@ptrCast(&pz), std.c.F_OK) == 0);
+    try testing.expect(pfs.exists(@ptrCast(&pz)));
     const content = try readFile(testing.allocator, written_path);
     defer testing.allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "\"Bash\"") != null);

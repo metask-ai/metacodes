@@ -3631,7 +3631,7 @@ test "L2 target mismatch skips checker while retaining auditable dispatch filter
     try overwriteArtifact(allocator, checker_path, checker_script);
     const checker_z = try allocator.dupeZ(u8, checker_path);
     defer allocator.free(checker_z);
-    if (std.c.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
     const config = cc.project_harness_runtime.Config{
         .checker_path = checker_path,
         .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
@@ -3924,7 +3924,7 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
     try overwriteArtifact(allocator, checker_path, checker_script);
     const checker_z = try allocator.dupeZ(u8, checker_path);
     defer allocator.free(checker_z);
-    if (std.c.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
     const config = cc.project_harness_runtime.Config{
         .checker_path = checker_path,
         .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
@@ -4012,7 +4012,7 @@ test "L2 exact recovery checker fault fails closed before Edit side effects" {
     try overwriteArtifact(allocator, checker_path, checker_script);
     const checker_z = try allocator.dupeZ(u8, checker_path);
     defer allocator.free(checker_z);
-    if (std.c.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
     const config = cc.project_harness_runtime.Config{
         .checker_path = checker_path,
         .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
@@ -4104,7 +4104,7 @@ test "L2 same-cardinality batch binding drift has no durable verdict and no disp
     try overwriteArtifact(allocator, checker_path, checker_script);
     const checker_z = try allocator.dupeZ(u8, checker_path);
     defer allocator.free(checker_z);
-    if (std.c.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
     const config = cc.project_harness_runtime.Config{
         .checker_path = checker_path,
         .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),

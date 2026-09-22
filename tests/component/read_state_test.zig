@@ -41,12 +41,12 @@ test "L2 read_state: hashFileContent 一致 + 内容变则哈希变" {
     // parallel shard; this test has no business depending on either.
     var dir_buf: [512]u8 = undefined;
     const dir = cc.util_fs.testing.perPidDir(&dir_buf, "cc-zig-read-state");
-    if (std.c.mkdir(dir.ptr, 0o755) != 0 and !pfs.exists(dir.ptr)) return fixtureFailure("mkdir", dir.ptr);
-    defer _ = std.c.rmdir(dir.ptr);
+    if (pfs.mkdir(dir.ptr, 0o755) != 0 and !pfs.exists(dir.ptr)) return fixtureFailure("mkdir", dir.ptr);
+    defer _ = pfs.rmdir(dir.ptr);
     var path_buf: [512]u8 = undefined;
     const p = try std.fmt.bufPrintZ(&path_buf, "{s}/cc-rs-hash.txt", .{dir});
     try writeFile(p, "hello world");
-    defer _ = std.c.unlink(p);
+    defer pfs.unlinkPath(p) catch {};
     const h1 = cc.core_read_state.hashFileContent(p);
     const h2 = cc.core_read_state.hashFileContent(p);
     try std.testing.expect(h1 != 0); // 0 is hashFileContent's "unreadable" sentinel, not a hash

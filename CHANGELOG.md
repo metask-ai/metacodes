@@ -52,6 +52,58 @@ status, compatibility boundaries, and entry points are defined by
   the tool_result, that a boundary interrupt stops before a second request,
   that whitespace is dropped, and that the continuation boundary is not
   polled; `ui_backend_test.zig` covers the command gating and the history.
+- Windows: `platform.fs.realpath` resolved paths lexically (`_fullpath`), so a
+  `metacodes.exe` started through an NTFS symlink or junction reported the
+  invoking path as its physical path and every adjacent lookup (`bin/rg.exe`,
+  `libexec/metacodes/<kernel>.exe`, `vendor/tinykg/`) searched beside the link
+  (#140). A new `platform.fs.finalPath` resolves an existing path through a
+  handle (`CreateFileW` + `GetFinalPathNameByHandleW`, `\\?\` and `\\?\UNC\`
+  prefixes stripped; null when the path cannot be opened, like POSIX
+  `realpath`) and `selfExeRealPath` uses it. `realpath` itself stays lexical
+  on Windows on purpose — callers compare its output against paths they built
+  themselves (workspace root, permission rules, memory directories), and the
+  physical form (on-disk case, long names, mapped drives expanded to UNC)
+  would stop matching — but it is now the wide `_wfullpath`, so CJK
+  components survive. The `paths.zig` symlink test runs on Windows when the
+  runner may create symlinks, a junction variant (`mklink /J`, no privilege
+  needed) was added at unit and process level, and `adjacent_symlink_test`
+  starts the real `selfexe_probe.exe` through a symlink and through a junction.
+- Windows: path-taking CRT calls decoded UTF-8 paths with the process ANSI
+  code page (#121). File creation (`_open`) and every directory creation
+  (`_mkdir`) were narrow while the existence checks, `statPath`, unlink and
+  rename were wide, so one path string named two filesystem objects: `Write`
+  could pass its must-read-first check on `测试.txt` and then truncate the
+  code-page counterpart (`娴嬭瘯.txt` under CP936), and CJK parent directories
+  were created under the wrong names. `platform.fs` now converts to UTF-16
+  for every path-taking entry point — `open` (`_wopen`, `_O_BINARY` kept),
+  new `mkdir`/`rmdir`/`chdir`/`chmod`/`fopen`/`getCwd` (`_wmkdir`, `_wrmdir`,
+  `_wchdir`, `_wchmod`, `_wfopen`, `GetCurrentDirectoryW`), `realpath`
+  (`_wfullpath`) — and every production `std.c.unlink`/`rename`/`access`/
+  `chdir`/`fopen`/`mkdir`/`rmdir`/`chmod` call in `src/` goes through those
+  wrappers, so a file created wide is also deleted, renamed and probed wide
+  (the file lock, suspend state, goal file, the kgd install temp holding an
+  API key, `.git` and `MEMORY.md` discovery, the KG pointer files). The input
+  side is fixed with it: `homeDir`/`tempDir` read the environment through
+  `GetEnvironmentVariableW` and `getCwd` through `GetCurrentDirectoryW`, so a
+  CJK user profile or working directory reaches the wrappers as UTF-8 instead
+  of ANSI bytes the strict conversion would reject. `Write`, `ApplyPatch` and
+  the worktree tool share one `mkdir -p` walker (`util.fs.mkdirAll`, with a
+  fast path when the directory already exists). `NOFOLLOW`/`isSymlink` decide
+  by reparse *tag* (symlink or junction), so OneDrive placeholders and other
+  reparse-tagged regular files are no longer refused as links. errno is no
+  longer converted with a bare `@enumFromInt` (a value `std.c.E` does not name
+  panicked in Debug/ReleaseSafe): callers compare integers (`lastErrnoIs`) or
+  look the name up (`errnoTag`/`errnoName`); the wrapper sets errno and
+  `GetLastError` itself when it refuses an operation (`ENAMETOOLONG`/`EINVAL`
+  for an over-long or invalid path, `ELOOP` for a `NOFOLLOW` open of a link);
+  `unlinkPath` reports `NotFound` separately so idempotent cleanup no longer
+  guesses with a second `exists()` (logout reported success while the
+  credentials file remained when both calls failed for a permission reason).
+  Tests create `测试目录/测试.txt` through the wrappers and verify the exact
+  names through `std.Io` and directory enumeration, drive `chdir`/`getCwd`/
+  `fopen`/`chmod` through a CJK directory, read a CJK environment value back
+  as UTF-8, and on Windows seed the ANSI-decoded counterpart and prove `Write`
+  leaves it untouched.
 - Adjacent-artifact resolution disagreed across resolvers when `metacodes` was
   started through a symlink (the common `ln -s <prefix>/bin/metacodes
   ~/bin/metacodes` install): macOS reports the invoked symlink as the

@@ -206,7 +206,7 @@ fn popWorktree(ctx: *const ToolContext) !?WorktreeEntry {
 fn chdir(path: []const u8) !void {
     const path_z = try std.heap.page_allocator.dupeZ(u8, path);
     defer std.heap.page_allocator.free(path_z);
-    if (std.c.chdir(path_z) != 0) return error.ChdirFailed;
+    if (pfs.chdir(path_z) != 0) return error.ChdirFailed; // 宽字符(#121):CJK worktree 路径
 }
 
 fn getCwd(allocator: std.mem.Allocator) ![]u8 {
@@ -214,18 +214,8 @@ fn getCwd(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn mkdirP(path: []const u8) !void {
-    var cur: usize = 0;
-    while (cur < path.len) : (cur += 1) {
-        if (cur > 0 and (path[cur] == '/' or cur == path.len - 1)) {
-            const len = if (path[cur] == '/') cur else cur + 1;
-            var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-            if (len >= buf.len) return error.PathTooLong;
-            @memcpy(buf[0..len], path[0..len]);
-            buf[len] = 0;
-            const seg_z: [*:0]const u8 = @ptrCast(&buf);
-            _ = std.c.mkdir(seg_z, 0o755);
-        }
-    }
+    // 唯一的 mkdir -p 走查器在 util/fs.zig(Windows 两种分隔符 + 盘符前缀都在那里处理)。
+    return @import("../util/fs.zig").mkdirBestEffort(path, 0o755);
 }
 
 fn worktreeExists(allocator: std.mem.Allocator, path: []const u8) bool {

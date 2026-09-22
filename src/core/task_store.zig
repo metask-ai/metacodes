@@ -184,7 +184,7 @@ pub const TaskStore = struct {
         var published = false;
         defer {
             if (fd_open) pfs.close(fd);
-            if (!published) _ = std.c.unlink(tmp.ptr);
+            if (!published) pfs.unlinkPath(tmp.ptr) catch {};
         }
         var offset: usize = 0;
         while (offset < written.len) {

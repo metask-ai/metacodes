@@ -147,43 +147,15 @@ fn canonicalForWrite(allocator: std.mem.Allocator, candidate: []const u8) ![]u8 
     return recombined;
 }
 
-/// lstat(不跟随 symlink)判断 path 本身是否为 symlink。不存在/出错 → false(非 symlink)。
-/// std.c.lstat 在此 zig 0.16 std 无绑定(同 read_state.zig 记的 std.c.stat 缺失),自声明 extern。
-/// macOS arm64 ABI 符号为裸 `lstat`($INODE64 后缀是 x86_64 legacy)。
-extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
-
-// Windows:symlink/junction/mount-point 统一是 **reparse point**(NTFS 概念),
-// GetFileAttributesW 的 FILE_ATTRIBUTE_REPARSE_POINT(0x400) 位标识。GetFileAttributesW
-// 本身**不跟随** reparse(返回链接自身属性),故等价 lstat 语义——正是防 TOCTOU 逃逸所需。
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
-extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
-
+/// lstat 语义(不跟随)判断 path 本身是否为 symlink——防 TOCTOU 逃逸。走 pfs.isSymlink
+/// (linux statx / macOS fstatat / Windows 按 reparse tag 判 symlink 与 junction),不再各自
+/// 声明 extern。不存在/出错 → false(非 symlink)。
 fn isSymlink(path: []const u8) bool {
     if (path.len + 1 > std.fs.max_path_bytes) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    if (builtin.os.tag == .windows) {
-        // UTF-8 → UTF-16,GetFileAttributesW 查 REPARSE_POINT 位(不跟随 → lstat 语义)。
-        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
-        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return false;
-        if (wlen >= wbuf.len) return false;
-        wbuf[wlen] = 0;
-        const attrs = GetFileAttributesW(@ptrCast(&wbuf));
-        if (attrs == INVALID_FILE_ATTRIBUTES) return false; // 不存在/出错 → 非 symlink
-        return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-    }
-    if (builtin.os.tag == .linux) {
-        var stx: std.os.linux.Statx = undefined;
-        const flags: u32 = std.os.linux.AT.SYMLINK_NOFOLLOW;
-        const rc = std.os.linux.statx(std.os.linux.AT.FDCWD, @ptrCast(&buf), flags, .{ .TYPE = true }, &stx);
-        if (@as(isize, @bitCast(rc)) < 0) return false;
-        return (stx.mode & std.os.linux.S.IFMT) == std.os.linux.S.IFLNK;
-    }
-    var st: std.c.Stat = undefined;
-    if (lstat(@ptrCast(&buf), &st) != 0) return false;
-    return (st.mode & std.c.S.IFMT) == std.c.S.IFLNK;
+    return pfs.isSymlink(@ptrCast(&buf));
 }
 
 fn path_exists(path: []const u8) bool {
@@ -191,7 +163,7 @@ fn path_exists(path: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    return std.c.access(@ptrCast(&buf), std.c.F_OK) == 0;
+    return pfs.exists(@ptrCast(&buf)); // 宽字符(#121):CJK home 下窄字符 access 找不到 MEMORY.md
 }
 
 /// 读 MEMORY.md 索引并按 cc 上限截断。返回 owned(caller free)。不存在/空 → null。

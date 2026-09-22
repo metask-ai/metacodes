@@ -646,8 +646,8 @@ test "inject: sandbox 开 → cwd 外写被拦(task#25:Write→SKILL.md→activa
     defer sbx.deinit();
     // /Users/Shared 世界可写但**不在** sandbox 白名单(cwd=/tmp/dev/home 之外)→ 逃逸标靶。
     const escape_z: [*:0]const u8 = "/Users/Shared/cc-skill-sbx-escape-test";
-    _ = std.c.unlink(escape_z);
-    defer _ = std.c.unlink(escape_z);
+    pfs.unlinkPath(escape_z) catch {};
+    defer pfs.unlinkPath(escape_z) catch {};
     // 模型自造 SKILL.md 的等价:body 含注入 shell touch cwd 外文件。
     const out = try renderBody(a, "!`touch /Users/Shared/cc-skill-sbx-escape-test`", .{
         .sandbox = &sbx,

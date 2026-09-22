@@ -1028,11 +1028,11 @@ test "matchesMode: symlink deny triggers if target matches (任一)" {
     const fd = pfs.open(secret.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.SkipZigTest;
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(secret.ptr);
+    defer pfs.unlinkPath(secret.ptr) catch {};
     // 创建 symlink link → secret
-    _ = std.c.unlink(link.ptr);
+    pfs.unlinkPath(link.ptr) catch {};
     if (std.c.symlink(secret.ptr, link.ptr) != 0) return error.SkipZigTest;
-    defer _ = std.c.unlink(link.ptr);
+    defer pfs.unlinkPath(link.ptr) catch {};
 
     // deny 规则:Read(secret 的 basename) — 裸文件名 gitignore 语义,匹配任意深度
     // 用户访问 link(basename=link.txt 不匹配),但 realpath 解析到 secret
@@ -1100,14 +1100,14 @@ test "isInWorkingDirs: 指向区外的 symlink 不放行(allow 双匹配语义)"
     // 每进程唯一目录里造 dir + 指向 /etc/hosts 的 symlink
     var dir_buf: [512]u8 = undefined;
     const dir = @import("../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-wd");
-    _ = std.c.mkdir(dir.ptr, 0o755);
-    defer _ = std.c.rmdir(dir.ptr);
+    _ = pfs.mkdir(dir.ptr, 0o755);
+    defer _ = pfs.rmdir(dir.ptr);
     var link_buf: [600]u8 = undefined;
     const linkz = try std.fmt.bufPrint(&link_buf, "{s}/esc.txt\x00", .{dir});
     const link = linkz[0 .. linkz.len - 1];
-    _ = std.c.unlink(@ptrCast(linkz.ptr));
+    pfs.unlinkPath(@ptrCast(linkz.ptr)) catch {};
     if (std.c.symlink("/etc/hosts", @ptrCast(linkz.ptr)) != 0) return error.SkipZigTest;
-    defer _ = std.c.unlink(@ptrCast(linkz.ptr));
+    defer pfs.unlinkPath(@ptrCast(linkz.ptr)) catch {};
 
     // dir 为唯一工作目录:link 词法在内,但 realpath 指向 /etc/hosts(集外)→ 拒
     const mctx = MatchContext{ .cwd = dir };

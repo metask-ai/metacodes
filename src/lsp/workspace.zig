@@ -10,7 +10,7 @@ const MAX_WALK = 64;
 
 /// 文件/目录是否存在(F_OK)。path 须 null 结尾。
 fn exists(path_z: [*:0]const u8) bool {
-    return std.c.access(path_z, std.c.F_OK) == 0;
+    return pfs.exists(path_z); // 宽字符(#121):CJK 项目目录下窄字符 access 找不到 .git
 }
 
 /// 从 start 向上找含 `.git` 的最近祖先目录(git worktree root)。找到 → 写进 out_buf 返回 slice;
@@ -134,7 +134,7 @@ test "isInsideWorkspace: 边界正确(不误配前缀)" {
 fn mkd(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
-    _ = std.c.mkdir(z.ptr, 0o755);
+    _ = pfs.mkdir(z.ptr, 0o755);
 }
 fn touch(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
