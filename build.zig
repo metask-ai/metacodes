@@ -1924,9 +1924,17 @@ pub fn build(b: *std.Build) void {
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "scripts/check_doc_facts.py",
     });
-    const doc_check_step = b.step("doc:check", "Check documentation links and facts");
+    // A version without `-dev` is legal only on its tagged commit or on a
+    // `release/<version>` head: closes the window between a release PR merging
+    // and the reopen PR (doc/RELEASE_AUTOMATION_DESIGN.md stage D).
+    const version_state_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/check_version_state.py",
+    });
+    const doc_check_step = b.step("doc:check", "Check documentation links, facts and the version state");
     doc_check_step.dependOn(&doc_check_cmd.step);
     doc_check_step.dependOn(&doc_facts_cmd.step);
+    doc_check_step.dependOn(&version_state_cmd.step);
     const notices_cmd = b.addSystemCommand(&.{ if (@import("builtin").os.tag == .windows) "python" else "python3", "scripts/gen_third_party_notices.py", "--check" });
     const notices_step = b.step("release:notices", "Check generated third-party notices");
     notices_step.dependOn(&notices_cmd.step);
@@ -1951,6 +1959,16 @@ pub fn build(b: *std.Build) void {
     const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
     gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
     test_step.dependOn(&gate_manifest_test_cmd.step);
+    const release_cut_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_release_cut",
+        "-v",
+    });
+    const release_cut_test_step = b.step("test:release-cut", "Test the release cut / reopen rules and the version-state gate");
+    release_cut_test_step.dependOn(&release_cut_test_cmd.step);
+    test_step.dependOn(&release_cut_test_cmd.step);
     const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true });
     const gate_coverage = if (@import("builtin").os.tag == .windows)
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
