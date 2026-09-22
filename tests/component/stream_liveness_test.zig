@@ -382,7 +382,11 @@ test "L2 liveness ⑧: 非流式请求正文阶段沉默 → StreamStalled 并�
 test "L2 liveness ⑨: 短文本后零字节沉默超过收头上限,正文上限内突发完整 tool_use → 正常收齐不报 stall" {
     const a = std.testing.allocator;
     const delay_ms: u32 = 1_500;
-    const body_ms: u64 = 6_000;
+    // 正文上限只需远大于沉默期;6 s 在满载的托管 macOS 上曾被撑破(8 个 shard 并行,
+    // mock 线程的 20 ms 切片睡眠总计漂到 >6 s,PR #119 CI 实测),故给 13× 余量。
+    // 断言只看下界(elapsed >= delay_ms),放大上限不削弱"沉默期内不 stall"这一命题;
+    // 变异检查仍成立:把上限压到收头上限(300 ms)本测试必以 StreamStalled 失败。
+    const body_ms: u64 = 20_000;
     // napi 网关实测形状:先发短文本,工具生成期间不发任何字节,完整参数只在一条长 SSE 行里到达。
     const content = "0123456789abcdef" ** 128;
     const input_json = "{\"file_path\":\"/tmp/burst.txt\",\"content\":\"" ++ content ++ "\"}";
