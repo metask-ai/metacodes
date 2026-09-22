@@ -12,6 +12,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Adjacent-artifact resolution disagreed across resolvers when `metacodes` was
+  started through a symlink (the common `ln -s <prefix>/bin/metacodes
+  ~/bin/metacodes` install): macOS reports the invoked symlink as the
+  executable path, so the release-layout lookups for `bin/rg` and both Lean
+  kernels landed in `~/bin` — rg silently fell back to a PATH copy with a
+  non-matching digest and the pinned kernels were unresolved (`doctor --strict`
+  red, project-rule activation failing closed) — while the TinyKG lookup, which
+  already applied `realpath`, resolved. All three now derive their prefix from
+  one helper, `platform.paths.selfExeRealPath` (self-exe path resolved through
+  `realpath`; a relative invoked path is refused outright, and the fallback to
+  the invoked path applies only when `realpath` fails). The REPL's TinyKG client no longer receives an
+  `argv[0]`-derived executable directory (forgeable, empty for a bare-name
+  `PATH` start, and a second basis next to the OS-reported one); it uses the
+  same helper.
+  A new process-level harness (`selfexe_probe`) is copied into a staged prefix
+  and started through a symlink in another directory to prove rg and both
+  kernels resolve beside the physical binary.
 - Image input was rejected locally (`image_input_unsupported`, status 28, no
   HTTP request) for non-Claude vision models reached through an Anthropic
   Messages-compatible endpoint, because the Anthropic profile only granted

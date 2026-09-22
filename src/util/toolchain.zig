@@ -1,8 +1,12 @@
 //! 外部工具链路径解析。
 //!
-//! 目前职责：找可用的 ripgrep 二进制（rg / rg.exe）。
+//! 目前职责：找可用的 ripgrep 二进制（rg / rg.exe）与相邻 Lean kernel。
 //! 开发布局查找顺序：RG_BIN、PATH、可执行文件同目录、固定 fallback。
 //! 发布布局查找顺序：RG_BIN、可执行文件同目录、PATH；不查询固定 fallback。
+//!
+//! "可执行文件同目录"一律从 `platform.paths.selfExeRealPath`(已解 symlink 的物理路径)
+//! 推导,与 KgClient 的 vendored tinykg 定位共用同一入口——经 `~/bin/metacodes` symlink
+//! 启动时三者必须落到同一个 `<prefix>`,不能一个解 symlink 两个不解。
 //!
 //! 未命中返回 error.RipgrepNotFound。结果缓存(进程内不变;并发 Grep 线程安全)。
 
@@ -164,14 +168,18 @@ test "resolution order follows layout" {
 var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
 
 /// <dir-of-self-executable>/rg[.exe]。resolve() 已在 init_mutex 内,静态 buf 安全。
+/// 目录取自物理路径(selfExeRealPath):经 symlink 启动时 rg 在 symlink 目标旁,不在 symlink 旁。
 fn nextToExecutable() ?[:0]const u8 {
     const paths = @import("platform").paths;
-    const exe = paths.selfExePath(exe_dir_buf[0 .. exe_dir_buf.len - RG_NAME.len - 2]) orelse return null;
+    // 可执行文件路径用满尺寸缓冲解析,再把 <dir>/rg 拼进静态 exe_dir_buf:旧写法把缩短了
+    // RG_NAME.len+2 的 buf 交给解析器,接近 PATH_MAX 的合法路径会在拼接前就被拒(Codex review)。
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = paths.selfExeRealPath(&exe_buf) orelse return null;
     const dir_sep: u8 = if (is_windows) '\\' else '/';
     const cut = std.mem.lastIndexOfScalar(u8, exe, dir_sep) orelse return null;
     const need = cut + 1 + RG_NAME.len;
     if (need + 1 > exe_dir_buf.len) return null;
-    // selfExePath 写在 buf 头部;截到目录后原地续接文件名。
+    @memcpy(exe_dir_buf[0 .. cut + 1], exe[0 .. cut + 1]);
     @memcpy(exe_dir_buf[cut + 1 ..][0..RG_NAME.len], RG_NAME);
     exe_dir_buf[need] = 0;
     if (pfs.exists(@ptrCast(&exe_dir_buf))) return exe_dir_buf[0..need :0];
@@ -204,6 +212,14 @@ pub fn kernelPathBeside(exe_path: []const u8, name: KernelName, buf: []u8) ?[:0]
     return buf[0..index :0];
 }
 
+/// Uncached: `<prefix>/libexec/metacodes/<kernel>` beside the **physical** executable
+/// (`selfExeRealPath`), so a symlinked install resolves the prefix the symlink points into.
+/// `exe_buf` receives the executable path, `buf` the kernel path; both outlive the result.
+fn kernelBesideSelf(name: KernelName, exe_buf: []u8, buf: []u8) ?[:0]const u8 {
+    const exe = @import("platform").paths.selfExeRealPath(exe_buf) orelse return null;
+    return kernelPathBeside(exe, name, buf);
+}
+
 /// Cached adjacent kernel resolution. The init mutex also protects the static
 /// sentinel byte: a first concurrent probe must not return another kernel's path.
 pub fn kernelAdjacentPath(name: KernelName) ?[:0]const u8 {
@@ -217,14 +233,10 @@ pub fn kernelAdjacentPath(name: KernelName) ?[:0]const u8 {
         .formal => formal_kernel_cached,
         .project => project_kernel_cached,
     };
-    const exe = switch (name) {
-        .formal => @import("platform").paths.selfExePath(&formal_kernel_exe_buf),
-        .project => @import("platform").paths.selfExePath(&project_kernel_exe_buf),
+    const resolved = switch (name) {
+        .formal => kernelBesideSelf(name, &formal_kernel_exe_buf, &formal_kernel_buf),
+        .project => kernelBesideSelf(name, &project_kernel_exe_buf, &project_kernel_buf),
     };
-    const resolved = if (exe) |path| switch (name) {
-        .formal => kernelPathBeside(path, name, &formal_kernel_buf),
-        .project => kernelPathBeside(path, name, &project_kernel_buf),
-    } else null;
     switch (name) {
         .formal => {
             formal_kernel_cached = resolved;
@@ -302,6 +314,70 @@ test "next-to-executable probe finds an adjacent rg" {
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, rg_path) catch {};
     const found = nextToExecutable() orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.endsWith(u8, found, "/rg"));
+}
+
+/// Stage `<root>/prefix/{bin/metacodes,bin/rg,libexec/metacodes/<kernels>}` plus
+/// `<root>/elsewhere/metacodes -> prefix/bin/metacodes`; returns the realpath'd root.
+fn stageSymlinkedInstall(tmp: *std.testing.TmpDir, root_buf: []u8) ![]const u8 {
+    try tmp.dir.createDirPath(std.testing.io, "prefix/bin");
+    try tmp.dir.createDirPath(std.testing.io, "prefix/libexec/metacodes");
+    try tmp.dir.createDirPath(std.testing.io, "elsewhere");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prefix/bin/metacodes", .data = "#!/bin/sh\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prefix/bin/" ++ RG_NAME, .data = "#!/bin/sh\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prefix/libexec/metacodes/" ++ FORMAL_KERNEL_NAME, .data = "kernel" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prefix/libexec/metacodes/" ++ PROJECT_KERNEL_NAME, .data = "kernel" });
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, root_buf)];
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = try std.fmt.bufPrint(&real_buf, "{s}/prefix/bin/metacodes", .{root});
+    try tmp.dir.symLink(std.testing.io, real, "elsewhere/metacodes", .{});
+    return root;
+}
+
+test "adjacent rg and kernels resolve when the executable is invoked through a symlink elsewhere" {
+    // 复现 2026-09-21 的安装形态:`ln -s <prefix>/bin/metacodes ~/bin/metacodes`。macOS 的
+    // selfExePath 报告的是 ~/bin 里的 symlink;相邻查找必须落到 <prefix>,不是 ~/bin。
+    if (is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try stageSymlinkedInstall(&tmp, &root_buf);
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "{s}/elsewhere/metacodes", .{root});
+    const paths = @import("platform").paths;
+    paths.test_self_exe_override = link;
+    defer paths.test_self_exe_override = null;
+
+    var expect_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rg = nextToExecutable() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect_buf, "{s}/prefix/bin/rg", .{root}), rg);
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    const formal = kernelBesideSelf(.formal, &exe_buf, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect_buf, "{s}/prefix/libexec/metacodes/{s}", .{ root, FORMAL_KERNEL_NAME }), formal);
+    const project = kernelBesideSelf(.project, &exe_buf, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect_buf, "{s}/prefix/libexec/metacodes/{s}", .{ root, PROJECT_KERNEL_NAME }), project);
+}
+
+test "adjacent lookups from the symlink directory itself find nothing (the fix is realpath, not a second search root)" {
+    // 负例:没有 realpath 时同一布局在 elsewhere/ 旁一无所获。把 override 指向一个**不是**
+    // symlink 的 elsewhere/metacodes 副本,证明命中来自解 symlink,而非 elsewhere 恰好也有产物。
+    if (is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try stageSymlinkedInstall(&tmp, &root_buf);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "elsewhere/metacodes-copy", .data = "#!/bin/sh\n" });
+    var copy_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const copy = try std.fmt.bufPrint(&copy_buf, "{s}/elsewhere/metacodes-copy", .{root});
+    const paths = @import("platform").paths;
+    paths.test_self_exe_override = copy;
+    defer paths.test_self_exe_override = null;
+    try std.testing.expect(nextToExecutable() == null);
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect(kernelBesideSelf(.formal, &exe_buf, &out) == null);
+    try std.testing.expect(kernelBesideSelf(.project, &exe_buf, &out) == null);
 }
 
 test "kernelPathBeside finds an adjacent Kernel without dot segments" {

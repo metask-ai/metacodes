@@ -2353,7 +2353,8 @@ pub const App = struct {
             .domain = domain,
             .config_bin = null, // config.json kg_bin(P2 接线)
             .config_store = null,
-            .exe_dir = app.config.exe_dir, // argv[0] 解析(H1:vendor 定位现在真可达)
+            // exe_dir 不传:与 rg / kernel 同走 platform.paths.selfExeRealPath(OS 级 self-exe +
+            // realpath),不再从 argv[0] 推导;字段只留给测试注入。
             .io = app.api_client.http_client.io,
         }) catch return;
         client.ensureReady();

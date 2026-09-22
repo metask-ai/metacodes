@@ -46,8 +46,12 @@ the pin (`scripts/verify_kernel_provenance.py` runs real kernels through doctor)
 
 The relative position of `bin/` and `vendor/tinykg/` is load-bearing: the
 executable resolves TinyKG at `../vendor/tinykg/` from its own directory and, under
-the release layout, ripgrep beside itself before `PATH` (#78, #79). Unpack the
-archive anywhere; do not move files inside it.
+the release layout, ripgrep beside itself before `PATH` (#78, #79). "Its own
+directory" is the physical one: the self-executable path is passed through
+`realpath` before any adjacent lookup, so `ln -s <prefix>/bin/metacodes
+~/bin/metacodes` keeps rg, both Lean kernels and TinyKG resolving inside
+`<prefix>` rather than beside the symlink. Unpack the archive anywhere; do not
+move files inside it.
 
 ## Release channels
 

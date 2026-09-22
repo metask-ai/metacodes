@@ -544,24 +544,6 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // 捕获 argv[0] 解析可执行文件目录(供 KgClient 定位 vendor/tinykg;H1)。
-    // argv[0] 含 '/' 才可定位;裸命令名(PATH 启动)→ null,回落 env/dev。realpath 解 symlink。
-    {
-        var a0_it = argsIter(init);
-        defer a0_it.deinit();
-        if (a0_it.next()) |argv0| {
-            if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
-                const z = allocator.dupeZ(u8, argv0) catch null;
-                if (z) |zz| {
-                    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-                    const resolved = pfs.realpath(zz.ptr, &rbuf);
-                    const full = if (resolved != null) std.mem.span(resolved.?) else argv0;
-                    if (std.fs.path.dirname(full)) |d| config.exe_dir = allocator.dupe(u8, d) catch null;
-                }
-            }
-        }
-    }
-
     // 初始化日志：读 METACODES_LOG / METACODES_LOG_FILE 环境变量
     const log = @import("util/log.zig");
     log.initFromEnv();

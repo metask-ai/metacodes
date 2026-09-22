@@ -793,6 +793,29 @@ pub fn build(b: *std.Build) void {
     });
     const install_mock_mcp = b.addInstallArtifact(mock_mcp_exe, .{});
 
+    // selfexe_probe 二进制:相邻产物解析的进程级探针(adjacent_symlink_test 把它复制成
+    // <prefix>/bin/metacodes 后经 symlink 启动)。只链 platform + toolchain,不拖整个 app 图。
+    const toolchain_probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/util/toolchain.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, toolchain_probe_mod);
+    const selfexe_probe_mod = b.createModule(.{
+        .root_source_file = b.path("tests/_harness/selfexe_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, selfexe_probe_mod);
+    selfexe_probe_mod.addImport("toolchain", toolchain_probe_mod);
+    const selfexe_probe_exe = b.addExecutable(.{
+        .name = "selfexe_probe",
+        .root_module = selfexe_probe_mod,
+    });
+    const install_selfexe_probe = b.addInstallArtifact(selfexe_probe_exe, .{});
+
     // replay_server 二进制(Stage 7):从 cassette 起 mock,供 e2e replay。测试专用。
     // 三端可编:曾经的三个 Windows blocker 已清(socket server→platform/net、
     // args→iterateAllocator、cassette 文件 IO→pfs)。TTY ui_tools 用例依赖它。
@@ -817,9 +840,10 @@ pub fn build(b: *std.Build) void {
         .root_module = replay_mod,
     });
     const install_replay = b.addInstallArtifact(replay_exe, .{});
-    const test_harness_step = b.step("test:harness", "Install the test harness binaries: mock_mcp_server and replay_server");
+    const test_harness_step = b.step("test:harness", "Install the test harness binaries: mock_mcp_server, replay_server and selfexe_probe");
     test_harness_step.dependOn(&install_mock_mcp.step);
     test_harness_step.dependOn(&install_replay.step);
+    test_harness_step.dependOn(&install_selfexe_probe.step);
 
     // ── metacodes-core 可复用库 module(root=src/lib.zig,UI 图不可达)──────────
     // 供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。
@@ -2109,6 +2133,7 @@ pub fn build(b: *std.Build) void {
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
         run_shard.expectExitCode(0);
         run_shard.step.dependOn(&install_mock_mcp.step);
+        run_shard.step.dependOn(&install_selfexe_probe.step);
         wireTinyKgTestInput(run_shard, staged_tinykg);
         wireTinyKgdTestInput(run_shard, staged_tinykgd);
         integration_reports[shard_index] = run_shard.captureStdOut(.{
