@@ -356,7 +356,7 @@ fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]cons
         _ = std.c.close(in_pipe[1]);
         _ = std.c.close(out_pipe[0]);
         const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-        applyStdioWiring(.{ in_pipe[0], out_pipe[1], devnull });
+        wireStdioOrExit(.{ in_pipe[0], out_pipe[1], devnull }, report.wr);
         execChild(argv, inherit_env, cwd, report.wr);
     }
     _ = std.c.close(in_pipe[0]); // 父不读 stdin pipe
@@ -516,7 +516,7 @@ pub fn spawnToFilesWithEnv(
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
         // out_fd/err_fd 是调用方开的落盘文件:父进程关着 stdio 时它们也可能落在 0..2。
-        applyStdioWiring(.{ -1, out_fd, err_fd });
+        wireStdioOrExit(.{ -1, out_fd, err_fd }, report.wr);
         execChild(argv, inherit_env, cwd, report.wr);
     }
     _ = std.c.close(report.wr);
@@ -670,13 +670,19 @@ fn waitpidRetry(pid: std.c.pid_t) c_int {
 /// `dup2(src, slot); close(src)` 在 src == slot 时先 no-op 再把刚接好的槽关掉,
 /// src 落在别的槽上时又会被后一个 dup2 盖掉(codex R1 #1)。所以分三步:先把所有落在
 /// 0..2 的源抬到 ≥3(F_DUPFD_CLOEXEC),再 dup2,最后只关 ≥3 的源(同一源接多个槽只关一次)。
-/// 只用 fcntl/dup2/close,异步信号安全。抬不上去的源原样使用——最坏退回旧行为。
-fn applyStdioWiring(srcs_in: [3]std.c.fd_t) void {
+/// 只用 fcntl/dup2/close,异步信号安全。同一个低位源出现在多个槽位时,每个槽位各拿一份
+/// 抬起来的副本(第一阶段不关原 fd),所以 {0, hi, 0} 这类形状是安全的。
+///
+/// 抬不上去(EMFILE/ENFILE)就返回 false,**一个槽都不接**:半接好的 stdio 会让后一个 dup2
+/// 盖掉还没用到的源,或让一个低位源穿过 exec 泄给程序;调用方经报告通道交代 errno 后
+/// `_exit`(codex R2 #2)。
+fn applyStdioWiring(srcs_in: [3]std.c.fd_t) bool {
     var srcs = srcs_in;
     for (&srcs) |*s| {
         if (s.* >= 0 and s.* < 3) {
             const lifted = std.c.fcntl(s.*, std.c.F.DUPFD_CLOEXEC, @as(c_int, 3));
-            if (lifted >= 3) s.* = lifted;
+            if (lifted < 3) return false;
+            s.* = lifted;
         }
     }
     for (srcs, 0..) |s, slot| {
@@ -690,6 +696,14 @@ fn applyStdioWiring(srcs_in: [3]std.c.fd_t) void {
         }
         if (!seen) _ = std.c.close(s);
     }
+    return true;
+}
+
+/// 子进程侧:接线失败就把 fcntl 的 errno 当 exec 步骤的失败交代出去,然后退出。
+fn wireStdioOrExit(srcs: [3]std.c.fd_t, report_fd: std.c.fd_t) void {
+    if (applyStdioWiring(srcs)) return;
+    reportChildFailure(report_fd, .exec, currentErrno());
+    std.c._exit(127);
 }
 
 /// Wire form of the child's report: `extern` so both sides of the fork agree
@@ -881,7 +895,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
         if (opts.stdin_data != null) _ = std.c.close(in_pipe[1]);
         if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
         const stderr_src: std.c.fd_t = if (opts.want_stderr) err_pipe[1] else std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-        applyStdioWiring(.{ if (opts.stdin_data != null) in_pipe[0] else -1, out_pipe[1], stderr_src });
+        wireStdioOrExit(.{ if (opts.stdin_data != null) in_pipe[0] else -1, out_pipe[1], stderr_src }, report.wr);
         execChild(argv, opts.inherit_env, opts.cwd, report.wr);
     }
 
@@ -1596,6 +1610,104 @@ test "capture: 父进程 fd 1/2 已关闭时,子进程 stdout/stderr 接线仍�
     var st: c_int = 0;
     _ = std.c.waitpid(helper, &st, 0);
     try std.testing.expectEqualStrings("out=1 err=1 code=0", buf[0..total]);
+}
+
+/// 测试助手:在 fork 出来的副本里把结论写回父进程后退出。
+fn reportAndExit(fd: std.c.fd_t, msg: []const u8) noreturn {
+    _ = std.c.write(fd, msg.ptr, msg.len);
+    std.c._exit(0);
+}
+
+/// 两个 fd 是否指向同一个文件对象(dev+ino)。
+fn sameFile(a: std.c.fd_t, b: std.c.fd_t) bool {
+    var sa: std.c.Stat = undefined;
+    var sb: std.c.Stat = undefined;
+    if (std.c.fstat(a, &sa) != 0 or std.c.fstat(b, &sb) != 0) return false;
+    return sa.ino == sb.ino and sa.dev == sb.dev;
+}
+
+/// 读回副本写的结论。
+fn readHelperReport(fd: std.c.fd_t, buf: []u8) []const u8 {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.c.read(fd, buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    return buf[0..total];
+}
+
+test "applyStdioWiring: stdio 全关时的重复低位源({0, hi, 0})各自抬起,接线正确(codex R2 #1)" {
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    var result_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expect(std.c.pipe(&result_pipe) == 0);
+    const helper = std.c.fork();
+    try std.testing.expect(helper >= 0);
+    if (helper == 0) {
+        _ = std.c.close(result_pipe[0]);
+        _ = std.c.close(0);
+        _ = std.c.close(1);
+        _ = std.c.close(2);
+        // 0/1/2 空着:pipe() 拿到 {0,1},open 拿到 2,再 open 一次拿一个 ≥3 的源。
+        var a: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&a) != 0) reportAndExit(result_pipe[1], "pipe-failed");
+        const two = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        const hi = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        if (!(a[0] == 0 and a[1] == 1 and two == 2 and hi >= 3)) reportAndExit(result_pipe[1], "layout-unexpected");
+        // 探针:各源的高位副本(接线会覆盖/关掉原 fd)。
+        const probe_pipe = std.c.dup(a[0]);
+        const probe_hi = std.c.dup(hi);
+        _ = std.c.close(two); // 槽位 2 空出来
+        if (!applyStdioWiring(.{ a[0], hi, a[0] })) reportAndExit(result_pipe[1], "wiring-returned-false");
+        // 0 与 2 都应是管道读端,1 应是 /dev/null。
+        if (!sameFile(0, probe_pipe) or !sameFile(2, probe_pipe) or !sameFile(1, probe_hi)) reportAndExit(result_pipe[1], "miswired");
+        reportAndExit(result_pipe[1], "ok");
+    }
+    _ = std.c.close(result_pipe[1]);
+    var buf: [64]u8 = undefined;
+    const got = readHelperReport(result_pipe[0], &buf);
+    _ = std.c.close(result_pipe[0]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(helper, &st, 0);
+    try std.testing.expectEqualStrings("ok", got);
+}
+
+test "applyStdioWiring: 低位源抬不起来(RLIMIT_NOFILE 收紧 → EMFILE)→ 返回 false,不半接(codex R2 #2)" {
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    var result_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expect(std.c.pipe(&result_pipe) == 0);
+    const helper = std.c.fork();
+    try std.testing.expect(helper >= 0);
+    if (helper == 0) {
+        _ = std.c.close(result_pipe[0]);
+        _ = std.c.close(0);
+        var a: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&a) != 0 or a[0] != 0) reportAndExit(result_pipe[1], "layout-unexpected");
+        // 探针 = 读端自己的副本(同一个打开文件描述;写端在 macOS 上是另一个 inode,不能当探针),
+        // 必须在收紧 rlimit 之前 dup。
+        const probe_pipe = std.c.dup(a[0]);
+        if (probe_pipe < 3) reportAndExit(result_pipe[1], "probe-failed");
+        // pipe()/dup() 各取最低空闲 fd,所以 [3, probe] 此刻全被占着;把软上限设成 probe+1,
+        // F_DUPFD_CLOEXEC(3) 在上限内找不到空位 → EMFILE(上限设成 3 会因 arg ≥ 上限而返 EINVAL,
+        // 测的就不是"没 fd 可用"了)。已开着的 fd 照常可用。
+        var rl: std.c.rlimit = undefined;
+        if (std.c.getrlimit(.NOFILE, &rl) != 0) reportAndExit(result_pipe[1], "getrlimit-failed");
+        rl.cur = @intCast(probe_pipe + 1);
+        if (std.c.setrlimit(.NOFILE, &rl) != 0) reportAndExit(result_pipe[1], "setrlimit-failed");
+        if (applyStdioWiring(.{ a[0], -1, -1 })) reportAndExit(result_pipe[1], "wiring-returned-true");
+        const e = std.c.errno(@as(c_int, -1)); // 紧接着读,后面的 fstat 会盖掉它
+        // 失败时一个槽都不接:0 仍是那条管道的读端,且 errno 说明原因。
+        if (!sameFile(0, probe_pipe)) reportAndExit(result_pipe[1], "slot-touched");
+        if (e != .MFILE and e != .NFILE) reportAndExit(result_pipe[1], "unexpected-errno");
+        reportAndExit(result_pipe[1], "ok");
+    }
+    _ = std.c.close(result_pipe[1]);
+    var buf: [64]u8 = undefined;
+    const got = readHelperReport(result_pipe[0], &buf);
+    _ = std.c.close(result_pipe[0]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(helper, &st, 0);
+    try std.testing.expectEqualStrings("ok", got);
 }
 
 test "capture 超时返 error.Timeout（有缓冲输出，验不 double-free）" {
