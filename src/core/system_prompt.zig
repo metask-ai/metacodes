@@ -115,6 +115,16 @@ const TONE_SECTION =
     \\ - Do not use a colon before tool calls. Your tool calls may not be shown directly in the output, so text like "Let me read the file:" followed by a read tool call should just be "Let me read the file." with a period.
 ;
 
+/// #114:多阶段/长任务的进度沟通预期。上面两段把"简洁"压得很紧,而 Output efficiency 里的
+/// "High-level status updates at natural milestones" 没有定义何时、何种粒度;这里把预期说清楚,
+/// 并明确它在多阶段任务里优先于"能一句话就不说三句"。运行期由 agent_loop 的进度更新义务
+/// (progress_updates.zig)兜底:连续几轮只调工具不说话 → 一条有界的 host 提醒。
+const PROGRESS_SECTION =
+    \\# Progress updates on longer tasks
+    \\
+    \\When a task takes several tool calls or more than a few seconds, tell the user where things stand before you continue: one or two sentences at a natural milestone — the stage you have reached, what you found, and what you will do next. These updates are process information, not the answer, and for multi-stage work they take precedence over the brevity rules above. Do not narrate every tool call, do not report private reasoning, and do not add updates to a task that finishes in a single step.
+;
+
 /// getOutputEfficiencySection 非 ant 分支。逐字复制。
 const OUTPUT_EFFICIENCY_SECTION =
     \\# Output efficiency
@@ -508,6 +518,7 @@ pub fn buildFullWithDefs(
         deferred_section,          sep,
         TONE_SECTION,              sep,
         OUTPUT_EFFICIENCY_SECTION, sep,
+        PROGRESS_SECTION,          sep,
         env_section,               if (memory_section.len > 0) sep else "",
         memory_section,            if (skills_section.len > 0) sep else "",
         skills_section,            if (agents_section.len > 0) sep else "",

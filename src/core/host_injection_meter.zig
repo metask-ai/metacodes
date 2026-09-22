@@ -19,11 +19,13 @@ const std = @import("std");
 /// (KG 枚举修复)——其语义是"修复或 fail-closed",不可静默放弃,进表
 /// 会把"额度尽"误判成完整性违规(review 抓到的 tool_loop 误杀地雷)。
 // 账目:required-first provider repair 2 + verification 2 +
-// requirement-ledger 2 + task-obligation 3 + delivery-cadence 2 = 11。
+// requirement-ledger 2 + task-obligation 3 + delivery-cadence 2 +
+// progress-update 2 = 13。
 // required-first 在任何普通工具前发生，仍走同一计量器，不能因为它是插件
-// 路由就绕过合成上界。交付节奏门在 turn 边界(早于终局各门)点火,额度
-// 若不随 Σ 增长会挤占终局义务,故 cap 同步 +2(Lean HostInjectionMeter.cap)。
-pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = 11;
+// 路由就绕过合成上界。交付节奏门与进度更新门(#114)都在 turn 边界(早于终局
+// 各门)点火,额度若不随 Σ 增长会挤占终局义务,故 cap 各同步 +2
+// (Lean HostInjectionMeter.cap 同步改;scripts/eval/tests 锁步检查)。
+pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = 13;
 
 pub const Meter = struct {
     used: u8 = 0,

@@ -106,6 +106,28 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Progress updates during multi-stage tasks (#114). The shared Core forwarded
+  and classified whatever visible text the model produced, but a model that
+  called tools round after round without writing a word left the user with
+  nothing but tool lifecycle events, and the default prompt's brevity rules
+  pushed in that direction. Two provider-neutral changes: the default system
+  prompt gains a short "Progress updates on longer tasks" section that defines
+  the expectation (a sentence or two at a natural milestone — stage, findings,
+  next step — taking precedence over the brevity rules for multi-stage work;
+  never for single-step tasks, never private reasoning), and the agent loop
+  gains a bounded progress-update obligation shaped like the delivery-cadence
+  gate: after `progress_update_silent_rounds` (default 3) consecutive tool
+  rounds with no visible assistant text, one host message at the turn boundary
+  asks for a short progress note; at most two per Run, counted by the shared
+  host-injection meter (cap 11 → 13, Lean model updated in lockstep), the
+  counter restarting after each nudge and on any narrated round; root agent
+  only. On by default for every path that shares the loop
+  (`agent_loop.Options.progress_updates`). The reply is ordinary `commentary`
+  (or the final answer if the model ends the turn); the output-segment
+  protocol is untouched. `tests/component/progress_updates_test.zig` drives
+  the loop through silent, narrated, bounded, disabled and single-step shapes
+  and asserts on the real request bytes and segment dispositions.
+
 - `providers.<id>.oauth_client_id` in `~/.metacodes/config.json` (#87): the
   OAuth client an installation registered for a built-in profile that declares
   none. `metacodes login --provider <id>`, `/login <id>` and the picker's

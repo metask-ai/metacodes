@@ -35,6 +35,7 @@ const result_budget_mod = @import("result_budget.zig");
 const verification_progress_mod = @import("verification_progress.zig");
 const requirement_ledger_mod = @import("requirement_ledger.zig");
 const delivery_cadence_mod = @import("delivery_cadence.zig");
+const progress_updates_mod = @import("progress_updates.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
@@ -454,6 +455,20 @@ pub const Options = struct {
     delivery_cadence_observe: bool = false,
     /// Crossing points in exploration-only tool calls (first / second nudge).
     delivery_cadence_thresholds: delivery_cadence_mod.Thresholds = .{},
+    /// Progress-update obligation (#114, task-agnostic process rule): a run
+    /// whose tool rounds stay silent — no visible assistant text before the
+    /// tool calls, round after round — receives a bounded nudge at the turn
+    /// boundary asking for a short progress note (stage, findings, next step).
+    /// On by default for every execution path that shares this loop; a task
+    /// that finishes within the threshold never sees it, and only the root
+    /// agent (`agent_depth == 0`) is nudged — a subagent's narration is not
+    /// user-visible. Never a denial; the reply is ordinary commentary (or the
+    /// final answer if the model ends the turn). Formal shape: same as
+    /// delivery cadence (bounded, meter-counted, boundary-only).
+    progress_updates: bool = true,
+    /// Consecutive silent tool rounds before a nudge (the stretch restarts
+    /// after each nudge and on any narrated round).
+    progress_update_silent_rounds: u32 = progress_updates_mod.DEFAULT_SILENT_ROUNDS,
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
@@ -862,6 +877,11 @@ pub fn run(
     var stream_turn_retries: u8 = 0;
     var requirement_ledger_state = requirement_ledger_mod.State{};
     var delivery_cadence_state = delivery_cadence_mod.State{};
+    // 进度更新义务(#114):连续"只调工具不说话"的轮数;任何带文本的工具轮或一次 nudge 归零。
+    var progress_state = progress_updates_mod.State{};
+    defer if (opts.progress_updates and progress_state.nudges > 0) {
+        log.info("agent", "progress update nudges={d} max_silent_rounds={d}", .{ progress_state.nudges, progress_state.max_silent_rounds });
+    };
     defer if (opts.delivery_cadence or opts.delivery_cadence_observe) {
         if (opts.tool_observer) |observer| {
             _ = observer.emit(.{ .delivery_cadence = .{
@@ -1034,6 +1054,23 @@ pub fn run(
                     log.info("agent", "delivery cadence observe level={d} exploration_calls={d}", .{ delivery_cadence_state.level, delivery_cadence_state.exploration_calls });
                 }
             }
+        }
+
+        // Progress-update obligation (#114): consecutive silent tool rounds earn a
+        // bounded nudge asking for a short progress note. Same shape as the cadence
+        // gate above — turn boundary, shared meter, never a denial. Root agent only:
+        // a subagent's narration is its parent's tool result, not user-visible.
+        if (opts.progress_updates and opts.agent_depth == 0 and
+            host_injection_meter.remaining() > 0 and
+            progress_state.decide(opts.progress_update_silent_rounds))
+        {
+            _ = host_injection_meter.tryConsume();
+            const silent_rounds = progress_state.silent_rounds;
+            progress_state.noteNudged();
+            const nudge = try std.fmt.allocPrint(allocator, progress_updates_mod.NUDGE_FMT, .{silent_rounds});
+            defer allocator.free(nudge);
+            try conversation.appendText(.user, nudge);
+            log.info("agent", "progress update nudge {d}/{d} silent_rounds={d}", .{ progress_state.nudges, progress_updates_mod.MAX_PROGRESS_NUDGES, silent_rounds });
         }
 
         // 进度事件:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具
@@ -2138,7 +2175,11 @@ pub fn run(
             break;
         };
         // 本轮跟着工具调用 → 这段文字是执行过程中的可见说明,不是最终答案。
-        if (has_tool_use) output_channel.close(.commentary, assistant_text.items);
+        if (has_tool_use) {
+            output_channel.close(.commentary, assistant_text.items);
+            // 进度更新传感器(#114):这一轮有没有对用户说话(可见文本;thinking 不算)。
+            progress_state.observeToolRound(assistant_text.items.len);
+        }
 
         if (!has_tool_use) {
             if (turn_stop_reason == .max_tokens and

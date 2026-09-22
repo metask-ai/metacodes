@@ -171,6 +171,17 @@ core 因此把它**已经知道**的判定发出来。一个 **段** = 一次 pr
 `ledger.finalText()` / `partialText()`(续写组已拼好)。**账本不传给 subagent**:子 agent 的
 输出是父 Run 的工具结果,不是父 Run 的答案。
 
+**进度更新义务(#114,`core/progress_updates.zig`)**:定性只回答"这段文本是什么",回答不了
+"为什么一段文本都没有"——模型可以一轮接一轮只调工具不说话,用户只剩工具生命周期事件,看不出
+阶段、发现与下一步。`run()` 因此观察每个工具轮是否带可见文本;连续
+`Options.progress_update_silent_rounds`(默认 3)轮沉默之后,在 turn 边界注入一条 host 消息
+(`[progress update]` 开头)要模型用一两句话说明阶段、发现与下一步——每 Run 至多
+`MAX_PROGRESS_NUDGES`(2)条,走全局 host 注入计量器,任何一轮带文本或注入一次后计数归零,仅根
+agent(`agent_depth == 0`)。回复按上表定性(后面跟工具调用 → `commentary`;自然 end_turn →
+`final`),core 不合成任何占位式进度文本,也不触碰最终答案。`Options.progress_updates=false`
+关闭。默认系统提示同时新增 "Progress updates on longer tasks" 段,定义多阶段任务的进度沟通
+预期(简单任务不要求)。
+
 #### 3.2.1.1 候选响应边界:这条响应能不能进 Conversation(`core/response_candidate.zig`)
 
 段的定性回答"这段文本算什么";候选响应边界回答的是上一个问题——**这条 provider 响应最终

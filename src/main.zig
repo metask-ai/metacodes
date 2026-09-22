@@ -76,6 +76,7 @@ pub const api_last_error = @import("api/last_error.zig"); // L2 stream liveness 
 pub const task_store = @import("core/task_store.zig"); // L2 requirement-ledger tests
 pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 ledger decide tests
 pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 delivery-cadence tests
+pub const progress_updates = @import("core/progress_updates.zig"); // L2 progress-update tests (#114)
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
