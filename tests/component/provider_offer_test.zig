@@ -435,12 +435,30 @@ test "L2: two clients read the same catalog and selection from one kernel" {
 
 // ── durable configuration ────────────────────────────────────────────────────
 
-fn tempConfigPath(a: std.mem.Allocator, name: []const u8) ![]u8 {
-    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pid = @import("platform").process.currentPid();
-    return std.fmt.allocPrint(a, "{s}/cc-zig-provider-test-{s}-{d}/config.json", .{ cc.util_fs.testing.tmpRoot(&rbuf), name, pid });
+/// Per-process fixture root `<tmp>/cc-zig-provider-l2-<pid>` (util/fs.zig testing.tmpRoot
+/// decides the platform root). Eight shard processes run this file's tests in parallel;
+/// a fixed `/tmp/...` spelling would be shared by all of them and, on Windows, would be
+/// resolved by the CRT against the process's current drive.
+var fixture_root_buf: [512]u8 = undefined;
+fn fixtureRoot() [:0]const u8 {
+    return cc.util_fs.testing.perPidDir(&fixture_root_buf, "cc-zig-provider-l2");
 }
 
+/// `<root>/<name>/config.json`; the store creates the parent directories itself.
+fn tempConfigPath(a: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}/{s}/config.json", .{ fixtureRoot(), name });
+}
+
+/// Remove a fixture document (plus its `.lock`/`.tmp` siblings) and the per-test
+/// directory holding it, then the per-process root if nothing else is left in it.
+///
+/// The directory removed is `dirname(path)`, so every fixture must sit in its own
+/// directory strictly below `fixtureRoot()`. The OAuth fixtures used to be spelled
+/// `/tmp/metacodes-oauth-l2-<name>.json`, which made this `rmdir("/tmp")`: a no-op on
+/// POSIX (never empty, sticky), but on Windows `\tmp` on the current drive is created
+/// empty by `scripts/windows_test_prelude.zig` moments earlier and the call succeeded,
+/// taking every `/tmp`-based fixture in the parallel shards with it (main@fd8165f1,
+/// 2026-09-21). The check below turns that shape into a loud failure.
 fn removeTempDir(path: []const u8) void {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     for ([_][]const u8{ path, ".lock", ".tmp" }, 0..) |suffix, index| {
@@ -451,8 +469,13 @@ fn removeTempDir(path: []const u8) void {
         _ = pfs.unlinkPath(target) catch {};
     }
     const dir = std.fs.path.dirname(path) orelse return;
+    const root = fixtureRoot();
+    if (!(dir.len > root.len and std.mem.startsWith(u8, dir, root) and dir[root.len] == '/')) {
+        std.debug.panic("fixture {s} is not in its own directory below {s}", .{ path, root });
+    }
     const dir_z = std.fmt.bufPrintZ(&buffer, "{s}", .{dir}) catch return;
     _ = std.c.rmdir(dir_z.ptr);
+    _ = std.c.rmdir(root.ptr); // fails while sibling fixtures still exist; that is fine
 }
 
 fn readWholeFile(a: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -1206,10 +1229,9 @@ test "L2: a configured provider's declared metadata reaches every client the sam
 
 // ── provider-scoped OAuth lifecycle ──────────────────────────────────────────
 
+/// `<root>/oauth-<name>/store.json`; the OAuth session creates the parent directories.
 fn oauthTempPath(a: std.mem.Allocator, name: []const u8) ![]u8 {
-    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pid = @import("platform").process.currentPid();
-    return std.fmt.allocPrint(a, "{s}/cc-zig-oauth-l2-{s}-{d}.json", .{ cc.util_fs.testing.tmpRoot(&rbuf), name, pid });
+    return std.fmt.allocPrint(a, "{s}/oauth-{s}/store.json", .{ fixtureRoot(), name });
 }
 
 test "L2: an expired provider token refreshes over real HTTP and persists the rotation" {

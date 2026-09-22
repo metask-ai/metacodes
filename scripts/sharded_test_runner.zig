@@ -112,6 +112,11 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.testing.log_level = .err;
         std.testing.environ = init.environ;
 
+        // The error return trace lives in this frame and is only appended to: every
+        // `return error.X` that unwinds into this loop (a skip is one) leaves its frames
+        // behind, so a later failure would print them ahead of its own. Start each test
+        // from an empty trace so what is dumped belongs to the test that failed.
+        if (@errorReturnTrace()) |trace| trace.index = 0;
         const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
         const result = test_fn.func();
         const end_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
