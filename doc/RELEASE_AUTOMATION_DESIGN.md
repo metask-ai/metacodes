@@ -39,15 +39,23 @@ human decision, the mechanism only makes it cheap).
   `+<commit12>` (and `.dirty`). A release commit drops `-dev`; the tag is the
   bare `X.Y.Z`. This is the existing #47 §6 / Q1 rule and stays.
 - Bump level is computed from the Conventional-Commit **types** of the first
-  line of every commit on `main` since the last tag (merge commits are skipped,
-  their PR commits are what count):
+  line of every commit reachable from `main` since the last tag (`git log
+  <tag>..main --no-merges`). This is well defined only because `main` takes
+  merge commits (the repository convention; squash or rebase merges would
+  erase the PR commits and are refused by the cut when it finds a first-parent
+  commit that is neither a merge nor conventional). Normalization: the type is
+  the text before the first `(` or `:` on the first line, lowercased,
+  trailing `!` noted; anything that does not parse (`merge main`, free text,
+  non-Latin subjects) or is not in the table is **unknown** and contributes
+  nothing. The cut PR body lists every unknown-typed commit so the reviewer can
+  raise the level by hand; the script never guesses.
 
   | commits contain | bump | pre-1.0 (current) |
   |---|---|---|
   | `!` after the type or a `BREAKING CHANGE:` footer | major | minor |
   | `feat` | minor | minor |
   | `fix`, `perf` | patch | patch |
-  | only `ci`, `test`, `tests`, `docs`, `chore`, `eval`, `review`, `scripts`, `core`, `merge`, unknown | none | none |
+  | only `ci`, `test`, `tests`, `docs`, `chore`, `eval`, `review`, `scripts`, `core`, `build`, `cli`, `transport`, `picker`, `vendor`, `gate`, `merge`, unknown | none | none |
 
   "none" means the cut is refused unless `--force-level` is given: a release
   with no user-visible change is a human decision, not a scheduled accident.
@@ -57,6 +65,10 @@ human decision, the mechanism only makes it cheap).
   `main` with `-dev` dropped. `main` at `0.2.0-dev` with only fixes since
   `0.1.0` still cuts `0.2.0`, because the `-dev` number is a floor a
   maintainer set on purpose (stage D, or by hand when a minor is planned).
+  The result must be **strictly greater than the last tag** in every mode,
+  `--force-level` included; a candidate equal to an existing tag (for example
+  `main` still at `0.2.0-dev` after `0.2.0` was tagged, before reopen) refuses
+  the cut with "reopen first" instead of producing a no-op release PR.
   Between a release and the next cut, `--version` on `main` therefore shows
   the floor (`0.2.1-dev+…`), not the version the commits will eventually
   imply; that is a display of intent, not a prediction.
@@ -65,7 +77,8 @@ human decision, the mechanism only makes it cheap).
 
 ```
 A cut ──▶ release PR ──(human merges)──▶ B tag ──▶ C build+draft ──(human publishes)──▶ D reopen dev
-   scripts/release_cut.py         release-tag.yml      release.yml (tag push)         release-tag.yml
+   release_cut.py (maintainer)   release-tag.yml      release.yml (dispatched by B,     release_cut.py --reopen
+                                 (pull_request_target) or a hand-pushed tag)            (maintainer)
 ```
 
 ### Stage A — cut (`scripts/release_cut.py`, run by a maintainer)
@@ -80,16 +93,20 @@ missing" forever. A GitHub App installation token would lift that limit; it is
 not worth a stored credential for a command a maintainer runs a few times a
 month. The script (Python 3.9, stdlib only, tested under `scripts/tests/`):
 
-1. `git describe --tags --abbrev=0` → last tag; `git log <tag>..HEAD
-   --format=%s%n%b --no-merges` → bump level per §2; version = bump applied to
-   the last tag, floored at the `-dev` version in `build.zig.zon`.
+1. Refuses unless `build.zig.zon` on `main` carries `-dev` (otherwise a
+   release is mid-flight: "reopen first"). `git describe --tags --abbrev=0` →
+   last tag; `git log <tag>..HEAD --format=%s%n%b --no-merges` → bump level per
+   §2; version = the larger of bump(last tag) and the `-dev` floor, and
+   strictly greater than the last tag.
 2. Rewrites, in one commit on branch `release/<version>`:
    - `build.zig.zon` `.version = "<version>"`, `src/version.zig`
      `pub const semver = "<version>";`
    - `CHANGELOG.md`: the `## Unreleased` block becomes `## <version> — <UTC
      date>` with its `### Added/Changed/Fixed/…` subsections; an empty
-     `## Unreleased` is reinserted above it. A block that is empty of entries
-     refuses the cut (the changelog is the release note, see stage C).
+     `## Unreleased` is reinserted above it. The parser fails closed: exactly
+     one `## Unreleased` heading, at least one `- ` entry under it, no existing
+     `## <version>` heading, headings only from the Keep-a-Changelog set;
+     anything else refuses the cut with the offending line.
    - `evals/plugin-v1/protocol.json` implementation fingerprint via
      `python3 scripts/eval/plugin_release_gate.py
      --refresh-implementation-fingerprint` (last, as always).
@@ -97,28 +114,45 @@ month. The script (Python 3.9, stdlib only, tested under `scripts/tests/`):
    generated, re-running the cut after more merges simply regenerates it) and
    opens the PR with title `release: <version>` and label `release`. The body
    is the new changelog section plus the bump derivation (which commits drove
-   the level, and which commits have no changelog line) so a reviewer can
-   dispute the level, not just the diff.
+   the level, which are unknown-typed, which have no changelog line) so a
+   reviewer can dispute the level, not just the diff. Every external command
+   is an argv list (`subprocess.run([...])`, no shell), the body goes through
+   `--body-file`, and repository, base and head are fixed arguments, so commit
+   subjects and changelog text can never become flags or commands.
 
 The PR is gated by the ordinary ruleset (four required checks, branch up to
 date). Merging it is the human decision that a release happens.
 
 ### Stage B — tag (`release-tag.yml`)
 
-`on: pull_request: types: [closed]`, `permissions: contents: write,
-actions: write`, and the job runs only when all of these hold: `merged ==
-true`, the `release` label is present, `head.repo.full_name ==
-github.repository` (never a fork), and the PR title is `release: <version>`
-where `<version>` equals `.version` in `build.zig.zon` at
-`merge_commit_sha` and carries no `-dev`. It refuses if the tag exists, then
-creates the annotated tag `<version>` on the merge commit and pushes it.
+`on: pull_request_target: types: [closed]` — not `pull_request`: a
+`pull_request` run executes the workflow file from the PR's merge commit, so a
+PR that edited `release-tag.yml` would run its own edit with the write token
+below. `pull_request_target` runs the file from the base branch, and the job
+**checks out nothing**: every input is read through the API. It has
+`permissions: contents: write, actions: write` (tag creation and
+`workflow_dispatch`; nothing else) and `GH_TOKEN: ${{ github.token }}` in
+`env`. It runs only when all of these hold: `merged == true`, the `release`
+label is present, `head.repo.full_name == github.repository`, and the PR
+title is `release: <version>` where `<version>` equals `.version` in
+`build.zig.zon` fetched with `gh api
+repos/{owner}/{repo}/contents/build.zig.zon?ref=<merge_commit_sha>` and
+carries no `-dev`. It never uses `GITHUB_SHA` / `GITHUB_REF` (for a closed PR
+those name the base branch and its latest merge, which a later merge can move);
+the tag is created through the git-data API at
+`github.event.pull_request.merge_commit_sha`. If the tag already exists it must
+peel to that same SHA (a hand-made tag at the right commit is fine); a tag at
+another commit **fails the job** with both SHAs in the log, it is never
+silently accepted.
 
-A tag pushed with `GITHUB_TOKEN` does not fire `release.yml`'s `push: tags`
-trigger (same recursion guard), so the job then starts stage C explicitly:
+A tag created with `GITHUB_TOKEN` does not fire `release.yml`'s `push: tags`
+trigger (recursion guard), so the job then starts stage C explicitly:
 `gh workflow run release.yml --ref <version> -f tag=<version> -f dry_run=false`.
-`workflow_dispatch` is the documented exception to the guard, and the dispatch
-path of `release.yml` already accepts a bare tag. Tags are never moved; a
-mistaken release is followed by a new patch release, not a re-tag.
+`workflow_dispatch` is the documented exception to the guard, the run uses the
+workflow file **at the tag** (the file must also exist on the default branch),
+and the dispatch path of `release.yml` already accepts a bare tag. Tags are
+never moved; a mistaken release is followed by a new patch release, not a
+re-tag.
 
 ### Stage C — build and draft (`release.yml`, extended)
 
@@ -131,9 +165,18 @@ the `publish` job stay. `share/doc/CHANGELOG-<version>.md` is the whole
 changelog rewrite imposes no parser contract on the bundle. Two changes to
 `publish`:
 
-- version is read from the tag (`github.ref_name`) on tag runs and from the
-  manifest on dispatch runs; `release_sums.py` and `gh release create` receive
-  that value, never a branch name (fixes gap §9.3).
+- one event-aware pair of values replaces every `inputs.tag` use (today it
+  appears in the concurrency group, both checkouts and the publish job, and is
+  empty on a `push` event): `RELEASE_REF = inputs.tag || github.ref_name`,
+  `DRY_RUN = (event == workflow_dispatch && inputs.dry_run) || ref is not a
+  bare X.Y.Z tag`. Concurrency groups on `RELEASE_REF`. `publish` runs only for
+  a bare tag with `DRY_RUN=false`; a branch or SHA ref always stops at
+  artifacts (fixes gap §9.3: `release_sums.py` and `gh release create` never
+  see a branch name).
+- reruns are safe: `gh release view <tag>` decides between `create --draft` and
+  `upload --clobber` onto the existing draft; because build artifacts expire
+  after seven days, a rerun always rebuilds from the immutable tag rather than
+  reusing artifacts.
 - release notes come from the CHANGELOG section for that version
   (`scripts/release_notes.py <version>` prints it) instead of the fixed
   sentence; the draft is still published by a human.
@@ -152,11 +195,15 @@ the release PR; the cut script prints the reminder) sets `build.zig.zon` /
 block if the cut left none, repins the fingerprint and opens `chore: reopen
 <next>-dev`. PATCH is the default floor; a maintainer who knows the next
 release is a minor passes `--reopen-level minor`. Until that PR merges, `main`
-briefly carries the released version without `-dev`; stage B's tag-exists
-check makes a second cut in that window a no-op, and `release_manifest.zig`
-would classify a build from that window as `stable` only if it is exactly the
-tagged commit (`git describe --exact-match`), so an accidental pre build from
-the window is still labelled correctly.
+carries the released version without `-dev`. Any other change merged in that
+window would carry an untagged bare version (`release:manifest` fails for it,
+`--version` looks stable). The window is closed by a gate, not by discipline:
+a new step in `doc:check` (`scripts/check_version_state.py`, so it runs in
+`gate:pr` and on every PR's CI) fails when the version has no `-dev` unless
+HEAD is exactly the tag of that version or the PR head branch is
+`release/<version>`. A PR that tries to merge during the window therefore goes
+red until the reopen PR lands; the cut itself (stage A) also refuses without
+`-dev`, see step 1.
 
 ## 4. Hotfixes and maintenance lines
 
@@ -193,6 +240,12 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
   is republished automatically because the draft is human-published.
 - **Fingerprint race**: the cut PR repins last; if `main` moves after, the
   merge is blocked by the ruleset and the re-cut repins again.
+- **Hand-made tag**: at the merge commit it is accepted; anywhere else stage B
+  fails loudly (§3 B). A maintainer who pushes a bare tag by hand still gets a
+  build through the `push: tags` trigger and the same publish rules.
+- **Draft exists / artifacts expired**: rerun rebuilds from the tag and updates
+  the existing draft (§3 C).
+- **Malformed changelog**: the cut refuses with the line; nothing is pushed.
 
 ## 7. Follow-ups scheduled, not designed here
 
@@ -208,9 +261,10 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 |---|---|
 | `scripts/release_cut.py` (new) | bump computation, version/changelog rewrite, PR body, `--reopen`; `--dry-run` prints the plan; run by a maintainer, not by CI |
 | `scripts/release_notes.py` (new) | print one CHANGELOG section |
+| `scripts/check_version_state.py` (new, wired into `doc:check`) | a bare version is legal only on the tagged commit or a `release/<version>` head; closes the reopen window |
 | `scripts/tests/test_release_cut.py` (new) | level table, floor rule, changelog rewrite idempotence, refusal cases |
-| `.github/workflows/release-tag.yml` (new) | stage B (tag the merged release PR, dispatch `release.yml`) |
-| `.github/workflows/release.yml` | tag trigger, version from tag/manifest, notes from changelog, no `--verify-tag` on dispatch |
+| `.github/workflows/release-tag.yml` (new) | stage B: `pull_request_target: closed`, API-only, tag at `merge_commit_sha`, dispatch `release.yml` |
+| `.github/workflows/release.yml` | tag trigger, event-aware `RELEASE_REF`/`DRY_RUN` replacing every `inputs.tag`, publish only for bare tags, rerun-safe draft handling, notes from changelog |
 | `release/LAYOUT.md` | fix "ReleaseSafe" (the executable is `ReleaseSmall`, `build.zig`), publish flow with stages A–D |
 | `README.md` | Lean kernels are not in the release unit (matches `release/LAYOUT.md`) |
 | `doc/RELEASE_RUNNER.md` | replace "Enabling the tag trigger" TODO with the stage C description |
@@ -237,6 +291,8 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 ## 10. Decisions to confirm
 
 - Pre-1.0 breaking changes bump MINOR (table in §2).
+- `main` keeps merge-commit merges (the bump derivation depends on it); the
+  cut refuses when it finds evidence of a squash or rebase merge.
 - Stage D reopens at PATCH `-dev`; a minor is a one-number edit in that PR.
 - The cut refuses a release whose commits carry no `feat`/`fix`/`perf` unless
   forced.
@@ -250,3 +306,20 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
   GitHub *pre-release* under it — needs the manifest's channel logic to accept
   that tag shape; (b) keep pre builds as artifacts only and satisfy the launch
   gate with the first stable `0.2.0`. (b) is the smaller change.
+
+## 11. Review log
+
+- Round 1 (self): GITHUB_TOKEN recursion guard (stages A/D moved to the
+  maintainer, stage B dispatches C), fork guard, floor rule, CHANGELOG staging
+  is a whole-file copy, pre-release publication left open.
+- Round 2 (Codex, read-only, session `01a0c778`): stage B moved to
+  `pull_request_target` with API-only inputs and the tag created at
+  `merge_commit_sha` (a `pull_request` run would execute a PR-edited workflow
+  with the write token); event-aware `RELEASE_REF`/`DRY_RUN` in `release.yml`;
+  bump-type normalization and the merge-commit requirement; strict
+  `candidate > last tag`; the reopen window closed by `check_version_state.py`;
+  hand-made tags at another commit fail instead of no-op; rerun-safe drafts;
+  fail-closed changelog grammar; argv-only subprocesses. Clarified, not
+  changed: a `workflow_dispatch` run uses the workflow file at the dispatched
+  ref (the file must also exist on the default branch), so the build procedure
+  is pinned by the tag.
