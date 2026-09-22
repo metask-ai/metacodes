@@ -138,7 +138,7 @@ pub const JobRegistry = struct {
             var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
             @memcpy(zbuf[0..base.len], base);
             zbuf[base.len] = 0;
-            _ = std.c.chmod(@ptrCast(&zbuf), 0o700);
+            _ = pfs.chmod(@ptrCast(&zbuf), 0o700);
         }
 
         return .{

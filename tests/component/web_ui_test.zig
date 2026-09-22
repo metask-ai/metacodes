@@ -349,7 +349,7 @@ test "U8: --resume-response 解析进 config.resume_response(内联 + @file)" {
         const content = "{\"answer\":42}";
         _ = pfs.write(fd, content);
         pfs.close(fd);
-        defer _ = std.c.unlink(path.ptr);
+        defer @import("platform").fs.unlinkPath(path.ptr) catch {};
         var argbuf: [600]u8 = undefined;
         const at_arg = try std.fmt.bufPrintZ(&argbuf, "@{s}", .{path});
         const argv = [_][*:0]const u8{ "metacodes", "--resume-response", at_arg.ptr };

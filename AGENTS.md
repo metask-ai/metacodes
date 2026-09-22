@@ -13,6 +13,17 @@ These rules apply to the entire repository.
   explicit error sets, and compile-time validation over optional-field protocols.
 - Every allocation has an owner. Name allocators by lifetime (`gpa`, `arena`,
   `scratch`) and place `defer` immediately after successful resource acquisition.
+- Path-taking file operations go through `src/platform/fs.zig` (`open`,
+  `openZ`, `mkdir`, `rmdir`, `chdir`, `chmod`, `fopen`, `unlinkPath`,
+  `renameReplace`, `exists`, `realpath`, `finalPath`, `getCwd`) and the
+  environment/cwd through `platform.paths`/`util.fs`, never through the
+  `std.c.*` spellings: on Windows those are the narrow CRT entry points, which
+  decode UTF-8 paths with the ANSI code page and reach a different file than
+  the wide-character checks do (POSIX-only code and fixed ASCII device paths
+  such as `/dev/null` are the only exceptions). `realpath` is lexical on
+  Windows; use `finalPath` when you need the physical path. Read errno through
+  `pfs.lastErrnoIs`/`pfs.errnoTag`, not a bare `@enumFromInt` or
+  `std.posix.errno`.
 - Preserve the kernel boundaries: plugins cannot replace the AgentLoop or bypass
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,

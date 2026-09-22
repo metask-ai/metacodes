@@ -775,7 +775,7 @@ fn ensurePrivateDirectory(allocator: std.mem.Allocator, path: []const u8) !void 
     // was already there would silently accept a shared one — and would follow a
     // planted directory symlink while doing it.
     if (!existed and @import("builtin").os.tag != .windows) {
-        if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.StagingDirectoryUnusable;
+        if (pfs.chmod(path_z.ptr, 0o700) != 0) return error.StagingDirectoryUnusable;
     }
     if (@import("builtin").os.tag == .windows) {
         // MSVCRT cannot open a directory, so there is no descriptor to
@@ -819,7 +819,7 @@ fn removeFile(path: []const u8) void {
     if (path.len >= buffer.len) return;
     @memcpy(buffer[0..path.len], path);
     buffer[path.len] = 0;
-    _ = std.c.unlink(&buffer);
+    pfs.unlinkPath(&buffer) catch {};
 }
 
 fn boolText(value: bool) []const u8 {
@@ -900,7 +900,7 @@ test "KgdServer: staging refuses a directory other people can write" {
     const shared = try std.fmt.allocPrintSentinel(a, "{s}/shared.import", .{root}, 0);
     defer a.free(shared);
     try @import("../../util/fs.zig").mkdirParents(std.mem.span(shared.ptr));
-    try testing.expectEqual(@as(c_int, 0), std.c.chmod(shared.ptr, 0o777));
+    try testing.expectEqual(@as(c_int, 0), pfs.chmod(shared.ptr, 0o777));
     try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, std.mem.span(shared.ptr)));
 
     // A shared parent: the engine reopens the staged file by pathname, so
@@ -909,7 +909,7 @@ test "KgdServer: staging refuses a directory other people can write" {
     const shared_parent = try std.fmt.allocPrintSentinel(a, "{s}/open-parent", .{root}, 0);
     defer a.free(shared_parent);
     try @import("../../util/fs.zig").mkdirParents(std.mem.span(shared_parent.ptr));
-    try testing.expectEqual(@as(c_int, 0), std.c.chmod(shared_parent.ptr, 0o777));
+    try testing.expectEqual(@as(c_int, 0), pfs.chmod(shared_parent.ptr, 0o777));
     const under_shared = try std.fmt.allocPrint(a, "{s}/open-parent/child.import", .{root});
     defer a.free(under_shared);
     try testing.expectError(error.StagingDirectoryUnusable, ensurePrivateDirectory(a, under_shared));

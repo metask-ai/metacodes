@@ -291,9 +291,9 @@ test "GlobTool brace pattern (*.{ts,tsx})" {
         _ = pfs.write(fd, "x\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(ts_path.ptr);
-    defer _ = std.c.unlink(tsx_path.ptr);
-    defer _ = std.c.unlink(txt_path.ptr);
+    defer pfs.unlinkPath(ts_path.ptr) catch {};
+    defer pfs.unlinkPath(tsx_path.ptr) catch {};
+    defer pfs.unlinkPath(txt_path.ptr) catch {};
 
     const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"cc-zig-glob-brace-*.{{ts,tsx}}\",\"path\":\"{s}\"}}", .{dir});
     defer std.testing.allocator.free(json);

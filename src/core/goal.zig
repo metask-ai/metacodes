@@ -154,7 +154,7 @@ pub const State = struct {
         if (self.current == null) {
             const path_z = try self.allocator.dupeZ(u8, path);
             defer self.allocator.free(path_z);
-            _ = std.c.unlink(path_z.ptr);
+            pfs.unlinkPath(path_z.ptr) catch {}; // 宽字符(#121):goal.json 由 pfs 按精确名写,也按精确名删
             return;
         }
         const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
@@ -322,8 +322,7 @@ fn ensureTestDir(path: []const u8) !void {
     if (path.len >= buf.len) return error.PathTooLong;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    if (std.c.mkdir(@ptrCast(&buf), 0o700) != 0) {
-        const e: std.c.E = @enumFromInt(std.c._errno().*);
-        if (e != .EXIST) return error.MkdirFailed;
+    if (pfs.mkdir(@ptrCast(&buf), 0o700) != 0) {
+        if (!pfs.lastErrnoIs(.EXIST)) return error.MkdirFailed;
     }
 }

@@ -59,7 +59,7 @@ const Home = struct {
         if (fd < 0) return error.ConfigWriteFailed;
         defer _ = pfs.close(fd);
         if (pfs.write(fd, content) != @as(isize, @intCast(content.len))) return error.ConfigWriteFailed;
-        if (std.c.chmod(path_z.ptr, mode) != 0) return error.ConfigChmodFailed;
+        if (pfs.chmod(path_z.ptr, mode) != 0) return error.ConfigChmodFailed;
         return path;
     }
 };

@@ -30,7 +30,7 @@ pub const WrappedCommand = struct {
         if (self.profile_path.len < pz.len) {
             @memcpy(pz[0..self.profile_path.len], self.profile_path);
             pz[self.profile_path.len] = 0;
-            _ = std.c.unlink(@ptrCast(&pz));
+            pfs.unlinkPath(@ptrCast(&pz)) catch {};
         }
         for (self.argv) |a| self.allocator.free(a);
         self.allocator.free(self.argv);
@@ -102,7 +102,7 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
         if (prof_path.len < pz.len) {
             @memcpy(pz[0..prof_path.len], prof_path);
             pz[prof_path.len] = 0;
-            _ = std.c.unlink(@ptrCast(&pz));
+            pfs.unlinkPath(@ptrCast(&pz)) catch {};
         }
         alloc.free(prof_path);
     }
@@ -129,7 +129,7 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
 
 /// sandbox-exec 是否存在?
 fn sandboxExecAvailable() bool {
-    return std.c.access("/usr/bin/sandbox-exec", std.c.F_OK) == 0;
+    return pfs.exists("/usr/bin/sandbox-exec");
 }
 
 /// 命令首 token(到第一个空白)。
@@ -181,7 +181,7 @@ pub const ShellWrap = struct {
             if (self.profile_path.len < pz.len) {
                 @memcpy(pz[0..self.profile_path.len], self.profile_path);
                 pz[self.profile_path.len] = 0;
-                _ = std.c.unlink(@ptrCast(&pz));
+                pfs.unlinkPath(@ptrCast(&pz)) catch {};
             }
         }
         self.allocator.free(self.command);
@@ -297,7 +297,7 @@ test "wrapCommand: enabled on macos → wrapped argv" {
     var pz: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(pz[0..wc.profile_path.len], wc.profile_path);
     pz[wc.profile_path.len] = 0;
-    try testing.expect(std.c.access(@ptrCast(&pz), std.c.F_OK) == 0);
+    try testing.expect(pfs.exists(@ptrCast(&pz)));
 }
 
 test "firstToken" {
@@ -320,8 +320,8 @@ test "e2e: sandbox blocks write outside cwd, allows inside" {
     var dir_z: [129]u8 = undefined;
     @memcpy(dir_z[0..dir.len], dir);
     dir_z[dir.len] = 0;
-    _ = std.c.mkdir(@ptrCast(&dir_z), 0o755);
-    defer _ = std.c.rmdir(@ptrCast(&dir_z));
+    _ = pfs.mkdir(@ptrCast(&dir_z), 0o755);
+    defer _ = pfs.rmdir(@ptrCast(&dir_z));
 
     const sb = config_mod.SandboxSettings{ .enabled = true };
     // 命令:cwd 内写 OK;cwd 外(/private/tmp/cczig_sbe2e_OUTSIDE)写应被拦
@@ -346,7 +346,7 @@ test "e2e: sandbox blocks write outside cwd, allows inside" {
     // 清理 cwd 内文件
     var ok_z: [160]u8 = undefined;
     const ok_path = std.fmt.bufPrint(&ok_z, "{s}/ok.txt\x00", .{dir}) catch return;
-    _ = std.c.unlink(@ptrCast(ok_path.ptr));
+    pfs.unlinkPath(@ptrCast(ok_path.ptr)) catch {};
 }
 
 /// 简易 `/bin/sh -c cmd` 捕获 stdout(测试用,复用 tools/common 的 spawn)。

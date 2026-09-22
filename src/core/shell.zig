@@ -9,6 +9,7 @@
 //! 对齐 codex-rs/core/src/shell.rs derive_exec_args + shell-command/shell_detect.rs。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const win = std.os.windows;
@@ -90,20 +91,10 @@ pub fn wrapCommand(allocator: std.mem.Allocator, shell: Shell, command: []const 
     };
 }
 
-// Windows 存在性检测:GetFileAttributesW(≠ INVALID),不打开文件——open-RDONLY 遇 ACL 读禁但
-// 可执行的系统二进制会误报"不存在"→ 错退 cmd(Linus finding 3)。POSIX 走 access(F_OK)。
-extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
-
+// 存在性检测走 pfs.exists:Windows GetFileAttributesW(≠ INVALID),不打开文件——open-RDONLY 遇 ACL
+// 读禁但可执行的系统二进制会误报"不存在"→ 错退 cmd(Linus finding 3);POSIX access(F_OK)。
 fn fileExists(path: [*:0]const u8) bool {
-    if (is_windows) {
-        var wbuf: [win.PATH_MAX_WIDE + 1]u16 = undefined;
-        const u8path = std.mem.span(path);
-        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, u8path) catch return false;
-        if (wlen >= wbuf.len) return false;
-        wbuf[wlen] = 0;
-        return GetFileAttributesW(@ptrCast(&wbuf)) != 0xFFFF_FFFF; // INVALID_FILE_ATTRIBUTES
-    }
-    return std.c.access(path, std.c.F_OK) == 0;
+    return pfs.exists(path);
 }
 
 // ============================================================================

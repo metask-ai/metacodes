@@ -14,6 +14,7 @@
 //! 已在测试差距清单登记(见 tests/README.md)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const cc = @import("cc");
 
 const tools = cc.tools;
@@ -29,7 +30,7 @@ fn simpleCtx(a: std.mem.Allocator) ToolContext {
 /// 各自 unlink 自己的文件。buf 须 ≥ 512。
 fn smokeDir(buf: []u8) [:0]const u8 {
     const d = cc.util_fs.testing.perPidDir(buf, "cc-zig-smoke");
-    _ = std.c.mkdir(d.ptr, 0o755);
+    _ = pfs.mkdir(d.ptr, 0o755);
     return d;
 }
 
@@ -104,10 +105,10 @@ test "L2 smoke: Write 新文件 → Read 读回内容一致" {
     var ctx = simpleCtx(a);
     var dir_buf: [512]u8 = undefined;
     const dir = smokeDir(&dir_buf);
-    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
     var path_buf: [512]u8 = undefined;
     const path = sub(&path_buf, dir, "write-read.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     var args_buf: [1024]u8 = undefined;
 
     const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"smoke_body_42\"}}", .{path}));
@@ -125,7 +126,7 @@ test "L2 smoke: Read 不存在文件 → FileNotFound" {
     var ctx = simpleCtx(a);
     var dir_buf: [512]u8 = undefined;
     const dir = smokeDir(&dir_buf);
-    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
     var args_buf: [1024]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}/nope-9z9z.txt\"}}", .{dir});
     try std.testing.expectError(error.FileNotFound, tools.dispatch(&ctx, "Read", args));
@@ -159,10 +160,10 @@ test "L2 smoke: Edit 替换字符串 → Read 读回新内容" {
     var ctx = simpleCtx(a);
     var dir_buf: [512]u8 = undefined;
     const dir = smokeDir(&dir_buf);
-    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
     var path_buf: [512]u8 = undefined;
     const path = sub(&path_buf, dir, "edit.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     var args_buf: [1024]u8 = undefined;
 
     const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"before_X done\"}}", .{path}));
@@ -183,10 +184,10 @@ test "L2 smoke: Edit old_string 未找到 → 错误(不静默成功)" {
     var ctx = simpleCtx(a);
     var dir_buf: [512]u8 = undefined;
     const dir = smokeDir(&dir_buf);
-    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
     var path_buf: [512]u8 = undefined;
     const path = sub(&path_buf, dir, "edit-nf.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     var args_buf: [1024]u8 = undefined;
     const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"hello\"}}", .{path}));
     a.free(wout);
@@ -205,10 +206,10 @@ test "L2 smoke: Grep 在临时文件里匹配已知串(content 模式带行号)"
     var ctx = simpleCtx(a);
     var dir_buf: [512]u8 = undefined;
     const dir = smokeDir(&dir_buf);
-    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
     var path_buf: [512]u8 = undefined;
     const path = sub(&path_buf, dir, "grep.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     var args_buf: [1024]u8 = undefined;
     const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"alpha\\nNEEDLE_777\\nbeta\"}}", .{path}));
     a.free(wout);
@@ -226,10 +227,10 @@ test "L2 smoke: Glob 匹配临时目录下文件" {
     var ctx = simpleCtx(a);
     var dir_buf: [512]u8 = undefined;
     const dir = smokeDir(&dir_buf);
-    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
     var path_buf: [512]u8 = undefined;
     const path = sub(&path_buf, dir, "glob-uniq.md");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     var args_buf: [1024]u8 = undefined;
     const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"x\"}}", .{path}));
     a.free(wout);
@@ -271,10 +272,10 @@ test "L2 e2e: Edit no-op 经 executeSlots → 富 detail 到达 slot(code=no_op_
     const tool_exec = cc.tool_exec;
     var dir_buf: [512]u8 = undefined;
     const dir = smokeDir(&dir_buf);
-    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
     var path_buf: [512]u8 = undefined;
     const path = sub(&path_buf, dir, "edit-noop-e2e.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     var args_buf: [1024]u8 = undefined;
     var ctx = simpleCtx(a);
     a.free(try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"abc\"}}", .{path})));
@@ -300,10 +301,10 @@ test "L2 e2e: Edit not-found 经 executeSlots → 富诊断到达 slot" {
     const tool_exec = cc.tool_exec;
     var dir_buf: [512]u8 = undefined;
     const dir = smokeDir(&dir_buf);
-    defer _ = std.c.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
+    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
     var path_buf: [512]u8 = undefined;
     const path = sub(&path_buf, dir, "edit-nf-e2e.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     var args_buf: [1024]u8 = undefined;
     var ctx = simpleCtx(a);
     a.free(try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"hello world\"}}", .{path})));

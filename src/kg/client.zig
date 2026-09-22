@@ -823,9 +823,12 @@ pub const KgClient = struct {
         if (path.len >= buf.len) return false;
         @memcpy(buf[0..path.len], path);
         buf[path.len] = 0;
-        // Windows:CRT _access 无 X_OK 概念(mode 1 非法)→ 存在即可执行(.exe 语义)。
-        const mode: c_uint = if (@import("builtin").os.tag == .windows) std.c.F_OK else std.c.X_OK;
-        return std.c.access(buf[0..path.len :0].ptr, mode) == 0;
+        // Windows:CRT _access 无 X_OK 概念(mode 1 非法)→ 存在即可执行(.exe 语义);宽字符 exists(#121)。
+        if (@import("builtin").os.tag == .windows) {
+            return pfs.exists(buf[0..path.len :0].ptr);
+        } else {
+            return std.c.access(buf[0..path.len :0].ptr, std.c.X_OK) == 0;
+        }
     }
 
     // ── 就绪与版本门(设计 §1 D2、§6)────────────────────────────────
@@ -3227,7 +3230,7 @@ fn extractKvU64(text: []const u8, key: []const u8) ?u64 {
 fn writeTmpFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
     const pz = try allocator.dupeZ(u8, path);
     defer allocator.free(pz);
-    const f = std.c.fopen(pz.ptr, "w") orelse return error.WriteFailed;
+    const f = pfs.fopen(pz.ptr, "w") orelse return error.WriteFailed;
     defer _ = std.c.fclose(f);
     if (bytes.len > 0) _ = std.c.fwrite(bytes.ptr, 1, bytes.len, f);
 }
@@ -3235,7 +3238,7 @@ fn writeTmpFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u
 fn deleteTmpFile(allocator: std.mem.Allocator, path: []const u8) void {
     const pz = allocator.dupeZ(u8, path) catch return;
     defer allocator.free(pz);
-    _ = std.c.unlink(pz.ptr);
+    pfs.unlinkPath(pz.ptr) catch {};
 }
 
 fn dirExists(path: []const u8) bool {
@@ -3243,8 +3246,8 @@ fn dirExists(path: []const u8) bool {
     if (path.len >= buf.len) return false;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    // F_OK: 存在即可(store 是目录;不存在 → init)。tinykg init 幂等,误判无害。
-    return std.c.access(buf[0..path.len :0].ptr, std.c.F_OK) == 0;
+    // 存在即可(store 是目录;不存在 → init)。tinykg init 幂等,误判无害。宽字符 exists(#121)。
+    return pfs.exists(buf[0..path.len :0].ptr);
 }
 
 fn ensureParentDir(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -3254,11 +3257,11 @@ fn ensureParentDir(allocator: std.mem.Allocator, path: []const u8) !void {
     if (grand) |g| {
         const gz = try allocator.dupeZ(u8, g);
         defer allocator.free(gz);
-        _ = std.c.mkdir(gz, 0o755);
+        _ = pfs.mkdir(gz, 0o755);
     }
     const pz = try allocator.dupeZ(u8, parent);
     defer allocator.free(pz);
-    _ = std.c.mkdir(pz, 0o755);
+    _ = pfs.mkdir(pz, 0o755);
 }
 
 fn sleepMs(ms: u64) void {

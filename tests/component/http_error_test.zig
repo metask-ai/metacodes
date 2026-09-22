@@ -44,7 +44,7 @@ test "L2 Stage6: HTTP 401 → error.Unauthorized 且 body 进日志" {
     const fd = pfs.open(full_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o644);
     try std.testing.expect(fd >= 0);
     defer pfs.close(fd);
-    defer _ = std.c.unlink(full_path.ptr);
+    defer pfs.unlinkPath(full_path.ptr) catch {};
     const previous_log_state = cc.util_log.setLogFileFdForTest(fd);
     defer cc.util_log.restoreForTest(previous_log_state);
     cc.util_log.setLevel(.debug);

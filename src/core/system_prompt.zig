@@ -9,6 +9,7 @@
 //! 需要 runtime 读 cwd / platform / model。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const model_name = @import("../api/model_name.zig");
 const util_fs = @import("../util/fs.zig");
 const kg_retrieval = @import("../kg/retrieval_protocol.zig");
@@ -183,7 +184,7 @@ fn isGitRepo(cwd: []const u8, scratch: *[std.fs.max_path_bytes + 32]u8) bool {
     var p: []const u8 = cwd;
     while (p.len > 0) {
         const len = std.fmt.bufPrint(scratch, "{s}/.git\x00", .{p}) catch return false;
-        if (std.c.access(@ptrCast(len.ptr), std.c.F_OK) == 0) return true;
+        if (pfs.exists(@ptrCast(len.ptr))) return true; // 宽字符(#121):CJK cwd 下窄字符 access 永远找不到 .git
         const last_slash = std.mem.lastIndexOfScalar(u8, p, '/') orelse return false;
         if (last_slash == 0) {
             // p 是 "/" 或 "/x"：检查完根目录就退出
