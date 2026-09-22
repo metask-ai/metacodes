@@ -351,3 +351,11 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
   `doc:check` but `ci.yml` runs scripts individually (explicit step, both
   platforms); cut reruns update the open PR and refuse a second cut; cut and
   reopen verify against a fresh `origin/main` and the remote tag.
+- Round 4 (Codex): all nine round-3 items confirmed. Fixed: the rehearsal's
+  release-PR exception trusted the branch name alone (a PR from any branch
+  named `release/<version>` could pass); in CI it now also needs the trusted
+  event metadata `ci.yml` passes (`RELEASE_PR_TITLE == release: <version>`
+  and the `release` label), and the merge-subject exception is honoured only
+  on push runs; the cut's push lease is taken against the freshly fetched
+  remote tip of the release branch; two stale "dispatch-only" / "tag trigger
+  is a follow-up" sentences updated.

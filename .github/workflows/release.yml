@@ -1,7 +1,8 @@
 name: Release
 
-# The release pipeline (#82, #47 stage 7). Dispatch-only: a bare `X.Y.Z` tag is
-# the stable channel, a `0.x.y-dev` commit the pre channel (#47 Q1/Q3), and
+# The release pipeline (#82, #47 stage 7). A bare `X.Y.Z` tag (pushed, or
+# created by release-tag.yml which then dispatches this workflow) is the
+# stable channel, a `0.x.y-dev` commit the pre channel (#47 Q1/Q3), and
 # neither is published without a human pressing the button on the draft this
 # workflow leaves behind. Every job runs on an ephemeral GitHub-hosted runner
 # (doc/RELEASE_RUNNER.md): nothing from a PR job or an earlier release can

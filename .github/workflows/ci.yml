@@ -116,6 +116,9 @@ jobs:
       # gate tags HEAD locally so the release-layout steps below can run the
       # stable channel on the candidate (doc/RELEASE_AUTOMATION_DESIGN.md §3).
       - name: Version state gate and release rehearsal
+        env:
+          RELEASE_PR_TITLE: ${{ github.event.pull_request.title }}
+          RELEASE_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: python3 scripts/check_version_state.py --rehearse
       - name: TinyKG binary-contract unit tests
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
@@ -263,6 +266,9 @@ jobs:
           zig test src/platform/exe_lookup.zig -lc
       - name: Version state gate and release rehearsal
         shell: cmd
+        env:
+          RELEASE_PR_TITLE: ${{ github.event.pull_request.title }}
+          RELEASE_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: python scripts\check_version_state.py --rehearse
       - name: Verify native bundle and fresh-store contract
         shell: cmd

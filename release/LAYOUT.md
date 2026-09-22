@@ -101,8 +101,8 @@ CHANGELOG section as notes; the maintainer then runs `python3
 scripts/release_cut.py --reopen` and publishes the draft after verifying an
 unpacked archive on a clean machine with `scripts/verify_release_bundle.py
 --native`. Pre-releases are dispatched by hand and never auto-attached (#47
-Q3); the stable tag trigger is a follow-up (`doc/RELEASE_RUNNER.md`,
-"Enabling the tag trigger").
+Q3); a bare `X.Y.Z` tag push also triggers the stable build
+(`doc/RELEASE_RUNNER.md`, "Triggers").
 
 ## What is deliberately not in the unit
 

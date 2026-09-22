@@ -11,8 +11,11 @@ CI run it. Between releases (`X.Y.Z-dev`) it is a no-op.
 
 Head branch detection: `GITHUB_HEAD_REF` (pull_request events check out a
 merge commit, so the branch name is only in the environment), else
-`git rev-parse --abbrev-ref HEAD`. Tags: `actions/checkout` with
-`fetch-depth: 0` fetches every branch and tag, so no fetch is needed here.
+`git rev-parse --abbrev-ref HEAD`. In CI the release-PR exception also needs
+RELEASE_PR_TITLE == `release: <version>` and `release` in RELEASE_PR_LABELS
+(ci.yml passes both from the event payload); the merge-subject exception is
+honoured only on push runs. Tags: `actions/checkout` with `fetch-depth: 0`
+fetches every branch and tag, so no fetch is needed here.
 
 `--rehearse` (CI only): on a release PR head or on main's run of the release
 merge commit, tag HEAD locally so `release:verify` / `release:archive` can run
@@ -26,6 +29,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Dict, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 ZON_VERSION_RE = re.compile(r'\.version\s*=\s*"([^"]+)"')
@@ -56,12 +60,24 @@ def check(root: Path, head_ref: str) -> str:
     )
 
 
-def rehearsable(root: Path, version: str, head_ref: str) -> bool:
+def rehearsable(root: Path, version: str, head_ref: str, env: Optional[Dict[str, str]] = None) -> bool:
     """The two legitimate untagged bare-version states: the release PR itself
-    (head `release/<version>`) and main's own run on its merge commit, which
-    release-tag.yml is tagging concurrently."""
+    and main's own run on its merge commit, which release-tag.yml is tagging
+    concurrently. In CI the release PR is recognised by trusted event
+    metadata, not by its branch name alone: ci.yml passes the PR title and
+    labels (RELEASE_PR_TITLE / RELEASE_PR_LABELS) and the gate requires
+    `release: <version>` plus the `release` label — the same facts
+    release-tag.yml checks before tagging, so a branch merely named
+    `release/<version>` cannot pass. Outside CI (no GITHUB_ACTIONS) the branch
+    name is enough: that is the maintainer's own checkout."""
+    env = os.environ if env is None else env
     if head_ref == f"release/{version}":
-        return True
+        if env.get("GITHUB_ACTIONS") != "true":
+            return True
+        labels = [l.strip() for l in env.get("RELEASE_PR_LABELS", "").split(",") if l.strip()]
+        return env.get("RELEASE_PR_TITLE", "") == f"release: {version}" and "release" in labels
+    if env.get("GITHUB_ACTIONS") == "true" and env.get("GITHUB_EVENT_NAME") not in ("push", None):
+        return False  # only main's push run may rely on the merge subject
     subject = git("log", "-1", "--format=%s", "HEAD", root=root)
     return re.match(r"^Merge pull request #\d+ from \S+/release/" + re.escape(version) + r"$", subject) is not None
 

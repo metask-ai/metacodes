@@ -226,6 +226,21 @@ class ThrowawayRepoTest(unittest.TestCase):
         _commit(self.root, "fix: landed in the window")  # bare version, HEAD no longer the tagged commit
         self.assertIn("mid-flight", check_version_state.check(self.root, "main"))
 
+    def test_ci_release_pr_exception_needs_title_and_label(self):
+        _git("checkout", "-q", "-b", "release/0.2.0", cwd=self.root)
+        self._set_version("0.2.0", "release: 0.2.0")
+        ci = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request"}
+        self.assertFalse(check_version_state.rehearsable(self.root, "0.2.0", "release/0.2.0", ci))
+        self.assertFalse(check_version_state.rehearsable(self.root, "0.2.0", "release/0.2.0", dict(ci, RELEASE_PR_TITLE="release: 0.2.0")))
+        self.assertFalse(check_version_state.rehearsable(self.root, "0.2.0", "release/0.2.0", dict(ci, RELEASE_PR_TITLE="release: 0.2.0", RELEASE_PR_LABELS="bug")))
+        self.assertTrue(check_version_state.rehearsable(self.root, "0.2.0", "release/0.2.0", dict(ci, RELEASE_PR_TITLE="release: 0.2.0", RELEASE_PR_LABELS="bug,release")))
+        self.assertTrue(check_version_state.rehearsable(self.root, "0.2.0", "release/0.2.0", {}))  # maintainer checkout
+        # the merge-subject exception only on push runs
+        _git("checkout", "-q", "main", cwd=self.root)
+        _git("merge", "-q", "--no-ff", "-m", "Merge pull request #7 from metask-ai/release/0.2.0", "release/0.2.0", cwd=self.root)
+        self.assertTrue(check_version_state.rehearsable(self.root, "0.2.0", "main", {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push"}))
+        self.assertFalse(check_version_state.rehearsable(self.root, "0.2.0", "feature/x", {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request"}))
+
     def test_rehearsal_tags_only_the_legitimate_states_locally(self):
         self.assertIn("no rehearsal needed", check_version_state.rehearse(self.root, "main"))
         _git("checkout", "-q", "-b", "release/0.2.0", cwd=self.root)

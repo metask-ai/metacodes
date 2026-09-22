@@ -333,7 +333,11 @@ def open_pr(root: Path, branch: str, title: str, body: str, label: Optional[str]
     run(["git", "checkout", "-B", branch], root)
     run(["git", "add", "--"] + files, root)
     run(["git", "commit", "-m", title], root)
-    run(["git", "push", "--force-with-lease", "-u", "origin", branch], root)
+    # Lease against the remote tip as just fetched (empty = must not exist),
+    # not against whatever stale origin/<branch> the clone happened to hold.
+    run(["git", "fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], root, check=False)
+    expected = run(["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], root, check=False).strip()
+    run(["git", "push", f"--force-with-lease=refs/heads/{branch}:{expected}", "-u", "origin", branch], root)
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as handle:
         handle.write(body)
         body_path = handle.name
