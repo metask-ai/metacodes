@@ -9,6 +9,7 @@
 //! 需要 runtime 读 cwd / platform / model。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const model_name = @import("../api/model_name.zig");
 const util_fs = @import("../util/fs.zig");
 const kg_retrieval = @import("../kg/retrieval_protocol.zig");
@@ -115,6 +116,16 @@ const TONE_SECTION =
     \\ - Do not use a colon before tool calls. Your tool calls may not be shown directly in the output, so text like "Let me read the file:" followed by a read tool call should just be "Let me read the file." with a period.
 ;
 
+/// #114:多阶段/长任务的进度沟通预期。上面两段把"简洁"压得很紧,而 Output efficiency 里的
+/// "High-level status updates at natural milestones" 没有定义何时、何种粒度;这里把预期说清楚,
+/// 并明确它在多阶段任务里优先于"能一句话就不说三句"。运行期由 agent_loop 的进度更新义务
+/// (progress_updates.zig)兜底:连续几轮只调工具不说话 → 一条有界的 host 提醒。
+const PROGRESS_SECTION =
+    \\# Progress updates on longer tasks
+    \\
+    \\On multi-stage work (several tool calls, more than a few seconds), say where things stand at natural milestones: one or two sentences on the stage reached, what you found, and what comes next. This outranks the brevity rules above. Never for single-step tasks, never per tool call, never private reasoning.
+;
+
 /// getOutputEfficiencySection 非 ant 分支。逐字复制。
 const OUTPUT_EFFICIENCY_SECTION =
     \\# Output efficiency
@@ -173,7 +184,7 @@ fn isGitRepo(cwd: []const u8, scratch: *[std.fs.max_path_bytes + 32]u8) bool {
     var p: []const u8 = cwd;
     while (p.len > 0) {
         const len = std.fmt.bufPrint(scratch, "{s}/.git\x00", .{p}) catch return false;
-        if (std.c.access(@ptrCast(len.ptr), std.c.F_OK) == 0) return true;
+        if (pfs.exists(@ptrCast(len.ptr))) return true; // 宽字符(#121):CJK cwd 下窄字符 access 永远找不到 .git
         const last_slash = std.mem.lastIndexOfScalar(u8, p, '/') orelse return false;
         if (last_slash == 0) {
             // p 是 "/" 或 "/x"：检查完根目录就退出
@@ -508,6 +519,7 @@ pub fn buildFullWithDefs(
         deferred_section,          sep,
         TONE_SECTION,              sep,
         OUTPUT_EFFICIENCY_SECTION, sep,
+        PROGRESS_SECTION,          sep,
         env_section,               if (memory_section.len > 0) sep else "",
         memory_section,            if (skills_section.len > 0) sep else "",
         skills_section,            if (agents_section.len > 0) sep else "",

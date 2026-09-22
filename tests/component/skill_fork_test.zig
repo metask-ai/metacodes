@@ -30,7 +30,7 @@ fn fixtureRoot(buf: []u8, tag: []const u8) [:0]const u8 {
 }
 
 fn mkdirOrExisting(path: [*:0]const u8) !void {
-    if (std.c.mkdir(path, 0o755) == 0) return;
+    if (pfs.mkdir(path, 0o755) == 0) return;
     if (pfs.exists(path)) return;
     return fixtureFailure("mkdir", path);
 }
@@ -92,7 +92,7 @@ fn cleanup(root: []const u8, name: []const u8) void {
         0,
     ) catch return;
     defer allocator.free(path);
-    _ = std.c.unlink(path);
+    pfs.unlinkPath(path) catch {};
     const skill_dir = std.fmt.allocPrintSentinel(
         allocator,
         "{s}/{s}",
@@ -100,10 +100,10 @@ fn cleanup(root: []const u8, name: []const u8) void {
         0,
     ) catch return;
     defer allocator.free(skill_dir);
-    _ = std.c.rmdir(skill_dir);
+    _ = pfs.rmdir(skill_dir);
     const root_z = allocator.dupeZ(u8, root) catch return;
     defer allocator.free(root_z);
-    _ = std.c.rmdir(root_z);
+    _ = pfs.rmdir(root_z);
 }
 
 const Host = struct {

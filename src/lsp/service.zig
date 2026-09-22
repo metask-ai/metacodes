@@ -509,7 +509,7 @@ test "Service: MAX_LSP_CLIENTS 满 → getOrSpawn 拒绝(返 null,不标 broken)
 fn mkdirZ(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
-    _ = std.c.mkdir(z.ptr, 0o755);
+    _ = pfs.mkdir(z.ptr, 0o755);
 }
 fn writeFileZ(path: []const u8, content: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;

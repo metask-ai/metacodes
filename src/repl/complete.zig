@@ -269,7 +269,7 @@ test "path completion finds known file" {
     const path = tt.path(&path_buf, "complete-uniq-xyz.txt");
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     var line_buf: [600]u8 = undefined;
     const line = try std.fmt.bufPrint(&line_buf, "cat {s}/complete-uniq-", .{dir});
@@ -290,7 +290,7 @@ test "@-mention completion finds file" {
     const path = tt.path(&path_buf, "atmention-uniq.txt");
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     // 输入 "review @<dir>/atmention-" → 补全应找到文件,replace_start 在 @ 之后
     var line_buf: [600]u8 = undefined;

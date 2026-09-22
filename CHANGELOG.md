@@ -23,6 +23,87 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `UiEvent.queue_message` and `UiEvent.interrupt` were declared by the UI
+  protocol and produced by `TuiBackend.poll`, but no production path ever
+  called `UiBackend.poll` (#115): the CLI implemented queued messages entirely
+  at the REPL layer, so a message typed during a Run could not reach the
+  Conversation until the whole Run had finished, and a source-level embedder of
+  `metacodes-core` had no way to steer an active Run. The agent loop now
+  drains `poll` at every turn boundary (previous tool_results appended, next
+  provider request not yet built; never during a stream, and not at the
+  boundary right after a max_tokens truncation, so a continuation stays one
+  answer): a `queue_message` is appended as a user message and rides the very
+  next request of the same Run (blank messages are dropped; the slice is freed
+  with the Run's allocator, so in-process backends allocate it with that
+  allocator), and an `interrupt` ends the Run there as `aborted`
+  (`evaluation_budget` → `budget`) without replacing AbortSignal's mid-stream
+  interruption. `TuiBackend.poll` hands over plain prompts only: `/commands`,
+  `!shell` and `exit` stay queued in order for the REPL to dispatch after the
+  Run, a consumed message is echoed (`❯ …`, same layout as the between-Run
+  echo) and added to the readline history, and a message taken just as Esc
+  aborts the Run is put back so it is resubmitted afterwards as before. The
+  queue preview now renders under the queue lock instead of from borrowed
+  slices. Messages still queued when a Run ends become the next Run's input
+  exactly as before, the web backend keeps its between-Run semantics, and the
+  AgentCore binary ABI is unchanged: it has no active-Run input operation, its
+  backend poll returns null, and `doc/AGENTCORE_BINARY_ABI.md` now states the
+  Host-side queueing contract. `tests/component/ui_queue_message_test.zig`
+  proves the queued text appears in the second request of the same Run after
+  the tool_result, that a boundary interrupt stops before a second request,
+  that whitespace is dropped, and that the continuation boundary is not
+  polled; `ui_backend_test.zig` covers the command gating and the history.
+- Windows: `platform.fs.realpath` resolved paths lexically (`_fullpath`), so a
+  `metacodes.exe` started through an NTFS symlink or junction reported the
+  invoking path as its physical path and every adjacent lookup (`bin/rg.exe`,
+  `libexec/metacodes/<kernel>.exe`, `vendor/tinykg/`) searched beside the link
+  (#140). A new `platform.fs.finalPath` resolves an existing path through a
+  handle (`CreateFileW` + `GetFinalPathNameByHandleW`, `\\?\` and `\\?\UNC\`
+  prefixes stripped; null when the path cannot be opened, like POSIX
+  `realpath`) and `selfExeRealPath` uses it. `realpath` itself stays lexical
+  on Windows on purpose — callers compare its output against paths they built
+  themselves (workspace root, permission rules, memory directories), and the
+  physical form (on-disk case, long names, mapped drives expanded to UNC)
+  would stop matching — but it is now the wide `_wfullpath`, so CJK
+  components survive. The `paths.zig` symlink test runs on Windows when the
+  runner may create symlinks, a junction variant (`mklink /J`, no privilege
+  needed) was added at unit and process level, and `adjacent_symlink_test`
+  starts the real `selfexe_probe.exe` through a symlink and through a junction.
+- Windows: path-taking CRT calls decoded UTF-8 paths with the process ANSI
+  code page (#121). File creation (`_open`) and every directory creation
+  (`_mkdir`) were narrow while the existence checks, `statPath`, unlink and
+  rename were wide, so one path string named two filesystem objects: `Write`
+  could pass its must-read-first check on `测试.txt` and then truncate the
+  code-page counterpart (`娴嬭瘯.txt` under CP936), and CJK parent directories
+  were created under the wrong names. `platform.fs` now converts to UTF-16
+  for every path-taking entry point — `open` (`_wopen`, `_O_BINARY` kept),
+  new `mkdir`/`rmdir`/`chdir`/`chmod`/`fopen`/`getCwd` (`_wmkdir`, `_wrmdir`,
+  `_wchdir`, `_wchmod`, `_wfopen`, `GetCurrentDirectoryW`), `realpath`
+  (`_wfullpath`) — and every production `std.c.unlink`/`rename`/`access`/
+  `chdir`/`fopen`/`mkdir`/`rmdir`/`chmod` call in `src/` goes through those
+  wrappers, so a file created wide is also deleted, renamed and probed wide
+  (the file lock, suspend state, goal file, the kgd install temp holding an
+  API key, `.git` and `MEMORY.md` discovery, the KG pointer files). The input
+  side is fixed with it: `homeDir`/`tempDir` read the environment through
+  `GetEnvironmentVariableW` and `getCwd` through `GetCurrentDirectoryW`, so a
+  CJK user profile or working directory reaches the wrappers as UTF-8 instead
+  of ANSI bytes the strict conversion would reject. `Write`, `ApplyPatch` and
+  the worktree tool share one `mkdir -p` walker (`util.fs.mkdirAll`, with a
+  fast path when the directory already exists). `NOFOLLOW`/`isSymlink` decide
+  by reparse *tag* (symlink or junction), so OneDrive placeholders and other
+  reparse-tagged regular files are no longer refused as links. errno is no
+  longer converted with a bare `@enumFromInt` (a value `std.c.E` does not name
+  panicked in Debug/ReleaseSafe): callers compare integers (`lastErrnoIs`) or
+  look the name up (`errnoTag`/`errnoName`); the wrapper sets errno and
+  `GetLastError` itself when it refuses an operation (`ENAMETOOLONG`/`EINVAL`
+  for an over-long or invalid path, `ELOOP` for a `NOFOLLOW` open of a link);
+  `unlinkPath` reports `NotFound` separately so idempotent cleanup no longer
+  guesses with a second `exists()` (logout reported success while the
+  credentials file remained when both calls failed for a permission reason).
+  Tests create `测试目录/测试.txt` through the wrappers and verify the exact
+  names through `std.Io` and directory enumeration, drive `chdir`/`getCwd`/
+  `fopen`/`chmod` through a CJK directory, read a CJK environment value back
+  as UTF-8, and on Windows seed the ANSI-decoded counterpart and prove `Write`
+  leaves it untouched.
 - Adjacent-artifact resolution disagreed across resolvers when `metacodes` was
   started through a symlink (the common `ln -s <prefix>/bin/metacodes
   ~/bin/metacodes` install): macOS reports the invoked symlink as the
@@ -116,6 +197,48 @@ status, compatibility boundaries, and entry points are defined by
   them. Every asset digest was checked against the GitHub Releases API.
 
 ### Added
+
+- Progress updates during multi-stage tasks (#114). The shared Core forwarded
+  and classified whatever visible text the model produced, but a model that
+  called tools round after round without writing a word left the user with
+  nothing but tool lifecycle events, and the default prompt's brevity rules
+  pushed in that direction. Two provider-neutral changes. The default system
+  prompt gains a short "Progress updates on longer tasks" section that defines
+  the expectation (a sentence or two at natural milestones — stage, findings,
+  next step — outranking the brevity rules on multi-stage work; never for
+  single-step tasks, never per tool call, never private reasoning); this
+  changes the static prompt prefix once, so the prompt cache is intentionally
+  invalidated one time on upgrade and stable afterwards. The agent loop gains
+  a bounded progress-update obligation shaped like the delivery-cadence gate:
+  a silent stretch — consecutive tool rounds with no visible model text
+  (whitespace and host-rendered decorations do not count; text the loop
+  continued past, or that max_tokens cut off, does) — that is long enough in
+  both rounds and wall-clock time (`Options.progress_update_thresholds`,
+  defaults 3 rounds and 10 s) earns one host message at the turn boundary
+  asking for a short progress note in the same reply, then the continuation.
+  At most two decisions per Run, counted by the shared host-injection meter
+  (cap 11 → 13, mirrored in Lean and now pinned by a comptime `cap = Σ`
+  assertion), the stretch restarting after each decision. It is a
+  host-contract field like its siblings: off in `agent_loop.Options`, left off
+  by canonical `buildRunOptions` (macro runs, skill runs and AgentCore hosts
+  are not nudged), switched on by hosts with a reader — the interactive REPL,
+  the web session and `--stream-json` print mode — and only for a Run whose
+  commentary a person can read (`event_projection`); `--no-progress-updates`
+  turns it off, `--progress-updates-observe` records decisions without
+  injecting. A terminal `progress_updates` observation record (decisions,
+  nudges, longest stretch, thresholds) is emitted for the eval trace parser,
+  whose policy check is lockstep-tested against the Zig bound and the new
+  `ProgressUpdates.lean` policy model (narration resets, below either
+  threshold never fires, decisions bounded over any trace). Host-injected user
+  records are no longer mistaken for the user's own words: `latestUserText`
+  (web-search display query), the transcript viewer and `/recap` skip or
+  label them. The reply is ordinary `commentary` (or the final answer if the
+  model ends the turn); the output-segment protocol is untouched.
+  `tests/component/progress_updates_test.zig` drives the loop through silent,
+  narrated, continued-text, whitespace, bounded, time-floored, observe, off,
+  subagent and single-step shapes and asserts on the real request bytes,
+  segment dispositions and the terminal record;
+  `session_api_parity_test.zig` pins the canonical exclusion.
 
 - `providers.<id>.oauth_client_id` in `~/.metacodes/config.json` (#87): the
   OAuth client an installation registered for a built-in profile that declares

@@ -1964,10 +1964,14 @@ pub const RenderRegion = struct {
     fn drawQueuePreview(self: *RenderRegion, w: *std.Io.Writer) u16 {
         const q = self.gen_queue orelse return 0;
         const MAX = 3;
-        var buf: [MAX][]const u8 = undefined;
-        const total = q.len();
+        // 持锁画:agent_loop 线程会在 turn 边界 popFront 并释放字节(#115),借用的 slice 只在
+        // 守卫期间有效;总数与展示条数也来自同一份视图,不再出现"+1 more"的瞬时错位。
+        const held = q.hold();
+        defer held.release();
+        const items = held.items();
+        const total = items.len;
         if (total == 0) return 0;
-        const shown = q.snapshot(&buf);
+        const shown = @min(total, MAX);
         var rows: u16 = 0;
         const th = self.theme;
         const inner_w: usize = if (self.cols > 6) self.cols - 6 else 30;
@@ -1975,7 +1979,7 @@ pub const RenderRegion = struct {
         while (i < shown) : (i += 1) {
             w.writeAll(ansi.clear.line) catch {};
             // 取首行(\n 前)+ 按 inner_w 截断(显示宽)。
-            const msg = buf[i];
+            const msg = items[i];
             const first_line = if (std.mem.indexOfScalar(u8, msg, '\n')) |p| msg[0..p] else msg;
             w.print("{s} ⏳ ", .{th.dim}) catch {};
             writeTruncatedWidth(w, first_line, inner_w);

@@ -14,6 +14,8 @@ pub const terminal = @import("terminal.zig");
 pub const net = @import("net.zig");
 pub const dir = @import("dir.zig");
 pub const exe_lookup = @import("exe_lookup.zig");
+/// 测试夹具(symlink-or-skip / junction / 目录枚举断言)。只在 test 块里用;见文件头。
+pub const test_support = @import("test_support.zig");
 
 // 测试发现:Zig 只收集**被引用到**的文件里的 test 块。此前本文件只有一串 `pub const x =
 // @import(...)`,没有引用它们的 test 块 —— `zig build test:platform` 因此长期跑 0 个测试,

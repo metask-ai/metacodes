@@ -599,7 +599,7 @@ test "readAllFromFdCapped:超 cap 返 FileTooLarge、cap 内正常读(轴A 统�
     @memset(&payload, 'z');
     _ = pfs.write(fd_w, &payload); // 10KB
     _ = pfs.close(fd_w);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     // cap=5KB < 10KB → FileTooLarge。
     {

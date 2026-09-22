@@ -30,7 +30,7 @@ fn makeSkill(parent: []const u8, name: []const u8, md: []const u8) !void {
     const allocator = std.testing.allocator;
     const parent_z = try allocator.dupeZ(u8, parent);
     defer allocator.free(parent_z);
-    _ = std.c.mkdir(parent_z, 0o755);
+    _ = pfs.mkdir(parent_z, 0o755);
     const skill_dir = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/{s}",
@@ -38,7 +38,7 @@ fn makeSkill(parent: []const u8, name: []const u8, md: []const u8) !void {
         0,
     );
     defer allocator.free(skill_dir);
-    _ = std.c.mkdir(skill_dir, 0o755);
+    _ = pfs.mkdir(skill_dir, 0o755);
     const definition_path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/{s}/SKILL.md",

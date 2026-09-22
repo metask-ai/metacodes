@@ -135,6 +135,13 @@ pub const Config = struct {
     /// exploration-only tool calls. null = the product defaults (40 / 80).
     delivery_cadence_first: ?u32 = null,
     delivery_cadence_second: ?u32 = null,
+    /// Progress-update obligation (#114): a bounded turn-boundary nudge when
+    /// the model keeps calling tools without a word to the user. On by
+    /// default for hosts with a reader (interactive REPL, web session,
+    /// `--stream-json` print mode); `--no-progress-updates` turns it off,
+    /// `--progress-updates-observe` records decisions without injecting.
+    progress_updates: bool = true,
+    progress_updates_observe: bool = false,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,

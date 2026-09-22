@@ -37,6 +37,8 @@ test {
     _ = @import("component/verification_final_gate_test.zig");
     _ = @import("component/requirement_ledger_test.zig");
     _ = @import("component/delivery_cadence_test.zig");
+    _ = @import("component/progress_updates_test.zig");
+    _ = @import("component/ui_queue_message_test.zig");
     _ = @import("component/memdir_inject_test.zig");
     _ = @import("component/agent_background_test.zig");
     _ = @import("component/skill_fileref_test.zig");

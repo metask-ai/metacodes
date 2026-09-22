@@ -202,6 +202,10 @@ test "U11 parity: run Options 装配单源(web 只比 canonical 多 ui_requester
     // ——web 再漏字段(旧病:缺 lsp/swarm/background_request)会在此变红。
     try std.testing.expect(web_opts.ui_requester != null);
     web_opts.ui_requester = canonical.ui_requester;
+    // 进度更新义务是宿主契约字段(#114):web 有人在看,自己接上;canonical 不带。抹平后比对。
+    try std.testing.expect(web_opts.progress_updates);
+    web_opts.progress_updates = canonical.progress_updates;
+    web_opts.progress_updates_observe = canonical.progress_updates_observe;
     try std.testing.expect(std.meta.eql(canonical, web_opts));
 }
 
@@ -225,6 +229,12 @@ test "U11 parity: 过程义务门是宿主契约字段,canonical 不带(delivery
     try std.testing.expect(std.meta.eql(defaults.delivery_cadence_thresholds, canonical.delivery_cadence_thresholds));
     try std.testing.expect(!canonical.verification_final_gate);
     try std.testing.expect(!canonical.requirement_ledger);
+    // #114:进度更新门同样不进 canonical——即便 config 默认开着,宏 run / skill run 也不被提醒。
+    app.config.progress_updates = true;
+    app.config.progress_updates_observe = true;
+    const again = session_service.buildRunOptions(app, null);
+    try std.testing.expect(!again.progress_updates);
+    try std.testing.expect(!again.progress_updates_observe);
 }
 
 test "R3-1回归: Ctrl+B 身份轮换 —— 新 session_id + 新 transcript 目录,权限路由同步" {

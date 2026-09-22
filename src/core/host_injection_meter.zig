@@ -11,19 +11,43 @@
 
 const std = @import("std");
 
-/// 每 run **咨询性 nudge** 总上限 = 各门预算之和:验证终局闸(2)+ 需求
-/// 账本(2)+ 任务义务(3)+ 交付节奏(2)。cap=Σ ⇒ 计量器零行为变化,只把隐式合成上界
-/// 变成显式受执行的不变量;未来新门必须在总额度内分配,收紧 cap(< Σ)
-/// 是显式政策决定。两类注入**有意排除**:①一次性协议注入(账本 prompt、
+/// 每 run **咨询性 nudge** 总上限 = 各门预算之和:required-first 修复(2)+ 验证终局闸(2)
+/// + 需求账本(2)+ 任务义务(3)+ 交付节奏(2)+ 进度更新(2)。cap=Σ ⇒ 计量器零行为变化,
+/// 只把隐式合成上界变成显式受执行的不变量;agent_loop.zig 里的 comptime 断言让 Σ 与 cap
+/// 分不开——加门或改某门预算而不改 cap 编译不过。收紧 cap(< Σ)是显式政策决定。两类注入**有意排除**:①一次性协议注入(账本 prompt、
 /// 结局 note、截断续写)——无条件、按构造各至多 1 次;②完整性修复
 /// (KG 枚举修复)——其语义是"修复或 fail-closed",不可静默放弃,进表
 /// 会把"额度尽"误判成完整性违规(review 抓到的 tool_loop 误杀地雷)。
 // 账目:required-first provider repair 2 + verification 2 +
-// requirement-ledger 2 + task-obligation 3 + delivery-cadence 2 = 11。
+// requirement-ledger 2 + task-obligation 3 + delivery-cadence 2 +
+// progress-update 2 = 13。
 // required-first 在任何普通工具前发生，仍走同一计量器，不能因为它是插件
-// 路由就绕过合成上界。交付节奏门在 turn 边界(早于终局各门)点火,额度
-// 若不随 Σ 增长会挤占终局义务,故 cap 同步 +2(Lean HostInjectionMeter.cap)。
-pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = 11;
+// 路由就绕过合成上界。交付节奏门与进度更新门(#114)都在 turn 边界(早于终局
+// 各门)点火,额度若不随 Σ 增长会挤占终局义务,故 cap 各同步 +2
+// (Lean HostInjectionMeter.cap 同步改;scripts/eval/tests 锁步检查)。
+pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = 13;
+
+/// 各门注入进对话的 host 消息都以自己的 MARKER 开头(`[progress update]`、`[delivery cadence]`
+/// …)。消费 user 文本的地方——web_search 的显示 query、transcript 回放、/recap 拍平——据此把
+/// host 注入与用户原话分开:它们是 user role,但不是用户说的。
+pub const HOST_TEXT_MARKERS = [_][]const u8{
+    @import("progress_updates.zig").MARKER,
+    @import("delivery_cadence.zig").MARKER,
+};
+
+pub fn isHostInjectedText(text: []const u8) bool {
+    for (HOST_TEXT_MARKERS) |marker| {
+        if (std.mem.startsWith(u8, text, marker)) return true;
+    }
+    return false;
+}
+
+test "isHostInjectedText: gate markers, not user prose" {
+    try std.testing.expect(isHostInjectedText("[progress update]\nplease"));
+    try std.testing.expect(isHostInjectedText("[delivery cadence]\nplease"));
+    try std.testing.expect(!isHostInjectedText("[progress] is my own bracket"));
+    try std.testing.expect(!isHostInjectedText("fix the bug"));
+}
 
 pub const Meter = struct {
     used: u8 = 0,

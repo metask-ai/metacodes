@@ -2425,13 +2425,13 @@ pub const App = struct {
             defer allocator.free(dir);
             const dz = allocator.dupeZ(u8, dir) catch return;
             defer allocator.free(dz);
-            _ = std.c.mkdir(dz, 0o700);
+            _ = pfs.mkdir(dz, 0o700);
         }
         const full = std.fmt.allocPrint(allocator, "{s}/.metacodes/projects/{s}", .{ home, hash[0..] }) catch return;
         defer allocator.free(full);
         const fz = allocator.dupeZ(u8, full) catch return;
         defer allocator.free(fz);
-        _ = std.c.mkdir(fz, 0o700);
+        _ = pfs.mkdir(fz, 0o700);
     }
 
     /// domain id:默认由锚点(git 根/cwd)basename + hash 前 8 生成。隔离 worktree

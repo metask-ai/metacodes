@@ -1,4 +1,5 @@
 const std = @import("std");
+const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const harness = @import("harness");
 const cc = @import("cc");
@@ -621,7 +622,7 @@ fn installTaskSnapshotWrapper(
     try overwriteFile(allocator, wrapper, script);
     const wrapper_z = try allocator.dupeZ(u8, wrapper);
     defer allocator.free(wrapper_z);
-    if (std.c.chmod(wrapper_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(wrapper_z.ptr, 0o700) != 0) return error.SkipZigTest;
     return wrapper;
 }
 

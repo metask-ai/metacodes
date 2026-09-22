@@ -76,6 +76,7 @@ pub const api_last_error = @import("api/last_error.zig"); // L2 stream liveness 
 pub const task_store = @import("core/task_store.zig"); // L2 requirement-ledger tests
 pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 ledger decide tests
 pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 delivery-cadence tests
+pub const progress_updates = @import("core/progress_updates.zig"); // L2 progress-update tests (#114)
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
@@ -113,6 +114,7 @@ pub const swarm_tools = @import("swarm/tools.zig");
 pub const swarm_teammate_process = @import("swarm/teammate_process.zig");
 pub const tools_common = @import("tools/common.zig");
 pub const platform_fs = @import("platform").fs;
+pub const platform_test_support = @import("platform").test_support; // 组件测试的链接/枚举夹具
 pub const kg_inject = @import("kg/inject.zig");
 pub const kg_scoped_recall = @import("kg/scoped_recall.zig");
 pub const abort = @import("util/abort.zig");
@@ -230,6 +232,8 @@ pub const project_rule_bundle = @import("core/project_rule_bundle.zig");
 pub const project_rule_gate = @import("core/project_rule_gate.zig");
 pub const project_rule_activation = @import("core/project_rule_activation.zig");
 pub const repl_msg_queue = @import("repl/msg_queue.zig");
+pub const repl_history = @import("repl/history.zig");
+pub const repl_user_echo = @import("repl/user_echo.zig");
 pub const web_journal = @import("web/journal.zig");
 pub const web_backend = @import("web/backend.zig");
 pub const web_server = @import("web/server.zig");
@@ -2236,6 +2240,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.delivery_cadence = true;
         } else if (std.mem.eql(u8, arg, "--delivery-cadence-observe")) {
             config.delivery_cadence_observe = true;
+        } else if (std.mem.eql(u8, arg, "--no-progress-updates")) {
+            config.progress_updates = false;
+        } else if (std.mem.eql(u8, arg, "--progress-updates-observe")) {
+            config.progress_updates_observe = true;
         } else if (std.mem.eql(u8, arg, "--delivery-cadence-thresholds")) {
             const s = args.next() orelse {
                 setParseError(config, allocator, "missing value for --delivery-cadence-thresholds", .{});
@@ -2538,6 +2546,8 @@ fn printHelp() void {
         \\  --delivery-cadence    Nudge a run that keeps exploring without writing any deliverable
         \\  --delivery-cadence-observe  Record (not enforce) the delivery-cadence obligation
         \\  --delivery-cadence-thresholds <a>,<b>  Exploration-call counts for the two nudges (default 40,80)
+        \\  --no-progress-updates  Do not ask the model for a progress note after silent tool rounds
+        \\  --progress-updates-observe  Record (not enforce) the progress-update obligation
         \\  --max-tokens <n>      Override max output tokens per request
         \\  --session <id>        Explicit session id (resume a suspended session directory)
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
@@ -2649,6 +2659,7 @@ test {
     _ = &@import("api/catalog_fetch.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
+    _ = &@import("repl/user_echo.zig");
     _ = &@import("repl/multiline.zig");
     _ = &@import("repl/render.zig");
     _ = &@import("repl/headless.zig");

@@ -25,7 +25,7 @@ test "L2 transcript: 写 → loadTranscript 往返,消息数/角色/text 一致"
     // 隔离 HOME(Writer.init 写 $HOME/.metacodes/projects/<hash>/<sid>/)
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-l2");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
     // 1) 造一段对话
@@ -59,16 +59,16 @@ test "L2 transcript: 写 → loadTranscript 往返,消息数/角色/text 一致"
     // 清理 session 目录
     var pbuf: [512]u8 = undefined;
     const tpath = std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{session_dir}) catch return;
-    _ = std.c.unlink(tpath.ptr);
+    pfs.unlinkPath(tpath.ptr) catch {};
     const mpath = std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{session_dir}) catch return;
-    _ = std.c.unlink(mpath.ptr);
+    pfs.unlinkPath(mpath.ptr) catch {};
 }
 
 test "L2 transcript: openExisting resume 续写不重复已刷盘消息" {
     const a = std.testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-l2b");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
     // 第一段:写 2 条
@@ -96,15 +96,15 @@ test "L2 transcript: openExisting resume 续写不重复已刷盘消息" {
     try std.testing.expectEqualStrings("msg B", firstText(loaded.messages.items[2]));
 
     var pbuf: [512]u8 = undefined;
-    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
-    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr);
+    pfs.unlinkPath((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr) catch {};
+    pfs.unlinkPath((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr) catch {};
 }
 
 test "L2 transcript: arbitrary tool bytes cannot poison the JSONL resume path" {
     const a = std.testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-utf8-boundary");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
     var conv = Conversation.init(a);
@@ -124,15 +124,15 @@ test "L2 transcript: arbitrary tool bytes cannot poison the JSONL resume path" {
     try std.testing.expectEqualStrings("prev�`", firstText(loaded.messages.items[0]));
 
     var pbuf: [512]u8 = undefined;
-    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
-    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr);
+    pfs.unlinkPath((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr) catch {};
+    pfs.unlinkPath((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr) catch {};
 }
 
 test "L2 transcript: legacy invalid UTF-8 JSONL is repaired before resume" {
     const a = std.testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-legacy-repair");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var writer = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
@@ -159,16 +159,16 @@ test "L2 transcript: legacy invalid UTF-8 JSONL is repaired before resume" {
     try transcript.loadTranscript(&loaded_again, dir, a);
     try std.testing.expectEqualStrings("prev�`", firstText(loaded_again.messages.items[0]));
 
-    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
-    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl.corrupt", .{dir}) catch return).ptr);
-    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/meta.json", .{dir}) catch return).ptr);
+    pfs.unlinkPath((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl", .{dir}) catch return).ptr) catch {};
+    pfs.unlinkPath((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl.corrupt", .{dir}) catch return).ptr) catch {};
+    pfs.unlinkPath((std.fmt.bufPrintZ(&path_buf, "{s}/meta.json", .{dir}) catch return).ptr) catch {};
 }
 
 test "L2 transcript: invalid UTF-8 in meta is repaired and remains listable" {
     const a = std.testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-meta-repair");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var writer = try transcript.Writer.init(a, "/meta-repair-cwd", home, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
@@ -189,16 +189,16 @@ test "L2 transcript: invalid UTF-8 in meta is repaired and remains listable" {
     try std.testing.expectEqualStrings("bad�`", list[0].title);
     try std.testing.expect(std.unicode.utf8ValidateSlice(list[0].title));
 
-    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/meta.json", .{dir}) catch return).ptr);
-    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/meta.json.corrupt", .{dir}) catch return).ptr);
-    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
+    pfs.unlinkPath((std.fmt.bufPrintZ(&path_buf, "{s}/meta.json", .{dir}) catch return).ptr) catch {};
+    pfs.unlinkPath((std.fmt.bufPrintZ(&path_buf, "{s}/meta.json.corrupt", .{dir}) catch return).ptr) catch {};
+    pfs.unlinkPath((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl", .{dir}) catch return).ptr) catch {};
 }
 
 test "L2 transcript: torn final JSONL record is atomically discarded" {
     const a = std.testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-torn-tail");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var writer = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
@@ -238,9 +238,9 @@ test "L2 transcript: torn final JSONL record is atomically discarded" {
     defer a.free(backup);
     try std.testing.expectEqualStrings(complete ++ torn, backup);
 
-    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
-    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl.corrupt", .{dir}) catch return).ptr);
-    _ = std.c.unlink((std.fmt.bufPrintZ(&path_buf, "{s}/meta.json", .{dir}) catch return).ptr);
+    pfs.unlinkPath((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl", .{dir}) catch return).ptr) catch {};
+    pfs.unlinkPath((std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl.corrupt", .{dir}) catch return).ptr) catch {};
+    pfs.unlinkPath((std.fmt.bufPrintZ(&path_buf, "{s}/meta.json", .{dir}) catch return).ptr) catch {};
 }
 
 test "L2 transcript R2/F1回归: /retry 回卷后 flush 全量重写,resume 不复活被丢弃回合" {
@@ -250,7 +250,7 @@ test "L2 transcript R2/F1回归: /retry 回卷后 flush 全量重写,resume 不�
     const a = std.testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-l2-retry");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
     var conv = Conversation.init(a);
@@ -282,6 +282,6 @@ test "L2 transcript R2/F1回归: /retry 回卷后 flush 全量重写,resume 不�
     }
 
     var pbuf: [512]u8 = undefined;
-    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr);
-    _ = std.c.unlink((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr);
+    pfs.unlinkPath((std.fmt.bufPrintZ(&pbuf, "{s}/transcript.jsonl", .{dir}) catch return).ptr) catch {};
+    pfs.unlinkPath((std.fmt.bufPrintZ(&pbuf, "{s}/meta.json", .{dir}) catch return).ptr) catch {};
 }

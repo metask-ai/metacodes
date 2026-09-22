@@ -35,6 +35,7 @@ const result_budget_mod = @import("result_budget.zig");
 const verification_progress_mod = @import("verification_progress.zig");
 const requirement_ledger_mod = @import("requirement_ledger.zig");
 const delivery_cadence_mod = @import("delivery_cadence.zig");
+const progress_updates_mod = @import("progress_updates.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
@@ -85,6 +86,17 @@ pub const EventProjection = enum {
         return switch (self) {
             .legacy => agent_depth == 0,
             .run_root, .model_tool => true,
+        };
+    }
+
+    /// Progress-update nudges (#114) go to a run whose commentary a person can
+    /// read: the legacy root only (a subagent's narration is its parent's tool
+    /// result), the AgentCore external run root, never a model-tool child.
+    fn admitsProgressNudge(self: EventProjection, agent_depth: u8) bool {
+        return switch (self) {
+            .legacy => agent_depth == 0,
+            .run_root => true,
+            .model_tool => false,
         };
     }
 };
@@ -454,6 +466,25 @@ pub const Options = struct {
     delivery_cadence_observe: bool = false,
     /// Crossing points in exploration-only tool calls (first / second nudge).
     delivery_cadence_thresholds: delivery_cadence_mod.Thresholds = .{},
+    /// Progress-update obligation (#114, task-agnostic process rule): a run
+    /// whose tool rounds stay silent — no visible model text, round after
+    /// round, for longer than a few seconds — receives a bounded nudge at the
+    /// turn boundary asking for a short progress note (stage, findings, next
+    /// step). Host-contract field like the sibling gates: off here, switched
+    /// on by hosts with a reader (interactive REPL, web session, --stream-json
+    /// print mode); canonical buildRunOptions leaves it off, so macro runs,
+    /// skill runs and embedders are not nudged. Only a run whose commentary a
+    /// person can read is nudged (`event_projection`). Never a denial; the
+    /// reply is ordinary commentary (or the final answer if the model ends the
+    /// turn). Formal shape: same as delivery cadence (bounded, meter-counted,
+    /// boundary-only; ProgressUpdates.lean).
+    progress_updates: bool = false,
+    /// Record the gate's decisions (terminal `progress_updates` observation
+    /// record) without injecting: the control arm of an evaluation.
+    progress_updates_observe: bool = false,
+    /// Silent tool rounds and wall-clock silence both required before a nudge
+    /// (the stretch restarts after each decision and on any visible text).
+    progress_update_thresholds: progress_updates_mod.Thresholds = .{},
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
@@ -553,6 +584,17 @@ fn conversationHasSuccessfulRequiredFirst(
 }
 
 const MAX_REQUIRED_FIRST_REPAIRS: u8 = 2;
+/// 验证终局闸每 run 的 nudge 上限(VerificationGate.lean nudges_bounded)。
+const MAX_VERIFICATION_NUDGES: u8 = 2;
+
+comptime {
+    // 元规则①(host_injection_meter.zig):cap = Σ 各门预算,计量器才是"零行为变化"的显式上界。
+    // 加门、改某门预算而不改 cap(或反过来)在这里编译不过——计量器头注释里的账目不再靠人对齐。
+    std.debug.assert(@import("host_injection_meter.zig").MAX_HOST_INJECTIONS_PER_RUN ==
+        MAX_REQUIRED_FIRST_REPAIRS + MAX_VERIFICATION_NUDGES +
+            requirement_ledger_mod.MAX_LEDGER_NUDGES + @import("obligation_gate.zig").MAX_OBLIGATION_NUDGES +
+            delivery_cadence_mod.MAX_CADENCE_NUDGES + progress_updates_mod.MAX_PROGRESS_NUDGES);
+}
 
 fn requiredFirstRepairText(
     allocator: std.mem.Allocator,
@@ -815,11 +857,59 @@ pub fn drainFileChangesForTest(
     drainFileChanges(slots, base_ctx, backend, sess, journal, allocator);
 }
 
+/// One mapping for every way a Run can be stopped from outside: only the
+/// evaluation budget is a `budget` stop, everything else is `aborted`.
+fn stopReasonForReason(reason: @import("../util/abort.zig").Reason) StopReason {
+    return if (reason == .evaluation_budget) .budget else .aborted;
+}
+
 fn stopReasonForAbort(abort: ?*const AbortSignal) StopReason {
-    return if (abort) |signal|
-        if (signal.reason() == .evaluation_budget) .budget else .aborted
-    else
-        .aborted;
+    return if (abort) |signal| stopReasonForReason(signal.reason()) else .aborted;
+}
+
+/// UI → core input (#115). Drains `UiBackend.poll` at a turn boundary — the
+/// previous turn's tool_results are already appended and the next provider
+/// request has not been built yet — so a message the user queued during the
+/// previous stream rides the very next request of the same Run instead of
+/// waiting for the Run to finish. Returns the interrupt reason when the
+/// backend asked to stop, null after everything queued was consumed.
+///
+/// * `queue_message`: appended as a user record (blank text is dropped). The
+///   protocol transfers ownership of the slice to the poll caller; it is freed
+///   with the Run's allocator, so an in-process backend must allocate it with
+///   that allocator (TuiBackend's MsgQueue and the REPL's `run()` share one).
+///   The producer decides what is steerable: TuiBackend hands over plain
+///   prompts only and keeps `/commands`, `!shell` and `exit` queued for the
+///   REPL, which dispatches them after the Run as before.
+/// * `interrupt`: returned immediately; any further queued events stay on the
+///   backend for the host to decide about. This does not replace AbortSignal
+///   (mid-stream interruption still only goes through it, see
+///   doc/UI_DECOUPLE_BACKEND_FRAMEWORK.md §3.4); with `opts.abort` set the
+///   loop-top abort check wins first, so this arm serves a backend that has
+///   no shared signal.
+///
+/// Never called while a provider stream is being consumed, and skipped at a
+/// max_tokens continuation boundary (the group must stay one answer).
+fn drainUiEvents(
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    conversation: *Conversation,
+    allocator: std.mem.Allocator,
+    turn: u32,
+) !?@import("../util/abort.zig").Reason {
+    while (backend.pollEvent(sess)) |event| {
+        switch (event) {
+            .interrupt => |reason| return reason,
+            .queue_message => |text| {
+                defer allocator.free(text);
+                const trimmed = std.mem.trim(u8, text, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                try conversation.appendText(.user, trimmed);
+                log.info("agent", "queued user message consumed at turn {d} boundary bytes={d}", .{ turn, trimmed.len });
+            },
+        }
+    }
+    return null;
 }
 
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
@@ -851,6 +941,8 @@ pub fn run(
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
+    // 上一轮以 max_tokens 续写提示收尾 → 下一个 turn 边界不消费 UI 队列(见 drainUiEvents)。
+    var continuation_pending = false;
     // 输出语义通道:每个 provider stream 一个可见输出段,定性在 loop **真正知道**时才发。
     // defer 是兜底——任何忘记定性的退出路径把仍打开的段记为 partial(诚实读法:Run 结束了,
     // 但从没判定这段是答案)。显式定性发生在前,兜底只在遗漏时生效。
@@ -858,10 +950,28 @@ pub fn run(
     defer output_channel.close(.partial, "");
     var verification_nudges: u8 = 0;
     var required_first_repairs: u8 = 0;
-    const MAX_VERIFICATION_NUDGES: u8 = 2;
     var stream_turn_retries: u8 = 0;
     var requirement_ledger_state = requirement_ledger_mod.State{};
     var delivery_cadence_state = delivery_cadence_mod.State{};
+    // 进度更新义务(#114):沉默段 = 连续"只调工具不说话"的轮数 + 距上一次可见文本的时长;任何可见
+    // 文本或一次决策归零。终局记录与交付节奏门同款(评测 trace 据此归因 host 注入)。
+    var progress_state = progress_updates_mod.State.init(util_time.nowNs());
+    defer if (opts.progress_updates or opts.progress_updates_observe) {
+        if (opts.tool_observer) |observer| {
+            _ = observer.emit(.{ .progress_updates = .{
+                .enforced = opts.progress_updates,
+                .silent_rounds_threshold = opts.progress_update_thresholds.rounds,
+                .min_silent_ms = opts.progress_update_thresholds.min_silent_ms,
+                .max_silent_rounds = progress_state.max_silent_rounds,
+                .decisions = progress_state.decisions,
+                .nudges = progress_state.nudges,
+                .max_nudges = progress_updates_mod.MAX_PROGRESS_NUDGES,
+            } });
+        }
+        if (progress_state.decisions > 0) {
+            log.info("agent", "progress update decisions={d} nudges={d} max_silent_rounds={d}", .{ progress_state.decisions, progress_state.nudges, progress_state.max_silent_rounds });
+        }
+    };
     defer if (opts.delivery_cadence or opts.delivery_cadence_observe) {
         if (opts.tool_observer) |observer| {
             _ = observer.emit(.{ .delivery_cadence = .{
@@ -967,6 +1077,20 @@ pub fn run(
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
         };
 
+        // UI → core 输入(#115):生成期入队的用户消息在这里进对话,本 Run 的下一次请求就带上它;
+        // backend 的 interrupt 在边界结束本 Run。见 drainUiEvents 注。max_tokens 续写边界跳过:
+        // 刚追加的"接着写"提示与转向指令并排会让模型换题,而 Ledger 仍把下一段当同一答案的续写。
+        if (continuation_pending) {
+            continuation_pending = false;
+        } else if (try drainUiEvents(backend, sess, conversation, allocator, turns + 1)) |reason| {
+            log.warn("agent", "interrupt from UI backend before turn {d}: {s}", .{ turns + 1, @tagName(reason) });
+            return finishRun(backend, sess, trace_id, depth, .{
+                .stop_reason = stopReasonForReason(reason),
+                .turns = turns,
+                .tool_calls = total_tool_calls,
+            });
+        }
+
         // 2026-09-19 polling incident: deliver metadata at the boundary so
         // the model need not poll, while keeping child bytes behind BashOutput
         // and preserving owner/duplicate/role invariants.
@@ -1032,6 +1156,30 @@ pub fn run(
                     log.info("agent", "delivery cadence nudge {d}/{d} exploration_calls={d}", .{ delivery_cadence_state.nudges, delivery_cadence_mod.MAX_CADENCE_NUDGES, delivery_cadence_state.exploration_calls });
                 } else {
                     log.info("agent", "delivery cadence observe level={d} exploration_calls={d}", .{ delivery_cadence_state.level, delivery_cadence_state.exploration_calls });
+                }
+            }
+        }
+
+        // Progress-update obligation (#114): a silent stretch long enough in rounds
+        // and in time earns a bounded nudge asking for a short progress note. Same
+        // shape as the cadence gate above — turn boundary, shared meter, never a
+        // denial; observe mode counts the decision without injecting. Only a run
+        // whose commentary a person reads (event_projection). Formal model:
+        // ProgressUpdates.lean.
+        if ((opts.progress_updates or opts.progress_updates_observe) and
+            opts.event_projection.admitsProgressNudge(opts.agent_depth))
+        {
+            const now_ns = util_time.nowNs();
+            if (progress_state.decide(opts.progress_update_thresholds, now_ns)) {
+                if (!opts.progress_updates) {
+                    progress_state.noteDecided(false, now_ns);
+                    log.info("agent", "progress update observe decision {d}/{d} silent_rounds={d}", .{ progress_state.decisions, progress_updates_mod.MAX_PROGRESS_NUDGES, progress_state.silent_rounds });
+                } else if (host_injection_meter.tryConsume()) {
+                    const nudge = try std.fmt.allocPrint(allocator, progress_updates_mod.NUDGE_FMT, .{progress_state.silent_rounds});
+                    defer allocator.free(nudge);
+                    progress_state.noteDecided(true, now_ns);
+                    try conversation.appendText(.user, nudge);
+                    log.info("agent", "progress update nudge {d}/{d}", .{ progress_state.nudges, progress_updates_mod.MAX_PROGRESS_NUDGES });
                 }
             }
         }
@@ -1371,6 +1519,9 @@ pub fn run(
         }
         var assistant_text = std.ArrayList(u8).empty;
         defer assistant_text.deinit(allocator);
+        // 进度更新传感器(#114)的输入:本轮用户看到的模型文本里非空白的字节数(host 渲染的
+        // web_search 装饰、thinking 都不算)。
+        var visible_model_text_bytes: usize = 0;
 
         // 思考过程累加器:本轮所有 thinking_delta/reasoning_content 拼成一个 thinking block,
         // 存入 assistant message(preserved thinking)。下轮请求 serializeContent 回传。
@@ -1708,6 +1859,7 @@ pub fn run(
                         backend.emitEvent(sess, .{ .text_chunk = text });
                         output_channel.note(text.len);
                         try assistant_text.appendSlice(allocator, text);
+                        visible_model_text_bytes += progress_updates_mod.visibleLen(text);
                         log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
                         const admission = observeCandidate(
                             opts.response_observer,
@@ -1919,6 +2071,7 @@ pub fn run(
                 for (assistant_blocks.items) |b| b.deinit(allocator);
                 assistant_blocks.deinit(allocator);
                 assistant_text.clearRetainingCapacity();
+                visible_model_text_bytes = 0;
                 thinking_text.clearRetainingCapacity();
                 for (reasoning_items.items) |item| allocator.free(item);
                 reasoning_items.clearRetainingCapacity();
@@ -2002,6 +2155,7 @@ pub fn run(
                 for (assistant_blocks.items) |b| b.deinit(allocator);
                 assistant_blocks.clearRetainingCapacity();
                 assistant_text.clearRetainingCapacity();
+                visible_model_text_bytes = 0;
                 thinking_text.clearRetainingCapacity();
                 for (reasoning_items.items) |item| allocator.free(item);
                 reasoning_items.clearRetainingCapacity();
@@ -2137,6 +2291,9 @@ pub fn run(
             has_tool_use = true;
             break;
         };
+        // 进度更新传感器(#114):这一轮用户看到模型的字了吗。每轮都观察——被终局门退回的叙述、
+        // max_tokens 截断的叙述也是叙述,沉默段归零;只调工具不说话才算一轮沉默。
+        progress_state.observeTurn(visible_model_text_bytes, has_tool_use, util_time.nowNs());
         // 本轮跟着工具调用 → 这段文字是执行过程中的可见说明,不是最终答案。
         if (has_tool_use) output_channel.close(.commentary, assistant_text.items);
 
@@ -2199,6 +2356,7 @@ pub fn run(
                 // L4 诊断:续写。
                 backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations, .max = MAX_CONTINUATIONS } });
                 try conversation.appendText(.user, "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
+                continuation_pending = true;
                 continue;
             }
             const kg_pending = kgEnumerationPending(
@@ -3261,7 +3419,8 @@ fn latestUserText(conversation: *const @import("conversation.zig").Conversation)
         const m = conversation.messages.items[i];
         if (m.role != .user) continue;
         for (m.blocks) |b| {
-            if (b == .text and b.text.len > 0) return b.text;
+            // host 注入的记录(进度提醒等)不是用户原话:跳过,继续往前找。
+            if (b == .text and b.text.len > 0 and !@import("host_injection_meter.zig").isHostInjectedText(b.text)) return b.text;
         }
     }
     return "";
@@ -5274,7 +5433,7 @@ test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触�
 
     var marker_buf: [512]u8 = undefined;
     const marker = tt.path(&marker_buf, "stop-hook-fired.marker");
-    _ = std.c.unlink(marker.ptr);
+    pfs.unlinkPath(marker.ptr) catch {};
     const hook_cmd = try std.fmt.allocPrint(a, "cat > {s}", .{marker});
     defer a.free(hook_cmd);
     const cmds = [_][]const u8{hook_cmd};
@@ -5297,7 +5456,7 @@ test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触�
     }
 
     // 负向:subagent(depth=1)不触发(marker 删后不重现)。
-    _ = std.c.unlink(@ptrCast(marker.ptr));
+    pfs.unlinkPath(@ptrCast(marker.ptr)) catch {};
     fireStopHook(&hs, a, &c, "end_turn", 1);
     const fd2 = pfs.open(@ptrCast(marker.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     try std.testing.expect(fd2 < 0); // 不触发 → 文件不存在

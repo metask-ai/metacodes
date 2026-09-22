@@ -79,7 +79,7 @@ pub fn saveToFile(config: FileConfig, allocator: std.mem.Allocator, path: []cons
         if (parent.len > 0) {
             const parent_z = try allocator.dupeZ(u8, parent);
             defer allocator.free(parent_z);
-            _ = std.c.mkdir(parent_z, 0o700);
+            _ = pfs.mkdir(parent_z, 0o700);
         }
     }
 
@@ -145,8 +145,7 @@ fn readWhole(allocator: std.mem.Allocator, path_z: [:0]const u8) ![]u8 {
         // I/O error, or a transient permission failure must not be read as
         // "nothing here" — the caller merges onto this result and writes it
         // back, so a wrong empty read truncates every other writer's data.
-        const errno: std.c.E = @enumFromInt(std.c._errno().*);
-        if (errno != .NOENT) return error.ConfigUnreadable;
+        if (!pfs.lastErrnoIs(.NOENT)) return error.ConfigUnreadable;
         return allocator.dupe(u8, "");
     }
     defer _ = pfs.close(fd);
@@ -230,7 +229,7 @@ test "FileConfig: load missing file returns empty" {
 test "FileConfig: save + load roundtrip" {
     var path_buf: [512]u8 = undefined;
     const path = tt.path(&path_buf, "config-roundtrip.json");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const src = FileConfig{
         .model = "claude-test",
@@ -254,7 +253,7 @@ test "FileConfig: save + load roundtrip" {
 test "FileConfig: partial fields" {
     var path_buf: [512]u8 = undefined;
     const path = tt.path(&path_buf, "config-partial.json");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     const src = FileConfig{ .model = "only-model" };
     try saveToFile(src, testing.allocator, path);
     const loaded = try loadFromFile(testing.allocator, path);
@@ -334,8 +333,8 @@ test "an unreadable existing document is never treated as empty" {
     var dir_path_buf: [512]u8 = undefined;
     const dir_path = tt.path(&dir_path_buf, "config-unreadable-test");
     const dir_z: [:0]const u8 = dir_path;
-    _ = std.c.mkdir(dir_z.ptr, 0o700);
-    defer _ = std.c.rmdir(dir_z.ptr);
+    _ = pfs.mkdir(dir_z.ptr, 0o700);
+    defer _ = pfs.rmdir(dir_z.ptr);
 
     try std.testing.expectError(error.ConfigUnreadable, readWhole(a, dir_z));
     try std.testing.expectError(error.ConfigUnreadable, saveToFile(.{ .model = "x" }, a, dir_path));

@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const util_fs = @import("../util/fs.zig");
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
@@ -692,7 +693,7 @@ fn readFileArena(arena: std.mem.Allocator, abs: []const u8) ![]u8 {
 }
 
 fn writeFileMkParents(content: []const u8, abs: []const u8) !void {
-    mkdirParents(abs) catch {}; // best-effort;失败交给 openat 暴露
+    util_fs.mkdirParentsOf(abs) catch {}; // best-effort;失败交给 openat 暴露
     const fd = pfs.openZ(abs, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
     defer _ = pfs.close(fd);
     // 循环写:write(2) 允许短写(EINTR / ENOSPC 写到一半返回部分字节数,非负)。不循环会静默截断
@@ -709,29 +710,11 @@ fn writeFileMkParents(content: []const u8, abs: []const u8) !void {
     }
 }
 
-/// 为 abs 建所有缺失父目录(mkdir -p 到 dirname)。移植自 write.zig(私有,无法复用)。
-fn mkdirParents(path: []const u8) !void {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return;
-    if (slash == 0) return;
-    const dir = path[0..slash];
-    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    if (dir.len >= buf.len) return error.PathTooLong;
-    var i: usize = 1;
-    while (i <= dir.len) : (i += 1) {
-        if (i == dir.len or dir[i] == '/') {
-            @memcpy(buf[0..i], dir[0..i]);
-            buf[i] = 0;
-            const seg_z: [*:0]const u8 = @ptrCast(&buf);
-            if (std.c.mkdir(seg_z, 0o755) != 0) {
-                if (std.c._errno().* != @intFromEnum(std.c.E.EXIST)) return;
-            }
-        }
-    }
-}
-
+/// 删除文件走 `pfs.unlinkPath`(Windows DeleteFileW):窄字符 `unlink` 按 ANSI 代码页解码路径,删掉
+/// 的可能是中文路径的乱码对偶而不是 patch 指名的文件(#121)。
 fn deleteFile(arena: std.mem.Allocator, abs: []const u8) !void {
     const z = try arena.dupeZ(u8, abs);
-    if (std.c.unlink(z.ptr) != 0) return error.WriteError;
+    pfs.unlinkPath(z.ptr) catch return error.WriteError;
 }
 
 // ============================================================================
@@ -912,7 +895,7 @@ test "execute e2e: Update File 真写盘" {
         _ = pfs.write(fd, "foo\nbar\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(fpath.ptr);
+    defer pfs.unlinkPath(fpath.ptr) catch {};
 
     var ctx = ToolContext.simple(a);
     ctx.cwd_abs = "/"; // fpath 已是绝对路径
@@ -944,8 +927,8 @@ test "execute e2e: Add + Delete 事务性(context 失败则整批不落盘)" {
         _ = pfs.write(fd, "keep\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(existing.ptr);
-    defer _ = std.c.unlink(to_add.ptr);
+    defer pfs.unlinkPath(existing.ptr) catch {};
+    defer pfs.unlinkPath(to_add.ptr) catch {};
 
     var ctx = ToolContext.simple(a);
     ctx.cwd_abs = "/";
@@ -979,8 +962,8 @@ test "execute e2e: Move(重命名到新目录)写新 + 删旧(codex fixture 004)
         _ = pfs.write(fd, "old content\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(src.ptr);
-    defer _ = std.c.unlink(dst.ptr);
+    defer pfs.unlinkPath(src.ptr) catch {};
+    defer pfs.unlinkPath(dst.ptr) catch {};
 
     var ctx = ToolContext.simple(a);
     ctx.cwd_abs = "/";
@@ -1012,7 +995,7 @@ test "execute e2e: Add File 撞已存在文件 → 报错不覆盖(比 codex 更
         _ = pfs.write(fd, "PRECIOUS\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(fpath.ptr);
+    defer pfs.unlinkPath(fpath.ptr) catch {};
 
     var ctx = ToolContext.simple(a);
     ctx.cwd_abs = "/";
@@ -1039,7 +1022,7 @@ test "execute: protected path(.env)拦住 ApplyPatch(不再绕过细粒度权限
         _ = pfs.write(fd, "SECRET=1\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(fpath.ptr);
+    defer pfs.unlinkPath(fpath.ptr) catch {};
 
     const permission = @import("../permission.zig");
     var pctx = permission.createContext(.default, a); // 非 bypass → 权限门生效

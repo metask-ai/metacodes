@@ -14,7 +14,7 @@ const ppaths = @import("platform").paths;
 var auth_dir_buf: [512]u8 = undefined;
 fn authDir() [:0]const u8 {
     const d = cc.util_fs.testing.perPidDir(&auth_dir_buf, "cc-zig-auth-l2");
-    _ = std.c.mkdir(d.ptr, 0o755);
+    _ = @import("platform").fs.mkdir(d.ptr, 0o755);
     return d;
 }
 
@@ -79,7 +79,7 @@ test "L2 auth: stored OAuth resolves into Anthropic Authorization header" {
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer {
         if (std.heap.c_allocator.dupeZ(u8, auth_path)) |z| {
-            _ = std.c.unlink(z.ptr);
+            @import("platform").fs.unlinkPath(z.ptr) catch {};
             std.heap.c_allocator.free(z);
         } else |_| {}
     }
@@ -124,7 +124,7 @@ test "L2 auth: env API key wins by default, oauth-first is explicit override" {
     defer _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
     defer {
         if (std.heap.c_allocator.dupeZ(u8, auth_path)) |z| {
-            _ = std.c.unlink(z.ptr);
+            @import("platform").fs.unlinkPath(z.ptr) catch {};
             std.heap.c_allocator.free(z);
         } else |_| {}
     }
@@ -207,7 +207,7 @@ test "L2 auth: inherited credential FD authenticates without secret in initial e
     defer a.free(path);
     const path_z = try a.dupeZ(u8, path);
     defer a.free(path_z);
-    defer _ = std.c.unlink(path_z.ptr);
+    defer @import("platform").fs.unlinkPath(path_z.ptr) catch {};
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o600);
     if (fd < 0) return error.CredentialTestFileOpenFailed;
     errdefer pfs.close(fd);
@@ -265,7 +265,7 @@ test "L2 auth: runtime FD rejects an ambient second credential channel" {
     defer std.testing.allocator.free(path);
     const path_z = try std.testing.allocator.dupeZ(u8, path);
     defer std.testing.allocator.free(path_z);
-    defer _ = std.c.unlink(path_z.ptr);
+    defer @import("platform").fs.unlinkPath(path_z.ptr) catch {};
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o600);
     if (fd < 0) return error.CredentialTestFileOpenFailed;
     try std.testing.expectEqual(@as(isize, 10), pfs.write(fd, "fd-secret\n"));
@@ -298,7 +298,7 @@ test "L2 auth: oversized runtime credential fails closed and closes inherited FD
     defer a.free(path);
     const path_z = try a.dupeZ(u8, path);
     defer a.free(path_z);
-    defer _ = std.c.unlink(path_z.ptr);
+    defer @import("platform").fs.unlinkPath(path_z.ptr) catch {};
 
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o600);
     if (fd < 0) return error.CredentialTestFileOpenFailed;
@@ -345,7 +345,7 @@ test "L2 auth: stored API key wins over OAuth unless oauth-first is explicit" {
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer {
         if (std.heap.c_allocator.dupeZ(u8, auth_path)) |z| {
-            _ = std.c.unlink(z.ptr);
+            @import("platform").fs.unlinkPath(z.ptr) catch {};
             std.heap.c_allocator.free(z);
         } else |_| {}
     }
@@ -382,7 +382,7 @@ test "L2 auth: expiring OAuth refreshes before request and persists replacement"
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer {
         if (std.heap.c_allocator.dupeZ(u8, auth_path)) |z| {
-            _ = std.c.unlink(z.ptr);
+            @import("platform").fs.unlinkPath(z.ptr) catch {};
             std.heap.c_allocator.free(z);
         } else |_| {}
     }
@@ -449,7 +449,7 @@ test "L2 auth: invalid refresh grant surfaces login required without fallback" {
     defer _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
     defer {
         if (std.heap.c_allocator.dupeZ(u8, auth_path)) |z| {
-            _ = std.c.unlink(z.ptr);
+            @import("platform").fs.unlinkPath(z.ptr) catch {};
             std.heap.c_allocator.free(z);
         } else |_| {}
     }

@@ -2,6 +2,7 @@
 //! This deliberately does not change the shared CLI sandbox implementation.
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 
 const sandbox_exec = "/usr/bin/sandbox-exec";
@@ -32,7 +33,7 @@ fn classify(supported: bool, exists: bool, executable: bool) Availability {
 
 pub fn executableAvailability() Availability {
     if (builtin.os.tag != .macos) return .unsupported_os;
-    const exists = std.c.access(sandbox_exec, std.c.F_OK) == 0;
+    const exists = pfs.exists(sandbox_exec);
     const executable = exists and std.c.access(sandbox_exec, std.c.X_OK) == 0;
     return classify(true, exists, executable);
 }

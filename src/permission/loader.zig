@@ -154,7 +154,7 @@ test "load: cli layer parse + evaluate" {
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.WriteFailed;
     defer _ = pfs.close(fd);
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const json_body = "{\"permissions\":{\"allow\":[\"Bash(git *)\"],\"deny\":[\"Bash(git push)\"]}}";
     _ = pfs.write(fd, json_body);
