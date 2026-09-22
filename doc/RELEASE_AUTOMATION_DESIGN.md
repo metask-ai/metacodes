@@ -1,6 +1,6 @@
 # Release automation design: version bumping, cutting, tagging, publishing
 
-Status: design (2026-09-22). Builds on the mechanism that already exists
+Status: implemented 2026-09-22 (§8 lists the files). Builds on the mechanism that already exists
 (`release:stage` → `release:manifest` → `release:check` / `release:verify` →
 `release:archive` → `release:sums`, `.github/workflows/release.yml`,
 `release/LAYOUT.md`, `doc/RELEASE_RUNNER.md`). Nothing here replaces those
@@ -40,10 +40,12 @@ human decision, the mechanism only makes it cheap).
   bare `X.Y.Z`. This is the existing #47 §6 / Q1 rule and stays.
 - Bump level is computed from the Conventional-Commit **types** of the first
   line of every commit reachable from `main` since the last tag (`git log
-  <tag>..main --no-merges`). This is well defined only because `main` takes
-  merge commits (the repository convention; squash or rebase merges would
-  erase the PR commits and are refused by the cut when it finds a first-parent
-  commit that is neither a merge nor conventional). Normalization: the type is
+  <tag>..main --no-merges`). `main` takes merge commits (the repository
+  convention), so PR-internal commit types are visible; a squash or rebase
+  merge leaves a single non-merge commit on the first-parent line whose subject
+  is still classified, and the cut lists such commits in the PR body because
+  their inner types are lost (the history before the convention has several,
+  e.g. `subagent: … (#111)`). Normalization: the type is
   the text before the first `(` or `:` on the first line, lowercased,
   trailing `!` noted; anything that does not parse (`merge main`, free text,
   non-Latin subjects) or is not in the table is **unknown** and contributes
@@ -65,10 +67,10 @@ human decision, the mechanism only makes it cheap).
   `main` with `-dev` dropped. `main` at `0.2.0-dev` with only fixes since
   `0.1.0` still cuts `0.2.0`, because the `-dev` number is a floor a
   maintainer set on purpose (stage D, or by hand when a minor is planned).
-  The result must be **strictly greater than the last tag** in every mode,
-  `--force-level` included; a candidate equal to an existing tag (for example
-  `main` still at `0.2.0-dev` after `0.2.0` was tagged, before reopen) refuses
-  the cut with "reopen first" instead of producing a no-op release PR.
+  The result is always strictly greater than the last tag (`bump(tag)` is,
+  for every level, and the floor cannot pull it below); the script asserts it
+  anyway. The mid-flight state (`main` carrying the bare released version
+  before the reopen PR) is caught earlier by the `-dev` check in stage A.
   Between a release and the next cut, `--version` on `main` therefore shows
   the floor (`0.2.1-dev+…`), not the version the commits will eventually
   imply; that is a display of intent, not a prediction.
@@ -168,11 +170,11 @@ changelog rewrite imposes no parser contract on the bundle. Two changes to
 - one event-aware pair of values replaces every `inputs.tag` use (today it
   appears in the concurrency group, both checkouts and the publish job, and is
   empty on a `push` event): `RELEASE_REF = inputs.tag || github.ref_name`,
-  `DRY_RUN = (event == workflow_dispatch && inputs.dry_run) || ref is not a
-  bare X.Y.Z tag`. Concurrency groups on `RELEASE_REF`. `publish` runs only for
-  a bare tag with `DRY_RUN=false`; a branch or SHA ref always stops at
-  artifacts (fixes gap §9.3: `release_sums.py` and `gh release create` never
-  see a branch name).
+  and `publish` runs on a tag push or on `dry_run=false`, but its first step
+  refuses any ref that is not a bare `X.Y.Z` tag at HEAD (and runs
+  `check_version_state.py`), so a branch or SHA ref always stops at artifacts
+  (fixes gap §9.3: `release_sums.py` and `gh release create` never see a
+  branch name). Concurrency groups on `RELEASE_REF`.
 - reruns are safe: `gh release view <tag>` decides between `create --draft` and
   `upload --clobber` onto the existing draft; because build artifacts expire
   after seven days, a rerun always rebuilds from the immutable tag rather than
@@ -291,8 +293,8 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 ## 10. Decisions to confirm
 
 - Pre-1.0 breaking changes bump MINOR (table in §2).
-- `main` keeps merge-commit merges (the bump derivation depends on it); the
-  cut refuses when it finds evidence of a squash or rebase merge.
+- `main` keeps merge-commit merges (PR-internal commit types feed the bump);
+  squash-merged history is classified by its squash subject and listed.
 - Stage D reopens at PATCH `-dev`; a minor is a one-number edit in that PR.
 - The cut refuses a release whose commits carry no `feat`/`fix`/`perf` unless
   forced.

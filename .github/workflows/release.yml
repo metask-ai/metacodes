@@ -7,6 +7,13 @@ name: Release
 # (doc/RELEASE_RUNNER.md): nothing from a PR job or an earlier release can
 # precondition the machine, and no self-hosted machine ever holds the token.
 on:
+  # Stage C of doc/RELEASE_AUTOMATION_DESIGN.md: a bare X.Y.Z tag builds and
+  # drafts the stable channel. release-tag.yml creates that tag with the
+  # repository token, which never fires this trigger (recursion guard), so it
+  # also dispatches this workflow explicitly; the trigger serves hand-pushed
+  # tags. Pre-releases stay on workflow_dispatch with dry_run.
+  push:
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
     inputs:
       tag:
@@ -23,13 +30,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 # bindgen for the AgentCore bindings-regen gate; the hosted images ship cargo
 # but not bindgen. Pinned to the version doc/RELEASE_RUNNER.md names.
 env:
   BINDGEN_VERSION: 0.72.1
+  # One event-aware value replaces every direct `inputs.tag` use: on a tag
+  # push `inputs.*` is empty. The publish job additionally requires the ref to
+  # be a bare X.Y.Z tag, so a branch or SHA ref (pre channel) always stops at
+  # artifacts whatever dry_run says.
+  RELEASE_REF: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build-posix:
@@ -53,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
           fetch-tags: true
       # A release build must not inherit a cache another branch wrote: no
@@ -114,7 +126,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
           fetch-tags: true
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -170,7 +182,7 @@ jobs:
   publish:
     name: Draft release
     needs: [build-posix, build-windows]
-    if: ${{ !inputs.dry_run }}
+    if: ${{ github.event_name == 'push' || !inputs.dry_run }}
     timeout-minutes: 20
     runs-on: ubuntu-latest
     # The only job that can write to the repository, and only through the
@@ -180,20 +192,43 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
           fetch-tags: true
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: ${{ runner.temp }}/dist
           merge-multiple: true
+      - name: The ref must be a bare X.Y.Z tag at HEAD
+        # A workflow_dispatch with dry_run=false on a branch or SHA ref (pre
+        # channel) reaches this job and must stop here: only a tagged stable
+        # version is ever drafted, and its version state must be consistent.
+        run: |
+          set -euo pipefail
+          case "$RELEASE_REF" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "release ref '$RELEASE_REF' is not a bare X.Y.Z tag; pre-channel builds are never published" >&2; exit 1 ;;
+          esac
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          python3 scripts/check_version_state.py
       - name: SHA256SUMS over every archive
-        run: python3 scripts/release_sums.py "$RUNNER_TEMP/dist" "${{ inputs.tag }}"
-      - name: Create the draft release (a human publishes it)
+        run: python3 scripts/release_sums.py "$RUNNER_TEMP/dist" "$RELEASE_REF"
+      - name: Release notes from CHANGELOG.md
+        run: python3 scripts/release_notes.py "$RELEASE_REF" > "$RUNNER_TEMP/notes.md"
+      - name: Create or update the draft release (a human publishes it)
         env:
           GH_TOKEN: ${{ github.token }}
+        # Rerun-safe: a rerun after a failed upload updates the existing draft
+        # (--clobber) instead of failing on `create`; the archives were rebuilt
+        # from the immutable tag, never reused from expired artifacts.
         run: |
-          gh release create "${{ inputs.tag }}" --draft --verify-tag \
-            --title "metacodes ${{ inputs.tag }}" \
-            --notes "Draft created by the Release workflow. Verify an unpacked archive with scripts/verify_release_bundle.py --native before publishing." \
-            "$RUNNER_TEMP"/dist/*
+          set -euo pipefail
+          if gh release view "$RELEASE_REF" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_REF" --clobber "$RUNNER_TEMP"/dist/*
+            gh release edit "$RELEASE_REF" --draft --title "metacodes $RELEASE_REF" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "$RELEASE_REF" --draft --verify-tag \
+              --title "metacodes $RELEASE_REF" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              "$RUNNER_TEMP"/dist/*
+          fi

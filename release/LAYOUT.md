@@ -28,7 +28,7 @@ metacodes-<version>-<target-id>/
 
 | Path | Role | Where it comes from | Who checks it |
 |---|---|---|---|
-| `bin/metacodes[.exe]` | the product | `zig build` (ReleaseSafe for a release) | `--version --json` must be a strict subset of the manifest (`release:verify`) |
+| `bin/metacodes[.exe]` | the product | `zig build` (the executable is always `ReleaseSmall`, see `build.zig`; `-Doptimize` only affects the test binaries) | `--version --json` must be a strict subset of the manifest (`release:verify`) |
 | `bin/rg[.exe]` | runtime asset | `scripts/stage_ripgrep_binary.py` from `vendor/ripgrep/manifest.json` | digest in `files[]` and `components[]`; `doctor --strict` resolves it here under the release layout |
 | `vendor/tinykg/tinykg[.exe]` | runtime asset | `scripts/stage_tinykg_binary.py` from `vendor/tinykg/manifest.json` | digest; `doctor --strict`; `tinykg version` equals `components[tinykg].version` (`release:verify`) |
 | `vendor/tinykg/tinykg.provenance.json` | staging receipt | same script | listed in `files[]`; `components[tinykg].provenance_path` |
@@ -88,10 +88,17 @@ refusal of untagged stable versions.
 
 ## Publishing
 
-`.github/workflows/release.yml` runs the whole chain per platform on
-GitHub-hosted runners (`doc/RELEASE_RUNNER.md`) and leaves a *draft*
-GitHub Release holding every archive, its `.sha256`, and
-`metacodes-<version>-SHA256SUMS`; a maintainer publishes it after verifying an
+A release is cut, tagged and drafted by the four stages of
+`doc/RELEASE_AUTOMATION_DESIGN.md`: a maintainer runs `python3
+scripts/release_cut.py` (version derived from the Conventional-Commit types
+since the last tag, `## Unreleased` becomes the release section, release PR
+labelled `release`); merging that PR makes `release-tag.yml` tag the merge
+commit and dispatch `release.yml`; `release.yml` (also on a hand-pushed bare
+`X.Y.Z` tag) runs the whole chain per platform on GitHub-hosted runners
+(`doc/RELEASE_RUNNER.md`) and leaves a *draft* GitHub Release holding every
+archive, its `.sha256`, and `metacodes-<version>-SHA256SUMS`, with the
+CHANGELOG section as notes; the maintainer then runs `python3
+scripts/release_cut.py --reopen` and publishes the draft after verifying an
 unpacked archive on a clean machine with `scripts/verify_release_bundle.py
 --native`. Pre-releases are dispatched by hand and never auto-attached (#47
 Q3); the stable tag trigger is a follow-up (`doc/RELEASE_RUNNER.md`,

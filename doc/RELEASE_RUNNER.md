@@ -45,13 +45,17 @@ job.
   them byte for byte; a difference fails the release before anything is
   uploaded.
 
-## Enabling the tag trigger
+## Triggers
 
-`release.yml` is `workflow_dispatch` only. To let a bare `X.Y.Z` tag build the
-stable channel automatically, add `on: push: tags: ["[0-9]+.[0-9]+.[0-9]+"]`
-and keep pre-releases (`0.x.y-dev+<commit12>`) on `workflow_dispatch` (#47
-Q3). The remaining "Final launch gate" item in `OPEN_SOURCE_READINESS.md` is
-the immutable pre-release with checksums.
+`release.yml` runs on a bare `X.Y.Z` tag push and on `workflow_dispatch`
+(`doc/RELEASE_AUTOMATION_DESIGN.md` stage C). The stable path is normally
+reached through `release-tag.yml`, which tags a merged release PR and
+dispatches `release.yml` explicitly (a tag created with the repository token
+does not fire the push trigger). Pre-releases (`0.x.y-dev+<commit12>`) stay on
+`workflow_dispatch`; the `publish` job refuses any ref that is not a bare tag at
+HEAD, so a pre-channel run stops at artifacts whatever `dry_run` says. The
+remaining "Final launch gate" item in `OPEN_SOURCE_READINESS.md` is the
+immutable pre-release with checksums (design §10).
 
 ## What a release proves
 
