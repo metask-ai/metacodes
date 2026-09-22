@@ -180,6 +180,9 @@ class ChangelogTest(unittest.TestCase):
             self.assertIn(needle, body)
 
 
+LOCAL: dict = {}  # the maintainer's checkout: no GitHub Actions environment
+
+
 def _git(*argv: str, cwd: Path) -> str:
     env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x")
     return subprocess.run(["git", *argv], cwd=str(cwd), capture_output=True, text=True, check=True, env=env).stdout.strip()
@@ -210,21 +213,21 @@ class ThrowawayRepoTest(unittest.TestCase):
         _git("commit", "-q", "-m", subject, cwd=self.root)
 
     def test_version_state_gate(self):
-        self.assertEqual(check_version_state.check(self.root, "main"), "")  # -dev: no-op
+        self.assertEqual(check_version_state.check(self.root, "main", LOCAL), "")  # -dev: no-op
         self._set_version("0.2.0", "release: 0.2.0")
-        self.assertIn("mid-flight", check_version_state.check(self.root, "main"))
-        self.assertEqual(check_version_state.check(self.root, "release/0.2.0"), "")
-        self.assertIn("mid-flight", check_version_state.check(self.root, "release/0.2.1"))
+        self.assertIn("mid-flight", check_version_state.check(self.root, "main", LOCAL))
+        self.assertEqual(check_version_state.check(self.root, "release/0.2.0", LOCAL), "")
+        self.assertIn("mid-flight", check_version_state.check(self.root, "release/0.2.1", LOCAL))
         # the release PR's own merge commit on main is accepted before the tag exists
         _git("checkout", "-q", "-b", "release/0.2.0", cwd=self.root)
         _commit(self.root, "release: 0.2.0")
         _git("checkout", "-q", "main", cwd=self.root)
         _git("merge", "-q", "--no-ff", "-m", "Merge pull request #7 from metask-ai/release/0.2.0", "release/0.2.0", cwd=self.root)
-        self.assertEqual(check_version_state.check(self.root, "main"), "")
+        self.assertEqual(check_version_state.check(self.root, "main", LOCAL), "")
         _git("tag", "0.2.0", cwd=self.root)
-        self.assertEqual(check_version_state.check(self.root, "main"), "")
+        self.assertEqual(check_version_state.check(self.root, "main", LOCAL), "")
         _commit(self.root, "fix: landed in the window")  # bare version, HEAD no longer the tagged commit
-        self.assertIn("mid-flight", check_version_state.check(self.root, "main"))
+        self.assertIn("mid-flight", check_version_state.check(self.root, "main", LOCAL))
 
     def test_ci_release_pr_exception_needs_title_and_label(self):
         _git("checkout", "-q", "-b", "release/0.2.0", cwd=self.root)
@@ -241,17 +244,22 @@ class ThrowawayRepoTest(unittest.TestCase):
         self.assertTrue(check_version_state.rehearsable(self.root, "0.2.0", "main", {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push"}))
         self.assertFalse(check_version_state.rehearsable(self.root, "0.2.0", "feature/x", {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request"}))
         self.assertFalse(check_version_state.rehearsable(self.root, "0.2.0", "main", {"GITHUB_ACTIONS": "true"}))  # no event name: not a push
+        # end to end through check(): the CI environment must not leak into a fixture
+        ci_ok = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request", "RELEASE_PR_TITLE": "release: 0.2.0", "RELEASE_PR_LABELS": "release"}
+        _git("checkout", "-q", "release/0.2.0", cwd=self.root)
+        self.assertEqual(check_version_state.check(self.root, "release/0.2.0", ci_ok), "")
+        self.assertIn("mid-flight", check_version_state.check(self.root, "release/0.2.0", {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request"}))
 
     def test_rehearsal_tags_only_the_legitimate_states_locally(self):
-        self.assertIn("no rehearsal needed", check_version_state.rehearse(self.root, "main"))
+        self.assertIn("no rehearsal needed", check_version_state.rehearse(self.root, "main", LOCAL))
         _git("checkout", "-q", "-b", "release/0.2.0", cwd=self.root)
         self._set_version("0.2.0", "release: 0.2.0")
-        self.assertIn("tagged HEAD as 0.2.0 locally", check_version_state.rehearse(self.root, "release/0.2.0"))
+        self.assertIn("tagged HEAD as 0.2.0 locally", check_version_state.rehearse(self.root, "release/0.2.0", LOCAL))
         self.assertEqual(_git("describe", "--tags", "--exact-match", "HEAD", cwd=self.root), "0.2.0")
-        self.assertIn("already carries", check_version_state.rehearse(self.root, "release/0.2.0"))
+        self.assertIn("already carries", check_version_state.rehearse(self.root, "release/0.2.0", LOCAL))
         _git("tag", "-d", "0.2.0", cwd=self.root)
         _commit(self.root, "fix: unrelated on a bare version")
-        self.assertEqual(check_version_state.rehearse(self.root, "some/other-branch"), "")
+        self.assertEqual(check_version_state.rehearse(self.root, "some/other-branch", LOCAL), "")
 
     def test_commit_messages_and_merge_discipline(self):
         _git("checkout", "-q", "-b", "topic", cwd=self.root)

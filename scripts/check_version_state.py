@@ -40,8 +40,10 @@ def git(*argv: str, root: Path) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def check(root: Path, head_ref: str) -> str:
-    """Empty string = ok, otherwise the finding."""
+def check(root: Path, head_ref: str, env: Optional[Dict[str, str]] = None) -> str:
+    """Empty string = ok, otherwise the finding. `env` defaults to the process
+    environment; tests pass an explicit one (the CI environment itself sets
+    GITHUB_ACTIONS, which would otherwise leak into fixture repositories)."""
     text = (root / "build.zig.zon").read_text(encoding="utf-8")
     match = ZON_VERSION_RE.search(text)
     if match is None:
@@ -51,7 +53,7 @@ def check(root: Path, head_ref: str) -> str:
         return ""
     if git("describe", "--tags", "--exact-match", "HEAD", root=root) == version:
         return ""
-    if rehearsable(root, version, head_ref):
+    if rehearsable(root, version, head_ref, env):
         return ""
     return (
         f"build.zig.zon says {version} (no -dev) but HEAD is not tagged {version} and the head branch "
@@ -82,7 +84,7 @@ def rehearsable(root: Path, version: str, head_ref: str, env: Optional[Dict[str,
     return re.match(r"^Merge pull request #\d+ from \S+/release/" + re.escape(version) + r"$", subject) is not None
 
 
-def rehearse(root: Path, head_ref: str) -> str:
+def rehearse(root: Path, head_ref: str, env: Optional[Dict[str, str]] = None) -> str:
     """`--rehearse`: in a rehearsable state, create the release tag *locally*
     (never pushed) so the existing release chain (`release:manifest` stable
     channel: clean tree + `git describe --exact-match`) can run on the
@@ -93,7 +95,7 @@ def rehearse(root: Path, head_ref: str) -> str:
         return "no rehearsal needed (development version)"
     if git("describe", "--tags", "--exact-match", "HEAD", root=root) == version:
         return f"HEAD already carries tag {version}"
-    if not rehearsable(root, version, head_ref):
+    if not rehearsable(root, version, head_ref, env):
         return ""
     proc = subprocess.run(["git", "tag", version, "HEAD"], cwd=str(root), capture_output=True, text=True, check=False)
     if proc.returncode != 0:
