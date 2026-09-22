@@ -232,6 +232,8 @@ pub const project_rule_bundle = @import("core/project_rule_bundle.zig");
 pub const project_rule_gate = @import("core/project_rule_gate.zig");
 pub const project_rule_activation = @import("core/project_rule_activation.zig");
 pub const repl_msg_queue = @import("repl/msg_queue.zig");
+pub const repl_history = @import("repl/history.zig");
+pub const repl_user_echo = @import("repl/user_echo.zig");
 pub const web_journal = @import("web/journal.zig");
 pub const web_backend = @import("web/backend.zig");
 pub const web_server = @import("web/server.zig");
@@ -2657,6 +2659,7 @@ test {
     _ = &@import("api/catalog_fetch.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
+    _ = &@import("repl/user_echo.zig");
     _ = &@import("repl/multiline.zig");
     _ = &@import("repl/render.zig");
     _ = &@import("repl/headless.zig");

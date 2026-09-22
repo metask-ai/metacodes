@@ -24,6 +24,7 @@ const input = @import("input.zig");
 const complete = @import("complete.zig");
 const paste_mod = @import("paste.zig");
 const history_mod = @import("history.zig");
+const user_echo = @import("user_echo.zig");
 const multiline_mod = @import("multiline.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("../core/transcript.zig");
@@ -671,7 +672,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 同一地址——agent_loop(emit)与 watcher(键盘)共享这一个 TuiBackend 实例。
         // 不要把 tui_be 重新赋值 / 搬移 / 放进会 realloc 的容器,否则两个指针指向坟墓。
         var tui_be: ?tui_backend_mod.TuiBackend = if (region_writer) |*rw|
-            .{ .region = rw.region, .theme = &app.theme, .alloc = allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = &msg_queue, .abort_signal = &app.abort, .input_abort = &app.abort }
+            .{ .region = rw.region, .theme = &app.theme, .alloc = allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = &msg_queue, .history = &history, .abort_signal = &app.abort, .input_abort = &app.abort }
         else
             null;
         var fallback_be = debugBackend(app.config.verbose, true, &app.usage);
@@ -1134,54 +1135,16 @@ fn installSigwinch() void {
 /// 把提交的输入回显到 scrollback(复刻 Claude Code:提交后历史里留 "❯ <内容>")。
 /// 多行内容续行对齐 2 空格;空输入只打一个换行。commit 路径 + carryover 自动提交共用。
 fn echoUserSubmission(app: *app_mod.App, submitted: []const u8) void {
-    if (std.mem.trim(u8, submitted, " \t\r\n").len == 0) {
-        std.debug.print("\n", .{});
-        return;
-    }
+    // 排版(软折 + 2 列悬挂缩进)在 user_echo.zig,与 TuiBackend 在 turn 边界消费队列时的回显同源。
     const th = app.theme;
-    // 软折 + 2 列悬挂缩进(对齐 cc:长输入回显续行缩进 2 列,不回第 0 列)。
     const cols: usize = if (tui_term_root.getSize(1)) |s| s.cols else 80;
-    const avail: usize = if (cols > 6) cols - 2 else 0; // 0 = 不折
-    var first_logical = true;
-    var it = std.mem.splitScalar(u8, submitted, '\n');
-    while (it.next()) |seg| {
-        // 每个逻辑行按显示宽软折成多段;首段带前缀(❯/续行 2 空格),软折续段恒 2 空格。
-        var start: usize = 0;
-        var first_seg = true;
-        while (start <= seg.len) {
-            const end = if (avail == 0) seg.len else wrapPointAt(seg, start, avail);
-            const piece = seg[start..end];
-            if (first_logical and first_seg) {
-                std.debug.print("{s}❯{s} {s}\n", .{ th.accent, th.reset, piece });
-            } else {
-                std.debug.print("  {s}\n", .{piece});
-            }
-            first_seg = false;
-            if (end >= seg.len) break;
-            start = end;
-            // 续段跳过 1 个折点空格(对齐 cc 词折:断行处的空格不带到续行行首)。
-            if (start < seg.len and seg[start] == ' ') start += 1;
-        }
-        first_logical = false;
-    }
-}
-
-/// 从 start 起返回不超过 max_w 显示宽的最大 byte 终点(至少进 1 codepoint 防死循环)。纯文本用。
-fn wrapPointAt(s: []const u8, start: usize, max_w: usize) usize {
-    var i = start;
-    var w: usize = 0;
-    while (i < s.len) {
-        const cp_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        const e = @min(i + cp_len, s.len);
-        const cw = tui_term_root.displayWidth(s[i..e]);
-        if (w + cw > max_w) {
-            if (i == start) return e;
-            return i;
-        }
-        w += cw;
-        i = e;
-    }
-    return i;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.heap.c_allocator);
+    user_echo.render(&out, std.heap.c_allocator, th.accent, th.reset, cols, submitted) catch {
+        std.debug.print("{s}❯{s} {s}\n", .{ th.accent, th.reset, submitted });
+        return;
+    };
+    std.debug.print("{s}", .{out.items});
 }
 
 fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.History, app: *app_mod.App) ![]u8 {
