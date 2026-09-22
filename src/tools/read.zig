@@ -1153,7 +1153,7 @@ test "Read outline e2e: 真 zls documentSymbol → 大纲(需装 zls)" {
 fn e2eMkdir(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
-    _ = std.c.mkdir(z.ptr, 0o755);
+    _ = pfs.mkdir(z.ptr, 0o755);
 }
 fn e2eWrite(path: []const u8, content: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;

@@ -40,8 +40,8 @@ pub fn store(allocator: std.mem.Allocator, home: []const u8, id: usize, text: []
     // mkdir -p：先建 .metacodes，再建 pastes
     const parent_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes", .{home}, 0);
     defer allocator.free(parent_z);
-    _ = std.c.mkdir(parent_z.ptr, 0o700);
-    _ = std.c.mkdir(dir_z.ptr, 0o700);
+    _ = pfs.mkdir(parent_z.ptr, 0o700);
+    _ = pfs.mkdir(dir_z.ptr, 0o700);
 
     const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }, 0);
     defer allocator.free(path_z);
@@ -149,7 +149,7 @@ test "store + load + expand round trip" {
     const a = testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-home");
-    _ = std.c.mkdir(home.ptr, 0o700);
+    _ = pfs.mkdir(home.ptr, 0o700);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
     defer {
         // cleanup
@@ -181,7 +181,7 @@ test "store placeholder count = lines - 1 (cc v2.1.172)" {
     const a = testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-home");
-    _ = std.c.mkdir(home.ptr, 0o700);
+    _ = pfs.mkdir(home.ptr, 0o700);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
     defer {
         var pz: [256]u8 = undefined;

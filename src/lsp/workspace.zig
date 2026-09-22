@@ -134,7 +134,7 @@ test "isInsideWorkspace: 边界正确(不误配前缀)" {
 fn mkd(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
-    _ = std.c.mkdir(z.ptr, 0o755);
+    _ = pfs.mkdir(z.ptr, 0o755);
 }
 fn touch(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;

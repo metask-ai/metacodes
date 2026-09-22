@@ -322,8 +322,7 @@ fn ensureTestDir(path: []const u8) !void {
     if (path.len >= buf.len) return error.PathTooLong;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    if (std.c.mkdir(@ptrCast(&buf), 0o700) != 0) {
-        const e: std.c.E = @enumFromInt(std.c._errno().*);
-        if (e != .EXIST) return error.MkdirFailed;
+    if (pfs.mkdir(@ptrCast(&buf), 0o700) != 0) {
+        if (!pfs.lastErrnoIs(.EXIST)) return error.MkdirFailed;
     }
 }

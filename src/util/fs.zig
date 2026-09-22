@@ -33,9 +33,10 @@ pub fn mkdirParents(dir: []const u8) MkdirError!void {
     @memcpy(buf[0..dir.len], dir);
     buf[dir.len] = 0;
 
-    // 记录中间层第一个非 EEXIST 错误（用于日志；返回路径用 mid_failed bool）
+    // 记录中间层第一个非 EEXIST 错误（用于日志；返回路径用 mid_failed bool）。errno 只按整数
+    // 比较/按名查表(`pfs.errnoName`):裸 `@enumFromInt` 遇到 `std.c.E` 没命名的值会 panic(#121)。
     var mid_failed = false;
-    var mid_errno: std.c.E = .SUCCESS;
+    var mid_errno: c_int = 0;
     // Windows:跳过盘符前缀——mkdir("C:") 报非 EEXIST 错会把 mid_failed 置真,
     // 使"目录已存在"的重复调用(final EEXIST + mid_failed)返回假 MkdirFailed。
     const is_windows = @import("builtin").os.tag == .windows;
@@ -44,37 +45,57 @@ pub fn mkdirParents(dir: []const u8) MkdirError!void {
     while (i < dir.len) : (i += 1) {
         if (dir[i] != '/' and !(is_windows and dir[i] == '\\')) continue;
         buf[i] = 0;
-        if (std.c.mkdir(@ptrCast(&buf), 0o700) != 0) {
-            const e = currentErrno();
-            if (e != .EXIST and !mid_failed) {
+        if (pfs.mkdir(@ptrCast(&buf), 0o700) != 0) {
+            const e = pfs.lastErrno();
+            if (!pfs.lastErrnoIs(.EXIST) and !mid_failed) {
                 mid_failed = true;
                 mid_errno = e;
-                log.warn("fs", "mkdirParents: intermediate mkdir failed errno={s} at prefix={s}", .{ @tagName(e), buf[0..i] });
+                log.warn("fs", "mkdirParents: intermediate mkdir failed errno={s}({d}) at prefix={s}", .{ pfs.errnoName(e), e, buf[0..i] });
             }
         }
         buf[i] = dir[i]; // 还原原分隔符(Windows 可能是 '\\')
     }
 
     // 最终完整路径
-    if (std.c.mkdir(@ptrCast(&buf), 0o700) == 0) return;
-    const final_errno = currentErrno();
-    switch (final_errno) {
-        .EXIST => {
-            if (mid_failed) {
-                log.warn("fs", "mkdirParents: final EEXIST but mid failed errno={s}; not trusted: {s}", .{ @tagName(mid_errno), dir });
-                return error.MkdirFailed;
-            }
-            return;
-        },
-        else => {
-            log.warn("fs", "mkdirParents: final mkdir failed errno={s} path={s} (mid_failed={})", .{ @tagName(final_errno), dir, mid_failed });
+    if (pfs.mkdir(@ptrCast(&buf), 0o700) == 0) return;
+    const final_errno = pfs.lastErrno();
+    if (pfs.lastErrnoIs(.EXIST)) {
+        if (mid_failed) {
+            log.warn("fs", "mkdirParents: final EEXIST but mid failed errno={s}({d}); not trusted: {s}", .{ pfs.errnoName(mid_errno), mid_errno, dir });
             return error.MkdirFailed;
-        },
+        }
+        return;
     }
+    log.warn("fs", "mkdirParents: final mkdir failed errno={s}({d}) path={s} (mid_failed={})", .{ pfs.errnoName(final_errno), final_errno, dir, mid_failed });
+    return error.MkdirFailed;
 }
 
-fn currentErrno() std.c.E {
-    return @enumFromInt(std.c._errno().*);
+/// 为 `path` 建所有缺失的**父**目录(等价 `mkdir -p $(dirname path)`),Write / ApplyPatch 落盘前
+/// 自动建目录用(对齐 TS:Write 到不存在的目录会先 mkdir -p)。权限 0o755——用户可见的项目目录;
+/// 上面的 0o700 是 cache/session 私有目录。
+///
+/// best-effort:任一层 mkdir 失败且不是 EEXIST 即停(权限等问题交给随后的 open 以 WriteError
+/// 暴露),只有路径过长是本函数自己的错误。Windows:两种分隔符都认,跳过盘符前缀
+/// (`mkdir("C:")` 报非 EEXIST 错会让第一层就早退,一层都建不出来——实测复现);UNC
+/// (`\\server\share\...`)不支持,首段同样早退,交给 open 报错。建目录走 `pfs.mkdir`,中文父目录
+/// 在 Windows 落到精确的名字(#121)。
+pub fn mkdirParentsOf(path: []const u8) error{PathTooLong}!void {
+    const is_windows = @import("builtin").os.tag == .windows;
+    const slash = (if (is_windows) std.mem.lastIndexOfAny(u8, path, "/\\") else std.mem.lastIndexOfScalar(u8, path, '/')) orelse return; // 无目录分量
+    if (slash == 0) return; // 直接在根目录下,无需建
+    const dir = path[0..slash];
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (dir.len >= buf.len) return error.PathTooLong;
+    var i: usize = 1;
+    if (is_windows and dir.len >= 2 and dir[1] == ':') i = 3;
+    while (i <= dir.len) : (i += 1) {
+        if (i == dir.len or dir[i] == '/' or (is_windows and dir[i] == '\\')) {
+            @memcpy(buf[0..i], dir[0..i]);
+            buf[i] = 0;
+            const seg_z: [*:0]const u8 = @ptrCast(&buf);
+            if (pfs.mkdir(seg_z, 0o755) != 0 and !pfs.lastErrnoIs(.EXIST)) return;
+        }
+    }
 }
 
 /// 包装 `getcwd(3)`，返回 allocator-owned 的 slice。
@@ -370,6 +391,22 @@ test "mkdirParents creates nested dirs" {
 
 test "mkdirParents empty is noop" {
     try mkdirParents("");
+}
+
+test "mkdirParentsOf creates the parent chain of a file path and leaves the leaf alone" {
+    var root_buf: [512]u8 = undefined;
+    const root = testing.perPidDir(&root_buf, "cc-zig-mkdirp-of-root");
+    defer testing.rmrfBestEffort(root);
+    var file_buf: [600]u8 = undefined;
+    const file = try std.fmt.bufPrintZ(&file_buf, "{s}/a/b/leaf.txt", .{root});
+    try mkdirParentsOf(file);
+    var parent_buf: [600]u8 = undefined;
+    const parent = try std.fmt.bufPrintZ(&parent_buf, "{s}/a/b", .{root});
+    try std.testing.expect(pfs.exists(parent.ptr));
+    try std.testing.expect(!pfs.exists(file.ptr)); // 只建父目录,叶子归调用方
+    try mkdirParentsOf(file); // 幂等
+    try mkdirParentsOf("leaf.txt"); // 无目录分量 → no-op
+    try mkdirParentsOf("/leaf.txt"); // 根下 → no-op
 }
 
 test "mkdirParents existing dir ok" {

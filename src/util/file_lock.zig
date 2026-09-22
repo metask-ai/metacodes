@@ -78,7 +78,7 @@ pub fn acquire(target_path: []const u8, opts: Options) LockError!Lock {
     while (attempt <= opts.retries) : (attempt += 1) {
         if (tryCreate(&lock)) return lock;
         // 父目录不存在 → 永远建不出锁,立即报错(否则空耗重试后伪装成 LockBusy)。
-        if (@as(std.c.E, @enumFromInt(std.c._errno().*)) == .NOENT) return error.NoParentDir;
+        if (pfs.lastErrnoIs(.NOENT)) return error.NoParentDir;
         // 创建失败:检查陈旧锁。时间戳来源分平台:
         // - POSIX:锁文件内容 wall_ms 优先(写入即持锁时刻);内容读不到/解析不了(持锁者在
         //   open 与 write 之间崩溃 → 空锁文件)退回 mtime。(Linus MED-2:null 分支永不抢 → 死锁。)

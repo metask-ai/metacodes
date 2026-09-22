@@ -40,7 +40,7 @@ pub fn setDir(dir: []const u8) void {
     if (dir.len + 1 <= pbuf.len) {
         @memcpy(pbuf[0..dir.len], dir);
         pbuf[dir.len] = 0;
-        _ = std.c.mkdir(@ptrCast(&pbuf), @as(std.c.mode_t, 0o755));
+        _ = pfs.mkdir(@ptrCast(&pbuf), @as(std.c.mode_t, 0o755));
     }
     log.info("recorder", "recording to {s}", .{dir});
 }

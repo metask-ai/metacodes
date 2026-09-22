@@ -184,17 +184,20 @@ test "tempDir 非空" {
 }
 
 test "selfExeRealPath resolves a symlinked invocation to the physical executable" {
-    if (is_windows) return error.SkipZigTest; // symlink 需特权;Windows 走 _fullpath 不解 symlink
+    // Windows 也跑:realpath 现在经句柄解析 symlink/junction(#140)。runner 没有 symlink 特权时
+    // 由 symlinkOrSkip 标成 skip;junction 形态由下一个用例覆盖(不需特权)。
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "prefix/bin");
-    try tmp.dir.createDirPath(std.testing.io, "elsewhere");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prefix/bin/metacodes", .data = "#!/bin/sh\n" });
+    try tmp.dir.createDirPath(io, "prefix/bin");
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.writeFile(io, .{ .sub_path = "prefix/bin/metacodes", .data = "#!/bin/sh\n" });
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    // 物理路径的期望值来自 std(Windows 走 NT 宽字符 API + GetFinalPathNameByHandle),不是被测函数自己。
     var real_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const real = try std.fmt.bufPrint(&real_buf, "{s}/prefix/bin/metacodes", .{root});
-    try tmp.dir.symLink(std.testing.io, real, "elsewhere/metacodes", .{});
+    const real = real_buf[0..try tmp.dir.realPathFile(io, "prefix/bin/metacodes", &real_buf)];
+    try @import("test_links.zig").symlinkOrSkip(tmp.dir, io, real, "elsewhere/metacodes", .{});
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     const link = try std.fmt.bufPrint(&link_buf, "{s}/elsewhere/metacodes", .{root});
 
@@ -204,6 +207,35 @@ test "selfExeRealPath resolves a symlinked invocation to the physical executable
     try std.testing.expectEqualStrings(link, selfExePath(&raw_buf).?);
     var out: [std.fs.max_path_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(real, selfExeRealPath(&out).?);
+}
+
+test "selfExeRealPath resolves an invocation through an NTFS junction to the physical executable" {
+    // #140 的常见安装形态:`mklink /J`(目录挂载点,不需要特权)。`_fullpath` 是纯词法的,解不开它。
+    if (!is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "prefix/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "prefix/bin/metacodes.exe", .data = "MZ" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = real_buf[0..try tmp.dir.realPathFile(io, "prefix/bin/metacodes.exe", &real_buf)];
+    const junction = try std.fmt.allocPrint(a, "{s}\\elsewhere_j", .{root});
+    defer a.free(junction);
+    const target = try std.fmt.allocPrint(a, "{s}\\prefix", .{root});
+    defer a.free(target);
+    try @import("test_links.zig").junction(a, junction, target);
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "{s}\\elsewhere_j\\bin\\metacodes.exe", .{root});
+
+    test_self_exe_override = link;
+    defer test_self_exe_override = null;
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    const resolved = selfExeRealPath(&out).?;
+    try std.testing.expectEqualStrings(real, resolved);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "elsewhere_j") == null);
 }
 
 test "selfExeRealPath falls back to the invoked path when realpath fails" {

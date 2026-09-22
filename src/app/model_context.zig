@@ -93,7 +93,7 @@ pub const ModelContext = struct {
     fn writeFileBytes(self: *ModelContext, dir: []const u8, path: []const u8, bytes: []const u8) void {
         const dir_z = self.allocator.dupeZ(u8, dir) catch return;
         defer self.allocator.free(dir_z);
-        _ = std.c.mkdir(dir_z, 0o700);
+        _ = pfs.mkdir(dir_z, 0o700);
         const path_z = self.allocator.dupeZ(u8, path) catch return;
         defer self.allocator.free(path_z);
         const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));

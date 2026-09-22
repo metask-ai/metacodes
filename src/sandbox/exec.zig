@@ -320,7 +320,7 @@ test "e2e: sandbox blocks write outside cwd, allows inside" {
     var dir_z: [129]u8 = undefined;
     @memcpy(dir_z[0..dir.len], dir);
     dir_z[dir.len] = 0;
-    _ = std.c.mkdir(@ptrCast(&dir_z), 0o755);
+    _ = pfs.mkdir(@ptrCast(&dir_z), 0o755);
     defer _ = std.c.rmdir(@ptrCast(&dir_z));
 
     const sb = config_mod.SandboxSettings{ .enabled = true };

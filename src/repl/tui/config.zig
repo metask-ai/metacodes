@@ -36,7 +36,7 @@ pub fn saveTheme(alloc: std.mem.Allocator, home: []const u8, variant: theme_mod.
     // 确保 ~/.metacodes 存在
     var dir_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const dir_z = try std.fmt.bufPrint(&dir_buf, "{s}/.metacodes\x00", .{home});
-    _ = std.c.mkdir(@ptrCast(dir_z.ptr), 0o755); // 已存在 EEXIST 忽略
+    _ = pfs.mkdir(@ptrCast(dir_z.ptr), 0o755); // 已存在 EEXIST 忽略
 
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path_z = try std.fmt.bufPrint(&path_buf, "{s}/.metacodes/config.json\x00", .{home});
@@ -230,7 +230,7 @@ test "writeWithTheme: 字段不存在时追加" {
 test "loadTheme + saveTheme 往返(临时 home)" {
     var dir_buf: [512]u8 = undefined;
     const dir = @import("../../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-thtest");
-    _ = std.c.mkdir(dir.ptr, 0o755);
+    _ = pfs.mkdir(dir.ptr, 0o755);
     defer {
         // 清理 ~/.metacodes/config.json + ~/.metacodes + tmp 目录
         var p1_buf: [256]u8 = undefined;

@@ -50,8 +50,10 @@ the release layout, ripgrep beside itself before `PATH` (#78, #79). "Its own
 directory" is the physical one: the self-executable path is passed through
 `realpath` before any adjacent lookup, so `ln -s <prefix>/bin/metacodes
 ~/bin/metacodes` keeps rg, both Lean kernels and TinyKG resolving inside
-`<prefix>` rather than beside the symlink. Unpack the archive anywhere; do not
-move files inside it.
+`<prefix>` rather than beside the symlink. On Windows the same holds for an
+NTFS symlink or a junction (`mklink /J`): `realpath` resolves through a file
+handle (`GetFinalPathNameByHandleW`), not lexically. Unpack the archive
+anywhere; do not move files inside it.
 
 ## Release channels
 

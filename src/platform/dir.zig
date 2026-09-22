@@ -154,7 +154,7 @@ test "iterate a real directory finds seeded files" {
     const tmp_root = if (@import("builtin").os.tag == .windows) @import("paths.zig").tempDir() else "/tmp";
     var dbuf: [512]u8 = undefined;
     const dir_z = try std.fmt.bufPrintZ(&dbuf, "{s}/cczig_dir_{d}", .{ tmp_root, pid });
-    _ = std.c.mkdir(dir_z.ptr, 0o755);
+    _ = pfs.mkdir(dir_z.ptr, 0o755);
     defer {
         var ab: [600]u8 = undefined;
         const a = std.fmt.bufPrintZ(&ab, "{s}/alpha.md", .{dir_z}) catch unreachable;

@@ -319,10 +319,11 @@ pub fn clearDefault(allocator: std.mem.Allocator) !void {
     defer allocator.free(path);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    if (std.c.unlink(path_z.ptr) != 0) {
-        const e: std.c.E = @enumFromInt(std.c._errno().*);
-        if (e != .NOENT) return error.UnlinkFailed;
-    }
+    // 宽字符删除(Windows DeleteFileW;#121)。已经不存在 = 目标状态达成,不算失败。
+    pfs.unlinkPath(path_z.ptr) catch {
+        if (!pfs.exists(path_z.ptr)) return;
+        return error.UnlinkFailed;
+    };
 }
 
 pub fn importOAuthTokenResponse(allocator: std.mem.Allocator, body: []const u8, now_seconds: i64) !StoredCredentials {
@@ -798,8 +799,7 @@ fn checkFilePrivate(path: []const u8) !void {
     defer std.heap.c_allocator.free(path_z);
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) {
-        const e: std.c.E = @enumFromInt(std.c._errno().*);
-        if (e == .NOENT) return error.NotFound;
+        if (pfs.lastErrnoIs(.NOENT)) return error.NotFound;
         return error.OpenFailed;
     }
     _ = pfs.close(fd);

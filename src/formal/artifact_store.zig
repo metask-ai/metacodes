@@ -318,7 +318,7 @@ fn createExclusiveDirectory(allocator: std.mem.Allocator, path: []const u8) !voi
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
     // EEXIST is an identity collision and must never become overwrite.
-    if (std.c.mkdir(path_z.ptr, 0o700) != 0) return error.EventDirectoryCreateFailed;
+    if (pfs.mkdir(path_z.ptr, 0o700) != 0) return error.EventDirectoryCreateFailed;
 }
 
 fn maybeWrite(
@@ -570,7 +570,7 @@ test "formal artifact bundle remains authoritative when discovery index append f
     // fail after manifest publication without interfering with bundle writes.
     const index_path_z = try std.testing.allocator.dupeZ(u8, index_path);
     defer std.testing.allocator.free(index_path_z);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(index_path_z.ptr, 0o700));
+    try std.testing.expectEqual(@as(c_int, 0), pfs.mkdir(index_path_z.ptr, 0o700));
 
     const event_id: [64]u8 = .{'b'} ** 64;
     const persisted = try persist(

@@ -1,7 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const pfs = @import("platform").fs;
+const pdir = @import("platform").dir;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
+const util_fs = @import("../util/fs.zig");
 const util_json = @import("../util/json.zig");
 const read_state = @import("../core/read_state.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -62,7 +65,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     };
 
     // 自动建父目录（对齐 TS：Write 到不存在的目录会先 mkdir -p）。
-    try mkdirParents(path);
+    try util_fs.mkdirParentsOf(path);
 
     const write_flags: pfs.O = if (ctx.project_write_exclusive_create)
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .EXCL = true }
@@ -72,21 +75,23 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         // EACCES/EROFS 与其他 open 失败对模型是不同的可行动作:权限失败应换目标
         // 路径或报告权限问题,而不是盲目重试。带 errno 的富 detail 走 error_detail
         // 通道(与 edit.zig setDetail 同款),无通道时退回裸 WriteError。
-        const errno: std.c.E = @enumFromInt(std.c._errno().*);
+        // errno 先读再分配(allocPrint 可能改它);按名查表,没命名的值不裸转枚举(#121)。
+        const errno_raw = pfs.lastErrno();
+        const errno_tag = pfs.errnoTag(errno_raw);
         if (ctx.error_detail) |slot| {
-            slot.* = switch (errno) {
+            slot.* = if (errno_tag) |tag| switch (tag) {
                 .ACCES, .ROFS => std.fmt.allocPrint(
                     ctx.allocator,
                     "permission denied writing '{s}' (errno {d}): the target directory is not writable by the current user. Write to a writable location instead or report the permission problem.",
-                    .{ path, @intFromEnum(errno) },
+                    .{ path, errno_raw },
                 ) catch null,
                 .NOENT, .NOTDIR => std.fmt.allocPrint(
                     ctx.allocator,
                     "cannot create '{s}' (errno {d}): a path component is missing or not a directory.",
-                    .{ path, @intFromEnum(errno) },
+                    .{ path, errno_raw },
                 ) catch null,
                 else => null,
-            };
+            } else null;
         }
         return error.WriteError;
     };
@@ -131,8 +136,9 @@ const MAX_WRITE_OLD_SIZE: usize = 10 * 1024 * 1024;
 /// path stayed unchanged across the unavoidable open/read/write interval.
 fn captureBeforeContent(allocator: std.mem.Allocator, path: []const u8) observation.BeforeContent {
     const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
-        const errno: std.c.E = @enumFromInt(std.c._errno().*);
-        return if (errno == .NOENT) .missing else .unknown;
+        // openZ 在没调 CRT 就拒绝(路径过长)时也写了 errno,所以这里读到的总是本次 open 的原因;
+        // 整数比较,不裸转枚举(#121)。
+        return if (pfs.lastErrnoIs(.NOENT)) .missing else .unknown;
     };
     defer _ = pfs.close(fd);
     const bytes = common.readAllFromFdCapped(fd, allocator, MAX_WRITE_OLD_SIZE) catch return .unknown;
@@ -214,41 +220,6 @@ fn publishFileChange(
     });
 }
 
-/// 为 path 创建所有缺失的父目录（等价 mkdir -p 到 dirname）。已存在的目录忽略。
-/// 失败（权限等）静默返回——后续 openat 会以 WriteError 暴露真正问题。
-fn mkdirParents(path: []const u8) !void {
-    const is_windows = @import("builtin").os.tag == .windows;
-    // 找最后一个分隔符,其左侧即父目录路径(Windows 两种分隔符都认)
-    const slash = (if (is_windows) std.mem.lastIndexOfAny(u8, path, "/\\") else std.mem.lastIndexOfScalar(u8, path, '/')) orelse return; // 无目录分量
-    if (slash == 0) return; // 直接在根目录下，无需建
-    const dir = path[0..slash];
-
-    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    if (dir.len >= buf.len) return error.PathTooLong;
-
-    // 逐级建：对每个分隔符位置，把到该处的前缀 mkdir 一次
-    // Windows 从盘符根后开始("C:/x" 的首段前缀 "C:" 会 mkdir 失败且 errno 非 EEXIST,
-    // 触发下面的 early-return → 真正的父目录一层都没建 → 后续 openZ ENOENT。实测复现。
-    // UNC("\\server\share\...")不支持:首段 mkdir 同样非 EEXIST 早退,交给 openZ 报错(review F1)。
-    var i: usize = 1;
-    if (is_windows and dir.len >= 2 and dir[1] == ':') i = 3;
-    while (i <= dir.len) : (i += 1) {
-        if (i == dir.len or dir[i] == '/' or (is_windows and dir[i] == '\\')) {
-            @memcpy(buf[0..i], dir[0..i]);
-            buf[i] = 0;
-            const seg_z: [*:0]const u8 = @ptrCast(&buf);
-            // mkdir 返回 <0 且 errno=EEXIST 时忽略
-            if (std.c.mkdir(seg_z, 0o755) != 0) {
-                const errno = std.c._errno().*;
-                if (errno != @intFromEnum(std.c.E.EXIST)) {
-                    // 其它错误（如权限）不在此处 fatal——交给 openat
-                    return;
-                }
-            }
-        }
-    }
-}
-
 fn testCtx() ToolContext {
     return ToolContext.simple(std.testing.allocator);
 }
@@ -307,7 +278,7 @@ test "WriteTool EACCES detail names the unwritable directory (errno through erro
     const ctx = ToolContext{ .allocator = a, .read_state = &rs, .error_detail = &detail };
     var dbuf: [256]u8 = undefined;
     const dir = tt.path(&dbuf, "ro-dir-4c1e");
-    try std.testing.expect(std.c.mkdir(dir.ptr, 0o500) == 0);
+    try std.testing.expect(pfs.mkdir(dir.ptr, 0o500) == 0);
     defer {
         _ = std.c.chmod(dir.ptr, 0o700);
         _ = std.c.rmdir(dir.ptr);
@@ -431,3 +402,117 @@ test "WriteTool ~ 展开端到端" {
     try std.testing.expect(fd >= 0); // 文件存在 = ~ 已展开
     _ = pfs.close(fd);
 }
+
+// ── #121:UTF-8 路径必须落到精确的名字 ─────────────────────────────────────────
+// Windows 窄字符 CRT(`_open`/`_mkdir`)会把 UTF-8 字节按 ANSI 代码页解码,`测试.txt` 落成乱码名;
+// 存在性检查(宽字符 statPath)与实际写入看的是两个对象,must-read-first 因此失守。以下用例
+// 全平台跑:POSIX 上 UTF-8 是原生编码,充当回归基线;Windows 原生 CI 是真正的证据。验证一律走
+// std.Io(Windows 走 NT 宽字符 API)与 platform/dir 枚举,不用 pfs 自读自证。
+
+/// 目录里除 `.`/`..` 外的条目数,并断言每个条目都叫 `expected_name`。
+fn countEntriesNamed(dir_z: [*:0]const u8, expected_name: []const u8) !usize {
+    var it = pdir.open(dir_z) orelse return error.TestUnexpectedResult;
+    defer pdir.close(&it);
+    var entries: usize = 0;
+    while (pdir.next(&it)) |ent| {
+        if (std.mem.eql(u8, ent.name, ".") or std.mem.eql(u8, ent.name, "..")) continue;
+        try std.testing.expectEqualStrings(expected_name, ent.name);
+        entries += 1;
+    }
+    return entries;
+}
+
+test "WriteTool: a CJK path with CJK parent directories is created at exactly the requested names" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = tt.normalizeSlashes(root_buf[0..try tmp.dir.realPath(io, &root_buf)]);
+    var rs = read_state.ReadState.init(a);
+    defer rs.deinit();
+    const ctx = ToolContext{ .allocator = a, .read_state = &rs };
+    const args = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/测试目录/子目录/测试.txt\",\"content\":\"你好\\n\"}}", .{root});
+    defer a.free(args);
+    const result = try execute(&ctx, args);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
+
+    // 独立读回:内容落在精确名下。
+    const bytes = try tmp.dir.readFileAlloc(io, "测试目录/子目录/测试.txt", a, .limited(64));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("你好\n", bytes);
+    // 三层各只有一个精确名的条目,没有乱码兄弟(父目录是 Write 自动建的)。
+    const root_z = try a.dupeZ(u8, root);
+    defer a.free(root_z);
+    const l1 = try std.fmt.allocPrintSentinel(a, "{s}/测试目录", .{root}, 0);
+    defer a.free(l1);
+    const l2 = try std.fmt.allocPrintSentinel(a, "{s}/测试目录/子目录", .{root}, 0);
+    defer a.free(l2);
+    try std.testing.expectEqual(@as(usize, 1), try countEntriesNamed(root_z.ptr, "测试目录"));
+    try std.testing.expectEqual(@as(usize, 1), try countEntriesNamed(l1.ptr, "子目录"));
+    try std.testing.expectEqual(@as(usize, 1), try countEntriesNamed(l2.ptr, "测试.txt"));
+
+    // 同一个对象:刚写过的文件已记进 ReadState,紧接着的第二次 Write 走 stale/must-read 校验而不是
+    // "文件不存在 → 允许创建"——这证明 statPath(宽字符)与 open 看到的是同一个文件。
+    const again = try execute(&ctx, args);
+    defer a.free(again);
+    try std.testing.expect(std.mem.indexOf(u8, again, "\"success\":true") != null);
+}
+
+test "WriteTool: must-read-first still rejects an existing CJK-path file" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "测试.txt", .data = "old" }); // 外部(std.Io)创建,从未 Read
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = tt.normalizeSlashes(root_buf[0..try tmp.dir.realPath(io, &root_buf)]);
+    var rs = read_state.ReadState.init(a);
+    defer rs.deinit();
+    const ctx = ToolContext{ .allocator = a, .read_state = &rs };
+    const args = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/测试.txt\",\"content\":\"new\"}}", .{root});
+    defer a.free(args);
+    try std.testing.expectError(error.NotRead, execute(&ctx, args));
+    const kept = try tmp.dir.readFileAlloc(io, "测试.txt", a, .limited(16));
+    defer a.free(kept);
+    try std.testing.expectEqualStrings("old", kept);
+}
+
+test "WriteTool (Windows): the ANSI-decoded counterpart of a CJK path is never touched" {
+    // 复现 #121 的覆盖场景:请求的 `测试.txt` 不存在,而它按进程 ANSI 代码页误解码出来的名字
+    // (窄字符 CRT 实际会打开的那个)存在且可写。Write 必须新建请求的文件,旧文件一字不动。
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = tt.normalizeSlashes(root_buf[0..try tmp.dir.realPath(io, &root_buf)]);
+
+    const intended = "测试.txt";
+    var wide: [64]u16 = undefined;
+    const wlen = MultiByteToWideChar(0, 0, intended.ptr, @intCast(intended.len), &wide, wide.len); // CP_ACP
+    if (wlen <= 0) return error.TestUnexpectedResult;
+    var mojibake_buf: [256]u8 = undefined;
+    const mojibake = mojibake_buf[0..try std.unicode.utf16LeToUtf8(&mojibake_buf, wide[0..@intCast(wlen)])];
+    if (std.mem.eql(u8, mojibake, intended)) return error.SkipZigTest; // 进程代码页已是 UTF-8:没有乱码对偶可测
+    try tmp.dir.writeFile(io, .{ .sub_path = mojibake, .data = "keep" });
+
+    var rs = read_state.ReadState.init(a);
+    defer rs.deinit();
+    const ctx = ToolContext{ .allocator = a, .read_state = &rs };
+    const args = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/{s}\",\"content\":\"new\"}}", .{ root, intended });
+    defer a.free(args);
+    const result = try execute(&ctx, args);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
+
+    const kept = try tmp.dir.readFileAlloc(io, mojibake, a, .limited(16));
+    defer a.free(kept);
+    try std.testing.expectEqualStrings("keep", kept);
+    const written = try tmp.dir.readFileAlloc(io, intended, a, .limited(16));
+    defer a.free(written);
+    try std.testing.expectEqualStrings("new", written);
+}
+extern "kernel32" fn MultiByteToWideChar(CodePage: u32, dwFlags: u32, lpMultiByteStr: [*]const u8, cbMultiByte: c_int, lpWideCharStr: ?[*]u16, cchWideChar: c_int) callconv(.winapi) c_int;

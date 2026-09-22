@@ -4405,7 +4405,7 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     const ppaths = @import("platform").paths;
     var home_buf: [512]u8 = undefined;
     const home = util_fs.testing.perPidDir(&home_buf, "cc-zig-resume-l2-16");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer util_fs.testing.rmrfBestEffort(home);
     // handleResume 走 homeDir()(env);setEnv HOME 后 defer 还原,免污染同 binary 其它测试(单线程顺序跑)。
     const old_home = std.c.getenv("HOME");

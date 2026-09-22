@@ -135,8 +135,7 @@ pub fn ensureInbox(path: []const u8) !void {
     // (Linus review LOW:权限问题被吞会让邮箱"看似存在实则永远写不进")。
     const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(c_uint, 0o644));
     if (fd < 0) {
-        const e: std.c.E = @enumFromInt(std.c._errno().*);
-        if (e == .EXIST) return; // 已存在
+        if (pfs.lastErrnoIs(.EXIST)) return; // 已存在
         return error.OpenFailed;
     }
     defer pfs.close(fd);

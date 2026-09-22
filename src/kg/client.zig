@@ -3254,11 +3254,11 @@ fn ensureParentDir(allocator: std.mem.Allocator, path: []const u8) !void {
     if (grand) |g| {
         const gz = try allocator.dupeZ(u8, g);
         defer allocator.free(gz);
-        _ = std.c.mkdir(gz, 0o755);
+        _ = pfs.mkdir(gz, 0o755);
     }
     const pz = try allocator.dupeZ(u8, parent);
     defer allocator.free(pz);
-    _ = std.c.mkdir(pz, 0o755);
+    _ = pfs.mkdir(pz, 0o755);
 }
 
 fn sleepMs(ms: u64) void {

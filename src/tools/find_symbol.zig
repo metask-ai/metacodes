@@ -360,7 +360,7 @@ test "REGRESSION issue #17: LSP 在位但符号能力缺失 → 仍不是裸 []"
     {
         var zbuf: [std.fs.max_path_bytes]u8 = undefined;
         const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{base}) catch return;
-        _ = std.c.mkdir(z.ptr, 0o755);
+        _ = pfs.mkdir(z.ptr, 0o755);
     }
     const file = try std.fmt.allocPrint(a, "{s}/probe.zig", .{base});
     defer a.free(file);

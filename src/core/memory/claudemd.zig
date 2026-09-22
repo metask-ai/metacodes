@@ -196,7 +196,7 @@ fn writeFileAt(dir_abs: []const u8, name: []const u8, data: []const u8) !void {
 fn mkdirAt(dir_abs: []const u8, name: []const u8) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir_abs, name });
-    const rc = std.c.mkdir(path, 0o755);
+    const rc = pfs.mkdir(path, 0o755);
     if (rc != 0) {
         const e = std.posix.errno(rc);
         if (e != .EXIST) return error.MkdirFailed;

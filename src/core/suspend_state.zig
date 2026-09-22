@@ -112,7 +112,7 @@ test "suspend state 落盘往返 + clear" {
     // per-pid 临时目录(避免并发 test artifact 撞固定路径,见 tools/test_tmp.zig 教训),结束删掉。
     var dirbuf: [512]u8 = undefined;
     const dir = @import("../util/fs.zig").testing.perPidDir(&dirbuf, "cc-zig-suspend-test");
-    _ = std.c.mkdir(dir.ptr, 0o700);
+    _ = pfs.mkdir(dir.ptr, 0o700);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(dir);
 
     try write(dir, .{ .tool_use_id = "tu_42", .kind = "video_timeline", .payload_json = "{\"clips\":3}" }, a);

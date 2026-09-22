@@ -223,7 +223,7 @@ fn mkdirP(path: []const u8) !void {
             @memcpy(buf[0..len], path[0..len]);
             buf[len] = 0;
             const seg_z: [*:0]const u8 = @ptrCast(&buf);
-            _ = std.c.mkdir(seg_z, 0o755);
+            _ = pfs.mkdir(seg_z, 0o755);
         }
     }
 }

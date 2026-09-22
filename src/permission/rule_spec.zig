@@ -1100,7 +1100,7 @@ test "isInWorkingDirs: 指向区外的 symlink 不放行(allow 双匹配语义)"
     // 每进程唯一目录里造 dir + 指向 /etc/hosts 的 symlink
     var dir_buf: [512]u8 = undefined;
     const dir = @import("../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-wd");
-    _ = std.c.mkdir(dir.ptr, 0o755);
+    _ = pfs.mkdir(dir.ptr, 0o755);
     defer _ = std.c.rmdir(dir.ptr);
     var link_buf: [600]u8 = undefined;
     const linkz = try std.fmt.bufPrint(&link_buf, "{s}/esc.txt\x00", .{dir});

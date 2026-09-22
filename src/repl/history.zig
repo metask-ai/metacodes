@@ -137,7 +137,7 @@ pub const History = struct {
             if (parent.len > 0) {
                 const parent_z = try allocatorDupeZ(self.allocator, parent);
                 defer self.allocator.free(parent_z);
-                _ = std.c.mkdir(parent_z, 0o700);
+                _ = pfs.mkdir(parent_z, 0o700);
             }
         }
 

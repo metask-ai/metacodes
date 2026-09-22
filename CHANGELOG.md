@@ -12,6 +12,37 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Windows: `platform.fs.realpath` resolved paths lexically (`_fullpath`), so a
+  `metacodes.exe` started through an NTFS symlink or junction reported the
+  invoking path as its physical path and every adjacent lookup (`bin/rg.exe`,
+  `libexec/metacodes/<kernel>.exe`, `vendor/tinykg/`) searched beside the link
+  (#140). `realpath` now resolves an existing path through a handle
+  (`CreateFileW` + `GetFinalPathNameByHandleW`, `\\?\` and `\\?\UNC\` prefixes
+  stripped) and keeps the lexical answer only for paths it cannot open. The
+  `paths.zig` symlink test now runs on Windows when the runner may create
+  symlinks, a junction variant (`mklink /J`, no privilege needed) was added at
+  unit and process level, and `adjacent_symlink_test` starts the real
+  `selfexe_probe.exe` through a symlink and through a junction.
+- Windows: file creation and directory creation passed UTF-8 paths to the
+  narrow CRT entry points (`_open`, `_mkdir`), which decode them with the
+  process ANSI code page, while the existence checks, `statPath`, unlink and
+  rename already used the wide-character APIs — the same path string named two
+  different filesystem objects, so `Write` could pass its must-read-first check
+  on `测试.txt` and then truncate the code-page counterpart (`娴嬭瘯.txt` under
+  CP936), and CJK parent directories were created under the wrong names
+  (#121). `platform.fs.open` now converts to UTF-16 and calls `_wopen`
+  (`_O_BINARY` preserved); a new `platform.fs.mkdir` (`_wmkdir` on Windows)
+  replaces every direct `std.c.mkdir` call in the tree; `Write` and
+  `ApplyPatch` share one `util.fs.mkdirParentsOf`, and `ApplyPatch` deletes
+  through `unlinkPath` (`DeleteFileW`). errno is no longer converted with a
+  bare `@enumFromInt` (a value `std.c.E` does not name panicked in
+  Debug/ReleaseSafe): callers compare integers (`lastErrnoIs`) or look the
+  name up (`errnoTag`/`errnoName`), and the wrapper sets an explicit errno
+  when it refuses an operation itself (`ENAMETOOLONG` for an over-long path,
+  `EINVAL` for invalid UTF-8, `ELOOP` for a `NOFOLLOW` open of a reparse
+  point). Tests create `测试目录/测试.txt` through the wrappers and verify the
+  exact names through `std.Io` and directory enumeration; on Windows they also
+  seed the ANSI-decoded counterpart and prove `Write` leaves it untouched.
 - Adjacent-artifact resolution disagreed across resolvers when `metacodes` was
   started through a symlink (the common `ln -s <prefix>/bin/metacodes
   ~/bin/metacodes` install): macOS reports the invoked symlink as the

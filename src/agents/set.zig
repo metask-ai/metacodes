@@ -435,8 +435,8 @@ test "AgentSet: recursive subfolder discovery (path doesn't affect name)" {
     const sub_dir = try std.fmt.bufPrint(&sub_buf, "{s}/review", .{dir});
     const sub_z = std.fmt.allocPrintSentinel(a, "{s}", .{sub_dir}, 0) catch unreachable;
     defer a.free(sub_z);
-    _ = std.c.mkdir(dir.ptr, 0o755);
-    _ = std.c.mkdir(sub_z, 0o755);
+    _ = pfs.mkdir(dir.ptr, 0o755);
+    _ = pfs.mkdir(sub_z, 0o755);
     try makeAgentInDir(sub_dir, "security.md", "---\nname: security\ndescription: sec review\n---\nbody\n");
 
     var set = AgentSet.init(a);
@@ -476,7 +476,7 @@ fn makeAgent(parent: []const u8, filename: []const u8, md: []const u8) !void {
     const a = testing.allocator;
     const parent_z = try a.dupeZ(u8, parent);
     defer a.free(parent_z);
-    _ = std.c.mkdir(parent_z, 0o755);
+    _ = pfs.mkdir(parent_z, 0o755);
     try makeAgentInDir(parent, filename, md);
 }
 

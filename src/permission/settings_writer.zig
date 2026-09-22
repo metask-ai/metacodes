@@ -82,7 +82,7 @@ fn ensureDir(path: []const u8) !void {
     @memcpy(dir_buf[0..sep], path[0..sep]);
     dir_buf[sep] = 0;
     // mkdir 不存在则建,EEXIST 忽略;父父级不存在直接失败(让 caller 报错)
-    _ = std.c.mkdir(@ptrCast(&dir_buf), 0o755);
+    _ = pfs.mkdir(@ptrCast(&dir_buf), 0o755);
 }
 
 fn readFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -312,7 +312,7 @@ test "addAllowRule: 端到端创建文件" {
     // per-pid 临时目录(POSIX /tmp,Windows %TEMP%),见 tools/test_tmp.zig 头注释。
     var home_buf: [512]u8 = undefined;
     const home = @import("../tools/test_tmp.zig").path(&home_buf, "cczig_psave");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer {
         // 清理:.claude 子目录 + settings.json + home
         var p_buf: [std.fs.max_path_bytes]u8 = undefined;
