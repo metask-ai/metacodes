@@ -10,6 +10,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- Release automation (`doc/RELEASE_AUTOMATION_DESIGN.md`): `scripts/release_cut.py`
+  derives the next version from the Conventional-Commit types since the last
+  tag, rewrites `build.zig.zon` / `src/version.zig` / this file in one release
+  PR and reopens `-dev` afterwards; `release-tag.yml` tags a merged release PR
+  and dispatches `release.yml`; `release.yml` also runs on a bare `X.Y.Z` tag,
+  drafts with the CHANGELOG section as notes, updates an existing draft on
+  rerun and never publishes a non-tag ref; `scripts/check_version_state.py`
+  (in `doc:check`) closes the window between a release merging and reopen.
+
 ### Fixed
 
 - Windows: `platform.fs.realpath` resolved paths lexically (`_fullpath`), so a
