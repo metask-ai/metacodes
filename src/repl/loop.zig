@@ -901,6 +901,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             if (bd) |b| std.debug.print("\x1b[33m  动作分布:{s}\x1b[0m\n", .{b});
             std.debug.print("\x1b[33m直接输入你的下一步(如\"继续\")续接对话,或调整方向。\x1b[0m\n", .{});
         }
+        // 熔断停止(环境故障累计达 MAX_ENVIRONMENT_FAULTS,或插件契约 fail-closed):原因已在
+        // 上方逐条打印,这里只说明"为什么停、怎么续",不再复述。
+        if (result.stop_reason == .tool_loop) {
+            std.debug.print("\x1b[33m运行已被熔断停止(tool_loop):原因见上方各条提示。处理好之后直接输入下一步续接。\x1b[0m\n", .{});
+        }
         // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
         // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。
         if (result.stop_reason == .api_error) {

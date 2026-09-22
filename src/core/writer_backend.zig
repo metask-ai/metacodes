@@ -106,6 +106,17 @@ pub const WriterBackend = struct {
                 ) catch return;
                 self.emit(s);
             },
+            .environment_fault => |f| {
+                // 与 TUI 同款一行(headless / job buffer / 测试 sink 都能看到)。
+                var buf: [768]u8 = undefined;
+                const detail = f.detail[0..@min(f.detail.len, 400)];
+                const tail: []const u8 = if (f.count >= f.limit) " — stopping this run; fix the environment, then continue." else "";
+                const s = if (self.colorize)
+                    std.fmt.bufPrint(&buf, "\x1b[33m⚠ environment fault {d}/{d} [{s} · {s}]: {s}{s}\x1b[0m\n", .{ f.count, f.limit, f.tool, f.code, detail, tail }) catch return
+                else
+                    std.fmt.bufPrint(&buf, "environment fault {d}/{d} [{s} · {s}]: {s}{s}\n", .{ f.count, f.limit, f.tool, f.code, detail, tail }) catch return;
+                self.emit(s);
+            },
             .retry_notice => |r| {
                 if (!self.show_retry) return;
                 if (r.attempt < 3) return;
