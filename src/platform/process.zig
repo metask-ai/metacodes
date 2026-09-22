@@ -1618,12 +1618,13 @@ fn reportAndExit(fd: std.c.fd_t, msg: []const u8) noreturn {
     std.c._exit(0);
 }
 
-/// 两个 fd 是否指向同一个文件对象(dev+ino)。
+/// 两个 fd 是否指向同一个文件对象(dev+ino)。走 platform/fs.fileInfo:`std.c.fstat` 在
+/// Linux 目标上是 void(glibc 的 fstat 不是导出符号),直接调会在 Linux CI 上编译失败。
 fn sameFile(a: std.c.fd_t, b: std.c.fd_t) bool {
-    var sa: std.c.Stat = undefined;
-    var sb: std.c.Stat = undefined;
-    if (std.c.fstat(a, &sa) != 0 or std.c.fstat(b, &sb) != 0) return false;
-    return sa.ino == sb.ino and sa.dev == sb.dev;
+    const pfs = @import("fs.zig");
+    const ia = pfs.fileInfo(a) catch return false;
+    const ib = pfs.fileInfo(b) catch return false;
+    return ia.inode == ib.inode and ia.device == ib.device;
 }
 
 /// 读回副本写的结论。
