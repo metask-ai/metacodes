@@ -76,7 +76,7 @@ def rehearsable(root: Path, version: str, head_ref: str, env: Optional[Dict[str,
             return True
         labels = [l.strip() for l in env.get("RELEASE_PR_LABELS", "").split(",") if l.strip()]
         return env.get("RELEASE_PR_TITLE", "") == f"release: {version}" and "release" in labels
-    if env.get("GITHUB_ACTIONS") == "true" and env.get("GITHUB_EVENT_NAME") not in ("push", None):
+    if env.get("GITHUB_ACTIONS") == "true" and env.get("GITHUB_EVENT_NAME") != "push":
         return False  # only main's push run may rely on the merge subject
     subject = git("log", "-1", "--format=%s", "HEAD", root=root)
     return re.match(r"^Merge pull request #\d+ from \S+/release/" + re.escape(version) + r"$", subject) is not None

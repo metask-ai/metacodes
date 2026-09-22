@@ -359,3 +359,7 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
   on push runs; the cut's push lease is taken against the freshly fetched
   remote tip of the release branch; two stale "dispatch-only" / "tag trigger
   is a follow-up" sentences updated.
+- Round 5 (Codex): no High or Medium remains; the three round-4 fixes
+  confirmed; one strictness nit applied (the merge-subject exception requires
+  `GITHUB_EVENT_NAME == push` literally). The rehearsal tag stays a local ref:
+  it reaches no staged prefix, bundle check, doctor output, cache or upload.

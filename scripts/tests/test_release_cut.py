@@ -240,6 +240,7 @@ class ThrowawayRepoTest(unittest.TestCase):
         _git("merge", "-q", "--no-ff", "-m", "Merge pull request #7 from metask-ai/release/0.2.0", "release/0.2.0", cwd=self.root)
         self.assertTrue(check_version_state.rehearsable(self.root, "0.2.0", "main", {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push"}))
         self.assertFalse(check_version_state.rehearsable(self.root, "0.2.0", "feature/x", {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request"}))
+        self.assertFalse(check_version_state.rehearsable(self.root, "0.2.0", "main", {"GITHUB_ACTIONS": "true"}))  # no event name: not a push
 
     def test_rehearsal_tags_only_the_legitimate_states_locally(self):
         self.assertIn("no rehearsal needed", check_version_state.rehearse(self.root, "main"))
