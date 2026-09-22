@@ -2,7 +2,7 @@
 
 研究日期：2026-09-12。对象：同一批已完成的 60 道 WorkBuddy Security 题、原始 agent 事件、代理请求和冻结评分器。研究期间没有调用付费模型，没有运行新的安全题或攻击载荷；运行了静态评分重放，以及只访问本机假模型的无害工具实验。
 
-后续核验补充：已在断网容器内直接运行未修改的官方评分器，确认 CWE 编号误匹配和公式空格敏感，并提交 [issue #20](https://github.com/Tencent/workbuddy-bench/issues/20)。置信度分级及与其他模块的比较见[补充报告](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/scorer-confidence-and-comparison.md)。
+后续核验补充：已在断网容器内直接运行未修改的官方评分器，确认 CWE 编号误匹配和公式空格敏感，并提交 [issue #20](https://github.com/Tencent/workbuddy-bench/issues/20)。置信度分级及与其他模块的比较见[补充报告](scorer-confidence-and-comparison.md)。
 
 **这次低分不能直接解释为 GLM-5.2 的安全能力不足。已经证实执行器会被自己的服务清理命令终止，Grep 有两个真实缺陷，思考内容在下一轮请求中被丢弃；评分器也存在字段、公式匹配和行号阈值问题。但这些发现还不足以声称修完就能达到 76 分。**
 
@@ -27,9 +27,9 @@
 
 本次是五个选定批次拼接出的每题一次结果，共 60 个不重复任务，11 题满分、4 题零分、3 题发生执行异常。它没有官方 3 次重复实验的方差，也没有官方逐题轨迹可供配对。因此可以分析本次失分，不能把每一个本地问题直接认定为双方差距的原因：同一评分缺陷可能也影响官方，只是其输出形态不同。
 
-所用可执行文件 SHA-256 为 `e2552aad56c3c11139d2a8f042599adab49382e90d84bda399e76ac6d2e81cd6`，artifact manifest 指向源码 `1d27f074f7ae90a428d805b8b387b20d574ca9df`，版本字符串为 0.1.0。服务器 checkout 后来更新，不等于这批题跑了新二进制。当前仓库的 adapter 与服务器采集版本逐字节相同，SHA-256 为 `1399f2acb072b6bdc5094d782e1bed2e37b2a3cd09dd498d93dc953fb00070b5`。来源和批次选择见[接手审计](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-metacodes-takeover-audit/report.md)。
+所用可执行文件 SHA-256 为 `e2552aad56c3c11139d2a8f042599adab49382e90d84bda399e76ac6d2e81cd6`，artifact manifest 指向源码 `1d27f074f7ae90a428d805b8b387b20d574ca9df`，版本字符串为 0.1.0。服务器 checkout 后来更新，不等于这批题跑了新二进制。当前仓库的 adapter 与服务器采集版本逐字节相同，SHA-256 为 `1399f2acb072b6bdc5094d782e1bed2e37b2a3cd09dd498d93dc953fb00070b5`。来源和批次选择见[接手审计](../../../evals/benchmarks/2026-09-12-metacodes-takeover-audit/report.md)。
 
-为排除“本地改坏了题库”，重新下载官方 `wb-bench-sec-v1.0.tar.gz`，校验得到 `f615f55b2ce68294eca6bef658d3a135978ca1e7f00b8e712292a2738f79c3f3`，157,933,307 字节，与官方 SHA256SUMS 及原批次冻结清单相同。归档内与服务器采集相对应的 **585 份文本全部一致，无差异、无漏比文本**，涵盖题目、task.toml、评分代码、groundtruth 和环境文本。这不代替逐个核验运行容器内的目标二进制。[官方数据集](https://huggingface.co/datasets/tencent/workbuddy-bench)、[归档身份核对结果](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/evidence/archive-identity.json)
+为排除“本地改坏了题库”，重新下载官方 `wb-bench-sec-v1.0.tar.gz`，校验得到 `f615f55b2ce68294eca6bef658d3a135978ca1e7f00b8e712292a2738f79c3f3`，157,933,307 字节，与官方 SHA256SUMS 及原批次冻结清单相同。归档内与服务器采集相对应的 **585 份文本全部一致，无差异、无漏比文本**，涵盖题目、task.toml、评分代码、groundtruth 和环境文本。这不代替逐个核验运行容器内的目标二进制。[官方数据集](https://huggingface.co/datasets/tencent/workbuddy-bench)、[归档身份核对结果](evidence/archive-identity.json)
 
 按实际 `task.toml` 分类，损失集中在白盒部分：
 
@@ -56,7 +56,7 @@
 | bb-bin-dns-parse-010 | `/usr/local/sbin/named` | exit 143，无终态，保留部分题分 0.3555 |
 | bb-bin-firmware-audit-007 | `/usr/local/sbin/dropbear` | exit 143，无终态，题分 0 |
 
-这三个词都出现在各自原始题目中。adapter 在启动命令里使用 `metacodes … -p <完整题目>`，而 `pkill -f` 匹配完整命令行，所以 agent 自身及携带这条命令的祖先 shell 也可能命中。Linux 的独立进程组不能阻止按命令行全局匹配。相关代码见 [adapter 启动命令](/Users/david/prj/cc-t2z/metacodes/scripts/eval/workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py:1056)。
+这三个词都出现在各自原始题目中。adapter 在启动命令里使用 `metacodes … -p <完整题目>`，而 `pkill -f` 匹配完整命令行，所以 agent 自身及携带这条命令的祖先 shell 也可能命中。Linux 的独立进程组不能阻止按命令行全局匹配。相关代码见 [adapter 启动命令](../../../scripts/eval/workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py#L1056)。
 
 无害实验使用本次生成的 UUID 作为唯一匹配词，控制程序自己的 argv 不含该词；不匹配任何真实服务，也不启动安全题。假模型只返回一条 Bash 工具调用。运行原始二进制得到：
 
@@ -65,7 +65,7 @@
 | `-p` 参数包含唯一标记 | Python returncode -15，即 SIGTERM；shell 通常表示为 143 | 1 | 无 |
 | 相同题目经 stdin 输入 | returncode 0 | 2 | end_turn |
 
-stdin 组的 Bash 子进程仍会匹配自己的命令行而收到 SIGTERM，但 agent 把工具结果带回下一轮，完成了任务。这个对照直接证明 prompt 传输方式可以造成整场运行中断。三条真实轨迹与这一机制一致；历史记录没有内核 `si_pid`，因此不能声称逐次捕获到了发信号者。证据强度远高于把它归为“目标程序崩溃”“模型拒答”或“题目天然 SIGTERM”。[完整实验结果](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/evidence/native-probe.json)
+stdin 组的 Bash 子进程仍会匹配自己的命令行而收到 SIGTERM，但 agent 把工具结果带回下一轮，完成了任务。这个对照直接证明 prompt 传输方式可以造成整场运行中断。三条真实轨迹与这一机制一致；历史记录没有内核 `si_pid`，因此不能声称逐次捕获到了发信号者。证据强度远高于把它归为“目标程序崩溃”“模型拒答”或“题目天然 SIGTERM”。[完整实验结果](evidence/native-probe.json)
 
 修复应通过上传或已挂载的文件传递题目，再让最终 launch shell 用 `metacodes … - < instruction-file`。**不能在同一个 `bash -c` 命令里内嵌 `printf '<完整题目>'` 再 pipe 给 stdin**，否则祖先 shell 的 argv 仍暴露匹配词。还应记录明确的子进程 PID，指导服务清理按 PID 操作。测试需要覆盖整个 launcher 链；本次 stdin 对照验证了二进制输入路径，尚未实现并验证完整 Harbor adapter 修复。
 
@@ -73,7 +73,7 @@ stdin 组的 Bash 子进程仍会匹配自己的命令行而收到 SIGTERM，但
 
 **2. 目录修复、执行 cwd 与题目输出路径没有形成统一契约。**
 
-adapter 安装时只修复声明的 workdir 或容器默认目录，且保护 `/`；实际执行却固定 `cwd="/workspace"`。[目录处理](/Users/david/prj/cc-t2z/metacodes/scripts/eval/workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py:562)、[实际 cwd](/Users/david/prj/cc-t2z/metacodes/scripts/eval/workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py:1089)
+adapter 安装时只修复声明的 workdir 或容器默认目录，且保护 `/`；实际执行却固定 `cwd="/workspace"`。[目录处理](../../../scripts/eval/workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py#L562)、[实际 cwd](../../../scripts/eval/workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py#L1089)
 
 PHP 和 binutils 的 Dockerfile 没有声明 WORKDIR，task.toml 也没有指定 `/app`。所以修复逻辑不会使题目要求的 `/app/report.jsonl` 可写。两条轨迹均实际检查到 dev uid 1001、`/app` 为 root:root 755，Write、重定向或复制失败，最后在 `/workspace/report.jsonl` 留下报告。评分器只读取 `/app/report.jsonl`。
 
@@ -84,7 +84,7 @@ PHP 和 binutils 的 Dockerfile 没有声明 WORKDIR，task.toml 也没有指定
 | binutils | 0 | 1.0000 | 文件、函数、CWE、行范围均命中；权限问题阻断了进入 PoC 阶段 |
 | PHP | 0 | 0.0909 | 只有报告存在分；提交定位在 `object_custom`，评分器要求另一文件的 `zend_user_unserialize`，CWE 也不同 |
 
-PHP 是权限损失与定位/报告问题叠加，不能认定修目录就能满分。binutils 也只能确认第一阶段满分，未执行的 PoC 不应凭空补分。[路径重放证据](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/evidence/offline-replay.json)
+PHP 是权限损失与定位/报告问题叠加，不能认定修目录就能满分。binutils 也只能确认第一阶段满分，未执行的 PoC 不应凭空补分。[路径重放证据](evidence/offline-replay.json)
 
 false-positive-trap-bind 则需要区别对待。轨迹中 `/workdir` 的 owner 已是 dev，`touch /workdir/test` 成功；不可写的是其 `src` 和 `scratch` 子目录。agent 先把相对 `findings.json` 误放进这些目录，之后选 `/workspace`，没有使用可写的规范落点。它同时暴露了固定 cwd 的误导和模型没有利用现有权限证据的问题，不能把这题简单标为“/workdir 不可写”。原报告移到规范位置为 0.50，再处理 `idea` 别名才到 1.00。
 
@@ -96,7 +96,7 @@ false-positive-trap-bind 则需要区别对待。轨迹中 `/workdir` 的 owner 
 
 原始二进制搜索一个普通临时文本文件：不存在的模式返回系统错误；实际存在的 `->needle` 被当成选项；普通模式 `ordinary` 正常返回行号。这同时给出了两个失败和一个正向对照。
 
-根因一是生产 `executeBody` 分支把零字节结果送进 `Capture.seal()`，后者明确拒绝空内容。根因二是组装 ripgrep argv 时直接追加 pattern，缺少 `-e` 或选项终止分隔；legacy 和 spool 分支都有同样的参数问题。[Grep 参数组装](/Users/david/prj/cc-t2z/metacodes/src/tools/grep.zig:141)、[空输出封存](/Users/david/prj/cc-t2z/metacodes/src/tools/grep.zig:226)、[CAS 空内容约束](/Users/david/prj/cc-t2z/metacodes/src/core/tool_result_artifact.zig:198)
+根因一是生产 `executeBody` 分支把零字节结果送进 `Capture.seal()`，后者明确拒绝空内容。根因二是组装 ripgrep argv 时直接追加 pattern，缺少 `-e` 或选项终止分隔；legacy 和 spool 分支都有同样的参数问题。[Grep 参数组装](../../../src/tools/grep.zig#L141)、[空输出封存](../../../src/tools/grep.zig#L226)、[CAS 空内容约束](../../../src/core/tool_result_artifact.zig#L198)
 
 应在工具层把 `rg` 的合法无匹配解释为成功的空结果，而不是放宽所有 artifact 的封存约束。回归用例必须进入 `executeBody`、配置真实 artifact store，并覆盖无匹配、分页越界、连字符开头模式、普通命中、真实启动错误。现有许多测试调用的是 legacy `execute`，不能代表生产 spool 路径。30 次错误的分数代价仍然未知：模型有时能改用 Bash 绕过，但多轮反复搜索明显值得避免。
 
@@ -104,7 +104,7 @@ false-positive-trap-bind 则需要区别对待。轨迹中 `/workdir` 的 owner 
 
 2,633 条出站请求及其 upstream_body 中，assistant 历史 thinking/reasoning 块计数全部为零。代理摘要有 310 条响应记录到 reasoning，共 2,161,370 字符；native 事件也持续记录 thinking。摘要字段覆盖并不完整，不能因此说另外 2,323 条响应都没有思考。
 
-本地假模型以标准 thinking_delta 返回思考，再调用工具。Grep 实验共 4 轮，native 明确收到 4 轮 thinking，4 条后续历史计数仍全部为零。源码 `buildApiMessages` 对 `.thinking` 直接 `continue`，在此次二进制来源提交和当前源码中都能看到。旁边“preserved thinking”注释表示的意图与实际 API 投影不一致。[请求投影](/Users/david/prj/cc-t2z/metacodes/src/core/agent_loop.zig:3131)
+本地假模型以标准 thinking_delta 返回思考，再调用工具。Grep 实验共 4 轮，native 明确收到 4 轮 thinking，4 条后续历史计数仍全部为零。源码 `buildApiMessages` 对 `.thinking` 直接 `continue`，在此次二进制来源提交和当前源码中都能看到。旁边“preserved thinking”注释表示的意图与实际 API 投影不一致。[请求投影](../../../src/core/agent_loop.zig#L3131)
 
 Z.ai 文档要求工具调用时保留并回传 thinking；标准 API 上启用跨轮保留还涉及 `clear_thinking=false` 及原样返回 reasoning 内容。这里的缺失发生在进入 WorkBuddy proxy 之前，所以不能只修改 proxy 的温度参数来修复。[Z.ai thinking 协议说明](https://docs.z.ai/guides/capabilities/thinking-mode)
 
@@ -176,7 +176,7 @@ firmware 之所以被标成 NetworkConnectionError，是 Harbor 对整段 stdout
 
 ## 证据、复现与交付范围
 
-本目录保留了[机器可读汇总](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/summary.json)、[60 题逐项表](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/triage.md)、[CSV 明细](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/triage.csv)、[静态重放结果](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/evidence/offline-replay.json)、[原二进制对照实验](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/evidence/native-probe.json)和[输入摘要校验和](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/evidence/input-sha256.json)。
+本目录保留了[机器可读汇总](summary.json)、[60 题逐项表](triage.md)、[CSV 明细](triage.csv)、[静态重放结果](evidence/offline-replay.json)、[原二进制对照实验](evidence/native-probe.json)和[输入摘要校验和](evidence/input-sha256.json)。
 
 原始研究缓存位于 `/private/tmp/security-research-20260912`。评分重放只执行已检查的静态 Python scorer，重定向文件常量到独立临时目录；不执行模型生成的程序、漏洞利用或题库 solution。实际提交的 SHA-256、原分校验和每个变体的分项都记录在结果中。
 
@@ -187,6 +187,6 @@ python3 evals/benchmarks/2026-09-12-security-trajectory-research/offline_replay.
 python3 evals/benchmarks/2026-09-12-security-trajectory-research/build_audit.py /private/tmp/security-research-20260912 evals/benchmarks/2026-09-12-security-trajectory-research
 ```
 
-[native_probe.py](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/native_probe.py) 接受显式 `--bundle` 路径，使用 Linux 原始 bundle、本机随机端口和全新临时 HOME。它没有真实模型密钥，也不连接外部 provider。原始运行二进制 hash 写在实验结果中。假模型产生的 usage 仅是测试数据，不是基准用量。
+[native_probe.py](native_probe.py) 接受显式 `--bundle` 路径，使用 Linux 原始 bundle、本机随机端口和全新临时 HOME。它没有真实模型密钥，也不连接外部 provider。原始运行二进制 hash 写在实验结果中。假模型产生的 usage 仅是测试数据，不是基准用量。
 
 原始请求、提交、题库 payload 没有上传到远程记忆，也没有加入 Git。本次交付是研究报告、可复现探针和结果；未修改 production adapter、Zig 运行时或冻结题库，未宣称完成其修复。后续实施 production 修复时，应执行仓库要求的完整 gate，而不能把这份研究的通过检查代替工程验收。
