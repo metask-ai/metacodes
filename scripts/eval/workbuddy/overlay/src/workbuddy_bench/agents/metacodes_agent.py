@@ -597,9 +597,9 @@ class MetacodesAgent(BaseInstalledAgent):
             await self.exec_as_root(
                 environment,
                 command=(
-                    "if [ -d /app ] && [ ! -L /app ]; then "
+                    "(if [ -d /app ] && [ ! -L /app ]; then "
                     f"chown {escaped_user} /app && chmod u+rwx /app; "
-                    "fi"
+                    "fi) || true"
                 ),
                 cwd="/",
             )
