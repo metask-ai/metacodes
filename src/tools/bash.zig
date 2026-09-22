@@ -1,6 +1,8 @@
 const std = @import("std");
 const shell_mod = @import("../core/shell.zig");
 const pfs = @import("platform").fs;
+const process = @import("platform").process;
+const util_fs = @import("../util/fs.zig");
 const common = @import("common.zig");
 const security = @import("security.zig");
 const util_time = @import("../util/time.zig");
@@ -599,6 +601,38 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return tool_result.resolveAttachments(ctx.allocator, json, &attachments);
 }
 
+/// A spawn that never ran the command: the child (or `CreateProcessW`) refused
+/// before exec and `platform/process` handed the reason back instead of an
+/// exit code. Turn it into a tool error the model can act on. The old signal —
+/// `exit_code` 127 with two empty streams — read like "command not found", and
+/// a model given it kept trying simpler commands until its turn budget was
+/// gone. Any other error passes through untouched.
+fn describeSpawnFailure(ctx: *const ToolContext, err: anyerror, cwd: ?[]const u8) anyerror {
+    switch (err) {
+        error.ChildChdirFailed, error.ChildExecFailed => {},
+        else => return err,
+    }
+    const failure = process.takeLastSpawnFailure();
+    var code_buf: [32]u8 = undefined;
+    const cause: []const u8 = if (failure) |f| f.describeCode(&code_buf) else "cause not reported";
+    if (err == error.ChildExecFailed) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "the {s} shell could not be started ({s}); the command never ran. This is a host problem, not a problem with the command: a different command will fail the same way until the shell is available again.", .{ shell_mod.detectDefault().name(), cause });
+        return error.ChildExecFailed;
+    }
+    const dir = cwd orelse ".";
+    // 进程自己的 cwd 是内核句柄:在 CLI 里它就是会话目录,改名后照样解析出新名字,所以
+    // 它是"被改名了、现在叫什么"的最好线索。但嵌入宿主(agentcore)里会话根与进程 cwd
+    // 本就无关,所以只陈述事实、不断言二者是同一个目录,由读者判断。
+    const resolved: ?[]u8 = util_fs.getCwd(ctx.allocator) catch null;
+    defer if (resolved) |r| ctx.allocator.free(r);
+    if (resolved != null and !std.mem.eql(u8, resolved.?, dir)) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "working directory '{s}' is unavailable: the shell could not enter it ({s}). It was renamed or removed after this session started. This process's current directory is '{s}'; if that is the same directory under a new name, restart metacodes from there. Every Bash call runs in the session working directory, so another command will fail the same way until the path exists again.", .{ dir, cause, resolved.? });
+    } else {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "working directory '{s}' is unavailable: the shell could not enter it ({s}). It was renamed or removed after this session started. Every Bash call runs in the session working directory, so another command will fail the same way until the path exists again. Restart metacodes from an existing directory, or restore the original path.", .{ dir, cause });
+    }
+    return error.WorkingDirectoryUnavailable;
+}
+
 fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_result.SealedHandles) anyerror![]u8 {
     const allocator = ctx.allocator;
     const command_escaped = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
@@ -666,7 +700,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
                 // 后台:profile 文件不能删(进程还在跑),detach
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-                const j = try registry.spawnBackgroundOwned(command, cwd_opt, ctx.session);
+                const j = registry.spawnBackgroundOwned(command, cwd_opt, ctx.session) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
                 // Same rule as the auto-backgrounded snapshot: the spool is a
                 // staging path and never model-visible. BashOutput polls by
                 // job_id and reads incrementally.
@@ -702,7 +736,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
         // still awaited before PostToolUse/formal re-observation.
         if (sandbox_wrap) |*sw| sw.detached = true;
         const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-        return try runAutoBackgroundable(
+        return runAutoBackgroundable(
             allocator,
             registry,
             command,
@@ -715,7 +749,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.tool_result_metrics,
             attachments,
             ctx.session,
-        );
+        ) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
     }
 
     // Source embedders may provide artifact storage without a long-lived job
@@ -726,7 +760,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
         var transient_jobs = try @import("../core/job_registry.zig").JobRegistry.init(allocator);
         defer transient_jobs.deinit();
         const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-        return try runAutoBackgroundable(
+        return runAutoBackgroundable(
             allocator,
             &transient_jobs,
             command,
@@ -739,7 +773,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.tool_result_metrics,
             attachments,
             ctx.session,
-        );
+        ) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
     }
 
     // 可移植 shell(复刻 codex):POSIX /bin/sh -c;Windows 原生 PowerShell/cmd,零 git-bash。
@@ -750,7 +784,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
     var argv: [6]?[*:0]const u8 = undefined;
     shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
     const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-    const out = try common.spawnCaptureWithStderrTimed(argv[0..], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES, cwd_opt);
+    const out = common.spawnCaptureWithStderrTimed(argv[0..], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES, cwd_opt) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
@@ -961,6 +995,24 @@ test "BashTool timeout over ms grain is enforced" {
     const dt = nowMs() - t0;
     // killGroup 含 2s SIGTERM 等待期；总耗时 ≈ 300 + ≤2000 < 3000
     try std.testing.expect(dt < 3000);
+}
+
+test "BashTool: 会话 cwd 已消失 → WorkingDirectoryUnavailable,detail 说明目录与原因" {
+    // 复刻 2026-09-22 的事故:agent 把自己的 cwd 改名后,每次 Bash 都返回 exit 127 + 双空流,
+    // 模型试到 `echo retry294` 撞上 400 轮上限。现在必须是一条说明原因的结构化错误。
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("test_tmp.zig").path(&dir_buf, "bash-vanished-cwd");
+    _ = std.c.mkdir(dir.ptr, 0o700);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.rmdir(dir.ptr));
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| std.testing.allocator.free(d);
+    var ctx = testCtx();
+    ctx.cwd_abs = dir;
+    ctx.error_detail = &detail;
+    try std.testing.expectError(error.WorkingDirectoryUnavailable, execute(&ctx, "{\"command\":\"echo hello\"}"));
+    const d = detail orelse return error.TestExpectedDetail;
+    try std.testing.expect(std.mem.indexOf(u8, d, dir) != null);
+    if (@import("builtin").os.tag != .windows) try std.testing.expect(std.mem.indexOf(u8, d, "ENOENT") != null);
 }
 
 test "BashTool description is parsed without error" {

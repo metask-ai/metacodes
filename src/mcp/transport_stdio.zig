@@ -17,6 +17,7 @@ const process = @import("platform").process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const Capture = @import("../core/tool_result_artifact.zig").Capture;
 const util_time = @import("../util/time.zig");
+const log = @import("../util/log.zig");
 
 /// 单行(一条 JSON-RPC 响应/resource)字节上限(轴A OOM 防线)。MCP resource 可合法较大(文件内容),
 /// 64MB 对真实响应绰绰;超此值必是无 `\n` 的病态/恶意巨型行 → 断帧报错 error.McpLineTooLarge。
@@ -38,7 +39,17 @@ pub const StdioTransport = struct {
     /// spawn 子进程。argv 以 null 结尾，argv[0] 是绝对路径或在 PATH 内。
     /// 走可移植 platform/process.spawnPipes（POSIX fork+pipe / Windows CreateProcessW+CreatePipe）。
     pub fn spawn(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8) !StdioTransport {
-        const child = process.spawnPipes(argv, false, null) catch return error.SpawnFailed;
+        const child = process.spawnPipes(argv, false, null) catch {
+            // 子进程报了具体原因(程序不存在/不可执行)就记进日志;错误名保持 SpawnFailed,
+            // 调用方语义不动。过去这里 spawn "成功"、server 立刻死、握手再撞 McpServerCrashed,
+            // 原因全程无人知道。
+            if (process.takeLastSpawnFailure()) |failure| {
+                var code_buf: [32]u8 = undefined;
+                const argv0: []const u8 = if (argv.len > 0 and argv[0] != null) std.mem.span(argv[0].?) else "?";
+                log.warn("mcp", "cannot start MCP server {s}: {s} failed ({s})", .{ argv0, @tagName(failure.step), failure.describeCode(&code_buf) });
+            }
+            return error.SpawnFailed;
+        };
         return .{
             .child = child,
             .read_buf = .empty,
@@ -221,10 +232,13 @@ test "StdioTransport: multiple lines preserve order" {
 test "StdioTransport: EOF after close returns error" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const allocator = testing.allocator;
-    const argv = [_]?[*:0]const u8{ "/bin/true", null };
+    // `/bin/sh -c true`,不是 `/bin/true`:macOS 上没有 /bin/true(只有 /usr/bin/true)。这个测试
+    // 此前在 macOS 上一直"绿":exec 失败的子进程静默退出 127,父端读到的 EOF 恰好是它要的 EOF。
+    // 子进程报告通道把那次 exec 失败暴露成 SpawnFailed 之后,它才第一次真的测到"子进程退出后 EOF"。
+    const argv = [_]?[*:0]const u8{ "/bin/sh", "-c", "true", null };
     var t = try StdioTransport.spawn(allocator, argv[0..]);
     defer t.close();
-    // /bin/true 立即退出，EOF
+    // 子进程立即退出，EOF
     const result = t.recvLine();
     try testing.expectError(error.Eof, result);
 }

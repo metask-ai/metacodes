@@ -421,15 +421,12 @@ fn isValidJson(alloc: std.mem.Allocator, s: []const u8) bool {
 
 const testing = std.testing;
 
-test "McpClient: connect to nonexistent command fails clean" {
+test "McpClient: connect to nonexistent command fails at spawn, before any handshake" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const argv = [_]?[*:0]const u8{ "/nonexistent/mcp-server", null };
-    if (McpClient.connect(testing.allocator, argv[0..])) |_| {
-        // 不应成功
-        try testing.expect(false);
-    } else |err| {
-        try testing.expect(err == error.McpServerCrashed or err == error.McpMalformedResponse);
-    }
+    // 子进程报告通道让 exec 失败在 spawn 处就返回;过去是 spawn "成功"、server 立刻死、
+    // 握手再撞 McpServerCrashed/McpMalformedResponse,失败原因全程无人知道。
+    try testing.expectError(error.SpawnFailed, McpClient.connect(testing.allocator, argv[0..]));
 }
 
 /// An oversized JSON result, sealed but not published: the file is validated

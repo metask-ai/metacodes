@@ -703,8 +703,14 @@ pub fn forkExecTeammate(a: std.mem.Allocator, p: SpawnProcessParams) !i64 {
     defer freeArgv(a, argv);
     const exe_path_z: [*:0]const u8 = argv[0].?; // argv[0] = dupeZ(exe),NUL 结尾
 
+    // 与 platform/process 的 spawn 共用 fork 串行锁:这个 fork 不能落在别处"建了 pipe
+    // 还没关子进程侧"的窗口里,否则那条 pipe 会跟着进 teammate 进程,对方永远等不到 EOF。
+    process_mod.forkSerialLock();
     const pid = std.c.fork();
-    if (pid < 0) return error.ForkFailed;
+    if (pid < 0) {
+        process_mod.forkSerialUnlock();
+        return error.ForkFailed;
+    }
     if (pid == 0) {
         // 子进程:只用 async-signal-safe 调用(setsid/open/dup2/close/execve),不分配。
         _ = std.c.setsid();
@@ -718,6 +724,7 @@ pub fn forkExecTeammate(a: std.mem.Allocator, p: SpawnProcessParams) !i64 {
         _ = std.c.execve(exe_path_z, @ptrCast(argv.ptr), @ptrCast(std.c.environ));
         std.c._exit(127); // execve 失败
     }
+    process_mod.forkSerialUnlock();
     return @intCast(pid); // 父进程:返回子 pid(i64 平台中立)
 }
 

@@ -188,6 +188,8 @@ fn captureWithSpawnRetry(
 ) process.CaptureError!process.Captured {
     return process.capture(argv, allocator, opts) catch |e| switch (e) {
         error.Timeout, error.Aborted, error.OutOfMemory => return e,
+        // 子进程自己报的失败(cwd 进不去/程序起不来)是确定性的:150ms 后只会原样再失败一次。
+        error.ChildChdirFailed, error.ChildExecFailed => return e,
         else => {
             @import("../util/time.zig").sleepMs(150);
             return process.capture(argv, allocator, opts);
@@ -222,6 +224,9 @@ fn spawnCaptureStdoutAbortableTimedCapped(
         error.Timeout => return error.Timeout,
         error.Aborted => return error.Aborted,
         error.OutOfMemory => return error.OutOfMemory,
+        // 子进程自己交代的失败原样上抛(process.takeLastSpawnFailure 有原因),
+        // 让工具层能说清是 cwd 没了还是程序起不来,而不是笼统的 SpawnError。
+        error.ChildChdirFailed, error.ChildExecFailed => return e,
         else => return error.SpawnError,
     };
     allocator.free(r.stderr); // want_stderr=false → 空 slice，defensive free
@@ -313,6 +318,7 @@ pub fn spawnCaptureToSpoolTimed(
     const proc = process.spawnToFilesWithEnv(argv, out_fd, err_fd, cwd, false) catch |first_err| blk: {
         switch (first_err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ChildChdirFailed, error.ChildExecFailed => return first_err,
             else => {},
         }
         util_time.sleepMs(150);
@@ -445,6 +451,9 @@ pub fn spawnCaptureWithStderrTimed(
         error.Timeout => return error.Timeout,
         error.Aborted => return error.Aborted,
         error.OutOfMemory => return error.OutOfMemory,
+        // 子进程自己交代的失败原样上抛(process.takeLastSpawnFailure 有原因),
+        // 让工具层能说清是 cwd 没了还是程序起不来,而不是笼统的 SpawnError。
+        error.ChildChdirFailed, error.ChildExecFailed => return e,
         else => return error.SpawnError,
     };
     return .{ .stdout = r.stdout, .stderr = r.stderr, .exit_code = r.exit_code, .capture_complete = r.capture_complete };
@@ -566,7 +575,7 @@ test "spawnCaptureStdoutCapped 截断无限输出且不挂死" {
     var argv = [_]?[*:0]const u8{ "/usr/bin/yes", "abcdefgh", null };
     const out = spawnCaptureStdoutCapped(argv[0..argv.len], a, null, 5000, 8 * 1024) catch |e| {
         // 某些环境 yes 路径不同 → 跳过(不算失败)
-        if (e == error.SpawnError) return;
+        if (e == error.SpawnError or e == error.ChildExecFailed) return;
         return e;
     };
     defer a.free(out);
@@ -618,7 +627,7 @@ test "spawnCaptureWithStderrTimed:max_bytes 封顶无限输出 killpg 止血不�
     // `yes` 无限打印 stdout;无 cap 会挂到 timeout;cap=32KB → 读够即 killpg,快速返回 ≤ 略多于 32KB。
     var argv = [_]?[*:0]const u8{ "/usr/bin/yes", "abcdefgh", null };
     const out = spawnCaptureWithStderrTimed(argv[0..argv.len], a, null, 8000, null, 32 * 1024, null) catch |e| {
-        if (e == error.SpawnError) return; // 环境无 yes → 跳过
+        if (e == error.SpawnError or e == error.ChildExecFailed) return; // 环境无 yes → 跳过
         return e;
     };
     defer a.free(out.stdout);
