@@ -53,11 +53,13 @@ human decision, the mechanism only makes it cheap).
   with no user-visible change is a human decision, not a scheduled accident.
   Pre-1.0, a breaking change bumps MINOR (SemVer §4 leaves 0.x free; the table
   is one line in the script and flips to MAJOR at 1.0.0).
-- The computed version must be **greater** than the `-dev` version currently
-  on `main` only in the sense that it is the same numbers with `-dev` dropped
-  or higher; if `main` says `0.2.0-dev` and the commits imply a patch of
-  `0.1.0`, the cut still produces `0.2.0` (the `-dev` number is a floor set
-  when the previous release reopened development, see §3 stage D).
+- Two candidates, the larger wins: `bump(last tag)` and the `-dev` version on
+  `main` with `-dev` dropped. `main` at `0.2.0-dev` with only fixes since
+  `0.1.0` still cuts `0.2.0`, because the `-dev` number is a floor a
+  maintainer set on purpose (stage D, or by hand when a minor is planned).
+  Between a release and the next cut, `--version` on `main` therefore shows
+  the floor (`0.2.1-dev+…`), not the version the commits will eventually
+  imply; that is a display of intent, not a prediction.
 
 ## 3. Pipeline: four stages, two of them already exist
 
@@ -66,12 +68,17 @@ A cut ──▶ release PR ──(human merges)──▶ B tag ──▶ C build
    scripts/release_cut.py         release-tag.yml      release.yml (tag push)         release-tag.yml
 ```
 
-### Stage A — cut (`scripts/release_cut.py`, `release-cut.yml`)
+### Stage A — cut (`scripts/release_cut.py`, run by a maintainer)
 
-Triggered by `workflow_dispatch` (inputs: `level` = `auto` | `patch` | `minor`
-| `major`, `dry_run`). Runs on `ubuntu-latest` with `contents: write` and
-`pull-requests: write` through the ephemeral token. The script (Python 3.9,
-stdlib only, tested under `scripts/tests/`):
+A maintainer runs `python3 scripts/release_cut.py [--level auto|patch|minor|
+major] [--dry-run]` on an up-to-date `main` checkout; the script ends by
+running `gh pr create` under the maintainer's own `gh` login. It is **not** a
+workflow on purpose: a pull request created (or a branch pushed) with the
+repository's `GITHUB_TOKEN` does not trigger `pull_request` workflows (GitHub's
+recursion guard), so a bot-opened release PR would sit at "required checks
+missing" forever. A GitHub App installation token would lift that limit; it is
+not worth a stored credential for a command a maintainer runs a few times a
+month. The script (Python 3.9, stdlib only, tested under `scripts/tests/`):
 
 1. `git describe --tags --abbrev=0` → last tag; `git log <tag>..HEAD
    --format=%s%n%b --no-merges` → bump level per §2; version = bump applied to
@@ -86,29 +93,43 @@ stdlib only, tested under `scripts/tests/`):
    - `evals/plugin-v1/protocol.json` implementation fingerprint via
      `python3 scripts/eval/plugin_release_gate.py
      --refresh-implementation-fingerprint` (last, as always).
-3. Opens the release PR with title `release: <version>` and label `release`.
-   The body is the new changelog section plus the bump derivation (which
-   commits drove the level) so a reviewer can dispute the level, not just the
-   diff.
+3. Pushes branch `release/<version>` (`--force-with-lease`: the branch is
+   generated, re-running the cut after more merges simply regenerates it) and
+   opens the PR with title `release: <version>` and label `release`. The body
+   is the new changelog section plus the bump derivation (which commits drove
+   the level, and which commits have no changelog line) so a reviewer can
+   dispute the level, not just the diff.
 
 The PR is gated by the ordinary ruleset (four required checks, branch up to
 date). Merging it is the human decision that a release happens.
 
 ### Stage B — tag (`release-tag.yml`)
 
-`on: pull_request: types: [closed]` filtered on `merged == true` and the
-`release` label. The job reads the version from `build.zig.zon` on the merge
-commit, refuses if it still carries `-dev` or if the tag exists, then creates
-the annotated tag `<version>` on `github.event.pull_request.merge_commit_sha`
-and pushes it. Tags are never moved; a mistaken release is followed by a new
-patch release, not a re-tag.
+`on: pull_request: types: [closed]`, `permissions: contents: write,
+actions: write`, and the job runs only when all of these hold: `merged ==
+true`, the `release` label is present, `head.repo.full_name ==
+github.repository` (never a fork), and the PR title is `release: <version>`
+where `<version>` equals `.version` in `build.zig.zon` at
+`merge_commit_sha` and carries no `-dev`. It refuses if the tag exists, then
+creates the annotated tag `<version>` on the merge commit and pushes it.
+
+A tag pushed with `GITHUB_TOKEN` does not fire `release.yml`'s `push: tags`
+trigger (same recursion guard), so the job then starts stage C explicitly:
+`gh workflow run release.yml --ref <version> -f tag=<version> -f dry_run=false`.
+`workflow_dispatch` is the documented exception to the guard, and the dispatch
+path of `release.yml` already accepts a bare tag. Tags are never moved; a
+mistaken release is followed by a new patch release, not a re-tag.
 
 ### Stage C — build and draft (`release.yml`, extended)
 
 Add `on: push: tags: ["[0-9]+.[0-9]+.[0-9]+"]` (the TODO in
-`doc/RELEASE_RUNNER.md` "Enabling the tag trigger"). The matrix, the seven-point
-`release:verify`, the double-archive comparison and the `publish` job stay.
-Two changes to `publish`:
+`doc/RELEASE_RUNNER.md` "Enabling the tag trigger") for tags a maintainer
+pushes by hand; stage B reaches the same workflow through `workflow_dispatch`.
+The matrix, the seven-point `release:verify`, the double-archive comparison and
+the `publish` job stay. `share/doc/CHANGELOG-<version>.md` is the whole
+`CHANGELOG.md` copied at stage time (`build.zig` release extras), so the cut's
+changelog rewrite imposes no parser contract on the bundle. Two changes to
+`publish`:
 
 - version is read from the tag (`github.ref_name`) on tag runs and from the
   manifest on dispatch runs; `release_sums.py` and `gh release create` receive
@@ -122,14 +143,20 @@ Two changes to `publish`:
 skipped on that path because there is no tag (today it is unconditional and
 would fail).
 
-### Stage D — reopen development (same `release-tag.yml`)
+### Stage D — reopen development (`scripts/release_cut.py --reopen`)
 
-After the tag is pushed the job opens a second, trivial PR `chore: reopen
-<next>-dev` that sets `build.zig.zon` / `src/version.zig` to `X.Y.(Z+1)-dev`
-and re-adds the empty `## Unreleased` block if the cut left none. PATCH is the
-default floor; a maintainer who knows the next release is a minor edits the
-number in that PR. This keeps `main` always one `-dev` ahead of the last tag,
-which is what `release_manifest.zig`'s `pre` channel and `--version` assume.
+For the same recursion-guard reason as stage A, the reopen PR is opened by the
+maintainer: `python3 scripts/release_cut.py --reopen` (run right after merging
+the release PR; the cut script prints the reminder) sets `build.zig.zon` /
+`src/version.zig` to `X.Y.(Z+1)-dev`, re-adds the empty `## Unreleased`
+block if the cut left none, repins the fingerprint and opens `chore: reopen
+<next>-dev`. PATCH is the default floor; a maintainer who knows the next
+release is a minor passes `--reopen-level minor`. Until that PR merges, `main`
+briefly carries the released version without `-dev`; stage B's tag-exists
+check makes a second cut in that window a no-op, and `release_manifest.zig`
+would classify a build from that window as `stable` only if it is exactly the
+tagged commit (`git describe --exact-match`), so an accidental pre build from
+the window is still labelled correctly.
 
 ## 4. Hotfixes and maintenance lines
 
@@ -179,11 +206,10 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 
 | file | change |
 |---|---|
-| `scripts/release_cut.py` (new) | bump computation, version/changelog rewrite, PR body; `--dry-run` prints the plan |
+| `scripts/release_cut.py` (new) | bump computation, version/changelog rewrite, PR body, `--reopen`; `--dry-run` prints the plan; run by a maintainer, not by CI |
 | `scripts/release_notes.py` (new) | print one CHANGELOG section |
 | `scripts/tests/test_release_cut.py` (new) | level table, floor rule, changelog rewrite idempotence, refusal cases |
-| `.github/workflows/release-cut.yml` (new) | stage A |
-| `.github/workflows/release-tag.yml` (new) | stages B and D |
+| `.github/workflows/release-tag.yml` (new) | stage B (tag the merged release PR, dispatch `release.yml`) |
 | `.github/workflows/release.yml` | tag trigger, version from tag/manifest, notes from changelog, no `--verify-tag` on dispatch |
 | `release/LAYOUT.md` | fix "ReleaseSafe" (the executable is `ReleaseSmall`, `build.zig`), publish flow with stages A–D |
 | `README.md` | Lean kernels are not in the release unit (matches `release/LAYOUT.md`) |
@@ -215,3 +241,12 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 - The cut refuses a release whose commits carry no `feat`/`fix`/`perf` unless
   forced.
 - Attestation and SBOM stay follow-ups (§7).
+- Publishing a pre-release (the `OPEN_SOURCE_READINESS.md` launch-gate item
+  "immutable pre-release with checksums") needs a tag, and the pre channel's
+  version `X.Y.Z-dev+<commit12>` has none by design (`release_manifest.zig`
+  sets `tag = null`). Two options, not chosen here: (a) `release.yml` on
+  `dry_run=false` for a non-tag ref creates a lightweight tag
+  `pre/<version-without-build-metadata>.<yyyymmdd>` on the built commit and a
+  GitHub *pre-release* under it — needs the manifest's channel logic to accept
+  that tag shape; (b) keep pre builds as artifacts only and satisfy the launch
+  gate with the first stable `0.2.0`. (b) is the smaller change.
