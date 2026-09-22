@@ -332,7 +332,7 @@ test "L2 RuntimeHost hot-swaps first-party core profiles without mutating live S
     try std.testing.expectEqual(@as(u32, 1), new_result.tool_calls);
     const old_body = (old_server.lastRequest() orelse return error.NoRequestCaptured).body();
     const new_body = (new_server.lastRequest() orelse return error.NoRequestCaptured).body();
-    try std.testing.expect(std.c.access(target_path.ptr, std.c.F_OK) == 0);
+    try std.testing.expect(pfs.exists(target_path.ptr));
     try std.testing.expect(std.mem.indexOf(u8, old_body, "generation-one-readable") != null);
     try std.testing.expect(std.mem.indexOf(u8, old_body, "\"name\":\"Read\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, old_body, "\\\"name\\\":\\\"Write\\\"") == null and std.mem.indexOf(u8, old_body, "\"name\":\"Write\"") == null);
@@ -636,7 +636,7 @@ test "L2 AgentSession rejects an unadvertised Runtime tool before prefetch or di
     var sink_state: u8 = 0;
     const result = try session.runText(1, "do not trust the provider", 4, .{ .ctx = &sink_state, .emit = Sink.emit });
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
-    try std.testing.expect(std.c.access(marker.ptr, std.c.F_OK) != 0);
+    try std.testing.expect(!pfs.exists(marker.ptr));
     const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "unknown_tool") != null);
 }

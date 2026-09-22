@@ -203,8 +203,8 @@ test "Monitor: sandbox 开启时命令被 sandbox-exec 包裹(cwd 外写被拦,t
 
     // /Users/Shared 世界可写但**不在** sandbox 白名单(cwd/dev/tmp/home 之外)→ 好判别标靶。
     const escape = "/Users/Shared/cc-mon-sbx-escape-test";
-    _ = std.c.unlink(escape);
-    defer _ = std.c.unlink(escape);
+    @import("platform").fs.unlinkPath(escape) catch {};
+    defer @import("platform").fs.unlinkPath(escape) catch {};
 
     const out = try execute(&ctx, "{\"command\":\"touch /Users/Shared/cc-mon-sbx-escape-test\"}");
     defer a.free(out);

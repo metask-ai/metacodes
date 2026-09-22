@@ -426,7 +426,7 @@ pub fn atomicWrite(path: []const u8, body: []const u8) !void {
         const n = pfs.write(fd, body[written..]);
         if (n <= 0) {
             pfs.close(fd);
-            _ = std.c.unlink(tmp.ptr);
+            pfs.unlinkPath(tmp.ptr) catch {};
             return error.WriteFailed;
         }
         written += @intCast(n);
@@ -459,7 +459,7 @@ pub fn atomicWrite(path: []const u8, body: []const u8) !void {
         rename_ok = pfs.renameReplace(tmp.ptr, @ptrCast(&path_buf)) == 0;
     }
     if (!rename_ok) {
-        _ = std.c.unlink(tmp.ptr);
+        pfs.unlinkPath(tmp.ptr) catch {};
         return error.RenameFailed;
     }
 }

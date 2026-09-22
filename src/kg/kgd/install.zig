@@ -274,7 +274,7 @@ fn writeConfig(
     // From here the temporary exists and holds the API key: every failure path
     // out of this function must take it with them, including the allocation
     // below, which is easy to forget precisely because it looks unrelated.
-    errdefer _ = std.c.unlink(temporary.ptr);
+    errdefer pfs.unlinkPath(temporary.ptr) catch {};
     const body = document.written();
     var written: usize = 0;
     while (written < body.len) {
@@ -295,7 +295,7 @@ fn restrictDirectory(allocator: std.mem.Allocator, path: []const u8) !void {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
     if (@import("builtin").os.tag == .windows) return;
-    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.ChmodFailed;
+    if (pfs.chmod(path_z.ptr, 0o700) != 0) return error.ChmodFailed;
 }
 
 const testing = std.testing;
@@ -483,5 +483,5 @@ fn writeRaw(allocator: std.mem.Allocator, path: []const u8, body: []const u8, mo
         return error.WriteFailed;
     }
     _ = pfs.close(fd);
-    if (std.c.chmod(path_z.ptr, mode) != 0) return error.ChmodFailed;
+    if (pfs.chmod(path_z.ptr, mode) != 0) return error.ChmodFailed;
 }

@@ -113,6 +113,7 @@ pub const swarm_tools = @import("swarm/tools.zig");
 pub const swarm_teammate_process = @import("swarm/teammate_process.zig");
 pub const tools_common = @import("tools/common.zig");
 pub const platform_fs = @import("platform").fs;
+pub const platform_test_support = @import("platform").test_support; // 组件测试的链接/枚举夹具
 pub const kg_inject = @import("kg/inject.zig");
 pub const kg_scoped_recall = @import("kg/scoped_recall.zig");
 pub const abort = @import("util/abort.zig");

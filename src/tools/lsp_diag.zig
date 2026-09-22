@@ -3,6 +3,7 @@
 //! 没装配)→ 全 no-op。
 //! best-effort:任何失败绝不阻断写入(graceful degradation)。
 const std = @import("std");
+const pfs = @import("platform").fs;
 const ToolContext = @import("context.zig").ToolContext;
 const log = @import("../util/log.zig");
 const util_json = @import("../util/json.zig");
@@ -15,11 +16,8 @@ pub fn absPath(file_path: []const u8, buf: []u8) ?[]const u8 {
         return buf[0..file_path.len];
     }
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    cwd_buf[cwd_buf.len - 1] = 0; // 哨兵(同 util/fs.getCwd)
-    if (std.c.getcwd(&cwd_buf, cwd_buf.len - 1) == null) return null;
-    const end = std.mem.indexOfScalar(u8, &cwd_buf, 0) orelse return null;
-    if (end == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}/{s}", .{ cwd_buf[0..end], file_path }) catch null;
+    const cwd = pfs.getCwd(&cwd_buf) orelse return null; // 哨兵与 Windows 宽字符 cwd 都在 pfs 里
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ cwd, file_path }) catch null;
 }
 
 /// 写前:用**旧内容** snapshot baseline(delta 基准)。ctx.lsp==null → no-op。

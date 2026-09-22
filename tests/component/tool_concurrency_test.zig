@@ -163,7 +163,7 @@ test "L2 WebSearch 独立 provider 让混合批并发且 Read 不被隔离" {
 }
 
 fn mkdir(p: [*:0]const u8) void {
-    _ = std.c.mkdir(p, 0o755);
+    _ = pfs.mkdir(p, 0o755);
 }
 fn touch(p: [*:0]const u8) void {
     const fd = pfs.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
@@ -250,7 +250,7 @@ test "L2 并发: executeSlots 保留聚合大结果给 hook/UI 后置投影" {
     const a = std.testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-cc-budget-home");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
     // 3 个 denied slot 各预填 ~80k 内容。dispatch 层必须保持原字节；
     // agent_loop 才是唯一投影提交点。
@@ -290,7 +290,7 @@ test "L2 并发: executeSlots 对 Read/Grep 都不提前投影" {
     const a = std.testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-cc-budget-home2");
-    _ = std.c.mkdir(home.ptr, 0o755);
+    _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
     // ReadArtifact 的防环由 result_projection 的 inline-only policy 保证；
     // dispatch 层不再按工具名做持久化分叉。

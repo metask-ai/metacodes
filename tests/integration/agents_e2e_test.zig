@@ -8,7 +8,7 @@ fn makeAgent(parent: []const u8, filename: []const u8, md: []const u8) !void {
     const a = std.testing.allocator;
     const parent_z = try a.dupeZ(u8, parent);
     defer a.free(parent_z);
-    _ = std.c.mkdir(parent_z, 0o755);
+    _ = pfs.mkdir(parent_z, 0o755);
     const md_path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ parent, filename }, 0);
     defer a.free(md_path);
     const fd = pfs.open(md_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
@@ -20,14 +20,14 @@ fn rmAgent(parent: []const u8, filename: []const u8) void {
     const a = std.testing.allocator;
     const md_path = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ parent, filename }, 0) catch return;
     defer a.free(md_path);
-    _ = std.c.unlink(md_path);
+    pfs.unlinkPath(md_path) catch {};
 }
 
 fn rmDir(p: []const u8) void {
     const a = std.testing.allocator;
     const pz = a.dupeZ(u8, p) catch return;
     defer a.free(pz);
-    _ = std.c.rmdir(pz);
+    _ = pfs.rmdir(pz);
 }
 
 fn currentProjectRoot(allocator: std.mem.Allocator) ![]u8 {

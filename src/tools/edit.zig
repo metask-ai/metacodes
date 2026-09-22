@@ -609,7 +609,7 @@ test "EditTool basic replace" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const write = @import("write.zig");
     var b1: [320]u8 = undefined;
@@ -628,7 +628,7 @@ test "EditTool replace_all" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-all-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const write = @import("write.zig");
     var b1: [320]u8 = undefined;
@@ -650,7 +650,7 @@ test "EditTool string not found" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-nf-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const write = @import("write.zig");
     var b1: [320]u8 = undefined;
@@ -664,7 +664,7 @@ test "EditTool MultipleMatches without replace_all" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-multi-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const write = @import("write.zig");
     var b1: [320]u8 = undefined;
@@ -679,7 +679,7 @@ test "EditTool MultipleMatches bypass with replace_all" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-multi-ok-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const write = @import("write.zig");
     var b1: [320]u8 = undefined;
@@ -696,7 +696,7 @@ test "EditTool strips cat-n line numbers from old_string" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-lnstrip-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const write = @import("write.zig");
     var b1: [320]u8 = undefined;
@@ -748,7 +748,7 @@ test "EditTool not-read-first rejects" {
     var path_buf: [512]u8 = undefined;
     const path = tt.path(&path_buf, "edit-mrf-test.txt");
     var args_buf: [1024]u8 = undefined;
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.write(fd, "hello");
@@ -765,7 +765,7 @@ test "EditTool stale rejected" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-stale-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.write(fd, "hello");
@@ -784,7 +784,7 @@ test "EditTool after read succeeds" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-after-read-test.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
 
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.write(fd, "foo");
@@ -824,7 +824,7 @@ test "EditTool old==new 拒绝(NoOpEdit)+ detail" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-noop.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     const write = @import("write.zig");
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
@@ -844,7 +844,7 @@ test "EditTool not-found 诊断:仅空白差异提示" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-wsdiff.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     const write = @import("write.zig");
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
@@ -887,7 +887,7 @@ test "EditTool smart-quote fallback replaces curly with straight" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "edit-smartquote.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     // 文件含弯引号
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     const content = "const s = \xE2\x80\x9Chello\xE2\x80\x9D;\n";
@@ -921,7 +921,7 @@ test "Edit result reports final_newlines fact" {
     const ctx = ToolContext.simple(a);
     var buf: [512]u8 = undefined;
     const path = tt.path(&buf, "cc-zig-edit-final-newlines.txt");
-    defer _ = std.c.unlink(path.ptr);
+    defer pfs.unlinkPath(path.ptr) catch {};
     const write = @import("write.zig");
     var b1: [640]u8 = undefined;
     a.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"gen-old\\n\"}}", .{path})));

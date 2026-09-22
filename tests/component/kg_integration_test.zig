@@ -5,6 +5,7 @@
 //! 找不到二进制(CI 无 tinykg)→ SkipZigTest(不是失败:KG 是增强非依赖)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const cc = @import("cc");
 const tinykg_binary = @import("tinykg_binary.zig");
@@ -1369,7 +1370,7 @@ test "L2 KG migrate: TinyKG 发布失败时恢复 legacy 且 session fail closed
     defer a.free(foreign_staging);
     const staging_z = try a.dupeZ(u8, foreign_staging);
     defer a.free(staging_z);
-    if (std.c.mkdir(staging_z.ptr, 0o700) != 0) return error.MkdirFailed;
+    if (pfs.mkdir(staging_z.ptr, 0o700) != 0) return error.MkdirFailed;
 
     var failed = try makeClient(a, bin, store, "proj-auto-fail");
     defer failed.deinit();
@@ -1848,7 +1849,7 @@ test "L2 KG: claim packet 失败会释放刚取得的租约" {
     try overwriteFile(a, wrapper, script);
     const wrapper_z = try a.dupeZ(u8, wrapper);
     defer a.free(wrapper_z);
-    if (std.c.chmod(wrapper_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    if (pfs.chmod(wrapper_z.ptr, 0o700) != 0) return error.SkipZigTest;
     a.free(kg.bin_path.?);
     kg.bin_path = try a.dupe(u8, wrapper);
 
@@ -2420,7 +2421,7 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
         var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
         @memcpy(zbuf[0..memdir_abs.len], memdir_abs);
         zbuf[memdir_abs.len] = 0;
-        _ = std.c.mkdir(@ptrCast(&zbuf), 0o755);
+        _ = pfs.mkdir(@ptrCast(&zbuf), 0o755);
     }
 
     var kg = try makeClient(a, bin, store, "proj-auto");
@@ -3346,7 +3347,7 @@ test "L2 KG v42: 深探针 data 失败 → 隔离重建(字节保全);transient 
     {
         const shim_z = try a.dupeZ(u8, shim);
         defer a.free(shim_z);
-        if (std.c.chmod(shim_z.ptr, 0o755) != 0) return error.SkipZigTest;
+        if (pfs.chmod(shim_z.ptr, 0o755) != 0) return error.SkipZigTest;
     }
 
     const poison = try std.fmt.allocPrint(a, "{s}/POISON", .{store});

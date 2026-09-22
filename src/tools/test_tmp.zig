@@ -61,5 +61,5 @@ test "path: per-pid 唯一目录 + 可建文件" {
     const fd = pfs.open(p.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     _ = pfs.close(fd);
-    _ = std.c.unlink(p.ptr);
+    pfs.unlinkPath(p.ptr) catch {};
 }
